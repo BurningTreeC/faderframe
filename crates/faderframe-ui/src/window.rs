@@ -24,6 +24,8 @@ pub struct Chrome {
     /// Measures how tall the edit toolbar must be at the window's width.
     pub edit_bar_layout: faderframe_view_arranger::edit_bar::EditToolbarView,
     pub notice: gtk::Label,
+    /// Warnings and errors pop up here for a few seconds.
+    pub toast: Toast,
     pub engine: gtk::Label,
     pub midi_button: gtk::Button,
     pub midi_led: gtk::Label,
@@ -32,6 +34,74 @@ pub struct Chrome {
     pub import_bar: gtk::ProgressBar,
     pub workspaces: gtk::DropDown,
     pub workspace_guard: Rc<Cell<bool>>,
+}
+
+/// A message that slides in at the top of the window.
+pub struct Toast {
+    pub revealer: gtk::Revealer,
+    label: gtk::Label,
+    frame: gtk::Box,
+    /// Time stamp of the notice shown last, and until when it stays.
+    shown: Cell<Option<std::time::Instant>>,
+    until: Cell<Option<std::time::Instant>>,
+}
+
+impl Toast {
+    fn new() -> Self {
+        let label = gtk::Label::new(None);
+        label.set_wrap(true);
+        label.set_max_width_chars(80);
+        label.set_xalign(0.0);
+        let close = gtk::Button::from_icon_name("window-close-symbolic");
+        close.add_css_class("flat");
+        close.set_valign(gtk::Align::Center);
+        let frame = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        frame.add_css_class("toast");
+        frame.append(&label);
+        frame.append(&close);
+        let revealer = gtk::Revealer::new();
+        revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
+        revealer.set_halign(gtk::Align::Center);
+        revealer.set_valign(gtk::Align::Start);
+        revealer.set_margin_top(10);
+        revealer.set_child(Some(&frame));
+        revealer.set_can_target(true);
+        let r = revealer.clone();
+        close.connect_clicked(move |_| r.set_reveal_child(false));
+        Self {
+            revealer,
+            label,
+            frame,
+            shown: Cell::new(None),
+            until: Cell::new(None),
+        }
+    }
+
+    /// Show new warnings and errors; hide after five seconds.
+    fn update(&self, s: &Session) {
+        let now = std::time::Instant::now();
+        if let Some(n) = s.latest_notice()
+            && n.level != NoticeLevel::Info
+            && self.shown.get() != Some(n.at)
+            && n.at.elapsed().as_secs() < 5
+        {
+            self.shown.set(Some(n.at));
+            self.label.set_text(&n.text);
+            set_class(&self.frame, "toast-error", n.level == NoticeLevel::Error);
+            set_class(
+                &self.frame,
+                "toast-warning",
+                n.level == NoticeLevel::Warning,
+            );
+            self.revealer.set_reveal_child(true);
+            self.until
+                .set(Some(now + std::time::Duration::from_secs(5)));
+        }
+        if self.until.get().is_some_and(|u| now >= u) {
+            self.until.set(None);
+            self.revealer.set_reveal_child(false);
+        }
+    }
 }
 
 fn set_class(w: &impl IsA<gtk::Widget>, class: &str, on: bool) {
@@ -77,6 +147,7 @@ impl Chrome {
             }
             self.edit_bar.queue_draw();
         }
+        self.toast.update(s);
         if !full {
             return;
         }
@@ -557,7 +628,11 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
     status.append(&engine_button);
     status.append(&platform);
     content.append(&status);
-    window.set_child(Some(&content));
+    let toast = Toast::new();
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&content));
+    overlay.add_overlay(&toast.revealer);
+    window.set_child(Some(&overlay));
 
     app.dock.borrow_mut().main_slot = Some(slot);
     *app.chrome.borrow_mut() = Some(Chrome {
@@ -572,6 +647,7 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
             app.theme.clone(),
         ),
         notice,
+        toast,
         engine,
         midi_button,
         midi_led,

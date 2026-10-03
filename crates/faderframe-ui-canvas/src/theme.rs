@@ -350,7 +350,8 @@ impl Theme {
                 record: Color::hex(0xff4b4b),
                 automation: Color::hex(0x5fc27a),
                 clip_radius: 4.0,
-                clip_header: 15.0,
+                // Tall enough for the clip gain knob.
+                clip_header: 22.0,
                 clip_text: Color::hex(0x121212),
                 selection_outline: Color::hex(0xf5f5f5),
                 track_height: 72.0,

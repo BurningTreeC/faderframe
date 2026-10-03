@@ -76,6 +76,9 @@ pub struct AppState {
     pub chrome: RefCell<Option<Chrome>>,
     canvases: RefCell<Vec<glib::WeakRef<CanvasWidget>>>,
     layout_rev: Cell<u64>,
+    /// Session revision the widgets show (changes made by the frame tick —
+    /// finished recordings, imports, analyses — redraw too).
+    shown_rev: Cell<u64>,
     last_tick: Cell<Option<Instant>>,
     frame: Cell<u64>,
     /// Background CLAP scan in progress.
@@ -87,6 +90,7 @@ impl AppState {
         Rc::new(Self {
             app: app.clone(),
             layout_rev: Cell::new(session.layout_revision()),
+            shown_rev: Cell::new(session.revision()),
             session: RefCell::new(session),
             theme: Theme::studio(),
             options: RefCell::new(options),
@@ -142,7 +146,11 @@ impl AppState {
 
     /// Bring widgets in line with the session after a change.
     pub fn after_change(self: &Rc<Self>) {
-        let rev = self.session.borrow().layout_revision();
+        let (rev, model_rev) = {
+            let s = self.session.borrow();
+            (s.layout_revision(), s.revision())
+        };
+        self.shown_rev.set(model_rev);
         if rev != self.layout_rev.get() {
             self.layout_rev.set(rev);
             crate::dock::realize(self);
@@ -197,8 +205,16 @@ impl AppState {
             .last_tick
             .replace(Some(now))
             .map_or(1.0 / 60.0, |t| (now - t).as_secs_f32().min(0.25));
-        if let Ok(mut s) = self.session.try_borrow_mut() {
-            s.tick(dt);
+        let changed = match self.session.try_borrow_mut() {
+            Ok(mut s) => {
+                s.tick(dt);
+                s.revision() != self.shown_rev.get()
+            }
+            Err(_) => false,
+        };
+        if changed {
+            // e.g. a take placed after the recording stopped.
+            self.after_change();
         }
         crate::plugin_window::tick(self);
         // Windows views asked for.

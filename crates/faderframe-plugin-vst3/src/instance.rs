@@ -107,6 +107,8 @@ pub struct Vst3Instance {
     latency: u32,
     tail: TailLength,
     needs_restart: bool,
+    /// Activations so far (see `PluginInstance::activation`).
+    activations: u64,
     view: Option<ComPtr<IPlugView>>,
     view_open: bool,
     /// Editor edits forwarded since the last poll (for "dirty").
@@ -171,6 +173,7 @@ impl Vst3Instance {
             latency: 0,
             tail: TailLength::None,
             needs_restart: false,
+            activations: 0,
             view: None,
             view_open: false,
             edited: false,
@@ -455,6 +458,10 @@ impl FfInstance for Vst3Instance {
         self.latency
     }
 
+    fn activation(&self) -> u64 {
+        self.activations
+    }
+
     fn tail(&self) -> TailLength {
         self.tail
     }
@@ -661,6 +668,7 @@ impl FfInstance for Vst3Instance {
                 out_tx,
             );
             self.rt = Some(Arc::new(TryCell::new(Some(active))));
+            self.activations += 1;
             self.to_rt = Some(tx);
             self.from_rt = Some(out_rx);
             self.config = Some(*config);

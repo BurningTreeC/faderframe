@@ -229,6 +229,13 @@ pub trait PluginInstance {
     /// Set a parameter from the UI; reaches the processor without blocking.
     fn set_parameter(&mut self, id: ParameterId, value: f64) -> Result<(), PluginError>;
     fn latency_samples(&self) -> u32;
+    /// Counts (re)activations. Processors of different activations are not
+    /// interchangeable: after a restart the old one is dead, so the engine
+    /// must not keep it in place of the new one (it is part of the node's
+    /// identity). Instances whose processors are independent keep 0.
+    fn activation(&self) -> u64 {
+        0
+    }
     fn tail(&self) -> TailLength;
     fn save_state(&mut self) -> Result<Vec<u8>, PluginError>;
     fn load_state(&mut self, data: &[u8]) -> Result<(), PluginError>;

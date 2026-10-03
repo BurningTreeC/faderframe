@@ -33,6 +33,7 @@ pub use editing::{
     ClipEdge, CounterUnit, EditFlag, EditMode, EditRange, EditTool, GridMode, NudgeTarget,
     NudgeValue, ZoomRequest, parse_position,
 };
+pub use faderframe_workspace::{DEFAULT_INSERT_SLOTS, INSERT_SLOTS_RANGE};
 pub use sync::{MtcRate, SyncSettings, SyncSource, SyncStatus, Timecode};
 
 pub use meters::{METER_FLOOR_DB, MeterChannel, MeterDisplay};
@@ -44,7 +45,7 @@ use faderframe_audio::{
 };
 use faderframe_audio_files::PeakCache;
 pub use faderframe_automation::{AutomationMode, AutomationTarget};
-use faderframe_core::{AudioSourceId, ClipId, NoteId, TrackId, builtin};
+use faderframe_core::{AudioSourceId, ClipId, NoteId, TrackId};
 use faderframe_engine::{
     EngineConfig, EngineController, EngineError, EngineProcessor, Source, SourceMap, StreamPlan,
 };
@@ -113,8 +114,9 @@ pub enum TransportAction {
     ReturnToStart,
     ToggleLoop,
     SetLoop(Option<MusicalRange>),
-    /// Record mode on/off: capture armed tracks while playing (punching in
-    /// on the fly when already playing).
+    /// The record button: stopped — record the armed tracks and play;
+    /// playing — punch in here; recording — punch out (keeps playing).
+    /// With nothing armed it only warns.
     ToggleRecord,
     /// Restrict recording to the punch range (defaults to the loop range).
     TogglePunch,
@@ -364,6 +366,8 @@ pub enum Action {
     },
     /// Width of the arranger's track header column (saved with the layout).
     SetHeaderWidth(f32),
+    /// Insert slots per mixer strip (saved with the layout).
+    SetMixerInsertSlots(u16),
     /// Remember where a plugin editor window is (saved with the layout).
     SetPluginWindowPosition {
         plugin: faderframe_core::PluginInstanceId,
@@ -1030,6 +1034,13 @@ impl Session {
             from: r.from,
             to: r.to,
         })
+    }
+
+    /// Insert slots per mixer strip.
+    pub fn mixer_insert_slots(&self) -> usize {
+        self.workspace
+            .mixer_insert_slots
+            .unwrap_or(faderframe_workspace::DEFAULT_INSERT_SLOTS) as usize
     }
 
     /// Arranger track header width (`None`: the theme default).
@@ -2090,6 +2101,11 @@ impl Session {
                 self.add_track_from_preset(&path)?;
             }
             Action::ApplyTrackPreset { track, path } => self.apply_track_preset(track, &path)?,
+            Action::SetMixerInsertSlots(n) => {
+                let (lo, hi) = faderframe_workspace::INSERT_SLOTS_RANGE;
+                self.workspace.mixer_insert_slots = Some(n.clamp(lo, hi));
+                self.revision += 1;
+            }
             Action::SetHeaderWidth(w) => {
                 let (lo, hi) = faderframe_workspace::HEADER_WIDTH_RANGE;
                 self.workspace.header_width = Some(w.clamp(lo, hi));
@@ -2319,11 +2335,16 @@ impl Session {
                 self.edit(Command::SetLoop { range, enabled })?;
             }
             TransportAction::ToggleRecord => {
+                // Recording: punch out (playback continues). Playing: punch
+                // in here. Stopped: record and play.
                 if self.recording.is_some() {
                     self.stop_recording()?;
                 } else {
                     let from = self.transport.position;
                     self.start_recording(from)?;
+                    if self.recording.is_some() && !self.transport.playing {
+                        self.play()?;
+                    }
                 }
             }
             TransportAction::TogglePunch => {
@@ -2394,6 +2415,21 @@ impl Session {
         plugin: PluginRef,
     ) -> Result<()> {
         let hosted = plugin.format != faderframe_project::PluginFormat::Builtin;
+        // An instrument picked for an insert slot of an instrument track
+        // that has none becomes its instrument.
+        let target =
+            match target {
+                PluginTarget::Insert(_)
+                    if self.project.track(track).is_some_and(|t| {
+                        t.kind == TrackKind::Instrument && t.instrument.is_none()
+                    }) && self.available_plugins().iter().any(|p| {
+                        p.plugin.id == plugin.id && p.plugin.format == plugin.format && p.instrument
+                    }) =>
+                {
+                    PluginTarget::Instrument
+                }
+                other => other,
+            };
         match target {
             PluginTarget::Insert(index) => self.dispatch(Action::InsertPlugin {
                 track,
@@ -2820,15 +2856,8 @@ impl Session {
             // Like a console channel: input 1 (or 1–2 for stereo) by default.
             track.input = faderframe_project::InputRouting::Hardware { first_channel: 0 };
         }
-        if kind == TrackKind::Instrument {
-            track.instrument = Some(PluginSlot {
-                id: p.ids.allocate(),
-                plugin: PluginRef::builtin(builtin::SYNTH, "FaderFrame Synth"),
-                bypass: false,
-                parameters: Vec::new(),
-                state: None,
-            });
-        }
+        // Instrument tracks start without an instrument: one is chosen
+        // from the plugins (built-in synth, CLAP, VST3).
         // Content tracks go after the last selected/content track; buses and
         // auxes go just before the master.
         let index = if kind.is_summing() {
@@ -2985,7 +3014,10 @@ mod tests {
         let before = s.project().tracks.len();
         let id = s.add_track(TrackKind::Instrument).unwrap();
         assert_eq!(s.project().tracks.len(), before + 1);
-        assert!(s.project().track(id).unwrap().instrument.is_some());
+        assert!(
+            s.project().track(id).unwrap().instrument.is_none(),
+            "instruments are chosen from the plugins"
+        );
         assert_eq!(s.selection.primary_track(), Some(id));
         assert!(s.is_dirty());
         s.dispatch(Action::Undo).unwrap();

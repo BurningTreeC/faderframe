@@ -381,6 +381,22 @@ instance per slot. Built-ins: synth, echo, gain, latency probe (used to test
 PDC end to end). Failed plugins are bypassed and flagged; missing formats
 pass audio through with a warning.
 
+A plugin node's key includes its latency, bypass and the instance's
+activation count (`PluginInstance::activation`): a restart (requested by
+the plugin, e.g. when its editor opens, or a latency change) deactivates
+the old processor, so the rebuilt graph must keep the fresh one rather than
+adopt the old, dead one. Instrument tracks feed their MIDI (clips and live
+input) to the instrument slot and to every insert whose plugin takes notes;
+an instrument track without an instrument routes MIDI tracks to the first
+such insert. Instrument tracks start without an instrument.
+
+Opt-in tests run installed plugins end to end:
+`FADERFRAME_TEST_BUNDLES=<bundle>:<bundle> cargo test -p faderframe-bench
+--test installed_plugins -- --ignored` (offline: effects keep mono/stereo
+tracks audible, instruments play a clip) and the same with
+`-p faderframe-session` (live session: inserting while playing with the
+editor opening, instruments playing live MIDI as instrument and insert).
+
 ### CLAP
 
 * **Scanning** runs each bundle in a throw-away helper process
@@ -697,6 +713,11 @@ the event loop. DAW work surfaces are **custom-rendered views**:
   fader, segmented meter, LED buttons, scribble strips) using a `Theme`
   (skins replace the theme, not the views). Track headers reuse the same
   controls.
+
+The UI's frame tick (`AppState::tick`, every 16 ms) redraws every view
+when the session's revision changed during the tick — finished recordings,
+imports and analyses arrive there, not through a user action. Warnings and
+errors also pop up as a toast at the top of the main window.
 
 HiDPI and fractional scaling are handled entirely by GTK; views never assume
 96 DPI. On Wayland the app is a native Wayland client (the status bar shows

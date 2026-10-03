@@ -28,3 +28,7 @@ faderframe-transport.workspace = true
 faderframe-realtime.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+faderframe-plugin-clap.workspace = true
+faderframe-plugin-vst3.workspace = true

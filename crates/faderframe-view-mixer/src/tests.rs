@@ -377,3 +377,82 @@ fn clicking_the_pan_value_opens_a_text_field() {
     assert!((t.pan + 0.3).abs() < 1e-6, "{}", t.pan);
     assert!(commit("nonsense").is_none());
 }
+
+#[test]
+fn the_inserts_grip_sizes_the_section_and_more_slots_show() {
+    let mut s = session();
+    let theme = Theme::default();
+    let mut view = MixerView::new(theme.clone());
+    let size = Size::new(1400.0, 900.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    let bass = MixerView::channel_tracks(&s)[1].id;
+    let l = view.layout_of(&s, bass, size).unwrap();
+    assert_eq!(
+        l.inserts.as_ref().map(Vec::len),
+        Some(5),
+        "five slots by default"
+    );
+    let grip = l.inserts_grip.unwrap().center();
+    assert_eq!(view.hit_test(grip, size, &s), Some(Hit::InsertsGrip(bass)));
+    // Drag three slots down.
+    let mut actions = run(&mut view, down(grip, 1), size, &s).0;
+    let to = Point::new(grip.x, grip.y + 3.0 * INSERT_SLOT_STEP + 2.0);
+    actions.extend(
+        run(
+            &mut view,
+            ViewEvent::PointerMove {
+                pos: to,
+                modifiers: Modifiers::NONE,
+                dragging: true,
+            },
+            size,
+            &s,
+        )
+        .0,
+    );
+    actions.extend(
+        run(
+            &mut view,
+            ViewEvent::PointerUp {
+                pos: to,
+                button: PointerButton::Primary,
+                modifiers: Modifiers::NONE,
+            },
+            size,
+            &s,
+        )
+        .0,
+    );
+    assert_eq!(actions, vec![Action::SetMixerInsertSlots(8)]);
+    for a in actions {
+        s.dispatch(a).unwrap();
+    }
+    assert_eq!(s.mixer_insert_slots(), 8);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    let l = view.layout_of(&s, bass, size).unwrap();
+    assert_eq!(l.inserts.as_ref().map(Vec::len), Some(8));
+    // Double-click resets.
+    let grip = l.inserts_grip.unwrap().center();
+    let (a, _) = run(&mut view, down(grip, 2), size, &s);
+    assert_eq!(a, vec![Action::SetMixerInsertSlots(5)]);
+    // More plugins than slots: "+N more" grows the section.
+    s.dispatch(Action::SetMixerInsertSlots(2)).unwrap();
+    for _ in 0..4 {
+        let n = s.project().track(bass).unwrap().inserts.len();
+        s.dispatch(Action::InsertPlugin {
+            track: bass,
+            index: n,
+            plugin: faderframe_project::PluginRef::builtin(faderframe_core::builtin::GAIN, "Gain"),
+        })
+        .unwrap();
+    }
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    assert!(p.texts().contains(&"+3 more"), "{:?}", p.texts());
+    let l = view.layout_of(&s, bass, size).unwrap();
+    let last = l.inserts.as_ref().unwrap()[1].center();
+    let (a, _) = run(&mut view, down(last, 1), size, &s);
+    assert_eq!(a, vec![Action::SetMixerInsertSlots(5)]);
+}

@@ -885,10 +885,15 @@ impl ArrangerView {
         };
         let is_folder = clip.as_takes().is_some();
         let label_x = rect.x.max(lanes.x) + if is_folder { 5.0 + DISCLOSURE_W } else { 5.0 };
+        // The name ends where the gain knob starts.
+        let name_end = self
+            .gain_badge(clip, rect)
+            .map_or(rect.right(), |b| b.x)
+            .min(rect.right());
         let name_rect = Rect::new(
             label_x,
             rect.y,
-            (rect.right() - label_x - 4.0).max(0.0),
+            (name_end - label_x - 4.0).max(0.0),
             header_h,
         );
         if let Some(f) = clip.as_takes() {
@@ -2520,6 +2525,23 @@ impl CanvasView<Session, Action> for ArrangerView {
                 modifiers,
                 precise,
             } => {
+                // The wheel over a clip's gain knob turns it (0.5 dB steps).
+                if !modifiers.alt
+                    && !modifiers.ctrl
+                    && let Some((clip, ClipZone::Gain)) = self.zone_at(model, size, pos)
+                {
+                    let steps = if precise { -dy / 30.0 } else { -dy };
+                    let clips = if model.selection.clips.contains(&clip) {
+                        model.selection.clips.iter().copied().collect()
+                    } else {
+                        vec![clip]
+                    };
+                    cx.emit(Action::ClipGain {
+                        clips,
+                        delta_db: (steps * 0.5 * 10.0).round() / 10.0,
+                    });
+                    return true;
+                }
                 if modifiers.alt && !modifiers.ctrl {
                     // Alt+wheel: all track heights.
                     let steps = if precise { dy / 30.0 } else { dy };

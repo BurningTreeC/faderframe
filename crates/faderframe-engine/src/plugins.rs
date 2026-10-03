@@ -51,6 +51,8 @@ impl Default for PluginHost {
 pub struct ActivatedPlugin {
     pub processor: Box<dyn PluginProcessor>,
     pub latency: u32,
+    /// The instance's activation the processor belongs to.
+    pub activation: u64,
     pub failed: Arc<AtomicBool>,
 }
 
@@ -236,6 +238,7 @@ impl PluginHost {
         Ok(ActivatedPlugin {
             processor,
             latency: hosted.instance.latency_samples(),
+            activation: hosted.instance.activation(),
             failed: Arc::clone(&hosted.failed),
         })
     }

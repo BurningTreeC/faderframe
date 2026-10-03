@@ -2,7 +2,9 @@
 
 use faderframe_ui_canvas::{Rect, Theme};
 
-pub const INSERT_SLOTS: usize = 4;
+/// Height of one insert slot including its gap (the grip moves in these
+/// steps).
+pub const INSERT_SLOT_STEP: f32 = SLOT_H + SLOT_GAP;
 /// Send knobs per row.
 pub const SENDS_PER_ROW: usize = 2;
 /// Most send rows a strip shows at once (more sends are paged in banks).
@@ -16,8 +18,11 @@ pub struct StripLayout {
     pub color_bar: Rect,
     pub header: Rect,
     pub input: Option<InputRow>,
-    pub inserts: Option<[Rect; INSERT_SLOTS]>,
+    /// Insert slots shown (as many as wanted and fit).
+    pub inserts: Option<Vec<Rect>>,
     pub inserts_label: Option<Rect>,
+    /// The rule under the inserts: drag it to show more or fewer slots.
+    pub inserts_grip: Option<Rect>,
     /// Visible send slots (rows × [`SENDS_PER_ROW`]).
     pub sends: Option<Vec<SendSlot>>,
     pub sends_label: Option<Rect>,
@@ -67,14 +72,15 @@ const SECTION_GAP: f32 = 7.0;
 const MIN_FADER_H: f32 = 110.0;
 
 impl StripLayout {
-    /// `send_rows`: how many rows of send knobs are wanted (fewer are
-    /// shown when the strip is short).
+    /// `send_rows` / `insert_slots`: how many rows of send knobs and insert
+    /// slots are wanted (fewer are shown when the strip is short).
     pub fn new(
         strip: Rect,
         theme: &Theme,
         has_input: bool,
         has_sends: bool,
         send_rows: usize,
+        insert_slots: usize,
     ) -> Self {
         let _ = theme;
         let mut r = strip.inset_xy(MARGIN, 0.0);
@@ -102,8 +108,11 @@ impl StripLayout {
             }
         };
         let show_input = has_input && take(INPUT_H + SECTION_GAP);
-        let inserts_h = LABEL_H + INSERT_SLOTS as f32 * (SLOT_H + SLOT_GAP) + SECTION_GAP;
-        let show_inserts = take(inserts_h);
+        let insert_slots = (1..=insert_slots.max(1))
+            .rev()
+            .find(|&n| take(LABEL_H + n as f32 * INSERT_SLOT_STEP + SECTION_GAP))
+            .unwrap_or(0);
+        let show_inserts = insert_slots > 0;
         let send_rows = if has_sends {
             (1..=send_rows.clamp(1, MAX_SEND_ROWS))
                 .rev()
@@ -135,18 +144,22 @@ impl StripLayout {
             }
         });
 
-        let (inserts_label, inserts) = if show_inserts {
+        let (inserts_label, inserts, inserts_grip) = if show_inserts {
             let label = r.take_top(LABEL_H);
-            let mut slots = [Rect::default(); INSERT_SLOTS];
-            for s in &mut slots {
-                *s = r.take_top(SLOT_H);
-                r.take_top(SLOT_GAP);
-            }
-            dividers.push(r.y + SECTION_GAP * 0.5);
+            let slots = (0..insert_slots)
+                .map(|_| {
+                    let s = r.take_top(SLOT_H);
+                    r.take_top(SLOT_GAP);
+                    s
+                })
+                .collect();
+            let y = r.y + SECTION_GAP * 0.5;
+            dividers.push(y);
             r.take_top(SECTION_GAP);
-            (Some(label), Some(slots))
+            let grip = Rect::new(strip.x, y - 3.5, strip.w, 7.0);
+            (Some(label), Some(slots), Some(grip))
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         let (sends_label, sends, send_prev, send_next) = if show_sends {
@@ -204,6 +217,7 @@ impl StripLayout {
             input,
             inserts,
             inserts_label,
+            inserts_grip,
             sends,
             sends_label,
             send_prev,
@@ -230,22 +244,43 @@ mod tests {
     #[test]
     fn tall_strips_show_everything_short_strips_collapse() {
         let theme = Theme::default();
-        let tall = StripLayout::new(Rect::new(0.0, 0.0, 92.0, 760.0), &theme, true, true, 1);
+        let tall = StripLayout::new(Rect::new(0.0, 0.0, 92.0, 760.0), &theme, true, true, 1, 5);
         assert!(tall.input.is_some() && tall.inserts.is_some() && tall.sends.is_some());
         assert_eq!(tall.sends.as_ref().map(Vec::len), Some(SENDS_PER_ROW));
         assert!(tall.fader.h >= MIN_FADER_H);
-        let short = StripLayout::new(Rect::new(0.0, 0.0, 92.0, 330.0), &theme, true, true, 4);
+        let short = StripLayout::new(Rect::new(0.0, 0.0, 92.0, 330.0), &theme, true, true, 4, 5);
         assert!(short.inserts.is_none() && short.sends.is_none());
         assert!(short.fader.h >= MIN_FADER_H - 1.0);
         // More send rows when asked for and there is room; fewer when not.
-        let many = StripLayout::new(Rect::new(0.0, 0.0, 92.0, 900.0), &theme, true, true, 3);
+        let many = StripLayout::new(Rect::new(0.0, 0.0, 92.0, 900.0), &theme, true, true, 3, 5);
         assert_eq!(many.sends.as_ref().map(Vec::len), Some(3 * SENDS_PER_ROW));
-        let squeezed = StripLayout::new(Rect::new(0.0, 0.0, 92.0, 560.0), &theme, true, true, 4);
+        let squeezed = StripLayout::new(Rect::new(0.0, 0.0, 92.0, 560.0), &theme, true, true, 4, 5);
         let n = squeezed.sends.as_ref().map_or(0, Vec::len);
         assert!((SENDS_PER_ROW..4 * SENDS_PER_ROW).contains(&n), "{n}");
         assert!(squeezed.fader.h >= MIN_FADER_H - 1.0);
         // Nothing overlaps the scribble strip.
         assert!(tall.output.bottom() <= tall.scribble.y);
         assert!(tall.fader.bottom() <= tall.output.y);
+    }
+
+    #[test]
+    fn insert_slots_follow_the_wanted_count_and_the_space() {
+        let theme = Theme::default();
+        let strip = Rect::new(0.0, 0.0, 92.0, 900.0);
+        let five = StripLayout::new(strip, &theme, true, true, 1, 5);
+        assert_eq!(five.inserts.as_ref().map(Vec::len), Some(5));
+        let grip = five.inserts_grip.unwrap();
+        assert!(grip.y > five.inserts.as_ref().unwrap()[4].bottom() - 1.0);
+        let nine = StripLayout::new(strip, &theme, true, true, 1, 9);
+        assert_eq!(nine.inserts.as_ref().map(Vec::len), Some(9));
+        assert!(
+            (nine.inserts_grip.unwrap().y - grip.y - 4.0 * INSERT_SLOT_STEP).abs() < 0.01,
+            "the grip moves down by the added slots"
+        );
+        // A short strip shows fewer, never squeezing the fader.
+        let short = StripLayout::new(Rect::new(0.0, 0.0, 92.0, 450.0), &theme, true, true, 1, 12);
+        let n = short.inserts.as_ref().map_or(0, Vec::len);
+        assert!((1..12).contains(&n), "{n}");
+        assert!(short.fader.h >= MIN_FADER_H - 1.0);
     }
 }

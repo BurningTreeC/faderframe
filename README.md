@@ -32,8 +32,8 @@ hosting, an analogue-console-style mixer and dockable, detachable editors.
   selection Start/End/Length counters in bars, time or samples; zoom
   buttons. Range edits: separate, trim to selection, clear (Shuffle closes
   the gap), copy/cut/paste, duplicate, repeat, insert silence.
-* Clip gain (drag the dB readout in the clip's name strip, Ctrl+Shift+↑/↓,
-  Alt-click to type) and fades with five shapes (Linear, Equal Power,
+* Clip gain: a gain knob in every audio clip's name strip (drag or turn
+  the wheel; double-click resets, Alt-click types a value; Ctrl+Shift+↑/↓) and fades with five shapes (Linear, Equal Power,
   S-Curve, Fast, Slow) and a curve you bend by dragging its handle;
   right-click a fade to pick its shape.
 * Transient detection (spectral flux, adjustable sensitivity, cached) and
@@ -50,7 +50,8 @@ hosting, an analogue-console-style mixer and dockable, detachable editors.
   faders with a console fader law, segmented peak meters, routing menus,
   any number of sends per channel (rows grow, ◂ ▸ pages through banks),
   scribble strips, pinned master section; click a pan or level readout to
-  type a value.
+  type a value. The inserts section shows five slots by default; drag the
+  grip on the rule below it for more or fewer (saved with the layout).
 * Piano roll: select/draw/erase/split/mute tools, rubber-band selection,
   moving and Alt-copying with snap (Shift: free), resizing from either edge,
   chords (fixed or scale-aware), scales with highlighting, snap and folding,
@@ -76,7 +77,10 @@ hosting, an analogue-console-style mixer and dockable, detachable editors.
   `Audio/` folder; missing files show as offline clips.
 * Recording: arm tracks, choose a mono input or a stereo pair per track,
   record with punch in/out, pre-roll and metronome; takes are latency
-  compensated. Loop recording keeps every pass as a take.
+  compensated. Loop recording keeps every pass as a take. The record
+  button (Shift+R) records and plays when stopped, punches in while
+  playing and out while recording; with nothing armed a notice pops up.
+  Warnings and errors pop up at the top of the window.
 * Takes and comping: take folders with take lanes — click a lane to use a
   take, drag across it to comp a section, flatten when done. Record mode
   (keep as takes / replace) and loop-record mode (takes / last pass / new
@@ -95,7 +99,11 @@ hosting, an analogue-console-style mixer and dockable, detachable editors.
   → Processing threads.
 * Plugins: built-in synth/echo/gain and CLAP and VST3 effects and
   instruments, found by a crash-safe background scan and picked in a plugin browser (click an
-  empty insert slot or Track → Plugin Browser…). Click a filled insert slot
+  empty insert slot or Track → Plugin Browser…). New instrument tracks
+  start empty and open the browser to choose their instrument (an
+  instrument picked for an empty instrument track's insert slot becomes
+  its instrument); plugins that take notes in insert slots get the
+  track's MIDI too. Click a filled insert slot
   for the plugin's own GUI (Ctrl-click bypasses, right-click for the
   parameter window and more); editors open centred or where they were last,
   and their positions are saved with the project. Plugin state, parameters

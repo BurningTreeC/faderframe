@@ -771,3 +771,55 @@ fn the_upper_half_selects_a_range_and_keys_switch_modes() {
         vec![Action::SetEditTool(faderframe_session::EditTool::Select)]
     );
 }
+
+#[test]
+fn every_audio_clip_has_a_gain_knob_that_the_wheel_turns() {
+    let mut s = session();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 700.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    // Each visible audio clip shows its gain.
+    let audio_clips = s
+        .project()
+        .clips
+        .values()
+        .filter(|c| c.as_audio().is_some())
+        .count();
+    let readouts = p.texts().iter().filter(|t| **t == "0.0 dB").count();
+    assert!(
+        readouts >= 3 && readouts <= audio_clips,
+        "{readouts} of {audio_clips}"
+    );
+    let clip = clip_of(&s, "Bass");
+    let c = s.project().clip(clip).unwrap().clone();
+    let rect = view.clip_view_rect(&s, size, clip).unwrap();
+    let knob = ArrangerView::gain_knob(view.gain_badge(&c, rect).unwrap());
+    assert!(knob.w >= 16.0, "the name strip is tall enough for the knob");
+    let wheel = ViewEvent::Scroll {
+        pos: knob.center(),
+        dx: 0.0,
+        dy: -2.0,
+        modifiers: Modifiers::NONE,
+        precise: false,
+    };
+    let (a, _) = run(&mut view, wheel, size, &s);
+    assert_eq!(
+        a,
+        vec![Action::ClipGain {
+            clips: vec![clip],
+            delta_db: 1.0
+        }]
+    );
+    for a in a {
+        s.dispatch(a).unwrap();
+    }
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    assert!(p.texts().contains(&"+1.0 dB"));
+    // MIDI clips have no gain knob.
+    let melody = clip_of(&s, "Lead Synth");
+    let m = s.project().clip(melody).unwrap().clone();
+    let mrect = view.clip_view_rect(&s, size, melody).unwrap();
+    assert!(view.gain_badge(&m, mrect).is_none());
+}

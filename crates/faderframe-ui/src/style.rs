@@ -43,6 +43,10 @@ paned > separator { background-color: #0b0c0e; min-width: 5px; min-height: 5px; 
     font-size: 9.5pt;
 }
 .statusbar .notice-error { color: #ff7a66; }
+.toast { background-color: rgba(24, 26, 30, 0.96); color: #eceae4; border-radius: 8px;
+  padding: 8px 8px 8px 16px; border: 1px solid #3a3d44; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.55); }
+.toast.toast-warning { border-color: #e8c35a; }
+.toast.toast-error { border-color: #ff7a66; }
 .statusbar .notice-warning { color: #e8c35a; }
 .statusbar .engine { font-family: monospace; }
 .statusbar .engine-button { padding: 0 6px; min-height: 0; }

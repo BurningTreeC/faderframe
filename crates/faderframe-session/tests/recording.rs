@@ -319,3 +319,80 @@ fn mono_and_stereo_tracks_record_one_or_two_channels() {
     assert_eq!(channels(mono), 1);
     assert_eq!(channels(stereo), 2);
 }
+
+/// Tick like the UI's frame clock for `seconds`.
+fn settle(s: &mut Session, seconds: f64) {
+    let end = Instant::now() + Duration::from_secs_f64(seconds);
+    while Instant::now() < end {
+        s.tick(0.016);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Tick like the UI's frame clock until `done` or 5 s.
+fn frames_until(s: &mut Session, mut done: impl FnMut(&Session) -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        s.tick(0.016);
+        if done(s) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    false
+}
+
+#[test]
+fn ui_flow_record_button_then_stop_button_keeps_the_take() {
+    // As the UI does it: the record button, then the stop button; takes
+    // are finished by the frame tick (no wait_for_recordings).
+    for stop in [TransportAction::Stop, TransportAction::TogglePlay] {
+        let (mut s, t) = session();
+        s.dispatch(Action::Transport(TransportAction::ToggleRecord))
+            .unwrap();
+        s.dispatch(Action::Transport(TransportAction::Play))
+            .unwrap();
+        wait_position(&mut s, 0.3);
+        s.dispatch(Action::Transport(stop.clone())).unwrap();
+        let ok = frames_until(&mut s, |s| !clips(s, t).is_empty());
+        assert!(ok, "{stop:?}: the take never appeared");
+        // And it stays.
+        settle(&mut s, 0.4);
+        assert_eq!(clips(&s, t).len(), 1, "{stop:?}: the take disappeared");
+    }
+}
+
+#[test]
+fn the_record_button_starts_playing_and_warns_when_nothing_is_armed() {
+    let (mut s, t) = session();
+    s.dispatch(Action::Transport(TransportAction::ToggleRecord))
+        .unwrap();
+    assert!(
+        frames_until(&mut s, |s| s.transport().playing && s.transport().recording),
+        "recording and playing after one press"
+    );
+    wait_position(&mut s, 0.2);
+    // Pressing it again punches out; playback goes on.
+    s.dispatch(Action::Transport(TransportAction::ToggleRecord))
+        .unwrap();
+    assert!(
+        frames_until(&mut s, |s| !clips(s, t).is_empty()),
+        "the take is placed"
+    );
+    assert!(s.transport().playing, "punching out keeps playing");
+    s.dispatch(Action::Transport(TransportAction::Stop))
+        .unwrap();
+    // Nothing armed: no recording, a warning.
+    s.edit(Command::SetTrackRecordArm {
+        track: t,
+        on: false,
+    })
+    .unwrap();
+    s.dispatch(Action::Transport(TransportAction::ToggleRecord))
+        .unwrap();
+    settle(&mut s, 0.3);
+    assert!(!s.transport().playing && !s.transport().recording);
+    let n = s.latest_notice().unwrap();
+    assert_eq!(n.level, faderframe_session::NoticeLevel::Warning);
+    assert!(n.text.starts_with("Nothing is armed"), "{}", n.text);
+}

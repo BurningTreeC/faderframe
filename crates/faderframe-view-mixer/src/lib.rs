@@ -15,7 +15,7 @@
 
 mod layout;
 
-pub use layout::{INSERT_SLOTS, MAX_SEND_ROWS, SENDS_PER_ROW, StripLayout};
+pub use layout::{INSERT_SLOT_STEP, MAX_SEND_ROWS, SENDS_PER_ROW, StripLayout};
 
 use faderframe_core::gain::{SILENCE_DB, format_db};
 use faderframe_core::pan::{format_pan, parse_pan};
@@ -55,6 +55,8 @@ pub enum Hit {
     Scribble(TrackId),
     Meter(TrackId),
     Strip(TrackId),
+    /// The rule under the inserts: drag to show more or fewer slots.
+    InsertsGrip(TrackId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -80,6 +82,11 @@ enum Drag {
         start_x: f32,
         start_scroll: f32,
     },
+    /// Resizing the inserts section (all strips).
+    InsertSlots {
+        start_y: f32,
+        start: usize,
+    },
 }
 
 pub struct MixerView {
@@ -94,6 +101,8 @@ pub struct MixerView {
     send_bank: usize,
     /// Sends of the track with the most sends.
     max_sends: usize,
+    /// Insert slots per strip (the session's layout setting).
+    insert_slots: usize,
 }
 
 fn fader_cap_color(kind: TrackKind, theme: &Theme) -> Color {
@@ -140,6 +149,7 @@ impl MixerView {
             send_rows: 1,
             send_bank: 0,
             max_sends: 0,
+            insert_slots: faderframe_session::DEFAULT_INSERT_SLOTS as usize,
         }
     }
 
@@ -198,12 +208,14 @@ impl MixerView {
             matches!(t.kind, TrackKind::Audio | TrackKind::Instrument),
             t.kind != TrackKind::Master,
             self.send_rows,
+            self.insert_slots,
         )
     }
 
     /// Size the send section for the track with the most sends (always
     /// leaving one free slot to add another).
     fn update_sends(&mut self, model: &Session) {
+        self.insert_slots = model.mixer_insert_slots();
         self.max_sends = model
             .project()
             .tracks
@@ -272,6 +284,9 @@ impl MixerView {
             }
             if l.input.is_some_and(|i| i.input.contains(pos)) {
                 return Some(Hit::Input(id));
+            }
+            if l.inserts_grip.is_some_and(|g| g.contains(pos)) {
+                return Some(Hit::InsertsGrip(id));
             }
             if let Some(slots) = &l.inserts
                 && let Some(i) = slots.iter().position(|r| r.contains(pos))
@@ -374,7 +389,14 @@ impl MixerView {
 
         if let (Some(label), Some(slots)) = (l.inserts_label, &l.inserts) {
             controls::engraved(p, "INSERTS", label, th, Align::Center);
+            // More plugins than slots: the last slot says how many more.
+            let overflow = t.inserts.len() > slots.len();
             for (i, slot) in slots.iter().enumerate() {
+                if overflow && i + 1 == slots.len() {
+                    let more = t.inserts.len() - i;
+                    controls::well_label(p, *slot, &format!("+{more} more"), false, th);
+                    continue;
+                }
                 match t.inserts.get(i) {
                     Some(s) => {
                         let name = s.plugin.name.trim_start_matches("FaderFrame ");
@@ -388,6 +410,22 @@ impl MixerView {
                     None => controls::well_label(p, *slot, "—", true, th),
                 }
             }
+        }
+
+        if let Some(g) = l.inserts_grip {
+            // A grip on the rule: drag it to size the inserts section.
+            let hot = matches!(self.hover, Some(Hit::InsertsGrip(_)))
+                || matches!(self.drag, Some(Drag::InsertSlots { .. }));
+            let pill = Rect::new(g.center().x - 12.0, g.center().y - 1.5, 24.0, 3.0);
+            p.fill_rounded(
+                pill,
+                1.5,
+                &faderframe_ui_canvas::Paint::Solid(c.panel_label.with_alpha(if hot {
+                    0.9
+                } else {
+                    0.35
+                })),
+            );
         }
 
         if let (Some(label), Some(sends)) = (l.sends_label, &l.sends) {
@@ -721,7 +759,12 @@ impl MixerView {
                     "Browse Plugins…",
                     Action::OpenPluginBrowser {
                         track: t.id,
-                        target: faderframe_session::PluginTarget::Insert(slot.min(t.inserts.len())),
+                        target: match Self::empty_slot_target(t) {
+                            faderframe_session::PluginTarget::Insert(_) => {
+                                faderframe_session::PluginTarget::Insert(slot.min(t.inserts.len()))
+                            }
+                            other => other,
+                        },
                     },
                 ));
                 // Every effect: built-ins first, then hosted plugins by vendor.
@@ -906,6 +949,16 @@ impl MixerView {
         }
     }
 
+    /// What an empty insert slot offers: the instrument for an instrument
+    /// track that has none, else the next insert.
+    fn empty_slot_target(t: &Track) -> faderframe_session::PluginTarget {
+        if t.kind == TrackKind::Instrument && t.instrument.is_none() {
+            faderframe_session::PluginTarget::Instrument
+        } else {
+            faderframe_session::PluginTarget::Insert(t.inserts.len())
+        }
+    }
+
     fn pan_request(model: &Session, t: &Track, at: Rect) -> HostRequest<Action> {
         let id = t.id;
         HostRequest::TextInput {
@@ -1075,13 +1128,37 @@ impl MixerView {
                     cx.request(Self::output_menu(model, t, pos));
                 }
             }
+            Hit::InsertsGrip(_) => {
+                if clicks >= 2 {
+                    cx.emit(Action::SetMixerInsertSlots(
+                        faderframe_session::DEFAULT_INSERT_SLOTS,
+                    ));
+                } else {
+                    self.drag = Some(Drag::InsertSlots {
+                        start_y: pos.y,
+                        start: self.insert_slots,
+                    });
+                    cx.set_cursor(Cursor::ResizeVertical);
+                }
+            }
             Hit::Insert(id, slot) => {
-                if let Some(t) = Self::track(model, id) {
+                let shown = self
+                    .layout_of(model, id, size)
+                    .and_then(|l| l.inserts.map(|v| v.len()))
+                    .unwrap_or(0);
+                if let Some(t) = Self::track(model, id)
+                    && t.inserts.len() > shown
+                    && slot + 1 == shown
+                {
+                    // "+N more": grow the section to show them all.
+                    cx.emit(Action::SetMixerInsertSlots((t.inserts.len() + 1) as u16));
+                } else if let Some(t) = Self::track(model, id) {
                     if slot >= t.inserts.len() {
-                        // Empty slot: the plugin browser.
+                        // Empty slot: the plugin browser (an instrument track
+                        // without an instrument gets one first).
                         cx.emit(Action::OpenPluginBrowser {
                             track: id,
-                            target: faderframe_session::PluginTarget::Insert(t.inserts.len()),
+                            target: Self::empty_slot_target(t),
                         });
                     } else if mods.toggle() {
                         // Ctrl/Cmd-click: bypass toggle.
@@ -1255,6 +1332,11 @@ impl MixerView {
             ),
             Hit::Scribble(_) => "Double-click to rename · Right-click for options".into(),
             Hit::Meter(_) => "Peak meter · Click to clear clip indicators".into(),
+            Hit::InsertsGrip(_) => format!(
+                "Drag to show more or fewer insert slots (now {}) · Double-click for {}",
+                self.insert_slots,
+                faderframe_session::DEFAULT_INSERT_SLOTS
+            ),
             Hit::Strip(_) => return None,
         })
     }
@@ -1348,6 +1430,15 @@ impl CanvasView<Session, Action> for MixerView {
                             }
                         }
                     }
+                    Some(Drag::InsertSlots { start_y, start }) => {
+                        let (lo, hi) = faderframe_session::INSERT_SLOTS_RANGE;
+                        let n = (start as f32 + ((pos.y - start_y) / INSERT_SLOT_STEP).round())
+                            .clamp(lo as f32, hi as f32) as usize;
+                        if n != self.insert_slots {
+                            self.insert_slots = n;
+                            cx.emit(Action::SetMixerInsertSlots(n as u16));
+                        }
+                    }
                     Some(Drag::Scroll {
                         start_x,
                         start_scroll,
@@ -1367,9 +1458,9 @@ impl CanvasView<Session, Action> for MixerView {
                     self.hover = hit;
                     cx.set_cursor(match hit {
                         Some(Hit::FaderCap(_)) => Cursor::Grab,
-                        Some(Hit::FaderTrack(_) | Hit::Pan(_) | Hit::Send(..)) => {
-                            Cursor::ResizeVertical
-                        }
+                        Some(
+                            Hit::FaderTrack(_) | Hit::Pan(_) | Hit::Send(..) | Hit::InsertsGrip(_),
+                        ) => Cursor::ResizeVertical,
                         Some(Hit::Strip(_)) | None => Cursor::Default,
                         Some(_) => Cursor::Pointer,
                     });
@@ -1377,11 +1468,16 @@ impl CanvasView<Session, Action> for MixerView {
                 false
             }
             ViewEvent::PointerUp { .. } => {
-                if let Some(d) = self.drag.take()
-                    && matches!(d, Drag::Fader { .. } | Drag::Knob { .. })
-                {
-                    cx.emit(Action::EndGesture);
-                    cx.set_cursor(Cursor::Default);
+                match self.drag.take() {
+                    Some(Drag::Fader { .. } | Drag::Knob { .. }) => {
+                        cx.emit(Action::EndGesture);
+                        cx.set_cursor(Cursor::Default);
+                    }
+                    Some(Drag::InsertSlots { .. }) => {
+                        cx.set_cursor(Cursor::Default);
+                        cx.redraw();
+                    }
+                    _ => {}
                 }
                 true
             }

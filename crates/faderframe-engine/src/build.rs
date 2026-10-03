@@ -164,6 +164,15 @@ struct PluginCx<'a> {
 }
 
 impl PluginCx<'_> {
+    /// Does the plugin in `slot` take notes (instruments, MIDI-controlled
+    /// effects)?
+    fn takes_notes(&mut self, slot: &PluginSlot) -> bool {
+        self.plugins.instance(slot).is_ok_and(|inst| {
+            let d = inst.descriptor();
+            d.note_inputs > 0 || d.category == faderframe_plugin_host::PluginCategory::Instrument
+        })
+    }
+
     fn node(
         &mut self,
         b: &mut GraphBuilder<EngineContext>,
@@ -198,9 +207,14 @@ impl PluginCx<'_> {
             .collect();
         match self.plugins.activate(slot, &self.process) {
             Ok(p) => {
-                // Latency and bypass change the node's behaviour, so they are
-                // part of its identity: a change yields a fresh processor.
-                let sub = slot.id.raw() ^ ((p.latency as u64) << 40) ^ ((slot.bypass as u64) << 63);
+                // Latency and bypass change the node's behaviour, and a
+                // restarted plugin's old processor is dead: all are part of
+                // its identity, so a change yields the fresh processor
+                // instead of adopting the old one.
+                let sub = slot.id.raw()
+                    ^ ((p.latency as u64) << 40)
+                    ^ ((slot.bypass as u64) << 63)
+                    ^ p.activation.wrapping_mul(0x9e37_79b9_7f4a_7c15);
                 let channels = spec.audio_outputs.first().map_or(0, |l| l.channel_count());
                 let node = PluginNode::new(
                     track.id,
@@ -406,9 +420,6 @@ pub fn build_graph(
                     }
                     b.connect_audio(inst, 0, input, 0)?;
                     tn.instrument = Some(inst);
-                } else {
-                    pcx.warnings
-                        .push(format!("instrument track '{}' has no instrument", t.name));
                 }
             }
             _ => {}
@@ -416,13 +427,29 @@ pub fn build_graph(
 
         let mut prev = input;
         for slot in &t.inserts {
-            let spec = NodeSpec::new(format!("{} · {}", t.name, slot.plugin.name))
+            // Inserts that take notes (a synth placed as an insert, MIDI-
+            // controlled effects) get the track's MIDI too.
+            let notes = t.kind == TrackKind::Instrument && pcx.takes_notes(slot);
+            let mut spec = NodeSpec::new(format!("{} · {}", t.name, slot.plugin.name))
                 .group(gi)
                 .audio_in(layout)
                 .audio_out(layout);
+            if notes {
+                spec = spec.events_in(1);
+            }
             let node = pcx.node(&mut b, slot, t, spec, Role::Insert);
             own(&mut owners, node, t.id, Some(slot.id), NodeWork::Insert);
             b.connect_audio(prev, 0, node, 0)?;
+            if notes {
+                if let Some(midi) = tn.midi {
+                    b.connect_events(midi, 0, node, 0)?;
+                }
+                if let Some(live) = tn.midi_in {
+                    b.connect_events(live, 0, node, 0)?;
+                }
+                // MIDI tracks routed here reach it too.
+                tn.instrument.get_or_insert(node);
+            }
             prev = node;
         }
 

@@ -158,7 +158,17 @@ pub fn install(app: &Rc<AppState>) {
             "add-audio-stereo",
             A::AddTrackWithLayout(TrackKind::Audio, faderframe_core::ChannelLayout::Stereo),
         ),
-        dispatch(app, "add-instrument", A::AddTrack(TrackKind::Instrument)),
+        // A new instrument track asks for its instrument right away.
+        entry(app, "add-instrument", |a| {
+            a.dispatch(A::AddTrack(TrackKind::Instrument));
+            let track = a.session.borrow().selection.primary_track();
+            if let Some(track) = track {
+                a.dispatch(A::OpenPluginBrowser {
+                    track,
+                    target: faderframe_session::PluginTarget::Instrument,
+                });
+            }
+        }),
         dispatch(app, "add-midi", A::AddTrack(TrackKind::Midi)),
         dispatch(app, "add-bus", A::AddTrack(TrackKind::Bus)),
         dispatch(app, "add-aux", A::AddTrack(TrackKind::Aux)),
@@ -577,6 +587,21 @@ pub fn install(app: &Rc<AppState>) {
                     to,
                     drag: faderframe_session::warping::WarpDrag::Transients,
                 });
+            }
+        }),
+        // Development aid: `log-levels:x` logs every track's meter (peak
+        // dBFS, left/right) — scripted checks that a track makes sound.
+        named("log-levels", |a, _| {
+            let s = a.session.borrow();
+            for t in &s.project().tracks {
+                let m = s.meter(t.id);
+                tracing::info!(
+                    "level {}: {:.1} / {:.1} dBFS (hold {:.1})",
+                    t.name,
+                    m.left.level_db,
+                    m.right.level_db,
+                    m.left.hold_db.max(m.right.hold_db)
+                );
             }
         }),
         named("select-clip", |a, arg| {

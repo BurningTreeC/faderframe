@@ -189,14 +189,26 @@ impl ArrangerView {
         p.timeline.to_samples(self.time_at(x), rate) - p.timeline.to_samples(clip.start, rate)
     }
 
-    /// The clip gain readout in the clip's name strip.
+    /// The clip gain control in the clip's name strip: a knob and its
+    /// value (right end of the visible part of the clip).
     pub(crate) fn gain_badge(&self, clip: &Clip, rect: Rect) -> Option<Rect> {
         gain_of(clip)?;
         let h = self.header_band(rect);
-        // Inside the visible part of the clip.
         let right = rect.right().min(self.view_w);
-        (right - rect.x.max(self.header_w()) >= 110.0 && h >= 10.0)
-            .then(|| Rect::new(right - 56.0, rect.y + 1.0, 52.0, h - 2.0))
+        (right - rect.x.max(self.header_w()) >= 110.0 && h >= 12.0)
+            .then(|| Rect::new(right - 70.0, rect.y + 1.0, 67.0, h - 2.0))
+    }
+
+    /// The knob part of the gain control.
+    pub(crate) fn gain_knob(badge: Rect) -> Rect {
+        let d = badge.h.min(20.0);
+        Rect::new(badge.x, badge.center().y - d * 0.5, d, d)
+    }
+
+    /// Knob position of a clip gain: bipolar around 0 dB, ±24 dB at the
+    /// ends.
+    pub(crate) fn gain_knob_value(db: f32) -> f32 {
+        (0.5 + db.clamp(-24.0, 24.0) / 48.0).clamp(0.0, 1.0)
     }
 
     /// Centre of a fade's length handle.
@@ -1482,21 +1494,45 @@ impl ArrangerView {
         };
         let active = matches!(self.zone_hover, Some((c, ClipZone::Gain)) if c == clip.id)
             || matches!(&self.edit_drag, Some(EditDrag::Gain { clips, .. }) if clips.contains(&clip.id));
-        if db.abs() >= 0.05 || active {
-            let label = if db.abs() < 0.05 {
-                "0.0 dB".to_string()
-            } else {
-                format!("{db:+.1} dB")
-            };
-            if active {
-                p.fill_rounded(badge, 3.0, &Paint::Solid(Color::rgba(0.0, 0.0, 0.0, 0.35)));
-            }
-            p.text(
-                &label,
-                badge,
-                &TextStyle::new(self.theme.fonts.tiny + 0.5, text).align(Align::End),
-            );
+        if active {
+            p.fill_rounded(badge, 3.0, &Paint::Solid(Color::rgba(0.0, 0.0, 0.0, 0.3)));
         }
+        let knob = Self::gain_knob(badge);
+        controls::knob(
+            p,
+            knob,
+            Self::gain_knob_value(db),
+            true,
+            KnobLook {
+                cap: Color::hex(0x8a8f99),
+                ring: if db.abs() < 0.05 {
+                    text.with_alpha(0.5)
+                } else {
+                    Color::hex(0xffcf66)
+                },
+            },
+            &self.theme,
+        );
+        let label = if db.abs() < 0.05 {
+            "0.0 dB".to_string()
+        } else {
+            format!("{db:+.1} dB")
+        };
+        let label_rect = Rect::new(
+            knob.right() + 2.0,
+            badge.y,
+            badge.right() - knob.right() - 4.0,
+            badge.h,
+        );
+        p.text(
+            &label,
+            label_rect,
+            &TextStyle::new(
+                self.theme.fonts.tiny + 0.5,
+                text.with_alpha(if active || db.abs() >= 0.05 { 1.0 } else { 0.7 }),
+            )
+            .align(Align::End),
+        );
         if active {
             // 0 dB at three quarters of the height, +12 dB at the top.
             let content = self.content_rect(rect);

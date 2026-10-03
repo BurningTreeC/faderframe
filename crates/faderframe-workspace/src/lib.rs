@@ -106,7 +106,15 @@ pub struct WorkspaceSet {
     /// its top-left corner); new editors open centred.
     #[serde(default)]
     pub plugin_windows: std::collections::BTreeMap<faderframe_core::PluginInstanceId, (i32, i32)>,
+    /// Insert slots per mixer strip (`None` = [`DEFAULT_INSERT_SLOTS`]).
+    #[serde(default)]
+    pub mixer_insert_slots: Option<u16>,
 }
+
+/// Insert slots a mixer strip shows by default, and the range the user can
+/// drag the section to.
+pub const DEFAULT_INSERT_SLOTS: u16 = 5;
+pub const INSERT_SLOTS_RANGE: (u16, u16) = (1, 24);
 
 /// Narrowest and widest arranger track header column.
 pub const HEADER_WIDTH_RANGE: (f32, f32) = (190.0, 640.0);
@@ -130,6 +138,7 @@ impl Default for WorkspaceSet {
             automation_shown: Default::default(),
             header_width: None,
             plugin_windows: Default::default(),
+            mixer_insert_slots: None,
         }
     }
 }

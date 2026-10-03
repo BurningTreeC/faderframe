@@ -29,6 +29,8 @@ pub struct ClapInstance {
     latency: u32,
     /// The plugin asked for a restart: re-activate at the next opportunity.
     needs_restart: bool,
+    /// Activations so far (see `PluginInstance::activation`).
+    activations: u64,
     gui_open: bool,
     // Declared last: dropped after the processor has been deactivated.
     instance: PluginInstance<FfHost>,
@@ -66,6 +68,7 @@ impl ClapInstance {
             params_tx: None,
             latency: 0,
             needs_restart: false,
+            activations: 0,
             gui_open: false,
             instance,
         };
@@ -246,6 +249,10 @@ impl FfInstance for ClapInstance {
         self.latency
     }
 
+    fn activation(&self) -> u64 {
+        self.activations
+    }
+
     fn tail(&self) -> TailLength {
         TailLength::Infinite
     }
@@ -365,6 +372,7 @@ impl FfInstance for ClapInstance {
             self.params_tx = Some(tx);
             self.config = Some(*config);
             self.latency = self.read_latency();
+            self.activations += 1;
         }
         let cell = self
             .rt

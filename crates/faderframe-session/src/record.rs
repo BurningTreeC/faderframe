@@ -702,7 +702,7 @@ impl Session {
         if targets.is_empty() && midi_targets.is_empty() {
             self.notify(
                 NoticeLevel::Warning,
-                "nothing to record: arm an audio track with a hardware input, or an instrument/MIDI track",
+                "Nothing is armed for recording. Click R on a track to arm it (audio tracks need an input).",
             );
             return Ok(());
         }
