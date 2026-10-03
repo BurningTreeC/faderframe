@@ -5,6 +5,7 @@ use crate::canvas::CanvasWidget;
 use crate::state::AppState;
 use crate::transport_display::TransportDisplay;
 use faderframe_audio::format_sample_rate;
+use faderframe_engine::MetronomeMode;
 use faderframe_session::{Action, NoticeLevel, Session, WorkspaceAction};
 use gtk::prelude::*;
 use gtk::{gio, glib};
@@ -17,6 +18,11 @@ pub struct Chrome {
     pub play: gtk::Button,
     pub record: gtk::Button,
     pub looping: gtk::Button,
+    pub metronome: gtk::Button,
+    pub edit_button: gtk::Button,
+    pub edit_bar: CanvasWidget,
+    /// Measures how tall the edit toolbar must be at the window's width.
+    pub edit_bar_layout: faderframe_view_arranger::edit_bar::EditToolbarView,
     pub notice: gtk::Label,
     pub engine: gtk::Label,
     pub midi_button: gtk::Button,
@@ -50,6 +56,27 @@ impl Chrome {
         set_class(&self.play, "play-active", t.playing);
         set_class(&self.record, "rec-active", t.recording);
         set_class(&self.looping, "loop-active", s.project().loop_enabled);
+        let click = s.record.metronome;
+        if self.metronome.has_css_class("click-active") != (click != MetronomeMode::Off) {
+            set_class(&self.metronome, "click-active", click != MetronomeMode::Off);
+            self.metronome
+                .set_tooltip_text(Some(&format!("Metronome: {} (K)", click.label())));
+        }
+        let show = s.editor.show_edit_toolbar;
+        if self.edit_bar.is_visible() != show {
+            self.edit_bar.set_visible(show);
+        }
+        set_class(&self.edit_button, "edit-active", show);
+        if show {
+            let w = self.edit_bar.width();
+            if w > 0 {
+                let h = self.edit_bar_layout.preferred_height(w as f32, s) as i32;
+                if self.edit_bar.height_request() != h {
+                    self.edit_bar.set_size_request(-1, h);
+                }
+            }
+            self.edit_bar.queue_draw();
+        }
         if !full {
             return;
         }
@@ -90,11 +117,29 @@ impl Chrome {
         if learning != self.midi_button.has_css_class("learning") {
             if learning {
                 self.midi_button.add_css_class("learning");
-                self.midi_text.set_text("MIDI LEARN");
             } else {
                 self.midi_button.remove_css_class("learning");
-                self.midi_text.set_text("MIDI");
             }
+        }
+        // MIDI learn, or the external timing source.
+        let sync = s.sync_status();
+        let text = if learning {
+            "MIDI LEARN".to_string()
+        } else {
+            match sync.source {
+                faderframe_session::SyncSource::Internal => "MIDI".into(),
+                faderframe_session::SyncSource::MidiClock => match sync.tempo {
+                    Some(t) if sync.receiving => format!("MIDI · CLK {t:.1}"),
+                    _ => "MIDI · CLK –".into(),
+                },
+                faderframe_session::SyncSource::Mtc => match sync.timecode {
+                    Some((tc, _)) if sync.receiving => format!("MIDI · MTC {tc}"),
+                    _ => "MIDI · MTC –".into(),
+                },
+            }
+        };
+        if self.midi_text.text() != text {
+            self.midi_text.set_text(&text);
         }
         let load = s.dsp_load();
         let engine = match (s.stream_info(), s.stream_status()) {
@@ -176,6 +221,62 @@ pub fn menu_model() -> gio::Menu {
             ("Show / Hide Automation", "app.toggle-automation"),
         ]),
     );
+    let target = |label: &str, action: &str, arg: &str| {
+        let item = gio::MenuItem::new(Some(label), None);
+        item.set_action_and_target_value(Some(action), Some(&arg.to_variant()));
+        item
+    };
+    let range = gio::Menu::new();
+    for (label, arg) in [
+        ("Separate Clips (B)", "separate"),
+        ("Trim Clips to Selection (Ctrl+Alt+T)", "trim"),
+        ("Clear Selection Range", "clear"),
+        ("Insert Silence", "silence"),
+        ("Copy Range (Ctrl+C)", "copy"),
+        ("Cut Range (Ctrl+X)", "cut"),
+        ("Paste at Playhead (Ctrl+V)", "paste"),
+        ("Duplicate Range (Ctrl+D)", "duplicate"),
+    ] {
+        range.append_item(&target(label, "app.edit", arg));
+    }
+    edit.append_section(None, &range);
+    let warp = gio::Menu::new();
+    for (label, arg) in [
+        ("Quantize Transients to Grid", "quantize"),
+        ("Separate at Transients", "separate-transients"),
+        ("Remove Warp", "unwarp"),
+    ] {
+        warp.append_item(&target(label, "app.edit", arg));
+    }
+    edit.append_section(None, &warp);
+    let modes = gio::Menu::new();
+    for (label, arg) in [
+        ("Shuffle (Alt+1)", "shuffle"),
+        ("Slip (Alt+2)", "slip"),
+        ("Spot (Alt+3)", "spot"),
+        ("Grid (Alt+4)", "grid"),
+    ] {
+        modes.append_item(&target(label, "app.edit-mode", arg));
+    }
+    let tools = gio::Menu::new();
+    for (label, arg) in [
+        ("Smart (Alt+S)", "smart"),
+        ("Zoom (F5)", "zoom"),
+        ("Trim (F6)", "trim"),
+        ("Time-Stretch Trim", "stretch"),
+        ("Selector (F7)", "select"),
+        ("Grabber (Alt+8)", "grab"),
+        ("Separation Grabber", "separate"),
+        ("Scrubber (F9)", "scrub"),
+        ("Pencil (F10)", "pencil"),
+    ] {
+        tools.append_item(&target(label, "app.edit-tool", arg));
+    }
+    let edit_opts = gio::Menu::new();
+    edit_opts.append_submenu(Some("Edit Mode"), &modes);
+    edit_opts.append_submenu(Some("Edit Tool"), &tools);
+    edit_opts.append(Some("Edit Toolbar"), Some("app.toggle-edit-toolbar"));
+    edit.append_section(None, &edit_opts);
     edit.append_section(
         None,
         &section(&[
@@ -331,9 +432,24 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
     transport.append(&record);
     let looping = icon_button("media-playlist-repeat-symbolic", "Loop (L)", "app.loop");
     transport.append(&looping);
+    let metronome = gtk::Button::new();
+    metronome.set_child(Some(&crate::icons::image(
+        "faderframe-metronome-symbolic",
+        "♩",
+    )));
+    metronome.set_action_name(Some("app.toggle-metronome"));
+    metronome.set_tooltip_text(Some("Metronome (K)"));
+    transport.append(&metronome);
+    let edit_button = gtk::Button::with_label("Edit");
+    edit_button.set_tooltip_text(Some(
+        "Edit toolbar: edit modes, tools, grid and nudge, options, selection (Ctrl+E)",
+    ));
+    edit_button.set_action_name(Some("app.toggle-edit-toolbar"));
+    edit_button.add_css_class("edit-toggle");
+    transport.append(&edit_button);
 
-    let display = CanvasWidget::new(app, Box::new(TransportDisplay));
-    display.set_size_request(290, 38);
+    let display = CanvasWidget::new(app, Box::new(TransportDisplay::new()));
+    display.set_size_request(370, 38);
     display.set_hexpand(false);
     display.set_vexpand(false);
     display.add_css_class("lcd");
@@ -376,6 +492,19 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
     window.set_titlebar(Some(&header));
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    // The edit toolbar: full width under the header bar.
+    let edit_bar = CanvasWidget::new(
+        app,
+        Box::new(faderframe_view_arranger::edit_bar::EditToolbarView::new(
+            app.theme.clone(),
+        )),
+    );
+    edit_bar.set_size_request(-1, 36);
+    edit_bar.set_hexpand(true);
+    edit_bar.set_vexpand(false);
+    edit_bar.set_visible(app.session.borrow().editor.show_edit_toolbar);
+    app.register_canvas(&edit_bar);
+    content.append(&edit_bar);
     let slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
     slot.set_hexpand(true);
     slot.set_vexpand(true);
@@ -436,6 +565,12 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
         play,
         record,
         looping,
+        metronome,
+        edit_button,
+        edit_bar,
+        edit_bar_layout: faderframe_view_arranger::edit_bar::EditToolbarView::new(
+            app.theme.clone(),
+        ),
         notice,
         engine,
         midi_button,

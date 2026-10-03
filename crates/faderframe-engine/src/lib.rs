@@ -42,7 +42,7 @@ pub use record::{RecordBlock, RecordStreams, RecordTarget};
 pub use slots::{SlotRegistry, SlotsExhausted, StripSlots};
 pub use snapshot::{
     AudioRegion, Lane, MidiRegion, Source, SourceMap, StreamPlan, StreamRegion, TimelineSnapshot,
-    render_generated_sources,
+    WarpMode, WarpedRegion, render_generated_sources,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

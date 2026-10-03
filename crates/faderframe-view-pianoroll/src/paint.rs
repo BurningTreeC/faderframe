@@ -46,6 +46,7 @@ impl PianoRollView {
             self.paint_ghosts(p, l.grid, clip, model);
         }
         self.paint_notes(p, l.grid, m, color, model);
+        self.paint_glides(p, l.grid, m);
         self.paint_overlays(p, l.grid, clip, m, model);
         p.pop_clip();
 
@@ -520,6 +521,17 @@ impl PianoRollView {
                 _ => {}
             }
         });
+        // SysEx messages: small diamonds along the top.
+        for e in &m.sysex {
+            let x = self.x_of(e.time);
+            let mut d = Path::new();
+            d.move_to(Point::new(x, r.y + 2.0));
+            d.line_to(Point::new(x + 4.0, r.y + 6.0));
+            d.line_to(Point::new(x, r.y + 10.0));
+            d.line_to(Point::new(x - 4.0, r.y + 6.0));
+            d.close();
+            p.fill_path(&d, th.piano.lane_curve);
+        }
         // Clip end handle (drag to change the clip length).
         let length = match self.drag {
             Some(Drag::ClipEnd { length }) => length,
@@ -583,6 +595,7 @@ impl PianoRollView {
         match self.lane {
             LaneKind::Velocity => self.paint_velocity(p, area, m, color, model),
             LaneKind::Controller(c) => self.paint_controller(p, area, clip, m, c),
+            LaneKind::Expression(k) => self.paint_expression(p, area, clip, m, k, model),
         }
         p.pop_clip();
         // Header: lane name and a hint that it is a menu.
@@ -714,6 +727,144 @@ impl PianoRollView {
                 for (t, v) in points {
                     p.circle(
                         Point::new(self.x_of(*t), y_of(*v)),
+                        2.0,
+                        pr.lane_curve.lighten(0.3),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Pitch expression drawn over the notes (the glide's path through the
+    /// keys).
+    fn paint_glides(&self, p: &mut dyn Painter, g: Rect, m: &MidiClip) {
+        let pr = &self.theme.piano;
+        p.push_clip(g);
+        for e in m.expressions.iter().filter(|e| !e.pitch.is_empty()) {
+            let Some(n) = m.note(e.note) else { continue };
+            let (Some(r), Some(row)) = (self.note_rect(n), self.y_of(n.key)) else {
+                continue;
+            };
+            if r.right() < g.x || r.x > g.right() {
+                continue;
+            }
+            let mut path = Path::new();
+            let steps = ((r.w / 3.0).ceil() as usize).max(1);
+            for i in 0..=steps {
+                let f = i as f32 / steps as f32;
+                let t = MusicalTime((n.length.ticks() as f64 * f as f64) as i64);
+                let v = e.value_at(faderframe_project::ExpressionKind::Pitch, t);
+                let y = row + self.row_h * 0.5 - v * self.row_h;
+                let pt = Point::new(r.x + r.w * f, y);
+                if i == 0 {
+                    path.move_to(pt);
+                } else {
+                    path.line_to(pt);
+                }
+            }
+            p.stroke_path(&path, 1.5, pr.lane_curve.lighten(0.25));
+        }
+        p.pop_clip();
+    }
+
+    /// Per-note expression: each note's curve over its span (selected notes
+    /// bright, others faint).
+    fn paint_expression(
+        &self,
+        p: &mut dyn Painter,
+        area: Rect,
+        clip: &Clip,
+        m: &MidiClip,
+        kind: faderframe_project::ExpressionKind,
+        model: &Session,
+    ) {
+        use faderframe_project::ExpressionKind;
+        let th = &self.theme;
+        let pr = &th.piano;
+        if kind == ExpressionKind::Pitch {
+            p.hline(
+                area.x,
+                area.right(),
+                crate::expression_y(area, kind, 0.0),
+                Color::rgba(1.0, 1.0, 1.0, 0.14),
+            );
+        }
+        let (a, b) = (self.time_at(area.x), self.time_at(area.right()));
+        let any_selected = m
+            .notes
+            .iter()
+            .any(|n| model.selection.notes.contains(&n.id));
+        for n in m.notes.iter().filter(|n| n.end() > a && n.start < b) {
+            let selected = model.selection.notes.contains(&n.id);
+            let c = if selected {
+                pr.lane_curve
+            } else {
+                pr.lane_curve
+                    .with_alpha(if any_selected { 0.3 } else { 0.6 })
+            };
+            let x0 = self.x_of(n.start);
+            let x1 = self.x_of(n.end());
+            let e = m.expression(n.id);
+            let mut path = Path::new();
+            let steps = (((x1 - x0) / 3.0).ceil() as usize).clamp(1, 2000);
+            for i in 0..=steps {
+                let f = i as f32 / steps as f32;
+                let t = MusicalTime((n.length.ticks() as f64 * f as f64) as i64);
+                let v = e.map_or(kind.rest(), |e| e.value_at(kind, t));
+                let pt = Point::new(x0 + (x1 - x0) * f, crate::expression_y(area, kind, v));
+                if i == 0 {
+                    path.move_to(pt);
+                } else {
+                    path.line_to(pt);
+                }
+            }
+            p.stroke_path(&path, if selected { 1.8 } else { 1.0 }, c);
+            if let Some(e) = e
+                && self.ppq > 30.0
+                && selected
+            {
+                for pt in e.curve(kind) {
+                    p.circle(
+                        Point::new(
+                            self.x_of(n.start + pt.time),
+                            crate::expression_y(area, kind, pt.value),
+                        ),
+                        2.0,
+                        c,
+                    );
+                }
+            }
+        }
+        let mpe = model
+            .project()
+            .track(clip.track)
+            .is_some_and(|t| t.mpe.is_some());
+        if !mpe {
+            p.text(
+                "Turn on MPE for the track (lane menu) to hear per-note expression",
+                Rect::new(area.x, area.y, area.w, 14.0),
+                &TextStyle::new(th.fonts.tiny, th.ui.text_faint).center(),
+            );
+        }
+        if let Some(Drag::Expression {
+            points,
+            from,
+            to,
+            line,
+            erase,
+            ..
+        }) = &self.drag
+        {
+            if *erase {
+                let r =
+                    Rect::from_points(Point::new(from.x, area.y), Point::new(to.x, area.bottom()));
+                p.fill(r, Color::rgba(1.0, 0.3, 0.2, 0.2));
+            } else if *line {
+                p.line(*from, *to, 2.0, pr.lane_curve.lighten(0.3));
+            } else {
+                for (t, v) in points {
+                    p.circle(
+                        Point::new(self.x_of(*t), crate::expression_y(area, kind, *v)),
                         2.0,
                         pr.lane_curve.lighten(0.3),
                     );

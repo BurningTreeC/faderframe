@@ -8,7 +8,8 @@ use crate::{Result, SelectMode, Session, SessionError};
 use faderframe_core::{ClipId, NoteId};
 use faderframe_project::midi_ops::{self, ChordKind, QuantizeSettings, Scale};
 use faderframe_project::{
-    ClipContent, Command, ControllerPoint, MidiClip, MidiController, MidiNote,
+    ClipContent, Command, ControllerPoint, ExpressionKind, ExpressionPoint, MidiClip,
+    MidiController, MidiNote, NoteExpression,
 };
 use faderframe_timeline::{GridDivision, MusicalTime};
 use std::collections::HashSet;
@@ -121,6 +122,8 @@ pub struct PianoRollSettings {
     /// The lane under the notes: velocity (`None`) or a controller on a
     /// channel.
     pub lane: Option<(MidiController, u8)>,
+    /// Per-note expression in the lane instead (overrides `lane`).
+    pub expression: Option<ExpressionKind>,
 }
 
 impl Default for PianoRollSettings {
@@ -136,6 +139,7 @@ impl Default for PianoRollSettings {
             fold: KeyFold::Off,
             quantize: QuantizeSettings::default(),
             lane: None,
+            expression: None,
         }
     }
 }
@@ -164,6 +168,7 @@ impl Session {
             n.velocity = n.velocity.clamp(1, 127);
         }
         m.sort_notes();
+        m.prune_expressions();
         self.edit(Command::Batch {
             label: label.into(),
             commands: vec![Command::SetClipContent {
@@ -243,11 +248,28 @@ impl Session {
 
     /// Add notes (ids allocated); they become the selection.
     pub fn add_notes(&mut self, clip: ClipId, notes: &[MidiNote]) -> Result<Vec<NoteId>> {
+        self.add_notes_with(clip, notes, &[])
+    }
+
+    /// Add notes; `expressions` (keyed by the given notes' ids) are copied
+    /// to the new notes.
+    fn add_notes_with(
+        &mut self,
+        clip: ClipId,
+        notes: &[MidiNote],
+        expressions: &[NoteExpression],
+    ) -> Result<Vec<NoteId>> {
         let (_, mut m) = self.midi_clip(clip)?;
         let mut ids = Vec::with_capacity(notes.len());
         for n in notes {
             let id: NoteId = self.project.ids.allocate();
             m.notes.push(MidiNote { id, ..*n });
+            if let Some(e) = expressions.iter().find(|e| e.note == n.id) {
+                m.expressions.push(NoteExpression {
+                    note: id,
+                    ..e.clone()
+                });
+            }
             ids.push(id);
         }
         self.set_midi_clip(
@@ -334,13 +356,14 @@ impl Session {
                 ..*n
             })
             .collect();
-        self.add_notes(clip, &copies)
+        self.add_notes_with(clip, &copies, &m.expressions)
     }
 
     /// Split the notes crossing `at` (clip-relative) into two.
     pub fn split_notes(&mut self, clip: ClipId, notes: &[NoteId], at: MusicalTime) -> Result<()> {
         let (_, mut m) = self.midi_clip(clip)?;
         let mut added = Vec::new();
+        let mut split_expr = Vec::new();
         for n in m.notes.iter_mut() {
             if (notes.is_empty() || notes.contains(&n.id)) && n.start < at && n.end() > at {
                 let right = MidiNote {
@@ -349,6 +372,7 @@ impl Session {
                     length: n.end() - at,
                     ..*n
                 };
+                split_expr.push((n.id, at - n.start, right.id));
                 n.length = at - n.start;
                 added.push(right);
             }
@@ -357,6 +381,13 @@ impl Session {
             return Ok(());
         }
         m.notes.extend(added);
+        // Expression is cut with its note.
+        for (left, cut, right) in split_expr {
+            if let Some(e) = m.expressions.iter_mut().find(|e| e.note == left) {
+                let r = e.split_off(cut, right);
+                m.expressions.push(r);
+            }
+        }
         self.set_midi_clip(clip, "Split Notes", m)
     }
 
@@ -392,6 +423,12 @@ impl Session {
         for n in &mut sel {
             n.start -= a;
         }
+        self.note_clipboard_expressions = m
+            .expressions
+            .iter()
+            .filter(|e| sel.iter().any(|n| n.id == e.note))
+            .cloned()
+            .collect();
         self.note_clipboard = sel;
         Ok(())
     }
@@ -414,7 +451,27 @@ impl Session {
         if notes.is_empty() {
             return Ok(Vec::new());
         }
-        self.add_notes(clip, &notes)
+        let expressions = self.note_clipboard_expressions.clone();
+        self.add_notes_with(clip, &notes, &expressions)
+    }
+
+    /// Replace `kind` of a note's expression in `from..to` (relative to the
+    /// note's start).
+    pub fn set_note_expression(
+        &mut self,
+        clip: ClipId,
+        note: NoteId,
+        kind: ExpressionKind,
+        from: MusicalTime,
+        to: MusicalTime,
+        points: &[ExpressionPoint],
+    ) -> Result<()> {
+        let (_, mut m) = self.midi_clip(clip)?;
+        if m.note(note).is_none() {
+            return Err(SessionError::Other(format!("no note {note}")));
+        }
+        m.expression_mut(note).replace_range(kind, from, to, points);
+        self.set_midi_clip(clip, "Edit Expression", m)
     }
 
     /// Replace a controller lane's points in `from..to` (lane created on

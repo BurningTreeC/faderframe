@@ -21,9 +21,19 @@ pub mod midi;
 pub mod notes;
 pub mod performance;
 pub use performance::{Load, PerformanceReport, PluginPerformance, TrackPerformance};
+pub mod editing;
 pub mod record;
 pub mod render;
 mod selection;
+pub mod sync;
+mod sysex;
+mod transients;
+pub mod warping;
+pub use editing::{
+    ClipEdge, CounterUnit, EditFlag, EditMode, EditRange, EditTool, GridMode, NudgeTarget,
+    NudgeValue, ZoomRequest, parse_position,
+};
+pub use sync::{MtcRate, SyncSettings, SyncSource, SyncStatus, Timecode};
 
 pub use meters::{METER_FLOOR_DB, MeterChannel, MeterDisplay};
 pub use selection::{SelectMode, Selection};
@@ -274,6 +284,35 @@ pub enum Action {
         clip: ClipId,
         length: MusicalTime,
     },
+    /// Add SysEx messages to a MIDI clip (clip-relative time).
+    AddSysex {
+        clip: ClipId,
+        at: MusicalTime,
+        messages: Vec<Vec<u8>>,
+    },
+    RemoveSysex {
+        clip: ClipId,
+        index: usize,
+    },
+    /// Ask the shell for a `.syx` file to add to a clip at `at`.
+    RequestSysexImport {
+        clip: ClipId,
+        at: MusicalTime,
+    },
+    /// Send SysEx to a MIDI output now (port key).
+    SendSysex {
+        output: String,
+        messages: Vec<Vec<u8>>,
+    },
+    /// Replace a note's expression curve in `from..to` (note-relative).
+    SetNoteExpression {
+        clip: ClipId,
+        note: NoteId,
+        kind: faderframe_project::ExpressionKind,
+        from: MusicalTime,
+        to: MusicalTime,
+        points: Vec<faderframe_project::ExpressionPoint>,
+    },
     /// Play a note on a track's instrument (until `AuditionOff`).
     Audition {
         track: TrackId,
@@ -333,6 +372,127 @@ pub enum Action {
     },
     SetGrid(GridDivision),
     ToggleSnap,
+    SetEditMode(EditMode),
+    SetGridMode(GridMode),
+    SetEditTool(EditTool),
+    SetNudge(NudgeValue),
+    SetEditFlag(EditFlag, bool),
+    SetCounterUnit(CounterUnit),
+    SetTransientSensitivity(f32),
+    /// Ask the arranger to zoom.
+    Zoom(ZoomRequest),
+    /// The edit selection range (`None`: none); tracks via `SelectTracks`.
+    SetEditRange(Option<EditRange>),
+    /// Split at the selection's edges (or the selected clips at the
+    /// playhead).
+    Separate,
+    TrimToSelection,
+    /// Delete the selection range on the selected tracks.
+    ClearRange,
+    CopyRange,
+    CutRange,
+    /// Paste the copied range at the playhead.
+    PasteRange,
+    /// Copies right after the selection (1 = duplicate).
+    RepeatRange(u32),
+    InsertSilence,
+    Nudge {
+        forward: bool,
+        target: NudgeTarget,
+    },
+    TrimClip {
+        clip: ClipId,
+        edge: ClipEdge,
+        to: MusicalTime,
+    },
+    /// Fade lengths in project frames.
+    SetClipFades {
+        clip: ClipId,
+        fade_in: i64,
+        fade_out: i64,
+    },
+    SetClipGain {
+        clip: ClipId,
+        db: f32,
+    },
+    SpotClip {
+        clip: ClipId,
+        start: MusicalTime,
+    },
+    ShuffleClip {
+        clip: ClipId,
+        track: TrackId,
+        at: MusicalTime,
+    },
+    /// To the next (previous) clip boundary or transient; `extend` grows
+    /// the selection.
+    TabTo {
+        forward: bool,
+        extend: bool,
+    },
+    /// Move clips by `by` (ticks) and `tracks` lanes from where the gesture
+    /// started (all of them, or none, change track).
+    MoveClips {
+        clips: Vec<ClipId>,
+        by: i64,
+        tracks: i32,
+    },
+    /// Move one edge of clips by `by` ticks (`stretch`: time-compress or
+    /// expand instead of trimming).
+    TrimClips {
+        clips: Vec<ClipId>,
+        edge: ClipEdge,
+        by: i64,
+        stretch: bool,
+    },
+    /// Time-compress/expand a clip by moving an edge to `to`.
+    StretchClip {
+        clip: ClipId,
+        edge: ClipEdge,
+        to: MusicalTime,
+    },
+    /// Add `delta_db` to the clips' gain (from the gesture start).
+    ClipGain {
+        clips: Vec<ClipId>,
+        delta_db: f32,
+    },
+    /// Set the clips' gain.
+    SetClipsGain {
+        clips: Vec<ClipId>,
+        db: f32,
+    },
+    /// Fade length (project frames), shape or drawn bend (percent) of the
+    /// clips' fade-ins or fade-outs.
+    SetFade {
+        clips: Vec<ClipId>,
+        edge: ClipEdge,
+        length: Option<i64>,
+        shape: Option<faderframe_project::FadeShape>,
+        bend: Option<i16>,
+    },
+    SetClipsMuted {
+        clips: Vec<ClipId>,
+        muted: bool,
+    },
+    /// Pin source frame `source` of an audio clip at clip-relative output
+    /// frame `to` (adds a warp marker).
+    WarpTo {
+        clip: ClipId,
+        source: i64,
+        to: i64,
+        drag: warping::WarpDrag,
+    },
+    RemoveWarpMarker {
+        clip: ClipId,
+        source: i64,
+    },
+    QuantizeWarp(Vec<ClipId>),
+    ClearWarp(Vec<ClipId>),
+    SetWarpAlgorithm {
+        clips: Vec<ClipId>,
+        algorithm: faderframe_project::WarpAlgorithm,
+    },
+    SeparateAtTransients(Vec<ClipId>),
     ToggleFollowPlayhead,
 }
 
@@ -340,10 +500,27 @@ pub enum Action {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EditorSettings {
     pub grid: GridDivision,
+    /// Grid mode is on (kept in step with `edit_mode`).
     pub snap: bool,
     pub follow_playhead: bool,
     /// Scale, chords, note length, audition … of the piano roll.
     pub piano: PianoRollSettings,
+    pub edit_mode: EditMode,
+    pub grid_mode: GridMode,
+    pub tool: EditTool,
+    pub nudge: NudgeValue,
+    pub tab_to_transients: bool,
+    pub link_timeline: bool,
+    pub insertion_follows_playback: bool,
+    pub show_transients: bool,
+    pub warp: bool,
+    pub show_edit_toolbar: bool,
+    pub counter_unit: CounterUnit,
+    /// Transient detection sensitivity, 0–1 (more transients when higher).
+    pub transient_sensitivity: f32,
+    /// The latest zoom request and its sequence number (views apply each
+    /// request once).
+    pub zoom_request: (u64, ZoomRequest),
 }
 
 impl Default for EditorSettings {
@@ -353,6 +530,19 @@ impl Default for EditorSettings {
             snap: true,
             follow_playhead: true,
             piano: PianoRollSettings::default(),
+            edit_mode: EditMode::Grid,
+            grid_mode: GridMode::Absolute,
+            tool: EditTool::Smart,
+            nudge: NudgeValue::default(),
+            tab_to_transients: false,
+            link_timeline: true,
+            insertion_follows_playback: true,
+            show_transients: false,
+            warp: false,
+            show_edit_toolbar: false,
+            counter_unit: CounterUnit::BarsBeats,
+            transient_sensitivity: 0.5,
+            zoom_request: (0, ZoomRequest::Fit),
         }
     }
 }
@@ -389,6 +579,9 @@ pub const MEDIA_FOLDER: &str = "Audio";
 pub struct AudioPreferences {
     pub sample_rate: Option<u32>,
     pub buffer_size: Option<u32>,
+    /// Threads processing the graph, the audio thread included (`None`:
+    /// one per core; 1: the audio thread alone).
+    pub threads: Option<u16>,
 }
 
 /// A recording in progress (or whose writer is finishing).
@@ -449,6 +642,11 @@ pub struct Session {
     // Media. Declared after `audio` so the stream (the page reader) is
     // dropped before the disk loader frees pages.
     epoch: Arc<Epoch>,
+    /// DSP worker threads shared by this session's engines (created when
+    /// audio starts).
+    pool: Option<Arc<faderframe_realtime::WorkerPool>>,
+    /// Following an external MIDI clock / MTC.
+    sync: sync::SyncState,
     loader: media::DiskLoader,
     /// Where imported media is written.
     media_dir: PathBuf,
@@ -470,6 +668,15 @@ pub struct Session {
     ui_requests: Vec<UiRequest>,
     /// Notes copied in the piano roll (relative to the earliest).
     note_clipboard: Vec<MidiNote>,
+    range_clipboard: editing::RangeClipboard,
+    /// Where playback last started (for "insertion follows playback" off).
+    play_started_at: Option<i64>,
+    transients: transients::TransientCache,
+    /// Clips as the running gesture first saw them (drags recompute from
+    /// these).
+    gesture_base: HashMap<ClipId, faderframe_project::Clip>,
+    /// Expression of the clipboard's notes (by their original ids).
+    note_clipboard_expressions: Vec<faderframe_project::NoteExpression>,
     perf: performance::PerformanceMonitor,
     midi: midi::MidiState,
 }
@@ -494,6 +701,8 @@ pub enum UiRequest {
         plugin: faderframe_core::PluginInstanceId,
         generic: bool,
     },
+    /// Pick a `.syx` file and add its messages to `clip` at `at`.
+    ImportSysex { clip: ClipId, at: MusicalTime },
 }
 
 /// One parameter of a hosted plugin, for generic editors.
@@ -590,6 +799,8 @@ impl Session {
             layout_revision: 0,
             notices: VecDeque::new(),
             epoch,
+            pool: None,
+            sync: sync::SyncState::default(),
             loader,
             media_dir: media::new_unsaved_media_dir(),
             unsaved_media: true,
@@ -606,6 +817,11 @@ impl Session {
             automation_writer: Default::default(),
             ui_requests: Vec::new(),
             note_clipboard: Vec::new(),
+            range_clipboard: editing::RangeClipboard::default(),
+            play_started_at: None,
+            transients: transients::TransientCache::default(),
+            gesture_base: HashMap::new(),
+            note_clipboard_expressions: Vec::new(),
             perf: Default::default(),
             midi,
         };
@@ -897,9 +1113,10 @@ impl Session {
             if self.pending.is_none() {
                 self.recreate_engine()?;
             }
-            let Some(processor) = self.pending.take() else {
+            let Some(mut processor) = self.pending.take() else {
                 continue;
             };
+            processor.set_worker_pool(self.worker_pool(prefs.threads));
             let config = StreamConfig {
                 sample_rate: prefs.sample_rate,
                 buffer_size: prefs.buffer_size,
@@ -926,6 +1143,39 @@ impl Session {
             }
         }
         Err(last_err.unwrap_or_else(|| SessionError::Other("no audio backend available".into())))
+    }
+
+    /// The worker pool for `threads` processing threads in total (reused
+    /// while the count stays the same).
+    fn worker_pool(
+        &mut self,
+        threads: Option<u16>,
+    ) -> Option<Arc<faderframe_realtime::WorkerPool>> {
+        let workers = match threads {
+            Some(t) => (t as usize).saturating_sub(1),
+            None => faderframe_realtime::default_worker_count(),
+        };
+        if workers == 0 {
+            self.pool = None;
+            return None;
+        }
+        if self.pool.as_ref().is_none_or(|p| p.threads() != workers) {
+            self.pool = Some(Arc::new(faderframe_realtime::WorkerPool::new(
+                faderframe_realtime::PoolConfig::new(workers),
+            )));
+        }
+        self.pool.clone()
+    }
+
+    /// Threads processing the graph (the audio thread plus workers).
+    pub fn processing_threads(&self) -> usize {
+        1 + self.pool.as_ref().map_or(0, |p| p.threads())
+    }
+
+    /// Worker threads that could not get the audio thread's realtime
+    /// priority (no permission): they still work, but may be preempted.
+    pub fn worker_priority_failures(&self) -> u64 {
+        self.pool.as_ref().map_or(0, |p| p.priority_failures())
     }
 
     /// While no stream runs, the processor is owned here; drain its queues
@@ -1089,6 +1339,23 @@ impl Session {
                 }
             }
         }
+        // Generated sources added by an edit (or restored by undo).
+        let rate = self.engine.sample_rate();
+        let new_generated: Vec<(AudioSourceId, faderframe_audio_files::GeneratorSpec)> = self
+            .project
+            .sources
+            .values()
+            .filter(|s| !self.sources.contains_key(&s.id))
+            .filter_map(|s| match &s.spec {
+                SourceSpec::Generated { generator } => Some((s.id, generator.clone())),
+                SourceSpec::File { .. } => None,
+            })
+            .collect();
+        for (id, generator) in new_generated {
+            let data = Arc::new(faderframe_audio_files::generate(&generator, rate));
+            self.peaks.insert(id, Arc::new(PeakCache::build(&data)));
+            self.sources.insert(id, Source::Memory(data));
+        }
         let failed = media::open_file_sources(&self.project, dir.as_deref(), &mut self.sources);
         for (id, path, e) in failed {
             if self.missing.insert(id) {
@@ -1140,6 +1407,7 @@ impl Session {
     }
 
     fn poll_jobs(&mut self) {
+        self.poll_transients();
         let mut i = 0;
         while i < self.peak_jobs.len() {
             if self.peak_jobs[i].is_finished() {
@@ -1273,6 +1541,7 @@ impl Session {
                     fades: Default::default(),
                     stretch: Default::default(),
                     reversed: false,
+                    warp: None,
                 }),
             };
             clips.push(clip.id);
@@ -1519,6 +1788,7 @@ impl Session {
             Action::BeginGesture(label) => self.history.begin(label),
             Action::EndGesture => {
                 self.history.end();
+                self.gesture_base.clear();
                 self.automation_gesture_ended();
                 self.revision += 1;
             }
@@ -1606,7 +1876,12 @@ impl Session {
                     })?;
                 }
             }
-            Action::DeleteSelection => self.delete_selection()?,
+            Action::DeleteSelection => {
+                // A time range is cleared; otherwise the selected objects go.
+                if !self.clear_range()? {
+                    self.delete_selection()?;
+                }
+            }
             Action::SplitSelectedAtPlayhead => self.split_at_playhead()?,
             Action::InsertPlugin {
                 track,
@@ -1658,6 +1933,8 @@ impl Session {
                         length: length.max(MusicalTime(1)),
                         notes: Vec::new(),
                         controllers: Vec::new(),
+                        expressions: Vec::new(),
+                        sysex: Vec::new(),
                     }),
                 };
                 self.edit(Command::AddClip {
@@ -1759,6 +2036,21 @@ impl Session {
             Action::SetMidiClipLength { clip, length } => {
                 self.set_midi_clip_length(clip, length)?
             }
+            Action::SetNoteExpression {
+                clip,
+                note,
+                kind,
+                from,
+                to,
+                points,
+            } => self.set_note_expression(clip, note, kind, from, to, &points)?,
+            Action::AddSysex { clip, at, messages } => self.add_sysex(clip, at, messages)?,
+            Action::RemoveSysex { clip, index } => self.remove_sysex(clip, index)?,
+            Action::SendSysex { output, messages } => self.send_sysex(&output, messages)?,
+            Action::RequestSysexImport { clip, at } => {
+                self.ui_requests.push(UiRequest::ImportSysex { clip, at });
+                self.revision += 1;
+            }
             Action::Audition {
                 track,
                 key,
@@ -1832,8 +2124,143 @@ impl Session {
                 self.revision += 1;
             }
             Action::ToggleSnap => {
-                self.editor.snap = !self.editor.snap;
+                let mode = if self.editor.snap {
+                    EditMode::Slip
+                } else {
+                    EditMode::Grid
+                };
+                self.editor.edit_mode = mode;
+                self.editor.snap = mode == EditMode::Grid;
                 self.revision += 1;
+            }
+            Action::SetEditMode(mode) => {
+                self.editor.edit_mode = mode;
+                self.editor.snap = mode == EditMode::Grid;
+                self.revision += 1;
+            }
+            Action::SetGridMode(mode) => {
+                self.editor.grid_mode = mode;
+                self.editor.edit_mode = EditMode::Grid;
+                self.editor.snap = true;
+                self.revision += 1;
+            }
+            Action::SetEditTool(tool) => {
+                self.editor.tool = tool;
+                self.revision += 1;
+            }
+            Action::SetNudge(n) => {
+                self.editor.nudge = n;
+                self.revision += 1;
+            }
+            Action::SetEditFlag(flag, on) => {
+                let e = &mut self.editor;
+                match flag {
+                    EditFlag::TabToTransients => e.tab_to_transients = on,
+                    EditFlag::LinkTimeline => e.link_timeline = on,
+                    EditFlag::InsertionFollowsPlayback => e.insertion_follows_playback = on,
+                    EditFlag::ShowTransients => e.show_transients = on,
+                    EditFlag::Warp => e.warp = on,
+                    EditFlag::EditToolbar => e.show_edit_toolbar = on,
+                }
+                if matches!(
+                    flag,
+                    EditFlag::ShowTransients | EditFlag::Warp | EditFlag::TabToTransients
+                ) && on
+                {
+                    self.analyse_transients_of_project();
+                }
+                self.revision += 1;
+                if flag == EditFlag::EditToolbar {
+                    self.layout_revision += 1;
+                }
+            }
+            Action::SetCounterUnit(u) => {
+                self.editor.counter_unit = u;
+                self.revision += 1;
+            }
+            Action::Zoom(z) => {
+                self.editor.zoom_request = (self.editor.zoom_request.0 + 1, z);
+                self.revision += 1;
+            }
+            Action::SetTransientSensitivity(v) => {
+                self.editor.transient_sensitivity = v.clamp(0.0, 1.0);
+                self.revision += 1;
+            }
+            Action::SetEditRange(range) => self.set_edit_range(range)?,
+            Action::Separate => self.separate()?,
+            Action::TrimToSelection => self.trim_to_selection()?,
+            Action::ClearRange => {
+                self.clear_range()?;
+            }
+            Action::CopyRange => self.copy_range()?,
+            Action::CutRange => {
+                self.copy_range()?;
+                self.clear_range()?;
+            }
+            Action::PasteRange => self.paste_range()?,
+            Action::RepeatRange(n) => self.repeat_range(n)?,
+            Action::InsertSilence => self.insert_silence()?,
+            Action::Nudge { forward, target } => self.nudge(forward, target)?,
+            Action::TrimClip { clip, edge, to } => self.trim_clip(clip, edge, to)?,
+            Action::SetClipFades {
+                clip,
+                fade_in,
+                fade_out,
+            } => self.set_clip_fades(clip, fade_in, fade_out)?,
+            Action::SetClipGain { clip, db } => self.set_clip_gain(clip, db)?,
+            Action::SpotClip { clip, start } => self.spot_clip(clip, start)?,
+            Action::ShuffleClip { clip, track, at } => self.shuffle_clip(clip, track, at)?,
+            Action::TabTo { forward, extend } => self.tab_to(forward, extend)?,
+            Action::MoveClips { clips, by, tracks } => self.move_clips(&clips, by, tracks)?,
+            Action::TrimClips {
+                clips,
+                edge,
+                by,
+                stretch,
+            } => self.trim_clips(&clips, edge, by, stretch)?,
+            Action::StretchClip { clip, edge, to } => self.stretch_clip(clip, edge, to)?,
+            Action::ClipGain { clips, delta_db } => self.clip_gain(&clips, Some(delta_db), None)?,
+            Action::SetClipsGain { clips, db } => self.clip_gain(&clips, None, Some(db))?,
+            Action::SetFade {
+                clips,
+                edge,
+                length,
+                shape,
+                bend,
+            } => self.set_fade(&clips, edge, length, shape, bend)?,
+            Action::SetClipsMuted { clips, muted } => {
+                let cmds = clips
+                    .into_iter()
+                    .map(|clip| Command::SetClipMuted { clip, muted })
+                    .collect();
+                self.batch(if muted { "Mute Clips" } else { "Unmute Clips" }, cmds)?;
+            }
+            Action::WarpTo {
+                clip,
+                source,
+                to,
+                drag,
+            } => self.warp_to(clip, source, to, drag)?,
+            Action::RemoveWarpMarker { clip, source } => self.remove_warp_marker(clip, source)?,
+            Action::QuantizeWarp(clips) => {
+                for c in clips {
+                    self.quantize_warp(c)?;
+                }
+            }
+            Action::ClearWarp(clips) => {
+                for c in clips {
+                    self.clear_warp(c)?;
+                }
+            }
+            Action::SetWarpAlgorithm { clips, algorithm } => {
+                for c in clips {
+                    self.set_warp_algorithm(c, algorithm)?;
+                }
+            }
+            Action::SeparateAtTransients(clips) => {
+                for c in clips {
+                    self.separate_at_transients(c)?;
+                }
             }
             Action::ToggleFollowPlayhead => {
                 self.editor.follow_playhead = !self.editor.follow_playhead;
@@ -1852,6 +2279,7 @@ impl Session {
                     self.engine.transport(TransportCommand::Stop)?;
                     self.stop_recording()?;
                     self.automation_play_stopped();
+                    self.return_to_play_start()?;
                 } else if self.recording.is_some() {
                     self.stop_recording()?;
                 } else {
@@ -1863,6 +2291,7 @@ impl Session {
                     self.engine.transport(TransportCommand::Stop)?;
                     self.stop_recording()?;
                     self.automation_play_stopped();
+                    self.return_to_play_start()?;
                 } else {
                     self.play()?;
                 }
@@ -2457,6 +2886,18 @@ impl Session {
         })
     }
 
+    /// "Insertion follows playback" off: stopping returns to where
+    /// playback started.
+    fn return_to_play_start(&mut self) -> Result<()> {
+        if let Some(pos) = self.play_started_at.take()
+            && !self.editor.insertion_follows_playback
+        {
+            self.engine.transport(TransportCommand::Locate(pos))?;
+            self.transport.position = pos;
+        }
+        Ok(())
+    }
+
     fn split_at_playhead(&mut self) -> Result<()> {
         let at = self.playhead();
         let targets: Vec<ClipId> = self
@@ -2513,6 +2954,7 @@ mod tests {
                 &AudioPreferences {
                     sample_rate: Some(96_000),
                     buffer_size: Some(128),
+                    ..Default::default()
                 },
             )
             .unwrap();

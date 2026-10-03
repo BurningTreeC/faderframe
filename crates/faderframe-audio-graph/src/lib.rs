@@ -14,12 +14,10 @@
 //!    all buffers, and records dependency information for future parallel
 //!    scheduling. Everything that allocates happens here.
 //! 3. **Process** (audio thread): [`CompiledGraph::process`] runs the nodes
-//!    in order. It performs no allocation, locking or I/O.
-//!
-//! The executor is currently serial. The compiled form already contains the
-//! per-node dependency counts and dependents lists a dependency-aware
-//! multicore scheduler needs; nodes only read upstream output buffers and
-//! write their own buffers, so independent nodes may run concurrently.
+//!    in order; [`CompiledGraph::process_parallel`] runs independent jobs
+//!    (fused node chains) concurrently on a `faderframe_realtime::WorkerPool`,
+//!    most expensive path first. Neither allocates, locks or does I/O, and
+//!    both produce bit-identical output.
 //!
 //! The crate is generic over an engine-defined context type `C` handed to
 //! every processor, so it knows nothing about projects, transports or

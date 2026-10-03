@@ -226,8 +226,9 @@ impl MidiHub {
         port: &midir::MidiInputPort,
     ) -> Result<midir::MidiInputConnection<()>, String> {
         let mut input = midir::MidiInput::new(CLIENT_NAME).map_err(|e| e.to_string())?;
-        // Channel messages only: no SysEx, clock or active sensing.
-        input.ignore(midir::Ignore::All);
+        // Everything but active sensing: clock, MTC and SysEx are used for
+        // synchronisation and recording.
+        input.ignore(midir::Ignore::ActiveSense);
         let tx = self.tx.clone();
         input
             .connect(

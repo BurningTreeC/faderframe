@@ -18,7 +18,7 @@ mod layout;
 pub use layout::{INSERT_SLOTS, MAX_SEND_ROWS, SENDS_PER_ROW, StripLayout};
 
 use faderframe_core::gain::{SILENCE_DB, format_db};
-use faderframe_core::pan::format_pan;
+use faderframe_core::pan::{format_pan, parse_pan};
 use faderframe_core::{FaderLaw, TrackId};
 use faderframe_project::{
     Command, InputRouting, MonitorMode, OutputRouting, SendTap, Track, TrackColor, TrackKind,
@@ -37,6 +37,8 @@ pub enum Hit {
     FaderCap(TrackId),
     FaderTrack(TrackId),
     Pan(TrackId),
+    /// The pan value under the knob (click to type).
+    PanValue(TrackId),
     /// A send slot; the index is into the track's sends (bank applied).
     Send(TrackId, usize),
     /// Page the send slots by this many banks.
@@ -248,10 +250,11 @@ impl MixerView {
             let id = t.id;
             let geo = FaderGeometry::new(l.fader, &self.theme);
             let pos_now = self.law.db_to_position(model.shown_volume_db(t));
-            let checks: [(Option<Rect>, Hit); 12] = [
+            let checks: [(Option<Rect>, Hit); 13] = [
                 (Some(geo.cap_rect(pos_now).inset(-2.0)), Hit::FaderCap(id)),
                 (Some(l.fader), Hit::FaderTrack(id)),
                 (Some(l.meter), Hit::Meter(id)),
+                (Some(l.pan_readout), Hit::PanValue(id)),
                 (Some(l.pan_knob), Hit::Pan(id)),
                 (Some(l.mute), Hit::Mute(id)),
                 (Some(l.solo), Hit::Solo(id)),
@@ -903,6 +906,17 @@ impl MixerView {
         }
     }
 
+    fn pan_request(model: &Session, t: &Track, at: Rect) -> HostRequest<Action> {
+        let id = t.id;
+        HostRequest::TextInput {
+            at,
+            initial: format_pan(model.shown_pan(t)),
+            commit: Box::new(move |text| {
+                parse_pan(text).map(|pan| Action::Edit(Command::SetTrackPan { track: id, pan }))
+            }),
+        }
+    }
+
     fn layout_of(&self, model: &Session, id: TrackId, size: Size) -> Option<StripLayout> {
         self.visible_strips(model, size)
             .into_iter()
@@ -1089,9 +1103,15 @@ impl MixerView {
             Hit::Level(id) => {
                 if let (Some(t), Some(l)) =
                     (Self::track(model, id), self.layout_of(model, id, size))
-                    && clicks >= 2
                 {
                     cx.request(Self::level_request(t, l.level_readout));
+                }
+            }
+            Hit::PanValue(id) => {
+                if let (Some(t), Some(l)) =
+                    (Self::track(model, id), self.layout_of(model, id, size))
+                {
+                    cx.request(Self::pan_request(model, t, l.pan_readout));
                 }
             }
             Hit::Scribble(id) | Hit::Strip(id) => {
@@ -1228,7 +1248,11 @@ impl MixerView {
             Hit::Monitor(_) => "Input monitoring · Right-click for tape-style auto".into(),
             Hit::Input(_) => "Input routing".into(),
             Hit::Output(_) => "Output routing".into(),
-            Hit::Level(_) => "Double-click to type a level".into(),
+            Hit::Level(_) => "Click to type a level".into(),
+            Hit::PanValue(id) => format!(
+                "Pan {} · Click to type (C, L30, R45 or −100…100)",
+                format_pan(model.shown_pan(Self::track(model, id)?))
+            ),
             Hit::Scribble(_) => "Double-click to rename · Right-click for options".into(),
             Hit::Meter(_) => "Peak meter · Click to clear clip indicators".into(),
             Hit::Strip(_) => return None,

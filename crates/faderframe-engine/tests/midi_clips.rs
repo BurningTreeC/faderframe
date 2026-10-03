@@ -48,6 +48,8 @@ fn project(muted: bool, sustain: bool) -> TestProject {
             muted,
         }],
         controllers: Vec::new(),
+        expressions: Vec::new(),
+        sysex: Vec::new(),
     };
     if sustain {
         let mut lane = ControllerLane::new(MidiController::SUSTAIN, 0);

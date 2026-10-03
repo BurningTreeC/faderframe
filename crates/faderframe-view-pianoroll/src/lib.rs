@@ -27,7 +27,7 @@ mod toolbar;
 mod tests;
 
 use faderframe_core::{ClipId, NoteId};
-use faderframe_project::{Clip, MidiClip, MidiController, MidiNote, TrackColor};
+use faderframe_project::{Clip, ExpressionKind, MidiClip, MidiController, MidiNote, TrackColor};
 use faderframe_session::{KeyFold, Session};
 use faderframe_timeline::MusicalTime;
 use faderframe_ui_canvas::{Color, Point, Rect, Size, Theme};
@@ -102,6 +102,8 @@ pub enum LaneKind {
     #[default]
     Velocity,
     Controller(MidiController),
+    /// Per-note expression (MPE) of the selected notes.
+    Expression(ExpressionKind),
 }
 
 impl LaneKind {
@@ -109,6 +111,7 @@ impl LaneKind {
         match self {
             LaneKind::Velocity => "Velocity".into(),
             LaneKind::Controller(c) => c.label(),
+            LaneKind::Expression(k) => k.label().into(),
         }
     }
 }
@@ -159,6 +162,15 @@ enum Drag {
         line: bool,
         erase: bool,
     },
+    /// Drawing the expression of `notes` (id, start, end; clip-relative).
+    Expression {
+        notes: Vec<(NoteId, MusicalTime, MusicalTime)>,
+        points: Vec<(MusicalTime, f32)>,
+        from: Point,
+        to: Point,
+        line: bool,
+        erase: bool,
+    },
     /// Resizing the lane.
     Splitter { origin_y: f32, origin_h: f32 },
     /// Dragging the clip end in the ruler.
@@ -191,6 +203,8 @@ pub struct PianoRollView {
     last_length: MusicalTime,
     /// Visible keys, top to bottom (all 128, or folded).
     rows: Vec<u8>,
+    /// Rows the toolbar wraps into at the current width.
+    toolbar_rows: usize,
 }
 
 /// The regions of the view.
@@ -227,6 +241,7 @@ impl PianoRollView {
             hover: None,
             last_length: MusicalTime::from_quarters(0.25),
             rows: (0..=127u8).rev().collect(),
+            toolbar_rows: 1,
         }
     }
 
@@ -242,6 +257,17 @@ impl PianoRollView {
         self.lane
     }
 
+    /// Height of the (wrapping) toolbar.
+    fn toolbar_h(&self) -> f32 {
+        self.theme.piano.toolbar_height * self.toolbar_rows.max(1) as f32
+    }
+
+    /// Re-wrap the toolbar for `width` (before painting and events).
+    fn update_toolbar(&mut self, width: f32, model: &Session) {
+        let r = Rect::new(0.0, 0.0, width, self.theme.piano.toolbar_height);
+        self.toolbar_rows = self.toolbar_layout(r, model).1;
+    }
+
     fn kb_w(&self) -> f32 {
         self.theme.piano.keyboard_width
     }
@@ -249,7 +275,7 @@ impl PianoRollView {
     fn layout(&self, size: Size) -> Layout {
         let pr = &self.theme.piano;
         let mut r = Rect::from_size(size);
-        let toolbar = r.take_top(pr.toolbar_height);
+        let toolbar = r.take_top(self.toolbar_h());
         let head = r.take_top(pr.ruler_height);
         let lane_h = self.lane_h.clamp(36.0, (r.h * 0.6).max(36.0));
         let lane_row = r.take_bottom(lane_h);
@@ -279,7 +305,7 @@ impl PianoRollView {
     }
 
     fn grid_top(&self) -> f32 {
-        self.theme.piano.toolbar_height + self.theme.piano.ruler_height
+        self.toolbar_h() + self.theme.piano.ruler_height
     }
 
     /// Row index of a key (`None`: folded away).
@@ -411,6 +437,9 @@ impl faderframe_ui_canvas::CanvasView<Session, faderframe_session::Action> for P
         model: &Session,
         theme: &Theme,
     ) {
+        // The lane may have been chosen from a menu since the last event.
+        self.sync_lane(model);
+        self.update_toolbar(size.w, model);
         self.paint_view(p, size, model, theme);
     }
 
@@ -421,6 +450,7 @@ impl faderframe_ui_canvas::CanvasView<Session, faderframe_session::Action> for P
         model: &Session,
         cx: &mut faderframe_ui_canvas::EventCx<'_, faderframe_session::Action>,
     ) -> bool {
+        self.update_toolbar(size.w, model);
         self.handle_event(ev, size, model, cx)
     }
 
@@ -464,5 +494,29 @@ impl faderframe_ui_canvas::CanvasView<Session, faderframe_session::Action> for P
             faderframe_ui_canvas::ScrollAxis::Horizontal => self.scroll_x = offset.max(0.0),
             faderframe_ui_canvas::ScrollAxis::Vertical => self.scroll_y = offset.max(0.0),
         }
+    }
+}
+
+/// Values the expression lane shows (pitch: ±12 semitones).
+pub(crate) fn expression_span(kind: ExpressionKind) -> (f32, f32) {
+    match kind {
+        ExpressionKind::Pitch => (-12.0, 12.0),
+        ExpressionKind::Pressure | ExpressionKind::Timbre => (0.0, 1.0),
+    }
+}
+
+pub(crate) fn expression_y(area: Rect, kind: ExpressionKind, v: f32) -> f32 {
+    let (lo, hi) = expression_span(kind);
+    area.bottom() - area.h * ((v - lo) / (hi - lo)).clamp(0.0, 1.0)
+}
+
+pub(crate) fn expression_value(area: Rect, kind: ExpressionKind, y: f32) -> f32 {
+    let (lo, hi) = expression_span(kind);
+    let v = lo + (hi - lo) * ((area.bottom() - y) / area.h.max(1.0)).clamp(0.0, 1.0);
+    // Pitch snaps to whole semitones near them.
+    if kind == ExpressionKind::Pitch && (v - v.round()).abs() < 0.12 {
+        v.round()
+    } else {
+        v
     }
 }

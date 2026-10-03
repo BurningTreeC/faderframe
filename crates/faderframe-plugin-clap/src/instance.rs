@@ -12,7 +12,7 @@ use clack_host::events::event_types::ParamValueEvent;
 use clack_host::prelude::*;
 use faderframe_core::ParameterId;
 use faderframe_plugin_host::{
-    AudioPortInfo, ParameterInfo, ParameterUnit, PluginDescriptor, PluginError, PluginFormat,
+    ParameterInfo, ParameterUnit, PluginDescriptor, PluginError, PluginFormat,
     PluginInstance as FfInstance, PluginProcessor, ProcessConfig, TailLength,
 };
 use faderframe_realtime::TryCell;
@@ -35,27 +35,7 @@ pub struct ClapInstance {
 }
 
 pub(crate) fn descriptor_of(p: &ScannedPlugin) -> PluginDescriptor {
-    let ports = |list: &[u16]| {
-        list.iter()
-            .enumerate()
-            .map(|(i, &c)| AudioPortInfo {
-                channels: c,
-                is_main: i == 0,
-            })
-            .collect()
-    };
-    PluginDescriptor {
-        format: PluginFormat::Clap,
-        id: p.id.clone(),
-        name: p.name.clone(),
-        vendor: p.vendor.clone(),
-        version: p.version.clone(),
-        category: p.category(),
-        audio_inputs: ports(&p.audio_inputs),
-        audio_outputs: ports(&p.audio_outputs),
-        note_inputs: p.note_inputs,
-        note_outputs: p.note_outputs,
-    }
+    p.descriptor(PluginFormat::Clap)
 }
 
 fn text(bytes: &[u8]) -> String {

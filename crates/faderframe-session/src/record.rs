@@ -492,6 +492,7 @@ pub(crate) fn place_takes(
             fades: Default::default(),
             stretch: Default::default(),
             reversed: false,
+            warp: None,
         }),
     };
     // Existing material in the way.
@@ -655,6 +656,7 @@ impl Session {
         self.engine.transport(TransportCommand::Play)?;
         self.loader.wake();
         if !self.transport.playing {
+            self.play_started_at = Some(self.transport.position);
             self.automation_play_started();
         }
         Ok(())
@@ -1060,6 +1062,16 @@ impl Session {
                 } else {
                     f.fades.fade_out_shape
                 },
+                fade_in_bend: if touches_prev {
+                    0
+                } else {
+                    f.fades.fade_in_bend
+                },
+                fade_out_bend: if touches_next {
+                    0
+                } else {
+                    f.fades.fade_out_bend
+                },
             };
             commands.push(Command::AddClip {
                 clip: Box::new(Clip {
@@ -1077,6 +1089,7 @@ impl Session {
                         fades,
                         stretch: Default::default(),
                         reversed: false,
+                        warp: None,
                     }),
                 }),
             });

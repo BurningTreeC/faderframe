@@ -359,7 +359,11 @@ fn toolbar_switches_tools_and_opens_menus() {
     else {
         panic!("grid menu")
     };
-    assert!(items.iter().any(|i| i.label == "1/16T"));
+    assert!(
+        items.iter().any(|i| i.label == "1/256"),
+        "grids down to 1/256"
+    );
+    assert!(items.iter().any(|i| i.label == "Triplet"));
     let (a, _) = run(
         &mut view,
         down(
@@ -391,4 +395,122 @@ fn folding_shows_only_scale_or_used_keys() {
     paint(&mut view, &s);
     assert!(view.rows.len() < 128 && view.rows.len() >= used.len());
     assert!(view.rows.windows(2).all(|w| w[0] > w[1]), "top to bottom");
+}
+
+#[test]
+fn expression_lane_draws_the_notes_under_the_pointer_in_one_step() {
+    use faderframe_project::ExpressionKind;
+    let mut s = session();
+    let mut view = PianoRollView::new(Theme::default());
+    let mut pr = s.editor.piano;
+    pr.expression = Some(ExpressionKind::Pitch);
+    s.dispatch(Action::SetPianoRoll(pr)).unwrap();
+    paint(&mut view, &s);
+    let texts: Vec<String> = paint(&mut view, &s)
+        .texts()
+        .into_iter()
+        .map(|t| t.to_string())
+        .collect();
+    assert!(texts.iter().any(|t| t.starts_with("PITCH ▾")), "{texts:?}");
+    let n = notes(&s)[0];
+    let l = view.layout(SIZE);
+    let area = PianoRollView::lane_value_rect(l.lane);
+    // A line over the first note from 0 to the top (+12 semitones).
+    let shift = Modifiers {
+        shift: true,
+        ..Modifiers::NONE
+    };
+    let a = Point::new(view.x_of(n.start) + 1.0, area.center().y);
+    let b = Point::new(view.x_of(n.end()) - 1.0, area.y);
+    run(&mut view, down(a, shift, 1), &mut s);
+    run(&mut view, drag(b, shift), &mut s);
+    let (actions, _) = run(&mut view, up(b, shift), &mut s);
+    assert!(matches!(actions.first(), Some(Action::BeginGesture(_))));
+    assert!(matches!(actions.last(), Some(Action::EndGesture)));
+    let id = s.editor_clip().unwrap();
+    let m = s.project().clip(id).unwrap().as_midi().unwrap().clone();
+    let e = m.expression(n.id).expect("expression on the note");
+    assert!(e.value_at(ExpressionKind::Pitch, MusicalTime::ZERO).abs() < 0.5);
+    assert!(e.value_at(ExpressionKind::Pitch, n.length) > 11.0);
+    // Only notes sounding where the drag started got expression.
+    assert!(
+        m.expressions.iter().all(|x| {
+            let o = m.note(x.note).unwrap();
+            o.start <= n.start && o.end() > n.start
+        }),
+        "{:?}",
+        m.expressions
+    );
+    // One undo step for the whole gesture.
+    assert_eq!(s.history().undo_label(), Some("Edit Expression"));
+    s.dispatch(Action::Undo).unwrap();
+    let m = s.project().clip(id).unwrap().as_midi().unwrap().clone();
+    assert!(m.expressions.is_empty());
+}
+
+#[test]
+fn sysex_markers_explain_themselves_and_offer_deleting() {
+    let mut s = session();
+    let mut view = PianoRollView::new(Theme::default());
+    let clip = s.editor_clip().unwrap();
+    s.dispatch(Action::AddSysex {
+        clip,
+        at: MusicalTime::from_quarters_i(1),
+        messages: vec![vec![0xF0, 0x7E, 0x7F, 0x09, 0x01, 0xF7]],
+    })
+    .unwrap();
+    paint(&mut view, &s);
+    let l = view.layout(SIZE);
+    let at = Point::new(view.x_of(MusicalTime::from_quarters_i(1)), l.ruler.y + 5.0);
+    let tip = view.tooltip_at(at, SIZE, &s).unwrap();
+    assert!(tip.contains("F0 7E 7F 09 01 F7"), "{tip}");
+    let (_, requests) = run(
+        &mut view,
+        ViewEvent::PointerDown {
+            pos: at,
+            button: PointerButton::Secondary,
+            modifiers: Modifiers::NONE,
+            clicks: 1,
+        },
+        &mut s,
+    );
+    let Some(HostRequest::ContextMenu { items, .. }) = requests.first() else {
+        panic!("a menu: {} requests", requests.len())
+    };
+    let delete = items
+        .iter()
+        .find(|i| i.label.starts_with("Delete SysEx"))
+        .unwrap();
+    s.dispatch(delete.action.clone().unwrap()).unwrap();
+    let m = s.project().clip(clip).unwrap().as_midi().unwrap().clone();
+    assert!(m.sysex.is_empty());
+}
+
+#[test]
+fn toolbar_wraps_in_narrow_views() {
+    let s = session();
+    let mut view = PianoRollView::new(Theme::default());
+    let row = Theme::default().piano.toolbar_height;
+    let mut grid_tops = Vec::new();
+    for w in [1600.0, 900.0, 520.0, 380.0] {
+        let size = Size::new(w, 700.0);
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, size, &s, &Theme::default());
+        let l = view.layout(size);
+        let items = view.toolbar_items(l.toolbar, &s);
+        assert_eq!(items.len(), 18, "every control stays reachable at {w}");
+        assert!(
+            items
+                .iter()
+                .all(|(_, r, _, _)| r.right() <= w && r.bottom() <= l.toolbar.bottom() + 0.01),
+            "inside the toolbar at {w}"
+        );
+        assert!(l.grid.y >= l.toolbar.bottom());
+        grid_tops.push((l.toolbar.h / row).round() as usize);
+    }
+    assert_eq!(grid_tops[0], 1, "one row when wide: {grid_tops:?}");
+    assert!(
+        grid_tops[3] >= 4,
+        "four or more rows when narrow: {grid_tops:?}"
+    );
 }

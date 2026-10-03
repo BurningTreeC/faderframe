@@ -315,3 +315,88 @@ pub fn install_close_guard(app: &Rc<AppState>, window: &gtk::ApplicationWindow) 
         glib::Propagation::Stop
     });
 }
+
+fn sysex_filters() -> gio::ListStore {
+    let syx = gtk::FileFilter::new();
+    syx.set_name(Some("SysEx files (.syx)"));
+    syx.add_suffix("syx");
+    let all = gtk::FileFilter::new();
+    all.set_name(Some("All files"));
+    all.add_pattern("*");
+    let store = gio::ListStore::new::<gtk::FileFilter>();
+    store.append(&syx);
+    store.append(&all);
+    store
+}
+
+/// Read a `.syx` file into complete messages.
+fn read_sysex(path: &std::path::Path) -> Result<Vec<Vec<u8>>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let messages = faderframe_project::SysexEvent::split_messages(&bytes);
+    if messages.is_empty() {
+        return Err(format!("{}: no SysEx messages", path.display()));
+    }
+    Ok(messages)
+}
+
+/// Add the messages of a `.syx` file to `clip` at `at`.
+pub fn import_sysex(
+    app: &Rc<AppState>,
+    clip: faderframe_core::ClipId,
+    at: faderframe_timeline::MusicalTime,
+) {
+    let Some(win) = app.window.borrow().clone() else {
+        return;
+    };
+    let dialog = gtk::FileDialog::builder()
+        .title("Import SysEx")
+        .accept_label("Import")
+        .modal(true)
+        .filters(&sysex_filters())
+        .build();
+    let weak = Rc::downgrade(app);
+    dialog.open(Some(&win), gio::Cancellable::NONE, move |res| {
+        if let (Ok(file), Some(app)) = (res, weak.upgrade())
+            && let Some(path) = file.path()
+        {
+            match read_sysex(&path) {
+                Ok(messages) => {
+                    app.dispatch(faderframe_session::Action::AddSysex { clip, at, messages })
+                }
+                Err(e) => app
+                    .session
+                    .borrow_mut()
+                    .notify(faderframe_session::NoticeLevel::Warning, e),
+            }
+        }
+    });
+}
+
+/// Send the messages of a `.syx` file to MIDI output `output` (port key).
+pub fn send_sysex_file(app: &Rc<AppState>, output: String) {
+    let Some(win) = app.window.borrow().clone() else {
+        return;
+    };
+    let dialog = gtk::FileDialog::builder()
+        .title("Send SysEx File")
+        .accept_label("Send")
+        .modal(true)
+        .filters(&sysex_filters())
+        .build();
+    let weak = Rc::downgrade(app);
+    dialog.open(Some(&win), gio::Cancellable::NONE, move |res| {
+        if let (Ok(file), Some(app)) = (res, weak.upgrade())
+            && let Some(path) = file.path()
+        {
+            match read_sysex(&path) {
+                Ok(messages) => {
+                    app.dispatch(faderframe_session::Action::SendSysex { output, messages })
+                }
+                Err(e) => app
+                    .session
+                    .borrow_mut()
+                    .notify(faderframe_session::NoticeLevel::Warning, e),
+            }
+        }
+    });
+}

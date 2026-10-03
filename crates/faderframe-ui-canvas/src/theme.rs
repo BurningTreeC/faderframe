@@ -405,7 +405,7 @@ impl Theme {
                 engine_share: Color::hex(0x6f8fd8),
                 row_height: 30.0,
                 plugin_row_height: 24.0,
-                summary_height: 132.0,
+                summary_height: 152.0,
             },
         }
     }

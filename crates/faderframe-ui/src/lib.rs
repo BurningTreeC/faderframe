@@ -15,6 +15,7 @@ mod actions;
 pub mod canvas;
 mod dialogs;
 pub mod dock;
+mod icons;
 mod midi_prefs;
 pub mod painter;
 mod placeholder;
@@ -95,6 +96,7 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
     }
     options.sample_rate = options.sample_rate.or(prefs.sample_rate);
     options.buffer_size = options.buffer_size.or(prefs.buffer_size);
+    options.threads = options.threads.or(prefs.threads);
     let swept = faderframe_session::media::sweep_stale_scratch(Duration::from_secs(7 * 24 * 3600));
     if swept > 0 {
         tracing::info!("removed {swept} stale scratch media folder(s)");
@@ -107,6 +109,8 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
     )) {
         tracing::warn!("recording settings: {e}");
     }
+    session.set_sync_settings(prefs.sync_settings());
+    session.editor.show_edit_toolbar = prefs.show_edit_toolbar;
     // MIDI keyboards and controllers (FADERFRAME_NO_MIDI=1 keeps the
     // system's devices closed, e.g. for scripted runs).
     if std::env::var_os("FADERFRAME_NO_MIDI").is_none() {
@@ -183,7 +187,10 @@ pub fn run(options: RunOptions) -> glib::ExitCode {
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
     let holder: Rc<RefCell<Option<Rc<AppState>>>> = Rc::default();
-    app.connect_startup(|_| style::install());
+    app.connect_startup(|_| {
+        style::install();
+        icons::install();
+    });
     {
         let holder = Rc::clone(&holder);
         app.connect_activate(move |app| {

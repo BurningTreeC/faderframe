@@ -195,3 +195,95 @@ fn controller_lanes_and_clip_length() {
     .unwrap();
     assert_eq!(clip(&s, c).length, q(32.0));
 }
+
+#[test]
+fn expression_travels_with_notes() {
+    use faderframe_project::{ExpressionKind, ExpressionPoint};
+    let (mut s, c) = setup();
+    let first = clip(&s, c).notes[0].id;
+    // A pitch glide over the first note (0.4 quarters long).
+    s.dispatch(Action::SetNoteExpression {
+        clip: c,
+        note: first,
+        kind: ExpressionKind::Pitch,
+        from: MusicalTime::ZERO,
+        to: q(1.0),
+        points: vec![
+            ExpressionPoint {
+                time: MusicalTime::ZERO,
+                value: 0.0,
+            },
+            ExpressionPoint {
+                time: q(0.4),
+                value: 4.0,
+            },
+        ],
+    })
+    .unwrap();
+    let glide = |s: &Session, id: NoteId, t: f64| {
+        clip(s, c)
+            .expression(id)
+            .map(|e| e.value_at(ExpressionKind::Pitch, q(t)))
+    };
+    assert_eq!(glide(&s, first, 0.2), Some(2.0));
+    assert_eq!(s.history().undo_label(), Some("Edit Expression"));
+    // Moving and transposing keep it (same note).
+    s.dispatch(Action::NoteOperation {
+        clip: c,
+        notes: vec![first],
+        op: NoteOp::Move {
+            by: q(4.0),
+            keys: 12,
+        },
+    })
+    .unwrap();
+    assert_eq!(glide(&s, first, 0.2), Some(2.0));
+    // A duplicate gets a copy.
+    s.dispatch(Action::DuplicateNotes {
+        clip: c,
+        notes: vec![first],
+        offset: Some(q(1.0)),
+        keys: 0,
+    })
+    .unwrap();
+    let copy = *s.selection.notes.first().unwrap();
+    assert_ne!(copy, first);
+    assert_eq!(glide(&s, copy, 0.4), Some(4.0));
+    // Split: the right part continues from the cut.
+    let start = clip(&s, c).note(copy).unwrap().start;
+    s.dispatch(Action::SplitNotes {
+        clip: c,
+        notes: vec![copy],
+        at: start + q(0.2),
+    })
+    .unwrap();
+    let right = clip(&s, c)
+        .notes
+        .iter()
+        .find(|n| n.start == start + q(0.2))
+        .unwrap()
+        .id;
+    assert_eq!(glide(&s, right, 0.0), Some(2.0));
+    assert_eq!(glide(&s, right, 0.2), Some(4.0));
+    // Copy and paste take it along; deleting drops it.
+    s.dispatch(Action::CopyNotes {
+        clip: c,
+        notes: vec![first],
+    })
+    .unwrap();
+    let pasted = {
+        s.dispatch(Action::PasteNotes {
+            clip: c,
+            at: q(12.0),
+        })
+        .unwrap();
+        *s.selection.notes.first().unwrap()
+    };
+    assert_eq!(glide(&s, pasted, 0.2), Some(2.0));
+    s.dispatch(Action::RemoveNotes {
+        clip: c,
+        notes: vec![pasted],
+    })
+    .unwrap();
+    assert!(clip(&s, c).expression(pasted).is_none());
+}

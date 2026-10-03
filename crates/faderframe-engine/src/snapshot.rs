@@ -16,7 +16,10 @@ use faderframe_core::{
     AudioSourceId, AutomationLaneId, ParameterId, PluginInstanceId, SendId, TrackId, db_to_gain,
 };
 use faderframe_midi::MidiEvent;
-use faderframe_project::{ClipContent, FadeShape, Project, SourceSpec, TakeFolder};
+use faderframe_project::{
+    ClipContent, ExpressionKind, FadeShape, MidiClip, MpeConfig, Project, SourceSpec, TakeFolder,
+    WarpAlgorithm,
+};
 use faderframe_realtime::{Epoch, Reclaimer};
 use faderframe_timeline::Timeline;
 use std::collections::HashMap;
@@ -91,6 +94,9 @@ pub struct AudioRegion {
     pub fade_out: i64,
     pub fade_in_shape: FadeShape,
     pub fade_out_shape: FadeShape,
+    /// Drawn bends of the fade curves (−1…1).
+    pub fade_in_bend: f32,
+    pub fade_out_bend: f32,
     pub reversed: bool,
 }
 
@@ -101,11 +107,15 @@ impl AudioRegion {
         let mut g = self.gain;
         let into = t - self.start;
         if self.fade_in > 0 && into < self.fade_in {
-            g *= self.fade_in_shape.gain(into as f32 / self.fade_in as f32);
+            g *= self
+                .fade_in_shape
+                .gain_bent(into as f32 / self.fade_in as f32, self.fade_in_bend);
         }
         let left = self.end - t;
         if self.fade_out > 0 && left < self.fade_out {
-            g *= self.fade_out_shape.gain(left as f32 / self.fade_out as f32);
+            g *= self
+                .fade_out_shape
+                .gain_bent(left as f32 / self.fade_out as f32, self.fade_out_bend);
         }
         g
     }
@@ -130,6 +140,75 @@ impl AudioRegion {
     }
 }
 
+/// How a warped region is rendered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WarpMode {
+    /// Resampled along the time map: pitch follows the speed.
+    Varispeed,
+    /// Pitch-preserving time stretching.
+    Stretch(faderframe_stretch::Preset),
+}
+
+/// An audio clip played through a warp time map.
+#[derive(Debug)]
+pub struct WarpedRegion {
+    /// Identity of the clip (stretcher voices follow it across blocks).
+    pub key: u64,
+    /// Bounds, source, gain and fades (its `source_start`/`step` are the
+    /// unwarped values and unused).
+    pub region: AudioRegion,
+    /// Anchors: output frame relative to `region.start` → source frame (in
+    /// the source's own rate); strictly increasing, from 0 to the length.
+    pub points: Vec<(i64, f64)>,
+    /// Source frames inside the clip; outside them the stretcher hears
+    /// silence (no bleed from the rest of the file).
+    pub source_lo: f64,
+    pub source_hi: f64,
+    pub mode: WarpMode,
+    /// Pitch correction when the source rate differs from the engine rate
+    /// (stretching plays source frames at the engine rate).
+    pub transpose: f32,
+}
+
+impl WarpedRegion {
+    /// Segment index for output frame `rel` (the first or last segment
+    /// outside the anchors).
+    #[inline]
+    fn segment(&self, rel: f64) -> usize {
+        let n = self.points.len();
+        if n < 2 {
+            return 0;
+        }
+        self.points
+            .partition_point(|p| (p.0 as f64) <= rel)
+            .saturating_sub(1)
+            .min(n - 2)
+    }
+
+    /// Source frame at output frame `rel` (extrapolated linearly beyond
+    /// the ends). Realtime-safe.
+    #[inline]
+    pub fn source_at(&self, rel: f64) -> f64 {
+        if self.points.len() < 2 {
+            return self.points.first().map_or(rel, |p| p.1 + rel - p.0 as f64);
+        }
+        let i = self.segment(rel);
+        let (a, b) = (self.points[i], self.points[i + 1]);
+        a.1 + (rel - a.0 as f64) * (b.1 - a.1) / (b.0 - a.0).max(1) as f64
+    }
+
+    /// Source frames per output frame at `rel`.
+    #[inline]
+    pub fn rate_at(&self, rel: f64) -> f64 {
+        if self.points.len() < 2 {
+            return 1.0;
+        }
+        let i = self.segment(rel);
+        let (a, b) = (self.points[i], self.points[i + 1]);
+        (b.1 - a.1) / (b.0 - a.0).max(1) as f64
+    }
+}
+
 #[derive(Debug)]
 pub struct MidiRegion {
     pub start: i64,
@@ -142,8 +221,118 @@ pub struct MidiRegion {
 pub struct Lane {
     /// Sorted by start.
     pub audio: Vec<AudioRegion>,
+    /// Warped audio clips, sorted by start.
+    pub warped: Vec<WarpedRegion>,
     /// Sorted by start.
     pub midi: Vec<MidiRegion>,
+    /// The track's instrument speaks MPE (the player announces the zone).
+    pub mpe: Option<MpeConfig>,
+}
+
+/// One MIDI value of a note's expression on its channel.
+fn expression_event(kind: ExpressionKind, channel: u8, value: f32, cfg: MpeConfig) -> MidiEvent {
+    let seven = |v: f32| (v.clamp(0.0, 1.0) * 127.0).round() as u8;
+    match kind {
+        ExpressionKind::Pitch => MidiEvent::PitchBend {
+            channel,
+            value: (8192.0 + value / cfg.bend_range.max(1) as f32 * 8192.0)
+                .round()
+                .clamp(0.0, 16383.0) as u16,
+        },
+        ExpressionKind::Pressure => MidiEvent::ChannelPressure {
+            channel,
+            pressure: seven(value),
+        },
+        ExpressionKind::Timbre => MidiEvent::ControlChange {
+            channel,
+            controller: 74,
+            value: seven(value),
+        },
+    }
+}
+
+/// MPE: every note gets a member channel of its own (the least recently
+/// used free one, else the one freeing first), its expression's initial
+/// values right before the note-on, and the curves as pitch bend, channel
+/// pressure and CC 74 — sampled every 1/128 quarter, sent where the MIDI
+/// value changes.
+fn mpe_note_events(
+    m: &MidiClip,
+    clip_start: faderframe_timeline::MusicalTime,
+    clip_end: faderframe_timeline::MusicalTime,
+    cfg: MpeConfig,
+    to_samples: impl Fn(faderframe_timeline::MusicalTime) -> i64,
+    events: &mut Vec<(i64, MidiEvent)>,
+) {
+    use faderframe_timeline::MusicalTime;
+    let members = cfg.members.clamp(1, 15) as usize;
+    let mut free_at = [i64::MIN; 16];
+    let mut used = [0u64; 16];
+    let mut stamp = 0u64;
+    let mut notes: Vec<_> = m
+        .notes
+        .iter()
+        .filter(|n| !n.muted && clip_start + n.start < clip_end)
+        .collect();
+    notes.sort_by_key(|n| (n.start, n.key));
+    let step = MusicalTime(faderframe_timeline::TICKS_PER_QUARTER / 128);
+    for n in notes {
+        let on_pos = clip_start + n.start;
+        let off_pos = (on_pos + n.length).min(clip_end);
+        let on = to_samples(on_pos);
+        let off = to_samples(off_pos).max(on + 1);
+        let ch = (1..=members)
+            .filter(|&c| free_at[c] <= on)
+            .min_by_key(|&c| used[c])
+            .or_else(|| (1..=members).min_by_key(|&c| free_at[c]))
+            .unwrap_or(1);
+        stamp += 1;
+        used[ch] = stamp;
+        free_at[ch] = off;
+        let channel = ch as u8;
+        let expr = m.expression(n.id);
+        let value = |k: ExpressionKind, t: MusicalTime| expr.map_or(k.rest(), |e| e.value_at(k, t));
+        for k in ExpressionKind::ALL {
+            events.push((
+                on,
+                expression_event(k, channel, value(k, MusicalTime::ZERO), cfg),
+            ));
+        }
+        events.push((
+            on,
+            MidiEvent::NoteOn {
+                channel,
+                key: n.key,
+                velocity: n.velocity.max(1),
+            },
+        ));
+        if let Some(e) = expr {
+            let length = off_pos - on_pos;
+            for k in ExpressionKind::ALL {
+                if e.curve(k).is_empty() {
+                    continue;
+                }
+                let mut last = expression_event(k, channel, value(k, MusicalTime::ZERO), cfg);
+                let mut t = step;
+                while t < length {
+                    let ev = expression_event(k, channel, value(k, t), cfg);
+                    if ev != last {
+                        events.push((to_samples(on_pos + t), ev));
+                        last = ev;
+                    }
+                    t += step;
+                }
+            }
+        }
+        events.push((
+            off,
+            MidiEvent::NoteOff {
+                channel,
+                key: n.key,
+                velocity: 0,
+            },
+        ));
+    }
 }
 
 /// The automation of one track that drives the engine (lanes in Read,
@@ -234,7 +423,7 @@ impl TimelineSnapshot {
     pub fn region_count(&self) -> usize {
         self.lanes
             .iter()
-            .map(|(_, l)| l.audio.len() + l.midi.len())
+            .map(|(_, l)| l.audio.len() + l.warped.len() + l.midi.len())
             .sum()
     }
 
@@ -251,6 +440,32 @@ impl TimelineSnapshot {
                         source_start: r.source_start,
                         step: r.step,
                         reversed: r.reversed,
+                    });
+                }
+            }
+            // Warped clips: one linear piece per warp segment, widened by
+            // the stretcher's look-ahead and pre-roll (~0.25 s).
+            for w in &lane.warped {
+                let Source::Stream(s) = &w.region.source else {
+                    continue;
+                };
+                let margin = (self.sample_rate as i64 / 4).max(1);
+                for (k, seg) in w.points.windows(2).enumerate() {
+                    let (a, b) = (seg[0], seg[1]);
+                    let step = (b.1 - a.1) / (b.0 - a.0).max(1) as f64;
+                    let first = k == 0;
+                    let last = k + 2 == w.points.len();
+                    let start = w.region.start + a.0 - if first { margin } else { 0 };
+                    let end = w.region.start + b.0 + if last { margin } else { 0 };
+                    let source_start =
+                        (a.1 - if first { margin as f64 * step } else { 0.0 }).floor() as i64;
+                    regions.push(StreamRegion {
+                        source: Arc::clone(s),
+                        start,
+                        end,
+                        source_start: source_start.max(0),
+                        step: step.max(1e-3),
+                        reversed: false,
                     });
                 }
             }
@@ -275,6 +490,14 @@ impl TimelineSnapshot {
         let project_rate = project.sample_rate.max(1) as f64;
         let tl = &project.timeline;
         let mut lanes: HashMap<TrackId, Lane> = HashMap::new();
+        let mpe_of: HashMap<TrackId, MpeConfig> = project
+            .tracks
+            .iter()
+            .filter_map(|t| t.mpe.map(|m| (t.id, m)))
+            .collect();
+        for (&track, &cfg) in &mpe_of {
+            lanes.entry(track).or_default().mpe = Some(cfg);
+        }
         for clip in project.clips.values() {
             if clip.muted {
                 continue;
@@ -288,13 +511,29 @@ impl TimelineSnapshot {
                         rel_start: 0,
                         length: a.length,
                         gain_db: a.gain_db,
-                        fade_in: (a.fades.fade_in, a.fades.fade_in_shape),
-                        fade_out: (a.fades.fade_out, a.fades.fade_out_shape),
+                        fade_in: (a.fades.fade_in, a.fades.fade_in_shape, a.fades.fade_in_bend),
+                        fade_out: (
+                            a.fades.fade_out,
+                            a.fades.fade_out_shape,
+                            a.fades.fade_out_bend,
+                        ),
                         reversed: a.reversed,
                     }
                     .region(start, sources, sr, project_rate);
-                    if let Some(r) = region {
-                        lanes.entry(clip.track).or_default().audio.push(r);
+                    let Some(r) = region else { continue };
+                    let lane = lanes.entry(clip.track).or_default();
+                    match a.warp.as_ref() {
+                        Some(w) if !a.reversed && !w.is_identity(a.source_offset, a.length) => {
+                            lane.warped.push(warped_region(
+                                clip.id.raw(),
+                                r,
+                                a,
+                                w,
+                                sr,
+                                project_rate,
+                            ));
+                        }
+                        _ => lane.audio.push(r),
                     }
                 }
                 ClipContent::Takes(f) => {
@@ -321,7 +560,18 @@ impl TimelineSnapshot {
                             ));
                         }
                     }
-                    for n in m.notes.iter().filter(|n| !n.muted) {
+                    if let Some(&cfg) = mpe_of.get(&clip.track) {
+                        mpe_note_events(
+                            m,
+                            clip.start,
+                            clip_end,
+                            cfg,
+                            |t| tl.to_samples(t, sr),
+                            &mut events,
+                        );
+                    }
+                    let plain = !mpe_of.contains_key(&clip.track);
+                    for n in m.notes.iter().filter(|n| plain && !n.muted) {
                         let on_pos = clip.start + n.start;
                         if on_pos >= clip_end {
                             continue;
@@ -368,6 +618,7 @@ impl TimelineSnapshot {
         let mut lanes: Vec<(TrackId, Lane)> = lanes.into_iter().collect();
         for (_, lane) in &mut lanes {
             lane.audio.sort_by_key(|r| r.start);
+            lane.warped.sort_by_key(|w| w.region.start);
             lane.midi.sort_by_key(|r| r.start);
         }
         lanes.sort_by_key(|(t, _)| *t);
@@ -407,6 +658,51 @@ impl TimelineSnapshot {
     }
 }
 
+/// A warped clip's time map in engine units (output: engine frames from
+/// the clip start; source: the source's own frames).
+fn warped_region(
+    key: u64,
+    region: AudioRegion,
+    a: &faderframe_project::AudioClip,
+    w: &faderframe_project::Warp,
+    sr: f64,
+    project_rate: f64,
+) -> WarpedRegion {
+    let source_rate = match &region.source {
+        Source::Memory(_) => sr,
+        Source::Stream(s) => s.sample_rate().max(1) as f64,
+    };
+    let out = sr / project_rate;
+    let src = source_rate / project_rate;
+    let len = region.end - region.start;
+    let mut points: Vec<(i64, f64)> = w
+        .points(a.source_offset, a.length)
+        .into_iter()
+        .map(|m| ((m.at as f64 * out).round() as i64, m.source as f64 * src))
+        .collect();
+    // Exact ends, strictly increasing output frames.
+    if let Some(last) = points.last_mut() {
+        last.0 = len;
+    }
+    points.dedup_by(|b, a| b.0 <= a.0);
+    let channels = region.source.channels();
+    let mode = match w.algorithm {
+        WarpAlgorithm::Varispeed => WarpMode::Varispeed,
+        _ if channels > faderframe_stretch::MAX_CHANNELS => WarpMode::Varispeed,
+        WarpAlgorithm::Polyphonic => WarpMode::Stretch(faderframe_stretch::Preset::Polyphonic),
+        WarpAlgorithm::Rhythmic => WarpMode::Stretch(faderframe_stretch::Preset::Rhythmic),
+    };
+    WarpedRegion {
+        key,
+        source_lo: a.source_offset as f64 * src,
+        source_hi: (a.source_offset + w.source_length) as f64 * src,
+        points,
+        mode,
+        transpose: (source_rate / sr) as f32,
+        region,
+    }
+}
+
 /// Part of an audio source placed relative to a clip start (project frames).
 struct AudioPiece {
     source: AudioSourceId,
@@ -415,8 +711,9 @@ struct AudioPiece {
     rel_start: i64,
     length: i64,
     gain_db: f32,
-    fade_in: (i64, FadeShape),
-    fade_out: (i64, FadeShape),
+    /// Length, shape and drawn bend (percent).
+    fade_in: (i64, FadeShape, i16),
+    fade_out: (i64, FadeShape, i16),
     reversed: bool,
 }
 
@@ -457,6 +754,8 @@ impl AudioPiece {
             fade_out: to_engine(self.fade_out.0).min(length),
             fade_in_shape: self.fade_in.1,
             fade_out_shape: self.fade_out.1,
+            fade_in_bend: faderframe_project::bend_factor(self.fade_in.2),
+            fade_out_bend: faderframe_project::bend_factor(self.fade_out.2),
             reversed: self.reversed,
         })
     }
@@ -486,18 +785,22 @@ fn comp_pieces(f: &TakeFolder) -> Vec<AudioPiece> {
             p.end
         };
         let fade_in = if touches_prev {
-            (p.start + half - a, FadeShape::EqualPower)
+            (p.start + half - a, FadeShape::EqualPower, 0)
         } else if p.start == 0 {
-            (f.fades.fade_in, f.fades.fade_in_shape)
+            (f.fades.fade_in, f.fades.fade_in_shape, f.fades.fade_in_bend)
         } else {
-            (DECLICK, FadeShape::Linear)
+            (DECLICK, FadeShape::Linear, 0)
         };
         let fade_out = if touches_next {
-            (b - (p.end - half), FadeShape::EqualPower)
+            (b - (p.end - half), FadeShape::EqualPower, 0)
         } else if p.end == f.length {
-            (f.fades.fade_out, f.fades.fade_out_shape)
+            (
+                f.fades.fade_out,
+                f.fades.fade_out_shape,
+                f.fades.fade_out_bend,
+            )
         } else {
-            (DECLICK, FadeShape::Linear)
+            (DECLICK, FadeShape::Linear, 0)
         };
         out.push(AudioPiece {
             source: take.source,

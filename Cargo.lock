@@ -234,6 +234,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a76abbdb2907f6fd97fb6bc0b7be96b77d328f2dd9669d1075cc03369ed22154"
 
 [[package]]
+name = "com-scrape-types"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ce183b975b8fc736a20919c4002717255fbd867df575c792aeefa9a56a73ad0"
+
+[[package]]
 name = "combine"
 version = "4.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -328,6 +334,7 @@ version = "0.1.0"
 dependencies = [
  "faderframe-audio",
  "faderframe-plugin-clap",
+ "faderframe-plugin-vst3",
  "faderframe-ui",
  "tracing",
  "tracing-subscriber",
@@ -348,6 +355,7 @@ version = "0.1.0"
 dependencies = [
  "audioadapter-buffers",
  "faderframe-realtime",
+ "realfft",
  "rubato",
  "serde",
  "serde_json",
@@ -361,6 +369,7 @@ version = "0.1.0"
 dependencies = [
  "faderframe-core",
  "faderframe-midi",
+ "faderframe-realtime",
  "thiserror 2.0.21",
 ]
 
@@ -391,7 +400,9 @@ dependencies = [
  "faderframe-audio-files",
  "faderframe-core",
  "faderframe-engine",
+ "faderframe-plugin-clap",
  "faderframe-plugin-host",
+ "faderframe-plugin-vst3",
  "faderframe-project",
  "faderframe-realtime",
  "faderframe-timeline",
@@ -418,6 +429,7 @@ dependencies = [
  "faderframe-plugin-host",
  "faderframe-project",
  "faderframe-realtime",
+ "faderframe-stretch",
  "faderframe-timeline",
  "faderframe-transport",
  "rtrb",
@@ -473,7 +485,26 @@ dependencies = [
  "faderframe-midi",
  "faderframe-realtime",
  "faderframe-transport",
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "faderframe-plugin-vst3"
+version = "0.1.0"
+dependencies = [
+ "faderframe-audio-graph",
+ "faderframe-automation",
+ "faderframe-core",
+ "faderframe-midi",
+ "faderframe-plugin-host",
+ "faderframe-realtime",
+ "faderframe-transport",
+ "libloading 0.8.9",
+ "rtrb",
+ "tracing",
+ "vst3",
 ]
 
 [[package]]
@@ -495,6 +526,9 @@ dependencies = [
 [[package]]
 name = "faderframe-realtime"
 version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "faderframe-session"
@@ -514,8 +548,16 @@ dependencies = [
  "faderframe-transport",
  "faderframe-workspace",
  "rtrb",
+ "serde_json",
  "thiserror 2.0.21",
  "tracing",
+]
+
+[[package]]
+name = "faderframe-stretch"
+version = "0.1.0"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -548,6 +590,7 @@ dependencies = [
  "faderframe-engine",
  "faderframe-plugin-clap",
  "faderframe-plugin-host",
+ "faderframe-plugin-vst3",
  "faderframe-project",
  "faderframe-session",
  "faderframe-timeline",
@@ -2051,6 +2094,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "vst3"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e31e3fe7a6f028ded8c5a9984cf283319e6dc63572c9b71da1d4ee9d71d3b6bf"
+dependencies = [
+ "com-scrape-types",
 ]
 
 [[package]]

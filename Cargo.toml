@@ -18,6 +18,7 @@ faderframe-timeline = { path = "crates/faderframe-timeline" }
 faderframe-midi = { path = "crates/faderframe-midi" }
 faderframe-midi-io = { path = "crates/faderframe-midi-io" }
 faderframe-realtime = { path = "crates/faderframe-realtime" }
+faderframe-stretch = { path = "crates/faderframe-stretch" }
 faderframe-audio-graph = { path = "crates/faderframe-audio-graph" }
 faderframe-transport = { path = "crates/faderframe-transport" }
 faderframe-automation = { path = "crates/faderframe-automation" }
@@ -28,6 +29,7 @@ faderframe-audio-jack = { path = "crates/faderframe-audio-jack" }
 faderframe-audio-files = { path = "crates/faderframe-audio-files" }
 faderframe-plugin-host = { path = "crates/faderframe-plugin-host" }
 faderframe-plugin-clap = { path = "crates/faderframe-plugin-clap" }
+faderframe-plugin-vst3 = { path = "crates/faderframe-plugin-vst3" }
 faderframe-engine = { path = "crates/faderframe-engine" }
 faderframe-session = { path = "crates/faderframe-session" }
 faderframe-ui-canvas = { path = "crates/faderframe-ui-canvas" }
@@ -47,16 +49,25 @@ glib-unix = "0.22"
 jack = "0.13"
 # Realtime-safe wait-free SPSC ring buffer used for control <-> RT messaging.
 rtrb = "0.4"
+# futex and thread scheduling for the DSP worker pool.
+libc = "0.2"
 midir = "0.11"
 # Audio decoding (pure Rust; MPL-2.0, file-level copyleft, MIT-compatible).
 symphonia = { version = "0.6", default-features = false, features = ["wav", "aiff", "caf", "flac", "mp3", "ogg", "vorbis", "isomp4", "aac", "alac", "pcm", "adpcm"] }
 # High-quality sample-rate conversion.
 rubato = "5"
+# FFT for transient detection (already used by rubato).
+realfft = "3"
+cc = "1.2"
 audioadapter-buffers = "5"
 # CLAP plugin hosting (MIT OR Apache-2.0).
 clack-host = "0.2"
 clack-extensions = { version = "0.2", features = ["clack-host", "audio-ports", "gui", "latency", "log", "note-ports", "params", "posix-fd", "state", "tail", "thread-check", "timer"] }
 clack-plugin = "0.2"
+# VST3 hosting: bindings generated from the (MIT-licensed) VST 3 SDK headers
+# (MIT OR Apache-2.0); bundles are loaded with libloading.
+vst3 = "0.3"
+libloading = "0.8"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

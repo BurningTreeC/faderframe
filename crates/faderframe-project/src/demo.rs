@@ -171,6 +171,7 @@ pub fn demo_project(sample_rate: u32) -> Project {
                 },
                 stretch: StretchSettings::Off,
                 reversed: false,
+                warp: None,
             }),
         };
         track.clips.push(clip.id);
@@ -261,6 +262,8 @@ pub fn demo_project(sample_rate: u32) -> Project {
             length: bar4,
             notes,
             controllers: Vec::new(),
+            expressions: Vec::new(),
+            sysex: Vec::new(),
         }),
     };
     keys.clips.push(melody.id);

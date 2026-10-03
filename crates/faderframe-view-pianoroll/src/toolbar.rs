@@ -10,7 +10,7 @@ use faderframe_session::{
 };
 use faderframe_timeline::{GridDivision, MusicalTime};
 use faderframe_ui_canvas::{
-    EventCx, HostRequest, MenuItem, Paint, Painter, Point, Rect, TextStyle,
+    EventCx, Flow, FlowMetrics, HostRequest, MenuItem, Paint, Painter, Point, Rect, TextStyle,
 };
 
 /// A toolbar control.
@@ -32,7 +32,8 @@ pub(crate) enum Item {
     Inspector,
 }
 
-pub(crate) const GRIDS: [GridDivision; 11] = [
+/// Note lengths offered for new notes.
+pub(crate) const GRIDS: [GridDivision; 16] = [
     GridDivision::Bar,
     GridDivision::Note(2),
     GridDivision::Beat,
@@ -40,10 +41,15 @@ pub(crate) const GRIDS: [GridDivision; 11] = [
     GridDivision::Note(16),
     GridDivision::Note(32),
     GridDivision::Note(64),
+    GridDivision::Note(128),
+    GridDivision::Note(256),
     GridDivision::Triplet(4),
     GridDivision::Triplet(8),
     GridDivision::Triplet(16),
     GridDivision::Triplet(32),
+    GridDivision::Dotted(4),
+    GridDivision::Dotted(8),
+    GridDivision::Dotted(16),
 ];
 
 fn length_label(l: NoteLength) -> String {
@@ -61,60 +67,82 @@ impl PianoRollView {
         r: Rect,
         model: &Session,
     ) -> Vec<(Item, Rect, String, bool)> {
+        self.toolbar_layout(r, model).0
+    }
+
+    /// The controls wrapped into toolbar rows from the top of `r`, and the
+    /// number of rows.
+    pub(crate) fn toolbar_layout(
+        &self,
+        r: Rect,
+        model: &Session,
+    ) -> (Vec<(Item, Rect, String, bool)>, usize) {
         let pr = &model.editor.piano;
-        let mut x = r.x + 8.0;
-        let h = r.h - 8.0;
-        let y = r.y + 4.0;
-        let mut out = Vec::new();
-        let mut push = |item: Item, label: String, on: bool, w: f32, gap: f32| {
-            out.push((item, Rect::new(x, y, w, h), label, on));
-            x += w + gap;
+        let mut flow: Flow<(Item, String, bool)> = Flow::new();
+        let add = |flow: &mut Flow<(Item, String, bool)>, item, label: String, on, w| {
+            flow.item((item, label, on), w);
         };
-        for (i, t) in Tool::ALL.into_iter().enumerate() {
-            push(
+        for t in Tool::ALL {
+            add(
+                &mut flow,
                 Item::Tool(t),
                 t.label().into(),
                 self.tool == t,
                 48.0,
-                if i == Tool::ALL.len() - 1 { 10.0 } else { 1.0 },
             );
         }
-        push(
+        flow.group();
+        add(
+            &mut flow,
             Item::Grid,
             format!("Grid {}", model.editor.grid.label()),
             false,
-            72.0,
-            1.0,
+            78.0,
         );
-        push(Item::Snap, "Snap".into(), model.editor.snap, 42.0, 10.0);
-        push(
+        add(
+            &mut flow,
+            Item::Snap,
+            "Snap".into(),
+            model.editor.snap,
+            42.0,
+        );
+        flow.group();
+        add(
+            &mut flow,
             Item::Length,
             format!("Len {}", length_label(pr.note_length)),
             false,
-            70.0,
-            1.0,
+            74.0,
         );
-        push(
+        add(
+            &mut flow,
             Item::Velocity,
             format!("Vel {}", pr.velocity),
             false,
             54.0,
-            10.0,
         );
+        flow.group();
         let scale = if pr.scale.is_chromatic() {
             "Scale".to_string()
         } else {
             pr.scale.label()
         };
-        push(Item::Scale, scale, !pr.scale.is_chromatic(), 112.0, 1.0);
-        push(
+        add(
+            &mut flow,
+            Item::Scale,
+            scale,
+            !pr.scale.is_chromatic(),
+            112.0,
+        );
+        add(
+            &mut flow,
             Item::Fold,
             "Fold".into(),
             pr.fold != KeyFold::Off,
             40.0,
-            1.0,
         );
-        push(
+        add(
+            &mut flow,
             Item::Chord,
             if pr.chord == ChordKind::Single {
                 "Chord".into()
@@ -123,28 +151,46 @@ impl PianoRollView {
             },
             pr.chord != ChordKind::Single,
             92.0,
-            10.0,
         );
-        push(Item::Quantize, "Quantize".into(), false, 64.0, 0.0);
-        push(Item::QuantizeMenu, "▾".into(), false, 18.0, 10.0);
-        push(Item::Ghosts, "Ghosts".into(), pr.ghost_notes, 52.0, 1.0);
-        push(Item::Audition, "Listen".into(), pr.audition, 50.0, 1.0);
-        push(
+        flow.group();
+        add(&mut flow, Item::Quantize, "Quantize".into(), false, 64.0);
+        add(&mut flow, Item::QuantizeMenu, "▾".into(), false, 18.0);
+        flow.group();
+        add(
+            &mut flow,
+            Item::Ghosts,
+            "Ghosts".into(),
+            pr.ghost_notes,
+            52.0,
+        );
+        add(
+            &mut flow,
+            Item::Audition,
+            "Listen".into(),
+            pr.audition,
+            50.0,
+        );
+        add(
+            &mut flow,
             Item::Step,
             "Step In".into(),
             model.step_input().is_some(),
             56.0,
-            10.0,
         );
-        let inspector_x = x;
-        let w = (r.right() - 8.0 - inspector_x).max(0.0);
-        out.push((
-            Item::Inspector,
-            Rect::new(inspector_x, y, w, h),
-            self.inspector_text(model),
-            false,
-        ));
-        out
+        flow.fill((Item::Inspector, self.inspector_text(model), false), 180.0);
+        let metrics = FlowMetrics {
+            row_height: self.theme.piano.toolbar_height,
+            pad_x: 8.0,
+            pad_y: 4.0,
+        };
+        let (placed, rows) = flow.layout(r, metrics);
+        (
+            placed
+                .into_iter()
+                .map(|((item, label, on), rect)| (item, rect, label, on))
+                .collect(),
+            rows,
+        )
     }
 
     fn inspector_text(&self, model: &Session) -> String {
@@ -267,13 +313,12 @@ impl PianoRollView {
             Item::Tool(t) => self.tool = t,
             Item::Grid => cx.request(HostRequest::ContextMenu {
                 at,
-                items: GRIDS
-                    .iter()
-                    .enumerate()
-                    .map(|(i, g)| {
-                        let item = MenuItem::new(g.label(), Action::SetGrid(*g))
-                            .checked(model.editor.grid == *g);
-                        if i == 7 { item.separated() } else { item }
+                items: GridDivision::menu(model.editor.grid)
+                    .into_iter()
+                    .map(|e| {
+                        let item =
+                            MenuItem::new(e.label, Action::SetGrid(e.division)).checked(e.checked);
+                        if e.separated { item.separated() } else { item }
                     })
                     .collect(),
             }),
@@ -307,7 +352,7 @@ impl PianoRollView {
                             ..pr
                         },
                         pr.note_length == NoteLength::Fixed(*g),
-                        i == 0,
+                        i == 0 || i == 9 || i == 13,
                     ));
                 }
                 cx.request(Self::settings_menu(at, entries));

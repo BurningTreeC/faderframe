@@ -24,7 +24,7 @@ time; binary distributions that bundle them (e.g. Windows or macOS
 installers) must ship their license texts and comply with the LGPL's
 relinking provisions.
 
-## Rust crates (141)
+## Rust crates (146)
 
 Crates under the MPL-2.0 (the Symphonia audio decoders) are file-level
 copyleft: FaderFrame uses them unmodified from crates.io, where their
@@ -47,6 +47,7 @@ published under the MPL-2.0 as well.
 | bytemuck | 1.25.2 | Zlib OR Apache-2.0 OR MIT | https://github.com/Lokathor/bytemuck |
 | cairo-rs | 0.22.9 | MIT | https://github.com/gtk-rs/gtk-rs-core |
 | cairo-sys-rs | 0.22.9 | MIT | https://github.com/gtk-rs/gtk-rs-core |
+| cc | 1.6.0 | MIT OR Apache-2.0 | https://github.com/rust-lang/cc-rs |
 | cfg-expr | 0.20.10 | MIT OR Apache-2.0 | https://github.com/EmbarkStudios/cfg-expr |
 | cfg-if | 1.0.5 | MIT OR Apache-2.0 | https://github.com/rust-lang/cfg-if |
 | clack-common | 0.2.0 | MIT OR Apache-2.0 | https://github.com/prokopyl/clack |
@@ -54,10 +55,12 @@ published under the MPL-2.0 as well.
 | clack-host | 0.2.0 | MIT OR Apache-2.0 | https://github.com/prokopyl/clack |
 | clack-plugin | 0.2.0 | MIT OR Apache-2.0 | https://github.com/prokopyl/clack |
 | clap-sys | 0.5.0 | MIT/Apache-2.0 | https://github.com/micahrj/clap-sys |
+| com-scrape-types | 0.1.1 | MIT OR Apache-2.0 | https://github.com/coupler-rs/vst3-rs |
 | equivalent | 1.0.2 | Apache-2.0 OR MIT | https://github.com/indexmap-rs/equivalent |
 | errno | 0.3.14 | MIT OR Apache-2.0 | https://github.com/lambda-fairy/rust-errno |
 | extended | 0.1.0 | MIT | https://github.com/depp/extended-rs |
 | field-offset | 0.3.6 | MIT OR Apache-2.0 | https://github.com/Diggsey/rust-field-offset |
+| find-msvc-tools | 0.1.14 | MIT OR Apache-2.0 | https://github.com/rust-lang/cc-rs |
 | futures-channel | 0.3.34 | MIT OR Apache-2.0 | https://github.com/rust-lang/futures-rs |
 | futures-core | 0.3.34 | MIT OR Apache-2.0 | https://github.com/rust-lang/futures-rs |
 | futures-executor | 0.3.34 | MIT OR Apache-2.0 | https://github.com/rust-lang/futures-rs |
@@ -130,6 +133,7 @@ published under the MPL-2.0 as well.
 | serde_json | 1.0.151 | MIT OR Apache-2.0 | https://github.com/serde-rs/json |
 | serde_spanned | 1.1.1 | MIT OR Apache-2.0 | https://github.com/toml-rs/toml |
 | sharded-slab | 0.1.7 | MIT | https://github.com/hawkw/sharded-slab |
+| shlex | 2.0.1 | MIT OR Apache-2.0 | https://github.com/comex/rust-shlex |
 | slab | 0.4.12 | MIT | https://github.com/tokio-rs/slab |
 | smallvec | 1.16.2 | MIT OR Apache-2.0 | https://github.com/servo/rust-smallvec |
 | strength_reduce | 0.2.4 | MIT OR Apache-2.0 | http://github.com/ejmahler/strength_reduce |
@@ -169,22 +173,30 @@ published under the MPL-2.0 as well.
 | unicode-ident | 1.0.26 | (MIT OR Apache-2.0) AND Unicode-3.0 | https://github.com/dtolnay/unicode-ident |
 | version-compare | 0.2.1 | MIT | https://gitlab.com/timvisee/version-compare |
 | visibility | 0.1.1 | Zlib OR MIT OR Apache-2.0 | https://github.com/danielhenrymantilla/visibility.rs |
+| vst3 | 0.3.0 | MIT OR Apache-2.0 | https://github.com/coupler-rs/vst3-rs |
 | windowfunctions | 0.1.1 | MIT | https://github.com/HEnquist/windowfunctions-rs |
 | winnow | 1.0.4 | MIT | https://github.com/winnow-rs/winnow |
 | x11rb | 0.14.0 | MIT OR Apache-2.0 | https://github.com/psychon/x11rb |
 | x11rb-protocol | 0.14.0 | MIT OR Apache-2.0 | https://github.com/psychon/x11rb |
 | zmij | 1.0.23 | MIT | https://github.com/dtolnay/zmij |
 
+## Vendored C/C++ libraries (2, compiled in)
+
+| Library | Version | License | Source |
+|---|---|---|---|
+| Signalsmith Stretch | 1.3.1 | MIT | https://github.com/Signalsmith-Audio/signalsmith-stretch |
+| Signalsmith Linear | (with Stretch 1.3.1) | MIT | https://github.com/Signalsmith-Audio/linear |
+
 Crates without a license file in their published package (license per
 their SPDX expression above; texts at https://spdx.org/licenses/):
 
-realfft 3.5.0
+com-scrape-types 0.1.1, realfft 3.5.0
 
 ## License texts
 
 ### LICENSE
 
-Applies to: cairo-rs 0.22.9, cairo-sys-rs 0.22.9, clap-sys 0.5.0, gdk-pixbuf 0.22.0, gdk-pixbuf-sys 0.22.9, gdk4 0.11.5, gdk4-sys 0.11.5, gio 0.22.10, gio-sys 0.22.9, glib 0.22.10, glib-macros 0.22.9, glib-sys 0.22.9, glib-unix 0.22.8, glib-unix-sys 0.22.9, gobject-sys 0.22.9, graphene-rs 0.22.8, graphene-sys 0.22.9, gsk4 0.11.5, gsk4-sys 0.11.5, gtk4 0.11.5, gtk4-macros 0.11.5, gtk4-sys 0.11.5, itoa 1.0.18, lazy_static 1.5.1, linux-raw-sys 0.12.1, once_cell 1.21.4, pango 0.22.9, pango-sys 0.22.9, pin-project-lite 0.2.17, proc-macro-crate 3.5.0, proc-macro2 1.0.107, quote 1.0.47, rtrb 0.4.0, rustix 1.1.5, semver 1.0.28, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_json 1.0.151, syn 2.0.119, syn 3.0.6, system-deps 9.0.0, thiserror 2.0.21, thiserror-impl 2.0.21, unicode-ident 1.0.26, winnow 1.0.4, zmij 1.0.23
+Applies to: cairo-rs 0.22.9, cairo-sys-rs 0.22.9, clap-sys 0.5.0, gdk-pixbuf 0.22.0, gdk-pixbuf-sys 0.22.9, gdk4 0.11.5, gdk4-sys 0.11.5, gio 0.22.10, gio-sys 0.22.9, glib 0.22.10, glib-macros 0.22.9, glib-sys 0.22.9, glib-unix 0.22.8, glib-unix-sys 0.22.9, gobject-sys 0.22.9, graphene-rs 0.22.8, graphene-sys 0.22.9, gsk4 0.11.5, gsk4-sys 0.11.5, gtk4 0.11.5, gtk4-macros 0.11.5, gtk4-sys 0.11.5, itoa 1.0.18, lazy_static 1.5.1, linux-raw-sys 0.12.1, once_cell 1.21.4, pango 0.22.9, pango-sys 0.22.9, pin-project-lite 0.2.17, proc-macro-crate 3.5.0, proc-macro2 1.0.107, quote 1.0.47, rtrb 0.4.0, rustix 1.1.5, semver 1.0.28, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_json 1.0.151, syn 2.0.119, syn 3.0.6, system-deps 9.0.0, thiserror 2.0.21, thiserror-impl 2.0.21, unicode-ident 1.0.26, vst3 0.3.0, winnow 1.0.4, zmij 1.0.23
 
 ```text
 Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -208,7 +220,7 @@ SOFTWARE.
 
 ### LICENSE-APACHE
 
-Applies to: audioadapter 5.0.0, audioadapter-buffers 5.2.0, audioadapter-sample 5.2.0, autocfg 1.5.1, base64 0.22.1, bitflags 1.3.2, bitflags 2.13.2, bytemuck 1.25.2, cfg-expr 0.20.10, cfg-if 1.0.5, clap-sys 0.5.0, equivalent 1.0.2, errno 0.3.14, gethostname 1.1.0, hashbrown 0.17.1, heck 0.5.0, indexmap 2.14.2, lazy_static 1.5.1, linux-raw-sys 0.12.1, log 0.4.34, num-complex 0.4.6, num-integer 0.1.47, num-traits 0.2.19, once_cell 1.21.4, pkg-config 0.3.34, primal-check 0.3.4, regex-automata 0.4.18, regex-lite 0.1.9, regex-syntax 0.8.11, rtrb 0.4.0, rubato 5.0.1, rustc_version 0.4.1, rustix 1.1.5, smallvec 1.16.2, system-deps 9.0.0, thread_local 1.1.10, x11rb 0.14.0, x11rb-protocol 0.14.0
+Applies to: audioadapter 5.0.0, audioadapter-buffers 5.2.0, audioadapter-sample 5.2.0, autocfg 1.5.1, base64 0.22.1, bitflags 1.3.2, bitflags 2.13.2, bytemuck 1.25.2, cc 1.6.0, cfg-expr 0.20.10, cfg-if 1.0.5, clap-sys 0.5.0, equivalent 1.0.2, errno 0.3.14, find-msvc-tools 0.1.14, gethostname 1.1.0, hashbrown 0.17.1, heck 0.5.0, indexmap 2.14.2, lazy_static 1.5.1, linux-raw-sys 0.12.1, log 0.4.34, num-complex 0.4.6, num-integer 0.1.47, num-traits 0.2.19, once_cell 1.21.4, pkg-config 0.3.34, primal-check 0.3.4, regex-automata 0.4.18, regex-lite 0.1.9, regex-syntax 0.8.11, rtrb 0.4.0, rubato 5.0.1, rustc_version 0.4.1, rustix 1.1.5, smallvec 1.16.2, system-deps 9.0.0, thread_local 1.1.10, x11rb 0.14.0, x11rb-protocol 0.14.0
 
 ```text
 Apache License
@@ -416,7 +428,7 @@ Apache License
 
 ### LICENSE-APACHE
 
-Applies to: alsa 0.11.0, audio-codec-algorithms 0.8.1, clack-common 0.2.0, clack-extensions 0.2.0, clack-host 0.2.0, clack-plugin 0.2.0, field-offset 0.3.6, itoa 1.0.18, libc 0.2.190, pin-project-lite 0.2.17, proc-macro2 1.0.107, quote 1.0.47, semver 1.0.28, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_json 1.0.151, syn 2.0.119, syn 3.0.6, thiserror 2.0.21, thiserror-impl 2.0.21, unicode-ident 1.0.26
+Applies to: alsa 0.11.0, audio-codec-algorithms 0.8.1, clack-common 0.2.0, clack-extensions 0.2.0, clack-host 0.2.0, clack-plugin 0.2.0, field-offset 0.3.6, itoa 1.0.18, libc 0.2.190, pin-project-lite 0.2.17, proc-macro2 1.0.107, quote 1.0.47, semver 1.0.28, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_json 1.0.151, syn 2.0.119, syn 3.0.6, thiserror 2.0.21, thiserror-impl 2.0.21, unicode-ident 1.0.26, vst3 0.3.0
 
 ```text
 Apache License
@@ -1519,6 +1531,38 @@ DEALINGS IN THE SOFTWARE.
 
 ### LICENSE-MIT
 
+Applies to: cc 1.6.0, cfg-if 1.0.5, find-msvc-tools 0.1.14, pkg-config 0.3.34
+
+```text
+Copyright (c) 2014 Alex Crichton
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+```
+
+### LICENSE-MIT
+
 Applies to: clack-common 0.2.0, clack-extensions 0.2.0, clack-host 0.2.0, clack-plugin 0.2.0
 
 ```text
@@ -1851,38 +1895,6 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### LICENSE-MIT
-
-Applies to: cfg-if 1.0.5, pkg-config 0.3.34
-
-```text
-Copyright (c) 2014 Alex Crichton
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-```
-
 ### LICENSE
 
 Applies to: libloading 0.7.4, libloading 0.8.9
@@ -2016,6 +2028,62 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+```
+
+### LICENSE.txt
+
+Applies to: Signalsmith Linear (vendored)
+
+```text
+MIT License
+
+Copyright (c) 2025 Signalsmith Audio
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### LICENSE.txt
+
+Applies to: Signalsmith Stretch (vendored)
+
+```text
+MIT License
+
+Copyright (c) 2022 Geraint Luff / Signalsmith Audio Ltd.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 ```
 
 ### LICENSE-MIT
@@ -2881,6 +2949,54 @@ This project is dual-licensed under either of:
 - MIT license (see `LICENSE-MIT`)
 
 You may choose either license, at your option.
+```
+
+### LICENSE-APACHE
+
+Applies to: shlex 2.0.1
+
+```text
+Copyright 2015 Nicholas Allegra (comex).
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+```
+
+### LICENSE-MIT
+
+Applies to: shlex 2.0.1
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2015 Nicholas Allegra (comex).
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 ```
 
 ### LICENSE

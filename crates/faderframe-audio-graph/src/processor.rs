@@ -12,6 +12,10 @@ pub struct PrepareConfig {
     pub event_capacity: usize,
     /// Measure per-node processing time (two clock reads per node).
     pub measure_nodes: bool,
+    /// Below this much processing per cycle (all jobs, measured) the
+    /// parallel executor stays on the calling thread: waking workers would
+    /// cost more than it saves.
+    pub parallel_min_ns: u64,
 }
 
 impl PrepareConfig {
@@ -21,6 +25,7 @@ impl PrepareConfig {
             max_block_size,
             event_capacity: faderframe_midi::MidiBuffer::DEFAULT_CAPACITY,
             measure_nodes: true,
+            parallel_min_ns: 40_000,
         }
     }
 }

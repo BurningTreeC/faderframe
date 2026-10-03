@@ -4,12 +4,15 @@
 //! audio of the same callback is heard); [`MidiOutputs`] runs a thread that
 //! keeps them in time order and sends each when it is due, to every enabled
 //! output port (ALSA sequencer via `midir`) or a virtual capture port.
+//! SysEx comes from the control thread instead ([`MidiOutputs::send_sysex`]),
+//! scheduled ahead with its due time; scheduled SysEx can be cancelled (the
+//! transport stopped or jumped).
 
 use crate::{CLIENT_NAME, port_identity};
 use faderframe_midi::{MidiClock, MidiOutputEvent, MidiOutputQueue, midi_output_queue};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -57,6 +60,9 @@ type Sinks = Arc<Mutex<HashMap<u16, Sink>>>;
 /// A queued message: (due, sequence, port, length, bytes).
 type Pending = (u64, u64, u16, u8, [u8; 3]);
 
+/// Scheduled SysEx: (due, sequence, port, generation, bytes).
+type PendingSysex = (u64, u64, u16, u64, Vec<u8>);
+
 struct Known {
     key: String,
     name: String,
@@ -71,28 +77,38 @@ pub struct MidiOutputs {
     lister: Option<midir::MidiOutput>,
     clock: MidiClock,
     queues: Sender<rtrb::Consumer<MidiOutputEvent>>,
+    sysex: Sender<PendingSysex>,
+    /// Scheduled SysEx of older generations is dropped.
+    generation: Arc<AtomicU64>,
+    sysex_seq: u64,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
-fn run(
-    sinks: Sinks,
-    clock: MidiClock,
+struct Channels {
     queues: Receiver<rtrb::Consumer<MidiOutputEvent>>,
-    stop: Arc<AtomicBool>,
-) {
+    sysex: Receiver<PendingSysex>,
+    generation: Arc<AtomicU64>,
+}
+
+fn run(sinks: Sinks, clock: MidiClock, ch: Channels, stop: Arc<AtomicBool>) {
     let mut rx: Option<rtrb::Consumer<MidiOutputEvent>> = None;
     // (due, sequence) keeps equal-time messages in arrival order.
     let mut pending: BinaryHeap<Reverse<Pending>> = BinaryHeap::new();
+    let mut sysex: BinaryHeap<Reverse<PendingSysex>> = BinaryHeap::new();
     let mut seq = 0u64;
     while !stop.load(Ordering::Relaxed) {
         loop {
-            match queues.try_recv() {
+            match ch.queues.try_recv() {
                 Ok(q) => rx = Some(q),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return,
             }
         }
+        while let Ok(x) = ch.sysex.try_recv() {
+            sysex.push(Reverse(x));
+        }
+        let generation = ch.generation.load(Ordering::Acquire);
         if let Some(rx) = rx.as_mut() {
             while let Ok(m) = rx.pop() {
                 seq += 1;
@@ -111,10 +127,28 @@ fn run(
                     sink.send(now, &bytes[..len as usize]);
                 }
             }
+            while let Some(Reverse((due, _, port, g, _))) = sysex.peek() {
+                if *due > now + 200_000 {
+                    break;
+                }
+                let (port, g) = (*port, *g);
+                let Some(Reverse((.., data))) = sysex.pop() else {
+                    break;
+                };
+                if g == generation
+                    && let Some(sink) = s.get_mut(&port)
+                {
+                    sink.send(now, &data);
+                }
+            }
         }
-        let wait = pending.peek().map_or(1_000_000, |Reverse((due, ..))| {
-            due.saturating_sub(now).min(1_000_000)
-        });
+        let next = pending
+            .peek()
+            .map(|Reverse((due, ..))| *due)
+            .into_iter()
+            .chain(sysex.peek().map(|Reverse((due, ..))| *due))
+            .min();
+        let wait = next.map_or(1_000_000, |due| due.saturating_sub(now).min(1_000_000));
         std::thread::sleep(Duration::from_nanos(wait.max(100_000)));
     }
 }
@@ -125,12 +159,19 @@ impl MidiOutputs {
     pub fn new(clock: MidiClock) -> Self {
         let sinks: Sinks = Arc::new(Mutex::new(HashMap::new()));
         let (queues, rx) = channel();
+        let (sysex, sysex_rx) = channel();
+        let generation = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let (sinks, stop) = (Arc::clone(&sinks), Arc::clone(&stop));
+            let ch = Channels {
+                queues: rx,
+                sysex: sysex_rx,
+                generation: Arc::clone(&generation),
+            };
             std::thread::Builder::new()
                 .name("midi-out".into())
-                .spawn(move || run(sinks, clock, rx, stop))
+                .spawn(move || run(sinks, clock, ch, stop))
                 .ok()
         };
         Self {
@@ -141,9 +182,29 @@ impl MidiOutputs {
             lister: None,
             clock,
             queues,
+            sysex,
+            generation,
+            sysex_seq: 0,
             stop,
             thread,
         }
+    }
+
+    /// Send a SysEx message (`F0 … F7`) to output `port` at `due_ns` on the
+    /// MIDI clock (now if it is past).
+    pub fn send_sysex(&mut self, port: u16, due_ns: u64, data: Vec<u8>) {
+        self.sysex_seq += 1;
+        let g = self.generation.load(Ordering::Acquire);
+        let _ = self.sysex.send((due_ns, self.sysex_seq, port, g, data));
+    }
+
+    /// Drop every SysEx message scheduled so far that is not sent yet.
+    pub fn cancel_sysex(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn clock(&self) -> MidiClock {
+        self.clock
     }
 
     /// A fresh engine-side queue; the sender reads from it from now on.
@@ -324,5 +385,34 @@ mod tests {
         assert!(first + 2 * ms >= now + 10 * ms, "not early");
         assert!(first <= now + 25 * ms, "not very late");
         assert!(outs.ports().iter().any(|p| p.is_virtual && p.connected));
+    }
+
+    #[test]
+    fn sysex_is_sent_when_due_and_can_be_cancelled() {
+        let clock = MidiClock::new();
+        let mut outs = MidiOutputs::new(clock);
+        let (port, captured) = outs.virtual_output("Synth");
+        let ms = 1_000_000;
+        let now = clock.now_ns();
+        let dump = vec![
+            0xF0, 0x41, 0x10, 0x42, 0x12, 0x40, 0x00, 0x7F, 0x00, 0x41, 0xF7,
+        ];
+        outs.send_sysex(port, now + 15 * ms, dump.clone());
+        outs.send_sysex(port, now + 400 * ms, vec![0xF0, 1, 0xF7]);
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(captured.lock().unwrap().is_empty(), "not yet due");
+        std::thread::sleep(Duration::from_millis(40));
+        let got = captured.lock().unwrap().clone();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, dump);
+        assert!(got[0].0 + 2 * ms >= now + 15 * ms, "not early");
+        // The transport stopped: the later one never goes out.
+        outs.cancel_sysex();
+        std::thread::sleep(Duration::from_millis(450));
+        assert_eq!(captured.lock().unwrap().len(), 1);
+        // New messages after a cancel are sent.
+        outs.send_sysex(port, clock.now_ns(), vec![0xF0, 2, 0xF7]);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(captured.lock().unwrap().len(), 2);
     }
 }

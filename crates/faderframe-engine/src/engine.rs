@@ -14,7 +14,7 @@ use faderframe_core::TrackId;
 use faderframe_project::{Impact, Project};
 use faderframe_realtime::{
     CallbackMetrics, Epoch, MailboxReceiver, MailboxSender, MeterBank, MeterReading,
-    MetricsSnapshot, ParamTable, mailbox,
+    MetricsSnapshot, ParamTable, ScopedFlushDenormals, WorkerPool, mailbox,
 };
 use faderframe_timeline::MusicalTime;
 use faderframe_transport::{
@@ -22,7 +22,7 @@ use faderframe_transport::{
 };
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Static engine configuration.
@@ -38,6 +38,9 @@ pub struct EngineConfig {
     /// Control → RT message queue length.
     pub queue_capacity: usize,
     pub measure_nodes: bool,
+    /// Graphs doing less work per cycle than this stay on the audio thread
+    /// even with a worker pool (see `PrepareConfig::parallel_min_ns`).
+    pub parallel_min_ns: u64,
 }
 
 impl Default for EngineConfig {
@@ -49,6 +52,7 @@ impl Default for EngineConfig {
             meter_capacity: 2048,
             queue_capacity: 256,
             measure_nodes: true,
+            parallel_min_ns: 40_000,
         }
     }
 }
@@ -65,6 +69,14 @@ enum Message {
     MidiOutput(Box<faderframe_midi::MidiOutputQueue>),
     BeginMidiRecord(Box<crate::midi::MidiRecorder>),
     EndMidiRecord,
+    /// Locate so that `position` is where playback would be at `at_ns` (on
+    /// the MIDI clock), compensating for the time until the command is
+    /// applied, and play or stop.
+    Chase {
+        position: i64,
+        at_ns: u64,
+        play: bool,
+    },
 }
 
 /// Objects retired by the audio thread, dropped on the control thread.
@@ -105,6 +117,15 @@ pub struct EngineShared {
     midi_record_overruns: AtomicU64,
     /// MIDI output messages lost (sender thread too slow).
     midi_out_dropped: AtomicU64,
+    /// Wall-clock time spent processing the graph (all threads at once),
+    /// since the engine started.
+    graph_wall_ns: AtomicU64,
+    /// Start of the last callback on the MIDI clock (0: no MIDI clock) and
+    /// the transport position then: where playback is at any moment.
+    callback_ns: AtomicU64,
+    callback_position: AtomicI64,
+    /// Frames between processing and hearing (buffer + device).
+    output_latency: AtomicU32,
     /// Auditioning, mapped controls, clock outputs.
     pub midi: Arc<crate::midi::MidiShared>,
 }
@@ -164,6 +185,7 @@ pub fn create_with_epoch(
         midi_out: None,
         clock: crate::midi::ClockGen::default(),
         output_latency: 0,
+        pool: None,
     };
     let controller = EngineController {
         config,
@@ -181,6 +203,7 @@ pub fn create_with_epoch(
         node_timing: false,
         stats: GraphStats::default(),
         warnings: Vec::new(),
+        voices: Vec::new(),
         plan: Arc::new(StreamPlan::default()),
         suspended_lanes: Default::default(),
         midi_routing: crate::build::MidiRouting {
@@ -212,6 +235,8 @@ pub struct EngineProcessor {
     clock: crate::midi::ClockGen,
     /// Frames from a callback to its audio being heard (buffer + device).
     output_latency: u32,
+    /// DSP worker threads for the graph (none: serial on the audio thread).
+    pool: Option<Arc<WorkerPool>>,
 }
 
 impl EngineProcessor {
@@ -281,13 +306,40 @@ impl EngineProcessor {
                         self.retire(Garbage::MidiRecorder(old));
                     }
                 }
+                Message::Chase {
+                    position,
+                    at_ns,
+                    play,
+                } => {
+                    let now = self.midi.clock().map_or(at_ns, |c| c.now_ns());
+                    let late = now as f64 - at_ns as f64;
+                    let rate = self.stream_rate as f64;
+                    let adjusted = position + if play { (late * rate / 1e9) as i64 } else { 0 };
+                    self.transport.apply(TransportCommand::Locate(adjusted));
+                    self.transport.apply(if play {
+                        TransportCommand::Play
+                    } else {
+                        TransportCommand::Stop
+                    });
+                }
             }
         }
+    }
+
+    /// Process graphs on `pool`'s worker threads as well (control thread,
+    /// before the processor goes live). Several engines may share a pool.
+    pub fn set_worker_pool(&mut self, pool: Option<Arc<WorkerPool>>) {
+        self.pool = pool;
+    }
+
+    pub fn worker_pool(&self) -> Option<&Arc<WorkerPool>> {
+        self.pool.as_ref()
     }
 
     /// Process one device callback. Realtime-safe.
     pub fn process_device(&mut self, io: &mut dyn DeviceBuffers) {
         let started = Instant::now();
+        let _ftz = ScopedFlushDenormals::new();
         self.drain_messages();
         let frames = io.frames();
         if frames == 0 {
@@ -316,6 +368,15 @@ impl EngineProcessor {
         self.midi.take(frames, rate, &self.shared.midi_dropped);
         let callback_ns = self.midi_out.as_ref().map_or(0, |q| q.clock.now_ns());
 
+        if let Some(clock) = self.midi.clock() {
+            self.shared
+                .callback_ns
+                .store(clock.now_ns(), Ordering::Relaxed);
+            self.shared
+                .callback_position
+                .store(self.transport.position(), Ordering::Relaxed);
+        }
+        let mut graph_ns = 0u64;
         let mut offset = 0;
         while offset < frames {
             let n = self
@@ -385,11 +446,17 @@ impl EngineProcessor {
                         }
                     }
                 });
-                graph.process(&ProcessContext {
+                let cx = ProcessContext {
                     frames: n,
                     sample_rate: rate,
                     data: &self.ctx,
-                });
+                };
+                let g0 = Instant::now();
+                match self.pool.as_deref() {
+                    Some(pool) => graph.process_parallel(&cx, pool),
+                    None => graph.process(&cx),
+                }
+                graph_ns += g0.elapsed().as_nanos() as u64;
                 // External MIDI: due when this callback's audio is heard.
                 if let Some(q) = self.midi_out.as_deref_mut() {
                     let base = callback_ns;
@@ -449,6 +516,11 @@ impl EngineProcessor {
             offset += n;
         }
         self.shared.transport.publish(&self.transport);
+        // Single writer: a plain load and store.
+        let g = self.shared.graph_wall_ns.load(Ordering::Relaxed);
+        self.shared
+            .graph_wall_ns
+            .store(g + graph_ns, Ordering::Relaxed);
         let budget_ns = (frames as f64 * 1e9 / rate.max(1.0)) as u64;
         if graph_ok && let Some(graph) = self.graph.as_deref_mut() {
             graph.finish_cycle(budget_ns);
@@ -465,6 +537,9 @@ impl AudioCallback for EngineProcessor {
     fn prepare(&mut self, info: &StreamInfo) {
         self.stream_rate = info.sample_rate;
         self.output_latency = info.buffer_size + info.output_latency;
+        self.shared
+            .output_latency
+            .store(self.output_latency, Ordering::Relaxed);
         self.shared
             .stream_sample_rate
             .store(info.sample_rate, Ordering::Relaxed);
@@ -521,6 +596,20 @@ pub struct EngineController {
     midi_routing: crate::build::MidiRouting,
     /// Tracks taking live MIDI input.
     midi_live: std::collections::HashSet<faderframe_core::TrackId>,
+    /// Stretcher voices per track in the installed graph (a timeline edit
+    /// that changes them rebuilds the graph).
+    voices: Vec<(faderframe_core::TrackId, crate::nodes::StretchVoices)>,
+}
+
+/// Voices every audio track needs.
+fn voice_needs(project: &Project) -> Vec<(faderframe_core::TrackId, crate::nodes::StretchVoices)> {
+    project
+        .tracks
+        .iter()
+        .filter(|t| t.kind == faderframe_project::TrackKind::Audio)
+        .map(|t| (t.id, crate::build::stretch_voices(project, t)))
+        .filter(|(_, v)| !v.is_empty())
+        .collect()
 }
 
 impl EngineController {
@@ -604,6 +693,43 @@ impl EngineController {
 
     pub fn metrics(&self) -> MetricsSnapshot {
         self.shared.metrics.snapshot()
+    }
+
+    /// Wall-clock time the graph took, all callbacks so far.
+    pub fn graph_wall_ns(&self) -> u64 {
+        self.shared.graph_wall_ns.load(Ordering::Relaxed)
+    }
+
+    /// Locate so that playback is at `position` at time `at_ns` on the MIDI
+    /// clock (the engine adds the time until it applies the command) and
+    /// play, or stop there.
+    pub fn chase(&mut self, position: i64, at_ns: u64, play: bool) -> Result<(), EngineError> {
+        self.send(Message::Chase {
+            position,
+            at_ns,
+            play,
+        })
+    }
+
+    /// Where the processing position is at `t_ns` on the MIDI clock
+    /// (extrapolated from the last callback while playing); `None` before
+    /// the first callback with a MIDI clock.
+    pub fn position_at(&self, t_ns: u64) -> Option<i64> {
+        let cb = self.shared.callback_ns.load(Ordering::Relaxed);
+        if cb == 0 {
+            return None;
+        }
+        let pos = self.shared.callback_position.load(Ordering::Relaxed);
+        if !self.shared.transport.snapshot().playing {
+            return Some(pos);
+        }
+        let rate = self.stream_sample_rate() as f64;
+        Some(pos + ((t_ns as f64 - cb as f64) * rate / 1e9) as i64)
+    }
+
+    /// Frames from processing to hearing (device buffer + output latency).
+    pub fn output_latency(&self) -> u32 {
+        self.shared.output_latency.load(Ordering::Relaxed)
     }
 
     pub fn reset_metrics(&self) {
@@ -764,6 +890,10 @@ impl EngineController {
         match impact {
             Impact::None => Ok(()),
             Impact::Params => self.update_params(project),
+            Impact::Timeline if voice_needs(project) != self.voices => {
+                // A track gained (or no longer needs) stretcher voices.
+                self.sync(project, sources, Impact::Graph)
+            }
             Impact::Timeline => {
                 self.update_timeline(project, sources)?;
                 self.update_params(project)
@@ -789,6 +919,7 @@ impl EngineController {
         let mut prepare =
             PrepareConfig::new(self.config.sample_rate as f64, self.config.max_block_size);
         prepare.measure_nodes = self.config.measure_nodes;
+        prepare.parallel_min_ns = self.config.parallel_min_ns;
         let built = build_graph(
             project,
             &mut self.slots,
@@ -797,6 +928,7 @@ impl EngineController {
             &self.midi_routing,
         )?;
         let compiled = built.builder.compile(&prepare)?;
+        self.voices = voice_needs(project);
         // Parameters must be valid before the new graph's processors read them.
         self.slots
             .write_params(project, &self.params, &self.midi_live)?;

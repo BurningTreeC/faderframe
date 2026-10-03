@@ -181,6 +181,11 @@ impl MidiInputState {
         std::mem::replace(&mut self.queue, q)
     }
 
+    /// The clock MIDI input is stamped with (shared with the control side).
+    pub(crate) fn clock(&self) -> Option<faderframe_midi::MidiClock> {
+        self.queue.as_ref().map(|q| q.clock)
+    }
+
     /// Drain the queue for a callback of `frames` at `rate` (audio thread).
     pub(crate) fn take(&mut self, frames: usize, rate: f64, dropped: &AtomicU64) {
         self.events.clear();

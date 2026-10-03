@@ -196,6 +196,13 @@ fn render_one(
         ..EngineConfig::default()
     };
     let mut r = OfflineRenderer::new(project, sources, config, 1024, 2)?;
+    // Faster than realtime on every core.
+    let workers = faderframe_realtime::default_worker_count();
+    if workers > 0 {
+        r.processor.set_worker_pool(Some(std::sync::Arc::new(
+            faderframe_realtime::WorkerPool::new(faderframe_realtime::PoolConfig::new(workers)),
+        )));
+    }
     r.play_from(start)?;
     let mut out = vec![Vec::with_capacity(frames), Vec::with_capacity(frames)];
     while out[0].len() < frames {

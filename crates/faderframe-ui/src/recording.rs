@@ -31,6 +31,24 @@ pub fn apply(app: &Rc<AppState>, r: RecordSettings) {
     sync_actions(app, &r);
 }
 
+/// Metronome off, or back on in the mode it had (always, by default).
+pub fn toggle_metronome(app: &Rc<AppState>) {
+    let mut r = app.session.borrow().record;
+    let mut p = Preferences::load();
+    r.metronome = if r.metronome == MetronomeMode::Off {
+        MetronomeMode::from_id(&p.metronome_on)
+            .filter(|m| *m != MetronomeMode::Off)
+            .unwrap_or(MetronomeMode::Always)
+    } else {
+        p.metronome_on = r.metronome.id().into();
+        if let Err(e) = p.save() {
+            tracing::warn!("cannot save preferences: {e}");
+        }
+        MetronomeMode::Off
+    };
+    apply(app, r);
+}
+
 fn set_state(app: &Rc<AppState>, name: &str, value: &str) {
     if let Some(a) = app
         .app
@@ -90,7 +108,16 @@ pub fn install_actions(app: &Rc<AppState>) {
             }
         })
         .build();
+    let weak = Rc::downgrade(app);
+    let toggle_metronome = gio::ActionEntry::builder("toggle-metronome")
+        .activate(move |_, _, _| {
+            if let Some(app) = weak.upgrade() {
+                toggle_metronome(&app);
+            }
+        })
+        .build();
     app.app.add_action_entries([
+        toggle_metronome,
         radio(app, "record-mode", r.mode.id(), |r, id| {
             r.mode = RecordMode::from_id(id).unwrap_or(r.mode);
         }),

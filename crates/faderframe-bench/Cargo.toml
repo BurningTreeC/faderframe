@@ -19,3 +19,5 @@ faderframe-audio-files.workspace = true
 faderframe-realtime.workspace = true
 faderframe-timeline.workspace = true
 faderframe-plugin-host.workspace = true
+faderframe-plugin-clap.workspace = true
+faderframe-plugin-vst3.workspace = true

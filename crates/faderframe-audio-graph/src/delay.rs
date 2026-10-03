@@ -27,10 +27,6 @@ impl AudioDelay {
         }
     }
 
-    pub fn delay(&self) -> usize {
-        self.delay
-    }
-
     /// Push `src` into the ring and add the delayed signal into `dst`.
     pub fn process_mix(&mut self, src: &AudioBuffer, dst: &mut AudioBuffer) {
         let n = src.len().min(dst.len());

@@ -524,6 +524,20 @@ impl PerformanceView {
             ),
             t.ui.text_faint,
         );
+        let l4 = left.take_top(16.0);
+        line(
+            p,
+            l4,
+            &if report.threads > 1 {
+                format!(
+                    "{} threads · {} jobs · {:.1} busy at once",
+                    report.threads, report.graph_jobs, report.parallelism
+                )
+            } else {
+                format!("1 thread · {} jobs", report.graph_jobs)
+            },
+            t.ui.text_faint,
+        );
         self.paint_history(p, graph, report);
     }
 
@@ -616,12 +630,14 @@ impl PerformanceView {
         let mixing = (report.graph.average - plugins).max(0.0);
         let engine = report.engine;
         let used = plugins + mixing + engine;
-        let free = (1.0 - used).max(0.0);
+        // Capacity: one callback's time on every processing thread.
+        let capacity = report.threads.max(1) as f64;
+        let free = (capacity - used).max(0.0);
         let inner = r.inset_xy(PAD, 0.0);
         let (bar, legend) = inner.split_left(inner.w * 0.5);
         let bar = Rect::new(bar.x, bar.center().y - 6.0, bar.w - 12.0, 12.0);
         p.fill_rounded(bar, 3.0, &Paint::Solid(pt.bar_track));
-        let total = used.max(1.0);
+        let total = used.max(capacity);
         let mut x = bar.x;
         for (v, c) in [
             (plugins, pt.load_ok),
@@ -634,13 +650,21 @@ impl PerformanceView {
                 x += w;
             }
         }
+        let free_text = if report.threads > 1 {
+            format!(
+                "free {} of {} threads",
+                format_load(free / capacity),
+                report.threads
+            )
+        } else {
+            format!("free {}", format_load(free))
+        };
         p.text(
             &format!(
-                "plugins {} · mixing {} · engine {} · free {}",
+                "plugins {} · mixing {} · engine {} · {free_text}",
                 format_load(plugins),
                 format_load(mixing),
                 format_load(engine),
-                format_load(free)
             ),
             legend,
             &TextStyle::new(t.fonts.small, t.ui.text_dim),

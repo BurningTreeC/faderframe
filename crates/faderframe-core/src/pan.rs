@@ -79,9 +79,44 @@ pub fn format_pan(pan: f32) -> String {
     }
 }
 
+/// Parse a typed pan: "C", "L42", "42L", "R100", "-42" (left) or "42"
+/// (right), in percent. Returns −1…1.
+pub fn parse_pan(text: &str) -> Option<f32> {
+    let t = text.trim().to_ascii_uppercase();
+    let t = t.trim_end_matches('%').trim();
+    if t.is_empty() || t == "C" || t == "CENTER" || t == "CENTRE" || t == "MID" {
+        return Some(0.0);
+    }
+    let number = |s: &str| s.trim().parse::<f32>().ok().filter(|v| v.is_finite());
+    let pct = if let Some(rest) = t.strip_prefix('L') {
+        -number(rest)?
+    } else if let Some(rest) = t.strip_suffix('L') {
+        -number(rest)?
+    } else if let Some(rest) = t.strip_prefix('R') {
+        number(rest)?
+    } else if let Some(rest) = t.strip_suffix('R') {
+        number(rest)?
+    } else {
+        number(t)?
+    };
+    Some((pct / 100.0).clamp(-1.0, 1.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_pans() {
+        assert_eq!(parse_pan("c"), Some(0.0));
+        assert_eq!(parse_pan("L42"), Some(-0.42));
+        assert_eq!(parse_pan(" 30 l"), Some(-0.3));
+        assert_eq!(parse_pan("R100"), Some(1.0));
+        assert_eq!(parse_pan("-25"), Some(-0.25));
+        assert_eq!(parse_pan("250"), Some(1.0));
+        assert_eq!(parse_pan("left"), None);
+        assert_eq!(parse_pan(&format_pan(-0.7)), Some(-0.7));
+    }
 
     fn approx(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-4

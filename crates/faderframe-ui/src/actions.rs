@@ -90,11 +90,22 @@ pub fn install(app: &Rc<AppState>) {
                 hosts.sort_by_key(|(kind, _)| {
                     !matches!(kind, faderframe_workspace::ViewKind::Arranger)
                 });
-                hosts
+                // The edit toolbar (when shown) above everything.
+                let mut list: Vec<_> = a
+                    .chrome
+                    .borrow()
+                    .as_ref()
+                    .filter(|c| c.edit_bar.is_visible())
+                    .map(|c| c.edit_bar.clone())
                     .into_iter()
-                    .filter(|(_, h)| h.canvas.is_mapped())
-                    .map(|(_, h)| h.canvas.clone())
-                    .collect()
+                    .collect();
+                list.extend(
+                    hosts
+                        .into_iter()
+                        .filter(|(_, h)| h.canvas.is_mapped())
+                        .map(|(_, h)| h.canvas.clone()),
+                );
+                list
             };
             let main = a.window.borrow().clone();
             if let Some(w) = main.as_ref() {
@@ -128,6 +139,18 @@ pub fn install(app: &Rc<AppState>) {
         dispatch(app, "delete", A::DeleteSelection),
         dispatch(app, "split", A::SplitSelectedAtPlayhead),
         dispatch(app, "toggle-snap", A::ToggleSnap),
+        entry(app, "toggle-edit-toolbar", |a| {
+            let on = !a.session.borrow().editor.show_edit_toolbar;
+            a.dispatch(A::SetEditFlag(
+                faderframe_session::EditFlag::EditToolbar,
+                on,
+            ));
+            let mut p = crate::prefs::Preferences::load();
+            p.show_edit_toolbar = on;
+            if let Err(e) = p.save() {
+                tracing::warn!("cannot save preferences: {e}");
+            }
+        }),
         dispatch(app, "toggle-follow", A::ToggleFollowPlayhead),
         dispatch(app, "add-audio", A::AddTrack(TrackKind::Audio)),
         dispatch(
@@ -425,6 +448,177 @@ pub fn install(app: &Rc<AppState>) {
             }
         })
         .build();
+    // Editing by name (menus, scripts): `edit-mode:<shuffle|slip|spot|grid>`,
+    // `edit-tool:<smart|trim|stretch|select|grab|separate|scrub|pencil|zoom>`,
+    // `edit-flag:<warp|transients|tab-transients|link|insertion-follows>`
+    // (toggles), `edit:<separate|trim|clear|silence|copy|cut|paste|duplicate|
+    // quantize|separate-transients|unwarp>`, and the development aid
+    // `select-clip:<track>` (adds the track's first clip to the selection).
+    let named = |name: &'static str, f: fn(&Rc<AppState>, &str)| {
+        let weak = Rc::downgrade(app);
+        gio::ActionEntry::builder(name)
+            .parameter_type(Some(&String::static_variant_type()))
+            .activate(move |_, _, param| {
+                if let (Some(a), Some(arg)) =
+                    (weak.upgrade(), param.and_then(|p| p.get::<String>()))
+                {
+                    f(&a, &arg);
+                }
+            })
+            .build()
+    };
+    let edit_entries = [
+        named("edit-mode", |a, arg| {
+            use faderframe_session::EditMode as M;
+            match arg {
+                "shuffle" => a.dispatch(Action::SetEditMode(M::Shuffle)),
+                "slip" => a.dispatch(Action::SetEditMode(M::Slip)),
+                "spot" => a.dispatch(Action::SetEditMode(M::Spot)),
+                "grid" => a.dispatch(Action::SetEditMode(M::Grid)),
+                _ => tracing::warn!("edit-mode: unknown '{arg}'"),
+            }
+        }),
+        named("edit-tool", |a, arg| {
+            use faderframe_session::EditTool as T;
+            let tool = match arg {
+                "smart" => T::Smart,
+                "trim" => T::Trim,
+                "stretch" => T::TrimStretch,
+                "select" => T::Select,
+                "grab" => T::Grab,
+                "separate" => T::GrabSeparation,
+                "scrub" => T::Scrub,
+                "pencil" => T::Pencil,
+                "zoom" => T::Zoom,
+                _ => return tracing::warn!("edit-tool: unknown '{arg}'"),
+            };
+            a.dispatch(Action::SetEditTool(tool));
+        }),
+        named("edit-flag", |a, arg| {
+            use faderframe_session::EditFlag as F;
+            let e = a.session.borrow().editor;
+            let (flag, on) = match arg {
+                "warp" => (F::Warp, e.warp),
+                "transients" => (F::ShowTransients, e.show_transients),
+                "tab-transients" => (F::TabToTransients, e.tab_to_transients),
+                "link" => (F::LinkTimeline, e.link_timeline),
+                "insertion-follows" => (F::InsertionFollowsPlayback, e.insertion_follows_playback),
+                _ => return tracing::warn!("edit-flag: unknown '{arg}'"),
+            };
+            a.dispatch(Action::SetEditFlag(flag, !on));
+        }),
+        named("edit", |a, arg| {
+            let clips: Vec<faderframe_core::ClipId> =
+                a.session.borrow().selection.clips.iter().copied().collect();
+            let action = match arg {
+                "separate" => Action::Separate,
+                "trim" => Action::TrimToSelection,
+                "clear" => Action::ClearRange,
+                "silence" => Action::InsertSilence,
+                "copy" => Action::CopyRange,
+                "cut" => Action::CutRange,
+                "paste" => Action::PasteRange,
+                "duplicate" => Action::RepeatRange(1),
+                "quantize" => Action::QuantizeWarp(clips),
+                "separate-transients" => Action::SeparateAtTransients(clips),
+                "unwarp" => Action::ClearWarp(clips),
+                _ => return tracing::warn!("edit: unknown '{arg}'"),
+            };
+            a.dispatch(action);
+        }),
+        // Development aid: `fade-demo:x` gives the selected clips long
+        // fades (one drawn), +3 dB clip gain and, once transients are
+        // known, a warp marker pulling a hit later.
+        named("fade-demo", |a, _| {
+            use faderframe_session::ClipEdge;
+            let (clips, rate) = {
+                let s = a.session.borrow();
+                (
+                    s.selection.clips.iter().copied().collect::<Vec<_>>(),
+                    s.project().sample_rate as i64,
+                )
+            };
+            a.dispatch(Action::SetFade {
+                clips: clips.clone(),
+                edge: ClipEdge::Start,
+                length: Some(rate),
+                shape: Some(faderframe_project::FadeShape::SCurve),
+                bend: Some(45),
+            });
+            a.dispatch(Action::SetFade {
+                clips: clips.clone(),
+                edge: ClipEdge::End,
+                length: Some(rate * 3 / 2),
+                shape: Some(faderframe_project::FadeShape::EqualPower),
+                bend: None,
+            });
+            a.dispatch(Action::ClipGain {
+                clips: clips.clone(),
+                delta_db: 3.0,
+            });
+            let target = {
+                let s = a.session.borrow();
+                clips.iter().find_map(|c| {
+                    let clip = s.project().clip(*c)?;
+                    let faderframe_project::ClipContent::Audio(au) = &clip.content else {
+                        return None;
+                    };
+                    let hits = s.source_transients(au.source)?;
+                    let hit = hits
+                        .into_iter()
+                        .find(|h| *h > au.source_offset + rate * 2)?;
+                    Some((*c, hit, hit - au.source_offset + rate / 10))
+                })
+            };
+            if let Some((clip, source, to)) = target {
+                a.dispatch(Action::WarpTo {
+                    clip,
+                    source,
+                    to,
+                    drag: faderframe_session::warping::WarpDrag::Transients,
+                });
+            }
+        }),
+        named("select-clip", |a, arg| {
+            let clip = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == arg)
+                .and_then(|t| t.clips.first().copied());
+            match clip {
+                Some(c) => a.dispatch(Action::SelectClips {
+                    clips: vec![c],
+                    mode: faderframe_session::SelectMode::Add,
+                }),
+                None => tracing::warn!("select-clip: no clip on '{arg}'"),
+            }
+        }),
+    ];
+    // Development aid: `window-size:<w>x<h>` resizes the main window.
+    let weak = Rc::downgrade(app);
+    let window_size = gio::ActionEntry::builder("window-size")
+        .parameter_type(Some(&String::static_variant_type()))
+        .activate(move |_, _, param| {
+            let (Some(a), Some(text)) = (weak.upgrade(), param.and_then(|p| p.get::<String>()))
+            else {
+                return;
+            };
+            let size = text.split_once('x').and_then(|(w, h)| {
+                Some((w.trim().parse::<i32>().ok()?, h.trim().parse::<i32>().ok()?))
+            });
+            let window = a.window.borrow().clone();
+            match (size, window) {
+                (Some((w, h)), Some(window)) => {
+                    window.unmaximize();
+                    window.set_default_size(w, h);
+                }
+                _ => tracing::warn!("window-size: expected <w>x<h>, got '{text}'"),
+            }
+        })
+        .build();
     // Development aid: `select-track:<name>` selects a track by name.
     let weak = Rc::downgrade(app);
     let select = gio::ActionEntry::builder("select-track")
@@ -451,10 +645,86 @@ pub fn install(app: &Rc<AppState>) {
             }
         })
         .build();
+    // Development aid: `piano-lane:<velocity|pitch|pressure|timbre>` picks
+    // the piano roll's lane; `mpe-demo` turns MPE on for the edited clip's
+    // track and gives its first notes glides and swells.
+    let weak = Rc::downgrade(app);
+    let lane = gio::ActionEntry::builder("piano-lane")
+        .parameter_type(Some(&String::static_variant_type()))
+        .activate(move |_, _, param| {
+            let (Some(a), Some(name)) = (weak.upgrade(), param.and_then(|p| p.get::<String>()))
+            else {
+                return;
+            };
+            let mut pr = a.session.borrow().editor.piano;
+            pr.expression = faderframe_project::ExpressionKind::ALL
+                .into_iter()
+                .find(|k| k.label().eq_ignore_ascii_case(&name));
+            if pr.expression.is_none() {
+                pr.lane = None;
+            }
+            a.dispatch(Action::SetPianoRoll(pr));
+        })
+        .build();
+    let weak = Rc::downgrade(app);
+    let mpe_demo = gio::ActionEntry::builder("mpe-demo")
+        .activate(move |_, _, _| {
+            use faderframe_project::{ExpressionKind, ExpressionPoint};
+            use faderframe_timeline::MusicalTime;
+            let Some(a) = weak.upgrade() else { return };
+            let found = {
+                let s = a.session.borrow();
+                s.editor_clip().and_then(|c| {
+                    let clip = s.project().clip(c)?;
+                    let notes: Vec<_> = clip.as_midi()?.notes.iter().take(4).copied().collect();
+                    Some((c, clip.track, notes))
+                })
+            };
+            let Some((clip, track, notes)) = found else {
+                tracing::warn!("mpe-demo: no MIDI clip in the editor");
+                return;
+            };
+            a.dispatch(Action::Edit(faderframe_project::Command::SetTrackMpe {
+                track,
+                mpe: Some(faderframe_project::MpeConfig::default()),
+            }));
+            let pt = |q: f64, value: f32| ExpressionPoint {
+                time: MusicalTime::from_quarters(q),
+                value,
+            };
+            for (i, n) in notes.iter().enumerate() {
+                let len = n.length.ticks() as f64 / faderframe_timeline::TICKS_PER_QUARTER as f64;
+                let glide = [2.0, -1.0, 3.0, -2.0][i % 4];
+                for (kind, points) in [
+                    (
+                        ExpressionKind::Pitch,
+                        vec![pt(0.0, 0.0), pt(len * 0.4, 0.0), pt(len, glide)],
+                    ),
+                    (
+                        ExpressionKind::Pressure,
+                        vec![pt(0.0, 0.2), pt(len * 0.5, 0.9), pt(len, 0.4)],
+                    ),
+                ] {
+                    a.dispatch(Action::SetNoteExpression {
+                        clip,
+                        note: n.id,
+                        kind,
+                        from: MusicalTime::ZERO,
+                        to: n.length + MusicalTime(1),
+                        points,
+                    });
+                }
+            }
+        })
+        .build();
+    app.app.add_action_entries(edit_entries);
     app.app.add_action_entries([
         insert,
         midi,
         select,
+        window_size,
+        lane,
+        mpe_demo,
         show("show-insert", false),
         show("show-insert-params", true),
     ]);
@@ -463,6 +733,7 @@ pub fn install(app: &Rc<AppState>) {
         ("app.new", &["<Control>n"]),
         ("app.open", &["<Control>o"]),
         ("app.save", &["<Control>s"]),
+        ("app.toggle-edit-toolbar", &["<Control>e"]),
         ("app.import-audio", &["<Control>i"]),
         ("app.save-as", &["<Control><Shift>s"]),
         ("app.quit", &["<Control>q"]),
@@ -513,6 +784,10 @@ pub fn install_window_keys(app: &Rc<AppState>, window: &impl IsA<gtk::Widget>) {
             gdk::Key::space => TransportAction::TogglePlay,
             gdk::Key::Home => TransportAction::ReturnToStart,
             gdk::Key::l | gdk::Key::L if !shift => TransportAction::ToggleLoop,
+            gdk::Key::k | gdk::Key::K | gdk::Key::KP_7 | gdk::Key::KP_Home if !shift => {
+                crate::recording::toggle_metronome(&app);
+                return glib::Propagation::Stop;
+            }
             gdk::Key::R if shift => TransportAction::ToggleRecord,
             gdk::Key::KP_0 | gdk::Key::KP_Insert => TransportAction::Stop,
             gdk::Key::t | gdk::Key::T if !shift => {

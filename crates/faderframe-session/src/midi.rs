@@ -106,6 +106,94 @@ pub(crate) struct RecNote {
     pub pass: u32,
 }
 
+/// MPE recording: the member-channel pitch bend, pressure and CC 74 that
+/// arrive while a note sounds (and just before it, for its initial values)
+/// become that note's expression; such controller moves are removed from
+/// `ccs` (member-channel expression outside notes is dropped). `ids` are
+/// the notes' ids, `rate` the sample rate, `to_note_time` converts a
+/// (position, note start) pair to the time from the note's start.
+pub(crate) fn mpe_expressions(
+    notes: &[RecNote],
+    ids: &[faderframe_core::NoteId],
+    ccs: &mut Vec<RecController>,
+    bend_range: u8,
+    rate: f64,
+    to_note_time: impl Fn(i64, i64) -> faderframe_timeline::MusicalTime,
+) -> Vec<faderframe_project::NoteExpression> {
+    use faderframe_project::{ExpressionKind, ExpressionPoint, MidiController, NoteExpression};
+    let kind = |c: MidiController| match c {
+        MidiController::PitchBend => Some(ExpressionKind::Pitch),
+        MidiController::ChannelPressure => Some(ExpressionKind::Pressure),
+        MidiController::Cc { number: 74 } => Some(ExpressionKind::Timbre),
+        _ => None,
+    };
+    let lead = (rate * 0.02) as i64;
+    let mut out: Vec<NoteExpression> = Vec::new();
+    let mut taken = vec![false; ccs.len()];
+    for (n, &id) in notes.iter().zip(ids) {
+        if n.channel == 0 {
+            continue;
+        }
+        let mut e = NoteExpression::new(id);
+        for (i, &(pos, c, ch, v, _)) in ccs.iter().enumerate() {
+            let Some(k) = kind(c) else { continue };
+            if taken[i] || ch != n.channel || pos < n.start - lead || pos > n.end {
+                continue;
+            }
+            taken[i] = true;
+            let value = match k {
+                ExpressionKind::Pitch => (v as f32 - 8192.0) / 8192.0 * bend_range.max(1) as f32,
+                _ => v.min(127) as f32 / 127.0,
+            };
+            e.curve_mut(k).push(ExpressionPoint {
+                time: to_note_time(pos.max(n.start), n.start),
+                value,
+            });
+        }
+        for k in ExpressionKind::ALL {
+            let c = e.curve_mut(k);
+            c.sort_by_key(|p| p.time);
+            // Later values at the same time win (initial values arrive in a
+            // burst before the note).
+            c.reverse();
+            c.dedup_by_key(|p| p.time);
+            c.reverse();
+            // Keep the points where the curve bends.
+            let tol = if k == ExpressionKind::Pitch {
+                0.01
+            } else {
+                0.4 / 127.0
+            };
+            let mut kept: Vec<ExpressionPoint> = Vec::with_capacity(c.len());
+            for (j, p) in c.iter().enumerate() {
+                let next = c.get(j + 1);
+                let redundant = match (kept.last(), next) {
+                    (Some(a), Some(b)) => {
+                        let span = (b.time - a.time).ticks().max(1) as f32;
+                        let f = (p.time - a.time).ticks() as f32 / span;
+                        (a.value + (b.value - a.value) * f - p.value).abs() <= tol
+                    }
+                    _ => false,
+                };
+                if !redundant {
+                    kept.push(*p);
+                }
+            }
+            *c = kept;
+        }
+        if !e.is_empty() {
+            out.push(e);
+        }
+    }
+    let mut i = 0;
+    ccs.retain(|&(_, c, ch, _, _)| {
+        let keep = !taken[i] && !(ch != 0 && kind(c).is_some());
+        i += 1;
+        keep
+    });
+    out
+}
+
 /// Held keys of one track: (channel, key) → (start, velocity, pass).
 type HeldNotes = HashMap<(u8, u8), (i64, u8, u32)>;
 
@@ -120,6 +208,8 @@ pub(crate) struct MidiTake {
     /// Controller moves per track: (position, controller, channel, value,
     /// pass).
     pub controllers: Vec<Vec<RecController>>,
+    /// SysEx per track: (position, message).
+    pub sysex: Vec<Vec<(i64, Vec<u8>)>>,
     pub last: i64,
 }
 
@@ -136,6 +226,7 @@ impl MidiTake {
             open: vec![HashMap::new(); n],
             notes: vec![Vec::new(); n],
             controllers: vec![Vec::new(); n],
+            sysex: vec![Vec::new(); n],
             last: i64::MIN,
         }
     }
@@ -268,6 +359,8 @@ pub(crate) struct MidiState {
     /// (`None`: not built for this engine yet).
     consumed_for: Option<Vec<MidiMapping>>,
     step: Option<StepInput>,
+    /// SysEx playback scheduling.
+    pub(crate) sysex: crate::sysex::SysexPlayback,
     /// Keys of the chord being entered by step input (and how many are down).
     step_chord: Vec<(u8, u8, u8)>,
     step_down: usize,
@@ -298,6 +391,7 @@ impl MidiState {
                 pickup: HashMap::new(),
                 consumed_for: None,
                 step: None,
+                sysex: crate::sysex::SysexPlayback::default(),
                 step_chord: Vec::new(),
                 step_down: 0,
             },
@@ -805,6 +899,14 @@ impl Session {
             }
             self.revision += 1;
         }
+        let system = self.midi.feed.drain_system();
+        for ev in &system {
+            self.midi.activity.insert(ev.port, now);
+        }
+        let clock_now = self.midi.sender.clock().now_ns();
+        self.tick_sync(&system, clock_now);
+        self.record_sysex(&system);
+        self.tick_sysex(clock_now);
         let events = self.midi.feed.drain();
         if !events.is_empty() {
             let events: Vec<MidiInputEvent> = events
@@ -1258,6 +1360,7 @@ impl Session {
             };
             let mut notes = take.notes[i].clone();
             let mut ccs = take.controllers[i].clone();
+            let sysex_rec = take.sysex[i].clone();
             let last_pass = notes
                 .iter()
                 .map(|n| n.pass)
@@ -1269,28 +1372,49 @@ impl Session {
                 notes.retain(|n| n.pass == last);
                 ccs.retain(|c| c.4 == last);
             }
-            if notes.is_empty() && ccs.is_empty() {
+            if notes.is_empty() && ccs.is_empty() && sysex_rec.is_empty() {
                 continue;
             }
             notes.sort_by_key(|n| (n.start, n.key));
             let ids: Vec<faderframe_core::NoteId> =
                 notes.iter().map(|_| self.project.ids.allocate()).collect();
             let to_musical = |s: i64| self.engine.samples_to_musical(&self.project, s.max(0));
+            // MPE: member-channel expression goes with the notes.
+            let expressions = match self.project.track(*track).and_then(|t| t.mpe) {
+                Some(cfg) => mpe_expressions(
+                    &notes,
+                    &ids,
+                    &mut ccs,
+                    cfg.bend_range,
+                    self.engine.sample_rate() as f64,
+                    |pos, start| to_musical(pos) - to_musical(start),
+                ),
+                None => Vec::new(),
+            };
             let meter = &self.project.timeline.meter;
             let first = notes
                 .iter()
                 .map(|n| n.start)
                 .chain(ccs.iter().map(|c| c.0))
+                .chain(sysex_rec.iter().map(|x| x.0))
                 .min()
                 .unwrap_or(0);
             let last = notes
                 .iter()
                 .map(|n| n.end)
                 .chain(ccs.iter().map(|c| c.0))
+                .chain(sysex_rec.iter().map(|x| x.0))
                 .max()
                 .unwrap_or(first);
             let start = meter.bar_start(meter.bar_at(to_musical(first)));
             let end = meter.bar_start(meter.bar_at(to_musical(last)) + 1);
+            let sysex_events: Vec<faderframe_project::SysexEvent> = sysex_rec
+                .iter()
+                .map(|(pos, data)| faderframe_project::SysexEvent {
+                    time: (to_musical(*pos) - start).max(faderframe_timeline::MusicalTime::ZERO),
+                    data: data.clone(),
+                })
+                .collect();
             let midi_notes: Vec<MidiNote> = notes
                 .iter()
                 .zip(ids)
@@ -1356,11 +1480,75 @@ impl Session {
                         length: end - start,
                         notes: midi_notes,
                         controllers: lanes,
+                        expressions,
+                        sysex: sysex_events,
                     }),
                 }),
             });
             placed.push(id);
         }
         (commands, placed)
+    }
+}
+
+#[cfg(test)]
+mod mpe_tests {
+    use super::*;
+    use faderframe_project::{ExpressionKind, MidiController};
+    use faderframe_timeline::MusicalTime;
+
+    #[test]
+    fn member_channel_expression_becomes_note_expression() {
+        let rate = 48_000.0;
+        let ms = |m: i64| m * 48;
+        // Two notes on member channels 2 and 3, a sustain pedal and a mod
+        // wheel on the master channel, a stray bend after note 1 ended.
+        let notes = vec![
+            RecNote {
+                start: ms(100),
+                end: ms(600),
+                key: 60,
+                velocity: 90,
+                channel: 1,
+                pass: 0,
+            },
+            RecNote {
+                start: ms(200),
+                end: ms(700),
+                key: 64,
+                velocity: 90,
+                channel: 2,
+                pass: 0,
+            },
+        ];
+        let ids = [faderframe_core::NoteId(10), faderframe_core::NoteId(11)];
+        let pb = |pos, ch, v| (pos, MidiController::PitchBend, ch, v, 0u32);
+        let mut ccs = vec![
+            // Initial values just before note 1.
+            pb(ms(95), 1, 8192),
+            (ms(95), MidiController::ChannelPressure, 1, 0, 0),
+            pb(ms(300), 1, 8192 + 4096), // +24 st of ±48
+            (ms(400), MidiController::ChannelPressure, 1, 127, 0),
+            (ms(250), MidiController::Cc { number: 74 }, 2, 100, 0),
+            pb(ms(800), 1, 0),
+            (ms(150), MidiController::Cc { number: 64 }, 0, 127, 0),
+            (ms(150), MidiController::Cc { number: 1 }, 0, 64, 0),
+        ];
+        let to_time = |pos: i64, start: i64| MusicalTime((pos - start) * 1000);
+        let e = mpe_expressions(&notes, &ids, &mut ccs, 48, rate, to_time);
+        assert_eq!(e.len(), 2);
+        let first = e.iter().find(|x| x.note == ids[0]).unwrap();
+        assert_eq!(first.pitch.first().unwrap().time, MusicalTime::ZERO);
+        assert_eq!(first.pitch.last().unwrap().value, 24.0);
+        assert_eq!(first.pressure.last().unwrap().value, 1.0);
+        let second = e.iter().find(|x| x.note == ids[1]).unwrap();
+        assert!(
+            (second.value_at(ExpressionKind::Timbre, MusicalTime(ms(100) * 1000)) - 100.0 / 127.0)
+                .abs()
+                < 1e-6
+        );
+        // Master-channel controllers stay lanes; member expression is gone.
+        assert_eq!(ccs.len(), 2);
+        assert!(ccs.iter().all(|c| c.2 == 0));
     }
 }

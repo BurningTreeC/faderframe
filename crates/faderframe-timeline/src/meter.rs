@@ -27,6 +27,12 @@ impl TimeSignature {
         })
     }
 
+    /// Parse "7/8" (spaces allowed).
+    pub fn parse(text: &str) -> Option<Self> {
+        let (n, d) = text.split_once('/')?;
+        Self::new(n.trim().parse().ok()?, d.trim().parse().ok()?)
+    }
+
     /// Length of one beat (one denominator note).
     #[inline]
     pub fn beat_length(self) -> MusicalTime {
@@ -133,6 +139,14 @@ impl TimeSignatureMap {
         self.normalise();
     }
 
+    /// Remove the change at `bar` (the one at bar 0 always stays).
+    pub fn remove_change(&mut self, bar: i32) {
+        if bar > 0 {
+            self.changes.retain(|c| c.bar != bar);
+            self.normalise();
+        }
+    }
+
     fn normalise(&mut self) {
         if self.changes.is_empty() {
             self.changes.push(MeterChange {
@@ -233,6 +247,22 @@ mod tests {
 
     fn q(n: i64) -> MusicalTime {
         MusicalTime::from_quarters_i(n)
+    }
+
+    #[test]
+    fn parse_and_remove_changes() {
+        assert_eq!(TimeSignature::parse(" 7 / 8"), TimeSignature::new(7, 8));
+        assert_eq!(TimeSignature::parse("4/3"), None);
+        let mut map = TimeSignatureMap::new(TimeSignature::FOUR_FOUR);
+        map.set_change(MeterChange {
+            bar: 2,
+            signature: TimeSignature::new(3, 4).unwrap(),
+        });
+        assert_eq!(map.bar_start(3), q(11));
+        map.remove_change(2);
+        assert_eq!(map.bar_start(3), q(12));
+        map.remove_change(0);
+        assert_eq!(map.changes().len(), 1);
     }
 
     #[test]

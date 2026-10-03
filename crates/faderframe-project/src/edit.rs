@@ -124,6 +124,11 @@ pub enum Command {
         track: TrackId,
         output: Option<crate::MidiOutputRouting>,
     },
+    /// MPE on (a zone) or off for a track's instrument / MIDI output.
+    SetTrackMpe {
+        track: TrackId,
+        mpe: Option<crate::MpeConfig>,
+    },
     SetTrackPhaseInvert {
         track: TrackId,
         on: bool,
@@ -296,6 +301,11 @@ pub enum Command {
     SetTimeline {
         timeline: Box<Timeline>,
     },
+    /// Set (`Some`) or remove (`None`) the time signature change at `bar`.
+    SetTimeSignature {
+        bar: i32,
+        signature: Option<faderframe_timeline::TimeSignature>,
+    },
     SetLoop {
         range: Option<MusicalRange>,
         enabled: bool,
@@ -456,6 +466,7 @@ impl Command {
             SetTrackRecordArm { .. } => "Toggle Record Arm".into(),
             SetTrackMonitor { .. } => "Change Monitoring".into(),
             SetTrackMidiOutput { .. } => "Change MIDI Output".into(),
+            SetTrackMpe { .. } => "Change MPE".into(),
             SetTrackPhaseInvert { .. } => "Toggle Phase Invert".into(),
             RenameTrack { .. } => "Rename Track".into(),
             SetTrackColor { .. } => "Change Track Colour".into(),
@@ -492,6 +503,7 @@ impl Command {
             UpdateNote { .. } => "Edit Note".into(),
             SetTempo { .. } => "Change Tempo".into(),
             SetTimeline { .. } => "Change Tempo Map".into(),
+            SetTimeSignature { .. } => "Change Time Signature".into(),
             SetLoop { .. } => "Change Loop".into(),
             SetPunch { .. } => "Change Punch Range".into(),
             AddMarker { .. } => "Add Marker".into(),
@@ -560,10 +572,12 @@ impl Command {
             | UpdateNote { .. }
             | SetTempo { .. }
             | SetTimeline { .. }
+            | SetTimeSignature { .. }
             | SetLoop { .. } => Impact::Timeline,
             SetTrackRecordArm { .. }
             | SetTrackMonitor { .. }
             | SetTrackMidiOutput { .. }
+            | SetTrackMpe { .. }
             | SetTrackOutput { .. }
             | SetTrackInput { .. }
             | SetTrackLayout { .. }
@@ -634,6 +648,14 @@ impl Command {
                 let t = track_mut(p, track)?;
                 let old = std::mem::replace(&mut t.midi_output, output);
                 SetTrackMidiOutput { track, output: old }
+            }
+            SetTrackMpe { track, mpe } => {
+                let mpe = mpe.map(|m| crate::MpeConfig {
+                    members: m.members.clamp(1, 15),
+                    bend_range: m.bend_range.clamp(1, 96),
+                });
+                let old = std::mem::replace(&mut track_mut(p, track)?.mpe, mpe);
+                SetTrackMpe { track, mpe: old }
             }
             SetTrackMonitor { track, mode } => {
                 let old = std::mem::replace(&mut track_mut(p, track)?.monitor, mode);
@@ -1103,6 +1125,35 @@ impl Command {
                 p.timeline.tempo.set_initial_bpm(bpm);
                 SetTempo { bpm: old }
             }
+            SetTimeSignature { bar, signature } => {
+                let bar = bar.max(0);
+                let meter = &mut p.timeline.meter;
+                let old = meter
+                    .changes()
+                    .iter()
+                    .find(|c| c.bar == bar)
+                    .map(|c| c.signature);
+                match signature {
+                    Some(signature) => {
+                        let signature = faderframe_timeline::TimeSignature::new(
+                            signature.numerator,
+                            signature.denominator,
+                        )
+                        .ok_or_else(|| EditError::Invalid("invalid time signature".into()))?;
+                        meter.set_change(faderframe_timeline::MeterChange { bar, signature });
+                    }
+                    None if bar == 0 => {
+                        return Err(EditError::Invalid(
+                            "the first time signature cannot be removed".into(),
+                        ));
+                    }
+                    None => meter.remove_change(bar),
+                }
+                SetTimeSignature {
+                    bar,
+                    signature: old,
+                }
+            }
             SetTimeline { timeline } => {
                 let old = std::mem::replace(&mut p.timeline, *timeline);
                 SetTimeline {
@@ -1225,89 +1276,7 @@ fn split_clip(
         return Err(EditError::Invalid(format!("duplicate clip id {new_clip}")));
     }
     let original = p.clip(clip).ok_or(EditError::UnknownClip(clip))?.clone();
-    let end = original.end(&p.timeline, p.sample_rate);
-    if at <= original.start || at >= end {
-        return Err(EditError::Invalid("split point is outside the clip".into()));
-    }
-    let mut left = original.clone();
-    let mut right = original.clone();
-    right.id = new_clip;
-    right.start = at;
-    match (&mut left.content, &mut right.content) {
-        (ClipContent::Audio(l), ClipContent::Audio(r)) => {
-            let sr = p.sample_rate as f64;
-            let offset = p.timeline.to_samples(at, sr) - p.timeline.to_samples(original.start, sr);
-            if offset <= 0 || offset >= l.length {
-                return Err(EditError::Invalid("split point is outside the clip".into()));
-            }
-            r.source_offset = l.source_offset + offset;
-            r.length = l.length - offset;
-            l.length = offset;
-            l.fades = ClipFades {
-                fade_out: 0,
-                ..l.fades
-            };
-            r.fades = ClipFades {
-                fade_in: 0,
-                ..r.fades
-            };
-        }
-        (ClipContent::Takes(l), ClipContent::Takes(r)) => {
-            let sr = p.sample_rate as f64;
-            let offset = p.timeline.to_samples(at, sr) - p.timeline.to_samples(original.start, sr);
-            let (a, b) = l
-                .split(offset)
-                .ok_or_else(|| EditError::Invalid("split point is outside the clip".into()))?;
-            *l = a;
-            *r = b;
-        }
-        (ClipContent::Midi(l), ClipContent::Midi(r)) => {
-            let rel = at - original.start;
-            r.length = l.length - rel;
-            l.length = rel;
-            r.notes = l
-                .notes
-                .iter()
-                .filter(|n| n.start >= rel)
-                .map(|n| MidiNote {
-                    start: n.start - rel,
-                    ..*n
-                })
-                .collect();
-            l.notes.retain(|n| n.start < rel);
-            for n in &mut l.notes {
-                if n.end() > rel {
-                    n.length = rel - n.start;
-                }
-            }
-            // Controller values continue across the cut.
-            for (rl, ll) in r.controllers.iter_mut().zip(l.controllers.iter_mut()) {
-                let carried = ll.value_at(rel);
-                rl.points = ll
-                    .points
-                    .iter()
-                    .filter(|p| p.time >= rel)
-                    .map(|p| crate::ControllerPoint {
-                        time: p.time - rel,
-                        value: p.value,
-                    })
-                    .collect();
-                if let Some(v) = carried
-                    && rl.points.first().is_none_or(|p| p.time > MusicalTime::ZERO)
-                {
-                    rl.points.insert(
-                        0,
-                        crate::ControllerPoint {
-                            time: MusicalTime::ZERO,
-                            value: v,
-                        },
-                    );
-                }
-                ll.points.retain(|p| p.time < rel);
-            }
-        }
-        _ => return Err(EditError::Invalid("inconsistent clip content".into())),
-    }
+    let (left, right) = original.split_at(at, new_clip, &p.timeline, p.sample_rate)?;
     let track = original.track;
     let (left_start, left_content) = (left.start, left.content);
     clip_mut(p, clip)?.content = left_content;
@@ -1324,4 +1293,157 @@ fn split_clip(
             },
         ],
     })
+}
+
+impl Clip {
+    /// The two parts of this clip cut at `at` (the right one gets id
+    /// `right_id`). Audio and takes are cut at the sample, MIDI notes go
+    /// to the part they start in (cut short at the end of the left part),
+    /// controllers carry their value across, expression goes with notes.
+    pub fn split_at(
+        &self,
+        at: MusicalTime,
+        right_id: ClipId,
+        timeline: &faderframe_timeline::Timeline,
+        rate: u32,
+    ) -> Result<(Clip, Clip), EditError> {
+        let original = self;
+        let end = original.end(timeline, rate);
+        if at <= original.start || at >= end {
+            return Err(EditError::Invalid("split point is outside the clip".into()));
+        }
+        let mut left = original.clone();
+        let mut right = original.clone();
+        right.id = right_id;
+        right.start = at;
+        match (&mut left.content, &mut right.content) {
+            (ClipContent::Audio(l), ClipContent::Audio(r)) => {
+                let sr = rate as f64;
+                let offset = timeline.to_samples(at, sr) - timeline.to_samples(original.start, sr);
+                if offset <= 0 || offset >= l.length {
+                    return Err(EditError::Invalid("split point is outside the clip".into()));
+                }
+                match l.warp.take() {
+                    Some(w) => {
+                        let (src, right_warp) = w.after(l.source_offset, l.length, offset);
+                        r.source_offset = src;
+                        r.warp = Some(right_warp);
+                        l.warp = Some(w.before(l.source_offset, l.length, offset));
+                    }
+                    None => r.source_offset = l.source_offset + offset,
+                }
+                r.length = l.length - offset;
+                l.length = offset;
+                l.fades = ClipFades {
+                    fade_out: 0,
+                    ..l.fades
+                };
+                r.fades = ClipFades {
+                    fade_in: 0,
+                    ..r.fades
+                };
+            }
+            (ClipContent::Takes(l), ClipContent::Takes(r)) => {
+                let sr = rate as f64;
+                let offset = timeline.to_samples(at, sr) - timeline.to_samples(original.start, sr);
+                let (a, b) = l
+                    .split(offset)
+                    .ok_or_else(|| EditError::Invalid("split point is outside the clip".into()))?;
+                *l = a;
+                *r = b;
+            }
+            (ClipContent::Midi(l), ClipContent::Midi(r)) => {
+                let rel = at - original.start;
+                r.length = l.length - rel;
+                l.length = rel;
+                r.notes = l
+                    .notes
+                    .iter()
+                    .filter(|n| n.start >= rel)
+                    .map(|n| MidiNote {
+                        start: n.start - rel,
+                        ..*n
+                    })
+                    .collect();
+                l.notes.retain(|n| n.start < rel);
+                for n in &mut l.notes {
+                    if n.end() > rel {
+                        n.length = rel - n.start;
+                    }
+                }
+                // SysEx by time.
+                r.sysex = l
+                    .sysex
+                    .iter()
+                    .filter(|e| e.time >= rel)
+                    .map(|e| crate::SysexEvent {
+                        time: e.time - rel,
+                        data: e.data.clone(),
+                    })
+                    .collect();
+                l.sysex.retain(|e| e.time < rel);
+                // Expression goes with its note.
+                r.expressions = l
+                    .expressions
+                    .iter()
+                    .filter(|e| r.notes.iter().any(|n| n.id == e.note))
+                    .cloned()
+                    .collect();
+                l.prune_expressions();
+                // Controller values continue across the cut.
+                for (rl, ll) in r.controllers.iter_mut().zip(l.controllers.iter_mut()) {
+                    let carried = ll.value_at(rel);
+                    rl.points = ll
+                        .points
+                        .iter()
+                        .filter(|p| p.time >= rel)
+                        .map(|p| crate::ControllerPoint {
+                            time: p.time - rel,
+                            value: p.value,
+                        })
+                        .collect();
+                    if let Some(v) = carried
+                        && rl.points.first().is_none_or(|p| p.time > MusicalTime::ZERO)
+                    {
+                        rl.points.insert(
+                            0,
+                            crate::ControllerPoint {
+                                time: MusicalTime::ZERO,
+                                value: v,
+                            },
+                        );
+                    }
+                    ll.points.retain(|p| p.time < rel);
+                }
+            }
+            _ => return Err(EditError::Invalid("inconsistent clip content".into())),
+        }
+        Ok((left, right))
+    }
+
+    /// The part of this clip between `from` and `to` (a copy with id `id`),
+    /// `None` when they do not overlap.
+    pub fn slice(
+        &self,
+        from: MusicalTime,
+        to: MusicalTime,
+        id: ClipId,
+        timeline: &faderframe_timeline::Timeline,
+        rate: u32,
+    ) -> Option<Clip> {
+        let end = self.end(timeline, rate);
+        if to <= self.start || from >= end || to <= from {
+            return None;
+        }
+        let mut part = self.clone();
+        part.id = id;
+        if from > part.start {
+            part = part.split_at(from, id, timeline, rate).ok()?.1;
+        }
+        if to < end {
+            part = part.split_at(to, id, timeline, rate).ok()?.0;
+        }
+        part.id = id;
+        Some(part)
+    }
 }

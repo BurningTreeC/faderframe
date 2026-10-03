@@ -55,8 +55,10 @@ impl Voice {
     };
 }
 
-/// Pitch-bend range in semitones.
+/// Default pitch-bend range in semitones (RPN 0 changes it per channel).
 const BEND_RANGE: f32 = 2.0;
+/// MPE member channels' default bend range.
+const MPE_BEND_RANGE: f32 = 48.0;
 /// Full mod wheel: vibrato depth in semitones, at this rate.
 const VIBRATO_DEPTH: f32 = 0.5;
 const VIBRATO_HZ: f32 = 5.5;
@@ -67,15 +69,26 @@ struct ChannelState {
     sustain: bool,
     /// Semitones.
     bend: f32,
+    bend_range: f32,
     /// 0..=1.
     modulation: f32,
+    /// Channel pressure 0..=1 (louder).
+    pressure: f32,
+    /// CC 74, 0..=1 (brighter above the middle).
+    timbre: f32,
+    /// Selected RPN (MSB, LSB); 127/127 = none.
+    rpn: (u8, u8),
 }
 
 impl ChannelState {
     const REST: ChannelState = ChannelState {
         sustain: false,
         bend: 0.0,
+        bend_range: BEND_RANGE,
         modulation: 0.0,
+        pressure: 0.0,
+        timbre: 0.5,
+        rpn: (127, 127),
     };
 }
 
@@ -94,7 +107,9 @@ struct Settings {
 }
 
 /// Polyphonic two-oscillator subtractive synth (16 voices) with sustain
-/// pedal, pitch bend (±2 semitones) and mod-wheel vibrato.
+/// pedal, pitch bend (±2 semitones; RPN 0 sets the range per channel),
+/// MPE (member channels at ±48, pressure louder, CC 74 brighter) and
+/// mod-wheel vibrato.
 pub struct SynthProcessor {
     params: ParamValues,
     sample_rate: f32,
@@ -238,8 +253,45 @@ impl SynthProcessor {
                 value,
             } => self.channels[(channel & 15) as usize].modulation = value as f32 / 127.0,
             MidiEvent::PitchBend { channel, value } => {
-                self.channels[(channel & 15) as usize].bend =
-                    (value as f32 - 8192.0) / 8192.0 * BEND_RANGE
+                let c = &mut self.channels[(channel & 15) as usize];
+                c.bend = (value as f32 - 8192.0) / 8192.0 * c.bend_range;
+            }
+            MidiEvent::ChannelPressure { channel, pressure } => {
+                self.channels[(channel & 15) as usize].pressure = pressure as f32 / 127.0;
+            }
+            MidiEvent::ControlChange {
+                channel,
+                controller: 74,
+                value,
+            } => self.channels[(channel & 15) as usize].timbre = value as f32 / 127.0,
+            MidiEvent::ControlChange {
+                channel,
+                controller: 101,
+                value,
+            } => self.channels[(channel & 15) as usize].rpn.0 = value,
+            MidiEvent::ControlChange {
+                channel,
+                controller: 100,
+                value,
+            } => self.channels[(channel & 15) as usize].rpn.1 = value,
+            MidiEvent::ControlChange {
+                channel,
+                controller: 6,
+                value,
+            } => self.data_entry(channel & 15, value),
+            _ => {}
+        }
+    }
+
+    /// RPN data entry: 0 = pitch bend range, 6 = MPE configuration (on the
+    /// master channel: member channels get the MPE default range).
+    fn data_entry(&mut self, channel: u8, value: u8) {
+        match self.channels[channel as usize].rpn {
+            (0, 0) => self.channels[channel as usize].bend_range = value.max(1) as f32,
+            (0, 6) if channel == 0 => {
+                for ch in 1..=(value.min(15) as usize) {
+                    self.channels[ch].bend_range = MPE_BEND_RANGE;
+                }
             }
             _ => {}
         }
@@ -297,8 +349,9 @@ impl SynthProcessor {
                 }
                 // Filter coefficients at control rate (cutoff follows env).
                 if v.control_counter == 0 {
-                    let fc = (s.cutoff * 2f32.powf(s.env_octaves * v.env * v.velocity))
-                        .clamp(20.0, nyquist_guard);
+                    let fc = (s.cutoff
+                        * 2f32.powf(s.env_octaves * v.env * v.velocity + (ch.timbre - 0.5) * 4.0))
+                    .clamp(20.0, nyquist_guard);
                     v.g = (PI * fc / sr).tan();
                     v.k = s.k;
                 }
@@ -306,7 +359,7 @@ impl SynthProcessor {
                 let a1 = 1.0 / (1.0 + v.g * (v.g + v.k));
                 let a2 = v.g * a1;
                 let a3 = v.g * a2;
-                let amp = v.env * v.velocity * s.gain * 0.35;
+                let amp = v.env * v.velocity * s.gain * 0.35 * (1.0 + 0.5 * ch.pressure);
                 let mut side = [0.0f32; 2];
                 for o in 0..2 {
                     // PolyBLEP sawtooth.

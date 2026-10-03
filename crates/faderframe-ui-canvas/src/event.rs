@@ -52,6 +52,8 @@ pub enum Key {
     End,
     PageUp,
     PageDown,
+    /// Function keys F1…F12.
+    F(u8),
     Char(char),
     Other,
 }

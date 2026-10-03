@@ -319,6 +319,10 @@ pub struct Track {
     /// External MIDI device (MIDI tracks): what plays goes out there too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub midi_output: Option<MidiOutputRouting>,
+    /// The instrument (or MIDI output) speaks MPE: notes get member
+    /// channels and play their per-note expression.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mpe: Option<crate::MpeConfig>,
     #[serde(default)]
     pub monitor: MonitorMode,
 
@@ -358,6 +362,7 @@ impl Track {
             solo: false,
             record_arm: false,
             midi_output: None,
+            mpe: None,
             monitor: match kind {
                 TrackKind::Instrument | TrackKind::Midi => MonitorMode::Auto,
                 _ => MonitorMode::Off,

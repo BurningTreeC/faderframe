@@ -13,4 +13,5 @@ workspace = true
 [dependencies]
 faderframe-core.workspace = true
 faderframe-midi.workspace = true
+faderframe-realtime.workspace = true
 thiserror.workspace = true

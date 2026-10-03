@@ -14,14 +14,15 @@
 //! over IPC and exchange audio through shared memory with bounded,
 //! lock-free queues; the engine is unaffected.
 //!
-//! Formats: [`builtin`] is implemented. CLAP (via `clack-host`) is the next
-//! format; VST3 and AU follow. Third-party plugins are untrusted: scanning
-//! and (optionally) processing are meant to run in helper processes.
+//! Formats: [`builtin`] here; CLAP (`faderframe-plugin-clap`) and VST3
+//! (`faderframe-plugin-vst3`) in their own crates. Third-party plugins are
+//! untrusted: scanning runs in helper processes ([`scan`]).
 
 #![forbid(unsafe_code)]
 
 pub mod builtin;
 mod params;
+pub mod scan;
 
 pub use params::ParamValues;
 

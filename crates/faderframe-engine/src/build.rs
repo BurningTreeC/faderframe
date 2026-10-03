@@ -19,7 +19,7 @@ use crate::context::EngineContext;
 use crate::midi::{MidiFilter, MidiInputNode, MidiOutputSink, MidiShared, NO_PORT};
 use crate::nodes::{
     AudioClipPlayer, ChannelStrip, DeviceInputTap, DeviceOutputSink, MidiClipPlayer, MonitorGate,
-    PluginNode, SendNode,
+    PluginNode, SendNode, StretchVoices,
 };
 use crate::plugins::PluginHost;
 use crate::slots::SlotRegistry;
@@ -90,6 +90,43 @@ enum Role {
     Send = 7,
     DeviceOut = 8,
     MidiInput = 9,
+}
+
+/// Stretcher voices a track's clip player needs: one per pitch-preserving
+/// warp preset its clips use, two when such clips overlap.
+pub fn stretch_voices(project: &Project, track: &faderframe_project::Track) -> StretchVoices {
+    use faderframe_project::{ClipContent, WarpAlgorithm};
+    let mut spans: [Vec<(i64, i64)>; 2] = [Vec::new(), Vec::new()];
+    for c in project.clips_of(track.id) {
+        let ClipContent::Audio(a) = &c.content else {
+            continue;
+        };
+        let Some(w) = a.warp.as_ref() else { continue };
+        if c.muted || a.reversed || w.is_identity(a.source_offset, a.length) {
+            continue;
+        }
+        let i = match w.algorithm {
+            WarpAlgorithm::Polyphonic => 0,
+            WarpAlgorithm::Rhythmic => 1,
+            WarpAlgorithm::Varispeed => continue,
+        };
+        let start = c.start.ticks();
+        spans[i].push((start, c.end(&project.timeline, project.sample_rate).ticks()));
+    }
+    let need = |v: &mut Vec<(i64, i64)>| -> usize {
+        if v.is_empty() {
+            return 0;
+        }
+        v.sort();
+        let overlap = v.windows(2).any(|w| w[1].0 < w[0].1);
+        if overlap { 2 } else { 1 }
+    };
+    let [mut poly, mut rhythmic] = spans;
+    StretchVoices {
+        polyphonic: need(&mut poly),
+        rhythmic: need(&mut rhythmic),
+        channels: track.layout.channel_count().max(2),
+    }
 }
 
 /// FNV-1a over the identity of a node.
@@ -311,12 +348,22 @@ pub fn build_graph(
 
         match t.kind {
             TrackKind::Audio => {
+                let voices = stretch_voices(project, t);
                 let player = b.add_node(
                     NodeSpec::new(format!("{} · Clips", t.name))
-                        .key(node_key(t.id, Role::ClipPlayer, 0, &[layout]))
+                        .key(node_key(t.id, Role::ClipPlayer, voices.key(), &[layout]))
                         .group(gi)
                         .audio_out(layout),
-                    Box::new(AudioClipPlayer::new(t.id)),
+                    Box::new(if voices.is_empty() {
+                        AudioClipPlayer::new(t.id)
+                    } else {
+                        AudioClipPlayer::with_voices(
+                            t.id,
+                            voices,
+                            config.sample_rate,
+                            config.max_block_size,
+                        )
+                    }),
                 );
                 own(&mut owners, player, t.id, None, NodeWork::Clips);
                 b.connect_audio(player, 0, input, 0)?;

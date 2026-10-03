@@ -79,6 +79,34 @@ impl MidiClipPlayer {
         }
     }
 
+    /// Announce an MPE zone: the MPE configuration message (RPN 6) on the
+    /// master channel and the pitch bend range (RPN 0) of every member
+    /// channel. Sent whenever playback starts.
+    fn announce_mpe(cfg: faderframe_project::MpeConfig, out: &mut MidiBuffer) {
+        let cc = |channel: u8, controller: u8, value: u8| MidiEvent::ControlChange {
+            channel,
+            controller,
+            value,
+        };
+        let rpn = |out: &mut MidiBuffer, ch: u8, n: u8, value: u8| {
+            for ev in [
+                cc(ch, 101, 0),
+                cc(ch, 100, n),
+                cc(ch, 6, value),
+                cc(ch, 38, 0),
+                cc(ch, 101, 127),
+                cc(ch, 100, 127),
+            ] {
+                let _ = out.push(TimedMidiEvent::new(0, ev));
+            }
+        };
+        let members = cfg.members.clamp(1, 15);
+        rpn(out, 0, 6, members);
+        for ch in 1..=members {
+            rpn(out, ch, 0, cfg.bend_range.min(127));
+        }
+    }
+
     /// Send the controller values in effect at `pos` (realtime-safe).
     fn chase_to(&mut self, cx: &EngineContext, pos: i64, out: &mut MidiBuffer) {
         let Some(lane) = cx.timeline.lane(self.track) else {
@@ -128,6 +156,9 @@ impl Processor<EngineContext> for MidiClipPlayer {
         }
         let pos = t.sample_position;
         if started {
+            if let Some(cfg) = cx.data.timeline.lane(self.track).and_then(|l| l.mpe) {
+                Self::announce_mpe(cfg, out);
+            }
             self.chase_to(cx.data, pos, out);
         }
         let Some(lane) = cx.data.timeline.lane(self.track) else {

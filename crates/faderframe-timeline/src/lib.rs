@@ -16,7 +16,9 @@ mod meter;
 mod tempo;
 mod time;
 
-pub use grid::{GridDivision, GridLineKind, for_each_grid_line, snap_floor, snap_nearest};
+pub use grid::{
+    GridDivision, GridLineKind, GridMenuEntry, for_each_grid_line, snap_floor, snap_nearest,
+};
 pub use meter::{Bbt, MeterChange, TimeSignature, TimeSignatureMap};
 pub use tempo::{TempoCurve, TempoMap, TempoPoint};
 pub use time::{MusicalDuration, MusicalTime, TICKS_PER_QUARTER, format_seconds};
@@ -67,5 +69,32 @@ impl Timeline {
     /// "bar.beat.tick" display string (1-based bars and beats).
     pub fn format_bbt(&self, pos: MusicalTime) -> String {
         self.meter.to_bbt(pos).to_string()
+    }
+
+    /// Parse "bar", "bar.beat" or "bar.beat.tick" (1-based, ticks at 960
+    /// per quarter as displayed; `.`, `:`, `|` or spaces separate).
+    pub fn parse_bbt(&self, text: &str) -> Option<MusicalTime> {
+        let parts: Vec<&str> = text
+            .split(['.', ':', '|', ' '])
+            .filter(|p| !p.is_empty())
+            .collect();
+        if parts.is_empty() || parts.len() > 3 {
+            return None;
+        }
+        let num = |i: usize| -> Option<i64> {
+            parts
+                .get(i)
+                .map_or(Some(if i < 2 { 1 } else { 0 }), |p| p.parse().ok())
+        };
+        let (bar, beat, tick) = (num(0)?, num(1)?, num(2)?);
+        if bar < 1 || beat < 1 || !(0..100_000).contains(&tick) {
+            return None;
+        }
+        let bbt = Bbt {
+            bar: i32::try_from(bar - 1).ok()?,
+            beat: u32::try_from(beat - 1).ok()?,
+            tick: tick * TICKS_PER_QUARTER / 960,
+        };
+        Some(self.meter.from_bbt(bbt))
     }
 }

@@ -9,9 +9,12 @@
 #![forbid(unsafe_code)]
 
 mod automation;
+mod clip_edit;
+pub mod edit_bar;
 mod header;
 
 pub use automation::AUTO_LANE_H;
+pub use clip_edit::ClipZone;
 pub use header::HeaderLayout;
 
 use faderframe_core::gain::{SILENCE_DB, format_db};
@@ -106,12 +109,6 @@ pub enum Hit {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Drag {
-    Clip {
-        clip: ClipId,
-        grab: MusicalTime,
-        origin: Point,
-        moved: bool,
-    },
     Scrub,
     Loop {
         anchor: MusicalTime,
@@ -165,6 +162,8 @@ struct WaveSpan {
     /// Length in project frames.
     length: i64,
     gain: f32,
+    /// Warp anchors (output → source, project frames) of a warped clip.
+    warp: Option<Vec<faderframe_project::WarpMarker>>,
 }
 
 pub struct ArrangerView {
@@ -185,6 +184,14 @@ pub struct ArrangerView {
     /// Row tops (content coordinates) of the lane tracks, plus the end;
     /// rows grow while take lanes are open. Refreshed per paint/event.
     rows: Vec<f32>,
+    /// Clip editing drag (trims, fades, gain, warp, ranges, moves).
+    edit_drag: Option<clip_edit::EditDrag>,
+    /// The clip zone under the pointer (cursor and handle highlight).
+    zone_hover: Option<(ClipId, ClipZone)>,
+    /// Last zoom request handled.
+    zoom_seen: u64,
+    /// View width at the last paint/event.
+    view_w: f32,
 }
 
 fn color_of(c: TrackColor) -> Color {
@@ -214,6 +221,10 @@ impl ArrangerView {
             auto_drag: None,
             header_width,
             rows: Vec::new(),
+            edit_drag: None,
+            zone_hover: None,
+            zoom_seen: 0,
+            view_w: f32::MAX,
         }
     }
 
@@ -553,8 +564,21 @@ impl ArrangerView {
             model,
             color,
             |ch, s0, s1| {
-                let a = (s0 as f64 * pr) as i64;
-                let b = ((s1 as f64 * pr) as i64).max(a + 1);
+                let (a, b) = match &span.warp {
+                    // Through the time map: engine → project → source frames.
+                    Some(pts) => {
+                        let src = |s: i64| {
+                            faderframe_project::Warp::source_at_points(pts, s as f64 / ratio)
+                                - span.source_offset as f64
+                        };
+                        let a = (src(s0) * ratio * pr) as i64;
+                        (a, ((src(s1) * ratio * pr) as i64).max(a + 1))
+                    }
+                    None => {
+                        let a = (s0 as f64 * pr) as i64;
+                        (a, ((s1 as f64 * pr) as i64).max(a + 1))
+                    }
+                };
                 peaks.min_max(ch, src_off + a, src_off + b)
             },
         );
@@ -668,6 +692,7 @@ impl ArrangerView {
                 source_offset: take.source_offset + piece.start,
                 length: piece.end - piece.start,
                 gain: db_to_gain(f.gain_db + take.gain_db),
+                warp: None,
             };
             self.paint_waveform(p, area, vis, &span, model, color);
         }
@@ -728,6 +753,7 @@ impl ArrangerView {
                 source_offset: take.source_offset + take.start,
                 length: take.end - take.start,
                 gain: db_to_gain(f.gain_db + take.gain_db),
+                warp: None,
             };
             self.paint_waveform(
                 p,
@@ -756,6 +782,7 @@ impl ArrangerView {
                     source_offset: take.source_offset + piece.start,
                     length: piece.end - piece.start,
                     gain: wave.gain,
+                    warp: None,
                 };
                 self.paint_waveform(
                     p,
@@ -906,36 +933,19 @@ impl ArrangerView {
                     source_offset: audio.source_offset,
                     length: audio.length,
                     gain: db_to_gain(audio.gain_db),
+                    warp: audio
+                        .warp
+                        .as_ref()
+                        .map(|w| w.points(audio.source_offset, audio.length)),
                 };
                 self.paint_waveform(p, content, vis, &span, model, color);
-                // Fade handles.
-                let sr = model.project().sample_rate as f64;
-                for (frames, at_start) in
-                    [(audio.fades.fade_in, true), (audio.fades.fade_out, false)]
-                {
-                    let w = (frames as f64 / sr * model.project().timeline.tempo.bpm_at(clip.start)
-                        / 60.0) as f32
-                        * self.ppq;
-                    if w > 4.0 {
-                        let mut path = Path::new();
-                        if at_start {
-                            path.move_to(Point::new(rect.x, content.bottom()))
-                                .line_to(Point::new(rect.x + w, content.y))
-                                .line_to(Point::new(rect.x, content.y))
-                                .close();
-                        } else {
-                            path.move_to(Point::new(rect.right(), content.bottom()))
-                                .line_to(Point::new(rect.right() - w, content.y))
-                                .line_to(Point::new(rect.right(), content.y))
-                                .close();
-                        }
-                        p.fill_path(&path, Color::rgba(0.0, 0.0, 0.0, 0.28));
-                    }
-                }
+                self.paint_warp(p, model, clip, rect);
             }
             ClipContent::Midi(_) => self.paint_midi_preview(p, content, vis, clip, color),
             ClipContent::Takes(f) => self.paint_comp(p, content, vis, clip, f, model, color),
         }
+        self.paint_fades(p, model, clip, rect, color);
+        self.paint_gain(p, clip, rect, text_color);
         if clip.muted {
             p.fill(rect, Color::rgba(0.08, 0.08, 0.09, 0.6));
         }
@@ -1560,6 +1570,21 @@ impl ArrangerView {
                 });
             }
         }
+        // MPE: per-note expression on member channels.
+        if matches!(t.kind, TrackKind::Instrument | TrackKind::Midi) {
+            let on = t.mpe.is_some();
+            items.push(
+                MenuItem::new(
+                    "MPE (per-note expression)",
+                    Action::Edit(Command::SetTrackMpe {
+                        track: t.id,
+                        mpe: (!on).then(faderframe_project::MpeConfig::default),
+                    }),
+                )
+                .checked(on)
+                .separated(),
+            );
+        }
         // MIDI learn for the strip controls.
         if t.kind != TrackKind::Midi {
             for (i, (target, name)) in [
@@ -1671,20 +1696,15 @@ impl ArrangerView {
 
     fn grid_menu(model: &Session, at: Point) -> HostRequest<Action> {
         let ed = &model.editor;
-        let mut items: Vec<MenuItem<Action>> = [
-            GridDivision::Bar,
-            GridDivision::Beat,
-            GridDivision::Note(8),
-            GridDivision::Note(16),
-            GridDivision::Note(32),
-            GridDivision::Triplet(8),
-            GridDivision::Triplet(16),
-        ]
-        .into_iter()
-        .map(|g| {
-            MenuItem::new(format!("Grid {}", g.label()), Action::SetGrid(g)).checked(ed.grid == g)
-        })
-        .collect();
+        let mut items: Vec<MenuItem<Action>> = edit_bar::grid_menu(ed.grid)
+            .into_iter()
+            .map(|mut i| {
+                if !matches!(i.label.as_str(), "Triplet" | "Dotted") {
+                    i.label = format!("Grid {}", i.label);
+                }
+                i
+            })
+            .collect();
         items.push(
             MenuItem::new("Snap to Grid", Action::ToggleSnap)
                 .checked(ed.snap)
@@ -1698,6 +1718,14 @@ impl ArrangerView {
     }
 
     fn clip_menu(model: &Session, clip: &Clip, at: Point) -> HostRequest<Action> {
+        // Edits apply to the whole selection when the clip is part of it.
+        let selected = model.selection.clips.contains(&clip.id);
+        let targets: Vec<ClipId> = if selected {
+            model.selection.clips.iter().copied().collect()
+        } else {
+            vec![clip.id]
+        };
+        let many = targets.len() > 1;
         let mut items = vec![];
         if clip.as_takes().is_some() {
             items.push(MenuItem::new(
@@ -1717,24 +1745,30 @@ impl ArrangerView {
             ));
         }
         items.push(MenuItem::new(
-            if clip.muted {
-                "Unmute Clip"
-            } else {
-                "Mute Clip"
+            match (clip.muted, many) {
+                (true, false) => "Unmute Clip",
+                (true, true) => "Unmute Clips",
+                (false, false) => "Mute Clip",
+                (false, true) => "Mute Clips",
             },
-            Action::Edit(Command::SetClipMuted {
-                clip: clip.id,
+            Action::SetClipsMuted {
+                clips: targets.clone(),
                 muted: !clip.muted,
-            }),
+            },
         ));
         items.push(MenuItem::new(
             "Split at Playhead",
             Action::SplitSelectedAtPlayhead,
         ));
+        Self::clip_edit_menu(model, clip, at, &mut items);
         items.push(
             MenuItem::new(
-                "Delete",
-                Action::Edit(Command::RemoveClip { clip: clip.id }),
+                if many { "Delete Clips" } else { "Delete" },
+                if selected {
+                    Action::DeleteSelection
+                } else {
+                    Action::Edit(Command::RemoveClip { clip: clip.id })
+                },
             )
             .separated(),
         );
@@ -1962,39 +1996,7 @@ impl ArrangerView {
                 });
             }
             Hit::Clip { clip, track, at } => {
-                let Some(c) = model.project().clip(clip) else {
-                    return false;
-                };
-                if clicks >= 2 && c.as_midi().is_some() {
-                    cx.emit(Action::OpenClipEditor(clip));
-                    return true;
-                }
-                if clicks >= 2 && c.as_takes().is_some() {
-                    cx.emit(Action::ToggleTakeLanes(clip));
-                    return true;
-                }
-                if mods.toggle() {
-                    cx.emit(Action::SelectClips {
-                        clips: vec![clip],
-                        mode: SelectMode::Toggle,
-                    });
-                } else if !model.selection.clips.contains(&clip) {
-                    cx.emit(Action::SelectClips {
-                        clips: vec![clip],
-                        mode: SelectMode::Replace,
-                    });
-                }
-                cx.emit(Action::SelectTracks {
-                    tracks: vec![track],
-                    mode: SelectMode::Replace,
-                });
-                self.drag = Some(Drag::Clip {
-                    clip,
-                    grab: at - c.start,
-                    origin: pos,
-                    moved: false,
-                });
-                cx.set_cursor(Cursor::Grabbing);
+                return self.press_clip(clip, track, at, pos, clicks, mods, size, model, cx);
             }
             Hit::Lane { track, at } => {
                 let Some(t) = model.project().track(track) else {
@@ -2011,17 +2013,14 @@ impl ArrangerView {
                     });
                     return true;
                 }
-                cx.emit(Action::SelectClips {
-                    clips: vec![],
-                    mode: SelectMode::Replace,
-                });
-                cx.emit(Action::SelectTracks {
-                    tracks: vec![track],
-                    mode: SelectMode::Replace,
-                });
+                return self.press_lane(track, at, pos, mods, model, cx);
+            }
+            Hit::Empty(_) if model.editor.tool == faderframe_session::EditTool::Zoom => {
+                return self.press_zoom(pos, mods, cx);
             }
             Hit::Empty(_) => {
                 cx.emit(Action::ClearSelection);
+                cx.emit(Action::SetEditRange(None));
             }
         }
         true
@@ -2036,6 +2035,9 @@ impl ArrangerView {
         cx: &mut EventCx<'_, Action>,
     ) {
         if self.auto_drag_move(model, pos, mods, size.w, cx) {
+            return;
+        }
+        if self.edit_drag_move(pos, mods, model, cx) {
             return;
         }
         if let Some(comp) = &mut self.comp {
@@ -2081,42 +2083,6 @@ impl ArrangerView {
                     }
                     let range = MusicalRange::new(anchor.min(t), anchor.max(t));
                     cx.emit(Action::Transport(TransportAction::SetLoop(range)));
-                }
-            }
-            Some(Drag::Clip {
-                clip,
-                grab,
-                origin,
-                moved,
-            }) => {
-                if !moved {
-                    if pos.distance(origin) < DRAG_THRESHOLD {
-                        return;
-                    }
-                    cx.emit(Action::BeginGesture("Move Clip".into()));
-                    self.drag = Some(Drag::Clip {
-                        clip,
-                        grab,
-                        origin,
-                        moved: true,
-                    });
-                }
-                let Some(c) = model.project().clip(clip) else {
-                    return;
-                };
-                let start = self.snap(
-                    (self.time_at(pos.x) - grab).max(MusicalTime::ZERO),
-                    model,
-                    mods,
-                );
-                let tracks = Self::lane_tracks(model);
-                let track = self
-                    .row_at(pos.y)
-                    .and_then(|i| tracks.get(i))
-                    .filter(|t| clip_fits(t, c))
-                    .map_or(c.track, |t| t.id);
-                if start != c.start || track != c.track {
-                    cx.emit(Action::Edit(Command::MoveClip { clip, track, start }));
                 }
             }
             Some(Drag::Volume {
@@ -2175,9 +2141,12 @@ impl ArrangerView {
         }
     }
 
-    fn release(&mut self, model: &Session, cx: &mut EventCx<'_, Action>) {
+    fn release(&mut self, model: &Session, size: Size, cx: &mut EventCx<'_, Action>) {
         if self.auto_release(model, cx) {
             cx.set_cursor(Cursor::Default);
+            return;
+        }
+        if self.edit_release(model, size, cx) {
             return;
         }
         if let Some(comp) = self.comp.take() {
@@ -2197,9 +2166,7 @@ impl ArrangerView {
             return;
         }
         match self.drag.take() {
-            Some(Drag::Clip { moved: true, .. })
-            | Some(Drag::Volume { .. })
-            | Some(Drag::Pan { .. }) => {
+            Some(Drag::Volume { .. }) | Some(Drag::Pan { .. }) => {
                 cx.emit(Action::EndGesture);
             }
             Some(Drag::Loop { moved: false, .. }) => {
@@ -2223,6 +2190,8 @@ impl CanvasView<Session, Action> for ArrangerView {
     fn paint(&mut self, p: &mut dyn Painter, size: Size, model: &Session, theme: &Theme) {
         self.update_header_width(model);
         self.update_rows(model);
+        self.view_w = size.w;
+        self.apply_zoom_request(model, size);
         self.follow(model, size);
         self.clamp_scroll(model, size);
         let a = &theme.arranger;
@@ -2327,6 +2296,7 @@ impl CanvasView<Session, Action> for ArrangerView {
                 &TextStyle::new(theme.fonts.normal, theme.ui.text_faint).center(),
             );
         }
+        self.paint_edit_overlay(p, lanes, size, &tracks, model);
         let px = self.x_of(model.playhead());
         if px >= lanes.x {
             p.fill(Rect::new(px - 0.75, lanes.y, 1.5, lanes.h), a.playhead);
@@ -2409,6 +2379,7 @@ impl CanvasView<Session, Action> for ArrangerView {
     ) -> bool {
         self.update_header_width(model);
         self.update_rows(model);
+        self.view_w = size.w;
         match *ev {
             ViewEvent::PointerDown {
                 pos,
@@ -2442,6 +2413,12 @@ impl CanvasView<Session, Action> for ArrangerView {
                     }
                     Some(Hit::Clip { clip, .. }) => {
                         if let Some(c) = model.project().clip(clip) {
+                            if let Some((_, ClipZone::Fade(edge) | ClipZone::Bend(edge))) =
+                                self.zone_at(model, size, pos)
+                            {
+                                cx.request(Self::fade_menu(model, c, edge, pos));
+                                return true;
+                            }
                             if !model.selection.clips.contains(&clip) {
                                 cx.emit(Action::SelectClips {
                                     clips: vec![clip],
@@ -2487,6 +2464,21 @@ impl CanvasView<Session, Action> for ArrangerView {
             }
             ViewEvent::PointerMove { pos, .. } => {
                 let hit = self.hit_test(pos, size, model);
+                let zone = self.zone_at(model, size, pos);
+                if zone != self.zone_hover {
+                    self.zone_hover = zone;
+                    self.hover = hit;
+                    cx.redraw();
+                    if let Some((_, z)) = zone {
+                        cx.set_cursor(Self::zone_cursor(z));
+                        return false;
+                    }
+                    // Leaving a clip: fall through to the plain cursor.
+                    self.hover = None;
+                }
+                if zone.is_some() {
+                    return false;
+                }
                 if hit != self.hover {
                     self.hover = hit;
                     cx.set_cursor(match hit {
@@ -2511,11 +2503,14 @@ impl CanvasView<Session, Action> for ArrangerView {
                 false
             }
             ViewEvent::PointerUp { .. } => {
-                self.release(model, cx);
+                self.release(model, size, cx);
                 true
             }
             ViewEvent::PointerLeave => {
                 self.hover = None;
+                if self.zone_hover.take().is_some() {
+                    cx.redraw();
+                }
                 false
             }
             ViewEvent::Scroll {
@@ -2586,6 +2581,9 @@ impl CanvasView<Session, Action> for ArrangerView {
                 true
             }
             ViewEvent::Key { key, modifiers } => {
+                if let Some(handled) = self.edit_key(key, modifiers, size, model, cx) {
+                    return handled;
+                }
                 let action = match key {
                     Key::Delete | Key::Backspace => Some(Action::DeleteSelection),
                     Key::Char('s') | Key::Char('S') if !modifiers.ctrl => {

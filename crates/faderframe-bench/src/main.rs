@@ -6,6 +6,11 @@
 //! timing percentiles against the deadline. Averages hide xruns; the
 //! interesting numbers are p99, max and deadline misses.
 //!
+//! The graph runs on `--threads` threads (the audio thread plus a worker
+//! pool, as in the application); `--fx N` adds N echo inserts per track and
+//! `--plugin clap:<id>` / `--plugin vst3:<id>` an installed plugin (from the
+//! application's scan caches) to every track, to measure plugin load.
+//!
 //! Example: `cargo run -p faderframe-bench --release -- --tracks 128 --block 64 --rate 96000`
 
 #![forbid(unsafe_code)]
@@ -16,8 +21,9 @@ use faderframe_core::{ChannelLayout, TrackId, builtin};
 use faderframe_engine::offline::OfflineRenderer;
 use faderframe_engine::{EngineConfig, render_generated_sources};
 use faderframe_project::{
-    AudioClip, AudioSource, AuxSend, Clip, ClipContent, ClipFades, OutputRouting, PluginRef,
-    PluginSlot, Project, SendTap, SourceSpec, StretchSettings, Track, TrackColor, TrackKind,
+    AudioClip, AudioSource, AuxSend, Clip, ClipContent, ClipFades, OutputRouting, PluginFormat,
+    PluginRef, PluginSlot, Project, SendTap, SourceSpec, StretchSettings, Track, TrackColor,
+    TrackKind,
 };
 use faderframe_timeline::MusicalTime;
 use std::time::Instant;
@@ -32,6 +38,15 @@ struct Args {
     sends: bool,
     /// Per-node timing on, as in the live engine (performance meter).
     measure: bool,
+    /// Processing threads including the audio thread.
+    threads: usize,
+    /// Echo inserts per track.
+    fx: usize,
+    /// A third-party plugin on every track.
+    plugin: Option<PluginRef>,
+    /// Wait for each callback's deadline like a sound card (idle time
+    /// between callbacks: workers sleep and must be woken).
+    paced: bool,
 }
 
 fn parse() -> Result<Args, String> {
@@ -44,6 +59,10 @@ fn parse() -> Result<Args, String> {
         inserts: true,
         sends: true,
         measure: false,
+        threads: 1 + faderframe_realtime::default_worker_count(),
+        fx: 0,
+        plugin: None,
+        paced: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -59,9 +78,34 @@ fn parse() -> Result<Args, String> {
             "--no-inserts" => a.inserts = false,
             "--no-sends" => a.sends = false,
             "--measure-nodes" => a.measure = true,
+            "--threads" => {
+                a.threads = num("--threads")?
+                    .parse()
+                    .ok()
+                    .filter(|&t| t >= 1)
+                    .ok_or("bad --threads")?
+            }
+            "--fx" => a.fx = num("--fx")?.parse().map_err(|_| "bad --fx")?,
+            "--paced" => a.paced = true,
+            "--plugin" => {
+                let v = num("--plugin")?;
+                let (format, id) = v
+                    .split_once(':')
+                    .ok_or("--plugin needs clap:<id> or vst3:<id>")?;
+                let format = match format {
+                    "clap" => PluginFormat::Clap,
+                    "vst3" => PluginFormat::Vst3,
+                    _ => return Err("--plugin needs clap:<id> or vst3:<id>".into()),
+                };
+                a.plugin = Some(PluginRef {
+                    format,
+                    id: id.into(),
+                    name: id.into(),
+                });
+            }
             "-h" | "--help" => {
                 println!(
-                    "faderframe-bench [--tracks N] [--block FRAMES] [--rate HZ] [--seconds S] [--buses N] [--no-inserts] [--no-sends] [--measure-nodes]"
+                    "faderframe-bench [--tracks N] [--block FRAMES] [--rate HZ] [--seconds S] [--buses N] [--no-inserts] [--no-sends] [--measure-nodes] [--threads N] [--fx N] [--plugin clap:<id>|vst3:<id>] [--paced]"
                 );
                 std::process::exit(0);
             }
@@ -155,6 +199,24 @@ fn build(args: &Args) -> Project {
                 state: None,
             });
         }
+        for _ in 0..args.fx {
+            t.inserts.push(PluginSlot {
+                id: p.ids.allocate(),
+                plugin: PluginRef::builtin(builtin::ECHO, "Echo"),
+                bypass: false,
+                parameters: vec![],
+                state: None,
+            });
+        }
+        if let Some(plugin) = &args.plugin {
+            t.inserts.push(PluginSlot {
+                id: p.ids.allocate(),
+                plugin: plugin.clone(),
+                bypass: false,
+                parameters: vec![],
+                state: None,
+            });
+        }
         let clip = Clip {
             id: p.ids.allocate(),
             track: id,
@@ -170,6 +232,7 @@ fn build(args: &Args) -> Project {
                 fades: ClipFades::default(),
                 stretch: StretchSettings::Off,
                 reversed: false,
+                warp: None,
             }),
         };
         t.clips.push(clip.id);
@@ -188,6 +251,25 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // Third-party plugins: the application's scan results.
+    faderframe_plugin_host::set_default_registry(|| {
+        let mut r = faderframe_plugin_host::PluginRegistry::with_builtins();
+        r.add_factory(Box::new(faderframe_plugin_clap::ClapFactory::new()));
+        r.add_factory(Box::new(faderframe_plugin_vst3::Vst3Factory::new()));
+        r
+    });
+    if let Some(cache) =
+        std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache/faderframe"))
+    {
+        let load = |f: &str| {
+            faderframe_plugin_host::scan::ScanCache::load(&cache.join(f))
+                .plugins()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        faderframe_plugin_clap::set_catalog(load("clap-scan.json"));
+        faderframe_plugin_vst3::set_catalog(load("vst3-scan.json"));
+    }
     let project = build(&args);
     let sources = render_generated_sources(&project, args.rate);
     let config = EngineConfig {
@@ -203,6 +285,17 @@ fn main() {
             std::process::exit(1);
         }
     };
+    if args.threads > 1 {
+        r.processor.set_worker_pool(Some(std::sync::Arc::new(
+            faderframe_realtime::WorkerPool::new(faderframe_realtime::PoolConfig::new(
+                args.threads - 1,
+            )),
+        )));
+    }
+    let failed = r.controller.failed_plugins();
+    if !failed.is_empty() {
+        eprintln!("faderframe-bench: plugins failed to load: {failed:?}");
+    }
     let stats = r.controller.graph_stats().clone();
     let _ = r.play_from(0);
     let mut bufs = OwnedBuffers::new(2, 2, args.block);
@@ -215,7 +308,20 @@ fn main() {
     r.controller.reset_metrics();
     let mut times = Vec::with_capacity(callbacks);
     let wall = Instant::now();
-    for _ in 0..callbacks {
+    let period = std::time::Duration::from_nanos(budget_ns as u64);
+    for i in 0..callbacks {
+        if args.paced {
+            // The next "interrupt" of the virtual sound card.
+            let due = wall + period * i as u32;
+            while Instant::now() < due {
+                let left = due - Instant::now();
+                if left > std::time::Duration::from_micros(200) {
+                    std::thread::sleep(left - std::time::Duration::from_micros(100));
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+        }
         let t = Instant::now();
         r.processor.process_device(&mut bufs);
         times.push(t.elapsed().as_nanos() as u64);
@@ -229,17 +335,31 @@ fn main() {
     let mean = times.iter().sum::<u64>() as f64 / times.len().max(1) as f64 / 1000.0;
     println!("FaderFrame engine benchmark");
     println!(
-        "  config      : {} tracks, {} buses, inserts {}, sends {}, {} Hz, block {} frames",
+        "  config      : {} tracks, {} buses, inserts {}, sends {}, {} echo/track{}, {} Hz, block {} frames",
         args.tracks,
         args.buses,
         if args.inserts { "on" } else { "off" },
         if args.sends { "on" } else { "off" },
+        args.fx,
+        args.plugin.as_ref().map_or(String::new(), |p| format!(
+            ", plugin {:?} {}",
+            p.format, p.id
+        )),
         args.rate,
         args.block
     );
     println!(
-        "  graph       : {} nodes, {} edges, critical path {} nodes, max parallel width {}",
-        stats.nodes, stats.edges, stats.levels, stats.max_width
+        "  graph       : {} nodes in {} jobs, {} edges, critical path {} nodes, parallel width {} jobs",
+        stats.nodes, stats.jobs, stats.edges, stats.levels, stats.job_width
+    );
+    println!(
+        "  threads     : {} (audio thread{})",
+        args.threads,
+        if args.threads > 1 {
+            format!(" + {} workers", args.threads - 1)
+        } else {
+            String::new()
+        }
     );
     println!(
         "  callbacks   : {} ({:.1} s audio in {:.2} s wall, {:.1}× realtime)",
@@ -263,7 +383,7 @@ fn main() {
         mean * 1000.0 / budget_ns * 100.0,
         pct(0.99) * 1000.0 / budget_ns * 100.0
     );
-    println!("  misses      : {misses} callbacks over the deadline (single-threaded engine)");
+    println!("  misses      : {misses} callbacks over the deadline");
     let m = r.controller.metrics();
     println!(
         "  engine view : {} callbacks, histogram p99 ≤ {:.1} µs, {} deadline misses",

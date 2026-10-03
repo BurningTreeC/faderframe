@@ -83,6 +83,18 @@ impl Rect {
         self.x < o.right() && o.x < self.right() && self.y < o.bottom() && o.y < self.bottom()
     }
 
+    /// The smallest rectangle containing both.
+    pub fn union(&self, o: &Rect) -> Rect {
+        let x = self.x.min(o.x);
+        let y = self.y.min(o.y);
+        Rect::new(
+            x,
+            y,
+            self.right().max(o.right()) - x,
+            self.bottom().max(o.bottom()) - y,
+        )
+    }
+
     pub fn intersection(&self, o: &Rect) -> Rect {
         let x = self.x.max(o.x);
         let y = self.y.max(o.y);

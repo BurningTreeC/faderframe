@@ -19,6 +19,7 @@
 mod color;
 pub mod controls;
 mod event;
+pub mod flow;
 mod geometry;
 mod paint;
 mod painter;
@@ -28,6 +29,7 @@ mod view;
 
 pub use color::Color;
 pub use event::{Cursor, Key, Modifiers, PointerButton, ViewEvent};
+pub use flow::{Flow, FlowMetrics};
 pub use geometry::{Point, Rect, Size};
 pub use paint::{Paint, Path, PathCmd};
 pub use painter::{DrawOp, Painter, RecordingPainter};

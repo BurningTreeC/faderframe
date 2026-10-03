@@ -9,7 +9,10 @@
 //!
 //! Every message also goes to the control thread through a second bounded
 //! channel ([`MidiControlFeed`]) — for MIDI learn, controller mappings and
-//! activity display, which must work while no audio stream runs.
+//! activity display, which must work while no audio stream runs. System
+//! messages (clock, start/continue/stop, song position, MTC, SysEx) only
+//! go there, as [`MidiSystemEvent`]s: synchronisation and SysEx recording
+//! happen on the control side with the messages' timestamps.
 
 use crate::MidiEvent;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -85,16 +88,68 @@ pub struct MidiInputQueue {
     pub clock: MidiClock,
 }
 
+/// A system message (not for instruments: clock, transport, timecode,
+/// SysEx).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SystemMessage {
+    /// Timing clock, 24 per quarter note.
+    Clock,
+    Start,
+    Continue,
+    Stop,
+    /// Song position in sixteenth notes (6 clocks each).
+    SongPosition(u16),
+    /// MTC quarter frame (the data byte: piece type and value).
+    QuarterFrame(u8),
+    /// A complete SysEx message, `F0 … F7` included.
+    SysEx(Vec<u8>),
+}
+
+impl SystemMessage {
+    pub fn parse(msg: &[u8]) -> Option<Self> {
+        Some(match *msg.first()? {
+            0xF8 => Self::Clock,
+            0xFA => Self::Start,
+            0xFB => Self::Continue,
+            0xFC => Self::Stop,
+            0xF2 if msg.len() >= 3 => {
+                Self::SongPosition((msg[1] & 0x7F) as u16 | ((msg[2] & 0x7F) as u16) << 7)
+            }
+            0xF1 if msg.len() >= 2 => Self::QuarterFrame(msg[1] & 0x7F),
+            0xF0 if msg.len() >= 2 => Self::SysEx(msg.to_vec()),
+            _ => return None,
+        })
+    }
+}
+
+/// A system message as received from a port.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MidiSystemEvent {
+    pub port: u16,
+    pub time_ns: u64,
+    pub message: SystemMessage,
+}
+
 /// The control thread's copy of every input message.
 pub struct MidiControlFeed {
     rx: Receiver<MidiInputEvent>,
+    system: Receiver<MidiSystemEvent>,
 }
 
 impl MidiControlFeed {
-    /// Every message received since the last call (never blocks).
+    /// Every channel message received since the last call (never blocks).
     pub fn drain(&self) -> Vec<MidiInputEvent> {
         let mut out = Vec::new();
         while let Ok(ev) = self.rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    /// Every system message received since the last call (never blocks).
+    pub fn drain_system(&self) -> Vec<MidiSystemEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = self.system.try_recv() {
             out.push(ev);
         }
         out
@@ -106,6 +161,7 @@ impl MidiControlFeed {
 pub struct MidiInputSender {
     tx: Arc<Mutex<rtrb::Producer<MidiInputEvent>>>,
     control: SyncSender<MidiInputEvent>,
+    system: SyncSender<MidiSystemEvent>,
     clock: MidiClock,
     capacity: usize,
     dropped: Arc<AtomicU64>,
@@ -114,8 +170,20 @@ pub struct MidiInputSender {
 impl MidiInputSender {
     /// Stamp `msg` now and queue it; `false` if it was not a channel
     /// message or the queue was full (counted in [`Self::dropped`]).
+    /// System messages go to the control feed only.
     pub fn send(&self, port: u16, msg: &[u8]) -> bool {
-        let Some(ev) = MidiInputEvent::new(port, self.clock.now_ns(), msg) else {
+        let now = self.clock.now_ns();
+        if let Some(message) = SystemMessage::parse(msg) {
+            return self
+                .system
+                .try_send(MidiSystemEvent {
+                    port,
+                    time_ns: now,
+                    message,
+                })
+                .is_ok();
+        }
+        let Some(ev) = MidiInputEvent::new(port, now, msg) else {
             return false;
         };
         // The control copy may be lost when nobody reads it; that is fine.
@@ -159,11 +227,14 @@ impl MidiInputSender {
 pub fn midi_input_queue(capacity: usize) -> (MidiInputSender, MidiInputQueue, MidiControlFeed) {
     let (tx, rx) = rtrb::RingBuffer::new(capacity);
     let (ctx, crx) = sync_channel(capacity.max(1));
+    // Clock alone is ~100 messages a second; SysEx dumps come in bursts.
+    let (stx, srx) = sync_channel(4096);
     let clock = MidiClock::new();
     (
         MidiInputSender {
             tx: Arc::new(Mutex::new(tx)),
             control: ctx,
+            system: stx,
             clock,
             capacity,
             dropped: Arc::new(AtomicU64::new(0)),
@@ -172,7 +243,10 @@ pub fn midi_input_queue(capacity: usize) -> (MidiInputSender, MidiInputQueue, Mi
             consumer: rx,
             clock,
         },
-        MidiControlFeed { rx: crx },
+        MidiControlFeed {
+            rx: crx,
+            system: srx,
+        },
     )
 }
 
@@ -184,9 +258,20 @@ mod tests {
     fn channel_messages_pass_others_do_not() {
         let (tx, mut rx, feed) = midi_input_queue(4);
         assert!(tx.send(3, &[0x90, 60, 100]));
-        assert!(!tx.send(0, &[0xF8]), "clock");
-        assert!(!tx.send(0, &[0xF0, 1, 2, 3, 0xF7]), "SysEx");
+        // System messages only reach the control side.
+        assert!(tx.send(0, &[0xF8]), "clock");
+        assert!(tx.send(0, &[0xF0, 1, 2, 3, 0xF7]), "SysEx");
         assert!(!tx.send(0, &[]));
+        assert!(!tx.send(0, &[0xFE]), "active sensing is dropped");
+        let system: Vec<SystemMessage> =
+            feed.drain_system().into_iter().map(|e| e.message).collect();
+        assert_eq!(
+            system,
+            vec![
+                SystemMessage::Clock,
+                SystemMessage::SysEx(vec![0xF0, 1, 2, 3, 0xF7])
+            ]
+        );
         let ev = rx.consumer.pop().unwrap();
         assert_eq!(ev.port, 3);
         assert_eq!(

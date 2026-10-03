@@ -78,10 +78,18 @@ pub struct PerformanceReport {
     pub buffer_size: u32,
     /// Whole callbacks.
     pub total: Load,
-    /// The graph's share: every track's nodes.
+    /// Processing time of every track's nodes, summed over all threads (with
+    /// several threads it can exceed `total`).
     pub graph: Load,
     /// Outside the graph: device I/O, recording, metronome, scheduling.
     pub engine: f64,
+    /// Threads processing the graph (the audio thread plus workers).
+    pub threads: usize,
+    /// Graph CPU time ÷ graph wall time: how many threads were busy at once
+    /// on average (1 when serial).
+    pub parallelism: f64,
+    /// Jobs the graph is split into for the threads.
+    pub graph_jobs: usize,
     /// Total load per poll, oldest first.
     pub history: Vec<Load>,
     pub tracks: Vec<TrackPerformance>,
@@ -123,6 +131,8 @@ pub(crate) struct PerformanceMonitor {
     callback_ns: u64,
     budget_ns: u64,
     baseline: Option<Baseline>,
+    graph_wall_ns: u64,
+    graph_wall: f64,
     total: Load,
     graph: Load,
     tracks: HashMap<TrackId, (Load, Load)>,
@@ -151,6 +161,10 @@ impl PerformanceMonitor {
             }
         };
         self.total.update(share(d_callback), peak);
+        let wall = engine.graph_wall_ns();
+        let d_wall = wall.saturating_sub(self.graph_wall_ns);
+        self.graph_wall_ns = wall;
+        self.graph_wall = self.graph_wall * (1.0 - SMOOTHING) + share(d_wall) * SMOOTHING;
 
         // Graph nodes: deltas against the last poll of the same graph.
         let profile = engine.graph_profile();
@@ -264,7 +278,14 @@ impl PerformanceMonitor {
             buffer_size: engine.stream_buffer_size(),
             total: self.total,
             graph: self.graph,
-            engine: (self.total.average - self.graph.average).max(0.0),
+            engine: (self.total.average - self.graph_wall).max(0.0),
+            threads: 1,
+            parallelism: if self.graph_wall > 1e-6 {
+                (self.graph.average / self.graph_wall).max(1.0)
+            } else {
+                1.0
+            },
+            graph_jobs: stats.jobs,
             history: self.history.iter().copied().collect(),
             tracks,
             p99_load: m.p99_ns as f64 / budget,
@@ -320,6 +341,7 @@ impl Session {
         self.perf.measure(&mut self.engine, &self.project, running);
         self.perf.last_poll = Some(Instant::now());
         self.perf.report.late_disk_reads = late;
+        self.perf.report.threads = self.processing_threads();
     }
 
     pub(crate) fn tick_performance(&mut self) {

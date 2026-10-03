@@ -1,24 +1,77 @@
-//! The LCD-style position/tempo display in the header bar.
+//! The LCD-style position/tempo display in the header bar: position, tempo
+//! (double-click to type, the TAP pad to tap it in), time signature (click
+//! to type, right-click for common meters and meter changes), loop and
+//! record flags.
 
 use faderframe_project::Command;
-use faderframe_session::{Action, Session};
-use faderframe_timeline::format_seconds;
+use faderframe_session::{Action, Session, TransportAction};
+use faderframe_timeline::{TimeSignature, format_seconds};
 use faderframe_ui_canvas::{
-    Align, CanvasView, Color, EventCx, FontFamily, HostRequest, Paint, Painter, Point,
+    Align, CanvasView, Color, EventCx, FontFamily, HostRequest, MenuItem, Paint, Painter, Point,
     PointerButton, Rect, Size, TextStyle, Theme, ViewEvent,
 };
-
-pub struct TransportDisplay;
+use std::time::{Duration, Instant};
 
 const LCD_BG: Color = Color::hex(0x0d100e);
 const LCD_TEXT: Color = Color::hex(0xf0c46a);
 const LCD_DIM: Color = Color::hex(0x6f5a33);
 
+/// Taps further apart than this start a new measurement.
+const TAP_RESET: Duration = Duration::from_millis(2500);
+/// Taps averaged.
+const TAP_WINDOW: usize = 8;
+const TAP_FLASH: Duration = Duration::from_millis(120);
+
+/// Tempo from tap times (at least two, oldest first): the mean interval of
+/// the last few taps.
+pub fn tap_tempo(taps: &[Instant]) -> Option<f64> {
+    let taps = &taps[taps.len().saturating_sub(TAP_WINDOW)..];
+    if taps.len() < 2 {
+        return None;
+    }
+    let span = taps[taps.len() - 1].duration_since(taps[0]).as_secs_f64();
+    let interval = span / (taps.len() - 1) as f64;
+    (interval > 0.0).then(|| ((60.0 / interval).clamp(20.0, 400.0) * 100.0).round() / 100.0)
+}
+
+#[derive(Default)]
+pub struct TransportDisplay {
+    taps: Vec<Instant>,
+}
+
+impl TransportDisplay {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn tap(&mut self, now: Instant) -> Option<f64> {
+        if self
+            .taps
+            .last()
+            .is_some_and(|t| now.duration_since(*t) > TAP_RESET)
+        {
+            self.taps.clear();
+        }
+        self.taps.push(now);
+        if self.taps.len() > TAP_WINDOW {
+            self.taps.remove(0);
+        }
+        tap_tempo(&self.taps)
+    }
+
+    fn flashing(&self) -> bool {
+        self.taps.last().is_some_and(|t| t.elapsed() < TAP_FLASH)
+    }
+}
+
 struct Zones {
     bbt: Rect,
     time: Rect,
     tempo: Rect,
+    bpm: Rect,
+    tap: Rect,
     meter: Rect,
+    meter_label: Rect,
     flags: Rect,
 }
 
@@ -26,15 +79,92 @@ fn zones(size: Size) -> Zones {
     let r = Rect::from_size(size).inset_xy(10.0, 3.0);
     let (left, rest) = r.split_left(124.0);
     let (bbt, time) = left.split_top(left.h * 0.62);
-    let (tempo_col, flags) = rest.split_left((rest.w - 70.0).max(60.0));
-    let (tempo, meter) = tempo_col.split_top(tempo_col.h * 0.62);
+    let (tempo_col, rest) = rest.split_left(70.0);
+    let (tempo, bpm) = tempo_col.split_top(tempo_col.h * 0.62);
+    let (tap, rest) = rest.split_left(40.0);
+    let tap = tap.inset_xy(5.0, 2.0);
+    let (meter_col, flags) = rest.split_left((rest.w - 42.0).max(44.0));
+    let (meter, meter_label) = meter_col.split_top(meter_col.h * 0.62);
     Zones {
         bbt,
         time,
         tempo,
+        bpm,
+        tap,
         meter,
+        meter_label,
         flags,
     }
+}
+
+/// The meter change in effect at the playhead (its bar).
+fn current_change_bar(s: &Session) -> i32 {
+    let meter = &s.project().timeline.meter;
+    let bar = meter.bar_at(s.playhead());
+    meter
+        .changes()
+        .iter()
+        .rev()
+        .find(|c| c.bar <= bar)
+        .map_or(0, |c| c.bar)
+}
+
+fn set_meter(bar: i32, signature: TimeSignature) -> Action {
+    Action::Edit(Command::SetTimeSignature {
+        bar,
+        signature: Some(signature),
+    })
+}
+
+const COMMON_METERS: [(u8, u8); 8] = [
+    (2, 4),
+    (3, 4),
+    (4, 4),
+    (5, 4),
+    (6, 8),
+    (7, 8),
+    (9, 8),
+    (12, 8),
+];
+
+fn heading(label: String) -> MenuItem<Action> {
+    MenuItem::disabled(label).separated()
+}
+
+fn meter_menu(s: &Session, at: Point) -> HostRequest<Action> {
+    let meter = &s.project().timeline.meter;
+    let change_bar = current_change_bar(s);
+    let here = meter.bar_at(s.playhead()).max(0);
+    let current = meter.signature_of_bar(change_bar);
+    let mut items = vec![heading(format!("Meter from Bar {}", change_bar + 1))];
+    let section = |items: &mut Vec<MenuItem<Action>>, bar: i32, checked: Option<TimeSignature>| {
+        for sig in COMMON_METERS
+            .into_iter()
+            .filter_map(|(n, d)| TimeSignature::new(n, d))
+        {
+            items.push(
+                MenuItem::new(sig.to_string(), set_meter(bar, sig)).checked(Some(sig) == checked),
+            );
+        }
+    };
+    section(&mut items, change_bar, Some(current));
+    if here > change_bar {
+        items.push(heading(format!("New Meter at Bar {}", here + 1)));
+        section(&mut items, here, None);
+    }
+    if change_bar > 0 {
+        items.push(
+            MenuItem::new(
+                format!("Remove Meter Change at Bar {}", change_bar + 1),
+                Action::Edit(Command::SetTimeSignature {
+                    bar: change_bar,
+                    signature: None,
+                }),
+            )
+            .separated(),
+        );
+    }
+    HostRequest::ContextMenu { at, items }
 }
 
 impl CanvasView<Session, Action> for TransportDisplay {
@@ -47,6 +177,7 @@ impl CanvasView<Session, Action> for TransportDisplay {
         let project = s.project();
         let pos = s.playhead();
         let mono = |size: f32, c: Color| TextStyle::new(size, c).family(FontFamily::Mono);
+        let small = |c: Color| TextStyle::new(theme.fonts.tiny + 0.5, c).bold();
         p.text(
             &project.timeline.format_bbt(pos),
             z.bbt,
@@ -64,20 +195,50 @@ impl CanvasView<Session, Action> for TransportDisplay {
             z.tempo,
             &mono(theme.fonts.large, LCD_TEXT).align(Align::End),
         );
+        p.text(
+            "BPM",
+            z.bpm,
+            &small(LCD_TEXT.with_alpha(0.7)).align(Align::End),
+        );
+        // The tap pad.
+        let lit = self.flashing();
+        p.fill_rounded(
+            z.tap,
+            3.0,
+            &Paint::Solid(if lit {
+                LCD_TEXT.with_alpha(0.85)
+            } else {
+                LCD_TEXT.with_alpha(0.08)
+            }),
+        );
+        p.stroke_rounded(z.tap, 3.0, 1.0, LCD_TEXT.with_alpha(0.35));
+        p.text(
+            "TAP",
+            z.tap,
+            &small(if lit {
+                LCD_BG
+            } else {
+                LCD_TEXT.with_alpha(0.8)
+            })
+            .center(),
+        );
         let sig = project.timeline.meter.signature_at(pos);
         p.text(
-            &format!("BPM · {sig}"),
+            &sig.to_string(),
             z.meter,
-            &mono(theme.fonts.tiny + 0.5, LCD_TEXT.with_alpha(0.7)).align(Align::End),
+            &mono(theme.fonts.large, LCD_TEXT).align(Align::Center),
+        );
+        p.text(
+            "METER",
+            z.meter_label,
+            &small(LCD_TEXT.with_alpha(0.7)).center(),
         );
         let t = s.transport();
         let flag = |p: &mut dyn Painter, rect: Rect, label: &str, on: bool, color: Color| {
             p.text(
                 label,
                 rect,
-                &TextStyle::new(theme.fonts.tiny + 0.5, if on { color } else { LCD_DIM })
-                    .bold()
-                    .center(),
+                &small(if on { color } else { LCD_DIM }).center(),
             );
         };
         let (f1, f2) = z.flags.split_top(z.flags.h / 2.0);
@@ -92,59 +253,118 @@ impl CanvasView<Session, Action> for TransportDisplay {
         s: &Session,
         cx: &mut EventCx<'_, Action>,
     ) -> bool {
-        if let ViewEvent::PointerDown {
+        let ViewEvent::PointerDown {
             pos,
-            button: PointerButton::Primary,
+            button,
             clicks,
             ..
         } = *ev
-        {
-            let z = zones(size);
-            if z.tempo.contains(pos) && clicks >= 2 {
-                let bpm = s.project().timeline.tempo.points()[0].bpm;
-                cx.request(HostRequest::TextInput {
-                    at: z.tempo,
-                    initial: format!("{bpm:.2}"),
-                    commit: Box::new(|t| {
-                        t.trim()
-                            .trim_end_matches("BPM")
-                            .trim()
-                            .parse::<f64>()
-                            .ok()
-                            .filter(|v| v.is_finite())
-                            .map(|bpm| Action::Edit(Command::SetTempo { bpm }))
-                    }),
-                });
-                return true;
+        else {
+            return false;
+        };
+        let z = zones(size);
+        if z.tap.inset_xy(-4.0, -2.0).contains(pos) && button == PointerButton::Primary {
+            // Every press is a tap, however fast (multi-click counts too).
+            if let Some(bpm) = self.tap(Instant::now()) {
+                cx.emit(Action::Edit(Command::SetTempo { bpm }));
             }
-            if z.flags.contains(pos) {
-                cx.emit(Action::Transport(if pos.y < z.flags.center().y {
-                    faderframe_session::TransportAction::ToggleLoop
-                } else {
-                    faderframe_session::TransportAction::ToggleRecord
-                }));
-                return true;
+            cx.redraw();
+            return true;
+        }
+        let meter_zone = z.meter.union(&z.meter_label);
+        if meter_zone.contains(pos) {
+            match button {
+                PointerButton::Primary => {
+                    let bar = current_change_bar(s);
+                    let sig = s.project().timeline.meter.signature_of_bar(bar);
+                    cx.request(HostRequest::TextInput {
+                        at: meter_zone,
+                        initial: sig.to_string(),
+                        commit: Box::new(move |t| {
+                            TimeSignature::parse(t).map(|sig| set_meter(bar, sig))
+                        }),
+                    });
+                }
+                PointerButton::Secondary => cx.request(meter_menu(s, pos)),
+                _ => {}
             }
+            return true;
+        }
+        if button != PointerButton::Primary {
+            return false;
+        }
+        if z.tempo.union(&z.bpm).contains(pos) && clicks >= 2 {
+            let bpm = s.project().timeline.tempo.points()[0].bpm;
+            cx.request(HostRequest::TextInput {
+                at: z.tempo,
+                initial: format!("{bpm:.2}"),
+                commit: Box::new(|t| {
+                    t.trim()
+                        .trim_end_matches("BPM")
+                        .trim()
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|v| v.is_finite())
+                        .map(|bpm| Action::Edit(Command::SetTempo { bpm }))
+                }),
+            });
+            return true;
+        }
+        if z.flags.contains(pos) {
+            cx.emit(Action::Transport(if pos.y < z.flags.center().y {
+                TransportAction::ToggleLoop
+            } else {
+                TransportAction::ToggleRecord
+            }));
+            return true;
         }
         false
     }
 
     fn wants_frames(&self, s: &Session) -> bool {
-        s.transport().playing
+        s.transport().playing || self.flashing()
     }
 
     fn tooltip(&self, pos: Point, size: Size, _s: &Session) -> Option<String> {
         let z = zones(size);
-        if z.tempo.contains(pos) {
-            Some("Double-click to type a tempo".into())
+        Some(if z.tap.inset_xy(-4.0, -2.0).contains(pos) {
+            "Tap tempo: click in time with the music".into()
+        } else if z.tempo.union(&z.bpm).contains(pos) {
+            "Double-click to type a tempo".into()
+        } else if z.meter.union(&z.meter_label).contains(pos) {
+            "Time signature: click to type (e.g. 7/8) · right-click for common meters".into()
         } else if z.flags.contains(pos) {
-            Some("Toggle loop / record mode".into())
+            "Toggle loop / record mode".into()
         } else {
-            Some("Bars.Beats.Ticks and time".into())
-        }
+            "Bars.Beats.Ticks and time".into()
+        })
     }
 
     fn min_size(&self) -> Size {
-        Size::new(290.0, 38.0)
+        Size::new(370.0, 38.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn taps_average_their_intervals() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        assert_eq!(tap_tempo(&[at(0)]), None);
+        assert_eq!(tap_tempo(&[at(0), at(500)]), Some(120.0));
+        // Jitter averages out.
+        assert_eq!(
+            tap_tempo(&[at(0), at(490), at(1010), at(1500)]),
+            Some(120.0)
+        );
+        let mut d = TransportDisplay::new();
+        d.tap(at(0));
+        assert_eq!(d.tap(at(600)), Some(100.0));
+        // A long pause starts over.
+        assert_eq!(d.tap(at(5000)), None);
+        assert_eq!(d.tap(at(5400)), Some(150.0));
     }
 }

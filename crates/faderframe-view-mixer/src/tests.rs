@@ -342,3 +342,38 @@ fn instrument_strips_choose_a_midi_input() {
         assert!(labels.iter().any(|l| l == want), "{want} in {labels:?}");
     }
 }
+
+#[test]
+fn clicking_the_pan_value_opens_a_text_field() {
+    let mut s = session();
+    let theme = Theme::default();
+    let mut view = MixerView::new(theme.clone());
+    let size = Size::new(1200.0, 700.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    let bass = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.name == "Bass")
+        .unwrap()
+        .id;
+    let l = view.layout_of(&s, bass, size).unwrap();
+    assert_eq!(
+        view.hit_test(l.pan_readout.center(), size, &s),
+        Some(Hit::PanValue(bass))
+    );
+    let (_, requests) = run(&mut view, down(l.pan_readout.center(), 1), size, &s);
+    let Some(HostRequest::TextInput {
+        initial, commit, ..
+    }) = requests.into_iter().next()
+    else {
+        panic!("a text field")
+    };
+    assert_eq!(initial, "C");
+    let action = commit("L30").expect("valid pan");
+    s.dispatch(action).unwrap();
+    let t = s.project().track(bass).unwrap();
+    assert!((t.pan + 0.3).abs() < 1e-6, "{}", t.pan);
+    assert!(commit("nonsense").is_none());
+}

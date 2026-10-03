@@ -1,0 +1,16 @@
+[package]
+name = "faderframe-stretch"
+description = "Pitch-preserving time stretching for warped audio (vendored Signalsmith Stretch)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+build = "build.rs"
+links = "faderframe_stretch"
+
+[lints]
+workspace = true
+
+[build-dependencies]
+cc.workspace = true

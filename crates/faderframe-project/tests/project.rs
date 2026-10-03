@@ -521,6 +521,7 @@ fn sources_are_undoable_and_protected_while_in_use() {
             fades: Default::default(),
             stretch: Default::default(),
             reversed: false,
+            warp: None,
         }),
     };
     let mut h = History::default();
@@ -558,4 +559,47 @@ fn sources_are_undoable_and_protected_while_in_use() {
     h.redo(&mut p).unwrap();
     assert_eq!(p.sources.len(), 1);
     assert_eq!(p.clips.len(), 1);
+}
+
+#[test]
+fn time_signature_changes_undo() {
+    use faderframe_timeline::TimeSignature;
+    let mut p = demo_project(48_000);
+    let before = p.clone();
+    let mut h = History::default();
+    let seven_eight = TimeSignature::new(7, 8).unwrap();
+    h.apply(
+        &mut p,
+        Command::SetTimeSignature {
+            bar: 4,
+            signature: Some(seven_eight),
+        },
+    )
+    .unwrap();
+    assert_eq!(p.timeline.meter.signature_of_bar(5), seven_eight);
+    assert_eq!(
+        p.timeline.meter.signature_of_bar(3),
+        TimeSignature::FOUR_FOUR
+    );
+    assert_eq!(
+        Command::SetTimeSignature {
+            bar: 4,
+            signature: None
+        }
+        .impact(),
+        Impact::Timeline
+    );
+    // The first meter cannot be removed.
+    assert!(matches!(
+        h.apply(
+            &mut p,
+            Command::SetTimeSignature {
+                bar: 0,
+                signature: None
+            }
+        ),
+        Err(EditError::Invalid(_))
+    ));
+    h.undo(&mut p).unwrap();
+    assert_same(&p, &before);
 }

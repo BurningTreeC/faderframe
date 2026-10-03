@@ -14,6 +14,7 @@
 pub mod decode;
 mod generate;
 pub mod import;
+pub mod onsets;
 mod peaks;
 pub mod resample;
 pub mod stream;

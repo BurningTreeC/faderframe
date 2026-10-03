@@ -15,7 +15,7 @@ use faderframe_project::{Command, History};
 use faderframe_transport::TransportCommand;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 struct Counting;
 
@@ -23,10 +23,16 @@ static EVENTS: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     static ARMED: Cell<bool> = const { Cell::new(false) };
+    /// DSP worker threads of the test pool (counted while `WORKERS_ARMED`).
+    static WORKER: Cell<bool> = const { Cell::new(false) };
 }
 
+static WORKERS_ARMED: AtomicBool = AtomicBool::new(false);
+
 fn note() {
-    if ARMED.try_with(|a| a.get()).unwrap_or(false) {
+    let worker =
+        WORKER.try_with(|w| w.get()).unwrap_or(false) && WORKERS_ARMED.load(Ordering::Relaxed);
+    if worker || ARMED.try_with(|a| a.get()).unwrap_or(false) {
         EVENTS.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -61,7 +67,9 @@ static GLOBAL: Counting = Counting;
 fn armed<R>(f: impl FnOnce() -> R) -> (R, usize) {
     let before = EVENTS.load(Ordering::Relaxed);
     ARMED.with(|a| a.set(true));
+    WORKERS_ARMED.store(true, Ordering::SeqCst);
     let r = f();
+    WORKERS_ARMED.store(false, Ordering::SeqCst);
     ARMED.with(|a| a.set(false));
     (r, EVENTS.load(Ordering::Relaxed) - before)
 }
@@ -144,6 +152,40 @@ fn processing_does_not_allocate() {
         "old graph returned for dropping"
     );
     assert_eq!(r.controller.leaked_objects(), 0);
+}
+
+#[test]
+fn parallel_processing_does_not_allocate() {
+    use faderframe_realtime::{PoolConfig, WorkerPool};
+    use std::sync::Arc;
+    const SR: u32 = 48_000;
+    const BLOCK: usize = 256;
+    let project = demo_project(SR);
+    let sources = render_generated_sources(&project, SR);
+    let config = EngineConfig {
+        sample_rate: SR,
+        // The demo is light: use the workers anyway.
+        parallel_min_ns: 0,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&project, &sources, config, BLOCK, 2).unwrap();
+    let mut pool = PoolConfig::new(3);
+    pool.on_start = Some(|| WORKER.with(|w| w.set(true)));
+    r.processor
+        .set_worker_pool(Some(Arc::new(WorkerPool::new(pool))));
+    let mut bufs = OwnedBuffers::new(2, 2, BLOCK);
+    r.play_from(0).unwrap();
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    r.controller.set_node_timing(true);
+    let (_, n) = armed(|| {
+        for _ in 0..400 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(n, 0, "allocations/frees on the audio or worker threads");
+    assert!(bufs.output_ref(0).iter().any(|s| s.abs() > 1e-4), "audible");
 }
 
 #[test]
@@ -404,4 +446,64 @@ fn live_midi_input_and_midi_recording_do_not_allocate() {
     assert!(clock > 0, "clock went out");
     let recorded = std::iter::from_fn(|| rx.pop().ok()).count();
     assert!(recorded >= 24 * 3 - 1, "{recorded}");
+}
+
+#[test]
+fn warped_playback_does_not_allocate() {
+    use faderframe_project::{ClipContent, Warp, WarpAlgorithm, WarpMarker};
+    const SR: u32 = 48_000;
+    const BLOCK: usize = 256;
+    // Warp the demo's clips: the drums stretched (polyphonic) with
+    // markers, the plucks rhythmic, the bass varispeed.
+    let mut project = demo_project(SR);
+    let names = [
+        ("Drums", WarpAlgorithm::Polyphonic),
+        ("Pluck", WarpAlgorithm::Rhythmic),
+        ("Bass", WarpAlgorithm::Varispeed),
+    ];
+    for (name, algorithm) in names {
+        let t = project.tracks.iter().find(|t| t.name == name).unwrap();
+        let id = t.clips[0];
+        let Some(ClipContent::Audio(a)) = project.clips.get_mut(&id).map(|c| &mut c.content) else {
+            panic!("audio clip");
+        };
+        let src = a.length;
+        a.length = src * 5 / 4;
+        a.warp = Some(Warp {
+            source_length: src,
+            markers: vec![WarpMarker {
+                at: a.length / 3,
+                source: a.source_offset + src / 2,
+            }],
+            algorithm,
+        });
+    }
+    let sources = render_generated_sources(&project, SR);
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&project, &sources, config, BLOCK, 2).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, BLOCK);
+    r.play_from(SR as i64).unwrap();
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    // Playing, crossing warp markers, locating (re-priming the voices),
+    // stopping and starting.
+    let (_, n) = armed(|| {
+        for i in 0..600 {
+            if i == 200 {
+                let _ = r
+                    .controller
+                    .transport(TransportCommand::Locate(SR as i64 * 7));
+            }
+            if i == 400 {
+                let _ = r.controller.transport(TransportCommand::Stop);
+                let _ = r.controller.transport(TransportCommand::Play);
+            }
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(n, 0, "allocations/frees while playing warped audio");
 }

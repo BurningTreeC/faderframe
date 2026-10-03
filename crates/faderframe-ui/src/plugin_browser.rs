@@ -111,22 +111,19 @@ struct Browser {
 }
 
 fn entries(app: &AppState) -> Vec<Entry> {
-    let catalog = faderframe_plugin_clap::catalog();
     let mut out: Vec<Entry> = app
         .session
         .borrow()
         .available_plugins()
         .into_iter()
         .map(|p: AvailablePlugin| {
-            let clap = (p.plugin.format == PluginFormat::Clap)
-                .then(|| catalog.iter().find(|c| c.id == p.plugin.id))
-                .flatten();
             let ch = |n: u16| match n {
                 0 => "none".to_string(),
                 1 => "mono".to_string(),
                 2 => "stereo".to_string(),
                 n => format!("{n} channels"),
             };
+            let scanned = crate::plugins::scanned(p.plugin.format, &p.plugin.id);
             Entry {
                 vendor: if p.vendor.is_empty() {
                     "Unknown vendor".into()
@@ -135,14 +132,17 @@ fn entries(app: &AppState) -> Vec<Entry> {
                 },
                 version: p.version.clone(),
                 instrument: p.instrument,
-                features: clap.map(|c| c.features.clone()).unwrap_or_default(),
+                features: scanned
+                    .as_ref()
+                    .map(|c| c.features.clone())
+                    .unwrap_or_default(),
                 audio: format!("{} in · {} out", ch(p.audio_inputs), ch(p.audio_outputs)),
                 midi: if p.note_inputs > 0 {
                     "Note / MIDI input".into()
                 } else {
                     "—".into()
                 },
-                bundle: clap.map(|c| c.bundle.display().to_string()),
+                bundle: scanned.map(|c| c.bundle.display().to_string()),
                 plugin: p.plugin,
             }
         })
@@ -228,6 +228,7 @@ fn row_widget(e: &Entry) -> gtk::Widget {
         match e.plugin.format {
             PluginFormat::Builtin => "badge-builtin",
             PluginFormat::Clap => "badge-clap",
+            PluginFormat::Vst3 => "badge-vst3",
             _ => "badge-other",
         },
     ));
@@ -312,6 +313,7 @@ impl Browser {
         for (f, label) in [
             (PluginFormat::Builtin, "Built-in"),
             (PluginFormat::Clap, "CLAP"),
+            (PluginFormat::Vst3, "VST3"),
         ] {
             let n = entries.iter().filter(|e| e.plugin.format == f).count();
             let (r, scope) = item(label, n, Scope::Format(f));
@@ -526,7 +528,7 @@ pub fn open(app: &Rc<AppState>, track: TrackId, target: PluginTarget) {
     });
     header.pack_start(&kinds);
     let rescan = gtk::Button::from_icon_name("view-refresh-symbolic");
-    rescan.set_tooltip_text(Some("Rescan the CLAP folders"));
+    rescan.set_tooltip_text(Some("Rescan the CLAP and VST3 folders"));
     header.pack_end(&rescan);
     window.set_titlebar(Some(&header));
 
@@ -594,7 +596,7 @@ pub fn open(app: &Rc<AppState>, track: TrackId, target: PluginTarget) {
         subtitle,
         search: search.clone(),
         kind_buttons: kind_buttons.clone(),
-        generation: std::cell::Cell::new(faderframe_plugin_clap::catalog_generation()),
+        generation: std::cell::Cell::new(crate::plugins::catalog_generation()),
         scopes: RefCell::new(Vec::new()),
     });
     OPEN.with(|o| *o.borrow_mut() = Some(Rc::clone(&b)));
@@ -667,10 +669,9 @@ pub fn open(app: &Rc<AppState>, track: TrackId, target: PluginTarget) {
     rescan.connect_clicked(move |_| {
         if let Some(app) = weak_app.upgrade() {
             *app.plugin_scan.borrow_mut() = Some(crate::plugins::scan_in_background());
-            app.session.borrow_mut().notify(
-                faderframe_session::NoticeLevel::Info,
-                "rescanning CLAP plugins…",
-            );
+            app.session
+                .borrow_mut()
+                .notify(faderframe_session::NoticeLevel::Info, "rescanning plugins…");
         }
     });
     // Escape closes; arrow down from the search moves into the list.
@@ -701,7 +702,7 @@ pub fn open(app: &Rc<AppState>, track: TrackId, target: PluginTarget) {
         let Some(b) = weak.upgrade() else {
             return glib::ControlFlow::Break;
         };
-        let g = faderframe_plugin_clap::catalog_generation();
+        let g = crate::plugins::catalog_generation();
         if g != b.generation.get()
             && let Some(app) = b.app.upgrade()
         {

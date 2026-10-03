@@ -136,6 +136,7 @@ impl TestProject {
                     fades: ClipFades::default(),
                     stretch: StretchSettings::Off,
                     reversed: false,
+                    warp: None,
                 }),
             },
         );

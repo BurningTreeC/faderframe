@@ -230,6 +230,7 @@ fn live_playback_streams_without_misses_and_bounded_memory() {
         &AudioPreferences {
             sample_rate: Some(48_000),
             buffer_size: Some(64),
+            ..Default::default()
         },
     )
     .unwrap();

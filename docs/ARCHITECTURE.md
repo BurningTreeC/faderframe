@@ -19,6 +19,7 @@ faderframe-app            binary: CLI parsing, logging, starts the GTK app
        │    └─ faderframe-ui-canvas   Painter trait, events, CanvasView, theme, console controls
        ├─ faderframe-audio-jack       JACK backend (JACK2 / pipewire-jack)
        ├─ faderframe-plugin-clap      CLAP host (clack-host): scan helper, instances, editors
+       ├─ faderframe-plugin-vst3      VST3 host (vst3 bindings): modules, scan helper, instances, editors
        ├─ faderframe-midi-io          MIDI input devices (midir → ALSA sequencer), virtual inputs
        └─ faderframe-session          control-world hub (GTK-free)
             ├─ faderframe-engine       project→graph compiler, RT processor, controller, offline render
@@ -26,6 +27,7 @@ faderframe-app            binary: CLI parsing, logging, starts the GTK app
             │    ├─ faderframe-plugin-host   plugin abstraction + built-in plugins
             │    ├─ faderframe-transport     RT transport state, TransportInfo
             │    ├─ faderframe-realtime      atomics, mailbox, meters, param table, metrics
+            │    ├─ faderframe-stretch       time stretching (vendored Signalsmith Stretch, C shim)
             │    └─ faderframe-audio         backend abstraction, dummy backend
             ├─ faderframe-project      persistent model, commands, undo, file format
             │    ├─ faderframe-workspace     docking/workspace layout model (GTK-free)
@@ -42,10 +44,10 @@ on GTK**, and no crate except `faderframe-audio-jack` depends on JACK. The
 engine, session and views build and run headless (tests, CI, offline
 rendering, the benchmark).
 
-`faderframe-plugin-clap` implements the `faderframe-plugin-host` traits and
-is registered by the shell (`set_default_registry`), so the engine never
-names a plugin format. Planned crates (not created yet, to avoid empty
-boilerplate): a VST3 host (`faderframe-plugin-vst3`),
+`faderframe-plugin-clap` and `faderframe-plugin-vst3` implement the
+`faderframe-plugin-host` traits and are registered by the shell
+(`set_default_registry`), so the engine never names a plugin format.
+Planned crates (not created yet, to avoid empty boilerplate):
 PipeWire-native/ALSA/WASAPI/ASIO/CoreAudio backends, and an optional wgpu
 painter for dense views.
 
@@ -154,13 +156,67 @@ nothing about projects.
   latency; every edge arriving early gets a delay line of exactly the
   difference. Tracks, inserts, buses, sends, returns and the master are all
   covered because they are all just nodes.
-* **Scheduling**: the executor is currently serial. Nodes are stored in
-  topological order and each node only reads upstream output buffers and
-  writes its own, so the serial executor needs no `unsafe`, and the compiled
-  graph already carries per-node dependency counts, dependents lists and
-  levels (`GraphStats::levels`, `max_width`) for the planned dependency-aware
-  multicore scheduler (fixed worker threads, preallocated jobs, atomic
-  counters — no Rayon on the audio thread).
+* **Scheduling** is dependency-driven and multicore (below).
+
+### Multicore processing
+
+The graph runs on the audio thread plus a fixed pool of DSP worker threads
+(`faderframe_realtime::WorkerPool`; default one thread per logical core,
+Preferences → Audio → Processing threads, `--threads`).
+
+* **Jobs.** At compile time nodes are fused into jobs: a node whose only
+  dependent has no other input continues that dependent's job (a track's
+  input → inserts → strip chain), and a source feeding a node that depends
+  on sources only (clip players and live input into a track input) runs at
+  the start of that job. 128 tracks with sends and buses become ~260 jobs
+  instead of ~1200 nodes, so scheduling costs a few atomic operations per
+  track, not per node. `GraphStats::jobs` / `job_width` report the result.
+* **Execution.** Per cycle every job gets a counter of unfinished upstream
+  jobs; ready jobs go into a preallocated lock-free queue (each job is
+  pushed at most once per cycle). Threads pop jobs, run their nodes in
+  order, decrement their dependents' counters and continue directly with
+  one released dependent (cache-warm), queueing the others. The caller
+  returns when every job is done. Graphs whose width is one job, or whose
+  measured work is below `parallel_min_ns` (40 µs, with hysteresis), stay
+  on the audio thread — waking workers would cost more than it saves.
+* **Critical path first.** Every job's time is measured (two clock reads).
+  Every 16 cycles the audio thread smooths the costs and recomputes each
+  job's rank — its own cost plus the most expensive path to the end —
+  without allocating; roots start in rank order and a thread continues with
+  the released dependent of highest rank. A track with several heavy
+  plugins therefore starts first instead of becoming the tail of the cycle.
+  The verdict on threading carries over when an edit swaps the graph.
+* **Soundness without trusting the scheduler.** Node buffers and node work
+  (processor, input delay lines) live in `TaskCells`: per-cycle
+  pending → running → done cells that hand out `&mut` to exactly one
+  claimant and `&` only after done (acquire/release). A scheduling bug
+  would skip work, never race; `faderframe-audio-graph` stays free of
+  `unsafe`. Every node sums its inputs in a fixed order, so parallel output
+  is bit-identical to serial (tested on random graphs and the demo
+  project).
+* **The pool.** `WorkerPool::run` is a scoped broadcast: the job pointer is
+  published atomically, workers register in an `active` count before
+  reading it, and the caller waits for zero before returning. Idle workers
+  spin ~100 µs (consecutive chunks of a callback catch them awake), then
+  sleep on a futex; one non-blocking `FUTEX_WAKE` wakes as many as the
+  graph can use. Workers take the audio thread's scheduling policy and
+  priority (`SCHED_FIFO` under JACK/PipeWire) and flush denormals, as does
+  the audio thread for every callback (`ScopedFlushDenormals`). Without
+  realtime scheduling a preempted worker would stall the cycle, so the pool
+  then stays within the physical cores.
+* **Plugins** run on whichever thread processes their node. Each instance
+  is in one node, behind a `TryCell`, so calls never overlap; CLAP's
+  thread-check reports every DSP thread as an audio thread.
+* **Measured** (`faderframe-bench --paced`, Ryzen 7 5700G, 8 cores / 16
+  threads, `SCHED_FIFO`): 128 tracks × 4 echo inserts at 128 frames went
+  from 1542 µs (58 % load, 85 late callbacks) on one thread to 184 µs
+  (7 %) on 16; 64 instances of a real VST3/CLAP EQ (332 % of the deadline
+  on one thread) run at 27.5 % with a 774 µs p99.9 and no late callbacks,
+  28 % at 64-frame buffers.
+* **Metering.** The performance view reports graph CPU time summed over
+  threads, the graph's wall-clock share (so "engine" stays right), the
+  thread count and how many threads were busy at once; free capacity is
+  counted over all threads.
 
 ### Engine graph per track
 
@@ -192,8 +248,8 @@ meter, bar, loop, play/record state) for processors and plugins, plus a
 Events always carry a frame offset inside the block (`TimedMidiEvent`).
 `MidiBuffer` is fixed-capacity and sorted (note-offs before note-ons at the
 same offset); overflow drops and counts. The MIDI clip player emits events at
-exact offsets; the built-in synth renders between event offsets. MPE / note
-expressions are planned as additional event types.
+exact offsets; the built-in synth renders between event offsets (and
+handles RPN 0 bend range, the MPE zone message, pressure and CC 74).
 
 ### Live MIDI input (keyboards and controllers)
 
@@ -249,8 +305,52 @@ expressions are planned as additional event types.
   times: note-offs, controllers, note-ons). The clip player *chases*:
   starting or jumping mid-clip first sends each controller's current value,
   and on stop or jump moved controllers return to rest (pedals up, bend
-  centred). Splitting a clip carries the values across the cut. MPE input
-  passes through with its channels and records as per-channel lanes.
+  centred). Splitting a clip carries the values across the cut.
+* **MPE (per-note expression).** Expression is stored with the notes, not
+  the channels: `MidiClip::expressions` holds a `NoteExpression` per note
+  (pitch in semitones, pressure and timbre 0–1; points relative to the
+  note's start, linear between them), so notes can be moved, transposed,
+  copied, split and deleted with their expression (the session's note
+  operations carry it; clip splits move it with the notes). A track with
+  `Track::mpe` (`MpeConfig`: member channels, bend range ±48) plays MPE:
+  the timeline snapshot gives each note its own member channel (the least
+  recently used free one, else the one freeing first), sends the initial
+  values right before the note-on and samples the curves every 1/128
+  quarter into pitch bend, channel pressure and CC 74 where the MIDI value
+  changes; the clip player announces the zone (RPN 6 on the master channel,
+  RPN 0 on every member) whenever playback starts. Recording on an MPE
+  track turns each note's member-channel pitch bend, pressure and CC 74
+  (from just before its note-on to its note-off) into its expression,
+  thinned to the points where the curve bends; master-channel controllers
+  stay lanes.
+* **Following an external clock.** System messages (clock, start,
+  continue, stop, song position, MTC quarter frames, SysEx) bypass the
+  realtime queue: they reach the control side through the feed's system
+  channel, timestamped. `session::sync` follows MIDI clock (24 per quarter;
+  Start makes the next clock beat 0; song position moves while stopped) or
+  MTC (eight quarter frames make a timecode two frames long; 24, 25,
+  29.97 drop-frame and 30 fps; full-frame SysEx moves; a pause of 150 ms
+  stops). To start, `EngineController::chase` locates so that the engine is
+  at the master's position plus the output latency *as of the message's
+  timestamp* — the engine adds the time until it applies the command — and
+  plays, through the same path as the play button (recording, automation
+  writing). Each callback publishes its start time and position, so every
+  tick measures the distance to the master; three ticks beyond the
+  tolerance (15 ms) re-lock. The master's tempo is a least-squares fit over
+  up to eight seconds of clock timestamps (a gap, burst or tempo jump
+  restarts it); with "follow tempo" the project tempo is set to it — one
+  undoable edit — when the master starts or stops, never while playing
+  (running audio clips would jump). Settings (source, port, MTC offset)
+  are per machine (preferences).
+* **SysEx.** Variable-length data stays out of the realtime path.
+  `MidiClip::sysex` holds messages at musical times; SysEx arriving on a
+  recording track's input is placed where it was heard and becomes part of
+  the take. For tracks with an external MIDI output the session schedules
+  the messages 100 ms ahead to the output sender with exact due times from
+  the engine's time-to-position mapping, following loop wraps; a locate or
+  stop (the engine is not where it was predicted) cancels what was
+  scheduled (a generation counter in `MidiOutputs`). `.syx` files can be
+  imported into clips and sent to any output from the preferences.
 * **Auditioning and step input.** The editor plays notes on a track's
   instrument through a reserved port (`AUDITION_PORT`) that the track's
   `MidiInputNode` takes whatever its live state, never recorded. Step input
@@ -288,7 +388,9 @@ pass audio through with a warning.
   cannot take the DAW down. Results are cached by bundle size and mtime
   (`$XDG_CACHE_HOME/faderframe/clap-scan.json`); the shell rescans in the
   background at start-up and the plugin browser refreshes when the global
-  catalog generation changes.
+  catalog generation changes. The scan cache, helper protocol and
+  `ScannedPlugin` are format-independent (`faderframe_plugin_host::scan`;
+  directory bundles are stamped by the files inside).
 * **Extensions** are queried once `init()` has returned (CLAP forbids
   asking earlier, and bridges such as yabridge only know theirs then), plus
   from within `init()` for plugins that call the host while initialising.
@@ -330,6 +432,58 @@ pass audio through with a warning.
   sliders and switches, double-click to reset, live follow of automation
   and GUI changes, bypass, and a button to the plugin's own GUI. On Wayland
   the compositor places GTK windows; apps cannot.
+
+### VST3
+
+Bindings come from the `vst3` crate (generated from the MIT-licensed VST 3
+SDK headers); FaderFrame implements the host side itself.
+
+* **Modules.** A bundle's `Contents/<arch>-linux/*.so` is opened once per
+  process (`RTLD_NOW | RTLD_LOCAL`, `ModuleEntry` with the dlopen handle)
+  and never unloaded — plugins keep static state and threads that do not
+  survive `dlclose`, and every engine shares the factory. Scanning uses
+  `faderframe --scan-vst3 <bundle>` like CLAP (`vst3-scan.json`): classes
+  of category "Audio Module Class" are described via `IPluginFactory2`,
+  buses read from an initialised component, sub-categories ("Fx|EQ") mapped
+  onto CLAP's feature tags. The id is the class id as 32 hex digits.
+* **Set-up** follows the SDK's host workflow: initialise the component with
+  a per-instance host object, use it as edit controller if it is one, or
+  create the controller from `getControllerClassId`, initialise it and join
+  both through `IConnectionPoint`; set the component handler and give the
+  controller the component's state. The host object (`com::HostApp`) is
+  `IHostApplication` (creating `IMessage`/`IAttributeList` for plugins that
+  talk between their halves), `IComponentHandler(2)`, the editor's
+  `IPlugFrame` and Linux `IRunLoop`. Its callbacks only record (edits,
+  restart flags, resize requests, fd/timer registrations); the control
+  thread acts on them when it polls — callbacks may come from any thread.
+* **Parameters** are normalised in VST3. FaderFrame shows continuous ones as
+  0–1 and stepped ones as integers 0…steps, converting at the boundary; the
+  plugin formats values (`getParamStringByValue`). Hidden parameters and the
+  non-automatable proxies some frameworks register as MIDI controller
+  targets (JUCE, u-he: 16 × 130) are not listed. Unit names prefix
+  parameter names ("Unit/Name") like CLAP modules.
+* **Processing.** Activation activates the main audio buses and the first
+  event input, confirms the plugin's own arrangements, sets up 32-bit
+  processing and hands an `Active` (processor, all bus buffers, the host's
+  `IParameterChanges`/`IEventList` objects and the process context, all
+  preallocated) to a `TryCell` like CLAP. Per block: UI and editor changes
+  (offset 0, from a wait-free queue; they wait when the 512 queues of a
+  block are taken), then automation (sample offsets), then MIDI: notes and
+  poly pressure become events, CC/pitch bend/channel pressure become
+  parameter changes through the plugin's `IMidiMapping` (VST3 has no CC
+  events; the table is built at activation). Values the processor reports
+  in `outputParameterChanges` go back to the controller; note output goes to
+  the graph's event output. `reset()` is a `setProcessing` off/on cycle.
+  The processor is `Send` and runs on whichever thread processes its node.
+* **Editor edits** (`performEdit`) are forwarded to the processor and mark
+  the project dirty; the engine's explicit-value sync never overwrites them.
+* **State** is `FFV3` + length-prefixed component state + controller state;
+  foreign blobs are taken as component state. Loading also feeds the
+  component state to the controller (`setComponentState`).
+* **Editors** use the same XWayland parent windows as CLAP
+  (`X11EmbedWindowID`); `resizeView` is answered with `onSize`, and run-loop
+  file descriptors and timers become glib sources. VST3 has no floating
+  editors.
 
 ## 9. Audio backends
 
@@ -558,7 +712,10 @@ step cursor, playhead; click/drag locates), keyboard (names, scale and root
 marks, live keys of the input when the track is live, click/drag to
 listen), note grid and the lane below (velocity stems and line ramps, or a
 controller lane per controller and channel: freehand, Shift = line, Alt =
-erase). Tools: select (rubber band, double-click adds), draw (drag sets the
+erase, or per-note pitch / pressure / timbre expression of the selected
+notes — or those sounding under the pointer — as one undo step; pitch
+glides are also drawn over the notes; SysEx shows as diamonds in the ruler
+with their bytes on hover). Tools: select (rubber band, double-click adds), draw (drag sets the
 length; chords stamp the chosen chord, scale-aware), erase and mute
 (sweep), split. Dragging notes previews and commits once on release
 (`NoteOp::Move` / `Resize`, Alt copies via `DuplicateNotes`, Shift skips
@@ -573,6 +730,54 @@ edit is a session `Action` (`NoteOperation`, `AddNotes`, `AddChord`,
 one undo step each, ids allocated by the session. Pure note operations
 (quantize with strength/swing/ends, humanize, legato, reverse, invert,
 velocity ramps, scales and chords) are in `faderframe_project::midi_ops`.
+
+### Editing and elastic audio
+
+The editing model follows Pro Tools and lives in the session
+(`faderframe_session::editing`, `warping`, `transients`); the arranger
+(`clip_edit.rs`) and the edit toolbar (`edit_bar.rs`, a canvas view hosted
+full width under the header by `faderframe-ui`, wrapped into rows by
+`faderframe_ui_canvas::Flow`) only turn gestures into actions.
+
+* `EditorSettings`: edit mode (Shuffle / Slip / Spot / Grid, grid absolute
+  or relative — `snap` is true exactly in Grid mode), tool (Smart, Trim,
+  Time-Stretch Trim, Selector, Grabber, Separation Grabber, Scrubber,
+  Pencil, Zoom), grid value (`GridDivision` down to 1/256, triplet and
+  dotted; `GridDivision::menu` is the shared menu), nudge value, Tab to
+  Transients, Link Timeline and Edit Selection, Insertion Follows Playback,
+  transient display and sensitivity, warp view, counter units, and zoom
+  requests (a sequence number the arranger applies once).
+* `Selection::range` is the edit selection (a time range on the selected
+  tracks). Range operations — separate, trim, clear, copy/cut/paste, repeat,
+  insert silence, nudge, Tab — and clip edits are `Batch` commands, one
+  undo step each; Shuffle mode closes and opens gaps.
+* Multi-clip edits (`MoveClips`, `TrimClips`, `ClipGain`, `SetFade`,
+  `SetClipsMuted`) act on all selected clips when the pressed clip is
+  selected. Drags send absolute values inside a gesture and the session
+  recomputes from `gesture_clip` — the clip as the gesture first saw it —
+  so dragging back is lossless (trimmed notes and audio return).
+* Fades: length, `FadeShape` (Linear, Equal Power, S-Curve, Fast, Slow)
+  and a drawn bend (percent; `FadeShape::gain_bent`), the same function in
+  the engine and the views.
+* Transients: `faderframe_audio_files::onsets` (spectral flux of
+  log-magnitude spectra, adaptive median threshold, attack refinement, a
+  strength per onset) runs once per source on a helper thread, cached next
+  to the media as `.fftr`; the sensitivity filters by strength.
+* Warp: `AudioClip::warp` is a piecewise-linear output→source map
+  (`faderframe_project::Warp`: implicit start/end anchors, markers in
+  between, algorithm). Splitting, trimming and time-compression keep the
+  map; a marker drag pins the neighbouring transients (`WarpDrag`), a
+  range, or telescopes. The engine builds a `WarpedRegion` (anchors in
+  engine frames → source frames) per warped clip: Varispeed resamples
+  along the map; Polyphonic/Rhythmic run a `faderframe_stretch::Stretcher`
+  voice. Voices are allocated with the clip-player node (their count is in
+  the node key; a timeline edit that changes a track's needs escalates to a
+  graph rebuild), bound to a clip while playback continues and primed
+  after every jump: seek with the pre-roll ending at `source_at(t) + Li`,
+  run and discard `Lo` output frames — then output frame `u` is exactly
+  `source_at(u)` (feeding up to `source_at(u + Lo) + Li`). Outside the
+  clip's source range the stretcher hears silence. The disk plan gets one
+  linear piece per warp segment (widened for look-ahead and pre-roll).
 
 ### Docking
 
@@ -650,7 +855,13 @@ for its editor.
 11. `unsafe` is forbidden in every crate except `faderframe-realtime`
     (documented mailbox, `TryCell`), `faderframe-audio-jack` (JACK trait
     requirement), `faderframe-plugin-clap` (loading plugin libraries, window
-    handles for editors) and `faderframe-ui` (GObject subclassing macros).
+    handles for editors), `faderframe-plugin-vst3` (COM bindings, module
+    loading), `faderframe-stretch` (the C shim of the vendored
+    stretcher) and `faderframe-ui` (GObject subclassing macros).
+12. Vendored C/C++ code is listed in `THIRD_PARTY_LICENSES.md` and its
+    realtime entry points are proven allocation-free by counting C++
+    allocations in tests (`faderframe-stretch/tests/stretch.rs`; the Rust
+    counting allocator cannot see `operator new`).
 
 ## 14. Cross-platform strategy
 
@@ -695,15 +906,38 @@ clips (recorded, edited, chased), MIDI output to external devices with MIDI
 clock, soft takeover and relative encoders, consumed mapped controls,
 auditioning, step input, sustain/bend/vibrato in the built-in synth.
 
-Requested next: VST3 hosting.
+VST3 hosting (see §8): modules, scan helper, separate or combined
+controllers with messages, sample-accurate parameters and automation,
+notes, MIDI-mapped controllers, editor edits, state, embedded editors.
+
+Multicore processing (see §5): fused jobs, a lock-free dependency
+scheduler with measured critical-path ranks, a realtime worker pool with
+futex wake-up and priority inheritance, flush-to-zero on DSP threads.
+
+The rest of the MIDI work (see §7): following MIDI clock and MTC
+(sample-accurate chase, drift re-locks, tempo fit), per-note MPE
+expression (model, playback with member channels, recording, piano roll
+editing, MPE in the built-in synth) and SysEx (recording, scheduled
+playback to devices, `.syx` import and sending).
+
+Pro-style editing and elastic audio (see §11): edit modes and tools, an
+edit toolbar, edit-selection ranges, multi-clip edits, clip gain, fades
+with shapes and drawn curves, grids to 1/256, transient detection, warp
+markers with transient and range warping, quantizing, time-compression
+trims, and pitch-preserving warped playback. Transport: tap tempo,
+editable time signatures, a metronome button.
 
 Next, in order:
 
 1. ~~CLAP hosting~~ (done; still open: writing automation from plugin GUI
    gestures, note expressions, plugin-side preset browsing).
-2. ~~MIDI input and output, live play, MIDI learn, MIDI clock~~ (done;
-   still open: MTC and incoming clock sync, editing per-note MPE
-   expression, SysEx).
+2. ~~MIDI input and output, live play, MIDI learn, MIDI clock, clock and
+   MTC sync, MPE expression, SysEx~~ (done; possible next steps: MTC
+   output, varispeed chase without a shared word clock, SysEx to plugins,
+   Standard MIDI File import/export).
 3. ~~Automation lanes~~ (done) in the arranger, sample-accurate parameter events.
-4. Dependency-aware multicore scheduler.
-5. VST3, PipeWire-native backend, Windows and macOS ports.
+4. ~~Dependency-aware multicore scheduler~~ (done; possible next steps:
+   anticipative processing of tracks that are not monitored live, job
+   affinity for cache locality).
+5. ~~VST3~~ (done; still open: note expression, program lists, 64-bit
+   processing), PipeWire-native backend, Windows and macOS ports.

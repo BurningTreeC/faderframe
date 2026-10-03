@@ -1,5 +1,6 @@
 use super::*;
 use faderframe_engine::EngineConfig;
+use faderframe_session::ClipEdge;
 use faderframe_ui_canvas::RecordingPainter;
 
 fn session() -> Session {
@@ -100,7 +101,8 @@ fn dragging_a_clip_moves_it_with_snap_in_one_gesture() {
     let clip = s.project().track(bass).unwrap().clips[0];
     let start = s.project().clip(clip).unwrap().start;
     let row = view.row_rect(bass_row, size);
-    let grab = Point::new(view.x_of(start) + 30.0, row.center().y);
+    // The lower half grabs (the upper half selects a range).
+    let grab = Point::new(view.x_of(start) + 30.0, row.y + row.h * 0.8);
 
     let mut actions = run(&mut view, down(grab), size, &s).0;
     assert!(actions.contains(&Action::SelectClips {
@@ -489,4 +491,283 @@ fn header_column_resizes_horizontally() {
         .header_layout(&s, ArrangerView::lane_tracks(&s)[0].id, size)
         .unwrap();
     assert!(l.meter.right() <= w0 + 80.0);
+}
+
+fn with_mods(ev: ViewEvent, m: Modifiers) -> ViewEvent {
+    match ev {
+        ViewEvent::PointerDown {
+            pos,
+            button,
+            clicks,
+            ..
+        } => ViewEvent::PointerDown {
+            pos,
+            button,
+            modifiers: m,
+            clicks,
+        },
+        ViewEvent::PointerMove { pos, dragging, .. } => ViewEvent::PointerMove {
+            pos,
+            modifiers: m,
+            dragging,
+        },
+        other => other,
+    }
+}
+
+/// Press, move through `path`, release; dispatches everything.
+fn drag(
+    view: &mut ArrangerView,
+    s: &mut Session,
+    size: Size,
+    from: Point,
+    path: &[Point],
+    m: Modifiers,
+) -> Vec<Action> {
+    let mut all = run(view, with_mods(down(from), m), size, s).0;
+    for a in all.clone() {
+        s.dispatch(a).unwrap();
+    }
+    let mut last = from;
+    for p in path {
+        let acts = run(view, with_mods(mv(*p), m), size, s).0;
+        for a in &acts {
+            s.dispatch(a.clone()).unwrap();
+        }
+        all.extend(acts);
+        last = *p;
+    }
+    let acts = run(view, up(last), size, s).0;
+    for a in &acts {
+        s.dispatch(a.clone()).unwrap();
+    }
+    all.extend(acts);
+    all
+}
+
+fn clip_of(s: &Session, track: &str) -> ClipId {
+    let t = s.project().tracks.iter().find(|t| t.name == track).unwrap();
+    t.clips[0]
+}
+
+#[test]
+fn clicking_a_clip_selects_it_and_moves_the_playhead_to_the_snapped_click() {
+    let mut s = session();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 700.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    let clip = clip_of(&s, "Bass");
+    let rect = view.clip_view_rect(&s, size, clip).unwrap();
+    let t = s.project().clip(clip).unwrap().start + MusicalTime::from_quarters(5.1);
+    let at = Point::new(view.x_of(t), rect.y + rect.h * 0.8);
+    let actions = drag(&mut view, &mut s, size, at, &[], Modifiers::NONE);
+    assert!(actions.contains(&Action::SelectClips {
+        clips: vec![clip],
+        mode: SelectMode::Replace
+    }));
+    let expected = s.project().clip(clip).unwrap().start + MusicalTime::from_quarters_i(5);
+    assert!(
+        (s.playhead() - expected).quarters().abs() < 1e-3,
+        "Grid mode snaps the click to the beat: {:?}",
+        s.playhead()
+    );
+    // Slip mode: no snapping.
+    s.dispatch(Action::SetEditMode(faderframe_session::EditMode::Slip))
+        .unwrap();
+    drag(&mut view, &mut s, size, at, &[], Modifiers::NONE);
+    let off = (s.playhead() - t).quarters().abs();
+    assert!(off < 0.05, "unsnapped: {off}");
+}
+
+#[test]
+fn shift_click_selects_more_clips_and_edits_apply_to_all() {
+    let mut s = session();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 700.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    let (bass, pluck) = (clip_of(&s, "Bass"), clip_of(&s, "Pluck"));
+    let shift = Modifiers {
+        shift: true,
+        ..Modifiers::NONE
+    };
+    let r1 = view.clip_view_rect(&s, size, bass).unwrap();
+    let r2 = view.clip_view_rect(&s, size, pluck).unwrap();
+    let lower = |r: Rect| Point::new(r.x + 60.0, r.y + r.h * 0.8);
+    drag(&mut view, &mut s, size, lower(r1), &[], Modifiers::NONE);
+    drag(&mut view, &mut s, size, lower(r2), &[], shift);
+    assert_eq!(s.selection.clips.len(), 2, "shift adds to the selection");
+    // Dragging one moves both, by the same (snapped) amount, as one step.
+    let starts = |s: &Session| {
+        (
+            s.project().clip(bass).unwrap().start,
+            s.project().clip(pluck).unwrap().start,
+        )
+    };
+    let before = starts(&s);
+    let from = lower(r1);
+    let to = Point::new(from.x + 4.0 * view.ppq + 2.0, from.y);
+    let actions = drag(
+        &mut view,
+        &mut s,
+        size,
+        from,
+        &[Point::new(from.x + 8.0, from.y), to],
+        Modifiers::NONE,
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::MoveClips { clips, .. } if clips.len() == 2))
+    );
+    let after = starts(&s);
+    let q4 = MusicalTime::from_quarters_i(4);
+    assert_eq!(after, (before.0 + q4, before.1 + q4));
+    assert_eq!(s.selection.clips.len(), 2, "a drag keeps the group");
+    s.dispatch(Action::Undo).unwrap();
+    assert_eq!(starts(&s), before);
+    // Shift-clicking a selected clip removes it.
+    drag(&mut view, &mut s, size, lower(r2), &[], shift);
+    assert_eq!(s.selection.clips.len(), 1);
+}
+
+#[test]
+fn edges_trim_handles_fade_and_the_badge_sets_clip_gain() {
+    let mut s = session();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 700.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    let clip = clip_of(&s, "Bass");
+    let rect = view.clip_view_rect(&s, size, clip).unwrap();
+    let c = s.project().clip(clip).unwrap().clone();
+    let pt = Point::new(rect.right() - 2.0, rect.y + rect.h * 0.7);
+    assert_eq!(
+        view.clip_zone(&s, &c, rect, pt),
+        ClipZone::Trim(ClipEdge::End)
+    );
+    let end_before = c.end(&s.project().timeline, s.project().sample_rate);
+    let left = Point::new(pt.x - 2.0 * view.ppq, pt.y);
+    drag(
+        &mut view,
+        &mut s,
+        size,
+        pt,
+        &[Point::new(pt.x - 6.0, pt.y), left],
+        Modifiers::NONE,
+    );
+    let p_ = s.project();
+    let end_after = p_.clip(clip).unwrap().end(&p_.timeline, p_.sample_rate);
+    let want = end_before - MusicalTime::from_quarters_i(2);
+    assert!(
+        (end_after - want).quarters().abs() < 1e-3,
+        "{end_after:?} vs {want:?}"
+    );
+    // The top corner draws a fade-in.
+    let rect = view.clip_view_rect(&s, size, clip).unwrap();
+    let content = view.content_rect(rect);
+    let corner = Point::new(rect.x + 3.0, content.y + 3.0);
+    let c = s.project().clip(clip).unwrap().clone();
+    assert!(matches!(
+        view.clip_zone(&s, &c, rect, corner),
+        ClipZone::Fade(ClipEdge::Start)
+    ));
+    let ppq = view.ppq;
+    drag(
+        &mut view,
+        &mut s,
+        size,
+        corner,
+        &[
+            Point::new(corner.x + 10.0, corner.y),
+            Point::new(corner.x + ppq, corner.y),
+        ],
+        Modifiers::NONE,
+    );
+    let ClipContent::Audio(a) = &s.project().clip(clip).unwrap().content else {
+        panic!()
+    };
+    let quarter = s.project().sample_rate as i64 * 60 / 112;
+    assert!(
+        (a.fades.fade_in - quarter).abs() < quarter / 8,
+        "fade ≈ a quarter: {}",
+        a.fades.fade_in
+    );
+    // The gain readout drags clip gain.
+    let badge = view.gain_badge(&c, rect).unwrap().center();
+    let c = s.project().clip(clip).unwrap().clone();
+    assert_eq!(view.clip_zone(&s, &c, rect, badge), ClipZone::Gain);
+    drag(
+        &mut view,
+        &mut s,
+        size,
+        badge,
+        &[
+            Point::new(badge.x, badge.y - 10.0),
+            Point::new(badge.x, badge.y - 40.0),
+        ],
+        Modifiers::NONE,
+    );
+    let ClipContent::Audio(a) = &s.project().clip(clip).unwrap().content else {
+        panic!()
+    };
+    assert!(
+        (a.gain_db - 4.0).abs() < 0.01,
+        "40 px up = +4 dB: {}",
+        a.gain_db
+    );
+}
+
+#[test]
+fn the_upper_half_selects_a_range_and_keys_switch_modes() {
+    let mut s = session();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 700.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    let clip = clip_of(&s, "Bass");
+    let rect = view.clip_view_rect(&s, size, clip).unwrap();
+    let content = view.content_rect(rect);
+    let start = s.project().clip(clip).unwrap().start;
+    let a = Point::new(
+        view.x_of(start + MusicalTime::from_quarters(1.0)),
+        content.y + content.h * 0.3,
+    );
+    let b = Point::new(view.x_of(start + MusicalTime::from_quarters(3.0)), a.y);
+    drag(
+        &mut view,
+        &mut s,
+        size,
+        a,
+        &[Point::new(a.x + 10.0, a.y), b],
+        Modifiers::NONE,
+    );
+    let r = s.selection.range.unwrap();
+    assert_eq!(
+        (r.start, r.end),
+        (
+            start + MusicalTime::from_quarters_i(1),
+            start + MusicalTime::from_quarters_i(3)
+        )
+    );
+    let key = |k: Key, m: Modifiers| ViewEvent::Key {
+        key: k,
+        modifiers: m,
+    };
+    let alt = Modifiers {
+        alt: true,
+        ..Modifiers::NONE
+    };
+    for a in run(&mut view, key(Key::Char('1'), alt), size, &s).0 {
+        s.dispatch(a).unwrap();
+    }
+    assert_eq!(s.editor.edit_mode, faderframe_session::EditMode::Shuffle);
+    let (a, _) = run(&mut view, key(Key::Char('b'), Modifiers::NONE), size, &s);
+    assert_eq!(a, vec![Action::Separate]);
+    let (a, _) = run(&mut view, key(Key::F(7), Modifiers::NONE), size, &s);
+    assert_eq!(
+        a,
+        vec![Action::SetEditTool(faderframe_session::EditTool::Select)]
+    );
 }

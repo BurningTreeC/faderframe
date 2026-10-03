@@ -14,6 +14,10 @@ pub struct Preferences {
     pub backend: String,
     pub sample_rate: Option<u32>,
     pub buffer_size: Option<u32>,
+    /// Processing threads (`None`: one per core).
+    pub threads: Option<u16>,
+    /// The edit toolbar is shown.
+    pub show_edit_toolbar: bool,
     pub snap: bool,
     pub follow_playhead: bool,
     /// "takes" or "replace".
@@ -22,6 +26,9 @@ pub struct Preferences {
     pub loop_record_mode: String,
     /// "off", "recording" or "always".
     pub metronome: String,
+    /// The mode the metronome button switches on ("recording" or
+    /// "always").
+    pub metronome_on: String,
     pub preroll_bars: u32,
     /// Extra recording latency compensation in frames.
     pub record_latency_offset: i64,
@@ -31,6 +38,12 @@ pub struct Preferences {
     pub midi_disabled_outputs: Vec<String>,
     /// MIDI outputs that get MIDI clock.
     pub midi_clock_outputs: Vec<String>,
+    /// "internal", "midi-clock" or "mtc".
+    pub sync_source: String,
+    /// Input port key to follow (none: any).
+    pub sync_port: Option<String>,
+    /// MTC timecode of the project start.
+    pub mtc_offset: String,
 }
 
 impl Default for Preferences {
@@ -39,21 +52,43 @@ impl Default for Preferences {
             backend: "auto".into(),
             sample_rate: None,
             buffer_size: None,
+            threads: None,
+            show_edit_toolbar: false,
             snap: true,
             follow_playhead: true,
             record_mode: RecordMode::default().id().into(),
             loop_record_mode: LoopRecordMode::default().id().into(),
             metronome: MetronomeMode::Recording.id().into(),
+            metronome_on: MetronomeMode::Always.id().into(),
             preroll_bars: 0,
             record_latency_offset: 0,
             midi_disabled_inputs: Vec::new(),
             midi_disabled_outputs: Vec::new(),
             midi_clock_outputs: Vec::new(),
+            sync_source: "internal".into(),
+            sync_port: None,
+            mtc_offset: "00:00:00:00".into(),
         }
     }
 }
 
 impl Preferences {
+    /// External synchronisation as stored.
+    pub fn sync_settings(&self) -> faderframe_session::SyncSettings {
+        faderframe_session::SyncSettings {
+            source: faderframe_session::SyncSource::from_id(&self.sync_source),
+            port: self.sync_port.clone(),
+            offset: faderframe_session::Timecode::parse(&self.mtc_offset).unwrap_or_default(),
+            ..Default::default()
+        }
+    }
+
+    pub fn set_sync_settings(&mut self, s: &faderframe_session::SyncSettings) {
+        self.sync_source = s.source.id().into();
+        self.sync_port = s.port.clone();
+        self.mtc_offset = s.offset.to_string();
+    }
+
     pub fn path() -> PathBuf {
         glib::user_config_dir()
             .join("faderframe")

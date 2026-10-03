@@ -14,6 +14,8 @@ pub enum GridDivision {
     Note(u16),
     /// Triplet 1/n note (two thirds of `Note(n)`).
     Triplet(u16),
+    /// Dotted 1/n note (one and a half `Note(n)`).
+    Dotted(u16),
 }
 
 impl GridDivision {
@@ -26,7 +28,97 @@ impl GridDivision {
             GridDivision::Triplet(n) => {
                 MusicalTime(TICKS_PER_QUARTER * 4 * 2 / (3 * n.max(1) as i64))
             }
+            GridDivision::Dotted(n) => {
+                MusicalTime(TICKS_PER_QUARTER * 4 * 3 / (2 * n.max(1) as i64))
+            }
         }
+    }
+
+    /// Note values from a whole note down to 1/256 (2, 4, … 256).
+    pub const NOTE_VALUES: [u16; 9] = [1, 2, 4, 8, 16, 32, 64, 128, 256];
+
+    /// Every musical grid value an editor offers: bar and beat, straight
+    /// notes down to 1/256, triplets and dotted values.
+    pub fn all() -> Vec<GridDivision> {
+        let mut out = vec![GridDivision::Bar, GridDivision::Beat];
+        out.extend(
+            Self::NOTE_VALUES[1..]
+                .iter()
+                .map(|&n| GridDivision::Note(n)),
+        );
+        out.extend(
+            Self::NOTE_VALUES[1..]
+                .iter()
+                .map(|&n| GridDivision::Triplet(n)),
+        );
+        out.extend(
+            Self::NOTE_VALUES[1..8]
+                .iter()
+                .map(|&n| GridDivision::Dotted(n)),
+        );
+        out
+    }
+
+    /// The 1/n note value a straight, triplet or dotted division is based
+    /// on.
+    pub fn base_note(self) -> Option<u16> {
+        match self {
+            GridDivision::Note(n) | GridDivision::Triplet(n) | GridDivision::Dotted(n) => Some(n),
+            GridDivision::Bar | GridDivision::Beat => None,
+        }
+    }
+
+    /// Toggle triplet (straight ↔ triplet; dotted becomes triplet; bar and
+    /// beat become eighth triplets).
+    pub fn toggled_triplet(self) -> Self {
+        match self {
+            GridDivision::Triplet(n) => GridDivision::Note(n),
+            GridDivision::Note(n) | GridDivision::Dotted(n) => GridDivision::Triplet(n),
+            _ => GridDivision::Triplet(8),
+        }
+    }
+
+    /// Toggle dotted (dotted values go down to 1/128).
+    pub fn toggled_dotted(self) -> Self {
+        match self {
+            GridDivision::Dotted(n) => GridDivision::Note(n),
+            GridDivision::Note(n) | GridDivision::Triplet(n) => GridDivision::Dotted(n.min(128)),
+            _ => GridDivision::Dotted(8),
+        }
+    }
+
+    /// A grid menu: Bar, Beat, 1/2 … 1/256 (keeping the current triplet or
+    /// dotted modifier), then Triplet and Dotted toggles.
+    pub fn menu(current: GridDivision) -> Vec<GridMenuEntry> {
+        let mut out = vec![
+            GridMenuEntry::new("Bar", GridDivision::Bar, current == GridDivision::Bar),
+            GridMenuEntry::new("Beat", GridDivision::Beat, current == GridDivision::Beat),
+        ];
+        for &n in &Self::NOTE_VALUES[1..] {
+            let division = match current {
+                GridDivision::Triplet(_) => GridDivision::Triplet(n),
+                GridDivision::Dotted(_) if n <= 128 => GridDivision::Dotted(n),
+                _ => GridDivision::Note(n),
+            };
+            out.push(GridMenuEntry::new(
+                &format!("1/{n}"),
+                division,
+                current.base_note() == Some(n),
+            ));
+        }
+        let mut triplet = GridMenuEntry::new(
+            "Triplet",
+            current.toggled_triplet(),
+            matches!(current, GridDivision::Triplet(_)),
+        );
+        triplet.separated = true;
+        out.push(triplet);
+        out.push(GridMenuEntry::new(
+            "Dotted",
+            current.toggled_dotted(),
+            matches!(current, GridDivision::Dotted(_)),
+        ));
+        out
     }
 
     pub fn label(self) -> String {
@@ -35,6 +127,29 @@ impl GridDivision {
             GridDivision::Beat => "Beat".into(),
             GridDivision::Note(n) => format!("1/{n}"),
             GridDivision::Triplet(n) => format!("1/{n}T"),
+            GridDivision::Dotted(n) => format!("1/{n}D"),
+        }
+    }
+}
+
+/// One entry of a grid menu ([`GridDivision::menu`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GridMenuEntry {
+    pub label: String,
+    /// The division choosing the entry sets.
+    pub division: GridDivision,
+    pub checked: bool,
+    /// A separator goes before the entry.
+    pub separated: bool,
+}
+
+impl GridMenuEntry {
+    fn new(label: &str, division: GridDivision, checked: bool) -> Self {
+        Self {
+            label: label.into(),
+            division,
+            checked,
+            separated: false,
         }
     }
 }
@@ -120,6 +235,27 @@ pub fn for_each_grid_line(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn fine_grid_values_are_exact() {
+        let sig = crate::TimeSignature::FOUR_FOUR;
+        assert_eq!(
+            GridDivision::Note(256).step(sig).ticks() * 64,
+            TICKS_PER_QUARTER
+        );
+        assert_eq!(
+            GridDivision::Triplet(256).step(sig).ticks() * 96,
+            TICKS_PER_QUARTER
+        );
+        assert_eq!(
+            GridDivision::Dotted(16).step(sig).ticks() * 2,
+            GridDivision::Note(16).step(sig).ticks() * 3
+        );
+        let all = GridDivision::all();
+        assert!(all.contains(&GridDivision::Note(256)));
+        assert_eq!(GridDivision::Dotted(8).label(), "1/8D");
+    }
+
     use super::*;
     use crate::{MeterChange, TimeSignature};
 
@@ -171,6 +307,23 @@ mod tests {
                 (q(4.0), GridLineKind::Bar),
                 (q(4.5), GridLineKind::Subdivision),
             ]
+        );
+    }
+
+    #[test]
+    fn grid_menu_keeps_the_modifier() {
+        let m = GridDivision::menu(GridDivision::Triplet(16));
+        let e = |l: &str| m.iter().find(|e| e.label == l).unwrap().clone();
+        assert!(e("1/16").checked);
+        assert_eq!(e("1/256").division, GridDivision::Triplet(256));
+        assert!(e("Triplet").checked && e("Triplet").separated);
+        assert_eq!(e("Triplet").division, GridDivision::Note(16));
+        assert_eq!(e("Dotted").division, GridDivision::Dotted(16));
+        let m = GridDivision::menu(GridDivision::Dotted(8));
+        assert_eq!(
+            m.iter().find(|e| e.label == "1/256").unwrap().division,
+            GridDivision::Note(256),
+            "no dotted 1/256"
         );
     }
 }

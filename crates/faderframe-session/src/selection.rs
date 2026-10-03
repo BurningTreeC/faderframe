@@ -16,6 +16,9 @@ pub struct Selection {
     pub tracks: BTreeSet<TrackId>,
     pub clips: BTreeSet<ClipId>,
     pub notes: BTreeSet<NoteId>,
+    /// The edit selection: a time range on the selected tracks (a cursor
+    /// when empty).
+    pub range: Option<crate::editing::EditRange>,
 }
 
 fn apply<T: Ord + Copy>(set: &mut BTreeSet<T>, items: &[T], mode: SelectMode) {

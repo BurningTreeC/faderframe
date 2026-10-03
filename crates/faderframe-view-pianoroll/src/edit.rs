@@ -34,6 +34,10 @@ const LANES: [MidiController; 10] = [
 impl PianoRollView {
     /// Follow the lane chosen in the editor settings.
     pub(crate) fn sync_lane(&mut self, model: &Session) {
+        if let Some(k) = model.editor.piano.expression {
+            self.lane = LaneKind::Expression(k);
+            return;
+        }
         match model.editor.piano.lane {
             Some((c, ch)) => {
                 self.lane = LaneKind::Controller(c);
@@ -466,8 +470,36 @@ impl PianoRollView {
                     erase: mods.alt,
                 });
             }
+            LaneKind::Expression(k) => {
+                // The selected notes, else the notes sounding here.
+                let t = self.time_at(pos.x).max(MusicalTime::ZERO);
+                let selected: Vec<&MidiNote> = m
+                    .notes
+                    .iter()
+                    .filter(|n| model.selection.notes.contains(&n.id))
+                    .collect();
+                let notes: Vec<(NoteId, MusicalTime, MusicalTime)> = if selected.is_empty() {
+                    m.notes
+                        .iter()
+                        .filter(|n| n.start <= t && n.end() > t)
+                        .map(|n| (n.id, n.start, n.end()))
+                        .collect()
+                } else {
+                    selected.iter().map(|n| (n.id, n.start, n.end())).collect()
+                };
+                if !notes.is_empty() {
+                    let v = crate::expression_value(area, k, pos.y);
+                    self.drag = Some(Drag::Expression {
+                        notes,
+                        points: vec![(t, v)],
+                        from: pos,
+                        to: pos,
+                        line: mods.shift,
+                        erase: mods.alt,
+                    });
+                }
+            }
         }
-        let _ = model;
         true
     }
 
@@ -589,6 +621,30 @@ impl PianoRollView {
                     let area = Self::lane_value_rect(l.lane);
                     let t = self.time_at(pos.x).max(MusicalTime::ZERO);
                     let v = Self::lane_value(area, pos.y, c.max());
+                    let far = points
+                        .last()
+                        .is_none_or(|(lt, _)| (self.x_of(t) - self.x_of(*lt)).abs() >= 3.0);
+                    if far {
+                        points.push((t, v));
+                    }
+                }
+            }
+            Some(Drag::Expression {
+                points,
+                to,
+                line,
+                erase,
+                ..
+            }) => {
+                *to = pos;
+                if !*line && !*erase {
+                    let LaneKind::Expression(k) = self.lane else {
+                        self.drag = drag;
+                        return;
+                    };
+                    let area = Self::lane_value_rect(l.lane);
+                    let t = self.time_at(pos.x).max(MusicalTime::ZERO);
+                    let v = crate::expression_value(area, k, pos.y);
                     let far = points
                         .last()
                         .is_none_or(|(lt, _)| (self.x_of(t) - self.x_of(*lt)).abs() >= 3.0);
@@ -864,6 +920,76 @@ impl PianoRollView {
                     points: pts,
                 });
             }
+            Drag::Expression {
+                notes,
+                points,
+                from,
+                to,
+                line,
+                erase,
+            } => {
+                let LaneKind::Expression(k) = self.lane else {
+                    return;
+                };
+                let area = Self::lane_value_rect(l.lane);
+                let ta = self.time_at(from.x.min(to.x)).max(MusicalTime::ZERO);
+                let tb = self.time_at(from.x.max(to.x)).max(MusicalTime::ZERO);
+                // Clip-relative points of the gesture.
+                let pts: Vec<(MusicalTime, f32)> = if line {
+                    let (va, vb) = if from.x <= to.x {
+                        (
+                            crate::expression_value(area, k, from.y),
+                            crate::expression_value(area, k, to.y),
+                        )
+                    } else {
+                        (
+                            crate::expression_value(area, k, to.y),
+                            crate::expression_value(area, k, from.y),
+                        )
+                    };
+                    vec![(ta, va), (tb, vb)]
+                } else {
+                    let mut p = points;
+                    p.sort_by_key(|(t, _)| *t);
+                    p
+                };
+                let (ga, gb) = if erase || line {
+                    (ta, tb)
+                } else {
+                    (
+                        pts.first().map_or(ta, |p| p.0),
+                        pts.last().map_or(tb, |p| p.0),
+                    )
+                };
+                cx.emit(Action::BeginGesture("Edit Expression".into()));
+                for (id, start, end) in notes {
+                    let a = ga.max(start);
+                    let b = gb.min(end);
+                    if b < a {
+                        continue;
+                    }
+                    let rel: Vec<faderframe_project::ExpressionPoint> = if erase {
+                        Vec::new()
+                    } else {
+                        pts.iter()
+                            .filter(|(t, _)| *t >= a && *t <= b)
+                            .map(|&(t, value)| faderframe_project::ExpressionPoint {
+                                time: t - start,
+                                value,
+                            })
+                            .collect()
+                    };
+                    cx.emit(Action::SetNoteExpression {
+                        clip: clip_id,
+                        note: id,
+                        kind: k,
+                        from: a - start,
+                        to: b - start + MusicalTime(1),
+                        points: rel,
+                    });
+                }
+                cx.emit(Action::EndGesture);
+            }
             Drag::ClipEnd { length } => {
                 if length != m.length {
                     cx.emit(Action::SetMidiClipLength {
@@ -890,9 +1016,46 @@ impl PianoRollView {
     ) -> HostRequest<Action> {
         let pr = model.editor.piano;
         let set = |lane: Option<(MidiController, u8)>| {
-            Action::SetPianoRoll(PianoRollSettings { lane, ..pr })
+            Action::SetPianoRoll(PianoRollSettings {
+                lane,
+                expression: None,
+                ..pr
+            })
         };
-        let mut items = vec![MenuItem::new("Velocity", set(None)).checked(pr.lane.is_none())];
+        let mut items = vec![
+            MenuItem::new("Velocity", set(None))
+                .checked(pr.lane.is_none() && pr.expression.is_none()),
+        ];
+        // Per-note expression (MPE).
+        for (i, k) in faderframe_project::ExpressionKind::ALL
+            .into_iter()
+            .enumerate()
+        {
+            let item = MenuItem::new(
+                format!("{} Expression", k.label()),
+                Action::SetPianoRoll(PianoRollSettings {
+                    expression: Some(k),
+                    ..pr
+                }),
+            )
+            .checked(pr.expression == Some(k));
+            items.push(if i == 0 { item.separated() } else { item });
+        }
+        if let Some(track) = model.project().clip(clip).map(|c| c.track)
+            && let Some(t) = model.project().track(track)
+        {
+            let on = t.mpe.is_some();
+            items.push(
+                MenuItem::new(
+                    "MPE for this track",
+                    Action::Edit(faderframe_project::Command::SetTrackMpe {
+                        track,
+                        mpe: (!on).then(faderframe_project::MpeConfig::default),
+                    }),
+                )
+                .checked(on),
+            );
+        }
         let mut listed: Vec<MidiController> = LANES.to_vec();
         for l in &m.controllers {
             if !listed.contains(&l.controller) {
@@ -907,7 +1070,7 @@ impl PianoRollView {
                 c.label()
             };
             let item = MenuItem::new(label, set(Some((c, self.lane_channel))))
-                .checked(pr.lane.is_some_and(|(x, _)| x == c));
+                .checked(pr.expression.is_none() && pr.lane.is_some_and(|(x, _)| x == c));
             items.push(if i == 0 { item.separated() } else { item });
         }
         if let Some((c, ch)) = pr.lane {
@@ -1038,6 +1201,23 @@ impl PianoRollView {
             cx.request(self.lane_menu(pos, clip, m, model));
             return true;
         }
+        if l.ruler.contains(pos) {
+            // SysEx here: delete it; anywhere: import a file.
+            let at = self.time_at(pos.x).max(MusicalTime::ZERO);
+            let mut items = Vec::new();
+            if let Some(i) = self.sysex_at(m, pos.x) {
+                items.push(MenuItem::new(
+                    format!("Delete SysEx {}", m.sysex[i].describe()),
+                    Action::RemoveSysex { clip, index: i },
+                ));
+            }
+            items.push(MenuItem::new(
+                "Import SysEx File Here…",
+                Action::RequestSysexImport { clip, at },
+            ));
+            cx.request(HostRequest::ContextMenu { at: pos, items });
+            return true;
+        }
         if !l.grid.contains(pos) {
             return false;
         }
@@ -1068,6 +1248,10 @@ impl PianoRollView {
                         notes: m.notes.iter().map(|n| n.id).collect(),
                         mode: SelectMode::Replace,
                     },
+                ));
+                items.push(MenuItem::new(
+                    "Import SysEx File Here…",
+                    Action::RequestSysexImport { clip, at },
                 ));
                 items.push(
                     MenuItem::new(
@@ -1295,6 +1479,13 @@ impl PianoRollView {
         self.clamp_scroll(size, len);
     }
 
+    /// The SysEx message drawn at `x` in the ruler.
+    fn sysex_at(&self, m: &MidiClip, x: f32) -> Option<usize> {
+        m.sysex
+            .iter()
+            .position(|e| (self.x_of(e.time) - x).abs() <= 5.0)
+    }
+
     pub(crate) fn tooltip_at(&self, pos: Point, size: Size, model: &Session) -> Option<String> {
         let l = self.layout(size);
         if l.toolbar.contains(pos) {
@@ -1305,6 +1496,14 @@ impl PianoRollView {
         let (_, clip, m) = Self::clip(model)?;
         if l.ruler.contains(pos) && (pos.x - self.x_of(m.length)).abs() <= 6.0 {
             return Some("Clip end — drag to change the length".into());
+        }
+        if l.ruler.contains(pos)
+            && let Some(i) = self.sysex_at(m, pos.x)
+        {
+            return Some(format!(
+                "SysEx {} · sent to the track's MIDI output · right-click to delete",
+                m.sysex[i].describe()
+            ));
         }
         if l.lane_header.contains(pos) {
             return Some("Choose the lane: velocity or a controller".into());
@@ -1317,6 +1516,10 @@ impl PianoRollView {
                 LaneKind::Controller(c) => format!(
                     "{}: drag to draw · Shift-drag: line · Alt-drag: erase",
                     c.label()
+                ),
+                LaneKind::Expression(k) => format!(
+                    "{} of the selected notes (else those under the pointer): drag to draw · Shift-drag: line · Alt-drag: erase",
+                    k.label()
                 ),
             });
         }

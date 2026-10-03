@@ -6,8 +6,9 @@ use crate::{
     Processor,
 };
 use faderframe_midi::MidiBuffer;
+use faderframe_realtime::{PoolJob, TaskCells, WorkerPool};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 /// Accumulated time and peak load of one node or group.
@@ -106,6 +107,10 @@ pub struct GraphStats {
     pub output_latency: u32,
     pub compensated_edges: usize,
     pub max_compensation: u32,
+    /// Scheduling units of the parallel executor (fused node chains).
+    pub jobs: usize,
+    /// Largest number of jobs sharing a level: the threads worth using.
+    pub job_width: usize,
 }
 
 struct AudioSource {
@@ -122,43 +127,191 @@ struct EventSource {
     delay: Option<EventDelay>,
 }
 
-struct CompiledNode<C> {
+/// What never changes while the graph runs.
+struct NodeInfo {
     id: NodeId,
     key: Option<NodeKey>,
     role: NodeRole,
-    processor: Box<dyn Processor<C>>,
+    output_latency: u32,
+    /// (upstream node, compensation) per audio edge, for diagnostics.
+    compensation: Vec<(u32, u32)>,
+}
+
+/// A node's buffers: written by the node's own job, then read by its
+/// dependents (outputs) and the driver (device outputs' inputs).
+struct NodeBuffers {
     audio_in: Vec<AudioBuffer>,
     audio_out: Vec<AudioBuffer>,
     events_in: Vec<MidiBuffer>,
     events_out: Vec<MidiBuffer>,
+}
+
+/// What only the node's own job touches.
+struct NodeWork<C> {
+    processor: Box<dyn Processor<C>>,
     audio_sources: Vec<AudioSource>,
     event_sources: Vec<EventSource>,
-    latency: u32,
-    output_latency: u32,
+    /// Time used in the current callback.
+    cycle_ns: u64,
+}
+
+/// A scheduling unit: a chain of nodes run in order on one thread.
+struct Job {
+    nodes: Box<[u32]>,
+    dependents: Box<[u32]>,
+    deps: u32,
+}
+
+/// Dependency-driven parallel schedule (state reset every cycle).
+///
+/// Ranks are the measured cost from a job to the end of the graph (its own
+/// time plus the most expensive path through its dependents): roots start
+/// in rank order and a thread finishing a job continues with the released
+/// dependent of highest rank, so long plugin chains start first instead
+/// of becoming the tail of the cycle.
+struct Schedule {
+    jobs: Box<[Job]>,
+    /// Jobs in topological order.
+    order: Box<[u32]>,
+    /// Jobs without dependencies, highest rank first.
+    roots: Box<[u32]>,
+    /// Time each job took in the last cycle (written by its thread).
+    cost: Box<[AtomicU64]>,
+    /// Smoothed cost (audio thread only).
+    average: Box<[u64]>,
+    rank: Box<[AtomicU64]>,
+    cycles: u32,
+    /// Worth spreading over threads (hysteresis on the total cost).
+    parallel: bool,
+    remaining: Box<[AtomicU32]>,
+    /// Ready jobs (`job + 1`; 0 = slot reserved but not yet written).
+    queue: Box<[AtomicU32]>,
+    head: AtomicUsize,
+    tail: AtomicUsize,
+    finished: AtomicUsize,
+    /// Threads still allowed to join this cycle.
+    seats: AtomicUsize,
+}
+
+impl Schedule {
+    /// After a cycle (audio thread): smooth the measured costs and, every
+    /// 16 cycles, recompute ranks, the root order and whether parallel
+    /// processing pays off. No allocation.
+    fn after_cycle(&mut self, parallel_min_ns: u64) {
+        for (a, c) in self.average.iter_mut().zip(self.cost.iter_mut()) {
+            let c = *c.get_mut();
+            *a = if *a == 0 { c } else { (*a * 7 + c) / 8 };
+        }
+        self.cycles = self.cycles.wrapping_add(1);
+        if self.cycles % 16 != 1 {
+            return;
+        }
+        for &j in self.order.iter().rev() {
+            let j = j as usize;
+            let tail = self.jobs[j]
+                .dependents
+                .iter()
+                .map(|&d| *self.rank[d as usize].get_mut())
+                .max()
+                .unwrap_or(0);
+            // At least 1 ns per node, so unmeasured jobs keep their shape.
+            let own = self.average[j].max(self.jobs[j].nodes.len() as u64);
+            *self.rank[j].get_mut() = own + tail;
+        }
+        // Insertion sort, highest rank first (roots are few).
+        for i in 1..self.roots.len() {
+            let mut k = i;
+            while k > 0
+                && *self.rank[self.roots[k - 1] as usize].get_mut()
+                    < *self.rank[self.roots[k] as usize].get_mut()
+            {
+                self.roots.swap(k - 1, k);
+                k -= 1;
+            }
+        }
+        let total: u64 = self.average.iter().sum();
+        if self.parallel && total < parallel_min_ns / 2 {
+            self.parallel = false;
+        } else if !self.parallel && total >= parallel_min_ns {
+            self.parallel = true;
+        }
+    }
+
+    fn reset(&mut self, seats: usize) {
+        for (r, j) in self.remaining.iter_mut().zip(self.jobs.iter()) {
+            *r.get_mut() = j.deps;
+        }
+        for q in self.queue.iter_mut() {
+            *q.get_mut() = 0;
+        }
+        for (q, &r) in self.queue.iter_mut().zip(self.roots.iter()) {
+            *q.get_mut() = r + 1;
+        }
+        *self.head.get_mut() = 0;
+        *self.tail.get_mut() = self.roots.len();
+        *self.finished.get_mut() = 0;
+        *self.seats.get_mut() = seats;
+    }
+
+    #[inline]
+    fn push(&self, job: u32) {
+        let t = self.tail.fetch_add(1, Ordering::AcqRel);
+        // Every job becomes ready once per cycle: `t` stays in bounds.
+        if let Some(slot) = self.queue.get(t) {
+            slot.store(job + 1, Ordering::Release);
+        }
+    }
+
+    #[inline]
+    fn pop(&self) -> Option<u32> {
+        loop {
+            let h = self.head.load(Ordering::Acquire);
+            if h >= self.tail.load(Ordering::Acquire) {
+                return None;
+            }
+            let v = self.queue.get(h)?.load(Ordering::Acquire);
+            if v == 0 {
+                // Reserved by a pusher that has not stored yet.
+                return None;
+            }
+            if self
+                .head
+                .compare_exchange_weak(h, h + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(v - 1);
+            }
+        }
+    }
 }
 
 /// An immutable-topology, preallocated, ready-to-run graph.
 ///
-/// Nodes are stored in topological order, so every node's upstream nodes
-/// live at lower indices. The serial executor exploits that with
-/// `split_at_mut`; a future parallel executor uses
-/// [`CompiledGraph::dependency_count`] / [`CompiledGraph::dependents`].
+/// Nodes are stored in topological order. The serial executor runs them in
+/// that order; the parallel one runs *jobs* — chains of nodes fused at
+/// compile time (a node whose only dependent has no other input, plus
+/// source nodes feeding a single job) — as soon as their upstream jobs are
+/// done, on the calling thread and a [`WorkerPool`]. Both use the same node
+/// runner, so results are bit-identical: every node sums its inputs in a
+/// fixed order whatever thread ran its upstream nodes.
 pub struct CompiledGraph<C> {
-    nodes: Vec<CompiledNode<C>>,
+    info: Vec<NodeInfo>,
+    bufs: TaskCells<NodeBuffers>,
+    work: TaskCells<NodeWork<C>>,
     /// `NodeId.0` → topological index.
     position: Vec<u32>,
     key_index: Vec<(NodeKey, u32)>,
     dependency_counts: Vec<u32>,
     dependents: Vec<Vec<u32>>,
     levels: Vec<u32>,
+    schedule: Schedule,
     config: PrepareConfig,
     stats: GraphStats,
     timings: Arc<NodeTimings>,
-    /// Time per node / group in the current callback (audio thread only).
-    cycle_node_ns: Vec<u64>,
     cycle_group_ns: Vec<u64>,
 }
 
+/// Build node and job tables, compensation and timing for `builder`.
 pub(crate) fn compile<C>(
     builder: GraphBuilder<C>,
     config: &PrepareConfig,
@@ -186,9 +339,15 @@ pub(crate) fn compile<C>(
     }
 
     // Move descriptors into topological order.
+    struct Building<C> {
+        info: NodeInfo,
+        bufs: NodeBuffers,
+        work: NodeWork<C>,
+        latency: u32,
+    }
     let mut slots: Vec<Option<NodeDesc<C>>> = nodes.into_iter().map(Some).collect();
     let max_block = config.max_block_size.max(1);
-    let mut compiled: Vec<CompiledNode<C>> = Vec::with_capacity(order.len());
+    let mut compiled: Vec<Building<C>> = Vec::with_capacity(order.len());
     let mut labels: Vec<String> = Vec::with_capacity(order.len());
     let mut groups_of: Vec<Option<u32>> = Vec::with_capacity(order.len());
     for &n in &order {
@@ -201,31 +360,39 @@ pub(crate) fn compile<C>(
         };
         processor.prepare(config);
         let latency = processor.latency();
-        compiled.push(CompiledNode {
-            id: NodeId(n as u32),
-            key: spec.key,
-            role: spec.role,
-            processor,
-            audio_in: spec
-                .audio_inputs
-                .iter()
-                .map(|&l| AudioBuffer::new(l, max_block))
-                .collect(),
-            audio_out: spec
-                .audio_outputs
-                .iter()
-                .map(|&l| AudioBuffer::new(l, max_block))
-                .collect(),
-            events_in: (0..spec.event_inputs)
-                .map(|_| MidiBuffer::with_capacity(config.event_capacity))
-                .collect(),
-            events_out: (0..spec.event_outputs)
-                .map(|_| MidiBuffer::with_capacity(config.event_capacity))
-                .collect(),
-            audio_sources: Vec::new(),
-            event_sources: Vec::new(),
+        compiled.push(Building {
+            info: NodeInfo {
+                id: NodeId(n as u32),
+                key: spec.key,
+                role: spec.role,
+                output_latency: 0,
+                compensation: Vec::new(),
+            },
+            bufs: NodeBuffers {
+                audio_in: spec
+                    .audio_inputs
+                    .iter()
+                    .map(|&l| AudioBuffer::new(l, max_block))
+                    .collect(),
+                audio_out: spec
+                    .audio_outputs
+                    .iter()
+                    .map(|&l| AudioBuffer::new(l, max_block))
+                    .collect(),
+                events_in: (0..spec.event_inputs)
+                    .map(|_| MidiBuffer::with_capacity(config.event_capacity))
+                    .collect(),
+                events_out: (0..spec.event_outputs)
+                    .map(|_| MidiBuffer::with_capacity(config.event_capacity))
+                    .collect(),
+            },
+            work: NodeWork {
+                processor,
+                audio_sources: Vec::new(),
+                event_sources: Vec::new(),
+                cycle_ns: 0,
+            },
             latency,
-            output_latency: 0,
         });
         labels.push(spec.label);
         groups_of.push(spec.group);
@@ -245,13 +412,13 @@ pub(crate) fn compile<C>(
         let to = position[e.to.0 as usize] as usize;
         let from = position[e.from.0 as usize];
         match e.kind {
-            EdgeKind::Audio => compiled[to].audio_sources.push(AudioSource {
+            EdgeKind::Audio => compiled[to].work.audio_sources.push(AudioSource {
                 to_port: e.to_port,
                 from_node: from,
                 from_port: e.from_port,
                 delay: None,
             }),
-            EdgeKind::Events => compiled[to].event_sources.push(EventSource {
+            EdgeKind::Events => compiled[to].work.event_sources.push(EventSource {
                 to_port: e.to_port,
                 from_node: from,
                 from_port: e.from_port,
@@ -271,51 +438,56 @@ pub(crate) fn compile<C>(
         let (done, rest) = compiled.split_at_mut(i);
         let node = &mut rest[0];
         let arrival = node
+            .work
             .audio_sources
             .iter()
-            .map(|s| done[s.from_node as usize].output_latency)
+            .map(|s| done[s.from_node as usize].info.output_latency)
             .chain(
-                node.event_sources
+                node.work
+                    .event_sources
                     .iter()
-                    .map(|s| done[s.from_node as usize].output_latency),
+                    .map(|s| done[s.from_node as usize].info.output_latency),
             )
             .max()
             .unwrap_or(0);
-        for s in &mut node.audio_sources {
+        for s in &mut node.work.audio_sources {
             let src = &done[s.from_node as usize];
-            let comp = arrival - src.output_latency;
+            let comp = arrival - src.info.output_latency;
             if comp > 0 {
-                let channels = src.audio_out[s.from_port as usize].num_channels();
+                let channels = src.bufs.audio_out[s.from_port as usize].num_channels();
                 s.delay = Some(AudioDelay::new(channels, comp as usize, max_block));
                 stats.compensated_edges += 1;
                 stats.max_compensation = stats.max_compensation.max(comp);
             }
+            node.info.compensation.push((s.from_node, comp));
         }
-        for s in &mut node.event_sources {
-            let comp = arrival - done[s.from_node as usize].output_latency;
+        for s in &mut node.work.event_sources {
+            let comp = arrival - done[s.from_node as usize].info.output_latency;
             if comp > 0 {
                 s.delay = Some(EventDelay::new(comp as usize, config.event_capacity));
                 stats.compensated_edges += 1;
                 stats.max_compensation = stats.max_compensation.max(comp);
             }
         }
-        node.output_latency = arrival + node.latency;
-        if matches!(node.role, NodeRole::DeviceOutput { .. }) {
+        node.info.output_latency = arrival + node.latency;
+        if matches!(node.info.role, NodeRole::DeviceOutput { .. }) {
             stats.output_latency = stats.output_latency.max(arrival);
         }
     }
 
-    // Dependency information for parallel scheduling.
+    // Dependencies.
     let n = compiled.len();
     let mut dependency_counts = vec![0u32; n];
+    let mut upstream: Vec<Vec<u32>> = vec![Vec::new(); n];
     let mut dependents: Vec<Vec<u32>> = vec![Vec::new(); n];
     let mut levels = vec![0u32; n];
     for (i, node) in compiled.iter().enumerate() {
         let mut ups: Vec<u32> = node
+            .work
             .audio_sources
             .iter()
             .map(|s| s.from_node)
-            .chain(node.event_sources.iter().map(|s| s.from_node))
+            .chain(node.work.event_sources.iter().map(|s| s.from_node))
             .collect();
         ups.sort_unstable();
         ups.dedup();
@@ -325,9 +497,10 @@ pub(crate) fn compile<C>(
             .map(|&u| levels[u as usize] + 1)
             .max()
             .unwrap_or(0);
-        for u in ups {
+        for &u in &ups {
             dependents[u as usize].push(i as u32);
         }
+        upstream[i] = ups;
     }
     stats.levels = levels.iter().map(|&l| l as usize + 1).max().unwrap_or(0);
     let mut width = vec![0usize; stats.levels];
@@ -336,10 +509,12 @@ pub(crate) fn compile<C>(
     }
     stats.max_width = width.into_iter().max().unwrap_or(0);
 
+    let schedule = build_schedule(&upstream, &dependents, &mut stats);
+
     let mut key_index: Vec<(NodeKey, u32)> = compiled
         .iter()
         .enumerate()
-        .filter_map(|(i, nd)| nd.key.map(|k| (k, i as u32)))
+        .filter_map(|(i, nd)| nd.info.key.map(|k| (k, i as u32)))
         .collect();
     key_index.sort_by_key(|&(k, i)| (k, i));
     key_index.dedup_by_key(|&mut (k, _)| k);
@@ -357,19 +532,224 @@ pub(crate) fn compile<C>(
         groups: (0..group_count).map(|_| Timing::default()).collect(),
     });
 
+    let mut info = Vec::with_capacity(n);
+    let mut bufs = Vec::with_capacity(n);
+    let mut work = Vec::with_capacity(n);
+    for b in compiled {
+        info.push(b.info);
+        bufs.push(b.bufs);
+        work.push(b.work);
+    }
     Ok(CompiledGraph {
-        nodes: compiled,
+        info,
+        bufs: TaskCells::new(bufs),
+        work: TaskCells::new(work),
         position,
         key_index,
         dependency_counts,
         dependents,
         levels,
+        schedule,
         config: *config,
         stats,
         timings,
-        cycle_node_ns: vec![0; n],
         cycle_group_ns: vec![0; group_count],
     })
+}
+
+/// Fuse nodes into jobs and derive the job graph.
+fn build_schedule(
+    upstream: &[Vec<u32>],
+    dependents: &[Vec<u32>],
+    stats: &mut GraphStats,
+) -> Schedule {
+    let n = upstream.len();
+    // Chains: a node whose only dependent has no other input continues
+    // that dependent's job (topological order: `job[i]` is final here).
+    let mut job: Vec<u32> = (0..n as u32).collect();
+    for i in 0..n {
+        if let [d] = dependents[i][..]
+            && upstream[d as usize].len() == 1
+        {
+            job[d as usize] = job[i];
+        }
+    }
+    // Sources feeding exactly one node run at the start of its job — when
+    // that node depends on sources only (a track input fed by clip players
+    // and live input). Otherwise the source would wait for the node's other
+    // inputs instead of running in parallel with them.
+    let mut size = vec![0usize; n];
+    for &j in &job {
+        size[j as usize] += 1;
+    }
+    for i in 0..n {
+        if upstream[i].is_empty()
+            && size[job[i] as usize] == 1
+            && let [d] = dependents[i][..]
+            && upstream[d as usize]
+                .iter()
+                .all(|&u| upstream[u as usize].is_empty())
+        {
+            size[job[i] as usize] -= 1;
+            job[i] = job[d as usize];
+            size[job[i] as usize] += 1;
+        }
+    }
+    // Compact job ids (in order of first node: topological).
+    let mut id = vec![u32::MAX; n];
+    let mut members: Vec<Vec<u32>> = Vec::new();
+    for (i, &root) in job.iter().enumerate() {
+        let root = root as usize;
+        if id[root] == u32::MAX {
+            id[root] = members.len() as u32;
+            members.push(Vec::new());
+        }
+        members[id[root] as usize].push(i as u32);
+    }
+    let job_of: Vec<u32> = job.iter().map(|&j| id[j as usize]).collect();
+    let jobs_n = members.len();
+    let mut deps: Vec<Vec<u32>> = vec![Vec::new(); jobs_n];
+    for (j, nodes) in members.iter().enumerate() {
+        for &v in nodes {
+            for &u in &upstream[v as usize] {
+                let ju = job_of[u as usize];
+                if ju as usize != j {
+                    deps[j].push(ju);
+                }
+            }
+        }
+        deps[j].sort_unstable();
+        deps[j].dedup();
+    }
+    let mut job_dependents: Vec<Vec<u32>> = vec![Vec::new(); jobs_n];
+    for (j, ds) in deps.iter().enumerate() {
+        for &d in ds {
+            job_dependents[d as usize].push(j as u32);
+        }
+    }
+    // Jobs are numbered in topological order of their first node, but a
+    // fused job's later nodes may come after a dependent's first node:
+    // levels and ranks need a proper order.
+    let job_order = {
+        let pairs: Vec<(usize, usize)> = deps
+            .iter()
+            .enumerate()
+            .flat_map(|(j, ds)| ds.iter().map(move |&d| (d as usize, j)))
+            .collect();
+        topological_order(jobs_n, &pairs).unwrap_or_else(|_| (0..jobs_n).collect())
+    };
+    let mut level = vec![0usize; jobs_n];
+    for &j in &job_order {
+        level[j] = deps[j]
+            .iter()
+            .map(|&d| level[d as usize] + 1)
+            .max()
+            .unwrap_or(0);
+    }
+    let mut width = vec![0usize; level.iter().max().map_or(0, |l| l + 1)];
+    for &l in &level {
+        width[l] += 1;
+    }
+    // Longest path (in nodes) from a job to the end.
+    let mut rank = vec![0usize; jobs_n];
+    for &j in job_order.iter().rev() {
+        rank[j] = members[j].len()
+            + job_dependents[j]
+                .iter()
+                .map(|&d| rank[d as usize])
+                .max()
+                .unwrap_or(0);
+    }
+    let mut roots: Vec<u32> = (0..jobs_n as u32)
+        .filter(|&j| deps[j as usize].is_empty())
+        .collect();
+    roots.sort_by_key(|&j| std::cmp::Reverse(rank[j as usize]));
+    stats.jobs = jobs_n;
+    stats.job_width = width.into_iter().max().unwrap_or(0);
+    Schedule {
+        order: job_order.iter().map(|&j| j as u32).collect(),
+        cost: (0..jobs_n).map(|_| AtomicU64::new(0)).collect(),
+        average: vec![0; jobs_n].into(),
+        rank: rank.iter().map(|&r| AtomicU64::new(r as u64)).collect(),
+        cycles: 0,
+        parallel: true,
+        jobs: members
+            .into_iter()
+            .zip(deps)
+            .zip(job_dependents)
+            .map(|((nodes, deps), dependents)| Job {
+                nodes: nodes.into(),
+                dependents: dependents.into(),
+                deps: deps.len() as u32,
+            })
+            .collect(),
+        roots: roots.into(),
+        remaining: (0..jobs_n).map(|_| AtomicU32::new(0)).collect(),
+        queue: (0..jobs_n).map(|_| AtomicU32::new(0)).collect(),
+        head: AtomicUsize::new(0),
+        tail: AtomicUsize::new(0),
+        finished: AtomicUsize::new(0),
+        seats: AtomicUsize::new(0),
+    }
+}
+
+/// Graphs below this many nodes always run serially.
+const MIN_PARALLEL_NODES: usize = 8;
+
+/// One parallel cycle, shared by the participating threads.
+struct Exec<'a, 'c, C> {
+    graph: &'a CompiledGraph<C>,
+    cx: &'a ProcessContext<'c, C>,
+    frames: usize,
+    measure: bool,
+}
+
+impl<C: Sync> PoolJob for Exec<'_, '_, C> {
+    fn work(&self) {
+        let s = &self.graph.schedule;
+        // Threads beyond the graph's useful width leave at once.
+        if s.seats
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_err()
+        {
+            return;
+        }
+        let total = s.jobs.len();
+        let mut next: Option<u32> = None;
+        loop {
+            let j = match next.take().or_else(|| s.pop()) {
+                Some(j) => j,
+                None => {
+                    if s.finished.load(Ordering::Acquire) >= total {
+                        return;
+                    }
+                    std::hint::spin_loop();
+                    continue;
+                }
+            };
+            let Some(job) = s.jobs.get(j as usize) else {
+                continue;
+            };
+            self.graph
+                .run_job(j as usize, self.cx, self.frames, self.measure);
+            // Continue with the most expensive released dependent, queue
+            // the others.
+            let rank = |d: u32| s.rank[d as usize].load(Ordering::Relaxed);
+            for &d in job.dependents.iter() {
+                if s.remaining[d as usize].fetch_sub(1, Ordering::AcqRel) == 1 {
+                    match next {
+                        None => next = Some(d),
+                        Some(n) if rank(d) > rank(n) => {
+                            s.push(n);
+                            next = Some(d);
+                        }
+                        Some(_) => s.push(d),
+                    }
+                }
+            }
+            s.finished.fetch_add(1, Ordering::AcqRel);
+        }
+    }
 }
 
 impl<C> CompiledGraph<C> {
@@ -386,7 +766,7 @@ impl<C> CompiledGraph<C> {
     }
 
     pub fn node_count(&self) -> usize {
-        self.nodes.len()
+        self.info.len()
     }
 
     /// Topological index of a builder node id.
@@ -396,7 +776,7 @@ impl<C> CompiledGraph<C> {
 
     /// Node id at topological index `i`.
     pub fn id_at(&self, i: usize) -> NodeId {
-        self.nodes[i].id
+        self.info[i].id
     }
 
     /// Number of distinct upstream nodes of topological node `i`.
@@ -414,9 +794,14 @@ impl<C> CompiledGraph<C> {
         self.levels[i]
     }
 
+    /// Topological indices of the nodes of each parallel job.
+    pub fn jobs(&self) -> impl Iterator<Item = &[u32]> {
+        self.schedule.jobs.iter().map(|j| &j.nodes[..])
+    }
+
     /// Total latency at a node's outputs (its own plus upstream).
     pub fn output_latency(&self, id: NodeId) -> Option<u32> {
-        self.index_of(id).map(|i| self.nodes[i].output_latency)
+        self.index_of(id).map(|i| self.info[i].output_latency)
     }
 
     /// Delay-compensation applied on each edge into `id`
@@ -425,31 +810,28 @@ impl<C> CompiledGraph<C> {
         let Some(i) = self.index_of(id) else {
             return Vec::new();
         };
-        let node = &self.nodes[i];
-        node.audio_sources
+        self.info[i]
+            .compensation
             .iter()
-            .map(|s| {
-                (
-                    self.nodes[s.from_node as usize].id,
-                    s.delay.as_ref().map_or(0, |d| d.delay() as u32),
-                )
-            })
+            .map(|&(from, comp)| (self.info[from as usize].id, comp))
             .collect()
     }
 
+    /// A node's output after processing.
     pub fn audio_output(&self, id: NodeId, port: usize) -> Option<&AudioBuffer> {
         let i = self.index_of(id)?;
-        self.nodes[i].audio_out.get(port)
+        self.bufs.done(i)?.audio_out.get(port)
     }
 
+    /// A node's summed input after processing.
     pub fn audio_input(&self, id: NodeId, port: usize) -> Option<&AudioBuffer> {
         let i = self.index_of(id)?;
-        self.nodes[i].audio_in.get(port)
+        self.bufs.done(i)?.audio_in.get(port)
     }
 
     pub fn event_output(&self, id: NodeId, port: usize) -> Option<&MidiBuffer> {
         let i = self.index_of(id)?;
-        self.nodes[i].events_out.get(port)
+        self.bufs.done(i)?.events_out.get(port)
     }
 
     /// Give the driver mutable access to device-input nodes' output buffers
@@ -460,9 +842,9 @@ impl<C> CompiledGraph<C> {
         frames: usize,
         mut fill: impl FnMut(u16, &mut AudioBuffer),
     ) {
-        for node in &mut self.nodes {
-            if let NodeRole::DeviceInput { first_channel } = node.role
-                && let Some(buf) = node.audio_out.first_mut()
+        for (i, info) in self.info.iter().enumerate() {
+            if let NodeRole::DeviceInput { first_channel } = info.role
+                && let Some(buf) = self.bufs.get_mut(i).and_then(|b| b.audio_out.first_mut())
             {
                 buf.set_len(frames);
                 fill(first_channel, buf);
@@ -474,9 +856,9 @@ impl<C> CompiledGraph<C> {
     /// [`Self::process`]).
     #[inline]
     pub fn read_device_outputs(&self, mut read: impl FnMut(u16, &AudioBuffer)) {
-        for node in &self.nodes {
-            if let NodeRole::DeviceOutput { first_channel } = node.role
-                && let Some(buf) = node.audio_in.first()
+        for (i, info) in self.info.iter().enumerate() {
+            if let NodeRole::DeviceOutput { first_channel } = info.role
+                && let Some(buf) = self.bufs.done(i).and_then(|b| b.audio_in.first())
             {
                 read(first_channel, buf);
             }
@@ -487,76 +869,158 @@ impl<C> CompiledGraph<C> {
     /// [`Self::process`]).
     #[inline]
     pub fn read_event_outputs(&self, mut read: impl FnMut(u16, &MidiBuffer)) {
-        for node in &self.nodes {
-            if let NodeRole::EventOutput { port } = node.role
-                && let Some(buf) = node.events_out.first()
+        for (i, info) in self.info.iter().enumerate() {
+            if let NodeRole::EventOutput { port } = info.role
+                && let Some(buf) = self.bufs.done(i).and_then(|b| b.events_out.first())
             {
                 read(port, buf);
             }
         }
     }
 
-    /// Run every node once (audio thread). Realtime-safe.
-    pub fn process(&mut self, cx: &ProcessContext<'_, C>) {
-        let frames = cx.frames.min(self.config.max_block_size);
-        let measure = self.config.measure_nodes && self.timings.enabled.load(Ordering::Relaxed);
-        // One clock read per node: a node's end is the next one's start.
-        let mut last = measure.then(Instant::now);
-        for i in 0..self.nodes.len() {
-            let (done, rest) = self.nodes.split_at_mut(i);
-            let node = &mut rest[0];
-
-            for buf in &mut node.audio_in {
-                buf.set_len(frames);
-                buf.clear();
-            }
-            for src in &mut node.audio_sources {
-                let from = &done[src.from_node as usize].audio_out[src.from_port as usize];
-                let dst = &mut node.audio_in[src.to_port as usize];
-                match &mut src.delay {
-                    None => dst.mix_from(from),
-                    Some(delay) => delay.process_mix(from, dst),
-                }
-            }
-            for buf in &mut node.events_in {
-                buf.clear();
-            }
-            for src in &mut node.event_sources {
-                let from = &done[src.from_node as usize].events_out[src.from_port as usize];
-                let dst = &mut node.events_in[src.to_port as usize];
-                match &mut src.delay {
-                    None => dst.merge_from(from, 0),
-                    Some(delay) => delay.process_merge(from, dst, frames),
-                }
-            }
-            let is_device_input = matches!(node.role, NodeRole::DeviceInput { .. });
-            for buf in &mut node.audio_out {
-                if !is_device_input || buf.len() != frames {
-                    buf.set_len(frames);
-                }
-            }
-            for buf in &mut node.events_out {
-                buf.clear();
-            }
-
-            let mut io = NodeIo {
-                frames,
-                audio_in: &node.audio_in,
-                audio_out: &mut node.audio_out,
-                events_in: &node.events_in,
-                events_out: &mut node.events_out,
+    /// Gather node `i`'s inputs from its (finished) upstream nodes and run
+    /// its processor. `last` chains clock reads: a node's end is the next
+    /// one's start on the same thread.
+    #[inline]
+    fn run_node(
+        &self,
+        i: usize,
+        cx: &ProcessContext<'_, C>,
+        frames: usize,
+        last: &mut Option<Instant>,
+    ) {
+        let (Some(mut w), Some(mut b)) = (self.work.claim(i), self.bufs.claim(i)) else {
+            // Scheduling error (cannot happen): skip rather than race.
+            return;
+        };
+        let NodeWork {
+            processor,
+            audio_sources,
+            event_sources,
+            cycle_ns,
+        } = &mut *w;
+        let NodeBuffers {
+            audio_in,
+            audio_out,
+            events_in,
+            events_out,
+        } = &mut *b;
+        for buf in audio_in.iter_mut() {
+            buf.set_len(frames);
+            buf.clear();
+        }
+        for src in audio_sources.iter_mut() {
+            let Some(up) = self.bufs.done(src.from_node as usize) else {
+                continue;
             };
-            node.processor.process(cx, &mut io);
-            if let Some(start) = last {
-                let now = Instant::now();
-                let ns = now.duration_since(start).as_nanos() as u64;
-                last = Some(now);
-                self.cycle_node_ns[i] += ns;
-                if let Some(g) = self.timings.groups_of[i] {
-                    self.cycle_group_ns[g as usize] += ns;
-                }
+            let from = &up.audio_out[src.from_port as usize];
+            let dst = &mut audio_in[src.to_port as usize];
+            match &mut src.delay {
+                None => dst.mix_from(from),
+                Some(delay) => delay.process_mix(from, dst),
             }
         }
+        for buf in events_in.iter_mut() {
+            buf.clear();
+        }
+        for src in event_sources.iter_mut() {
+            let Some(up) = self.bufs.done(src.from_node as usize) else {
+                continue;
+            };
+            let from = &up.events_out[src.from_port as usize];
+            let dst = &mut events_in[src.to_port as usize];
+            match &mut src.delay {
+                None => dst.merge_from(from, 0),
+                Some(delay) => delay.process_merge(from, dst, frames),
+            }
+        }
+        let is_device_input = matches!(self.info[i].role, NodeRole::DeviceInput { .. });
+        for buf in audio_out.iter_mut() {
+            if !is_device_input || buf.len() != frames {
+                buf.set_len(frames);
+            }
+        }
+        for buf in events_out.iter_mut() {
+            buf.clear();
+        }
+        let mut io = NodeIo {
+            frames,
+            audio_in,
+            audio_out,
+            events_in,
+            events_out,
+        };
+        processor.process(cx, &mut io);
+        if let Some(start) = *last {
+            let now = Instant::now();
+            *cycle_ns += now.duration_since(start).as_nanos() as u64;
+            *last = Some(now);
+        }
+    }
+
+    /// Run one job's nodes in order and record its time.
+    #[inline]
+    fn run_job(&self, j: usize, cx: &ProcessContext<'_, C>, frames: usize, measure_nodes: bool) {
+        let s = &self.schedule;
+        let start = Instant::now();
+        let mut last = measure_nodes.then_some(start);
+        for &node in s.jobs[j].nodes.iter() {
+            self.run_node(node as usize, cx, frames, &mut last);
+        }
+        s.cost[j].store(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn measuring(&self) -> bool {
+        self.config.measure_nodes && self.timings.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Run every node once on this thread, job by job in topological
+    /// order (audio thread). Realtime-safe.
+    pub fn process(&mut self, cx: &ProcessContext<'_, C>) {
+        let frames = cx.frames.min(self.config.max_block_size);
+        self.bufs.reset();
+        self.work.reset();
+        let measure = self.measuring();
+        for k in 0..self.schedule.order.len() {
+            let j = self.schedule.order[k] as usize;
+            self.run_job(j, cx, frames, measure);
+        }
+        self.schedule.after_cycle(self.config.parallel_min_ns);
+    }
+
+    /// Run every node once, spreading independent jobs over this thread
+    /// and `pool`'s workers (audio thread). Falls back to [`Self::process`]
+    /// for graphs that cannot use more than one thread. Realtime-safe.
+    pub fn process_parallel(&mut self, cx: &ProcessContext<'_, C>, pool: &WorkerPool)
+    where
+        C: Sync,
+    {
+        let helpers = self
+            .stats
+            .job_width
+            .saturating_sub(1)
+            .min(pool.useful_helpers());
+        if helpers == 0 || self.info.len() < MIN_PARALLEL_NODES || !self.schedule.parallel {
+            self.process(cx);
+            return;
+        }
+        let frames = cx.frames.min(self.config.max_block_size);
+        self.bufs.reset();
+        self.work.reset();
+        self.schedule.reset(helpers + 1);
+        let exec = Exec {
+            graph: &*self,
+            cx,
+            frames,
+            measure: self.measuring(),
+        };
+        pool.run(&exec, helpers);
+        self.schedule.after_cycle(self.config.parallel_min_ns);
+    }
+
+    /// Whether the last cycles were worth spreading over threads.
+    pub fn runs_parallel(&self) -> bool {
+        self.schedule.parallel
     }
 
     /// End of a device callback (audio thread): publish the time each node
@@ -585,8 +1049,11 @@ impl<C> CompiledGraph<C> {
                 *ns = 0;
             }
         };
-        for (t, ns) in self.timings.nodes.iter().zip(&mut self.cycle_node_ns) {
-            publish(t, ns);
+        for (i, w) in self.work.iter_mut().enumerate() {
+            if let Some(g) = self.timings.groups_of[i] {
+                self.cycle_group_ns[g as usize] += w.cycle_ns;
+            }
+            publish(&self.timings.nodes[i], &mut w.cycle_ns);
         }
         for (t, ns) in self.timings.groups.iter().zip(&mut self.cycle_group_ns) {
             publish(t, ns);
@@ -606,15 +1073,18 @@ impl<C> CompiledGraph<C> {
         {
             return 0;
         }
+        // The new graph starts with the old one's verdict on threading.
+        self.schedule.parallel = old.schedule.parallel;
         let mut adopted = 0;
         for &(key, idx) in &self.key_index {
             if let Ok(pos) = old.key_index.binary_search_by_key(&key, |&(k, _)| k) {
                 let old_idx = old.key_index[pos].1 as usize;
-                std::mem::swap(
-                    &mut self.nodes[idx as usize].processor,
-                    &mut old.nodes[old_idx].processor,
-                );
-                adopted += 1;
+                if let (Some(new), Some(prev)) =
+                    (self.work.get_mut(idx as usize), old.work.get_mut(old_idx))
+                {
+                    std::mem::swap(&mut new.processor, &mut prev.processor);
+                    adopted += 1;
+                }
             }
         }
         adopted
@@ -623,8 +1093,8 @@ impl<C> CompiledGraph<C> {
     /// Reset every processor (audio thread), e.g. for an "all notes off /
     /// panic" request.
     pub fn reset_all(&mut self) {
-        for node in &mut self.nodes {
-            node.processor.reset();
+        for w in self.work.iter_mut() {
+            w.processor.reset();
         }
     }
 }

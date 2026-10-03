@@ -30,6 +30,7 @@ fn session() -> (Session, TrackId) {
         &AudioPreferences {
             sample_rate: Some(SR),
             buffer_size: Some(64),
+            ..Default::default()
         },
     )
     .unwrap();

@@ -151,6 +151,20 @@ fn output_rows(
             });
         }
         row.append(&clock);
+        let syx = gtk::Button::with_label("Send .syx…");
+        syx.add_css_class("flat");
+        syx.set_sensitive(o.enabled && o.connected);
+        syx.set_tooltip_text(Some("Send the SysEx messages of a file to this device"));
+        {
+            let weak = Rc::downgrade(app);
+            let key = o.key.clone();
+            syx.connect_clicked(move |_| {
+                if let Some(a) = weak.upgrade() {
+                    crate::dialogs::send_sysex_file(&a, key.clone());
+                }
+            });
+        }
+        row.append(&syx);
         let sw = gtk::Switch::new();
         sw.set_active(o.enabled);
         sw.set_valign(gtk::Align::Center);
@@ -221,6 +235,150 @@ fn mappings_rows(app: &Rc<AppState>, list: &gtk::ListBox) {
     }
 }
 
+struct SyncWidgets {
+    grid: gtk::Grid,
+    status: gtk::Label,
+}
+
+/// One line about the external timing source.
+pub fn sync_status_text(st: &faderframe_session::SyncStatus) -> String {
+    use faderframe_session::SyncSource;
+    match st.source {
+        SyncSource::Internal => "FaderFrame is the timing master".into(),
+        _ if !st.receiving => "Waiting for the master…".into(),
+        source => {
+            let what = match source {
+                SyncSource::MidiClock => st
+                    .tempo
+                    .map_or("MIDI clock".into(), |t| format!("MIDI clock at {t:.1} BPM")),
+                _ => st.timecode.map_or("MTC".into(), |(tc, rate)| {
+                    format!("MTC {tc} ({})", rate.label())
+                }),
+            };
+            let tempo = if st.tempo_differs {
+                " · tempo differs from the project's (followed at the next start or stop)"
+            } else {
+                ""
+            };
+            format!(
+                "{what} · {} · off by {:.1} ms · {} re-lock{}{tempo}",
+                if st.running { "following" } else { "stopped" },
+                st.error_ms,
+                st.relocks,
+                if st.relocks == 1 { "" } else { "s" }
+            )
+        }
+    }
+}
+
+/// Source, input and MTC start; changes apply at once and are saved.
+fn sync_section(app: &Rc<AppState>) -> SyncWidgets {
+    use faderframe_session::{SyncSource, Timecode};
+    let grid = gtk::Grid::new();
+    grid.set_row_spacing(8);
+    grid.set_column_spacing(12);
+    let label = |t: &str| {
+        let l = gtk::Label::new(Some(t));
+        l.set_xalign(1.0);
+        l.add_css_class("dim-label");
+        l
+    };
+    let current = app.session.borrow().sync_settings().clone();
+    let names: Vec<&str> = SyncSource::ALL.iter().map(|s| s.label()).collect();
+    let source = gtk::DropDown::from_strings(&names);
+    source.set_selected(
+        SyncSource::ALL
+            .iter()
+            .position(|s| *s == current.source)
+            .unwrap_or(0) as u32,
+    );
+    let ports: Vec<(String, String)> = app
+        .session
+        .borrow()
+        .midi_ports()
+        .into_iter()
+        .filter(|p| !p.is_virtual)
+        .map(|p| (p.key, p.name))
+        .collect();
+    let mut port_names = vec!["Any input".to_string()];
+    port_names.extend(ports.iter().map(|(_, n)| n.clone()));
+    if let Some(k) = &current.port
+        && !ports.iter().any(|(key, _)| key == k)
+    {
+        port_names.push(format!("{k} (absent)"));
+    }
+    let refs: Vec<&str> = port_names.iter().map(String::as_str).collect();
+    let port = gtk::DropDown::from_strings(&refs);
+    port.set_selected(match &current.port {
+        None => 0,
+        Some(k) => ports
+            .iter()
+            .position(|(key, _)| key == k)
+            .map_or(port_names.len() - 1, |i| i + 1) as u32,
+    });
+    let offset = gtk::Entry::new();
+    offset.set_text(&current.offset.to_string());
+    offset.set_max_width_chars(12);
+    offset.set_tooltip_text(Some(
+        "Timecode at the project start (hh:mm:ss:ff), e.g. 01:00:00:00",
+    ));
+    let status = gtk::Label::new(None);
+    status.set_xalign(0.0);
+    status.add_css_class("dim-label");
+    grid.attach(&label("Follow"), 0, 0, 1, 1);
+    grid.attach(&source, 1, 0, 1, 1);
+    grid.attach(&label("From"), 0, 1, 1, 1);
+    grid.attach(&port, 1, 1, 1, 1);
+    grid.attach(&label("MTC at project start"), 0, 2, 1, 1);
+    grid.attach(&offset, 1, 2, 1, 1);
+    grid.attach(&status, 1, 3, 1, 1);
+
+    let apply = {
+        let weak = Rc::downgrade(app);
+        let (source, port, offset) = (source.clone(), port.clone(), offset.clone());
+        let ports = ports.clone();
+        let absent = current.port.clone();
+        move || {
+            let Some(app) = weak.upgrade() else { return };
+            let mut s = app.session.borrow().sync_settings().clone();
+            s.source = SyncSource::ALL[source.selected() as usize % SyncSource::ALL.len()];
+            s.port = match port.selected() as usize {
+                0 => None,
+                i => ports.get(i - 1).map(|(k, _)| k.clone()).or(absent.clone()),
+            };
+            match Timecode::parse(&offset.text()) {
+                Some(tc) => {
+                    s.offset = tc;
+                    offset.remove_css_class("error");
+                }
+                None => offset.add_css_class("error"),
+            }
+            app.session.borrow_mut().set_sync_settings(s.clone());
+            let mut p = Preferences::load();
+            p.set_sync_settings(&s);
+            if let Err(e) = p.save() {
+                tracing::warn!("cannot save preferences: {e}");
+            }
+        }
+    };
+    let apply = Rc::new(apply);
+    for d in [&source, &port] {
+        let apply = Rc::clone(&apply);
+        d.connect_selected_notify(move |_| apply());
+    }
+    {
+        let apply = Rc::clone(&apply);
+        offset.connect_activate(move |_| apply());
+    }
+    {
+        let apply = Rc::clone(&apply);
+        let focus = gtk::EventControllerFocus::new();
+        focus.connect_leave(move |_| apply());
+        offset.add_controller(focus);
+    }
+    SyncWidgets { grid, status }
+}
+
 pub fn page(app: &Rc<AppState>) -> gtk::Widget {
     let body = gtk::Box::new(gtk::Orientation::Vertical, 6);
     body.set_margin_start(18);
@@ -259,6 +417,10 @@ pub fn page(app: &Rc<AppState>) -> gtk::Widget {
     out_hint.set_xalign(0.0);
     out_hint.add_css_class("dim-label");
     body.append(&out_hint);
+
+    body.append(&heading("SYNC"));
+    let sync = sync_section(app);
+    body.append(&sync.grid);
 
     body.append(&heading("CONTROLLER MAPPINGS"));
     let maps = gtk::ListBox::new();
@@ -342,6 +504,8 @@ pub fn page(app: &Rc<AppState>) -> gtk::Widget {
             *maps_seen.borrow_mut() = Some(ids);
             mappings_rows(&a, &maps);
         }
+        sync.status
+            .set_text(&sync_status_text(&a.session.borrow().sync_status()));
         glib::ControlFlow::Continue
     };
     refresh();

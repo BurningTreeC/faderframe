@@ -21,7 +21,7 @@ pub use buffer::{MidiBuffer, MidiBufferFull};
 pub use event::{MidiEvent, TimedMidiEvent};
 pub use input::{
     MAX_MIDI_PORTS, MidiClock, MidiControlFeed, MidiInputEvent, MidiInputQueue, MidiInputSender,
-    midi_input_queue,
+    MidiSystemEvent, SystemMessage, midi_input_queue,
 };
 pub use output::{MidiOutputEvent, MidiOutputQueue, midi_output_queue};
 pub use tracker::NoteTracker;

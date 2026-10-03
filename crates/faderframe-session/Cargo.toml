@@ -11,6 +11,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+serde_json.workspace = true
 faderframe-core.workspace = true
 faderframe-midi.workspace = true
 faderframe-midi-io.workspace = true

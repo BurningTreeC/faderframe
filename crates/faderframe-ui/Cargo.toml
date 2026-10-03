@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 faderframe-plugin-clap.workspace = true
+faderframe-plugin-vst3.workspace = true
 faderframe-plugin-host.workspace = true
 gtk.workspace = true
 x11rb.workspace = true

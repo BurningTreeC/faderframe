@@ -6,7 +6,8 @@ dependencies reachable from the workspace members; dev-dependencies are
 excluded) with its SPDX license expression, and reproduces each distinct
 license text once together with the crates it applies to. System libraries
 that are linked dynamically (and therefore not redistributed by this
-repository) are listed separately.
+repository) are listed separately, and so are C/C++ libraries vendored
+into a crate and compiled into the binaries.
 
 Usage:
     python3 scripts/third_party_licenses.py           # (re)write the file
@@ -38,6 +39,25 @@ SYSTEM_LIBRARIES = [
     ("HarfBuzz", "MIT-like (Old MIT)", "https://github.com/harfbuzz/harfbuzz", "text shaping via Pango"),
     ("libjack (JACK2)", "LGPL-2.1-or-later", "https://github.com/jackaudio/jack2", "loaded at runtime with dlopen"),
     ("pipewire-jack", "MIT", "https://gitlab.freedesktop.org/pipewire/pipewire", "alternative libjack provider, loaded at runtime"),
+]
+
+
+# (name, version, license, source, licence file relative to the repository)
+VENDORED = [
+    (
+        "Signalsmith Stretch",
+        "1.3.1",
+        "MIT",
+        "https://github.com/Signalsmith-Audio/signalsmith-stretch",
+        "crates/faderframe-stretch/vendor/signalsmith-stretch/LICENSE.txt",
+    ),
+    (
+        "Signalsmith Linear",
+        "(with Stretch 1.3.1)",
+        "MIT",
+        "https://github.com/Signalsmith-Audio/linear",
+        "crates/faderframe-stretch/vendor/signalsmith-linear/LICENSE.txt",
+    ),
 ]
 
 
@@ -137,6 +157,19 @@ def render(meta: dict) -> str:
         repo = p.get("repository") or ""
         lic = (p.get("license") or "see license file").replace("|", "\\|")
         lines.append(f"| {p['name']} | {p['version']} | {lic} | {repo} |")
+    lines += [
+        "",
+        f"## Vendored C/C++ libraries ({len(VENDORED)}, compiled in)",
+        "",
+        "| Library | Version | License | Source |",
+        "|---|---|---|---|",
+    ]
+    for name, version, lic, url, path in VENDORED:
+        lines.append(f"| {name} | {version} | {lic} | {url} |")
+        text = (ROOT / path).read_text(encoding="utf-8").strip()
+        key = hashlib.sha256(normalise(text).encode()).hexdigest()
+        g = groups.setdefault(key, {"name": Path(path).name, "text": text, "crates": []})
+        g["crates"].append(f"{name} (vendored)")
     if missing:
         lines += [
             "",

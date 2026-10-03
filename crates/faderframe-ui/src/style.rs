@@ -15,6 +15,7 @@ headerbar popovermenubar { background: transparent; }
 .transport button.play-active { color: #5ad66b; }
 .transport button.rec-active { color: #ff4b4b; }
 .transport button.loop-active { color: #ff8a5c; }
+.transport button.click-active { color: #6fb7ff; }
 .lcd { border-radius: 6px; margin: 4px 6px; }
 notebook.dock-tabs > header {
     background-color: #1f2125;
@@ -99,6 +100,9 @@ scrollbar { background-color: #17181b; }
 .badge-instrument { background-color: #3a2b40; color: #e0aef5; }
 .badge-builtin { background-color: #2a2c30; color: #b5b2ab; }
 .badge-clap { background-color: #3d2a20; color: #ffb38f; }
+.badge-vst3 { background-color: #1f2c3d; color: #8fc4ff; }
+.edit-toggle { font-weight: 700; padding-left: 10px; padding-right: 10px; }
+.edit-toggle.edit-active { background-color: alpha(#e0753a, 0.35); color: #ffd2b8; }
 .badge-other { background-color: #2a2c30; color: #b5b2ab; }
 .plugin-detail { padding: 22px 20px 18px 20px; background-color: #1b1c20; }
 .detail-title { font-size: 16pt; font-weight: 800; color: #f2efe8; }

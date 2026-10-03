@@ -1,0 +1,27 @@
+[package]
+name = "faderframe-plugin-vst3"
+description = "VST3 plugin hosting for FaderFrame"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-core.workspace = true
+faderframe-audio-graph.workspace = true
+faderframe-automation.workspace = true
+faderframe-midi.workspace = true
+faderframe-plugin-host.workspace = true
+faderframe-realtime.workspace = true
+faderframe-transport.workspace = true
+vst3.workspace = true
+libloading.workspace = true
+rtrb.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+faderframe-midi.workspace = true

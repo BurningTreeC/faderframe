@@ -81,14 +81,29 @@ fn audio_page(app: &Rc<AppState>, alive: &Rc<std::cell::Cell<bool>>) -> gtk::Wid
     );
     row(&g, 2, "Buffer size", &buffer);
 
+    // Processing threads: automatic (one per core) or a fixed count.
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let mut thread_names = vec![format!("Automatic ({cores})")];
+    thread_names.extend((1..=cores).map(|n| match n {
+        1 => "1 (audio thread only)".to_string(),
+        n => n.to_string(),
+    }));
+    let thread_refs: Vec<&str> = thread_names.iter().map(String::as_str).collect();
+    let threads = gtk::DropDown::from_strings(&thread_refs);
+    threads.set_selected(opts.threads.map_or(0, |t| (t as usize).min(cores) as u32));
+    threads.set_tooltip_text(Some(
+        "Threads that process tracks, buses and plugins in parallel, the audio thread included",
+    ));
+    row(&g, 3, "Processing threads", &threads);
+
     let status = gtk::Label::new(None);
     status.set_xalign(0.0);
     status.set_selectable(true);
-    row(&g, 3, "Stream", &status);
+    row(&g, 4, "Stream", &status);
     let stats = gtk::Label::new(None);
     stats.set_xalign(0.0);
     stats.add_css_class("monospace");
-    row(&g, 4, "DSP load", &stats);
+    row(&g, 5, "DSP load", &stats);
 
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let apply = gtk::Button::with_label("Apply & Restart Audio");
@@ -101,15 +116,17 @@ fn audio_page(app: &Rc<AppState>, alive: &Rc<std::cell::Cell<bool>>) -> gtk::Wid
     buttons.append(&apply);
     buttons.append(&live);
     buttons.append(&reset);
-    g.attach(&buttons, 1, 5, 1, 1);
+    g.attach(&buttons, 1, 6, 1, 1);
     g.attach(
         &note(
             "JACK and PipeWire own the sample rate: FaderFrame follows whatever the server runs at \
              and rebuilds its engine automatically when it changes. Any buffer size from 16 to 8192 \
-             frames works; larger device buffers are processed in internal blocks.",
+             frames works; larger device buffers are processed in internal blocks. Tracks, buses and \
+             plugins are spread over the processing threads; with realtime permission they run at \
+             the audio thread's priority.",
         ),
         0,
-        6,
+        7,
         2,
         1,
     );
@@ -129,19 +146,24 @@ fn audio_page(app: &Rc<AppState>, alive: &Rc<std::cell::Cell<bool>>) -> gtk::Wid
         rate,
         #[weak]
         buffer,
+        #[weak]
+        threads,
         move |_| {
             let Some(app) = weak.upgrade() else { return };
             let (b, r, f) = selected(&backend, &rate, &buffer);
+            let t = (threads.selected() > 0).then(|| threads.selected() as u16);
             {
                 let mut o = app.options.borrow_mut();
                 o.backend = b;
                 o.sample_rate = r;
                 o.buffer_size = f;
+                o.threads = t;
             }
             let mut prefs = Preferences::load();
             prefs.set_backend(b);
             prefs.sample_rate = r;
             prefs.buffer_size = f;
+            prefs.threads = t;
             if let Err(e) = prefs.save() {
                 tracing::warn!("cannot save preferences: {e}");
             }
@@ -195,7 +217,7 @@ fn audio_page(app: &Rc<AppState>, alive: &Rc<std::cell::Cell<bool>>) -> gtk::Wid
         let us = |ns: u64| ns as f64 / 1000.0;
         let (resident, disk_misses) = s.streaming_stats();
         stats.set_text(&format!(
-            "p50 {:.0} µs · p95 {:.0} µs · p99 {:.0} µs · max {:.0} µs\n{} callbacks · {} deadline misses · {} xruns · budget {:.0} µs\ndisk: {:.1} MiB resident · {} late reads",
+            "p50 {:.0} µs · p95 {:.0} µs · p99 {:.0} µs · max {:.0} µs\n{} callbacks · {} deadline misses · {} xruns · budget {:.0} µs\ndisk: {:.1} MiB resident · {} late reads\n{} processing thread{}{}",
             us(m.p50_ns),
             us(m.p95_ns),
             us(m.p99_ns),
@@ -205,7 +227,14 @@ fn audio_page(app: &Rc<AppState>, alive: &Rc<std::cell::Cell<bool>>) -> gtk::Wid
             s.stream_status().map_or(0, |st| st.xruns),
             us(m.last_budget_ns),
             resident as f64 / (1 << 20) as f64,
-            disk_misses
+            disk_misses,
+            s.processing_threads(),
+            if s.processing_threads() == 1 { "" } else { "s" },
+            if s.worker_priority_failures() > 0 {
+                " · no realtime permission for the workers"
+            } else {
+                ""
+            }
         ));
         glib::ControlFlow::Continue
     };

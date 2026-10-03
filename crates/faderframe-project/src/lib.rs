@@ -16,6 +16,7 @@
 mod clip;
 pub mod demo;
 mod edit;
+mod expression;
 pub mod file;
 mod history;
 pub mod midi_ops;
@@ -24,12 +25,14 @@ pub mod preset;
 mod project;
 mod takes;
 mod track;
+mod warp;
 
 pub use clip::{
     AudioClip, Clip, ClipContent, ClipFades, ControllerLane, ControllerPoint, FadeShape, MidiClip,
-    MidiController, MidiNote, StretchSettings,
+    MidiController, MidiNote, StretchSettings, SysexEvent, bend_factor,
 };
 pub use edit::{CoalesceKey, Command, EditError, Impact, MAX_LEVEL_DB, RemovedTrack};
+pub use expression::{ExpressionKind, ExpressionPoint, MpeConfig, NoteExpression};
 pub use history::{History, Replayed};
 pub use midimap::{
     MappingMode, MappingTarget, MidiControl, MidiMapping, MidiSource, TransportControl,
@@ -41,3 +44,4 @@ pub use track::{
     AuxSend, InputRouting, MidiOutputRouting, MonitorMode, OutputRouting, PluginFormat, PluginRef,
     PluginSlot, SavedParameter, SendTap, Track, TrackColor, TrackKind, midi_port_display,
 };
+pub use warp::{Warp, WarpAlgorithm, WarpMarker};

@@ -65,6 +65,24 @@ pub struct AudioClip {
     pub stretch: StretchSettings,
     #[serde(default)]
     pub reversed: bool,
+    /// Elastic audio: the clip's time map (`None`: plays 1:1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warp: Option<crate::Warp>,
+}
+
+impl AudioClip {
+    /// The source frame played at clip-relative output frame `out`.
+    pub fn source_at(&self, out: f64) -> f64 {
+        match &self.warp {
+            Some(w) => w.source_of(self.source_offset, self.length, out),
+            None => self.source_offset as f64 + out,
+        }
+    }
+
+    /// Source frames the clip covers.
+    pub fn source_span(&self) -> i64 {
+        self.warp.as_ref().map_or(self.length, |w| w.source_length)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,10 +93,31 @@ pub enum FadeShape {
     /// sin/cos — constant power, the usual crossfade shape.
     EqualPower,
     SCurve,
+    /// Slow start (cubic) — "slow" in the fade menus.
     Exponential,
+    /// Fast start, slow end (inverse cubic) — "fast".
+    Logarithmic,
 }
 
 impl FadeShape {
+    pub const ALL: [FadeShape; 5] = [
+        FadeShape::Linear,
+        FadeShape::EqualPower,
+        FadeShape::SCurve,
+        FadeShape::Logarithmic,
+        FadeShape::Exponential,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FadeShape::Linear => "Linear",
+            FadeShape::EqualPower => "Equal Power",
+            FadeShape::SCurve => "S-Curve",
+            FadeShape::Logarithmic => "Fast",
+            FadeShape::Exponential => "Slow",
+        }
+    }
+
     /// Fade-in gain at fraction `t` (0..=1); fade-outs use `gain(1 - t)`.
     pub fn gain(self, t: f32) -> f32 {
         let t = t.clamp(0.0, 1.0);
@@ -87,8 +126,32 @@ impl FadeShape {
             FadeShape::EqualPower => (t * std::f32::consts::FRAC_PI_2).sin(),
             FadeShape::SCurve => t * t * (3.0 - 2.0 * t),
             FadeShape::Exponential => t * t * t,
+            FadeShape::Logarithmic => {
+                let u = 1.0 - t;
+                1.0 - u * u * u
+            }
         }
     }
+
+    /// Fade-in gain with a drawn bend (−1…1: 0 keeps the shape, positive
+    /// bulges up — faster —, negative sags — slower).
+    #[inline]
+    pub fn gain_bent(self, t: f32, bend: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        let t = if bend > 0.0 {
+            1.0 - (1.0 - t).powf(1.0 + 3.0 * bend)
+        } else if bend < 0.0 {
+            t.powf(1.0 - 3.0 * bend)
+        } else {
+            t
+        };
+        self.gain(t)
+    }
+}
+
+/// A drawn fade bend in percent (−100…100) as a factor.
+pub fn bend_factor(percent: i16) -> f32 {
+    percent.clamp(-100, 100) as f32 / 100.0
 }
 
 /// Fade lengths in frames (project rate).
@@ -100,6 +163,15 @@ pub struct ClipFades {
     pub fade_in_shape: FadeShape,
     #[serde(default)]
     pub fade_out_shape: FadeShape,
+    /// Drawn bend of the fade-in curve, percent (−100…100).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub fade_in_bend: i16,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub fade_out_bend: i16,
+}
+
+fn is_zero(v: &i16) -> bool {
+    *v == 0
 }
 
 /// Time-stretch / pitch settings (only `Off` is implemented so far; the
@@ -284,9 +356,122 @@ pub struct MidiClip {
     /// Controller values (mod wheel, pitch bend, sustain, …).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub controllers: Vec<ControllerLane>,
+    /// Per-note expression (MPE), by note id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expressions: Vec<crate::NoteExpression>,
+    /// System exclusive messages (sent to the track's external MIDI
+    /// device), sorted by time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sysex: Vec<SysexEvent>,
 }
 
 impl MidiClip {
+    /// The clip played `factor` times as long (time-stretched MIDI: note
+    /// positions and lengths, controllers, expression and SysEx scale).
+    pub fn scaled(&self, factor: f64) -> MidiClip {
+        let f = factor.max(1e-3);
+        let t = |m: MusicalTime| MusicalTime((m.ticks() as f64 * f).round() as i64);
+        let mut out = self.clone();
+        out.length = t(self.length);
+        for n in &mut out.notes {
+            n.start = t(n.start);
+            n.length = t(n.length).max(MusicalTime(1));
+        }
+        for l in &mut out.controllers {
+            for p in &mut l.points {
+                p.time = t(p.time);
+            }
+        }
+        for e in &mut out.expressions {
+            for p in e
+                .pitch
+                .iter_mut()
+                .chain(&mut e.pressure)
+                .chain(&mut e.timbre)
+            {
+                p.time = t(p.time);
+            }
+        }
+        for e in &mut out.sysex {
+            e.time = t(e.time);
+        }
+        out
+    }
+}
+
+/// A SysEx message in a clip.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SysexEvent {
+    /// From the clip start.
+    pub time: MusicalTime,
+    /// The whole message, `F0 … F7`.
+    pub data: Vec<u8>,
+}
+
+impl SysexEvent {
+    /// Split a byte stream (e.g. a `.syx` file) into complete messages.
+    pub fn split_messages(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut cur: Option<Vec<u8>> = None;
+        for &b in bytes {
+            match b {
+                0xF0 => cur = Some(vec![b]),
+                0xF7 => {
+                    if let Some(mut m) = cur.take() {
+                        m.push(b);
+                        out.push(m);
+                    }
+                }
+                b if b < 0x80 => {
+                    if let Some(m) = &mut cur {
+                        m.push(b);
+                    }
+                }
+                // Other status bytes abort a message.
+                _ => cur = None,
+            }
+        }
+        out
+    }
+
+    /// "F0 41 10 … F7 (11 bytes)", shortened for display.
+    pub fn describe(&self) -> String {
+        let hex: Vec<String> = self
+            .data
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02X}"))
+            .collect();
+        let more = if self.data.len() > 8 { " …" } else { "" };
+        format!("{}{more} ({} bytes)", hex.join(" "), self.data.len())
+    }
+}
+
+impl MidiClip {
+    pub fn expression(&self, note: NoteId) -> Option<&crate::NoteExpression> {
+        self.expressions.iter().find(|e| e.note == note)
+    }
+
+    /// A note's expression, created when missing.
+    pub fn expression_mut(&mut self, note: NoteId) -> &mut crate::NoteExpression {
+        let i = match self.expressions.iter().position(|e| e.note == note) {
+            Some(i) => i,
+            None => {
+                self.expressions.push(crate::NoteExpression::new(note));
+                self.expressions.len() - 1
+            }
+        };
+        &mut self.expressions[i]
+    }
+
+    /// Drop expressions of notes that are gone and empty ones.
+    pub fn prune_expressions(&mut self) {
+        let notes = &self.notes;
+        self.expressions
+            .retain(|e| !e.is_empty() && notes.iter().any(|n| n.id == e.note));
+        self.expressions.sort_by_key(|e| e.note);
+    }
+
     pub fn lane(&self, controller: MidiController, channel: u8) -> Option<&ControllerLane> {
         self.controllers
             .iter()
@@ -435,6 +620,7 @@ mod tests {
                 fades: ClipFades::default(),
                 stretch: StretchSettings::Off,
                 reversed: false,
+                warp: None,
             }),
         };
         assert_eq!(clip.end(&timeline, 48_000), MusicalTime::from_quarters_i(6));

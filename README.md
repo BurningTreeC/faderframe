@@ -17,11 +17,40 @@ hosting, an analogue-console-style mixer and dockable, detachable editors.
 * GTK 4 application, native on Wayland, HiDPI/fractional scaling via GTK.
 * Arranger (virtualised): tracks, audio clips with waveforms, MIDI clips,
   move/split/delete, snapping, zoom, loop range, playhead, console-style track
-  headers with mute/solo/arm/monitor, volume, pan and meters.
+  headers with mute/solo/arm/monitor, volume, pan and meters. Clicking a
+  clip selects it and moves the playhead to the (snapped) click; Shift- or
+  Ctrl-click selects more clips, and moves, trims, fades and gain changes
+  apply to every selected clip.
+* Pro-style editing, with an edit toolbar under the transport (Edit button
+  or Ctrl+E; it wraps into as many rows as the window needs): edit modes
+  Shuffle, Slip, Spot and Grid (absolute or relative); the Smart tool
+  (upper half selects a range, lower half grabs, edges trim, top corners
+  fade) plus Zoom, Trim and Time-Stretch Trim, Selector, Grabber and
+  Separation Grabber, Scrubber and Pencil; grids from a bar down to 1/256
+  with triplet and dotted values; nudge values; Tab to clip boundaries or
+  transients; Link Timeline and Edit Selection; Insertion Follows Playback;
+  selection Start/End/Length counters in bars, time or samples; zoom
+  buttons. Range edits: separate, trim to selection, clear (Shuffle closes
+  the gap), copy/cut/paste, duplicate, repeat, insert silence.
+* Clip gain (drag the dB readout in the clip's name strip, Ctrl+Shift+↑/↓,
+  Alt-click to type) and fades with five shapes (Linear, Equal Power,
+  S-Curve, Fast, Slow) and a curve you bend by dragging its handle;
+  right-click a fade to pick its shape.
+* Transient detection (spectral flux, adjustable sensitivity, cached) and
+  elastic audio: Warp view shows transients and warp markers — double-click
+  adds a marker, dragging a transient moves just that hit (its neighbours
+  stay pinned), dragging inside a selection warps only that range,
+  Ctrl-drag telescopes; Quantize Transients to Grid, Separate at Transients
+  and time-compression trims. Warped clips play pitch-preserving
+  (Polyphonic or Rhythmic, via Signalsmith Stretch) or as Varispeed.
+* Transport: tap tempo (the TAP pad in the display), editable time
+  signature (click it; right-click for common meters and meter changes),
+  metronome button (K).
 * Analogue-console mixer: inserts, sends (pre-FX / pre / post), pan, M/S/R,
   faders with a console fader law, segmented peak meters, routing menus,
   any number of sends per channel (rows grow, ◂ ▸ pages through banks),
-  scribble strips, pinned master section.
+  scribble strips, pinned master section; click a pan or level readout to
+  type a value.
 * Piano roll: select/draw/erase/split/mute tools, rubber-band selection,
   moving and Alt-copying with snap (Shift: free), resizing from either edge,
   chords (fixed or scale-aware), scales with highlighting, snap and folding,
@@ -60,13 +89,23 @@ hosting, an analogue-console-style mixer and dockable, detachable editors.
   plugin parameters and bypass: lanes under each track (A button / A key),
   point editing and freehand drawing with curve shapes, Read / Touch /
   Latch / Write modes; faders follow the automation while playing.
-* Plugins: built-in synth/echo/gain and CLAP effects and instruments, found
-  by a crash-safe background scan and picked in a plugin browser (click an
+* Multicore engine: tracks, buses and plugins are processed in parallel on
+  all cores (critical path first, realtime priority, flush-to-zero), with
+  output bit-identical to single-threaded processing; Preferences → Audio
+  → Processing threads.
+* Plugins: built-in synth/echo/gain and CLAP and VST3 effects and
+  instruments, found by a crash-safe background scan and picked in a plugin browser (click an
   empty insert slot or Track → Plugin Browser…). Click a filled insert slot
   for the plugin's own GUI (Ctrl-click bypasses, right-click for the
   parameter window and more); editors open centred or where they were last,
   and their positions are saved with the project. Plugin state, parameters
   and automation are saved too.
+* MIDI sync: follow an external MIDI clock (tempo too) or MIDI time code
+  (Preferences → MIDI → Sync). MPE: per-note pitch, pressure and timbre —
+  recorded from MPE controllers, drawn in the piano roll's expression
+  lanes, played on member channels (track menu → MPE). SysEx is recorded,
+  sent to external devices with the clip, imported from and sent as `.syx`
+  files.
 * MIDI keyboards and controllers: every MIDI input (ALSA sequencer, incl.
   PipeWire; hotplug) — instrument tracks play what you play while armed or
   selected, with constant low latency; choose the input and channel per
@@ -142,6 +181,18 @@ server needed when `pipewire-jack` is installed).
 | Ctrl+wheel / Shift+wheel | Zoom / scroll horizontally |
 | Shift or Ctrl while dragging | Fine adjustment |
 | Alt while dragging | Disable snapping |
+| Ctrl+E | Show / hide the edit toolbar |
+| K (or keypad 7) | Metronome on / off |
+| Alt+1 … Alt+4 | Edit mode: Shuffle, Slip, Spot, Grid |
+| Alt+S, F5–F7, F9, F10 (Alt+5 … Alt+0) | Smart, Zoom, Trim, Selector, Scrubber, Pencil (Grabber: Alt+8) |
+| B | Separate clips at the selection (or the selected clips at the playhead) |
+| Ctrl+C / Ctrl+X / Ctrl+V / Ctrl+D | Copy / cut / paste / duplicate the selection range |
+| Alt+R | Repeat the selection range… |
+| Ctrl+Alt+T | Trim clips to the selection |
+| , / . | Nudge back / forward (Alt: trim start, Ctrl: trim end) |
+| Tab / Shift+Tab | Next / previous clip boundary or transient (Ctrl: extend the selection) |
+| Ctrl+Shift+↑ / ↓ | Clip gain ±0.5 dB |
+| Ctrl+] / Ctrl+[ | Zoom in / out |
 
 ## Development
 

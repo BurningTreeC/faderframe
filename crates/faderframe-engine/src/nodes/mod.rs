@@ -7,7 +7,7 @@ mod plugin;
 mod send;
 mod strip;
 
-pub use clip_player::AudioClipPlayer;
+pub use clip_player::{AudioClipPlayer, StretchVoices};
 pub use io::{DeviceInputTap, DeviceOutputSink, MonitorGate};
 pub use midi_player::MidiClipPlayer;
 pub use plugin::PluginNode;

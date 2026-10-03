@@ -60,6 +60,8 @@ pub struct RunOptions {
     pub empty: bool,
     pub sample_rate: Option<u32>,
     pub buffer_size: Option<u32>,
+    /// Processing threads (audio thread included; `None`: one per core).
+    pub threads: Option<u16>,
     /// Audio files to import after start-up (onto new tracks at bar 1).
     pub import: Vec<PathBuf>,
 }
@@ -174,6 +176,7 @@ impl AppState {
                 AudioPreferences {
                     sample_rate: o.sample_rate,
                     buffer_size: o.buffer_size,
+                    threads: o.threads,
                 },
             )
         };
@@ -212,6 +215,9 @@ impl AppState {
                 faderframe_session::UiRequest::PluginEditor {
                     plugin, generic, ..
                 } => crate::plugin_window::open(self, plugin, generic),
+                faderframe_session::UiRequest::ImportSysex { clip, at } => {
+                    crate::dialogs::import_sysex(self, clip, at);
+                }
             }
         }
         let report = self
@@ -231,9 +237,10 @@ impl AppState {
                 s.notify(
                     faderframe_session::NoticeLevel::Info,
                     format!(
-                        "{} CLAP plugin{} available",
-                        r.plugins,
-                        if r.plugins == 1 { "" } else { "s" }
+                        "{} CLAP and {} VST3 plugin{} available",
+                        r.clap,
+                        r.vst3,
+                        if r.vst3 == 1 { "" } else { "s" }
                     ),
                 );
             }

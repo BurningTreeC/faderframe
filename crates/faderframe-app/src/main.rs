@@ -16,6 +16,7 @@ OPTIONS:
     --backend <auto|jack|dummy>   Audio system (default: from preferences, else auto)
     --sample-rate <HZ>            Requested sample rate (44100, 48000, 96000, 192000, …)
     --buffer-size <FRAMES>        Requested buffer size (32, 64, 128, 256, 512, …)
+    --threads <N>                 Processing threads incl. the audio thread (default: one per core)
     --empty                       Start with an empty project instead of the demo session
     --import <FILE>               Import an audio file on start-up (repeatable)
     -h, --help                    Show this help
@@ -61,6 +62,15 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<RunOptions>, Strin
                         .map_err(|_| format!("invalid buffer size '{v}'"))?,
                 );
             }
+            "--threads" => {
+                let v = value("--threads")?;
+                o.threads = Some(
+                    v.parse::<u16>()
+                        .ok()
+                        .filter(|t| (1..=256).contains(t))
+                        .ok_or_else(|| format!("invalid thread count '{v}'"))?,
+                );
+            }
             "--empty" => o.empty = true,
             "--import" => o.import.push(PathBuf::from(value("--import")?)),
             s if s.starts_with('-') => return Err(format!("unknown option '{s}'")),
@@ -81,6 +91,12 @@ fn main() -> ExitCode {
         && let Some(bundle) = args.get(2)
     {
         let code = faderframe_plugin_clap::scan::run_scan_subprocess(std::path::Path::new(bundle));
+        return ExitCode::from(code.clamp(0, 255) as u8);
+    }
+    if args.get(1).map(String::as_str) == Some("--scan-vst3")
+        && let Some(bundle) = args.get(2)
+    {
+        let code = faderframe_plugin_vst3::scan::run_scan_subprocess(std::path::Path::new(bundle));
         return ExitCode::from(code.clamp(0, 255) as u8);
     }
 

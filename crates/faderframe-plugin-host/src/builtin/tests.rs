@@ -200,3 +200,87 @@ fn latency_probe_reports_and_applies_its_latency() {
         "zero latency is a passthrough"
     );
 }
+
+/// Render `blocks` blocks and return the left channel.
+fn record(p: &mut dyn PluginProcessor, rig: &mut Rig, blocks: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(blocks * BLOCK);
+    for _ in 0..blocks {
+        rig.run(p);
+        rig.ev_in[0].clear();
+        out.extend_from_slice(rig.outs[0].channel(0));
+    }
+    out
+}
+
+/// Fundamental by autocorrelation (smallest lag within 90 % of the best).
+fn fundamental(x: &[f32]) -> f64 {
+    let corr = |lag: usize| -> f64 {
+        x.iter()
+            .zip(&x[lag..])
+            .map(|(a, b)| (*a as f64) * (*b as f64))
+            .sum()
+    };
+    let lags = 30..1500;
+    let c: Vec<f64> = lags.clone().map(corr).collect();
+    let best = c.iter().cloned().fold(f64::MIN, f64::max);
+    // Skip the zero-lag lobe, then take the first peak near the best.
+    let mut i = c.iter().position(|&v| v < 0.0).unwrap_or(0);
+    while i + 1 < c.len() && !(c[i] >= 0.9 * best && c[i] >= c[i + 1] && c[i] >= c[i - 1]) {
+        i += 1;
+    }
+    SR / (lags.start + i) as f64
+}
+
+#[test]
+fn synth_bend_range_follows_rpn_and_the_mpe_zone() {
+    let cc = |channel, controller, value| MidiEvent::ControlChange {
+        channel,
+        controller,
+        value,
+    };
+    let pitch = |events: &[MidiEvent]| {
+        let mut inst = BuiltinFactory.instantiate(builtin::SYNTH).unwrap();
+        let mut p = inst.create_processor(&config()).unwrap();
+        let mut rig = Rig::new();
+        for &e in events {
+            rig.ev_in[0].push(TimedMidiEvent::new(0, e)).unwrap();
+        }
+        rig.ev_in[0]
+            .push(TimedMidiEvent::new(
+                1,
+                MidiEvent::NoteOn {
+                    channel: 1,
+                    key: 45,
+                    velocity: 120,
+                },
+            ))
+            .unwrap();
+        // Skip the attack, then measure.
+        record(p.as_mut(), &mut rig, 40);
+        fundamental(&record(p.as_mut(), &mut rig, 64))
+    };
+    let full_bend = MidiEvent::PitchBend {
+        channel: 1,
+        value: 16383,
+    };
+    let plain = pitch(&[]);
+    assert!((plain - 110.0).abs() < 2.0, "A2 ≈ 110 Hz: {plain}");
+    // Default range: +2 semitones.
+    let two = pitch(&[full_bend]);
+    assert!((two / plain - 2f64.powf(2.0 / 12.0)).abs() < 0.03, "{two}");
+    // RPN 0 = 12 semitones: an octave up.
+    let twelve = pitch(&[cc(1, 101, 0), cc(1, 100, 0), cc(1, 6, 12), full_bend]);
+    assert!((twelve / plain - 2.0).abs() < 0.03, "{twelve}");
+    // MPE zone on the master channel: members bend ±48 — a quarter of the
+    // way up is an octave.
+    let mpe = pitch(&[
+        cc(0, 101, 0),
+        cc(0, 100, 6),
+        cc(0, 6, 15),
+        MidiEvent::PitchBend {
+            channel: 1,
+            value: 8192 + 2048,
+        },
+    ]);
+    assert!((mpe / plain - 2.0).abs() < 0.03, "{mpe}");
+}

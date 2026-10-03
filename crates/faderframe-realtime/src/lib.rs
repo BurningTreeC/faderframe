@@ -14,24 +14,38 @@
 //!
 //! * [`PageTable`] / [`Epoch`] — lock-free page table with epoch-based
 //!   reclamation for disk streaming.
+//! * [`WorkerPool`] — fixed DSP worker threads running scoped jobs (futex
+//!   wake-up, the audio thread's priority) and [`TaskCells`], the per-cycle
+//!   pending/running/done cells a parallel graph executor works on.
+//! * [`ScopedFlushDenormals`] — flush-to-zero on DSP threads.
 //!
-//! `mailbox` and `pages` contain the crate's only `unsafe` code (pointer
-//! ownership transfer through `AtomicPtr`s), with invariants documented inline.
+//! The pool's wake-up is the only syscall made on the audio thread besides
+//! reading the clock (`FUTEX_WAKE`, which never blocks). `unsafe` code is
+//! confined to `mailbox` and `pages` (pointer ownership transfer through
+//! `AtomicPtr`s), `cells` (interior mutability guarded by atomic states),
+//! `pool` (scoped job pointer, futex, thread scheduling) and `denormals`
+//! (the FP control register), with invariants documented inline.
 
 mod atomic;
+mod cells;
+mod denormals;
 mod mailbox;
 mod meters;
 mod metrics;
 mod pages;
 mod params;
+mod pool;
 mod slots;
 mod trycell;
 
 pub use atomic::AtomicF32;
+pub use cells::{Claim, TaskCells};
+pub use denormals::{ScopedFlushDenormals, flush_denormals_on_this_thread};
 pub use mailbox::{MailboxReceiver, MailboxSender, mailbox};
 pub use meters::{MeterBank, MeterRange, MeterReading};
 pub use metrics::{CallbackMetrics, MetricsSnapshot};
 pub use pages::{Epoch, PageTable, Reclaimer, Retired};
 pub use params::{ParamSlot, ParamTable};
+pub use pool::{PoolConfig, PoolJob, WorkerPool, default_worker_count, physical_cores};
 pub use slots::SlotAllocator;
 pub use trycell::{TryCell, TryCellGuard};
