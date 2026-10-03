@@ -102,7 +102,11 @@ pub fn stretch_voices(project: &Project, track: &faderframe_project::Track) -> S
             continue;
         };
         let Some(w) = a.warp.as_ref() else { continue };
-        if c.muted || a.reversed || w.is_identity(a.source_offset, a.length) {
+        if c.muted
+            || a.reversed
+            || track.freeze.is_some()
+            || w.is_identity(a.source_offset, a.length)
+        {
             continue;
         }
         let i = match w.algorithm {
@@ -150,6 +154,8 @@ fn node_key(track: TrackId, role: Role, sub: u64, layouts: &[ChannelLayout]) -> 
 #[derive(Default, Clone, Copy)]
 struct TrackNodes {
     input: Option<NodeId>,
+    /// The signal after the inserts (before fader, mute and solo).
+    post_fx: Option<NodeId>,
     strip: Option<NodeId>,
     instrument: Option<NodeId>,
     midi: Option<NodeId>,
@@ -171,6 +177,14 @@ impl PluginCx<'_> {
             let d = inst.descriptor();
             d.note_inputs > 0 || d.category == faderframe_plugin_host::PluginCategory::Instrument
         })
+    }
+
+    /// Layout of the plugin's sidechain input (its second audio input),
+    /// if it has one.
+    fn sidechain_layout(&mut self, slot: &PluginSlot) -> Option<ChannelLayout> {
+        let inst = self.plugins.instance(slot).ok()?;
+        let port = inst.descriptor().audio_inputs.get(1)?;
+        (port.channels > 0).then(|| ChannelLayout::from_channel_count(port.channels as usize))
     }
 
     fn node(
@@ -205,7 +219,11 @@ impl PluginCx<'_> {
             .chain(spec.audio_outputs.iter())
             .copied()
             .collect();
-        match self.plugins.activate(slot, &self.process) {
+        let process = ProcessConfig {
+            sidechain: spec.audio_inputs.len() > 1,
+            ..self.process
+        };
+        match self.plugins.activate(slot, &process) {
             Ok(p) => {
                 // Latency and bypass change the node's behaviour, and a
                 // restarted plugin's old processor is dead: all are part of
@@ -264,10 +282,13 @@ pub fn build_graph(
         process: ProcessConfig {
             sample_rate: config.sample_rate,
             max_block_size: config.max_block_size as u32,
+            sidechain: false,
         },
         warnings: &mut warnings,
     };
     let mut nodes: HashMap<TrackId, TrackNodes> = HashMap::new();
+    // (plugin node, source track) of connected sidechain inputs.
+    let mut sidechains: Vec<(NodeId, TrackId)> = Vec::new();
     let mut owners: Vec<(NodeId, NodeOwner)> = Vec::new();
     let own = |owners: &mut Vec<(NodeId, NodeOwner)>,
                node: NodeId,
@@ -288,9 +309,14 @@ pub fn build_graph(
     // Pass 1: per-track chains.
     for (gi, t) in project.tracks.iter().enumerate() {
         let gi = gi as u32;
+        // VCAs have no audio: they scale their members' strips.
+        if t.kind == TrackKind::Vca {
+            continue;
+        }
         let mut tn = TrackNodes::default();
         let layout = t.layout;
-        if matches!(t.kind, TrackKind::Instrument | TrackKind::Midi) {
+        let frozen = t.freeze.is_some();
+        if matches!(t.kind, TrackKind::Instrument | TrackKind::Midi) && !frozen {
             let midi = b.add_node(
                 NodeSpec::new(format!("{} · MIDI", t.name))
                     .key(node_key(t.id, Role::MidiPlayer, 0, &[]))
@@ -361,6 +387,18 @@ pub fn build_graph(
         tn.input = Some(own(&mut owners, input, t.id, None, NodeWork::Input));
 
         match t.kind {
+            // Frozen: the rendered audio, straight to the strip.
+            TrackKind::Audio | TrackKind::Instrument if frozen => {
+                let player = b.add_node(
+                    NodeSpec::new(format!("{} · Frozen", t.name))
+                        .key(node_key(t.id, Role::ClipPlayer, 0xF0_0000, &[layout]))
+                        .group(gi)
+                        .audio_out(layout),
+                    Box::new(AudioClipPlayer::new(t.id)),
+                );
+                own(&mut owners, player, t.id, None, NodeWork::Clips);
+                b.connect_audio(player, 0, input, 0)?;
+            }
             TrackKind::Audio => {
                 let voices = stretch_voices(project, t);
                 let player = b.add_node(
@@ -426,7 +464,7 @@ pub fn build_graph(
         }
 
         let mut prev = input;
-        for slot in &t.inserts {
+        for slot in t.inserts.iter().filter(|_| !frozen) {
             // Inserts that take notes (a synth placed as an insert, MIDI-
             // controlled effects) get the track's MIDI too.
             let notes = t.kind == TrackKind::Instrument && pcx.takes_notes(slot);
@@ -437,7 +475,22 @@ pub fn build_graph(
             if notes {
                 spec = spec.events_in(1);
             }
+            // A sidechain source that has a pre-fader signal and does not
+            // depend on this track.
+            let key = slot.sidechain.filter(|&src| {
+                project
+                    .track(src)
+                    .is_some_and(|s| s.kind.has_audio() && s.kind != TrackKind::Midi)
+                    && !project.reaches(t.id, src, None)
+            });
+            let key = key.and_then(|src| Some((src, pcx.sidechain_layout(slot)?)));
+            if let Some((_, l)) = key {
+                spec = spec.audio_in(l);
+            }
             let node = pcx.node(&mut b, slot, t, spec, Role::Insert);
+            if let Some((src, _)) = key {
+                sidechains.push((node, src));
+            }
             own(&mut owners, node, t.id, Some(slot.id), NodeWork::Insert);
             b.connect_audio(prev, 0, node, 0)?;
             if notes {
@@ -471,6 +524,7 @@ pub fn build_graph(
             )),
         );
         b.connect_audio(prev, 0, strip, 0)?;
+        tn.post_fx = Some(prev);
         tn.strip = Some(own(&mut owners, strip, t.id, None, NodeWork::Strip));
         nodes.insert(t.id, tn);
     }
@@ -553,6 +607,13 @@ pub fn build_graph(
             own(&mut owners, node, t.id, None, NodeWork::Send);
             b.connect_audio(tap_node, tap_port, node, 0)?;
             b.connect_audio(node, 0, dst, 0)?;
+        }
+    }
+    // Sidechains tap their source after its inserts: before its fader,
+    // mute and solo, so a muted "ghost" track can still key.
+    for (node, src) in sidechains {
+        if let Some(tap) = nodes.get(&src).and_then(|n| n.post_fx) {
+            b.connect_audio(tap, 0, node, 1)?;
         }
     }
     Ok(BuiltGraph {

@@ -152,6 +152,7 @@ fn build(args: &Args) -> Project {
                 bypass: false,
                 parameters: vec![],
                 state: None,
+                sidechain: None,
             });
         }
         buses.push(id);
@@ -166,6 +167,7 @@ fn build(args: &Args) -> Project {
         bypass: false,
         parameters: vec![],
         state: None,
+        sidechain: None,
     });
     p.tracks.insert(0, aux_track);
     for i in 0..args.tracks {
@@ -197,6 +199,7 @@ fn build(args: &Args) -> Project {
                 bypass: false,
                 parameters: vec![],
                 state: None,
+                sidechain: None,
             });
         }
         for _ in 0..args.fx {
@@ -206,6 +209,7 @@ fn build(args: &Args) -> Project {
                 bypass: false,
                 parameters: vec![],
                 state: None,
+                sidechain: None,
             });
         }
         if let Some(plugin) = &args.plugin {
@@ -215,6 +219,7 @@ fn build(args: &Args) -> Project {
                 bypass: false,
                 parameters: vec![],
                 state: None,
+                sidechain: None,
             });
         }
         let clip = Clip {

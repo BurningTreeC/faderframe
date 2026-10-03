@@ -23,6 +23,9 @@ pub enum TrackKind {
     Aux,
     /// The main output. Exactly one per project.
     Master,
+    /// A fader without audio that scales (and mutes, solos) the tracks
+    /// assigned to it.
+    Vca,
 }
 
 impl TrackKind {
@@ -34,6 +37,7 @@ impl TrackKind {
             TrackKind::Bus => "Bus",
             TrackKind::Aux => "Aux",
             TrackKind::Master => "Master",
+            TrackKind::Vca => "VCA",
         }
     }
 
@@ -50,9 +54,9 @@ impl TrackKind {
         matches!(self, TrackKind::Bus | TrackKind::Aux | TrackKind::Master)
     }
 
-    /// Produces audio (as opposed to MIDI-only tracks).
+    /// Produces audio (as opposed to MIDI-only tracks and VCAs).
     pub fn has_audio(self) -> bool {
-        !matches!(self, TrackKind::Midi)
+        !matches!(self, TrackKind::Midi | TrackKind::Vca)
     }
 }
 
@@ -276,6 +280,10 @@ pub struct PluginSlot {
     /// Opaque plugin state (base64 when written by a real plugin format).
     #[serde(default)]
     pub state: Option<String>,
+    /// Track whose signal (after its inserts, before its fader, mute and
+    /// solo) feeds the plugin's sidechain input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidechain: Option<TrackId>,
 }
 
 /// A channel of the project: audio/instrument/MIDI track, bus, aux or master.
@@ -328,6 +336,67 @@ pub struct Track {
 
     #[serde(default)]
     pub automation: AutomationSet,
+    /// Frozen: plays this rendered audio instead of its clips, instrument
+    /// and inserts (which are unloaded until the track is unfrozen).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freeze: Option<Freeze>,
+    /// The VCA fader that scales this track.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vca: Option<TrackId>,
+    /// The group whose linked controls this track follows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<faderframe_core::GroupId>,
+}
+
+/// Tracks whose controls move together.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TrackGroup {
+    pub id: faderframe_core::GroupId,
+    pub name: String,
+    pub color: TrackColor,
+    /// Inactive groups keep their members but link nothing.
+    #[serde(default = "yes")]
+    pub active: bool,
+    #[serde(default)]
+    pub link: GroupLink,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// What a group links. Volume is linked relatively (members keep their
+/// balance); the switches are set alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GroupLink {
+    pub volume: bool,
+    pub mute: bool,
+    pub solo: bool,
+    pub arm: bool,
+    pub selection: bool,
+}
+
+impl Default for GroupLink {
+    fn default() -> Self {
+        Self {
+            volume: true,
+            mute: true,
+            solo: true,
+            arm: true,
+            selection: true,
+        }
+    }
+}
+
+/// The rendered audio of a frozen track.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Freeze {
+    pub source: faderframe_core::AudioSourceId,
+    /// Where the audio starts on the timeline.
+    pub start: faderframe_timeline::MusicalTime,
+    /// Project-rate frames.
+    pub length: i64,
 }
 
 impl Track {
@@ -368,6 +437,9 @@ impl Track {
                 _ => MonitorMode::Off,
             },
             automation: AutomationSet::default(),
+            freeze: None,
+            vca: None,
+            group: None,
         }
     }
 

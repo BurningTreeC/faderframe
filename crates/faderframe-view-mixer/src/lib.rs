@@ -57,6 +57,10 @@ pub enum Hit {
     Strip(TrackId),
     /// The rule under the inserts: drag to show more or fewer slots.
     InsertsGrip(TrackId),
+    /// The group/VCA tags (click for the group and VCA menu).
+    Tags(TrackId),
+    /// The colour bar on top: opens the colour chooser.
+    Color(TrackId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -87,6 +91,15 @@ enum Drag {
         start_y: f32,
         start: usize,
     },
+    /// An insert pressed: a click on release, or dragged to another slot
+    /// (reorder; another track: copy, Shift: move; Ctrl: duplicate).
+    Insert {
+        track: TrackId,
+        plugin: faderframe_core::PluginInstanceId,
+        origin: Point,
+        pos: Point,
+        moved: bool,
+    },
 }
 
 pub struct MixerView {
@@ -103,6 +116,8 @@ pub struct MixerView {
     max_sends: usize,
     /// Insert slots per strip (the session's layout setting).
     insert_slots: usize,
+    /// The project has groups or VCAs: strips show a tag row.
+    show_tags: bool,
 }
 
 fn fader_cap_color(kind: TrackKind, theme: &Theme) -> Color {
@@ -119,6 +134,21 @@ pub fn track_color(c: TrackColor) -> Color {
     Color::rgb8(c.r, c.g, c.b)
 }
 
+/// A session menu entry as a menu item.
+pub fn menu_item(e: faderframe_session::GroupMenuEntry) -> MenuItem<Action> {
+    let mut m = match e.action {
+        Some(a) => MenuItem::new(e.label, a),
+        None => MenuItem::disabled(e.label),
+    };
+    if let Some(on) = e.checked {
+        m = m.checked(on);
+    }
+    if e.separated {
+        m = m.separated();
+    }
+    m
+}
+
 fn kind_tag(kind: TrackKind) -> &'static str {
     match kind {
         TrackKind::Audio => "AUDIO",
@@ -127,6 +157,7 @@ fn kind_tag(kind: TrackKind) -> &'static str {
         TrackKind::Bus => "BUS",
         TrackKind::Aux => "AUX",
         TrackKind::Master => "MAIN",
+        TrackKind::Vca => "VCA",
     }
 }
 
@@ -150,6 +181,7 @@ impl MixerView {
             send_bank: 0,
             max_sends: 0,
             insert_slots: faderframe_session::DEFAULT_INSERT_SLOTS as usize,
+            show_tags: false,
         }
     }
 
@@ -202,13 +234,15 @@ impl MixerView {
     }
 
     fn layout_for(&self, rect: Rect, t: &Track) -> StripLayout {
+        let vca = t.kind == TrackKind::Vca;
         StripLayout::new(
             rect,
             &self.theme,
             matches!(t.kind, TrackKind::Audio | TrackKind::Instrument),
-            t.kind != TrackKind::Master,
+            t.kind != TrackKind::Master && !vca,
             self.send_rows,
-            self.insert_slots,
+            if vca { 0 } else { self.insert_slots.max(1) },
+            self.show_tags,
         )
     }
 
@@ -216,6 +250,8 @@ impl MixerView {
     /// leaving one free slot to add another).
     fn update_sends(&mut self, model: &Session) {
         self.insert_slots = model.mixer_insert_slots();
+        let p = model.project();
+        self.show_tags = !p.groups.is_empty() || p.tracks.iter().any(|t| t.kind == TrackKind::Vca);
         self.max_sends = model
             .project()
             .tracks
@@ -262,17 +298,21 @@ impl MixerView {
             let id = t.id;
             let geo = FaderGeometry::new(l.fader, &self.theme);
             let pos_now = self.law.db_to_position(model.shown_volume_db(t));
-            let checks: [(Option<Rect>, Hit); 13] = [
+            // VCAs have only a fader, mute and solo.
+            let audio = (t.kind != TrackKind::Vca).then_some(());
+            let color = Rect::new(l.color_bar.x, l.color_bar.y, l.color_bar.w, 7.0);
+            let checks: [(Option<Rect>, Hit); 14] = [
+                (Some(color), Hit::Color(id)),
                 (Some(geo.cap_rect(pos_now).inset(-2.0)), Hit::FaderCap(id)),
                 (Some(l.fader), Hit::FaderTrack(id)),
-                (Some(l.meter), Hit::Meter(id)),
-                (Some(l.pan_readout), Hit::PanValue(id)),
-                (Some(l.pan_knob), Hit::Pan(id)),
+                (audio.map(|_| l.meter), Hit::Meter(id)),
+                (audio.map(|_| l.pan_readout), Hit::PanValue(id)),
+                (audio.map(|_| l.pan_knob), Hit::Pan(id)),
                 (Some(l.mute), Hit::Mute(id)),
                 (Some(l.solo), Hit::Solo(id)),
-                (Some(l.record), Hit::Record(id)),
+                (audio.map(|_| l.record), Hit::Record(id)),
                 (Some(l.level_readout), Hit::Level(id)),
-                (Some(l.output), Hit::Output(id)),
+                (audio.map(|_| l.output), Hit::Output(id)),
                 (Some(l.scribble), Hit::Scribble(id)),
                 (l.input.map(|i| i.phase), Hit::Phase(id)),
                 (l.input.map(|i| i.monitor), Hit::Monitor(id)),
@@ -287,6 +327,9 @@ impl MixerView {
             }
             if l.inserts_grip.is_some_and(|g| g.contains(pos)) {
                 return Some(Hit::InsertsGrip(id));
+            }
+            if l.tags.is_some_and(|g| g.contains(pos)) {
+                return Some(Hit::Tags(id));
             }
             if let Some(slots) = &l.inserts
                 && let Some(i) = slots.iter().position(|r| r.contains(pos))
@@ -358,6 +401,9 @@ impl MixerView {
             controls::engraved(p, &format!("{number}"), l.header, th, Align::Start);
             controls::engraved(p, kind_tag(t.kind), l.header, th, Align::End);
         }
+        if let Some(tags) = l.tags {
+            self.paint_tags(p, tags, t, model);
+        }
 
         if let Some(row) = l.input {
             let label = match &t.input {
@@ -388,7 +434,12 @@ impl MixerView {
         }
 
         if let (Some(label), Some(slots)) = (l.inserts_label, &l.inserts) {
-            controls::engraved(p, "INSERTS", label, th, Align::Center);
+            let title = if t.freeze.is_some() {
+                "INSERTS · FROZEN"
+            } else {
+                "INSERTS"
+            };
+            controls::engraved(p, title, label, th, Align::Center);
             // More plugins than slots: the last slot says how many more.
             let overflow = t.inserts.len() > slots.len();
             for (i, slot) in slots.iter().enumerate() {
@@ -400,10 +451,15 @@ impl MixerView {
                 match t.inserts.get(i) {
                     Some(s) => {
                         let name = s.plugin.name.trim_start_matches("FaderFrame ");
+                        // Keyed plugins name their sidechain source.
+                        let key = s
+                            .sidechain
+                            .and_then(|k| model.project().track(k))
+                            .map_or(String::new(), |k| format!(" ⟵ {}", k.name));
                         let text = if s.bypass {
-                            format!("({name})")
+                            format!("({name}{key})")
                         } else {
-                            name.to_string()
+                            format!("{name}{key}")
                         };
                         controls::well_label(p, *slot, &text, s.bypass, th);
                     }
@@ -491,22 +547,29 @@ impl MixerView {
             }
         }
 
-        controls::knob(
-            p,
-            l.pan_knob,
-            (model.shown_pan(t) + 1.0) * 0.5,
-            true,
-            KnobLook {
-                cap: c.pan_cap,
-                ring: c.panel_label,
-            },
-            th,
-        );
-        controls::readout(p, l.pan_readout, &format_pan(model.shown_pan(t)), th);
+        let vca = t.kind == TrackKind::Vca;
+        if vca {
+            controls::engraved(p, "VCA", l.pan_knob, th, Align::Center);
+        } else {
+            controls::knob(
+                p,
+                l.pan_knob,
+                (model.shown_pan(t) + 1.0) * 0.5,
+                true,
+                KnobLook {
+                    cap: c.pan_cap,
+                    ring: c.panel_label,
+                },
+                th,
+            );
+            controls::readout(p, l.pan_readout, &format_pan(model.shown_pan(t)), th);
+        }
 
         controls::led_button(p, l.mute, "M", model.shown_mute(t), c.led.mute, th);
         controls::led_button(p, l.solo, "S", t.solo, c.led.solo, th);
-        if t.kind.has_clips() {
+        if vca {
+            controls::led_button(p, l.record, "·", false, c.led.record, th);
+        } else if t.kind.has_clips() {
             controls::led_button(p, l.record, "R", t.record_arm, c.led.record, th);
         } else {
             controls::led_button(p, l.record, "·", false, c.led.record, th);
@@ -538,6 +601,18 @@ impl MixerView {
             &scale,
             th,
         );
+        if vca {
+            // A VCA has no signal: its well says what it controls.
+            let n = model.project().vca_members(t.id).len();
+            let label = match n {
+                0 => "no tracks".to_string(),
+                1 => "1 track".to_string(),
+                n => format!("{n} tracks"),
+            };
+            controls::well_label(p, l.output, &label, n == 0, th);
+            controls::scribble(p, l.scribble, &t.name, color, th);
+            return;
+        }
         let m: MeterDisplay = model.meter(t.id);
         let level = |ch: &faderframe_session::MeterChannel| MeterLevel {
             level_db: ch.level_db,
@@ -559,6 +634,42 @@ impl MixerView {
         };
         controls::well_label(p, l.output, &out, t.output == OutputRouting::None, th);
         controls::scribble(p, l.scribble, &t.name, color, th);
+    }
+
+    /// The group (filled, its colour) and VCA (outlined, the VCA's colour)
+    /// a track follows.
+    fn paint_tags(&self, p: &mut dyn Painter, area: Rect, t: &Track, model: &Session) {
+        let th = &self.theme;
+        let project = model.project();
+        let half = (area.w - 3.0) * 0.5;
+        let left = Rect::new(area.x, area.y, half, area.h);
+        let right = Rect::new(area.x + half + 3.0, area.y, half, area.h);
+        let style = |c: Color| {
+            faderframe_ui_canvas::TextStyle::new(th.fonts.tiny, c)
+                .center()
+                .bold()
+        };
+        match t.group.and_then(|g| project.group(g)) {
+            Some(g) => {
+                let gc = track_color(g.color);
+                let fill = if g.active { gc } else { gc.with_alpha(0.35) };
+                p.fill_rounded(left, 3.0, &fill.into());
+                p.text(
+                    &g.name,
+                    left.inset_xy(2.0, 0.0),
+                    &style(Color::hex(0x101114)),
+                );
+            }
+            None => controls::engraved(p, "—", left, th, Align::Center),
+        }
+        match t.vca.and_then(|v| project.track(v)) {
+            Some(v) => {
+                let vc = track_color(v.color);
+                p.stroke_rounded(right.inset(0.5), 3.0, 1.0, vc);
+                p.text(&v.name, right.inset_xy(2.0, 0.0), &style(vc));
+            }
+            None => controls::engraved(p, "—", right, th, Align::Center),
+        }
     }
 
     // --- interaction helpers ---------------------------------------------------
@@ -735,6 +846,51 @@ impl MixerView {
                         },
                     ));
                 }
+                // Presets: the user's and the plugin format's own.
+                let presets = model.plugin_presets(s.id);
+                items.push(
+                    MenuItem::new("Save Preset…", Action::PromptSavePluginPreset(s.id)).separated(),
+                );
+                for p in presets.iter().take(24) {
+                    items.push(MenuItem::new(
+                        format!(
+                            "Preset: {}{}",
+                            p.name,
+                            if p.factory { " (factory)" } else { "" }
+                        ),
+                        Action::LoadPluginPreset {
+                            plugin: s.id,
+                            path: p.path.clone(),
+                        },
+                    ));
+                }
+                if presets.len() > 24 {
+                    items.push(MenuItem::disabled(format!(
+                        "… {} more in the parameter window",
+                        presets.len() - 24
+                    )));
+                }
+                // Sidechain: which track's pre-fader signal keys the plugin.
+                if model.plugin_has_sidechain(s.id) {
+                    let set = |source| {
+                        Action::Edit(Command::SetPluginSidechain {
+                            track: t.id,
+                            plugin: s.id,
+                            source,
+                        })
+                    };
+                    items.push(
+                        MenuItem::new("Sidechain: None", set(None))
+                            .checked(s.sidechain.is_none())
+                            .separated(),
+                    );
+                    for (id, name) in model.sidechain_sources(s.id) {
+                        items.push(
+                            MenuItem::new(format!("Sidechain from {name}"), set(Some(id)))
+                                .checked(s.sidechain == Some(id)),
+                        );
+                    }
+                }
                 items.push(
                     MenuItem::new(
                         if s.bypass { "Enable" } else { "Bypass" },
@@ -896,7 +1052,7 @@ impl MixerView {
         HostRequest::ContextMenu { at, items }
     }
 
-    fn track_menu(t: &Track, at: Point) -> HostRequest<Action> {
+    fn track_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
         let mut items = Vec::new();
         if t.kind != TrackKind::Master {
             items.push(MenuItem::new(
@@ -904,6 +1060,14 @@ impl MixerView {
                 Action::Edit(Command::RemoveTrack { track: t.id }),
             ));
         }
+        items.push(
+            MenuItem::new(
+                "Colour…",
+                Action::PickColor(faderframe_session::ColorTarget::Track(t.id)),
+            )
+            .separated(),
+        );
+        items.extend(model.group_menu(t.id).into_iter().map(menu_item));
         for (i, c) in TrackColor::PALETTE.iter().enumerate() {
             let mut item = MenuItem::new(
                 format!("Colour {}", i + 1),
@@ -947,6 +1111,109 @@ impl MixerView {
                 parse_db(text).map(|db| Action::Edit(Command::SetTrackVolume { track: id, db }))
             }),
         }
+    }
+
+    /// While an insert is dragged: the slot it would land in and a label
+    /// at the pointer.
+    fn paint_insert_drag(&self, p: &mut dyn Painter, size: Size, model: &Session) {
+        let Some(Drag::Insert {
+            track,
+            plugin,
+            pos,
+            moved: true,
+            ..
+        }) = self.drag
+        else {
+            return;
+        };
+        let th = &self.theme;
+        let name = Self::track(model, track)
+            .and_then(|t| t.inserts.iter().find(|s| s.id == plugin))
+            .map_or_else(String::new, |s| {
+                s.plugin.name.trim_start_matches("FaderFrame ").to_string()
+            });
+        let target = match self.hit_test(pos, size, model) {
+            Some(Hit::Insert(to, i)) => self
+                .layout_of(model, to, size)
+                .and_then(|l| l.inserts.and_then(|v| v.get(i).copied()))
+                .map(|r| (to, r)),
+            _ => None,
+        };
+        let verb = match target {
+            Some((to, _)) if to != track => "Copy",
+            _ => "Move",
+        };
+        if let Some((_, r)) = target {
+            p.stroke_rounded(r.inset(-1.0), 3.0, 1.5, th.ui.accent);
+        }
+        let label = format!("{verb} {name}");
+        let style = faderframe_ui_canvas::TextStyle::new(th.fonts.small, th.ui.text);
+        let w = p.text_width(&label, &style) + 14.0;
+        let r = Rect::new(pos.x + 12.0, pos.y + 6.0, w, 20.0);
+        p.fill_rounded(
+            r,
+            4.0,
+            &faderframe_ui_canvas::Paint::Solid(Color::rgba(0.1, 0.11, 0.13, 0.92)),
+        );
+        p.stroke_rounded(r, 4.0, 1.0, th.ui.accent.with_alpha(0.8));
+        p.text(&label, r, &style.center());
+    }
+
+    /// What releasing a pressed insert does: a click opens its editor
+    /// (Ctrl: toggles bypass); dropped on an insert slot it moves within
+    /// the track (Ctrl: duplicates) or copies to another track (Shift:
+    /// moves).
+    #[allow(clippy::too_many_arguments)]
+    fn insert_drop(
+        &self,
+        model: &Session,
+        size: Size,
+        track: TrackId,
+        plugin: faderframe_core::PluginInstanceId,
+        moved: bool,
+        pos: Point,
+        mods: faderframe_ui_canvas::Modifiers,
+    ) -> Option<Action> {
+        let t = Self::track(model, track)?;
+        let slot = t.inserts.iter().find(|s| s.id == plugin)?;
+        if !moved {
+            return Some(if mods.toggle() {
+                Action::Edit(Command::SetPluginBypass {
+                    track,
+                    plugin,
+                    bypass: !slot.bypass,
+                })
+            } else {
+                Action::OpenPluginEditor {
+                    track,
+                    plugin,
+                    generic: false,
+                }
+            });
+        }
+        let Some(Hit::Insert(to, index)) = self.hit_test(pos, size, model) else {
+            return None;
+        };
+        let copy = if to == track {
+            mods.toggle()
+        } else {
+            !mods.shift
+        };
+        Some(if copy {
+            Action::CopyPlugin {
+                track,
+                plugin,
+                to,
+                index,
+            }
+        } else {
+            Action::MovePlugin {
+                track,
+                plugin,
+                to,
+                index,
+            }
+        })
     }
 
     /// What an empty insert slot offers: the instrument for an instrument
@@ -1128,6 +1395,18 @@ impl MixerView {
                     cx.request(Self::output_menu(model, t, pos));
                 }
             }
+            Hit::Color(id) => {
+                cx.emit(Action::PickColor(faderframe_session::ColorTarget::Track(
+                    id,
+                )));
+            }
+            Hit::Tags(id) => {
+                let items: Vec<MenuItem<Action>> =
+                    model.group_menu(id).into_iter().map(menu_item).collect();
+                if !items.is_empty() {
+                    cx.request(HostRequest::ContextMenu { at: pos, items });
+                }
+            }
             Hit::InsertsGrip(_) => {
                 if clicks >= 2 {
                     cx.emit(Action::SetMixerInsertSlots(
@@ -1160,19 +1439,21 @@ impl MixerView {
                             track: id,
                             target: Self::empty_slot_target(t),
                         });
-                    } else if mods.toggle() {
-                        // Ctrl/Cmd-click: bypass toggle.
-                        let s = &t.inserts[slot];
-                        cx.emit(Action::Edit(Command::SetPluginBypass {
-                            track: id,
-                            plugin: s.id,
-                            bypass: !s.bypass,
-                        }));
-                    } else {
-                        cx.emit(Action::OpenPluginEditor {
+                    } else if mods.alt {
+                        // Alt-click: remove.
+                        cx.emit(Action::Edit(Command::RemovePlugin {
                             track: id,
                             plugin: t.inserts[slot].id,
-                            generic: false,
+                        }));
+                    } else {
+                        // Click (editor; Ctrl: bypass) or drag, decided on
+                        // release.
+                        self.drag = Some(Drag::Insert {
+                            track: id,
+                            plugin: t.inserts[slot].id,
+                            origin: pos,
+                            pos,
+                            moved: false,
                         });
                     }
                 }
@@ -1234,8 +1515,8 @@ impl MixerView {
             Hit::Input(id) | Hit::Monitor(id) => {
                 Self::track(model, id).map(|t| Self::input_menu(model, t, pos))
             }
-            Hit::Scribble(id) | Hit::Strip(id) => {
-                Self::track(model, id).map(|t| Self::track_menu(t, pos))
+            Hit::Scribble(id) | Hit::Strip(id) | Hit::Tags(id) => {
+                Self::track(model, id).map(|t| Self::track_menu(model, t, pos))
             }
             Hit::Level(id) => match (Self::track(model, id), self.layout_of(model, id, size)) {
                 (Some(t), Some(l)) => Some(Self::level_request(t, l.level_readout)),
@@ -1312,7 +1593,7 @@ impl MixerView {
             .into(),
             Hit::Insert(id, i) => {
                 if Self::track(model, id).is_some_and(|t| i < t.inserts.len()) {
-                    "Insert · Click: editor · Ctrl-click: bypass · Right-click: more".into()
+                    "Insert · Click: editor · Ctrl-click: bypass · Alt-click: remove · Drag: reorder (Ctrl: duplicate), onto another track: copy (Shift: move) · Right-click: more".into()
                 } else {
                     "Empty insert · Click to open the plugin browser · Right-click for a quick list"
                         .into()
@@ -1325,6 +1606,19 @@ impl MixerView {
             Hit::Monitor(_) => "Input monitoring · Right-click for tape-style auto".into(),
             Hit::Input(_) => "Input routing".into(),
             Hit::Output(_) => "Output routing".into(),
+            Hit::Color(_) => "Track colour · Click to choose (the selected tracks follow)".into(),
+            Hit::Tags(id) => {
+                let t = Self::track(model, id)?;
+                let group = t
+                    .group
+                    .and_then(|g| model.project().group(g))
+                    .map_or("no group".to_string(), |g| format!("group '{}'", g.name));
+                let vca = t
+                    .vca
+                    .and_then(|v| model.project().track(v))
+                    .map_or("no VCA".to_string(), |v| format!("VCA '{}'", v.name));
+                format!("{} · {group} · {vca} · Click to change", t.name)
+            }
             Hit::Level(_) => "Click to type a level".into(),
             Hit::PanValue(id) => format!(
                 "Pan {} · Click to type (C, L30, R45 or −100…100)",
@@ -1372,6 +1666,7 @@ impl CanvasView<Session, Action> for MixerView {
         if let Some(m) = model.project().master() {
             self.paint_strip(p, master, m, 0, model);
         }
+        self.paint_insert_drag(p, size, model);
     }
 
     fn event(
@@ -1430,6 +1725,26 @@ impl CanvasView<Session, Action> for MixerView {
                             }
                         }
                     }
+                    Some(Drag::Insert {
+                        track,
+                        plugin,
+                        origin,
+                        moved,
+                        ..
+                    }) => {
+                        let moved = moved || pos.distance(origin) >= 4.0;
+                        if moved {
+                            cx.set_cursor(Cursor::Grabbing);
+                        }
+                        self.drag = Some(Drag::Insert {
+                            track,
+                            plugin,
+                            origin,
+                            pos,
+                            moved,
+                        });
+                        cx.redraw();
+                    }
                     Some(Drag::InsertSlots { start_y, start }) => {
                         let (lo, hi) = faderframe_session::INSERT_SLOTS_RANGE;
                         let n = (start as f32 + ((pos.y - start_y) / INSERT_SLOT_STEP).round())
@@ -1467,7 +1782,11 @@ impl CanvasView<Session, Action> for MixerView {
                 }
                 false
             }
-            ViewEvent::PointerUp { .. } => {
+            ViewEvent::PointerUp {
+                pos: up_pos,
+                modifiers: up_mods,
+                ..
+            } => {
                 match self.drag.take() {
                     Some(Drag::Fader { .. } | Drag::Knob { .. }) => {
                         cx.emit(Action::EndGesture);
@@ -1476,6 +1795,21 @@ impl CanvasView<Session, Action> for MixerView {
                     Some(Drag::InsertSlots { .. }) => {
                         cx.set_cursor(Cursor::Default);
                         cx.redraw();
+                    }
+                    Some(Drag::Insert {
+                        track,
+                        plugin,
+                        pos: _,
+                        moved,
+                        ..
+                    }) => {
+                        cx.set_cursor(Cursor::Default);
+                        cx.redraw();
+                        if let Some(a) =
+                            self.insert_drop(model, size, track, plugin, moved, up_pos, up_mods)
+                        {
+                            cx.emit(a);
+                        }
                     }
                     _ => {}
                 }

@@ -18,6 +18,7 @@ use clack_extensions::params::{
     HostParams, HostParamsImplMainThread, HostParamsImplShared, ParamClearFlags, ParamRescanFlags,
     PluginParams,
 };
+#[cfg(unix)]
 use clack_extensions::posix_fd::{FdFlags, HostPosixFd, HostPosixFdImpl, PluginPosixFd};
 use clack_extensions::state::{HostState, HostStateImpl, PluginState};
 use clack_extensions::thread_check::{HostThreadCheck, HostThreadCheckImpl};
@@ -39,6 +40,7 @@ pub struct PluginExtensions {
     pub note_ports: Option<PluginNotePorts>,
     pub gui: Option<PluginGui>,
     pub timer: Option<PluginTimer>,
+    #[cfg(unix)]
     pub posix_fd: Option<PluginPosixFd>,
 }
 
@@ -111,6 +113,7 @@ impl<'a> SharedHandler<'a> for FfShared {
             note_ports: instance.get_extension(),
             gui: instance.get_extension(),
             timer: instance.get_extension(),
+            #[cfg(unix)]
             posix_fd: instance.get_extension(),
         });
     }
@@ -213,8 +216,9 @@ impl HostParamsImplShared for FfShared {
 /// Main-thread host state of one instance.
 pub struct FfMainThread<'a> {
     pub shared: &'a FfShared,
-    /// File descriptors the plugin registered (its GUI's event loop).
-    pub fds: std::cell::RefCell<Vec<(i32, FdFlags)>>,
+    /// File descriptors the plugin registered (its GUI's event loop; only
+    /// on Unix): (fd, read, write, error).
+    pub fds: std::cell::RefCell<Vec<(i32, [bool; 3])>>,
     /// Timers: (id, period in ms).
     pub timers: std::cell::RefCell<Vec<(u32, u32)>>,
     next_timer: std::cell::Cell<u32>,
@@ -231,11 +235,21 @@ impl<'a> FfMainThread<'a> {
     }
 }
 
+#[cfg(unix)]
+fn interest(flags: FdFlags) -> [bool; 3] {
+    [
+        flags.contains(FdFlags::READ),
+        flags.contains(FdFlags::WRITE),
+        flags.contains(FdFlags::ERROR),
+    ]
+}
+
+#[cfg(unix)]
 impl HostPosixFdImpl for FfMainThread<'_> {
     fn register_fd(&self, fd: std::os::fd::RawFd, flags: FdFlags) -> Result<(), HostError> {
         let mut fds = self.fds.borrow_mut();
         fds.retain(|(f, _)| *f != fd);
-        fds.push((fd, flags));
+        fds.push((fd, interest(flags)));
         Ok(())
     }
 
@@ -243,7 +257,7 @@ impl HostPosixFdImpl for FfMainThread<'_> {
         let mut fds = self.fds.borrow_mut();
         match fds.iter_mut().find(|(f, _)| *f == fd) {
             Some(e) => {
-                e.1 = flags;
+                e.1 = interest(flags);
                 Ok(())
             }
             None => Err(HostError::Message("unknown fd")),
@@ -332,8 +346,9 @@ impl HostHandlers for FfHost {
             .register::<HostAudioPorts>()
             .register::<HostNotePorts>()
             .register::<HostGui>()
-            .register::<HostTimer>()
-            .register::<HostPosixFd>();
+            .register::<HostTimer>();
+        #[cfg(unix)]
+        builder.register::<HostPosixFd>();
     }
 }
 
@@ -356,6 +371,7 @@ pub fn query_extensions(h: &PluginMainThreadHandle<'_>) -> PluginExtensions {
         note_ports: h.get_extension(),
         gui: h.get_extension(),
         timer: h.get_extension(),
+        #[cfg(unix)]
         posix_fd: h.get_extension(),
     }
 }

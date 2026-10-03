@@ -24,6 +24,11 @@ pub enum RenderRange {
     Loop,
     /// Bars `start..end` (0-based, end exclusive).
     Bars { start: i32, end: i32 },
+    /// An exact span.
+    Span {
+        start: MusicalTime,
+        end: MusicalTime,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +44,9 @@ pub enum RenderSource {
 pub enum RenderChannels {
     Stereo,
     Mono,
+    /// The first output channel alone (a mono master, e.g. freezing a mono
+    /// track).
+    First,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -151,6 +159,7 @@ pub fn resolve_range(
             project.timeline.meter.bar_start(start.max(0)),
             project.timeline.meter.bar_start(end.max(start + 1)),
         ),
+        RenderRange::Span { start, end } => (start, end),
     };
     if b <= a {
         return Err(RenderError::EmptyRange);
@@ -224,6 +233,9 @@ fn finish(
     settings: &RenderSettings,
     path: &Path,
 ) -> Result<(), RenderError> {
+    if settings.channels == RenderChannels::First {
+        audio.truncate(1);
+    }
     if settings.channels == RenderChannels::Mono {
         let mono: Vec<f32> = audio[0]
             .iter()
@@ -250,6 +262,53 @@ fn finish(
             source,
         }
     })
+}
+
+/// A project that renders only `track` after its inserts and before its
+/// fader (unity, centre, no sends or fader automation, straight to a plain
+/// master), and the span its clips cover. `None` when it has no clips.
+pub fn track_render_project(
+    project: &Project,
+    track: TrackId,
+) -> Option<(Project, MusicalTime, MusicalTime)> {
+    use faderframe_automation::AutomationTarget as A;
+    let clips = project.clips_of(track);
+    let start = clips.iter().map(|c| c.start).min()?;
+    let end = clips
+        .iter()
+        .map(|c| c.end(&project.timeline, project.sample_rate))
+        .max()?;
+    let mono = project
+        .track(track)
+        .is_some_and(|t| t.layout == faderframe_core::ChannelLayout::Mono);
+    let mut p = project.clone();
+    for t in &mut p.tracks {
+        t.solo = t.id == track;
+        if t.kind == TrackKind::Master {
+            // A mono track renders through a mono master: no pan law.
+            if mono {
+                t.layout = faderframe_core::ChannelLayout::Mono;
+            }
+            t.volume_db = 0.0;
+            t.pan = 0.0;
+            t.mute = false;
+            t.phase_invert = false;
+            t.inserts.clear();
+            t.automation.lanes.clear();
+        }
+        if t.id == track {
+            t.volume_db = 0.0;
+            t.pan = 0.0;
+            t.mute = false;
+            t.freeze = None;
+            t.sends.clear();
+            t.output = faderframe_project::OutputRouting::Master;
+            t.automation
+                .lanes
+                .retain(|l| !matches!(l.target, A::TrackVolume | A::TrackPan | A::TrackMute));
+        }
+    }
+    Some((p, start, end))
 }
 
 /// Start rendering `project` on a worker thread.

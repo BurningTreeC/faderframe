@@ -3,7 +3,7 @@
 use crate::state::AppState;
 use faderframe_project::file::FILE_EXTENSION;
 use gtk::prelude::*;
-use gtk::{gio, glib};
+use gtk::{gdk, gio, glib};
 use std::rc::Rc;
 
 fn project_filters() -> gio::ListStore {
@@ -51,6 +51,105 @@ fn audio_filters() -> gio::ListStore {
     store.append(&audio);
     store.append(&all);
     store
+}
+
+fn midi_filters() -> gio::ListStore {
+    let midi = gtk::FileFilter::new();
+    midi.set_name(Some("MIDI files"));
+    for ext in ["mid", "midi", "smf", "kar"] {
+        midi.add_suffix(ext);
+    }
+    let all = gtk::FileFilter::new();
+    all.set_name(Some("All files"));
+    all.add_pattern("*");
+    let store = gio::ListStore::new::<gtk::FileFilter>();
+    store.append(&midi);
+    store.append(&all);
+    store
+}
+
+/// File → Import MIDI File…: new instrument tracks at the playhead; into
+/// a project without clips at bar 1 with the file's tempo and meter.
+pub fn import_midi(app: &Rc<AppState>) {
+    let Some(win) = app.window.borrow().clone() else {
+        return;
+    };
+    let dialog = gtk::FileDialog::builder()
+        .title("Import MIDI File")
+        .modal(true)
+        .filters(&midi_filters())
+        .build();
+    let weak = Rc::downgrade(app);
+    dialog.open(Some(&win), gio::Cancellable::NONE, move |res| {
+        let (Ok(file), Some(app)) = (res, weak.upgrade()) else {
+            return;
+        };
+        let Some(path) = file.path() else { return };
+        let (empty, playhead) = {
+            let s = app.session.borrow();
+            (s.project().clips.is_empty(), s.playhead())
+        };
+        let at = if empty {
+            faderframe_timeline::MusicalTime::ZERO
+        } else {
+            playhead
+        };
+        app.dispatch(faderframe_session::Action::ImportMidiFile {
+            path,
+            at,
+            tempo: empty,
+        });
+    });
+}
+
+/// File → Export MIDI File…: every instrument/MIDI track (or the selected
+/// clips).
+pub fn export_midi(app: &Rc<AppState>) {
+    let Some(win) = app.window.borrow().clone() else {
+        return;
+    };
+    let name = format!("{}.mid", app.session.borrow().project().name);
+    let dialog = gtk::FileDialog::builder()
+        .title("Export MIDI File")
+        .modal(true)
+        .initial_name(name)
+        .filters(&midi_filters())
+        .build();
+    let weak = Rc::downgrade(app);
+    dialog.save(Some(&win), gio::Cancellable::NONE, move |res| {
+        let (Ok(file), Some(app)) = (res, weak.upgrade()) else {
+            return;
+        };
+        let Some(path) = file.path() else { return };
+        export_midi_to(&app, &path);
+    });
+}
+
+/// Write the MIDI file (selected MIDI clips only when some are selected).
+pub fn export_midi_to(app: &Rc<AppState>, path: &std::path::Path) {
+    let clips: Vec<faderframe_core::ClipId> = {
+        let s = app.session.borrow();
+        s.selection
+            .clips
+            .iter()
+            .copied()
+            .filter(|c| s.project().clip(*c).is_some_and(|c| c.as_midi().is_some()))
+            .collect()
+    };
+    let only = (!clips.is_empty()).then_some(clips.as_slice());
+    let result = app.session.borrow().export_midi_file(path, only);
+    match result {
+        Ok(n) => app.session.borrow_mut().notify(
+            faderframe_session::NoticeLevel::Info,
+            format!(
+                "exported {n} track{} to {}",
+                if n == 1 { "" } else { "s" },
+                path.display()
+            ),
+        ),
+        Err(e) => app.report(e, true),
+    }
+    app.after_change();
 }
 
 /// File → Import Audio…: onto the selected audio track (others on new
@@ -274,6 +373,168 @@ pub fn confirm_discard(app: &Rc<AppState>, next: impl Fn(&Rc<AppState>) + 'stati
             _ => {}
         }
     });
+}
+
+/// Ask for a name and save a plugin's settings as a preset.
+pub fn save_preset(app: &Rc<AppState>, plugin: faderframe_core::PluginInstanceId) {
+    let plugin_name = app
+        .session
+        .borrow()
+        .plugin_slot(plugin)
+        .map(|(_, s)| s.plugin.name.clone())
+        .unwrap_or_default();
+    name_prompt(
+        app,
+        &format!("Save Preset — {plugin_name}"),
+        "Save the current settings as a preset:",
+        "",
+        "Save",
+        move |name| faderframe_session::Action::SavePluginPreset { plugin, name },
+    );
+}
+
+pub fn rename_group(app: &Rc<AppState>, group: faderframe_core::GroupId) {
+    let Some(name) = app
+        .session
+        .borrow()
+        .project()
+        .group(group)
+        .map(|g| g.name.clone())
+    else {
+        return;
+    };
+    name_prompt(
+        app,
+        "Rename Group",
+        "Group name:",
+        &name,
+        "Rename",
+        move |name| faderframe_session::Action::RenameGroup { group, name },
+    );
+}
+
+/// A small modal window asking for a name.
+fn name_prompt(
+    app: &Rc<AppState>,
+    title: &str,
+    prompt: &str,
+    initial: &str,
+    ok: &str,
+    action: impl Fn(String) -> faderframe_session::Action + 'static,
+) {
+    let Some(main) = app.window.borrow().clone() else {
+        return;
+    };
+    let win = gtk::Window::builder()
+        .title(title)
+        .modal(true)
+        .transient_for(&main)
+        .resizable(false)
+        .default_width(360)
+        .build();
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    body.set_margin_top(14);
+    body.set_margin_bottom(14);
+    body.set_margin_start(14);
+    body.set_margin_end(14);
+    let entry = gtk::Entry::new();
+    entry.set_text(initial);
+    entry.set_activates_default(true);
+    let label = gtk::Label::new(Some(prompt));
+    label.set_halign(gtk::Align::Start);
+    body.append(&label);
+    body.append(&entry);
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    buttons.set_halign(gtk::Align::End);
+    let cancel = gtk::Button::with_label("Cancel");
+    let confirm = gtk::Button::with_label(ok);
+    confirm.add_css_class("suggested-action");
+    buttons.append(&cancel);
+    buttons.append(&confirm);
+    body.append(&buttons);
+    win.set_child(Some(&body));
+    win.set_default_widget(Some(&confirm));
+    let w = win.clone();
+    cancel.connect_clicked(move |_| w.close());
+    let weak = Rc::downgrade(app);
+    let w = win.clone();
+    confirm.connect_clicked(move |_| {
+        let name = entry.text().trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        if let Some(app) = weak.upgrade() {
+            app.dispatch(action(name));
+        }
+        w.close();
+    });
+    win.present();
+}
+
+/// GTK's colour chooser for a track (the selected tracks follow, as with
+/// any edit of one of them) or a section.
+pub fn pick_color(app: &Rc<AppState>, target: faderframe_session::ColorTarget) {
+    use faderframe_project::{Command, TrackColor};
+    use faderframe_session::ColorTarget;
+    let Some(main) = app.window.borrow().clone() else {
+        return;
+    };
+    let (title, initial) = {
+        let s = app.session.borrow();
+        let p = s.project();
+        match target {
+            ColorTarget::Track(t) => match p.track(t) {
+                Some(t) => (format!("Colour of {}", t.name), t.color),
+                None => return,
+            },
+            ColorTarget::Section(id) => match p.sections.iter().find(|x| x.id == id) {
+                Some(x) => (format!("Colour of {}", x.name), x.color),
+                None => return,
+            },
+        }
+    };
+    let dialog = gtk::ColorDialog::new();
+    dialog.set_title(&title);
+    dialog.set_modal(true);
+    dialog.set_with_alpha(false);
+    let rgba = gdk::RGBA::new(
+        initial.r as f32 / 255.0,
+        initial.g as f32 / 255.0,
+        initial.b as f32 / 255.0,
+        1.0,
+    );
+    let weak = Rc::downgrade(app);
+    dialog.choose_rgba(
+        Some(&main),
+        Some(&rgba),
+        gio::Cancellable::NONE,
+        move |res| {
+            let (Ok(c), Some(app)) = (res, weak.upgrade()) else {
+                return;
+            };
+            let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let color = TrackColor::rgb(to8(c.red()), to8(c.green()), to8(c.blue()));
+            let action = match target {
+                ColorTarget::Track(track) => {
+                    faderframe_session::Action::Edit(Command::SetTrackColor { track, color })
+                }
+                ColorTarget::Section(id) => {
+                    let section = app
+                        .session
+                        .borrow()
+                        .project()
+                        .sections
+                        .iter()
+                        .find(|x| x.id == id)
+                        .cloned();
+                    let Some(mut section) = section else { return };
+                    section.color = color;
+                    faderframe_session::Action::Edit(Command::UpdateSection { section })
+                }
+            };
+            app.dispatch(action);
+        },
+    );
 }
 
 pub fn about(app: &Rc<AppState>) {

@@ -12,6 +12,8 @@
 //! No JACK type escapes this crate: the engine only sees
 //! [`faderframe_audio::DeviceBuffers`].
 
+#![cfg(target_os = "linux")]
+
 use faderframe_audio::{
     AudioBackend, AudioCallback, AudioError, AudioStream, DeviceBuffers, DeviceInfo, StreamConfig,
     StreamInfo, StreamMonitor, StreamStatus, validate_format,

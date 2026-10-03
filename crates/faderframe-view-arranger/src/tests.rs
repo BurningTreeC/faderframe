@@ -823,3 +823,172 @@ fn every_audio_clip_has_a_gain_knob_that_the_wheel_turns() {
     let mrect = view.clip_view_rect(&s, size, melody).unwrap();
     assert!(view.gain_badge(&m, mrect).is_none());
 }
+
+#[test]
+fn the_pencil_redraws_samples_when_zoomed_in_to_sample_level() {
+    let mut s = session();
+    s.dispatch(Action::SetEditTool(faderframe_session::EditTool::Pencil))
+        .unwrap();
+    let theme = Theme::default();
+    let mut view = ArrangerView::new(theme.clone());
+    let size = Size::new(1400.0, 700.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    let clip = clip_of(&s, "Pluck");
+    let rect = view.clip_view_rect(&s, size, clip).unwrap();
+    let content = view.clip_content_rect(rect);
+    let half = content.h * 0.46;
+    let from = Point::new(rect.x + 100.0, content.center().y - half * 0.5);
+    let to = Point::new(rect.x + 260.0, content.center().y);
+
+    // Not zoomed in: the Pencil leaves audio alone.
+    let (acts, _) = run(&mut view, down(from), size, &s);
+    run(&mut view, up(from), size, &s);
+    assert!(!acts.iter().any(|a| matches!(a, Action::RedrawAudio { .. })));
+
+    view.ppq = 200_000.0;
+    view.scroll_x = 0.0;
+    view.paint(&mut p, size, &s, &theme);
+    assert!(view.sample_zoom(&s).is_some());
+    let mut acts = run(&mut view, down(from), size, &s).0;
+    for k in 1..=4 {
+        let x = from.x + (to.x - from.x) * k as f32 / 4.0;
+        let y = from.y + (to.y - from.y) * k as f32 / 4.0;
+        acts.extend(run(&mut view, mv(Point::new(x, y)), size, &s).0);
+    }
+    view.paint(&mut p, size, &s, &theme);
+    acts.extend(run(&mut view, up(to), size, &s).0);
+    let Some(Action::RedrawAudio {
+        clip: c,
+        channel,
+        start,
+        samples,
+    }) = acts
+        .into_iter()
+        .find(|a| matches!(a, Action::RedrawAudio { .. }))
+    else {
+        panic!("no redraw")
+    };
+    assert_eq!((c, channel), (clip, None), "mono: one lane, all channels");
+    assert!(start > 0);
+    // ~160 px at ~7.8 px per sample.
+    assert!((18..=23).contains(&samples.len()), "{}", samples.len());
+    assert!((samples[0] - 0.5).abs() < 0.02, "{}", samples[0]);
+    assert!(samples.last().unwrap().abs() < 0.02);
+    assert!(
+        samples.windows(2).all(|w| w[1] <= w[0] + 1e-6),
+        "a falling line"
+    );
+}
+
+#[test]
+fn global_lanes_add_markers_sections_and_change_the_tempo() {
+    use faderframe_session::lanes::GlobalLane;
+    let mut s = session();
+    let theme = Theme::default();
+    let mut view = ArrangerView::new(theme.clone());
+    let size = Size::new(1400.0, 700.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    let lanes = view.global_lanes();
+    assert_eq!(lanes.len(), 4);
+    let lane = |l: GlobalLane| {
+        let (_, y, h) = lanes.iter().copied().find(|(x, ..)| *x == l).unwrap();
+        y + h / 2.0
+    };
+    let x_at = |view: &ArrangerView, q: f64| view.x_of(MusicalTime::from_quarters(q));
+
+    // Double-click on the markers lane.
+    let at = Point::new(x_at(&view, 8.0), lane(GlobalLane::Markers));
+    let dbl = ViewEvent::PointerDown {
+        pos: at,
+        button: PointerButton::Primary,
+        modifiers: Modifiers::NONE,
+        clicks: 2,
+    };
+    let (acts, _) = run(&mut view, dbl, size, &s);
+    assert_eq!(
+        acts,
+        vec![Action::AddMarker(MusicalTime::from_quarters(8.0))]
+    );
+    run(&mut view, up(at), size, &s);
+    for a in acts {
+        s.dispatch(a).unwrap();
+    }
+    view.paint(&mut p, size, &s, &theme);
+    assert!(matches!(
+        view.hit_test(Point::new(at.x + 6.0, at.y), size, &s),
+        Some(Hit::Global(GlobalHit::Marker(_)))
+    ));
+
+    // Drag across the arranger lane: a section snapped to the grid.
+    let y = lane(GlobalLane::Arranger);
+    let (a, b, c) = (x_at(&view, 4.1), x_at(&view, 12.0), x_at(&view, 16.1));
+    let acts = drag(
+        &mut view,
+        &mut s,
+        size,
+        Point::new(a, y),
+        &[Point::new(b, y), Point::new(c, y)],
+        Modifiers::NONE,
+    );
+    assert!(acts.contains(&Action::AddSection {
+        start: MusicalTime::from_quarters(4.0),
+        end: MusicalTime::from_quarters(16.0),
+    }));
+    assert_eq!(s.project().sections.len(), 1);
+    assert_eq!(s.project().sections[0].name, "Intro");
+
+    // Drag the first tempo point up.
+    view.paint(&mut p, size, &s, &theme);
+    let bpm = s.project().timeline.tempo.points()[0].bpm;
+    let (_, ty, th) = lanes
+        .iter()
+        .copied()
+        .find(|(x, ..)| *x == GlobalLane::Tempo)
+        .unwrap();
+    let lane_rect = Rect::new(view.header_w(), ty, size.w - view.header_w(), th);
+    let point_y = ArrangerView::tempo_y_for_test(lane_rect, &s, bpm);
+    let from = Point::new(x_at(&view, 0.0), point_y);
+    assert_eq!(
+        view.hit_test(from, size, &s),
+        Some(Hit::Global(GlobalHit::Tempo(0)))
+    );
+    let acts = drag(
+        &mut view,
+        &mut s,
+        size,
+        from,
+        &[
+            Point::new(from.x, from.y - 10.0),
+            Point::new(from.x + 1.0, from.y - 20.0),
+        ],
+        Modifiers::NONE,
+    );
+    assert!(
+        acts.iter()
+            .any(|a| matches!(a, Action::SetTempoPoint { index: 0, .. }))
+    );
+    assert!(s.project().timeline.tempo.points()[0].bpm > bpm + 5.0);
+
+    // The lane title shows or hides lanes.
+    let label = Point::new(20.0, lane(GlobalLane::Signature));
+    let (_, req) = run(
+        &mut view,
+        ViewEvent::PointerDown {
+            pos: label,
+            button: PointerButton::Primary,
+            modifiers: Modifiers::NONE,
+            clicks: 1,
+        },
+        size,
+        &s,
+    );
+    let Some(HostRequest::ContextMenu { items, .. }) = req
+        .iter()
+        .find(|r| matches!(r, HostRequest::ContextMenu { .. }))
+    else {
+        panic!("lanes menu")
+    };
+    assert_eq!(items.len(), 4);
+}

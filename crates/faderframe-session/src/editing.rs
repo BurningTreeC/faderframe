@@ -164,6 +164,8 @@ pub enum EditFlag {
     /// After stopping, the playhead stays where playback stopped (off:
     /// it returns to where playback started).
     InsertionFollowsPlayback,
+    /// The editors scroll to keep the playhead in view while playing.
+    FollowPlayhead,
     /// Draw detected transients in audio clips.
     ShowTransients,
     /// Warp view: warp markers on audio clips, dragging them stretches.

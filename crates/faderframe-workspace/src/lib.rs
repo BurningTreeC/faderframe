@@ -64,6 +64,10 @@ impl ViewId {
     pub fn performance() -> Self {
         Self::new("performance")
     }
+
+    pub fn tools() -> Self {
+        Self::new("tools")
+    }
 }
 
 impl fmt::Debug for ViewId {

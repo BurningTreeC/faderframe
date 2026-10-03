@@ -56,16 +56,61 @@ pub fn canvases_to_png(
         .map_err(|e| e.to_string())
 }
 
-/// Capture the window; if GTK has no frame of it (hidden workspace while
-/// animating), render the editor canvases directly instead.
+/// Capture the window. A window that is being redrawn (playback animates
+/// the editors) has no current frame between paints, so it is captured
+/// right after its next paint; if no paint comes (a hidden workspace gets
+/// no frames), the editor canvases are rendered directly instead.
 pub fn capture(
     window: &gtk::ApplicationWindow,
     canvases: &[crate::canvas::CanvasWidget],
     path: &Path,
 ) {
-    let result = window_to_png(window, path).or_else(|_| canvases_to_png(window, canvases, path));
-    match result {
-        Ok(()) => tracing::info!("screenshot saved to {}", path.display()),
-        Err(e) => tracing::warn!("screenshot failed: {e}"),
+    if window_to_png(window, path).is_ok() {
+        tracing::info!("screenshot saved to {}", path.display());
+        return;
     }
+    let done = std::rc::Rc::new(std::cell::Cell::new(false));
+    let fallback = {
+        let (window, canvases, path, done) = (
+            window.clone(),
+            canvases.to_vec(),
+            path.to_path_buf(),
+            std::rc::Rc::clone(&done),
+        );
+        move || {
+            if done.replace(true) {
+                return;
+            }
+            let result = window_to_png(&window, &path).or_else(|e| {
+                tracing::info!("full-window capture failed ({e}); rendering the canvases");
+                canvases_to_png(&window, &canvases, &path)
+            });
+            match result {
+                Ok(()) => tracing::info!("screenshot saved to {}", path.display()),
+                Err(e) => tracing::warn!("screenshot failed: {e}"),
+            }
+        }
+    };
+    if let Some(clock) = window.frame_clock() {
+        let handler = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (h, w, p, d) = (
+            std::rc::Rc::clone(&handler),
+            window.clone(),
+            path.to_path_buf(),
+            std::rc::Rc::clone(&done),
+        );
+        let id = clock.connect_after_paint(move |clock| {
+            if let Some(id) = h.borrow_mut().take() {
+                clock.disconnect(id);
+            }
+            if !d.get() && window_to_png(&w, &p).is_ok() {
+                d.set(true);
+                tracing::info!("screenshot saved to {}", p.display());
+            }
+        });
+        *handler.borrow_mut() = Some(id);
+        window.queue_draw();
+    }
+    // No paint within half a second: render what can be rendered.
+    gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(500), fallback);
 }

@@ -659,10 +659,11 @@ impl IBStreamTrait for MemoryStream {
         let Ok(mut i) = self.inner.lock() else {
             return kResultFalse;
         };
-        let base = match mode as u32 {
-            m if m == kIBSeekSet => 0,
-            m if m == kIBSeekCur => i.1 as i64,
-            m if m == kIBSeekEnd => i.0.len() as i64,
+        // The constants' integer type differs between platforms.
+        let base = match mode as i64 {
+            m if m == kIBSeekSet as i64 => 0,
+            m if m == kIBSeekCur as i64 => i.1 as i64,
+            m if m == kIBSeekEnd as i64 => i.0.len() as i64,
             _ => return kInvalidArgument,
         };
         let new = (base + pos).max(0) as usize;

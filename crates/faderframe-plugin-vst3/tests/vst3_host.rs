@@ -3,6 +3,9 @@
 //! messages), stepped parameters, sample-accurate automation, notes and
 //! MIDI-mapped controllers, editor edits, output parameters and state.
 #![allow(non_snake_case, clippy::unwrap_used)]
+// The bindings' constant types differ between platforms (u32 on Linux,
+// i32 on Windows): casts that are no-ops here are needed there.
+#![allow(clippy::unnecessary_cast)]
 
 use faderframe_audio_graph::{AudioBuffer, NodeIo};
 use faderframe_automation::ParameterEvent;
@@ -133,7 +136,8 @@ impl IComponentTrait for TestProcessor {
         };
         util::write_wstr(&mut bus.name, "Main");
         bus.busType = BusTypes_::kMain as i32;
-        bus.flags = BusInfo_::BusFlags_::kDefaultActive;
+        // The constants' integer type differs between platforms.
+        bus.flags = BusInfo_::BusFlags_::kDefaultActive as _;
         kResultOk
     }
     unsafe fn getRoutingInfo(&self, _i: *mut RoutingInfo, _o: *mut RoutingInfo) -> tresult {
@@ -227,8 +231,8 @@ impl IAudioProcessorTrait for TestProcessor {
                 let mut e: Event = unsafe { std::mem::zeroed() };
                 unsafe { events.getEvent(i, &mut e) };
                 let delta = match e.r#type as u32 {
-                    t if t == Event_::EventTypes_::kNoteOnEvent => 1,
-                    t if t == Event_::EventTypes_::kNoteOffEvent => -1,
+                    t if t == Event_::EventTypes_::kNoteOnEvent as u32 => 1,
+                    t if t == Event_::EventTypes_::kNoteOffEvent as u32 => -1,
                     _ => 0,
                 };
                 if delta != 0 && ncount < 64 {
@@ -621,6 +625,7 @@ fn instantiate() -> Box<dyn PluginInstance> {
 const CONFIG: ProcessConfig = ProcessConfig {
     sample_rate: 48_000.0,
     max_block_size: BLOCK as u32,
+    sidechain: false,
 };
 
 #[test]

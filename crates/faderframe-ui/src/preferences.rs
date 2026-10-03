@@ -15,12 +15,6 @@ thread_local! {
     static OPEN: RefCell<Option<glib::WeakRef<gtk::Window>>> = const { RefCell::new(None) };
 }
 
-const BACKENDS: [BackendChoice; 3] = [
-    BackendChoice::Auto,
-    BackendChoice::Jack,
-    BackendChoice::Dummy,
-];
-
 fn row(grid: &gtk::Grid, y: i32, label: &str, widget: &impl IsA<gtk::Widget>) {
     let l = gtk::Label::new(Some(label));
     l.set_xalign(1.0);
@@ -49,10 +43,11 @@ fn note(text: &str) -> gtk::Label {
 fn audio_page(app: &Rc<AppState>, alive: &Rc<std::cell::Cell<bool>>) -> gtk::Widget {
     let g = form();
     let opts = app.options.borrow().clone();
-    let backend_names: Vec<&str> = BACKENDS.iter().map(|b| b.label()).collect();
+    let backends = BackendChoice::available();
+    let backend_names: Vec<&str> = backends.iter().map(|b| b.label()).collect();
     let backend = gtk::DropDown::from_strings(&backend_names);
     backend.set_selected(
-        BACKENDS
+        backends
             .iter()
             .position(|b| *b == opts.backend)
             .unwrap_or(0) as u32,
@@ -132,7 +127,8 @@ fn audio_page(app: &Rc<AppState>, alive: &Rc<std::cell::Cell<bool>>) -> gtk::Wid
     );
 
     let selected = move |backend: &gtk::DropDown, rate: &gtk::DropDown, buffer: &gtk::DropDown| {
-        let b = BACKENDS[backend.selected() as usize % BACKENDS.len()];
+        let backends = BackendChoice::available();
+        let b = backends[backend.selected() as usize % backends.len()];
         let r = (rate.selected() > 0).then(|| STANDARD_SAMPLE_RATES[rate.selected() as usize - 1]);
         let f =
             (buffer.selected() > 0).then(|| STANDARD_BUFFER_SIZES[buffer.selected() as usize - 1]);

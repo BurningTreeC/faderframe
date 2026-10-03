@@ -47,6 +47,7 @@ fn slot(p: &mut Project, format: PluginFormat, plugin: &ScannedPlugin) -> Plugin
         bypass: false,
         parameters: Vec::new(),
         state: None,
+        sidechain: None,
     }
 }
 

@@ -112,6 +112,9 @@ pub enum TailLength {
 pub struct ProcessConfig {
     pub sample_rate: f64,
     pub max_block_size: u32,
+    /// The host feeds the plugin's second audio input (its sidechain) as
+    /// the processor's second graph input.
+    pub sidechain: bool,
 }
 
 /// Outcome of one `process` call. Kept `Copy` and allocation-free; detailed
@@ -145,6 +148,15 @@ pub struct PluginProcessContext<'a> {
     pub transport: &'a TransportInfo,
     /// Sample-accurate parameter changes for this block, sorted by offset.
     pub param_events: &'a [ParameterEvent],
+}
+
+/// A parameter moved in the plugin's own editor (plain units), with the
+/// gesture around it when the plugin reports one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EditorEdit {
+    Begin(ParameterId),
+    Value(ParameterId, f64),
+    End(ParameterId),
 }
 
 /// What a plugin asked the host for since the last poll.
@@ -229,6 +241,22 @@ pub trait PluginInstance {
     /// Set a parameter from the UI; reaches the processor without blocking.
     fn set_parameter(&mut self, id: ParameterId, value: f64) -> Result<(), PluginError>;
     fn latency_samples(&self) -> u32;
+    /// Preset files in the plugin format's own preset folders (e.g. VST3
+    /// `.vstpreset`).
+    fn preset_files(&self) -> Vec<std::path::PathBuf> {
+        Vec::new()
+    }
+    /// The state ([`Self::load_state`] format) of one of those files.
+    fn state_from_preset_file(&self, _data: &[u8]) -> Result<Vec<u8>, PluginError> {
+        Err(PluginError::InvalidState(
+            "this plugin has no preset files".into(),
+        ))
+    }
+    /// Parameter moves made in the plugin's own editor since the last call
+    /// (for automation writing).
+    fn take_editor_edits(&mut self) -> Vec<EditorEdit> {
+        Vec::new()
+    }
     /// Counts (re)activations. Processors of different activations are not
     /// interchangeable: after a restart the old one is dead, so the engine
     /// must not keep it in place of the new one (it is part of the node's

@@ -40,6 +40,7 @@ struct Editors {
     x11: RefCell<Option<Result<X11, String>>>,
     native: RefCell<Vec<NativeEditor>>,
     generic: RefCell<HashMap<PluginInstanceId, gtk::Window>>,
+    #[cfg(unix)]
     fds: RefCell<HashMap<(PluginInstanceId, i32), FdWatch>>,
     timers: RefCell<HashMap<(PluginInstanceId, u32), (u32, glib::SourceId)>>,
     ticks: Cell<u64>,
@@ -801,6 +802,7 @@ fn track_positions(app: &Rc<AppState>) {
 
 // --- plugin event sources -----------------------------------------------------------
 
+#[cfg(unix)]
 struct FdWatch {
     fd: PluginFd,
     source: Option<glib::SourceId>,
@@ -808,6 +810,7 @@ struct FdWatch {
     gone: Rc<Cell<bool>>,
 }
 
+#[cfg(unix)]
 fn watch_fd(app: &Rc<AppState>, plugin: PluginInstanceId, fd: PluginFd) -> FdWatch {
     use glib::IOCondition as C;
     let mut cond = C::empty();
@@ -855,7 +858,9 @@ fn reconcile_sources(app: &Rc<AppState>) {
     let Ok(sources) = app.session.try_borrow().map(|s| s.plugin_event_sources()) else {
         return;
     };
-    let mut want_fds = HashMap::new();
+    // Descriptors exist only on Unix (the CLAP posix-fd extension).
+    #[cfg_attr(not(unix), allow(unused_mut, unused_variables))]
+    let mut want_fds: HashMap<(PluginInstanceId, i32), PluginFd> = HashMap::new();
     let mut want_timers = HashMap::new();
     for (plugin, src) in sources {
         for fd in src.fds {
@@ -866,19 +871,22 @@ fn reconcile_sources(app: &Rc<AppState>) {
         }
     }
     EDITORS.with(|e| {
-        let mut fds = e.fds.borrow_mut();
-        fds.retain(|k, w| {
-            let keep = want_fds.get(k) == Some(&w.fd) && !w.gone.get();
-            if !keep
-                && !w.gone.get()
-                && let Some(source) = w.source.take()
-            {
-                source.remove();
+        #[cfg(unix)]
+        {
+            let mut fds = e.fds.borrow_mut();
+            fds.retain(|k, w| {
+                let keep = want_fds.get(k) == Some(&w.fd) && !w.gone.get();
+                if !keep
+                    && !w.gone.get()
+                    && let Some(source) = w.source.take()
+                {
+                    source.remove();
+                }
+                keep
+            });
+            for (k, fd) in want_fds {
+                fds.entry(k).or_insert_with(|| watch_fd(app, k.0, fd));
             }
-            keep
-        });
-        for (k, fd) in want_fds {
-            fds.entry(k).or_insert_with(|| watch_fd(app, k.0, fd));
         }
         let mut timers = e.timers.borrow_mut();
         let stale: Vec<_> = timers
@@ -1108,6 +1116,42 @@ fn open_generic(app: &Rc<AppState>, plugin: PluginInstanceId) {
         });
     }
     header.pack_start(&bypass);
+    // Presets: rebuilt each time the menu opens.
+    let presets = gtk::MenuButton::new();
+    presets.set_label("Presets");
+    let weak = Rc::downgrade(app);
+    presets.set_create_popup_func(move |button| {
+        let Some(app) = weak.upgrade() else { return };
+        let menu = gtk::gio::Menu::new();
+        let save = gtk::gio::Menu::new();
+        let item = gtk::gio::MenuItem::new(Some("Save Preset…"), None);
+        item.set_action_and_target_value(
+            Some("app.save-preset"),
+            Some(&plugin.raw().to_string().to_variant()),
+        );
+        save.append_item(&item);
+        menu.append_section(None, &save);
+        let list = gtk::gio::Menu::new();
+        let found = app.session.borrow().plugin_presets(plugin);
+        if found.is_empty() {
+            list.append(Some("No presets yet"), None);
+        }
+        for p in found {
+            let label = if p.factory {
+                format!("{} (factory)", p.name)
+            } else {
+                p.name.clone()
+            }
+            .replace('_', "__");
+            let item = gtk::gio::MenuItem::new(Some(&label), None);
+            let target = format!("{}\n{}", plugin.raw(), p.path.display());
+            item.set_action_and_target_value(Some("app.load-preset"), Some(&target.to_variant()));
+            list.append_item(&item);
+        }
+        menu.append_section(None, &list);
+        button.set_menu_model(Some(&menu));
+    });
+    header.pack_start(&presets);
     if has_native(app, plugin) {
         let native = gtk::Button::with_label("Plugin GUI");
         native.set_tooltip_text(Some("Open the plugin's own editor"));

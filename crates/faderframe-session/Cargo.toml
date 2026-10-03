@@ -11,7 +11,10 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+faderframe-analysis.workspace = true
 serde_json.workspace = true
+serde.workspace = true
+midly.workspace = true
 faderframe-core.workspace = true
 faderframe-midi.workspace = true
 faderframe-midi-io.workspace = true
@@ -30,5 +33,7 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+faderframe-audio-graph.workspace = true
+midly.workspace = true
 faderframe-plugin-clap.workspace = true
 faderframe-plugin-vst3.workspace = true

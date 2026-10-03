@@ -131,6 +131,7 @@ fn plugin_parameters_are_automated_through_events() {
         bypass: false,
         parameters: Vec::new(),
         state: None,
+        sidechain: None,
     });
     let reference = render(&tp, 1000)[500];
     lane(
@@ -165,6 +166,7 @@ fn automated_bypass_keeps_latency_alignment() {
         bypass: false,
         parameters: Vec::new(),
         state: None,
+        sidechain: None,
     });
     let plain = render(&tp, Q * 3);
     lane(
@@ -184,4 +186,54 @@ fn automated_bypass_keeps_latency_alignment() {
             bypassed[i]
         );
     }
+}
+
+#[test]
+fn vcas_scale_mute_and_solo_their_members_also_when_automated() {
+    let (mut tp, t) = setup();
+    let reference = render(&tp, 1000)[500];
+    let db = |out: &[f32], i: usize| 20.0 * (out[i].abs() / reference).log10();
+    let vca = tp.track(TrackKind::Vca, "VCA", ChannelLayout::Mono);
+    let outer = tp.track(TrackKind::Vca, "Outer", ChannelLayout::Mono);
+    tp.project.track_mut(t).unwrap().vca = Some(vca);
+    tp.project.track_mut(vca).unwrap().vca = Some(outer);
+    tp.project.track_mut(vca).unwrap().volume_db = -6.0;
+    tp.project.track_mut(outer).unwrap().volume_db = -4.0;
+    tp.project.track_mut(t).unwrap().volume_db = -2.0;
+    let out = render(&tp, 1000);
+    assert!((db(&out, 500) - -12.0).abs() < 0.05, "{}", db(&out, 500));
+
+    // A muted (outer) VCA silences the member; a soloed one solos it.
+    tp.project.track_mut(outer).unwrap().mute = true;
+    assert!(render(&tp, 1000)[500].abs() < 1e-6);
+    tp.project.track_mut(outer).unwrap().mute = false;
+    let other = tp.track(TrackKind::Audio, "B", ChannelLayout::Mono);
+    let src = tp.dc(1, 0.25, 1000);
+    tp.clip(other, src, MusicalTime::ZERO, 1000);
+    tp.project.track_mut(vca).unwrap().solo = true;
+    assert!(
+        (db(&render(&tp, 1000), 500) - -12.0).abs() < 0.05,
+        "B is silenced"
+    );
+    tp.project.track_mut(vca).unwrap().solo = false;
+
+    // Automating the inner VCA replaces its static -6 dB.
+    lane(
+        &mut tp,
+        vca,
+        AutomationTarget::TrackVolume,
+        &[(0.0, 0.0, CurveShape::Step), (2.0, -20.0, CurveShape::Step)],
+    );
+    tp.project.track_mut(other).unwrap().mute = true;
+    let out = render(&tp, Q * 3);
+    assert!((db(&out, Q) - -6.0).abs() < 0.05, "{}", db(&out, Q));
+    assert!((db(&out, Q * 2 + 500) - -26.0).abs() < 0.05);
+    lane(
+        &mut tp,
+        outer,
+        AutomationTarget::TrackMute,
+        &[(0.0, 0.0, CurveShape::Step), (1.0, 1.0, CurveShape::Step)],
+    );
+    let out = render(&tp, Q * 2);
+    assert!(out[Q / 2].abs() > 0.1 && out[Q + 500].abs() < 1e-6);
 }

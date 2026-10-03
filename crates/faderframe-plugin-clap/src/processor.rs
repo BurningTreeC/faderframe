@@ -11,8 +11,8 @@
 
 use crate::host::FfHost;
 use clack_host::events::event_types::{
-    MidiEvent as ClapMidi, NoteOffEvent, NoteOnEvent, ParamValueEvent, TransportEvent,
-    TransportFlags,
+    MidiEvent as ClapMidi, NoteOffEvent, NoteOnEvent, ParamGestureBeginEvent, ParamGestureEndEvent,
+    ParamValueEvent, TransportEvent, TransportFlags,
 };
 use clack_host::events::{EventFlags, EventHeader, Match, Pckn};
 use clack_host::prelude::*;
@@ -41,6 +41,9 @@ pub(crate) struct RtState {
     events_in: EventBuffer,
     events_out: EventBuffer,
     params_rx: rtrb::Consumer<(u32, f64)>,
+    /// Parameter moves the plugin reports (its editor): (0 begin, 1 value,
+    /// 2 end, id, value) for automation writing.
+    edits_tx: rtrb::Producer<(u8, u32, f64)>,
     steady: u64,
     max_frames: usize,
 }
@@ -52,6 +55,7 @@ impl RtState {
         outputs: &[u16],
         max_frames: usize,
         params_rx: rtrb::Consumer<(u32, f64)>,
+        edits_tx: rtrb::Producer<(u8, u32, f64)>,
     ) -> Self {
         let bufs = |ports: &[u16]| -> Vec<Vec<Vec<f32>>> {
             ports
@@ -69,6 +73,7 @@ impl RtState {
             events_in: EventBuffer::with_capacity(EVENT_CAPACITY),
             events_out: EventBuffer::with_capacity(EVENT_CAPACITY),
             params_rx,
+            edits_tx,
             steady: 0,
             max_frames,
         }
@@ -212,10 +217,11 @@ impl PluginProcessor for ClapProcessor {
         }
         st.events_in.sort();
 
-        // Audio: main input into port 0, other ports silent.
+        // Audio: graph input `p` into port `p` (the main input, then the
+        // sidechain when connected), other ports silent.
         for (p, port) in st.in_bufs.iter_mut().enumerate() {
             for (c, ch) in port.iter_mut().enumerate() {
-                let src = (p == 0).then(|| io.audio_in.first()).flatten();
+                let src = io.audio_in.get(p);
                 match src {
                     Some(inp) if inp.num_channels() > 0 => {
                         let s = inp.channel(c.min(inp.num_channels() - 1));
@@ -263,6 +269,22 @@ impl PluginProcessor for ClapProcessor {
             )
         };
         st.steady += n as u64;
+        // Parameter moves the plugin made itself (its editor), for the host.
+        for e in st.events_out.iter() {
+            let edit = if let Some(v) = e.as_event::<ParamValueEvent>() {
+                v.param_id().map(|id| (1u8, id.get(), v.value()))
+            } else if let Some(b) = e.as_event::<ParamGestureBeginEvent>() {
+                b.param_id().map(|id| (0u8, id.get(), 0.0))
+            } else if let Some(b) = e.as_event::<ParamGestureEndEvent>() {
+                b.param_id().map(|id| (2u8, id.get(), 0.0))
+            } else {
+                None
+            };
+            if let Some(edit) = edit {
+                // Full queue: dropped (the next moves follow).
+                let _ = st.edits_tx.push(edit);
+            }
+        }
 
         // Main output port to the graph (no output ports: pass through).
         if let Some(out) = io.audio_out.first_mut() {

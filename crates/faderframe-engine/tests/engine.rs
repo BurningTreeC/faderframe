@@ -148,6 +148,7 @@ fn plugin_latency_is_compensated_at_the_summing_point() {
                 value: latency as f64,
             }],
             state: None,
+            sidechain: None,
         };
         tp.project.track_mut(b).unwrap().inserts.push(slot);
         let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config(), 256, 2).unwrap();
@@ -329,4 +330,82 @@ fn feedback_routing_is_refused_by_the_project_layer() {
     // The engine graph still compiles.
     let sources = render_generated_sources(&project, SR);
     OfflineRenderer::new(&project, &sources, config(), 256, 2).unwrap();
+}
+
+#[test]
+fn sidechain_keys_a_compressor_from_a_muted_track_and_refuses_loops() {
+    let mut tp = TestProject::new(SR);
+    let bus = tp.track(TrackKind::Bus, "Bus", ChannelLayout::Stereo);
+    let pad = tp.track(TrackKind::Audio, "Pad", ChannelLayout::Stereo);
+    let key = tp.track(TrackKind::Audio, "Key", ChannelLayout::Stereo);
+    tp.route(pad, bus);
+    let tone = tp.dc(2, 0.25, SR as usize);
+    let kick = tp.dc(2, 1.0, 9600);
+    tp.clip(pad, tone, MusicalTime::ZERO, SR as i64);
+    tp.clip(key, kick, MusicalTime::from_quarters_i(1), 9600);
+    tp.project.track_mut(key).unwrap().mute = true;
+    let comp = tp.project.ids.allocate();
+    let p = |id: u32, value: f64| SavedParameter {
+        id: ParameterId(id),
+        value,
+    };
+    tp.project.track_mut(pad).unwrap().inserts.push(PluginSlot {
+        id: comp,
+        plugin: PluginRef::builtin(builtin::COMPRESSOR, "Compressor"),
+        bypass: false,
+        // -20 dB threshold, 20:1, fast attack and release.
+        parameters: vec![p(0, -20.0), p(1, 20.0), p(2, 0.1), p(3, 5.0)],
+        state: None,
+        sidechain: None,
+    });
+    // Keyed by itself: 0.25 (-12 dB) is compressed.
+    let out = render_project(&tp.project, &tp.sources, config(), 64, 0, SR as usize).unwrap();
+    assert!(approx(out[0][12_000], 0.104, 0.01), "{}", out[0][12_000]);
+
+    Command::SetPluginSidechain {
+        track: pad,
+        plugin: comp,
+        source: Some(key),
+    }
+    .apply(&mut tp.project)
+    .unwrap();
+    let out = render_project(&tp.project, &tp.sources, config(), 64, 0, SR as usize).unwrap();
+    // Keyed by the (muted) kick: untouched while it is silent, ducked by
+    // ~19 dB while it plays, and the kick itself is not heard.
+    assert!(approx(out[0][12_000], 0.25, 1e-4), "{}", out[0][12_000]);
+    assert!(approx(out[0][30_000], 0.028, 0.004), "{}", out[0][30_000]);
+    assert!(approx(out[1][40_000], 0.25, 0.01), "{}", out[1][40_000]);
+
+    // The bus depends on the pad: keying the pad from it would loop.
+    let looped = Command::SetPluginSidechain {
+        track: pad,
+        plugin: comp,
+        source: Some(bus),
+    }
+    .apply(&mut tp.project);
+    assert!(looped.is_err());
+}
+
+#[test]
+fn scrubbing_plays_a_faded_snippet_and_returns_to_the_pointer() {
+    let mut tp = TestProject::new(SR);
+    let a = tp.track(TrackKind::Audio, "A", ChannelLayout::Stereo);
+    let src = tp.dc(2, 0.5, SR as usize);
+    tp.clip(a, src, MusicalTime::ZERO, SR as i64);
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config(), 256, 2).unwrap();
+    r.controller
+        .transport(faderframe_transport::TransportCommand::Scrub {
+            position: 12_000,
+            frames: 3200,
+        })
+        .unwrap();
+    let out = r.render(8000);
+    // Fade in over 200 frames, full level, fade out, then silence.
+    assert!(out[0][0].abs() < 0.01);
+    assert!(approx(out[0][1500], 0.5, 1e-4), "{}", out[0][1500]);
+    assert!(out[0][3199].abs() < 0.01);
+    assert!(out[0][3300..].iter().all(|s| *s == 0.0));
+    let snap = r.controller.transport_snapshot();
+    assert!(!snap.playing && !snap.scrubbing);
+    assert_eq!(snap.position, 12_000);
 }

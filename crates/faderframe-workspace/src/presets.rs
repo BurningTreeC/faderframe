@@ -44,11 +44,12 @@ impl Preset {
             Preset::Mixing => (0.22, ViewId::mixer(), false),
             // Arranger top, piano roll bottom.
             Preset::Midi => (0.42, ViewId::piano_roll(), false),
-            // Mixer + meters (analyzers to come).
-            Preset::Mastering => (0.30, ViewId::mixer(), false),
+            // The meters (loudness, level, phase, spectrum) dominate.
+            Preset::Mastering => (0.42, ViewId::tools(), false),
         };
         let bottom_views = vec![
             ViewId::mixer(),
+            ViewId::tools(),
             ViewId::piano_roll(),
             ViewId::automation(),
             ViewId::performance(),
@@ -83,6 +84,10 @@ mod tests {
             assert_eq!(l.views.len(), ViewKind::ALL.len());
             assert!(l.views.contains_key(&ViewId::performance()));
         }
+        assert!(
+            layouts[4].is_showing(&ViewId::tools()),
+            "mastering shows the meters"
+        );
         assert!(layouts[0].is_showing(&ViewId::mixer()));
         assert!(!layouts[1].is_showing(&ViewId::piano_roll()));
         assert!(layouts[3].is_showing(&ViewId::piano_roll()));

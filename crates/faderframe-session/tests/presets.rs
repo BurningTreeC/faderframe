@@ -1,62 +1,89 @@
+//! Plugin presets: saving and loading (undoable), listing.
 #![allow(clippy::unwrap_used)]
-//! Track presets through the session: save into the library, list, recall
-//! as a new track, apply onto another track, undo.
 
+use faderframe_core::{ParameterId, builtin};
 use faderframe_engine::EngineConfig;
-use faderframe_project::{Command, Project, TrackKind};
+use faderframe_project::{Command, PluginRef};
 use faderframe_session::{Action, Session};
 
 #[test]
-fn save_list_recall_and_apply_track_presets() {
-    let dir = std::env::temp_dir().join(format!("ff-presets-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let mut s = Session::new(Project::new("P", 48_000), None, EngineConfig::default()).unwrap();
-    s.set_track_preset_dir(dir.clone());
-    assert!(s.track_presets().is_empty());
-    let vox = s.add_track(TrackKind::Audio).unwrap();
-    s.edit(Command::RenameTrack {
-        track: vox,
-        name: "Lead Vox".into(),
+fn presets_save_load_and_undo() {
+    let data = std::env::temp_dir().join(format!("ff-presets-{}", std::process::id()));
+    // SAFETY: set before any thread of this test binary reads it (one test).
+    unsafe { std::env::set_var("XDG_DATA_HOME", &data) };
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let bass = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.name == "Bass")
+        .unwrap()
+        .id;
+    s.dispatch(Action::InsertPlugin {
+        track: bass,
+        index: 0,
+        plugin: PluginRef::builtin(builtin::ECHO, "Echo"),
     })
     .unwrap();
-    s.edit(Command::SetTrackVolume {
-        track: vox,
-        db: -3.0,
+    let echo = s.project().track(bass).unwrap().inserts[0].id;
+    let p = ParameterId(1);
+    let set = |s: &mut Session, v: f64| {
+        s.dispatch(Action::Edit(Command::SetPluginParameter {
+            track: bass,
+            plugin: echo,
+            parameter: p,
+            value: Some(v),
+        }))
+        .unwrap();
+    };
+    let value = |s: &Session| {
+        s.plugin_slot(echo)
+            .unwrap()
+            .1
+            .parameters
+            .iter()
+            .find(|q| q.id == p)
+            .map(|q| q.value)
+    };
+    set(&mut s, 0.37);
+    s.dispatch(Action::SavePluginPreset {
+        plugin: echo,
+        name: "Short Slap".into(),
     })
     .unwrap();
-    s.edit(Command::SetTrackLayout {
-        track: vox,
-        layout: faderframe_core::ChannelLayout::Stereo,
+    let presets = s.plugin_presets(echo);
+    assert_eq!(presets.len(), 1);
+    assert_eq!(presets[0].name, "Short Slap");
+    assert!(presets[0].path.starts_with(&data));
+    set(&mut s, 0.9);
+    s.dispatch(Action::LoadPluginPreset {
+        plugin: echo,
+        path: presets[0].path.clone(),
     })
     .unwrap();
-    s.dispatch(Action::SaveTrackPreset { track: vox }).unwrap();
-    s.dispatch(Action::SaveTrackPreset { track: vox }).unwrap();
-    let names: Vec<_> = s.track_presets().iter().map(|p| p.name.clone()).collect();
+    assert!((value(&s).unwrap() - 0.37).abs() < 1e-6, "{:?}", value(&s));
     assert_eq!(
-        names,
-        vec!["Lead Vox", "Lead Vox 2"],
-        "saving twice never overwrites"
+        s.plugin_parameter_value(echo, p)
+            .map(|v| (v * 100.0).round() / 100.0),
+        Some(0.37),
+        "the running plugin follows"
     );
-
-    let path = s.track_presets()[0].path.clone();
-    let before = s.project().tracks.len();
-    s.dispatch(Action::AddTrackFromPreset { path: path.clone() })
-        .unwrap();
-    assert_eq!(s.project().tracks.len(), before + 1);
-    let new = *s.selection.tracks.iter().next().unwrap();
-    let t = s.project().track(new).unwrap();
-    assert_eq!((t.name.as_str(), t.volume_db), ("Lead Vox", -3.0));
-    assert_eq!(t.layout, faderframe_core::ChannelLayout::Stereo);
-
-    let other = s.add_track(TrackKind::Audio).unwrap();
-    s.dispatch(Action::ApplyTrackPreset { track: other, path })
-        .unwrap();
-    assert_eq!(s.project().track(other).unwrap().volume_db, -3.0);
     s.dispatch(Action::Undo).unwrap();
-    assert_eq!(
-        s.project().track(other).unwrap().volume_db,
-        0.0,
-        "one undo step"
+    assert_eq!(value(&s), Some(0.9));
+    // A preset of another plugin is refused.
+    s.dispatch(Action::InsertPlugin {
+        track: bass,
+        index: 1,
+        plugin: PluginRef::builtin(builtin::GAIN, "Gain"),
+    })
+    .unwrap();
+    let gain = s.project().track(bass).unwrap().inserts[1].id;
+    assert!(
+        s.dispatch(Action::LoadPluginPreset {
+            plugin: gain,
+            path: presets[0].path.clone(),
+        })
+        .is_err()
     );
-    std::fs::remove_dir_all(&dir).unwrap();
+    let _ = std::fs::remove_dir_all(&data);
 }

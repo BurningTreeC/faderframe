@@ -173,6 +173,31 @@ pub struct PerformanceTheme {
     pub summary_height: f32,
 }
 
+/// The Tools view (mastering meters).
+#[derive(Clone, Debug)]
+pub struct ToolsTheme {
+    pub background: Color,
+    pub panel: Color,
+    pub header: Color,
+    /// Meter and graph backgrounds.
+    pub well: Color,
+    pub grid: Color,
+    /// Levels: safe, near the top, over.
+    pub level_ok: Color,
+    pub level_warn: Color,
+    pub level_over: Color,
+    /// RMS inside the peak bar.
+    pub rms: Color,
+    pub hold: Color,
+    pub spectrum: Color,
+    pub spectrum_peak: Color,
+    pub target: Color,
+    pub goniometer: Color,
+    /// Big readouts.
+    pub readout: Color,
+    pub toolbar_height: f32,
+}
+
 impl PerformanceTheme {
     /// Colour for a load (share of the callback budget).
     pub fn load_color(&self, load: f64) -> Color {
@@ -229,6 +254,7 @@ pub struct Theme {
     pub arranger: ArrangerTheme,
     pub piano: PianoRollTheme,
     pub perf: PerformanceTheme,
+    pub tools: ToolsTheme,
 }
 
 impl Default for Theme {
@@ -407,6 +433,24 @@ impl Theme {
                 row_height: 30.0,
                 plugin_row_height: 24.0,
                 summary_height: 152.0,
+            },
+            tools: ToolsTheme {
+                background: Color::hex(0x17181b),
+                panel: Color::hex(0x1e2024),
+                header: Color::hex(0x24262b),
+                well: Color::hex(0x101114),
+                grid: Color::rgba(1.0, 1.0, 1.0, 0.07),
+                level_ok: Color::hex(0x4fc36b),
+                level_warn: Color::hex(0xe1c14b),
+                level_over: Color::hex(0xf04a3c),
+                rms: Color::hex(0x2f8a47),
+                hold: Color::hex(0xf2efe8),
+                spectrum: Color::hex(0x5fb0e8),
+                spectrum_peak: Color::hex(0xffb38f),
+                target: accent,
+                goniometer: Color::hex(0x7fe0a0),
+                readout: Color::hex(0xf2efe8),
+                toolbar_height: 32.0,
             },
         }
     }

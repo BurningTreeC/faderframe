@@ -61,6 +61,7 @@ impl PresetPlugin {
             bypass: self.bypass,
             parameters: self.parameters.clone(),
             state: self.state.clone(),
+            sidechain: None,
         }
     }
 }
@@ -379,6 +380,7 @@ mod tests {
                 value: 0.4,
             }],
             state: Some("c3RhdGU=".into()),
+            sidechain: None,
         });
         t.sends.push(AuxSend {
             id: p.ids.allocate(),

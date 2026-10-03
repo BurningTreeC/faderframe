@@ -273,6 +273,7 @@ fn parameters_state_and_processing() {
     let config = ProcessConfig {
         sample_rate: 48_000.0,
         max_block_size: 256,
+        sidechain: false,
     };
     let mut proc = inst.create_processor(&config).unwrap();
     let out = run_block(proc.as_mut(), &[], 256);
@@ -308,6 +309,7 @@ fn parameters_state_and_processing() {
         .create_processor(&ProcessConfig {
             sample_rate: 96_000.0,
             max_block_size: 512,
+            sidechain: false,
         })
         .unwrap();
     let out = run_block(proc.as_mut(), &[], 64);
@@ -349,6 +351,7 @@ fn hosts_an_installed_plugin() {
             .create_processor(&ProcessConfig {
                 sample_rate: 48_000.0,
                 max_block_size: 512,
+                sidechain: false,
             })
             .unwrap();
         let mut peak = 0.0f32;

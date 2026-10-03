@@ -1,26 +1,51 @@
 # FaderFrame
 
-A multitrack recording, editing and mixing environment written in Rust —
-Linux first, Wayland native, GTK 4 native.
+A multitrack recording, editing, mixing and mastering environment written in
+Rust — Linux first, Wayland native, GTK 4 native; Windows and macOS builds
+come from the same code.
 
-FaderFrame aims to become a professional DAW: graph-based routing with buses,
-aux sends and sidechains, hard-realtime audio processing with automatic plugin
-delay compensation, MIDI and virtual instruments, automation, CLAP/VST3
-hosting, an analogue-console-style mixer and dockable, detachable editors.
+FaderFrame aims to be a professional DAW: graph-based routing with buses,
+aux sends and sidechains, hard-realtime multicore audio processing with
+automatic plugin delay compensation, MIDI and virtual instruments,
+automation, CLAP/VST3 hosting, an analogue-console-style mixer, mastering
+meters and dockable, detachable editors.
 
-> **Status: early development.** The architecture and a first vertical slice
-> work; many features are still to come. See
-> [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#status-and-roadmap).
+> **Status: in active development.** Most of a working DAW is there; see
+> [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#status-and-roadmap) for what
+> comes next.
+
+## Screenshots
+
+The demo session playing — Mixing workspace:
+
+![Mixing workspace with the analogue-console mixer](docs/screenshots/mixing.png)
+
+The MIDI workspace with the piano roll editing the lead synth's melody:
+
+![Piano roll showing a MIDI clip](docs/screenshots/piano-roll.png)
+
+The Mastering workspace with the Tools view (EBU R128 loudness, levels,
+phase and spectrum):
+
+![Mastering workspace with loudness, level, phase and spectrum meters](docs/screenshots/mastering.png)
 
 ## What works today
 
 * GTK 4 application, native on Wayland, HiDPI/fractional scaling via GTK.
 * Arranger (virtualised): tracks, audio clips with waveforms, MIDI clips,
-  move/split/delete, snapping, zoom, loop range, playhead, console-style track
-  headers with mute/solo/arm/monitor, volume, pan and meters. Clicking a
-  clip selects it and moves the playhead to the (snapped) click; Shift- or
-  Ctrl-click selects more clips, and moves, trims, fades and gain changes
-  apply to every selected clip.
+  move/split/delete, snapping, zoom down to single samples, loop range,
+  playhead, console-style track headers with mute/solo/arm/monitor, volume,
+  pan and meters. Clicking a clip selects it and moves the playhead to the
+  (snapped) click; Shift- or Ctrl-click selects more clips, and moves,
+  trims, fades and gain changes apply to every selected clip.
+* Global lanes under the ruler (click a lane's title to show or hide
+  lanes): **markers** (double-click to add, drag to move, double-click to
+  rename, click to jump there), the **arranger** lane for song sections
+  (drag to create Intro, Verse, Chorus …; move, resize, rename, recolour,
+  loop or select a section), **time signature** changes and the **tempo**
+  map (drag points up and down or sideways, type values, steps or ramps).
+* Track colours: click a track's colour stripe (arranger) or colour bar
+  (mixer) for a colour chooser, or pick from the palette in the track menu.
 * Pro-style editing, with an edit toolbar under the transport (Edit button
   or Ctrl+E; it wraps into as many rows as the window needs): edit modes
   Shuffle, Slip, Spot and Grid (absolute or relative); the Smart tool
@@ -30,8 +55,12 @@ hosting, an analogue-console-style mixer and dockable, detachable editors.
   with triplet and dotted values; nudge values; Tab to clip boundaries or
   transients; Link Timeline and Edit Selection; Insertion Follows Playback;
   selection Start/End/Length counters in bars, time or samples; zoom
-  buttons. Range edits: separate, trim to selection, clear (Shuffle closes
-  the gap), copy/cut/paste, duplicate, repeat, insert silence.
+  buttons; a Follow button for scrolling along while playing. Range edits:
+  separate, trim to selection, clear (Shuffle closes the gap),
+  copy/cut/paste, duplicate, repeat, insert silence. The Scrubber plays the
+  audio under the pointer while you drag; zoomed in to single samples, the
+  Pencil redraws the waveform (click repair, on a copy — undo brings the
+  original back).
 * Clip gain: a gain knob in every audio clip's name strip (drag or turn
   the wheel; double-click resets, Alt-click types a value; Ctrl+Shift+↑/↓) and fades with five shapes (Linear, Equal Power,
   S-Curve, Fast, Slow) and a curve you bend by dragging its handle;
@@ -52,6 +81,23 @@ hosting, an analogue-console-style mixer and dockable, detachable editors.
   scribble strips, pinned master section; click a pan or level readout to
   type a value. The inserts section shows five slots by default; drag the
   grip on the rule below it for more or fewer (saved with the layout).
+  Drag inserts to reorder them or onto another track to copy them with
+  their settings (Ctrl copies within a track, Shift moves to another
+  track); Alt-click removes one.
+* Groups, VCAs and multi-track edits: with several tracks selected, moving
+  a fader, pan or send moves all of them relatively (balances survive even
+  pulling everything to −∞ and back), and mute, solo, arm, polarity,
+  monitoring, colour, output and VCA are set on all of them. Track groups
+  link volume, mute, solo, record arm and selection (each switchable, the
+  group can be deactivated); VCA faders scale, mute and solo the tracks
+  assigned to them, nested VCAs included, with automation. The mixer shows
+  each strip's group and VCA.
+* Sidechains: any plugin with a sidechain input can be keyed by another
+  track (insert menu → Sidechain from …; the signal after its inserts, so a
+  muted "ghost" track still keys); the built-in compressor has one.
+* Freeze and bounce: Freeze Track renders a track after its inserts and
+  plays the file instead (its plugins are unloaded until you unfreeze);
+  Bounce to New Track puts the rendered audio on a new track.
 * Piano roll: select/draw/erase/split/mute tools, rubber-band selection,
   moving and Alt-copying with snap (Shift: free), resizing from either edge,
   chords (fixed or scale-aware), scales with highlighting, snap and folding,
@@ -61,15 +107,25 @@ hosting, an analogue-console-style mixer and dockable, detachable editors.
   clips, auditioning, step input from a MIDI keyboard, copy/paste/duplicate,
   clip-length handle, inspector with numeric entry, live keys on the
   keyboard.
-* Docking: mixer / piano roll / automation tabs in a bottom dock, detach any
-  view into its own window and dock it back, workspaces (Recording, Editing,
-  Mixing, MIDI, Mastering), layouts saved with the project.
+* Docking: mixer / Tools / piano roll / automation / performance tabs in a
+  bottom dock, detach any view into its own window and dock it back,
+  workspaces (Recording, Editing, Mixing, MIDI, Mastering), layouts saved
+  with the project.
+* Mastering meters (Tools, F12; the Mastering workspace opens on them): EBU
+  R128 loudness — integrated, short-term and momentary, loudness range,
+  true peak and PLR against a delivery target (−14, −16, −23, −24 or −9
+  LUFS) with a short-term history; peak/RMS levels in dBFS or K-12/14/20;
+  goniometer and correlation; an FFT spectrum with peak hold — for the
+  master or any track.
 * Engine: routing graph with cycle detection and plugin delay compensation,
-  buses, auxes, sends, solo-in-place, sample-accurate loops, built-in synth,
-  echo, gain and latency-probe plugins, realtime-safe (verified by an
-  allocation-counting test).
-* Audio: JACK (JACK2 or PipeWire-JACK) and a silent dummy device. All common
-  sample rates (44.1 – 192 kHz) and buffer sizes (16 – 8192 frames).
+  buses, auxes, sends, sidechains, solo-in-place, sample-accurate loops,
+  built-in synth, echo, compressor, gain and latency-probe plugins,
+  realtime-safe (verified by an allocation-counting test).
+* Audio: native PipeWire (one node with a port per channel, linked to your
+  default devices), JACK (JACK2 or PipeWire-JACK), ALSA, WASAPI (Windows),
+  CoreAudio (macOS) and a silent dummy device; *Automatic* picks PipeWire,
+  then JACK, then ALSA on Linux. All common sample rates (44.1 – 192 kHz)
+  and buffer sizes (16 – 8192 frames).
 * Audio import: WAV, AIFF, CAF, FLAC, MP3, Ogg Vorbis, AAC/M4A, ALAC — via
   File → Import Audio (Ctrl+I) or drag & drop onto the arranger. Files are
   converted to the project rate once and streamed from disk during playback
@@ -97,7 +153,7 @@ hosting, an analogue-console-style mixer and dockable, detachable editors.
   all cores (critical path first, realtime priority, flush-to-zero), with
   output bit-identical to single-threaded processing; Preferences → Audio
   → Processing threads.
-* Plugins: built-in synth/echo/gain and CLAP and VST3 effects and
+* Plugins: built-in synth/echo/compressor/gain and CLAP and VST3 effects and
   instruments, found by a crash-safe background scan and picked in a plugin browser (click an
   empty insert slot or Track → Plugin Browser…). New instrument tracks
   start empty and open the browser to choose their instrument (an
@@ -105,17 +161,24 @@ hosting, an analogue-console-style mixer and dockable, detachable editors.
   its instrument); plugins that take notes in insert slots get the
   track's MIDI too. Click a filled insert slot
   for the plugin's own GUI (Ctrl-click bypasses, right-click for the
-  parameter window and more); editors open centred or where they were last,
-  and their positions are saved with the project. Plugin state, parameters
-  and automation are saved too.
+  parameter window, presets, sidechain and more); editors open centred or
+  where they were last, and their positions are saved with the project.
+  Plugin state, parameters and automation are saved too. Moving a knob in a
+  plugin's own GUI writes automation like FaderFrame's controls do. Presets:
+  save and load your own for any plugin (insert menu or the parameter
+  window's Presets menu), and VST3 factory presets are listed too.
+* MIDI files: File → Import MIDI File… (a track per MIDI track or channel,
+  with controllers and SysEx; tempo and meter too when the project is
+  empty) and File → Export MIDI File… (all MIDI tracks, or the selected
+  clips).
 * MIDI sync: follow an external MIDI clock (tempo too) or MIDI time code
   (Preferences → MIDI → Sync). MPE: per-note pitch, pressure and timbre —
   recorded from MPE controllers, drawn in the piano roll's expression
   lanes, played on member channels (track menu → MPE). SysEx is recorded,
   sent to external devices with the clip, imported from and sent as `.syx`
   files.
-* MIDI keyboards and controllers: every MIDI input (ALSA sequencer, incl.
-  PipeWire; hotplug) — instrument tracks play what you play while armed or
+* MIDI keyboards and controllers: every MIDI input (ALSA sequencer incl.
+  PipeWire, CoreMIDI, WinMM; hotplug) — instrument tracks play what you play while armed or
   selected, with constant low latency; choose the input and channel per
   track (track menu → MIDI In). Record MIDI into clips (takes or replace,
   loop recording). MIDI learn: right-click a fader, pan, mute, send,
@@ -142,33 +205,47 @@ hosting, an analogue-console-style mixer and dockable, detachable editors.
 
 ## Building
 
-Requirements:
+Requirements: Rust 1.92 or newer (`rustup`) and GTK 4.14+ with `pkg-config`.
 
-* Rust 1.92 or newer (`rustup`)
-* GTK 4.14+ development files and `pkg-config`
-* JACK development files (`jack.pc`) — needed at build time; libjack is loaded
-  at run time, so FaderFrame still starts without it.
+**Linux** additionally needs the development files of JACK (`jack.pc`;
+libjack itself is loaded at run time, so FaderFrame starts without it),
+ALSA and PipeWire, and libclang (the PipeWire bindings are generated at
+build time):
 
 | Distribution | Packages |
 |---|---|
-| Arch / Manjaro | `gtk4 pkgconf pipewire-jack` (or `jack2`) |
-| Debian / Ubuntu (24.04+) | `libgtk-4-dev pkg-config libjack-jackd2-dev` |
-| Fedora | `gtk4-devel pkgconf-pkg-config pipewire-jack-audio-connection-kit-devel` |
+| Arch / Manjaro | `gtk4 pkgconf pipewire-jack` (or `jack2`) `alsa-lib pipewire clang` |
+| Debian / Ubuntu (24.04+) | `libgtk-4-dev pkg-config libjack-jackd2-dev libasound2-dev libpipewire-0.3-dev libclang-dev` |
+| Fedora | `gtk4-devel pkgconf-pkg-config pipewire-jack-audio-connection-kit-devel alsa-lib-devel pipewire-devel clang-devel` |
+
+**macOS** (Apple Silicon or Intel): `brew install gtk4 pkgconf`.
+
+**Windows**: in an [MSYS2](https://www.msys2.org) UCRT64 shell,
+`pacman -S mingw-w64-ucrt-x86_64-gtk4 mingw-w64-ucrt-x86_64-pkgconf
+mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-rust`.
+
+On Windows and macOS, plugins open in FaderFrame's parameter window for
+now (their own GUIs embed on Linux only), and the audio API is WASAPI or
+CoreAudio (no ASIO yet). CI builds and tests all three platforms.
 
 ```bash
 cargo build --release
-cargo run --release -p faderframe-app          # starts with the demo session
+cargo run --release -p faderframe-app -- --demo   # starts with the demo session
 ```
 
 The binary is `target/release/faderframe`:
 
 ```text
-faderframe [--backend auto|jack|dummy] [--sample-rate HZ] [--buffer-size FRAMES]
-           [--empty] [--import FILE]... [PROJECT.ffproj]
+faderframe [--backend auto|pipewire|jack|system|dummy] [--sample-rate HZ]
+           [--buffer-size FRAMES] [--threads N] [--empty | --demo]
+           [--import FILE]... [PROJECT.ffproj]
 ```
 
-With PipeWire, JACK clients connect to the PipeWire graph directly (no JACK
-server needed when `pipewire-jack` is installed).
+Without `--empty`, `--demo` or a project, FaderFrame opens what
+Preferences → General → On start-up says (the last project by default).
+`system` is ALSA, WASAPI or CoreAudio. JACK clients connect to the PipeWire
+graph directly when `pipewire-jack` is installed; the native PipeWire
+backend needs no JACK at all.
 
 ### Shortcuts
 
@@ -185,6 +262,7 @@ server needed when `pipewire-jack` is installed).
 | Ctrl+Z / Ctrl+Shift+Z | Undo / redo |
 | F2 / F3 / F4 | Toggle bottom dock / show mixer / show piano roll |
 | F8 | Performance meter |
+| F12 | Tools (loudness, level, phase, spectrum) |
 | Ctrl+1 … Ctrl+5 | Workspaces |
 | Ctrl+I | Import audio files |
 | Ctrl+Shift+R | Render / export |
@@ -213,7 +291,7 @@ cargo clippy --workspace --all-targets
 cargo test --workspace                 # or: cargo nextest run --workspace
 cargo run -p faderframe-bench --release -- --tracks 128 --block 64 --rate 96000
 python3 scripts/third_party_licenses.py --check
-cargo deny check licenses
+cargo deny check licenses bans sources
 ```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design, crate

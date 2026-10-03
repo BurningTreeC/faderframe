@@ -25,7 +25,10 @@ faderframe-automation = { path = "crates/faderframe-automation" }
 faderframe-workspace = { path = "crates/faderframe-workspace" }
 faderframe-project = { path = "crates/faderframe-project" }
 faderframe-audio = { path = "crates/faderframe-audio" }
+faderframe-analysis = { path = "crates/faderframe-analysis" }
+faderframe-audio-cpal = { path = "crates/faderframe-audio-cpal" }
 faderframe-audio-jack = { path = "crates/faderframe-audio-jack" }
+faderframe-audio-pipewire = { path = "crates/faderframe-audio-pipewire" }
 faderframe-audio-files = { path = "crates/faderframe-audio-files" }
 faderframe-plugin-host = { path = "crates/faderframe-plugin-host" }
 faderframe-plugin-clap = { path = "crates/faderframe-plugin-clap" }
@@ -35,6 +38,7 @@ faderframe-session = { path = "crates/faderframe-session" }
 faderframe-ui-canvas = { path = "crates/faderframe-ui-canvas" }
 faderframe-view-arranger = { path = "crates/faderframe-view-arranger" }
 faderframe-view-mixer = { path = "crates/faderframe-view-mixer" }
+faderframe-view-tools = { path = "crates/faderframe-view-tools" }
 faderframe-view-performance = { path = "crates/faderframe-view-performance" }
 faderframe-view-pianoroll = { path = "crates/faderframe-view-pianoroll" }
 faderframe-ui = { path = "crates/faderframe-ui" }
@@ -47,6 +51,8 @@ glib-unix = "0.22"
 # Audio backends. `jack` loads libjack at runtime (dynamic_loading), so the
 # application still starts on machines without JACK/pipewire-jack.
 jack = "0.13"
+cpal = "0.18"
+pipewire = "0.10"
 # Realtime-safe wait-free SPSC ring buffer used for control <-> RT messaging.
 rtrb = "0.4"
 # futex and thread scheduling for the DSP worker pool.
@@ -58,6 +64,7 @@ symphonia = { version = "0.6", default-features = false, features = ["wav", "aif
 rubato = "5"
 # FFT for transient detection (already used by rubato).
 realfft = "3"
+midly = { version = "0.5", default-features = false, features = ["alloc", "std"] }
 cc = "1.2"
 audioadapter-buffers = "5"
 # CLAP plugin hosting (MIT OR Apache-2.0).

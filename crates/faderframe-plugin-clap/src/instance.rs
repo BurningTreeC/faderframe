@@ -5,7 +5,6 @@ use crate::processor::{ClapProcessor, RtProc, RtState, SharedRt};
 use crate::scan::ScannedPlugin;
 use clack_extensions::gui::{GuiApiType, GuiConfiguration, GuiError, GuiSize, Window};
 use clack_extensions::params::{ParamInfoBuffer, ParamInfoFlags};
-use clack_extensions::posix_fd::FdFlags;
 use clack_extensions::timer::TimerId;
 use clack_host::events::Pckn;
 use clack_host::events::event_types::ParamValueEvent;
@@ -31,6 +30,8 @@ pub struct ClapInstance {
     needs_restart: bool,
     /// Activations so far (see `PluginInstance::activation`).
     activations: u64,
+    /// Parameter moves from the audio thread (the plugin's editor).
+    edits_rx: Option<rtrb::Consumer<(u8, u32, f64)>>,
     gui_open: bool,
     // Declared last: dropped after the processor has been deactivated.
     instance: PluginInstance<FfHost>,
@@ -69,6 +70,7 @@ impl ClapInstance {
             latency: 0,
             needs_restart: false,
             activations: 0,
+            edits_rx: None,
             gui_open: false,
             instance,
         };
@@ -253,6 +255,22 @@ impl FfInstance for ClapInstance {
         self.activations
     }
 
+    fn take_editor_edits(&mut self) -> Vec<faderframe_plugin_host::EditorEdit> {
+        use faderframe_plugin_host::EditorEdit as E;
+        let mut out = Vec::new();
+        if let Some(rx) = self.edits_rx.as_mut() {
+            while let Ok((kind, id, value)) = rx.pop() {
+                let id = ParameterId(id);
+                out.push(match kind {
+                    0 => E::Begin(id),
+                    2 => E::End(id),
+                    _ => E::Value(id, value),
+                });
+            }
+        }
+        out
+    }
+
     fn tail(&self) -> TailLength {
         TailLength::Infinite
     }
@@ -311,18 +329,25 @@ impl FfInstance for ClapInstance {
                     .fds
                     .borrow()
                     .iter()
-                    .map(|&(fd, f)| faderframe_plugin_host::PluginFd {
-                        fd,
-                        read: f.contains(FdFlags::READ),
-                        write: f.contains(FdFlags::WRITE),
-                        error: f.contains(FdFlags::ERROR),
-                    })
+                    .map(
+                        |&(fd, [read, write, error])| faderframe_plugin_host::PluginFd {
+                            fd,
+                            read,
+                            write,
+                            error,
+                        },
+                    )
                     .collect(),
                 timers: m.timers.borrow().clone(),
             })
     }
 
+    #[cfg(not(unix))]
+    fn on_fd(&mut self, _fd: faderframe_plugin_host::PluginFd) {}
+
+    #[cfg(unix)]
     fn on_fd(&mut self, fd: faderframe_plugin_host::PluginFd) {
+        use clack_extensions::posix_fd::FdFlags;
         let Some(posix) = self.ext().posix_fd else {
             return;
         };
@@ -361,13 +386,16 @@ impl FfInstance for ClapInstance {
                 )
                 .map_err(|e| PluginError::Failed(format!("{}: {e}", self.scanned.name)))?;
             let (tx, rx) = rtrb::RingBuffer::new(1024);
+            let (edits_tx, edits_rx) = rtrb::RingBuffer::new(1024);
             let state = RtState::new(
                 stopped,
                 &self.scanned.audio_inputs,
                 &self.scanned.audio_outputs,
                 config.max_block_size.max(1) as usize,
                 rx,
+                edits_tx,
             );
+            self.edits_rx = Some(edits_rx);
             self.rt = Some(Arc::new(TryCell::new(state)));
             self.params_tx = Some(tx);
             self.config = Some(*config);

@@ -268,7 +268,14 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
         None,
         &section(&[("Save", "app.save"), ("Save As…", "app.save-as")]),
     );
-    file.append_section(None, &section(&[("Import Audio…", "app.import-audio")]));
+    file.append_section(
+        None,
+        &section(&[
+            ("Import Audio…", "app.import-audio"),
+            ("Import MIDI File…", "app.import-midi"),
+            ("Export MIDI File…", "app.export-midi"),
+        ]),
+    );
     file.append_section(None, &section(&[("Render / Export…", "app.render")]));
     file.append_section(None, &section(&[("Preferences…", "app.preferences")]));
     file.append_section(None, &section(&[("Quit", "app.quit")]));
@@ -368,6 +375,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             ("Add MIDI Track", "app.add-midi"),
             ("Add Bus", "app.add-bus"),
             ("Add Aux (FX Return)", "app.add-aux"),
+            ("Add VCA", "app.add-vca"),
         ]),
     );
     track.append_section(
@@ -416,6 +424,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             ("Mixer", "app.show-mixer"),
             ("Piano Roll", "app.show-piano-roll"),
             ("Automation", "app.show-automation"),
+            ("Tools (Loudness, Level, Phase, Spectrum)", "app.show-tools"),
             ("Performance Meter", "app.show-performance"),
             ("Show / Hide Bottom Dock", "app.toggle-dock"),
         ]),
@@ -425,6 +434,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
         &section(&[
             ("Detach Mixer", "app.detach-mixer"),
             ("Detach Piano Roll", "app.detach-piano-roll"),
+            ("Detach Tools", "app.detach-tools"),
             ("Detach Performance Meter", "app.detach-performance"),
             ("Dock All Windows", "app.dock-all"),
         ]),

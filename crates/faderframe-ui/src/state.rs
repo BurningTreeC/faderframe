@@ -15,24 +15,57 @@ use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BackendChoice {
-    /// JACK if a server is reachable, otherwise the silent dummy device.
+    /// Linux: native PipeWire if its server runs, else JACK, else ALSA;
+    /// elsewhere the system API. The silent dummy device last.
     #[default]
     Auto,
+    /// Linux only.
+    PipeWire,
+    /// Linux only.
     Jack,
+    /// The operating system's API: WASAPI, CoreAudio or ALSA.
+    System,
     Dummy,
 }
 
 impl BackendChoice {
+    /// The choices this platform offers.
+    pub fn available() -> Vec<BackendChoice> {
+        if cfg!(target_os = "linux") {
+            vec![
+                BackendChoice::Auto,
+                BackendChoice::PipeWire,
+                BackendChoice::Jack,
+                BackendChoice::System,
+                BackendChoice::Dummy,
+            ]
+        } else {
+            vec![
+                BackendChoice::Auto,
+                BackendChoice::System,
+                BackendChoice::Dummy,
+            ]
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
-            BackendChoice::Auto => "Automatic (JACK, else silent)",
+            BackendChoice::Auto if cfg!(target_os = "linux") => {
+                "Automatic (PipeWire, else JACK, else ALSA, else silent)"
+            }
+            BackendChoice::Auto if cfg!(windows) => "Automatic (WASAPI, else silent)",
+            BackendChoice::Auto => "Automatic (CoreAudio, else silent)",
+            BackendChoice::PipeWire => "PipeWire (native)",
             BackendChoice::Jack => "JACK / PipeWire-JACK",
+            BackendChoice::System if cfg!(windows) => "WASAPI",
+            BackendChoice::System if cfg!(target_os = "macos") => "CoreAudio",
+            BackendChoice::System => "ALSA (direct)",
             BackendChoice::Dummy => "No audio device (silent)",
         }
     }
 
     pub fn backends(self) -> Vec<Box<dyn AudioBackend>> {
-        let jack = || Box::new(faderframe_audio_jack::JackBackend) as Box<dyn AudioBackend>;
+        let system = || Box::new(faderframe_audio_cpal::CpalBackend) as Box<dyn AudioBackend>;
         // FADERFRAME_DUMMY_TONE=<Hz> feeds a test tone to the dummy
         // device's inputs (for trying out recording without hardware).
         let tone = std::env::var("FADERFRAME_DUMMY_TONE")
@@ -44,10 +77,26 @@ impl BackendChoice {
                 None => faderframe_audio::dummy::DummyBackend::default(),
             }) as Box<dyn AudioBackend>
         };
+        #[cfg(target_os = "linux")]
+        {
+            let jack = || Box::new(faderframe_audio_jack::JackBackend) as Box<dyn AudioBackend>;
+            let pipewire =
+                || Box::new(faderframe_audio_pipewire::PipeWireBackend) as Box<dyn AudioBackend>;
+            match self {
+                BackendChoice::Auto => vec![pipewire(), jack(), system(), dummy()],
+                BackendChoice::PipeWire => vec![pipewire()],
+                BackendChoice::Jack => vec![jack()],
+                BackendChoice::System => vec![system()],
+                BackendChoice::Dummy => vec![dummy()],
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
         match self {
-            BackendChoice::Auto => vec![jack(), dummy()],
-            BackendChoice::Jack => vec![jack()],
             BackendChoice::Dummy => vec![dummy()],
+            BackendChoice::System | BackendChoice::PipeWire | BackendChoice::Jack => {
+                vec![system()]
+            }
+            BackendChoice::Auto => vec![system(), dummy()],
         }
     }
 }
@@ -247,6 +296,15 @@ impl AppState {
                 } => crate::plugin_window::open(self, plugin, generic),
                 faderframe_session::UiRequest::ImportSysex { clip, at } => {
                     crate::dialogs::import_sysex(self, clip, at);
+                }
+                faderframe_session::UiRequest::SavePluginPreset { plugin } => {
+                    crate::dialogs::save_preset(self, plugin);
+                }
+                faderframe_session::UiRequest::RenameGroup(group) => {
+                    crate::dialogs::rename_group(self, group);
+                }
+                faderframe_session::UiRequest::PickColor(target) => {
+                    crate::dialogs::pick_color(self, target);
                 }
             }
         }

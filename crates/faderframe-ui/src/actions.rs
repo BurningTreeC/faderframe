@@ -47,6 +47,8 @@ pub fn install(app: &Rc<AppState>) {
         }),
         entry(app, "clear-recent", crate::recent::clear),
         entry(app, "import-audio", crate::dialogs::import_audio),
+        entry(app, "import-midi", crate::dialogs::import_midi),
+        entry(app, "export-midi", crate::dialogs::export_midi),
         entry(app, "cancel-import", |a| {
             a.session.borrow().cancel_imports()
         }),
@@ -173,6 +175,8 @@ pub fn install(app: &Rc<AppState>) {
         dispatch(app, "add-midi", A::AddTrack(TrackKind::Midi)),
         dispatch(app, "add-bus", A::AddTrack(TrackKind::Bus)),
         dispatch(app, "add-aux", A::AddTrack(TrackKind::Aux)),
+        dispatch(app, "add-vca", A::AddTrack(TrackKind::Vca)),
+        dispatch(app, "group-selected", A::GroupSelectedTracks),
         dispatch(app, "remove-tracks", A::RemoveSelectedTracks),
         dispatch(app, "arm-selected", A::ToggleArmSelected),
         entry(app, "save-track-preset", |a| {
@@ -297,6 +301,16 @@ pub fn install(app: &Rc<AppState>) {
             app,
             "show-performance",
             A::Workspace(W::ShowView(ViewId::performance())),
+        ),
+        dispatch(
+            app,
+            "show-tools",
+            A::Workspace(W::ShowView(ViewId::tools())),
+        ),
+        dispatch(
+            app,
+            "detach-tools",
+            A::Workspace(W::Detach(ViewId::tools())),
         ),
         dispatch(
             app,
@@ -461,7 +475,7 @@ pub fn install(app: &Rc<AppState>) {
         .build();
     // Editing by name (menus, scripts): `edit-mode:<shuffle|slip|spot|grid>`,
     // `edit-tool:<smart|trim|stretch|select|grab|separate|scrub|pencil|zoom>`,
-    // `edit-flag:<warp|transients|tab-transients|link|insertion-follows>`
+    // `edit-flag:<warp|transients|tab-transients|link|insertion-follows|follow>`
     // (toggles), `edit:<separate|trim|clear|silence|copy|cut|paste|duplicate|
     // quantize|separate-transients|unwarp>`, and the development aid
     // `select-clip:<track>` (adds the track's first clip to the selection).
@@ -514,6 +528,7 @@ pub fn install(app: &Rc<AppState>) {
                 "tab-transients" => (F::TabToTransients, e.tab_to_transients),
                 "link" => (F::LinkTimeline, e.link_timeline),
                 "insertion-follows" => (F::InsertionFollowsPlayback, e.insertion_follows_playback),
+                "follow" => (F::FollowPlayhead, e.follow_playhead),
                 _ => return tracing::warn!("edit-flag: unknown '{arg}'"),
             };
             a.dispatch(Action::SetEditFlag(flag, !on));
@@ -605,10 +620,144 @@ pub fn install(app: &Rc<AppState>) {
                 );
             }
         }),
+        // Presets (menus): `save-preset:<plugin id>`, `load-preset:<id>\n<path>`.
+        named("save-preset", |a, arg| {
+            if let Ok(id) = arg.parse::<u64>() {
+                a.dispatch(Action::PromptSavePluginPreset(
+                    faderframe_core::PluginInstanceId(id),
+                ));
+            }
+        }),
+        named("load-preset", |a, arg| {
+            if let Some((id, path)) = arg.split_once('\n')
+                && let Ok(id) = id.parse::<u64>()
+            {
+                a.dispatch(Action::LoadPluginPreset {
+                    plugin: faderframe_core::PluginInstanceId(id),
+                    path: std::path::PathBuf::from(path),
+                });
+            }
+        }),
+        // Development aids: `import-midi-from:<path>` / `export-midi-to:<path>`.
+        named("import-midi-from", |a, arg| {
+            let empty = a.session.borrow().project().clips.is_empty();
+            a.dispatch(Action::ImportMidiFile {
+                path: std::path::PathBuf::from(arg),
+                at: faderframe_timeline::MusicalTime::ZERO,
+                tempo: empty,
+            });
+        }),
+        named("export-midi-to", |a, arg| {
+            crate::dialogs::export_midi_to(a, std::path::Path::new(arg));
+        }),
         // Development aid: `save-to:<path>` saves the project there.
         named("save-to", |a, arg| {
             let path = std::path::PathBuf::from(arg);
             a.with_session(|s| s.save_as(&path));
+        }),
+        // Development aids: `add-marker:<quarters>`, `add-section:<a>-<b>`
+        // (quarters) and `add-tempo:<quarters>`.
+        named("add-marker", |a, arg| {
+            if let Ok(q) = arg.parse::<f64>() {
+                a.dispatch(Action::AddMarker(
+                    faderframe_timeline::MusicalTime::from_quarters(q),
+                ));
+            }
+        }),
+        named("add-section", |a, arg| {
+            let mut parts = arg.split('-').filter_map(|v| v.parse::<f64>().ok());
+            if let (Some(x), Some(y)) = (parts.next(), parts.next()) {
+                a.dispatch(Action::AddSection {
+                    start: faderframe_timeline::MusicalTime::from_quarters(x),
+                    end: faderframe_timeline::MusicalTime::from_quarters(y),
+                });
+            }
+        }),
+        named("add-tempo", |a, arg| {
+            if let Ok(q) = arg.parse::<f64>() {
+                a.dispatch(Action::AddTempoPoint(
+                    faderframe_timeline::MusicalTime::from_quarters(q),
+                ));
+            }
+        }),
+        // Development aids: `zoom:<in|out|fit|selection>` zooms the
+        // editors; `locate:<quarters>` moves the playhead.
+        named("zoom", |a, arg| {
+            use faderframe_session::ZoomRequest as Z;
+            let z = match arg {
+                "in" => Z::In,
+                "out" => Z::Out,
+                "selection" => Z::Selection,
+                _ => Z::Fit,
+            };
+            a.dispatch(Action::Zoom(z));
+        }),
+        named("locate", |a, arg| {
+            if let Ok(q) = arg.parse::<f64>() {
+                a.dispatch(Action::Transport(
+                    faderframe_session::TransportAction::Locate(
+                        faderframe_timeline::MusicalTime::from_quarters(q),
+                    ),
+                ));
+            }
+        }),
+        // Development aids: `select-also:<name>` adds a track to the
+        // selection; `assign-vca:<name>` assigns the selection to a VCA.
+        named("select-also", |a, arg| {
+            let id = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == arg)
+                .map(|t| t.id);
+            if let Some(id) = id {
+                a.dispatch(Action::SelectTracks {
+                    tracks: vec![id],
+                    mode: faderframe_session::SelectMode::Add,
+                });
+            }
+        }),
+        named("assign-vca", |a, arg| {
+            let id = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == arg)
+                .map(|t| t.id);
+            if let Some(id) = id {
+                a.dispatch(Action::AssignSelectedToVca(id));
+            }
+        }),
+        // Development aids: `freeze-track:<name>`, `bounce-track:<name>`.
+        named("freeze-track", |a, arg| {
+            let id = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == arg)
+                .map(|t| t.id);
+            if let Some(id) = id {
+                a.dispatch(Action::FreezeTrack(id));
+            }
+        }),
+        named("bounce-track", |a, arg| {
+            let id = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == arg)
+                .map(|t| t.id);
+            if let Some(id) = id {
+                a.dispatch(Action::BounceTrack(id));
+            }
         }),
         named("select-clip", |a, arg| {
             let clip = a
@@ -788,6 +937,7 @@ pub fn install(app: &Rc<AppState>) {
         ("app.show-mixer", &["F3"]),
         ("app.show-piano-roll", &["F4"]),
         ("app.show-performance", &["F8"]),
+        ("app.show-tools", &["F12"]),
         ("app.workspace-1", &["<Control>1"]),
         ("app.workspace-2", &["<Control>2"]),
         ("app.workspace-3", &["<Control>3"]),

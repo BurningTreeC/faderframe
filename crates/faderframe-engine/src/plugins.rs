@@ -27,6 +27,9 @@ struct Hosted {
     /// The plugin's own value before the first explicit one (restored when
     /// the explicit value is dropped, e.g. by undo).
     baseline: HashMap<ParameterId, f64>,
+    /// The slot state the instance has (a different one, e.g. a preset or
+    /// its undo, is loaded).
+    state: Option<String>,
 }
 
 /// Owns one [`PluginInstance`] per project plugin slot.
@@ -93,6 +96,7 @@ impl PluginHost {
                     failed: Arc::new(AtomicBool::new(false)),
                     applied,
                     baseline,
+                    state: slot.state.clone(),
                 },
             );
         }
@@ -108,6 +112,45 @@ impl PluginHost {
             faderframe_plugin_host::PluginPoll::default(),
             faderframe_plugin_host::PluginPoll::merge,
         )
+    }
+
+    /// Parameter moves made in plugins' own editors since the last call.
+    pub fn take_editor_edits(
+        &mut self,
+    ) -> Vec<(PluginInstanceId, faderframe_plugin_host::EditorEdit)> {
+        let mut out = Vec::new();
+        for (id, h) in &mut self.instances {
+            out.extend(h.instance.take_editor_edits().into_iter().map(|e| (*id, e)));
+        }
+        out
+    }
+
+    /// The slot state now matches the instance (it was just captured from
+    /// it): nothing to load.
+    pub fn note_state(&mut self, plugin: PluginInstanceId, state: &str) {
+        if let Some(h) = self.instances.get_mut(&plugin) {
+            h.state = Some(state.to_string());
+        }
+    }
+
+    /// Preset files of the plugin format's own folders.
+    pub fn preset_files(&self, plugin: PluginInstanceId) -> Vec<std::path::PathBuf> {
+        self.instances
+            .get(&plugin)
+            .map_or_else(Vec::new, |h| h.instance.preset_files())
+    }
+
+    /// The state (encoded for [`PluginSlot::state`]) of a preset file.
+    pub fn state_from_preset_file(
+        &self,
+        plugin: PluginInstanceId,
+        data: &[u8],
+    ) -> Result<String, PluginError> {
+        let h = self
+            .instances
+            .get(&plugin)
+            .ok_or_else(|| PluginError::NotFound(format!("{plugin}")))?;
+        Ok(encode_state(&h.instance.state_from_preset_file(data)?))
     }
 
     /// The current state of an instantiated plugin, encoded for
@@ -134,6 +177,17 @@ impl PluginHost {
             let Some(h) = self.instances.get_mut(&slot.id) else {
                 continue;
             };
+            if h.state != slot.state {
+                // A new state (preset, undo): load it; explicit values follow.
+                if let Some(bytes) = slot.state.as_deref().and_then(decode_state)
+                    && let Err(e) = h.instance.load_state(&bytes)
+                {
+                    tracing::warn!("{}: cannot load the state: {e}", slot.plugin.name);
+                }
+                h.state = slot.state.clone();
+                h.applied.clear();
+                h.baseline.clear();
+            }
             for p in &slot.parameters {
                 if h.applied.get(&p.id) == Some(&p.value) {
                     continue;
@@ -223,6 +277,17 @@ impl PluginHost {
         self.instances.get(&plugin).map(|h| h.instance.parameters())
     }
 
+    /// Does the instantiated plugin have a sidechain (second audio) input?
+    pub fn has_sidechain(&self, plugin: PluginInstanceId) -> bool {
+        self.instances.get(&plugin).is_some_and(|h| {
+            h.instance
+                .descriptor()
+                .audio_inputs
+                .get(1)
+                .is_some_and(|p| p.channels > 0)
+        })
+    }
+
     pub fn instance(&mut self, slot: &PluginSlot) -> Result<&mut dyn PluginInstance, PluginError> {
         Ok(self.ensure(slot)?.instance.as_mut())
     }
@@ -245,9 +310,11 @@ impl PluginHost {
 
     /// Drop instances whose slots no longer exist in the project.
     pub fn retain_project(&mut self, project: &Project) {
+        // Frozen tracks' plugins are unloaded (restored from their slots).
         let live: HashSet<PluginInstanceId> = project
             .tracks
             .iter()
+            .filter(|t| t.freeze.is_none())
             .flat_map(|t| t.inserts.iter().chain(t.instrument.iter()).map(|s| s.id))
             .collect();
         self.instances.retain(|id, _| live.contains(id));

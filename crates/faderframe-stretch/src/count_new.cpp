@@ -6,6 +6,16 @@
 #include <cstdlib>
 #include <new>
 
+#ifdef _WIN32
+#include <malloc.h>
+// Windows has no aligned_alloc; aligned blocks need their own free.
+static void *ff_aligned_alloc(std::size_t align, std::size_t n) { return _aligned_malloc(n, align); }
+static void ff_aligned_free(void *p) { _aligned_free(p); }
+#else
+static void *ff_aligned_alloc(std::size_t align, std::size_t n) { return std::aligned_alloc(align, n); }
+static void ff_aligned_free(void *p) { std::free(p); }
+#endif
+
 static std::atomic<uint64_t> allocations{0};
 
 extern "C" uint64_t ff_stretch_cpp_allocations() { return allocations.load(); }
@@ -18,7 +28,7 @@ void *operator new(std::size_t n) {
 void *operator new[](std::size_t n) { return operator new(n); }
 void *operator new(std::size_t n, std::align_val_t a) {
     allocations.fetch_add(1, std::memory_order_relaxed);
-    if (void *p = std::aligned_alloc(std::size_t(a), (n + std::size_t(a) - 1) / std::size_t(a) * std::size_t(a))) return p;
+    if (void *p = ff_aligned_alloc(std::size_t(a), (n + std::size_t(a) - 1) / std::size_t(a) * std::size_t(a))) return p;
     throw std::bad_alloc();
 }
 void *operator new[](std::size_t n, std::align_val_t a) { return operator new(n, a); }
@@ -26,7 +36,7 @@ void operator delete(void *p) noexcept { std::free(p); }
 void operator delete[](void *p) noexcept { std::free(p); }
 void operator delete(void *p, std::size_t) noexcept { std::free(p); }
 void operator delete[](void *p, std::size_t) noexcept { std::free(p); }
-void operator delete(void *p, std::align_val_t) noexcept { std::free(p); }
-void operator delete[](void *p, std::align_val_t) noexcept { std::free(p); }
-void operator delete(void *p, std::size_t, std::align_val_t) noexcept { std::free(p); }
-void operator delete[](void *p, std::size_t, std::align_val_t) noexcept { std::free(p); }
+void operator delete(void *p, std::align_val_t) noexcept { ff_aligned_free(p); }
+void operator delete[](void *p, std::align_val_t) noexcept { ff_aligned_free(p); }
+void operator delete(void *p, std::size_t, std::align_val_t) noexcept { ff_aligned_free(p); }
+void operator delete[](void *p, std::size_t, std::align_val_t) noexcept { ff_aligned_free(p); }

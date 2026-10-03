@@ -131,6 +131,18 @@ pub(crate) enum EditDrag {
         from: MusicalTime,
         to: MusicalTime,
     },
+    /// Pencil at sample level: redrawing an audio clip's samples.
+    Redraw {
+        clip: ClipId,
+        /// One stacked channel, or all.
+        channel: Option<usize>,
+        map: crate::FrameMap,
+        /// The waveform lane drawn in (values from y).
+        lane: Rect,
+        /// Drawn values by source frame.
+        points: std::collections::BTreeMap<i64, f32>,
+        last: (i64, f32),
+    },
 }
 
 fn fades_of(c: &Clip) -> Option<(ClipFades, i64)> {
@@ -477,13 +489,18 @@ impl ArrangerView {
         match tool {
             EditTool::Zoom => return self.press_zoom(pos, mods, cx),
             EditTool::Scrub => {
-                cx.emit(locate(self.snap(at, model, mods)));
-                self.drag = Some(Drag::Scrub);
+                cx.emit(Action::Transport(
+                    faderframe_session::TransportAction::Scrub(self.snap(at, model, mods)),
+                ));
+                self.drag = Some(Drag::Scrub { audible: true });
                 return true;
             }
             EditTool::Pencil => {
                 if clicks >= 2 && c.as_midi().is_some() {
                     cx.emit(Action::OpenClipEditor(clip));
+                } else if let Some(drag) = self.start_redraw(c, rect, pos, model) {
+                    self.edit_drag = Some(drag);
+                    cx.set_cursor(Cursor::Crosshair);
                 }
                 return true;
             }
@@ -885,8 +902,10 @@ impl ArrangerView {
         match model.editor.tool {
             EditTool::Zoom => self.press_zoom(pos, mods, cx),
             EditTool::Scrub => {
-                cx.emit(locate(self.snap(at, model, mods)));
-                self.drag = Some(Drag::Scrub);
+                cx.emit(Action::Transport(
+                    faderframe_session::TransportAction::Scrub(self.snap(at, model, mods)),
+                ));
+                self.drag = Some(Drag::Scrub { audible: true });
                 true
             }
             EditTool::Pencil => {
@@ -943,6 +962,105 @@ impl ArrangerView {
     // --- dragging ----------------------------------------------------------------
 
     /// Continue an editing drag; false when none is running.
+    /// A Pencil press on an audio clip at sample level starts redrawing.
+    fn start_redraw(&self, c: &Clip, rect: Rect, pos: Point, model: &Session) -> Option<EditDrag> {
+        self.sample_zoom(model)?;
+        let ClipContent::Audio(a) = &c.content else {
+            return None;
+        };
+        if a.warp.is_some() || a.reversed {
+            return None;
+        }
+        let ratio = model.frame_ratio();
+        let pr = model.peak_rate(a.source) / model.sample_rate() as f64;
+        let map = crate::FrameMap {
+            source: a.source,
+            start: model.engine().musical_to_samples(model.project(), c.start),
+            len: (a.length as f64 * ratio) as i64,
+            src_off: a.source_offset as f64 * ratio * pr,
+            pr,
+            gain: faderframe_core::db_to_gain(a.gain_db),
+        };
+        let channels = model.source_frames(a.source, 0, 0)?.len();
+        let content = self.clip_content_rect(rect);
+        let lanes = Self::wave_lanes(content, channels);
+        let (i, (lane, _)) = lanes
+            .iter()
+            .enumerate()
+            .find(|(_, (l, _))| pos.y >= l.y && pos.y < l.bottom())?;
+        let channel = (lanes.len() > 1).then_some(i);
+        let point = self.redraw_point(&map, *lane, pos, model)?;
+        let mut points = std::collections::BTreeMap::new();
+        points.insert(point.0, point.1);
+        Some(EditDrag::Redraw {
+            clip: c.id,
+            channel,
+            map,
+            lane: *lane,
+            points,
+            last: point,
+        })
+    }
+
+    /// The source frame and value under `pos` (inside the clip).
+    fn redraw_point(
+        &self,
+        map: &crate::FrameMap,
+        lane: Rect,
+        pos: Point,
+        model: &Session,
+    ) -> Option<(i64, f32)> {
+        let s = self.sample_at_x(model, pos.x);
+        let f = map.frame_at(s);
+        let (first, last) = map.frames();
+        if f < first || f >= last {
+            return None;
+        }
+        let half = lane.h * 0.46;
+        let v = (lane.center().y - pos.y) / half.max(1.0) / map.gain.max(1e-3);
+        Some((f, v.clamp(-1.0, 1.0)))
+    }
+
+    /// The samples being redrawn, over the clip's waveform.
+    pub(crate) fn paint_redraw(
+        &self,
+        p: &mut dyn Painter,
+        model: &Session,
+        clip: ClipId,
+        _content: Rect,
+    ) {
+        let Some(EditDrag::Redraw {
+            clip: c,
+            map,
+            lane,
+            points,
+            ..
+        }) = &self.edit_drag
+        else {
+            return;
+        };
+        if *c != clip {
+            return;
+        }
+        let half = lane.h * 0.46;
+        let mid = lane.center().y;
+        let color = self.theme.ui.accent;
+        let mut path = faderframe_ui_canvas::Path::new();
+        for (i, (f, v)) in points.iter().enumerate() {
+            let pt = Point::new(
+                self.x_of_sample(model, map.sample_of(*f)),
+                mid - (v * map.gain).clamp(-1.0, 1.0) * half,
+            );
+            if i == 0 {
+                path.move_to(pt);
+            } else {
+                path.line_to(pt);
+            }
+            p.circle(pt, 2.0, color);
+        }
+        p.stroke_path(&path, 1.6, color);
+    }
+
     pub(crate) fn edit_drag_move(
         &mut self,
         pos: Point,
@@ -1190,6 +1308,27 @@ impl ArrangerView {
                 *to = self.snap(t_at, model, mods).max(*from);
                 cx.redraw();
             }
+            EditDrag::Redraw {
+                map,
+                lane,
+                points,
+                last,
+                ..
+            } => {
+                if let Some((f, v)) = self.redraw_point(map, *lane, pos, model) {
+                    // Every frame between the last point and this one
+                    // (fast strokes leave no gaps).
+                    let (lf, lv) = *last;
+                    let n = (f - lf).abs();
+                    for k in 0..=n {
+                        let t = if n == 0 { 1.0 } else { k as f32 / n as f32 };
+                        let frame = lf + (f - lf).signum() * k;
+                        points.insert(frame, lv + (v - lv) * t);
+                    }
+                    *last = (f, v);
+                    cx.redraw();
+                }
+            }
         }
         self.edit_drag = Some(drag);
         true
@@ -1262,6 +1401,27 @@ impl ArrangerView {
                 }
                 cx.redraw();
             }
+            EditDrag::Redraw {
+                clip,
+                channel,
+                points,
+                ..
+            } => {
+                if let (Some((&start, _)), Some((&end, _))) =
+                    (points.first_key_value(), points.last_key_value())
+                {
+                    // Contiguous values (the stroke filled every frame).
+                    let samples: Vec<f32> = (start..=end)
+                        .map(|f| points.get(&f).copied().unwrap_or(0.0))
+                        .collect();
+                    cx.emit(Action::RedrawAudio {
+                        clip,
+                        channel,
+                        start,
+                        samples,
+                    });
+                }
+            }
             EditDrag::Pencil { track, from, to } => {
                 let length = if to > from {
                     to - from
@@ -1296,7 +1456,7 @@ impl ArrangerView {
         let lanes_w = (size.w - self.header_w()).max(1.0);
         let q = (b - a).quarters().max(1e-3) as f32;
         self.ppq = (lanes_w * 0.94 / q).clamp(MIN_PPQ, MAX_PPQ);
-        self.scroll_x = a.quarters() as f32 * self.ppq - lanes_w * 0.03;
+        self.scroll_x = a.quarters() * self.ppq as f64 - lanes_w as f64 * 0.03;
         self.clamp_scroll(model, size);
     }
 

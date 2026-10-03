@@ -12,6 +12,8 @@ workspace = true
 
 [dependencies]
 faderframe-audio.workspace = true
-jack.workspace = true
 tracing.workspace = true
 rtrb.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+jack.workspace = true

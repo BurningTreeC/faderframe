@@ -456,3 +456,194 @@ fn the_inserts_grip_sizes_the_section_and_more_slots_show() {
     let (a, _) = run(&mut view, down(last, 1), size, &s);
     assert_eq!(a, vec![Action::SetMixerInsertSlots(5)]);
 }
+
+fn press_drag_release(
+    view: &mut MixerView,
+    s: &Session,
+    size: Size,
+    from: Point,
+    to: Point,
+    m: Modifiers,
+) -> Vec<Action> {
+    let mut all = run(
+        view,
+        ViewEvent::PointerDown {
+            pos: from,
+            button: PointerButton::Primary,
+            modifiers: m,
+            clicks: 1,
+        },
+        size,
+        s,
+    )
+    .0;
+    if to != from {
+        for p in [Point::new(from.x + 6.0, from.y + 3.0), to] {
+            all.extend(
+                run(
+                    view,
+                    ViewEvent::PointerMove {
+                        pos: p,
+                        modifiers: m,
+                        dragging: true,
+                    },
+                    size,
+                    s,
+                )
+                .0,
+            );
+        }
+    }
+    all.extend(
+        run(
+            view,
+            ViewEvent::PointerUp {
+                pos: to,
+                button: PointerButton::Primary,
+                modifiers: m,
+            },
+            size,
+            s,
+        )
+        .0,
+    );
+    all
+}
+
+#[test]
+fn inserts_drag_to_reorder_copy_and_alt_click_removes() {
+    use faderframe_core::builtin;
+    use faderframe_project::PluginRef;
+    let mut s = session();
+    let theme = Theme::default();
+    let mut view = MixerView::new(theme.clone());
+    let size = Size::new(1400.0, 900.0);
+    let channels = MixerView::channel_tracks(&s);
+    let (bass, pluck) = (channels[1].id, channels[2].id);
+    for (i, (id, name)) in [(builtin::GAIN, "Gain"), (builtin::ECHO, "Echo")]
+        .into_iter()
+        .enumerate()
+    {
+        s.dispatch(Action::InsertPlugin {
+            track: bass,
+            index: i,
+            plugin: PluginRef::builtin(id, name),
+        })
+        .unwrap();
+    }
+    let names = |s: &Session, t| -> Vec<String> {
+        s.project()
+            .track(t)
+            .unwrap()
+            .inserts
+            .iter()
+            .map(|x| x.plugin.name.clone())
+            .collect()
+    };
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    let slots = |v: &MixerView, s: &Session, t| v.layout_of(s, t, size).unwrap().inserts.unwrap();
+    let b = slots(&view, &s, bass);
+    let gain = s.project().track(bass).unwrap().inserts[0].id;
+    // A click opens the editor; Ctrl-click toggles bypass.
+    let a = press_drag_release(
+        &mut view,
+        &s,
+        size,
+        b[0].center(),
+        b[0].center(),
+        Modifiers::NONE,
+    );
+    assert_eq!(
+        a,
+        vec![Action::OpenPluginEditor {
+            track: bass,
+            plugin: gain,
+            generic: false
+        }]
+    );
+    let ctrl = Modifiers {
+        ctrl: true,
+        ..Modifiers::NONE
+    };
+    let a = press_drag_release(&mut view, &s, size, b[0].center(), b[0].center(), ctrl);
+    assert!(matches!(
+        a[..],
+        [Action::Edit(Command::SetPluginBypass { bypass: true, .. })]
+    ));
+    // Dragging the first insert onto the second slot reorders, one step.
+    let a = press_drag_release(
+        &mut view,
+        &s,
+        size,
+        b[0].center(),
+        b[1].center(),
+        Modifiers::NONE,
+    );
+    for x in a {
+        s.dispatch(x).unwrap();
+    }
+    assert_eq!(names(&s, bass), ["Echo", "Gain"]);
+    s.dispatch(Action::Undo).unwrap();
+    assert_eq!(names(&s, bass), ["Gain", "Echo"]);
+    // Set a parameter on the echo, then drag it onto the Pluck strip: a
+    // copy with the same settings.
+    let echo = s.project().track(bass).unwrap().inserts[1].clone();
+    let param = faderframe_core::ParameterId(1);
+    s.dispatch(Action::Edit(Command::SetPluginParameter {
+        track: bass,
+        plugin: echo.id,
+        parameter: param,
+        value: Some(0.37),
+    }))
+    .unwrap();
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    let pl = slots(&view, &s, pluck);
+    let a = press_drag_release(
+        &mut view,
+        &s,
+        size,
+        b[1].center(),
+        pl[0].center(),
+        Modifiers::NONE,
+    );
+    for x in a {
+        s.dispatch(x).unwrap();
+    }
+    let copy = s.project().track(pluck).unwrap().inserts[0].clone();
+    assert_eq!(copy.plugin, echo.plugin);
+    assert_ne!(copy.id, echo.id, "a new instance");
+    assert!(
+        copy.parameters
+            .iter()
+            .any(|p| p.id == param && (p.value - 0.37).abs() < 1e-6),
+        "settings travel with the copy: {:?}",
+        copy.parameters
+    );
+    assert_eq!(names(&s, bass), ["Gain", "Echo"], "the original stays");
+    // Shift-drag moves to the other track instead.
+    let shift = Modifiers {
+        shift: true,
+        ..Modifiers::NONE
+    };
+    let a = press_drag_release(&mut view, &s, size, b[0].center(), pl[1].center(), shift);
+    for x in a {
+        s.dispatch(x).unwrap();
+    }
+    assert_eq!(names(&s, bass), ["Echo"]);
+    assert_eq!(names(&s, pluck), ["Echo", "Gain"]);
+    // Alt-click removes.
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    let b = slots(&view, &s, bass);
+    let alt = Modifiers {
+        alt: true,
+        ..Modifiers::NONE
+    };
+    let a = press_drag_release(&mut view, &s, size, b[0].center(), b[0].center(), alt);
+    for x in a {
+        s.dispatch(x).unwrap();
+    }
+    assert!(names(&s, bass).is_empty());
+}

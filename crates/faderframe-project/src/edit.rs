@@ -78,6 +78,8 @@ pub enum CoalesceKey {
     Punch,
     Automation(TrackId, AutomationLaneId),
     PluginParameter(PluginInstanceId, ParameterId),
+    Marker(MarkerId),
+    Section(faderframe_core::SectionId),
 }
 
 /// State needed to undo a track removal.
@@ -208,6 +210,48 @@ pub enum Command {
         track: TrackId,
         slot: Option<PluginSlot>,
     },
+    /// Feed `source`'s signal (after its inserts, before its fader, mute
+    /// and solo) to a plugin's sidechain input (`None`: none).
+    SetPluginSidechain {
+        track: TrackId,
+        plugin: PluginInstanceId,
+        source: Option<TrackId>,
+    },
+    /// Add a track group (members join with `SetTrackGroup`).
+    AddGroup {
+        group: Box<crate::TrackGroup>,
+    },
+    /// Remove a group definition (members are released first by the
+    /// session).
+    RemoveGroup {
+        group: faderframe_core::GroupId,
+    },
+    /// Replace a group's name, colour, active state or links.
+    UpdateGroup {
+        group: Box<crate::TrackGroup>,
+    },
+    SetTrackGroup {
+        track: TrackId,
+        group: Option<faderframe_core::GroupId>,
+    },
+    /// Assign a track to a VCA fader (`None`: none).
+    SetTrackVca {
+        track: TrackId,
+        vca: Option<TrackId>,
+    },
+    /// Freeze (`Some`) or unfreeze a track.
+    SetTrackFreeze {
+        track: TrackId,
+        freeze: Option<crate::Freeze>,
+    },
+    /// Replace a plugin's saved state and explicit parameter values (a
+    /// preset); the running plugin follows.
+    SetPluginState {
+        track: TrackId,
+        plugin: PluginInstanceId,
+        state: Option<String>,
+        parameters: Vec<crate::SavedParameter>,
+    },
 
     // --- track structure -------------------------------------------------
     AddTrack {
@@ -319,6 +363,20 @@ pub enum Command {
     },
     RemoveMarker {
         marker: MarkerId,
+    },
+    /// Move or rename a marker.
+    UpdateMarker {
+        marker: Marker,
+    },
+    AddSection {
+        section: crate::Section,
+    },
+    RemoveSection {
+        section: faderframe_core::SectionId,
+    },
+    /// Move, resize, rename or recolour a section.
+    UpdateSection {
+        section: crate::Section,
     },
     /// Add a controller mapping at `index` in the mapping list.
     AddMidiMapping {
@@ -482,6 +540,18 @@ impl Command {
             RemovePlugin { .. } => "Remove Plugin".into(),
             SetPluginBypass { .. } => "Toggle Bypass".into(),
             SetPluginParameter { .. } => "Change Plugin Parameter".into(),
+            SetPluginState { .. } => "Load Preset".into(),
+            SetPluginSidechain { .. } => "Set Sidechain".into(),
+            AddGroup { .. } => "Add Group".into(),
+            RemoveGroup { .. } => "Delete Group".into(),
+            UpdateGroup { .. } => "Change Group".into(),
+            SetTrackGroup { group: Some(_), .. } => "Add to Group".into(),
+            SetTrackGroup { group: None, .. } => "Remove from Group".into(),
+            SetTrackVca { .. } => "Assign VCA".into(),
+            SetTrackFreeze {
+                freeze: Some(_), ..
+            } => "Freeze Track".into(),
+            SetTrackFreeze { freeze: None, .. } => "Unfreeze Track".into(),
             SetInstrument { .. } => "Change Instrument".into(),
             AddTrack { .. } | RestoreTrack(_) => "Add Track".into(),
             RemoveTrack { .. } => "Remove Track".into(),
@@ -508,6 +578,10 @@ impl Command {
             SetPunch { .. } => "Change Punch Range".into(),
             AddMarker { .. } => "Add Marker".into(),
             RemoveMarker { .. } => "Remove Marker".into(),
+            UpdateMarker { .. } => "Edit Marker".into(),
+            AddSection { .. } => "Add Section".into(),
+            RemoveSection { .. } => "Delete Section".into(),
+            UpdateSection { .. } => "Edit Section".into(),
             AddMidiMapping { .. } => "MIDI Learn".into(),
             RemoveMidiMapping { .. } => "Remove MIDI Mapping".into(),
             UpdateMidiMapping { .. } => "Change MIDI Mapping".into(),
@@ -527,6 +601,8 @@ impl Command {
             SetTempo { .. } => CoalesceKey::Tempo,
             SetLoop { .. } => CoalesceKey::Loop,
             SetPunch { .. } => CoalesceKey::Punch,
+            UpdateMarker { marker } => CoalesceKey::Marker(marker.id),
+            UpdateSection { section } => CoalesceKey::Section(section.id),
             SetAutomationLane { track, lane } => CoalesceKey::Automation(*track, lane.id),
             SetPluginParameter {
                 plugin, parameter, ..
@@ -544,18 +620,27 @@ impl Command {
             | SetTrackSolo { .. }
             | SetTrackPhaseInvert { .. }
             | SetSendLevel { .. }
-            | SetPluginParameter { .. } => Impact::Params,
+            | SetPluginParameter { .. }
+            | SetPluginState { .. } => Impact::Params,
             RenameTrack { .. }
             | SetTrackColor { .. }
             | MoveTrack { .. }
             | AddMarker { .. }
             | RemoveMarker { .. }
+            | UpdateMarker { .. }
+            | AddSection { .. }
+            | RemoveSection { .. }
+            | UpdateSection { .. }
             | AddMidiMapping { .. }
             | RemoveMidiMapping { .. }
             | UpdateMidiMapping { .. }
             | SetPunch { .. }
             | RenameProject { .. }
-            | RenameClip { .. } => Impact::None,
+            | RenameClip { .. }
+            | AddGroup { .. }
+            | RemoveGroup { .. }
+            | UpdateGroup { .. }
+            | SetTrackGroup { .. } => Impact::None,
             AddSource { .. }
             | RemoveSource { .. }
             | AddAutomationLane { .. }
@@ -591,7 +676,11 @@ impl Command {
             | SetInstrument { .. }
             | AddTrack { .. }
             | RemoveTrack { .. }
-            | RestoreTrack(_) => Impact::Graph,
+            | RestoreTrack(_)
+            | SetTrackFreeze { .. }
+            | SetPluginSidechain { .. } => Impact::Graph,
+            // VCA automation travels with the timeline snapshot.
+            SetTrackVca { .. } => Impact::Timeline,
             Batch { commands, .. } => commands
                 .iter()
                 .map(Command::impact)
@@ -833,6 +922,119 @@ impl Command {
                     plugin,
                     parameter,
                     value: old,
+                }
+            }
+            SetPluginSidechain {
+                track,
+                plugin,
+                source,
+            } => {
+                if let Some(src) = source {
+                    let ok = p.track(src).is_some_and(|t| t.kind.has_audio());
+                    if !ok {
+                        return Err(EditError::Invalid(
+                            "the sidechain source has no audio".into(),
+                        ));
+                    }
+                    if p.would_cycle(src, track) {
+                        return Err(EditError::Invalid(
+                            "that sidechain would create a feedback loop".into(),
+                        ));
+                    }
+                }
+                let slot = track_mut(p, track)?
+                    .plugin_mut(plugin)
+                    .ok_or(EditError::UnknownPlugin(plugin))?;
+                let old = std::mem::replace(&mut slot.sidechain, source);
+                SetPluginSidechain {
+                    track,
+                    plugin,
+                    source: old,
+                }
+            }
+            AddGroup { group } => {
+                if p.group(group.id).is_some() {
+                    return Err(EditError::Invalid(format!("group {} exists", group.id)));
+                }
+                let id = group.id;
+                p.groups.push(*group);
+                RemoveGroup { group: id }
+            }
+            RemoveGroup { group } => {
+                let i = p
+                    .groups
+                    .iter()
+                    .position(|g| g.id == group)
+                    .ok_or_else(|| EditError::Invalid(format!("unknown group {group}")))?;
+                AddGroup {
+                    group: Box::new(p.groups.remove(i)),
+                }
+            }
+            UpdateGroup { group } => {
+                let g = p
+                    .groups
+                    .iter_mut()
+                    .find(|g| g.id == group.id)
+                    .ok_or_else(|| EditError::Invalid(format!("unknown group {}", group.id)))?;
+                UpdateGroup {
+                    group: Box::new(std::mem::replace(g, *group)),
+                }
+            }
+            SetTrackGroup { track, group } => {
+                if let Some(g) = group
+                    && p.group(g).is_none()
+                {
+                    return Err(EditError::Invalid(format!("unknown group {g}")));
+                }
+                let old = std::mem::replace(&mut track_mut(p, track)?.group, group);
+                SetTrackGroup { track, group: old }
+            }
+            SetTrackVca { track, vca } => {
+                if let Some(v) = vca {
+                    let ok = p.track(v).is_some_and(|t| t.kind == TrackKind::Vca);
+                    if !ok {
+                        return Err(EditError::Invalid("that track is not a VCA".into()));
+                    }
+                    // The VCA must not (through its own VCAs) be scaled by
+                    // this track.
+                    let mut next = Some(v);
+                    let mut steps = 0;
+                    while let Some(id) = next {
+                        if id == track || steps > p.tracks.len() {
+                            return Err(EditError::Invalid("a VCA cannot control itself".into()));
+                        }
+                        next = p.track(id).and_then(|t| t.vca);
+                        steps += 1;
+                    }
+                }
+                let t = track_mut(p, track)?;
+                if t.kind == TrackKind::Master && vca.is_some() {
+                    return Err(EditError::Invalid("the master cannot follow a VCA".into()));
+                }
+                let old = std::mem::replace(&mut t.vca, vca);
+                SetTrackVca { track, vca: old }
+            }
+            SetTrackFreeze { track, freeze } => {
+                let t = track_mut(p, track)?;
+                let old = std::mem::replace(&mut t.freeze, freeze);
+                SetTrackFreeze { track, freeze: old }
+            }
+            SetPluginState {
+                track,
+                plugin,
+                state,
+                parameters,
+            } => {
+                let slot = track_mut(p, track)?
+                    .plugin_mut(plugin)
+                    .ok_or(EditError::UnknownPlugin(plugin))?;
+                let old_state = std::mem::replace(&mut slot.state, state);
+                let old_params = std::mem::replace(&mut slot.parameters, parameters);
+                SetPluginState {
+                    track,
+                    plugin,
+                    state: old_state,
+                    parameters: old_params,
                 }
             }
             SetInstrument { track, slot } => {
@@ -1193,6 +1395,48 @@ impl Command {
                 AddMarker {
                     marker: p.markers.remove(i),
                 }
+            }
+            UpdateMarker { marker } => {
+                let m = p
+                    .markers
+                    .iter_mut()
+                    .find(|m| m.id == marker.id)
+                    .ok_or(EditError::UnknownMarker(marker.id))?;
+                let old = std::mem::replace(m, marker);
+                p.markers.sort_by_key(|m| m.position);
+                UpdateMarker { marker: old }
+            }
+            AddSection { section } => {
+                if section.end <= section.start {
+                    return Err(EditError::Invalid("a section needs a length".into()));
+                }
+                let id = section.id;
+                p.sections.push(section);
+                p.sections.sort_by_key(|s| s.start);
+                RemoveSection { section: id }
+            }
+            RemoveSection { section } => {
+                let i = p
+                    .sections
+                    .iter()
+                    .position(|s| s.id == section)
+                    .ok_or_else(|| EditError::Invalid(format!("unknown section {section}")))?;
+                AddSection {
+                    section: p.sections.remove(i),
+                }
+            }
+            UpdateSection { section } => {
+                if section.end <= section.start {
+                    return Err(EditError::Invalid("a section needs a length".into()));
+                }
+                let s = p
+                    .sections
+                    .iter_mut()
+                    .find(|s| s.id == section.id)
+                    .ok_or_else(|| EditError::Invalid(format!("unknown section {}", section.id)))?;
+                let old = std::mem::replace(s, section);
+                p.sections.sort_by_key(|s| s.start);
+                UpdateSection { section: old }
             }
             AddMidiMapping { index, mapping } => {
                 if p.midi_mappings.iter().any(|m| m.id == mapping.id) {

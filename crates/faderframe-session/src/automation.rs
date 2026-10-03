@@ -141,7 +141,15 @@ pub(crate) struct WriteState {
 #[derive(Debug, Default)]
 pub(crate) struct AutomationWriter {
     writing: HashMap<AutomationLaneId, WriteState>,
+    /// Lanes written from a plugin's own editor and when it last moved
+    /// them (Touch ends at the gesture's end, or after a pause for plugins
+    /// that report no gestures).
+    plugin_touch: HashMap<AutomationLaneId, std::time::Instant>,
 }
+
+/// A plugin editor's Touch ends this long after its last move when the
+/// plugin reports no gesture end.
+const PLUGIN_TOUCH_IDLE: std::time::Duration = std::time::Duration::from_millis(750);
 
 fn unit_label(u: ParameterUnit) -> &'static str {
     match u {
@@ -165,7 +173,9 @@ impl Session {
             return Vec::new();
         };
         let mut out = Vec::new();
-        if t.kind.has_audio() {
+        // VCAs automate their fader and mute.
+        let vca = t.kind == TrackKind::Vca;
+        if t.kind.has_audio() || vca {
             out.push(AutomationParam {
                 target: AutomationTarget::TrackVolume,
                 name: "Volume".into(),
@@ -175,15 +185,17 @@ impl Session {
                 kind: ParamKind::Gain,
                 unit: "dB",
             });
-            out.push(AutomationParam {
-                target: AutomationTarget::TrackPan,
-                name: "Pan".into(),
-                min: -1.0,
-                max: 1.0,
-                default: 0.0,
-                kind: ParamKind::Pan,
-                unit: "",
-            });
+            if !vca {
+                out.push(AutomationParam {
+                    target: AutomationTarget::TrackPan,
+                    name: "Pan".into(),
+                    min: -1.0,
+                    max: 1.0,
+                    default: 0.0,
+                    kind: ParamKind::Pan,
+                    unit: "",
+                });
+            }
             out.push(AutomationParam {
                 target: AutomationTarget::TrackMute,
                 name: "Mute".into(),
@@ -482,6 +494,19 @@ impl Session {
             Command::SetSendLevel { track, send, db } => {
                 (*track, AutomationTarget::SendLevel(*send), *db as f64)
             }
+            Command::SetPluginParameter {
+                track,
+                plugin,
+                parameter,
+                value: Some(v),
+            } => (
+                *track,
+                AutomationTarget::PluginParameter {
+                    plugin: *plugin,
+                    parameter: *parameter,
+                },
+                *v,
+            ),
             _ => return None,
         };
         Some((track, target, value))
@@ -490,13 +515,30 @@ impl Session {
     /// Called before every edit: record a point if the edit moves a control
     /// whose lane is being (or should start being) written.
     pub(crate) fn capture_automation(&mut self, cmd: &Command) {
-        if !self.transport.playing {
-            return;
-        }
         let Some((track, target, value)) = self.write_target(cmd) else {
             return;
         };
-        let Some(lane) = self
+        let written = self.write_point(track, target, value);
+        // A click (mute toggle) is not a gesture: Touch ends right away.
+        if let Some((_, AutomationMode::Touch)) = written
+            && target == AutomationTarget::TrackMute
+        {
+            self.commit_writes(|_| true);
+        }
+    }
+
+    /// Record `value` for `target` now if its lane writes (playing, mode
+    /// Touch/Latch/Write); returns the lane and its mode.
+    fn write_point(
+        &mut self,
+        track: TrackId,
+        target: AutomationTarget,
+        value: f64,
+    ) -> Option<(AutomationLaneId, AutomationMode)> {
+        if !self.transport.playing {
+            return None;
+        }
+        let lane = self
             .project
             .track(track)
             .and_then(|t| t.automation.lane(target))
@@ -506,10 +548,7 @@ impl Session {
                     AutomationMode::Touch | AutomationMode::Latch | AutomationMode::Write
                 )
             })
-            .map(|l| (l.id, l.mode))
-        else {
-            return;
-        };
+            .map(|l| (l.id, l.mode))?;
         let now = self.playhead();
         let started = !self.automation_writer.writing.contains_key(&lane.0);
         let shape = if target == AutomationTarget::TrackMute {
@@ -535,9 +574,64 @@ impl Session {
         if started {
             self.update_suspended();
         }
-        // A click (mute toggle) is not a gesture: Touch ends right away.
-        if target == AutomationTarget::TrackMute && lane.1 == AutomationMode::Touch {
-            self.commit_writes(|_| true);
+        Some(lane)
+    }
+
+    /// Parameter moves made in plugins' own editors: written like moves of
+    /// FaderFrame's controls (Touch ends with the plugin's gesture).
+    pub(crate) fn plugin_editor_edits(
+        &mut self,
+        edits: Vec<(
+            faderframe_core::PluginInstanceId,
+            faderframe_plugin_host::EditorEdit,
+        )>,
+    ) {
+        use faderframe_plugin_host::EditorEdit as E;
+        for (plugin, edit) in edits {
+            let Some(track) = self.plugin_slot(plugin).map(|(t, _)| t.id) else {
+                continue;
+            };
+            let parameter = match edit {
+                E::Begin(p) | E::End(p) | E::Value(p, _) => p,
+            };
+            let target = AutomationTarget::PluginParameter { plugin, parameter };
+            match edit {
+                E::Value(_, v) => {
+                    if let Some((lane, AutomationMode::Touch)) = self.write_point(track, target, v)
+                    {
+                        self.automation_writer
+                            .plugin_touch
+                            .insert(lane, std::time::Instant::now());
+                    }
+                }
+                E::End(_) => {
+                    let lane = self
+                        .project
+                        .track(track)
+                        .and_then(|t| t.automation.lane(target))
+                        .map(|l| l.id);
+                    if let Some(lane) = lane
+                        && self.automation_writer.plugin_touch.remove(&lane).is_some()
+                    {
+                        self.commit_lanes(vec![lane]);
+                    }
+                }
+                E::Begin(_) => {}
+            }
+        }
+        // Plugins without gesture events: Touch ends after a pause.
+        let idle: Vec<AutomationLaneId> = self
+            .automation_writer
+            .plugin_touch
+            .iter()
+            .filter(|(_, t)| t.elapsed() >= PLUGIN_TOUCH_IDLE)
+            .map(|(id, _)| *id)
+            .collect();
+        if !idle.is_empty() {
+            for id in &idle {
+                self.automation_writer.plugin_touch.remove(id);
+            }
+            self.commit_lanes(idle);
         }
     }
 
@@ -603,6 +697,11 @@ impl Session {
             .filter(|(_, s)| which(s))
             .map(|(id, _)| *id)
             .collect();
+        self.commit_lanes(ids);
+    }
+
+    /// Stop writing these lanes and store what was written (one undo step).
+    fn commit_lanes(&mut self, ids: Vec<AutomationLaneId>) {
         if ids.is_empty() {
             return;
         }

@@ -458,7 +458,8 @@ fn fill_context(c: &mut ProcessContext, t: &faderframe_transport::TransportInfo,
         c.cycleStartMusic = q(r.start);
         c.cycleEndMusic = q(r.end);
     }
-    c.state = state;
+    // Constant types differ between platforms' bindings.
+    c.state = state as _;
     c.sampleRate = t.sample_rate;
     c.projectTimeSamples = t.sample_position;
     c.continousTimeSamples = cont;
@@ -469,11 +470,11 @@ fn fill_context(c: &mut ProcessContext, t: &faderframe_transport::TransportInfo,
     c.timeSigDenominator = t.time_signature.denominator as i32;
 }
 
-fn note_event(offset: i32, kind: u32, set: impl FnOnce(&mut Event)) -> Event {
+fn note_event(offset: i32, kind: u16, set: impl FnOnce(&mut Event)) -> Event {
     let mut e = blank_event();
     e.busIndex = 0;
     e.sampleOffset = offset;
-    e.r#type = kind as u16;
+    e.r#type = kind;
     set(&mut e);
     e
 }
@@ -498,7 +499,7 @@ impl Active {
                     key,
                     velocity,
                 } if velocity > 0 => {
-                    self.in_events.push(note_event(t, kNoteOnEvent, |e| {
+                    self.in_events.push(note_event(t, kNoteOnEvent as u16, |e| {
                         e.__field0.noteOn = NoteOnEvent {
                             channel: channel as i16,
                             pitch: key as i16,
@@ -515,29 +516,31 @@ impl Active {
                         MidiEvent::NoteOff { velocity, .. } => velocity,
                         _ => 64,
                     };
-                    self.in_events.push(note_event(t, kNoteOffEvent, |e| {
-                        e.__field0.noteOff = NoteOffEvent {
-                            channel: channel as i16,
-                            pitch: key as i16,
-                            velocity: velocity as f32 / 127.0,
-                            noteId: -1,
-                            tuning: 0.0,
-                        }
-                    }));
+                    self.in_events
+                        .push(note_event(t, kNoteOffEvent as u16, |e| {
+                            e.__field0.noteOff = NoteOffEvent {
+                                channel: channel as i16,
+                                pitch: key as i16,
+                                velocity: velocity as f32 / 127.0,
+                                noteId: -1,
+                                tuning: 0.0,
+                            }
+                        }));
                 }
                 MidiEvent::PolyPressure {
                     channel,
                     key,
                     pressure,
                 } => {
-                    self.in_events.push(note_event(t, kPolyPressureEvent, |e| {
-                        e.__field0.polyPressure = PolyPressureEvent {
-                            channel: channel as i16,
-                            pitch: key as i16,
-                            pressure: pressure as f32 / 127.0,
-                            noteId: -1,
-                        }
-                    }));
+                    self.in_events
+                        .push(note_event(t, kPolyPressureEvent as u16, |e| {
+                            e.__field0.polyPressure = PolyPressureEvent {
+                                channel: channel as i16,
+                                pitch: key as i16,
+                                pressure: pressure as f32 / 127.0,
+                                noteId: -1,
+                            }
+                        }));
                 }
                 MidiEvent::ControlChange {
                     channel,
@@ -591,11 +594,12 @@ impl Active {
             self.midi_in(io, last);
         }
 
-        // Audio: the main input into bus 0, other buses silent.
+        // Audio: graph input `b` into bus `b` (the main input, then the
+        // sidechain when connected), other buses silent.
         for (b, bus) in self.inputs.bufs.iter_mut().enumerate() {
             for (c, ch) in bus.iter_mut().enumerate() {
-                match io.audio_in.first() {
-                    Some(inp) if b == 0 && inp.num_channels() > 0 => {
+                match io.audio_in.get(b) {
+                    Some(inp) if inp.num_channels() > 0 => {
                         let s = inp.channel(c.min(inp.num_channels() - 1));
                         ch[..n].copy_from_slice(&s[..n]);
                     }
@@ -659,7 +663,7 @@ impl Active {
                 // SAFETY: the union member matches the event type.
                 let event = unsafe {
                     match e.r#type as u32 {
-                        t if t == kNoteOnEvent => {
+                        t if t == kNoteOnEvent as u32 => {
                             let n = e.__field0.noteOn;
                             MidiEvent::NoteOn {
                                 channel: (n.channel & 15) as u8,
@@ -667,7 +671,7 @@ impl Active {
                                 velocity: (n.velocity * 127.0).round().clamp(1.0, 127.0) as u8,
                             }
                         }
-                        t if t == kNoteOffEvent => {
+                        t if t == kNoteOffEvent as u32 => {
                             let n = e.__field0.noteOff;
                             MidiEvent::NoteOff {
                                 channel: (n.channel & 15) as u8,

@@ -109,6 +109,8 @@ pub struct Vst3Instance {
     needs_restart: bool,
     /// Activations so far (see `PluginInstance::activation`).
     activations: u64,
+    /// Editor gestures and values for automation writing.
+    editor_edits: Vec<faderframe_plugin_host::EditorEdit>,
     view: Option<ComPtr<IPlugView>>,
     view_open: bool,
     /// Editor edits forwarded since the last poll (for "dirty").
@@ -174,6 +176,7 @@ impl Vst3Instance {
             tail: TailLength::None,
             needs_restart: false,
             activations: 0,
+            editor_edits: Vec::new(),
             view: None,
             view_open: false,
             edited: false,
@@ -310,7 +313,9 @@ impl Vst3Instance {
         any.then_some(map)
     }
 
-    fn set_bus_states(&self) -> (Vec<u16>, Vec<u16>, bool) {
+    /// Activate the main buses, the default-active ones and, with a
+    /// sidechain, the second input bus.
+    fn set_bus_states(&self, sidechain: bool) -> (Vec<u16>, Vec<u16>, bool) {
         use vst3::Steinberg::Vst::BusDirections_::{kInput, kOutput};
         use vst3::Steinberg::Vst::BusInfo_::BusFlags_::kDefaultActive;
         use vst3::Steinberg::Vst::BusTypes_::kMain;
@@ -324,8 +329,11 @@ impl Vst3Instance {
             for (dir, count) in [(kInput, inputs.len()), (kOutput, outputs.len())] {
                 for i in 0..count as i32 {
                     let mut info: BusInfo = std::mem::zeroed();
+                    let side = sidechain && dir == kInput && i == 1;
                     let active = c.getBusInfo(kAudio as i32, dir as i32, i, &mut info) == kResultOk
-                        && (info.busType == kMain as i32 || info.flags & kDefaultActive != 0);
+                        && (info.busType == kMain as i32
+                            || info.flags as u32 & kDefaultActive as u32 != 0
+                            || side);
                     c.activateBus(kAudio as i32, dir as i32, i, active as u8);
                 }
             }
@@ -458,6 +466,18 @@ impl FfInstance for Vst3Instance {
         self.latency
     }
 
+    fn preset_files(&self) -> Vec<std::path::PathBuf> {
+        crate::presets::files(&self.scanned)
+    }
+
+    fn state_from_preset_file(&self, data: &[u8]) -> Result<Vec<u8>, PluginError> {
+        crate::presets::state(data, &self.scanned.id)
+    }
+
+    fn take_editor_edits(&mut self) -> Vec<faderframe_plugin_host::EditorEdit> {
+        std::mem::take(&mut self.editor_edits)
+    }
+
     fn activation(&self) -> u64 {
         self.activations
     }
@@ -545,11 +565,18 @@ impl FfInstance for Vst3Instance {
                 poll.restart = true;
             }
         }
-        // Editor edits reach the processor.
+        // Editor edits reach the processor (and automation writing).
+        use faderframe_plugin_host::EditorEdit as E;
         for e in self.state.take_edits() {
-            if let Edit::Perform(id, n) = e {
-                self.send(id, n);
-                self.edited = true;
+            match e {
+                Edit::Perform(id, n) => {
+                    self.send(id, n);
+                    self.edited = true;
+                    let plain = self.map.plain(id, n);
+                    self.editor_edits.push(E::Value(ParameterId(id), plain));
+                }
+                Edit::Begin(id) => self.editor_edits.push(E::Begin(ParameterId(id))),
+                Edit::End(id) => self.editor_edits.push(E::End(ParameterId(id))),
             }
         }
         // Values the processor changed go to the controller.
@@ -626,7 +653,7 @@ impl FfInstance for Vst3Instance {
                     return Err(fail("32-bit float processing is not supported"));
                 }
             }
-            let (inputs, outputs, events) = self.set_bus_states();
+            let (inputs, outputs, events) = self.set_bus_states(config.sidechain);
             let mut setup = ProcessSetup {
                 processMode: kRealtime as i32,
                 symbolicSampleSize: kSample32 as i32,

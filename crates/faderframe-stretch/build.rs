@@ -5,6 +5,12 @@ fn main() {
     println!("cargo::rerun-if-changed=src/shim.cpp");
     println!("cargo::rerun-if-changed=src/count_new.cpp");
     println!("cargo::rerun-if-changed=vendor");
+    println!("cargo::rerun-if-env-changed=FADERFRAME_CHECK_ONLY");
+    // `cargo check` for a target without a C++ toolchain (cross-checking
+    // the Windows and macOS code paths): nothing is linked, so skip it.
+    if std::env::var_os("FADERFRAME_CHECK_ONLY").is_some() {
+        return;
+    }
     cc::Build::new()
         .cpp(true)
         .std("c++14")

@@ -115,6 +115,7 @@ pub fn demo_project(sample_rate: u32) -> Project {
         bypass: false,
         parameters: Vec::new(),
         state: None,
+        sidechain: None,
     });
 
     for (t, level) in [(&mut pluck, -10.0), (&mut pad, -14.0), (&mut keys, -8.0)] {
@@ -138,6 +139,7 @@ pub fn demo_project(sample_rate: u32) -> Project {
         bypass: false,
         parameters: Vec::new(),
         state: None,
+        sidechain: None,
     });
     echo_track.volume_db = -4.0;
 

@@ -9,10 +9,14 @@
 //! side ([`Vst3Processor`]) fills preallocated parameter-change and event
 //! lists; nothing allocates per block, and any (single) thread may run it.
 #![deny(unsafe_op_in_unsafe_fn)]
+// The bindings' constant types differ between platforms (u32 on Linux,
+// i32 on Windows): casts that are no-ops here are needed there.
+#![allow(clippy::unnecessary_cast)]
 
 pub mod com;
 mod instance;
 pub mod module;
+mod presets;
 mod processor;
 pub mod scan;
 pub mod util;

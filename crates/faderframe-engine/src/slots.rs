@@ -1,7 +1,8 @@
 //! Stable parameter/meter slot assignment (control thread).
 
-use faderframe_core::{SendId, TrackId};
-use faderframe_project::{Project, TrackKind};
+use faderframe_automation::AutomationTarget;
+use faderframe_core::{AutomationLaneId, SendId, TrackId};
+use faderframe_project::Project;
 use faderframe_realtime::{MeterRange, ParamSlot, ParamTable, SlotAllocator};
 use std::collections::{HashMap, HashSet};
 
@@ -16,12 +17,15 @@ pub struct StripSlots {
     pub mute: ParamSlot,
     /// 1.0 = polarity inverted.
     pub phase: ParamSlot,
-    /// 1.0 = silenced because other tracks are soloed (kept apart from
-    /// `mute` so mute automation never overrides solo).
+    /// 1.0 = silenced because other tracks are soloed or a VCA is muted
+    /// (kept apart from `mute` so mute automation never overrides them).
     pub solo_mute: ParamSlot,
+    /// Linear gain of the track's VCAs whose faders are not automated
+    /// (automated ones come with the timeline snapshot).
+    pub vca: ParamSlot,
 }
 
-const STRIP_SLOT_COUNT: u32 = 5;
+const STRIP_SLOT_COUNT: u32 = 6;
 /// Meter channels reserved per track (stereo).
 const METER_CHANNELS: u16 = 2;
 
@@ -82,6 +86,7 @@ impl SlotRegistry {
             mute: ParamSlot(base + 2),
             phase: ParamSlot(base + 3),
             solo_mute: ParamSlot(base + 4),
+            vca: ParamSlot(base + 5),
         };
         self.strips.insert(track, s);
         Ok(s)
@@ -175,6 +180,7 @@ impl SlotRegistry {
         project: &Project,
         table: &ParamTable,
         midi_live: &HashSet<TrackId>,
+        suspended: &HashSet<AutomationLaneId>,
     ) -> Result<(), SlotsExhausted> {
         let solo = project.solo_audible();
         for t in &project.tracks {
@@ -182,13 +188,29 @@ impl SlotRegistry {
                 let slot = self.midi_live(t.id)?;
                 table.set(slot, if midi_live.contains(&t.id) { 1.0 } else { 0.0 });
             }
-            if t.kind == TrackKind::Midi {
+            if !t.kind.has_audio() {
                 continue;
             }
             let s = self.strip(t.id)?;
             table.set(s.volume, faderframe_core::db_to_gain(t.volume_db));
             table.set(s.pan, t.pan);
-            let solo_muted = solo.as_ref().is_some_and(|set| !set.contains(&t.id));
+            // VCAs: static faders and mutes here, automated ones in the
+            // snapshot.
+            let (mut vca_gain, mut vca_muted) = (1.0f32, false);
+            for v in project.vca_chain(t) {
+                let lane = |target: AutomationTarget| {
+                    v.automation
+                        .lanes
+                        .iter()
+                        .any(|l| l.target == target && crate::snapshot::drives(l, suspended))
+                };
+                if !lane(AutomationTarget::TrackVolume) {
+                    vca_gain *= faderframe_core::db_to_gain(v.volume_db);
+                }
+                vca_muted |= v.mute && !lane(AutomationTarget::TrackMute);
+            }
+            table.set(s.vca, vca_gain);
+            let solo_muted = vca_muted || solo.as_ref().is_some_and(|set| !set.contains(&t.id));
             table.set(s.mute, if t.mute { 1.0 } else { 0.0 });
             table.set(s.solo_mute, if solo_muted { 1.0 } else { 0.0 });
             table.set(s.phase, if t.phase_invert { 1.0 } else { 0.0 });

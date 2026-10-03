@@ -344,6 +344,10 @@ pub struct TrackAutomation {
     pub volume: Option<SampleLane>,
     pub pan: Option<SampleLane>,
     pub mute: Option<SampleLane>,
+    /// Automated faders (dB) of the VCAs scaling the track.
+    pub vca_volume: Vec<SampleLane>,
+    /// Automated mutes of the VCAs scaling the track.
+    pub vca_mute: Vec<SampleLane>,
     pub sends: Vec<(SendId, SampleLane)>,
     pub params: Vec<(PluginInstanceId, ParameterId, SampleLane)>,
     pub bypass: Vec<(PluginInstanceId, SampleLane)>,
@@ -354,6 +358,8 @@ impl TrackAutomation {
         self.volume.is_none()
             && self.pan.is_none()
             && self.mute.is_none()
+            && self.vca_volume.is_empty()
+            && self.vca_mute.is_empty()
             && self.sends.is_empty()
             && self.params.is_empty()
             && self.bypass.is_empty()
@@ -382,6 +388,14 @@ impl TrackAutomation {
             .filter(move |(p, _, _)| *p == plugin)
             .map(|(_, id, l)| (*id, l))
     }
+}
+
+/// Does the lane drive its target (rather than the static value)?
+pub(crate) fn drives(
+    lane: &faderframe_automation::AutomationLane,
+    suspended: &HashSet<faderframe_core::AutomationLaneId>,
+) -> bool {
+    lane.mode != AutomationMode::Off && !lane.curve.is_empty() && !suspended.contains(&lane.id)
 }
 
 #[derive(Debug)]
@@ -498,8 +512,31 @@ impl TimelineSnapshot {
         for (&track, &cfg) in &mpe_of {
             lanes.entry(track).or_default().mpe = Some(cfg);
         }
+        // Frozen tracks play their rendered audio instead of their clips.
+        let frozen: HashSet<TrackId> = project
+            .tracks
+            .iter()
+            .filter(|t| t.freeze.is_some())
+            .map(|t| t.id)
+            .collect();
+        for t in project.tracks.iter() {
+            let Some(f) = &t.freeze else { continue };
+            let piece = AudioPiece {
+                source: f.source,
+                source_offset: 0,
+                rel_start: 0,
+                length: f.length,
+                gain_db: 0.0,
+                fade_in: (0, FadeShape::Linear, 0),
+                fade_out: (0, FadeShape::Linear, 0),
+                reversed: false,
+            };
+            if let Some(r) = piece.region(tl.to_samples(f.start, sr), sources, sr, project_rate) {
+                lanes.entry(t.id).or_default().audio.push(r);
+            }
+        }
         for clip in project.clips.values() {
-            if clip.muted {
+            if clip.muted || frozen.contains(&clip.track) {
                 continue;
             }
             let start = tl.to_samples(clip.start, sr);
@@ -625,11 +662,20 @@ impl TimelineSnapshot {
         let mut automation: Vec<(TrackId, TrackAutomation)> = Vec::new();
         for t in &project.tracks {
             let mut a = TrackAutomation::default();
+            if t.kind.has_audio() {
+                for v in project.vca_chain(t) {
+                    for lane in v.automation.lanes.iter().filter(|l| drives(l, suspended)) {
+                        let rt = SampleLane::from_curve(&lane.curve, |m| tl.to_samples(m, sr));
+                        match lane.target {
+                            AutomationTarget::TrackVolume => a.vca_volume.push(rt),
+                            AutomationTarget::TrackMute => a.vca_mute.push(rt),
+                            _ => {}
+                        }
+                    }
+                }
+            }
             for lane in &t.automation.lanes {
-                if lane.mode == AutomationMode::Off
-                    || lane.curve.is_empty()
-                    || suspended.contains(&lane.id)
-                {
+                if !drives(lane, suspended) {
                     continue;
                 }
                 let rt = SampleLane::from_curve(&lane.curve, |m| tl.to_samples(m, sr));

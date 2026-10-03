@@ -12,6 +12,7 @@ fn config() -> ProcessConfig {
     ProcessConfig {
         sample_rate: SR,
         max_block_size: BLOCK as u32,
+        sidechain: false,
     }
 }
 
@@ -57,7 +58,7 @@ impl Rig {
 fn registry_lists_and_instantiates_builtins() {
     let reg = PluginRegistry::with_builtins();
     let list = reg.scan();
-    assert_eq!(list.len(), 4);
+    assert_eq!(list.len(), 5);
     assert!(
         list.iter()
             .any(|d| d.category == PluginCategory::Instrument)

@@ -15,13 +15,16 @@ that keep it that way.
 ```text
 faderframe-app            binary: CLI parsing, logging, starts the GTK app
   └─ faderframe-ui        GTK 4 shell: windows, menus, dialogs, docking, canvas host
-       ├─ faderframe-view-arranger / -view-mixer / -view-pianoroll   (GTK-free views)
+       ├─ faderframe-view-arranger / -mixer / -pianoroll / -performance / -tools   (GTK-free views)
        │    └─ faderframe-ui-canvas   Painter trait, events, CanvasView, theme, console controls
-       ├─ faderframe-audio-jack       JACK backend (JACK2 / pipewire-jack)
+       ├─ faderframe-audio-pipewire   native PipeWire backend (pw_filter, Linux)
+       ├─ faderframe-audio-jack       JACK backend (JACK2 / pipewire-jack, Linux)
+       ├─ faderframe-audio-cpal       system backend through cpal: WASAPI, CoreAudio, ALSA
        ├─ faderframe-plugin-clap      CLAP host (clack-host): scan helper, instances, editors
        ├─ faderframe-plugin-vst3      VST3 host (vst3 bindings): modules, scan helper, instances, editors
-       ├─ faderframe-midi-io          MIDI input devices (midir → ALSA sequencer), virtual inputs
+       ├─ faderframe-midi-io          MIDI devices (midir: ALSA sequencer, CoreMIDI, WinMM), virtual ports
        └─ faderframe-session          control-world hub (GTK-free)
+            ├─ faderframe-analysis     loudness (EBU R128), true peak, levels, phase, FFT spectrum
             ├─ faderframe-engine       project→graph compiler, RT processor, controller, offline render
             │    ├─ faderframe-audio-graph   generic DSP graph: ports, edges, PDC, compile, executor
             │    ├─ faderframe-plugin-host   plugin abstraction + built-in plugins
@@ -40,16 +43,15 @@ faderframe-bench          headless engine benchmark (callback percentiles)
 ```
 
 Dependencies only point downwards. **No crate below `faderframe-ui` depends
-on GTK**, and no crate except `faderframe-audio-jack` depends on JACK. The
-engine, session and views build and run headless (tests, CI, offline
-rendering, the benchmark).
+on GTK**, and only the backend crates name an audio API (JACK, PipeWire,
+cpal). The engine, session and views build and run headless (tests, CI,
+offline rendering, the benchmark).
 
 `faderframe-plugin-clap` and `faderframe-plugin-vst3` implement the
 `faderframe-plugin-host` traits and are registered by the shell
 (`set_default_registry`), so the engine never names a plugin format.
-Planned crates (not created yet, to avoid empty boilerplate):
-PipeWire-native/ALSA/WASAPI/ASIO/CoreAudio backends, and an optional wgpu
-painter for dense views.
+Planned crates (not created yet, to avoid empty boilerplate): an ASIO
+backend, Audio Unit hosting, and an optional wgpu painter for dense views.
 
 ## 2. Control world vs realtime world
 
@@ -96,16 +98,21 @@ counting global allocator and asserts zero allocations and deallocations.
 persistent data:
 
 * `tracks: Vec<Track>` in display order — kinds `Audio`, `Instrument`,
-  `Midi`, `Bus`, `Aux`, `Master` (exactly one) share one structure: fader,
-  pan, mute/solo/arm/monitor, inserts, instrument slot, sends
-  (pre-FX / pre-fader / post-fader), input and output routing, automation,
-  and an explicit `ChannelLayout` (mono, stereo, discrete N).
+  `Midi`, `Bus`, `Aux`, `Vca`, `Master` (exactly one) share one structure:
+  fader, pan, mute/solo/arm/monitor, inserts (each with an optional
+  sidechain source), instrument slot, sends (pre-FX / pre-fader /
+  post-fader), input and output routing, automation, the VCA and group it
+  follows, a freeze (rendered audio) and an explicit `ChannelLayout` (mono,
+  stereo, discrete N).
+* `groups` — `TrackGroup`s (name, colour, active, `GroupLink`: volume,
+  mute, solo, record arm, selection); members name theirs in `Track::group`.
 * `clips: BTreeMap<ClipId, Clip>` — audio clips (source, offset, length in
   project-rate frames, gain, fades, stretch settings, reverse) and MIDI clips
   (length + notes relative to the clip). Clip starts are `MusicalTime`.
 * `sources` — files or deterministic generators (the demo session).
 * `timeline` (tempo map with constant and linearly ramped segments, meter
-  map), markers, loop range, `IdAllocator`.
+  map), markers, arrangement `sections` (named, coloured ranges: Intro,
+  Verse, …), loop and punch ranges, MIDI mappings, `IdAllocator`.
 
 Routing validity is checked when a command is applied: targets must exist
 and be summing tracks (instrument tracks for MIDI tracks), and
@@ -114,7 +121,13 @@ and be summing tracks (instrument tracks for MIDI tracks), and
 
 Solo is solo-in-place: a soloed track keeps everything it feeds and
 everything that feeds it audible (`Project::solo_audible`), and the result is
-written into per-strip mute slots.
+written into per-strip mute slots. A soloed VCA solos the tracks it scales.
+
+**VCAs** are tracks without audio: a member's gain is its own fader times
+its VCA's (and that VCA's VCA, `Project::vca_chain`); a muted VCA mutes its
+members. `Project::would_cycle` also follows sidechain edges
+(`dependency_edges`), so a plugin can't be keyed by a track that depends on
+it, and `SetTrackVca` refuses VCA loops.
 
 ### Undo/redo
 
@@ -222,16 +235,32 @@ Preferences → Audio → Processing threads, `--threads`).
 
 ```text
 sources ──► TrackInput ──► insert₁ … insertₙ ──► ChannelStrip ──out0 (post)──► destination TrackInput / device out
-(clips,      (sum point,                          │      └─out1 (pre)
- monitor,     pre-FX tap)                         └─► SendNode (pre-FX / pre-fader / post-fader) ──► aux / bus
- instrument)
+(clips,      (sum point,         │  ▲             │      └─out1 (pre)
+ monitor,     pre-FX tap)        │  └ sidechain   └─► SendNode (pre-FX / pre-fader / post-fader) ──► aux / bus
+ instrument)                     └──► (post-insert tap) ──► sidechain input of a plugin on another track
 MIDI clip player ──events──► instrument plugin       MIDI tracks ──events──► target instrument
 ```
 
 The channel strip implements polarity, mute, the fader (dB via a table-driven
 console `FaderLaw`, unity at 75 % travel, "-inf" stored as −144 dB) and
 pan: constant-power −3 dB for mono sources, 0 dB balance for stereo sources
-(`faderframe_core::pan`). All gain changes are ramped per block.
+(`faderframe_core::pan`). All gain changes are ramped per block. A strip
+also applies its VCAs: the static gain of unautomated VCAs comes in a
+parameter slot, automated VCA faders and mutes as lanes in the timeline
+snapshot (so VCA automation is sample-accurate on every member). The strip
+of the analysed track (the Tools view) copies its post-fader output into a
+`ScopeRing`.
+
+* **Sidechains.** A `PluginSlot::sidechain` names a source track; a plugin
+  with a second audio input gets the source's signal *after its inserts and
+  before its fader, mute and solo* (a muted "ghost kick" still keys) as
+  graph input 1 — PDC aligns it like any edge. CLAP ports and VST3 buses
+  map graph inputs by index; VST3 activates its second input bus only when
+  keyed (`ProcessConfig::sidechain`). The built-in compressor detects on
+  the sidechain when connected, else on its input.
+* **Frozen tracks** (`Track::freeze`) skip their MIDI, instrument and insert
+  nodes: a clip player plays the rendered file into the strip, and the
+  plugin host unloads their plugins (state stays in the slots).
 
 ## 6. Transport and timing
 
@@ -242,6 +271,14 @@ for 44.1/48/88.2/96/176.4/192 kHz × 32…4096 and odd 441-frame buffers in
 `tests/formats.rs`). Each block gets a `TransportInfo` (position, tempo,
 meter, bar, loop, play/record state) for processors and plugins, plus a
 `discontinuity` flag on stop/locate/wrap so note generators release notes.
+
+**Scrubbing** (`TransportCommand::Scrub`) plays a short snippet (~70 ms)
+from a position, faded in and out (1/16 of its length at each end), and
+then returns there. Further scrub commands extend the snippet while the
+pointer follows on, or fade it out and jump; while playing normally a scrub
+only locates. The published snapshot reports scrubbing apart from playing,
+so the control side treats it as stopped (no automation writing, follow
+scrolling or MIDI clock).
 
 ## 7. MIDI and instruments
 
@@ -254,7 +291,8 @@ handles RPN 0 bend range, the MPE zone message, pressure and CC 74).
 ### Live MIDI input (keyboards and controllers)
 
 * **Devices.** `faderframe-midi-io::MidiHub` connects every enabled input of
-  the ALSA sequencer (via `midir`; PipeWire's MIDI bridges appear there too)
+  the ALSA sequencer (via `midir`; PipeWire's MIDI bridges appear there too;
+  CoreMIDI and WinMM on macOS and Windows)
   and adds virtual inputs (the built-in "FaderFrame Keyboard" used by
   tests, scripting and future on-screen keys). Ports are identified by name
   without the sequencer's client:port numbers, so a device keeps its routing
@@ -366,6 +404,14 @@ handles RPN 0 bend range, the MPE zone message, pressure and CC 74).
   ppqn, Start/Continue with Song Position, Stop, re-sync on loop wraps) is
   generated on the audio thread for the outputs selected in preferences.
 
+* **Standard MIDI Files** (`session::midifile`, parsed and written with
+  `midly`). Import makes an instrument track per MIDI track (format 0 files
+  are split per channel, channel 10 as drums) with notes, controllers
+  (CC, pitch bend, channel pressure) and SysEx; into an empty project it
+  also takes tempo and meter changes — all one undo step. Export writes
+  format 1 at 960 PPQ: a conductor track (tempo, meter) and one track per
+  instrument/MIDI track, or only the selected MIDI clips.
+
 ## 8. Plugins
 
 `faderframe_plugin_host` mirrors how CLAP/VST3 split a plugin:
@@ -377,9 +423,28 @@ handles RPN 0 bend range, the MPE zone message, pressure and CC 74).
 
 Neither trait assumes the plugin is in-process; a sandboxed plugin is a proxy
 pair speaking IPC with shared-memory audio. `PluginHost` (engine) owns one
-instance per slot. Built-ins: synth, echo, gain, latency probe (used to test
-PDC end to end). Failed plugins are bypassed and flagged; missing formats
-pass audio through with a warning.
+instance per slot. Built-ins: synth, echo, compressor (with a sidechain
+input), gain, latency probe (used to test PDC end to end). Failed plugins
+are bypassed and flagged; missing formats pass audio through with a
+warning.
+
+* **Automation from plugin editors.** Formats report the user's moves in a
+  plugin's own GUI as `EditorEdit`s (begin, value, end): CLAP from the
+  processor's output events (gesture begin/end and parameter values, through
+  a wait-free queue), VST3 from `beginEdit`/`performEdit`/`endEdit`. The
+  session records them like control moves: Touch ends with the gesture end
+  (or after 750 ms of rest for plugins that send none), Latch and Write when
+  playback stops.
+* **Presets.** User presets are `.ffpreset` files (JSON: plugin reference,
+  state, explicit parameter values) under
+  `$XDG_DATA_HOME/faderframe/presets/<format>/<id>/`; VST3 factory presets
+  (`.vstpreset` from the standard folders, matched by class id) are listed
+  too and loaded into the plugin's state. Loading is
+  `Command::SetPluginState` — one undo step; the engine follows a changed
+  slot state.
+* **Inserts** move and copy between slots and tracks
+  (`Action::MovePlugin`/`CopyPlugin`: a copy gets a new id and the
+  original's captured state).
 
 A plugin node's key includes its latency, bypass and the instance's
 activation count (`PluginInstance::activation`): a restart (requested by
@@ -443,7 +508,8 @@ editor opening, instruments playing live MIDI as instrument and insert).
   registered through `posix-fd` become glib fd sources and `timer`
   registrations glib timeouts, reconciled every UI tick.
 * **Generic editor.** Every plugin (built-ins, plugins without a GUI, no X
-  server) has a GTK parameter window: filter, module sections from CLAP's
+  server, Windows and macOS for now) has a GTK parameter window with a
+  presets menu: filter, module sections from CLAP's
   "Module/Name" paths, the plugin's own value text (`value_to_text`),
   sliders and switches, double-click to reset, live follow of automation
   and GUI changes, bypass, and a button to the plugin's own GUI. On Wayland
@@ -454,9 +520,11 @@ editor opening, instruments playing live MIDI as instrument and insert).
 Bindings come from the `vst3` crate (generated from the MIT-licensed VST 3
 SDK headers); FaderFrame implements the host side itself.
 
-* **Modules.** A bundle's `Contents/<arch>-linux/*.so` is opened once per
-  process (`RTLD_NOW | RTLD_LOCAL`, `ModuleEntry` with the dlopen handle)
-  and never unloaded — plugins keep static state and threads that do not
+* **Modules.** A bundle's binary (`Contents/<arch>-linux/*.so`,
+  `Contents/<arch>-win/*.vst3`, `Contents/MacOS/*`) is opened once per
+  process — Linux: `RTLD_NOW | RTLD_LOCAL` and `ModuleEntry` with the dlopen
+  handle; Windows: the optional `InitDll`; macOS: `bundleEntry` with a
+  `CFBundleRef` — and never unloaded — plugins keep static state and threads that do not
   survive `dlclose`, and every engine shares the factory. Scanning uses
   `faderframe --scan-vst3 <bundle>` like CLAP (`vst3-scan.json`): classes
   of category "Audio Module Class" are described via `IPluginFactory2`,
@@ -509,12 +577,31 @@ SDK headers); FaderFrame implements the host side itself.
 allocation in their process callbacks. Status (xruns, rate, buffer size,
 shutdown) is shared through lock-free `StreamMonitor` atomics.
 
-* `JackBackend` — JACK2 or pipewire-jack, libjack loaded at runtime. The
-  server owns rate and buffer size; FaderFrame follows (the session rebuilds
-  the engine on a rate change) and can request a buffer size live.
-* `DummyBackend` — timer-driven, silent; used when no audio server exists
+* `PipeWireBackend` (Linux) — one DSP node (`pw_filter`) with a mono float
+  port per channel; inputs and outputs are processed in the same cycle on
+  PipeWire's realtime data thread, so recording stays sample-aligned. A
+  control thread runs a PipeWire main loop and owns every PipeWire object
+  (the stream handle only holds that thread and a channel). The node asks
+  for the requested rate and quantum (`node.rate`, `node.latency`), is
+  scheduled even when unlinked (`node.always-process`), and the callback
+  re-prepares the engine when the graph's rate or quantum changes.
+  Auto-connect links the ports to the highest-priority sink and source,
+  found through the registry. Raw `pw_filter` calls go through
+  `pipewire-sys`; the rest uses pipewire-rs.
+* `JackBackend` (Linux) — JACK2 or pipewire-jack, libjack loaded at
+  runtime. The server owns rate and buffer size; FaderFrame follows (the
+  session rebuilds the engine on a rate change) and can request a buffer
+  size live.
+* `CpalBackend` — the system API through cpal: WASAPI (Windows), CoreAudio
+  (macOS), ALSA (Linux). Playback drives the engine; capture arrives
+  through a lock-free ring (a few milliseconds of extra input latency);
+  `f32`, `i32` and `i16` devices. The streams live on a control thread, so
+  the stream handle is `Send` everywhere.
+* `DummyBackend` — timer-driven, silent; used when no audio device exists
   and in CI.
-* Planned: PipeWire native, ALSA, WASAPI/ASIO (Windows), CoreAudio (macOS).
+
+*Automatic* tries PipeWire, JACK, ALSA, then the dummy device on Linux, and
+the system API, then the dummy device elsewhere.
 
 ## 10. Session
 
@@ -526,6 +613,40 @@ ballistics, peak hold and clip latching on the UI side) and reacts to stream
 status (rate change, server shutdown). `render::start` runs offline bounces
 (master or stems, range, rate, channels, tail, normalise, dither) on a
 worker thread through the same engine path.
+
+### Freezing and bouncing
+
+Both render a track after its inserts and before its fader
+(`render::track_render_project`: a copy where the track is soloed at unity
+and centre into a plain master — mono tracks through a mono master, so no
+pan law applies — with a tail for reverbs) on a worker thread; the tick
+finishes the job. *Freeze* sets `Track::freeze` (the file, its start and
+length) in one undo step: the engine plays the file instead of clips,
+instrument and inserts, the plugins are unloaded, and edits of the frozen
+track's clips and plugins are refused until it is unfrozen. *Bounce to New
+Track* puts the file on a new audio track below and mutes the original.
+
+### Groups and multi-track edits
+
+`Session::edit` expands an edit of one track to the tracks that follow it
+(`group_edits`): members of its active group for the linked controls, and —
+for the user's own edits (`Action::Edit`), not mapped controllers or
+automation — the other selected tracks when the edited track is one of
+several selected. Levels, pan and sends to the same destination move
+relatively (inside a gesture from where each track started, so balances
+survive pulling everything to −∞ and back); mute, solo, record arm,
+polarity, monitoring, colour, output and VCA assignment are set alike
+(invalid targets, such as feedback loops, are skipped). The edit and its
+followers are one `Batch`, one undo step; selecting a member selects its
+group when the group links selection.
+
+### Sample-level redraw
+
+The Pencil at sample-level zoom redraws audio samples (click repair). The
+redraw never touches the original: the source is copied in chunks with the
+drawn samples into a new float WAV in the media folder, and only that clip
+switches to it (`AddSource` + `SetClipContent`, one undo step). Other clips
+on the source keep the original.
 
 ### Media: import and disk streaming
 
@@ -714,6 +835,21 @@ the event loop. DAW work surfaces are **custom-rendered views**:
   (skins replace the theme, not the views). Track headers reuse the same
   controls.
 
+The arranger has **global lanes** under the ruler (shown or hidden from
+their titles): markers (double-click adds, drag moves, double-click
+renames, click locates), the arranger lane of sections (drag to create;
+move, resize, rename, recolour, loop or select a section's range), time
+signature changes (pick from a menu or type, per bar) and the tempo map
+(points dragged up/down for the tempo and sideways for the position, typed
+values, step or ramp to the next point). Marker and section edits are
+commands; tempo edits replace the timeline (`SetTimeline`), merged into one
+undo step per drag. The horizontal scroll position is an `f64`, so the
+arranger zooms down to single samples anywhere in a long project; there it
+draws the samples themselves and the Pencil redraws them. Track colours
+come from the palette or a colour chooser (click a track's colour stripe in
+the arranger or the colour bar in the mixer); the mixer shows each strip's
+group and VCA in a tag row once a project has any.
+
 The UI's frame tick (`AppState::tick`, every 16 ms) redraws every view
 when the session's revision changed during the tick — finished recordings,
 imports and analyses arrive there, not through a user action. Warnings and
@@ -766,8 +902,11 @@ full width under the header by `faderframe-ui`, wrapped into rows by
   Pencil, Zoom), grid value (`GridDivision` down to 1/256, triplet and
   dotted; `GridDivision::menu` is the shared menu), nudge value, Tab to
   Transients, Link Timeline and Edit Selection, Insertion Follows Playback,
-  transient display and sensitivity, warp view, counter units, and zoom
-  requests (a sequence number the arranger applies once).
+  Follow Playhead (scrolling while playing), transient display and
+  sensitivity, warp view, counter units, the shown global lanes, and zoom
+  requests (a sequence number the arranger applies once). The Scrubber
+  plays snippets of audio while dragging (see §6); the Pencil draws MIDI
+  clips on instrument tracks and redraws samples at sample-level zoom.
 * `Selection::range` is the edit selection (a time range on the selected
   tracks). Range operations — separate, trim, clear, copy/cut/paste, repeat,
   insert silence, nudge, Tab — and clip edits are `Batch` commands, one
@@ -805,7 +944,9 @@ full width under the header by `faderframe-ui`, wrapped into rows by
 `faderframe_workspace` models layouts independently of GTK: per window a tree
 of `Split`s and `TabGroup`s; named dock areas (`main`, `bottom`) persist when
 empty so detached views have a home; floating windows; geometry; presets
-(Recording, Editing, Mixing, MIDI, Mastering). `faderframe_ui::dock::realize`
+(Recording, Editing, Mixing, MIDI, Mastering — the bottom dock holds the
+mixer, Tools, piano roll, automation and performance views; Mastering opens
+on Tools). Views added after a layout was saved register on first use. `faderframe_ui::dock::realize`
 turns the active layout into `gtk::Paned` / `gtk::Notebook` /
 `gtk::ApplicationWindow`s. Every view has exactly one persistent host widget
 that is only re-parented, so detaching a view never copies state. Divider
@@ -822,6 +963,34 @@ the sum of deadlines (average load over any window) and the worst callback
 since last taken. `faderframe-bench` measures worst-case callback time for N
 tracks/buses/inserts/sends at any rate and block size (`--measure-nodes`
 includes the per-node timing cost).
+
+### Tools (mastering meters)
+
+The strip of the analysed track (the master unless another is chosen)
+copies its post-fader output into a `ScopeRing` (`faderframe-realtime`): an
+overwriting ring of `f32` bits in atomics — one writer, never waits; a
+reader that falls more than its capacity behind is told how many frames it
+lost. Every UI tick the session feeds what arrived to an `Analyzer`
+(`faderframe-analysis`, control side, tested against EBU Tech 3341/3342
+cases):
+
+* **Loudness** after ITU-R BS.1770-4 / EBU R128: K-weighting designed for
+  any rate, momentary (400 ms), short-term (3 s), gated integrated loudness
+  (absolute −70 LUFS, relative −10 LU), loudness range (EBU Tech 3342: 10th
+  to 95th percentile of gated short-term values), maximum momentary and
+  short-term values and true peak (4× oversampling, polyphase windowed
+  sinc). The measurement accumulates while playing; it restarts when
+  playback starts (optional) or on demand.
+* **Level**: sample peak with hold and 300 ms RMS per channel, in dBFS or on
+  a K-System scale (K-12/14/20).
+* **Phase**: correlation (−1 … +1, ~100 ms) and goniometer points.
+* **Spectrum**: Hann-windowed 8192-point FFT of the mid signal (own radix-2
+  FFT), 75 % overlap, fast attack/slow release, decaying peak hold, read out
+  on a log axis.
+
+The `Tools` view (F12; the Mastering workspace shows it in the bottom dock)
+draws them with a source picker, a loudness target (−14, −16, −23, −24, −9
+LUFS) and a short-term history.
 
 ### Performance meter
 
@@ -874,11 +1043,13 @@ for its editor.
 9. Channel layouts are explicit everywhere; nothing assumes stereo.
 10. IDs are persisted newtypes, allocated by the project's `IdAllocator`.
 11. `unsafe` is forbidden in every crate except `faderframe-realtime`
-    (documented mailbox, `TryCell`), `faderframe-audio-jack` (JACK trait
-    requirement), `faderframe-plugin-clap` (loading plugin libraries, window
-    handles for editors), `faderframe-plugin-vst3` (COM bindings, module
-    loading), `faderframe-stretch` (the C shim of the vendored
-    stretcher) and `faderframe-ui` (GObject subclassing macros).
+    (documented mailbox, `TryCell`, task cells, worker pool, denormals),
+    `faderframe-audio-jack` (JACK trait requirement),
+    `faderframe-audio-pipewire` (the raw `pw_filter` API),
+    `faderframe-plugin-clap` (loading plugin libraries, window handles for
+    editors), `faderframe-plugin-vst3` (COM bindings, module loading),
+    `faderframe-stretch` (the C shim of the vendored stretcher) and
+    `faderframe-ui` (GObject subclassing macros).
 12. Vendored C/C++ code is listed in `THIRD_PARTY_LICENSES.md` and its
     realtime entry points are proven allocation-free by counting C++
     allocations in tests (`faderframe-stretch/tests/stretch.rs`; the Rust
@@ -886,79 +1057,84 @@ for its editor.
 
 ## 14. Cross-platform strategy
 
-Platform specifics are isolated in backends and the GTK shell. Windows:
-GTK 4 Win32 backend, WASAPI and ASIO backends implementing `AudioBackend`.
-macOS: GTK 4 macOS backend, CoreAudio, AU as an additional plugin format. The
-core crates already build for every target the toolchain supports.
+Linux is the primary platform; Windows and macOS build from the same code.
+Platform specifics are isolated in backends and the GTK shell:
+
+| | Linux | Windows | macOS |
+|---|---|---|---|
+| Audio | PipeWire, JACK, ALSA (cpal) | WASAPI (cpal) | CoreAudio (cpal) |
+| MIDI | ALSA sequencer (midir) | WinMM (midir) | CoreMIDI (midir) |
+| CLAP / VST3 | ✓, editors embedded via XWayland | ✓, generic parameter windows | ✓, generic parameter windows |
+| DSP threads | futex wake-up, the audio thread's `SCHED_FIFO` | `park`/`unpark`, normal priority | `park`/`unpark`, normal priority |
+
+* JACK and PipeWire are Linux-only dependencies; their crates are empty
+  elsewhere. CLAP's posix-fd extension (plugin GUI event loops) exists on
+  Unix only. VST3 loads modules per platform (see §8). The test-only C++
+  allocation counter uses `_aligned_malloc` on Windows.
+* Every crate, test and benchmark is cross-checked for
+  `x86_64-pc-windows-gnu` and `aarch64-apple-darwin` (`cargo check
+  --workspace --all-targets`; `FADERFRAME_CHECK_ONLY=1` skips the
+  vendored C++ build where no target C++ toolchain exists).
+* CI: the main workflow builds, lints and tests on Linux; the *Ports*
+  workflow builds and tests on macOS (Apple Silicon `macos-15`, Intel
+  `macos-15-intel`, GTK from Homebrew) and Windows (MSYS2 UCRT64 with its
+  GTK 4 and Rust packages).
+
+Still open for the ports: embedding plugin editors (HWND on Windows,
+NSView on macOS), realtime priority for DSP workers (MMCSS, Mach time
+constraints), ASIO, Audio Units, and packaging (app bundle, installer).
 
 ## Status and roadmap
 
-Implemented in this first vertical slice: workspace and crate structure,
-project model with undo and versioned files, tempo/meter maps, graph engine
-with PDC and state adoption, transport with sample-accurate loops, built-in
-synth/echo/gain/latency plugins, JACK and dummy backends, offline render with
-WAV export (stems, normalise, dither), GTK shell with docking/detaching and
-workspaces, arranger, analogue mixer, piano roll, preferences and render
-windows, benchmark, and tests. Audio file import (Symphonia decoding,
-rubato resampling, peak caches, drag & drop and File → Import Audio) and
-lock-free disk streaming with read-ahead and epoch reclamation.
+**Implemented.** The engine: routing graph with PDC, state adoption and
+sidechains; multicore scheduling with measured critical-path ranks;
+sample-accurate transport, loops and scrubbing; built-in synth, echo,
+compressor, gain and latency probe; offline render and export (stems,
+normalise, dither); freeze and bounce in place. Audio: native PipeWire,
+JACK, the system API (WASAPI, CoreAudio, ALSA) and a dummy device.
+Recording with punch, pre-roll, metronome, take folders and comping.
+Automation of every automatable parameter, written from controls, MIDI
+controllers and plugin editors. Media import (Symphonia, rubato) and
+lock-free disk streaming.
 
-Recording (lock-free capture, writer thread, latency compensation, punch,
-pre-roll, metronome, mono/stereo inputs), take folders with comping and
-selectable record/loop-record modes, any number of sends per strip (paged
-in banks), resizable tracks and track presets. Automation of every
-automatable parameter (lanes, sample-accurate playback, Touch/Latch/Write).
+MIDI: devices with hotplug, live play with constant latency, recording,
+MIDI learn, MIDI output and clock, clock/MTC sync, MPE, SysEx, Standard
+MIDI File import and export, and a full piano roll.
 
-CLAP hosting: scanning in a helper process with a cache, a plugin browser
-window, effects and instruments in the graph with latency reporting,
-restarts, parameters, automation and state, native editors embedded via
-XWayland (placed centred or where they were last) and a generic parameter
-editor for every plugin.
+Plugins: CLAP and VST3 hosting with crash-safe scanning, a plugin browser,
+embedded editors (Linux), generic parameter windows, presets (user and VST3
+factory), inserts that move and copy between tracks, sidechain inputs.
 
-Performance meter: total DSP load with history and breakdown, per track and
-per plugin instance, measured on demand inside the graph executor.
+Mixing: an analogue-console mixer, sends in banks, track groups with
+linked controls, VCAs, relative edits of every selected track, track
+presets, and the Tools view for mastering (EBU R128 loudness and true peak,
+levels with K-System scales, phase, spectrum).
 
-MIDI keyboards and controllers: device management with hotplug, live play
-with constant-latency scheduling, MIDI recording into clips, MIDI learn for
-every automatable parameter and transport functions.
+Editing: Pro Tools-style edit modes and tools, edit-selection ranges, clip
+gain, shaped fades, transient detection, warp markers and pitch-preserving
+playback, sample-level waveform redraw, global lanes for markers, song
+sections, time signatures and the tempo map, and track colours from a
+colour chooser.
 
-Piano roll (see §11) and the rest of the MIDI work: controller lanes in
-clips (recorded, edited, chased), MIDI output to external devices with MIDI
-clock, soft takeover and relative encoders, consumed mapped controls,
-auditioning, step input, sustain/bend/vibrato in the built-in synth.
+Shell: docking and detaching, workspaces (Recording, Editing, Mixing,
+MIDI, Mastering), performance meter, preferences, recent projects and
+start-up choice. Windows and macOS builds (see §14).
 
-VST3 hosting (see §8): modules, scan helper, separate or combined
-controllers with messages, sample-accurate parameters and automation,
-notes, MIDI-mapped controllers, editor edits, state, embedded editors.
+**Next**, roughly in order:
 
-Multicore processing (see §5): fused jobs, a lock-free dependency
-scheduler with measured critical-path ranks, a realtime worker pool with
-futex wake-up and priority inheritance, flush-to-zero on DSP threads.
-
-The rest of the MIDI work (see §7): following MIDI clock and MTC
-(sample-accurate chase, drift re-locks, tempo fit), per-note MPE
-expression (model, playback with member channels, recording, piano roll
-editing, MPE in the built-in synth) and SysEx (recording, scheduled
-playback to devices, `.syx` import and sending).
-
-Pro-style editing and elastic audio (see §11): edit modes and tools, an
-edit toolbar, edit-selection ranges, multi-clip edits, clip gain, fades
-with shapes and drawn curves, grids to 1/256, transient detection, warp
-markers with transient and range warping, quantizing, time-compression
-trims, and pitch-preserving warped playback. Transport: tap tempo,
-editable time signatures, a metronome button.
-
-Next, in order:
-
-1. ~~CLAP hosting~~ (done; still open: writing automation from plugin GUI
-   gestures, note expressions, plugin-side preset browsing).
-2. ~~MIDI input and output, live play, MIDI learn, MIDI clock, clock and
-   MTC sync, MPE expression, SysEx~~ (done; possible next steps: MTC
-   output, varispeed chase without a shared word clock, SysEx to plugins,
-   Standard MIDI File import/export).
-3. ~~Automation lanes~~ (done) in the arranger, sample-accurate parameter events.
-4. ~~Dependency-aware multicore scheduler~~ (done; possible next steps:
-   anticipative processing of tracks that are not monitored live, job
-   affinity for cache locality).
-5. ~~VST3~~ (done; still open: note expression, program lists, 64-bit
-   processing), PipeWire-native backend, Windows and macOS ports.
+1. **Arrangement editing with sections**: move, copy and delete sections
+   *with their content* (clips, automation, tempo), the way the arranger
+   lane is used for song structure.
+2. **Mastering**: offline loudness analysis per song and loudness
+   normalisation on export, dithering and true-peak limiting for delivery
+   formats, an album/sequence view.
+3. **Ports**: plugin editors on Windows (HWND) and macOS (NSView),
+   realtime DSP worker priority there, ASIO, Audio Units, packaging
+   (Flatpak, macOS app bundle, Windows installer).
+4. **Plugins**: note expressions (CLAP, VST3), VST3 program lists and
+   64-bit processing, sandboxed plugins (out-of-process with shared-memory
+   audio), SysEx to plugins.
+5. **MIDI**: MTC output, varispeed chase without a shared word clock.
+6. **Performance**: anticipative processing of tracks that are not
+   monitored live, job affinity for cache locality, an optional wgpu
+   painter for dense views.

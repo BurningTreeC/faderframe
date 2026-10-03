@@ -4,6 +4,7 @@ use crate::slots::StripSlots;
 use faderframe_audio_graph::{
     AudioBuffer, NodeIo, ProcessContext, Processor, for_each_channel_route,
 };
+use faderframe_automation::SampleLane;
 use faderframe_core::{PanLaw, TrackId, db_to_gain, pan::stereo_balance};
 use faderframe_realtime::MeterRange;
 
@@ -126,11 +127,18 @@ impl Processor<EngineContext> for ChannelStrip {
         } else {
             1.0
         };
+        let vca_gain = params.get(self.slots.vca);
         let auto = cx.data.timeline.automation(self.track);
         let (vol_lane, pan_lane, mute_lane) = auto.map_or((None, None, None), |a| {
             (a.volume.as_ref(), a.pan.as_ref(), a.mute.as_ref())
         });
-        let automated = vol_lane.is_some() || pan_lane.is_some() || mute_lane.is_some();
+        let (vca_volume, vca_mute): (&[SampleLane], &[SampleLane]) =
+            auto.map_or((&[], &[]), |a| (&a.vca_volume, &a.vca_mute));
+        let automated = vol_lane.is_some()
+            || pan_lane.is_some()
+            || mute_lane.is_some()
+            || !vca_volume.is_empty()
+            || !vca_mute.is_empty();
 
         let Some(input) = io.audio_in.first() else {
             return;
@@ -154,8 +162,18 @@ impl Processor<EngineContext> for ChannelStrip {
             let mute = mute_lane
                 .and_then(|l| l.value_at(at))
                 .map_or(static_mute, |v| v >= 0.5);
-            let audible = if mute || solo_muted { 0.0 } else { polarity };
-            self.render(input, io.audio_out, off, m, fader, pan, audible);
+            let vca = vca_volume.iter().fold(vca_gain, |g, l| {
+                l.value_at(at).map_or(g, |db| g * db_to_gain(db as f32))
+            });
+            let vca_muted = vca_mute
+                .iter()
+                .any(|l| l.value_at(at).is_some_and(|v| v >= 0.5));
+            let audible = if mute || solo_muted || vca_muted {
+                0.0
+            } else {
+                polarity
+            };
+            self.render(input, io.audio_out, off, m, fader * vca, pan, audible);
             values = (fader, pan, mute);
             off += m;
         }
@@ -170,6 +188,12 @@ impl Processor<EngineContext> for ChannelStrip {
         let Some(post) = io.audio_out.first() else {
             return;
         };
+        // The analysed track feeds the scope (mono: both sides alike).
+        if cx.data.scope.source() == Some(self.track.raw()) && post.num_channels() > 0 {
+            let l = &post.channel(0)[..n];
+            let r = &post.channel(post.num_channels().min(2) - 1)[..n];
+            cx.data.scope.push(l, r);
+        }
         let out_ch = post.num_channels().min(MAX_CHANNELS);
         for c in 0..out_ch {
             if let Some(idx) = self.meter.channel(c) {

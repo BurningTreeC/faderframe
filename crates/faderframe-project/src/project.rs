@@ -58,6 +58,17 @@ pub struct Marker {
     pub name: String,
 }
 
+/// A named part of the arrangement (Intro, Verse, Chorus …) on the
+/// arranger lane.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Section {
+    pub id: faderframe_core::SectionId,
+    pub name: String,
+    pub start: MusicalTime,
+    pub end: MusicalTime,
+    pub color: crate::TrackColor,
+}
+
 /// A range in musical time (`start < end`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MusicalRange {
@@ -102,6 +113,12 @@ pub struct Project {
     /// Controller mappings (MIDI learn).
     #[serde(default)]
     pub midi_mappings: Vec<crate::MidiMapping>,
+    /// Sections of the arrangement, by start.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sections: Vec<Section>,
+    /// Track groups (members name theirs in `Track::group`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<crate::TrackGroup>,
     #[serde(default)]
     pub ids: IdAllocator,
 }
@@ -130,8 +147,50 @@ impl Project {
             clips: BTreeMap::new(),
             sources: BTreeMap::new(),
             midi_mappings: Vec::new(),
+            groups: Vec::new(),
+            sections: Vec::new(),
             ids,
         }
+    }
+
+    pub fn group(&self, id: faderframe_core::GroupId) -> Option<&crate::TrackGroup> {
+        self.groups.iter().find(|g| g.id == id)
+    }
+
+    /// Members of a group, in track order.
+    pub fn group_members(&self, id: faderframe_core::GroupId) -> Vec<TrackId> {
+        self.tracks
+            .iter()
+            .filter(|t| t.group == Some(id))
+            .map(|t| t.id)
+            .collect()
+    }
+
+    /// The VCAs scaling `track`: its own, then the one that VCA is assigned
+    /// to, and so on (loops and missing VCAs end the chain).
+    pub fn vca_chain(&self, track: &Track) -> Vec<&Track> {
+        let mut chain: Vec<&Track> = Vec::new();
+        let mut next = track.vca;
+        while let Some(id) = next {
+            let Some(v) = self.track(id).filter(|v| v.kind == TrackKind::Vca) else {
+                break;
+            };
+            if v.id == track.id || chain.iter().any(|c| c.id == v.id) {
+                break;
+            }
+            chain.push(v);
+            next = v.vca;
+        }
+        chain
+    }
+
+    /// Tracks assigned to a VCA directly.
+    pub fn vca_members(&self, vca: TrackId) -> Vec<TrackId> {
+        self.tracks
+            .iter()
+            .filter(|t| t.vca == Some(vca))
+            .map(|t| t.id)
+            .collect()
     }
 
     pub fn track(&self, id: TrackId) -> Option<&Track> {
@@ -211,10 +270,24 @@ impl Project {
         edges
     }
 
-    /// Is `to` reachable from `from` along routing edges (plus an optional
-    /// extra edge being considered)?
-    pub fn reaches(&self, from: TrackId, to: TrackId, extra: Option<(TrackId, TrackId)>) -> bool {
+    /// Routing edges plus sidechain feeds (the source must be processed
+    /// first; not a signal route for solo).
+    pub fn dependency_edges(&self) -> Vec<(TrackId, TrackId)> {
         let mut edges = self.routing_edges();
+        for t in &self.tracks {
+            for s in t.inserts.iter().chain(t.instrument.iter()) {
+                if let Some(src) = s.sidechain {
+                    edges.push((src, t.id));
+                }
+            }
+        }
+        edges
+    }
+
+    /// Is `to` reachable from `from` along dependency edges (plus an
+    /// optional extra edge being considered)?
+    pub fn reaches(&self, from: TrackId, to: TrackId, extra: Option<(TrackId, TrackId)>) -> bool {
+        let mut edges = self.dependency_edges();
         edges.extend(extra);
         let mut stack = vec![from];
         let mut seen = HashSet::new();
@@ -242,12 +315,23 @@ impl Project {
     /// everything it feeds (its buses, aux returns, master) and everything
     /// feeding it (sources of a soloed bus). Explicit mutes still apply.
     pub fn solo_audible(&self) -> Option<HashSet<TrackId>> {
+        // A soloed VCA solos the tracks it scales.
         let soloed: Vec<TrackId> = self
             .tracks
             .iter()
-            .filter(|t| t.solo)
+            .filter(|t| t.solo || self.vca_chain(t).iter().any(|v| v.solo))
+            .filter(|t| t.kind != TrackKind::Vca)
             .map(|t| t.id)
             .collect();
+        if soloed.is_empty()
+            && self
+                .tracks
+                .iter()
+                .any(|t| t.kind == TrackKind::Vca && t.solo)
+        {
+            // A soloed VCA without members silences everything else.
+            return Some(self.master_id().into_iter().collect());
+        }
         if soloed.is_empty() {
             return None;
         }
@@ -278,9 +362,12 @@ impl Project {
         Some(audible)
     }
 
-    /// Whether a track is silenced by its own mute or by another track's solo.
+    /// Whether a track is silenced by its own mute, a muted VCA or another
+    /// track's solo.
     pub fn effectively_muted(&self, track: &Track, solo: Option<&HashSet<TrackId>>) -> bool {
-        track.mute || solo.is_some_and(|set| !set.contains(&track.id))
+        track.mute
+            || self.vca_chain(track).iter().any(|v| v.mute)
+            || solo.is_some_and(|set| !set.contains(&track.id))
     }
 
     /// Next unused palette colour.

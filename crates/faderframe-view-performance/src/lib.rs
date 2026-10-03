@@ -114,6 +114,7 @@ fn kind_tag(k: TrackKind) -> &'static str {
         TrackKind::Bus => "BUS",
         TrackKind::Aux => "AUX",
         TrackKind::Master => "MASTER",
+        TrackKind::Vca => "VCA",
     }
 }
 

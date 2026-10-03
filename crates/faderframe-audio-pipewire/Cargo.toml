@@ -1,0 +1,18 @@
+[package]
+name = "faderframe-audio-pipewire"
+description = "Native PipeWire audio backend (pw_filter with DSP ports)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-audio.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire.workspace = true

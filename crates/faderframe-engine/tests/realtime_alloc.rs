@@ -302,6 +302,7 @@ fn automation_does_not_allocate() {
         bypass: false,
         parameters: Vec::new(),
         state: None,
+        sidechain: None,
     });
     let ramp = || {
         AutomationCurve::from_points(

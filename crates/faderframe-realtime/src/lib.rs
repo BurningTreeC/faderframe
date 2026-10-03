@@ -7,6 +7,7 @@
 //! * [`AtomicF32`] — lock-free `f32` cell.
 //! * [`ParamTable`] — control → RT continuous parameter values.
 //! * [`MeterBank`] — RT → control peak/RMS meter values.
+//! * [`ScopeRing`] — RT → control stereo audio of one source (analysers).
 //! * [`CallbackMetrics`] — callback duration histogram, deadline misses,
 //!   xruns; percentiles are computed on the control side.
 //! * [`SlotAllocator`] — control-side allocator for table slots.
@@ -35,6 +36,7 @@ mod metrics;
 mod pages;
 mod params;
 mod pool;
+mod scope;
 mod slots;
 mod trycell;
 
@@ -47,5 +49,6 @@ pub use metrics::{CallbackMetrics, MetricsSnapshot};
 pub use pages::{Epoch, PageTable, Reclaimer, Retired};
 pub use params::{ParamSlot, ParamTable};
 pub use pool::{PoolConfig, PoolJob, WorkerPool, default_worker_count, physical_cores};
+pub use scope::ScopeRing;
 pub use slots::SlotAllocator;
 pub use trycell::{TryCell, TryCellGuard};

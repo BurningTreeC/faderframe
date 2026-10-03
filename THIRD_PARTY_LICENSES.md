@@ -24,7 +24,7 @@ time; binary distributions that bundle them (e.g. Windows or macOS
 installers) must ship their license texts and comply with the LGPL's
 relinking provisions.
 
-## Rust crates (146)
+## Rust crates (170)
 
 Crates under the MPL-2.0 (the Symphonia audio decoders) are file-level
 copyleft: FaderFrame uses them unmodified from crates.io, where their
@@ -36,26 +36,35 @@ published under the MPL-2.0 as well.
 | aho-corasick | 1.1.5 | Unlicense OR MIT | https://github.com/BurntSushi/aho-corasick |
 | alsa | 0.11.0 | Apache-2.0/MIT | https://github.com/diwic/alsa-rs |
 | alsa-sys | 0.4.0 | MIT | https://github.com/diwic/alsa-sys |
+| annotate-snippets | 0.11.5 | MIT OR Apache-2.0 | https://github.com/rust-lang/annotate-snippets-rs |
+| anstyle | 1.0.14 | MIT OR Apache-2.0 | https://github.com/rust-cli/anstyle.git |
 | audio-codec-algorithms | 0.8.1 | 0BSD OR Apache-2.0 | https://github.com/karip/audio-codec-algorithms |
 | audioadapter | 5.0.0 | MIT OR Apache-2.0 | https://github.com/HEnquist/audioadapter-rs |
 | audioadapter-buffers | 5.2.0 | MIT OR Apache-2.0 | https://github.com/HEnquist/audioadapter-buffers-rs |
 | audioadapter-sample | 5.2.0 | MIT OR Apache-2.0 | https://github.com/HEnquist/audioadapter-sample-rs |
 | autocfg | 1.5.1 | Apache-2.0 OR MIT | https://github.com/cuviper/autocfg |
 | base64 | 0.22.1 | MIT OR Apache-2.0 | https://github.com/marshallpierce/rust-base64 |
+| bindgen | 0.72.1 | BSD-3-Clause | https://github.com/rust-lang/rust-bindgen |
 | bitflags | 1.3.2 | MIT/Apache-2.0 | https://github.com/bitflags/bitflags |
 | bitflags | 2.13.2 | MIT OR Apache-2.0 | https://github.com/bitflags/bitflags |
 | bytemuck | 1.25.2 | Zlib OR Apache-2.0 OR MIT | https://github.com/Lokathor/bytemuck |
 | cairo-rs | 0.22.9 | MIT | https://github.com/gtk-rs/gtk-rs-core |
 | cairo-sys-rs | 0.22.9 | MIT | https://github.com/gtk-rs/gtk-rs-core |
 | cc | 1.6.0 | MIT OR Apache-2.0 | https://github.com/rust-lang/cc-rs |
+| cexpr | 0.6.0 | Apache-2.0/MIT | https://github.com/jethrogb/rust-cexpr |
 | cfg-expr | 0.20.10 | MIT OR Apache-2.0 | https://github.com/EmbarkStudios/cfg-expr |
 | cfg-if | 1.0.5 | MIT OR Apache-2.0 | https://github.com/rust-lang/cfg-if |
 | clack-common | 0.2.0 | MIT OR Apache-2.0 | https://github.com/prokopyl/clack |
 | clack-extensions | 0.2.0 | MIT OR Apache-2.0 | https://github.com/prokopyl/clack |
 | clack-host | 0.2.0 | MIT OR Apache-2.0 | https://github.com/prokopyl/clack |
 | clack-plugin | 0.2.0 | MIT OR Apache-2.0 | https://github.com/prokopyl/clack |
+| clang-sys | 1.9.1 | Apache-2.0 | https://github.com/KyleMayes/clang-sys |
 | clap-sys | 0.5.0 | MIT/Apache-2.0 | https://github.com/micahrj/clap-sys |
 | com-scrape-types | 0.1.1 | MIT OR Apache-2.0 | https://github.com/coupler-rs/vst3-rs |
+| cookie-factory | 0.3.3 | MIT | https://github.com/rust-bakery/cookie-factory |
+| cpal | 0.18.2 | Apache-2.0 | https://github.com/RustAudio/cpal |
+| dasp_sample | 0.11.0 | MIT OR Apache-2.0 | https://github.com/rustaudio/sample.git |
+| either | 1.18.0 | MIT OR Apache-2.0 | https://github.com/rayon-rs/either |
 | equivalent | 1.0.2 | Apache-2.0 OR MIT | https://github.com/indexmap-rs/equivalent |
 | errno | 0.3.14 | MIT OR Apache-2.0 | https://github.com/lambda-fairy/rust-errno |
 | extended | 0.1.0 | MIT | https://github.com/depp/extended-rs |
@@ -80,6 +89,7 @@ published under the MPL-2.0 as well.
 | glib-sys | 0.22.9 | MIT | https://github.com/gtk-rs/gtk-rs-core |
 | glib-unix | 0.22.8 | MIT | https://github.com/gtk-rs/gtk-rs-core |
 | glib-unix-sys | 0.22.9 | MIT | https://github.com/gtk-rs/gtk-rs-core |
+| glob | 0.3.4 | MIT OR Apache-2.0 | https://github.com/rust-lang/glob |
 | gobject-sys | 0.22.9 | MIT | https://github.com/gtk-rs/gtk-rs-core |
 | graphene-rs | 0.22.8 | MIT | https://github.com/gtk-rs/gtk-rs-core |
 | graphene-sys | 0.22.9 | MIT | https://github.com/gtk-rs/gtk-rs-core |
@@ -91,6 +101,7 @@ published under the MPL-2.0 as well.
 | hashbrown | 0.17.1 | MIT OR Apache-2.0 | https://github.com/rust-lang/hashbrown |
 | heck | 0.5.0 | MIT OR Apache-2.0 | https://github.com/withoutboats/heck |
 | indexmap | 2.14.2 | Apache-2.0 OR MIT | https://github.com/indexmap-rs/indexmap |
+| itertools | 0.13.0 | MIT OR Apache-2.0 | https://github.com/rust-itertools/itertools |
 | itoa | 1.0.18 | MIT OR Apache-2.0 | https://github.com/dtolnay/itoa |
 | jack | 0.13.5 | MIT | https://github.com/RustAudio/rust-jack |
 | jack-sys | 0.5.1 | MIT OR Apache-2.0 | https://github.com/RustAudio/rust-jack/tree/main/jack-sys |
@@ -98,12 +109,18 @@ published under the MPL-2.0 as well.
 | libc | 0.2.190 | MIT OR Apache-2.0 | https://github.com/rust-lang/libc |
 | libloading | 0.7.4 | ISC | https://github.com/nagisa/rust_libloading/ |
 | libloading | 0.8.9 | ISC | https://github.com/nagisa/rust_libloading/ |
+| libspa | 0.10.1 | MIT | https://gitlab.freedesktop.org/pipewire/pipewire-rs |
+| libspa-sys | 0.10.1 | MIT | https://gitlab.freedesktop.org/pipewire/pipewire-rs |
 | linux-raw-sys | 0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://github.com/sunfishcode/linux-raw-sys |
 | log | 0.4.34 | MIT OR Apache-2.0 | https://github.com/rust-lang/log |
 | matchers | 0.2.0 | MIT | https://github.com/hawkw/matchers |
 | memchr | 2.8.3 | Unlicense OR MIT | https://github.com/BurntSushi/memchr |
 | memoffset | 0.9.1 | MIT | https://github.com/Gilnaa/memoffset |
 | midir | 0.11.0 | MIT | https://github.com/Boddlnagg/midir |
+| midly | 0.5.3 | Unlicense | https://github.com/negamartin/midly |
+| minimal-lexical | 0.2.1 | MIT/Apache-2.0 | https://github.com/Alexhuszagh/minimal-lexical |
+| nom | 7.1.3 | MIT | https://github.com/Geal/nom |
+| nom | 8.0.0 | MIT | https://github.com/rust-bakery/nom |
 | nu-ansi-term | 0.50.3 | MIT | https://github.com/nushell/nu-ansi-term |
 | num-complex | 0.4.6 | MIT OR Apache-2.0 | https://github.com/rust-num/num-complex |
 | num-integer | 0.1.47 | MIT OR Apache-2.0 | https://github.com/rust-num/num-integer |
@@ -112,17 +129,21 @@ published under the MPL-2.0 as well.
 | pango | 0.22.9 | MIT | https://github.com/gtk-rs/gtk-rs-core |
 | pango-sys | 0.22.9 | MIT | https://github.com/gtk-rs/gtk-rs-core |
 | pin-project-lite | 0.2.17 | Apache-2.0 OR MIT | https://github.com/taiki-e/pin-project-lite |
+| pipewire | 0.10.1 | MIT | https://gitlab.freedesktop.org/pipewire/pipewire-rs |
+| pipewire-sys | 0.10.1 | MIT | https://gitlab.freedesktop.org/pipewire/pipewire-rs |
 | pkg-config | 0.3.34 | MIT OR Apache-2.0 | https://github.com/rust-lang/pkg-config-rs |
 | primal-check | 0.3.4 | MIT OR Apache-2.0 | https://github.com/huonw/primal |
 | proc-macro-crate | 3.5.0 | MIT OR Apache-2.0 | https://github.com/bkchr/proc-macro-crate |
 | proc-macro2 | 1.0.107 | MIT OR Apache-2.0 | https://github.com/dtolnay/proc-macro2 |
 | quote | 1.0.47 | MIT OR Apache-2.0 | https://github.com/dtolnay/quote |
 | realfft | 3.5.0 | MIT | https://github.com/HEnquist/realfft |
+| regex | 1.13.1 | MIT OR Apache-2.0 | https://github.com/rust-lang/regex |
 | regex-automata | 0.4.18 | MIT OR Apache-2.0 | https://github.com/rust-lang/regex |
 | regex-lite | 0.1.9 | MIT OR Apache-2.0 | https://github.com/rust-lang/regex |
 | regex-syntax | 0.8.11 | MIT OR Apache-2.0 | https://github.com/rust-lang/regex |
 | rtrb | 0.4.0 | MIT OR Apache-2.0 | https://github.com/mgeier/rtrb |
 | rubato | 5.0.1 | MIT OR Apache-2.0 | https://github.com/HEnquist/rubato |
+| rustc-hash | 2.1.3 | Apache-2.0 OR MIT | https://github.com/rust-lang/rustc-hash |
 | rustc_version | 0.4.1 | MIT OR Apache-2.0 | https://github.com/djc/rustc-version-rs |
 | rustfft | 6.4.1 | MIT OR Apache-2.0 | https://github.com/ejmahler/RustFFT |
 | rustix | 1.1.5 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://github.com/bytecodealliance/rustix |
@@ -133,6 +154,7 @@ published under the MPL-2.0 as well.
 | serde_json | 1.0.151 | MIT OR Apache-2.0 | https://github.com/serde-rs/json |
 | serde_spanned | 1.1.1 | MIT OR Apache-2.0 | https://github.com/toml-rs/toml |
 | sharded-slab | 0.1.7 | MIT | https://github.com/hawkw/sharded-slab |
+| shlex | 1.3.0 | MIT OR Apache-2.0 | https://github.com/comex/rust-shlex |
 | shlex | 2.0.1 | MIT OR Apache-2.0 | https://github.com/comex/rust-shlex |
 | slab | 0.4.12 | MIT | https://github.com/tokio-rs/slab |
 | smallvec | 1.16.2 | MIT OR Apache-2.0 | https://github.com/servo/rust-smallvec |
@@ -154,6 +176,7 @@ published under the MPL-2.0 as well.
 | symphonia-metadata | 0.6.1 | MPL-2.0 | https://github.com/pdeljanov/Symphonia |
 | syn | 2.0.119 | MIT OR Apache-2.0 | https://github.com/dtolnay/syn |
 | syn | 3.0.6 | MIT OR Apache-2.0 | https://github.com/dtolnay/syn |
+| system-deps | 7.0.8 | MIT OR Apache-2.0 | https://github.com/gdesmott/system-deps |
 | system-deps | 9.0.0 | MIT OR Apache-2.0 | https://github.com/gdesmott/system-deps |
 | target-lexicon | 0.13.5 | Apache-2.0 WITH LLVM-exception | https://github.com/bytecodealliance/target-lexicon |
 | thiserror | 2.0.21 | MIT OR Apache-2.0 | https://github.com/dtolnay/thiserror |
@@ -171,6 +194,7 @@ published under the MPL-2.0 as well.
 | tracing-subscriber | 0.3.23 | MIT | https://github.com/tokio-rs/tracing |
 | transpose | 0.2.3 | MIT OR Apache-2.0 | https://github.com/ejmahler/transpose |
 | unicode-ident | 1.0.26 | (MIT OR Apache-2.0) AND Unicode-3.0 | https://github.com/dtolnay/unicode-ident |
+| unicode-width | 0.2.2 | MIT OR Apache-2.0 | https://github.com/unicode-rs/unicode-width |
 | version-compare | 0.2.1 | MIT | https://gitlab.com/timvisee/version-compare |
 | visibility | 0.1.1 | Zlib OR MIT OR Apache-2.0 | https://github.com/danielhenrymantilla/visibility.rs |
 | vst3 | 0.3.0 | MIT OR Apache-2.0 | https://github.com/coupler-rs/vst3-rs |
@@ -190,13 +214,13 @@ published under the MPL-2.0 as well.
 Crates without a license file in their published package (license per
 their SPDX expression above; texts at https://spdx.org/licenses/):
 
-com-scrape-types 0.1.1, realfft 3.5.0
+com-scrape-types 0.1.1, cookie-factory 0.3.3, dasp_sample 0.11.0, midly 0.5.3, realfft 3.5.0
 
 ## License texts
 
 ### LICENSE
 
-Applies to: cairo-rs 0.22.9, cairo-sys-rs 0.22.9, clap-sys 0.5.0, gdk-pixbuf 0.22.0, gdk-pixbuf-sys 0.22.9, gdk4 0.11.5, gdk4-sys 0.11.5, gio 0.22.10, gio-sys 0.22.9, glib 0.22.10, glib-macros 0.22.9, glib-sys 0.22.9, glib-unix 0.22.8, glib-unix-sys 0.22.9, gobject-sys 0.22.9, graphene-rs 0.22.8, graphene-sys 0.22.9, gsk4 0.11.5, gsk4-sys 0.11.5, gtk4 0.11.5, gtk4-macros 0.11.5, gtk4-sys 0.11.5, itoa 1.0.18, lazy_static 1.5.1, linux-raw-sys 0.12.1, once_cell 1.21.4, pango 0.22.9, pango-sys 0.22.9, pin-project-lite 0.2.17, proc-macro-crate 3.5.0, proc-macro2 1.0.107, quote 1.0.47, rtrb 0.4.0, rustix 1.1.5, semver 1.0.28, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_json 1.0.151, syn 2.0.119, syn 3.0.6, system-deps 9.0.0, thiserror 2.0.21, thiserror-impl 2.0.21, unicode-ident 1.0.26, vst3 0.3.0, winnow 1.0.4, zmij 1.0.23
+Applies to: cairo-rs 0.22.9, cairo-sys-rs 0.22.9, clap-sys 0.5.0, gdk-pixbuf 0.22.0, gdk-pixbuf-sys 0.22.9, gdk4 0.11.5, gdk4-sys 0.11.5, gio 0.22.10, gio-sys 0.22.9, glib 0.22.10, glib-macros 0.22.9, glib-sys 0.22.9, glib-unix 0.22.8, glib-unix-sys 0.22.9, gobject-sys 0.22.9, graphene-rs 0.22.8, graphene-sys 0.22.9, gsk4 0.11.5, gsk4-sys 0.11.5, gtk4 0.11.5, gtk4-macros 0.11.5, gtk4-sys 0.11.5, itoa 1.0.18, lazy_static 1.5.1, linux-raw-sys 0.12.1, minimal-lexical 0.2.1, once_cell 1.21.4, pango 0.22.9, pango-sys 0.22.9, pin-project-lite 0.2.17, proc-macro-crate 3.5.0, proc-macro2 1.0.107, quote 1.0.47, rtrb 0.4.0, rustc-hash 2.1.3, rustix 1.1.5, semver 1.0.28, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_json 1.0.151, syn 2.0.119, syn 3.0.6, system-deps 7.0.8, system-deps 9.0.0, thiserror 2.0.21, thiserror-impl 2.0.21, unicode-ident 1.0.26, vst3 0.3.0, winnow 1.0.4, zmij 1.0.23
 
 ```text
 Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -220,7 +244,7 @@ SOFTWARE.
 
 ### LICENSE-APACHE
 
-Applies to: audioadapter 5.0.0, audioadapter-buffers 5.2.0, audioadapter-sample 5.2.0, autocfg 1.5.1, base64 0.22.1, bitflags 1.3.2, bitflags 2.13.2, bytemuck 1.25.2, cc 1.6.0, cfg-expr 0.20.10, cfg-if 1.0.5, clap-sys 0.5.0, equivalent 1.0.2, errno 0.3.14, find-msvc-tools 0.1.14, gethostname 1.1.0, hashbrown 0.17.1, heck 0.5.0, indexmap 2.14.2, lazy_static 1.5.1, linux-raw-sys 0.12.1, log 0.4.34, num-complex 0.4.6, num-integer 0.1.47, num-traits 0.2.19, once_cell 1.21.4, pkg-config 0.3.34, primal-check 0.3.4, regex-automata 0.4.18, regex-lite 0.1.9, regex-syntax 0.8.11, rtrb 0.4.0, rubato 5.0.1, rustc_version 0.4.1, rustix 1.1.5, smallvec 1.16.2, system-deps 9.0.0, thread_local 1.1.10, x11rb 0.14.0, x11rb-protocol 0.14.0
+Applies to: audioadapter 5.0.0, audioadapter-buffers 5.2.0, audioadapter-sample 5.2.0, autocfg 1.5.1, base64 0.22.1, bitflags 1.3.2, bitflags 2.13.2, bytemuck 1.25.2, cc 1.6.0, cexpr 0.6.0, cfg-expr 0.20.10, cfg-if 1.0.5, clang-sys 1.9.1, clap-sys 0.5.0, cpal 0.18.2, either 1.18.0, equivalent 1.0.2, errno 0.3.14, find-msvc-tools 0.1.14, gethostname 1.1.0, glob 0.3.4, hashbrown 0.17.1, heck 0.5.0, indexmap 2.14.2, itertools 0.13.0, lazy_static 1.5.1, linux-raw-sys 0.12.1, log 0.4.34, minimal-lexical 0.2.1, num-complex 0.4.6, num-integer 0.1.47, num-traits 0.2.19, once_cell 1.21.4, pkg-config 0.3.34, primal-check 0.3.4, regex 1.13.1, regex-automata 0.4.18, regex-lite 0.1.9, regex-syntax 0.8.11, rtrb 0.4.0, rubato 5.0.1, rustc_version 0.4.1, rustix 1.1.5, smallvec 1.16.2, system-deps 7.0.8, system-deps 9.0.0, thread_local 1.1.10, unicode-width 0.2.2, x11rb 0.14.0, x11rb-protocol 0.14.0
 
 ```text
 Apache License
@@ -428,7 +452,7 @@ Apache License
 
 ### LICENSE-APACHE
 
-Applies to: alsa 0.11.0, audio-codec-algorithms 0.8.1, clack-common 0.2.0, clack-extensions 0.2.0, clack-host 0.2.0, clack-plugin 0.2.0, field-offset 0.3.6, itoa 1.0.18, libc 0.2.190, pin-project-lite 0.2.17, proc-macro2 1.0.107, quote 1.0.47, semver 1.0.28, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_json 1.0.151, syn 2.0.119, syn 3.0.6, thiserror 2.0.21, thiserror-impl 2.0.21, unicode-ident 1.0.26, vst3 0.3.0
+Applies to: alsa 0.11.0, audio-codec-algorithms 0.8.1, clack-common 0.2.0, clack-extensions 0.2.0, clack-host 0.2.0, clack-plugin 0.2.0, field-offset 0.3.6, itoa 1.0.18, libc 0.2.190, pin-project-lite 0.2.17, proc-macro2 1.0.107, quote 1.0.47, rustc-hash 2.1.3, semver 1.0.28, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_json 1.0.151, syn 2.0.119, syn 3.0.6, thiserror 2.0.21, thiserror-impl 2.0.21, unicode-ident 1.0.26, vst3 0.3.0
 
 ```text
 Apache License
@@ -989,41 +1013,9 @@ Exhibit B - "Incompatible With Secondary Licenses" Notice
   defined by the Mozilla Public License, v. 2.0.
 ```
 
-### LICENSE-MIT
-
-Applies to: bitflags 1.3.2, bitflags 2.13.2, log 0.4.34, num-complex 0.4.6, num-integer 0.1.47, num-traits 0.2.19, regex-automata 0.4.18, regex-lite 0.1.9, regex-syntax 0.8.11
-
-```text
-Copyright (c) 2014 The Rust Project Developers
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-```
-
 ### LICENSE-APACHE
 
-Applies to: jack-sys 0.5.1, rustfft 6.4.1, serde_spanned 1.1.1, strength_reduce 0.2.4, toml 1.1.6+spec-1.1.0, toml_datetime 1.1.1+spec-1.1.0, toml_edit 0.25.15+spec-1.1.0, toml_parser 1.1.3+spec-1.1.0, toml_writer 1.1.2+spec-1.1.0
+Applies to: annotate-snippets 0.11.5, anstyle 1.0.14, jack-sys 0.5.1, rustfft 6.4.1, serde_spanned 1.1.1, strength_reduce 0.2.4, toml 1.1.6+spec-1.1.0, toml_datetime 1.1.1+spec-1.1.0, toml_edit 0.25.15+spec-1.1.0, toml_parser 1.1.3+spec-1.1.0, toml_writer 1.1.2+spec-1.1.0
 
 ```text
 Apache License
@@ -1227,6 +1219,64 @@ Apache License
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
+```
+
+### LICENSE-MIT
+
+Applies to: bitflags 1.3.2, bitflags 2.13.2, glob 0.3.4, log 0.4.34, num-complex 0.4.6, num-integer 0.1.47, num-traits 0.2.19, regex 1.13.1, regex-automata 0.4.18, regex-lite 0.1.9, regex-syntax 0.8.11
+
+```text
+Copyright (c) 2014 The Rust Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+```
+
+### LICENSE-MIT
+
+Applies to: annotate-snippets 0.11.5, anstyle 1.0.14, serde_spanned 1.1.1, toml 1.1.6+spec-1.1.0, toml_datetime 1.1.1+spec-1.1.0, toml_edit 0.25.15+spec-1.1.0, toml_parser 1.1.3+spec-1.1.0, toml_writer 1.1.2+spec-1.1.0
+
+```text
+Copyright (c) Individual contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 ```
 
 ### LICENSE-APACHE
@@ -1471,32 +1521,6 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### LICENSE-MIT
-
-Applies to: serde_spanned 1.1.1, toml 1.1.6+spec-1.1.0, toml_datetime 1.1.1+spec-1.1.0, toml_edit 0.25.15+spec-1.1.0, toml_parser 1.1.3+spec-1.1.0, toml_writer 1.1.2+spec-1.1.0
-
-```text
-Copyright (c) Individual contributors
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
-
 ### LICENSE
 
 Applies to: tracing 0.1.44, tracing-attributes 0.1.31, tracing-core 0.1.36, tracing-log 0.2.0, tracing-subscriber 0.3.23
@@ -1590,6 +1614,33 @@ SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
 CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+```
+
+### LICENSE
+
+Applies to: libspa 0.10.1, libspa-sys 0.10.1, pipewire 0.10.1, pipewire-sys 0.10.1
+
+```text
+Copyright The pipewire-rs Contributors.
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the "Software"),
+to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice (including the next
+paragraph) shall be included in all copies or substantial portions of the
+Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
@@ -1895,6 +1946,70 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
+### LICENSE-MIT
+
+Applies to: either 1.18.0, itertools 0.13.0
+
+```text
+Copyright (c) 2015
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+```
+
+### LICENSE-MIT
+
+Applies to: heck 0.5.0, unicode-width 0.2.2
+
+```text
+Copyright (c) 2015 The Rust Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+```
+
 ### LICENSE
 
 Applies to: libloading 0.7.4, libloading 0.8.9
@@ -1938,6 +2053,33 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+```
+
+### LICENSE
+
+Applies to: nom 7.1.3, nom 8.0.0
+
+```text
+Copyright (c) 2014-2019 Geoffroy Couprie
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
 ### LICENSE-MIT
@@ -1996,6 +2138,54 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+```
+
+### LICENSE-APACHE
+
+Applies to: shlex 1.3.0, shlex 2.0.1
+
+```text
+Copyright 2015 Nicholas Allegra (comex).
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+```
+
+### LICENSE-MIT
+
+Applies to: shlex 1.3.0, shlex 2.0.1
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2015 Nicholas Allegra (comex).
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 ```
 
 ### LICENSE-MIT
@@ -2223,6 +2413,42 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
+### LICENSE
+
+Applies to: bindgen 0.72.1
+
+```text
+BSD 3-Clause License
+
+Copyright (c) 2013, Jyun-Yan You
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+* Neither the name of the copyright holder nor the names of its
+  contributors may be used to endorse or promote products derived from
+  this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
 ### LICENSE-MIT
 
 Applies to: bytemuck 1.25.2
@@ -2255,6 +2481,38 @@ Permission is granted to anyone to use this software for any purpose, including 
 2. Altered source versions must be plainly marked as such, and must not be misrepresented as being the original software.
 
 3. This notice may not be removed or altered from any source distribution.
+```
+
+### LICENSE-MIT
+
+Applies to: cexpr 0.6.0
+
+```text
+(C) Copyright 2016 Jethro G. Beekman
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
 ```
 
 ### LICENSE-MIT
@@ -2413,38 +2671,6 @@ Applies to: hashbrown 0.17.1
 
 ```text
 Copyright (c) 2016 Amanieu d'Antras
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-```
-
-### LICENSE-MIT
-
-Applies to: heck 0.5.0
-
-```text
-Copyright (c) 2015 The Rust Project Developers
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -2641,6 +2867,50 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+```
+
+### LICENSE.md
+
+Applies to: minimal-lexical 0.2.1
+
+```text
+Minimal-lexical is dual licensed under the Apache 2.0 license as well as the MIT
+license. See the LICENCE-MIT and the LICENCE-APACHE files for the licenses.
+
+---
+
+`src/bellerophon.rs` is loosely based off the Golang implementation,
+found [here](https://github.com/golang/go/blob/b10849fbb97a2244c086991b4623ae9f32c212d0/src/strconv/extfloat.go).
+That code (used if the `compact` feature is enabled) is subject to a
+[3-clause BSD license](https://github.com/golang/go/blob/b10849fbb97a2244c086991b4623ae9f32c212d0/LICENSE):
+
+Copyright (c) 2009 The Go Authors. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+   * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+   * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+   * Neither the name of Google Inc. nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
 ### LICENSE
@@ -2949,54 +3219,6 @@ This project is dual-licensed under either of:
 - MIT license (see `LICENSE-MIT`)
 
 You may choose either license, at your option.
-```
-
-### LICENSE-APACHE
-
-Applies to: shlex 2.0.1
-
-```text
-Copyright 2015 Nicholas Allegra (comex).
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-```
-
-### LICENSE-MIT
-
-Applies to: shlex 2.0.1
-
-```text
-The MIT License (MIT)
-
-Copyright (c) 2015 Nicholas Allegra (comex).
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
 ```
 
 ### LICENSE

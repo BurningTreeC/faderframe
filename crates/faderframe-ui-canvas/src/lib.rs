@@ -36,6 +36,6 @@ pub use painter::{DrawOp, Painter, RecordingPainter};
 pub use text::{Align, FontFamily, FontWeight, TextStyle};
 pub use theme::{
     ArrangerTheme, ConsoleTheme, FaderStyle, KnobStyle, LedStyle, MeterStyle, PerformanceTheme,
-    PianoRollTheme, Theme, Typography, UiPalette,
+    PianoRollTheme, Theme, ToolsTheme, Typography, UiPalette,
 };
 pub use view::{CanvasView, EventCx, HostRequest, MenuItem, ScrollAxis, ScrollInfo, TextCommit};

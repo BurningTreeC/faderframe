@@ -1,0 +1,17 @@
+[package]
+name = "faderframe-audio-cpal"
+description = "System audio backend through cpal: WASAPI (Windows), CoreAudio (macOS), ALSA (Linux)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-audio.workspace = true
+cpal.workspace = true
+rtrb.workspace = true
+tracing.workspace = true

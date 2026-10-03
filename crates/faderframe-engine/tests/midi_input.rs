@@ -35,6 +35,7 @@ fn synth_project(input: InputRouting) -> (TestProject, faderframe_core::TrackId)
         bypass: false,
         parameters: Vec::new(),
         state: None,
+        sidechain: None,
     };
     let track = tp.project.track_mut(t).unwrap();
     track.instrument = Some(slot);

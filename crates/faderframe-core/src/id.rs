@@ -63,6 +63,14 @@ define_id!(
     AudioSourceId, "source#"
 );
 define_id!(
+    /// A group of tracks whose controls are linked.
+    GroupId, "group#"
+);
+define_id!(
+    /// A named section of the arrangement (Intro, Verse, Chorus …).
+    SectionId, "section#"
+);
+define_id!(
     /// A timeline marker.
     MarkerId, "marker#"
 );

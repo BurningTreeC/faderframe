@@ -220,6 +220,7 @@ impl EditToolbarView {
                 e.insertion_follows_playback,
                 74.0,
             ),
+            (EditFlag::FollowPlayhead, "Follow", e.follow_playhead, 52.0),
         ] {
             add(&mut flow, Item::Flag(flag), label.into(), on, w);
         }
@@ -346,7 +347,9 @@ impl EditToolbarView {
                 "Grabber (Alt+8): move clips (Separate: lift the selected range out and move it)".into()
             }
             Item::Tool(EditTool::Scrub) => "Scrubber (F9, Alt+9): drag to move the playhead".into(),
-            Item::Tool(EditTool::Pencil) => "Pencil (F10, Alt+0): draw MIDI clips on instrument tracks".into(),
+            Item::Tool(EditTool::Pencil) => {
+                "Pencil (F10, Alt+0): draw MIDI clips on instrument tracks; zoomed in to single samples, redraw audio (click repair)".into()
+            }
             Item::TrimMenu => "Trim tool kind".into(),
             Item::GrabMenu => "Grabber kind".into(),
             Item::GridValue => "Grid value (up to 1/256)".into(),
@@ -359,6 +362,9 @@ impl EditToolbarView {
             }
             Item::Flag(EditFlag::InsertionFollowsPlayback) => {
                 "Insertion Follows Playback: off returns to where playback started when stopping".into()
+            }
+            Item::Flag(EditFlag::FollowPlayhead) => {
+                "Follow Playhead: the arranger and piano roll scroll along while playing".into()
             }
             Item::Flag(EditFlag::ShowTransients) => "Show detected transients in audio clips".into(),
             Item::Flag(EditFlag::Warp) => {
@@ -430,6 +436,7 @@ impl EditToolbarView {
                     EditFlag::TabToTransients => e.tab_to_transients,
                     EditFlag::LinkTimeline => e.link_timeline,
                     EditFlag::InsertionFollowsPlayback => e.insertion_follows_playback,
+                    EditFlag::FollowPlayhead => e.follow_playhead,
                     EditFlag::ShowTransients => e.show_transients,
                     EditFlag::Warp => e.warp,
                     EditFlag::EditToolbar => e.show_edit_toolbar,

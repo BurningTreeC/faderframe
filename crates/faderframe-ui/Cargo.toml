@@ -16,18 +16,18 @@ faderframe-plugin-vst3.workspace = true
 faderframe-plugin-host.workspace = true
 gtk.workspace = true
 x11rb.workspace = true
-glib-unix.workspace = true
 faderframe-core.workspace = true
 faderframe-automation.workspace = true
 faderframe-project.workspace = true
 faderframe-workspace.workspace = true
 faderframe-session.workspace = true
 faderframe-audio.workspace = true
-faderframe-audio-jack.workspace = true
+faderframe-audio-cpal.workspace = true
 faderframe-ui-canvas.workspace = true
 faderframe-view-arranger.workspace = true
 faderframe-view-mixer.workspace = true
 faderframe-view-performance.workspace = true
+faderframe-view-tools.workspace = true
 faderframe-view-pianoroll.workspace = true
 faderframe-timeline.workspace = true
 faderframe-transport.workspace = true
@@ -36,3 +36,11 @@ serde.workspace = true
 serde_json.workspace = true
 faderframe-engine.workspace = true
 faderframe-audio-files.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+glib-unix.workspace = true
+
+# Audio servers of Linux desktops.
+[target.'cfg(target_os = "linux")'.dependencies]
+faderframe-audio-jack.workspace = true
+faderframe-audio-pipewire.workspace = true

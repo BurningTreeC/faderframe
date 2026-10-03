@@ -38,10 +38,11 @@ pub use midimap::{
     MappingMode, MappingTarget, MidiControl, MidiMapping, MidiSource, TransportControl,
 };
 pub use preset::{PresetError, TrackPreset};
-pub use project::{AudioSource, Marker, MusicalRange, Project, SourceSpec};
+pub use project::{AudioSource, Marker, MusicalRange, Project, Section, SourceSpec};
 pub use takes::{CompPiece, CompSegment, DEFAULT_COMP_CROSSFADE, Take, TakeFolder};
 pub use track::{
-    AuxSend, InputRouting, MidiOutputRouting, MonitorMode, OutputRouting, PluginFormat, PluginRef,
-    PluginSlot, SavedParameter, SendTap, Track, TrackColor, TrackKind, midi_port_display,
+    AuxSend, Freeze, GroupLink, InputRouting, MidiOutputRouting, MonitorMode, OutputRouting,
+    PluginFormat, PluginRef, PluginSlot, SavedParameter, SendTap, Track, TrackColor, TrackGroup,
+    TrackKind, midi_port_display,
 };
 pub use warp::{Warp, WarpAlgorithm, WarpMarker};

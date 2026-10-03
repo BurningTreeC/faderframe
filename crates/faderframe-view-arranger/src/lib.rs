@@ -11,10 +11,12 @@
 mod automation;
 mod clip_edit;
 pub mod edit_bar;
+mod global;
 mod header;
 
 pub use automation::AUTO_LANE_H;
 pub use clip_edit::ClipZone;
+pub use global::{GlobalHit, SectionPart};
 pub use header::HeaderLayout;
 
 use faderframe_core::gain::{SILENCE_DB, format_db};
@@ -36,7 +38,9 @@ use faderframe_ui_canvas::{
 };
 
 const MIN_PPQ: f32 = 1.5;
-const MAX_PPQ: f32 = 800.0;
+/// Deep enough to see single samples (≈16 px per sample at 120 BPM and
+/// 48 kHz) for redrawing them with the Pencil.
+const MAX_PPQ: f32 = 400_000.0;
 const LOOP_BAND: f32 = 11.0;
 const DRAG_THRESHOLD: f32 = 3.0;
 /// Height of one take lane under an open take folder.
@@ -69,12 +73,16 @@ pub enum HeaderPart {
     Resize,
     /// Show/hide the automation lanes.
     Automation,
+    /// The colour stripe: opens the colour chooser.
+    Color,
     Body,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Hit {
     Corner,
+    /// The markers, arranger, signature and tempo lanes.
+    Global(GlobalHit),
     LoopBand(MusicalTime),
     Ruler(MusicalTime),
     Header(TrackId, HeaderPart),
@@ -109,7 +117,10 @@ pub enum Hit {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Drag {
-    Scrub,
+    /// Moving the playhead; `audible` (the Scrub tool) plays snippets.
+    Scrub {
+        audible: bool,
+    },
     Loop {
         anchor: MusicalTime,
         moved: bool,
@@ -127,7 +138,7 @@ enum Drag {
     },
     Pan2D {
         origin: Point,
-        sx: f32,
+        sx: f64,
         sy: f32,
     },
     HeaderWidth {
@@ -166,11 +177,61 @@ struct WaveSpan {
     warp: Option<Vec<faderframe_project::WarpMarker>>,
 }
 
+/// Engine samples of a (non-warped) span ↔ the source's own frames.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FrameMap {
+    pub source: faderframe_core::AudioSourceId,
+    /// Engine sample of the span's first frame.
+    pub start: i64,
+    /// Length in engine samples.
+    pub len: i64,
+    /// Source frame at `start`.
+    pub src_off: f64,
+    /// Source frames per engine sample.
+    pub pr: f64,
+    pub gain: f32,
+}
+
+impl FrameMap {
+    fn of(span: &WaveSpan, model: &Session) -> Self {
+        let ratio = model.frame_ratio();
+        let pr = model.peak_rate(span.source) / model.sample_rate() as f64;
+        Self {
+            source: span.source,
+            start: span.start,
+            len: (span.length as f64 * ratio) as i64,
+            src_off: span.source_offset as f64 * ratio * pr,
+            pr,
+            gain: span.gain,
+        }
+    }
+
+    /// Source frame at engine sample `s`.
+    pub fn frame_at(&self, s: i64) -> i64 {
+        (self.src_off + (s - self.start) as f64 * self.pr).round() as i64
+    }
+
+    /// Engine sample of source frame `f`.
+    pub fn sample_of(&self, f: i64) -> i64 {
+        self.start + ((f as f64 - self.src_off) / self.pr).round() as i64
+    }
+
+    /// Source frames the span covers.
+    pub fn frames(&self) -> (i64, i64) {
+        (
+            self.frame_at(self.start),
+            self.frame_at(self.start + self.len),
+        )
+    }
+}
+
 pub struct ArrangerView {
     theme: Theme,
     /// Zoom: pixels per quarter note.
     ppq: f32,
-    scroll_x: f32,
+    /// Pixels from the timeline start (f64: sample-level zoom deep into a
+    /// project needs the precision).
+    scroll_x: f64,
     scroll_y: f32,
     drag: Option<Drag>,
     hover: Option<Hit>,
@@ -192,6 +253,9 @@ pub struct ArrangerView {
     zoom_seen: u64,
     /// View width at the last paint/event.
     view_w: f32,
+    /// Shown global lanes (from the editor settings).
+    lanes: faderframe_session::lanes::GlobalLanes,
+    global_drag: Option<global::GlobalDrag>,
 }
 
 fn color_of(c: TrackColor) -> Color {
@@ -225,6 +289,8 @@ impl ArrangerView {
             zone_hover: None,
             zoom_seen: 0,
             view_w: f32::MAX,
+            lanes: Default::default(),
+            global_drag: None,
         }
     }
 
@@ -236,13 +302,15 @@ impl ArrangerView {
 
     /// Pick up the saved header width (called before painting/events).
     fn update_header_width(&mut self, model: &Session) {
+        self.lanes = model.editor.lanes;
         self.header_width = model
             .header_width()
             .unwrap_or(self.theme.arranger.header_width);
     }
 
+    /// The ruler and the global lanes under it.
     fn ruler_h(&self) -> f32 {
-        self.theme.arranger.ruler_height
+        self.base_ruler_h() + Self::global_lanes_h(&self.lanes)
     }
 
     fn row_h(&self) -> f32 {
@@ -250,11 +318,11 @@ impl ArrangerView {
     }
 
     pub fn x_of(&self, t: MusicalTime) -> f32 {
-        self.header_w() + t.quarters() as f32 * self.ppq - self.scroll_x
+        self.header_w() + (t.quarters() * self.ppq as f64 - self.scroll_x) as f32
     }
 
     pub fn time_at(&self, x: f32) -> MusicalTime {
-        MusicalTime::from_quarters(((x - self.header_w() + self.scroll_x) / self.ppq) as f64)
+        MusicalTime::from_quarters(((x - self.header_w()) as f64 + self.scroll_x) / self.ppq as f64)
     }
 
     fn lane_tracks(model: &Session) -> Vec<&Track> {
@@ -365,7 +433,8 @@ impl ArrangerView {
 
     fn clamp_scroll(&mut self, model: &Session, size: Size) {
         let lanes_w = (size.w - self.header_w()).max(1.0);
-        let max_x = (self.content_quarters(model) as f32 * self.ppq - lanes_w * 0.5).max(0.0);
+        let max_x =
+            (self.content_quarters(model) * self.ppq as f64 - lanes_w as f64 * 0.5).max(0.0);
         self.scroll_x = self.scroll_x.clamp(0.0, max_x);
         let rows = Self::lane_tracks(model).len() as f32;
         let total = if self.rows.len() > 1 {
@@ -415,6 +484,9 @@ impl ArrangerView {
         if pos.y >= self.ruler_h() && (pos.x - self.header_w()).abs() <= 3.0 {
             return Some(Hit::HeaderEdge);
         }
+        if pos.y >= self.base_ruler_h() && pos.y < self.ruler_h() {
+            return self.global_hit(pos, size, model).map(Hit::Global);
+        }
         if pos.y < self.ruler_h() {
             return Some(if pos.x < self.header_w() {
                 Hit::Corner
@@ -457,6 +529,15 @@ impl ArrangerView {
                 (Some(l.volume.inset_xy(-2.0, -3.0)), HeaderPart::Volume),
                 (Some(l.meter), HeaderPart::Meter),
                 (Some(l.name), HeaderPart::Name),
+                (
+                    Some(Rect::new(
+                        l.stripe.x,
+                        l.stripe.y,
+                        l.stripe.w + 3.0,
+                        l.stripe.h,
+                    )),
+                    HeaderPart::Color,
+                ),
             ]
             .into_iter()
             .find(|(r, _)| r.is_some_and(|r| r.contains(pos)))
@@ -510,6 +591,97 @@ impl ArrangerView {
         self.x_of(model.engine().samples_to_musical(model.project(), sample))
     }
 
+    /// Engine sample at view x.
+    pub(crate) fn sample_at_x(&self, model: &Session, x: f32) -> i64 {
+        model
+            .engine()
+            .musical_to_samples(model.project(), self.time_at(x))
+    }
+
+    /// Pixels per engine sample when zoomed in to sample level (single
+    /// samples are drawn and the Pencil redraws them).
+    pub(crate) fn sample_zoom(&self, model: &Session) -> Option<f32> {
+        let x = self.header_w() + 10.0;
+        let n = self.sample_at_x(model, x + 1000.0) - self.sample_at_x(model, x);
+        let px = 1000.0 / n.max(1) as f32;
+        (px >= 2.0).then_some(px)
+    }
+
+    /// Where a clip's waveform is drawn inside its rectangle.
+    pub(crate) fn clip_content_rect(&self, rect: Rect) -> Rect {
+        let header_h = self.theme.arranger.clip_header.min(rect.h * 0.5);
+        Rect::new(rect.x, rect.y + header_h, rect.w, rect.h - header_h).inset_xy(0.0, 2.0)
+    }
+
+    /// Waveform lanes of `area`: stereo is stacked when there is room.
+    pub(crate) fn wave_lanes(area: Rect, channels: usize) -> Vec<(Rect, Vec<usize>)> {
+        let channels = channels.min(2);
+        if channels == 2 && area.h >= 40.0 {
+            let (top, bottom) = area.split_top(area.h / 2.0);
+            vec![(top, vec![0]), (bottom, vec![1])]
+        } else {
+            vec![(area, (0..channels).collect())]
+        }
+    }
+
+    /// Single samples as a line (dots when far apart), at sample-level
+    /// zoom.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_samples(
+        &self,
+        p: &mut dyn Painter,
+        area: Rect,
+        vis: (f32, f32),
+        map: &FrameMap,
+        px: f32,
+        model: &Session,
+        color: Color,
+    ) {
+        let s0 = self.sample_at_x(model, vis.0).max(map.start);
+        let s1 = self.sample_at_x(model, vis.1).min(map.start + map.len);
+        if s1 <= s0 || area.h < 6.0 {
+            return;
+        }
+        let (f0, f1) = (map.frame_at(s0) - 1, map.frame_at(s1) + 2);
+        let count = (f1 - f0).clamp(0, 20_000) as usize;
+        let Some(data) = model.source_frames(map.source, f0, count) else {
+            return;
+        };
+        let (first, last) = map.frames();
+        let gain = map.gain.min(4.0);
+        let line = color.lighten(0.45);
+        for (lane, chans) in Self::wave_lanes(area, data.len()) {
+            let mid = lane.center().y;
+            let half = lane.h * 0.46;
+            p.hline(vis.0, vis.1, mid, color.lighten(0.3).with_alpha(0.25));
+            for &ch in &chans {
+                let mut path = Path::new();
+                let mut started = false;
+                for (i, v) in data[ch].iter().enumerate() {
+                    let f = f0 + i as i64;
+                    if f < first || f >= last {
+                        continue;
+                    }
+                    let x = self.x_of_sample(model, map.sample_of(f));
+                    let y = mid - (v * gain).clamp(-1.0, 1.0) * half;
+                    let pt = Point::new(x, y);
+                    if started {
+                        path.line_to(pt);
+                    } else {
+                        path.move_to(pt);
+                        started = true;
+                    }
+                    if px >= 6.0 {
+                        p.circle(pt, 1.8, line);
+                    }
+                }
+                if started {
+                    p.stroke_path(&path, 1.3, line);
+                }
+            }
+        }
+    }
+
     // --- painting ------------------------------------------------------------------
 
     fn paint_grid(&self, p: &mut dyn Painter, lanes: Rect, model: &Session) {
@@ -544,6 +716,13 @@ impl ArrangerView {
         model: &Session,
         color: Color,
     ) {
+        if span.warp.is_none()
+            && let Some(px) = self.sample_zoom(model)
+        {
+            let map = FrameMap::of(span, model);
+            self.paint_samples(p, area, vis, &map, px, model, color);
+            return;
+        }
         let Some(peaks) = model.peaks(span.source) else {
             return;
         };
@@ -609,14 +788,7 @@ impl ArrangerView {
         let tl = &model.project().timeline;
         let sr = model.sample_rate() as f64;
         let gain = gain.min(4.0);
-        let channels = channels.min(2);
-        let stacked = channels == 2 && area.h >= 40.0;
-        let lanes: Vec<(Rect, Vec<usize>)> = if stacked {
-            let (top, bottom) = area.split_top(area.h / 2.0);
-            vec![(top, vec![0]), (bottom, vec![1])]
-        } else {
-            vec![(area, (0..channels).collect())]
-        };
+        let lanes = Self::wave_lanes(area, channels);
         let step = (1.0 / p.scale_factor().max(1.0)).max(0.5);
         let fill = color.lighten(0.3).with_alpha(0.9);
         for (lane, chans) in lanes {
@@ -928,8 +1100,7 @@ impl ArrangerView {
                 &TextStyle::new(self.theme.fonts.small, text_color).bold(),
             );
         }
-        let content =
-            Rect::new(rect.x, rect.y + header_h, rect.w, rect.h - header_h).inset_xy(0.0, 2.0);
+        let content = self.clip_content_rect(rect);
         match &clip.content {
             ClipContent::Audio(audio) => {
                 let span = WaveSpan {
@@ -944,6 +1115,7 @@ impl ArrangerView {
                         .map(|w| w.points(audio.source_offset, audio.length)),
                 };
                 self.paint_waveform(p, content, vis, &span, model, color);
+                self.paint_redraw(p, model, clip.id, content);
                 self.paint_warp(p, model, clip, rect);
             }
             ClipContent::Midi(_) => self.paint_midi_preview(p, content, vis, clip, color),
@@ -953,6 +1125,18 @@ impl ArrangerView {
         self.paint_gain(p, clip, rect, text_color);
         if clip.muted {
             p.fill(rect, Color::rgba(0.08, 0.08, 0.09, 0.6));
+        }
+        if track.freeze.is_some() {
+            // Frozen: frosted, labelled.
+            p.fill(rect, Color::rgba(0.62, 0.8, 1.0, 0.28));
+            if rect.w > 70.0 {
+                let r = Rect::new(rect.x.max(lanes.x) + 5.0, rect.bottom() - 15.0, 70.0, 12.0);
+                p.text(
+                    "❄ FROZEN",
+                    r,
+                    &TextStyle::new(self.theme.fonts.tiny, Color::hex(0xdff0ff)).bold(),
+                );
+            }
         }
         if clip
             .content
@@ -1044,12 +1228,32 @@ impl ArrangerView {
             } else {
                 String::new()
             };
-            p.text(
-                &format!(
-                    "{} · {}{input}{plug}{out}",
+            // Group and VCA membership.
+            let group = t
+                .group
+                .and_then(|g| model.project().group(g))
+                .map(|g| format!(" · {}", g.name))
+                .unwrap_or_default();
+            let vca = t
+                .vca
+                .and_then(|v| model.project().track(v))
+                .map(|v| format!(" · {}", v.name))
+                .unwrap_or_default();
+            let text = if t.kind == TrackKind::Vca {
+                let n = model.project().vca_members(t.id).len();
+                format!(
+                    "VCA · {n} track{}{group}{vca}",
+                    if n == 1 { "" } else { "s" }
+                )
+            } else {
+                format!(
+                    "{} · {}{input}{plug}{out}{group}{vca}",
                     t.kind.label(),
                     t.layout.short_name()
-                ),
+                )
+            };
+            p.text(
+                &text,
                 info,
                 &TextStyle::new(th.fonts.tiny + 0.5, th.ui.text_dim).family(FontFamily::Condensed),
             );
@@ -1102,7 +1306,7 @@ impl ArrangerView {
                 th,
             );
         }
-        if t.kind.has_audio() {
+        if t.kind.has_audio() || t.kind == TrackKind::Vca {
             // Mini horizontal fader.
             let v = l.volume;
             let pos = self.law.db_to_position(model.shown_volume_db(t));
@@ -1268,7 +1472,7 @@ impl ArrangerView {
         let lanes_w = size.w - self.header_w();
         if x > size.w - 30.0 || x < self.header_w() {
             self.scroll_x =
-                (model.playhead().quarters() as f32 * self.ppq - lanes_w * 0.1).max(0.0);
+                (model.playhead().quarters() * self.ppq as f64 - lanes_w as f64 * 0.1).max(0.0);
         }
     }
 
@@ -1480,6 +1684,7 @@ impl ArrangerView {
             ),
             MenuItem::new("Add Bus", Action::AddTrack(TrackKind::Bus)),
             MenuItem::new("Add Aux (FX Return)", Action::AddTrack(TrackKind::Aux)),
+            MenuItem::new("Add VCA", Action::AddTrack(TrackKind::Vca)),
         ];
         items.push(
             MenuItem::new(
@@ -1488,6 +1693,48 @@ impl ArrangerView {
             )
             .separated(),
         );
+        items.push(
+            MenuItem::new(
+                "Colour…",
+                Action::PickColor(faderframe_session::ColorTarget::Track(t.id)),
+            )
+            .separated(),
+        );
+        // Groups and VCAs.
+        items.extend(model.group_menu(t.id).into_iter().map(|e| {
+            let mut m = match e.action {
+                Some(a) => MenuItem::new(e.label, a),
+                None => MenuItem::disabled(e.label),
+            };
+            if let Some(on) = e.checked {
+                m = m.checked(on);
+            }
+            if e.separated {
+                m = m.separated();
+            }
+            m
+        }));
+        // Freezing and bouncing (tracks with clips).
+        if matches!(t.kind, TrackKind::Audio | TrackKind::Instrument) {
+            let busy = model.bouncing().contains(&t.id);
+            let frozen = t.freeze.is_some();
+            items.push(
+                if busy {
+                    MenuItem::disabled("Rendering…")
+                } else if frozen {
+                    MenuItem::new("Unfreeze Track", Action::UnfreezeTrack(t.id))
+                } else {
+                    MenuItem::new("Freeze Track", Action::FreezeTrack(t.id))
+                }
+                .separated(),
+            );
+            if !frozen && !busy {
+                items.push(MenuItem::new(
+                    "Bounce to New Track",
+                    Action::BounceTrack(t.id),
+                ));
+            }
+        }
         // Instrument (instrument tracks): the plugin browser.
         if t.kind == TrackKind::Instrument {
             let current = t
@@ -1867,12 +2114,13 @@ impl ArrangerView {
                 cx.set_cursor(Cursor::ResizeHorizontal);
             }
             Hit::Automation { .. } => {}
+            Hit::Global(g) => return self.global_press(g, pos, clicks, mods, size, model, cx),
             Hit::Corner => cx.request(Self::grid_menu(model, pos)),
             Hit::Ruler(t) => {
                 cx.emit(Action::Transport(TransportAction::Locate(
                     self.snap(t, model, mods),
                 )));
-                self.drag = Some(Drag::Scrub);
+                self.drag = Some(Drag::Scrub { audible: false });
             }
             Hit::LoopBand(t) => {
                 self.drag = Some(Drag::Loop {
@@ -1928,7 +2176,7 @@ impl ArrangerView {
                         };
                         edit(cx, Command::SetTrackMonitor { track: id, mode });
                     }
-                    HeaderPart::Volume if t.kind.has_audio() => {
+                    HeaderPart::Volume if t.kind.has_audio() || t.kind == TrackKind::Vca => {
                         if clicks >= 2 {
                             edit(cx, Command::SetTrackVolume { track: id, db: 0.0 });
                         } else if let Some(l) = self.header_layout(model, id, size) {
@@ -1962,6 +2210,11 @@ impl ArrangerView {
                         }
                     }
                     HeaderPart::Meter => cx.emit(Action::ResetClipIndicators),
+                    HeaderPart::Color => {
+                        cx.emit(Action::PickColor(faderframe_session::ColorTarget::Track(
+                            id,
+                        )));
+                    }
                     HeaderPart::Name if clicks >= 2 => {
                         if let Some(l) = self.header_layout(model, id, size) {
                             cx.request(Self::rename_request(t, l.name));
@@ -2039,6 +2292,9 @@ impl ArrangerView {
         model: &Session,
         cx: &mut EventCx<'_, Action>,
     ) {
+        if self.global_drag_move(pos, mods, size, model, cx) {
+            return;
+        }
         if self.auto_drag_move(model, pos, mods, size.w, cx) {
             return;
         }
@@ -2074,11 +2330,13 @@ impl ArrangerView {
             return;
         }
         match self.drag {
-            Some(Drag::Scrub) => {
-                let t = self.time_at(pos.x).max(MusicalTime::ZERO);
-                cx.emit(Action::Transport(TransportAction::Locate(
-                    self.snap(t, model, mods),
-                )));
+            Some(Drag::Scrub { audible }) => {
+                let t = self.snap(self.time_at(pos.x).max(MusicalTime::ZERO), model, mods);
+                cx.emit(Action::Transport(if audible {
+                    TransportAction::Scrub(t)
+                } else {
+                    TransportAction::Locate(t)
+                }));
             }
             Some(Drag::Loop { anchor, .. }) => {
                 let t = self.snap(self.time_at(pos.x).max(MusicalTime::ZERO), model, mods);
@@ -2137,7 +2395,7 @@ impl ArrangerView {
                 }
             }
             Some(Drag::Pan2D { origin, sx, sy }) => {
-                self.scroll_x = sx - (pos.x - origin.x);
+                self.scroll_x = sx - (pos.x - origin.x) as f64;
                 self.scroll_y = sy - (pos.y - origin.y);
                 self.clamp_scroll(model, size);
                 cx.redraw();
@@ -2147,6 +2405,9 @@ impl ArrangerView {
     }
 
     fn release(&mut self, model: &Session, size: Size, cx: &mut EventCx<'_, Action>) {
+        if self.global_release(model, cx) {
+            return;
+        }
         if self.auto_release(model, cx) {
             cx.set_cursor(Cursor::Default);
             return;
@@ -2186,7 +2447,7 @@ impl ArrangerView {
     fn zoom_at(&mut self, x: f32, factor: f32, model: &Session, size: Size) {
         let t = self.time_at(x);
         self.ppq = (self.ppq * factor).clamp(MIN_PPQ, MAX_PPQ);
-        self.scroll_x = t.quarters() as f32 * self.ppq - (x - self.header_w());
+        self.scroll_x = t.quarters() * self.ppq as f64 - (x - self.header_w()) as f64;
         self.clamp_scroll(model, size);
     }
 }
@@ -2239,6 +2500,7 @@ impl CanvasView<Session, Action> for ArrangerView {
             );
         }
         self.paint_grid(p, lanes, model);
+        self.paint_marker_guides(p, lanes, model);
         if let Some(lr) = model.project().loop_range
             && model.project().loop_enabled
         {
@@ -2364,15 +2626,16 @@ impl CanvasView<Session, Action> for ArrangerView {
                 self.header_w(),
                 0.0,
                 size.w - self.header_w(),
-                self.ruler_h(),
+                self.base_ruler_h(),
             ),
             model,
         );
         self.paint_corner(
             p,
-            Rect::new(0.0, 0.0, self.header_w(), self.ruler_h()),
+            Rect::new(0.0, 0.0, self.header_w(), self.base_ruler_h()),
             model,
         );
+        self.paint_global_lanes(p, size, model);
     }
 
     fn event(
@@ -2436,6 +2699,7 @@ impl CanvasView<Session, Action> for ArrangerView {
                     Some(Hit::Corner) | Some(Hit::Ruler(_)) | Some(Hit::LoopBand(_)) => {
                         cx.request(Self::grid_menu(model, pos));
                     }
+                    Some(Hit::Global(g)) => cx.request(self.global_menu(g, model, pos)),
                     Some(Hit::TakeLane { clip, take, .. }) => {
                         if let Some(c) = model.project().clip(clip) {
                             cx.request(Self::take_menu(c, take, pos));
@@ -2494,6 +2758,15 @@ impl CanvasView<Session, Action> for ArrangerView {
                         Some(Hit::Automation { header: false, .. }) => Cursor::Crosshair,
                         Some(Hit::Automation { header: true, .. }) => Cursor::Pointer,
                         Some(Hit::Ruler(_) | Hit::LoopBand(_)) => Cursor::Pointer,
+                        Some(Hit::Global(GlobalHit::Section(
+                            _,
+                            SectionPart::Start | SectionPart::End,
+                        ))) => Cursor::ResizeHorizontal,
+                        Some(Hit::Global(GlobalHit::Empty(
+                            faderframe_session::lanes::GlobalLane::Arranger,
+                            _,
+                        ))) => Cursor::Crosshair,
+                        Some(Hit::Global(_)) => Cursor::Pointer,
                         Some(Hit::Header(_, HeaderPart::Volume)) => Cursor::ResizeHorizontal,
                         Some(Hit::Header(_, HeaderPart::Pan | HeaderPart::Resize)) => {
                             Cursor::ResizeVertical
@@ -2595,7 +2868,7 @@ impl CanvasView<Session, Action> for ArrangerView {
                         vy = 0.0;
                     }
                     let unit = if precise { 1.0 } else { 48.0 };
-                    self.scroll_x += hx * unit;
+                    self.scroll_x += (hx * unit) as f64;
                     self.scroll_y += vy * unit;
                     self.clamp_scroll(model, size);
                 }
@@ -2654,6 +2927,7 @@ impl CanvasView<Session, Action> for ArrangerView {
 
     fn tooltip(&self, pos: Point, size: Size, model: &Session) -> Option<String> {
         match self.hit_test(pos, size, model)? {
+            Hit::Global(g) => self.global_tooltip(g, model),
             Hit::Clip { clip, .. } => {
                 let p = model.project();
                 let c = p.clip(clip)?;
@@ -2690,6 +2964,9 @@ impl CanvasView<Session, Action> for ArrangerView {
                     HeaderPart::Monitor => "Input monitoring".into(),
                     HeaderPart::Name => "Double-click to rename".into(),
                     HeaderPart::Automation => "Show / hide automation lanes".into(),
+                    HeaderPart::Color => {
+                        "Track colour · Click to choose (the selected tracks follow)".into()
+                    }
                     HeaderPart::Resize => {
                         "Drag to change the track height · Double-click to reset · Alt+wheel: all tracks"
                             .into()
@@ -2734,7 +3011,7 @@ impl CanvasView<Session, Action> for ArrangerView {
             ScrollAxis::Horizontal => ScrollInfo {
                 content: self.content_quarters(model) as f32 * self.ppq,
                 viewport: (size.w - self.header_w()).max(0.0),
-                offset: self.scroll_x,
+                offset: self.scroll_x as f32,
             },
             ScrollAxis::Vertical => ScrollInfo {
                 content: if self.rows.len() > 1 {
@@ -2774,7 +3051,7 @@ impl CanvasView<Session, Action> for ArrangerView {
 
     fn set_scroll(&mut self, axis: ScrollAxis, offset: f32) {
         match axis {
-            ScrollAxis::Horizontal => self.scroll_x = offset.max(0.0),
+            ScrollAxis::Horizontal => self.scroll_x = offset.max(0.0) as f64,
             ScrollAxis::Vertical => self.scroll_y = offset.max(0.0),
         }
     }

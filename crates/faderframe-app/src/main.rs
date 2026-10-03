@@ -13,7 +13,9 @@ USAGE:
     faderframe [OPTIONS] [PROJECT.ffproj]
 
 OPTIONS:
-    --backend <auto|jack|dummy>   Audio system (default: from preferences, else auto)
+    --backend <auto|pipewire|jack|system|dummy>
+                                 Audio system (default: from preferences, else auto;
+                                 system: ALSA, WASAPI or CoreAudio)
     --sample-rate <HZ>            Requested sample rate (44100, 48000, 96000, 192000, …)
     --buffer-size <FRAMES>        Requested buffer size (32, 64, 128, 256, 512, …)
     --threads <N>                 Processing threads incl. the audio thread (default: one per core)
@@ -46,6 +48,8 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<RunOptions>, Strin
                 o.backend = match value("--backend")?.as_str() {
                     "auto" => BackendChoice::Auto,
                     "jack" => BackendChoice::Jack,
+                    "pipewire" | "pw" => BackendChoice::PipeWire,
+                    "system" | "alsa" | "wasapi" | "coreaudio" => BackendChoice::System,
                     "dummy" | "none" => BackendChoice::Dummy,
                     other => return Err(format!("unknown backend '{other}'")),
                 }

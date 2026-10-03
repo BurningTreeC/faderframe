@@ -17,6 +17,8 @@ pub struct EngineContext {
     /// written by the processors for the UI.
     pub readback: Arc<ParamTable>,
     pub meters: Arc<MeterBank>,
+    /// Post-fader audio of the analysed track (the Tools view).
+    pub scope: Arc<faderframe_realtime::ScopeRing>,
     /// Live MIDI input of this chunk (see [`crate::midi`]).
     pub midi_input: crate::midi::MidiInputBlock,
 }

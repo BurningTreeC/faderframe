@@ -25,6 +25,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
+/// Frames the analysis scope holds (~10 s at 48 kHz).
+const SCOPE_FRAMES: usize = 1 << 19;
+
 /// Static engine configuration.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EngineConfig {
@@ -158,6 +161,7 @@ pub fn create_with_epoch(
     let params = Arc::new(ParamTable::new(config.param_capacity));
     let readback = Arc::new(ParamTable::new(config.param_capacity));
     let meters = Arc::new(MeterBank::new(config.meter_capacity));
+    let scope = Arc::new(faderframe_realtime::ScopeRing::new(SCOPE_FRAMES));
     let processor = EngineProcessor {
         rx,
         graph_rx,
@@ -171,6 +175,7 @@ pub fn create_with_epoch(
             params: Arc::clone(&params),
             readback: Arc::clone(&readback),
             meters: Arc::clone(&meters),
+            scope: Arc::clone(&scope),
             midi_input: crate::midi::MidiInputBlock::with_capacity(
                 crate::midi::MIDI_INPUT_CAPACITY,
             ),
@@ -197,6 +202,7 @@ pub fn create_with_epoch(
         shared,
         params,
         meters,
+        scope,
         slots: SlotRegistry::new(config.param_capacity, config.meter_capacity),
         plugins: PluginHost::default(),
         profile: None,
@@ -412,7 +418,10 @@ impl EngineProcessor {
                     .fetch_add(got as u64, Ordering::Relaxed);
             }
             let clock_ports = self.shared.midi.clock_ports.load(Ordering::Relaxed);
+            let scrubbing = self.transport.scrubbing();
+            // Scrub snippets don't start and stop external gear.
             if clock_ports != 0
+                && !scrubbing
                 && let Some(q) = self.midi_out.as_deref_mut()
             {
                 let ns_per_frame = 1e9 / rate.max(1.0);
@@ -501,7 +510,15 @@ impl EngineProcessor {
                 MetronomeMode::Recording => info.recording,
                 MetronomeMode::Always => true,
             };
-            if click && info.playing {
+            if scrubbing {
+                // Snippets fade in and out (no clicks between them).
+                for c in 0..io.output_channels() {
+                    for (i, o) in io.output(c)[offset..offset + n].iter_mut().enumerate() {
+                        *o *= self.transport.scrub_gain(i);
+                    }
+                }
+            }
+            if click && info.playing && !scrubbing {
                 self.click.render(
                     io,
                     offset,
@@ -581,6 +598,7 @@ pub struct EngineController {
     shared: Arc<EngineShared>,
     params: Arc<ParamTable>,
     meters: Arc<MeterBank>,
+    scope: Arc<faderframe_realtime::ScopeRing>,
     slots: SlotRegistry,
     readback: Arc<ParamTable>,
     plugins: PluginHost,
@@ -758,6 +776,39 @@ impl EngineController {
         self.plugins.poll()
     }
 
+    /// Preset files of a plugin format's own folders (e.g. VST3).
+    pub fn plugin_preset_files(
+        &self,
+        plugin: faderframe_core::PluginInstanceId,
+    ) -> Vec<std::path::PathBuf> {
+        self.plugins.preset_files(plugin)
+    }
+
+    /// The encoded state of one of those preset files.
+    pub fn plugin_state_from_preset(
+        &self,
+        plugin: faderframe_core::PluginInstanceId,
+        data: &[u8],
+    ) -> Result<String, faderframe_plugin_host::PluginError> {
+        self.plugins.state_from_preset_file(plugin, data)
+    }
+
+    /// The slot state was captured from the running plugin.
+    pub fn note_plugin_state(&mut self, plugin: faderframe_core::PluginInstanceId, state: &str) {
+        self.plugins.note_state(plugin, state);
+    }
+
+    /// Parameter moves made in plugins' own editors since the last call
+    /// (for automation writing).
+    pub fn take_plugin_edits(
+        &mut self,
+    ) -> Vec<(
+        faderframe_core::PluginInstanceId,
+        faderframe_plugin_host::EditorEdit,
+    )> {
+        self.plugins.take_editor_edits()
+    }
+
     /// Current value of a hosted plugin's parameter (plain units).
     pub fn plugin_parameter_value(
         &mut self,
@@ -821,6 +872,21 @@ impl EngineController {
     /// Encoded state of a plugin instance (for saving into the project).
     pub fn plugin_state(&mut self, plugin: faderframe_core::PluginInstanceId) -> Option<String> {
         self.plugins.capture_state(plugin)
+    }
+
+    /// Audio of the analysed track (see [`Self::set_analysis_source`]).
+    pub fn scope(&self) -> &Arc<faderframe_realtime::ScopeRing> {
+        &self.scope
+    }
+
+    /// The track whose post-fader output the scope receives.
+    pub fn set_analysis_source(&self, track: Option<TrackId>) {
+        self.scope.set_source(track.map(|t| t.raw()));
+    }
+
+    /// Does the plugin have a sidechain input?
+    pub fn plugin_has_sidechain(&self, plugin: faderframe_core::PluginInstanceId) -> bool {
+        self.plugins.has_sidechain(plugin)
     }
 
     /// Parameters of an instantiated plugin (for automation lists).
@@ -907,8 +973,12 @@ impl EngineController {
     }
 
     pub fn update_params(&mut self, project: &Project) -> Result<(), EngineError> {
-        self.slots
-            .write_params(project, &self.params, &self.midi_live)?;
+        self.slots.write_params(
+            project,
+            &self.params,
+            &self.midi_live,
+            &self.suspended_lanes,
+        )?;
         self.plugins.sync_parameters(project);
         Ok(())
     }
@@ -930,8 +1000,12 @@ impl EngineController {
         let compiled = built.builder.compile(&prepare)?;
         self.voices = voice_needs(project);
         // Parameters must be valid before the new graph's processors read them.
-        self.slots
-            .write_params(project, &self.params, &self.midi_live)?;
+        self.slots.write_params(
+            project,
+            &self.params,
+            &self.midi_live,
+            &self.suspended_lanes,
+        )?;
         self.stats = compiled.stats().clone();
         let mut owners = vec![None; compiled.timings().len()];
         for (id, owner) in &built.owners {

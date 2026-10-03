@@ -10,7 +10,7 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Preferences {
-    /// "auto", "jack" or "dummy".
+    /// "auto", "pipewire", "jack", "system" or "dummy".
     pub backend: String,
     pub sample_rate: Option<u32>,
     pub buffer_size: Option<u32>,
@@ -141,6 +141,8 @@ impl Preferences {
     pub fn backend(&self) -> BackendChoice {
         match self.backend.as_str() {
             "jack" => BackendChoice::Jack,
+            "pipewire" => BackendChoice::PipeWire,
+            "system" => BackendChoice::System,
             "dummy" => BackendChoice::Dummy,
             _ => BackendChoice::Auto,
         }
@@ -150,6 +152,8 @@ impl Preferences {
         self.backend = match b {
             BackendChoice::Auto => "auto",
             BackendChoice::Jack => "jack",
+            BackendChoice::PipeWire => "pipewire",
+            BackendChoice::System => "system",
             BackendChoice::Dummy => "dummy",
         }
         .into();

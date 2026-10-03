@@ -1,0 +1,61 @@
+name: Ports
+
+# Builds and tests on macOS (Apple Silicon and Intel) and Windows. Kept apart
+# from CI (Linux, the primary platform) while the ports mature.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: macOS (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: Apple Silicon
+          - runner: macos-15-intel
+            arch: Intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: System dependencies
+        run: brew install gtk4 pkgconf
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build application
+        run: cargo build -p faderframe-app
+      - name: Tests
+        run: cargo test --workspace
+
+  windows:
+    name: Windows (MSYS2 UCRT64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-rust
+      - name: Build application
+        run: cargo build -p faderframe-app
+      - name: Tests
+        run: cargo test --workspace

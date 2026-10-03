@@ -1,6 +1,7 @@
 //! Plugins shipped with FaderFrame, implemented on the same
 //! [`PluginInstance`]/[`PluginProcessor`] API that external formats use.
 
+mod compressor;
 mod echo;
 mod gain;
 mod latency;
@@ -15,6 +16,7 @@ use faderframe_core::{ParameterId, builtin};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
+    Compressor,
     Gain,
     Echo,
     Synth,
@@ -25,6 +27,7 @@ impl Kind {
     fn from_id(id: &str) -> Option<Self> {
         Some(match id {
             builtin::GAIN => Kind::Gain,
+            builtin::COMPRESSOR => Kind::Compressor,
             builtin::ECHO => Kind::Echo,
             builtin::SYNTH => Kind::Synth,
             builtin::LATENCY_PROBE => Kind::LatencyProbe,
@@ -37,7 +40,18 @@ impl Kind {
             channels: 2,
             is_main: true,
         };
+        let sidechain = AudioPortInfo {
+            channels: 2,
+            is_main: false,
+        };
         let (id, name, category, inputs, notes) = match self {
+            Kind::Compressor => (
+                builtin::COMPRESSOR,
+                "Compressor",
+                PluginCategory::Effect,
+                vec![stereo, sidechain],
+                0,
+            ),
             Kind::Gain => (
                 builtin::GAIN,
                 "Gain",
@@ -95,6 +109,13 @@ impl Kind {
         use ParameterUnit::*;
         match self {
             Kind::Gain => vec![p(0, "Gain", -60.0, 24.0, 0.0, Decibels)],
+            Kind::Compressor => vec![
+                p(0, "Threshold", -60.0, 0.0, -20.0, Decibels),
+                p(1, "Ratio", 1.0, 20.0, 4.0, None),
+                p(2, "Attack", 0.1, 200.0, 10.0, Milliseconds),
+                p(3, "Release", 5.0, 2000.0, 150.0, Milliseconds),
+                p(4, "Makeup", 0.0, 24.0, 0.0, Decibels),
+            ],
             Kind::Echo => vec![
                 p(0, "Time", 10.0, 2000.0, 401.0, Milliseconds),
                 p(1, "Feedback", 0.0, 0.95, 0.38, Percent),
@@ -160,7 +181,7 @@ impl PluginInstance for BuiltinInstance {
         match self.kind {
             Kind::Echo => TailLength::Infinite,
             Kind::Synth => TailLength::Samples(48_000 * 5),
-            Kind::Gain => TailLength::None,
+            Kind::Gain | Kind::Compressor => TailLength::None,
             Kind::LatencyProbe => TailLength::Samples(self.latency_samples()),
         }
     }
@@ -180,6 +201,7 @@ impl PluginInstance for BuiltinInstance {
         let params = self.params.clone();
         Ok(match self.kind {
             Kind::Gain => Box::new(gain::GainProcessor::new(params)),
+            Kind::Compressor => Box::new(compressor::CompressorProcessor::new(params, config)),
             Kind::Echo => Box::new(echo::EchoProcessor::new(params, config)),
             Kind::Synth => Box::new(synth::SynthProcessor::new(params, config)),
             Kind::LatencyProbe => Box::new(latency::LatencyProcessor::new(self.latency_samples())),
@@ -196,10 +218,16 @@ impl PluginFactory for BuiltinFactory {
     }
 
     fn scan(&self) -> Vec<PluginDescriptor> {
-        [Kind::Synth, Kind::Echo, Kind::Gain, Kind::LatencyProbe]
-            .iter()
-            .map(|k| k.descriptor())
-            .collect()
+        [
+            Kind::Synth,
+            Kind::Echo,
+            Kind::Compressor,
+            Kind::Gain,
+            Kind::LatencyProbe,
+        ]
+        .iter()
+        .map(|k| k.descriptor())
+        .collect()
     }
 
     fn instantiate(&self, id: &str) -> Result<Box<dyn PluginInstance>, PluginError> {

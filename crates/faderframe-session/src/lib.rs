@@ -21,13 +21,22 @@ pub mod midi;
 pub mod notes;
 pub mod performance;
 pub use performance::{Load, PerformanceReport, PluginPerformance, TrackPerformance};
+pub mod analysis;
 pub mod editing;
+mod freeze;
+mod groups;
+pub mod lanes;
+mod redraw;
+pub use groups::GroupMenuEntry;
+mod midifile;
+pub mod presets;
 pub mod record;
 pub mod render;
 mod selection;
 pub mod sync;
 mod sysex;
 mod transients;
+pub use midifile::is_midi_file;
 pub mod warping;
 pub use editing::{
     ClipEdge, CounterUnit, EditFlag, EditMode, EditRange, EditTool, GridMode, NudgeTarget,
@@ -111,6 +120,8 @@ pub enum TransportAction {
     Stop,
     TogglePlay,
     Locate(MusicalTime),
+    /// Scrubbing: play a short snippet from here (the playhead stays).
+    Scrub(MusicalTime),
     ReturnToStart,
     ToggleLoop,
     SetLoop(Option<MusicalRange>),
@@ -179,6 +190,101 @@ pub enum Action {
         index: usize,
         plugin: PluginRef,
     },
+    /// Move an insert to slot `index` of `to` (the same track reorders);
+    /// the plugin keeps running with its state.
+    MovePlugin {
+        track: TrackId,
+        plugin: faderframe_core::PluginInstanceId,
+        to: TrackId,
+        index: usize,
+    },
+    /// Pencil at sample level: replace `samples` of the clip's audio from
+    /// source frame `start` (one channel or all), non-destructively.
+    RedrawAudio {
+        clip: ClipId,
+        channel: Option<usize>,
+        start: i64,
+        samples: Vec<f32>,
+    },
+    /// Open the colour chooser for a track (the selected tracks follow)
+    /// or a section.
+    PickColor(ColorTarget),
+    /// A marker at this position.
+    AddMarker(MusicalTime),
+    /// A section of the arrangement over this range.
+    AddSection {
+        start: MusicalTime,
+        end: MusicalTime,
+    },
+    /// A tempo change at this position (keeping the tempo there).
+    AddTempoPoint(MusicalTime),
+    /// Move tempo point `index` and set its tempo.
+    SetTempoPoint {
+        index: usize,
+        position: MusicalTime,
+        bpm: f64,
+    },
+    RemoveTempoPoint(usize),
+    /// Ramp from tempo point `index` to the next (or step).
+    SetTempoRamp {
+        index: usize,
+        ramp: bool,
+    },
+    ShowGlobalLane(lanes::GlobalLane, bool),
+    /// Analyse this track in the Tools view (`None`: the master).
+    SetAnalysisSource(Option<TrackId>),
+    /// Start a new loudness measurement.
+    ResetAnalysis,
+    SetLoudnessTarget(f32),
+    SetLevelScale(analysis::LevelScale),
+    SetResetOnPlay(bool),
+    /// Group the selected tracks.
+    GroupSelectedTracks,
+    DeleteGroup(faderframe_core::GroupId),
+    /// Turn a group's linking on or off.
+    SetGroupActive {
+        group: faderframe_core::GroupId,
+        active: bool,
+    },
+    /// Change what a group links.
+    SetGroupLink {
+        group: faderframe_core::GroupId,
+        link: faderframe_project::GroupLink,
+    },
+    RenameGroup {
+        group: faderframe_core::GroupId,
+        name: String,
+    },
+    /// Ask (in the shell) for a group's new name.
+    PromptRenameGroup(faderframe_core::GroupId),
+    /// Assign the selected tracks to a VCA.
+    AssignSelectedToVca(TrackId),
+    /// Render a track and play the result instead of its clips, instrument
+    /// and inserts (unloading its plugins).
+    FreezeTrack(TrackId),
+    UnfreezeTrack(TrackId),
+    /// Render a track (after its inserts) onto a new audio track and mute
+    /// the original.
+    BounceTrack(TrackId),
+    /// Ask (in the shell) for a preset name for the plugin.
+    PromptSavePluginPreset(faderframe_core::PluginInstanceId),
+    /// Save a plugin's current settings as a user preset named `name`.
+    SavePluginPreset {
+        plugin: faderframe_core::PluginInstanceId,
+        name: String,
+    },
+    /// Load a preset file into a plugin (one undo step).
+    LoadPluginPreset {
+        plugin: faderframe_core::PluginInstanceId,
+        path: PathBuf,
+    },
+    /// Copy an insert, with its current settings, to slot `index` of `to`.
+    CopyPlugin {
+        track: TrackId,
+        plugin: faderframe_core::PluginInstanceId,
+        to: TrackId,
+        index: usize,
+    },
     AddSend {
         track: TrackId,
         target: TrackId,
@@ -200,6 +306,13 @@ pub enum Action {
         velocity: u8,
     },
     /// Import audio files (decoded in the background; one undo step).
+    /// Import a Standard MIDI File as new instrument tracks at `at` (with
+    /// `tempo`: and its tempo map and time signatures).
+    ImportMidiFile {
+        path: PathBuf,
+        at: MusicalTime,
+        tempo: bool,
+    },
     ImportFiles {
         files: Vec<PathBuf>,
         /// Put the first file on this audio track (others get new tracks).
@@ -525,6 +638,8 @@ pub struct EditorSettings {
     /// The latest zoom request and its sequence number (views apply each
     /// request once).
     pub zoom_request: (u64, ZoomRequest),
+    /// Lanes under the arranger's ruler.
+    pub lanes: lanes::GlobalLanes,
 }
 
 impl Default for EditorSettings {
@@ -547,6 +662,7 @@ impl Default for EditorSettings {
             counter_unit: CounterUnit::BarsBeats,
             transient_sensitivity: 0.5,
             zoom_request: (0, ZoomRequest::Fit),
+            lanes: lanes::GlobalLanes::default(),
         }
     }
 }
@@ -676,6 +792,17 @@ pub struct Session {
     /// Where playback last started (for "insertion follows playback" off).
     play_started_at: Option<i64>,
     transients: transients::TransientCache,
+    /// Track renders for freezing and bouncing.
+    bounces: Vec<freeze::PendingBounce>,
+    /// The Tools view's meters.
+    analysis: analysis::AnalysisState,
+    /// Where tracks following a multi-track fader/pan/send move started
+    /// (for the running gesture).
+    follow_base: HashMap<groups::FollowKey, f32>,
+    /// The edit being applied comes from the user (`Action::Edit`): other
+    /// selected tracks follow it (mapped controllers and automation don't
+    /// move the selection).
+    user_edit: bool,
     /// Clips as the running gesture first saw them (drags recompute from
     /// these).
     gesture_base: HashMap<ClipId, faderframe_project::Clip>,
@@ -707,6 +834,21 @@ pub enum UiRequest {
     },
     /// Pick a `.syx` file and add its messages to `clip` at `at`.
     ImportSysex { clip: ClipId, at: MusicalTime },
+    /// Ask for a name and save the plugin's settings as a preset.
+    SavePluginPreset {
+        plugin: faderframe_core::PluginInstanceId,
+    },
+    /// Ask for a group's new name.
+    RenameGroup(faderframe_core::GroupId),
+    /// Pick a colour (track or section).
+    PickColor(ColorTarget),
+}
+
+/// What a picked colour is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorTarget {
+    Track(TrackId),
+    Section(faderframe_core::SectionId),
 }
 
 /// One parameter of a hosted plugin, for generic editors.
@@ -825,6 +967,10 @@ impl Session {
             play_started_at: None,
             transients: transients::TransientCache::default(),
             gesture_base: HashMap::new(),
+            bounces: Vec::new(),
+            analysis: analysis::AnalysisState::new(config.sample_rate),
+            follow_base: HashMap::new(),
+            user_edit: false,
             note_clipboard_expressions: Vec::new(),
             perf: Default::default(),
             midi,
@@ -833,6 +979,7 @@ impl Session {
         s.render_sources();
         s.engine.sync(&s.project, &s.sources, Impact::Graph)?;
         s.update_loader();
+        s.apply_analysis_source();
         s.editor_clip = s.first_midi_clip();
         Ok(s)
     }
@@ -1089,6 +1236,7 @@ impl Session {
         self.engine.transport(TransportCommand::Locate(position))?;
         self.pending = Some(processor);
         self.update_loader();
+        self.apply_analysis_source();
         Ok(())
     }
 
@@ -1242,6 +1390,8 @@ impl Session {
     /// Poll the engine (call once per UI frame). `dt` is in seconds.
     pub fn tick(&mut self, dt: f32) {
         self.poll_jobs();
+        self.poll_bounces();
+        self.poll_analysis(dt);
         self.pump_idle();
         self.poll_recording();
         self.engine.collect_garbage();
@@ -1256,6 +1406,9 @@ impl Session {
         } else if plugin_poll.params_changed {
             self.revision += 1;
         }
+        // Moves in plugins' own editors write automation like ours do.
+        let edits = self.engine.take_plugin_edits();
+        self.plugin_editor_edits(edits);
         if was_playing && !self.transport.playing {
             // Stopped (by the user, the end of a bounce, a dropped stream):
             // Latch/Write automation ends here.
@@ -1783,7 +1936,26 @@ impl Session {
 
     /// Apply an undoable edit.
     pub fn edit(&mut self, cmd: Command) -> Result<()> {
+        if let Some(name) = self.frozen_target(&cmd) {
+            return Err(SessionError::Other(format!(
+                "'{name}' is frozen: unfreeze it to edit it"
+            )));
+        }
+        // Linked group members and other selected tracks follow (one undo
+        // step).
+        let linked = self.group_edits(&cmd);
         self.capture_automation(&cmd);
+        for c in &linked {
+            self.capture_automation(c);
+        }
+        let cmd = if linked.is_empty() {
+            cmd
+        } else {
+            Command::Batch {
+                label: cmd.label(),
+                commands: std::iter::once(cmd).chain(linked).collect(),
+            }
+        };
         if removes_plugins(&cmd) {
             // Undo restores removed plugins from their slots: keep the
             // slots' state current.
@@ -1795,11 +1967,17 @@ impl Session {
 
     pub fn dispatch(&mut self, action: Action) -> Result<()> {
         match action {
-            Action::Edit(cmd) => self.edit(cmd)?,
+            Action::Edit(cmd) => {
+                self.user_edit = true;
+                let r = self.edit(cmd);
+                self.user_edit = false;
+                r?;
+            }
             Action::BeginGesture(label) => self.history.begin(label),
             Action::EndGesture => {
                 self.history.end();
                 self.gesture_base.clear();
+                self.follow_base.clear();
                 self.automation_gesture_ended();
                 self.revision += 1;
             }
@@ -1823,6 +2001,7 @@ impl Session {
             }
             Action::Workspace(w) => self.workspace_action(w)?,
             Action::SelectTracks { tracks, mode } => {
+                let tracks = self.with_group_selection(&tracks);
                 self.selection.select_tracks(&tracks, mode);
                 self.revision += 1;
             }
@@ -1905,9 +2084,87 @@ impl Session {
                     bypass: false,
                     parameters: Vec::new(),
                     state: None,
+                    sidechain: None,
                 };
                 self.edit(Command::InsertPlugin { track, index, slot })?;
             }
+            Action::MovePlugin {
+                track,
+                plugin,
+                to,
+                index,
+            } => self.move_plugin(track, plugin, to, index, false)?,
+            Action::CopyPlugin {
+                track,
+                plugin,
+                to,
+                index,
+            } => self.move_plugin(track, plugin, to, index, true)?,
+            Action::RedrawAudio {
+                clip,
+                channel,
+                start,
+                samples,
+            } => self.redraw_audio(clip, channel, start, &samples)?,
+            Action::PickColor(target) => self.ui_requests.push(UiRequest::PickColor(target)),
+            Action::AddMarker(at) => {
+                self.add_marker(at)?;
+            }
+            Action::AddSection { start, end } => {
+                self.add_section(start, end)?;
+            }
+            Action::AddTempoPoint(at) => self.add_tempo_point(at)?,
+            Action::SetTempoPoint {
+                index,
+                position,
+                bpm,
+            } => self.set_tempo_point(index, position, bpm)?,
+            Action::RemoveTempoPoint(index) => self.remove_tempo_point(index)?,
+            Action::SetTempoRamp { index, ramp } => self.set_tempo_ramp(index, ramp)?,
+            Action::ShowGlobalLane(lane, on) => {
+                self.editor.lanes.set(lane, on);
+                self.revision += 1;
+            }
+            Action::SetAnalysisSource(track) => {
+                self.set_analysis_source(track);
+                self.revision += 1;
+            }
+            Action::ResetAnalysis => self.reset_analysis(),
+            Action::SetLoudnessTarget(lufs) => {
+                self.update_analysis_settings(|s| s.target_lufs = lufs);
+            }
+            Action::SetLevelScale(scale) => self.update_analysis_settings(|s| s.scale = scale),
+            Action::SetResetOnPlay(on) => self.update_analysis_settings(|s| s.reset_on_play = on),
+            Action::GroupSelectedTracks => {
+                let tracks: Vec<TrackId> = self.selection.tracks.iter().copied().collect();
+                self.create_group(&tracks)?;
+            }
+            Action::DeleteGroup(group) => self.delete_group(group)?,
+            Action::PromptRenameGroup(group) => {
+                self.ui_requests.push(UiRequest::RenameGroup(group));
+            }
+            Action::AssignSelectedToVca(vca) => self.assign_selected_to_vca(vca)?,
+            Action::SetGroupActive { group, active } => {
+                self.update_group(group, |g| g.active = active)?;
+            }
+            Action::SetGroupLink { group, link } => self.update_group(group, |g| g.link = link)?,
+            Action::RenameGroup { group, name } => {
+                let name = name.trim().to_string();
+                if !name.is_empty() {
+                    self.update_group(group, |g| g.name = name)?;
+                }
+            }
+            Action::FreezeTrack(track) => self.start_bounce(track, true)?,
+            Action::UnfreezeTrack(track) => self.unfreeze(track)?,
+            Action::BounceTrack(track) => self.start_bounce(track, false)?,
+            Action::PromptSavePluginPreset(plugin) => {
+                self.ui_requests
+                    .push(UiRequest::SavePluginPreset { plugin });
+            }
+            Action::SavePluginPreset { plugin, name } => {
+                self.save_plugin_preset(plugin, &name)?;
+            }
+            Action::LoadPluginPreset { plugin, path } => self.load_plugin_preset(plugin, &path)?,
             Action::AddSend {
                 track,
                 target,
@@ -2094,6 +2351,7 @@ impl Session {
                     bypass: false,
                     parameters: Vec::new(),
                     state: None,
+                    sidechain: None,
                 });
                 self.edit(Command::SetInstrument { track, slot })?;
             }
@@ -2132,8 +2390,23 @@ impl Session {
                 }
                 self.revision += 1;
             }
+            Action::ImportMidiFile { path, at, tempo } => {
+                self.import_midi_file(&path, at, tempo)?;
+            }
             Action::ImportFiles { files, track, at } => {
-                self.import_audio(files, ImportTarget { track, at });
+                // MIDI files become instrument tracks; the rest is audio.
+                let (midi, audio): (Vec<PathBuf>, Vec<PathBuf>) =
+                    files.into_iter().partition(|f| is_midi_file(f));
+                let empty = self.project.clips.is_empty();
+                for f in midi {
+                    if let Err(e) = self.import_midi_file(&f, at, empty && at == MusicalTime::ZERO)
+                    {
+                        self.notify(NoticeLevel::Error, e.to_string());
+                    }
+                }
+                if !audio.is_empty() {
+                    self.import_audio(audio, ImportTarget { track, at });
+                }
             }
             Action::SetGrid(grid) => {
                 self.editor.grid = grid;
@@ -2174,6 +2447,7 @@ impl Session {
                     EditFlag::TabToTransients => e.tab_to_transients = on,
                     EditFlag::LinkTimeline => e.link_timeline = on,
                     EditFlag::InsertionFollowsPlayback => e.insertion_follows_playback = on,
+                    EditFlag::FollowPlayhead => e.follow_playhead = on,
                     EditFlag::ShowTransients => e.show_transients = on,
                     EditFlag::Warp => e.warp = on,
                     EditFlag::EditToolbar => e.show_edit_toolbar = on,
@@ -2318,6 +2592,17 @@ impl Session {
                 // Show the new position immediately, even while stopped.
                 self.transport.position = s;
             }
+            TransportAction::Scrub(pos) => {
+                let s = to_samples(self, pos.max(MusicalTime::ZERO));
+                // ~70 ms: long enough to hear, short enough to follow the
+                // pointer.
+                let frames = (self.project.sample_rate as f64 * 0.07) as u32;
+                self.engine.transport(TransportCommand::Scrub {
+                    position: s,
+                    frames,
+                })?;
+                self.transport.position = s;
+            }
             TransportAction::ReturnToStart => {
                 self.engine.transport(TransportCommand::Locate(0))?;
                 self.transport.position = 0;
@@ -2454,6 +2739,76 @@ impl Session {
             });
         }
         Ok(())
+    }
+
+    /// Move (or `copy`, with its current settings) an insert to slot
+    /// `index` of track `to`.
+    fn move_plugin(
+        &mut self,
+        track: TrackId,
+        plugin: faderframe_core::PluginInstanceId,
+        to: TrackId,
+        index: usize,
+        copy: bool,
+    ) -> Result<()> {
+        if copy {
+            // The slot carries the plugin's current state into the copy.
+            self.capture_plugin_states();
+        }
+        let src = self
+            .project
+            .track(track)
+            .ok_or_else(|| SessionError::Other(format!("no track {track}")))?;
+        let from = src
+            .inserts
+            .iter()
+            .position(|s| s.id == plugin)
+            .ok_or_else(|| SessionError::Other("no such insert".into()))?;
+        let mut slot = src.inserts[from].clone();
+        let dest = self
+            .project
+            .track(to)
+            .ok_or_else(|| SessionError::Other(format!("no track {to}")))?;
+        if !dest.kind.has_audio() {
+            return Err(SessionError::Other(format!(
+                "'{}' cannot hold plugins",
+                dest.name
+            )));
+        }
+        let len = dest.inserts.len();
+        if copy {
+            slot.id = self.project.ids.allocate();
+            let index = index.min(len);
+            return self.batch(
+                "Copy Plugin",
+                vec![Command::InsertPlugin {
+                    track: to,
+                    index,
+                    slot,
+                }],
+            );
+        }
+        // Within the track the plugin lands in the slot it was dropped on.
+        let index = if to == track {
+            let target = index.min(len - 1);
+            if target == from {
+                return Ok(());
+            }
+            target
+        } else {
+            index.min(len)
+        };
+        self.batch(
+            "Move Plugin",
+            vec![
+                Command::RemovePlugin { track, plugin },
+                Command::InsertPlugin {
+                    track: to,
+                    index,
+                    slot,
+                },
+            ],
+        )
     }
 
     /// The slot of a plugin instance and its track.
@@ -2598,6 +2953,7 @@ impl Session {
                     }
                     if let Some(state) = &state {
                         s.state = Some(state.clone());
+                        self.engine.note_plugin_state(id, state);
                     }
                     // Explicit values follow what the plugin's own editor
                     // did since (they are applied after the state on load).
@@ -2856,11 +3212,15 @@ impl Session {
             // Like a console channel: input 1 (or 1–2 for stereo) by default.
             track.input = faderframe_project::InputRouting::Hardware { first_channel: 0 };
         }
+        if kind == TrackKind::Vca {
+            track.output = faderframe_project::OutputRouting::None;
+            track.layout = faderframe_core::ChannelLayout::Mono;
+        }
         // Instrument tracks start without an instrument: one is chosen
         // from the plugins (built-in synth, CLAP, VST3).
         // Content tracks go after the last selected/content track; buses and
         // auxes go just before the master.
-        let index = if kind.is_summing() {
+        let index = if kind.is_summing() || kind == TrackKind::Vca {
             p.tracks
                 .iter()
                 .position(|t| t.kind == TrackKind::Master)
