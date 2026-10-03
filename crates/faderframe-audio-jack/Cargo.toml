@@ -1,0 +1,17 @@
+[package]
+name = "faderframe-audio-jack"
+description = "JACK audio backend (works with JACK2 and pipewire-jack)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-audio.workspace = true
+jack.workspace = true
+tracing.workspace = true
+rtrb.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "faderframe-audio-graph"
+description = "Directed audio/event processing graph with latency compensation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-core.workspace = true
+faderframe-midi.workspace = true
+thiserror.workspace = true

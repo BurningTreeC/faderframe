@@ -1,0 +1,16 @@
+[package]
+name = "faderframe-transport"
+description = "Realtime transport state, commands and plugin-facing transport info"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-core.workspace = true
+faderframe-timeline.workspace = true
+serde.workspace = true

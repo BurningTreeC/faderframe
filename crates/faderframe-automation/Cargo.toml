@@ -1,0 +1,16 @@
+[package]
+name = "faderframe-automation"
+description = "Automation curves and interpolation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-core.workspace = true
+faderframe-timeline.workspace = true
+serde.workspace = true

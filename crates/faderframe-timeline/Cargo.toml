@@ -1,0 +1,18 @@
+[package]
+name = "faderframe-timeline"
+description = "Musical time, tempo map, time signatures and grid snapping"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-core.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

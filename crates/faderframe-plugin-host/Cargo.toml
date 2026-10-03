@@ -1,0 +1,20 @@
+[package]
+name = "faderframe-plugin-host"
+description = "Format-independent plugin hosting abstraction and built-in processors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-core.workspace = true
+faderframe-midi.workspace = true
+faderframe-audio-graph.workspace = true
+faderframe-transport.workspace = true
+faderframe-automation.workspace = true
+faderframe-realtime.workspace = true
+thiserror.workspace = true

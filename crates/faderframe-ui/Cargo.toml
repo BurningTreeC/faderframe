@@ -1,0 +1,31 @@
+[package]
+name = "faderframe-ui"
+description = "GTK 4 application shell, docking and canvas widget host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+gtk.workspace = true
+faderframe-core.workspace = true
+faderframe-project.workspace = true
+faderframe-workspace.workspace = true
+faderframe-session.workspace = true
+faderframe-audio.workspace = true
+faderframe-audio-jack.workspace = true
+faderframe-ui-canvas.workspace = true
+faderframe-view-arranger.workspace = true
+faderframe-view-mixer.workspace = true
+faderframe-view-pianoroll.workspace = true
+faderframe-timeline.workspace = true
+faderframe-transport.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+faderframe-engine.workspace = true
+faderframe-audio-files.workspace = true

@@ -1,0 +1,41 @@
+# Rust build output
+/target
+**/*.rs.bk
+*.pdb
+
+# Profiling / coverage artefacts
+perf.data
+perf.data.old
+*.profraw
+*.profdata
+flamegraph.svg
+/criterion
+
+# Local scratch space and test renders
+/scratch
+*.wav.tmp
+
+# FaderFrame project autosaves / backups (projects themselves are not ignored)
+*.ffproj.bak
+*.ffproj.autosave
+
+# Flatpak / packaging build dirs
+/.flatpak-builder
+/build-dir
+/repo
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.#*
+\#*#
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+AGENTS.md
+CLAUDE.md

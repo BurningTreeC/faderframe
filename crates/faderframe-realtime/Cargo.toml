@@ -1,0 +1,13 @@
+[package]
+name = "faderframe-realtime"
+description = "Realtime-safe primitives: atomics, meter bank, parameter table, callback metrics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

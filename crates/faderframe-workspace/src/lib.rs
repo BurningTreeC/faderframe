@@ -1,0 +1,197 @@
+//! Docking / workspace layout model.
+//!
+//! This crate describes *where* editor views live — split ratios, tab
+//! groups, detached windows — independently of any GUI toolkit. The GTK
+//! shell realises a [`WorkspaceLayout`] into widgets and writes user changes
+//! (dragging a divider, switching tabs, detaching) back into it. Because the
+//! model only stores [`ViewId`]s, moving a view between the main window and
+//! a floating window never copies view or project state.
+//!
+//! Structure:
+//!
+//! * every window (main or floating) has a [`DockNode`] tree of
+//!   [`DockNode::Split`]s and [`TabGroup`]s;
+//! * tab groups may carry a [`DockAreaId`] ("main", "bottom", ...). Named
+//!   areas persist even when empty (they simply hide), which gives detached
+//!   views a well-defined home to return to;
+//! * a [`WorkspaceSet`] holds several named layouts (screensets) such as
+//!   Recording, Editing, Mixing, MIDI and Mastering.
+
+#![forbid(unsafe_code)]
+
+mod layout;
+mod presets;
+
+pub use layout::{
+    Axis, DockAreaId, DockNode, FloatingWindow, LayoutError, TabBar, TabGroup, ViewKind,
+    ViewLocation, WindowGeometry, WindowId, WindowRef, WorkspaceLayout,
+};
+pub use presets::Preset;
+
+use serde::{Deserialize, Serialize};
+use std::fmt;
+
+/// Identifier of an editor view instance ("arranger", "mixer", ...).
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ViewId(pub String);
+
+impl ViewId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn arranger() -> Self {
+        Self::new("arranger")
+    }
+
+    pub fn mixer() -> Self {
+        Self::new("mixer")
+    }
+
+    pub fn piano_roll() -> Self {
+        Self::new("piano-roll")
+    }
+
+    pub fn automation() -> Self {
+        Self::new("automation")
+    }
+}
+
+impl fmt::Debug for ViewId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "view:{}", self.0)
+    }
+}
+
+impl fmt::Display for ViewId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A named layout (screenset).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Workspace {
+    pub name: String,
+    pub layout: WorkspaceLayout,
+}
+
+/// All workspaces of a project plus the active one.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceSet {
+    pub active: usize,
+    pub workspaces: Vec<Workspace>,
+}
+
+impl Default for WorkspaceSet {
+    fn default() -> Self {
+        Self {
+            active: 0,
+            workspaces: Preset::ALL
+                .iter()
+                .map(|p| Workspace {
+                    name: p.name().to_string(),
+                    layout: p.layout(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl WorkspaceSet {
+    pub fn active(&self) -> &Workspace {
+        &self.workspaces[self.active.min(self.workspaces.len().saturating_sub(1))]
+    }
+
+    pub fn active_mut(&mut self) -> &mut Workspace {
+        let i = self.active.min(self.workspaces.len().saturating_sub(1));
+        &mut self.workspaces[i]
+    }
+
+    pub fn active_layout(&self) -> &WorkspaceLayout {
+        &self.active().layout
+    }
+
+    pub fn active_layout_mut(&mut self) -> &mut WorkspaceLayout {
+        &mut self.active_mut().layout
+    }
+
+    /// Switch to workspace `index` (no-op if out of range).
+    pub fn switch_to(&mut self, index: usize) -> bool {
+        if index < self.workspaces.len() {
+            self.active = index;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Reset the active workspace to its preset (if it is one).
+    pub fn reset_active(&mut self) {
+        let ws = self.active_mut();
+        if let Some(p) = Preset::ALL.iter().find(|p| p.name() == ws.name) {
+            ws.layout = p.layout();
+        }
+    }
+
+    /// Repair invariants after loading (empty set, bad indices, invalid layouts).
+    pub fn sanitise(&mut self) {
+        if self.workspaces.is_empty() {
+            *self = Self::default();
+        }
+        self.active = self.active.min(self.workspaces.len() - 1);
+        for ws in &mut self.workspaces {
+            if ws.layout.validate().is_err() {
+                ws.layout = Preset::ALL
+                    .iter()
+                    .find(|p| p.name() == ws.name)
+                    .map(|p| p.layout())
+                    .unwrap_or_else(|| Preset::Recording.layout());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_set_contains_all_presets_and_is_valid() {
+        let set = WorkspaceSet::default();
+        assert_eq!(set.workspaces.len(), Preset::ALL.len());
+        for ws in &set.workspaces {
+            ws.layout.validate().unwrap();
+        }
+        assert_eq!(set.active().name, "Recording");
+    }
+
+    #[test]
+    fn serde_round_trip() {
+        let mut set = WorkspaceSet::default();
+        set.active_layout_mut()
+            .detach(&ViewId::mixer(), WindowGeometry::default())
+            .unwrap();
+        let json = serde_json::to_string_pretty(&set).unwrap();
+        let back: WorkspaceSet = serde_json::from_str(&json).unwrap();
+        assert_eq!(set, back);
+    }
+
+    #[test]
+    fn sanitise_repairs_broken_layouts() {
+        let mut set = WorkspaceSet {
+            active: 99,
+            ..WorkspaceSet::default()
+        };
+        set.workspaces[0].layout.main =
+            DockNode::Tabs(TabGroup::new(None, vec![ViewId::mixer(), ViewId::mixer()]));
+        set.sanitise();
+        assert_eq!(set.active, set.workspaces.len() - 1);
+        set.workspaces[0].layout.validate().unwrap();
+    }
+}

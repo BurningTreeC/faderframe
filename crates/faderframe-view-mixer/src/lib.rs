@@ -1,0 +1,1207 @@
+//! The analogue-console mixer surface.
+//!
+//! A single custom-rendered view draws every channel strip (no widget per
+//! knob or fader). Strips are virtualised horizontally: only strips that
+//! intersect the viewport are laid out and painted, so sessions with
+//! hundreds of channels cost the same per frame as a dozen. The master strip
+//! is pinned to the right edge.
+//!
+//! The view owns presentation state only (scroll offset, the active drag,
+//! hover). All changes go out as [`Action`]s; continuous gestures are
+//! wrapped in `BeginGesture`/`EndGesture` so a whole fader move is one undo
+//! step.
+
+#![forbid(unsafe_code)]
+
+mod layout;
+
+pub use layout::{INSERT_SLOTS, SEND_SLOTS, StripLayout};
+
+use faderframe_core::gain::{SILENCE_DB, format_db};
+use faderframe_core::pan::format_pan;
+use faderframe_core::{FaderLaw, TrackId, builtin};
+use faderframe_project::{
+    Command, InputRouting, MonitorMode, OutputRouting, PluginRef, SendTap, Track, TrackColor,
+    TrackKind,
+};
+use faderframe_session::{Action, MeterDisplay, SelectMode, Session};
+use faderframe_ui_canvas::controls::{self, FaderGeometry, KnobLook, MeterLevel};
+use faderframe_ui_canvas::{
+    Align, CanvasView, Color, Cursor, EventCx, HostRequest, MenuItem, Painter, Point,
+    PointerButton, Rect, ScrollAxis, ScrollInfo, Size, Theme, ViewEvent,
+};
+
+const MASTER_GAP: f32 = 8.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Hit {
+    FaderCap(TrackId),
+    FaderTrack(TrackId),
+    Pan(TrackId),
+    Send(TrackId, usize),
+    Insert(TrackId, usize),
+    Mute(TrackId),
+    Solo(TrackId),
+    Record(TrackId),
+    Phase(TrackId),
+    Monitor(TrackId),
+    Input(TrackId),
+    Output(TrackId),
+    Level(TrackId),
+    Scribble(TrackId),
+    Meter(TrackId),
+    Strip(TrackId),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum KnobTarget {
+    Pan,
+    Send(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Drag {
+    Fader {
+        track: TrackId,
+        start_y: f32,
+        start_pos: f32,
+    },
+    Knob {
+        track: TrackId,
+        target: KnobTarget,
+        start_y: f32,
+        start_value: f32,
+    },
+    Scroll {
+        start_x: f32,
+        start_scroll: f32,
+    },
+}
+
+pub struct MixerView {
+    theme: Theme,
+    scroll_x: f32,
+    drag: Option<Drag>,
+    hover: Option<Hit>,
+    law: FaderLaw,
+}
+
+fn fader_cap_color(kind: TrackKind, theme: &Theme) -> Color {
+    let c = &theme.console;
+    match kind {
+        TrackKind::Bus => c.fader_cap_bus,
+        TrackKind::Aux => c.fader_cap_aux,
+        TrackKind::Master => c.fader_cap_master,
+        _ => c.fader_cap_audio,
+    }
+}
+
+pub fn track_color(c: TrackColor) -> Color {
+    Color::rgb8(c.r, c.g, c.b)
+}
+
+fn kind_tag(kind: TrackKind) -> &'static str {
+    match kind {
+        TrackKind::Audio => "AUDIO",
+        TrackKind::Instrument => "INST",
+        TrackKind::Midi => "MIDI",
+        TrackKind::Bus => "BUS",
+        TrackKind::Aux => "AUX",
+        TrackKind::Master => "MAIN",
+    }
+}
+
+/// Built-in effects offered for insert slots.
+const EFFECTS: [(&str, &str); 3] = [
+    (builtin::ECHO, "FaderFrame Echo"),
+    (builtin::GAIN, "FaderFrame Gain"),
+    (builtin::LATENCY_PROBE, "Latency Probe"),
+];
+
+fn parse_db(text: &str) -> Option<f32> {
+    let t = text.trim().trim_end_matches("dB").trim();
+    if t.eq_ignore_ascii_case("-inf") || t.eq_ignore_ascii_case("inf") || t == "-∞" {
+        return Some(SILENCE_DB);
+    }
+    t.parse::<f32>().ok().filter(|v| v.is_finite())
+}
+
+impl MixerView {
+    pub fn new(theme: Theme) -> Self {
+        Self {
+            theme,
+            scroll_x: 0.0,
+            drag: None,
+            hover: None,
+            law: FaderLaw::console(),
+        }
+    }
+
+    fn pitch(&self) -> f32 {
+        self.theme.console.strip_width + self.theme.console.strip_gap
+    }
+
+    fn channel_tracks(model: &Session) -> Vec<&Track> {
+        model
+            .project()
+            .tracks
+            .iter()
+            .filter(|t| t.kind != TrackKind::Master && t.kind != TrackKind::Midi)
+            .collect()
+    }
+
+    fn master_rect(&self, size: Size) -> Rect {
+        let w = self.theme.console.master_width;
+        Rect::new(size.w - w, 0.0, w, size.h)
+    }
+
+    fn viewport_w(&self, size: Size) -> f32 {
+        (size.w - self.theme.console.master_width - MASTER_GAP).max(0.0)
+    }
+
+    fn content_w(&self, count: usize) -> f32 {
+        count as f32 * self.pitch()
+    }
+
+    fn clamp_scroll(&mut self, count: usize, size: Size) {
+        let max = (self.content_w(count) - self.viewport_w(size)).max(0.0);
+        self.scroll_x = self.scroll_x.clamp(0.0, max);
+    }
+
+    /// Index range of strips intersecting the viewport.
+    pub fn visible_range(&self, count: usize, size: Size) -> std::ops::Range<usize> {
+        let pitch = self.pitch();
+        let first = (self.scroll_x / pitch).floor().max(0.0) as usize;
+        let last = ((self.scroll_x + self.viewport_w(size)) / pitch).ceil() as usize;
+        first.min(count)..last.min(count)
+    }
+
+    fn strip_rect(&self, index: usize, size: Size) -> Rect {
+        Rect::new(
+            index as f32 * self.pitch() - self.scroll_x,
+            0.0,
+            self.theme.console.strip_width,
+            size.h,
+        )
+    }
+
+    fn layout_for(&self, rect: Rect, t: &Track) -> StripLayout {
+        StripLayout::new(
+            rect,
+            &self.theme,
+            t.kind == TrackKind::Audio,
+            t.kind != TrackKind::Master,
+        )
+    }
+
+    /// Strips with their rects (visible channels + master).
+    fn visible_strips<'m>(&self, model: &'m Session, size: Size) -> Vec<(Rect, &'m Track)> {
+        let tracks = Self::channel_tracks(model);
+        let mut out: Vec<(Rect, &Track)> = self
+            .visible_range(tracks.len(), size)
+            .map(|i| (self.strip_rect(i, size), tracks[i]))
+            .collect();
+        if let Some(m) = model.project().master() {
+            out.push((self.master_rect(size), m));
+        }
+        out
+    }
+
+    pub fn hit_test(&self, pos: Point, size: Size, model: &Session) -> Option<Hit> {
+        let master = self.master_rect(size);
+        for (rect, t) in self.visible_strips(model, size) {
+            if !rect.contains(pos) {
+                continue;
+            }
+            // Channel strips are clipped by the master section.
+            if t.kind != TrackKind::Master && pos.x >= master.x - MASTER_GAP {
+                continue;
+            }
+            let l = self.layout_for(rect, t);
+            let id = t.id;
+            let geo = FaderGeometry::new(l.fader, &self.theme);
+            let pos_now = self.law.db_to_position(t.volume_db);
+            let checks: [(Option<Rect>, Hit); 12] = [
+                (Some(geo.cap_rect(pos_now).inset(-2.0)), Hit::FaderCap(id)),
+                (Some(l.fader), Hit::FaderTrack(id)),
+                (Some(l.meter), Hit::Meter(id)),
+                (Some(l.pan_knob), Hit::Pan(id)),
+                (Some(l.mute), Hit::Mute(id)),
+                (Some(l.solo), Hit::Solo(id)),
+                (Some(l.record), Hit::Record(id)),
+                (Some(l.level_readout), Hit::Level(id)),
+                (Some(l.output), Hit::Output(id)),
+                (Some(l.scribble), Hit::Scribble(id)),
+                (l.input.map(|i| i.phase), Hit::Phase(id)),
+                (l.input.map(|i| i.monitor), Hit::Monitor(id)),
+            ];
+            for (r, hit) in checks {
+                if r.is_some_and(|r| r.contains(pos)) {
+                    return Some(hit);
+                }
+            }
+            if l.input.is_some_and(|i| i.input.contains(pos)) {
+                return Some(Hit::Input(id));
+            }
+            if let Some(slots) = &l.inserts
+                && let Some(i) = slots.iter().position(|r| r.contains(pos))
+            {
+                return Some(Hit::Insert(id, i));
+            }
+            if let Some(sends) = &l.sends
+                && let Some(i) = sends
+                    .iter()
+                    .position(|s| s.knob.contains(pos) || s.label.contains(pos))
+            {
+                return Some(Hit::Send(id, i));
+            }
+            return Some(Hit::Strip(id));
+        }
+        None
+    }
+
+    // --- painting --------------------------------------------------------------
+
+    fn paint_strip(
+        &self,
+        p: &mut dyn Painter,
+        rect: Rect,
+        t: &Track,
+        number: usize,
+        model: &Session,
+    ) {
+        let th = &self.theme;
+        let c = &th.console;
+        let is_master = t.kind == TrackKind::Master;
+        let l = self.layout_for(rect, t);
+        let (top, bottom) = if is_master {
+            (c.master_panel_top, c.master_panel_bottom)
+        } else {
+            (c.panel_top, c.panel_bottom)
+        };
+        controls::panel(p, rect, top, bottom, th);
+        let color = track_color(t.color);
+        p.fill(l.color_bar, color);
+        if model.selection.tracks.contains(&t.id) {
+            p.stroke_rounded(rect.inset(1.0), 2.0, 1.5, c.selected_glow);
+        }
+        for &y in &l.dividers {
+            controls::section_line(p, rect.x + 4.0, rect.right() - 4.0, y, th);
+        }
+
+        // Header.
+        if is_master {
+            controls::screw(p, Point::new(rect.x + 8.0, l.header.center().y), 3.0, th);
+            controls::screw(
+                p,
+                Point::new(rect.right() - 8.0, l.header.center().y),
+                3.0,
+                th,
+            );
+            controls::engraved(p, "MASTER", l.header, th, Align::Center);
+        } else {
+            controls::engraved(p, &format!("{number}"), l.header, th, Align::Start);
+            controls::engraved(p, kind_tag(t.kind), l.header, th, Align::End);
+        }
+
+        if let Some(row) = l.input {
+            let label = match t.input {
+                InputRouting::None => "IN —".to_string(),
+                InputRouting::Hardware { first_channel } => match t.layout.channel_count() {
+                    1 => format!("IN {}", first_channel + 1),
+                    n => format!("IN {}-{}", first_channel + 1, first_channel as usize + n),
+                },
+            };
+            controls::well_label(p, row.input, &label, t.input == InputRouting::None, th);
+            controls::led_button(p, row.phase, "Ø", t.phase_invert, c.led.phase, th);
+            let mon_label = match t.monitor {
+                MonitorMode::Auto => "A",
+                _ => "I",
+            };
+            controls::led_button(
+                p,
+                row.monitor,
+                mon_label,
+                t.monitor != MonitorMode::Off,
+                c.led.monitor,
+                th,
+            );
+        }
+
+        if let (Some(label), Some(slots)) = (l.inserts_label, &l.inserts) {
+            controls::engraved(p, "INSERTS", label, th, Align::Center);
+            for (i, slot) in slots.iter().enumerate() {
+                match t.inserts.get(i) {
+                    Some(s) => {
+                        let name = s.plugin.name.trim_start_matches("FaderFrame ");
+                        let text = if s.bypass {
+                            format!("({name})")
+                        } else {
+                            name.to_string()
+                        };
+                        controls::well_label(p, *slot, &text, s.bypass, th);
+                    }
+                    None => controls::well_label(p, *slot, "—", true, th),
+                }
+            }
+        }
+
+        if let (Some(label), Some(sends)) = (l.sends_label, &l.sends) {
+            controls::engraved(p, "SENDS", label, th, Align::Center);
+            for (i, slot) in sends.iter().enumerate() {
+                let send = t.sends.get(i);
+                let value = send.map_or(0.0, |s| self.law.db_to_position(s.level_db));
+                let ring = match send {
+                    Some(s) if s.enabled => c.send_cap.lighten(0.35),
+                    _ => c.knob.ring_track,
+                };
+                controls::knob(
+                    p,
+                    slot.knob,
+                    value,
+                    false,
+                    KnobLook {
+                        cap: c.send_cap,
+                        ring,
+                    },
+                    th,
+                );
+                let name = send
+                    .and_then(|s| model.project().track(s.target))
+                    .map_or_else(|| "—".to_string(), |dst| dst.name.clone());
+                let tap = match send.map(|s| s.tap) {
+                    Some(SendTap::PreFx) => "PRE-FX ",
+                    Some(SendTap::PreFader) => "PRE ",
+                    _ => "",
+                };
+                controls::engraved(p, &format!("{tap}{name}"), slot.label, th, Align::Center);
+            }
+        }
+
+        controls::knob(
+            p,
+            l.pan_knob,
+            (t.pan + 1.0) * 0.5,
+            true,
+            KnobLook {
+                cap: c.pan_cap,
+                ring: c.panel_label,
+            },
+            th,
+        );
+        controls::readout(p, l.pan_readout, &format_pan(t.pan), th);
+
+        controls::led_button(p, l.mute, "M", t.mute, c.led.mute, th);
+        controls::led_button(p, l.solo, "S", t.solo, c.led.solo, th);
+        if t.kind.has_clips() {
+            controls::led_button(p, l.record, "R", t.record_arm, c.led.record, th);
+        } else {
+            controls::led_button(p, l.record, "·", false, c.led.record, th);
+        }
+
+        controls::readout(p, l.level_readout, &format_db(t.volume_db), th);
+        let geo = FaderGeometry::new(l.fader, th);
+        let marks: [(f32, &str); 10] = [
+            (12.0, "12"),
+            (6.0, "6"),
+            (0.0, "0"),
+            (-5.0, "5"),
+            (-10.0, "10"),
+            (-20.0, "20"),
+            (-30.0, "30"),
+            (-40.0, "40"),
+            (-60.0, "60"),
+            (SILENCE_DB, "∞"),
+        ];
+        let scale: Vec<(f32, &str)> = marks
+            .iter()
+            .map(|&(db, s)| (self.law.db_to_position(db), s))
+            .collect();
+        controls::fader(
+            p,
+            &geo,
+            self.law.db_to_position(t.volume_db),
+            fader_cap_color(t.kind, th),
+            &scale,
+            th,
+        );
+        let m: MeterDisplay = model.meter(t.id);
+        let level = |ch: &faderframe_session::MeterChannel| MeterLevel {
+            level_db: ch.level_db,
+            hold_db: ch.hold_db,
+            clipped: ch.clipped,
+        };
+        controls::meter(p, l.meter, &[level(&m.left), level(&m.right)], th);
+
+        let out = match t.output {
+            OutputRouting::Master => "→ Master".to_string(),
+            OutputRouting::Track { track } => model
+                .project()
+                .track(track)
+                .map_or_else(|| "→ ?".to_string(), |d| format!("→ {}", d.name)),
+            OutputRouting::Hardware { first_channel } => {
+                format!("→ Out {}-{}", first_channel + 1, first_channel + 2)
+            }
+            OutputRouting::None => "→ none".to_string(),
+        };
+        controls::well_label(p, l.output, &out, t.output == OutputRouting::None, th);
+        controls::scribble(p, l.scribble, &t.name, color, th);
+    }
+
+    // --- interaction helpers ---------------------------------------------------
+
+    fn track(model: &Session, id: TrackId) -> Option<&Track> {
+        model.project().track(id)
+    }
+
+    fn knob_value(&self, t: &Track, target: KnobTarget) -> Option<f32> {
+        match target {
+            KnobTarget::Pan => Some((t.pan + 1.0) * 0.5),
+            KnobTarget::Send(i) => t.sends.get(i).map(|s| self.law.db_to_position(s.level_db)),
+        }
+    }
+
+    fn knob_command(&self, t: &Track, target: KnobTarget, value: f32) -> Option<Command> {
+        let value = value.clamp(0.0, 1.0);
+        match target {
+            KnobTarget::Pan => {
+                // Snap to centre near the middle for convenience.
+                let pan = value * 2.0 - 1.0;
+                let pan = if pan.abs() < 0.01 { 0.0 } else { pan };
+                Some(Command::SetTrackPan { track: t.id, pan })
+            }
+            KnobTarget::Send(i) => t.sends.get(i).map(|s| Command::SetSendLevel {
+                track: t.id,
+                send: s.id,
+                db: self.law.position_to_db(value),
+            }),
+        }
+    }
+
+    fn output_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
+        let p = model.project();
+        let mut items = Vec::new();
+        let set = |output| {
+            Action::Edit(Command::SetTrackOutput {
+                track: t.id,
+                output,
+            })
+        };
+        if t.kind != TrackKind::Master {
+            items.push(
+                MenuItem::new("Master", set(OutputRouting::Master))
+                    .checked(t.output == OutputRouting::Master),
+            );
+            for dst in p.tracks.iter().filter(|d| {
+                matches!(d.kind, TrackKind::Bus | TrackKind::Aux)
+                    && d.id != t.id
+                    && !p.would_cycle(t.id, d.id)
+            }) {
+                let out = OutputRouting::Track { track: dst.id };
+                items.push(
+                    MenuItem::new(format!("{} ({})", dst.name, dst.kind.label()), set(out))
+                        .checked(t.output == out),
+                );
+            }
+        }
+        for first in [0u16, 2] {
+            let out = OutputRouting::Hardware {
+                first_channel: first,
+            };
+            let mut item = MenuItem::new(
+                format!("Hardware Out {}-{}", first + 1, first + 2),
+                set(out),
+            )
+            .checked(t.output == out);
+            if first == 0 {
+                item = item.separated();
+            }
+            items.push(item);
+        }
+        items.push(
+            MenuItem::new("Not connected", set(OutputRouting::None))
+                .checked(t.output == OutputRouting::None),
+        );
+        HostRequest::ContextMenu { at, items }
+    }
+
+    fn input_menu(t: &Track, at: Point) -> HostRequest<Action> {
+        let set = |input| Action::Edit(Command::SetTrackInput { track: t.id, input });
+        let mut items = vec![
+            MenuItem::new("No input", set(InputRouting::None))
+                .checked(t.input == InputRouting::None),
+        ];
+        let n = t.layout.channel_count() as u16;
+        for first in (0..4u16).step_by(n.max(1) as usize) {
+            let input = InputRouting::Hardware {
+                first_channel: first,
+            };
+            let label = if n == 1 {
+                format!("Hardware In {}", first + 1)
+            } else {
+                format!("Hardware In {}-{}", first + 1, first + n)
+            };
+            items.push(MenuItem::new(label, set(input)).checked(t.input == input));
+        }
+        items.push(
+            MenuItem::new(
+                "Monitor: tape-style (auto)",
+                Action::Edit(Command::SetTrackMonitor {
+                    track: t.id,
+                    mode: MonitorMode::Auto,
+                }),
+            )
+            .checked(t.monitor == MonitorMode::Auto)
+            .separated(),
+        );
+        HostRequest::ContextMenu { at, items }
+    }
+
+    fn insert_menu(model: &Session, t: &Track, slot: usize, at: Point) -> HostRequest<Action> {
+        let mut items = Vec::new();
+        match t.inserts.get(slot) {
+            Some(s) => {
+                items.push(MenuItem::disabled(s.plugin.name.clone()));
+                items.push(
+                    MenuItem::new(
+                        if s.bypass { "Enable" } else { "Bypass" },
+                        Action::Edit(Command::SetPluginBypass {
+                            track: t.id,
+                            plugin: s.id,
+                            bypass: !s.bypass,
+                        }),
+                    )
+                    .separated(),
+                );
+                items.push(MenuItem::new(
+                    "Remove",
+                    Action::Edit(Command::RemovePlugin {
+                        track: t.id,
+                        plugin: s.id,
+                    }),
+                ));
+            }
+            None => {
+                let _ = model;
+                for (id, name) in EFFECTS {
+                    items.push(MenuItem::new(
+                        format!("Insert {name}"),
+                        Action::InsertPlugin {
+                            track: t.id,
+                            index: slot,
+                            plugin: PluginRef::builtin(id, name),
+                        },
+                    ));
+                }
+                items.push(MenuItem::disabled("CLAP / VST3 hosting: coming next").separated());
+            }
+        }
+        HostRequest::ContextMenu { at, items }
+    }
+
+    fn send_menu(model: &Session, t: &Track, slot: usize, at: Point) -> HostRequest<Action> {
+        let p = model.project();
+        let mut items = Vec::new();
+        match t.sends.get(slot) {
+            Some(s) => {
+                for (tap, label) in [
+                    (SendTap::PreFx, "Pre-FX"),
+                    (SendTap::PreFader, "Pre-fader"),
+                    (SendTap::PostFader, "Post-fader"),
+                ] {
+                    items.push(
+                        MenuItem::new(
+                            label,
+                            Action::Edit(Command::SetSendTap {
+                                track: t.id,
+                                send: s.id,
+                                tap,
+                            }),
+                        )
+                        .checked(s.tap == tap),
+                    );
+                }
+                items.push(
+                    MenuItem::new(
+                        if s.enabled { "Disable" } else { "Enable" },
+                        Action::Edit(Command::SetSendEnabled {
+                            track: t.id,
+                            send: s.id,
+                            enabled: !s.enabled,
+                        }),
+                    )
+                    .separated(),
+                );
+                items.push(MenuItem::new(
+                    "Remove Send",
+                    Action::Edit(Command::RemoveSend {
+                        track: t.id,
+                        send: s.id,
+                    }),
+                ));
+            }
+            None => {
+                for dst in p
+                    .tracks
+                    .iter()
+                    .filter(|d| matches!(d.kind, TrackKind::Bus | TrackKind::Aux) && d.id != t.id)
+                {
+                    let ok = !p.would_cycle(t.id, dst.id);
+                    let label = format!("Send to {}", dst.name);
+                    items.push(if ok {
+                        MenuItem::new(
+                            label,
+                            Action::AddSend {
+                                track: t.id,
+                                target: dst.id,
+                                level_db: -10.0,
+                                tap: SendTap::PostFader,
+                            },
+                        )
+                    } else {
+                        MenuItem::disabled(format!("{label} (feedback)"))
+                    });
+                }
+                if items.is_empty() {
+                    items.push(MenuItem::disabled("Add an Aux or Bus track first"));
+                }
+            }
+        }
+        HostRequest::ContextMenu { at, items }
+    }
+
+    fn track_menu(t: &Track, at: Point) -> HostRequest<Action> {
+        let mut items = Vec::new();
+        if t.kind != TrackKind::Master {
+            items.push(MenuItem::new(
+                "Remove Track",
+                Action::Edit(Command::RemoveTrack { track: t.id }),
+            ));
+        }
+        for (i, c) in TrackColor::PALETTE.iter().enumerate() {
+            let mut item = MenuItem::new(
+                format!("Colour {}", i + 1),
+                Action::Edit(Command::SetTrackColor {
+                    track: t.id,
+                    color: *c,
+                }),
+            )
+            .checked(t.color == *c);
+            if i == 0 {
+                item = item.separated();
+            }
+            items.push(item);
+        }
+        HostRequest::ContextMenu { at, items }
+    }
+
+    fn rename_request(t: &Track, at: Rect) -> HostRequest<Action> {
+        let id = t.id;
+        HostRequest::TextInput {
+            at,
+            initial: t.name.clone(),
+            commit: Box::new(move |text| {
+                let name = text.trim();
+                (!name.is_empty()).then(|| {
+                    Action::Edit(Command::RenameTrack {
+                        track: id,
+                        name: name.to_string(),
+                    })
+                })
+            }),
+        }
+    }
+
+    fn level_request(t: &Track, at: Rect) -> HostRequest<Action> {
+        let id = t.id;
+        HostRequest::TextInput {
+            at,
+            initial: format_db(t.volume_db),
+            commit: Box::new(move |text| {
+                parse_db(text).map(|db| Action::Edit(Command::SetTrackVolume { track: id, db }))
+            }),
+        }
+    }
+
+    fn layout_of(&self, model: &Session, id: TrackId, size: Size) -> Option<StripLayout> {
+        self.visible_strips(model, size)
+            .into_iter()
+            .find(|(_, t)| t.id == id)
+            .map(|(r, t)| self.layout_for(r, t))
+    }
+
+    fn press(
+        &mut self,
+        pos: Point,
+        clicks: u32,
+        mods: faderframe_ui_canvas::Modifiers,
+        size: Size,
+        model: &Session,
+        cx: &mut EventCx<'_, Action>,
+    ) -> bool {
+        let Some(hit) = self.hit_test(pos, size, model) else {
+            self.drag = Some(Drag::Scroll {
+                start_x: pos.x,
+                start_scroll: self.scroll_x,
+            });
+            return true;
+        };
+        let toggle = |cx: &mut EventCx<'_, Action>, cmd: Command| cx.emit(Action::Edit(cmd));
+        match hit {
+            Hit::FaderCap(id) | Hit::FaderTrack(id) => {
+                let Some(t) = Self::track(model, id) else {
+                    return false;
+                };
+                if clicks >= 2 {
+                    cx.emit(Action::Edit(Command::SetTrackVolume { track: id, db: 0.0 }));
+                    return true;
+                }
+                cx.emit(Action::BeginGesture("Volume".into()));
+                let mut start = self.law.db_to_position(t.volume_db);
+                if matches!(hit, Hit::FaderTrack(_))
+                    && let Some(l) = self.layout_of(model, id, size)
+                {
+                    // Clicking the slot jumps the cap there.
+                    start = FaderGeometry::new(l.fader, &self.theme).pos_for(pos.y);
+                    cx.emit(Action::Edit(Command::SetTrackVolume {
+                        track: id,
+                        db: self.law.position_to_db(start),
+                    }));
+                }
+                self.drag = Some(Drag::Fader {
+                    track: id,
+                    start_y: pos.y,
+                    start_pos: start,
+                });
+                cx.set_cursor(Cursor::Grabbing);
+            }
+            Hit::Pan(id) | Hit::Send(id, _) => {
+                let Some(t) = Self::track(model, id) else {
+                    return false;
+                };
+                let target = match hit {
+                    Hit::Send(_, i) => KnobTarget::Send(i),
+                    _ => KnobTarget::Pan,
+                };
+                let Some(value) = self.knob_value(t, target) else {
+                    if let Hit::Send(_, i) = hit {
+                        cx.request(Self::send_menu(model, t, i, pos));
+                    }
+                    return true;
+                };
+                if clicks >= 2 {
+                    let reset = match target {
+                        KnobTarget::Pan => 0.5,
+                        KnobTarget::Send(_) => self.law.unity_position(),
+                    };
+                    if let Some(cmd) = self.knob_command(t, target, reset) {
+                        cx.emit(Action::Edit(cmd));
+                    }
+                    return true;
+                }
+                cx.emit(Action::BeginGesture(match target {
+                    KnobTarget::Pan => "Pan".into(),
+                    KnobTarget::Send(_) => "Send Level".into(),
+                }));
+                self.drag = Some(Drag::Knob {
+                    track: id,
+                    target,
+                    start_y: pos.y,
+                    start_value: value,
+                });
+                cx.set_cursor(Cursor::ResizeVertical);
+            }
+            Hit::Mute(id) => {
+                if let Some(t) = Self::track(model, id) {
+                    toggle(
+                        cx,
+                        Command::SetTrackMute {
+                            track: id,
+                            on: !t.mute,
+                        },
+                    );
+                }
+            }
+            Hit::Solo(id) => {
+                if let Some(t) = Self::track(model, id) {
+                    toggle(
+                        cx,
+                        Command::SetTrackSolo {
+                            track: id,
+                            on: !t.solo,
+                        },
+                    );
+                }
+            }
+            Hit::Record(id) => {
+                if let Some(t) = Self::track(model, id).filter(|t| t.kind.has_clips()) {
+                    toggle(
+                        cx,
+                        Command::SetTrackRecordArm {
+                            track: id,
+                            on: !t.record_arm,
+                        },
+                    );
+                }
+            }
+            Hit::Phase(id) => {
+                if let Some(t) = Self::track(model, id) {
+                    toggle(
+                        cx,
+                        Command::SetTrackPhaseInvert {
+                            track: id,
+                            on: !t.phase_invert,
+                        },
+                    );
+                }
+            }
+            Hit::Monitor(id) => {
+                if let Some(t) = Self::track(model, id) {
+                    let mode = if t.monitor == MonitorMode::Off {
+                        MonitorMode::Input
+                    } else {
+                        MonitorMode::Off
+                    };
+                    toggle(cx, Command::SetTrackMonitor { track: id, mode });
+                }
+            }
+            Hit::Input(id) => {
+                if let Some(t) = Self::track(model, id) {
+                    cx.request(Self::input_menu(t, pos));
+                }
+            }
+            Hit::Output(id) => {
+                if let Some(t) = Self::track(model, id) {
+                    cx.request(Self::output_menu(model, t, pos));
+                }
+            }
+            Hit::Insert(id, slot) => {
+                if let Some(t) = Self::track(model, id) {
+                    cx.request(Self::insert_menu(model, t, slot, pos));
+                }
+            }
+            Hit::Level(id) => {
+                if let (Some(t), Some(l)) =
+                    (Self::track(model, id), self.layout_of(model, id, size))
+                    && clicks >= 2
+                {
+                    cx.request(Self::level_request(t, l.level_readout));
+                }
+            }
+            Hit::Scribble(id) | Hit::Strip(id) => {
+                if clicks >= 2
+                    && matches!(hit, Hit::Scribble(_))
+                    && let (Some(t), Some(l)) =
+                        (Self::track(model, id), self.layout_of(model, id, size))
+                {
+                    cx.request(Self::rename_request(t, l.scribble));
+                    return true;
+                }
+                let mode = if mods.toggle() {
+                    SelectMode::Toggle
+                } else {
+                    SelectMode::Replace
+                };
+                cx.emit(Action::SelectTracks {
+                    tracks: vec![id],
+                    mode,
+                });
+            }
+            Hit::Meter(_) => cx.emit(Action::ResetClipIndicators),
+        }
+        true
+    }
+
+    fn secondary(
+        &mut self,
+        pos: Point,
+        size: Size,
+        model: &Session,
+        cx: &mut EventCx<'_, Action>,
+    ) -> bool {
+        let Some(hit) = self.hit_test(pos, size, model) else {
+            return false;
+        };
+        let req = match hit {
+            Hit::Send(id, i) => Self::track(model, id).map(|t| Self::send_menu(model, t, i, pos)),
+            Hit::Insert(id, i) => {
+                Self::track(model, id).map(|t| Self::insert_menu(model, t, i, pos))
+            }
+            Hit::Output(id) => Self::track(model, id).map(|t| Self::output_menu(model, t, pos)),
+            Hit::Input(id) | Hit::Monitor(id) => {
+                Self::track(model, id).map(|t| Self::input_menu(t, pos))
+            }
+            Hit::Scribble(id) | Hit::Strip(id) => {
+                Self::track(model, id).map(|t| Self::track_menu(t, pos))
+            }
+            Hit::Level(id) => match (Self::track(model, id), self.layout_of(model, id, size)) {
+                (Some(t), Some(l)) => Some(Self::level_request(t, l.level_readout)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(r) = req {
+            cx.request(r);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn tooltip_for(&self, hit: Hit, model: &Session) -> Option<String> {
+        let name = |id: TrackId| {
+            Self::track(model, id)
+                .map(|t| t.name.clone())
+                .unwrap_or_default()
+        };
+        Some(match hit {
+            Hit::FaderCap(id) | Hit::FaderTrack(id) => {
+                let t = Self::track(model, id)?;
+                format!(
+                    "{}: {} dB\nDrag · Shift/Ctrl for fine · Double-click for 0 dB · Wheel",
+                    t.name,
+                    format_db(t.volume_db)
+                )
+            }
+            Hit::Pan(id) => {
+                let t = Self::track(model, id)?;
+                format!("Pan {} · Double-click to centre", format_pan(t.pan))
+            }
+            Hit::Send(id, i) => match Self::track(model, id)?.sends.get(i) {
+                Some(s) => format!(
+                    "Send level {} dB · Right-click for options",
+                    format_db(s.level_db)
+                ),
+                None => "Click to add a send".into(),
+            },
+            Hit::Insert(_, _) => "Insert slot · Click to add or manage".into(),
+            Hit::Mute(id) => format!("Mute {}", name(id)),
+            Hit::Solo(id) => format!("Solo {}", name(id)),
+            Hit::Record(id) => format!("Record-arm {}", name(id)),
+            Hit::Phase(_) => "Invert polarity".into(),
+            Hit::Monitor(_) => "Input monitoring · Right-click for tape-style auto".into(),
+            Hit::Input(_) => "Input routing".into(),
+            Hit::Output(_) => "Output routing".into(),
+            Hit::Level(_) => "Double-click to type a level".into(),
+            Hit::Scribble(_) => "Double-click to rename · Right-click for options".into(),
+            Hit::Meter(_) => "Peak meter · Click to clear clip indicators".into(),
+            Hit::Strip(_) => return None,
+        })
+    }
+}
+
+impl CanvasView<Session, Action> for MixerView {
+    fn paint(&mut self, p: &mut dyn Painter, size: Size, model: &Session, theme: &Theme) {
+        let tracks = Self::channel_tracks(model);
+        self.clamp_scroll(tracks.len(), size);
+        p.fill(Rect::from_size(size), theme.ui.background);
+        let viewport = Rect::new(0.0, 0.0, self.viewport_w(size), size.h);
+        p.push_clip(viewport);
+        for i in self.visible_range(tracks.len(), size) {
+            self.paint_strip(p, self.strip_rect(i, size), tracks[i], i + 1, model);
+        }
+        if tracks.is_empty() {
+            let style =
+                faderframe_ui_canvas::TextStyle::new(theme.fonts.normal, theme.ui.text_faint)
+                    .center();
+            p.text(
+                "No channels — add a track from the Track menu",
+                viewport,
+                &style,
+            );
+        }
+        p.pop_clip();
+        // Gap and master section.
+        let master = self.master_rect(size);
+        let gap = Rect::new(master.x - MASTER_GAP, 0.0, MASTER_GAP, size.h);
+        p.fill(gap, theme.ui.border);
+        p.shadow(master, 0.0, Color::rgba(0.0, 0.0, 0.0, 0.6), -2.0, 0.0, 6.0);
+        if let Some(m) = model.project().master() {
+            self.paint_strip(p, master, m, 0, model);
+        }
+    }
+
+    fn event(
+        &mut self,
+        ev: &ViewEvent,
+        size: Size,
+        model: &Session,
+        cx: &mut EventCx<'_, Action>,
+    ) -> bool {
+        match *ev {
+            ViewEvent::PointerDown {
+                pos,
+                button: PointerButton::Primary,
+                modifiers,
+                clicks,
+            } => self.press(pos, clicks, modifiers, size, model, cx),
+            ViewEvent::PointerDown {
+                pos,
+                button: PointerButton::Secondary,
+                ..
+            } => self.secondary(pos, size, model, cx),
+            ViewEvent::PointerMove {
+                pos,
+                modifiers,
+                dragging: true,
+            } => {
+                match self.drag {
+                    Some(Drag::Fader {
+                        track,
+                        start_y,
+                        start_pos,
+                    }) => {
+                        let Some(l) = self.layout_of(model, track, size) else {
+                            return true;
+                        };
+                        let geo = FaderGeometry::new(l.fader, &self.theme);
+                        let scale = if modifiers.fine() { 0.2 } else { 1.0 };
+                        let pos_new = start_pos + (start_y - pos.y) / geo.travel().max(1.0) * scale;
+                        cx.emit(Action::Edit(Command::SetTrackVolume {
+                            track,
+                            db: self.law.position_to_db(pos_new.clamp(0.0, 1.0)),
+                        }));
+                    }
+                    Some(Drag::Knob {
+                        track,
+                        target,
+                        start_y,
+                        start_value,
+                    }) => {
+                        if let Some(t) = Self::track(model, track) {
+                            let v = start_value
+                                + controls::drag_delta(pos.y - start_y, modifiers.fine());
+                            if let Some(cmd) = self.knob_command(t, target, v) {
+                                cx.emit(Action::Edit(cmd));
+                            }
+                        }
+                    }
+                    Some(Drag::Scroll {
+                        start_x,
+                        start_scroll,
+                    }) => {
+                        self.scroll_x = start_scroll - (pos.x - start_x);
+                        let n = Self::channel_tracks(model).len();
+                        self.clamp_scroll(n, size);
+                        cx.redraw();
+                    }
+                    None => {}
+                }
+                true
+            }
+            ViewEvent::PointerMove { pos, .. } => {
+                let hit = self.hit_test(pos, size, model);
+                if hit != self.hover {
+                    self.hover = hit;
+                    cx.set_cursor(match hit {
+                        Some(Hit::FaderCap(_)) => Cursor::Grab,
+                        Some(Hit::FaderTrack(_) | Hit::Pan(_) | Hit::Send(..)) => {
+                            Cursor::ResizeVertical
+                        }
+                        Some(Hit::Strip(_)) | None => Cursor::Default,
+                        Some(_) => Cursor::Pointer,
+                    });
+                }
+                false
+            }
+            ViewEvent::PointerUp { .. } => {
+                if let Some(d) = self.drag.take()
+                    && matches!(d, Drag::Fader { .. } | Drag::Knob { .. })
+                {
+                    cx.emit(Action::EndGesture);
+                    cx.set_cursor(Cursor::Default);
+                }
+                true
+            }
+            ViewEvent::PointerLeave => {
+                self.hover = None;
+                false
+            }
+            ViewEvent::Scroll {
+                pos,
+                dx,
+                dy,
+                modifiers,
+                precise,
+            } => {
+                let steps = if precise { dy / 20.0 } else { dy };
+                match self.hit_test(pos, size, model) {
+                    Some(Hit::FaderCap(id) | Hit::FaderTrack(id)) if dx == 0.0 => {
+                        if let Some(t) = Self::track(model, id) {
+                            let step = if modifiers.fine() { 0.1 } else { 0.5 };
+                            let base = if t.volume_db <= SILENCE_DB {
+                                -80.0
+                            } else {
+                                t.volume_db
+                            };
+                            cx.emit(Action::Edit(Command::SetTrackVolume {
+                                track: id,
+                                db: base - steps * step,
+                            }));
+                        }
+                        true
+                    }
+                    Some(Hit::Pan(id) | Hit::Send(id, _)) if dx == 0.0 => {
+                        let target = match self.hit_test(pos, size, model) {
+                            Some(Hit::Send(_, i)) => KnobTarget::Send(i),
+                            _ => KnobTarget::Pan,
+                        };
+                        if let Some(t) = Self::track(model, id)
+                            && let Some(v) = self.knob_value(t, target)
+                        {
+                            let step = if modifiers.fine() { 0.005 } else { 0.025 };
+                            if let Some(cmd) = self.knob_command(t, target, v - steps * step) {
+                                cx.emit(Action::Edit(cmd));
+                            }
+                        }
+                        true
+                    }
+                    _ => {
+                        let delta = if dx != 0.0 { dx } else { dy };
+                        let px = if precise {
+                            delta
+                        } else {
+                            delta * self.pitch() * 0.5
+                        };
+                        self.scroll_x += px;
+                        let n = Self::channel_tracks(model).len();
+                        self.clamp_scroll(n, size);
+                        cx.redraw();
+                        true
+                    }
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn wants_frames(&self, model: &Session) -> bool {
+        model.is_animating()
+    }
+
+    fn tooltip(&self, pos: Point, size: Size, model: &Session) -> Option<String> {
+        self.hit_test(pos, size, model)
+            .and_then(|h| self.tooltip_for(h, model))
+    }
+
+    fn min_size(&self) -> Size {
+        Size::new(self.theme.console.master_width + self.pitch() * 2.0, 330.0)
+    }
+
+    fn scroll_info(&self, axis: ScrollAxis, size: Size, model: &Session) -> Option<ScrollInfo> {
+        (axis == ScrollAxis::Horizontal).then(|| ScrollInfo {
+            content: self.content_w(Self::channel_tracks(model).len()),
+            viewport: self.viewport_w(size),
+            offset: self.scroll_x,
+        })
+    }
+
+    fn set_scroll(&mut self, axis: ScrollAxis, offset: f32) {
+        if axis == ScrollAxis::Horizontal {
+            self.scroll_x = offset.max(0.0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

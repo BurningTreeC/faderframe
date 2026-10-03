@@ -1,0 +1,27 @@
+[package]
+name = "faderframe-engine"
+description = "Realtime audio engine: project-to-graph compilation, RT processor, control handle, offline render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-core.workspace = true
+faderframe-timeline.workspace = true
+faderframe-midi.workspace = true
+faderframe-realtime.workspace = true
+faderframe-audio-graph.workspace = true
+faderframe-transport.workspace = true
+faderframe-project.workspace = true
+faderframe-audio.workspace = true
+faderframe-audio-files.workspace = true
+faderframe-plugin-host.workspace = true
+faderframe-automation.workspace = true
+rtrb.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

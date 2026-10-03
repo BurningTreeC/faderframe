@@ -1,0 +1,74 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+default-members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+publish = false
+license = "MIT"
+repository = "https://github.com/BurningTreeC/faderframe"
+
+[workspace.dependencies]
+# --- internal crates -------------------------------------------------------
+faderframe-core = { path = "crates/faderframe-core" }
+faderframe-timeline = { path = "crates/faderframe-timeline" }
+faderframe-midi = { path = "crates/faderframe-midi" }
+faderframe-realtime = { path = "crates/faderframe-realtime" }
+faderframe-audio-graph = { path = "crates/faderframe-audio-graph" }
+faderframe-transport = { path = "crates/faderframe-transport" }
+faderframe-automation = { path = "crates/faderframe-automation" }
+faderframe-workspace = { path = "crates/faderframe-workspace" }
+faderframe-project = { path = "crates/faderframe-project" }
+faderframe-audio = { path = "crates/faderframe-audio" }
+faderframe-audio-jack = { path = "crates/faderframe-audio-jack" }
+faderframe-audio-files = { path = "crates/faderframe-audio-files" }
+faderframe-plugin-host = { path = "crates/faderframe-plugin-host" }
+faderframe-engine = { path = "crates/faderframe-engine" }
+faderframe-session = { path = "crates/faderframe-session" }
+faderframe-ui-canvas = { path = "crates/faderframe-ui-canvas" }
+faderframe-view-arranger = { path = "crates/faderframe-view-arranger" }
+faderframe-view-mixer = { path = "crates/faderframe-view-mixer" }
+faderframe-view-pianoroll = { path = "crates/faderframe-view-pianoroll" }
+faderframe-ui = { path = "crates/faderframe-ui" }
+
+# --- external crates -------------------------------------------------------
+# GUI shell (Linux first; GTK 4.14+ for GSK path rendering).
+gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
+# Audio backends. `jack` loads libjack at runtime (dynamic_loading), so the
+# application still starts on machines without JACK/pipewire-jack.
+jack = "0.13"
+# Realtime-safe wait-free SPSC ring buffer used for control <-> RT messaging.
+rtrb = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+dbg_macro = "warn"
+todo = "warn"
+
+[profile.dev]
+# Keep DSP code usable in debug builds.
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+debug = "line-tables-only"
+lto = "thin"
+codegen-units = 4
+
+[profile.bench-rt]
+inherits = "release"
+debug = true

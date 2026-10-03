@@ -1,0 +1,42 @@
+# cargo-deny configuration: `cargo deny check`
+#
+# FaderFrame is MIT licensed. Only permissive licenses (and MPL-2.0, which is
+# file-level copyleft and compatible with distributing an MIT application)
+# are accepted for Rust dependencies. Adding a dependency with any other
+# license fails CI and must be discussed first.
+
+[graph]
+all-features = false
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+unused-allowed-license = "allow"
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "MPL-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[advisories]
+version = 2
+yanked = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,609 @@
+//! GTK host for [`CanvasView`]s.
+//!
+//! `CanvasWidget` is a custom `gtk::Widget` subclass. It paints its view
+//! through [`SnapshotPainter`] in `snapshot()`, turns GTK event-controller
+//! signals into toolkit-neutral [`ViewEvent`]s, executes the view's
+//! [`HostRequest`]s (native popover menus, inline text entry) and forwards
+//! emitted actions to the [`AppState`]. The same widget instance (and so the
+//! same view state) is re-parented when its view moves between docks and
+//! windows.
+
+use crate::painter::{SnapshotPainter, TextCache};
+use crate::state::AppState;
+use faderframe_session::{Action, Session};
+use faderframe_ui_canvas::{
+    CanvasView, Cursor, EventCx, HostRequest, Key, MenuItem, Modifiers, Point, PointerButton,
+    ScrollAxis, Size, ViewEvent,
+};
+use gtk::glib;
+use gtk::prelude::*;
+use gtk::subclass::prelude::*;
+use gtk::{gdk, graphene};
+use std::cell::{Cell, RefCell};
+use std::rc::{Rc, Weak};
+
+pub type DynView = Box<dyn CanvasView<Session, Action>>;
+
+mod imp {
+    use super::*;
+
+    #[derive(Default)]
+    pub struct CanvasWidget {
+        pub view: RefCell<Option<DynView>>,
+        pub app: RefCell<Weak<AppState>>,
+        pub text_cache: RefCell<TextCache>,
+        pub dragging: Cell<bool>,
+        pub drag_button: Cell<u32>,
+        pub drag_origin: Cell<(f64, f64)>,
+        pub last_cursor: Cell<Option<Cursor>>,
+        pub hadj: RefCell<Option<gtk::Adjustment>>,
+        pub vadj: RefCell<Option<gtk::Adjustment>>,
+        pub syncing: Cell<bool>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for CanvasWidget {
+        const NAME: &'static str = "FaderFrameCanvas";
+        type Type = super::CanvasWidget;
+        type ParentType = gtk::Widget;
+    }
+
+    impl ObjectImpl for CanvasWidget {}
+
+    impl WidgetImpl for CanvasWidget {
+        fn snapshot(&self, snapshot: &gtk::Snapshot) {
+            let widget = self.obj();
+            let Some(app) = self.app.borrow().upgrade() else {
+                return;
+            };
+            let Ok(session) = app.session.try_borrow() else {
+                // Painting while the session is being mutated would be a
+                // re-entrancy bug; skip the frame instead of panicking.
+                widget.queue_draw();
+                return;
+            };
+            let size = Size::new(widget.width() as f32, widget.height() as f32);
+            self.text_cache.borrow_mut().begin_frame();
+            snapshot.push_clip(&graphene::Rect::new(0.0, 0.0, size.w, size.h));
+            let w: &gtk::Widget = widget.upcast_ref();
+            let mut painter = SnapshotPainter::new(snapshot, w, &self.text_cache);
+            if let Some(view) = self.view.borrow_mut().as_mut() {
+                view.paint(&mut painter, size, &session, &app.theme);
+            }
+            snapshot.pop();
+        }
+
+        fn measure(&self, orientation: gtk::Orientation, _for_size: i32) -> (i32, i32, i32, i32) {
+            let min = self
+                .view
+                .borrow()
+                .as_ref()
+                .map_or(Size::new(50.0, 50.0), |v| v.min_size());
+            let m = match orientation {
+                gtk::Orientation::Horizontal => min.w,
+                _ => min.h,
+            } as i32;
+            (m, m, -1, -1)
+        }
+    }
+}
+
+glib::wrapper! {
+    pub struct CanvasWidget(ObjectSubclass<imp::CanvasWidget>)
+        @extends gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+}
+
+fn modifiers(state: gdk::ModifierType) -> Modifiers {
+    Modifiers {
+        shift: state.contains(gdk::ModifierType::SHIFT_MASK),
+        ctrl: state.contains(gdk::ModifierType::CONTROL_MASK),
+        alt: state.contains(gdk::ModifierType::ALT_MASK),
+        meta: state.intersects(gdk::ModifierType::SUPER_MASK | gdk::ModifierType::META_MASK),
+    }
+}
+
+fn button(b: u32) -> PointerButton {
+    match b {
+        1 => PointerButton::Primary,
+        2 => PointerButton::Middle,
+        3 => PointerButton::Secondary,
+        other => PointerButton::Other(other),
+    }
+}
+
+fn map_key(key: gdk::Key) -> Key {
+    match key {
+        gdk::Key::space => Key::Space,
+        gdk::Key::Return | gdk::Key::KP_Enter => Key::Enter,
+        gdk::Key::Escape => Key::Escape,
+        gdk::Key::Delete | gdk::Key::KP_Delete => Key::Delete,
+        gdk::Key::BackSpace => Key::Backspace,
+        gdk::Key::Tab => Key::Tab,
+        gdk::Key::Left => Key::Left,
+        gdk::Key::Right => Key::Right,
+        gdk::Key::Up => Key::Up,
+        gdk::Key::Down => Key::Down,
+        gdk::Key::Home => Key::Home,
+        gdk::Key::End => Key::End,
+        gdk::Key::Page_Up => Key::PageUp,
+        gdk::Key::Page_Down => Key::PageDown,
+        k => k.to_unicode().map_or(Key::Other, Key::Char),
+    }
+}
+
+fn cursor_name(c: Cursor) -> &'static str {
+    match c {
+        Cursor::Default => "default",
+        Cursor::Pointer => "pointer",
+        Cursor::Grab => "grab",
+        Cursor::Grabbing => "grabbing",
+        Cursor::ResizeHorizontal => "ew-resize",
+        Cursor::ResizeVertical => "ns-resize",
+        Cursor::Text => "text",
+        Cursor::Crosshair => "crosshair",
+        Cursor::Move => "move",
+    }
+}
+
+impl CanvasWidget {
+    pub fn new(app: &Rc<AppState>, view: DynView) -> Self {
+        let w: Self = glib::Object::new();
+        let imp = w.imp();
+        *imp.view.borrow_mut() = Some(view);
+        *imp.app.borrow_mut() = Rc::downgrade(app);
+        w.set_focusable(true);
+        w.set_hexpand(true);
+        w.set_vexpand(true);
+        w.set_has_tooltip(true);
+        w.add_css_class("canvas");
+        w.install_controllers();
+        w.install_tick();
+        w.connect_scale_factor_notify(|w| w.imp().text_cache.borrow_mut().clear());
+        w
+    }
+
+    fn app(&self) -> Option<Rc<AppState>> {
+        self.imp().app.borrow().upgrade()
+    }
+
+    fn size(&self) -> Size {
+        Size::new(self.width() as f32, self.height() as f32)
+    }
+
+    /// Deliver an event to the view and act on the result.
+    pub fn deliver(&self, ev: ViewEvent) -> bool {
+        let Some(app) = self.app() else { return false };
+        let mut actions = Vec::new();
+        let mut requests = Vec::new();
+        let (handled, redraw, cursor) = {
+            let Ok(session) = app.session.try_borrow() else {
+                return false;
+            };
+            let mut cx = EventCx::new(&mut actions, &mut requests);
+            let handled = match self.imp().view.borrow_mut().as_mut() {
+                Some(v) => v.event(&ev, self.size(), &session, &mut cx),
+                None => false,
+            };
+            (handled, cx.wants_redraw(), cx.cursor())
+        };
+        if let Some(c) = cursor
+            && self.imp().last_cursor.get() != Some(c)
+        {
+            self.imp().last_cursor.set(Some(c));
+            self.set_cursor_from_name(Some(cursor_name(c)));
+        }
+        for req in requests {
+            self.handle_request(&app, req);
+        }
+        let had_actions = !actions.is_empty();
+        for a in actions {
+            app.dispatch(a);
+        }
+        if redraw || had_actions {
+            self.queue_draw();
+        }
+        handled
+    }
+
+    fn handle_request(&self, app: &Rc<AppState>, req: HostRequest<Action>) {
+        match req {
+            HostRequest::GrabFocus => {
+                self.grab_focus();
+            }
+            HostRequest::ContextMenu { at, items } => show_menu(self.upcast_ref(), at, items, app),
+            HostRequest::TextInput {
+                at,
+                initial,
+                commit,
+            } => {
+                let popover = gtk::Popover::new();
+                popover.set_has_arrow(true);
+                let entry = gtk::Entry::new();
+                entry.set_text(&initial);
+                entry.set_width_chars(16);
+                popover.set_child(Some(&entry));
+                popover.set_parent(self);
+                popover.set_pointing_to(Some(&gdk::Rectangle::new(
+                    at.x as i32,
+                    at.y as i32,
+                    at.w.max(1.0) as i32,
+                    at.h.max(1.0) as i32,
+                )));
+                let commit = Rc::new(commit);
+                let weak_app = Rc::downgrade(app);
+                entry.connect_activate(glib::clone!(
+                    #[weak]
+                    popover,
+                    move |e| {
+                        let text = e.text().to_string();
+                        popover.popdown();
+                        if let (Some(action), Some(app)) = (commit(&text), weak_app.upgrade()) {
+                            app.dispatch(action);
+                        }
+                    }
+                ));
+                popover.connect_closed(|p| {
+                    let p = p.clone();
+                    glib::idle_add_local_once(move || p.unparent());
+                });
+                popover.popup();
+                entry.grab_focus();
+                entry.select_region(0, -1);
+            }
+        }
+    }
+
+    fn install_controllers(&self) {
+        let click = gtk::GestureClick::new();
+        click.set_button(0);
+        click.connect_pressed(glib::clone!(
+            #[weak(rename_to = w)]
+            self,
+            move |g, n, x, y| {
+                let b = g.current_button();
+                w.imp().drag_button.set(b);
+                w.deliver(ViewEvent::PointerDown {
+                    pos: Point::new(x as f32, y as f32),
+                    button: button(b),
+                    modifiers: modifiers(g.current_event_state()),
+                    clicks: n.max(1) as u32,
+                });
+            }
+        ));
+        self.add_controller(click);
+
+        let drag = gtk::GestureDrag::new();
+        drag.set_button(0);
+        drag.connect_drag_begin(glib::clone!(
+            #[weak(rename_to = w)]
+            self,
+            move |_, x, y| {
+                w.imp().dragging.set(true);
+                w.imp().drag_origin.set((x, y));
+            }
+        ));
+        drag.connect_drag_update(glib::clone!(
+            #[weak(rename_to = w)]
+            self,
+            move |g, dx, dy| {
+                let (x, y) = w.imp().drag_origin.get();
+                w.deliver(ViewEvent::PointerMove {
+                    pos: Point::new((x + dx) as f32, (y + dy) as f32),
+                    modifiers: modifiers(g.current_event_state()),
+                    dragging: true,
+                });
+            }
+        ));
+        drag.connect_drag_end(glib::clone!(
+            #[weak(rename_to = w)]
+            self,
+            move |g, dx, dy| {
+                w.imp().dragging.set(false);
+                let (x, y) = w.imp().drag_origin.get();
+                w.deliver(ViewEvent::PointerUp {
+                    pos: Point::new((x + dx) as f32, (y + dy) as f32),
+                    button: button(w.imp().drag_button.get()),
+                    modifiers: modifiers(g.current_event_state()),
+                });
+            }
+        ));
+        self.add_controller(drag);
+
+        let motion = gtk::EventControllerMotion::new();
+        motion.connect_motion(glib::clone!(
+            #[weak(rename_to = w)]
+            self,
+            move |c, x, y| {
+                if !w.imp().dragging.get() {
+                    w.deliver(ViewEvent::PointerMove {
+                        pos: Point::new(x as f32, y as f32),
+                        modifiers: modifiers(c.current_event_state()),
+                        dragging: false,
+                    });
+                }
+            }
+        ));
+        motion.connect_leave(glib::clone!(
+            #[weak(rename_to = w)]
+            self,
+            move |_| {
+                w.deliver(ViewEvent::PointerLeave);
+            }
+        ));
+        self.add_controller(motion);
+
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+        scroll.connect_scroll(glib::clone!(
+            #[weak(rename_to = w)]
+            self,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |c, dx, dy| {
+                let precise = c.unit() == gdk::ScrollUnit::Surface;
+                let pos = w.pointer_position();
+                let handled = w.deliver(ViewEvent::Scroll {
+                    pos,
+                    dx: dx as f32,
+                    dy: dy as f32,
+                    modifiers: modifiers(c.current_event_state()),
+                    precise,
+                });
+                if handled {
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            }
+        ));
+        self.add_controller(scroll);
+
+        let keys = gtk::EventControllerKey::new();
+        keys.connect_key_pressed(glib::clone!(
+            #[weak(rename_to = w)]
+            self,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, key, _, state| {
+                let k = map_key(key);
+                // Space is the global transport key; let it bubble.
+                if k == Key::Space {
+                    return glib::Propagation::Proceed;
+                }
+                if w.deliver(ViewEvent::Key {
+                    key: k,
+                    modifiers: modifiers(state),
+                }) {
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            }
+        ));
+        self.add_controller(keys);
+
+        let focus = gtk::EventControllerFocus::new();
+        focus.connect_leave(glib::clone!(
+            #[weak(rename_to = w)]
+            self,
+            move |_| {
+                w.deliver(ViewEvent::FocusLost);
+            }
+        ));
+        self.add_controller(focus);
+
+        self.connect_query_tooltip(|w, x, y, keyboard, tooltip| {
+            if keyboard {
+                return false;
+            }
+            let Some(app) = w.app() else { return false };
+            let Ok(session) = app.session.try_borrow() else {
+                return false;
+            };
+            let text = w
+                .imp()
+                .view
+                .borrow()
+                .as_ref()
+                .and_then(|v| v.tooltip(Point::new(x as f32, y as f32), w.size(), &session));
+            match text {
+                Some(t) => {
+                    tooltip.set_text(Some(&t));
+                    true
+                }
+                None => false,
+            }
+        });
+    }
+
+    fn pointer_position(&self) -> Point {
+        self.root()
+            .and_then(|root| {
+                let surface = root.native()?.surface()?;
+                let seat = self.display().default_seat()?;
+                let pointer = seat.pointer()?;
+                let (x, y, _) = surface.device_position(&pointer)?;
+                let p = root.compute_point(self, &graphene::Point::new(x as f32, y as f32))?;
+                Some(Point::new(p.x(), p.y()))
+            })
+            .unwrap_or_default()
+    }
+
+    fn install_tick(&self) {
+        self.add_tick_callback(|w, _clock| {
+            if let Some(app) = w.app()
+                && let Ok(session) = app.session.try_borrow()
+            {
+                let animate = w
+                    .imp()
+                    .view
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|v| v.wants_frames(&session));
+                drop(session);
+                if animate {
+                    w.queue_draw();
+                }
+                w.sync_scrollbars();
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    /// Attach native scrollbars driven by the view's scroll state.
+    pub fn bind_scrollbars(&self, hadj: Option<gtk::Adjustment>, vadj: Option<gtk::Adjustment>) {
+        for (adj, axis) in [
+            (hadj.as_ref(), ScrollAxis::Horizontal),
+            (vadj.as_ref(), ScrollAxis::Vertical),
+        ] {
+            if let Some(adj) = adj {
+                adj.connect_value_changed(glib::clone!(
+                    #[weak(rename_to = w)]
+                    self,
+                    move |a| {
+                        if w.imp().syncing.get() {
+                            return;
+                        }
+                        if let Some(v) = w.imp().view.borrow_mut().as_mut() {
+                            v.set_scroll(axis, a.value() as f32);
+                        }
+                        w.queue_draw();
+                    }
+                ));
+            }
+        }
+        *self.imp().hadj.borrow_mut() = hadj;
+        *self.imp().vadj.borrow_mut() = vadj;
+    }
+
+    fn sync_scrollbars(&self) {
+        let Some(app) = self.app() else { return };
+        let Ok(session) = app.session.try_borrow() else {
+            return;
+        };
+        let size = self.size();
+        let imp = self.imp();
+        imp.syncing.set(true);
+        for (adj, axis) in [
+            (&imp.hadj, ScrollAxis::Horizontal),
+            (&imp.vadj, ScrollAxis::Vertical),
+        ] {
+            let Some(adj) = adj.borrow().clone() else {
+                continue;
+            };
+            let info = imp
+                .view
+                .borrow()
+                .as_ref()
+                .and_then(|v| v.scroll_info(axis, size, &session));
+            match info {
+                Some(i) if i.content > i.viewport + 1.0 => {
+                    let upper = i.content as f64;
+                    let page = i.viewport as f64;
+                    let value = (i.offset as f64).min(upper - page).max(0.0);
+                    if (adj.upper() - upper).abs() > 0.5
+                        || (adj.page_size() - page).abs() > 0.5
+                        || (adj.value() - value).abs() > 0.5
+                    {
+                        adj.configure(value, 0.0, upper, 24.0, page * 0.9, page);
+                    }
+                }
+                _ => {
+                    if adj.upper() != 0.0 {
+                        adj.configure(0.0, 0.0, 0.0, 1.0, 1.0, 0.0);
+                    }
+                }
+            }
+        }
+        imp.syncing.set(false);
+    }
+}
+
+/// Native popover menu for a view's context menu request.
+pub fn show_menu(
+    parent: &gtk::Widget,
+    at: Point,
+    items: Vec<MenuItem<Action>>,
+    app: &Rc<AppState>,
+) {
+    let popover = gtk::Popover::new();
+    popover.set_has_arrow(false);
+    popover.add_css_class("ff-menu");
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    for item in items {
+        if item.separator_before && list.first_child().is_some() {
+            list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        }
+        let mark = match item.checked {
+            Some(true) => "✓  ",
+            Some(false) => "    ",
+            None => "",
+        };
+        let label = gtk::Label::new(Some(&format!("{mark}{}", item.label)));
+        label.set_xalign(0.0);
+        let button = gtk::Button::new();
+        button.set_child(Some(&label));
+        button.add_css_class("flat");
+        match item.action {
+            Some(action) => {
+                let weak = Rc::downgrade(app);
+                button.connect_clicked(glib::clone!(
+                    #[weak]
+                    popover,
+                    move |_| {
+                        popover.popdown();
+                        if let Some(app) = weak.upgrade() {
+                            app.dispatch(action.clone());
+                        }
+                    }
+                ));
+            }
+            None => button.set_sensitive(false),
+        }
+        list.append(&button);
+    }
+    let scroller = gtk::ScrolledWindow::new();
+    scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    scroller.set_propagate_natural_height(true);
+    scroller.set_max_content_height(520);
+    scroller.set_child(Some(&list));
+    popover.set_child(Some(&scroller));
+    popover.set_parent(parent);
+    popover.set_pointing_to(Some(&gdk::Rectangle::new(at.x as i32, at.y as i32, 1, 1)));
+    popover.connect_closed(|p| {
+        let p = p.clone();
+        glib::idle_add_local_once(move || p.unparent());
+    });
+    popover.popup();
+}
+
+/// A canvas plus optional native scrollbars, the unit the dock places.
+#[derive(Clone)]
+pub struct ViewHost {
+    pub root: gtk::Grid,
+    pub canvas: CanvasWidget,
+}
+
+impl ViewHost {
+    pub fn new(app: &Rc<AppState>, view: DynView, horizontal: bool, vertical: bool) -> Self {
+        let canvas = CanvasWidget::new(app, view);
+        let root = gtk::Grid::new();
+        root.set_hexpand(true);
+        root.set_vexpand(true);
+        root.attach(&canvas, 0, 0, 1, 1);
+        let hadj = horizontal.then(|| {
+            let adj = gtk::Adjustment::new(0.0, 0.0, 0.0, 1.0, 1.0, 0.0);
+            let bar = gtk::Scrollbar::new(gtk::Orientation::Horizontal, Some(&adj));
+            root.attach(&bar, 0, 1, 1, 1);
+            adj
+        });
+        let vadj = vertical.then(|| {
+            let adj = gtk::Adjustment::new(0.0, 0.0, 0.0, 1.0, 1.0, 0.0);
+            let bar = gtk::Scrollbar::new(gtk::Orientation::Vertical, Some(&adj));
+            root.attach(&bar, 1, 0, 1, 1);
+            adj
+        });
+        canvas.bind_scrollbars(hadj, vadj);
+        Self { root, canvas }
+    }
+}

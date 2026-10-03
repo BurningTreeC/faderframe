@@ -1,0 +1,17 @@
+[package]
+name = "faderframe-audio-files"
+description = "Audio source data, waveform peak caches and generated audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

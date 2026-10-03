@@ -1,0 +1,392 @@
+//! The Preferences window (audio, editing, engine, project).
+
+use crate::prefs::Preferences;
+use crate::state::{AppState, BackendChoice};
+use faderframe_audio::{STANDARD_BUFFER_SIZES, STANDARD_SAMPLE_RATES, format_sample_rate};
+use faderframe_project::Command;
+use faderframe_session::Action;
+use gtk::glib;
+use gtk::prelude::*;
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::Duration;
+
+thread_local! {
+    static OPEN: RefCell<Option<glib::WeakRef<gtk::Window>>> = const { RefCell::new(None) };
+}
+
+const BACKENDS: [BackendChoice; 3] = [
+    BackendChoice::Auto,
+    BackendChoice::Jack,
+    BackendChoice::Dummy,
+];
+
+fn row(grid: &gtk::Grid, y: i32, label: &str, widget: &impl IsA<gtk::Widget>) {
+    let l = gtk::Label::new(Some(label));
+    l.set_xalign(1.0);
+    l.add_css_class("dim-label");
+    grid.attach(&l, 0, y, 1, 1);
+    widget.set_hexpand(true);
+    grid.attach(widget, 1, y, 1, 1);
+}
+
+fn form() -> gtk::Grid {
+    let g = gtk::Grid::new();
+    g.set_row_spacing(10);
+    g.set_column_spacing(14);
+    g.add_css_class("audio-settings");
+    g
+}
+
+fn note(text: &str) -> gtk::Label {
+    let l = gtk::Label::new(Some(text));
+    l.set_wrap(true);
+    l.set_xalign(0.0);
+    l.add_css_class("dim-label");
+    l
+}
+
+fn audio_page(app: &Rc<AppState>, alive: &Rc<std::cell::Cell<bool>>) -> gtk::Widget {
+    let g = form();
+    let opts = app.options.borrow().clone();
+    let backend_names: Vec<&str> = BACKENDS.iter().map(|b| b.label()).collect();
+    let backend = gtk::DropDown::from_strings(&backend_names);
+    backend.set_selected(
+        BACKENDS
+            .iter()
+            .position(|b| *b == opts.backend)
+            .unwrap_or(0) as u32,
+    );
+    row(&g, 0, "Audio system", &backend);
+
+    let mut rate_names = vec!["Device / server default".to_string()];
+    rate_names.extend(STANDARD_SAMPLE_RATES.iter().map(|r| format_sample_rate(*r)));
+    let rate_refs: Vec<&str> = rate_names.iter().map(String::as_str).collect();
+    let rate = gtk::DropDown::from_strings(&rate_refs);
+    rate.set_selected(
+        opts.sample_rate
+            .and_then(|r| STANDARD_SAMPLE_RATES.iter().position(|x| *x == r))
+            .map_or(0, |i| i as u32 + 1),
+    );
+    row(&g, 1, "Sample rate", &rate);
+
+    let mut buf_names = vec!["Device / server default".to_string()];
+    buf_names.extend(STANDARD_BUFFER_SIZES.iter().map(|b| format!("{b} frames")));
+    let buf_refs: Vec<&str> = buf_names.iter().map(String::as_str).collect();
+    let buffer = gtk::DropDown::from_strings(&buf_refs);
+    buffer.set_selected(
+        opts.buffer_size
+            .and_then(|b| STANDARD_BUFFER_SIZES.iter().position(|x| *x == b))
+            .map_or(0, |i| i as u32 + 1),
+    );
+    row(&g, 2, "Buffer size", &buffer);
+
+    let status = gtk::Label::new(None);
+    status.set_xalign(0.0);
+    status.set_selectable(true);
+    row(&g, 3, "Stream", &status);
+    let stats = gtk::Label::new(None);
+    stats.set_xalign(0.0);
+    stats.add_css_class("monospace");
+    row(&g, 4, "DSP load", &stats);
+
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let apply = gtk::Button::with_label("Apply & Restart Audio");
+    apply.add_css_class("suggested-action");
+    let live = gtk::Button::with_label("Change Buffer Size Now");
+    live.set_tooltip_text(Some(
+        "Ask the running JACK/PipeWire graph for the selected buffer size without restarting",
+    ));
+    let reset = gtk::Button::with_label("Reset Statistics");
+    buttons.append(&apply);
+    buttons.append(&live);
+    buttons.append(&reset);
+    g.attach(&buttons, 1, 5, 1, 1);
+    g.attach(
+        &note(
+            "JACK and PipeWire own the sample rate: FaderFrame follows whatever the server runs at \
+             and rebuilds its engine automatically when it changes. Any buffer size from 16 to 8192 \
+             frames works; larger device buffers are processed in internal blocks.",
+        ),
+        0,
+        6,
+        2,
+        1,
+    );
+
+    let selected = move |backend: &gtk::DropDown, rate: &gtk::DropDown, buffer: &gtk::DropDown| {
+        let b = BACKENDS[backend.selected() as usize % BACKENDS.len()];
+        let r = (rate.selected() > 0).then(|| STANDARD_SAMPLE_RATES[rate.selected() as usize - 1]);
+        let f =
+            (buffer.selected() > 0).then(|| STANDARD_BUFFER_SIZES[buffer.selected() as usize - 1]);
+        (b, r, f)
+    };
+    let weak = Rc::downgrade(app);
+    apply.connect_clicked(glib::clone!(
+        #[weak]
+        backend,
+        #[weak]
+        rate,
+        #[weak]
+        buffer,
+        move |_| {
+            let Some(app) = weak.upgrade() else { return };
+            let (b, r, f) = selected(&backend, &rate, &buffer);
+            {
+                let mut o = app.options.borrow_mut();
+                o.backend = b;
+                o.sample_rate = r;
+                o.buffer_size = f;
+            }
+            let mut prefs = Preferences::load();
+            prefs.set_backend(b);
+            prefs.sample_rate = r;
+            prefs.buffer_size = f;
+            if let Err(e) = prefs.save() {
+                tracing::warn!("cannot save preferences: {e}");
+            }
+            app.start_audio();
+        }
+    ));
+    let weak = Rc::downgrade(app);
+    live.connect_clicked(glib::clone!(
+        #[weak]
+        buffer,
+        move |_| {
+            let Some(app) = weak.upgrade() else { return };
+            if buffer.selected() == 0 {
+                return;
+            }
+            let frames = STANDARD_BUFFER_SIZES[buffer.selected() as usize - 1];
+            app.with_session(|s| s.request_buffer_size(frames));
+        }
+    ));
+    let weak = Rc::downgrade(app);
+    reset.connect_clicked(move |_| {
+        if let Some(app) = weak.upgrade() {
+            app.session.borrow().engine().reset_metrics();
+        }
+    });
+
+    let weak = Rc::downgrade(app);
+    let alive = Rc::clone(alive);
+    let refresh = move || {
+        let Some(app) = weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        if !alive.get() {
+            return glib::ControlFlow::Break;
+        }
+        let s = app.session.borrow();
+        status.set_text(&match (s.stream_info(), s.stream_status()) {
+            (Some(info), Some(st)) => format!(
+                "{} · {} · {} · {} frames ({:.2} ms) · {} in / {} out",
+                info.backend.to_uppercase(),
+                info.device,
+                format_sample_rate(st.sample_rate),
+                st.buffer_size,
+                st.buffer_size as f64 * 1000.0 / st.sample_rate.max(1) as f64,
+                info.input_channels,
+                info.output_channels
+            ),
+            _ => "No audio stream is running".into(),
+        });
+        let m = s.metrics();
+        let us = |ns: u64| ns as f64 / 1000.0;
+        stats.set_text(&format!(
+            "p50 {:.0} µs · p95 {:.0} µs · p99 {:.0} µs · max {:.0} µs\n{} callbacks · {} deadline misses · {} xruns · budget {:.0} µs",
+            us(m.p50_ns),
+            us(m.p95_ns),
+            us(m.p99_ns),
+            us(m.max_ns),
+            m.callbacks,
+            m.deadline_misses,
+            s.stream_status().map_or(0, |st| st.xruns),
+            us(m.last_budget_ns)
+        ));
+        glib::ControlFlow::Continue
+    };
+    refresh();
+    glib::timeout_add_local(Duration::from_millis(500), refresh);
+    g.upcast()
+}
+
+fn editing_page(app: &Rc<AppState>) -> gtk::Widget {
+    let g = form();
+    let ed = app.session.borrow().editor;
+    let snap = gtk::CheckButton::with_label("Snap to grid");
+    snap.set_active(ed.snap);
+    let follow = gtk::CheckButton::with_label("Follow the playhead while playing");
+    follow.set_active(ed.follow_playhead);
+    g.attach(&snap, 1, 0, 1, 1);
+    g.attach(&follow, 1, 1, 1, 1);
+    g.attach(
+        &note("Grid resolution is chosen from the arranger's top-left corner. Hold Alt while dragging to bypass snapping; Shift or Ctrl give fine control on faders and knobs."),
+        0,
+        2,
+        2,
+        1,
+    );
+    let persist = |snap: bool, follow: bool| {
+        let mut p = Preferences::load();
+        p.snap = snap;
+        p.follow_playhead = follow;
+        let _ = p.save();
+    };
+    let weak = Rc::downgrade(app);
+    snap.connect_toggled(move |b| {
+        let Some(app) = weak.upgrade() else { return };
+        let ed = app.session.borrow().editor;
+        if ed.snap != b.is_active() {
+            app.dispatch(Action::ToggleSnap);
+        }
+        persist(b.is_active(), ed.follow_playhead);
+    });
+    let weak = Rc::downgrade(app);
+    follow.connect_toggled(move |b| {
+        let Some(app) = weak.upgrade() else { return };
+        let ed = app.session.borrow().editor;
+        if ed.follow_playhead != b.is_active() {
+            app.dispatch(Action::ToggleFollowPlayhead);
+        }
+        persist(ed.snap, b.is_active());
+    });
+    g.upcast()
+}
+
+fn engine_page(app: &Rc<AppState>) -> gtk::Widget {
+    let g = form();
+    let s = app.session.borrow();
+    let e = s.engine();
+    let st = e.graph_stats();
+    let sr = e.sample_rate() as f64;
+    let lines = [
+        (
+            "Internal block size",
+            format!("{} frames", e.config().max_block_size),
+        ),
+        (
+            "Graph nodes / edges",
+            format!("{} / {}", st.nodes, st.edges),
+        ),
+        (
+            "Critical path",
+            format!(
+                "{} nodes deep, up to {} nodes in parallel",
+                st.levels, st.max_width
+            ),
+        ),
+        (
+            "Delay compensation",
+            format!(
+                "{} samples ({:.2} ms) total, {} compensated connections",
+                st.output_latency,
+                st.output_latency as f64 * 1000.0 / sr.max(1.0),
+                st.compensated_edges
+            ),
+        ),
+        (
+            "Scheduling",
+            "single-threaded (dependency-aware multicore scheduler planned)".to_string(),
+        ),
+    ];
+    for (i, (k, v)) in lines.iter().enumerate() {
+        let l = gtk::Label::new(Some(v));
+        l.set_xalign(0.0);
+        l.set_selectable(true);
+        row(&g, i as i32, k, &l);
+    }
+    let warnings = e.warnings().join("\n");
+    if !warnings.is_empty() {
+        g.attach(&note(&warnings), 0, lines.len() as i32, 2, 1);
+    }
+    g.upcast()
+}
+
+fn project_page(app: &Rc<AppState>) -> gtk::Widget {
+    let g = form();
+    let (name, bpm, rate) = {
+        let s = app.session.borrow();
+        let p = s.project();
+        (
+            p.name.clone(),
+            p.timeline.tempo.points()[0].bpm,
+            p.sample_rate,
+        )
+    };
+    let name_entry = gtk::Entry::new();
+    name_entry.set_text(&name);
+    row(&g, 0, "Project name", &name_entry);
+    let tempo = gtk::SpinButton::with_range(20.0, 400.0, 0.5);
+    tempo.set_digits(2);
+    tempo.set_value(bpm);
+    row(&g, 1, "Tempo (BPM)", &tempo);
+    let rate_label = gtk::Label::new(Some(&format_sample_rate(rate)));
+    rate_label.set_xalign(0.0);
+    row(&g, 2, "Project sample rate", &rate_label);
+    g.attach(
+        &note("Clip positions are stored in musical time; audio offsets are project-rate frames and are scaled when the engine runs at another rate."),
+        0,
+        3,
+        2,
+        1,
+    );
+    let weak = Rc::downgrade(app);
+    name_entry.connect_activate(move |e| {
+        if let Some(app) = weak.upgrade() {
+            app.dispatch(Action::Edit(Command::RenameProject {
+                name: e.text().to_string(),
+            }));
+        }
+    });
+    let weak = Rc::downgrade(app);
+    tempo.connect_value_changed(move |t| {
+        if let Some(app) = weak.upgrade() {
+            app.dispatch(Action::Edit(Command::SetTempo { bpm: t.value() }));
+        }
+    });
+    g.upcast()
+}
+
+/// Open (or raise) the preferences window, optionally on a given page.
+pub fn open(app: &Rc<AppState>, page: Option<&str>) {
+    if let Some(win) = OPEN.with(|o| o.borrow().as_ref().and_then(|w| w.upgrade())) {
+        win.present();
+        return;
+    }
+    let win = gtk::Window::builder()
+        .application(&app.app)
+        .title("Preferences — FaderFrame")
+        .default_width(760)
+        .default_height(480)
+        .build();
+    if let Some(main) = app.window.borrow().as_ref() {
+        win.set_transient_for(Some(main));
+    }
+    crate::actions::install_window_keys(app, &win);
+    let alive = Rc::new(std::cell::Cell::new(true));
+    let stack = gtk::Stack::new();
+    stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+    stack.add_titled(&audio_page(app, &alive), Some("audio"), "Audio");
+    stack.add_titled(&editing_page(app), Some("editing"), "Editing");
+    stack.add_titled(&engine_page(app), Some("engine"), "Engine");
+    stack.add_titled(&project_page(app), Some("project"), "Project");
+    if let Some(p) = page {
+        stack.set_visible_child_name(p);
+    }
+    let sidebar = gtk::StackSidebar::new();
+    sidebar.set_stack(&stack);
+    sidebar.set_size_request(150, -1);
+    let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    body.append(&sidebar);
+    body.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+    stack.set_hexpand(true);
+    body.append(&stack);
+    win.set_child(Some(&body));
+    win.connect_close_request(move |_| {
+        alive.set(false);
+        glib::Propagation::Proceed
+    });
+    OPEN.with(|o| *o.borrow_mut() = Some(win.downgrade()));
+    win.present();
+}

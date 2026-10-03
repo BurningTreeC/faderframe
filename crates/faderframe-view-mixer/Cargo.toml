@@ -1,0 +1,20 @@
+[package]
+name = "faderframe-view-mixer"
+description = "Analogue-console-style mixer view"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-core.workspace = true
+faderframe-project.workspace = true
+faderframe-session.workspace = true
+faderframe-ui-canvas.workspace = true
+
+[dev-dependencies]
+faderframe-engine.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "faderframe-audio"
+description = "Audio backend abstraction (device enumeration, streams, callbacks)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+rtrb.workspace = true

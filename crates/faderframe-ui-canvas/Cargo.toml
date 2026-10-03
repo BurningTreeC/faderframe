@@ -1,0 +1,13 @@
+[package]
+name = "faderframe-ui-canvas"
+description = "Toolkit-independent custom view framework: painter, events, theme and console controls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

@@ -1,0 +1,320 @@
+//! Visual themes ("skins").
+//!
+//! All colours, sizes and typographic choices of the custom surfaces live
+//! here instead of being scattered through the views, so alternative skins
+//! (classic British/American console feel, light studio …) can be added by
+//! constructing a different [`Theme`]. The default is an original design
+//! inspired by general analogue-console principles — no brand is imitated.
+
+use crate::Color;
+
+#[derive(Clone, Debug)]
+pub struct Typography {
+    pub tiny: f32,
+    pub small: f32,
+    pub normal: f32,
+    pub large: f32,
+    pub display: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct UiPalette {
+    pub background: Color,
+    pub surface: Color,
+    pub surface_alt: Color,
+    pub border: Color,
+    pub text: Color,
+    pub text_dim: Color,
+    pub text_faint: Color,
+    /// Playhead / record-ready accent.
+    pub accent: Color,
+    /// Selection highlight.
+    pub selection: Color,
+}
+
+#[derive(Clone, Debug)]
+pub struct KnobStyle {
+    pub body_dark: Color,
+    pub body_light: Color,
+    pub cap_top: Color,
+    pub cap_bottom: Color,
+    pub pointer: Color,
+    pub ring_track: Color,
+    pub shadow: Color,
+}
+
+#[derive(Clone, Debug)]
+pub struct FaderStyle {
+    pub slot: Color,
+    pub slot_edge: Color,
+    pub cap_top: Color,
+    pub cap_bottom: Color,
+    pub cap_line: Color,
+    pub cap_grip: Color,
+    pub scale_text: Color,
+    pub scale_tick: Color,
+    pub cap_width: f32,
+    pub cap_height: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct MeterStyle {
+    pub background: Color,
+    pub green: Color,
+    pub yellow: Color,
+    pub orange: Color,
+    pub red: Color,
+    /// Brightness of unlit segments relative to lit ones.
+    pub unlit: f32,
+    pub peak: Color,
+    pub clip: Color,
+    pub segment: f32,
+    pub gap: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct LedStyle {
+    pub mute: Color,
+    pub solo: Color,
+    pub record: Color,
+    pub monitor: Color,
+    pub phase: Color,
+    pub off: Color,
+    pub bezel: Color,
+    pub label_off: Color,
+    pub label_on: Color,
+}
+
+#[derive(Clone, Debug)]
+pub struct ConsoleTheme {
+    pub strip_width: f32,
+    pub master_width: f32,
+    pub strip_gap: f32,
+    pub panel_top: Color,
+    pub panel_bottom: Color,
+    pub panel_edge_light: Color,
+    pub panel_edge_dark: Color,
+    pub panel_label: Color,
+    pub section_line: Color,
+    pub master_panel_top: Color,
+    pub master_panel_bottom: Color,
+    pub well: Color,
+    pub well_text: Color,
+    pub well_text_empty: Color,
+    pub knob: KnobStyle,
+    pub send_cap: Color,
+    pub pan_cap: Color,
+    pub trim_cap: Color,
+    pub fader: FaderStyle,
+    pub fader_cap_audio: Color,
+    pub fader_cap_bus: Color,
+    pub fader_cap_aux: Color,
+    pub fader_cap_master: Color,
+    pub meter: MeterStyle,
+    pub led: LedStyle,
+    pub scribble_bg: Color,
+    pub scribble_text: Color,
+    pub selected_glow: Color,
+}
+
+#[derive(Clone, Debug)]
+pub struct ArrangerTheme {
+    pub background: Color,
+    pub lane_a: Color,
+    pub lane_b: Color,
+    pub lane_selected: Color,
+    pub header_bg: Color,
+    pub header_bg_selected: Color,
+    pub header_border: Color,
+    pub ruler_bg: Color,
+    pub ruler_text: Color,
+    pub bar_line: Color,
+    pub beat_line: Color,
+    pub sub_line: Color,
+    pub loop_on: Color,
+    pub loop_off: Color,
+    pub playhead: Color,
+    pub clip_radius: f32,
+    pub clip_header: f32,
+    pub clip_text: Color,
+    pub selection_outline: Color,
+    pub track_height: f32,
+    pub header_width: f32,
+    pub ruler_height: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct PianoRollTheme {
+    pub background: Color,
+    pub white_row: Color,
+    pub black_row: Color,
+    pub octave_line: Color,
+    pub bar_line: Color,
+    pub beat_line: Color,
+    pub sub_line: Color,
+    pub key_white: Color,
+    pub key_white_shade: Color,
+    pub key_black: Color,
+    pub key_text: Color,
+    pub velocity_bg: Color,
+    pub keyboard_width: f32,
+    pub row_height: f32,
+    pub velocity_height: f32,
+    pub ruler_height: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct Theme {
+    pub name: &'static str,
+    pub fonts: Typography,
+    pub ui: UiPalette,
+    pub console: ConsoleTheme,
+    pub arranger: ArrangerTheme,
+    pub piano: PianoRollTheme,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self::studio()
+    }
+}
+
+impl Theme {
+    /// "Studio": dark anodised console, warm cream legends, modern editors.
+    pub fn studio() -> Self {
+        let accent = Color::hex(0xff6a3d);
+        Self {
+            name: "Studio",
+            fonts: Typography {
+                tiny: 8.5,
+                small: 10.0,
+                normal: 11.5,
+                large: 13.5,
+                display: 20.0,
+            },
+            ui: UiPalette {
+                background: Color::hex(0x17181b),
+                surface: Color::hex(0x1e2024),
+                surface_alt: Color::hex(0x25282d),
+                border: Color::hex(0x0d0e10),
+                text: Color::hex(0xe6e3dc),
+                text_dim: Color::hex(0x9a9c9f),
+                text_faint: Color::hex(0x5f6266),
+                accent,
+                selection: Color::hex(0x6fc3ff),
+            },
+            console: ConsoleTheme {
+                strip_width: 92.0,
+                master_width: 112.0,
+                strip_gap: 2.0,
+                panel_top: Color::hex(0x3b3e43),
+                panel_bottom: Color::hex(0x2b2d31),
+                panel_edge_light: Color::rgba(1.0, 1.0, 1.0, 0.10),
+                panel_edge_dark: Color::rgba(0.0, 0.0, 0.0, 0.55),
+                panel_label: Color::hex(0xbdb6a5),
+                section_line: Color::rgba(0.0, 0.0, 0.0, 0.45),
+                master_panel_top: Color::hex(0x43403b),
+                master_panel_bottom: Color::hex(0x302e2b),
+                well: Color::hex(0x111214),
+                well_text: Color::hex(0xdcd4bf),
+                well_text_empty: Color::hex(0x4a4d52),
+                knob: KnobStyle {
+                    body_dark: Color::hex(0x141517),
+                    body_light: Color::hex(0x3c3e43),
+                    cap_top: Color::hex(0x5a5d63),
+                    cap_bottom: Color::hex(0x26282c),
+                    pointer: Color::hex(0xf4ecd9),
+                    ring_track: Color::hex(0x0c0d0f),
+                    shadow: Color::rgba(0.0, 0.0, 0.0, 0.6),
+                },
+                send_cap: Color::hex(0x3d7fb5),
+                pan_cap: Color::hex(0x8d9096),
+                trim_cap: Color::hex(0xb5443c),
+                fader: FaderStyle {
+                    slot: Color::hex(0x08090a),
+                    slot_edge: Color::rgba(1.0, 1.0, 1.0, 0.07),
+                    cap_top: Color::hex(0xe4e2dc),
+                    cap_bottom: Color::hex(0x8f8d88),
+                    cap_line: Color::hex(0x161616),
+                    cap_grip: Color::rgba(0.0, 0.0, 0.0, 0.22),
+                    scale_text: Color::hex(0x9d978a),
+                    scale_tick: Color::rgba(0.85, 0.82, 0.74, 0.35),
+                    cap_width: 30.0,
+                    cap_height: 48.0,
+                },
+                fader_cap_audio: Color::hex(0xdcd9d2),
+                fader_cap_bus: Color::hex(0x6f93c0),
+                fader_cap_aux: Color::hex(0x6fae88),
+                fader_cap_master: Color::hex(0xc9483f),
+                meter: MeterStyle {
+                    background: Color::hex(0x060707),
+                    green: Color::hex(0x3fd16b),
+                    yellow: Color::hex(0xe6cb4a),
+                    orange: Color::hex(0xf08a3a),
+                    red: Color::hex(0xff3d3d),
+                    unlit: 0.13,
+                    peak: Color::hex(0xf6f2e8),
+                    clip: Color::hex(0xff2a2a),
+                    segment: 2.0,
+                    gap: 1.0,
+                },
+                led: LedStyle {
+                    mute: Color::hex(0xf2b134),
+                    solo: Color::hex(0x5ad66b),
+                    record: Color::hex(0xff4b4b),
+                    monitor: Color::hex(0x4fb3ff),
+                    phase: Color::hex(0xc58bff),
+                    off: Color::hex(0x2c2e33),
+                    bezel: Color::hex(0x0f1012),
+                    label_off: Color::hex(0xa9a497),
+                    label_on: Color::hex(0x141414),
+                },
+                scribble_bg: Color::hex(0xe9e3d1),
+                scribble_text: Color::hex(0x1f1d19),
+                selected_glow: Color::hex(0x6fc3ff).with_alpha(0.55),
+            },
+            arranger: ArrangerTheme {
+                background: Color::hex(0x191a1d),
+                lane_a: Color::hex(0x1d1f23),
+                lane_b: Color::hex(0x1a1c1f),
+                lane_selected: Color::hex(0x23272d),
+                header_bg: Color::hex(0x25272c),
+                header_bg_selected: Color::hex(0x2e333a),
+                header_border: Color::hex(0x101113),
+                ruler_bg: Color::hex(0x202226),
+                ruler_text: Color::hex(0xb3b0a9),
+                bar_line: Color::rgba(1.0, 1.0, 1.0, 0.10),
+                beat_line: Color::rgba(1.0, 1.0, 1.0, 0.045),
+                sub_line: Color::rgba(1.0, 1.0, 1.0, 0.022),
+                loop_on: accent.with_alpha(0.22),
+                loop_off: Color::rgba(1.0, 1.0, 1.0, 0.07),
+                playhead: accent,
+                clip_radius: 4.0,
+                clip_header: 15.0,
+                clip_text: Color::hex(0x121212),
+                selection_outline: Color::hex(0xf5f5f5),
+                track_height: 72.0,
+                header_width: 252.0,
+                ruler_height: 30.0,
+            },
+            piano: PianoRollTheme {
+                background: Color::hex(0x18191c),
+                white_row: Color::hex(0x202226),
+                black_row: Color::hex(0x1a1b1e),
+                octave_line: Color::rgba(1.0, 1.0, 1.0, 0.09),
+                bar_line: Color::rgba(1.0, 1.0, 1.0, 0.12),
+                beat_line: Color::rgba(1.0, 1.0, 1.0, 0.05),
+                sub_line: Color::rgba(1.0, 1.0, 1.0, 0.025),
+                key_white: Color::hex(0xe8e5de),
+                key_white_shade: Color::hex(0xc4c1ba),
+                key_black: Color::hex(0x1b1c1f),
+                key_text: Color::hex(0x6d7177),
+                velocity_bg: Color::hex(0x141518),
+                keyboard_width: 66.0,
+                row_height: 13.0,
+                velocity_height: 84.0,
+                ruler_height: 24.0,
+            },
+        }
+    }
+}
