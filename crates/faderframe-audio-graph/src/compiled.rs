@@ -697,6 +697,21 @@ fn build_schedule(
 const MIN_PARALLEL_NODES: usize = 8;
 
 /// One parallel cycle, shared by the participating threads.
+/// Decrement `seats` if it is positive (a compare-exchange loop:
+/// `fetch_update` is deprecated on newer toolchains, `try_update` missing on
+/// older ones).
+#[inline]
+fn take_seat(seats: &std::sync::atomic::AtomicUsize) -> bool {
+    let mut n = seats.load(Ordering::Acquire);
+    while n > 0 {
+        match seats.compare_exchange_weak(n, n - 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(now) => n = now,
+        }
+    }
+    false
+}
+
 struct Exec<'a, 'c, C> {
     graph: &'a CompiledGraph<C>,
     cx: &'a ProcessContext<'c, C>,
@@ -708,10 +723,7 @@ impl<C: Sync> PoolJob for Exec<'_, '_, C> {
     fn work(&self) {
         let s = &self.graph.schedule;
         // Threads beyond the graph's useful width leave at once.
-        if s.seats
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
-            .is_err()
-        {
+        if !take_seat(&s.seats) {
             return;
         }
         let total = s.jobs.len();
