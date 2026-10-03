@@ -179,6 +179,7 @@ pub fn menu_model() -> gio::Menu {
     track.append_section(
         None,
         &section(&[
+            ("Plugin Browser…", "app.plugin-browser"),
             ("Record-Arm Selected Tracks", "app.arm-selected"),
             ("Remove Selected Tracks", "app.remove-tracks"),
         ]),

@@ -91,6 +91,24 @@ impl PluginCx<'_> {
         spec: NodeSpec,
         role: Role,
     ) -> NodeId {
+        let mut spec = spec;
+        // Hosted formats get their own main port layouts; the graph converts
+        // between them and the track (mono ↔ stereo).
+        if slot.plugin.format != faderframe_project::PluginFormat::Builtin
+            && let Ok(inst) = self.plugins.instance(slot)
+        {
+            let d = inst.descriptor();
+            if let (Some(l), Some(p)) = (spec.audio_inputs.first_mut(), d.audio_inputs.first())
+                && p.channels > 0
+            {
+                *l = ChannelLayout::from_channel_count(p.channels as usize);
+            }
+            if let (Some(l), Some(p)) = (spec.audio_outputs.first_mut(), d.audio_outputs.first())
+                && p.channels > 0
+            {
+                *l = ChannelLayout::from_channel_count(p.channels as usize);
+            }
+        }
         let layouts: Vec<ChannelLayout> = spec
             .audio_inputs
             .iter()

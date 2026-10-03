@@ -1,0 +1,32 @@
+[package]
+name = "faderframe-plugin-clap"
+description = "CLAP plugin hosting for FaderFrame (via clack-host)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-core.workspace = true
+faderframe-audio-graph.workspace = true
+faderframe-automation.workspace = true
+faderframe-midi.workspace = true
+faderframe-plugin-host.workspace = true
+faderframe-realtime.workspace = true
+faderframe-transport.workspace = true
+clack-host.workspace = true
+clack-extensions.workspace = true
+serde.workspace = true
+rtrb.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+clack-host = { workspace = true, features = ["clack-plugin"] }
+clack-plugin.workspace = true
+clack-extensions = { workspace = true, features = ["clack-plugin"] }

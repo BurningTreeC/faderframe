@@ -15,7 +15,8 @@ use faderframe_automation::AutomationLane;
 use faderframe_core::ChannelLayout;
 use faderframe_core::gain::SILENCE_DB;
 use faderframe_core::{
-    AudioSourceId, AutomationLaneId, ClipId, MarkerId, NoteId, PluginInstanceId, SendId, TrackId,
+    AudioSourceId, AutomationLaneId, ClipId, MarkerId, NoteId, ParameterId, PluginInstanceId,
+    SendId, TrackId,
 };
 use faderframe_timeline::{MusicalTime, Timeline};
 
@@ -76,6 +77,7 @@ pub enum CoalesceKey {
     Loop,
     Punch,
     Automation(TrackId, AutomationLaneId),
+    PluginParameter(PluginInstanceId, ParameterId),
 }
 
 /// State needed to undo a track removal.
@@ -183,6 +185,14 @@ pub enum Command {
         track: TrackId,
         plugin: PluginInstanceId,
         bypass: bool,
+    },
+    /// A parameter value stored in the slot (plain units); `None` drops the
+    /// explicit value, leaving the plugin's own (state) value.
+    SetPluginParameter {
+        track: TrackId,
+        plugin: PluginInstanceId,
+        parameter: ParameterId,
+        value: Option<f64>,
     },
     SetInstrument {
         track: TrackId,
@@ -442,6 +452,7 @@ impl Command {
             InsertPlugin { .. } => "Insert Plugin".into(),
             RemovePlugin { .. } => "Remove Plugin".into(),
             SetPluginBypass { .. } => "Toggle Bypass".into(),
+            SetPluginParameter { .. } => "Change Plugin Parameter".into(),
             SetInstrument { .. } => "Change Instrument".into(),
             AddTrack { .. } | RestoreTrack(_) => "Add Track".into(),
             RemoveTrack { .. } => "Remove Track".into(),
@@ -484,6 +495,9 @@ impl Command {
             SetLoop { .. } => CoalesceKey::Loop,
             SetPunch { .. } => CoalesceKey::Punch,
             SetAutomationLane { track, lane } => CoalesceKey::Automation(*track, lane.id),
+            SetPluginParameter {
+                plugin, parameter, ..
+            } => CoalesceKey::PluginParameter(*plugin, *parameter),
             _ => return None,
         })
     }
@@ -496,7 +510,8 @@ impl Command {
             | SetTrackMute { .. }
             | SetTrackSolo { .. }
             | SetTrackPhaseInvert { .. }
-            | SetSendLevel { .. } => Impact::Params,
+            | SetSendLevel { .. }
+            | SetPluginParameter { .. } => Impact::Params,
             RenameTrack { .. }
             | SetTrackColor { .. }
             | MoveTrack { .. }
@@ -737,6 +752,35 @@ impl Command {
                     track,
                     plugin,
                     bypass: old,
+                }
+            }
+            SetPluginParameter {
+                track,
+                plugin,
+                parameter,
+                value,
+            } => {
+                let slot = track_mut(p, track)?
+                    .plugin_mut(plugin)
+                    .ok_or(EditError::UnknownPlugin(plugin))?;
+                let i = slot.parameters.iter().position(|q| q.id == parameter);
+                let old = i.map(|i| slot.parameters[i].value);
+                match (i, value) {
+                    (Some(i), Some(v)) => slot.parameters[i].value = v,
+                    (None, Some(v)) => slot.parameters.push(crate::SavedParameter {
+                        id: parameter,
+                        value: v,
+                    }),
+                    (Some(i), None) => {
+                        slot.parameters.remove(i);
+                    }
+                    (None, None) => {}
+                }
+                SetPluginParameter {
+                    track,
+                    plugin,
+                    parameter,
+                    value: old,
                 }
             }
             SetInstrument { track, slot } => {

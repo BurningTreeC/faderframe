@@ -95,7 +95,17 @@ pub struct WorkspaceSet {
     /// Automation lanes shown in the arranger.
     #[serde(default)]
     pub automation_shown: std::collections::BTreeSet<faderframe_core::AutomationLaneId>,
+    /// Width of the arranger's track header column (`None` = theme default).
+    #[serde(default)]
+    pub header_width: Option<f32>,
+    /// Where each plugin's editor window was last (screen coordinates of
+    /// its top-left corner); new editors open centred.
+    #[serde(default)]
+    pub plugin_windows: std::collections::BTreeMap<faderframe_core::PluginInstanceId, (i32, i32)>,
 }
+
+/// Narrowest and widest arranger track header column.
+pub const HEADER_WIDTH_RANGE: (f32, f32) = (190.0, 640.0);
 
 /// Smallest and largest arranger track heights.
 pub const TRACK_HEIGHT_RANGE: (f32, f32) = (40.0, 480.0);
@@ -114,6 +124,8 @@ impl Default for WorkspaceSet {
             track_height: None,
             track_heights: Default::default(),
             automation_shown: Default::default(),
+            header_width: None,
+            plugin_windows: Default::default(),
         }
     }
 }

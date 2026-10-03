@@ -11,6 +11,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+faderframe-plugin-clap.workspace = true
 faderframe-ui.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

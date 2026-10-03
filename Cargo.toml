@@ -26,6 +26,7 @@ faderframe-audio = { path = "crates/faderframe-audio" }
 faderframe-audio-jack = { path = "crates/faderframe-audio-jack" }
 faderframe-audio-files = { path = "crates/faderframe-audio-files" }
 faderframe-plugin-host = { path = "crates/faderframe-plugin-host" }
+faderframe-plugin-clap = { path = "crates/faderframe-plugin-clap" }
 faderframe-engine = { path = "crates/faderframe-engine" }
 faderframe-session = { path = "crates/faderframe-session" }
 faderframe-ui-canvas = { path = "crates/faderframe-ui-canvas" }
@@ -37,6 +38,8 @@ faderframe-ui = { path = "crates/faderframe-ui" }
 # --- external crates -------------------------------------------------------
 # GUI shell (Linux first; GTK 4.14+ for GSK path rendering).
 gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
+x11rb = { version = "0.14", default-features = false, features = ["randr"] }
+glib-unix = "0.22"
 # Audio backends. `jack` loads libjack at runtime (dynamic_loading), so the
 # application still starts on machines without JACK/pipewire-jack.
 jack = "0.13"
@@ -47,6 +50,11 @@ symphonia = { version = "0.6", default-features = false, features = ["wav", "aif
 # High-quality sample-rate conversion.
 rubato = "5"
 audioadapter-buffers = "5"
+# CLAP plugin hosting (MIT OR Apache-2.0).
+clack-host = "0.2"
+clack-extensions = { version = "0.2", features = ["clack-host", "audio-ports", "gui", "latency", "log", "note-ports", "params", "posix-fd", "state", "tail", "thread-check", "timer"] }
+clack-plugin = "0.2"
+base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

@@ -1,8 +1,9 @@
 //! Control-side ownership of plugin instances.
 
-use faderframe_core::PluginInstanceId;
+use faderframe_core::{ParameterId, PluginInstanceId};
 use faderframe_plugin_host::{
-    PluginError, PluginFormat, PluginInstance, PluginProcessor, PluginRegistry, ProcessConfig,
+    PluginEditor, PluginError, PluginEventSources, PluginFd, PluginFormat, PluginInstance,
+    PluginProcessor, PluginRegistry, ProcessConfig,
 };
 use faderframe_project::{PluginFormat as ProjectFormat, PluginSlot, Project};
 use std::collections::{HashMap, HashSet};
@@ -21,6 +22,11 @@ fn host_format(f: ProjectFormat) -> PluginFormat {
 struct Hosted {
     instance: Box<dyn PluginInstance>,
     failed: Arc<AtomicBool>,
+    /// Explicit slot values last pushed to the instance.
+    applied: HashMap<ParameterId, f64>,
+    /// The plugin's own value before the first explicit one (restored when
+    /// the explicit value is dropped, e.g. by undo).
+    baseline: HashMap<ParameterId, f64>,
 }
 
 /// Owns one [`PluginInstance`] per project plugin slot.
@@ -37,7 +43,7 @@ pub struct PluginHost {
 
 impl Default for PluginHost {
     fn default() -> Self {
-        Self::new(PluginRegistry::with_builtins())
+        Self::new(PluginRegistry::default())
     }
 }
 
@@ -65,20 +71,146 @@ impl PluginHost {
             let mut instance = self
                 .registry
                 .instantiate(host_format(slot.plugin.format), &slot.plugin.id)?;
+            // Saved state first (complete), then explicit parameter values.
+            if let Some(state) = slot.state.as_deref().and_then(decode_state) {
+                let _ = instance.load_state(&state);
+            }
+            let mut applied = HashMap::new();
+            let mut baseline = HashMap::new();
             for p in &slot.parameters {
+                if let Some(v) = instance.parameter(p.id) {
+                    baseline.insert(p.id, v);
+                }
                 let _ = instance.set_parameter(p.id, p.value);
+                applied.insert(p.id, p.value);
             }
             self.instances.insert(
                 slot.id,
                 Hosted {
                     instance,
                     failed: Arc::new(AtomicBool::new(false)),
+                    applied,
+                    baseline,
                 },
             );
         }
         self.instances
             .get_mut(&slot.id)
             .ok_or_else(|| PluginError::NotFound(slot.plugin.id.clone()))
+    }
+
+    /// Let every instance handle its requests; the merged result says
+    /// whether the graph must be rebuilt.
+    pub fn poll(&mut self) -> faderframe_plugin_host::PluginPoll {
+        self.instances.values_mut().map(|h| h.instance.poll()).fold(
+            faderframe_plugin_host::PluginPoll::default(),
+            faderframe_plugin_host::PluginPoll::merge,
+        )
+    }
+
+    /// The current state of an instantiated plugin, encoded for
+    /// [`PluginSlot::state`].
+    pub fn capture_state(&mut self, plugin: PluginInstanceId) -> Option<String> {
+        let bytes = self
+            .instances
+            .get_mut(&plugin)?
+            .instance
+            .save_state()
+            .ok()?;
+        (!bytes.is_empty()).then(|| encode_state(&bytes))
+    }
+
+    /// Push changed explicit parameter values (slot `parameters`) to the
+    /// instantiated plugins; values dropped from a slot fall back to the
+    /// plugin's own value from before.
+    pub fn sync_parameters(&mut self, project: &Project) {
+        for slot in project
+            .tracks
+            .iter()
+            .flat_map(|t| t.inserts.iter().chain(t.instrument.iter()))
+        {
+            let Some(h) = self.instances.get_mut(&slot.id) else {
+                continue;
+            };
+            for p in &slot.parameters {
+                if h.applied.get(&p.id) == Some(&p.value) {
+                    continue;
+                }
+                if !h.baseline.contains_key(&p.id)
+                    && let Some(v) = h.instance.parameter(p.id)
+                {
+                    h.baseline.insert(p.id, v);
+                }
+                let _ = h.instance.set_parameter(p.id, p.value);
+                h.applied.insert(p.id, p.value);
+            }
+            if h.applied.len() != slot.parameters.len() {
+                let dropped: Vec<ParameterId> = h
+                    .applied
+                    .keys()
+                    .filter(|id| !slot.parameters.iter().any(|p| p.id == **id))
+                    .copied()
+                    .collect();
+                for id in dropped {
+                    h.applied.remove(&id);
+                    if let Some(v) = h.baseline.get(&id) {
+                        let _ = h.instance.set_parameter(id, *v);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The plugin's own text for a value.
+    pub fn format_parameter(
+        &mut self,
+        plugin: PluginInstanceId,
+        id: ParameterId,
+        value: f64,
+    ) -> Option<String> {
+        self.instances
+            .get_mut(&plugin)?
+            .instance
+            .format_parameter(id, value)
+    }
+
+    /// Current value of a parameter (plain units).
+    pub fn parameter_value(&mut self, plugin: PluginInstanceId, id: ParameterId) -> Option<f64> {
+        self.instances.get_mut(&plugin)?.instance.parameter(id)
+    }
+
+    /// Note a value the plugin changed itself (its editor) as applied, so the
+    /// next sync does not push the stale slot value back.
+    pub fn note_parameter(&mut self, plugin: PluginInstanceId, id: ParameterId, value: f64) {
+        if let Some(h) = self.instances.get_mut(&plugin) {
+            h.applied.insert(id, value);
+        }
+    }
+
+    /// The plugin's own editor, if it has one.
+    pub fn editor(&mut self, plugin: PluginInstanceId) -> Option<&mut dyn PluginEditor> {
+        self.instances.get_mut(&plugin)?.instance.editor()
+    }
+
+    /// File descriptors and timers every plugin registered.
+    pub fn event_sources(&self) -> Vec<(PluginInstanceId, PluginEventSources)> {
+        self.instances
+            .iter()
+            .map(|(id, h)| (*id, h.instance.event_sources()))
+            .filter(|(_, s)| !s.fds.is_empty() || !s.timers.is_empty())
+            .collect()
+    }
+
+    pub fn on_fd(&mut self, plugin: PluginInstanceId, fd: PluginFd) {
+        if let Some(h) = self.instances.get_mut(&plugin) {
+            h.instance.on_fd(fd);
+        }
+    }
+
+    pub fn on_timer(&mut self, plugin: PluginInstanceId, timer: u32) {
+        if let Some(h) = self.instances.get_mut(&plugin) {
+            h.instance.on_timer(timer);
+        }
     }
 
     /// Parameters of an instantiated plugin.
@@ -126,4 +258,17 @@ impl PluginHost {
             .map(|(id, _)| *id)
             .collect()
     }
+}
+
+/// Plugin state in project files: base64 of the plugin's own bytes.
+pub fn encode_state(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+pub fn decode_state(text: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(text.trim())
+        .ok()
 }

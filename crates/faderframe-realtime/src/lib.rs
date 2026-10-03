@@ -25,6 +25,7 @@ mod metrics;
 mod pages;
 mod params;
 mod slots;
+mod trycell;
 
 pub use atomic::AtomicF32;
 pub use mailbox::{MailboxReceiver, MailboxSender, mailbox};
@@ -33,3 +34,4 @@ pub use metrics::{CallbackMetrics, MetricsSnapshot};
 pub use pages::{Epoch, PageTable, Reclaimer, Retired};
 pub use params::{ParamSlot, ParamTable};
 pub use slots::SlotAllocator;
+pub use trycell::{TryCell, TryCellGuard};

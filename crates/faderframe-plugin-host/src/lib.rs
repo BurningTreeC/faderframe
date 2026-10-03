@@ -72,6 +72,7 @@ pub enum ParameterUnit {
     Decibels,
     Milliseconds,
     Hertz,
+    /// A fraction (0–1) shown as a percentage.
     Percent,
     Samples,
 }
@@ -145,17 +146,118 @@ pub struct PluginProcessContext<'a> {
     pub param_events: &'a [ParameterEvent],
 }
 
+/// What a plugin asked the host for since the last poll.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PluginPoll {
+    /// The plugin must be re-activated (latency or ports changed): rebuild
+    /// the graph.
+    pub restart: bool,
+    pub params_changed: bool,
+    pub state_dirty: bool,
+}
+
+impl PluginPoll {
+    pub fn merge(self, o: PluginPoll) -> PluginPoll {
+        PluginPoll {
+            restart: self.restart || o.restart,
+            params_changed: self.params_changed || o.params_changed,
+            state_dirty: self.state_dirty || o.state_dirty,
+        }
+    }
+}
+
+/// A file descriptor a plugin wants watched (its GUI's event loop).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PluginFd {
+    pub fd: i32,
+    pub read: bool,
+    pub write: bool,
+    pub error: bool,
+}
+
+/// Event sources a plugin registered: file descriptors and timers
+/// (`(id, period in ms)`), serviced by the host's main loop.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PluginEventSources {
+    pub fds: Vec<PluginFd>,
+    pub timers: Vec<(u32, u32)>,
+}
+
+/// What a plugin's editor asked the host for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EditorRequests {
+    pub resize: Option<(u32, u32)>,
+    pub show: bool,
+    pub hide: bool,
+    /// The editor window was closed by the plugin (or its connection lost).
+    pub closed: bool,
+}
+
+/// A plugin's own editor GUI (control/UI thread).
+pub trait PluginEditor {
+    /// Can embed into an X11 window (Linux/BSD).
+    fn can_embed_x11(&mut self) -> bool;
+    /// Can open its own top-level window.
+    fn can_float(&mut self) -> bool;
+    /// Create the embedded (X11) editor; returns its size in pixels. The
+    /// host then creates a parent window of that size and calls
+    /// [`attach_x11`](Self::attach_x11).
+    fn open_embedded(&mut self) -> Result<(u32, u32), PluginError>;
+    /// Put the created editor into X11 window `parent` and show it.
+    fn attach_x11(&mut self, parent: u64) -> Result<(), PluginError>;
+    /// Open as the plugin's own window.
+    fn open_floating(&mut self, title: &str) -> Result<(), PluginError>;
+    fn close(&mut self);
+    fn is_open(&self) -> bool;
+    fn can_resize(&mut self) -> bool;
+    /// Ask for a new size; returns the size actually applied.
+    fn set_size(&mut self, width: u32, height: u32) -> Option<(u32, u32)>;
+    fn take_requests(&mut self) -> EditorRequests;
+}
+
 /// Control-thread side of a plugin instance.
-pub trait PluginInstance: Send {
+///
+/// Not `Send`: formats such as CLAP require every main-thread call of an
+/// instance to come from the thread that created it, so instances stay on
+/// the thread that owns the engine controller (the UI thread, or a render
+/// thread for its own instances).
+pub trait PluginInstance {
     fn descriptor(&self) -> &PluginDescriptor;
     fn parameters(&self) -> &[ParameterInfo];
-    fn parameter(&self, id: ParameterId) -> Option<f64>;
+    fn parameter(&mut self, id: ParameterId) -> Option<f64>;
     /// Set a parameter from the UI; reaches the processor without blocking.
     fn set_parameter(&mut self, id: ParameterId, value: f64) -> Result<(), PluginError>;
     fn latency_samples(&self) -> u32;
     fn tail(&self) -> TailLength;
-    fn save_state(&self) -> Result<Vec<u8>, PluginError>;
+    fn save_state(&mut self) -> Result<Vec<u8>, PluginError>;
     fn load_state(&mut self, data: &[u8]) -> Result<(), PluginError>;
+    /// Handle plugin requests (main-thread callbacks, restarts); call
+    /// regularly on the control thread.
+    fn poll(&mut self) -> PluginPoll {
+        PluginPoll::default()
+    }
+
+    /// The plugin's own editor, if it has one.
+    fn editor(&mut self) -> Option<&mut dyn PluginEditor> {
+        None
+    }
+
+    /// The plugin's own text for a parameter value (e.g. "1.2 kHz").
+    fn format_parameter(&mut self, _id: ParameterId, _value: f64) -> Option<String> {
+        None
+    }
+
+    /// File descriptors and timers the plugin registered.
+    fn event_sources(&self) -> PluginEventSources {
+        PluginEventSources::default()
+    }
+
+    /// A registered file descriptor is ready.
+    fn on_fd(&mut self, _fd: PluginFd) {}
+
+    /// A registered timer fired.
+    fn on_timer(&mut self, _id: u32) {}
+
     /// Activate for processing and return the audio-thread half.
     fn create_processor(
         &mut self,
@@ -171,7 +273,7 @@ pub trait PluginProcessor: Send {
 }
 
 /// Something that can list and instantiate plugins of one format.
-pub trait PluginFactory: Send {
+pub trait PluginFactory {
     fn format(&self) -> PluginFormat;
     fn scan(&self) -> Vec<PluginDescriptor>;
     fn instantiate(&self, id: &str) -> Result<Box<dyn PluginInstance>, PluginError>;
@@ -182,9 +284,21 @@ pub struct PluginRegistry {
     factories: Vec<Box<dyn PluginFactory>>,
 }
 
+/// Builds the process-wide default registry (set once by the application
+/// to add format hosts such as CLAP; engines use it for their plugin host).
+static DEFAULT_REGISTRY: std::sync::OnceLock<fn() -> PluginRegistry> = std::sync::OnceLock::new();
+
+/// Install the builder of [`PluginRegistry::default`] (first call wins).
+pub fn set_default_registry(builder: fn() -> PluginRegistry) {
+    let _ = DEFAULT_REGISTRY.set(builder);
+}
+
 impl Default for PluginRegistry {
     fn default() -> Self {
-        Self::with_builtins()
+        match DEFAULT_REGISTRY.get() {
+            Some(build) => build(),
+            None => Self::with_builtins(),
+        }
     }
 }
 

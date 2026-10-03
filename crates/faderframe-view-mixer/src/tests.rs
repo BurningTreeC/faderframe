@@ -155,9 +155,32 @@ fn routing_and_insert_clicks_open_menus() {
         }
         _ => panic!("expected output menu"),
     }
+    // An empty insert slot opens the plugin browser for that slot …
     let slot = l.inserts.unwrap()[0];
-    let (_, req) = run(&mut view, down(slot.center(), 1), size, &s);
-    assert!(matches!(req.first(), Some(HostRequest::ContextMenu { .. })));
+    let (a, _) = run(&mut view, down(slot.center(), 1), size, &s);
+    assert_eq!(
+        a,
+        vec![Action::OpenPluginBrowser {
+            track: first.id,
+            target: faderframe_session::PluginTarget::Insert(0),
+        }]
+    );
+    // … and right-click gives the quick list, browser first.
+    let ev = ViewEvent::PointerDown {
+        pos: slot.center(),
+        button: PointerButton::Secondary,
+        modifiers: Modifiers::NONE,
+        clicks: 1,
+    };
+    let (_, req) = run(&mut view, ev, size, &s);
+    let Some(HostRequest::ContextMenu { items, .. }) = req
+        .into_iter()
+        .find(|r| matches!(r, HostRequest::ContextMenu { .. }))
+    else {
+        panic!("expected the insert menu");
+    };
+    assert_eq!(items[0].label, "Browse Plugins…");
+    assert!(items.iter().any(|i| i.label.contains("Echo")));
 }
 
 #[test]

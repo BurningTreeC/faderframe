@@ -76,6 +76,8 @@ pub struct AppState {
     layout_rev: Cell<u64>,
     last_tick: Cell<Option<Instant>>,
     frame: Cell<u64>,
+    /// Background CLAP scan in progress.
+    pub plugin_scan: RefCell<Option<std::sync::mpsc::Receiver<crate::plugins::ScanReport>>>,
 }
 
 impl AppState {
@@ -92,6 +94,7 @@ impl AppState {
             canvases: RefCell::new(Vec::new()),
             last_tick: Cell::new(None),
             frame: Cell::new(0),
+            plugin_scan: RefCell::new(None),
         })
     }
 
@@ -193,6 +196,47 @@ impl AppState {
             .map_or(1.0 / 60.0, |t| (now - t).as_secs_f32().min(0.25));
         if let Ok(mut s) = self.session.try_borrow_mut() {
             s.tick(dt);
+        }
+        crate::plugin_window::tick(self);
+        // Windows views asked for.
+        let requests = self
+            .session
+            .try_borrow_mut()
+            .map(|mut s| s.take_ui_requests())
+            .unwrap_or_default();
+        for r in requests {
+            match r {
+                faderframe_session::UiRequest::PluginBrowser { track, target } => {
+                    crate::plugin_browser::open(self, track, target);
+                }
+                faderframe_session::UiRequest::PluginEditor {
+                    plugin, generic, ..
+                } => crate::plugin_window::open(self, plugin, generic),
+            }
+        }
+        let report = self
+            .plugin_scan
+            .borrow()
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok());
+        if let Some(r) = report {
+            self.plugin_scan.borrow_mut().take();
+            if let Ok(mut s) = self.session.try_borrow_mut() {
+                for e in &r.new_errors {
+                    s.notify(
+                        faderframe_session::NoticeLevel::Warning,
+                        format!("plugin scan: {e}"),
+                    );
+                }
+                s.notify(
+                    faderframe_session::NoticeLevel::Info,
+                    format!(
+                        "{} CLAP plugin{} available",
+                        r.plugins,
+                        if r.plugins == 1 { "" } else { "s" }
+                    ),
+                );
+            }
         }
         let frame = self.frame.get() + 1;
         self.frame.set(frame);

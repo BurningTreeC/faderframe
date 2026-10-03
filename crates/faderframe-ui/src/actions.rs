@@ -56,6 +56,12 @@ pub fn install(app: &Rc<AppState>) {
                 w.close();
             }
         }),
+        // Development aid for scripted runs: quit without the unsaved-changes
+        // question.
+        entry(app, "quit-discard", |a| {
+            a.session.borrow_mut().stop_audio();
+            a.app.quit();
+        }),
         entry(app, "render", crate::render::open),
         entry(app, "preferences", |a| crate::preferences::open(a, None)),
         entry(app, "audio-settings", |a| {
@@ -87,8 +93,31 @@ pub fn install(app: &Rc<AppState>) {
                     .map(|(_, h)| h.canvas.clone())
                     .collect()
             };
-            if let Some(w) = a.window.borrow().as_ref() {
+            let main = a.window.borrow().clone();
+            if let Some(w) = main.as_ref() {
                 crate::screenshot::capture(w, &canvases, std::path::Path::new(&path));
+                // Other open windows (plugin browser, preferences, …).
+                for (i, other) in a
+                    .app
+                    .windows()
+                    .into_iter()
+                    .filter(|o| {
+                        o.upcast_ref::<gtk::Window>() != w.upcast_ref::<gtk::Window>()
+                            && o.is_visible()
+                    })
+                    .enumerate()
+                {
+                    let p = std::path::Path::new(&path);
+                    let stem = p
+                        .file_stem()
+                        .map_or_else(String::new, |s| s.to_string_lossy().to_string());
+                    let file = p.with_file_name(format!("{stem}-w{}.png", i + 2));
+                    match crate::screenshot::window_to_png(&other, &file) {
+                        Ok(()) => tracing::info!("screenshot saved to {}", file.display()),
+                        Err(e) => tracing::warn!("screenshot of a window failed: {e}"),
+                    }
+                }
+                crate::plugin_window::screenshot(std::path::Path::new(&path));
             }
         }),
         dispatch(app, "undo", A::Undo),
@@ -141,6 +170,33 @@ pub fn install(app: &Rc<AppState>) {
             "export-track-preset",
             crate::dialogs::export_track_preset,
         ),
+        entry(app, "plugin-browser", |a| {
+            let target = {
+                let s = a.session.borrow();
+                let p = s.project();
+                s.selection
+                    .tracks
+                    .iter()
+                    .filter_map(|t| p.track(*t))
+                    .chain(
+                        p.tracks
+                            .iter()
+                            .filter(|t| t.kind.has_audio() && t.kind != TrackKind::Master),
+                    )
+                    .next()
+                    .map(|t| {
+                        let target = if t.kind == TrackKind::Instrument && t.instrument.is_none() {
+                            faderframe_session::PluginTarget::Instrument
+                        } else {
+                            faderframe_session::PluginTarget::Insert(t.inserts.len())
+                        };
+                        (t.id, target)
+                    })
+            };
+            if let Some((track, target)) = target {
+                crate::plugin_browser::open(a, track, target);
+            }
+        }),
         entry(app, "toggle-automation", |a| {
             let tracks: Vec<_> = {
                 let s = a.session.borrow();
@@ -249,6 +305,88 @@ pub fn install(app: &Rc<AppState>) {
         ));
     }
     app.app.add_action_entries(entries);
+    // Development aid: insert a plugin (by id) on the selected or first
+    // audio track, e.g. FADERFRAME_STARTUP_ACTIONS="insert-plugin:com.vendor.plugin".
+    let weak = Rc::downgrade(app);
+    let insert = gio::ActionEntry::builder("insert-plugin")
+        .parameter_type(Some(&String::static_variant_type()))
+        .activate(move |_, _, param| {
+            let (Some(a), Some(id)) = (weak.upgrade(), param.and_then(|p| p.get::<String>()))
+            else {
+                return;
+            };
+            let found = {
+                let s = a.session.borrow();
+                let plugin = s
+                    .available_plugins()
+                    .into_iter()
+                    .find(|p| p.plugin.id == id);
+                let p = s.project();
+                let track = s
+                    .selection
+                    .tracks
+                    .iter()
+                    .filter_map(|t| p.track(*t))
+                    .chain(p.tracks.iter().filter(|t| t.kind == TrackKind::Audio))
+                    .next()
+                    .map(|t| (t.id, t.inserts.len()));
+                plugin.zip(track)
+            };
+            match found {
+                Some((plugin, (track, index))) => {
+                    let placed = a.session.borrow_mut().place_plugin(
+                        track,
+                        faderframe_session::PluginTarget::Insert(index),
+                        plugin.plugin,
+                    );
+                    if let Err(e) = placed {
+                        a.report(e, false);
+                    }
+                    a.after_change();
+                }
+                None => tracing::warn!("insert-plugin: no plugin '{id}' or no audio track"),
+            }
+        })
+        .build();
+    // Development aid: `show-insert:<n>` / `show-insert-params:<n>` open the
+    // editor of insert n of the selected (or first audio) track.
+    let show = |name: &'static str, generic: bool| {
+        let weak = Rc::downgrade(app);
+        gio::ActionEntry::builder(name)
+            .parameter_type(Some(&String::static_variant_type()))
+            .activate(move |_, _, param| {
+                let Some(a) = weak.upgrade() else { return };
+                let n: usize = param
+                    .and_then(|p| p.get::<String>())
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let found = {
+                    let s = a.session.borrow();
+                    let p = s.project();
+                    s.selection
+                        .tracks
+                        .iter()
+                        .filter_map(|t| p.track(*t))
+                        .chain(p.tracks.iter().filter(|t| t.kind == TrackKind::Audio))
+                        .find(|t| t.inserts.len() > n)
+                        .map(|t| (t.id, t.inserts[n].id))
+                };
+                match found {
+                    Some((track, plugin)) => a.dispatch(Action::OpenPluginEditor {
+                        track,
+                        plugin,
+                        generic,
+                    }),
+                    None => tracing::warn!("{name}: no insert {n}"),
+                }
+            })
+            .build()
+    };
+    app.app.add_action_entries([
+        insert,
+        show("show-insert", false),
+        show("show-insert-params", true),
+    ]);
 
     let accels: &[(&str, &[&str])] = &[
         ("app.new", &["<Control>n"]),

@@ -444,6 +444,82 @@ impl EngineController {
         Arc::clone(&self.shared)
     }
 
+    /// Every plugin the registry knows (built-ins and scanned formats).
+    pub fn available_plugins(&self) -> Vec<faderframe_plugin_host::PluginDescriptor> {
+        self.plugins.registry().scan()
+    }
+
+    /// Let plugins handle their requests (call from the UI timer); returns
+    /// what they asked for (a restart needs a graph rebuild).
+    pub fn poll_plugins(&mut self) -> faderframe_plugin_host::PluginPoll {
+        self.plugins.poll()
+    }
+
+    /// Current value of a hosted plugin's parameter (plain units).
+    pub fn plugin_parameter_value(
+        &mut self,
+        plugin: faderframe_core::PluginInstanceId,
+        parameter: faderframe_core::ParameterId,
+    ) -> Option<f64> {
+        self.plugins.parameter_value(plugin, parameter)
+    }
+
+    /// The plugin's own text for a parameter value.
+    pub fn format_plugin_parameter(
+        &mut self,
+        plugin: faderframe_core::PluginInstanceId,
+        parameter: faderframe_core::ParameterId,
+        value: f64,
+    ) -> Option<String> {
+        self.plugins.format_parameter(plugin, parameter, value)
+    }
+
+    /// Record a value the plugin changed itself as already applied.
+    pub fn note_plugin_parameter(
+        &mut self,
+        plugin: faderframe_core::PluginInstanceId,
+        parameter: faderframe_core::ParameterId,
+        value: f64,
+    ) {
+        self.plugins.note_parameter(plugin, parameter, value);
+    }
+
+    /// The plugin's own editor GUI, if it has one.
+    pub fn plugin_editor(
+        &mut self,
+        plugin: faderframe_core::PluginInstanceId,
+    ) -> Option<&mut dyn faderframe_plugin_host::PluginEditor> {
+        self.plugins.editor(plugin)
+    }
+
+    /// File descriptors and timers hosted plugins registered (serviced by
+    /// the UI main loop).
+    pub fn plugin_event_sources(
+        &self,
+    ) -> Vec<(
+        faderframe_core::PluginInstanceId,
+        faderframe_plugin_host::PluginEventSources,
+    )> {
+        self.plugins.event_sources()
+    }
+
+    pub fn plugin_on_fd(
+        &mut self,
+        plugin: faderframe_core::PluginInstanceId,
+        fd: faderframe_plugin_host::PluginFd,
+    ) {
+        self.plugins.on_fd(plugin, fd);
+    }
+
+    pub fn plugin_on_timer(&mut self, plugin: faderframe_core::PluginInstanceId, timer: u32) {
+        self.plugins.on_timer(plugin, timer);
+    }
+
+    /// Encoded state of a plugin instance (for saving into the project).
+    pub fn plugin_state(&mut self, plugin: faderframe_core::PluginInstanceId) -> Option<String> {
+        self.plugins.capture_state(plugin)
+    }
+
     /// Parameters of an instantiated plugin (for automation lists).
     pub fn plugin_parameters(
         &self,
@@ -525,6 +601,7 @@ impl EngineController {
 
     pub fn update_params(&mut self, project: &Project) -> Result<(), EngineError> {
         self.slots.write_params(project, &self.params)?;
+        self.plugins.sync_parameters(project);
         Ok(())
     }
 

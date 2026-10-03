@@ -74,6 +74,16 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<RunOptions>, Strin
 }
 
 fn main() -> ExitCode {
+    // Plugin scan helper (run by FaderFrame itself; a crashing plugin only
+    // takes this process down).
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--scan-clap")
+        && let Some(bundle) = args.get(2)
+    {
+        let code = faderframe_plugin_clap::scan::run_scan_subprocess(std::path::Path::new(bundle));
+        return ExitCode::from(code.clamp(0, 255) as u8);
+    }
+
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()

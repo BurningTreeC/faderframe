@@ -84,6 +84,8 @@ pub enum Hit {
         track: TrackId,
         at: MusicalTime,
     },
+    /// The divider between the track headers and the lanes.
+    HeaderEdge,
     /// The disclosure triangle of a take folder.
     TakeToggle(ClipId),
     /// An automation lane row (`header`: in the header column).
@@ -131,6 +133,10 @@ enum Drag {
         sx: f32,
         sy: f32,
     },
+    HeaderWidth {
+        start_x: f32,
+        start_w: f32,
+    },
     Height {
         track: TrackId,
         start_y: f32,
@@ -174,6 +180,8 @@ pub struct ArrangerView {
     drop_at: Option<(Option<TrackId>, MusicalTime)>,
     comp: Option<CompDrag>,
     auto_drag: Option<automation::AutoDrag>,
+    /// Track header column width (from the layout, else the theme).
+    header_width: f32,
     /// Row tops (content coordinates) of the lane tracks, plus the end;
     /// rows grow while take lanes are open. Refreshed per paint/event.
     rows: Vec<f32>,
@@ -192,6 +200,7 @@ fn clip_fits(track: &Track, clip: &Clip) -> bool {
 
 impl ArrangerView {
     pub fn new(theme: Theme) -> Self {
+        let header_width = theme.arranger.header_width;
         Self {
             theme,
             ppq: 34.0,
@@ -203,6 +212,7 @@ impl ArrangerView {
             drop_at: None,
             comp: None,
             auto_drag: None,
+            header_width,
             rows: Vec::new(),
         }
     }
@@ -210,7 +220,14 @@ impl ArrangerView {
     // --- coordinates -------------------------------------------------------------
 
     fn header_w(&self) -> f32 {
-        self.theme.arranger.header_width
+        self.header_width
+    }
+
+    /// Pick up the saved header width (called before painting/events).
+    fn update_header_width(&mut self, model: &Session) {
+        self.header_width = model
+            .header_width()
+            .unwrap_or(self.theme.arranger.header_width);
     }
 
     fn ruler_h(&self) -> f32 {
@@ -384,6 +401,9 @@ impl ArrangerView {
 
     pub fn hit_test(&self, pos: Point, size: Size, model: &Session) -> Option<Hit> {
         let at = self.time_at(pos.x).max(MusicalTime::ZERO);
+        if pos.y >= self.ruler_h() && (pos.x - self.header_w()).abs() <= 3.0 {
+            return Some(Hit::HeaderEdge);
+        }
         if pos.y < self.ruler_h() {
             return Some(if pos.x < self.header_w() {
                 Hit::Corner
@@ -1004,8 +1024,17 @@ impl ArrangerView {
                 .as_ref()
                 .map(|s| format!(" · {}", s.plugin.name.trim_start_matches("FaderFrame ")))
                 .unwrap_or_default();
+            let input = if t.kind == TrackKind::Audio {
+                format!(" · {}", model.input_label(t))
+            } else {
+                String::new()
+            };
             p.text(
-                &format!("{} · {}{plug}{out}", t.kind.label(), t.layout.short_name()),
+                &format!(
+                    "{} · {}{input}{plug}{out}",
+                    t.kind.label(),
+                    t.layout.short_name()
+                ),
                 info,
                 &TextStyle::new(th.fonts.tiny + 0.5, th.ui.text_dim).family(FontFamily::Condensed),
             );
@@ -1424,6 +1453,65 @@ impl ArrangerView {
             )
             .separated(),
         );
+        // Instrument (instrument tracks): the plugin browser.
+        if t.kind == TrackKind::Instrument {
+            let current = t
+                .instrument
+                .as_ref()
+                .map_or_else(|| "none".to_string(), |s| s.plugin.name.clone());
+            items.push(
+                MenuItem::new(
+                    format!("Choose Instrument… (now: {current})"),
+                    Action::OpenPluginBrowser {
+                        track: t.id,
+                        target: faderframe_session::PluginTarget::Instrument,
+                    },
+                )
+                .separated(),
+            );
+            if let Some(slot) = &t.instrument {
+                items.push(MenuItem::new(
+                    format!("Show {} Editor", slot.plugin.name),
+                    Action::OpenPluginEditor {
+                        track: t.id,
+                        plugin: slot.id,
+                        generic: false,
+                    },
+                ));
+            }
+        }
+        // Editors of the inserts.
+        for slot in &t.inserts {
+            items.push(MenuItem::new(
+                format!("Show {} Editor", slot.plugin.name),
+                Action::OpenPluginEditor {
+                    track: t.id,
+                    plugin: slot.id,
+                    generic: false,
+                },
+            ));
+        }
+        if t.kind.has_audio() && t.kind != TrackKind::Master {
+            items.push(MenuItem::new(
+                "Add Insert Plugin…",
+                Action::OpenPluginBrowser {
+                    track: t.id,
+                    target: faderframe_session::PluginTarget::Insert(t.inserts.len()),
+                },
+            ));
+        }
+        // Input source (audio tracks): mono or stereo, which input(s).
+        if t.kind == TrackKind::Audio {
+            for (i, c) in model.input_choices(t.id).into_iter().enumerate() {
+                let item =
+                    MenuItem::new(format!("Input: {}", c.label), c.action).checked(c.checked);
+                items.push(if i == 0 || c.group_start {
+                    item.separated()
+                } else {
+                    item
+                });
+            }
+        }
         // Track presets.
         if t.kind != TrackKind::Master {
             items.push(
@@ -1640,6 +1728,16 @@ impl ArrangerView {
             return true;
         }
         match hit {
+            Hit::HeaderEdge if clicks >= 2 => {
+                cx.emit(Action::SetHeaderWidth(self.theme.arranger.header_width));
+            }
+            Hit::HeaderEdge => {
+                self.drag = Some(Drag::HeaderWidth {
+                    start_x: pos.x,
+                    start_w: self.header_w(),
+                });
+                cx.set_cursor(Cursor::ResizeHorizontal);
+            }
             Hit::Automation { .. } => {}
             Hit::Corner => cx.request(Self::grid_menu(model, pos)),
             Hit::Ruler(t) => {
@@ -1958,6 +2056,13 @@ impl ArrangerView {
                     pan: if pan.abs() < 0.01 { 0.0 } else { pan },
                 }));
             }
+            Some(Drag::HeaderWidth { start_x, start_w }) => {
+                let (lo, hi) = faderframe_workspace::HEADER_WIDTH_RANGE;
+                let w = (start_w + pos.x - start_x).round().clamp(lo, hi);
+                if (w - self.header_w()).abs() >= 1.0 {
+                    cx.emit(Action::SetHeaderWidth(w));
+                }
+            }
             Some(Drag::Height {
                 track,
                 start_y,
@@ -2027,6 +2132,7 @@ impl ArrangerView {
 
 impl CanvasView<Session, Action> for ArrangerView {
     fn paint(&mut self, p: &mut dyn Painter, size: Size, model: &Session, theme: &Theme) {
+        self.update_header_width(model);
         self.update_rows(model);
         self.follow(model, size);
         self.clamp_scroll(model, size);
@@ -2212,6 +2318,7 @@ impl CanvasView<Session, Action> for ArrangerView {
         model: &Session,
         cx: &mut EventCx<'_, Action>,
     ) -> bool {
+        self.update_header_width(model);
         self.update_rows(model);
         match *ev {
             ViewEvent::PointerDown {
@@ -2296,6 +2403,7 @@ impl CanvasView<Session, Action> for ArrangerView {
                     cx.set_cursor(match hit {
                         Some(Hit::Clip { .. }) => Cursor::Grab,
                         Some(Hit::TakeToggle(_)) => Cursor::Pointer,
+                        Some(Hit::HeaderEdge) => Cursor::ResizeHorizontal,
                         Some(Hit::TakeLane { .. }) => Cursor::Crosshair,
                         Some(Hit::Automation { header: false, .. }) => Cursor::Crosshair,
                         Some(Hit::Automation { header: true, .. }) => Cursor::Pointer,
@@ -2456,6 +2564,7 @@ impl CanvasView<Session, Action> for ArrangerView {
             Hit::Ruler(_) => Some("Click or drag to move the playhead".into()),
             Hit::LoopBand(_) => Some("Drag to set the loop range · Click to toggle looping".into()),
             Hit::Corner => Some("Grid, snap and follow settings".into()),
+            Hit::HeaderEdge => Some("Drag to resize the track headers · Double-click to reset".into()),
             Hit::Header(id, part) => {
                 let t = model.project().track(id)?;
                 Some(match part {
@@ -2531,6 +2640,7 @@ impl CanvasView<Session, Action> for ArrangerView {
     }
 
     fn drag_files(&mut self, pos: Option<Point>, size: Size, model: &Session) -> bool {
+        self.update_header_width(model);
         self.update_rows(model);
         let next = pos.and_then(|p| self.drop_target(p, size, model));
         self.drop_at = next;

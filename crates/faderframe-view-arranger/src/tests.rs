@@ -462,3 +462,31 @@ fn automation_lanes_show_and_edit_points() {
         AutomationMode::Touch
     );
 }
+
+#[test]
+fn header_column_resizes_horizontally() {
+    let mut s = session();
+    let theme = Theme::default();
+    let mut view = ArrangerView::new(theme.clone());
+    let size = Size::new(1400.0, 900.0);
+    view.paint(&mut RecordingPainter::new(), size, &s, &theme);
+    let w0 = view.header_w();
+    let edge = Point::new(w0, 200.0);
+    assert_eq!(view.hit_test(edge, size, &s), Some(Hit::HeaderEdge));
+    let mut actions = run(&mut view, down(edge), size, &s).0;
+    actions.extend(run(&mut view, mv(Point::new(w0 + 80.0, 200.0)), size, &s).0);
+    actions.extend(run(&mut view, up(Point::new(w0 + 80.0, 200.0)), size, &s).0);
+    for a in actions {
+        s.dispatch(a).unwrap();
+    }
+    assert_eq!(s.header_width(), Some(w0 + 80.0));
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    assert_eq!(view.header_w(), w0 + 80.0);
+    // Lanes start after the wider header.
+    assert!((view.x_of(MusicalTime::ZERO) - (w0 + 80.0)).abs() < 1e-3);
+    let l = view
+        .header_layout(&s, ArrangerView::lane_tracks(&s)[0].id, size)
+        .unwrap();
+    assert!(l.meter.right() <= w0 + 80.0);
+}

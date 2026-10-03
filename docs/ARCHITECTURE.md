@@ -18,6 +18,7 @@ faderframe-app            binary: CLI parsing, logging, starts the GTK app
        ├─ faderframe-view-arranger / -view-mixer / -view-pianoroll   (GTK-free views)
        │    └─ faderframe-ui-canvas   Painter trait, events, CanvasView, theme, console controls
        ├─ faderframe-audio-jack       JACK backend (JACK2 / pipewire-jack)
+       ├─ faderframe-plugin-clap      CLAP host (clack-host): scan helper, instances, editors
        └─ faderframe-session          control-world hub (GTK-free)
             ├─ faderframe-engine       project→graph compiler, RT processor, controller, offline render
             │    ├─ faderframe-audio-graph   generic DSP graph: ports, edges, PDC, compile, executor
@@ -40,8 +41,10 @@ on GTK**, and no crate except `faderframe-audio-jack` depends on JACK. The
 engine, session and views build and run headless (tests, CI, offline
 rendering, the benchmark).
 
-Planned crates (not created yet, to avoid empty boilerplate): CLAP and VST3
-format hosts (`faderframe-plugin-clap`, `faderframe-plugin-vst3`),
+`faderframe-plugin-clap` implements the `faderframe-plugin-host` traits and
+is registered by the shell (`set_default_registry`), so the engine never
+names a plugin format. Planned crates (not created yet, to avoid empty
+boilerplate): a VST3 host (`faderframe-plugin-vst3`),
 PipeWire-native/ALSA/WASAPI/ASIO/CoreAudio backends, and an optional wgpu
 painter for dense views.
 
@@ -203,9 +206,58 @@ expressions are planned as additional event types.
 Neither trait assumes the plugin is in-process; a sandboxed plugin is a proxy
 pair speaking IPC with shared-memory audio. `PluginHost` (engine) owns one
 instance per slot. Built-ins: synth, echo, gain, latency probe (used to test
-PDC end to end). CLAP via `clack-host` is the next format, then VST3, then AU.
-Failed plugins are bypassed and flagged; missing formats pass audio through
-with a warning.
+PDC end to end). Failed plugins are bypassed and flagged; missing formats
+pass audio through with a warning.
+
+### CLAP
+
+* **Scanning** runs each bundle in a throw-away helper process
+  (`faderframe --scan-clap <bundle>`, JSON on stdout), so a crashing plugin
+  cannot take the DAW down. Results are cached by bundle size and mtime
+  (`$XDG_CACHE_HOME/faderframe/clap-scan.json`); the shell rescans in the
+  background at start-up and the plugin browser refreshes when the global
+  catalog generation changes.
+* **Extensions** are queried once `init()` has returned (CLAP forbids
+  asking earlier, and bridges such as yabridge only know theirs then), plus
+  from within `init()` for plugins that call the host while initialising.
+* **Threads.** A `ClapInstance` lives on the main (UI) thread and is not
+  `Send`. Its live audio processor sits in a `TryCell` shared by every graph
+  generation that references it: the audio thread `try_lock`s it (busy =
+  one silent block, never a wait), the control thread may block briefly to
+  reconfigure. `start_processing` happens on the audio thread; while
+  processing — or stopping processing on behalf of the audio thread — a
+  thread-local scope makes the thread-check extension report "audio thread"
+  (offline renders run both roles on one thread).
+* **Parameters** reach a running plugin as `ParamValueEvent`s from a
+  wait-free queue (UI) and from automation (`ParameterEvents`, sample
+  offsets within the block); while inactive they are flushed through
+  `params.flush`. A slot's explicit values (`PluginSlot::parameters`, edited
+  by `Command::SetPluginParameter`, one undo step per gesture) are applied
+  after the saved state; the engine remembers the plugin's own value before
+  the first explicit one so undo can restore it. Before saving, explicit
+  values are refreshed from the plugin, so changes made in its own GUI win.
+* **State** is the plugin's own blob, base64 in the slot, captured before
+  save/render/engine rebuild and before edits that remove plugins.
+* **Editors.** On Linux CLAP GUIs embed into an X11 window. FaderFrame is a
+  Wayland client, so the parent is a top-level window on a separate X11
+  connection (`x11rb`, XWayland): created at the editor's size, with
+  fixed-size hints for non-resizable editors (window managers float them),
+  `WM_DELETE_WINDOW` closing the editor, configure events resizing
+  resizable ones and `request_resize` resizing the parent. Plugins that
+  cannot embed but can float open their own window. Editors open centred
+  on the monitor showing FaderFrame — in X11 coordinates from RandR,
+  matched by connector name, because XWayland's layout can differ from the
+  Wayland one (e.g. physical pixels with zero scaling) — or where they were
+  last; positions are kept per plugin instance in the workspace and saved
+  with the project. Plugin GUIs run on the GTK main loop: descriptors
+  registered through `posix-fd` become glib fd sources and `timer`
+  registrations glib timeouts, reconciled every UI tick.
+* **Generic editor.** Every plugin (built-ins, plugins without a GUI, no X
+  server) has a GTK parameter window: filter, module sections from CLAP's
+  "Module/Name" paths, the plugin's own value text (`value_to_text`),
+  sliders and switches, double-click to reset, live follow of automation
+  and GUI changes, bypass, and a button to the plugin's own GUI. On Wayland
+  the compositor places GTK windows; apps cannot.
 
 ## 9. Audio backends
 
@@ -468,8 +520,9 @@ block size.
 9. Channel layouts are explicit everywhere; nothing assumes stereo.
 10. IDs are persisted newtypes, allocated by the project's `IdAllocator`.
 11. `unsafe` is forbidden in every crate except `faderframe-realtime`
-    (documented mailbox), `faderframe-audio-jack` (JACK trait requirement) and
-    `faderframe-ui` (GObject subclassing macros).
+    (documented mailbox, `TryCell`), `faderframe-audio-jack` (JACK trait
+    requirement), `faderframe-plugin-clap` (loading plugin libraries, window
+    handles for editors) and `faderframe-ui` (GObject subclassing macros).
 
 ## 14. Cross-platform strategy
 
@@ -496,13 +549,20 @@ selectable record/loop-record modes, any number of sends per strip (paged
 in banks), resizable tracks and track presets. Automation of every
 automatable parameter (lanes, sample-accurate playback, Touch/Latch/Write).
 
-Requested next: MIDI keyboards and controllers (with MIDI learn into
-automation) and a best-in-class piano roll; VST3 hosting after CLAP.
+CLAP hosting: scanning in a helper process with a cache, a plugin browser
+window, effects and instruments in the graph with latency reporting,
+restarts, parameters, automation and state, native editors embedded via
+XWayland (placed centred or where they were last) and a generic parameter
+editor for every plugin.
+
+Requested next: a performance meter (total, per track, per plugin), MIDI
+keyboards and controllers (with MIDI learn into automation) and a
+best-in-class piano roll; VST3 hosting after that.
 
 Next, in order:
 
-1. CLAP hosting (`clack-host`), plugin scanning in a helper process, plugin
-   GUIs, parameter automation, state.
+1. ~~CLAP hosting~~ (done; still open: writing automation from plugin GUI
+   gestures, note expressions, plugin-side preset browsing).
 2. MIDI input/output (`midir`), live auditioning, MIDI learn.
 3. ~~Automation lanes~~ (done) in the arranger, sample-accurate parameter events.
 4. Dependency-aware multicore scheduler.

@@ -108,10 +108,8 @@ impl AutomationParam {
             }
             ParamKind::Linear | ParamKind::Log => {
                 if self.unit == "%" {
-                    format!(
-                        "{:.0} %",
-                        (v - self.min) / (self.max - self.min).max(1e-12) * 100.0
-                    )
+                    // Percent parameters are fractions.
+                    format!("{:.0} %", v * 100.0)
                 } else if self.unit.is_empty() {
                     format!("{v:.2}")
                 } else {

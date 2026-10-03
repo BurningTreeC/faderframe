@@ -370,7 +370,7 @@ pub fn open(app: &Rc<AppState>) {
                     .set_text(&format!("Cannot create {}: {e}", dir.display()));
                 return;
             }
-            let started = app.session.borrow().render(settings);
+            let started = app.session.borrow_mut().render(settings);
             match started {
                 Ok(j) => {
                     *job.borrow_mut() = Some(j);

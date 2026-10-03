@@ -205,6 +205,23 @@ pub enum Action {
         lane: faderframe_core::AutomationLaneId,
         mode: AutomationMode,
     },
+    /// Ask the shell to open the plugin browser for a track.
+    OpenPluginBrowser {
+        track: TrackId,
+        target: PluginTarget,
+    },
+    /// Ask the shell to show a plugin's editor: its own GUI, or (`generic`,
+    /// or when it has none) the generic parameter window.
+    OpenPluginEditor {
+        track: TrackId,
+        plugin: faderframe_core::PluginInstanceId,
+        generic: bool,
+    },
+    /// Choose (or remove) the instrument of an instrument track.
+    SetInstrumentPlugin {
+        track: TrackId,
+        plugin: Option<PluginRef>,
+    },
     /// Save a track's settings into the track preset library.
     SaveTrackPreset {
         track: TrackId,
@@ -223,6 +240,14 @@ pub enum Action {
     SetTrackHeight {
         track: Option<TrackId>,
         height: f32,
+    },
+    /// Width of the arranger's track header column (saved with the layout).
+    SetHeaderWidth(f32),
+    /// Remember where a plugin editor window is (saved with the layout).
+    SetPluginWindowPosition {
+        plugin: faderframe_core::PluginInstanceId,
+        x: i32,
+        y: i32,
     },
     SetGrid(GridDivision),
     ToggleSnap,
@@ -354,6 +379,73 @@ pub struct Session {
     preset_dir: PathBuf,
     presets: Vec<PresetEntry>,
     automation_writer: automation::AutomationWriter,
+    ui_requests: Vec<UiRequest>,
+}
+
+/// Where a plugin chosen in the browser goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PluginTarget {
+    /// Insert slot (index in the insert chain).
+    Insert(usize),
+    Instrument,
+}
+
+/// Things views ask the toolkit shell to show (polled every frame).
+#[derive(Clone, Debug, PartialEq)]
+pub enum UiRequest {
+    PluginBrowser {
+        track: TrackId,
+        target: PluginTarget,
+    },
+    PluginEditor {
+        track: TrackId,
+        plugin: faderframe_core::PluginInstanceId,
+        generic: bool,
+    },
+}
+
+/// One parameter of a hosted plugin, for generic editors.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PluginParameterView {
+    pub info: faderframe_plugin_host::ParameterInfo,
+    /// Current value (plain units).
+    pub value: f64,
+    /// Explicitly stored in the project slot.
+    pub explicit: bool,
+}
+
+/// A plugin offered in insert/instrument menus.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AvailablePlugin {
+    pub plugin: PluginRef,
+    pub vendor: String,
+    pub version: String,
+    pub instrument: bool,
+    /// Channels of the main audio ports.
+    pub audio_inputs: u16,
+    pub audio_outputs: u16,
+    pub note_inputs: u16,
+}
+
+/// Does this command remove plugin slots (directly or with a track)?
+fn removes_plugins(cmd: &Command) -> bool {
+    match cmd {
+        Command::RemovePlugin { .. }
+        | Command::RemoveTrack { .. }
+        | Command::SetInstrument { .. } => true,
+        Command::Batch { commands, .. } => commands.iter().any(removes_plugins),
+        _ => false,
+    }
+}
+
+/// One entry of a track's input menu.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InputChoice {
+    pub label: String,
+    pub action: Action,
+    pub checked: bool,
+    /// Draw a separator before this entry.
+    pub group_start: bool,
 }
 
 /// A track preset in the library.
@@ -414,6 +506,7 @@ impl Session {
             preset_dir: media::data_dir().join("track-presets"),
             presets: Vec::new(),
             automation_writer: Default::default(),
+            ui_requests: Vec::new(),
         };
         s.rescan_track_presets();
         s.render_sources();
@@ -622,6 +715,11 @@ impl Session {
         })
     }
 
+    /// Arranger track header width (`None`: the theme default).
+    pub fn header_width(&self) -> Option<f32> {
+        self.workspace.header_width
+    }
+
     /// Arranger height of a track (`None`: the theme default).
     pub fn track_height(&self, track: TrackId) -> Option<f32> {
         self.workspace.track_height(track)
@@ -640,6 +738,7 @@ impl Session {
     // --- audio ---------------------------------------------------------------
 
     fn recreate_engine(&mut self) -> Result<()> {
+        self.capture_plugin_states();
         let position = self.transport.position;
         self.engine_config.sample_rate = self.engine.sample_rate();
         let (engine, processor) =
@@ -737,9 +836,11 @@ impl Session {
 
     /// Start an offline render of the current project state.
     pub fn render(
-        &self,
+        &mut self,
         settings: render::RenderSettings,
     ) -> std::result::Result<render::RenderJob, render::RenderError> {
+        // The render thread creates its own plugin instances from the slots.
+        self.capture_plugin_states();
         let mut project = self.project.clone();
         let dir = self.project_dir();
         for s in project.sources.values_mut() {
@@ -772,6 +873,15 @@ impl Session {
         self.engine.collect_garbage();
         let was_playing = self.transport.playing;
         self.transport = self.engine.transport_snapshot();
+        let plugin_poll = self.engine.poll_plugins();
+        if plugin_poll.restart {
+            // Latency or ports changed: rebuild (re-activates the plugin).
+            if let Err(e) = self.sync(Impact::Graph) {
+                self.notify(NoticeLevel::Error, e.to_string());
+            }
+        } else if plugin_poll.params_changed {
+            self.revision += 1;
+        }
         if was_playing && !self.transport.playing {
             // Stopped (by the user, the end of a bounce, a dropped stream):
             // Latch/Write automation ends here.
@@ -1190,6 +1300,7 @@ impl Session {
         if self.unsaved_media {
             self.consolidate_media(&project_media);
         }
+        self.capture_plugin_states();
         let mut stored = self.project.clone();
         for s in stored.sources.values_mut() {
             if let SourceSpec::File { path: p, .. } = &mut s.spec {
@@ -1278,6 +1389,11 @@ impl Session {
     /// Apply an undoable edit.
     pub fn edit(&mut self, cmd: Command) -> Result<()> {
         self.capture_automation(&cmd);
+        if removes_plugins(&cmd) {
+            // Undo restores removed plugins from their slots: keep the
+            // slots' state current.
+            self.capture_plugin_states();
+        }
         let impact = self.history.apply(&mut self.project, cmd)?;
         self.sync(impact)
     }
@@ -1480,13 +1596,48 @@ impl Session {
                 }
             }
             Action::SaveTrackPreset { track } => self.save_track_preset(track)?,
+            Action::OpenPluginBrowser { track, target } => {
+                self.ui_requests
+                    .push(UiRequest::PluginBrowser { track, target });
+                self.revision += 1;
+            }
+            Action::OpenPluginEditor {
+                track,
+                plugin,
+                generic,
+            } => {
+                self.ui_requests.push(UiRequest::PluginEditor {
+                    track,
+                    plugin,
+                    generic,
+                });
+                self.revision += 1;
+            }
+            Action::SetInstrumentPlugin { track, plugin } => {
+                let slot = plugin.map(|plugin| PluginSlot {
+                    id: self.project.ids.allocate(),
+                    plugin,
+                    bypass: false,
+                    parameters: Vec::new(),
+                    state: None,
+                });
+                self.edit(Command::SetInstrument { track, slot })?;
+            }
             Action::AddTrackFromPreset { path } => {
                 self.add_track_from_preset(&path)?;
             }
             Action::ApplyTrackPreset { track, path } => self.apply_track_preset(track, &path)?,
+            Action::SetHeaderWidth(w) => {
+                let (lo, hi) = faderframe_workspace::HEADER_WIDTH_RANGE;
+                self.workspace.header_width = Some(w.clamp(lo, hi));
+                self.revision += 1;
+            }
             Action::SetTrackHeight { track, height } => {
                 self.workspace.set_track_height(track, height);
                 self.revision += 1;
+            }
+            Action::SetPluginWindowPosition { plugin, x, y } => {
+                self.workspace.plugin_windows.insert(plugin, (x, y));
             }
             Action::ShowAutomation { track, target } => {
                 self.show_automation(track, target)?;
@@ -1620,6 +1771,274 @@ impl Session {
         }
         self.layout_revision += 1;
         Ok(())
+    }
+
+    // --- plugins ----------------------------------------------------------------------
+
+    /// Requests for the shell (windows to open); clears them.
+    pub fn take_ui_requests(&mut self) -> Vec<UiRequest> {
+        std::mem::take(&mut self.ui_requests)
+    }
+
+    /// Insert a plugin into `track` at `target`.
+    pub fn place_plugin(
+        &mut self,
+        track: TrackId,
+        target: PluginTarget,
+        plugin: PluginRef,
+    ) -> Result<()> {
+        let hosted = plugin.format != faderframe_project::PluginFormat::Builtin;
+        match target {
+            PluginTarget::Insert(index) => self.dispatch(Action::InsertPlugin {
+                track,
+                index,
+                plugin,
+            })?,
+            PluginTarget::Instrument => self.dispatch(Action::SetInstrumentPlugin {
+                track,
+                plugin: Some(plugin),
+            })?,
+        }
+        // Like most DAWs: a newly placed hosted plugin shows its editor.
+        let placed = self.project.track(track).and_then(|t| match target {
+            PluginTarget::Insert(i) => t.inserts.get(i.min(t.inserts.len().saturating_sub(1))),
+            PluginTarget::Instrument => t.instrument.as_ref(),
+        });
+        if hosted && let Some(slot) = placed {
+            self.ui_requests.push(UiRequest::PluginEditor {
+                track,
+                plugin: slot.id,
+                generic: false,
+            });
+        }
+        Ok(())
+    }
+
+    /// The slot of a plugin instance and its track.
+    pub fn plugin_slot(
+        &self,
+        plugin: faderframe_core::PluginInstanceId,
+    ) -> Option<(&faderframe_project::Track, &PluginSlot)> {
+        self.project.tracks.iter().find_map(|t| {
+            t.inserts
+                .iter()
+                .chain(t.instrument.iter())
+                .find(|s| s.id == plugin)
+                .map(|s| (t, s))
+        })
+    }
+
+    /// The parameters of a hosted plugin with their current values.
+    pub fn plugin_parameter_views(
+        &mut self,
+        plugin: faderframe_core::PluginInstanceId,
+    ) -> Vec<PluginParameterView> {
+        let infos = self
+            .engine
+            .plugin_parameters(plugin)
+            .map(<[_]>::to_vec)
+            .unwrap_or_default();
+        let explicit: Vec<faderframe_core::ParameterId> = self
+            .plugin_slot(plugin)
+            .map(|(_, s)| s.parameters.iter().map(|p| p.id).collect())
+            .unwrap_or_default();
+        infos
+            .into_iter()
+            .map(|info| {
+                let value = self
+                    .engine
+                    .plugin_parameter_value(plugin, info.id)
+                    .unwrap_or(info.default);
+                PluginParameterView {
+                    explicit: explicit.contains(&info.id),
+                    info,
+                    value,
+                }
+            })
+            .collect()
+    }
+
+    /// Current value of one plugin parameter (plain units).
+    pub fn plugin_parameter_value(
+        &mut self,
+        plugin: faderframe_core::PluginInstanceId,
+        parameter: faderframe_core::ParameterId,
+    ) -> Option<f64> {
+        self.engine.plugin_parameter_value(plugin, parameter)
+    }
+
+    /// The plugin's own text for a value, if it formats values itself.
+    pub fn format_plugin_parameter(
+        &mut self,
+        plugin: faderframe_core::PluginInstanceId,
+        parameter: faderframe_core::ParameterId,
+        value: f64,
+    ) -> Option<String> {
+        self.engine
+            .format_plugin_parameter(plugin, parameter, value)
+    }
+
+    /// A hosted plugin's own editor GUI (call only from the UI thread).
+    pub fn plugin_editor(
+        &mut self,
+        plugin: faderframe_core::PluginInstanceId,
+    ) -> Option<&mut dyn faderframe_plugin_host::PluginEditor> {
+        self.engine.plugin_editor(plugin)
+    }
+
+    /// File descriptors and timers plugins registered for the UI main loop.
+    pub fn plugin_event_sources(
+        &self,
+    ) -> Vec<(
+        faderframe_core::PluginInstanceId,
+        faderframe_plugin_host::PluginEventSources,
+    )> {
+        self.engine.plugin_event_sources()
+    }
+
+    pub fn plugin_on_fd(
+        &mut self,
+        plugin: faderframe_core::PluginInstanceId,
+        fd: faderframe_plugin_host::PluginFd,
+    ) {
+        self.engine.plugin_on_fd(plugin, fd);
+    }
+
+    pub fn plugin_on_timer(&mut self, plugin: faderframe_core::PluginInstanceId, timer: u32) {
+        self.engine.plugin_on_timer(plugin, timer);
+    }
+
+    /// Plugins that can be inserted (effects) or used as instruments.
+    pub fn available_plugins(&self) -> Vec<AvailablePlugin> {
+        use faderframe_plugin_host::{PluginCategory, PluginFormat as F};
+        self.engine
+            .available_plugins()
+            .into_iter()
+            .map(|d| AvailablePlugin {
+                plugin: PluginRef {
+                    format: match d.format {
+                        F::Builtin => faderframe_project::PluginFormat::Builtin,
+                        F::Clap => faderframe_project::PluginFormat::Clap,
+                        F::Vst3 => faderframe_project::PluginFormat::Vst3,
+                        F::AudioUnit => faderframe_project::PluginFormat::AudioUnit,
+                    },
+                    id: d.id,
+                    name: d.name,
+                },
+                vendor: d.vendor,
+                version: d.version,
+                instrument: d.category == PluginCategory::Instrument,
+                audio_inputs: d.audio_inputs.first().map_or(0, |p| p.channels),
+                audio_outputs: d.audio_outputs.first().map_or(0, |p| p.channels),
+                note_inputs: d.note_inputs,
+            })
+            .collect()
+    }
+
+    /// Store every hosted plugin's current state in its project slot (before
+    /// saving, rendering, rebuilding the engine or removing plugins).
+    /// Bookkeeping, not an edit: it does not touch the undo history.
+    pub fn capture_plugin_states(&mut self) {
+        let slots: Vec<faderframe_core::PluginInstanceId> = self
+            .project
+            .tracks
+            .iter()
+            .flat_map(|t| t.instrument.iter().chain(t.inserts.iter()))
+            .filter(|s| s.plugin.format != faderframe_project::PluginFormat::Builtin)
+            .map(|s| s.id)
+            .collect();
+        for id in slots {
+            let state = self.engine.plugin_state(id);
+            for t in &mut self.project.tracks {
+                for s in t.instrument.iter_mut().chain(t.inserts.iter_mut()) {
+                    if s.id != id {
+                        continue;
+                    }
+                    if let Some(state) = &state {
+                        s.state = Some(state.clone());
+                    }
+                    // Explicit values follow what the plugin's own editor
+                    // did since (they are applied after the state on load).
+                    for p in &mut s.parameters {
+                        if let Some(v) = self.engine.plugin_parameter_value(id, p.id) {
+                            p.value = v;
+                            self.engine.note_plugin_parameter(id, p.id, v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- inputs -----------------------------------------------------------------------
+
+    /// The input choices of an audio track for menus: no input, every mono
+    /// input, every stereo pair. Choosing one also sets the track format
+    /// (mono or stereo), which is what gets recorded.
+    pub fn input_choices(&self, track: TrackId) -> Vec<InputChoice> {
+        use faderframe_core::ChannelLayout;
+        use faderframe_project::InputRouting;
+        let Some(t) = self.project.track(track) else {
+            return Vec::new();
+        };
+        let set = |input: InputRouting, layout: ChannelLayout| {
+            let mut commands = Vec::new();
+            if layout != t.layout {
+                commands.push(Command::SetTrackLayout { track, layout });
+            }
+            commands.push(Command::SetTrackInput { track, input });
+            Action::Edit(Command::Batch {
+                label: "Change Input".into(),
+                commands,
+            })
+        };
+        let inputs = self.stream_info().map_or(8, |i| i.input_channels).max(2);
+        let stereo = t.layout.channel_count() >= 2;
+        let mut out = vec![InputChoice {
+            label: "No input".into(),
+            action: Action::Edit(Command::SetTrackInput {
+                track,
+                input: InputRouting::None,
+            }),
+            checked: t.input == InputRouting::None,
+            group_start: false,
+        }];
+        for first in 0..inputs {
+            let input = InputRouting::Hardware {
+                first_channel: first,
+            };
+            out.push(InputChoice {
+                label: format!("Mono · In {}", first + 1),
+                action: set(input, ChannelLayout::Mono),
+                checked: !stereo && t.input == input,
+                group_start: first == 0,
+            });
+        }
+        for first in (0..inputs.saturating_sub(1)).step_by(2) {
+            let input = InputRouting::Hardware {
+                first_channel: first,
+            };
+            out.push(InputChoice {
+                label: format!("Stereo · In {}–{}", first + 1, first + 2),
+                action: set(input, ChannelLayout::Stereo),
+                checked: stereo && t.input == input,
+                group_start: first == 0,
+            });
+        }
+        out
+    }
+
+    /// "In 1", "In 3–4", "No input".
+    pub fn input_label(&self, t: &Track) -> String {
+        match t.input {
+            faderframe_project::InputRouting::None => "No input".into(),
+            faderframe_project::InputRouting::Hardware { first_channel } => {
+                match t.layout.channel_count() {
+                    1 => format!("In {}", first_channel + 1),
+                    n => format!("In {}–{}", first_channel + 1, first_channel as usize + n),
+                }
+            }
+        }
     }
 
     // --- track presets -------------------------------------------------------------

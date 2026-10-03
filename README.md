@@ -52,6 +52,13 @@ hosting, an analogue-console-style mixer and dockable, detachable editors.
   plugin parameters and bypass: lanes under each track (A button / A key),
   point editing and freehand drawing with curve shapes, Read / Touch /
   Latch / Write modes; faders follow the automation while playing.
+* Plugins: built-in synth/echo/gain and CLAP effects and instruments, found
+  by a crash-safe background scan and picked in a plugin browser (click an
+  empty insert slot or Track → Plugin Browser…). Click a filled insert slot
+  for the plugin's own GUI (Ctrl-click bypasses, right-click for the
+  parameter window and more); editors open centred or where they were last,
+  and their positions are saved with the project. Plugin state, parameters
+  and automation are saved too.
 * Render / export to WAV (16/24-bit with TPDF dither, 32-bit float): master
   or stems, project/loop/bar range, any sample rate, mono or stereo, tail,
   normalisation.

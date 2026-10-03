@@ -1,0 +1,362 @@
+#![allow(clippy::unwrap_used)]
+//! Hosting a real CLAP plugin (built with `clack-plugin`, loaded without a
+//! shared library): parameters, state, activation and processing with
+//! sample-accurate parameter events.
+
+use clack_extensions::params::{
+    ParamDisplayWriter, ParamInfo, ParamInfoFlags, ParamInfoWriter, PluginAudioProcessorParams,
+    PluginMainThreadParams, PluginParams,
+};
+use clack_extensions::state::{PluginState, PluginStateImpl};
+use clack_plugin::events::spaces::CoreEventSpace;
+use clack_plugin::prelude::*;
+use clack_plugin::stream::{InputStream, OutputStream};
+use faderframe_audio_graph::{AudioBuffer, NodeIo};
+use faderframe_automation::ParameterEvent;
+use faderframe_core::{ChannelLayout, ParameterId, db_to_gain};
+use faderframe_plugin_clap::ClapFactory;
+use faderframe_plugin_clap::scan::ScannedPlugin;
+use faderframe_plugin_host::{PluginFactory, PluginProcessContext, ProcessConfig};
+use std::ffi::CStr;
+use std::io::{Read, Write as _};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// --- the test plugin -------------------------------------------------------------
+
+struct TestGain;
+
+pub struct GainShared {
+    gain_db: AtomicU64,
+}
+
+impl GainShared {
+    fn get(&self) -> f64 {
+        f64::from_bits(self.gain_db.load(Ordering::Relaxed))
+    }
+    fn set(&self, v: f64) {
+        self.gain_db
+            .store(v.clamp(-60.0, 12.0).to_bits(), Ordering::Relaxed);
+    }
+    fn apply(&self, events: &InputEvents) {
+        for e in events {
+            if let Some(CoreEventSpace::ParamValue(p)) = e.as_core_event() {
+                self.set(p.value());
+            }
+        }
+    }
+}
+
+impl PluginShared<'_> for GainShared {}
+
+pub struct GainMain<'a> {
+    shared: &'a GainShared,
+}
+
+impl<'a> PluginMainThread<'a, GainShared> for GainMain<'a> {}
+
+impl PluginMainThreadParams for GainMain<'_> {
+    fn count(&self) -> u32 {
+        1
+    }
+
+    fn get_info(&self, index: u32, info: &mut ParamInfoWriter) {
+        if index == 0 {
+            info.set(&ParamInfo {
+                id: ClapId::new(0),
+                flags: ParamInfoFlags::IS_AUTOMATABLE,
+                cookie: Default::default(),
+                name: b"Gain",
+                module: b"",
+                min_value: -60.0,
+                max_value: 12.0,
+                default_value: 0.0,
+            });
+        }
+    }
+
+    fn get_value(&self, id: ClapId) -> Option<f64> {
+        (id == ClapId::new(0)).then(|| self.shared.get())
+    }
+
+    fn value_to_text(
+        &self,
+        _id: ClapId,
+        value: f64,
+        writer: &mut ParamDisplayWriter,
+    ) -> std::fmt::Result {
+        std::fmt::Write::write_fmt(writer, format_args!("{value:.1} dB"))
+    }
+
+    fn text_to_value(&self, _id: ClapId, text: &CStr) -> Option<f64> {
+        text.to_str().ok()?.trim_end_matches(" dB").parse().ok()
+    }
+
+    fn flush(&self, input: &InputEvents, _output: &mut OutputEvents) {
+        self.shared.apply(input);
+    }
+}
+
+impl PluginStateImpl for GainMain<'_> {
+    fn save(&self, output: &mut OutputStream) -> Result<(), PluginError> {
+        output.write_all(&self.shared.get().to_le_bytes())?;
+        Ok(())
+    }
+
+    fn load(&self, input: &mut InputStream) -> Result<(), PluginError> {
+        let mut b = [0u8; 8];
+        input.read_exact(&mut b)?;
+        self.shared.set(f64::from_le_bytes(b));
+        Ok(())
+    }
+}
+
+pub struct GainProcessor<'a> {
+    shared: &'a GainShared,
+}
+
+impl<'a> PluginAudioProcessor<'a, GainShared, GainMain<'a>> for GainProcessor<'a> {
+    fn activate(
+        _host: HostAudioProcessorHandle<'a>,
+        _main: &GainMain<'a>,
+        shared: &'a GainShared,
+        _config: PluginAudioConfiguration,
+    ) -> Result<Self, PluginError> {
+        Ok(Self { shared })
+    }
+
+    fn process(
+        &mut self,
+        _process: Process,
+        mut audio: Audio,
+        events: Events,
+    ) -> Result<ProcessStatus, PluginError> {
+        self.shared.apply(events.input);
+        let gain = db_to_gain(self.shared.get() as f32);
+        let mut port = audio.port_pair(0).ok_or(PluginError::Message("no port"))?;
+        let mut channels = port
+            .channels()?
+            .into_f32()
+            .ok_or(PluginError::Message("not f32"))?;
+        for pair in channels.iter_mut() {
+            match pair {
+                ChannelPair::InputOutput(i, o) => {
+                    for (o, i) in o.iter_mut().zip(i.iter()) {
+                        *o = *i * gain;
+                    }
+                }
+                ChannelPair::InPlace(b) => {
+                    for s in b.iter_mut() {
+                        *s *= gain;
+                    }
+                }
+                ChannelPair::OutputOnly(o) => o.fill(0.0),
+                ChannelPair::InputOnly(_) => {}
+            }
+        }
+        Ok(ProcessStatus::Continue)
+    }
+}
+
+impl PluginAudioProcessorParams for GainProcessor<'_> {
+    fn flush(&mut self, input: &InputEvents, _output: &mut OutputEvents) {
+        self.shared.apply(input);
+    }
+}
+
+impl Plugin for TestGain {
+    type AudioProcessor<'a> = GainProcessor<'a>;
+    type Shared<'a> = GainShared;
+    type MainThread<'a> = GainMain<'a>;
+
+    fn declare_extensions(builder: &mut PluginExtensions<Self>, _shared: Option<&GainShared>) {
+        builder.register::<PluginParams>().register::<PluginState>();
+    }
+}
+
+impl DefaultPluginFactory for TestGain {
+    fn get_descriptor() -> PluginDescriptor {
+        use clack_plugin::plugin::features::*;
+        PluginDescriptor::new("org.faderframe.test-gain", "Test Gain")
+            .with_features([AUDIO_EFFECT, STEREO])
+    }
+
+    fn new_shared(_host: HostSharedHandle<'_>) -> Result<GainShared, PluginError> {
+        Ok(GainShared {
+            gain_db: AtomicU64::new(0f64.to_bits()),
+        })
+    }
+
+    fn new_main_thread<'a>(
+        _host: HostMainThreadHandle<'a>,
+        shared: &'a GainShared,
+    ) -> Result<GainMain<'a>, PluginError> {
+        Ok(GainMain { shared })
+    }
+}
+
+// --- the tests --------------------------------------------------------------------------
+
+const BUNDLE: &CStr = c"/faderframe-test/test-gain.clap";
+
+fn factory() -> ClapFactory {
+    let entry =
+        clack_host::prelude::PluginEntry::load_from_clack::<SinglePluginEntry<TestGain>>(BUNDLE)
+            .unwrap();
+    faderframe_plugin_clap::set_catalog(vec![ScannedPlugin {
+        id: "org.faderframe.test-gain".into(),
+        name: "Test Gain".into(),
+        vendor: "FaderFrame".into(),
+        version: "1".into(),
+        features: vec!["audio-effect".into(), "stereo".into()],
+        bundle: BUNDLE.to_str().unwrap().into(),
+        audio_inputs: vec![2],
+        audio_outputs: vec![2],
+        note_inputs: 0,
+        note_outputs: 0,
+    }]);
+    ClapFactory::new().with_entry(BUNDLE.to_str().unwrap().into(), entry)
+}
+
+fn run_block(
+    proc: &mut dyn faderframe_plugin_host::PluginProcessor,
+    events: &[ParameterEvent],
+    frames: usize,
+) -> Vec<f32> {
+    let mut input = AudioBuffer::new(ChannelLayout::Stereo, frames);
+    input.set_len(frames);
+    for c in 0..2 {
+        input.channel_mut(c).fill(0.5);
+    }
+    let mut output = AudioBuffer::new(ChannelLayout::Stereo, frames);
+    output.set_len(frames);
+    let inputs = [input];
+    let mut outputs = [output];
+    let mut io = NodeIo {
+        frames,
+        audio_in: &inputs,
+        audio_out: &mut outputs,
+        events_in: &[],
+        events_out: &mut [],
+    };
+    let transport = faderframe_transport::TransportInfo::default();
+    let ctx = PluginProcessContext {
+        transport: &transport,
+        param_events: events,
+    };
+    let status = proc.process(&ctx, &mut io);
+    assert_ne!(status, faderframe_plugin_host::ProcessStatus::Error);
+    outputs[0].channel(0).to_vec()
+}
+
+#[test]
+fn parameters_state_and_processing() {
+    let f = factory();
+    assert_eq!(f.scan().len(), 1);
+    let mut inst = f.instantiate("org.faderframe.test-gain").unwrap();
+    let params = inst.parameters().to_vec();
+    assert_eq!(params.len(), 1);
+    assert_eq!(params[0].name, "Gain");
+    assert!(params[0].automatable);
+    assert_eq!((params[0].min, params[0].max), (-60.0, 12.0));
+
+    // Inactive: parameter changes are flushed.
+    inst.set_parameter(ParameterId(0), -6.0).unwrap();
+    assert_eq!(inst.parameter(ParameterId(0)), Some(-6.0));
+
+    // State round trip into a second instance.
+    let state = inst.save_state().unwrap();
+    let mut other = f.instantiate("org.faderframe.test-gain").unwrap();
+    other.load_state(&state).unwrap();
+    assert_eq!(other.parameter(ParameterId(0)), Some(-6.0));
+
+    // Processing: the parameter value, then an automation event.
+    let config = ProcessConfig {
+        sample_rate: 48_000.0,
+        max_block_size: 256,
+    };
+    let mut proc = inst.create_processor(&config).unwrap();
+    let out = run_block(proc.as_mut(), &[], 256);
+    assert!(
+        (out[100] - 0.5 * db_to_gain(-6.0)).abs() < 1e-5,
+        "{}",
+        out[100]
+    );
+    let ev = [ParameterEvent {
+        parameter: ParameterId(0),
+        value: -20.0,
+        sample_offset: 0,
+    }];
+    let out = run_block(proc.as_mut(), &ev, 256);
+    assert!(
+        (out[100] - 0.5 * db_to_gain(-20.0)).abs() < 1e-5,
+        "{}",
+        out[100]
+    );
+
+    // A second processor handle shares the live plugin (graph rebuilds).
+    let mut again = inst.create_processor(&config).unwrap();
+    let out = run_block(again.as_mut(), &[], 128);
+    assert!((out[10] - 0.5 * db_to_gain(-20.0)).abs() < 1e-5);
+
+    // Parameter changes from the UI while active reach the processor.
+    inst.set_parameter(ParameterId(0), 0.0).unwrap();
+    let out = run_block(proc.as_mut(), &[], 64);
+    assert!((out[10] - 0.5).abs() < 1e-5, "{}", out[10]);
+
+    // A new configuration re-activates; old handles go silent, safely.
+    let mut fresh = inst
+        .create_processor(&ProcessConfig {
+            sample_rate: 96_000.0,
+            max_block_size: 512,
+        })
+        .unwrap();
+    let out = run_block(proc.as_mut(), &[], 64);
+    assert!(out.iter().all(|v| *v == 0.0), "stale handle is silent");
+    let out = run_block(fresh.as_mut(), &[], 512);
+    assert!((out[300] - 0.5).abs() < 1e-5);
+    drop(inst);
+    let out = run_block(fresh.as_mut(), &[], 64);
+    assert!(
+        out.iter().all(|v| *v == 0.0),
+        "after the instance is gone the node is silent"
+    );
+}
+
+/// Host a real installed plugin end to end (opt-in):
+/// `FADERFRAME_TEST_CLAP=~/.clap/Vendor/Plugin.clap cargo test -p faderframe-plugin-clap -- --ignored`
+#[test]
+#[ignore = "needs FADERFRAME_TEST_CLAP pointing at an installed CLAP bundle"]
+fn hosts_an_installed_plugin() {
+    let Some(bundle) = std::env::var_os("FADERFRAME_TEST_CLAP") else {
+        return;
+    };
+    let bundle = std::path::PathBuf::from(bundle);
+    let plugins = faderframe_plugin_clap::scan::describe_bundle(&bundle).unwrap();
+    assert!(!plugins.is_empty());
+    faderframe_plugin_clap::set_catalog(plugins.clone());
+    let f = ClapFactory::new();
+    for p in plugins.iter().filter(|p| !p.is_instrument()) {
+        let mut inst = f.instantiate(&p.id).unwrap();
+        eprintln!(
+            "{}: {} parameters, latency {}",
+            p.name,
+            inst.parameters().len(),
+            inst.latency_samples()
+        );
+        let state = inst.save_state().unwrap();
+        inst.load_state(&state).unwrap();
+        let mut proc = inst
+            .create_processor(&ProcessConfig {
+                sample_rate: 48_000.0,
+                max_block_size: 512,
+            })
+            .unwrap();
+        let mut peak = 0.0f32;
+        for _ in 0..50 {
+            let out = run_block(proc.as_mut(), &[], 512);
+            peak = out.iter().fold(peak, |m, v| m.max(v.abs()));
+            assert!(out.iter().all(|v| v.is_finite()));
+        }
+        eprintln!("{}: output peak {peak} for a 0.5 DC input", p.name);
+    }
+}

@@ -17,6 +17,9 @@ mod dialogs;
 pub mod dock;
 pub mod painter;
 mod placeholder;
+mod plugin_browser;
+mod plugin_window;
+mod plugins;
 mod preferences;
 pub mod prefs;
 mod recording;
@@ -116,6 +119,7 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
         gtk::prelude::WidgetExt::display(&window).type_().name()
     );
     state.start_audio();
+    *state.plugin_scan.borrow_mut() = Some(plugins::scan_in_background());
     if let Some(e) = error {
         state.report(faderframe_session::SessionError::Other(e), true);
     }
@@ -152,13 +156,18 @@ fn run_startup_actions(app: gtk::Application, steps: Vec<String>, i: usize, dela
                 return;
             }
             tracing::info!("startup action: {step}");
-            app.activate_action(step, None);
+            // `name:argument` passes a string parameter.
+            match step.split_once(':') {
+                Some((name, arg)) => app.activate_action(name, Some(&arg.to_variant())),
+                None => app.activate_action(step, None),
+            }
         }
     });
 }
 
 /// Run the application; returns the process exit code.
 pub fn run(options: RunOptions) -> glib::ExitCode {
+    plugins::install();
     let app = gtk::Application::builder()
         .application_id(APP_ID)
         .flags(gio::ApplicationFlags::NON_UNIQUE)

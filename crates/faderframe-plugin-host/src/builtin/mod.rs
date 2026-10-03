@@ -141,7 +141,7 @@ impl PluginInstance for BuiltinInstance {
         self.params.infos()
     }
 
-    fn parameter(&self, id: ParameterId) -> Option<f64> {
+    fn parameter(&mut self, id: ParameterId) -> Option<f64> {
         self.params.get_by_id(id)
     }
 
@@ -165,7 +165,7 @@ impl PluginInstance for BuiltinInstance {
         }
     }
 
-    fn save_state(&self) -> Result<Vec<u8>, PluginError> {
+    fn save_state(&mut self) -> Result<Vec<u8>, PluginError> {
         Ok(self.params.save())
     }
 

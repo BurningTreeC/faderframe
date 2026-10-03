@@ -4,7 +4,8 @@
 use gtk::prelude::*;
 use std::path::Path;
 
-pub fn window_to_png(window: &gtk::ApplicationWindow, path: &Path) -> Result<(), String> {
+pub fn window_to_png(window: &impl IsA<gtk::Window>, path: &Path) -> Result<(), String> {
+    let window = window.upcast_ref::<gtk::Window>();
     let (w, h) = (window.width(), window.height());
     if w <= 0 || h <= 0 {
         return Err("the window has no size yet".into());

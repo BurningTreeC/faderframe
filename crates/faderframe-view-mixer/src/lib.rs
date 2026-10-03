@@ -19,10 +19,9 @@ pub use layout::{INSERT_SLOTS, MAX_SEND_ROWS, SENDS_PER_ROW, StripLayout};
 
 use faderframe_core::gain::{SILENCE_DB, format_db};
 use faderframe_core::pan::format_pan;
-use faderframe_core::{ChannelLayout, FaderLaw, TrackId, builtin};
+use faderframe_core::{FaderLaw, TrackId};
 use faderframe_project::{
-    Command, InputRouting, MonitorMode, OutputRouting, PluginRef, SendTap, Track, TrackColor,
-    TrackKind,
+    Command, InputRouting, MonitorMode, OutputRouting, SendTap, Track, TrackColor, TrackKind,
 };
 use faderframe_session::{Action, MeterDisplay, SelectMode, Session};
 use faderframe_ui_canvas::controls::{self, FaderGeometry, KnobLook, MeterLevel};
@@ -119,13 +118,6 @@ fn kind_tag(kind: TrackKind) -> &'static str {
         TrackKind::Master => "MAIN",
     }
 }
-
-/// Built-in effects offered for insert slots.
-const EFFECTS: [(&str, &str); 3] = [
-    (builtin::ECHO, "FaderFrame Echo"),
-    (builtin::GAIN, "FaderFrame Gain"),
-    (builtin::LATENCY_PROBE, "Latency Probe"),
-];
 
 fn parse_db(text: &str) -> Option<f32> {
     let t = text.trim().trim_end_matches("dB").trim();
@@ -602,62 +594,18 @@ impl MixerView {
     }
 
     fn input_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
-        // Choosing an input also chooses the track format: a mono input
-        // records (and processes) mono, a pair records stereo.
-        let set = |input: InputRouting, layout: ChannelLayout| {
-            let mut commands = Vec::new();
-            if layout != t.layout {
-                commands.push(Command::SetTrackLayout {
-                    track: t.id,
-                    layout,
-                });
-            }
-            commands.push(Command::SetTrackInput { track: t.id, input });
-            Action::Edit(Command::Batch {
-                label: "Change Input".into(),
-                commands,
+        let mut items: Vec<MenuItem<Action>> = model
+            .input_choices(t.id)
+            .into_iter()
+            .map(|c| {
+                let item = MenuItem::new(c.label, c.action).checked(c.checked);
+                if c.group_start {
+                    item.separated()
+                } else {
+                    item
+                }
             })
-        };
-        let inputs = model.stream_info().map_or(8, |i| i.input_channels).max(2);
-        let mut items = vec![
-            MenuItem::new(
-                "No input",
-                Action::Edit(Command::SetTrackInput {
-                    track: t.id,
-                    input: InputRouting::None,
-                }),
-            )
-            .checked(t.input == InputRouting::None),
-        ];
-        let stereo = t.layout.channel_count() >= 2;
-        for first in 0..inputs {
-            let input = InputRouting::Hardware {
-                first_channel: first,
-            };
-            let mut item = MenuItem::new(
-                format!("Mono · In {}", first + 1),
-                set(input, ChannelLayout::Mono),
-            )
-            .checked(!stereo && t.input == input);
-            if first == 0 {
-                item = item.separated();
-            }
-            items.push(item);
-        }
-        for first in (0..inputs.saturating_sub(1)).step_by(2) {
-            let input = InputRouting::Hardware {
-                first_channel: first,
-            };
-            let mut item = MenuItem::new(
-                format!("Stereo · In {}–{}", first + 1, first + 2),
-                set(input, ChannelLayout::Stereo),
-            )
-            .checked(stereo && t.input == input);
-            if first == 0 {
-                item = item.separated();
-            }
-            items.push(item);
-        }
+            .collect();
         items.push(
             MenuItem::new(
                 "Monitor: tape-style (auto)",
@@ -677,6 +625,29 @@ impl MixerView {
         match t.inserts.get(slot) {
             Some(s) => {
                 items.push(MenuItem::disabled(s.plugin.name.clone()));
+                let builtin = s.plugin.format == faderframe_project::PluginFormat::Builtin;
+                items.push(MenuItem::new(
+                    if builtin {
+                        "Show Editor"
+                    } else {
+                        "Show Plugin GUI"
+                    },
+                    Action::OpenPluginEditor {
+                        track: t.id,
+                        plugin: s.id,
+                        generic: false,
+                    },
+                ));
+                if !builtin {
+                    items.push(MenuItem::new(
+                        "Show Parameters",
+                        Action::OpenPluginEditor {
+                            track: t.id,
+                            plugin: s.id,
+                            generic: true,
+                        },
+                    ));
+                }
                 items.push(
                     MenuItem::new(
                         if s.bypass { "Enable" } else { "Bypass" },
@@ -697,18 +668,58 @@ impl MixerView {
                 ));
             }
             None => {
-                let _ = model;
-                for (id, name) in EFFECTS {
-                    items.push(MenuItem::new(
-                        format!("Insert {name}"),
+                items.push(MenuItem::new(
+                    "Browse Plugins…",
+                    Action::OpenPluginBrowser {
+                        track: t.id,
+                        target: faderframe_session::PluginTarget::Insert(slot.min(t.inserts.len())),
+                    },
+                ));
+                // Every effect: built-ins first, then hosted plugins by vendor.
+                let mut effects: Vec<_> = model
+                    .available_plugins()
+                    .into_iter()
+                    .filter(|p| !p.instrument)
+                    .collect();
+                effects.sort_by(|a, b| {
+                    let builtin = |p: &faderframe_session::AvailablePlugin| {
+                        p.plugin.format != faderframe_project::PluginFormat::Builtin
+                    };
+                    (
+                        builtin(a),
+                        a.vendor.to_lowercase(),
+                        a.plugin.name.to_lowercase(),
+                    )
+                        .cmp(&(
+                            builtin(b),
+                            b.vendor.to_lowercase(),
+                            b.plugin.name.to_lowercase(),
+                        ))
+                });
+                let mut last_vendor = None;
+                for p in effects {
+                    let label = if p.plugin.format == faderframe_project::PluginFormat::Builtin {
+                        format!("Insert {}", p.plugin.name)
+                    } else {
+                        format!("{} · {}", p.vendor, p.plugin.name)
+                    };
+                    let mut item = MenuItem::new(
+                        label,
                         Action::InsertPlugin {
                             track: t.id,
                             index: slot,
-                            plugin: PluginRef::builtin(id, name),
+                            plugin: p.plugin.clone(),
                         },
-                    ));
+                    );
+                    if last_vendor.as_ref() != Some(&p.vendor) {
+                        item = item.separated();
+                    }
+                    last_vendor = Some(p.vendor.clone());
+                    items.push(item);
                 }
-                items.push(MenuItem::disabled("CLAP / VST3 hosting: coming next").separated());
+                if items.is_empty() {
+                    items.push(MenuItem::disabled("No effect plugins found"));
+                }
             }
         }
         HostRequest::ContextMenu { at, items }
@@ -998,7 +1009,27 @@ impl MixerView {
             }
             Hit::Insert(id, slot) => {
                 if let Some(t) = Self::track(model, id) {
-                    cx.request(Self::insert_menu(model, t, slot, pos));
+                    if slot >= t.inserts.len() {
+                        // Empty slot: the plugin browser.
+                        cx.emit(Action::OpenPluginBrowser {
+                            track: id,
+                            target: faderframe_session::PluginTarget::Insert(t.inserts.len()),
+                        });
+                    } else if mods.toggle() {
+                        // Ctrl/Cmd-click: bypass toggle.
+                        let s = &t.inserts[slot];
+                        cx.emit(Action::Edit(Command::SetPluginBypass {
+                            track: id,
+                            plugin: s.id,
+                            bypass: !s.bypass,
+                        }));
+                    } else {
+                        cx.emit(Action::OpenPluginEditor {
+                            track: id,
+                            plugin: t.inserts[slot].id,
+                            generic: false,
+                        });
+                    }
                 }
             }
             Hit::Level(id) => {
@@ -1104,7 +1135,14 @@ impl MixerView {
                 "Next sends"
             }
             .into(),
-            Hit::Insert(_, _) => "Insert slot · Click to add or manage".into(),
+            Hit::Insert(id, i) => {
+                if Self::track(model, id).is_some_and(|t| i < t.inserts.len()) {
+                    "Insert · Click: editor · Ctrl-click: bypass · Right-click: more".into()
+                } else {
+                    "Empty insert · Click to open the plugin browser · Right-click for a quick list"
+                        .into()
+                }
+            }
             Hit::Mute(id) => format!("Mute {}", name(id)),
             Hit::Solo(id) => format!("Solo {}", name(id)),
             Hit::Record(id) => format!("Record-arm {}", name(id)),
