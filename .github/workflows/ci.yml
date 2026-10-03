@@ -16,7 +16,7 @@ jobs:
     name: fmt · clippy · test
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: System dependencies
         run: |
           sudo apt-get update
@@ -32,6 +32,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests
         run: cargo test --workspace
+      - name: Build application
+        run: cargo build -p faderframe-app
       - name: GUI smoke test (headless X11)
         env:
           FADERFRAME_STARTUP_ACTIONS: detach-mixer,show-piano-roll,workspace-3,quit
@@ -43,7 +45,7 @@ jobs:
     name: cargo-deny
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses bans sources
