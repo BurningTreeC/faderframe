@@ -24,6 +24,7 @@ mod plugin_window;
 mod plugins;
 mod preferences;
 pub mod prefs;
+mod recent;
 mod recording;
 mod render;
 mod screenshot;
@@ -46,32 +47,86 @@ use std::time::Duration;
 
 pub const APP_ID: &str = "io.github.BurningTreeC.FaderFrame";
 
-fn build_session(options: &RunOptions) -> (Session, Option<String>) {
+/// What to start with: a project file, a new empty project or the demo.
+enum Start {
+    Open(std::path::PathBuf),
+    New,
+    Demo,
+}
+
+/// The command line first (`PROJECT`, `--empty`, `--demo`), then the
+/// start-up preference; the last project falls back to the demo session on
+/// a first start and to a new project when its file is gone.
+fn start_choice(
+    options: &RunOptions,
+    prefs: &prefs::Preferences,
+) -> (Start, Option<std::path::PathBuf>) {
+    use recent::StartupProject as S;
+    if let Some(p) = &options.project {
+        return (Start::Open(p.clone()), None);
+    }
+    if options.empty {
+        return (Start::New, None);
+    }
+    if options.demo {
+        return (Start::Demo, None);
+    }
+    match S::from_id(&prefs.startup_project).unwrap_or_default() {
+        S::New => (Start::New, None),
+        S::Demo => (Start::Demo, None),
+        S::Last => match recent::startup_path(prefs) {
+            Some(p) if p.exists() => (Start::Open(p), None),
+            // The last project is gone.
+            Some(p) => (Start::New, Some(p)),
+            None => (Start::Demo, None),
+        },
+    }
+}
+
+fn build_session(options: &RunOptions, prefs: &prefs::Preferences) -> (Session, Option<String>) {
     let config = EngineConfig {
         sample_rate: options.sample_rate.unwrap_or(48_000),
         ..EngineConfig::default()
     };
+    let (start, gone) = start_choice(options, prefs);
+    let mut error = None;
+    match &start {
+        Start::Open(p) => tracing::info!("start-up: opening {}", p.display()),
+        Start::New => tracing::info!("start-up: a new project"),
+        Start::Demo => tracing::info!("start-up: the demo session"),
+    }
     let make = || -> Result<Session, faderframe_session::SessionError> {
-        if options.empty {
-            let mut s = Session::new(Project::new("Untitled", config.sample_rate), None, config)?;
-            s.new_project(false)?;
-            Ok(s)
-        } else {
-            Session::demo(config)
+        match start {
+            Start::Demo => Session::demo(config),
+            Start::New | Start::Open(_) => {
+                let mut s =
+                    Session::new(Project::new("Untitled", config.sample_rate), None, config)?;
+                s.new_project(false)?;
+                Ok(s)
+            }
         }
     };
     let mut session = match make() {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!("cannot create the demo session: {e}");
+            tracing::error!("cannot create the session: {e}");
             #[allow(clippy::expect_used)]
             let s = Session::new(Project::new("Untitled", config.sample_rate), None, config)
                 .expect("an empty session can always be created");
             s
         }
     };
-    let mut error = None;
-    if let Some(path) = &options.project
+    if let Some(p) = gone {
+        session.notify(
+            faderframe_session::NoticeLevel::Warning,
+            format!(
+                "The last project ({}) is gone; started a new one",
+                p.display()
+            ),
+        );
+        recent::forget_path(&p);
+    }
+    if let Start::Open(path) = &start
         && let Err(e) = session.open(path)
     {
         error = Some(format!("Cannot open {}: {e}", path.display()));
@@ -101,7 +156,7 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
     if swept > 0 {
         tracing::info!("removed {swept} stale scratch media folder(s)");
     }
-    let (mut session, error) = build_session(&options);
+    let (mut session, error) = build_session(&options, &prefs);
     session.editor.snap = prefs.snap;
     session.editor.follow_playhead = prefs.follow_playhead;
     if let Err(e) = session.dispatch(faderframe_session::Action::SetRecordSettings(

@@ -245,7 +245,7 @@ fn icon_button(icon: &str, tooltip: &str, action: &str) -> gtk::Button {
     b
 }
 
-pub fn menu_model() -> gio::Menu {
+pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
     let menu = gio::Menu::new();
     let section = |items: &[(&str, &str)]| {
         let s = gio::Menu::new();
@@ -255,14 +255,15 @@ pub fn menu_model() -> gio::Menu {
         s
     };
     let file = gio::Menu::new();
-    file.append_section(
-        None,
-        &section(&[
+    file.append_section(None, &{
+        let s = section(&[
             ("New Project", "app.new"),
             ("New Demo Session", "app.new-demo"),
             ("Open…", "app.open"),
-        ]),
-    );
+        ]);
+        s.append_submenu(Some("Open Recent"), recent);
+        s
+    });
     file.append_section(
         None,
         &section(&[("Save", "app.save"), ("Save As…", "app.save-as")]),
@@ -474,7 +475,7 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
         .build();
 
     let header = gtk::HeaderBar::new();
-    let menubar = gtk::PopoverMenuBar::from_model(Some(&menu_model()));
+    let menubar = gtk::PopoverMenuBar::from_model(Some(&menu_model(&app.recent_menu)));
     header.pack_start(&menubar);
 
     let transport = gtk::Box::new(gtk::Orientation::Horizontal, 4);

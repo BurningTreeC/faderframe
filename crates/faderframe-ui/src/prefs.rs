@@ -18,6 +18,10 @@ pub struct Preferences {
     pub threads: Option<u16>,
     /// The edit toolbar is shown.
     pub show_edit_toolbar: bool,
+    /// What a new start opens: "last", "new" or "demo".
+    pub startup_project: String,
+    /// Recently used projects, most recent first (absolute paths).
+    pub recent_projects: Vec<String>,
     pub snap: bool,
     pub follow_playhead: bool,
     /// "takes" or "replace".
@@ -54,6 +58,8 @@ impl Default for Preferences {
             buffer_size: None,
             threads: None,
             show_edit_toolbar: false,
+            startup_project: crate::recent::StartupProject::default().id().into(),
+            recent_projects: Vec::new(),
             snap: true,
             follow_playhead: true,
             record_mode: RecordMode::default().id().into(),

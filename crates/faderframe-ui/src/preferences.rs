@@ -243,6 +243,59 @@ fn audio_page(app: &Rc<AppState>, alive: &Rc<std::cell::Cell<bool>>) -> gtk::Wid
     g.upcast()
 }
 
+fn general_page(app: &Rc<AppState>) -> gtk::Widget {
+    use crate::recent::StartupProject;
+    let g = form();
+    let prefs = Preferences::load();
+    let labels: Vec<&str> = StartupProject::ALL.iter().map(|s| s.label()).collect();
+    let startup = gtk::DropDown::from_strings(&labels);
+    let current = StartupProject::from_id(&prefs.startup_project).unwrap_or_default();
+    startup.set_selected(
+        StartupProject::ALL
+            .iter()
+            .position(|s| *s == current)
+            .unwrap_or(0) as u32,
+    );
+    row(&g, 0, "On start-up", &startup);
+    g.attach(
+        &note("A project given on the command line always wins; --empty and --demo choose for one start."),
+        0,
+        1,
+        2,
+        1,
+    );
+    let recent = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    let count = gtk::Label::new(Some(&format!(
+        "{} remembered (File → Open Recent)",
+        prefs.recent_projects.len()
+    )));
+    count.set_xalign(0.0);
+    count.set_hexpand(true);
+    let clear = gtk::Button::with_label("Clear");
+    clear.set_sensitive(!prefs.recent_projects.is_empty());
+    recent.append(&count);
+    recent.append(&clear);
+    row(&g, 2, "Recent projects", &recent);
+    startup.connect_selected_notify(|d| {
+        let mut p = Preferences::load();
+        let choice =
+            StartupProject::ALL[(d.selected() as usize).min(StartupProject::ALL.len() - 1)];
+        p.startup_project = choice.id().into();
+        if let Err(e) = p.save() {
+            tracing::warn!("cannot save preferences: {e}");
+        }
+    });
+    let weak = Rc::downgrade(app);
+    clear.connect_clicked(move |b| {
+        if let Some(app) = weak.upgrade() {
+            crate::recent::clear(&app);
+            count.set_text("0 remembered (File → Open Recent)");
+            b.set_sensitive(false);
+        }
+    });
+    g.upcast()
+}
+
 fn editing_page(app: &Rc<AppState>) -> gtk::Widget {
     let g = form();
     let ed = app.session.borrow().editor;
@@ -402,6 +455,7 @@ pub fn open(app: &Rc<AppState>, page: Option<&str>) {
     // Size by the visible page only (hidden pages are not measured).
     stack.set_hhomogeneous(false);
     stack.set_vhomogeneous(false);
+    stack.add_titled(&general_page(app), Some("general"), "General");
     stack.add_titled(&audio_page(app, &alive), Some("audio"), "Audio");
     stack.add_titled(&editing_page(app), Some("editing"), "Editing");
     stack.add_titled(

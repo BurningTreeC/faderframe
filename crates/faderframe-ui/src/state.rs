@@ -6,8 +6,8 @@ use crate::window::Chrome;
 use faderframe_audio::AudioBackend;
 use faderframe_session::{Action, AudioPreferences, NoticeLevel, Session, SessionError};
 use faderframe_ui_canvas::Theme;
-use gtk::glib;
 use gtk::prelude::*;
+use gtk::{gio, glib};
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -57,7 +57,10 @@ impl BackendChoice {
 pub struct RunOptions {
     pub backend: BackendChoice,
     pub project: Option<PathBuf>,
+    /// Start with a new, empty project (`--empty`).
     pub empty: bool,
+    /// Start with the demo session (`--demo`).
+    pub demo: bool,
     pub sample_rate: Option<u32>,
     pub buffer_size: Option<u32>,
     /// Processing threads (audio thread included; `None`: one per core).
@@ -81,6 +84,10 @@ pub struct AppState {
     shown_rev: Cell<u64>,
     last_tick: Cell<Option<Instant>>,
     frame: Cell<u64>,
+    /// File → Open Recent (rebuilt when the list changes).
+    pub recent_menu: gio::Menu,
+    /// The project file the recent list last recorded.
+    pub shown_path: RefCell<Option<PathBuf>>,
     /// Background CLAP scan in progress.
     pub plugin_scan: RefCell<Option<std::sync::mpsc::Receiver<crate::plugins::ScanReport>>>,
 }
@@ -101,6 +108,12 @@ impl AppState {
             last_tick: Cell::new(None),
             frame: Cell::new(0),
             plugin_scan: RefCell::new(None),
+            recent_menu: {
+                let m = gio::Menu::new();
+                crate::recent::rebuild_menu(&m, &crate::prefs::Preferences::load().recent_projects);
+                m
+            },
+            shown_path: RefCell::new(None),
         })
     }
 
@@ -157,6 +170,7 @@ impl AppState {
         }
         self.redraw_all();
         self.update_chrome(true);
+        crate::recent::note_session_path(self);
     }
 
     /// Show an error: always in the status bar, optionally as a dialog.

@@ -17,7 +17,9 @@ OPTIONS:
     --sample-rate <HZ>            Requested sample rate (44100, 48000, 96000, 192000, …)
     --buffer-size <FRAMES>        Requested buffer size (32, 64, 128, 256, 512, …)
     --threads <N>                 Processing threads incl. the audio thread (default: one per core)
-    --empty                       Start with an empty project instead of the demo session
+    --empty                       Start with a new, empty project
+    --demo                        Start with the demo session
+                                  (without these or a PROJECT: Preferences → General → On start-up)
     --import <FILE>               Import an audio file on start-up (repeatable)
     -h, --help                    Show this help
     -V, --version                 Show the version
@@ -72,6 +74,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<RunOptions>, Strin
                 );
             }
             "--empty" => o.empty = true,
+            "--demo" => o.demo = true,
             "--import" => o.import.push(PathBuf::from(value("--import")?)),
             s if s.starts_with('-') => return Err(format!("unknown option '{s}'")),
             path => o.project = Some(PathBuf::from(path)),

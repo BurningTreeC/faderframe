@@ -45,6 +45,7 @@ pub fn install(app: &Rc<AppState>) {
         entry(app, "open", |a| {
             crate::dialogs::confirm_discard(a, crate::dialogs::open_project)
         }),
+        entry(app, "clear-recent", crate::recent::clear),
         entry(app, "import-audio", crate::dialogs::import_audio),
         entry(app, "cancel-import", |a| {
             a.session.borrow().cancel_imports()
@@ -604,6 +605,11 @@ pub fn install(app: &Rc<AppState>) {
                 );
             }
         }),
+        // Development aid: `save-to:<path>` saves the project there.
+        named("save-to", |a, arg| {
+            let path = std::path::PathBuf::from(arg);
+            a.with_session(|s| s.save_as(&path));
+        }),
         named("select-clip", |a, arg| {
             let clip = a
                 .session
@@ -743,6 +749,16 @@ pub fn install(app: &Rc<AppState>) {
         })
         .build();
     app.app.add_action_entries(edit_entries);
+    let weak = Rc::downgrade(app);
+    let open_recent = gio::ActionEntry::builder("open-recent")
+        .parameter_type(Some(&String::static_variant_type()))
+        .activate(move |_, _, param| {
+            if let (Some(a), Some(path)) = (weak.upgrade(), param.and_then(|p| p.get::<String>())) {
+                crate::recent::open(&a, path);
+            }
+        })
+        .build();
+    app.app.add_action_entries([open_recent]);
     app.app.add_action_entries([
         insert,
         midi,

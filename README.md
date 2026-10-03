@@ -134,8 +134,11 @@ hosting, an analogue-console-style mixer and dockable, detachable editors.
 * Render / export to WAV (16/24-bit with TPDF dither, 32-bit float): master
   or stems, project/loop/bar range, any sample rate, mono or stereo, tail,
   normalisation.
-* Preferences (audio system, sample rate, buffer size, live DSP statistics,
-  editing defaults), undo/redo, versioned project files (`.ffproj`).
+* Preferences (start-up project, audio system, sample rate, buffer size,
+  live DSP statistics, editing defaults), undo/redo, versioned project
+  files (`.ffproj`). A new start opens the last project, a new one or the
+  demo session (Preferences → General; `--empty` / `--demo` / a project
+  path override it once); File → Open Recent lists the last ten projects.
 
 ## Building
 
