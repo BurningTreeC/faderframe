@@ -11,12 +11,18 @@
 
 #![forbid(unsafe_code)]
 
+pub mod decode;
 mod generate;
+pub mod import;
 mod peaks;
+pub mod resample;
+pub mod stream;
 pub mod wav;
+pub mod wavstream;
 
 pub use generate::{GeneratorSpec, generate};
-pub use peaks::{PeakCache, PeakLevel};
+pub use peaks::{PeakBuilder, PeakCache, PeakLevel};
+pub use stream::{PAGE_FRAMES, Page, StreamSource};
 pub use wav::{WavData, WavFormat, read_wav, write_wav};
 
 /// Decoded, non-interleaved audio in memory. Immutable once shared, so the

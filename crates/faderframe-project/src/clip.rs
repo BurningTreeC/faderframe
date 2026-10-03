@@ -1,4 +1,4 @@
-use crate::TrackColor;
+use crate::{TakeFolder, TrackColor};
 use faderframe_core::{AudioSourceId, ClipId, NoteId, TrackId};
 use faderframe_timeline::{MusicalTime, Timeline};
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,24 @@ pub struct Clip {
 pub enum ClipContent {
     Audio(AudioClip),
     Midi(MidiClip),
+    /// Several recorded takes and the comp that plays (audio tracks).
+    Takes(TakeFolder),
+}
+
+impl ClipContent {
+    /// Audio sources this content references.
+    pub fn sources(&self) -> Vec<AudioSourceId> {
+        match self {
+            ClipContent::Audio(a) => vec![a.source],
+            ClipContent::Takes(f) => f.sources().collect(),
+            ClipContent::Midi(_) => Vec::new(),
+        }
+    }
+
+    /// Audio material (plain audio or a take folder)?
+    pub fn is_audio(&self) -> bool {
+        !matches!(self, ClipContent::Midi(_))
+    }
 }
 
 /// Audio region referencing part of an audio source.
@@ -142,32 +160,44 @@ impl Clip {
             ClipContent::Audio(a) => {
                 timeline.end_of_sample_span(self.start, a.length, project_rate as f64)
             }
+            ClipContent::Takes(f) => {
+                timeline.end_of_sample_span(self.start, f.length, project_rate as f64)
+            }
             ClipContent::Midi(m) => self.start + m.length,
         }
     }
 
+    /// Plays audio (a plain audio clip or a take folder).
     pub fn is_audio(&self) -> bool {
-        matches!(self.content, ClipContent::Audio(_))
+        self.content.is_audio()
     }
 
     pub fn as_midi(&self) -> Option<&MidiClip> {
         match &self.content {
             ClipContent::Midi(m) => Some(m),
-            ClipContent::Audio(_) => None,
+            _ => None,
         }
     }
 
     pub fn as_midi_mut(&mut self) -> Option<&mut MidiClip> {
         match &mut self.content {
             ClipContent::Midi(m) => Some(m),
-            ClipContent::Audio(_) => None,
+            _ => None,
         }
     }
 
+    /// A plain audio clip (not a take folder).
     pub fn as_audio(&self) -> Option<&AudioClip> {
         match &self.content {
             ClipContent::Audio(a) => Some(a),
-            ClipContent::Midi(_) => None,
+            _ => None,
+        }
+    }
+
+    pub fn as_takes(&self) -> Option<&TakeFolder> {
+        match &self.content {
+            ClipContent::Takes(f) => Some(f),
+            _ => None,
         }
     }
 }

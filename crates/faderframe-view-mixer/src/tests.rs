@@ -167,3 +167,85 @@ fn numeric_entry_parses_levels() {
     assert_eq!(parse_db("-inf"), Some(SILENCE_DB));
     assert_eq!(parse_db("loud"), None);
 }
+
+#[test]
+fn many_sends_grow_the_send_section_and_page_in_banks() {
+    let mut s = session();
+    let theme = Theme::default();
+    let size = Size::new(1400.0, 1000.0);
+    let source = MixerView::channel_tracks(&s)
+        .iter()
+        .find(|t| t.kind == TrackKind::Audio)
+        .unwrap()
+        .id;
+    let mut auxes = Vec::new();
+    for _ in 0..9 {
+        auxes.push(s.add_track(TrackKind::Aux).unwrap());
+    }
+    // Five sends on one strip: three rows (5 sends + 1 free slot).
+    let existing = s.project().track(source).unwrap().sends.len();
+    for aux in auxes.iter().take(5usize.saturating_sub(existing)) {
+        s.dispatch(Action::AddSend {
+            track: source,
+            target: *aux,
+            level_db: -6.0,
+            tap: SendTap::PostFader,
+        })
+        .unwrap();
+    }
+    let mut view = MixerView::new(theme.clone());
+    view.paint(&mut RecordingPainter::new(), size, &s, &theme);
+    assert_eq!(view.send_rows, 3);
+    let i = MixerView::channel_tracks(&s)
+        .iter()
+        .position(|t| t.id == source)
+        .unwrap();
+    let l = view.layout_for(view.strip_rect(i, size), s.project().track(source).unwrap());
+    let slots = l.sends.clone().unwrap();
+    assert_eq!(slots.len(), 6);
+    assert_eq!(
+        view.hit_test(slots[4].knob.center(), size, &s),
+        Some(Hit::Send(source, 4))
+    );
+    // The free sixth slot offers the remaining auxes, not the used ones.
+    let (_, req) = run(&mut view, down(slots[5].knob.center(), 1), size, &s);
+    let Some(HostRequest::ContextMenu { items, .. }) = req.into_iter().next() else {
+        panic!("add-send menu expected");
+    };
+    let used: Vec<String> = s
+        .project()
+        .track(source)
+        .unwrap()
+        .sends
+        .iter()
+        .map(|x| format!("Send to {}", s.project().track(x.target).unwrap().name))
+        .collect();
+    assert!(items.iter().all(|it| !used.contains(&it.label)));
+    assert!(!items.is_empty());
+
+    // Nine sends need more than one bank of eight.
+    for aux in &auxes[5..] {
+        s.dispatch(Action::AddSend {
+            track: source,
+            target: *aux,
+            level_db: -6.0,
+            tap: SendTap::PostFader,
+        })
+        .unwrap();
+    }
+    view.paint(&mut RecordingPainter::new(), size, &s, &theme);
+    assert_eq!(view.send_rows, MAX_SEND_ROWS);
+    let l = view.layout_for(view.strip_rect(i, size), s.project().track(source).unwrap());
+    let next = l.send_next.unwrap();
+    assert_eq!(
+        view.hit_test(next.center(), size, &s),
+        Some(Hit::SendBank(1))
+    );
+    run(&mut view, down(next.center(), 1), size, &s);
+    assert_eq!(view.send_bank, 1);
+    let slots = l.sends.unwrap();
+    assert_eq!(
+        view.hit_test(slots[0].knob.center(), size, &s),
+        Some(Hit::Send(source, 8))
+    );
+}

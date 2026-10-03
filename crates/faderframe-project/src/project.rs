@@ -88,6 +88,11 @@ pub struct Project {
     pub loop_range: Option<MusicalRange>,
     #[serde(default)]
     pub loop_enabled: bool,
+    /// Recording only happens inside this range while punch is enabled.
+    #[serde(default)]
+    pub punch_range: Option<MusicalRange>,
+    #[serde(default)]
+    pub punch_enabled: bool,
     /// Display order. Contains exactly one [`TrackKind::Master`].
     pub tracks: Vec<Track>,
     #[serde(default)]
@@ -116,6 +121,8 @@ impl Project {
             markers: Vec::new(),
             loop_range: None,
             loop_enabled: false,
+            punch_range: None,
+            punch_enabled: false,
             tracks: vec![master],
             clips: BTreeMap::new(),
             sources: BTreeMap::new(),

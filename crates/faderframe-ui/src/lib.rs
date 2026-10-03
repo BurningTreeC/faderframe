@@ -19,7 +19,9 @@ pub mod painter;
 mod placeholder;
 mod preferences;
 pub mod prefs;
+mod recording;
 mod render;
+mod screenshot;
 pub mod state;
 mod style;
 mod transport_display;
@@ -69,6 +71,15 @@ fn build_session(options: &RunOptions) -> (Session, Option<String>) {
     {
         error = Some(format!("Cannot open {}: {e}", path.display()));
     }
+    if !options.import.is_empty() {
+        session.import_audio(
+            options.import.clone(),
+            faderframe_session::ImportTarget {
+                track: None,
+                at: faderframe_timeline::MusicalTime::ZERO,
+            },
+        );
+    }
     (session, error)
 }
 
@@ -80,12 +91,22 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
     }
     options.sample_rate = options.sample_rate.or(prefs.sample_rate);
     options.buffer_size = options.buffer_size.or(prefs.buffer_size);
+    let swept = faderframe_session::media::sweep_stale_scratch(Duration::from_secs(7 * 24 * 3600));
+    if swept > 0 {
+        tracing::info!("removed {swept} stale scratch media folder(s)");
+    }
     let (mut session, error) = build_session(&options);
     session.editor.snap = prefs.snap;
     session.editor.follow_playhead = prefs.follow_playhead;
+    if let Err(e) = session.dispatch(faderframe_session::Action::SetRecordSettings(
+        prefs.record_settings(),
+    )) {
+        tracing::warn!("recording settings: {e}");
+    }
     let state = AppState::new(app, session, options);
     let window = window::build(&state);
     actions::install(&state);
+    recording::install_actions(&state);
     actions::install_window_keys(&state, &window);
     dialogs::install_close_guard(&state, &window);
     dock::realize(&state);
@@ -98,16 +119,17 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
     if let Some(e) = error {
         state.report(faderframe_session::SessionError::Other(e), true);
     }
-    // Smoke-testing aid: FADERFRAME_STARTUP_ACTIONS="play,detach-mixer"
-    // activates application actions shortly after start-up.
+    // Smoke-testing aid: FADERFRAME_STARTUP_ACTIONS="play,wait:2000,stop"
+    // activates application actions shortly after start-up, in order;
+    // `wait:<ms>` pauses between them.
     if let Ok(list) = std::env::var("FADERFRAME_STARTUP_ACTIONS") {
-        let app = app.clone();
-        glib::timeout_add_local_once(Duration::from_millis(700), move || {
-            for name in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                tracing::info!("startup action: {name}");
-                app.activate_action(name, None);
-            }
-        });
+        let steps: Vec<String> = list
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        run_startup_actions(app.clone(), steps, 0, 700);
     }
     let weak = Rc::downgrade(&state);
     glib::timeout_add_local(Duration::from_millis(16), move || match weak.upgrade() {
@@ -118,6 +140,21 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
         None => glib::ControlFlow::Break,
     });
     state
+}
+
+fn run_startup_actions(app: gtk::Application, steps: Vec<String>, i: usize, delay_ms: u64) {
+    glib::timeout_add_local_once(Duration::from_millis(delay_ms), move || {
+        let mut i = i;
+        while let Some(step) = steps.get(i) {
+            i += 1;
+            if let Some(ms) = step.strip_prefix("wait:").and_then(|v| v.parse().ok()) {
+                run_startup_actions(app, steps, i, ms);
+                return;
+            }
+            tracing::info!("startup action: {step}");
+            app.activate_action(step, None);
+        }
+    });
 }
 
 /// Run the application; returns the process exit code.

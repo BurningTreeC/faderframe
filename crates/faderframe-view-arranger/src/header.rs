@@ -18,6 +18,8 @@ pub struct HeaderLayout {
     pub solo: Rect,
     pub record: Rect,
     pub monitor: Rect,
+    /// Show/hide the track's automation lanes.
+    pub automation: Rect,
     pub pan: Option<Rect>,
     pub volume: Rect,
     pub volume_text: Rect,
@@ -39,7 +41,7 @@ impl HeaderLayout {
             meter.x - (row.x + STRIPE_W + 8.0) - 8.0,
             row.h - 12.0,
         );
-        let buttons_w = 4.0 * BUTTON_W + 3.0 * GAP;
+        let buttons_w = 5.0 * BUTTON_W + 4.0 * GAP;
         let bx = inner.right() - buttons_w;
         let b = |i: f32| Rect::new(bx + i * (BUTTON_W + GAP), inner.y, BUTTON_W, BUTTON_H);
         let name = Rect::new(inner.x, inner.y, (bx - inner.x - 6.0).max(10.0), 16.0);
@@ -66,6 +68,7 @@ impl HeaderLayout {
             solo: b(1.0),
             record: b(2.0),
             monitor: b(3.0),
+            automation: b(4.0),
             pan,
             volume,
             volume_text,
@@ -87,6 +90,7 @@ mod tests {
             l.solo,
             l.record,
             l.monitor,
+            l.automation,
             l.volume,
             l.volume_text,
             l.meter,

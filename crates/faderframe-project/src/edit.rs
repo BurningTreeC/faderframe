@@ -7,11 +7,16 @@
 //! re-synchronised (parameter values, timeline content, or the whole graph).
 
 use crate::{
-    AuxSend, Clip, ClipContent, ClipFades, InputRouting, Marker, MidiNote, MonitorMode,
-    MusicalRange, OutputRouting, PluginSlot, Project, SendTap, Track, TrackColor, TrackKind,
+    AudioSource, AuxSend, Clip, ClipContent, ClipFades, InputRouting, Marker, MidiNote,
+    MonitorMode, MusicalRange, OutputRouting, PluginSlot, Project, SendTap, Track, TrackColor,
+    TrackKind,
 };
+use faderframe_automation::AutomationLane;
+use faderframe_core::ChannelLayout;
 use faderframe_core::gain::SILENCE_DB;
-use faderframe_core::{ClipId, MarkerId, NoteId, PluginInstanceId, SendId, TrackId};
+use faderframe_core::{
+    AudioSourceId, AutomationLaneId, ClipId, MarkerId, NoteId, PluginInstanceId, SendId, TrackId,
+};
 use faderframe_timeline::{MusicalTime, Timeline};
 
 /// Upper limit for fader and send levels.
@@ -31,6 +36,10 @@ pub enum EditError {
     UnknownNote(NoteId),
     #[error("unknown marker {0}")]
     UnknownMarker(MarkerId),
+    #[error("unknown audio source {0}")]
+    UnknownSource(AudioSourceId),
+    #[error("audio source {0} is still used by clips")]
+    SourceInUse(AudioSourceId),
     #[error("the master track cannot be removed")]
     CannotRemoveMaster,
     #[error("invalid routing: {0}")]
@@ -65,6 +74,8 @@ pub enum CoalesceKey {
     Note(ClipId, NoteId),
     Tempo,
     Loop,
+    Punch,
+    Automation(TrackId, AutomationLaneId),
 }
 
 /// State needed to undo a track removal.
@@ -128,6 +139,11 @@ pub enum Command {
         track: TrackId,
         input: InputRouting,
     },
+    /// Mono/stereo format of a track (what it records and processes).
+    SetTrackLayout {
+        track: TrackId,
+        layout: ChannelLayout,
+    },
     AddSend {
         track: TrackId,
         send: AuxSend,
@@ -187,6 +203,31 @@ pub enum Command {
         index: usize,
     },
 
+    // --- automation --------------------------------------------------------------
+    AddAutomationLane {
+        track: TrackId,
+        lane: Box<AutomationLane>,
+    },
+    RemoveAutomationLane {
+        track: TrackId,
+        lane: AutomationLaneId,
+    },
+    /// Replace a lane (points, mode, target) by id; coalesces while dragging.
+    SetAutomationLane {
+        track: TrackId,
+        lane: Box<AutomationLane>,
+    },
+
+    // --- media -----------------------------------------------------------------
+    /// Register an audio source (e.g. an imported file).
+    AddSource {
+        source: Box<AudioSource>,
+    },
+    /// Unregister an unused audio source (the media file stays on disk).
+    RemoveSource {
+        source: AudioSourceId,
+    },
+
     // --- clips ---------------------------------------------------------------
     AddClip {
         clip: Box<Clip>,
@@ -244,6 +285,10 @@ pub enum Command {
         range: Option<MusicalRange>,
         enabled: bool,
     },
+    SetPunch {
+        range: Option<MusicalRange>,
+        enabled: bool,
+    },
     AddMarker {
         marker: Marker,
     },
@@ -280,7 +325,7 @@ fn clamp_level(db: f32) -> f32 {
 fn check_clip_fits(p: &Project, track: TrackId, content: &ClipContent) -> Result<(), EditError> {
     let t = p.track(track).ok_or(EditError::UnknownTrack(track))?;
     let ok = match content {
-        ClipContent::Audio(_) => t.kind == TrackKind::Audio,
+        ClipContent::Audio(_) | ClipContent::Takes(_) => t.kind == TrackKind::Audio,
         ClipContent::Midi(_) => matches!(t.kind, TrackKind::Instrument | TrackKind::Midi),
     };
     if ok {
@@ -288,15 +333,26 @@ fn check_clip_fits(p: &Project, track: TrackId, content: &ClipContent) -> Result
     } else {
         Err(EditError::Invalid(format!(
             "a {} clip cannot be placed on {} track '{}'",
-            if matches!(content, ClipContent::Audio(_)) {
-                "audio"
-            } else {
-                "MIDI"
-            },
+            if content.is_audio() { "audio" } else { "MIDI" },
             t.kind.label(),
             t.name
         )))
     }
+}
+
+/// Every referenced source must exist; take folders are normalised.
+fn check_sources(p: &Project, content: &mut ClipContent) -> Result<(), EditError> {
+    if let Some(s) = content
+        .sources()
+        .into_iter()
+        .find(|s| !p.sources.contains_key(s))
+    {
+        return Err(EditError::UnknownSource(s));
+    }
+    if let ClipContent::Takes(f) = content {
+        f.normalize();
+    }
+    Ok(())
 }
 
 fn check_output(p: &Project, track: TrackId, output: OutputRouting) -> Result<(), EditError> {
@@ -377,6 +433,7 @@ impl Command {
             SetTrackColor { .. } => "Change Track Colour".into(),
             SetTrackOutput { .. } => "Change Output".into(),
             SetTrackInput { .. } => "Change Input".into(),
+            SetTrackLayout { .. } => "Change Track Format".into(),
             AddSend { .. } => "Add Send".into(),
             RemoveSend { .. } => "Remove Send".into(),
             SetSendLevel { .. } => "Change Send Level".into(),
@@ -389,6 +446,11 @@ impl Command {
             AddTrack { .. } | RestoreTrack(_) => "Add Track".into(),
             RemoveTrack { .. } => "Remove Track".into(),
             MoveTrack { .. } => "Move Track".into(),
+            AddAutomationLane { .. } => "Add Automation Lane".into(),
+            RemoveAutomationLane { .. } => "Remove Automation Lane".into(),
+            SetAutomationLane { .. } => "Edit Automation".into(),
+            AddSource { .. } => "Add Audio".into(),
+            RemoveSource { .. } => "Remove Audio".into(),
             AddClip { .. } => "Add Clip".into(),
             RemoveClip { .. } => "Delete Clip".into(),
             MoveClip { .. } => "Move Clip".into(),
@@ -402,6 +464,7 @@ impl Command {
             SetTempo { .. } => "Change Tempo".into(),
             SetTimeline { .. } => "Change Tempo Map".into(),
             SetLoop { .. } => "Change Loop".into(),
+            SetPunch { .. } => "Change Punch Range".into(),
             AddMarker { .. } => "Add Marker".into(),
             RemoveMarker { .. } => "Remove Marker".into(),
             RenameProject { .. } => "Rename Project".into(),
@@ -419,6 +482,8 @@ impl Command {
             UpdateNote { clip, note } => CoalesceKey::Note(*clip, note.id),
             SetTempo { .. } => CoalesceKey::Tempo,
             SetLoop { .. } => CoalesceKey::Loop,
+            SetPunch { .. } => CoalesceKey::Punch,
+            SetAutomationLane { track, lane } => CoalesceKey::Automation(*track, lane.id),
             _ => return None,
         })
     }
@@ -437,9 +502,15 @@ impl Command {
             | MoveTrack { .. }
             | AddMarker { .. }
             | RemoveMarker { .. }
+            | SetPunch { .. }
             | RenameProject { .. }
             | RenameClip { .. } => Impact::None,
-            AddClip { .. }
+            AddSource { .. }
+            | RemoveSource { .. }
+            | AddAutomationLane { .. }
+            | RemoveAutomationLane { .. }
+            | SetAutomationLane { .. }
+            | AddClip { .. }
             | RemoveClip { .. }
             | MoveClip { .. }
             | SetClipContent { .. }
@@ -455,6 +526,7 @@ impl Command {
             | SetTrackMonitor { .. }
             | SetTrackOutput { .. }
             | SetTrackInput { .. }
+            | SetTrackLayout { .. }
             | AddSend { .. }
             | RemoveSend { .. }
             | SetSendTap { .. }
@@ -546,6 +618,14 @@ impl Command {
             SetTrackInput { track, input } => {
                 let old = std::mem::replace(&mut track_mut(p, track)?.input, input);
                 SetTrackInput { track, input: old }
+            }
+            SetTrackLayout { track, layout } => {
+                let t = track_mut(p, track)?;
+                if t.kind == TrackKind::Master && layout.channel_count() < 2 {
+                    return Err(EditError::Invalid("the master must be stereo".into()));
+                }
+                let old = std::mem::replace(&mut t.layout, layout);
+                SetTrackLayout { track, layout: old }
             }
             AddSend {
                 track,
@@ -766,8 +846,83 @@ impl Command {
                 p.tracks.insert(to, t);
                 MoveTrack { track, index: from }
             }
-            AddClip { clip } => {
+            AddAutomationLane { track, lane } => {
+                let t = track_mut(p, track)?;
+                if t.automation
+                    .lanes
+                    .iter()
+                    .any(|l| l.id == lane.id || l.target == lane.target)
+                {
+                    return Err(EditError::Invalid(
+                        "the track already has this automation lane".into(),
+                    ));
+                }
+                let id = lane.id;
+                t.automation.lanes.push(*lane);
+                RemoveAutomationLane { track, lane: id }
+            }
+            RemoveAutomationLane { track, lane } => {
+                let t = track_mut(p, track)?;
+                let i = t
+                    .automation
+                    .lanes
+                    .iter()
+                    .position(|l| l.id == lane)
+                    .ok_or_else(|| EditError::Invalid(format!("unknown automation lane {lane}")))?;
+                let old = t.automation.lanes.remove(i);
+                AddAutomationLane {
+                    track,
+                    lane: Box::new(old),
+                }
+            }
+            SetAutomationLane { track, lane } => {
+                let t = track_mut(p, track)?;
+                let slot = t
+                    .automation
+                    .lanes
+                    .iter_mut()
+                    .find(|l| l.id == lane.id)
+                    .ok_or_else(|| {
+                        EditError::Invalid(format!("unknown automation lane {}", lane.id))
+                    })?;
+                let old = std::mem::replace(slot, *lane);
+                SetAutomationLane {
+                    track,
+                    lane: Box::new(old),
+                }
+            }
+            AddSource { source } => {
+                if p.sources.contains_key(&source.id) {
+                    return Err(EditError::Invalid(format!(
+                        "duplicate source id {}",
+                        source.id
+                    )));
+                }
+                let id = source.id;
+                p.sources.insert(id, *source);
+                RemoveSource { source: id }
+            }
+            RemoveSource { source } => {
+                if !p.sources.contains_key(&source) {
+                    return Err(EditError::UnknownSource(source));
+                }
+                if p.clips
+                    .values()
+                    .any(|c| c.content.sources().contains(&source))
+                {
+                    return Err(EditError::SourceInUse(source));
+                }
+                let s = p
+                    .sources
+                    .remove(&source)
+                    .ok_or(EditError::UnknownSource(source))?;
+                AddSource {
+                    source: Box::new(s),
+                }
+            }
+            AddClip { mut clip } => {
                 check_clip_fits(p, clip.track, &clip.content)?;
+                check_sources(p, &mut clip.content)?;
                 if p.clips.contains_key(&clip.id) {
                     return Err(EditError::Invalid(format!("duplicate clip id {}", clip.id)));
                 }
@@ -813,6 +968,8 @@ impl Command {
             } => {
                 let track = p.clip(clip).ok_or(EditError::UnknownClip(clip))?.track;
                 check_clip_fits(p, track, &content)?;
+                let mut content = content;
+                check_sources(p, &mut content)?;
                 let c = clip_mut(p, clip)?;
                 let old_start = std::mem::replace(&mut c.start, start);
                 let old = std::mem::replace(&mut c.content, *content);
@@ -883,6 +1040,15 @@ impl Command {
                 let old_enabled =
                     std::mem::replace(&mut p.loop_enabled, enabled && range.is_some());
                 SetLoop {
+                    range: old_range,
+                    enabled: old_enabled,
+                }
+            }
+            SetPunch { range, enabled } => {
+                let old_range = std::mem::replace(&mut p.punch_range, range);
+                let old_enabled =
+                    std::mem::replace(&mut p.punch_enabled, enabled && range.is_some());
+                SetPunch {
                     range: old_range,
                     enabled: old_enabled,
                 }
@@ -976,6 +1142,15 @@ fn split_clip(
                 fade_in: 0,
                 ..r.fades
             };
+        }
+        (ClipContent::Takes(l), ClipContent::Takes(r)) => {
+            let sr = p.sample_rate as f64;
+            let offset = p.timeline.to_samples(at, sr) - p.timeline.to_samples(original.start, sr);
+            let (a, b) = l
+                .split(offset)
+                .ok_or_else(|| EditError::Invalid("split point is outside the clip".into()))?;
+            *l = a;
+            *r = b;
         }
         (ClipContent::Midi(l), ClipContent::Midi(r)) => {
             let rel = at - original.start;

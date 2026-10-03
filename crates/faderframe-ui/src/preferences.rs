@@ -193,8 +193,9 @@ fn audio_page(app: &Rc<AppState>, alive: &Rc<std::cell::Cell<bool>>) -> gtk::Wid
         });
         let m = s.metrics();
         let us = |ns: u64| ns as f64 / 1000.0;
+        let (resident, disk_misses) = s.streaming_stats();
         stats.set_text(&format!(
-            "p50 {:.0} µs · p95 {:.0} µs · p99 {:.0} µs · max {:.0} µs\n{} callbacks · {} deadline misses · {} xruns · budget {:.0} µs",
+            "p50 {:.0} µs · p95 {:.0} µs · p99 {:.0} µs · max {:.0} µs\n{} callbacks · {} deadline misses · {} xruns · budget {:.0} µs\ndisk: {:.1} MiB resident · {} late reads",
             us(m.p50_ns),
             us(m.p95_ns),
             us(m.p99_ns),
@@ -202,7 +203,9 @@ fn audio_page(app: &Rc<AppState>, alive: &Rc<std::cell::Cell<bool>>) -> gtk::Wid
             m.callbacks,
             m.deadline_misses,
             s.stream_status().map_or(0, |st| st.xruns),
-            us(m.last_budget_ns)
+            us(m.last_budget_ns),
+            resident as f64 / (1 << 20) as f64,
+            disk_misses
         ));
         glib::ControlFlow::Continue
     };
@@ -369,6 +372,11 @@ pub fn open(app: &Rc<AppState>, page: Option<&str>) {
     stack.set_transition_type(gtk::StackTransitionType::Crossfade);
     stack.add_titled(&audio_page(app, &alive), Some("audio"), "Audio");
     stack.add_titled(&editing_page(app), Some("editing"), "Editing");
+    stack.add_titled(
+        &crate::recording::page(app, row),
+        Some("recording"),
+        "Recording",
+    );
     stack.add_titled(&engine_page(app), Some("engine"), "Engine");
     stack.add_titled(&project_page(app), Some("project"), "Project");
     if let Some(p) = page {

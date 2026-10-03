@@ -5,6 +5,8 @@
 //! MIDI/synth voices, the echo plugin, a loop wrap, a stop/start and a graph
 //! swap with state adoption.
 
+mod common;
+
 use faderframe_audio::OwnedBuffers;
 use faderframe_engine::offline::OfflineRenderer;
 use faderframe_engine::{EngineConfig, render_generated_sources};
@@ -130,4 +132,176 @@ fn processing_does_not_allocate() {
         "old graph returned for dropping"
     );
     assert_eq!(r.controller.leaked_objects(), 0);
+}
+
+#[test]
+fn streamed_playback_does_not_allocate() {
+    use faderframe_audio_files::{PAGE_FRAMES, WavFormat, write_wav};
+    use faderframe_core::ChannelLayout;
+    use faderframe_project::TrackKind;
+    use faderframe_realtime::Reclaimer;
+    use faderframe_timeline::MusicalTime;
+
+    const SR: u32 = 48_000;
+    let path = std::env::temp_dir().join(format!("ff-rt-stream-{}.wav", std::process::id()));
+    let n = PAGE_FRAMES * 3;
+    let data: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin() * 0.3).collect();
+    write_wav(&path, &[data.clone(), data], SR, WavFormat::Float32, false).unwrap();
+    let mut tp = common::TestProject::new(SR);
+    let t = tp.track(TrackKind::Audio, "A", ChannelLayout::Stereo);
+    let src = tp.stream(&path);
+    tp.clip(t, src, MusicalTime::ZERO, n as i64);
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 2).unwrap();
+    r.play_from(0).unwrap();
+    let plan = r.controller.stream_plan();
+    let shared = r.controller.shared();
+    let mut rec = Reclaimer::default();
+    plan.ensure(&[(0, n as i64)], &shared.epoch, &mut rec, &mut Vec::new())
+        .unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    let (_, allocs) = armed(|| {
+        for _ in 0..100 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations while reading streamed pages");
+    assert!(
+        bufs.output_ref(0).iter().any(|s| s.abs() > 0.01),
+        "streamed audio audible"
+    );
+    assert_eq!(plan.sources()[0].misses(), 0);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn recording_and_metronome_do_not_allocate() {
+    use faderframe_core::ChannelLayout;
+    use faderframe_engine::{MetronomeMode, RecordTarget};
+    use faderframe_project::TrackKind;
+    use faderframe_transport::TransportCommand;
+
+    const SR: u32 = 48_000;
+    let mut tp = common::TestProject::new(SR);
+    let t = tp.track(TrackKind::Audio, "In", ChannelLayout::Stereo);
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 2).unwrap();
+    let mut streams = r
+        .controller
+        .begin_recording(
+            vec![RecordTarget {
+                track: t,
+                first_channel: 0,
+                channels: 2,
+            }],
+            0,
+            i64::MAX,
+            4.0,
+        )
+        .unwrap();
+    r.controller.metronome().set_mode(MetronomeMode::Always);
+    r.controller
+        .transport(TransportCommand::SetRecording(true))
+        .unwrap();
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    let (_, allocs) = armed(|| {
+        for _ in 0..200 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations while recording");
+    assert!(streams.headers.pop().is_ok(), "blocks were captured");
+}
+
+#[test]
+fn automation_does_not_allocate() {
+    use faderframe_automation::{
+        AutomationCurve, AutomationLane, AutomationMode, AutomationPoint, AutomationTarget,
+        CurveShape,
+    };
+    use faderframe_core::{ChannelLayout, ParameterId, builtin};
+    use faderframe_project::{PluginRef, PluginSlot, TrackKind};
+    use faderframe_timeline::MusicalTime;
+
+    const SR: u32 = 48_000;
+    let mut tp = common::TestProject::new(SR);
+    let t = tp.track(TrackKind::Audio, "A", ChannelLayout::Stereo);
+    let src = tp.dc(2, 0.3, 200_000);
+    tp.clip(t, src, MusicalTime::ZERO, 200_000);
+    let plugin = tp.project.ids.allocate();
+    tp.project.track_mut(t).unwrap().inserts.push(PluginSlot {
+        id: plugin,
+        plugin: PluginRef::builtin(builtin::GAIN, "Gain"),
+        bypass: false,
+        parameters: Vec::new(),
+        state: None,
+    });
+    let ramp = || {
+        AutomationCurve::from_points(
+            (0..20)
+                .map(|i| AutomationPoint {
+                    time: MusicalTime::from_quarters(i as f64 * 0.25),
+                    value: -(i % 4) as f64 * 3.0,
+                    shape: if i % 3 == 0 {
+                        CurveShape::Step
+                    } else {
+                        CurveShape::Smooth
+                    },
+                })
+                .collect(),
+        )
+    };
+    for target in [
+        AutomationTarget::TrackVolume,
+        AutomationTarget::TrackPan,
+        AutomationTarget::TrackMute,
+        AutomationTarget::PluginParameter {
+            plugin,
+            parameter: ParameterId(0),
+        },
+        AutomationTarget::PluginBypass(plugin),
+    ] {
+        let id = tp.project.ids.allocate();
+        tp.project
+            .track_mut(t)
+            .unwrap()
+            .automation
+            .lanes
+            .push(AutomationLane {
+                id,
+                target,
+                curve: ramp(),
+                mode: AutomationMode::Read,
+                visible: true,
+            });
+    }
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 2).unwrap();
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    let (_, allocs) = armed(|| {
+        for _ in 0..300 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations while automating");
 }

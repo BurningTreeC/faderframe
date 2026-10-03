@@ -125,6 +125,11 @@ def render(meta: dict) -> str:
         "",
         f"## Rust crates ({len(pkgs)})",
         "",
+        "Crates under the MPL-2.0 (the Symphonia audio decoders) are file-level",
+        "copyleft: FaderFrame uses them unmodified from crates.io, where their",
+        "source is available; modified versions of those files would have to be",
+        "published under the MPL-2.0 as well.",
+        "",
         "| Crate | Version | License | Repository |",
         "|---|---|---|---|",
     ]

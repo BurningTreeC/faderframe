@@ -19,23 +19,29 @@
 #![forbid(unsafe_code)]
 
 mod build;
+mod click;
 mod context;
 mod engine;
 pub mod nodes;
 pub mod offline;
 mod plugins;
+pub mod record;
 mod slots;
 mod snapshot;
 
 pub use build::{BuiltGraph, build_graph};
+pub use click::{MetronomeMode, MetronomeShared};
 pub use context::EngineContext;
 pub use engine::{
     EngineConfig, EngineController, EngineProcessor, EngineShared, TrackMeter, create,
+    create_with_epoch,
 };
 pub use plugins::{ActivatedPlugin, PluginHost};
+pub use record::{RecordBlock, RecordStreams, RecordTarget};
 pub use slots::{SlotRegistry, SlotsExhausted, StripSlots};
 pub use snapshot::{
-    AudioRegion, Lane, MidiRegion, SourceMap, TimelineSnapshot, render_generated_sources,
+    AudioRegion, Lane, MidiRegion, Source, SourceMap, StreamPlan, StreamRegion, TimelineSnapshot,
+    render_generated_sources,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

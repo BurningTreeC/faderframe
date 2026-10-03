@@ -458,3 +458,83 @@ fn clip_content_replacement_is_undoable() {
     h.undo(&mut p).unwrap();
     assert_eq!(p.clip(clip).unwrap(), &c);
 }
+
+#[test]
+fn sources_are_undoable_and_protected_while_in_use() {
+    use faderframe_project::{AudioSource, Command, EditError, History, SourceSpec};
+    let mut p = faderframe_project::Project::new("S", 48_000);
+    let track: faderframe_core::TrackId = p.ids.allocate();
+    p.tracks.insert(
+        0,
+        faderframe_project::Track::new(
+            track,
+            faderframe_project::TrackKind::Audio,
+            "A",
+            faderframe_project::TrackColor::palette(0),
+        ),
+    );
+    let id = p.ids.allocate();
+    let source = AudioSource {
+        id,
+        name: "take".into(),
+        spec: SourceSpec::File {
+            path: "/media/take.wav".into(),
+            channels: 1,
+            frames: 48_000,
+            sample_rate: 48_000,
+        },
+    };
+    let clip_id = p.ids.allocate();
+    let clip = faderframe_project::Clip {
+        id: clip_id,
+        track,
+        name: "take".into(),
+        color: None,
+        start: faderframe_timeline::MusicalTime::ZERO,
+        muted: false,
+        content: faderframe_project::ClipContent::Audio(faderframe_project::AudioClip {
+            source: id,
+            source_offset: 0,
+            length: 48_000,
+            gain_db: 0.0,
+            fades: Default::default(),
+            stretch: Default::default(),
+            reversed: false,
+        }),
+    };
+    let mut h = History::default();
+    // A clip cannot reference an unknown source.
+    assert!(matches!(
+        h.apply(
+            &mut p,
+            Command::AddClip {
+                clip: Box::new(clip.clone())
+            }
+        ),
+        Err(EditError::UnknownSource(_))
+    ));
+    h.apply(
+        &mut p,
+        Command::Batch {
+            label: "Import".into(),
+            commands: vec![
+                Command::AddSource {
+                    source: Box::new(source),
+                },
+                Command::AddClip {
+                    clip: Box::new(clip),
+                },
+            ],
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        h.apply(&mut p, Command::RemoveSource { source: id }),
+        Err(EditError::SourceInUse(_))
+    ));
+    h.undo(&mut p).unwrap();
+    assert!(p.sources.is_empty() && p.clips.is_empty());
+    h.redo(&mut p).unwrap();
+    assert_eq!(p.sources.len(), 1);
+    assert_eq!(p.clips.len(), 1);
+}

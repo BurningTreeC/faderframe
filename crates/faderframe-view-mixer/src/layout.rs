@@ -3,7 +3,10 @@
 use faderframe_ui_canvas::{Rect, Theme};
 
 pub const INSERT_SLOTS: usize = 4;
-pub const SEND_SLOTS: usize = 2;
+/// Send knobs per row.
+pub const SENDS_PER_ROW: usize = 2;
+/// Most send rows a strip shows at once (more sends are paged in banks).
+pub const MAX_SEND_ROWS: usize = 4;
 
 /// Rectangles of every control on one strip. Optional sections are `None`
 /// when the strip is too short to show them.
@@ -15,8 +18,12 @@ pub struct StripLayout {
     pub input: Option<InputRow>,
     pub inserts: Option<[Rect; INSERT_SLOTS]>,
     pub inserts_label: Option<Rect>,
-    pub sends: Option<[SendSlot; SEND_SLOTS]>,
+    /// Visible send slots (rows × [`SENDS_PER_ROW`]).
+    pub sends: Option<Vec<SendSlot>>,
     pub sends_label: Option<Rect>,
+    /// Bank arrows in the SENDS label (previous / next page of sends).
+    pub send_prev: Option<Rect>,
+    pub send_next: Option<Rect>,
     pub pan_knob: Rect,
     pub pan_readout: Rect,
     pub mute: Rect,
@@ -60,7 +67,15 @@ const SECTION_GAP: f32 = 7.0;
 const MIN_FADER_H: f32 = 110.0;
 
 impl StripLayout {
-    pub fn new(strip: Rect, theme: &Theme, has_input: bool, has_sends: bool) -> Self {
+    /// `send_rows`: how many rows of send knobs are wanted (fewer are
+    /// shown when the strip is short).
+    pub fn new(
+        strip: Rect,
+        theme: &Theme,
+        has_input: bool,
+        has_sends: bool,
+        send_rows: usize,
+    ) -> Self {
         let _ = theme;
         let mut r = strip.inset_xy(MARGIN, 0.0);
         let color_bar = Rect::new(strip.x, strip.y, strip.w, 3.0);
@@ -89,7 +104,15 @@ impl StripLayout {
         let show_input = has_input && take(INPUT_H + SECTION_GAP);
         let inserts_h = LABEL_H + INSERT_SLOTS as f32 * (SLOT_H + SLOT_GAP) + SECTION_GAP;
         let show_inserts = take(inserts_h);
-        let show_sends = has_sends && take(LABEL_H + SEND_H + SECTION_GAP);
+        let send_rows = if has_sends {
+            (1..=send_rows.clamp(1, MAX_SEND_ROWS))
+                .rev()
+                .find(|&n| take(LABEL_H + n as f32 * SEND_H + SECTION_GAP))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let show_sends = send_rows > 0;
 
         let mut dividers = Vec::new();
         let input = show_input.then(|| {
@@ -126,25 +149,28 @@ impl StripLayout {
             (None, None)
         };
 
-        let (sends_label, sends) = if show_sends {
+        let (sends_label, sends, send_prev, send_next) = if show_sends {
             let label = r.take_top(LABEL_H);
-            let row = r.take_top(SEND_H);
-            let half = row.w / 2.0;
-            let mut slots = [SendSlot {
-                knob: Rect::default(),
-                label: Rect::default(),
-            }; SEND_SLOTS];
-            for (i, s) in slots.iter_mut().enumerate() {
-                let col = Rect::new(row.x + half * i as f32, row.y, half, row.h);
-                let size = (col.w - 4.0).min(32.0);
-                s.knob = Rect::new(col.center().x - size / 2.0, col.y, size, size);
-                s.label = Rect::new(col.x, col.y + size + 1.0, col.w, row.h - size - 1.0);
+            let mut slots = Vec::with_capacity(send_rows * SENDS_PER_ROW);
+            for _ in 0..send_rows {
+                let row = r.take_top(SEND_H);
+                let col_w = row.w / SENDS_PER_ROW as f32;
+                for i in 0..SENDS_PER_ROW {
+                    let col = Rect::new(row.x + col_w * i as f32, row.y, col_w, row.h);
+                    let size = (col.w - 4.0).min(32.0);
+                    slots.push(SendSlot {
+                        knob: Rect::new(col.center().x - size / 2.0, col.y, size, size),
+                        label: Rect::new(col.x, col.y + size + 1.0, col.w, row.h - size - 1.0),
+                    });
+                }
             }
+            let prev = Rect::new(label.x, label.y, 12.0, label.h);
+            let next = Rect::new(label.right() - 12.0, label.y, 12.0, label.h);
             dividers.push(r.y + SECTION_GAP * 0.5);
             r.take_top(SECTION_GAP);
-            (Some(label), Some(slots))
+            (Some(label), Some(slots), Some(prev), Some(next))
         } else {
-            (None, None)
+            (None, None, None, None)
         };
 
         let pan_area = r.take_top(PAN_H);
@@ -180,6 +206,8 @@ impl StripLayout {
             inserts_label,
             sends,
             sends_label,
+            send_prev,
+            send_next,
             pan_knob,
             pan_readout,
             mute,
@@ -202,12 +230,20 @@ mod tests {
     #[test]
     fn tall_strips_show_everything_short_strips_collapse() {
         let theme = Theme::default();
-        let tall = StripLayout::new(Rect::new(0.0, 0.0, 92.0, 760.0), &theme, true, true);
+        let tall = StripLayout::new(Rect::new(0.0, 0.0, 92.0, 760.0), &theme, true, true, 1);
         assert!(tall.input.is_some() && tall.inserts.is_some() && tall.sends.is_some());
+        assert_eq!(tall.sends.as_ref().map(Vec::len), Some(SENDS_PER_ROW));
         assert!(tall.fader.h >= MIN_FADER_H);
-        let short = StripLayout::new(Rect::new(0.0, 0.0, 92.0, 330.0), &theme, true, true);
+        let short = StripLayout::new(Rect::new(0.0, 0.0, 92.0, 330.0), &theme, true, true, 4);
         assert!(short.inserts.is_none() && short.sends.is_none());
         assert!(short.fader.h >= MIN_FADER_H - 1.0);
+        // More send rows when asked for and there is room; fewer when not.
+        let many = StripLayout::new(Rect::new(0.0, 0.0, 92.0, 900.0), &theme, true, true, 3);
+        assert_eq!(many.sends.as_ref().map(Vec::len), Some(3 * SENDS_PER_ROW));
+        let squeezed = StripLayout::new(Rect::new(0.0, 0.0, 92.0, 560.0), &theme, true, true, 4);
+        let n = squeezed.sends.as_ref().map_or(0, Vec::len);
+        assert!((SENDS_PER_ROW..4 * SENDS_PER_ROW).contains(&n), "{n}");
+        assert!(squeezed.fader.h >= MIN_FADER_H - 1.0);
         // Nothing overlaps the scribble strip.
         assert!(tall.output.bottom() <= tall.scribble.y);
         assert!(tall.fader.bottom() <= tall.output.y);

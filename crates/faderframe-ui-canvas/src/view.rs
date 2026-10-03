@@ -152,4 +152,22 @@ pub trait CanvasView<M, A> {
     }
 
     fn set_scroll(&mut self, _axis: ScrollAxis, _offset: f32) {}
+
+    /// Files are dragged over the view at `pos` (`None`: the drag left).
+    /// Return whether dropping there would be accepted (views typically
+    /// remember the position to paint a drop indicator).
+    fn drag_files(&mut self, _pos: Option<Point>, _size: Size, _model: &M) -> bool {
+        false
+    }
+
+    /// Files were dropped at `pos`.
+    fn drop_files(
+        &mut self,
+        _files: &[std::path::PathBuf],
+        _pos: Point,
+        _size: Size,
+        _model: &M,
+    ) -> Option<A> {
+        None
+    }
 }

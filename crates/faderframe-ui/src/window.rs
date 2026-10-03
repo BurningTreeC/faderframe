@@ -19,6 +19,8 @@ pub struct Chrome {
     pub looping: gtk::Button,
     pub notice: gtk::Label,
     pub engine: gtk::Label,
+    pub import_box: gtk::Box,
+    pub import_bar: gtk::ProgressBar,
     pub workspaces: gtk::DropDown,
     pub workspace_guard: Rc<Cell<bool>>,
 }
@@ -60,6 +62,18 @@ impl Chrome {
                 );
             }
             None => self.notice.set_text(""),
+        }
+        let imports = s.imports();
+        self.import_box.set_visible(!imports.is_empty());
+        if let Some(job) = imports.first() {
+            self.import_bar.set_fraction(job.fraction());
+            let more = imports.len() - 1;
+            let text = if more > 0 {
+                format!("Importing {} (+{more} queued)", job.current_name())
+            } else {
+                format!("Importing {}", job.current_name())
+            };
+            self.import_bar.set_text(Some(&text));
         }
         let m = s.metrics();
         let engine = match (s.stream_info(), s.stream_status()) {
@@ -116,6 +130,7 @@ pub fn menu_model() -> gio::Menu {
         None,
         &section(&[("Save", "app.save"), ("Save As…", "app.save-as")]),
     );
+    file.append_section(None, &section(&[("Import Audio…", "app.import-audio")]));
     file.append_section(None, &section(&[("Render / Export…", "app.render")]));
     file.append_section(None, &section(&[("Preferences…", "app.preferences")]));
     file.append_section(None, &section(&[("Quit", "app.quit")]));
@@ -136,6 +151,13 @@ pub fn menu_model() -> gio::Menu {
     edit.append_section(
         None,
         &section(&[
+            ("Show / Hide Take Lanes", "app.toggle-take-lanes"),
+            ("Show / Hide Automation", "app.toggle-automation"),
+        ]),
+    );
+    edit.append_section(
+        None,
+        &section(&[
             ("Snap to Grid", "app.toggle-snap"),
             ("Follow Playhead", "app.toggle-follow"),
         ]),
@@ -146,7 +168,8 @@ pub fn menu_model() -> gio::Menu {
     track.append_section(
         None,
         &section(&[
-            ("Add Audio Track", "app.add-audio"),
+            ("Add Audio Track (Mono)", "app.add-audio"),
+            ("Add Audio Track (Stereo)", "app.add-audio-stereo"),
             ("Add Instrument Track", "app.add-instrument"),
             ("Add MIDI Track", "app.add-midi"),
             ("Add Bus", "app.add-bus"),
@@ -155,7 +178,22 @@ pub fn menu_model() -> gio::Menu {
     );
     track.append_section(
         None,
-        &section(&[("Remove Selected Tracks", "app.remove-tracks")]),
+        &section(&[
+            ("Record-Arm Selected Tracks", "app.arm-selected"),
+            ("Remove Selected Tracks", "app.remove-tracks"),
+        ]),
+    );
+    track.append_section(
+        None,
+        &section(&[
+            ("Save Selected Track as Preset", "app.save-track-preset"),
+            ("New Track from Preset…", "app.track-from-preset"),
+            ("Apply Preset to Selected Track…", "app.apply-track-preset"),
+            (
+                "Export Selected Track as Preset…",
+                "app.export-track-preset",
+            ),
+        ]),
     );
     menu.append_submenu(Some("_Track"), &track);
 
@@ -170,8 +208,9 @@ pub fn menu_model() -> gio::Menu {
     );
     transport.append_section(
         None,
-        &section(&[("Loop", "app.loop"), ("Record Mode", "app.record")]),
+        &section(&[("Loop", "app.loop"), ("Record", "app.record")]),
     );
+    transport.append_section(None, &crate::recording::menu());
     transport.append_section(None, &section(&[("Panic (All Notes Off)", "app.panic")]));
     menu.append_submenu(Some("T_ransport"), &transport);
 
@@ -205,6 +244,11 @@ pub fn menu_model() -> gio::Menu {
         &section(&[("Reset Current Workspace", "app.workspace-reset")]),
     );
     view.append_submenu(Some("Workspace"), &ws);
+    let heights = gio::Menu::new();
+    for (i, (name, _)) in faderframe_view_arranger::TRACK_HEIGHTS.iter().enumerate() {
+        heights.append(Some(name), Some(&format!("app.track-height-{i}")));
+    }
+    view.append_submenu(Some("Track Height (all tracks · Alt+wheel)"), &heights);
     menu.append_submenu(Some("_View"), &view);
 
     let audio = gio::Menu::new();
@@ -321,8 +365,21 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
     notice.set_ellipsize(gtk::pango::EllipsizeMode::End);
     let engine = gtk::Label::new(None);
     engine.add_css_class("engine");
+    let import_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    let import_bar = gtk::ProgressBar::new();
+    import_bar.set_show_text(true);
+    import_bar.set_valign(gtk::Align::Center);
+    import_bar.set_width_request(260);
+    let cancel = gtk::Button::from_icon_name("process-stop-symbolic");
+    cancel.set_action_name(Some("app.cancel-import"));
+    cancel.set_tooltip_text(Some("Cancel import"));
+    cancel.add_css_class("flat");
+    import_box.append(&import_bar);
+    import_box.append(&cancel);
+    import_box.set_visible(false);
     let platform = gtk::Label::new(Some(&platform_label(&window)));
     status.append(&notice);
+    status.append(&import_box);
     status.append(&engine);
     status.append(&platform);
     content.append(&status);
@@ -336,6 +393,8 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
         looping,
         notice,
         engine,
+        import_box,
+        import_bar,
         workspaces,
         workspace_guard: guard,
     });

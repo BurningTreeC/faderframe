@@ -20,6 +20,7 @@ hosting, an analogue-console-style mixer and dockable, detachable editors.
   headers with mute/solo/arm/monitor, volume, pan and meters.
 * Analogue-console mixer: inserts, sends (pre-FX / pre / post), pan, M/S/R,
   faders with a console fader law, segmented peak meters, routing menus,
+  any number of sends per channel (rows grow, ◂ ▸ pages through banks),
   scribble strips, pinned master section.
 * Piano roll: draw, move, resize, delete notes, velocity lane, transpose.
 * Docking: mixer / piano roll / automation tabs in a bottom dock, detach any
@@ -31,6 +32,26 @@ hosting, an analogue-console-style mixer and dockable, detachable editors.
   allocation-counting test).
 * Audio: JACK (JACK2 or PipeWire-JACK) and a silent dummy device. All common
   sample rates (44.1 – 192 kHz) and buffer sizes (16 – 8192 frames).
+* Audio import: WAV, AIFF, CAF, FLAC, MP3, Ogg Vorbis, AAC/M4A, ALAC — via
+  File → Import Audio (Ctrl+I) or drag & drop onto the arranger. Files are
+  converted to the project rate once and streamed from disk during playback
+  (bounded memory, lock-free read-ahead); media is kept in the project's
+  `Audio/` folder; missing files show as offline clips.
+* Recording: arm tracks, choose a mono input or a stereo pair per track,
+  record with punch in/out, pre-roll and metronome; takes are latency
+  compensated. Loop recording keeps every pass as a take.
+* Takes and comping: take folders with take lanes — click a lane to use a
+  take, drag across it to comp a section, flatten when done. Record mode
+  (keep as takes / replace) and loop-record mode (takes / last pass / new
+  track per pass) are selectable in Transport and Preferences → Recording.
+* Track presets: save a track's channel settings (format, input, plugins
+  with state, fader, pan, sends, output, colour) and recall them as a new
+  track or onto another track. Resizable tracks (drag a header's bottom
+  edge, Alt+wheel for all, View → Track Height).
+* Automation for every automatable parameter — volume, pan, mute, sends,
+  plugin parameters and bypass: lanes under each track (A button / A key),
+  point editing and freehand drawing with curve shapes, Read / Touch /
+  Latch / Write modes; faders follow the automation while playing.
 * Render / export to WAV (16/24-bit with TPDF dither, 32-bit float): master
   or stems, project/loop/bar range, any sample rate, mono or stereo, tail,
   normalisation.
@@ -61,7 +82,7 @@ The binary is `target/release/faderframe`:
 
 ```text
 faderframe [--backend auto|jack|dummy] [--sample-rate HZ] [--buffer-size FRAMES]
-           [--empty] [PROJECT.ffproj]
+           [--empty] [--import FILE]... [PROJECT.ffproj]
 ```
 
 With PipeWire, JACK clients connect to the PipeWire graph directly (no JACK
@@ -74,10 +95,15 @@ server needed when `pipewire-jack` is installed).
 | Space | Play / pause |
 | Home | Return to start |
 | L | Toggle loop |
-| Shift+R | Record mode |
+| Shift+R | Record |
+| Ctrl+P | Punch in/out |
+| T | Show / hide the take lanes of the selected take folder |
+| A | Show / hide automation of the selected tracks |
+| Alt+wheel | Track height (all tracks) |
 | Ctrl+Z / Ctrl+Shift+Z | Undo / redo |
 | F2 / F3 / F4 | Toggle bottom dock / show mixer / show piano roll |
 | Ctrl+1 … Ctrl+5 | Workspaces |
+| Ctrl+I | Import audio files |
 | Ctrl+Shift+R | Render / export |
 | Ctrl+, | Preferences |
 | Ctrl+wheel / Shift+wheel | Zoom / scroll horizontally |

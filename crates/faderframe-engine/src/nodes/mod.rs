@@ -17,6 +17,25 @@ pub use strip::ChannelStrip;
 /// Maximum channels a strip/send processes individually.
 pub(crate) const MAX_CHANNELS: usize = 8;
 
+/// Frames between automation evaluations (and plugin parameter events)
+/// while a curve changes: 0.7 ms at 48 kHz.
+pub(crate) const AUTOMATION_STEP: usize = 32;
+
+/// Timeline sample at which automation is read for block offset `offset`:
+/// while stopped the playhead does not move, so every offset reads it.
+#[inline]
+pub(crate) fn automation_at(
+    cx: &faderframe_audio_graph::ProcessContext<'_, crate::context::EngineContext>,
+    offset: usize,
+) -> i64 {
+    let t = &cx.data.transport;
+    if t.playing {
+        t.sample_position + offset as i64
+    } else {
+        t.sample_position
+    }
+}
+
 /// Linear ramp helper: per-sample increments from `from` to `to` over `n`.
 #[inline]
 pub(crate) fn ramp_step(from: f32, to: f32, n: usize) -> f32 {

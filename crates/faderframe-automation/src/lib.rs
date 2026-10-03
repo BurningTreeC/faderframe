@@ -71,6 +71,53 @@ impl AutomationCurve {
         (index < self.points.len()).then(|| self.points.remove(index))
     }
 
+    /// Replace point `index` (re-sorting if its time moved); returns its new
+    /// index.
+    pub fn update(&mut self, index: usize, point: AutomationPoint) -> Option<usize> {
+        self.remove(index)?;
+        Some(self.insert(point))
+    }
+
+    /// Replace everything in `[from, to]` by `points` (written automation),
+    /// keeping the curve continuous at both ends: the old value is pinned
+    /// just outside the written range.
+    pub fn replace_range(
+        &mut self,
+        from: MusicalTime,
+        to: MusicalTime,
+        points: &[AutomationPoint],
+    ) {
+        let before = self.value_at(from);
+        let after = self.value_at(to);
+        let had_after = self.points.iter().any(|p| p.time > to);
+        let had_before = self.points.iter().any(|p| p.time < from);
+        self.points.retain(|p| p.time < from || p.time > to);
+        if had_before && let Some(v) = before {
+            self.insert(AutomationPoint {
+                time: from,
+                value: v,
+                shape: CurveShape::Linear,
+            });
+        }
+        for p in points {
+            self.insert(*p);
+        }
+        if had_after && let Some(v) = after {
+            self.insert(AutomationPoint {
+                time: to,
+                value: v,
+                shape: CurveShape::Linear,
+            });
+        }
+    }
+
+    /// Indices of points inside `[from, to]`.
+    pub fn range(&self, from: MusicalTime, to: MusicalTime) -> std::ops::Range<usize> {
+        let a = self.points.partition_point(|p| p.time < from);
+        let b = self.points.partition_point(|p| p.time <= to);
+        a..b.max(a)
+    }
+
     /// Value at `time`, or `None` for an empty curve. Before the first point
     /// the first value holds; after the last point the last value holds.
     pub fn value_at(&self, time: MusicalTime) -> Option<f64> {
@@ -90,6 +137,118 @@ impl AutomationCurve {
         }
         let t = (time - a.time).ticks() as f64 / span as f64;
         Some(interpolate(a.value, b.value, t, a.shape))
+    }
+}
+
+/// Drop points that a straight line between their neighbours reproduces
+/// within `tolerance` (Ramer–Douglas–Peucker over time and value), keeping
+/// the first and last point. Used to thin written automation.
+pub fn thin(points: &[AutomationPoint], tolerance: f64) -> Vec<AutomationPoint> {
+    if points.len() <= 2 {
+        return points.to_vec();
+    }
+    let mut keep = vec![false; points.len()];
+    keep[0] = true;
+    keep[points.len() - 1] = true;
+    let mut stack = vec![(0usize, points.len() - 1)];
+    while let Some((a, b)) = stack.pop() {
+        let (pa, pb) = (&points[a], &points[b]);
+        let span = (pb.time - pa.time).ticks() as f64;
+        let mut worst = (0.0, a);
+        for (i, p) in points.iter().enumerate().take(b).skip(a + 1) {
+            let t = if span > 0.0 {
+                (p.time - pa.time).ticks() as f64 / span
+            } else {
+                0.0
+            };
+            let line = pa.value + (pb.value - pa.value) * t;
+            let d = (p.value - line).abs();
+            if d > worst.0 {
+                worst = (d, i);
+            }
+        }
+        if worst.0 > tolerance {
+            keep[worst.1] = true;
+            stack.push((a, worst.1));
+            stack.push((worst.1, b));
+        }
+    }
+    points
+        .iter()
+        .zip(keep)
+        .filter(|(_, k)| *k)
+        .map(|(p, _)| *p)
+        .collect()
+}
+
+/// A curve converted to absolute engine samples, for the audio thread.
+/// Evaluation is allocation-free (binary search + interpolation).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SampleLane {
+    points: Vec<SamplePoint>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SamplePoint {
+    pub at: i64,
+    pub value: f64,
+    pub shape: CurveShape,
+}
+
+impl SampleLane {
+    /// Convert `curve` with `to_samples` (musical time → engine sample).
+    pub fn from_curve(curve: &AutomationCurve, to_samples: impl Fn(MusicalTime) -> i64) -> Self {
+        Self {
+            points: curve
+                .points()
+                .iter()
+                .map(|p| SamplePoint {
+                    at: to_samples(p.time),
+                    value: p.value,
+                    shape: p.shape,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.points.is_empty()
+    }
+
+    pub fn points(&self) -> &[SamplePoint] {
+        &self.points
+    }
+
+    /// Value at engine sample `s` (`None` for an empty lane).
+    #[inline]
+    pub fn value_at(&self, s: i64) -> Option<f64> {
+        let first = self.points.first()?;
+        if s < first.at {
+            return Some(first.value);
+        }
+        let i = self.points.partition_point(|p| p.at <= s) - 1;
+        let a = &self.points[i];
+        let Some(b) = self.points.get(i + 1) else {
+            return Some(a.value);
+        };
+        let span = b.at - a.at;
+        if span <= 0 {
+            return Some(b.value);
+        }
+        Some(interpolate(
+            a.value,
+            b.value,
+            (s - a.at) as f64 / span as f64,
+            a.shape,
+        ))
+    }
+
+    /// First point strictly after `s` and before `end` (for placing
+    /// sample-accurate events at breakpoints).
+    #[inline]
+    pub fn next_point_in(&self, s: i64, end: i64) -> Option<i64> {
+        let i = self.points.partition_point(|p| p.at <= s);
+        self.points.get(i).map(|p| p.at).filter(|&at| at < end)
     }
 }
 
@@ -252,6 +411,63 @@ mod tests {
         c.insert(pt(8.0, 5.0, CurveShape::Linear));
         assert!((c.value_at(q(3.999)).unwrap() - 1.0).abs() < 1e-3);
         assert_eq!(c.value_at(q(4.0)), Some(5.0));
+    }
+
+    #[test]
+    fn sample_lane_matches_curve_and_finds_breakpoints() {
+        let c = AutomationCurve::from_points(vec![
+            pt(0.0, 0.0, CurveShape::Linear),
+            pt(1.0, 1.0, CurveShape::Step),
+            pt(2.0, 0.5, CurveShape::Linear),
+        ]);
+        // 1 quarter = 24 000 samples (120 bpm, 48 kHz).
+        let l = SampleLane::from_curve(&c, |t| (t.quarters() * 24_000.0) as i64);
+        assert_eq!(l.value_at(12_000), Some(0.5));
+        assert_eq!(l.value_at(30_000), Some(1.0), "step holds");
+        assert_eq!(l.value_at(48_000), Some(0.5));
+        assert_eq!(l.next_point_in(0, 30_000), Some(24_000));
+        assert_eq!(l.next_point_in(24_000, 40_000), None);
+        assert_eq!(SampleLane::default().value_at(5), None);
+    }
+
+    #[test]
+    fn replace_range_keeps_the_curve_continuous() {
+        let mut c = AutomationCurve::from_points(vec![
+            pt(0.0, 0.0, CurveShape::Linear),
+            pt(8.0, 8.0, CurveShape::Linear),
+        ]);
+        c.replace_range(
+            q(2.0),
+            q(4.0),
+            &[
+                pt(2.5, 10.0, CurveShape::Linear),
+                pt(3.5, 10.0, CurveShape::Linear),
+            ],
+        );
+        assert!(
+            (c.value_at(q(2.0)).unwrap() - 2.0).abs() < 1e-9,
+            "old value pinned at the start"
+        );
+        assert_eq!(c.value_at(q(3.0)), Some(10.0));
+        assert!(
+            (c.value_at(q(4.0)).unwrap() - 4.0).abs() < 1e-9,
+            "old value restored at the end"
+        );
+        assert!((c.value_at(q(6.0)).unwrap() - 6.0).abs() < 1e-9);
+        assert_eq!(c.range(q(2.0), q(4.0)).len(), 4);
+    }
+
+    #[test]
+    fn thinning_keeps_shape_within_tolerance() {
+        let pts: Vec<_> = (0..=100)
+            .map(|i| {
+                let x = i as f64 / 10.0;
+                pt(x, if x < 5.0 { x } else { 10.0 - x }, CurveShape::Linear)
+            })
+            .collect();
+        let thin = thin(&pts, 0.01);
+        assert_eq!(thin.len(), 3, "a triangle needs three points");
+        assert_eq!(thin[1].time, q(5.0));
     }
 
     #[test]

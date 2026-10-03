@@ -167,6 +167,30 @@ impl CanvasWidget {
         self.imp().app.borrow().upgrade()
     }
 
+    /// Paint the view into a fresh render node, independent of GTK's
+    /// redraw state (screenshots of a window that is not on screen).
+    pub fn render_node(&self) -> Option<gtk::gsk::RenderNode> {
+        let app = self.app()?;
+        let session = app.session.try_borrow().ok()?;
+        let size = Size::new(self.width() as f32, self.height() as f32);
+        if size.w <= 0.0 || size.h <= 0.0 {
+            return None;
+        }
+        let snapshot = gtk::Snapshot::new();
+        let imp = self.imp();
+        imp.text_cache.borrow_mut().begin_frame();
+        snapshot.push_clip(&graphene::Rect::new(0.0, 0.0, size.w, size.h));
+        let w: &gtk::Widget = self.upcast_ref();
+        {
+            let mut painter = SnapshotPainter::new(&snapshot, w, &imp.text_cache);
+            if let Some(view) = imp.view.borrow_mut().as_mut() {
+                view.paint(&mut painter, size, &session, &app.theme);
+            }
+        }
+        snapshot.pop();
+        snapshot.to_node()
+    }
+
     fn size(&self) -> Size {
         Size::new(self.width() as f32, self.height() as f32)
     }
@@ -391,6 +415,81 @@ impl CanvasWidget {
             }
         ));
         self.add_controller(focus);
+
+        // Files dragged in from a file manager (or another app).
+        let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+        let hover = |w: &CanvasWidget, pos: Option<Point>| -> gdk::DragAction {
+            let Some(app) = w.app() else {
+                return gdk::DragAction::empty();
+            };
+            let Ok(session) = app.session.try_borrow() else {
+                return gdk::DragAction::empty();
+            };
+            let accepted = w
+                .imp()
+                .view
+                .borrow_mut()
+                .as_mut()
+                .is_some_and(|v| v.drag_files(pos, w.size(), &session));
+            w.queue_draw();
+            if accepted {
+                gdk::DragAction::COPY
+            } else {
+                gdk::DragAction::empty()
+            }
+        };
+        drop.connect_enter(glib::clone!(
+            #[weak(rename_to = w)]
+            self,
+            #[upgrade_or]
+            gdk::DragAction::empty(),
+            move |_, x, y| hover(&w, Some(Point::new(x as f32, y as f32)))
+        ));
+        drop.connect_motion(glib::clone!(
+            #[weak(rename_to = w)]
+            self,
+            #[upgrade_or]
+            gdk::DragAction::empty(),
+            move |_, x, y| hover(&w, Some(Point::new(x as f32, y as f32)))
+        ));
+        drop.connect_leave(glib::clone!(
+            #[weak(rename_to = w)]
+            self,
+            move |_| {
+                hover(&w, None);
+            }
+        ));
+        drop.connect_drop(glib::clone!(
+            #[weak(rename_to = w)]
+            self,
+            #[upgrade_or]
+            false,
+            move |_, value, x, y| {
+                let Ok(list) = value.get::<gdk::FileList>() else {
+                    return false;
+                };
+                let files: Vec<std::path::PathBuf> =
+                    list.files().iter().filter_map(|f| f.path()).collect();
+                let Some(app) = w.app() else { return false };
+                let action = {
+                    let Ok(session) = app.session.try_borrow() else {
+                        return false;
+                    };
+                    w.imp().view.borrow_mut().as_mut().and_then(|v| {
+                        v.drop_files(&files, Point::new(x as f32, y as f32), w.size(), &session)
+                    })
+                };
+                w.queue_draw();
+                match action {
+                    Some(a) => {
+                        app.dispatch(a);
+                        true
+                    }
+                    None => false,
+                }
+            }
+        ));
+        self.add_controller(drop);
 
         self.connect_query_tooltip(|w, x, y, keyboard, tooltip| {
             if keyboard {

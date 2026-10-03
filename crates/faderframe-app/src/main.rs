@@ -17,6 +17,7 @@ OPTIONS:
     --sample-rate <HZ>            Requested sample rate (44100, 48000, 96000, 192000, …)
     --buffer-size <FRAMES>        Requested buffer size (32, 64, 128, 256, 512, …)
     --empty                       Start with an empty project instead of the demo session
+    --import <FILE>               Import an audio file on start-up (repeatable)
     -h, --help                    Show this help
     -V, --version                 Show the version
 
@@ -61,6 +62,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<RunOptions>, Strin
                 );
             }
             "--empty" => o.empty = true,
+            "--import" => o.import.push(PathBuf::from(value("--import")?)),
             s if s.starts_with('-') => return Err(format!("unknown option '{s}'")),
             path => o.project = Some(PathBuf::from(path)),
         }
@@ -128,6 +130,13 @@ mod tests {
         assert_eq!(o.sample_rate, Some(96_000));
         assert_eq!(o.buffer_size, Some(64));
         assert_eq!(o.project, Some(PathBuf::from("song.ffproj")));
+        let o = parse(args(&["--import", "a.wav", "--import", "b.flac"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            o.import,
+            vec![PathBuf::from("a.wav"), PathBuf::from("b.flac")]
+        );
         assert!(parse(args(&["--backend", "asio"])).is_err());
         assert!(
             parse(args(&["--sample-rate", "12"])).is_ok(),

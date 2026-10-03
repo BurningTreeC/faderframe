@@ -1,9 +1,10 @@
 //! A hardware-less backend driven by a timer thread.
 //!
 //! It calls the engine at the real-time rate implied by the configured
-//! sample rate and buffer size, feeding silence and discarding output. This
-//! keeps the transport, meters and DSP load display alive on machines
-//! without an audio server, and is used in CI.
+//! sample rate and buffer size, feeding silence (or a test tone, see
+//! [`DummyBackend::with_input_tone`]) and discarding output. This keeps the
+//! transport, meters and DSP load display alive on machines without an
+//! audio server, and is used in CI and recording tests.
 //!
 //! The thread sleeps *between* callbacks to emulate a device clock; nothing
 //! sleeps inside the processing callback itself.
@@ -20,8 +21,32 @@ use std::time::{Duration, Instant};
 pub const DEFAULT_SAMPLE_RATE: u32 = 48_000;
 pub const DEFAULT_BUFFER_SIZE: u32 = 256;
 
-#[derive(Debug, Default)]
-pub struct DummyBackend;
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DummyBackend {
+    /// Sine frequency fed to every input channel (amplitude 0.5), if any.
+    input_tone: Option<f32>,
+    /// Shape the tone into plucked notes (twice a second).
+    pluck: bool,
+}
+
+impl DummyBackend {
+    /// Inputs carry a steady 0.5-amplitude sine of `hz` instead of silence.
+    pub fn with_input_tone(hz: f32) -> Self {
+        Self {
+            input_tone: Some(hz),
+            pluck: false,
+        }
+    }
+
+    /// Inputs carry plucked notes of `hz` (decaying, twice a second, input
+    /// 2 an octave up) — a test signal with a recognisable waveform.
+    pub fn with_input_pluck(hz: f32) -> Self {
+        Self {
+            input_tone: Some(hz),
+            pluck: true,
+        }
+    }
+}
 
 impl AudioBackend for DummyBackend {
     fn id(&self) -> &'static str {
@@ -68,6 +93,8 @@ impl AudioBackend for DummyBackend {
             output_latency: 0,
         };
         let monitor = StreamMonitor::new(sample_rate, buffer_size);
+        let tone = self.input_tone;
+        let pluck = self.pluck;
         let stop = Arc::new(AtomicBool::new(false));
         let requested = Arc::new(AtomicU32::new(buffer_size));
 
@@ -87,6 +114,8 @@ impl AudioBackend for DummyBackend {
                     callback.prepare(&info);
                     monitor.set_running(true);
                     let mut next = Instant::now();
+                    let mut phase = 0.0f64;
+                    let mut t = 0u64;
                     while !stop.load(Ordering::Relaxed) {
                         let want = requested.load(Ordering::Relaxed);
                         if want != info.buffer_size {
@@ -99,6 +128,27 @@ impl AudioBackend for DummyBackend {
                             info.buffer_size as f64 / info.sample_rate as f64,
                         );
                         bufs.set_frames(info.buffer_size as usize);
+                        if let Some(hz) = tone {
+                            let sr = info.sample_rate as f64;
+                            let inc = std::f64::consts::TAU * hz as f64 / sr;
+                            let start = phase;
+                            for c in 0..ins {
+                                let mut ph = start;
+                                let octave = if pluck && c % 2 == 1 { 2.0 } else { 1.0 };
+                                for (i, s) in bufs.input_mut(c).iter_mut().enumerate() {
+                                    let env = if pluck {
+                                        let x = ((t + i as u64) as f64 / sr) % 0.5;
+                                        0.05 + 0.8 * (-x * 9.0).exp()
+                                    } else {
+                                        1.0
+                                    };
+                                    *s = ((ph * octave).sin() * 0.5 * env) as f32;
+                                    ph += inc;
+                                }
+                                phase = ph % std::f64::consts::TAU;
+                            }
+                            t += info.buffer_size as u64;
+                        }
                         callback.process(&mut bufs);
                         monitor.record_callback();
                         next += period;
@@ -189,7 +239,7 @@ mod tests {
     fn drives_callback_and_changes_buffer_size() {
         let frames = Arc::new(AtomicU64::new(0));
         let prepared = Arc::new(AtomicU32::new(0));
-        let mut backend = DummyBackend;
+        let mut backend = DummyBackend::default();
         let mut stream = backend
             .open_stream(
                 StreamConfig {
@@ -220,7 +270,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_formats() {
-        let mut backend = DummyBackend;
+        let mut backend = DummyBackend::default();
         let res = backend.open_stream(
             StreamConfig {
                 sample_rate: Some(1),

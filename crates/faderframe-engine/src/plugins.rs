@@ -81,6 +81,14 @@ impl PluginHost {
             .ok_or_else(|| PluginError::NotFound(slot.plugin.id.clone()))
     }
 
+    /// Parameters of an instantiated plugin.
+    pub fn parameters(
+        &self,
+        plugin: PluginInstanceId,
+    ) -> Option<&[faderframe_plugin_host::ParameterInfo]> {
+        self.instances.get(&plugin).map(|h| h.instance.parameters())
+    }
+
     pub fn instance(&mut self, slot: &PluginSlot) -> Result<&mut dyn PluginInstance, PluginError> {
         Ok(self.ensure(slot)?.instance.as_mut())
     }

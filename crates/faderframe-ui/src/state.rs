@@ -33,7 +33,17 @@ impl BackendChoice {
 
     pub fn backends(self) -> Vec<Box<dyn AudioBackend>> {
         let jack = || Box::new(faderframe_audio_jack::JackBackend) as Box<dyn AudioBackend>;
-        let dummy = || Box::new(faderframe_audio::dummy::DummyBackend) as Box<dyn AudioBackend>;
+        // FADERFRAME_DUMMY_TONE=<Hz> feeds a test tone to the dummy
+        // device's inputs (for trying out recording without hardware).
+        let tone = std::env::var("FADERFRAME_DUMMY_TONE")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok());
+        let dummy = move || {
+            Box::new(match tone {
+                Some(hz) => faderframe_audio::dummy::DummyBackend::with_input_pluck(hz),
+                None => faderframe_audio::dummy::DummyBackend::default(),
+            }) as Box<dyn AudioBackend>
+        };
         match self {
             BackendChoice::Auto => vec![jack(), dummy()],
             BackendChoice::Jack => vec![jack()],
@@ -50,6 +60,8 @@ pub struct RunOptions {
     pub empty: bool,
     pub sample_rate: Option<u32>,
     pub buffer_size: Option<u32>,
+    /// Audio files to import after start-up (onto new tracks at bar 1).
+    pub import: Vec<PathBuf>,
 }
 
 pub struct AppState {

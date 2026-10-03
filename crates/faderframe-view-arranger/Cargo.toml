@@ -15,6 +15,7 @@ faderframe-core.workspace = true
 faderframe-timeline.workspace = true
 faderframe-project.workspace = true
 faderframe-session.workspace = true
+faderframe-automation.workspace = true
 faderframe-ui-canvas.workspace = true
 faderframe-audio-files.workspace = true
 

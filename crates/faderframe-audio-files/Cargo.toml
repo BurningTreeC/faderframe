@@ -12,6 +12,11 @@ workspace = true
 
 [dependencies]
 serde.workspace = true
+symphonia.workspace = true
+rubato.workspace = true
+audioadapter-buffers.workspace = true
+faderframe-realtime.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

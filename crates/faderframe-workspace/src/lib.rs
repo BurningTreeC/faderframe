@@ -86,7 +86,19 @@ pub struct Workspace {
 pub struct WorkspaceSet {
     pub active: usize,
     pub workspaces: Vec<Workspace>,
+    /// Arranger track height for all tracks (logical pixels; `None` = theme
+    /// default) and per-track overrides.
+    #[serde(default)]
+    pub track_height: Option<f32>,
+    #[serde(default)]
+    pub track_heights: std::collections::BTreeMap<faderframe_core::TrackId, f32>,
+    /// Automation lanes shown in the arranger.
+    #[serde(default)]
+    pub automation_shown: std::collections::BTreeSet<faderframe_core::AutomationLaneId>,
 }
+
+/// Smallest and largest arranger track heights.
+pub const TRACK_HEIGHT_RANGE: (f32, f32) = (40.0, 480.0);
 
 impl Default for WorkspaceSet {
     fn default() -> Self {
@@ -99,11 +111,36 @@ impl Default for WorkspaceSet {
                     layout: p.layout(),
                 })
                 .collect(),
+            track_height: None,
+            track_heights: Default::default(),
+            automation_shown: Default::default(),
         }
     }
 }
 
 impl WorkspaceSet {
+    /// Height of a track in the arranger, if not the theme default.
+    pub fn track_height(&self, track: faderframe_core::TrackId) -> Option<f32> {
+        self.track_heights
+            .get(&track)
+            .copied()
+            .or(self.track_height)
+    }
+
+    /// Set one track's height, or (with `None`) every track's.
+    pub fn set_track_height(&mut self, track: Option<faderframe_core::TrackId>, height: f32) {
+        let h = height.clamp(TRACK_HEIGHT_RANGE.0, TRACK_HEIGHT_RANGE.1);
+        match track {
+            Some(t) => {
+                self.track_heights.insert(t, h);
+            }
+            None => {
+                self.track_height = Some(h);
+                self.track_heights.clear();
+            }
+        }
+    }
+
     pub fn active(&self) -> &Workspace {
         &self.workspaces[self.active.min(self.workspaces.len().saturating_sub(1))]
     }
@@ -193,5 +230,27 @@ mod tests {
         set.sanitise();
         assert_eq!(set.active, set.workspaces.len() - 1);
         set.workspaces[0].layout.validate().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod track_height_tests {
+    use super::*;
+    use faderframe_core::TrackId;
+
+    #[test]
+    fn heights_clamp_override_and_round_trip() {
+        let mut ws = WorkspaceSet::default();
+        assert_eq!(ws.track_height(TrackId(3)), None);
+        ws.set_track_height(None, 100.0);
+        ws.set_track_height(Some(TrackId(3)), 9999.0);
+        assert_eq!(ws.track_height(TrackId(3)), Some(TRACK_HEIGHT_RANGE.1));
+        assert_eq!(ws.track_height(TrackId(4)), Some(100.0));
+        let json = serde_json::to_string(&ws).unwrap();
+        let back: WorkspaceSet = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ws);
+        // Setting all heights clears overrides.
+        ws.set_track_height(None, 10.0);
+        assert_eq!(ws.track_height(TrackId(3)), Some(TRACK_HEIGHT_RANGE.0));
     }
 }

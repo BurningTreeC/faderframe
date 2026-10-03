@@ -12,13 +12,17 @@
 //! * [`SlotAllocator`] — control-side allocator for table slots.
 //! * [`mailbox`] — latest-value handoff of boxed objects (graphs, snapshots).
 //!
-//! `mailbox` contains the crate's only `unsafe` code (pointer ownership
-//! transfer through an `AtomicPtr`), with its invariants documented inline.
+//! * [`PageTable`] / [`Epoch`] — lock-free page table with epoch-based
+//!   reclamation for disk streaming.
+//!
+//! `mailbox` and `pages` contain the crate's only `unsafe` code (pointer
+//! ownership transfer through `AtomicPtr`s), with invariants documented inline.
 
 mod atomic;
 mod mailbox;
 mod meters;
 mod metrics;
+mod pages;
 mod params;
 mod slots;
 
@@ -26,5 +30,6 @@ pub use atomic::AtomicF32;
 pub use mailbox::{MailboxReceiver, MailboxSender, mailbox};
 pub use meters::{MeterBank, MeterRange, MeterReading};
 pub use metrics::{CallbackMetrics, MetricsSnapshot};
+pub use pages::{Epoch, PageTable, Reclaimer, Retired};
 pub use params::{ParamSlot, ParamTable};
 pub use slots::SlotAllocator;

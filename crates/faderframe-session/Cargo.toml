@@ -19,6 +19,7 @@ faderframe-engine.workspace = true
 faderframe-audio.workspace = true
 faderframe-audio-files.workspace = true
 faderframe-plugin-host.workspace = true
+faderframe-automation.workspace = true
 faderframe-transport.workspace = true
 faderframe-realtime.workspace = true
 thiserror.workspace = true

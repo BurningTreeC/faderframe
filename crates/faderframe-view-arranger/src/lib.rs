@@ -8,16 +8,18 @@
 
 #![forbid(unsafe_code)]
 
+mod automation;
 mod header;
 
+pub use automation::AUTO_LANE_H;
 pub use header::HeaderLayout;
 
 use faderframe_core::gain::{SILENCE_DB, format_db};
 use faderframe_core::pan::format_pan;
 use faderframe_core::{ClipId, FaderLaw, TrackId, db_to_gain};
 use faderframe_project::{
-    Clip, ClipContent, Command, MonitorMode, MusicalRange, OutputRouting, Track, TrackColor,
-    TrackKind,
+    Clip, ClipContent, Command, MonitorMode, MusicalRange, OutputRouting, TakeFolder, Track,
+    TrackColor, TrackKind,
 };
 use faderframe_session::{Action, SelectMode, Session, TransportAction};
 use faderframe_timeline::{
@@ -34,6 +36,21 @@ const MIN_PPQ: f32 = 1.5;
 const MAX_PPQ: f32 = 800.0;
 const LOOP_BAND: f32 = 11.0;
 const DRAG_THRESHOLD: f32 = 3.0;
+/// Height of one take lane under an open take folder.
+const LANE_H: f32 = 30.0;
+/// Width of the take-folder disclosure triangle in a clip header.
+const DISCLOSURE_W: f32 = 15.0;
+/// Header controls never spread over more than this height.
+const HEADER_MAX_H: f32 = 96.0;
+/// Height of the resize grip at a track's bottom edge (header column).
+const RESIZE_GRIP: f32 = 4.0;
+/// Track height presets (View → Track Height, track context menu).
+pub const TRACK_HEIGHTS: [(&str, f32); 4] = [
+    ("Small", 44.0),
+    ("Medium", 72.0),
+    ("Large", 120.0),
+    ("Extra Large", 200.0),
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeaderPart {
@@ -45,6 +62,10 @@ pub enum HeaderPart {
     Pan,
     Volume,
     Meter,
+    /// The bottom edge: drag to change the track height.
+    Resize,
+    /// Show/hide the automation lanes.
+    Automation,
     Body,
 }
 
@@ -62,6 +83,21 @@ pub enum Hit {
     Lane {
         track: TrackId,
         at: MusicalTime,
+    },
+    /// The disclosure triangle of a take folder.
+    TakeToggle(ClipId),
+    /// An automation lane row (`header`: in the header column).
+    Automation {
+        track: TrackId,
+        lane: faderframe_core::AutomationLaneId,
+        header: bool,
+    },
+    /// A take lane of an open take folder; `pos` is the folder frame.
+    TakeLane {
+        clip: ClipId,
+        track: TrackId,
+        take: usize,
+        pos: i64,
     },
     Empty(MusicalTime),
 }
@@ -95,6 +131,34 @@ enum Drag {
         sx: f32,
         sy: f32,
     },
+    Height {
+        track: TrackId,
+        start_y: f32,
+        start_h: f32,
+    },
+}
+
+/// Swipe comping in progress (kept outside `Drag`, which is `Copy`).
+struct CompDrag {
+    clip: ClipId,
+    take: usize,
+    anchor: i64,
+    origin: Point,
+    moved: bool,
+    /// The folder before the swipe; every move recomputes from it.
+    base: TakeFolder,
+}
+
+/// Audio of one source placed on the timeline, for waveform drawing.
+struct WaveSpan {
+    source: faderframe_core::AudioSourceId,
+    /// Engine sample of the first frame.
+    start: i64,
+    /// Source frame (project rate) at `start`.
+    source_offset: i64,
+    /// Length in project frames.
+    length: i64,
+    gain: f32,
 }
 
 pub struct ArrangerView {
@@ -106,6 +170,13 @@ pub struct ArrangerView {
     drag: Option<Drag>,
     hover: Option<Hit>,
     law: FaderLaw,
+    /// Files being dragged in: target track (`None` = new tracks) and time.
+    drop_at: Option<(Option<TrackId>, MusicalTime)>,
+    comp: Option<CompDrag>,
+    auto_drag: Option<automation::AutoDrag>,
+    /// Row tops (content coordinates) of the lane tracks, plus the end;
+    /// rows grow while take lanes are open. Refreshed per paint/event.
+    rows: Vec<f32>,
 }
 
 fn color_of(c: TrackColor) -> Color {
@@ -114,7 +185,7 @@ fn color_of(c: TrackColor) -> Color {
 
 fn clip_fits(track: &Track, clip: &Clip) -> bool {
     match clip.content {
-        ClipContent::Audio(_) => track.kind == TrackKind::Audio,
+        ClipContent::Audio(_) | ClipContent::Takes(_) => track.kind == TrackKind::Audio,
         ClipContent::Midi(_) => matches!(track.kind, TrackKind::Instrument | TrackKind::Midi),
     }
 }
@@ -129,6 +200,10 @@ impl ArrangerView {
             drag: None,
             hover: None,
             law: FaderLaw::console(),
+            drop_at: None,
+            comp: None,
+            auto_drag: None,
+            rows: Vec::new(),
         }
     }
 
@@ -163,25 +238,92 @@ impl ArrangerView {
             .collect()
     }
 
+    /// Take lanes shown under a track (the most takes of its open folders).
+    fn open_lanes(t: &Track, model: &Session) -> usize {
+        model
+            .project()
+            .clips_of(t.id)
+            .into_iter()
+            .filter(|c| model.takes_open(c.id))
+            .filter_map(|c| c.as_takes())
+            .map(|f| f.takes.len())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Height of a track's main lane (without take lanes).
+    fn base_h(&self, model: &Session, track: TrackId) -> f32 {
+        model.track_height(track).unwrap_or(self.row_h())
+    }
+
+    /// Height of the header controls area (tall tracks keep their
+    /// controls at the top).
+    fn header_h(&self, model: &Session, track: TrackId) -> f32 {
+        self.base_h(model, track).min(HEADER_MAX_H)
+    }
+
+    fn update_rows(&mut self, model: &Session) {
+        self.rows.clear();
+        let mut y = 0.0;
+        self.rows.push(y);
+        for t in Self::lane_tracks(model) {
+            y += self.base_h(model, t.id)
+                + Self::open_lanes(t, model) as f32 * LANE_H
+                + model.shown_lanes(t.id).len() as f32 * AUTO_LANE_H;
+            self.rows.push(y);
+        }
+    }
+
+    /// Top of row `i` in content coordinates (rows past the end continue
+    /// at the base height, e.g. for the "new track" drop hint).
+    fn row_top(&self, i: usize) -> f32 {
+        match self.rows.get(i) {
+            Some(y) => *y,
+            None => {
+                let last = self.rows.len().saturating_sub(1);
+                self.rows.last().copied().unwrap_or(0.0) + (i - last) as f32 * self.row_h()
+            }
+        }
+    }
+
+    fn total_rows_height(&self) -> f32 {
+        self.rows.last().copied().unwrap_or(0.0)
+    }
+
     fn row_at(&self, y: f32) -> Option<usize> {
         let rel = y - self.ruler_h() + self.scroll_y;
-        (rel >= 0.0).then(|| (rel / self.row_h()) as usize)
+        if rel < 0.0 {
+            return None;
+        }
+        let total = self.total_rows_height();
+        if rel >= total {
+            let n = self.rows.len().saturating_sub(1);
+            return Some(n + ((rel - total) / self.row_h()) as usize);
+        }
+        Some(self.rows.partition_point(|&o| o <= rel).saturating_sub(1))
     }
 
     fn row_rect(&self, i: usize, size: Size) -> Rect {
-        Rect::new(
-            0.0,
-            self.ruler_h() + i as f32 * self.row_h() - self.scroll_y,
-            size.w,
-            self.row_h(),
-        )
+        let top = self.row_top(i);
+        let h = match (self.rows.get(i), self.rows.get(i + 1)) {
+            (Some(a), Some(b)) => b - a,
+            _ => self.row_h(),
+        };
+        Rect::new(0.0, self.ruler_h() + top - self.scroll_y, size.w, h)
     }
 
     pub fn visible_rows(&self, count: usize, size: Size) -> std::ops::Range<usize> {
-        let first = (self.scroll_y / self.row_h()).floor().max(0.0) as usize;
-        let last = ((self.scroll_y + size.h - self.ruler_h()) / self.row_h())
-            .ceil()
-            .max(0.0) as usize;
+        if self.rows.len() != count + 1 {
+            let first = (self.scroll_y / self.row_h()).floor().max(0.0) as usize;
+            let last = ((self.scroll_y + size.h - self.ruler_h()) / self.row_h())
+                .ceil()
+                .max(0.0) as usize;
+            return first.min(count)..last.min(count);
+        }
+        let top = self.scroll_y;
+        let bottom = self.scroll_y + size.h - self.ruler_h();
+        let first = self.rows.partition_point(|&o| o <= top).saturating_sub(1);
+        let last = self.rows.partition_point(|&o| o < bottom);
         first.min(count)..last.min(count)
     }
 
@@ -198,7 +340,12 @@ impl ArrangerView {
         let max_x = (self.content_quarters(model) as f32 * self.ppq - lanes_w * 0.5).max(0.0);
         self.scroll_x = self.scroll_x.clamp(0.0, max_x);
         let rows = Self::lane_tracks(model).len() as f32;
-        let max_y = (rows * self.row_h() - (size.h - self.ruler_h()) + self.row_h()).max(0.0);
+        let total = if self.rows.len() > 1 {
+            self.total_rows_height()
+        } else {
+            rows * self.row_h()
+        };
+        let max_y = (total - (size.h - self.ruler_h()) + self.row_h()).max(0.0);
         self.scroll_y = self.scroll_y.clamp(0.0, max_y);
     }
 
@@ -227,7 +374,12 @@ impl ArrangerView {
         let end = clip.end(&p.timeline, p.sample_rate);
         let x0 = self.x_of(clip.start);
         let x1 = self.x_of(end);
-        Rect::new(x0, row.y + 3.0, (x1 - x0).max(2.0), row.h - 6.0)
+        Rect::new(
+            x0,
+            row.y + 3.0,
+            (x1 - x0).max(2.0),
+            self.base_h(model, clip.track) - 6.0,
+        )
     }
 
     pub fn hit_test(&self, pos: Point, size: Size, model: &Session) -> Option<Hit> {
@@ -247,13 +399,29 @@ impl ArrangerView {
         };
         let t = tracks[i];
         let row = self.row_rect(i, size);
+        if let Some((g, part)) = self.auto_hit(model, t, row, pos) {
+            return Some(Hit::Automation {
+                track: t.id,
+                lane: g.lane,
+                header: part.is_some(),
+            });
+        }
         if pos.x < self.header_w() {
-            let l = HeaderLayout::new(Rect::new(0.0, row.y, self.header_w(), row.h));
+            if pos.y >= row.bottom() - RESIZE_GRIP {
+                return Some(Hit::Header(t.id, HeaderPart::Resize));
+            }
+            let l = HeaderLayout::new(Rect::new(
+                0.0,
+                row.y,
+                self.header_w(),
+                self.header_h(model, t.id),
+            ));
             let part = [
                 (Some(l.mute), HeaderPart::Mute),
                 (Some(l.solo), HeaderPart::Solo),
                 (Some(l.record), HeaderPart::Record),
                 (Some(l.monitor), HeaderPart::Monitor),
+                (Some(l.automation), HeaderPart::Automation),
                 (l.pan, HeaderPart::Pan),
                 (Some(l.volume.inset_xy(-2.0, -3.0)), HeaderPart::Volume),
                 (Some(l.meter), HeaderPart::Meter),
@@ -264,16 +432,51 @@ impl ArrangerView {
             .map_or(HeaderPart::Body, |(_, p)| p);
             return Some(Hit::Header(t.id, part));
         }
-        for clip in model.project().clips_of(t.id).into_iter().rev() {
-            if self.clip_rect(clip, row, model).contains(pos) {
+        let p = model.project();
+        for clip in p.clips_of(t.id).into_iter().rev() {
+            let rect = self.clip_rect(clip, row, model);
+            if rect.contains(pos) {
+                if clip.as_takes().is_some() && self.disclosure_rect(rect).contains(pos) {
+                    return Some(Hit::TakeToggle(clip.id));
+                }
                 return Some(Hit::Clip {
                     clip: clip.id,
                     track: t.id,
                     at,
                 });
             }
+            // Take lanes below the main lane.
+            if let Some(f) = clip.as_takes()
+                && model.takes_open(clip.id)
+                && pos.x >= rect.x
+                && pos.x < rect.right()
+            {
+                let lanes_top = row.y + self.base_h(model, t.id);
+                let k = ((pos.y - lanes_top) / LANE_H).floor();
+                if k >= 0.0 && (k as usize) < f.takes.len() {
+                    let rate = p.sample_rate as f64;
+                    let frame =
+                        p.timeline.to_samples(at, rate) - p.timeline.to_samples(clip.start, rate);
+                    return Some(Hit::TakeLane {
+                        clip: clip.id,
+                        track: t.id,
+                        take: k as usize,
+                        pos: frame.clamp(0, f.length),
+                    });
+                }
+            }
         }
         Some(Hit::Lane { track: t.id, at })
+    }
+
+    fn disclosure_rect(&self, clip: Rect) -> Rect {
+        let h = self.theme.arranger.clip_header.min(clip.h * 0.5);
+        Rect::new(clip.x + 2.0, clip.y, DISCLOSURE_W, h)
+    }
+
+    /// x of an engine sample position.
+    fn x_of_sample(&self, model: &Session, sample: i64) -> f32 {
+        self.x_of(model.engine().samples_to_musical(model.project(), sample))
     }
 
     // --- painting ------------------------------------------------------------------
@@ -300,32 +503,69 @@ impl ArrangerView {
         });
     }
 
+    /// Waveform of a clip or a part of a take, clipped to `vis`.
     fn paint_waveform(
         &self,
         p: &mut dyn Painter,
         area: Rect,
         vis: (f32, f32),
-        clip: &Clip,
+        span: &WaveSpan,
         model: &Session,
         color: Color,
     ) {
-        let Some(audio) = clip.as_audio() else {
+        let Some(peaks) = model.peaks(span.source) else {
             return;
         };
-        let Some(peaks) = model.peaks(audio.source) else {
-            return;
-        };
-        if area.h < 6.0 || vis.1 <= vis.0 {
+        let ratio = model.frame_ratio();
+        let len = (span.length as f64 * ratio) as i64;
+        // Peak frames per engine frame (streamed files keep their own rate).
+        let pr = model.peak_rate(span.source) / model.sample_rate() as f64;
+        let src_off = (span.source_offset as f64 * ratio * pr) as i64;
+        let channels = peaks.channels();
+        self.fill_wave(
+            p,
+            area,
+            vis,
+            span.start,
+            len,
+            channels,
+            span.gain,
+            model,
+            color,
+            |ch, s0, s1| {
+                let a = (s0 as f64 * pr) as i64;
+                let b = ((s1 as f64 * pr) as i64).max(a + 1);
+                peaks.min_max(ch, src_off + a, src_off + b)
+            },
+        );
+    }
+
+    /// Fill a min/max waveform for engine samples `start..start + len`,
+    /// clipped to `vis`. `peak(channel, a, b)` gets sample offsets relative
+    /// to `start`. Stereo material is stacked when there is room.
+    #[allow(clippy::too_many_arguments)]
+    fn fill_wave(
+        &self,
+        p: &mut dyn Painter,
+        area: Rect,
+        vis: (f32, f32),
+        start: i64,
+        len: i64,
+        channels: usize,
+        gain: f32,
+        model: &Session,
+        color: Color,
+        mut peak: impl FnMut(usize, i64, i64) -> Option<(f32, f32)>,
+    ) {
+        let x0 = self.x_of_sample(model, start).max(vis.0);
+        let x1 = self.x_of_sample(model, start + len).min(vis.1);
+        if area.h < 6.0 || x1 <= x0 || len <= 0 {
             return;
         }
         let tl = &model.project().timeline;
         let sr = model.sample_rate() as f64;
-        let ratio = model.frame_ratio();
-        let clip_start = tl.to_samples(clip.start, sr);
-        let src_off = (audio.source_offset as f64 * ratio) as i64;
-        let len = (audio.length as f64 * ratio) as i64;
-        let gain = db_to_gain(audio.gain_db).min(4.0);
-        let channels = peaks.channels().min(2);
+        let gain = gain.min(4.0);
+        let channels = channels.min(2);
         let stacked = channels == 2 && area.h >= 40.0;
         let lanes: Vec<(Rect, Vec<usize>)> = if stacked {
             let (top, bottom) = area.split_top(area.h / 2.0);
@@ -340,15 +580,15 @@ impl ArrangerView {
             let half = lane.h * 0.46;
             let mut top = Vec::new();
             let mut bottom = Vec::new();
-            let mut x = vis.0;
-            while x < vis.1 {
-                let s0 = tl.to_samples(self.time_at(x), sr) - clip_start;
-                let s1 = tl.to_samples(self.time_at(x + step), sr) - clip_start;
+            let mut x = x0;
+            while x < x1 {
+                let s0 = tl.to_samples(self.time_at(x), sr) - start;
+                let s1 = tl.to_samples(self.time_at(x + step), sr) - start;
                 let (s0, s1) = (s0.clamp(0, len), s1.clamp(0, len).max(s0.clamp(0, len) + 1));
                 let mut lo = 0.0f32;
                 let mut hi = 0.0f32;
                 for &ch in &chans {
-                    if let Some((a, b)) = peaks.min_max(ch, src_off + s0, src_off + s1) {
+                    if let Some((a, b)) = peak(ch, s0, s1) {
                         lo = lo.min(a);
                         hi = hi.max(b);
                     }
@@ -371,7 +611,155 @@ impl ArrangerView {
             }
             path.close();
             p.fill_path(&path, fill);
-            p.hline(vis.0, vis.1, mid, color.lighten(0.3).with_alpha(0.25));
+            p.hline(x0, x1, mid, color.lighten(0.3).with_alpha(0.25));
+        }
+    }
+
+    /// Engine sample where a clip starts.
+    fn clip_start_sample(model: &Session, clip: &Clip) -> i64 {
+        model
+            .engine()
+            .musical_to_samples(model.project(), clip.start)
+    }
+
+    /// Engine samples of `frames` project frames.
+    fn engine_frames(model: &Session, frames: i64) -> i64 {
+        (frames as f64 * model.frame_ratio()).round() as i64
+    }
+
+    /// The comp of a take folder in its main lane.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_comp(
+        &self,
+        p: &mut dyn Painter,
+        area: Rect,
+        vis: (f32, f32),
+        clip: &Clip,
+        f: &TakeFolder,
+        model: &Session,
+        color: Color,
+    ) {
+        let base = Self::clip_start_sample(model, clip);
+        for piece in f.pieces() {
+            let take = &f.takes[piece.take];
+            let span = WaveSpan {
+                source: take.source,
+                start: base + Self::engine_frames(model, piece.start),
+                source_offset: take.source_offset + piece.start,
+                length: piece.end - piece.start,
+                gain: db_to_gain(f.gain_db + take.gain_db),
+            };
+            self.paint_waveform(p, area, vis, &span, model, color);
+        }
+        // Comp boundaries.
+        for (a, _, _) in f.segments().skip(1) {
+            let x = self.x_of_sample(model, base + Self::engine_frames(model, a));
+            if x > vis.0 && x < vis.1 {
+                p.vline(x, area.y, area.bottom(), Color::rgba(1.0, 1.0, 1.0, 0.35));
+            }
+        }
+    }
+
+    /// Lanes of an open take folder: every take, comped parts highlighted.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_take_lanes(
+        &self,
+        p: &mut dyn Painter,
+        clip_rect: Rect,
+        lanes_top: f32,
+        lanes: Rect,
+        clip: &Clip,
+        f: &TakeFolder,
+        model: &Session,
+        color: Color,
+    ) {
+        let base = Self::clip_start_sample(model, clip);
+        let vis = (
+            clip_rect.x.max(lanes.x),
+            clip_rect.right().min(lanes.right()),
+        );
+        if vis.1 <= vis.0 {
+            return;
+        }
+        let pieces = f.pieces();
+        let text = TextStyle::new(self.theme.fonts.small, Color::hex(0xe8e4dc));
+        for (k, take) in f.takes.iter().enumerate() {
+            let lane = Rect::new(
+                clip_rect.x,
+                lanes_top + k as f32 * LANE_H,
+                clip_rect.w,
+                LANE_H - 1.0,
+            );
+            p.fill(
+                Rect::new(vis.0, lane.y, vis.1 - vis.0, lane.h),
+                color.darken(0.8).with_alpha(0.9),
+            );
+            let tx0 = self.x_of_sample(model, base + Self::engine_frames(model, take.start));
+            let tx1 = self.x_of_sample(model, base + Self::engine_frames(model, take.end));
+            let body = Rect::new(tx0, lane.y + 1.0, tx1 - tx0, lane.h - 2.0);
+            p.fill_rounded(
+                body,
+                2.0,
+                &Paint::Solid(color.darken(0.62).with_alpha(0.85)),
+            );
+            let wave = WaveSpan {
+                source: take.source,
+                start: base + Self::engine_frames(model, take.start),
+                source_offset: take.source_offset + take.start,
+                length: take.end - take.start,
+                gain: db_to_gain(f.gain_db + take.gain_db),
+            };
+            self.paint_waveform(
+                p,
+                body.inset_xy(0.0, 2.0),
+                vis,
+                &wave,
+                model,
+                color.darken(0.35),
+            );
+            // Comped parts of this take.
+            for piece in pieces.iter().filter(|q| q.take == k) {
+                let x0 = self
+                    .x_of_sample(model, base + Self::engine_frames(model, piece.start))
+                    .max(vis.0);
+                let x1 = self
+                    .x_of_sample(model, base + Self::engine_frames(model, piece.end))
+                    .min(vis.1);
+                if x1 <= x0 {
+                    continue;
+                }
+                let r = Rect::new(x0, lane.y + 1.0, x1 - x0, lane.h - 2.0);
+                p.fill(r, color.with_alpha(0.45));
+                let span = WaveSpan {
+                    source: take.source,
+                    start: base + Self::engine_frames(model, piece.start),
+                    source_offset: take.source_offset + piece.start,
+                    length: piece.end - piece.start,
+                    gain: wave.gain,
+                };
+                self.paint_waveform(
+                    p,
+                    r.inset_xy(0.0, 2.0),
+                    (x0, x1),
+                    &span,
+                    model,
+                    color.lighten(0.2),
+                );
+                p.stroke_rounded(r, 1.5, 1.0, color.lighten(0.35));
+            }
+            // Label on a dark chip so it stays readable over comped parts.
+            let label_text = format!("{} · {}", k + 1, take.name);
+            let w = (p.text_width(&label_text, &text) + 10.0).min(vis.1 - vis.0 - 4.0);
+            if w > 16.0 {
+                let chip = Rect::new(vis.0 + 3.0, lane.y + 3.0, w, 14.0);
+                p.fill_rounded(
+                    chip,
+                    3.0,
+                    &Paint::Solid(Color::rgba(0.05, 0.05, 0.06, 0.72)),
+                );
+                p.text(&label_text, chip.inset_xy(5.0, 0.0), &text);
+            }
+            p.hline(vis.0, vis.1, lane.bottom(), Color::rgba(0.0, 0.0, 0.0, 0.5));
         }
     }
 
@@ -448,14 +836,40 @@ impl ArrangerView {
         } else {
             Color::hex(0xf2f0ea)
         };
-        let label_x = rect.x.max(lanes.x) + 5.0;
+        let is_folder = clip.as_takes().is_some();
+        let label_x = rect.x.max(lanes.x) + if is_folder { 5.0 + DISCLOSURE_W } else { 5.0 };
         let name_rect = Rect::new(
             label_x,
             rect.y,
             (rect.right() - label_x - 4.0).max(0.0),
             header_h,
         );
-        if name_rect.w > 12.0 {
+        if let Some(f) = clip.as_takes() {
+            // Disclosure triangle: open/close the take lanes.
+            let d = self.disclosure_rect(rect);
+            if d.x >= lanes.x - DISCLOSURE_W {
+                let c = d.center();
+                let mut tri = Path::new();
+                if model.takes_open(clip.id) {
+                    tri.move_to(Point::new(c.x - 4.0, c.y - 2.0))
+                        .line_to(Point::new(c.x + 4.0, c.y - 2.0))
+                        .line_to(Point::new(c.x, c.y + 3.0));
+                } else {
+                    tri.move_to(Point::new(c.x - 2.0, c.y - 4.0))
+                        .line_to(Point::new(c.x + 3.0, c.y))
+                        .line_to(Point::new(c.x - 2.0, c.y + 4.0));
+                }
+                tri.close();
+                p.fill_path(&tri, text_color);
+            }
+            if name_rect.w > 12.0 {
+                p.text(
+                    &format!("{} · {} takes", clip.name, f.takes.len()),
+                    name_rect,
+                    &TextStyle::new(self.theme.fonts.small, text_color).bold(),
+                );
+            }
+        } else if name_rect.w > 12.0 {
             p.text(
                 &clip.name,
                 name_rect,
@@ -466,7 +880,14 @@ impl ArrangerView {
             Rect::new(rect.x, rect.y + header_h, rect.w, rect.h - header_h).inset_xy(0.0, 2.0);
         match &clip.content {
             ClipContent::Audio(audio) => {
-                self.paint_waveform(p, content, vis, clip, model, color);
+                let span = WaveSpan {
+                    source: audio.source,
+                    start: Self::clip_start_sample(model, clip),
+                    source_offset: audio.source_offset,
+                    length: audio.length,
+                    gain: db_to_gain(audio.gain_db),
+                };
+                self.paint_waveform(p, content, vis, &span, model, color);
                 // Fade handles.
                 let sr = model.project().sample_rate as f64;
                 for (frames, at_start) in
@@ -493,9 +914,36 @@ impl ArrangerView {
                 }
             }
             ClipContent::Midi(_) => self.paint_midi_preview(p, content, vis, clip, color),
+            ClipContent::Takes(f) => self.paint_comp(p, content, vis, clip, f, model, color),
         }
         if clip.muted {
             p.fill(rect, Color::rgba(0.08, 0.08, 0.09, 0.6));
+        }
+        if clip
+            .content
+            .sources()
+            .iter()
+            .any(|s| model.is_source_missing(*s))
+        {
+            // Offline media: hatched, with a label.
+            p.fill(content, Color::rgba(0.35, 0.05, 0.05, 0.55));
+            let mut x = content.x - content.h;
+            while x < content.right() {
+                p.line(
+                    Point::new(x, content.bottom()),
+                    Point::new(x + content.h, content.y),
+                    1.0,
+                    Color::rgba(1.0, 0.4, 0.35, 0.25),
+                );
+                x += 9.0;
+            }
+            if content.w > 50.0 && content.h > 12.0 {
+                p.text(
+                    "OFFLINE",
+                    Rect::new(content.x.max(lanes.x) + 5.0, content.y, 80.0, content.h),
+                    &TextStyle::new(self.theme.fonts.small, Color::hex(0xffb4a8)).bold(),
+                );
+            }
         }
         p.pop_clip();
         if selected {
@@ -562,7 +1010,7 @@ impl ArrangerView {
                 &TextStyle::new(th.fonts.tiny + 0.5, th.ui.text_dim).family(FontFamily::Condensed),
             );
         }
-        controls::led_button(p, l.mute, "M", t.mute, c.led.mute, th);
+        controls::led_button(p, l.mute, "M", model.shown_mute(t), c.led.mute, th);
         controls::led_button(p, l.solo, "S", t.solo, c.led.solo, th);
         let armable = t.kind.has_clips();
         controls::led_button(
@@ -582,13 +1030,26 @@ impl ArrangerView {
             c.led.monitor,
             th,
         );
+        let automated = t
+            .automation
+            .lanes
+            .iter()
+            .any(|a| !a.curve.is_empty() && a.mode != faderframe_session::AutomationMode::Off);
+        controls::led_button(
+            p,
+            l.automation,
+            "A",
+            !model.shown_lanes(t.id).is_empty() || automated,
+            th.arranger.automation,
+            th,
+        );
         if let Some(pan) = l.pan
             && t.kind.has_audio()
         {
             controls::knob(
                 p,
                 pan,
-                (t.pan + 1.0) * 0.5,
+                (model.shown_pan(t) + 1.0) * 0.5,
                 true,
                 KnobLook {
                     cap: c.pan_cap,
@@ -600,7 +1061,7 @@ impl ArrangerView {
         if t.kind.has_audio() {
             // Mini horizontal fader.
             let v = l.volume;
-            let pos = self.law.db_to_position(t.volume_db);
+            let pos = self.law.db_to_position(model.shown_volume_db(t));
             let slot = Rect::new(v.x, v.center().y - 1.5, v.w, 3.0);
             p.fill_rounded(slot, 1.5, &Paint::Solid(c.fader.slot));
             p.fill_rounded(
@@ -618,7 +1079,7 @@ impl ArrangerView {
                 &Paint::vertical(cap, c.fader.cap_top, c.fader.cap_bottom),
             );
             p.text(
-                &format_db(t.volume_db),
+                &format_db(model.shown_volume_db(t)),
                 l.volume_text,
                 &TextStyle::new(th.fonts.tiny + 0.5, th.ui.text_dim)
                     .family(FontFamily::Mono)
@@ -655,6 +1116,17 @@ impl ArrangerView {
                 a.loop_off
             };
             p.fill_rounded(r, 2.0, &Paint::Solid(col));
+        }
+        if let Some(pr) = project.punch_range {
+            let x0 = self.x_of(pr.start);
+            let x1 = self.x_of(pr.end);
+            let r = Rect::new(x0, band.bottom(), x1 - x0, 3.0);
+            let col = if project.punch_enabled {
+                a.record.with_alpha(0.85)
+            } else {
+                a.record.with_alpha(0.3)
+            };
+            p.fill(r, col);
         }
         let meter = &project.timeline.meter;
         let (grid, every) = self.display_grid();
@@ -756,6 +1228,145 @@ impl ArrangerView {
         }
     }
 
+    /// The take being recorded: a growing red region on every armed track.
+    fn paint_recording(
+        &self,
+        p: &mut dyn Painter,
+        lanes: Rect,
+        size: Size,
+        tracks: &[&Track],
+        model: &Session,
+    ) {
+        let Some(rec) = model.recording_view() else {
+            return;
+        };
+        let t = model.transport();
+        if !t.recording || !t.playing || t.position <= rec.from {
+            return;
+        }
+        let pos = t.position.min(rec.to);
+        let mut start = rec.from;
+        if let Some(lr) = model
+            .project()
+            .loop_range
+            .filter(|_| model.project().loop_enabled)
+        {
+            let ls = model.engine().musical_to_samples(model.project(), lr.start);
+            if pos >= ls && start < ls && t.looping {
+                start = start.max(ls);
+            }
+        }
+        let x0 = self.x_of_sample(model, start).max(lanes.x);
+        let x1 = self.x_of_sample(model, pos).min(lanes.right());
+        if x1 <= x0 {
+            return;
+        }
+        let red = self.theme.arranger.record;
+        for (i, track) in tracks.iter().enumerate() {
+            if !rec.tracks.contains(&track.id) {
+                continue;
+            }
+            let row = self.row_rect(i, size);
+            if row.bottom() < lanes.y || row.y > lanes.bottom() {
+                continue;
+            }
+            let r = Rect::new(x0, row.y + 3.0, x1 - x0, self.base_h(model, track.id) - 6.0);
+            p.fill_rounded(r, 3.0, &Paint::Solid(red.with_alpha(0.22)));
+            // The waveform of what has been written so far (current pass),
+            // drawn where the take will land (latency compensated).
+            let header = 15.0f32.min(r.h * 0.4);
+            let wave_area = Rect::new(r.x, r.y + header, r.w, r.h - header).inset_xy(0.0, 2.0);
+            p.push_clip(r);
+            model.with_live_take(track.id, |live| {
+                let Some(seg) = live.segments.last() else {
+                    return;
+                };
+                let start = seg.timeline_start - rec.latency;
+                let offset = seg.file_offset as i64 + rec.latency;
+                let len = seg.frames as i64 - rec.latency;
+                let channels = live.peaks.channels();
+                self.fill_wave(
+                    p,
+                    wave_area,
+                    (lanes.x, lanes.right()),
+                    start,
+                    len,
+                    channels,
+                    1.0,
+                    model,
+                    red.lighten(0.1),
+                    |ch, a, b| live.peaks.min_max(ch, offset + a, offset + b),
+                );
+            });
+            p.pop_clip();
+            p.stroke_rounded(r, 3.0, 1.2, red.with_alpha(0.9));
+            if r.w > 40.0 {
+                p.text(
+                    "● REC",
+                    Rect::new(r.x + 6.0, r.y, 80.0, 16.0),
+                    &TextStyle::new(self.theme.fonts.small, red.lighten(0.3)).bold(),
+                );
+            }
+        }
+    }
+
+    fn paint_drop_hint(
+        &self,
+        p: &mut dyn Painter,
+        lanes: Rect,
+        size: Size,
+        tracks: &[&Track],
+        target: Option<TrackId>,
+        at: MusicalTime,
+    ) {
+        let accent = self.theme.arranger.selection_outline;
+        let row = match target.and_then(|t| tracks.iter().position(|x| x.id == t)) {
+            Some(i) => self.row_rect(i, size),
+            // New tracks appear below the last one.
+            None => self.row_rect(tracks.len(), size),
+        };
+        let band = Rect::new(lanes.x, row.y, lanes.w, row.h);
+        p.fill(band, accent.with_alpha(0.12));
+        p.stroke_rounded(band.inset_xy(1.0, 1.0), 3.0, 1.0, accent.with_alpha(0.6));
+        let x = self.x_of(at);
+        p.fill(Rect::new(x - 1.0, row.y + 2.0, 2.0, row.h - 4.0), accent);
+        let label = if target.is_some() {
+            "Drop to import here"
+        } else {
+            "Drop to import on new tracks"
+        };
+        p.text(
+            label,
+            Rect::new(x + 8.0, row.y, 260.0, row.h),
+            &TextStyle::new(self.theme.fonts.small, accent).bold(),
+        );
+    }
+
+    /// Where files dropped at `pos` go: an audio track under the pointer,
+    /// otherwise new tracks; time snapped to the grid.
+    fn drop_target(
+        &self,
+        pos: Point,
+        size: Size,
+        model: &Session,
+    ) -> Option<(Option<TrackId>, MusicalTime)> {
+        if pos.x < self.header_w() || pos.y < self.ruler_h() || pos.x > size.w {
+            return None;
+        }
+        let at = self.snap(
+            self.time_at(pos.x).max(MusicalTime::ZERO),
+            model,
+            Modifiers::default(),
+        );
+        let tracks = Self::lane_tracks(model);
+        let target = self
+            .row_at(pos.y)
+            .and_then(|i| tracks.get(i))
+            .filter(|t| t.kind == TrackKind::Audio)
+            .map(|t| t.id);
+        Some((target, at))
+    }
+
     // --- interaction ----------------------------------------------------------------
 
     fn snap(&self, t: MusicalTime, model: &Session, mods: Modifiers) -> MusicalTime {
@@ -764,6 +1375,16 @@ impl ArrangerView {
         } else {
             model.editor.snap(t, &model.project().timeline.meter)
         }
+    }
+
+    /// Snap a folder-relative frame of `clip` to the grid (unless Alt).
+    fn snap_frame(&self, frame: i64, clip: ClipId, model: &Session, mods: Modifiers) -> i64 {
+        let p = model.project();
+        let Some(c) = p.clip(clip) else { return frame };
+        let rate = p.sample_rate as f64;
+        let base = p.timeline.to_samples(c.start, rate);
+        let t = p.timeline.to_musical(base + frame, rate);
+        p.timeline.to_samples(self.snap(t, model, mods), rate) - base
     }
 
     fn header_layout(&self, model: &Session, track: TrackId, size: Size) -> Option<HeaderLayout> {
@@ -775,14 +1396,20 @@ impl ArrangerView {
             0.0,
             row.y,
             self.header_w(),
-            row.h,
+            self.header_h(model, track),
         )))
     }
 
     fn track_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
-        let _ = model;
         let mut items = vec![
-            MenuItem::new("Add Audio Track", Action::AddTrack(TrackKind::Audio)),
+            MenuItem::new("Add Audio Track (Mono)", Action::AddTrack(TrackKind::Audio)),
+            MenuItem::new(
+                "Add Audio Track (Stereo)",
+                Action::AddTrackWithLayout(
+                    TrackKind::Audio,
+                    faderframe_core::ChannelLayout::Stereo,
+                ),
+            ),
             MenuItem::new(
                 "Add Instrument Track",
                 Action::AddTrack(TrackKind::Instrument),
@@ -797,6 +1424,57 @@ impl ArrangerView {
             )
             .separated(),
         );
+        // Track presets.
+        if t.kind != TrackKind::Master {
+            items.push(
+                MenuItem::new(
+                    "Save as Track Preset",
+                    Action::SaveTrackPreset { track: t.id },
+                )
+                .separated(),
+            );
+        }
+        let presets = model.track_presets();
+        for (i, preset) in presets.iter().take(12).enumerate() {
+            let mut item = MenuItem::new(
+                format!("New Track from “{}”", preset.name),
+                Action::AddTrackFromPreset {
+                    path: preset.path.clone(),
+                },
+            );
+            if i == 0 {
+                item = item.separated();
+            }
+            items.push(item);
+        }
+        for (i, preset) in presets.iter().take(12).enumerate() {
+            let mut item = MenuItem::new(
+                format!("Apply “{}” to {}", preset.name, t.name),
+                Action::ApplyTrackPreset {
+                    track: t.id,
+                    path: preset.path.clone(),
+                },
+            );
+            if i == 0 {
+                item = item.separated();
+            }
+            items.push(item);
+        }
+        let current = model.track_height(t.id);
+        for (i, (name, h)) in TRACK_HEIGHTS.iter().enumerate() {
+            let mut item = MenuItem::new(
+                format!("Height: {name}"),
+                Action::SetTrackHeight {
+                    track: Some(t.id),
+                    height: *h,
+                },
+            )
+            .checked(current.map_or(i == 1, |c| (c - h).abs() < 0.5));
+            if i == 0 {
+                item = item.separated();
+            }
+            items.push(item);
+        }
         for (i, c) in TrackColor::PALETTE.iter().enumerate() {
             let mut item = MenuItem::new(
                 format!("Colour {}", i + 1),
@@ -842,8 +1520,19 @@ impl ArrangerView {
         HostRequest::ContextMenu { at, items }
     }
 
-    fn clip_menu(clip: &Clip, at: Point) -> HostRequest<Action> {
+    fn clip_menu(model: &Session, clip: &Clip, at: Point) -> HostRequest<Action> {
         let mut items = vec![];
+        if clip.as_takes().is_some() {
+            items.push(MenuItem::new(
+                if model.takes_open(clip.id) {
+                    "Hide Takes"
+                } else {
+                    "Show Takes"
+                },
+                Action::ToggleTakeLanes(clip.id),
+            ));
+            items.push(MenuItem::new("Flatten Comp", Action::FlattenTakes(clip.id)));
+        }
         if clip.as_midi().is_some() {
             items.push(MenuItem::new(
                 "Edit in Piano Roll",
@@ -872,6 +1561,40 @@ impl ArrangerView {
             )
             .separated(),
         );
+        HostRequest::ContextMenu { at, items }
+    }
+
+    fn take_menu(clip: &Clip, take: usize, at: Point) -> HostRequest<Action> {
+        let Some(f) = clip.as_takes() else {
+            return HostRequest::ContextMenu {
+                at,
+                items: Vec::new(),
+            };
+        };
+        let edit = |f: TakeFolder| {
+            Action::Edit(Command::SetClipContent {
+                clip: clip.id,
+                start: clip.start,
+                content: Box::new(ClipContent::Takes(f)),
+            })
+        };
+        let mut use_take = f.clone();
+        use_take.use_take(take);
+        let mut without = f.clone();
+        without.remove_take(take);
+        let name = f.takes.get(take).map_or("take", |t| t.name.as_str());
+        let mut items = vec![
+            MenuItem::new(format!("Use “{name}”"), edit(use_take)),
+            MenuItem::new(format!("Delete “{name}”"), edit(without)),
+        ];
+        if f.takes.len() <= 1 {
+            items[1] = MenuItem::disabled("Delete take (the only one)");
+        }
+        items.push(MenuItem::new("Flatten Comp", Action::FlattenTakes(clip.id)).separated());
+        items.push(MenuItem::new(
+            "Hide Takes",
+            Action::ToggleTakeLanes(clip.id),
+        ));
         HostRequest::ContextMenu { at, items }
     }
 
@@ -905,7 +1628,19 @@ impl ArrangerView {
         let Some(hit) = self.hit_test(pos, size, model) else {
             return false;
         };
+        if let Hit::Automation { track, .. } = hit {
+            let tracks = Self::lane_tracks(model);
+            let Some((i, t)) = tracks.iter().enumerate().find(|(_, t)| t.id == track) else {
+                return false;
+            };
+            let row = self.row_rect(i, size);
+            if let Some((g, part)) = self.auto_hit(model, t, row, pos) {
+                return self.auto_press(model, g, part, pos, clicks, mods, size.w, cx);
+            }
+            return true;
+        }
         match hit {
+            Hit::Automation { .. } => {}
             Hit::Corner => cx.request(Self::grid_menu(model, pos)),
             Hit::Ruler(t) => {
                 cx.emit(Action::Transport(TransportAction::Locate(
@@ -925,6 +1660,19 @@ impl ArrangerView {
                 };
                 let edit = |cx: &mut EventCx<'_, Action>, c| cx.emit(Action::Edit(c));
                 match part {
+                    HeaderPart::Automation => cx.emit(Action::ToggleTrackAutomation(id)),
+                    HeaderPart::Resize if clicks >= 2 => cx.emit(Action::SetTrackHeight {
+                        track: Some(id),
+                        height: self.row_h(),
+                    }),
+                    HeaderPart::Resize => {
+                        self.drag = Some(Drag::Height {
+                            track: id,
+                            start_y: pos.y,
+                            start_h: self.base_h(model, id),
+                        });
+                        cx.set_cursor(Cursor::ResizeVertical);
+                    }
                     HeaderPart::Mute => edit(
                         cx,
                         Command::SetTrackMute {
@@ -962,7 +1710,7 @@ impl ArrangerView {
                             self.drag = Some(Drag::Volume {
                                 track: id,
                                 origin_x: pos.x,
-                                start: self.law.db_to_position(t.volume_db),
+                                start: self.law.db_to_position(model.shown_volume_db(t)),
                                 width: l.volume.w,
                             });
                             cx.set_cursor(Cursor::ResizeHorizontal);
@@ -982,7 +1730,7 @@ impl ArrangerView {
                             self.drag = Some(Drag::Pan {
                                 track: id,
                                 origin_y: pos.y,
-                                start: (t.pan + 1.0) * 0.5,
+                                start: (model.shown_pan(t) + 1.0) * 0.5,
                             });
                             cx.set_cursor(Cursor::ResizeVertical);
                         }
@@ -1006,12 +1754,36 @@ impl ArrangerView {
                     }
                 }
             }
+            Hit::TakeToggle(clip) => cx.emit(Action::ToggleTakeLanes(clip)),
+            Hit::TakeLane {
+                clip,
+                take,
+                pos: frame,
+                ..
+            } => {
+                let Some(f) = model.project().clip(clip).and_then(|c| c.as_takes()) else {
+                    return false;
+                };
+                let anchor = self.snap_frame(frame, clip, model, mods);
+                self.comp = Some(CompDrag {
+                    clip,
+                    take,
+                    anchor,
+                    origin: pos,
+                    moved: false,
+                    base: f.clone(),
+                });
+            }
             Hit::Clip { clip, track, at } => {
                 let Some(c) = model.project().clip(clip) else {
                     return false;
                 };
                 if clicks >= 2 && c.as_midi().is_some() {
                     cx.emit(Action::OpenClipEditor(clip));
+                    return true;
+                }
+                if clicks >= 2 && c.as_takes().is_some() {
+                    cx.emit(Action::ToggleTakeLanes(clip));
                     return true;
                 }
                 if mods.toggle() {
@@ -1076,6 +1848,37 @@ impl ArrangerView {
         model: &Session,
         cx: &mut EventCx<'_, Action>,
     ) {
+        if self.auto_drag_move(model, pos, mods, size.w, cx) {
+            return;
+        }
+        if let Some(comp) = &mut self.comp {
+            if !comp.moved {
+                if pos.distance(comp.origin) < DRAG_THRESHOLD {
+                    return;
+                }
+                comp.moved = true;
+                cx.emit(Action::BeginGesture("Comp Takes".into()));
+            }
+            let (clip, take, anchor) = (comp.clip, comp.take, comp.anchor);
+            let mut f = comp.base.clone();
+            let Some(c) = model.project().clip(clip) else {
+                return;
+            };
+            let p = model.project();
+            let rate = p.sample_rate as f64;
+            let at = self.time_at(pos.x).max(MusicalTime::ZERO);
+            let frame = p.timeline.to_samples(at, rate) - p.timeline.to_samples(c.start, rate);
+            let frame = self.snap_frame(frame, clip, model, mods);
+            f.set_comp(anchor.min(frame), anchor.max(frame), Some(take));
+            if c.as_takes() != Some(&f) {
+                cx.emit(Action::Edit(Command::SetClipContent {
+                    clip,
+                    start: c.start,
+                    content: Box::new(ClipContent::Takes(f)),
+                }));
+            }
+            return;
+        }
         match self.drag {
             Some(Drag::Scrub) => {
                 let t = self.time_at(pos.x).max(MusicalTime::ZERO);
@@ -1155,6 +1958,19 @@ impl ArrangerView {
                     pan: if pan.abs() < 0.01 { 0.0 } else { pan },
                 }));
             }
+            Some(Drag::Height {
+                track,
+                start_y,
+                start_h,
+            }) => {
+                let h = (start_h + pos.y - start_y).round();
+                if (h - self.base_h(model, track)).abs() >= 1.0 {
+                    cx.emit(Action::SetTrackHeight {
+                        track: Some(track),
+                        height: h,
+                    });
+                }
+            }
             Some(Drag::Pan2D { origin, sx, sy }) => {
                 self.scroll_x = sx - (pos.x - origin.x);
                 self.scroll_y = sy - (pos.y - origin.y);
@@ -1166,6 +1982,26 @@ impl ArrangerView {
     }
 
     fn release(&mut self, model: &Session, cx: &mut EventCx<'_, Action>) {
+        if self.auto_release(model, cx) {
+            cx.set_cursor(Cursor::Default);
+            return;
+        }
+        if let Some(comp) = self.comp.take() {
+            if comp.moved {
+                cx.emit(Action::EndGesture);
+            } else if let Some(c) = model.project().clip(comp.clip) {
+                // A click uses the whole take.
+                let mut f = comp.base;
+                f.use_take(comp.take);
+                cx.emit(Action::Edit(Command::SetClipContent {
+                    clip: comp.clip,
+                    start: c.start,
+                    content: Box::new(ClipContent::Takes(f)),
+                }));
+            }
+            cx.set_cursor(Cursor::Default);
+            return;
+        }
         match self.drag.take() {
             Some(Drag::Clip { moved: true, .. })
             | Some(Drag::Volume { .. })
@@ -1191,6 +2027,7 @@ impl ArrangerView {
 
 impl CanvasView<Session, Action> for ArrangerView {
     fn paint(&mut self, p: &mut dyn Painter, size: Size, model: &Session, theme: &Theme) {
+        self.update_rows(model);
         self.follow(model, size);
         self.clamp_scroll(model, size);
         let a = &theme.arranger;
@@ -1217,6 +2054,14 @@ impl CanvasView<Session, Action> for ArrangerView {
                 a.lane_b
             };
             p.fill(Rect::new(lanes.x, row.y, lanes.w, row.h), bg);
+            let base = self.base_h(model, t.id);
+            if row.h > base + 0.5 {
+                // Take-lane area of a track with an open take folder.
+                p.fill(
+                    Rect::new(lanes.x, row.y + base, lanes.w, row.h - base),
+                    Color::rgba(0.0, 0.0, 0.0, 0.22),
+                );
+            }
             p.hline(
                 lanes.x,
                 lanes.right(),
@@ -1249,6 +2094,13 @@ impl CanvasView<Session, Action> for ArrangerView {
                 );
             }
         }
+        if let Some(pr) = model.project().punch_range
+            && model.project().punch_enabled
+        {
+            for x in [self.x_of(pr.start), self.x_of(pr.end)] {
+                p.vline(x, lanes.y, lanes.bottom(), a.record.with_alpha(0.55));
+            }
+        }
         for i in rows.clone() {
             let row = self.row_rect(i, size);
             let t = tracks[i];
@@ -1258,8 +2110,21 @@ impl CanvasView<Session, Action> for ArrangerView {
                     continue;
                 }
                 self.paint_clip(p, rect, lanes, clip, t, model);
+                if let Some(f) = clip.as_takes()
+                    && model.takes_open(clip.id)
+                {
+                    let color = color_of(clip.color.unwrap_or(t.color));
+                    let top = row.y + self.base_h(model, t.id);
+                    self.paint_take_lanes(p, rect, top, lanes, clip, f, model, color);
+                }
             }
         }
+        for i in rows.clone() {
+            let row = self.row_rect(i, size);
+            let t = tracks[i];
+            self.paint_automation(p, model, t, row, lanes, false, color_of(t.color));
+        }
+        self.paint_recording(p, lanes, size, &tracks, model);
         if tracks.is_empty() {
             p.text(
                 "Empty project — add a track from the Track menu or right-click the header column",
@@ -1270,6 +2135,9 @@ impl CanvasView<Session, Action> for ArrangerView {
         let px = self.x_of(model.playhead());
         if px >= lanes.x {
             p.fill(Rect::new(px - 0.75, lanes.y, 1.5, lanes.h), a.playhead);
+        }
+        if let Some((target, at)) = self.drop_at {
+            self.paint_drop_hint(p, lanes, size, &tracks, target, at);
         }
         p.pop_clip();
         p.shadow(
@@ -1292,8 +2160,22 @@ impl CanvasView<Session, Action> for ArrangerView {
         p.push_clip(headers);
         for i in rows {
             let row = self.row_rect(i, size);
-            let l = HeaderLayout::new(Rect::new(0.0, row.y, self.header_w(), row.h));
+            let l = HeaderLayout::new(Rect::new(
+                0.0,
+                row.y,
+                self.header_w(),
+                self.header_h(model, tracks[i].id),
+            ));
             self.paint_header(p, &l, tracks[i], model);
+            self.paint_automation(
+                p,
+                model,
+                tracks[i],
+                row,
+                lanes,
+                true,
+                color_of(tracks[i].color),
+            );
         }
         p.pop_clip();
         p.vline(self.header_w() - 1.0, 0.0, size.h, a.header_border);
@@ -1330,6 +2212,7 @@ impl CanvasView<Session, Action> for ArrangerView {
         model: &Session,
         cx: &mut EventCx<'_, Action>,
     ) -> bool {
+        self.update_rows(model);
         match *ev {
             ViewEvent::PointerDown {
                 pos,
@@ -1369,11 +2252,30 @@ impl CanvasView<Session, Action> for ArrangerView {
                                     mode: SelectMode::Replace,
                                 });
                             }
-                            cx.request(Self::clip_menu(c, pos));
+                            cx.request(Self::clip_menu(model, c, pos));
                         }
                     }
                     Some(Hit::Corner) | Some(Hit::Ruler(_)) | Some(Hit::LoopBand(_)) => {
                         cx.request(Self::grid_menu(model, pos));
+                    }
+                    Some(Hit::TakeLane { clip, take, .. }) => {
+                        if let Some(c) = model.project().clip(clip) {
+                            cx.request(Self::take_menu(c, take, pos));
+                        }
+                    }
+                    Some(Hit::Automation { track, header, .. }) => {
+                        let tracks = Self::lane_tracks(model);
+                        if let Some((i, t)) = tracks.iter().enumerate().find(|(_, t)| t.id == track)
+                        {
+                            let row = self.row_rect(i, size);
+                            if let Some((g, _)) = self.auto_hit(model, t, row, pos) {
+                                cx.request(if header {
+                                    Self::parameter_menu(model, track, pos)
+                                } else {
+                                    self.lane_menu(model, g, pos, size.w)
+                                });
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -1393,9 +2295,15 @@ impl CanvasView<Session, Action> for ArrangerView {
                     self.hover = hit;
                     cx.set_cursor(match hit {
                         Some(Hit::Clip { .. }) => Cursor::Grab,
+                        Some(Hit::TakeToggle(_)) => Cursor::Pointer,
+                        Some(Hit::TakeLane { .. }) => Cursor::Crosshair,
+                        Some(Hit::Automation { header: false, .. }) => Cursor::Crosshair,
+                        Some(Hit::Automation { header: true, .. }) => Cursor::Pointer,
                         Some(Hit::Ruler(_) | Hit::LoopBand(_)) => Cursor::Pointer,
                         Some(Hit::Header(_, HeaderPart::Volume)) => Cursor::ResizeHorizontal,
-                        Some(Hit::Header(_, HeaderPart::Pan)) => Cursor::ResizeVertical,
+                        Some(Hit::Header(_, HeaderPart::Pan | HeaderPart::Resize)) => {
+                            Cursor::ResizeVertical
+                        }
                         Some(Hit::Header(_, HeaderPart::Body | HeaderPart::Name)) | None => {
                             Cursor::Default
                         }
@@ -1420,6 +2328,19 @@ impl CanvasView<Session, Action> for ArrangerView {
                 modifiers,
                 precise,
             } => {
+                if modifiers.alt && !modifiers.ctrl {
+                    // Alt+wheel: all track heights.
+                    let steps = if precise { dy / 30.0 } else { dy };
+                    let current = Self::lane_tracks(model)
+                        .first()
+                        .map_or(self.row_h(), |t| self.base_h(model, t.id));
+                    let height = (current * 1.12f32.powf(-steps)).round();
+                    cx.emit(Action::SetTrackHeight {
+                        track: None,
+                        height,
+                    });
+                    return true;
+                }
                 if modifiers.ctrl {
                     let steps = if precise { dy / 30.0 } else { dy };
                     self.zoom_at(
@@ -1540,16 +2461,21 @@ impl CanvasView<Session, Action> for ArrangerView {
                 Some(match part {
                     HeaderPart::Volume => format!(
                         "Volume {} dB · Drag · Double-click for 0 dB",
-                        format_db(t.volume_db)
+                        format_db(model.shown_volume_db(t))
                     ),
                     HeaderPart::Pan => {
-                        format!("Pan {} · Double-click to centre", format_pan(t.pan))
+                        format!("Pan {} · Double-click to centre", format_pan(model.shown_pan(t)))
                     }
                     HeaderPart::Mute => "Mute".into(),
                     HeaderPart::Solo => "Solo".into(),
                     HeaderPart::Record => "Record arm".into(),
                     HeaderPart::Monitor => "Input monitoring".into(),
                     HeaderPart::Name => "Double-click to rename".into(),
+                    HeaderPart::Automation => "Show / hide automation lanes".into(),
+                    HeaderPart::Resize => {
+                        "Drag to change the track height · Double-click to reset · Alt+wheel: all tracks"
+                            .into()
+                    }
                     _ => return None,
                 })
             }
@@ -1558,6 +2484,25 @@ impl CanvasView<Session, Action> for ArrangerView {
                 matches!(t.kind, TrackKind::Instrument | TrackKind::Midi)
                     .then(|| "Double-click to create a MIDI clip".into())
             }
+            Hit::TakeToggle(clip) => Some(if model.takes_open(clip) {
+                "Hide the take lanes".into()
+            } else {
+                "Show the take lanes to comp".into()
+            }),
+            Hit::TakeLane { clip, take, .. } => {
+                let f = model.project().clip(clip)?.as_takes()?;
+                Some(format!(
+                    "{}\nClick: use this take · Drag: comp this section · Right-click: more",
+                    f.takes.get(take)?.name
+                ))
+            }
+            Hit::Automation { header: true, .. } => {
+                Some("Click the name to choose parameters · the mode button sets Off/Read/Touch/Latch/Write".into())
+            }
+            Hit::Automation { header: false, .. } => Some(
+                "Click: add a point · Drag: move (Alt: no snap) · Double-click: delete · Ctrl+drag: draw · Right-click: shapes"
+                    .into(),
+            ),
             Hit::Empty(_) => None,
         }
     }
@@ -1574,10 +2519,37 @@ impl CanvasView<Session, Action> for ArrangerView {
                 offset: self.scroll_x,
             },
             ScrollAxis::Vertical => ScrollInfo {
-                content: Self::lane_tracks(model).len() as f32 * self.row_h() + self.row_h(),
+                content: if self.rows.len() > 1 {
+                    self.total_rows_height() + self.row_h()
+                } else {
+                    Self::lane_tracks(model).len() as f32 * self.row_h() + self.row_h()
+                },
                 viewport: (size.h - self.ruler_h()).max(0.0),
                 offset: self.scroll_y,
             },
+        })
+    }
+
+    fn drag_files(&mut self, pos: Option<Point>, size: Size, model: &Session) -> bool {
+        self.update_rows(model);
+        let next = pos.and_then(|p| self.drop_target(p, size, model));
+        self.drop_at = next;
+        next.is_some()
+    }
+
+    fn drop_files(
+        &mut self,
+        files: &[std::path::PathBuf],
+        pos: Point,
+        size: Size,
+        model: &Session,
+    ) -> Option<Action> {
+        self.drop_at = None;
+        let (track, at) = self.drop_target(pos, size, model)?;
+        Some(Action::ImportFiles {
+            files: files.to_vec(),
+            track,
+            at,
         })
     }
 

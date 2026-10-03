@@ -134,6 +134,10 @@ pub struct ArrangerTheme {
     pub loop_on: Color,
     pub loop_off: Color,
     pub playhead: Color,
+    /// Recording region and punch range.
+    pub record: Color,
+    /// Automation button and lanes.
+    pub automation: Color,
     pub clip_radius: f32,
     pub clip_header: f32,
     pub clip_text: Color,
@@ -289,6 +293,8 @@ impl Theme {
                 loop_on: accent.with_alpha(0.22),
                 loop_off: Color::rgba(1.0, 1.0, 1.0, 0.07),
                 playhead: accent,
+                record: Color::hex(0xff4b4b),
+                automation: Color::hex(0x5fc27a),
                 clip_radius: 4.0,
                 clip_header: 15.0,
                 clip_text: Color::hex(0x121212),

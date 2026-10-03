@@ -1,8 +1,10 @@
-use super::{MAX_CHANNELS, ramp_step};
+use super::{AUTOMATION_STEP, MAX_CHANNELS, automation_at, ramp_step};
 use crate::context::EngineContext;
 use crate::slots::StripSlots;
-use faderframe_audio_graph::{NodeIo, ProcessContext, Processor, for_each_channel_route};
-use faderframe_core::{PanLaw, pan::stereo_balance};
+use faderframe_audio_graph::{
+    AudioBuffer, NodeIo, ProcessContext, Processor, for_each_channel_route,
+};
+use faderframe_core::{PanLaw, TrackId, db_to_gain, pan::stereo_balance};
 use faderframe_realtime::MeterRange;
 
 /// Channel strip: polarity, mute, fader, pan/balance and post-fader metering.
@@ -12,11 +14,14 @@ use faderframe_realtime::MeterRange;
 /// * output 1 — pre-fader (post-insert, post-mute) in the track layout,
 ///   used by pre-fader sends
 ///
-/// All gain changes are ramped linearly across the block, so fader moves,
-/// mutes and solos never click. Pan law: mono sources use `pan_law`
-/// (default constant-power, -3 dB centre); stereo sources use a 0 dB
-/// balance control (see `faderframe_core::pan`).
+/// All gain changes are ramped linearly, so fader moves, mutes and solos
+/// never click. Automated volume, pan and mute are evaluated every
+/// [`AUTOMATION_STEP`] frames and ramped in between (breakpoints land within
+/// that step; steps in the curve become short declicked ramps). Pan law:
+/// mono sources use `pan_law` (default constant-power, -3 dB centre); stereo
+/// sources use a 0 dB balance control (see `faderframe_core::pan`).
 pub struct ChannelStrip {
+    track: TrackId,
     slots: StripSlots,
     meter: MeterRange,
     pan_law: PanLaw,
@@ -25,8 +30,9 @@ pub struct ChannelStrip {
 }
 
 impl ChannelStrip {
-    pub fn new(slots: StripSlots, meter: MeterRange, pan_law: PanLaw) -> Self {
+    pub fn new(track: TrackId, slots: StripSlots, meter: MeterRange, pan_law: PanLaw) -> Self {
         Self {
+            track,
             slots,
             meter,
             pan_law,
@@ -34,44 +40,36 @@ impl ChannelStrip {
             pre: f32::NAN,
         }
     }
-}
 
-impl Processor<EngineContext> for ChannelStrip {
-    fn process(&mut self, cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
-        let params = &cx.data.params;
-        let fader = params.get(self.slots.volume);
-        let pan = params.get(self.slots.pan);
-        let mute = params.get(self.slots.mute) >= 0.5;
-        let polarity = if params.get(self.slots.phase) >= 0.5 {
-            -1.0
-        } else {
-            1.0
-        };
-        let audible = if mute { 0.0 } else { polarity };
-
-        let Some(input) = io.audio_in.first() else {
-            return;
-        };
-        let n = io.frames;
+    /// Gains for frames `off..off + m` reaching `fader`/`pan`/`audible` at
+    /// the end of the range.
+    #[allow(clippy::too_many_arguments)]
+    fn render(
+        &mut self,
+        input: &AudioBuffer,
+        outs: &mut [AudioBuffer],
+        off: usize,
+        m: usize,
+        fader: f32,
+        pan: f32,
+        audible: f32,
+    ) {
         let in_ch = input.num_channels();
-
         // Pre-fader output (track layout).
-        if let Some(pre) = io.audio_out.get_mut(1) {
+        if let Some(pre) = outs.get_mut(1) {
             let from = if self.pre.is_nan() { audible } else { self.pre };
-            let step = ramp_step(from, audible, n);
+            let step = ramp_step(from, audible, m);
             for c in 0..pre.num_channels() {
-                let src = input.channel(c.min(in_ch.saturating_sub(1)));
+                let src = &input.channel(c.min(in_ch.saturating_sub(1)))[off..off + m];
                 let mut g = from;
-                for (o, &x) in pre.channel_mut(c).iter_mut().zip(src) {
+                for (o, &x) in pre.channel_mut(c)[off..off + m].iter_mut().zip(src) {
                     g += step;
                     *o = x * g;
                 }
             }
             self.pre = audible;
         }
-
-        // Post-fader output.
-        let Some(post) = io.audio_out.first_mut() else {
+        let Some(post) = outs.first_mut() else {
             return;
         };
         let out_ch = post.num_channels().min(MAX_CHANNELS);
@@ -92,25 +90,87 @@ impl Processor<EngineContext> for ChannelStrip {
         for t in &mut target[..out_ch] {
             *t *= fader * audible;
         }
-        post.clear();
+        let current = self.post;
         for_each_channel_route(in_ch, post.num_channels(), |s, d, w| {
             if d >= MAX_CHANNELS {
                 return;
             }
-            let from = if self.post[d].is_nan() {
+            let from = if current[d].is_nan() {
                 target[d]
             } else {
-                self.post[d]
+                current[d]
             };
-            let step = ramp_step(from, target[d], n);
+            let step = ramp_step(from, target[d], m);
             let mut g = from;
-            for (o, &x) in post.channel_mut(d).iter_mut().zip(input.channel(s)) {
+            for (o, &x) in post.channel_mut(d)[off..off + m]
+                .iter_mut()
+                .zip(&input.channel(s)[off..off + m])
+            {
                 g += step;
                 *o += x * g * w;
             }
         });
         self.post[..out_ch].copy_from_slice(&target[..out_ch]);
+    }
+}
 
+impl Processor<EngineContext> for ChannelStrip {
+    fn process(&mut self, cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
+        let params = &cx.data.params;
+        let static_fader = params.get(self.slots.volume);
+        let static_pan = params.get(self.slots.pan);
+        let static_mute = params.get(self.slots.mute) >= 0.5;
+        let solo_muted = params.get(self.slots.solo_mute) >= 0.5;
+        let polarity = if params.get(self.slots.phase) >= 0.5 {
+            -1.0
+        } else {
+            1.0
+        };
+        let auto = cx.data.timeline.automation(self.track);
+        let (vol_lane, pan_lane, mute_lane) = auto.map_or((None, None, None), |a| {
+            (a.volume.as_ref(), a.pan.as_ref(), a.mute.as_ref())
+        });
+        let automated = vol_lane.is_some() || pan_lane.is_some() || mute_lane.is_some();
+
+        let Some(input) = io.audio_in.first() else {
+            return;
+        };
+        let n = io.frames;
+        if let Some(post) = io.audio_out.first_mut() {
+            post.clear();
+        }
+        let step = if automated { AUTOMATION_STEP } else { n.max(1) };
+        let mut values = (static_fader, static_pan, static_mute);
+        let mut off = 0;
+        while off < n {
+            let m = step.min(n - off);
+            let at = automation_at(cx, off + m);
+            let fader = vol_lane
+                .and_then(|l| l.value_at(at))
+                .map_or(static_fader, |db| db_to_gain(db as f32));
+            let pan = pan_lane
+                .and_then(|l| l.value_at(at))
+                .map_or(static_pan, |v| v.clamp(-1.0, 1.0) as f32);
+            let mute = mute_lane
+                .and_then(|l| l.value_at(at))
+                .map_or(static_mute, |v| v >= 0.5);
+            let audible = if mute || solo_muted { 0.0 } else { polarity };
+            self.render(input, io.audio_out, off, m, fader, pan, audible);
+            values = (fader, pan, mute);
+            off += m;
+        }
+        if automated {
+            // What the faders show while automation plays.
+            let rb = &cx.data.readback;
+            rb.set(self.slots.volume, values.0);
+            rb.set(self.slots.pan, values.1);
+            rb.set(self.slots.mute, if values.2 { 1.0 } else { 0.0 });
+        }
+
+        let Some(post) = io.audio_out.first() else {
+            return;
+        };
+        let out_ch = post.num_channels().min(MAX_CHANNELS);
         for c in 0..out_ch {
             if let Some(idx) = self.meter.channel(c) {
                 cx.data.meters.measure(idx, post.channel(c));

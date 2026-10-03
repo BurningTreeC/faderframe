@@ -278,7 +278,13 @@ pub fn start(project: Project, settings: RenderSettings) -> Result<RenderJob, Re
     let handle = std::thread::Builder::new()
         .name("faderframe-render".into())
         .spawn(move || -> Result<Vec<PathBuf>, RenderError> {
-            let sources = render_generated_sources(&project, settings.sample_rate);
+            // File paths are absolute here (see `Session::render`). Streams
+            // are opened afresh: their page tables must not be shared with
+            // the live engine.
+            let mut sources = render_generated_sources(&project, settings.sample_rate);
+            for (_, path, e) in crate::media::open_file_sources(&project, None, &mut sources) {
+                tracing::warn!("render: {}: {e}", path.display());
+            }
             let mut written = Vec::new();
             if stems.is_empty() {
                 let audio = render_one(&project, &settings, &sources, start, frames, &p)?;

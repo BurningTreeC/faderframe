@@ -11,6 +11,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+faderframe-core.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 

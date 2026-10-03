@@ -102,7 +102,16 @@ impl PluginCx<'_> {
                 // Latency and bypass change the node's behaviour, so they are
                 // part of its identity: a change yields a fresh processor.
                 let sub = slot.id.raw() ^ ((p.latency as u64) << 40) ^ ((slot.bypass as u64) << 63);
-                let node = PluginNode::new(p.processor, p.latency, slot.bypass, p.failed);
+                let channels = spec.audio_outputs.first().map_or(0, |l| l.channel_count());
+                let node = PluginNode::new(
+                    track.id,
+                    slot.id,
+                    p.processor,
+                    p.latency,
+                    slot.bypass,
+                    p.failed,
+                    channels,
+                );
                 b.add_node(
                     spec.key(node_key(track.id, role, sub, &layouts)),
                     Box::new(node),
@@ -239,7 +248,12 @@ pub fn build_graph(
                 .audio_in(layout)
                 .audio_out(dest)
                 .audio_out(layout),
-            Box::new(ChannelStrip::new(strip_slots, meter, PanLaw::default())),
+            Box::new(ChannelStrip::new(
+                t.id,
+                strip_slots,
+                meter,
+                PanLaw::default(),
+            )),
         );
         b.connect_audio(prev, 0, strip, 0)?;
         tn.strip = Some(strip);
@@ -312,7 +326,7 @@ pub fn build_graph(
                     ))
                     .audio_in(tap_layout)
                     .audio_out(target.layout),
-                Box::new(SendNode::new(level)),
+                Box::new(SendNode::new(t.id, send.id, level)),
             );
             b.connect_audio(tap_node, tap_port, node, 0)?;
             b.connect_audio(node, 0, dst, 0)?;

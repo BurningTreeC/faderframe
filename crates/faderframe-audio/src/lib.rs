@@ -119,7 +119,9 @@ impl Default for StreamConfig {
             device: None,
             sample_rate: None,
             buffer_size: None,
-            input_channels: 2,
+            // Enough for multitrack recording; JACK connects them to the
+            // physical capture ports.
+            input_channels: 8,
             output_channels: 2,
             client_name: "FaderFrame".into(),
             auto_connect: true,

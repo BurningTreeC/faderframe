@@ -180,6 +180,31 @@ pub fn demo_project(sample_rate: u32) -> Project {
     audio_clip(&mut p, &mut bass, "Bassline", bass_src, bar2, 2);
     audio_clip(&mut p, &mut pluck, "Pluck Arp", pluck_src, bar0, 0);
     audio_clip(&mut p, &mut pad, "Pad", pad_src, bar4, 4);
+    // The pad swells in and dips before the loop point.
+    {
+        use faderframe_automation::{
+            AutomationCurve, AutomationLane, AutomationMode, AutomationPoint, AutomationTarget,
+            CurveShape,
+        };
+        let at = |q: f64, value: f64, shape| AutomationPoint {
+            time: MusicalTime::from_quarters(q),
+            value,
+            shape,
+        };
+        let id = p.ids.allocate();
+        pad.automation.lanes.push(AutomationLane {
+            id,
+            target: AutomationTarget::TrackVolume,
+            curve: AutomationCurve::from_points(vec![
+                at(16.0, -30.0, CurveShape::Smooth),
+                at(22.0, -8.0, CurveShape::Linear),
+                at(28.0, -8.0, CurveShape::Exponential),
+                at(31.5, -20.0, CurveShape::Linear),
+            ]),
+            mode: AutomationMode::Read,
+            visible: true,
+        });
+    }
 
     // Melody for the instrument track (A minor pentatonic phrases).
     let phrases: [&[(f64, f64, u8)]; 4] = [

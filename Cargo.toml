@@ -42,6 +42,11 @@ gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
 jack = "0.13"
 # Realtime-safe wait-free SPSC ring buffer used for control <-> RT messaging.
 rtrb = "0.4"
+# Audio decoding (pure Rust; MPL-2.0, file-level copyleft, MIT-compatible).
+symphonia = { version = "0.6", default-features = false, features = ["wav", "aiff", "caf", "flac", "mp3", "ogg", "vorbis", "isomp4", "aac", "alac", "pcm", "adpcm"] }
+# High-quality sample-rate conversion.
+rubato = "5"
+audioadapter-buffers = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

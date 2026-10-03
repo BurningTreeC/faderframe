@@ -41,9 +41,9 @@ engine, session and views build and run headless (tests, CI, offline
 rendering, the benchmark).
 
 Planned crates (not created yet, to avoid empty boilerplate): CLAP and VST3
-format hosts (`faderframe-plugin-clap`, `faderframe-plugin-vst3`), a
-recording/disk-streaming crate, PipeWire-native/ALSA/WASAPI/ASIO/CoreAudio
-backends, and an optional wgpu painter for dense views.
+format hosts (`faderframe-plugin-clap`, `faderframe-plugin-vst3`),
+PipeWire-native/ALSA/WASAPI/ASIO/CoreAudio backends, and an optional wgpu
+painter for dense views.
 
 ## 2. Control world vs realtime world
 
@@ -233,6 +233,173 @@ status (rate change, server shutdown). `render::start` runs offline bounces
 (master or stems, range, rate, channels, tail, normalise, dither) on a
 worker thread through the same engine path.
 
+### Media: import and disk streaming
+
+Imported files are decoded once with Symphonia (`faderframe-audio-files::
+decode`: WAV, AIFF, CAF, FLAC, MP3, Ogg Vorbis, MP4/AAC, ALAC, ADPCM),
+converted to the project sample rate with rubato's FFT resampler (exact
+output length, start-up delay removed) and written as 32-bit float WAV
+(`WavWriter`) together with a waveform peak cache (`.ffpk`, built
+incrementally by `PeakBuilder`). Converting once makes every later read a
+single positional `pread`, independent of the original codec, and lets the
+original move or disappear.
+
+* **Where media lives.** `<project dir>/Audio/` for saved projects. A
+  never-saved project imports into a scratch folder under
+  `$XDG_DATA_HOME/faderframe/unsaved/<stamp>-<pid>/`; the first *Save As*
+  moves (or, across file systems, copies) that media next to the project.
+  Scratch folders are deleted with their session; the shell sweeps folders
+  of dead processes older than a week at start-up.
+* **Paths.** In memory, `SourceSpec::File` paths are absolute (so undo
+  history stays valid across save-as); `.ffproj` files store them relative
+  to the project file when they are inside its directory.
+* **Undo.** `Command::AddSource`/`RemoveSource` register sources; an import
+  is one `Batch` (sources, new tracks, clips). Removing a source that clips
+  still use is rejected; undo never deletes media files.
+* **Offline media.** A file source that cannot be opened is reported once,
+  its clips play silence and are drawn hatched "OFFLINE"; the project still
+  opens.
+
+Playback streams from those files (`faderframe-audio-files::stream`). A
+`StreamSource` is the open `WavFile` plus a `PageTable` (in
+`faderframe-realtime`) of 16384-frame pages: an array of `AtomicPtr`s the
+audio thread reads wait-free. The **disk loader** thread
+(`faderframe-session::media::DiskLoader`) keeps the pages from just behind
+the playhead to 3 s ahead resident (plus the loop start while looping),
+using the `StreamPlan` the engine controller derives from every timeline
+snapshot, and evicts everything else. Evicted pages are retired through
+**epoch-based reclamation**: the engine advances an `Epoch` after every
+callback (including idle pumps), and a page retired at epoch *e* is freed
+only once epoch *e*+1 has completed, i.e. once no callback that might still
+hold it is running. All engines of a session share one epoch, so pages
+survive engine replacement safely. A page that is not resident when needed
+plays as silence and counts as a late read (shown in Preferences → Audio);
+the audio thread never waits for the disk. Memory is bounded by the
+resident window, not file length.
+
+The clip player reads in-memory sources directly and streamed ones by page
+segments; when a file's rate differs from the engine's (engine restarted
+at another rate), it interpolates linearly between resident samples. The
+offline renderer is its own loader: before each block it synchronously
+loads the pages that block needs, so bounces never drop out. Renders open
+their own `StreamSource`s (page tables are never shared with the live
+engine).
+
+### Recording, takes and comping
+
+**Capture.** When record mode starts, the session asks the engine
+(`EngineController::begin_recording`) for a pair of lock-free rings sized
+for `RecordSettings::buffer_seconds` of the armed inputs — headers
+(`RecordBlock`: timeline position, frames, pass) and samples — and hands
+the producer ends to the audio thread inside a `Recorder`. While the
+transport plays *and* records, `process_device` copies the device input
+channels of every target (armed audio track with a hardware input; the
+track's mono/stereo format decides one or two channels) into the rings,
+clipped sample-accurately to the record window (punch range, or "from the
+record start"). Every discontinuity — loop wrap, locate, re-entering the
+window — starts a new *pass*. A full ring never blocks: the block is dropped
+and counted, and the writer fills the hole with silence so later audio
+stays in place. Ending recording retires the `Recorder` through the
+garbage queue, so the rings are freed on the control thread.
+
+**Writer.** `faderframe-session::record::RecordWriter` drains the rings on
+its own thread into one float WAV per armed track (created on the first
+captured block, in the media folder), builds the waveform peaks on the fly,
+and records one `Segment` per pass. Peaks and segments live in a shared
+`LiveTake` (`PeakBuilder` keeps a base and a coarse level and answers
+`min_max` including the newest partial peak), so the arranger draws the
+take's waveform while it is being recorded — every frame, at a cost bounded
+by the coarse level however long the take gets. When the rings are abandoned the files
+are finalised and the session turns them into clips in **one undo step**
+(`Batch "Record"`): an `AddSource`, then the takes. Takes are compensated
+for input + output latency as reported by the driver plus a user offset —
+the file is read `latency` frames later than its capture position, so
+what was played lines up with what was heard.
+
+**Take folders.** `ClipContent::Takes(TakeFolder)` holds several `Take`s
+(each a source, its alignment and the folder range it has material for) and
+a *comp*: sorted `CompSegment`s, each playing one take (or nothing) until
+the next one starts — the comp can never overlap or leave holes. Comp edits
+(`set_comp`, `use_take`, `remove_take`) are ordinary `SetClipContent`
+commands, so a swipe coalesces into one undo step; folders move, delete and
+split like any clip. The engine expands the comp into regions with centred
+equal-power crossfades (`crossfade`, 10 ms by default) at touching segment
+boundaries and short declicks elsewhere. *Flatten Comp* replaces a folder by
+plain clips with the same fades.
+
+**Record modes** (`RecordSettings`, Transport menu / Preferences → Recording):
+
+| Setting | Options |
+|---|---|
+| Record mode (over existing clips) | *Takes* — overlapped clips and folders become takes of one folder, the new take is comped in over its range, playback elsewhere is unchanged · *Replace* — overlapped clips are cut back (tape style) |
+| Loop recording | *Passes as takes* · *Keep last pass* · *New track per pass* (earlier passes on new, muted tracks) |
+| Metronome | Off · While recording · Always (`click.rs`: decaying sine per beat, accented downbeats, follows tempo and meter, live output only) |
+| Pre-roll | 0/1/2/4 bars before the record start when starting from stop |
+| Punch | `Project::punch_range` + `punch_enabled` (`Command::SetPunch`); capture only inside it |
+
+**Arranger.** Rows have per-track heights (stored in `WorkspaceSet`:
+default + per-track overrides, saved with the layout; drag a header's
+bottom edge, Alt+wheel for all, View → Track Height). Open take folders
+(`Session::takes_open`, editor state like the selection) add a lane per
+take below the track; clicking a lane uses that take, dragging comps the
+swiped range (snapped), right-click offers Use/Delete Take and Flatten.
+While recording, armed tracks show a growing red region; the punch range is
+drawn in the ruler.
+
+### Automation
+
+**Model** (`faderframe-automation`): each track has an `AutomationSet` of
+lanes; a lane has a target (volume, pan, mute, a send level, a plugin
+parameter, a plugin's bypass), a mode (Off, Read, Touch, Latch, Write) and a
+curve of points in musical time with plain values (dB, -1..1, 0/1, the
+plugin's own units) and a shape per segment (step, linear, smooth,
+exponential). `Command::{Add,Remove,Set}AutomationLane` edit lanes; a lane
+replacement coalesces while dragging, so a point drag is one undo step.
+`Session::automatable_parameters` lists everything automatable — strip
+parameters, sends, and every `automatable` parameter plus bypass of the
+instrument and inserts, from the plugin's `ParameterInfo` — with ranges and
+a mapping to lane height (fader law for gains, log for Hz/ms).
+
+**Playback.** The timeline snapshot carries each track's driving lanes
+converted to engine samples (`SampleLane`: binary search + interpolation,
+no allocation). Channel strips and sends evaluate volume, pan, mute and send
+levels every `AUTOMATION_STEP` (32) frames and ramp in between; mute
+automation is kept apart from solo-implied muting (separate parameter slot).
+Plugin nodes turn their lanes into sample-accurate `ParameterEvent`s — one
+at every breakpoint inside the block and one per step on ramps — into a
+preallocated buffer; automated bypass is a soft bypass that keeps the
+plugin running and crossfades to the input delayed by the plugin's
+latency, so summing points stay aligned. While stopped, the value at the
+playhead applies.
+
+**Writing.** While playing, moving a control whose lane is in Touch or
+Latch mode (or any control of a Write lane, from the start of playback)
+records points at the playhead. Written lanes are *suspended* in the engine
+(`EngineController::set_suspended_lanes`), so the control is heard. Touch
+ends with the gesture, Latch and Write when playback stops; the points are
+thinned (Ramer–Douglas–Peucker) and replace the curve over the written
+range in one undo step. Controls display `Session::display_value`: the
+automated value at the playhead while a lane drives the parameter.
+
+**Arranger.** The header's **A** button (or the A key, Edit → Show/Hide
+Automation) shows a track's lanes below its main lane and take lanes (shown
+lanes are layout state, saved with the project). Lane header: parameter
+picker, mode, close. In the lane: click adds a point, drag moves it
+(snapped; Alt for free), double-click deletes, Ctrl+drag draws freehand,
+right-click sets segment shapes, clears the lane or changes the mode.
+
+### Track presets
+
+`faderframe_project::preset::TrackPreset` captures a track's channel
+settings (kind, mono/stereo format, input, monitoring, instrument and
+inserts with parameters and opaque state, fader, pan, polarity, sends,
+output, colour — not clips or automation) as versioned JSON (`.fftrack`).
+Other tracks are referenced by name and resolved on use; unknown targets
+are reported and dropped. The session keeps a library folder
+(`$XDG_DATA_HOME/faderframe/track-presets`): save a track into it, add a
+new track from a preset, or apply one onto an existing track as one undo
+step.
+
 ## 11. UI architecture
 
 GTK owns windows, menus, dialogs, text entry, clipboard, accessibility and
@@ -286,7 +453,8 @@ block size.
    their backend crates; the generic engine sees `DeviceBuffers` only.
 3. The realtime path performs no allocation, deallocation, locking, I/O,
    logging, sleeping or thread creation. Retired objects go back to the
-   control thread.
+   control thread; evicted disk pages are freed by the loader only after the
+   reading epoch has passed.
 4. Realtime-visible state changes only through the mailboxes, the bounded
    SPSC queue and atomics. The audio thread never reads the `Project`.
 5. All project mutations go through `Command`s (undoable, impact-tagged);
@@ -318,16 +486,24 @@ with PDC and state adoption, transport with sample-accurate loops, built-in
 synth/echo/gain/latency plugins, JACK and dummy backends, offline render with
 WAV export (stems, normalise, dither), GTK shell with docking/detaching and
 workspaces, arranger, analogue mixer, piano roll, preferences and render
-windows, benchmark, and tests.
+windows, benchmark, and tests. Audio file import (Symphonia decoding,
+rubato resampling, peak caches, drag & drop and File → Import Audio) and
+lock-free disk streaming with read-ahead and epoch reclamation.
+
+Recording (lock-free capture, writer thread, latency compensation, punch,
+pre-roll, metronome, mono/stereo inputs), take folders with comping and
+selectable record/loop-record modes, any number of sends per strip (paged
+in banks), resizable tracks and track presets. Automation of every
+automatable parameter (lanes, sample-accurate playback, Touch/Latch/Write).
+
+Requested next: MIDI keyboards and controllers (with MIDI learn into
+automation) and a best-in-class piano roll; VST3 hosting after CLAP.
 
 Next, in order:
 
-1. Audio file import (Symphonia), disk streaming with read-ahead, resampling.
-2. Recording: lock-free capture buffers → writer thread, punch, takes, input
-   latency compensation.
-3. CLAP hosting (`clack-host`), plugin scanning in a helper process, plugin
+1. CLAP hosting (`clack-host`), plugin scanning in a helper process, plugin
    GUIs, parameter automation, state.
-4. MIDI input/output (`midir`), live auditioning, MIDI learn.
-5. Automation lanes in the arranger, sample-accurate parameter events.
-6. Dependency-aware multicore scheduler.
-7. VST3, PipeWire-native backend, Windows and macOS ports.
+2. MIDI input/output (`midir`), live auditioning, MIDI learn.
+3. ~~Automation lanes~~ (done) in the arranger, sample-accurate parameter events.
+4. Dependency-aware multicore scheduler.
+5. VST3, PipeWire-native backend, Windows and macOS ports.

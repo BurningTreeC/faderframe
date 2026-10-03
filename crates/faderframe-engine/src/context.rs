@@ -13,5 +13,8 @@ pub struct EngineContext {
     pub discontinuity: bool,
     pub timeline: Box<TimelineSnapshot>,
     pub params: Arc<ParamTable>,
+    /// Automated values of strip/send parameters (same slots as `params`),
+    /// written by the processors for the UI.
+    pub readback: Arc<ParamTable>,
     pub meters: Arc<MeterBank>,
 }

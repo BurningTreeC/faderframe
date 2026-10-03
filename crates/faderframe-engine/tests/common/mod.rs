@@ -57,8 +57,47 @@ impl TestProject {
                 },
             },
         );
-        self.sources.insert(id, Arc::new(data));
+        self.sources.insert(id, Arc::new(data).into());
         id
+    }
+
+    /// Disk-streamed source backed by the WAV file at `path`.
+    pub fn stream(&mut self, path: &std::path::Path) -> AudioSourceId {
+        let s = faderframe_audio_files::StreamSource::open(path).unwrap();
+        let id: AudioSourceId = self.project.ids.allocate();
+        self.project.sources.insert(
+            id,
+            AudioSource {
+                id,
+                name: "file".into(),
+                spec: SourceSpec::File {
+                    path: path.to_path_buf(),
+                    channels: s.channels() as u16,
+                    frames: s.frames() as i64,
+                    sample_rate: s.sample_rate(),
+                },
+            },
+        );
+        self.sources
+            .insert(id, faderframe_engine::Source::Stream(s));
+        id
+    }
+
+    /// Clip with a source offset.
+    pub fn clip_at(
+        &mut self,
+        track: TrackId,
+        source: AudioSourceId,
+        start: MusicalTime,
+        offset: i64,
+        length: i64,
+    ) {
+        self.clip(track, source, start, length);
+        let id = *self.project.track(track).unwrap().clips.last().unwrap();
+        if let Some(ClipContent::Audio(a)) = self.project.clips.get_mut(&id).map(|c| &mut c.content)
+        {
+            a.source_offset = offset;
+        }
     }
 
     /// Constant-value source of `frames` frames.

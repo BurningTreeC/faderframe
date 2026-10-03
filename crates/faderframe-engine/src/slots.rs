@@ -16,9 +16,12 @@ pub struct StripSlots {
     pub mute: ParamSlot,
     /// 1.0 = polarity inverted.
     pub phase: ParamSlot,
+    /// 1.0 = silenced because other tracks are soloed (kept apart from
+    /// `mute` so mute automation never overrides solo).
+    pub solo_mute: ParamSlot,
 }
 
-const STRIP_SLOT_COUNT: u32 = 4;
+const STRIP_SLOT_COUNT: u32 = 5;
 /// Meter channels reserved per track (stereo).
 const METER_CHANNELS: u16 = 2;
 
@@ -61,6 +64,7 @@ impl SlotRegistry {
             pan: ParamSlot(base + 1),
             mute: ParamSlot(base + 2),
             phase: ParamSlot(base + 3),
+            solo_mute: ParamSlot(base + 4),
         };
         self.strips.insert(track, s);
         Ok(s)
@@ -93,6 +97,14 @@ impl SlotRegistry {
         };
         self.track_meters.insert(track, m);
         Ok(m)
+    }
+
+    pub fn strip_of(&self, track: TrackId) -> Option<StripSlots> {
+        self.strips.get(&track).copied()
+    }
+
+    pub fn send_of(&self, send: SendId) -> Option<ParamSlot> {
+        self.sends.get(&send).copied()
     }
 
     pub fn meter_of(&self, track: TrackId) -> Option<MeterRange> {
@@ -147,8 +159,9 @@ impl SlotRegistry {
             let s = self.strip(t.id)?;
             table.set(s.volume, faderframe_core::db_to_gain(t.volume_db));
             table.set(s.pan, t.pan);
-            let muted = project.effectively_muted(t, solo.as_ref());
-            table.set(s.mute, if muted { 1.0 } else { 0.0 });
+            let solo_muted = solo.as_ref().is_some_and(|set| !set.contains(&t.id));
+            table.set(s.mute, if t.mute { 1.0 } else { 0.0 });
+            table.set(s.solo_mute, if solo_muted { 1.0 } else { 0.0 });
             table.set(s.phase, if t.phase_invert { 1.0 } else { 0.0 });
             for send in &t.sends {
                 let slot = self.send(send.id)?;

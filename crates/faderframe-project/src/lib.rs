@@ -18,7 +18,9 @@ pub mod demo;
 mod edit;
 pub mod file;
 mod history;
+pub mod preset;
 mod project;
+mod takes;
 mod track;
 
 pub use clip::{
@@ -26,7 +28,9 @@ pub use clip::{
 };
 pub use edit::{CoalesceKey, Command, EditError, Impact, MAX_LEVEL_DB, RemovedTrack};
 pub use history::{History, Replayed};
+pub use preset::{PresetError, TrackPreset};
 pub use project::{AudioSource, Marker, MusicalRange, Project, SourceSpec};
+pub use takes::{CompPiece, CompSegment, DEFAULT_COMP_CROSSFADE, Take, TakeFolder};
 pub use track::{
     AuxSend, InputRouting, MonitorMode, OutputRouting, PluginFormat, PluginRef, PluginSlot,
     SavedParameter, SendTap, Track, TrackColor, TrackKind,

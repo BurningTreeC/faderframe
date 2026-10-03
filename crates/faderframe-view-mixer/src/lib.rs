@@ -15,11 +15,11 @@
 
 mod layout;
 
-pub use layout::{INSERT_SLOTS, SEND_SLOTS, StripLayout};
+pub use layout::{INSERT_SLOTS, MAX_SEND_ROWS, SENDS_PER_ROW, StripLayout};
 
 use faderframe_core::gain::{SILENCE_DB, format_db};
 use faderframe_core::pan::format_pan;
-use faderframe_core::{FaderLaw, TrackId, builtin};
+use faderframe_core::{ChannelLayout, FaderLaw, TrackId, builtin};
 use faderframe_project::{
     Command, InputRouting, MonitorMode, OutputRouting, PluginRef, SendTap, Track, TrackColor,
     TrackKind,
@@ -38,7 +38,10 @@ pub enum Hit {
     FaderCap(TrackId),
     FaderTrack(TrackId),
     Pan(TrackId),
+    /// A send slot; the index is into the track's sends (bank applied).
     Send(TrackId, usize),
+    /// Page the send slots by this many banks.
+    SendBank(i32),
     Insert(TrackId, usize),
     Mute(TrackId),
     Solo(TrackId),
@@ -84,6 +87,12 @@ pub struct MixerView {
     drag: Option<Drag>,
     hover: Option<Hit>,
     law: FaderLaw,
+    /// Send rows shown (from the track with the most sends, +1 free slot).
+    send_rows: usize,
+    /// Send bank shown (pages of `send_rows * SENDS_PER_ROW` sends).
+    send_bank: usize,
+    /// Sends of the track with the most sends.
+    max_sends: usize,
 }
 
 fn fader_cap_color(kind: TrackKind, theme: &Theme) -> Color {
@@ -134,6 +143,9 @@ impl MixerView {
             drag: None,
             hover: None,
             law: FaderLaw::console(),
+            send_rows: 1,
+            send_bank: 0,
+            max_sends: 0,
         }
     }
 
@@ -191,7 +203,30 @@ impl MixerView {
             &self.theme,
             t.kind == TrackKind::Audio,
             t.kind != TrackKind::Master,
+            self.send_rows,
         )
+    }
+
+    /// Size the send section for the track with the most sends (always
+    /// leaving one free slot to add another).
+    fn update_sends(&mut self, model: &Session) {
+        self.max_sends = model
+            .project()
+            .tracks
+            .iter()
+            .map(|t| t.sends.len())
+            .max()
+            .unwrap_or(0);
+        self.send_rows = (self.max_sends + 1)
+            .div_ceil(SENDS_PER_ROW)
+            .clamp(1, MAX_SEND_ROWS);
+        let pages = self.send_pages(self.send_rows * SENDS_PER_ROW);
+        self.send_bank = self.send_bank.min(pages - 1);
+    }
+
+    /// Banks needed to reach every send plus one free slot.
+    fn send_pages(&self, per_page: usize) -> usize {
+        (self.max_sends + 1).div_ceil(per_page.max(1)).max(1)
     }
 
     /// Strips with their rects (visible channels + master).
@@ -220,7 +255,7 @@ impl MixerView {
             let l = self.layout_for(rect, t);
             let id = t.id;
             let geo = FaderGeometry::new(l.fader, &self.theme);
-            let pos_now = self.law.db_to_position(t.volume_db);
+            let pos_now = self.law.db_to_position(model.shown_volume_db(t));
             let checks: [(Option<Rect>, Hit); 12] = [
                 (Some(geo.cap_rect(pos_now).inset(-2.0)), Hit::FaderCap(id)),
                 (Some(l.fader), Hit::FaderTrack(id)),
@@ -248,12 +283,22 @@ impl MixerView {
             {
                 return Some(Hit::Insert(id, i));
             }
-            if let Some(sends) = &l.sends
-                && let Some(i) = sends
+            if let Some(sends) = &l.sends {
+                let per_page = sends.len();
+                if self.send_pages(per_page) > 1 {
+                    if l.send_prev.is_some_and(|r| r.contains(pos)) {
+                        return Some(Hit::SendBank(-1));
+                    }
+                    if l.send_next.is_some_and(|r| r.contains(pos)) {
+                        return Some(Hit::SendBank(1));
+                    }
+                }
+                if let Some(i) = sends
                     .iter()
                     .position(|s| s.knob.contains(pos) || s.label.contains(pos))
-            {
-                return Some(Hit::Send(id, i));
+                {
+                    return Some(Hit::Send(id, self.send_bank * per_page + i));
+                }
             }
             return Some(Hit::Strip(id));
         }
@@ -347,10 +392,41 @@ impl MixerView {
         }
 
         if let (Some(label), Some(sends)) = (l.sends_label, &l.sends) {
-            controls::engraved(p, "SENDS", label, th, Align::Center);
+            let per_page = sends.len();
+            let pages = self.send_pages(per_page);
+            let first = self.send_bank * per_page;
+            if pages > 1 {
+                let text = format!("SENDS {}–{}", first + 1, first + per_page);
+                controls::engraved(p, &text, label, th, Align::Center);
+                for (r, glyph, enabled) in [
+                    (l.send_prev, "◂", self.send_bank > 0),
+                    (l.send_next, "▸", self.send_bank + 1 < pages),
+                ] {
+                    if let Some(r) = r {
+                        let col = if enabled {
+                            c.panel_label
+                        } else {
+                            c.panel_label.with_alpha(0.3)
+                        };
+                        p.text(
+                            glyph,
+                            r,
+                            &faderframe_ui_canvas::TextStyle::new(th.fonts.small, col).center(),
+                        );
+                    }
+                }
+            } else {
+                controls::engraved(p, "SENDS", label, th, Align::Center);
+            }
             for (i, slot) in sends.iter().enumerate() {
-                let send = t.sends.get(i);
-                let value = send.map_or(0.0, |s| self.law.db_to_position(s.level_db));
+                let index = first + i;
+                if index > t.sends.len() {
+                    // Only the next free slot is offered for a new send.
+                    continue;
+                }
+                let send = t.sends.get(index);
+                let value =
+                    send.map_or(0.0, |s| self.law.db_to_position(model.shown_send_db(t, s)));
                 let ring = match send {
                     Some(s) if s.enabled => c.send_cap.lighten(0.35),
                     _ => c.knob.ring_track,
@@ -381,7 +457,7 @@ impl MixerView {
         controls::knob(
             p,
             l.pan_knob,
-            (t.pan + 1.0) * 0.5,
+            (model.shown_pan(t) + 1.0) * 0.5,
             true,
             KnobLook {
                 cap: c.pan_cap,
@@ -389,9 +465,9 @@ impl MixerView {
             },
             th,
         );
-        controls::readout(p, l.pan_readout, &format_pan(t.pan), th);
+        controls::readout(p, l.pan_readout, &format_pan(model.shown_pan(t)), th);
 
-        controls::led_button(p, l.mute, "M", t.mute, c.led.mute, th);
+        controls::led_button(p, l.mute, "M", model.shown_mute(t), c.led.mute, th);
         controls::led_button(p, l.solo, "S", t.solo, c.led.solo, th);
         if t.kind.has_clips() {
             controls::led_button(p, l.record, "R", t.record_arm, c.led.record, th);
@@ -399,7 +475,7 @@ impl MixerView {
             controls::led_button(p, l.record, "·", false, c.led.record, th);
         }
 
-        controls::readout(p, l.level_readout, &format_db(t.volume_db), th);
+        controls::readout(p, l.level_readout, &format_db(model.shown_volume_db(t)), th);
         let geo = FaderGeometry::new(l.fader, th);
         let marks: [(f32, &str); 10] = [
             (12.0, "12"),
@@ -420,7 +496,7 @@ impl MixerView {
         controls::fader(
             p,
             &geo,
-            self.law.db_to_position(t.volume_db),
+            self.law.db_to_position(model.shown_volume_db(t)),
             fader_cap_color(t.kind, th),
             &scale,
             th,
@@ -525,23 +601,62 @@ impl MixerView {
         HostRequest::ContextMenu { at, items }
     }
 
-    fn input_menu(t: &Track, at: Point) -> HostRequest<Action> {
-        let set = |input| Action::Edit(Command::SetTrackInput { track: t.id, input });
+    fn input_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
+        // Choosing an input also chooses the track format: a mono input
+        // records (and processes) mono, a pair records stereo.
+        let set = |input: InputRouting, layout: ChannelLayout| {
+            let mut commands = Vec::new();
+            if layout != t.layout {
+                commands.push(Command::SetTrackLayout {
+                    track: t.id,
+                    layout,
+                });
+            }
+            commands.push(Command::SetTrackInput { track: t.id, input });
+            Action::Edit(Command::Batch {
+                label: "Change Input".into(),
+                commands,
+            })
+        };
+        let inputs = model.stream_info().map_or(8, |i| i.input_channels).max(2);
         let mut items = vec![
-            MenuItem::new("No input", set(InputRouting::None))
-                .checked(t.input == InputRouting::None),
+            MenuItem::new(
+                "No input",
+                Action::Edit(Command::SetTrackInput {
+                    track: t.id,
+                    input: InputRouting::None,
+                }),
+            )
+            .checked(t.input == InputRouting::None),
         ];
-        let n = t.layout.channel_count() as u16;
-        for first in (0..4u16).step_by(n.max(1) as usize) {
+        let stereo = t.layout.channel_count() >= 2;
+        for first in 0..inputs {
             let input = InputRouting::Hardware {
                 first_channel: first,
             };
-            let label = if n == 1 {
-                format!("Hardware In {}", first + 1)
-            } else {
-                format!("Hardware In {}-{}", first + 1, first + n)
+            let mut item = MenuItem::new(
+                format!("Mono · In {}", first + 1),
+                set(input, ChannelLayout::Mono),
+            )
+            .checked(!stereo && t.input == input);
+            if first == 0 {
+                item = item.separated();
+            }
+            items.push(item);
+        }
+        for first in (0..inputs.saturating_sub(1)).step_by(2) {
+            let input = InputRouting::Hardware {
+                first_channel: first,
             };
-            items.push(MenuItem::new(label, set(input)).checked(t.input == input));
+            let mut item = MenuItem::new(
+                format!("Stereo · In {}–{}", first + 1, first + 2),
+                set(input, ChannelLayout::Stereo),
+            )
+            .checked(stereo && t.input == input);
+            if first == 0 {
+                item = item.separated();
+            }
+            items.push(item);
         }
         items.push(
             MenuItem::new(
@@ -641,11 +756,11 @@ impl MixerView {
                 ));
             }
             None => {
-                for dst in p
-                    .tracks
-                    .iter()
-                    .filter(|d| matches!(d.kind, TrackKind::Bus | TrackKind::Aux) && d.id != t.id)
-                {
+                for dst in p.tracks.iter().filter(|d| {
+                    matches!(d.kind, TrackKind::Bus | TrackKind::Aux)
+                        && d.id != t.id
+                        && !t.sends.iter().any(|s| s.target == d.id)
+                }) {
                     let ok = !p.would_cycle(t.id, dst.id);
                     let label = format!("Send to {}", dst.name);
                     items.push(if ok {
@@ -757,7 +872,7 @@ impl MixerView {
                     return true;
                 }
                 cx.emit(Action::BeginGesture("Volume".into()));
-                let mut start = self.law.db_to_position(t.volume_db);
+                let mut start = self.law.db_to_position(model.shown_volume_db(t));
                 if matches!(hit, Hit::FaderTrack(_))
                     && let Some(l) = self.layout_of(model, id, size)
                 {
@@ -774,6 +889,12 @@ impl MixerView {
                     start_pos: start,
                 });
                 cx.set_cursor(Cursor::Grabbing);
+            }
+            Hit::SendBank(delta) => {
+                let pages = self.send_pages(self.send_rows * SENDS_PER_ROW);
+                self.send_bank =
+                    (self.send_bank as i64 + delta as i64).clamp(0, pages as i64 - 1) as usize;
+                cx.redraw();
             }
             Hit::Pan(id) | Hit::Send(id, _) => {
                 let Some(t) = Self::track(model, id) else {
@@ -867,7 +988,7 @@ impl MixerView {
             }
             Hit::Input(id) => {
                 if let Some(t) = Self::track(model, id) {
-                    cx.request(Self::input_menu(t, pos));
+                    cx.request(Self::input_menu(model, t, pos));
                 }
             }
             Hit::Output(id) => {
@@ -929,7 +1050,7 @@ impl MixerView {
             }
             Hit::Output(id) => Self::track(model, id).map(|t| Self::output_menu(model, t, pos)),
             Hit::Input(id) | Hit::Monitor(id) => {
-                Self::track(model, id).map(|t| Self::input_menu(t, pos))
+                Self::track(model, id).map(|t| Self::input_menu(model, t, pos))
             }
             Hit::Scribble(id) | Hit::Strip(id) => {
                 Self::track(model, id).map(|t| Self::track_menu(t, pos))
@@ -960,12 +1081,15 @@ impl MixerView {
                 format!(
                     "{}: {} dB\nDrag · Shift/Ctrl for fine · Double-click for 0 dB · Wheel",
                     t.name,
-                    format_db(t.volume_db)
+                    format_db(model.shown_volume_db(t))
                 )
             }
             Hit::Pan(id) => {
                 let t = Self::track(model, id)?;
-                format!("Pan {} · Double-click to centre", format_pan(t.pan))
+                format!(
+                    "Pan {} · Double-click to centre",
+                    format_pan(model.shown_pan(t))
+                )
             }
             Hit::Send(id, i) => match Self::track(model, id)?.sends.get(i) {
                 Some(s) => format!(
@@ -974,6 +1098,12 @@ impl MixerView {
                 ),
                 None => "Click to add a send".into(),
             },
+            Hit::SendBank(d) => if d < 0 {
+                "Previous sends"
+            } else {
+                "Next sends"
+            }
+            .into(),
             Hit::Insert(_, _) => "Insert slot · Click to add or manage".into(),
             Hit::Mute(id) => format!("Mute {}", name(id)),
             Hit::Solo(id) => format!("Solo {}", name(id)),
@@ -992,6 +1122,7 @@ impl MixerView {
 
 impl CanvasView<Session, Action> for MixerView {
     fn paint(&mut self, p: &mut dyn Painter, size: Size, model: &Session, theme: &Theme) {
+        self.update_sends(model);
         let tracks = Self::channel_tracks(model);
         self.clamp_scroll(tracks.len(), size);
         p.fill(Rect::from_size(size), theme.ui.background);
@@ -1028,6 +1159,7 @@ impl CanvasView<Session, Action> for MixerView {
         model: &Session,
         cx: &mut EventCx<'_, Action>,
     ) -> bool {
+        self.update_sends(model);
         match *ev {
             ViewEvent::PointerDown {
                 pos,
