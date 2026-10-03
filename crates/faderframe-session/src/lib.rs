@@ -17,6 +17,9 @@
 pub mod automation;
 pub mod media;
 mod meters;
+pub mod midi;
+pub mod performance;
+pub use performance::{Load, PerformanceReport, PluginPerformance, TrackPerformance};
 pub mod record;
 pub mod render;
 mod selection;
@@ -47,6 +50,7 @@ use faderframe_workspace::{
     DockAreaId, LayoutError, ViewId, WindowGeometry, WindowId, WorkspaceSet,
 };
 pub use media::{ImportJob, ImportTarget};
+pub use midi::{KEYBOARD_PORT, LiveNote, MidiPortStatus, MidiPreferences};
 pub use record::{LiveTake, LoopRecordMode, RecordMode, RecordSettings, RecordedTake};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -205,6 +209,11 @@ pub enum Action {
         lane: faderframe_core::AutomationLaneId,
         mode: AutomationMode,
     },
+    /// Clear performance peaks, history and callback statistics.
+    ResetPerformance,
+    /// Map the next control moved on a MIDI device to this target.
+    MidiLearn(faderframe_project::MappingTarget),
+    CancelMidiLearn,
     /// Ask the shell to open the plugin browser for a track.
     OpenPluginBrowser {
         track: TrackId,
@@ -308,7 +317,10 @@ pub struct AudioPreferences {
 
 /// A recording in progress (or whose writer is finishing).
 struct ActiveRecording {
-    writer: record::RecordWriter,
+    /// Audio takes (none when only MIDI tracks are armed).
+    writer: Option<record::RecordWriter>,
+    /// MIDI takes.
+    midi: Option<midi::MidiTake>,
     from: i64,
     to: i64,
     tracks: Vec<TrackId>,
@@ -380,6 +392,8 @@ pub struct Session {
     presets: Vec<PresetEntry>,
     automation_writer: automation::AutomationWriter,
     ui_requests: Vec<UiRequest>,
+    perf: performance::PerformanceMonitor,
+    midi: midi::MidiState,
 }
 
 /// Where a plugin chosen in the browser goes.
@@ -463,7 +477,11 @@ impl Session {
         config: EngineConfig,
     ) -> Result<Self> {
         let epoch = Epoch::new();
-        let (engine, processor) = faderframe_engine::create_with_epoch(config, Arc::clone(&epoch));
+        let (mut engine, processor) =
+            faderframe_engine::create_with_epoch(config, Arc::clone(&epoch));
+        let (midi, midi_queue) = midi::MidiState::new();
+        engine.set_midi_input(midi_queue)?;
+        engine.set_midi_ports(midi.port_map());
         let loader = media::DiskLoader::start(
             Arc::new(StreamPlan::default()),
             engine.shared(),
@@ -507,6 +525,8 @@ impl Session {
             presets: Vec::new(),
             automation_writer: Default::default(),
             ui_requests: Vec::new(),
+            perf: Default::default(),
+            midi,
         };
         s.rescan_track_presets();
         s.render_sources();
@@ -744,6 +764,9 @@ impl Session {
         let (engine, processor) =
             faderframe_engine::create_with_epoch(self.engine_config, Arc::clone(&self.epoch));
         self.engine = engine;
+        self.engine.set_midi_input(self.midi.renew_queue())?;
+        self.engine.set_midi_ports(self.midi.port_map());
+        self.engine.set_midi_live(self.midi.live().clone());
         self.engine
             .sync(&self.project, &self.sources, Impact::Graph)?;
         self.engine.transport(TransportCommand::Locate(position))?;
@@ -896,6 +919,8 @@ impl Session {
             self.metrics = self.engine.metrics();
             self.last_metrics = Instant::now();
         }
+        self.tick_performance();
+        self.tick_midi();
         let status = self.stream_status();
         if let Some(status) = status {
             if status.shut_down {
@@ -1601,6 +1626,9 @@ impl Session {
                     .push(UiRequest::PluginBrowser { track, target });
                 self.revision += 1;
             }
+            Action::ResetPerformance => self.reset_performance(),
+            Action::MidiLearn(target) => self.start_midi_learn(target),
+            Action::CancelMidiLearn => self.cancel_midi_learn(),
             Action::OpenPluginEditor {
                 track,
                 plugin,
@@ -1751,6 +1779,12 @@ impl Session {
             WorkspaceAction::ShowView(v) => {
                 if layout.is_showing(&v) {
                     return Ok(());
+                }
+                // Layouts saved before a view existed do not know it yet.
+                if !layout.views.contains_key(&v)
+                    && let Some(kind) = faderframe_workspace::ViewKind::of_default_id(&v)
+                {
+                    layout.views.insert(v.clone(), kind);
                 }
                 layout.activate(&v)?;
             }
@@ -2009,7 +2043,7 @@ impl Session {
             };
             out.push(InputChoice {
                 label: format!("Mono · In {}", first + 1),
-                action: set(input, ChannelLayout::Mono),
+                action: set(input.clone(), ChannelLayout::Mono),
                 checked: !stereo && t.input == input,
                 group_start: first == 0,
             });
@@ -2020,7 +2054,7 @@ impl Session {
             };
             out.push(InputChoice {
                 label: format!("Stereo · In {}–{}", first + 1, first + 2),
-                action: set(input, ChannelLayout::Stereo),
+                action: set(input.clone(), ChannelLayout::Stereo),
                 checked: stereo && t.input == input,
                 group_start: first == 0,
             });
@@ -2028,14 +2062,23 @@ impl Session {
         out
     }
 
-    /// "In 1", "In 3–4", "No input".
+    /// "In 1", "In 3–4", "No input", "MIDI · All", "MIDI · MPK mini 3 · Ch 10".
     pub fn input_label(&self, t: &Track) -> String {
-        match t.input {
+        match &t.input {
             faderframe_project::InputRouting::None => "No input".into(),
             faderframe_project::InputRouting::Hardware { first_channel } => {
                 match t.layout.channel_count() {
                     1 => format!("In {}", first_channel + 1),
-                    n => format!("In {}–{}", first_channel + 1, first_channel as usize + n),
+                    n => format!("In {}–{}", first_channel + 1, *first_channel as usize + n),
+                }
+            }
+            faderframe_project::InputRouting::Midi { port, channel } => {
+                let port = port
+                    .as_deref()
+                    .map_or("All", faderframe_project::midi_port_display);
+                match channel {
+                    Some(c) => format!("MIDI · {port} · Ch {}", c + 1),
+                    None => format!("MIDI · {port}"),
                 }
             }
         }

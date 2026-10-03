@@ -377,6 +377,7 @@ pub fn open(app: &Rc<AppState>, page: Option<&str>) {
         Some("recording"),
         "Recording",
     );
+    stack.add_titled(&crate::midi_prefs::page(app), Some("midi"), "MIDI");
     stack.add_titled(&engine_page(app), Some("engine"), "Engine");
     stack.add_titled(&project_page(app), Some("project"), "Project");
     if let Some(p) = page {

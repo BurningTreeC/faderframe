@@ -692,6 +692,15 @@ impl ArrangerView {
             }
             items.push(item);
         }
+        // A controller knob for this parameter.
+        let target = faderframe_project::MappingTarget::Parameter {
+            track: g.track,
+            target: lane.target,
+        };
+        for (k, (label, action)) in model.midi_learn_menu(target).into_iter().enumerate() {
+            let item = MenuItem::new(label, action);
+            items.push(if k == 0 { item.separated() } else { item });
+        }
         items.push(MenuItem::new("Hide Lane", Action::HideAutomationLane(lane.id)).separated());
         HostRequest::ContextMenu { at: pos, items }
     }

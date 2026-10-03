@@ -32,12 +32,7 @@ impl Preset {
 
     pub fn layout(self) -> WorkspaceLayout {
         let mut views = BTreeMap::new();
-        for kind in [
-            ViewKind::Arranger,
-            ViewKind::Mixer,
-            ViewKind::PianoRoll,
-            ViewKind::Automation,
-        ] {
+        for kind in ViewKind::ALL {
             views.insert(kind.default_id(), kind);
         }
         let (ratio, active, hidden) = match self {
@@ -52,7 +47,12 @@ impl Preset {
             // Mixer + meters (analyzers to come).
             Preset::Mastering => (0.30, ViewId::mixer(), false),
         };
-        let bottom_views = vec![ViewId::mixer(), ViewId::piano_roll(), ViewId::automation()];
+        let bottom_views = vec![
+            ViewId::mixer(),
+            ViewId::piano_roll(),
+            ViewId::automation(),
+            ViewId::performance(),
+        ];
         let active_idx = bottom_views.iter().position(|v| *v == active).unwrap_or(0);
         let main = DockNode::split(
             Axis::Vertical,
@@ -80,11 +80,20 @@ mod tests {
         let layouts: Vec<_> = Preset::ALL.iter().map(|p| p.layout()).collect();
         for l in &layouts {
             l.validate().unwrap();
-            assert_eq!(l.views.len(), 4);
+            assert_eq!(l.views.len(), ViewKind::ALL.len());
+            assert!(l.views.contains_key(&ViewId::performance()));
         }
         assert!(layouts[0].is_showing(&ViewId::mixer()));
         assert!(!layouts[1].is_showing(&ViewId::piano_roll()));
         assert!(layouts[3].is_showing(&ViewId::piano_roll()));
         assert_ne!(layouts[0], layouts[2]);
+    }
+
+    #[test]
+    fn views_are_found_by_default_id() {
+        for kind in ViewKind::ALL {
+            assert_eq!(ViewKind::of_default_id(&kind.default_id()), Some(kind));
+        }
+        assert_eq!(ViewKind::of_default_id(&ViewId::new("nope")), None);
     }
 }

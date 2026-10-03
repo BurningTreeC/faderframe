@@ -1,0 +1,16 @@
+[package]
+name = "faderframe-midi-io"
+description = "MIDI input devices (ALSA sequencer via midir) feeding the engine's MIDI queue"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-midi.workspace = true
+midir.workspace = true
+tracing.workspace = true

@@ -30,6 +30,8 @@ struct Args {
     buses: usize,
     inserts: bool,
     sends: bool,
+    /// Per-node timing on, as in the live engine (performance meter).
+    measure: bool,
 }
 
 fn parse() -> Result<Args, String> {
@@ -41,6 +43,7 @@ fn parse() -> Result<Args, String> {
         buses: 4,
         inserts: true,
         sends: true,
+        measure: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -55,9 +58,10 @@ fn parse() -> Result<Args, String> {
             "--buses" => a.buses = num("--buses")?.parse().map_err(|_| "bad --buses")?,
             "--no-inserts" => a.inserts = false,
             "--no-sends" => a.sends = false,
+            "--measure-nodes" => a.measure = true,
             "-h" | "--help" => {
                 println!(
-                    "faderframe-bench [--tracks N] [--block FRAMES] [--rate HZ] [--seconds S] [--buses N] [--no-inserts] [--no-sends]"
+                    "faderframe-bench [--tracks N] [--block FRAMES] [--rate HZ] [--seconds S] [--buses N] [--no-inserts] [--no-sends] [--measure-nodes]"
                 );
                 std::process::exit(0);
             }
@@ -189,7 +193,7 @@ fn main() {
     let config = EngineConfig {
         sample_rate: args.rate,
         max_block_size: args.block.max(16),
-        measure_nodes: false,
+        measure_nodes: args.measure,
         ..EngineConfig::default()
     };
     let mut r = match OfflineRenderer::new(&project, &sources, config, args.block, 2) {

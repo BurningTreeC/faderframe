@@ -61,6 +61,9 @@ enum Message {
     ResetProcessors,
     BeginRecord(Box<Recorder>),
     EndRecord,
+    MidiInput(Box<faderframe_midi::MidiInputQueue>),
+    BeginMidiRecord(Box<crate::midi::MidiRecorder>),
+    EndMidiRecord,
 }
 
 /// Objects retired by the audio thread, dropped on the control thread.
@@ -68,6 +71,8 @@ enum Garbage {
     Graph(#[allow(dead_code)] Box<CompiledGraph<EngineContext>>),
     Timeline(#[allow(dead_code)] Box<TimelineSnapshot>),
     Recorder(#[allow(dead_code)] Box<Recorder>),
+    MidiQueue(#[allow(dead_code)] Box<faderframe_midi::MidiInputQueue>),
+    MidiRecorder(#[allow(dead_code)] Box<crate::midi::MidiRecorder>),
 }
 
 /// State shared between the processor and the controller (atomics only).
@@ -92,6 +97,10 @@ pub struct EngineShared {
     record_overruns: AtomicU64,
     /// Frames captured since the engine started.
     recorded_frames: AtomicU64,
+    /// MIDI input events dropped (block full) and recorded events lost
+    /// (session too slow).
+    midi_dropped: AtomicU64,
+    midi_record_overruns: AtomicU64,
 }
 
 /// Create a connected controller/processor pair.
@@ -133,12 +142,17 @@ pub fn create_with_epoch(
             params: Arc::clone(&params),
             readback: Arc::clone(&readback),
             meters: Arc::clone(&meters),
+            midi_input: crate::midi::MidiInputBlock::with_capacity(
+                crate::midi::MIDI_INPUT_CAPACITY,
+            ),
         },
         transport: TransportState::default(),
         shared: Arc::clone(&shared),
         stream_rate: config.sample_rate,
         recorder: None,
         click: Click::default(),
+        midi: crate::midi::MidiInputState::new(),
+        midi_recorder: None,
     };
     let controller = EngineController {
         config,
@@ -152,11 +166,14 @@ pub fn create_with_epoch(
         meters,
         slots: SlotRegistry::new(config.param_capacity, config.meter_capacity),
         plugins: PluginHost::default(),
-        timings: None,
+        profile: None,
+        node_timing: false,
         stats: GraphStats::default(),
         warnings: Vec::new(),
         plan: Arc::new(StreamPlan::default()),
         suspended_lanes: Default::default(),
+        midi_ports: Default::default(),
+        midi_live: Default::default(),
     };
     (controller, processor)
 }
@@ -175,6 +192,8 @@ pub struct EngineProcessor {
     stream_rate: u32,
     recorder: Option<Box<Recorder>>,
     click: Click,
+    midi: crate::midi::MidiInputState,
+    midi_recorder: Option<Box<crate::midi::MidiRecorder>>,
 }
 
 impl EngineProcessor {
@@ -222,6 +241,23 @@ impl EngineProcessor {
                         self.retire(Garbage::Recorder(old));
                     }
                 }
+                Message::MidiInput(q) => {
+                    // Pointer swap; the old queue is dropped on the control
+                    // thread.
+                    if let Some(old) = self.midi.replace_queue(Some(q)) {
+                        self.retire(Garbage::MidiQueue(old));
+                    }
+                }
+                Message::BeginMidiRecord(r) => {
+                    if let Some(old) = self.midi_recorder.replace(r) {
+                        self.retire(Garbage::MidiRecorder(old));
+                    }
+                }
+                Message::EndMidiRecord => {
+                    if let Some(old) = self.midi_recorder.take() {
+                        self.retire(Garbage::MidiRecorder(old));
+                    }
+                }
             }
         }
     }
@@ -254,11 +290,14 @@ impl EngineProcessor {
             .map_or(1024, |g| g.config().max_block_size)
             .max(1);
 
+        self.midi.take(frames, rate, &self.shared.midi_dropped);
+
         let mut offset = 0;
         while offset < frames {
             let n = self
                 .transport
                 .frames_until_wrap((frames - offset).min(max_block));
+            self.midi.chunk(offset, n, &mut self.ctx.midi_input);
             let info = self.transport.info(&self.ctx.timeline.timeline, rate);
             self.ctx.transport = info;
             self.ctx.discontinuity = self.transport.take_discontinuity();
@@ -266,6 +305,17 @@ impl EngineProcessor {
                 self.click.reset();
             }
             let pos = self.transport.position();
+            if info.playing
+                && info.recording
+                && let Some(rec) = self.midi_recorder.as_deref_mut()
+            {
+                rec.capture(
+                    &self.ctx.midi_input,
+                    pos,
+                    n,
+                    &self.shared.midi_record_overruns,
+                );
+            }
             if info.playing
                 && info.recording
                 && let Some(rec) = self.recorder.as_deref_mut()
@@ -327,6 +377,9 @@ impl EngineProcessor {
         }
         self.shared.transport.publish(&self.transport);
         let budget_ns = (frames as f64 * 1e9 / rate.max(1.0)) as u64;
+        if graph_ok && let Some(graph) = self.graph.as_deref_mut() {
+            graph.finish_cycle(budget_ns);
+        }
         self.shared
             .metrics
             .record(started.elapsed().as_nanos() as u64, budget_ns);
@@ -360,6 +413,16 @@ pub struct TrackMeter {
 
 /// The control-thread half: rebuilds graphs, publishes snapshots and
 /// parameter values, sends transport commands and reads meters/metrics.
+/// Per-node timings of a compiled graph and what each node does: node `i`
+/// of [`NodeTimings`] works for `owners[i]`; timing group `g` is the track
+/// `groups[g]`.
+#[derive(Clone)]
+pub struct GraphProfile {
+    pub timings: Arc<NodeTimings>,
+    pub owners: Arc<[Option<crate::build::NodeOwner>]>,
+    pub groups: Arc<[faderframe_core::TrackId]>,
+}
+
 pub struct EngineController {
     config: EngineConfig,
     tx: Producer<Message>,
@@ -372,12 +435,18 @@ pub struct EngineController {
     slots: SlotRegistry,
     readback: Arc<ParamTable>,
     plugins: PluginHost,
-    timings: Option<Arc<NodeTimings>>,
+    profile: Option<GraphProfile>,
+    /// Per-node timing wanted (the performance meter is looking).
+    node_timing: bool,
     stats: GraphStats,
     warnings: Vec<String>,
     plan: Arc<StreamPlan>,
     /// Automation lanes being written (they do not drive their parameter).
     suspended_lanes: std::collections::HashSet<faderframe_core::AutomationLaneId>,
+    /// MIDI port keys → indices in MIDI events.
+    midi_ports: std::collections::HashMap<String, u16>,
+    /// Tracks taking live MIDI input.
+    midi_live: std::collections::HashSet<faderframe_core::TrackId>,
 }
 
 impl EngineController {
@@ -422,7 +491,41 @@ impl EngineController {
     }
 
     pub fn node_timings(&self) -> Option<Arc<NodeTimings>> {
-        self.timings.clone()
+        self.profile.as_ref().map(|p| Arc::clone(&p.timings))
+    }
+
+    /// Timings of the current graph with what each node does for whom.
+    pub fn graph_profile(&self) -> Option<GraphProfile> {
+        self.profile.clone()
+    }
+
+    /// Latency of a hosted plugin instance (samples).
+    pub fn plugin_latency(&self, plugin: faderframe_core::PluginInstanceId) -> Option<u32> {
+        self.plugins.latency(plugin)
+    }
+
+    /// Plugin instances that reported a processing failure.
+    pub fn failed_plugins(&self) -> Vec<faderframe_core::PluginInstanceId> {
+        self.plugins.failed()
+    }
+
+    /// Measure every graph node (per-track and per-plugin load). Costs a
+    /// clock read per node and callback, so it is only on while wanted;
+    /// the total DSP load is always measured.
+    pub fn set_node_timing(&mut self, on: bool) {
+        self.node_timing = on;
+        if let Some(p) = &self.profile {
+            p.timings.set_enabled(on);
+        }
+    }
+
+    pub fn node_timing(&self) -> bool {
+        self.node_timing
+    }
+
+    /// Highest single-callback DSP load since the last call (resets it).
+    pub fn take_peak_load(&self) -> f64 {
+        self.shared.metrics.take_peak_load()
     }
 
     pub fn metrics(&self) -> MetricsSnapshot {
@@ -600,7 +703,8 @@ impl EngineController {
     }
 
     pub fn update_params(&mut self, project: &Project) -> Result<(), EngineError> {
-        self.slots.write_params(project, &self.params)?;
+        self.slots
+            .write_params(project, &self.params, &self.midi_live)?;
         self.plugins.sync_parameters(project);
         Ok(())
     }
@@ -611,12 +715,30 @@ impl EngineController {
         let mut prepare =
             PrepareConfig::new(self.config.sample_rate as f64, self.config.max_block_size);
         prepare.measure_nodes = self.config.measure_nodes;
-        let built = build_graph(project, &mut self.slots, &mut self.plugins, &prepare)?;
+        let built = build_graph(
+            project,
+            &mut self.slots,
+            &mut self.plugins,
+            &prepare,
+            &self.midi_ports,
+        )?;
         let compiled = built.builder.compile(&prepare)?;
         // Parameters must be valid before the new graph's processors read them.
-        self.slots.write_params(project, &self.params)?;
+        self.slots
+            .write_params(project, &self.params, &self.midi_live)?;
         self.stats = compiled.stats().clone();
-        self.timings = Some(compiled.timings());
+        let mut owners = vec![None; compiled.timings().len()];
+        for (id, owner) in &built.owners {
+            if let Some(i) = compiled.index_of(*id) {
+                owners[i] = Some(*owner);
+            }
+        }
+        compiled.timings().set_enabled(self.node_timing);
+        self.profile = Some(GraphProfile {
+            timings: compiled.timings(),
+            owners: owners.into(),
+            groups: project.tracks.iter().map(|t| t.id).collect(),
+        });
         self.warnings = built.warnings;
         for w in &self.warnings {
             tracing::warn!("{w}");
@@ -677,6 +799,59 @@ impl EngineController {
     /// collection).
     pub fn end_recording(&mut self) -> Result<(), EngineError> {
         self.send(Message::EndRecord)
+    }
+
+    /// Feed live MIDI from this queue (replaces the previous one).
+    pub fn set_midi_input(
+        &mut self,
+        queue: faderframe_midi::MidiInputQueue,
+    ) -> Result<(), EngineError> {
+        self.send(Message::MidiInput(Box::new(queue)))
+    }
+
+    /// Port keys → port indices of the MIDI input (a change needs a graph
+    /// rebuild to reach tracks routed to a named port).
+    pub fn set_midi_ports(&mut self, ports: std::collections::HashMap<String, u16>) {
+        self.midi_ports = ports;
+    }
+
+    pub fn midi_ports(&self) -> &std::collections::HashMap<String, u16> {
+        &self.midi_ports
+    }
+
+    /// Which tracks take live MIDI input (applied with the next parameter
+    /// update).
+    pub fn set_midi_live(&mut self, tracks: std::collections::HashSet<faderframe_core::TrackId>) {
+        self.midi_live = tracks;
+    }
+
+    pub fn midi_live(&self) -> &std::collections::HashSet<faderframe_core::TrackId> {
+        &self.midi_live
+    }
+
+    /// Start capturing the MIDI input of `targets` inside `from..to`.
+    pub fn begin_midi_recording(
+        &mut self,
+        targets: Vec<crate::midi::MidiRecordTarget>,
+        from: i64,
+        to: i64,
+    ) -> Result<rtrb::Consumer<crate::midi::RecordedMidi>, EngineError> {
+        let (rec, rx) = crate::midi::midi_recording(targets, from, to, 16 * 1024);
+        self.send(Message::BeginMidiRecord(Box::new(rec)))?;
+        Ok(rx)
+    }
+
+    pub fn end_midi_recording(&mut self) -> Result<(), EngineError> {
+        self.send(Message::EndMidiRecord)
+    }
+
+    /// MIDI input events dropped (more than a block holds) and recorded
+    /// events lost.
+    pub fn midi_counters(&self) -> (u64, u64) {
+        (
+            self.shared.midi_dropped.load(Ordering::Relaxed),
+            self.shared.midi_record_overruns.load(Ordering::Relaxed),
+        )
     }
 
     /// Frames dropped by the recorder (writer too slow) and captured.

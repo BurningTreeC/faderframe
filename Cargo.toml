@@ -16,6 +16,7 @@ repository = "https://github.com/BurningTreeC/faderframe"
 faderframe-core = { path = "crates/faderframe-core" }
 faderframe-timeline = { path = "crates/faderframe-timeline" }
 faderframe-midi = { path = "crates/faderframe-midi" }
+faderframe-midi-io = { path = "crates/faderframe-midi-io" }
 faderframe-realtime = { path = "crates/faderframe-realtime" }
 faderframe-audio-graph = { path = "crates/faderframe-audio-graph" }
 faderframe-transport = { path = "crates/faderframe-transport" }
@@ -32,6 +33,7 @@ faderframe-session = { path = "crates/faderframe-session" }
 faderframe-ui-canvas = { path = "crates/faderframe-ui-canvas" }
 faderframe-view-arranger = { path = "crates/faderframe-view-arranger" }
 faderframe-view-mixer = { path = "crates/faderframe-view-mixer" }
+faderframe-view-performance = { path = "crates/faderframe-view-performance" }
 faderframe-view-pianoroll = { path = "crates/faderframe-view-pianoroll" }
 faderframe-ui = { path = "crates/faderframe-ui" }
 
@@ -45,6 +47,7 @@ glib-unix = "0.22"
 jack = "0.13"
 # Realtime-safe wait-free SPSC ring buffer used for control <-> RT messaging.
 rtrb = "0.4"
+midir = "0.11"
 # Audio decoding (pure Rust; MPL-2.0, file-level copyleft, MIT-compatible).
 symphonia = { version = "0.6", default-features = false, features = ["wav", "aiff", "caf", "flac", "mp3", "ogg", "vorbis", "isomp4", "aac", "alac", "pcm", "adpcm"] }
 # High-quality sample-rate conversion.

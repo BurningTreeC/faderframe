@@ -17,4 +17,6 @@ pub struct EngineContext {
     /// written by the processors for the UI.
     pub readback: Arc<ParamTable>,
     pub meters: Arc<MeterBank>,
+    /// Live MIDI input of this chunk (see [`crate::midi`]).
+    pub midi_input: crate::midi::MidiInputBlock,
 }

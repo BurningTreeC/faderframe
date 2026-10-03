@@ -1274,6 +1274,50 @@ fn open_generic(app: &Rc<AppState>, plugin: PluginInstanceId) {
             }
         });
         row.row.add_controller(click);
+        // Right-click: MIDI learn for this parameter.
+        let menu = gtk::GestureClick::new();
+        menu.set_button(3);
+        let me = Rc::downgrade(&editor);
+        menu.connect_pressed(move |g, _, x, y| {
+            let Some(me) = me.upgrade() else { return };
+            let Some(app) = me.app.upgrade() else { return };
+            let Some(widget) = g.widget() else { return };
+            let target = faderframe_project::MappingTarget::Parameter {
+                track: me.track,
+                target: faderframe_automation::AutomationTarget::PluginParameter {
+                    plugin: me.plugin,
+                    parameter: me.rows[i].info.id,
+                },
+            };
+            let entries = app.session.borrow().midi_learn_menu(target);
+            let popover = gtk::Popover::new();
+            popover.add_css_class("ff-menu");
+            let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            for (label, action) in entries {
+                let b = gtk::Button::with_label(&label);
+                b.add_css_class("flat");
+                if let Some(l) = b.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
+                    l.set_xalign(0.0);
+                }
+                let weak = Rc::downgrade(&app);
+                let pop = popover.downgrade();
+                b.connect_clicked(move |_| {
+                    if let Some(p) = pop.upgrade() {
+                        p.popdown();
+                    }
+                    if let Some(a) = weak.upgrade() {
+                        a.dispatch(action.clone());
+                    }
+                });
+                list.append(&b);
+            }
+            popover.set_child(Some(&list));
+            popover.set_parent(&widget);
+            popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.connect_closed(|p| p.unparent());
+            popover.popup();
+        });
+        row.row.add_controller(menu);
     }
     {
         let me = Rc::downgrade(&editor);

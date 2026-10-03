@@ -99,6 +99,9 @@ pub struct Project {
     pub clips: BTreeMap<ClipId, Clip>,
     #[serde(default)]
     pub sources: BTreeMap<AudioSourceId, AudioSource>,
+    /// Controller mappings (MIDI learn).
+    #[serde(default)]
+    pub midi_mappings: Vec<crate::MidiMapping>,
     #[serde(default)]
     pub ids: IdAllocator,
 }
@@ -126,6 +129,7 @@ impl Project {
             tracks: vec![master],
             clips: BTreeMap::new(),
             sources: BTreeMap::new(),
+            midi_mappings: Vec::new(),
             ids,
         }
     }

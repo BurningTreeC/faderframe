@@ -300,11 +300,33 @@ pub(crate) fn carve(
     a: MusicalTime,
     b: MusicalTime,
 ) -> Vec<Command> {
+    carve_where(p, track, a, b, |c| c.is_audio())
+}
+
+/// [`carve`] for MIDI clips (recording in Replace mode).
+pub(crate) fn carve_midi(
+    p: &mut Project,
+    track: TrackId,
+    a: MusicalTime,
+    b: MusicalTime,
+) -> Vec<Command> {
+    carve_where(p, track, a, b, |c| {
+        matches!(c.content, faderframe_project::ClipContent::Midi(_))
+    })
+}
+
+fn carve_where(
+    p: &mut Project,
+    track: TrackId,
+    a: MusicalTime,
+    b: MusicalTime,
+    kind: impl Fn(&faderframe_project::Clip) -> bool,
+) -> Vec<Command> {
     let mut out = Vec::new();
     let clips: Vec<(ClipId, MusicalTime, MusicalTime)> = p
         .clips_of(track)
         .into_iter()
-        .filter(|c| !c.muted && c.is_audio())
+        .filter(|c| !c.muted && kind(c))
         .map(|c| (c.id, c.start, c.end(&p.timeline, p.sample_rate)))
         .filter(|&(_, s, e)| s < b && e > a)
         .collect();
@@ -661,7 +683,8 @@ impl Session {
                         channels: t.layout.channel_count() as u16,
                     })
                 }
-                faderframe_project::InputRouting::None => None,
+                faderframe_project::InputRouting::None
+                | faderframe_project::InputRouting::Midi { .. } => None,
             })
             .collect()
     }
@@ -673,14 +696,45 @@ impl Session {
             return Err(SessionError::Other("start audio before recording".into()));
         };
         let targets = self.record_targets();
-        if targets.is_empty() {
+        let midi_targets = self.midi_record_targets();
+        if targets.is_empty() && midi_targets.is_empty() {
             self.notify(
                 NoticeLevel::Warning,
-                "nothing to record: arm an audio track that has a hardware input",
+                "nothing to record: arm an audio track with a hardware input, or an instrument/MIDI track",
             );
             return Ok(());
         }
         let (from, to) = self.punch_window().unwrap_or((from, i64::MAX));
+        // MIDI: input is placed one buffer late (constant latency) and heard
+        // after the output latency; the take moves back by both.
+        let midi = if midi_targets.is_empty() {
+            None
+        } else {
+            let shift =
+                info.buffer_size as i64 + info.output_latency as i64 + self.record.latency_offset;
+            let tracks: Vec<TrackId> = midi_targets.iter().map(|t| t.track).collect();
+            let rx = self.engine.begin_midi_recording(midi_targets, from, to)?;
+            Some(crate::midi::MidiTake::new(rx, tracks, shift))
+        };
+        let midi_tracks: Vec<TrackId> = midi.as_ref().map(|m| m.tracks.clone()).unwrap_or_default();
+        if targets.is_empty() {
+            self.engine.metronome().set_mode(self.record.metronome);
+            self.engine
+                .transport(TransportCommand::SetRecording(true))?;
+            self.recording = Some(ActiveRecording {
+                writer: None,
+                midi,
+                from,
+                to,
+                tracks: midi_tracks,
+                latency: info.input_latency as i64
+                    + info.output_latency as i64
+                    + self.record.latency_offset,
+                seen: false,
+            });
+            self.pump_idle();
+            return Ok(());
+        }
         std::fs::create_dir_all(&self.media_dir)
             .map_err(|e| SessionError::Other(format!("{}: {e}", self.media_dir.display())))?;
         let mut paths: Vec<PathBuf> = Vec::new();
@@ -703,7 +757,7 @@ impl Session {
             }
             paths.push(path);
         }
-        let tracks = targets.iter().map(|t| t.track).collect();
+        let tracks = targets.iter().map(|t| t.track).chain(midi_tracks).collect();
         let latency =
             info.input_latency as i64 + info.output_latency as i64 + self.record.latency_offset;
         let streams = self
@@ -715,7 +769,8 @@ impl Session {
         self.engine
             .transport(TransportCommand::SetRecording(true))?;
         self.recording = Some(ActiveRecording {
-            writer,
+            writer: Some(writer),
+            midi,
             from,
             to,
             tracks,
@@ -728,10 +783,16 @@ impl Session {
 
     /// Leave record mode; the takes become clips once the writer is done.
     pub(crate) fn stop_recording(&mut self) -> Result<()> {
-        if let Some(r) = self.recording.take() {
+        if let Some(mut r) = self.recording.take() {
             self.engine
                 .transport(TransportCommand::SetRecording(false))?;
             self.engine.end_recording()?;
+            if let Some(m) = r.midi.as_mut() {
+                self.engine.end_midi_recording()?;
+                m.drain();
+                let at = self.engine.transport_snapshot().position - m.shift;
+                m.close_all(at.max(m.last));
+            }
             self.pump_idle();
             self.finishing.push(r);
         }
@@ -744,16 +805,23 @@ impl Session {
         // Read the live atomics: the cached snapshot may predate the
         // command that started this recording.
         let rt_recording = self.engine.transport_snapshot().recording;
+        if let Some(m) = self.recording.as_mut().and_then(|r| r.midi.as_mut()) {
+            m.drain();
+        }
         let ended = self.recording.as_mut().is_some_and(|r| {
             r.seen |= rt_recording;
-            (r.seen && !rt_recording) || r.writer.is_finished()
+            (r.seen && !rt_recording) || r.writer.as_ref().is_some_and(|w| w.is_finished())
         });
         if ended && let Err(e) = self.stop_recording() {
             self.notify(NoticeLevel::Error, e.to_string());
         }
         let mut i = 0;
         while i < self.finishing.len() {
-            if self.finishing[i].writer.is_finished() {
+            if self.finishing[i]
+                .writer
+                .as_ref()
+                .is_none_or(|w| w.is_finished())
+            {
                 let r = self.finishing.remove(i);
                 if let Err(e) = self.finish_recording(r) {
                     self.notify(NoticeLevel::Error, format!("recording: {e}"));
@@ -768,7 +836,7 @@ impl Session {
     /// thread is blocked while `f` runs, so keep it short (one paint).
     pub fn with_live_take<R>(&self, track: TrackId, f: impl FnOnce(&LiveTake) -> R) -> Option<R> {
         let r = self.recording.as_ref()?;
-        let (_, live) = r.writer.live.iter().find(|(t, _)| *t == track)?;
+        let (_, live) = r.writer.as_ref()?.live.iter().find(|(t, _)| *t == track)?;
         let guard = live.lock().ok()?;
         Some(f(&guard))
     }
@@ -789,7 +857,7 @@ impl Session {
     }
 
     fn finish_recording(&mut self, r: ActiveRecording) -> Result<()> {
-        let outcome = r.writer.join();
+        let outcome = r.writer.map(RecordWriter::join).unwrap_or_default();
         if let Some(e) = &outcome.error {
             self.notify(NoticeLevel::Error, format!("recording: {e}"));
         }
@@ -797,6 +865,11 @@ impl Session {
         let mut commands = Vec::new();
         let mut placed = Vec::new();
         let mut opened = Vec::new();
+        if let Some(m) = &r.midi {
+            let (c, p) = self.midi_take_commands(m);
+            commands.extend(c);
+            placed.extend(p);
+        }
         for take in outcome.takes {
             let p = &mut self.project;
             let Some(track_name) = p.track(take.track).map(|t| t.name.clone()) else {

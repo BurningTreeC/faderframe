@@ -33,7 +33,7 @@ pub use paint::{Paint, Path, PathCmd};
 pub use painter::{DrawOp, Painter, RecordingPainter};
 pub use text::{Align, FontFamily, FontWeight, TextStyle};
 pub use theme::{
-    ArrangerTheme, ConsoleTheme, FaderStyle, KnobStyle, LedStyle, MeterStyle, PianoRollTheme,
-    Theme, Typography, UiPalette,
+    ArrangerTheme, ConsoleTheme, FaderStyle, KnobStyle, LedStyle, MeterStyle, PerformanceTheme,
+    PianoRollTheme, Theme, Typography, UiPalette,
 };
 pub use view::{CanvasView, EventCx, HostRequest, MenuItem, ScrollAxis, ScrollInfo, TextCommit};

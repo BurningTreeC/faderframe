@@ -134,7 +134,7 @@ impl TrackPreset {
             kind: track.kind,
             layout: track.layout,
             color: track.color,
-            input: track.input,
+            input: track.input.clone(),
             output,
             volume_db: track.volume_db,
             pan: track.pan,
@@ -218,7 +218,7 @@ impl TrackPreset {
         let id: TrackId = p.ids.allocate();
         let mut t = Track::new(id, self.kind, name.unwrap_or(&self.name), self.color);
         t.layout = self.layout;
-        t.input = self.input;
+        t.input = self.input.clone();
         t.volume_db = self.volume_db;
         t.pan = self.pan;
         t.phase_invert = self.phase_invert;
@@ -278,7 +278,7 @@ impl TrackPreset {
         if t.kind == TrackKind::Audio {
             c.push(Command::SetTrackInput {
                 track,
-                input: self.input,
+                input: self.input.clone(),
             });
             c.push(Command::SetTrackMonitor {
                 track,

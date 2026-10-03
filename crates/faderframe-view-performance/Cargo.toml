@@ -1,0 +1,21 @@
+[package]
+name = "faderframe-view-performance"
+description = "Performance meter: DSP load in total, per track and per plugin instance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-core.workspace = true
+faderframe-project.workspace = true
+faderframe-session.workspace = true
+faderframe-ui-canvas.workspace = true
+
+[dev-dependencies]
+faderframe-audio.workspace = true
+faderframe-engine.workspace = true

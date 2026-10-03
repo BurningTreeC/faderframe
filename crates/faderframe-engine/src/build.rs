@@ -16,6 +16,7 @@
 
 use crate::EngineError;
 use crate::context::EngineContext;
+use crate::midi::{MidiFilter, MidiInputNode, NO_PORT};
 use crate::nodes::{
     AudioClipPlayer, ChannelStrip, DeviceInputTap, DeviceOutputSink, MidiClipPlayer, MonitorGate,
     PluginNode, SendNode,
@@ -24,6 +25,7 @@ use crate::plugins::PluginHost;
 use crate::slots::SlotRegistry;
 use faderframe_audio_graph::nodes::Passthrough;
 use faderframe_audio_graph::{GraphBuilder, NodeId, NodeKey, NodeRole, NodeSpec, PrepareConfig};
+use faderframe_core::PluginInstanceId;
 use faderframe_core::{ChannelLayout, PanLaw, TrackId};
 use faderframe_plugin_host::ProcessConfig;
 use faderframe_project::{
@@ -35,6 +37,34 @@ use std::collections::HashMap;
 pub struct BuiltGraph {
     pub builder: GraphBuilder<EngineContext>,
     pub warnings: Vec<String>,
+    /// What every node does and for whom (performance accounting). Node
+    /// groups are track indices in project order.
+    pub owners: Vec<(NodeId, NodeOwner)>,
+}
+
+/// The kind of work a graph node does for its track.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NodeWork {
+    Clips,
+    Midi,
+    /// Live MIDI input.
+    MidiInput,
+    HardwareIn,
+    Monitor,
+    Input,
+    Instrument,
+    Insert,
+    Strip,
+    Send,
+    HardwareOut,
+}
+
+/// The track (and plugin instance) a graph node works for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeOwner {
+    pub track: TrackId,
+    pub plugin: Option<PluginInstanceId>,
+    pub work: NodeWork,
 }
 
 #[derive(Clone, Copy)]
@@ -47,6 +77,7 @@ enum Role {
     Strip = 6,
     Send = 7,
     DeviceOut = 8,
+    MidiInput = 9,
 }
 
 /// FNV-1a over the identity of a node.
@@ -73,6 +104,7 @@ struct TrackNodes {
     strip: Option<NodeId>,
     instrument: Option<NodeId>,
     midi: Option<NodeId>,
+    midi_in: Option<NodeId>,
 }
 
 /// Everything needed to turn plugin slots into graph nodes.
@@ -159,6 +191,7 @@ pub fn build_graph(
     slots: &mut SlotRegistry,
     plugins: &mut PluginHost,
     config: &PrepareConfig,
+    midi_ports: &HashMap<String, u16>,
 ) -> Result<BuiltGraph, EngineError> {
     let mut b = GraphBuilder::<EngineContext>::new();
     let mut warnings = Vec::new();
@@ -171,20 +204,57 @@ pub fn build_graph(
         warnings: &mut warnings,
     };
     let mut nodes: HashMap<TrackId, TrackNodes> = HashMap::new();
+    let mut owners: Vec<(NodeId, NodeOwner)> = Vec::new();
+    let own = |owners: &mut Vec<(NodeId, NodeOwner)>,
+               node: NodeId,
+               track: TrackId,
+               plugin: Option<PluginInstanceId>,
+               work: NodeWork| {
+        owners.push((
+            node,
+            NodeOwner {
+                track,
+                plugin,
+                work,
+            },
+        ));
+        node
+    };
 
     // Pass 1: per-track chains.
-    for t in &project.tracks {
+    for (gi, t) in project.tracks.iter().enumerate() {
+        let gi = gi as u32;
         let mut tn = TrackNodes::default();
         let layout = t.layout;
         if matches!(t.kind, TrackKind::Instrument | TrackKind::Midi) {
-            tn.midi = Some(
-                b.add_node(
-                    NodeSpec::new(format!("{} · MIDI", t.name))
-                        .key(node_key(t.id, Role::MidiPlayer, 0, &[]))
-                        .events_out(1),
-                    Box::new(MidiClipPlayer::new(t.id)),
-                ),
+            let midi = b.add_node(
+                NodeSpec::new(format!("{} · MIDI", t.name))
+                    .key(node_key(t.id, Role::MidiPlayer, 0, &[]))
+                    .group(gi)
+                    .events_out(1),
+                Box::new(MidiClipPlayer::new(t.id)),
             );
+            tn.midi = Some(own(&mut owners, midi, t.id, None, NodeWork::Midi));
+            // Live input (played through while the session says so).
+            if let InputRouting::Midi { port, channel } = &t.input {
+                let filter = MidiFilter {
+                    port: port
+                        .as_ref()
+                        .map(|k| midi_ports.get(k).copied().unwrap_or(NO_PORT)),
+                    channel: *channel,
+                };
+                let sub = (filter.port.map_or(0x1_0000, u64::from) << 8)
+                    | filter.channel.map_or(0xFF, u64::from);
+                let live = slots.midi_live(t.id)?;
+                let node = b.add_node(
+                    NodeSpec::new(format!("{} · MIDI In", t.name))
+                        .key(node_key(t.id, Role::MidiInput, sub, &[]))
+                        .group(gi)
+                        .events_out(1),
+                    Box::new(MidiInputNode::new(filter, live)),
+                );
+                tn.midi_in = Some(own(&mut owners, node, t.id, None, NodeWork::MidiInput));
+            }
         }
         if t.kind == TrackKind::Midi {
             nodes.insert(t.id, tn);
@@ -194,20 +264,23 @@ pub fn build_graph(
         let input = b.add_node(
             NodeSpec::new(format!("{} · Input", t.name))
                 .key(node_key(t.id, Role::Input, 0, &[layout]))
+                .group(gi)
                 .audio_in(layout)
                 .audio_out(layout),
             Box::new(Passthrough),
         );
-        tn.input = Some(input);
+        tn.input = Some(own(&mut owners, input, t.id, None, NodeWork::Input));
 
         match t.kind {
             TrackKind::Audio => {
                 let player = b.add_node(
                     NodeSpec::new(format!("{} · Clips", t.name))
                         .key(node_key(t.id, Role::ClipPlayer, 0, &[layout]))
+                        .group(gi)
                         .audio_out(layout),
                     Box::new(AudioClipPlayer::new(t.id)),
                 );
+                own(&mut owners, player, t.id, None, NodeWork::Clips);
                 b.connect_audio(player, 0, input, 0)?;
                 if let InputRouting::Hardware { first_channel } = t.input
                     && t.monitor != MonitorMode::Off
@@ -215,15 +288,19 @@ pub fn build_graph(
                     let dev = b.add_node(
                         NodeSpec::new(format!("{} · Hardware In", t.name))
                             .role(NodeRole::DeviceInput { first_channel })
+                            .group(gi)
                             .audio_out(layout),
                         Box::new(DeviceInputTap),
                     );
+                    own(&mut owners, dev, t.id, None, NodeWork::HardwareIn);
                     let gate = b.add_node(
                         NodeSpec::new(format!("{} · Monitor", t.name))
+                            .group(gi)
                             .audio_in(layout)
                             .audio_out(layout),
                         Box::new(MonitorGate::new(t.monitor, t.record_arm)),
                     );
+                    own(&mut owners, gate, t.id, None, NodeWork::Monitor);
                     b.connect_audio(dev, 0, gate, 0)?;
                     b.connect_audio(gate, 0, input, 0)?;
                 }
@@ -231,11 +308,16 @@ pub fn build_graph(
             TrackKind::Instrument => {
                 if let Some(slot) = &t.instrument {
                     let spec = NodeSpec::new(format!("{} · {}", t.name, slot.plugin.name))
+                        .group(gi)
                         .events_in(1)
                         .audio_out(layout);
                     let inst = pcx.node(&mut b, slot, t, spec, Role::Instrument);
+                    own(&mut owners, inst, t.id, Some(slot.id), NodeWork::Instrument);
                     if let Some(midi) = tn.midi {
                         b.connect_events(midi, 0, inst, 0)?;
+                    }
+                    if let Some(live) = tn.midi_in {
+                        b.connect_events(live, 0, inst, 0)?;
                     }
                     b.connect_audio(inst, 0, input, 0)?;
                     tn.instrument = Some(inst);
@@ -250,9 +332,11 @@ pub fn build_graph(
         let mut prev = input;
         for slot in &t.inserts {
             let spec = NodeSpec::new(format!("{} · {}", t.name, slot.plugin.name))
+                .group(gi)
                 .audio_in(layout)
                 .audio_out(layout);
             let node = pcx.node(&mut b, slot, t, spec, Role::Insert);
+            own(&mut owners, node, t.id, Some(slot.id), NodeWork::Insert);
             b.connect_audio(prev, 0, node, 0)?;
             prev = node;
         }
@@ -263,6 +347,7 @@ pub fn build_graph(
         let strip = b.add_node(
             NodeSpec::new(format!("{} · Strip", t.name))
                 .key(node_key(t.id, Role::Strip, 0, &[layout, dest]))
+                .group(gi)
                 .audio_in(layout)
                 .audio_out(dest)
                 .audio_out(layout),
@@ -274,12 +359,13 @@ pub fn build_graph(
             )),
         );
         b.connect_audio(prev, 0, strip, 0)?;
-        tn.strip = Some(strip);
+        tn.strip = Some(own(&mut owners, strip, t.id, None, NodeWork::Strip));
         nodes.insert(t.id, tn);
     }
 
     // Pass 2: outputs and sends.
-    for t in &project.tracks {
+    for (gi, t) in project.tracks.iter().enumerate() {
+        let gi = gi as u32;
         let Some(tn) = nodes.get(&t.id).copied() else {
             continue;
         };
@@ -289,6 +375,9 @@ pub fn build_graph(
                     (tn.midi, nodes.get(&track).and_then(|n| n.instrument))
             {
                 b.connect_events(midi, 0, inst, 0)?;
+                if let Some(live) = tn.midi_in {
+                    b.connect_events(live, 0, inst, 0)?;
+                }
             }
             continue;
         }
@@ -314,9 +403,11 @@ pub fn build_graph(
                             &[dest],
                         ))
                         .role(NodeRole::DeviceOutput { first_channel })
+                        .group(gi)
                         .audio_in(dest),
                     Box::new(DeviceOutputSink),
                 );
+                own(&mut owners, out, t.id, None, NodeWork::HardwareOut);
                 b.connect_audio(strip, 0, out, 0)?;
             }
             OutputRouting::None => {}
@@ -342,10 +433,12 @@ pub fn build_graph(
                         send.id.raw(),
                         &[tap_layout, target.layout],
                     ))
+                    .group(gi)
                     .audio_in(tap_layout)
                     .audio_out(target.layout),
                 Box::new(SendNode::new(t.id, send.id, level)),
             );
+            own(&mut owners, node, t.id, None, NodeWork::Send);
             b.connect_audio(tap_node, tap_port, node, 0)?;
             b.connect_audio(node, 0, dst, 0)?;
         }
@@ -353,5 +446,6 @@ pub fn build_graph(
     Ok(BuiltGraph {
         builder: b,
         warnings,
+        owners,
     })
 }

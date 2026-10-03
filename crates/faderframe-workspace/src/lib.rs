@@ -60,6 +60,10 @@ impl ViewId {
     pub fn automation() -> Self {
         Self::new("automation")
     }
+
+    pub fn performance() -> Self {
+        Self::new("performance")
+    }
 }
 
 impl fmt::Debug for ViewId {

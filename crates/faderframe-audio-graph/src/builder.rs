@@ -42,6 +42,9 @@ pub struct NodeSpec {
     pub audio_outputs: Vec<ChannelLayout>,
     pub event_inputs: u16,
     pub event_outputs: u16,
+    /// Accounting group (e.g. the track the node belongs to): processing
+    /// time is also summed per group and callback ([`crate::NodeTimings`]).
+    pub group: Option<u32>,
 }
 
 impl NodeSpec {
@@ -54,6 +57,11 @@ impl NodeSpec {
 
     pub fn key(mut self, key: NodeKey) -> Self {
         self.key = Some(key);
+        self
+    }
+
+    pub fn group(mut self, group: u32) -> Self {
+        self.group = Some(group);
         self
     }
 

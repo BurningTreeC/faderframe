@@ -19,6 +19,9 @@ pub struct Chrome {
     pub looping: gtk::Button,
     pub notice: gtk::Label,
     pub engine: gtk::Label,
+    pub midi_button: gtk::Button,
+    pub midi_led: gtk::Label,
+    pub midi_text: gtk::Label,
     pub import_box: gtk::Box,
     pub import_bar: gtk::ProgressBar,
     pub workspaces: gtk::DropDown,
@@ -75,16 +78,34 @@ impl Chrome {
             };
             self.import_bar.set_text(Some(&text));
         }
-        let m = s.metrics();
+        let active = s.midi_active();
+        if active != self.midi_led.has_css_class("active") {
+            if active {
+                self.midi_led.add_css_class("active");
+            } else {
+                self.midi_led.remove_css_class("active");
+            }
+        }
+        let learning = s.midi_learning().is_some();
+        if learning != self.midi_button.has_css_class("learning") {
+            if learning {
+                self.midi_button.add_css_class("learning");
+                self.midi_text.set_text("MIDI LEARN");
+            } else {
+                self.midi_button.remove_css_class("learning");
+                self.midi_text.set_text("MIDI");
+            }
+        }
+        let load = s.dsp_load();
         let engine = match (s.stream_info(), s.stream_status()) {
             (Some(info), Some(status)) => format!(
-                "{} · {} · {} fr ({:.1} ms) · DSP {:>3.0}% · p99 {:>3.0}% · xruns {}",
+                "{} · {} · {} fr ({:.1} ms) · DSP {:>3.0}% · peak {:>3.0}% · xruns {}",
                 info.backend.to_uppercase(),
                 format_sample_rate(status.sample_rate),
                 status.buffer_size,
                 status.buffer_size as f64 * 1000.0 / status.sample_rate.max(1) as f64,
-                m.last_load() * 100.0,
-                m.p99_load() * 100.0,
+                load.average * 100.0,
+                load.peak * 100.0,
                 status.xruns
             ),
             _ => "audio stopped".to_string(),
@@ -222,6 +243,7 @@ pub fn menu_model() -> gio::Menu {
             ("Mixer", "app.show-mixer"),
             ("Piano Roll", "app.show-piano-roll"),
             ("Automation", "app.show-automation"),
+            ("Performance Meter", "app.show-performance"),
             ("Show / Hide Bottom Dock", "app.toggle-dock"),
         ]),
     );
@@ -230,6 +252,7 @@ pub fn menu_model() -> gio::Menu {
         &section(&[
             ("Detach Mixer", "app.detach-mixer"),
             ("Detach Piano Roll", "app.detach-piano-roll"),
+            ("Detach Performance Meter", "app.detach-performance"),
             ("Dock All Windows", "app.dock-all"),
         ]),
     );
@@ -366,6 +389,13 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
     notice.set_ellipsize(gtk::pango::EllipsizeMode::End);
     let engine = gtk::Label::new(None);
     engine.add_css_class("engine");
+    // The DSP readout opens the performance meter.
+    let engine_button = gtk::Button::new();
+    engine_button.set_child(Some(&engine));
+    engine_button.add_css_class("flat");
+    engine_button.add_css_class("engine-button");
+    engine_button.set_action_name(Some("app.show-performance"));
+    engine_button.set_tooltip_text(Some("Performance meter (F8): load per track and plugin"));
     let import_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     let import_bar = gtk::ProgressBar::new();
     import_bar.set_show_text(true);
@@ -381,7 +411,21 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
     let platform = gtk::Label::new(Some(&platform_label(&window)));
     status.append(&notice);
     status.append(&import_box);
-    status.append(&engine);
+    // MIDI activity (and MIDI learn) indicator → Preferences, MIDI.
+    let midi_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    let midi_led = gtk::Label::new(Some("●"));
+    midi_led.add_css_class("midi-led");
+    let midi_text = gtk::Label::new(Some("MIDI"));
+    midi_box.append(&midi_led);
+    midi_box.append(&midi_text);
+    let midi_button = gtk::Button::new();
+    midi_button.set_child(Some(&midi_box));
+    midi_button.add_css_class("flat");
+    midi_button.add_css_class("midi-button");
+    midi_button.set_action_name(Some("app.midi-settings"));
+    midi_button.set_tooltip_text(Some("MIDI inputs and controller mappings"));
+    status.append(&midi_button);
+    status.append(&engine_button);
     status.append(&platform);
     content.append(&status);
     window.set_child(Some(&content));
@@ -394,6 +438,9 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
         looping,
         notice,
         engine,
+        midi_button,
+        midi_led,
+        midi_text,
         import_box,
         import_bar,
         workspaces,

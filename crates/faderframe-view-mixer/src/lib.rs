@@ -193,7 +193,7 @@ impl MixerView {
         StripLayout::new(
             rect,
             &self.theme,
-            t.kind == TrackKind::Audio,
+            matches!(t.kind, TrackKind::Audio | TrackKind::Instrument),
             t.kind != TrackKind::Master,
             self.send_rows,
         )
@@ -342,12 +342,16 @@ impl MixerView {
         }
 
         if let Some(row) = l.input {
-            let label = match t.input {
+            let label = match &t.input {
                 InputRouting::None => "IN —".to_string(),
                 InputRouting::Hardware { first_channel } => match t.layout.channel_count() {
                     1 => format!("IN {}", first_channel + 1),
-                    n => format!("IN {}-{}", first_channel + 1, first_channel as usize + n),
+                    n => format!("IN {}-{}", first_channel + 1, *first_channel as usize + n),
                 },
+                InputRouting::Midi { channel: None, .. } => "MIDI".to_string(),
+                InputRouting::Midi {
+                    channel: Some(c), ..
+                } => format!("MIDI {}", c + 1),
             };
             controls::well_label(p, row.input, &label, t.input == InputRouting::None, th);
             controls::led_button(p, row.phase, "Ø", t.phase_invert, c.led.phase, th);
@@ -593,9 +597,32 @@ impl MixerView {
         HostRequest::ContextMenu { at, items }
     }
 
+    /// MIDI learn for a control (and removing its mappings).
+    fn learn_menu(
+        model: &Session,
+        t: &Track,
+        target: faderframe_automation::AutomationTarget,
+        at: Point,
+    ) -> HostRequest<Action> {
+        let target = faderframe_project::MappingTarget::Parameter {
+            track: t.id,
+            target,
+        };
+        let mut items = vec![MenuItem::disabled(model.mapping_target_label(&target))];
+        for (i, (label, action)) in model.midi_learn_menu(target).into_iter().enumerate() {
+            let item = MenuItem::new(label, action);
+            items.push(if i == 0 { item.separated() } else { item });
+        }
+        HostRequest::ContextMenu { at, items }
+    }
+
     fn input_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
-        let mut items: Vec<MenuItem<Action>> = model
-            .input_choices(t.id)
+        let choices = if t.kind == TrackKind::Instrument {
+            model.midi_input_choices(t.id)
+        } else {
+            model.input_choices(t.id)
+        };
+        let mut items: Vec<MenuItem<Action>> = choices
             .into_iter()
             .map(|c| {
                 let item = MenuItem::new(c.label, c.action).checked(c.checked);
@@ -606,6 +633,25 @@ impl MixerView {
                 }
             })
             .collect();
+        if t.kind == TrackKind::Instrument {
+            // Live play: never, when armed or selected, always.
+            for (i, (mode, label)) in [
+                (MonitorMode::Off, "Play Live: Off"),
+                (MonitorMode::Auto, "Play Live: when armed or selected"),
+                (MonitorMode::Input, "Play Live: always"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let item = MenuItem::new(
+                    label,
+                    Action::Edit(Command::SetTrackMonitor { track: t.id, mode }),
+                )
+                .checked(t.monitor == mode);
+                items.push(if i == 0 { item.separated() } else { item });
+            }
+            return HostRequest::ContextMenu { at, items };
+        }
         items.push(
             MenuItem::new(
                 "Monitor: tape-style (auto)",
@@ -765,6 +811,14 @@ impl MixerView {
                         send: s.id,
                     }),
                 ));
+                let target = faderframe_project::MappingTarget::Parameter {
+                    track: t.id,
+                    target: faderframe_automation::AutomationTarget::SendLevel(s.id),
+                };
+                for (i, (label, action)) in model.midi_learn_menu(target).into_iter().enumerate() {
+                    let item = MenuItem::new(label, action);
+                    items.push(if i == 0 { item.separated() } else { item });
+                }
             }
             None => {
                 for dst in p.tracks.iter().filter(|d| {
@@ -1090,6 +1144,30 @@ impl MixerView {
                 (Some(t), Some(l)) => Some(Self::level_request(t, l.level_readout)),
                 _ => None,
             },
+            Hit::FaderCap(id) | Hit::FaderTrack(id) => Self::track(model, id).map(|t| {
+                Self::learn_menu(
+                    model,
+                    t,
+                    faderframe_automation::AutomationTarget::TrackVolume,
+                    pos,
+                )
+            }),
+            Hit::Pan(id) => Self::track(model, id).map(|t| {
+                Self::learn_menu(
+                    model,
+                    t,
+                    faderframe_automation::AutomationTarget::TrackPan,
+                    pos,
+                )
+            }),
+            Hit::Mute(id) => Self::track(model, id).map(|t| {
+                Self::learn_menu(
+                    model,
+                    t,
+                    faderframe_automation::AutomationTarget::TrackMute,
+                    pos,
+                )
+            }),
             _ => None,
         };
         if let Some(r) = req {

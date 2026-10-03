@@ -58,10 +58,16 @@ fn create_view(app: &Rc<AppState>, kind: ViewKind) -> ViewHost {
             app,
             Box::new(crate::placeholder::PlaceholderView::new(
                 "Automation",
-                "Automation lanes are modelled and interpolated in the engine crates; the lane editor arrives with phase 7.",
+                "Automation lanes are edited in the arranger: press A (or a track's A button) to show them.",
             )),
             false,
             false,
+        ),
+        ViewKind::Performance => ViewHost::new(
+            app,
+            Box::new(faderframe_view_performance::PerformanceView::new(theme)),
+            false,
+            true,
         ),
     };
     app.register_canvas(&host.canvas);

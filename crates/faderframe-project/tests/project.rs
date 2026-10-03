@@ -3,8 +3,8 @@
 use faderframe_core::{ClipId, NoteId, SendId, TrackId};
 use faderframe_project::demo::demo_project;
 use faderframe_project::{
-    AuxSend, ClipContent, Command, EditError, History, Impact, MidiNote, OutputRouting, Project,
-    SendTap, Track, TrackColor, TrackKind, file,
+    AuxSend, ClipContent, Command, EditError, History, Impact, InputRouting, MidiNote, MonitorMode,
+    OutputRouting, Project, SendTap, Track, TrackColor, TrackKind, file,
 };
 use faderframe_timeline::MusicalTime;
 use faderframe_workspace::WorkspaceSet;
@@ -431,6 +431,26 @@ fn file_format_errors_and_migration() {
     let loaded = file::from_str(&value.to_string()).unwrap();
     assert_eq!(loaded.project.tracks.len(), 1);
     assert!(loaded.notes.iter().any(|n| n.contains("version 0")));
+
+    // Version 1: instrument tracks had no MIDI input; they get one.
+    let demo = demo_project(48_000);
+    let mut value: serde_json::Value =
+        serde_json::from_str(&file::to_string(&demo, None).unwrap()).unwrap();
+    value["version"] = 1.into();
+    for t in value["project"]["tracks"].as_array_mut().unwrap() {
+        t["input"] = serde_json::json!({ "type": "none" });
+        t["monitor"] = "off".into();
+    }
+    let loaded = file::from_str(&value.to_string()).unwrap();
+    for t in &loaded.project.tracks {
+        if t.kind == TrackKind::Instrument {
+            assert_eq!(t.input, InputRouting::all_midi());
+            assert_eq!(t.monitor, MonitorMode::Auto);
+        } else {
+            assert_eq!(t.input, InputRouting::None, "{}", t.name);
+            assert_eq!(t.monitor, MonitorMode::Off);
+        }
+    }
 }
 
 #[test]

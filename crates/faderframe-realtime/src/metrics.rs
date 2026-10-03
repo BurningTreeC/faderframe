@@ -47,6 +47,10 @@ pub struct CallbackMetrics {
     last_budget_ns: AtomicU64,
     deadline_misses: AtomicU64,
     xruns: AtomicU64,
+    /// Sum of the callbacks' deadlines (for average load over any window).
+    total_budget_ns: AtomicU64,
+    /// Highest load of one callback (millionths) since last taken.
+    window_peak_ppm: AtomicU64,
     histogram: Box<[AtomicU64]>,
 }
 
@@ -69,6 +73,9 @@ pub struct MetricsSnapshot {
     pub last_budget_ns: u64,
     pub deadline_misses: u64,
     pub xruns: u64,
+    /// Totals since the last reset: processing time and deadlines.
+    pub total_ns: u64,
+    pub total_budget_ns: u64,
 }
 
 impl MetricsSnapshot {
@@ -101,6 +108,8 @@ impl CallbackMetrics {
             last_budget_ns: AtomicU64::new(0),
             deadline_misses: AtomicU64::new(0),
             xruns: AtomicU64::new(0),
+            total_budget_ns: AtomicU64::new(0),
+            window_peak_ppm: AtomicU64::new(0),
             histogram: (0..BUCKETS).map(|_| AtomicU64::new(0)).collect(),
         }
     }
@@ -114,6 +123,11 @@ impl CallbackMetrics {
         self.last_ns.store(duration_ns, Ordering::Relaxed);
         self.last_budget_ns.store(budget_ns, Ordering::Relaxed);
         self.histogram[bucket_index(duration_ns)].fetch_add(1, Ordering::Relaxed);
+        self.total_budget_ns.fetch_add(budget_ns, Ordering::Relaxed);
+        if budget_ns > 0 {
+            let ppm = (duration_ns as u128 * 1_000_000 / budget_ns as u128) as u64;
+            self.window_peak_ppm.fetch_max(ppm, Ordering::Relaxed);
+        }
         if duration_ns > budget_ns {
             self.deadline_misses.fetch_add(1, Ordering::Relaxed);
         }
@@ -125,6 +139,11 @@ impl CallbackMetrics {
         self.xruns.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Highest load of a single callback since the last call (resets it).
+    pub fn take_peak_load(&self) -> f64 {
+        self.window_peak_ppm.swap(0, Ordering::Relaxed) as f64 / 1e6
+    }
+
     /// Reset all counters (control thread; racing records are tolerated).
     pub fn reset(&self) {
         for a in [
@@ -134,6 +153,8 @@ impl CallbackMetrics {
             &self.last_ns,
             &self.deadline_misses,
             &self.xruns,
+            &self.total_budget_ns,
+            &self.window_peak_ppm,
         ] {
             a.store(0, Ordering::Relaxed);
         }
@@ -182,6 +203,8 @@ impl CallbackMetrics {
             last_budget_ns: self.last_budget_ns.load(Ordering::Relaxed),
             deadline_misses: self.deadline_misses.load(Ordering::Relaxed),
             xruns: self.xruns.load(Ordering::Relaxed),
+            total_ns: self.total_ns.load(Ordering::Relaxed),
+            total_budget_ns: self.total_budget_ns.load(Ordering::Relaxed),
         }
     }
 }

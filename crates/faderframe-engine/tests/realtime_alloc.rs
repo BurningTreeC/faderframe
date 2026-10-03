@@ -102,6 +102,18 @@ fn processing_does_not_allocate() {
     });
     assert_eq!(n, 0, "allocations/frees during playback incl. loop wrap");
 
+    // Per-node timing (performance meter) on: still nothing allocates.
+    r.controller.set_node_timing(true);
+    let (_, n) = armed(|| {
+        for _ in 0..100 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(n, 0, "allocations/frees with per-node timing");
+    let timings = r.controller.node_timings().unwrap();
+    assert!((0..timings.len()).any(|i| timings.total_ns(i) > 0));
+    assert!(timings.group_count() > 0);
+
     // Stop/start and a graph swap queued from the control side.
     r.controller.transport(TransportCommand::Stop).unwrap();
     r.controller.transport(TransportCommand::Play).unwrap();
@@ -304,4 +316,81 @@ fn automation_does_not_allocate() {
         }
     });
     assert_eq!(allocs, 0, "allocations while automating");
+}
+
+#[test]
+fn live_midi_input_and_midi_recording_do_not_allocate() {
+    use faderframe_engine::midi::{MidiFilter, MidiRecordTarget};
+    use faderframe_project::Impact;
+    use faderframe_transport::TransportCommand;
+    use std::collections::HashSet;
+
+    const SR: u32 = 48_000;
+    let project = demo_project(SR);
+    let sources = render_generated_sources(&project, SR);
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&project, &sources, config, 256, 2).unwrap();
+    let synth = project
+        .tracks
+        .iter()
+        .find(|t| t.instrument.is_some())
+        .unwrap()
+        .id;
+    let (tx, q, _feed) = faderframe_midi::midi_input_queue(256);
+    r.controller.set_midi_input(q).unwrap();
+    r.controller.set_midi_live(HashSet::from([synth]));
+    r.controller
+        .sync(&project, &sources, Impact::Params)
+        .unwrap();
+    let mut rx = r
+        .controller
+        .begin_midi_recording(
+            vec![MidiRecordTarget {
+                track: synth,
+                filter: MidiFilter {
+                    port: None,
+                    channel: None,
+                },
+            }],
+            0,
+            i64::MAX,
+        )
+        .unwrap();
+    r.controller
+        .transport(TransportCommand::SetRecording(true))
+        .unwrap();
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    let mut total = 0;
+    for key in 48..72u8 {
+        // Sent from this thread but outside the armed section (sending is
+        // not realtime code).
+        tx.send(0, &[0x90, key, 100]);
+        tx.send(0, &[0xB0, 1, key]);
+        let (_, n) = armed(|| {
+            for _ in 0..3 {
+                r.processor.process_device(&mut bufs);
+            }
+        });
+        total += n;
+        tx.send(0, &[0x80, key, 0]);
+    }
+    let (_, n) = armed(|| {
+        for _ in 0..20 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(
+        total + n,
+        0,
+        "allocations/frees with live MIDI and recording"
+    );
+    let recorded = std::iter::from_fn(|| rx.pop().ok()).count();
+    assert!(recorded >= 24 * 3 - 1, "{recorded}");
 }

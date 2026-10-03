@@ -280,3 +280,86 @@ fn processors_with_matching_keys_are_adopted() {
     // The counter kept its state (third call) instead of restarting at 1.
     assert_eq!(new.audio_output(n, 0).unwrap().channel(0)[0], 3.0);
 }
+
+#[test]
+fn timings_are_published_per_callback_for_nodes_and_groups() {
+    /// Spends at least `us` microseconds per call.
+    struct Busy {
+        us: u64,
+    }
+    impl Processor<Ctx> for Busy {
+        fn process(&mut self, _cx: &ProcessContext<'_, Ctx>, io: &mut NodeIo<'_>) {
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_micros(self.us) {
+                std::hint::spin_loop();
+            }
+            for out in io.audio_out.iter_mut() {
+                out.clear();
+            }
+        }
+    }
+    let mut b = GraphBuilder::<Ctx>::new();
+    let a = b.add_node(
+        NodeSpec::new("a").group(0).audio_out(Mono),
+        Box::new(Busy { us: 200 }),
+    );
+    let c = b.add_node(
+        NodeSpec::new("c").group(0).audio_in(Mono).audio_out(Mono),
+        Box::new(Busy { us: 100 }),
+    );
+    let lone = b.add_node(
+        NodeSpec::new("lone").audio_out(Mono),
+        Box::new(Busy { us: 50 }),
+    );
+    b.connect_audio(a, 0, c, 0).unwrap();
+    let mut g = b.compile(&config(64)).unwrap();
+    let t = g.timings();
+    assert_eq!(t.group_count(), 1);
+
+    let (ia, ic, il) = (
+        g.index_of(a).unwrap(),
+        g.index_of(c).unwrap(),
+        g.index_of(lone).unwrap(),
+    );
+    let i = |id| {
+        if id == a {
+            ia
+        } else if id == c {
+            ic
+        } else {
+            il
+        }
+    };
+    // Two chunks of one callback count as one cycle.
+    run(&mut g, 64);
+    run(&mut g, 64);
+    assert_eq!(
+        t.total_ns(i(a)),
+        0,
+        "nothing is published before the cycle ends"
+    );
+    let budget_ns = 10_000_000; // 10 ms
+    g.finish_cycle(budget_ns);
+
+    let (na, nc, nl) = (t.total_ns(i(a)), t.total_ns(i(c)), t.total_ns(i(lone)));
+    assert!(
+        na >= 400_000 && nc >= 200_000 && nl >= 100_000,
+        "{na} {nc} {nl}"
+    );
+    assert_eq!(t.group_of(i(a)), Some(0));
+    assert_eq!(t.group_of(i(lone)), None);
+    assert_eq!(
+        t.group_total_ns(0),
+        na + nc,
+        "a group is the sum of its nodes"
+    );
+    // Peaks: share of the callback budget.
+    let peak = t.take_peak(i(a));
+    assert!((peak - na as f64 / budget_ns as f64).abs() < 1e-6, "{peak}");
+    assert_eq!(t.take_peak(i(a)), 0.0, "taking resets the peak");
+    let gp = t.take_group_peak(0);
+    assert!(
+        (gp - (na + nc) as f64 / budget_ns as f64).abs() < 1e-6,
+        "{gp}"
+    );
+}

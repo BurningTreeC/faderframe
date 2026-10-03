@@ -25,6 +25,8 @@ pub struct Preferences {
     pub preroll_bars: u32,
     /// Extra recording latency compensation in frames.
     pub record_latency_offset: i64,
+    /// MIDI inputs (port keys) not to use.
+    pub midi_disabled_inputs: Vec<String>,
 }
 
 impl Default for Preferences {
@@ -40,6 +42,7 @@ impl Default for Preferences {
             metronome: MetronomeMode::Recording.id().into(),
             preroll_bars: 0,
             record_latency_offset: 0,
+            midi_disabled_inputs: Vec::new(),
         }
     }
 }

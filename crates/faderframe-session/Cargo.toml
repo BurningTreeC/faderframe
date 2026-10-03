@@ -12,6 +12,9 @@ workspace = true
 
 [dependencies]
 faderframe-core.workspace = true
+faderframe-midi.workspace = true
+faderframe-midi-io.workspace = true
+rtrb.workspace = true
 faderframe-timeline.workspace = true
 faderframe-project.workspace = true
 faderframe-workspace.workspace = true

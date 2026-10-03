@@ -13,8 +13,13 @@
 
 mod buffer;
 mod event;
+mod input;
 mod tracker;
 
 pub use buffer::{MidiBuffer, MidiBufferFull};
 pub use event::{MidiEvent, TimedMidiEvent};
+pub use input::{
+    MAX_MIDI_PORTS, MidiClock, MidiControlFeed, MidiInputEvent, MidiInputQueue, MidiInputSender,
+    midi_input_queue,
+};
 pub use tracker::NoteTracker;

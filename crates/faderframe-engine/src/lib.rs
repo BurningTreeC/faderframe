@@ -22,6 +22,7 @@ mod build;
 mod click;
 mod context;
 mod engine;
+pub mod midi;
 pub mod nodes;
 pub mod offline;
 mod plugins;
@@ -29,12 +30,12 @@ pub mod record;
 mod slots;
 mod snapshot;
 
-pub use build::{BuiltGraph, build_graph};
+pub use build::{BuiltGraph, NodeOwner, NodeWork, build_graph};
 pub use click::{MetronomeMode, MetronomeShared};
 pub use context::EngineContext;
 pub use engine::{
-    EngineConfig, EngineController, EngineProcessor, EngineShared, TrackMeter, create,
-    create_with_epoch,
+    EngineConfig, EngineController, EngineProcessor, EngineShared, GraphProfile, TrackMeter,
+    create, create_with_epoch,
 };
 pub use plugins::{ActivatedPlugin, PluginHost};
 pub use record::{RecordBlock, RecordStreams, RecordTarget};

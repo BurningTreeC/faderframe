@@ -19,6 +19,7 @@ faderframe-app            binary: CLI parsing, logging, starts the GTK app
        │    └─ faderframe-ui-canvas   Painter trait, events, CanvasView, theme, console controls
        ├─ faderframe-audio-jack       JACK backend (JACK2 / pipewire-jack)
        ├─ faderframe-plugin-clap      CLAP host (clack-host): scan helper, instances, editors
+       ├─ faderframe-midi-io          MIDI input devices (midir → ALSA sequencer), virtual inputs
        └─ faderframe-session          control-world hub (GTK-free)
             ├─ faderframe-engine       project→graph compiler, RT processor, controller, offline render
             │    ├─ faderframe-audio-graph   generic DSP graph: ports, edges, PDC, compile, executor
@@ -193,6 +194,51 @@ Events always carry a frame offset inside the block (`TimedMidiEvent`).
 same offset); overflow drops and counts. The MIDI clip player emits events at
 exact offsets; the built-in synth renders between event offsets. MPE / note
 expressions are planned as additional event types.
+
+### Live MIDI input (keyboards and controllers)
+
+* **Devices.** `faderframe-midi-io::MidiHub` connects every enabled input of
+  the ALSA sequencer (via `midir`; PipeWire's MIDI bridges appear there too)
+  and adds virtual inputs (the built-in "FaderFrame Keyboard" used by
+  tests, scripting and future on-screen keys). Ports are identified by name
+  without the sequencer's client:port numbers, so a device keeps its routing
+  and enable state across replugging; the session rescans every two seconds.
+  Hardware opens only when the shell calls `Session::start_midi`
+  (`FADERFRAME_NO_MIDI=1` skips it) — tests never touch real devices.
+* **Two paths.** Every channel message is stamped on arrival (`MidiClock`)
+  and pushed into one bounded queue for the audio thread and, as a copy,
+  into a channel for the control thread (`MidiControlFeed`): learn,
+  mappings and activity work without an audio stream. A new engine gets a
+  fresh queue (`MidiInputSender::renew`) without reconnecting devices.
+* **Scheduling.** Once per device callback the processor drains the queue
+  and places each event by arrival time — one block duration ago → frame 0,
+  just now → the end — so live input has a constant latency of one block
+  and keeps its timing instead of jittering by up to a block. Chunks see
+  their share in `EngineContext::midi_input`.
+* **Tracks.** Instrument and MIDI tracks have `InputRouting::Midi { port,
+  channel }` (any/one port, omni/one channel; new tracks default to all).
+  A `MidiInputNode` per such track filters and passes events to the
+  instrument while the track is *live*: monitoring `Input`, or `Auto` when
+  armed — or selected while no track is armed. The session computes the
+  live set; the node reads a per-track parameter slot and sends note-offs
+  for held keys when the track stops being live (no hanging notes).
+* **Recording.** Armed instrument/MIDI tracks record with the audio ones
+  (or alone): a `MidiRecorder` on the audio thread copies their filtered
+  events inside the record window into a ring with timeline positions and
+  pass numbers; the session pairs them into notes (shown live in the
+  arranger), moves them back by one block plus the output latency (plus the
+  user offset) and places a bar-aligned MIDI clip per track — on top in
+  Takes mode, carving earlier MIDI in Replace mode; loop recording merges
+  passes or keeps the last one (`LoopRecordMode::LastPass`).
+* **Controller mappings (MIDI learn).** `Project::midi_mappings` map a
+  source (port or any, channel, CC / pitch bend / aftertouch / note) to any
+  automatable parameter of a track or to a transport function. Learning
+  takes the next suitable control (notes only for switches and transport).
+  Mapped values go through the same `Command`s as the mouse inside a
+  gesture that closes after 400 ms of rest — one undo step per twist, and
+  Touch/Latch automation writing records controller moves. Mapping
+  commands are undoable and saved with the project. Mapped controls also
+  still reach a live instrument (pass-through).
 
 ## 8. Plugins
 
@@ -493,10 +539,40 @@ saved with the project.
 Meters: the RT side accumulates per-channel peak and mean square with atomic
 max; the UI consumes with atomic swap — no peak is lost between frames.
 Metrics: `CallbackMetrics` records every callback's duration against its
-deadline in a log-scaled histogram (p50/p95/p99/max, deadline misses, xruns)
-and per-node accumulated time (`NodeTimings`). `faderframe-bench` measures
-worst-case callback time for N tracks/buses/inserts/sends at any rate and
-block size.
+deadline in a log-scaled histogram (p50/p95/p99/max, deadline misses, xruns),
+the sum of deadlines (average load over any window) and the worst callback
+since last taken. `faderframe-bench` measures worst-case callback time for N
+tracks/buses/inserts/sends at any rate and block size (`--measure-nodes`
+includes the per-node timing cost).
+
+### Performance meter
+
+Per-node cost is measured inside the graph executor: one clock read per
+node (a node's end is the next one's start; the time includes gathering its
+inputs), summed per node and per *group* over all chunks of a device
+callback in audio-thread-owned scratch arrays. At the end of the callback
+`CompiledGraph::finish_cycle(budget)` publishes totals and peak shares of
+the budget with plain atomic stores (the audio thread is the only writer).
+Groups are tracks, so a track's peak is the real worst callback, not a sum
+of its nodes' peaks. `build_graph` records what every node does for whom
+(`NodeOwner`: track, plugin instance, `NodeWork`), which the controller
+keeps next to the timings (`GraphProfile`).
+
+Node timing costs about a clock read per node and callback (~15 % of the
+callback in the 128-track/64-frame benchmark of trivial nodes, far less with
+real plugins), so it runs on demand: `Session::performance()` keeps it on
+while read, and it switches off two seconds after the meter is hidden. The
+total DSP load (`Session::dsp_load`, status bar) is always measured.
+
+`session::performance` polls four times a second: loads are shares of the
+callback budget (100 % = the callback took as long as the audio it made),
+averages lightly smoothed, peaks held and decaying, 60 s of history, per
+track (total and own playback/mixing work) and per plugin instance (with
+latency, bypass and failure). The `Performance` view (F8, dockable or
+detached, also from the status bar's DSP readout) shows the total with
+history and a plugins/mixing/engine/free breakdown, and a sortable table of
+tracks with their plugins or of all plugin instances; double-click a plugin
+for its editor.
 
 ## 13. Invariants
 
@@ -555,15 +631,22 @@ restarts, parameters, automation and state, native editors embedded via
 XWayland (placed centred or where they were last) and a generic parameter
 editor for every plugin.
 
-Requested next: a performance meter (total, per track, per plugin), MIDI
-keyboards and controllers (with MIDI learn into automation) and a
-best-in-class piano roll; VST3 hosting after that.
+Performance meter: total DSP load with history and breakdown, per track and
+per plugin instance, measured on demand inside the graph executor.
+
+MIDI keyboards and controllers: device management with hotplug, live play
+with constant-latency scheduling, MIDI recording into clips, MIDI learn for
+every automatable parameter and transport functions.
+
+Requested next: a best-in-class piano roll; VST3 hosting after that.
 
 Next, in order:
 
 1. ~~CLAP hosting~~ (done; still open: writing automation from plugin GUI
    gestures, note expressions, plugin-side preset browsing).
-2. MIDI input/output (`midir`), live auditioning, MIDI learn.
+2. ~~MIDI input, live play, MIDI learn~~ (done; still open: MIDI output to
+   external devices, MIDI clock/MTC, MPE, relative encoders and soft
+   takeover, consuming mapped controls instead of passing them through).
 3. ~~Automation lanes~~ (done) in the arranger, sample-accurate parameter events.
 4. Dependency-aware multicore scheduler.
 5. VST3, PipeWire-native backend, Windows and macOS ports.

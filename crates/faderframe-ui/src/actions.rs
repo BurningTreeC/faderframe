@@ -67,6 +67,9 @@ pub fn install(app: &Rc<AppState>) {
         entry(app, "audio-settings", |a| {
             crate::preferences::open(a, Some("audio"))
         }),
+        entry(app, "midi-settings", |a| {
+            crate::preferences::open(a, Some("midi"))
+        }),
         entry(app, "restart-audio", |a| a.start_audio()),
         entry(app, "about", crate::dialogs::about),
         // Development aid: render the main window into the PNG named by
@@ -258,6 +261,16 @@ pub fn install(app: &Rc<AppState>) {
         ),
         dispatch(
             app,
+            "show-performance",
+            A::Workspace(W::ShowView(ViewId::performance())),
+        ),
+        dispatch(
+            app,
+            "detach-performance",
+            A::Workspace(W::Detach(ViewId::performance())),
+        ),
+        dispatch(
+            app,
             "toggle-dock",
             A::Workspace(W::ToggleArea(DockAreaId::bottom())),
         ),
@@ -382,8 +395,66 @@ pub fn install(app: &Rc<AppState>) {
             })
             .build()
     };
+    // Development aid: `midi:90 3c 64` plays bytes through the built-in
+    // keyboard input (as if a MIDI keyboard sent them).
+    let weak = Rc::downgrade(app);
+    let midi = gio::ActionEntry::builder("midi")
+        .parameter_type(Some(&String::static_variant_type()))
+        .activate(move |_, _, param| {
+            let (Some(a), Some(text)) = (weak.upgrade(), param.and_then(|p| p.get::<String>()))
+            else {
+                return;
+            };
+            let bytes: Vec<u8> = text
+                .split([' ', ','])
+                .filter(|t| !t.is_empty())
+                .filter_map(|t| u8::from_str_radix(t, 16).ok())
+                .collect();
+            // A status byte starts each message.
+            let s = a.session.borrow();
+            let mut msg: Vec<u8> = Vec::new();
+            for b in bytes {
+                if b >= 0x80 && !msg.is_empty() {
+                    s.midi_keyboard().send(&msg);
+                    msg.clear();
+                }
+                msg.push(b);
+            }
+            if !msg.is_empty() {
+                s.midi_keyboard().send(&msg);
+            }
+        })
+        .build();
+    // Development aid: `select-track:<name>` selects a track by name.
+    let weak = Rc::downgrade(app);
+    let select = gio::ActionEntry::builder("select-track")
+        .parameter_type(Some(&String::static_variant_type()))
+        .activate(move |_, _, param| {
+            let (Some(a), Some(name)) = (weak.upgrade(), param.and_then(|p| p.get::<String>()))
+            else {
+                return;
+            };
+            let id = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.id);
+            match id {
+                Some(id) => a.dispatch(Action::SelectTracks {
+                    tracks: vec![id],
+                    mode: faderframe_session::SelectMode::Replace,
+                }),
+                None => tracing::warn!("select-track: no track '{name}'"),
+            }
+        })
+        .build();
     app.app.add_action_entries([
         insert,
+        midi,
+        select,
         show("show-insert", false),
         show("show-insert-params", true),
     ]);
@@ -404,6 +475,7 @@ pub fn install(app: &Rc<AppState>) {
         ("app.toggle-dock", &["F2"]),
         ("app.show-mixer", &["F3"]),
         ("app.show-piano-roll", &["F4"]),
+        ("app.show-performance", &["F8"]),
         ("app.workspace-1", &["<Control>1"]),
         ("app.workspace-2", &["<Control>2"]),
         ("app.workspace-3", &["<Control>3"]),
@@ -433,6 +505,10 @@ pub fn install_window_keys(app: &Rc<AppState>, window: &impl IsA<gtk::Widget>) {
             return glib::Propagation::Proceed;
         }
         let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
+        if key == gdk::Key::Escape && app.session.borrow().midi_learning().is_some() {
+            app.dispatch(Action::CancelMidiLearn);
+            return glib::Propagation::Stop;
+        }
         let action = match key {
             gdk::Key::space => TransportAction::TogglePlay,
             gdk::Key::Home => TransportAction::ReturnToStart,

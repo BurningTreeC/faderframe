@@ -272,3 +272,73 @@ fn many_sends_grow_the_send_section_and_page_in_banks() {
         Some(Hit::Send(source, 8))
     );
 }
+
+fn right(pos: Point) -> ViewEvent {
+    ViewEvent::PointerDown {
+        pos,
+        button: PointerButton::Secondary,
+        modifiers: Modifiers::NONE,
+        clicks: 1,
+    }
+}
+
+fn menu_labels(req: Vec<HostRequest<Action>>) -> Vec<String> {
+    match req.into_iter().next() {
+        Some(HostRequest::ContextMenu { items, .. }) => {
+            items.into_iter().map(|i| i.label).collect()
+        }
+        _ => panic!("expected a menu"),
+    }
+}
+
+#[test]
+fn faders_knobs_and_buttons_offer_midi_learn() {
+    let s = session();
+    let mut view = MixerView::new(Theme::default());
+    let size = Size::new(1400.0, 760.0);
+    let first = MixerView::channel_tracks(&s)[0];
+    let l = view.layout_of(&s, first.id, size).unwrap();
+    for at in [l.fader.center(), l.mute.center()] {
+        let (_, req) = run(&mut view, right(at), size, &s);
+        let labels = menu_labels(req);
+        assert!(labels.iter().any(|l| l == "MIDI Learn…"), "{labels:?}");
+    }
+    // Learning starts from the menu entry.
+    let (_, req) = run(&mut view, right(l.fader.center()), size, &s);
+    let Some(HostRequest::ContextMenu { items, .. }) = req.into_iter().next() else {
+        panic!()
+    };
+    let learn = items
+        .into_iter()
+        .find(|i| i.label == "MIDI Learn…")
+        .unwrap();
+    assert!(matches!(
+        learn.action,
+        Some(Action::MidiLearn(
+            faderframe_project::MappingTarget::Parameter { .. }
+        ))
+    ));
+}
+
+#[test]
+fn instrument_strips_choose_a_midi_input() {
+    let s = session();
+    let mut view = MixerView::new(Theme::default());
+    let size = Size::new(1400.0, 760.0);
+    let synth = MixerView::channel_tracks(&s)
+        .into_iter()
+        .find(|t| t.kind == TrackKind::Instrument)
+        .unwrap();
+    let l = view.layout_of(&s, synth.id, size).unwrap();
+    let input = l.input.expect("instrument strips show their input").input;
+    let (_, req) = run(&mut view, right(input.center()), size, &s);
+    let labels = menu_labels(req);
+    for want in [
+        "All MIDI Inputs",
+        "All Channels",
+        "Channel 10",
+        "Play Live: always",
+    ] {
+        assert!(labels.iter().any(|l| l == want), "{want} in {labels:?}");
+    }
+}

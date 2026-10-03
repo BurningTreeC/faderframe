@@ -59,6 +59,19 @@ hosting, an analogue-console-style mixer and dockable, detachable editors.
   parameter window and more); editors open centred or where they were last,
   and their positions are saved with the project. Plugin state, parameters
   and automation are saved too.
+* MIDI keyboards and controllers: every MIDI input (ALSA sequencer, incl.
+  PipeWire; hotplug) — instrument tracks play what you play while armed or
+  selected, with constant low latency; choose the input and channel per
+  track (track menu → MIDI In). Record MIDI into clips (takes or replace,
+  loop recording). MIDI learn: right-click a fader, pan, mute, send,
+  automation lane or plugin parameter → MIDI Learn and move a knob; pads
+  can toggle switches or run transport functions. Inputs and mappings in
+  Preferences → MIDI.
+* Performance meter (F8, or click the DSP readout in the status bar): total
+  DSP load with a 60 s history and a breakdown into plugins, mixing and
+  engine work; load per track and per plugin instance (average and peak,
+  sortable, latency and bypass shown); xruns, late callbacks and late disk
+  reads.
 * Render / export to WAV (16/24-bit with TPDF dither, 32-bit float): master
   or stems, project/loop/bar range, any sample rate, mono or stereo, tail,
   normalisation.
@@ -109,6 +122,7 @@ server needed when `pipewire-jack` is installed).
 | Alt+wheel | Track height (all tracks) |
 | Ctrl+Z / Ctrl+Shift+Z | Undo / redo |
 | F2 / F3 / F4 | Toggle bottom dock / show mixer / show piano roll |
+| F8 | Performance meter |
 | Ctrl+1 … Ctrl+5 | Workspaces |
 | Ctrl+I | Import audio files |
 | Ctrl+Shift+R | Render / export |

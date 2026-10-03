@@ -1327,6 +1327,26 @@ impl ArrangerView {
                     |ch, a, b| live.peaks.min_max(ch, offset + a, offset + b),
                 );
             });
+            // MIDI: the notes played so far, where they will land; held
+            // notes grow with the playhead.
+            let notes = model.live_midi_notes(track.id);
+            if !notes.is_empty() {
+                let lo = notes.iter().map(|n| n.key).min().unwrap_or(60).min(60 - 6);
+                let hi = notes.iter().map(|n| n.key).max().unwrap_or(60).max(lo + 12);
+                let span = (hi - lo + 1) as f32;
+                let note_h = (wave_area.h / span).clamp(1.5, 8.0);
+                for n in &notes {
+                    let nx0 = self.x_of_sample(model, n.start);
+                    let nx1 = self.x_of_sample(model, n.end.unwrap_or(pos));
+                    let y = wave_area.bottom() - (n.key - lo) as f32 / span * wave_area.h - note_h;
+                    let alpha = 0.55 + 0.45 * (n.velocity as f32 / 127.0);
+                    p.fill_rounded(
+                        Rect::new(nx0, y, (nx1 - nx0).max(2.0), note_h.max(2.0)),
+                        1.0,
+                        &Paint::Solid(red.lighten(0.25).with_alpha(alpha)),
+                    );
+                }
+            }
             p.pop_clip();
             p.stroke_rounded(r, 3.0, 1.2, red.with_alpha(0.9));
             if r.w > 40.0 {
@@ -1499,6 +1519,63 @@ impl ArrangerView {
                     target: faderframe_session::PluginTarget::Insert(t.inserts.len()),
                 },
             ));
+        }
+        // MIDI input (instrument and MIDI tracks): which device and channel,
+        // and when the track plays what the keyboard plays.
+        if matches!(t.kind, TrackKind::Instrument | TrackKind::Midi) {
+            for (i, c) in model.midi_input_choices(t.id).into_iter().enumerate() {
+                let item =
+                    MenuItem::new(format!("MIDI In: {}", c.label), c.action).checked(c.checked);
+                items.push(if i == 0 || c.group_start {
+                    item.separated()
+                } else {
+                    item
+                });
+            }
+            for (i, (mode, label)) in [
+                (MonitorMode::Off, "Play Live: Off"),
+                (MonitorMode::Auto, "Play Live: when armed or selected"),
+                (MonitorMode::Input, "Play Live: always"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let item = MenuItem::new(
+                    label,
+                    Action::Edit(Command::SetTrackMonitor { track: t.id, mode }),
+                )
+                .checked(t.monitor == mode);
+                items.push(if i == 0 { item.separated() } else { item });
+            }
+        }
+        // MIDI learn for the strip controls.
+        if t.kind != TrackKind::Midi {
+            for (i, (target, name)) in [
+                (
+                    faderframe_automation::AutomationTarget::TrackVolume,
+                    "Volume",
+                ),
+                (faderframe_automation::AutomationTarget::TrackPan, "Pan"),
+                (faderframe_automation::AutomationTarget::TrackMute, "Mute"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let target = faderframe_project::MappingTarget::Parameter {
+                    track: t.id,
+                    target,
+                };
+                let mapped = model
+                    .midi_mappings_for(target)
+                    .first()
+                    .map(|m| format!(" (now {})", m.source.label()))
+                    .unwrap_or_default();
+                let item = MenuItem::new(
+                    format!("MIDI Learn {name}…{mapped}"),
+                    Action::MidiLearn(target),
+                );
+                items.push(if i == 0 { item.separated() } else { item });
+            }
         }
         // Input source (audio tracks): mono or stereo, which input(s).
         if t.kind == TrackKind::Audio {

@@ -137,13 +137,43 @@ pub enum MonitorMode {
     Auto,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum InputRouting {
     #[default]
     None,
     /// Hardware input channels starting at `first_channel` (count = track layout).
     Hardware { first_channel: u16 },
+    /// Live MIDI (instrument and MIDI tracks): one input port by its stable
+    /// name, or every port; one channel (0–15) or all.
+    Midi {
+        #[serde(default)]
+        port: Option<String>,
+        #[serde(default)]
+        channel: Option<u8>,
+    },
+}
+
+/// The shown part of a MIDI port key ("Device:Port" → "Port").
+pub fn midi_port_display(key: &str) -> &str {
+    match key.split_once(':') {
+        Some((_, port)) if !port.is_empty() => port,
+        _ => key,
+    }
+}
+
+impl InputRouting {
+    /// Every MIDI input, every channel.
+    pub fn all_midi() -> Self {
+        InputRouting::Midi {
+            port: None,
+            channel: None,
+        }
+    }
+
+    pub fn is_midi(&self) -> bool {
+        matches!(self, InputRouting::Midi { .. })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,7 +329,11 @@ impl Track {
             instrument: None,
             inserts: Vec::new(),
             sends: Vec::new(),
-            input: InputRouting::None,
+            // Instruments play what the keyboard plays.
+            input: match kind {
+                TrackKind::Instrument | TrackKind::Midi => InputRouting::all_midi(),
+                _ => InputRouting::None,
+            },
             output: match kind {
                 TrackKind::Master => OutputRouting::Hardware { first_channel: 0 },
                 _ => OutputRouting::Master,
@@ -310,7 +344,10 @@ impl Track {
             mute: false,
             solo: false,
             record_arm: false,
-            monitor: MonitorMode::Off,
+            monitor: match kind {
+                TrackKind::Instrument | TrackKind::Midi => MonitorMode::Auto,
+                _ => MonitorMode::Off,
+            },
             automation: AutomationSet::default(),
         }
     }
@@ -364,6 +401,22 @@ mod tests {
             TrackColor::palette(1),
         );
         assert_eq!(master.output, OutputRouting::Hardware { first_channel: 0 });
+        let synth = Track::new(
+            TrackId(3),
+            TrackKind::Instrument,
+            "Synth",
+            TrackColor::palette(2),
+        );
+        assert_eq!(synth.input, InputRouting::all_midi());
+        assert_eq!(synth.monitor, MonitorMode::Auto);
+        let json = serde_json::to_string(&InputRouting::Midi {
+            port: Some("MPK mini 3:MPK mini 3 MIDI 1".into()),
+            channel: Some(9),
+        })
+        .unwrap();
+        assert!(json.contains("\"type\":\"midi\""), "{json}");
+        let back: InputRouting = serde_json::from_str(r#"{"type":"midi"}"#).unwrap();
+        assert_eq!(back, InputRouting::all_midi());
         assert!(TrackKind::Bus.is_summing() && !TrackKind::Audio.is_summing());
     }
 }

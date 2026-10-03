@@ -21,7 +21,7 @@ use serde_json::Value;
 use std::path::Path;
 
 pub const FORMAT_ID: &str = "faderframe-project";
-pub const CURRENT_VERSION: u32 = 1;
+pub const CURRENT_VERSION: u32 = 2;
 pub const FILE_EXTENSION: &str = "ffproj";
 
 #[derive(Debug, thiserror::Error)]
@@ -69,7 +69,7 @@ type Migration = fn(Value) -> Result<Value, FileError>;
 
 /// `MIGRATIONS[i]` upgrades a document from version `i` to `i + 1`.
 /// Version 0 never existed publicly; the entry documents the pattern.
-const MIGRATIONS: &[Migration] = &[migrate_v0_to_v1];
+const MIGRATIONS: &[Migration] = &[migrate_v0_to_v1, migrate_v1_to_v2];
 
 fn migrate_v0_to_v1(mut doc: Value) -> Result<Value, FileError> {
     // Pre-release drafts stored the track list as "channels".
@@ -78,6 +78,33 @@ fn migrate_v0_to_v1(mut doc: Value) -> Result<Value, FileError> {
         && let Some(channels) = project.remove("channels")
     {
         project.insert("tracks".into(), channels);
+    }
+    Ok(doc)
+}
+
+/// Version 2 added live MIDI input: instrument and MIDI tracks of older
+/// projects get every MIDI input and play live when armed or selected, as
+/// new tracks do.
+fn migrate_v1_to_v2(mut doc: Value) -> Result<Value, FileError> {
+    let tracks = doc
+        .get_mut("project")
+        .and_then(|p| p.get_mut("tracks"))
+        .and_then(Value::as_array_mut);
+    for t in tracks.into_iter().flatten() {
+        let Some(t) = t.as_object_mut() else { continue };
+        let musical = matches!(
+            t.get("kind").and_then(Value::as_str),
+            Some("instrument" | "midi")
+        );
+        let no_input = t
+            .get("input")
+            .is_none_or(|i| i.get("type").and_then(Value::as_str) == Some("none"));
+        if musical && no_input {
+            t.insert("input".into(), serde_json::json!({ "type": "midi" }));
+            if t.get("monitor").is_none_or(|m| m.as_str() == Some("off")) {
+                t.insert("monitor".into(), Value::String("auto".into()));
+            }
+        }
     }
     Ok(doc)
 }

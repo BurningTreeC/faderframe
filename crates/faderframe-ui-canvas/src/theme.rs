@@ -147,6 +147,47 @@ pub struct ArrangerTheme {
     pub ruler_height: f32,
 }
 
+/// The performance meter: load bars, history graph, table.
+#[derive(Clone, Debug)]
+pub struct PerformanceTheme {
+    pub background: Color,
+    pub panel: Color,
+    pub header: Color,
+    pub row_a: Color,
+    pub row_b: Color,
+    pub row_hover: Color,
+    pub plugin_row: Color,
+    pub bar_track: Color,
+    /// Load colours: below half the budget, below 3/4, below 9/10, above.
+    pub load_ok: Color,
+    pub load_warn: Color,
+    pub load_high: Color,
+    pub load_critical: Color,
+    pub peak_mark: Color,
+    pub graph_grid: Color,
+    pub graph_avg: Color,
+    pub graph_peak: Color,
+    pub engine_share: Color,
+    pub row_height: f32,
+    pub plugin_row_height: f32,
+    pub summary_height: f32,
+}
+
+impl PerformanceTheme {
+    /// Colour for a load (share of the callback budget).
+    pub fn load_color(&self, load: f64) -> Color {
+        if load < 0.5 {
+            self.load_ok
+        } else if load < 0.75 {
+            self.load_warn
+        } else if load < 0.9 {
+            self.load_high
+        } else {
+            self.load_critical
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PianoRollTheme {
     pub background: Color,
@@ -175,6 +216,7 @@ pub struct Theme {
     pub console: ConsoleTheme,
     pub arranger: ArrangerTheme,
     pub piano: PianoRollTheme,
+    pub perf: PerformanceTheme,
 }
 
 impl Default for Theme {
@@ -320,6 +362,28 @@ impl Theme {
                 row_height: 13.0,
                 velocity_height: 84.0,
                 ruler_height: 24.0,
+            },
+            perf: PerformanceTheme {
+                background: Color::hex(0x17181b),
+                panel: Color::hex(0x1e2024),
+                header: Color::hex(0x24262b),
+                row_a: Color::hex(0x1b1d20),
+                row_b: Color::hex(0x191a1d),
+                row_hover: Color::hex(0x262a30),
+                plugin_row: Color::hex(0x16171a),
+                bar_track: Color::hex(0x101114),
+                load_ok: Color::hex(0x4fc36b),
+                load_warn: Color::hex(0xe1c14b),
+                load_high: Color::hex(0xf08a3c),
+                load_critical: Color::hex(0xf04a3c),
+                peak_mark: Color::hex(0xf2efe8),
+                graph_grid: Color::rgba(1.0, 1.0, 1.0, 0.06),
+                graph_avg: Color::hex(0x4fc36b),
+                graph_peak: Color::hex(0xffb38f),
+                engine_share: Color::hex(0x6f8fd8),
+                row_height: 30.0,
+                plugin_row_height: 24.0,
+                summary_height: 132.0,
             },
         }
     }

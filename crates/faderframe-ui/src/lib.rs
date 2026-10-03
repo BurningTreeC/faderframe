@@ -15,6 +15,7 @@ mod actions;
 pub mod canvas;
 mod dialogs;
 pub mod dock;
+mod midi_prefs;
 pub mod painter;
 mod placeholder;
 mod plugin_browser;
@@ -105,6 +106,13 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
         prefs.record_settings(),
     )) {
         tracing::warn!("recording settings: {e}");
+    }
+    // MIDI keyboards and controllers (FADERFRAME_NO_MIDI=1 keeps the
+    // system's devices closed, e.g. for scripted runs).
+    if std::env::var_os("FADERFRAME_NO_MIDI").is_none() {
+        session.start_midi(&faderframe_session::MidiPreferences {
+            disabled_inputs: prefs.midi_disabled_inputs.clone(),
+        });
     }
     let state = AppState::new(app, session, options);
     let window = window::build(&state);

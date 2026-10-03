@@ -44,6 +44,13 @@ paned > separator { background-color: #0b0c0e; min-width: 5px; min-height: 5px; 
 .statusbar .notice-error { color: #ff7a66; }
 .statusbar .notice-warning { color: #e8c35a; }
 .statusbar .engine { font-family: monospace; }
+.statusbar .engine-button { padding: 0 6px; min-height: 0; }
+.midi-led { color: #3a3d42; font-size: 9pt; }
+.midi-led.active { color: #5be07a; }
+.statusbar .midi-button { padding: 0 6px; min-height: 0; }
+.statusbar .midi-button label { font-family: monospace; }
+.statusbar .midi-button.learning { background-color: rgba(255,106,61,0.25); }
+.midi-port { padding: 6px 10px; }
 popover.ff-menu > contents { padding: 4px; }
 popover.ff-menu button { padding: 3px 12px; min-height: 24px; }
 scrollbar { background-color: #17181b; }

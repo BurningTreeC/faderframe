@@ -34,6 +34,8 @@ pub struct SlotRegistry {
     strips: HashMap<TrackId, StripSlots>,
     sends: HashMap<SendId, ParamSlot>,
     track_meters: HashMap<TrackId, MeterRange>,
+    /// 1.0 while a track takes live MIDI input.
+    midi_live: HashMap<TrackId, ParamSlot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -48,7 +50,22 @@ impl SlotRegistry {
             strips: HashMap::new(),
             sends: HashMap::new(),
             track_meters: HashMap::new(),
+            midi_live: HashMap::new(),
         }
+    }
+
+    /// The live-MIDI flag of a track.
+    pub fn midi_live(&mut self, track: TrackId) -> Result<ParamSlot, SlotsExhausted> {
+        if let Some(s) = self.midi_live.get(&track) {
+            return Ok(*s);
+        }
+        let slot = ParamSlot(
+            self.params
+                .allocate(1)
+                .ok_or(SlotsExhausted("parameters"))?,
+        );
+        self.midi_live.insert(track, slot);
+        Ok(slot)
     }
 
     pub fn strip(&mut self, track: TrackId) -> Result<StripSlots, SlotsExhausted> {
@@ -134,6 +151,13 @@ impl SlotRegistry {
             }
             keep
         });
+        self.midi_live.retain(|t, s| {
+            let keep = tracks.contains(t);
+            if !keep {
+                params.release(s.0, 1);
+            }
+            keep
+        });
         let meters = &mut self.meters;
         self.track_meters.retain(|t, m| {
             let keep = tracks.contains(t);
@@ -150,9 +174,14 @@ impl SlotRegistry {
         &mut self,
         project: &Project,
         table: &ParamTable,
+        midi_live: &HashSet<TrackId>,
     ) -> Result<(), SlotsExhausted> {
         let solo = project.solo_audible();
         for t in &project.tracks {
+            if t.input.is_midi() {
+                let slot = self.midi_live(t.id)?;
+                table.set(slot, if midi_live.contains(&t.id) { 1.0 } else { 0.0 });
+            }
             if t.kind == TrackKind::Midi {
                 continue;
             }

@@ -7,17 +7,50 @@ use crate::{
 };
 use faderframe_midi::MidiBuffer;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
-/// Per-node accumulated processing time, shared with the control side.
+/// Accumulated time and peak load of one node or group.
+#[derive(Debug, Default)]
+struct Timing {
+    total_ns: AtomicU64,
+    /// Highest share of a callback's time budget used in one callback, in
+    /// millionths, since the control side last took it.
+    peak_ppm: AtomicU64,
+}
+
+/// Per-node (and per-group) processing time, shared with the control side.
+///
+/// The executor sums each node's time — gathering its inputs plus its
+/// processor — over all chunks of a device callback; the driver publishes
+/// the sums with [`CompiledGraph::finish_cycle`], which also records the
+/// peak share of the callback's budget. Groups (see [`NodeSpec::group`])
+/// get the same per callback, so a group's peak is exact, not a sum of its
+/// nodes' peaks.
+///
+/// [`NodeSpec::group`]: crate::NodeSpec::group
 #[derive(Debug)]
 pub struct NodeTimings {
+    /// Measuring costs a clock read per node; it can be switched off at
+    /// run time (on by default when the graph was compiled with
+    /// `measure_nodes`).
+    enabled: AtomicBool,
     labels: Vec<String>,
-    total_ns: Box<[AtomicU64]>,
+    groups_of: Vec<Option<u32>>,
+    nodes: Box<[Timing]>,
+    groups: Box<[Timing]>,
 }
 
 impl NodeTimings {
+    /// Switch per-node measurement on or off (any thread).
+    pub fn set_enabled(&self, on: bool) {
+        self.enabled.store(on, Ordering::Relaxed);
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
     pub fn len(&self) -> usize {
         self.labels.len()
     }
@@ -31,9 +64,32 @@ impl NodeTimings {
         &self.labels[i]
     }
 
+    /// Accounting group of node `i`.
+    pub fn group_of(&self, i: usize) -> Option<u32> {
+        self.groups_of[i]
+    }
+
     /// Accumulated processing time of node `i` since the graph went live.
     pub fn total_ns(&self, i: usize) -> u64 {
-        self.total_ns[i].load(Ordering::Relaxed)
+        self.nodes[i].total_ns.load(Ordering::Relaxed)
+    }
+
+    /// Peak share of a callback's budget node `i` used since the last call
+    /// (resets it).
+    pub fn take_peak(&self, i: usize) -> f64 {
+        self.nodes[i].peak_ppm.swap(0, Ordering::Relaxed) as f64 / 1e6
+    }
+
+    pub fn group_count(&self) -> usize {
+        self.groups.len()
+    }
+
+    pub fn group_total_ns(&self, g: usize) -> u64 {
+        self.groups[g].total_ns.load(Ordering::Relaxed)
+    }
+
+    pub fn take_group_peak(&self, g: usize) -> f64 {
+        self.groups[g].peak_ppm.swap(0, Ordering::Relaxed) as f64 / 1e6
     }
 }
 
@@ -98,6 +154,9 @@ pub struct CompiledGraph<C> {
     config: PrepareConfig,
     stats: GraphStats,
     timings: Arc<NodeTimings>,
+    /// Time per node / group in the current callback (audio thread only).
+    cycle_node_ns: Vec<u64>,
+    cycle_group_ns: Vec<u64>,
 }
 
 pub(crate) fn compile<C>(
@@ -131,6 +190,7 @@ pub(crate) fn compile<C>(
     let max_block = config.max_block_size.max(1);
     let mut compiled: Vec<CompiledNode<C>> = Vec::with_capacity(order.len());
     let mut labels: Vec<String> = Vec::with_capacity(order.len());
+    let mut groups_of: Vec<Option<u32>> = Vec::with_capacity(order.len());
     for &n in &order {
         let Some(NodeDesc {
             spec,
@@ -168,6 +228,7 @@ pub(crate) fn compile<C>(
             output_latency: 0,
         });
         labels.push(spec.label);
+        groups_of.push(spec.group);
     }
 
     // Attach edges to their destination nodes (sorted for determinism).
@@ -283,9 +344,17 @@ pub(crate) fn compile<C>(
     key_index.sort_by_key(|&(k, i)| (k, i));
     key_index.dedup_by_key(|&mut (k, _)| k);
 
+    let group_count = groups_of
+        .iter()
+        .flatten()
+        .max()
+        .map_or(0, |&g| g as usize + 1);
     let timings = Arc::new(NodeTimings {
+        enabled: AtomicBool::new(config.measure_nodes),
         labels,
-        total_ns: (0..n).map(|_| AtomicU64::new(0)).collect(),
+        groups_of,
+        nodes: (0..n).map(|_| Timing::default()).collect(),
+        groups: (0..group_count).map(|_| Timing::default()).collect(),
     });
 
     Ok(CompiledGraph {
@@ -298,6 +367,8 @@ pub(crate) fn compile<C>(
         config: *config,
         stats,
         timings,
+        cycle_node_ns: vec![0; n],
+        cycle_group_ns: vec![0; group_count],
     })
 }
 
@@ -415,7 +486,9 @@ impl<C> CompiledGraph<C> {
     /// Run every node once (audio thread). Realtime-safe.
     pub fn process(&mut self, cx: &ProcessContext<'_, C>) {
         let frames = cx.frames.min(self.config.max_block_size);
-        let measure = self.config.measure_nodes;
+        let measure = self.config.measure_nodes && self.timings.enabled.load(Ordering::Relaxed);
+        // One clock read per node: a node's end is the next one's start.
+        let mut last = measure.then(Instant::now);
         for i in 0..self.nodes.len() {
             let (done, rest) = self.nodes.split_at_mut(i);
             let node = &mut rest[0];
@@ -453,7 +526,6 @@ impl<C> CompiledGraph<C> {
                 buf.clear();
             }
 
-            let start = measure.then(Instant::now);
             let mut io = NodeIo {
                 frames,
                 audio_in: &node.audio_in,
@@ -462,10 +534,49 @@ impl<C> CompiledGraph<C> {
                 events_out: &mut node.events_out,
             };
             node.processor.process(cx, &mut io);
-            if let Some(start) = start {
-                self.timings.total_ns[i]
-                    .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            if let Some(start) = last {
+                let now = Instant::now();
+                let ns = now.duration_since(start).as_nanos() as u64;
+                last = Some(now);
+                self.cycle_node_ns[i] += ns;
+                if let Some(g) = self.timings.groups_of[i] {
+                    self.cycle_group_ns[g as usize] += ns;
+                }
             }
+        }
+    }
+
+    /// End of a device callback (audio thread): publish the time each node
+    /// and group used in it, and their peak share of `budget_ns` (the
+    /// callback's duration). Realtime-safe.
+    pub fn finish_cycle(&mut self, budget_ns: u64) {
+        if !self.config.measure_nodes
+            || budget_ns == 0
+            || !self.timings.enabled.load(Ordering::Relaxed)
+        {
+            return;
+        }
+        let ppm = |ns: u64| (ns as u128 * 1_000_000 / budget_ns as u128) as u64;
+        // The audio thread is the only writer (the control side only reads
+        // totals and swaps peaks to zero), so plain loads and stores do —
+        // no locked read-modify-write per node. A peak taken between the
+        // load and the store lands in the next window.
+        let publish = |t: &Timing, ns: &mut u64| {
+            if *ns > 0 {
+                let total = t.total_ns.load(Ordering::Relaxed);
+                t.total_ns.store(total + *ns, Ordering::Relaxed);
+                let p = ppm(*ns);
+                if p > t.peak_ppm.load(Ordering::Relaxed) {
+                    t.peak_ppm.store(p, Ordering::Relaxed);
+                }
+                *ns = 0;
+            }
+        };
+        for (t, ns) in self.timings.nodes.iter().zip(&mut self.cycle_node_ns) {
+            publish(t, ns);
+        }
+        for (t, ns) in self.timings.groups.iter().zip(&mut self.cycle_group_ns) {
+            publish(t, ns);
         }
     }
 

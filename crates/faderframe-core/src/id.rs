@@ -71,6 +71,10 @@ define_id!(
     AutomationLaneId, "lane#"
 );
 define_id!(
+    /// A controller mapping (MIDI learn).
+    MidiMappingId, "mapping#"
+);
+define_id!(
     /// A note inside a MIDI clip.
     NoteId, "note#"
 );

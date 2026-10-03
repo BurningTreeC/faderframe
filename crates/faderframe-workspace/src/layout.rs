@@ -11,15 +11,31 @@ pub enum ViewKind {
     Mixer,
     PianoRoll,
     Automation,
+    Performance,
 }
 
 impl ViewKind {
+    pub const ALL: [ViewKind; 5] = [
+        ViewKind::Arranger,
+        ViewKind::Mixer,
+        ViewKind::PianoRoll,
+        ViewKind::Automation,
+        ViewKind::Performance,
+    ];
+
+    /// The kind whose default view has this id (views added after a layout
+    /// was saved are registered on first use).
+    pub fn of_default_id(id: &ViewId) -> Option<ViewKind> {
+        Self::ALL.into_iter().find(|k| k.default_id() == *id)
+    }
+
     pub fn title(self) -> &'static str {
         match self {
             ViewKind::Arranger => "Arranger",
             ViewKind::Mixer => "Mixer",
             ViewKind::PianoRoll => "Piano Roll",
             ViewKind::Automation => "Automation",
+            ViewKind::Performance => "Performance",
         }
     }
 
@@ -29,6 +45,7 @@ impl ViewKind {
             ViewKind::Mixer => ViewId::mixer(),
             ViewKind::PianoRoll => ViewId::piano_roll(),
             ViewKind::Automation => ViewId::automation(),
+            ViewKind::Performance => ViewId::performance(),
         }
     }
 }
@@ -690,13 +707,19 @@ mod tests {
     #[test]
     fn emptying_the_bottom_dock_hides_it_but_keeps_it() {
         let mut l = layout();
-        for v in [ViewId::mixer(), ViewId::piano_roll(), ViewId::automation()] {
-            l.detach(&v, WindowGeometry::default()).unwrap();
+        let bottom_views = [
+            ViewId::mixer(),
+            ViewId::piano_roll(),
+            ViewId::automation(),
+            ViewId::performance(),
+        ];
+        for v in &bottom_views {
+            l.detach(v, WindowGeometry::default()).unwrap();
         }
         let bottom = l.area(&DockAreaId::bottom()).unwrap();
         assert!(bottom.views.is_empty());
         assert!(!bottom.is_visible());
-        assert_eq!(l.floating.len(), 3);
+        assert_eq!(l.floating.len(), bottom_views.len());
         l.validate().unwrap();
         l.attach(&ViewId::automation(), None).unwrap();
         assert!(l.area(&DockAreaId::bottom()).unwrap().is_visible());

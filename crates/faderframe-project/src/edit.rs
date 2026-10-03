@@ -305,6 +305,14 @@ pub enum Command {
     RemoveMarker {
         marker: MarkerId,
     },
+    /// Add a controller mapping at `index` in the mapping list.
+    AddMidiMapping {
+        index: usize,
+        mapping: crate::MidiMapping,
+    },
+    RemoveMidiMapping {
+        mapping: faderframe_core::MidiMappingId,
+    },
     RenameProject {
         name: String,
     },
@@ -478,6 +486,8 @@ impl Command {
             SetPunch { .. } => "Change Punch Range".into(),
             AddMarker { .. } => "Add Marker".into(),
             RemoveMarker { .. } => "Remove Marker".into(),
+            AddMidiMapping { .. } => "MIDI Learn".into(),
+            RemoveMidiMapping { .. } => "Remove MIDI Mapping".into(),
             RenameProject { .. } => "Rename Project".into(),
             Batch { label, .. } => label.clone(),
         }
@@ -517,6 +527,8 @@ impl Command {
             | MoveTrack { .. }
             | AddMarker { .. }
             | RemoveMarker { .. }
+            | AddMidiMapping { .. }
+            | RemoveMidiMapping { .. }
             | SetPunch { .. }
             | RenameProject { .. }
             | RenameClip { .. } => Impact::None,
@@ -1111,6 +1123,29 @@ impl Command {
                     .ok_or(EditError::UnknownMarker(marker))?;
                 AddMarker {
                     marker: p.markers.remove(i),
+                }
+            }
+            AddMidiMapping { index, mapping } => {
+                if p.midi_mappings.iter().any(|m| m.id == mapping.id) {
+                    return Err(EditError::Invalid(format!(
+                        "duplicate MIDI mapping {}",
+                        mapping.id
+                    )));
+                }
+                let id = mapping.id;
+                p.midi_mappings
+                    .insert(index.min(p.midi_mappings.len()), mapping);
+                RemoveMidiMapping { mapping: id }
+            }
+            RemoveMidiMapping { mapping } => {
+                let index = p
+                    .midi_mappings
+                    .iter()
+                    .position(|m| m.id == mapping)
+                    .ok_or_else(|| EditError::Invalid(format!("unknown MIDI mapping {mapping}")))?;
+                AddMidiMapping {
+                    index,
+                    mapping: p.midi_mappings.remove(index),
                 }
             }
             RenameProject { name } => {

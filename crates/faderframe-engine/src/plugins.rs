@@ -250,6 +250,13 @@ impl PluginHost {
         self.instances.retain(|id, _| live.contains(id));
     }
 
+    /// Latency a hosted plugin reports (samples).
+    pub fn latency(&self, plugin: PluginInstanceId) -> Option<u32> {
+        self.instances
+            .get(&plugin)
+            .map(|h| h.instance.latency_samples())
+    }
+
     /// Plugins that reported a processing failure.
     pub fn failed(&self) -> Vec<PluginInstanceId> {
         self.instances
