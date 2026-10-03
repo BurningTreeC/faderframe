@@ -333,6 +333,7 @@ fn note_editing_round_trip() {
         key: 200, // sanitised to 127
         velocity: 0,
         channel: 0,
+        muted: false,
     };
     h.apply(&mut p, Command::AddNote { clip, note }).unwrap();
     let stored = *p.clip(clip).unwrap().as_midi().unwrap().note(id).unwrap();

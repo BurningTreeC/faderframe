@@ -154,6 +154,16 @@ pub enum InputRouting {
     },
 }
 
+/// An external MIDI device a track plays (MIDI tracks).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MidiOutputRouting {
+    /// Output port key (stable name, like input keys).
+    pub port: String,
+    /// Send on this channel (0–15) instead of the notes' own.
+    #[serde(default)]
+    pub channel: Option<u8>,
+}
+
 /// The shown part of a MIDI port key ("Device:Port" → "Port").
 pub fn midi_port_display(key: &str) -> &str {
     match key.split_once(':') {
@@ -306,6 +316,9 @@ pub struct Track {
     pub solo: bool,
     #[serde(default)]
     pub record_arm: bool,
+    /// External MIDI device (MIDI tracks): what plays goes out there too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub midi_output: Option<MidiOutputRouting>,
     #[serde(default)]
     pub monitor: MonitorMode,
 
@@ -344,6 +357,7 @@ impl Track {
             mute: false,
             solo: false,
             record_arm: false,
+            midi_output: None,
             monitor: match kind {
                 TrackKind::Instrument | TrackKind::Midi => MonitorMode::Auto,
                 _ => MonitorMode::Off,

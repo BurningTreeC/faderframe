@@ -16,7 +16,7 @@
 
 use crate::EngineError;
 use crate::context::EngineContext;
-use crate::midi::{MidiFilter, MidiInputNode, NO_PORT};
+use crate::midi::{MidiFilter, MidiInputNode, MidiOutputSink, MidiShared, NO_PORT};
 use crate::nodes::{
     AudioClipPlayer, ChannelStrip, DeviceInputTap, DeviceOutputSink, MidiClipPlayer, MonitorGate,
     PluginNode, SendNode,
@@ -32,6 +32,16 @@ use faderframe_project::{
     InputRouting, MonitorMode, OutputRouting, PluginSlot, Project, SendTap, Track, TrackKind,
 };
 use std::collections::HashMap;
+
+/// MIDI routing the graph builder needs.
+#[derive(Clone, Default)]
+pub struct MidiRouting {
+    /// Input port keys → indices.
+    pub inputs: HashMap<String, u16>,
+    /// Output port keys → indices.
+    pub outputs: HashMap<String, u16>,
+    pub shared: std::sync::Arc<MidiShared>,
+}
 
 /// Result of building a graph description.
 pub struct BuiltGraph {
@@ -49,6 +59,8 @@ pub enum NodeWork {
     Midi,
     /// Live MIDI input.
     MidiInput,
+    /// To an external MIDI device.
+    MidiOutput,
     HardwareIn,
     Monitor,
     Input,
@@ -191,8 +203,9 @@ pub fn build_graph(
     slots: &mut SlotRegistry,
     plugins: &mut PluginHost,
     config: &PrepareConfig,
-    midi_ports: &HashMap<String, u16>,
+    routing: &MidiRouting,
 ) -> Result<BuiltGraph, EngineError> {
+    let midi_ports = &routing.inputs;
     let mut b = GraphBuilder::<EngineContext>::new();
     let mut warnings = Vec::new();
     let mut pcx = PluginCx {
@@ -235,25 +248,50 @@ pub fn build_graph(
                 Box::new(MidiClipPlayer::new(t.id)),
             );
             tn.midi = Some(own(&mut owners, midi, t.id, None, NodeWork::Midi));
-            // Live input (played through while the session says so).
-            if let InputRouting::Midi { port, channel } = &t.input {
-                let filter = MidiFilter {
+            // Live input (played through while the session says so) and
+            // editor auditioning.
+            let filter = match &t.input {
+                InputRouting::Midi { port, channel } => Some(MidiFilter {
                     port: port
                         .as_ref()
                         .map(|k| midi_ports.get(k).copied().unwrap_or(NO_PORT)),
                     channel: *channel,
-                };
-                let sub = (filter.port.map_or(0x1_0000, u64::from) << 8)
-                    | filter.channel.map_or(0xFF, u64::from);
-                let live = slots.midi_live(t.id)?;
-                let node = b.add_node(
-                    NodeSpec::new(format!("{} · MIDI In", t.name))
-                        .key(node_key(t.id, Role::MidiInput, sub, &[]))
+                }),
+                _ => None,
+            };
+            let sub = filter.map_or(0x0200_0000, |f| {
+                (f.port.map_or(0x1_0000, u64::from) << 8) | f.channel.map_or(0xFF, u64::from)
+            });
+            let live = slots.midi_live(t.id)?;
+            let node = b.add_node(
+                NodeSpec::new(format!("{} · MIDI In", t.name))
+                    .key(node_key(t.id, Role::MidiInput, sub, &[]))
+                    .group(gi)
+                    .events_out(1),
+                Box::new(MidiInputNode::new(
+                    t.id,
+                    filter,
+                    live,
+                    std::sync::Arc::clone(&routing.shared),
+                )),
+            );
+            tn.midi_in = Some(own(&mut owners, node, t.id, None, NodeWork::MidiInput));
+            // An external MIDI device.
+            if let Some(out) = &t.midi_output {
+                let port = routing.outputs.get(&out.port).copied().unwrap_or(NO_PORT);
+                let sink = b.add_node(
+                    NodeSpec::new(format!("{} · MIDI Out", t.name))
+                        .role(NodeRole::EventOutput { port })
                         .group(gi)
+                        .events_in(1)
                         .events_out(1),
-                    Box::new(MidiInputNode::new(filter, live)),
+                    Box::new(MidiOutputSink::new(out.channel)),
                 );
-                tn.midi_in = Some(own(&mut owners, node, t.id, None, NodeWork::MidiInput));
+                own(&mut owners, sink, t.id, None, NodeWork::MidiOutput);
+                b.connect_events(midi, 0, sink, 0)?;
+                if let Some(live) = tn.midi_in {
+                    b.connect_events(live, 0, sink, 0)?;
+                }
             }
         }
         if t.kind == TrackKind::Midi {

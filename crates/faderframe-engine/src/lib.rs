@@ -30,7 +30,7 @@ pub mod record;
 mod slots;
 mod snapshot;
 
-pub use build::{BuiltGraph, NodeOwner, NodeWork, build_graph};
+pub use build::{BuiltGraph, MidiRouting, NodeOwner, NodeWork, build_graph};
 pub use click::{MetronomeMode, MetronomeShared};
 pub use context::EngineContext;
 pub use engine::{

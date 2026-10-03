@@ -21,6 +21,7 @@ use faderframe_core::TrackId;
 use faderframe_midi::{MidiEvent, MidiInputQueue, NoteTracker, TimedMidiEvent};
 use faderframe_realtime::ParamSlot;
 use rtrb::{Consumer, Producer, RingBuffer};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Input events handled per device callback (more are dropped and counted).
@@ -28,6 +29,98 @@ pub const MIDI_INPUT_CAPACITY: usize = 2048;
 
 /// A port index that no device has (a track routed to an absent port).
 pub const NO_PORT: u16 = u16::MAX;
+/// Events the editor plays for auditioning (they reach only the auditioned
+/// track's instrument, whatever its live state, and are never recorded).
+pub const AUDITION_PORT: u16 = u16::MAX - 1;
+
+/// Which controls MIDI learn mappings use: those do not reach instruments
+/// or recordings. Atomic bits per (port, channel): 128 CCs, 128 notes,
+/// pitch bend and pressure. Written by the session, read on the audio
+/// thread.
+#[derive(Debug)]
+pub struct ConsumedControls {
+    bits: Box<[AtomicU64]>,
+}
+
+const WORDS: usize = 5;
+
+/// A control a mapping takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsumedControl {
+    Cc(u8),
+    Note(u8),
+    PitchBend,
+    ChannelPressure,
+}
+
+impl Default for ConsumedControls {
+    fn default() -> Self {
+        Self {
+            bits: (0..faderframe_midi::MAX_MIDI_PORTS * 16 * WORDS)
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+        }
+    }
+}
+
+impl ConsumedControls {
+    fn word_bit(port: u16, channel: u8, c: ConsumedControl) -> (usize, u64) {
+        let port = (port as usize).min(faderframe_midi::MAX_MIDI_PORTS - 1);
+        let base = (port * 16 + (channel & 15) as usize) * WORDS;
+        let (w, b) = match c {
+            ConsumedControl::Cc(n) => ((n & 127) as usize / 64, n as u32 % 64),
+            ConsumedControl::Note(k) => (2 + (k & 127) as usize / 64, k as u32 % 64),
+            ConsumedControl::PitchBend => (4, 0),
+            ConsumedControl::ChannelPressure => (4, 1),
+        };
+        (base + w, 1u64 << b)
+    }
+
+    /// Replace the set: `(port, channel, control)`, `None` = every port
+    /// (control thread).
+    pub fn set(&self, controls: &[(Option<u16>, u8, ConsumedControl)]) {
+        let mut next = vec![0u64; self.bits.len()];
+        for &(port, channel, c) in controls {
+            let ports: Vec<u16> = match port {
+                Some(p) => vec![p],
+                None => (0..faderframe_midi::MAX_MIDI_PORTS as u16).collect(),
+            };
+            for p in ports {
+                let (w, b) = Self::word_bit(p, channel, c);
+                next[w] |= b;
+            }
+        }
+        for (a, v) in self.bits.iter().zip(next) {
+            a.store(v, Ordering::Relaxed);
+        }
+    }
+
+    /// Is this event taken by a mapping? (realtime-safe)
+    #[inline]
+    pub fn contains(&self, port: u16, ev: MidiEvent) -> bool {
+        let c = match ev {
+            MidiEvent::ControlChange { controller, .. } => ConsumedControl::Cc(controller),
+            MidiEvent::NoteOn { key, .. } | MidiEvent::NoteOff { key, .. } => {
+                ConsumedControl::Note(key)
+            }
+            MidiEvent::PitchBend { .. } => ConsumedControl::PitchBend,
+            MidiEvent::ChannelPressure { .. } => ConsumedControl::ChannelPressure,
+            _ => return false,
+        };
+        let (w, b) = Self::word_bit(port, ev.channel(), c);
+        self.bits[w].load(Ordering::Relaxed) & b != 0
+    }
+}
+
+/// MIDI state shared by the session and the audio thread.
+#[derive(Debug, Default)]
+pub struct MidiShared {
+    /// Raw id of the track the editor auditions (0 = none).
+    pub audition_track: AtomicU64,
+    pub consumed: ConsumedControls,
+    /// Output ports (bit per index < 64) that get MIDI clock.
+    pub clock_ports: AtomicU64,
+}
 
 /// Input events of the current chunk: (port, event at a chunk offset).
 #[derive(Debug)]
@@ -150,19 +243,29 @@ impl MidiFilter {
     }
 }
 
-/// A track's live MIDI input (events out: port 0).
+/// A track's live MIDI input and editor auditioning (events out: port 0).
 pub struct MidiInputNode {
-    filter: MidiFilter,
+    track: u64,
+    /// `None`: the track has no MIDI input (auditioning only).
+    filter: Option<MidiFilter>,
     live: ParamSlot,
     held: NoteTracker,
+    shared: Arc<MidiShared>,
 }
 
 impl MidiInputNode {
-    pub fn new(filter: MidiFilter, live: ParamSlot) -> Self {
+    pub fn new(
+        track: TrackId,
+        filter: Option<MidiFilter>,
+        live: ParamSlot,
+        shared: Arc<MidiShared>,
+    ) -> Self {
         Self {
+            track: track.raw(),
             filter,
             live,
             held: NoteTracker::default(),
+            shared,
         }
     }
 }
@@ -172,15 +275,23 @@ impl Processor<EngineContext> for MidiInputNode {
         let Some(out) = io.events_out.first_mut() else {
             return;
         };
-        if cx.data.params.get(self.live) < 0.5 {
+        let live = self.filter.is_some() && cx.data.params.get(self.live) >= 0.5;
+        if !live && self.held.any_active() {
             // No longer live: nothing may keep sounding.
-            if self.held.any_active() {
-                self.held.release_all(out, 0);
-            }
-            return;
+            self.held.release_all(out, 0);
         }
+        let audition = self.shared.audition_track.load(Ordering::Relaxed) == self.track;
         for &(port, ev) in cx.data.midi_input.iter() {
-            if self.filter.accepts(port, ev.event) {
+            if port == AUDITION_PORT {
+                if audition {
+                    let _ = out.push(ev);
+                }
+                continue;
+            }
+            if live
+                && self.filter.is_some_and(|f| f.accepts(port, ev.event))
+                && !self.shared.consumed.contains(port, ev.event)
+            {
                 self.held.observe(ev.event);
                 let _ = out.push(ev);
             }
@@ -189,6 +300,70 @@ impl Processor<EngineContext> for MidiInputNode {
 
     fn reset(&mut self) {
         self.held = NoteTracker::default();
+    }
+}
+
+/// Sends a track's events to an external MIDI device: copies events in to
+/// events out (optionally on another channel); the driver reads the output
+/// of this node (`NodeRole::EventOutput`).
+pub struct MidiOutputSink {
+    channel: Option<u8>,
+}
+
+impl MidiOutputSink {
+    pub fn new(channel: Option<u8>) -> Self {
+        Self { channel }
+    }
+}
+
+fn on_channel(ev: MidiEvent, ch: u8) -> MidiEvent {
+    match ev {
+        MidiEvent::NoteOn { key, velocity, .. } => MidiEvent::NoteOn {
+            channel: ch,
+            key,
+            velocity,
+        },
+        MidiEvent::NoteOff { key, velocity, .. } => MidiEvent::NoteOff {
+            channel: ch,
+            key,
+            velocity,
+        },
+        MidiEvent::PolyPressure { key, pressure, .. } => MidiEvent::PolyPressure {
+            channel: ch,
+            key,
+            pressure,
+        },
+        MidiEvent::ControlChange {
+            controller, value, ..
+        } => MidiEvent::ControlChange {
+            channel: ch,
+            controller,
+            value,
+        },
+        MidiEvent::ProgramChange { program, .. } => MidiEvent::ProgramChange {
+            channel: ch,
+            program,
+        },
+        MidiEvent::ChannelPressure { pressure, .. } => MidiEvent::ChannelPressure {
+            channel: ch,
+            pressure,
+        },
+        MidiEvent::PitchBend { value, .. } => MidiEvent::PitchBend { channel: ch, value },
+    }
+}
+
+impl Processor<EngineContext> for MidiOutputSink {
+    fn process(&mut self, _cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
+        let (Some(input), Some(out)) = (io.events_in.first(), io.events_out.first_mut()) else {
+            return;
+        };
+        for ev in input.iter() {
+            let e = match self.channel {
+                Some(ch) => on_channel(ev.event, ch),
+                None => ev.event,
+            };
+            let _ = out.push(TimedMidiEvent::new(ev.sample_offset, e));
+        }
     }
 }
 
@@ -250,6 +425,7 @@ impl MidiRecorder {
         pos: i64,
         frames: usize,
         overruns: &AtomicU64,
+        consumed: &ConsumedControls,
     ) {
         if self.next.is_some_and(|n| n != pos) {
             self.pass += 1;
@@ -257,7 +433,11 @@ impl MidiRecorder {
         self.next = Some(pos + frames as i64);
         for &(port, ev) in block.iter() {
             let at = pos + ev.sample_offset as i64;
-            if at < self.from || at >= self.to {
+            if at < self.from
+                || at >= self.to
+                || port == AUDITION_PORT
+                || consumed.contains(port, ev.event)
+            {
                 continue;
             }
             for (i, t) in self.targets.iter().enumerate() {
@@ -369,12 +549,112 @@ mod tests {
         let overruns = AtomicU64::new(0);
         let mut block = MidiInputBlock::with_capacity(4);
         block.push(0, TimedMidiEvent::new(10, ev));
-        rec.capture(&block, 900, 256, &overruns); // 910: before the window
-        rec.capture(&block, 1156, 256, &overruns); // 1166
-        rec.capture(&block, 1000, 256, &overruns); // loop wrap: 1010, pass 1
+        let consumed = ConsumedControls::default();
+        rec.capture(&block, 900, 256, &overruns, &consumed); // 910: before the window
+        rec.capture(&block, 1156, 256, &overruns, &consumed); // 1166
+        rec.capture(&block, 1000, 256, &overruns, &consumed); // loop wrap: 1010, pass 1
         let got: Vec<(i64, u32)> = std::iter::from_fn(|| rx.pop().ok())
             .map(|r| (r.position, r.pass))
             .collect();
         assert_eq!(got, vec![(1166, 0), (1010, 1)]);
+    }
+}
+
+/// MIDI clock (24 pulses per quarter) with start/stop/continue and song
+/// position, generated on the audio thread for every output port with
+/// clock enabled.
+#[derive(Debug, Default)]
+pub(crate) struct ClockGen {
+    was_playing: bool,
+}
+
+impl ClockGen {
+    /// Messages for a chunk of `frames` starting at `info` (offsets in the
+    /// chunk).
+    pub(crate) fn chunk(
+        &mut self,
+        info: &faderframe_transport::TransportInfo,
+        discontinuity: bool,
+        frames: usize,
+        mut emit: impl FnMut(u32, &[u8]),
+    ) {
+        let q0 = info.quarter_position.max(0.0);
+        let spp = |q: f64| {
+            let sixteenths = (q * 4.0).floor().clamp(0.0, 16383.0) as u16;
+            [0xF2, (sixteenths & 0x7F) as u8, (sixteenths >> 7) as u8]
+        };
+        if info.playing && (!self.was_playing || discontinuity) {
+            if self.was_playing {
+                emit(0, &[0xFC]);
+            }
+            if q0 <= 1e-9 {
+                emit(0, &[0xFA]);
+            } else {
+                emit(0, &spp(q0));
+                emit(0, &[0xFB]);
+            }
+        } else if !info.playing && self.was_playing {
+            emit(0, &[0xFC]);
+        }
+        self.was_playing = info.playing;
+        if !info.playing || info.tempo <= 0.0 {
+            return;
+        }
+        let frames_per_quarter = 60.0 / info.tempo * info.sample_rate.max(1.0);
+        let mut k = (q0 * 24.0).ceil();
+        loop {
+            let q = k / 24.0;
+            let offset = ((q - q0) * frames_per_quarter).round();
+            if offset >= frames as f64 {
+                break;
+            }
+            emit(offset.max(0.0) as u32, &[0xF8]);
+            k += 1.0;
+        }
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+    use faderframe_transport::TransportInfo;
+
+    fn info(playing: bool, q: f64) -> TransportInfo {
+        TransportInfo {
+            playing,
+            sample_rate: 48_000.0,
+            quarter_position: q,
+            tempo: 120.0,
+            ..TransportInfo::default()
+        }
+    }
+
+    #[test]
+    fn clock_pulses_start_and_stop() {
+        let mut c = ClockGen::default();
+        let mut got: Vec<(u32, Vec<u8>)> = Vec::new();
+        // 120 BPM: a quarter is 24 000 frames, a pulse every 1000.
+        c.chunk(&info(true, 0.0), false, 2500, |o, b| {
+            got.push((o, b.to_vec()))
+        });
+        assert_eq!(got[0], (0, vec![0xFA]), "start from the top");
+        let pulses: Vec<u32> = got
+            .iter()
+            .filter(|(_, b)| b == &[0xF8])
+            .map(|(o, _)| *o)
+            .collect();
+        assert_eq!(pulses, vec![0, 1000, 2000]);
+        got.clear();
+        c.chunk(&info(false, 0.1), false, 256, |o, b| {
+            got.push((o, b.to_vec()))
+        });
+        assert_eq!(got, vec![(0, vec![0xFC])]);
+        got.clear();
+        // Continue from bar 2 (quarter 4): song position 16 sixteenths.
+        c.chunk(&info(true, 4.0), false, 10, |o, b| {
+            got.push((o, b.to_vec()))
+        });
+        assert_eq!(got[0], (0, vec![0xF2, 16, 0]));
+        assert_eq!(got[1], (0, vec![0xFB]));
     }
 }

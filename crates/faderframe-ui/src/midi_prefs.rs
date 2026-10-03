@@ -11,11 +11,13 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
-/// Persist the enabled state of inputs.
+/// Persist which devices are used (and which get clock).
 fn save_disabled(app: &AppState) {
-    let disabled = app.session.borrow().midi_preferences().disabled_inputs;
+    let m = app.session.borrow().midi_preferences();
     let mut p = Preferences::load();
-    p.midi_disabled_inputs = disabled;
+    p.midi_disabled_inputs = m.disabled_inputs;
+    p.midi_disabled_outputs = m.disabled_outputs;
+    p.midi_clock_outputs = m.clock_outputs;
     if let Err(e) = p.save() {
         tracing::warn!("cannot save preferences: {e}");
     }
@@ -96,6 +98,79 @@ impl Ports {
     }
 }
 
+fn output_rows(
+    app: &Rc<AppState>,
+    list: &gtk::ListBox,
+    outs: &[faderframe_session::MidiOutputStatus],
+) {
+    while let Some(c) = list.first_child() {
+        list.remove(&c);
+    }
+    if outs.is_empty() {
+        let l = gtk::Label::new(Some("No MIDI outputs found."));
+        l.add_css_class("dim-label");
+        l.set_margin_top(6);
+        l.set_margin_bottom(6);
+        list.append(&l);
+        return;
+    }
+    for o in outs {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        row.add_css_class("midi-port");
+        let names = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let name = gtk::Label::new(Some(&o.name));
+        name.set_xalign(0.0);
+        names.append(&name);
+        let device = o.key.split_once(':').map_or(o.key.as_str(), |(d, _)| d);
+        let detail = gtk::Label::new(Some(&if !o.enabled {
+            "off".to_string()
+        } else if o.connected {
+            device.to_string()
+        } else {
+            format!("{device} · not connected")
+        }));
+        detail.add_css_class("dim-label");
+        detail.set_xalign(0.0);
+        names.append(&detail);
+        names.set_hexpand(true);
+        row.append(&names);
+        let clock = gtk::CheckButton::with_label("Clock");
+        clock.set_active(o.clock);
+        clock.set_tooltip_text(Some("Send MIDI clock (24 ppqn, start/stop, song position)"));
+        clock.set_sensitive(o.enabled);
+        {
+            let weak = Rc::downgrade(app);
+            let key = o.key.clone();
+            clock.connect_toggled(move |b| {
+                if let Some(a) = weak.upgrade() {
+                    a.session
+                        .borrow_mut()
+                        .set_midi_clock_output(&key, b.is_active());
+                    save_disabled(&a);
+                }
+            });
+        }
+        row.append(&clock);
+        let sw = gtk::Switch::new();
+        sw.set_active(o.enabled);
+        sw.set_valign(gtk::Align::Center);
+        sw.set_tooltip_text(Some("Use this output"));
+        {
+            let weak = Rc::downgrade(app);
+            let key = o.key.clone();
+            sw.connect_state_set(move |_, on| {
+                if let Some(a) = weak.upgrade() {
+                    a.session.borrow_mut().set_midi_output_enabled(&key, on);
+                    save_disabled(&a);
+                }
+                glib::Propagation::Proceed
+            });
+        }
+        row.append(&sw);
+        list.append(&row);
+    }
+}
+
 fn mappings_rows(app: &Rc<AppState>, list: &gtk::ListBox) {
     while let Some(c) = list.first_child() {
         list.remove(&c);
@@ -107,6 +182,7 @@ fn mappings_rows(app: &Rc<AppState>, list: &gtk::ListBox) {
             "No controller mappings. Right-click a fader, knob, mute button, send, automation lane or plugin parameter and choose MIDI Learn, then move a control on your device.",
         ));
         l.set_wrap(true);
+        l.set_natural_wrap_mode(gtk::NaturalWrapMode::Word);
         l.set_xalign(0.0);
         l.add_css_class("dim-label");
         l.set_margin_top(6);
@@ -165,9 +241,24 @@ pub fn page(app: &Rc<AppState>) -> gtk::Widget {
         "Instrument tracks play what you play while they are armed or selected (track menu: MIDI In, Play Live).",
     ));
     hint.set_wrap(true);
+    hint.set_natural_wrap_mode(gtk::NaturalWrapMode::Word);
     hint.set_xalign(0.0);
     hint.add_css_class("dim-label");
     body.append(&hint);
+
+    body.append(&heading("MIDI OUTPUTS"));
+    let outputs = gtk::ListBox::new();
+    outputs.set_selection_mode(gtk::SelectionMode::None);
+    outputs.add_css_class("boxed-list");
+    body.append(&outputs);
+    let out_hint = gtk::Label::new(Some(
+        "MIDI tracks play external instruments (track menu: MIDI Out). Clock sends tempo, start, stop and song position.",
+    ));
+    out_hint.set_wrap(true);
+    out_hint.set_natural_wrap_mode(gtk::NaturalWrapMode::Word);
+    out_hint.set_xalign(0.0);
+    out_hint.add_css_class("dim-label");
+    body.append(&out_hint);
 
     body.append(&heading("CONTROLLER MAPPINGS"));
     let maps = gtk::ListBox::new();
@@ -176,10 +267,11 @@ pub fn page(app: &Rc<AppState>) -> gtk::Widget {
     body.append(&maps);
 
     body.append(&heading("TRANSPORT"));
-    let transport = gtk::FlowBox::new();
-    transport.set_selection_mode(gtk::SelectionMode::None);
-    transport.set_max_children_per_line(5);
-    for control in TransportControl::ALL {
+    // (A grid: FlowBox mis-measures inside scrolled pages.)
+    let transport = gtk::Grid::new();
+    transport.set_row_spacing(6);
+    transport.set_column_spacing(6);
+    for (i, control) in TransportControl::ALL.into_iter().enumerate() {
         let b = gtk::Button::with_label(&format!("Learn {}", control.label()));
         b.set_tooltip_text(Some("Then press a pad or button on your device"));
         let weak = Rc::downgrade(app);
@@ -188,7 +280,7 @@ pub fn page(app: &Rc<AppState>) -> gtk::Widget {
                 a.dispatch(Action::MidiLearn(MappingTarget::Transport { control }));
             }
         });
-        transport.insert(&b, -1);
+        transport.attach(&b, (i % 3) as i32, (i / 3) as i32, 1, 1);
     }
     body.append(&transport);
 
@@ -198,6 +290,9 @@ pub fn page(app: &Rc<AppState>) -> gtk::Widget {
         .child(&body)
         .build();
 
+    // Outputs: rebuilt when the set or its state changes.
+    let outputs_seen: RefCell<Option<Vec<faderframe_session::MidiOutputStatus>>> =
+        RefCell::new(None);
     // Live state: ports (hotplug, activity) and mappings.
     let weak = Rc::downgrade(app);
     let maps_seen: RefCell<Option<Vec<faderframe_core::MidiMappingId>>> = RefCell::new(None);
@@ -223,6 +318,17 @@ pub fn page(app: &Rc<AppState>) -> gtk::Widget {
                     dot.remove_css_class("active");
                 }
             }
+        }
+        let outs: Vec<_> = a
+            .session
+            .borrow()
+            .midi_outputs()
+            .into_iter()
+            .filter(|o| !o.is_virtual)
+            .collect();
+        if outputs_seen.borrow().as_ref() != Some(&outs) {
+            *outputs_seen.borrow_mut() = Some(outs.clone());
+            output_rows(&a, &outputs, &outs);
         }
         let ids: Vec<_> = a
             .session

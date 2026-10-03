@@ -340,7 +340,14 @@ fn live_midi_input_and_midi_recording_do_not_allocate() {
         .unwrap()
         .id;
     let (tx, q, _feed) = faderframe_midi::midi_input_queue(256);
+    let (oq, mut orx) = faderframe_midi::midi_output_queue(4096, tx.clock());
     r.controller.set_midi_input(q).unwrap();
+    // MIDI clock out on port 0 while playing.
+    r.controller.set_midi_output(oq).unwrap();
+    r.controller
+        .midi_shared()
+        .clock_ports
+        .store(1, std::sync::atomic::Ordering::Relaxed);
     r.controller.set_midi_live(HashSet::from([synth]));
     r.controller
         .sync(&project, &sources, Impact::Params)
@@ -389,8 +396,12 @@ fn live_midi_input_and_midi_recording_do_not_allocate() {
     assert_eq!(
         total + n,
         0,
-        "allocations/frees with live MIDI and recording"
+        "allocations/frees with live MIDI, recording and MIDI clock"
     );
+    let clock = std::iter::from_fn(|| orx.pop().ok())
+        .filter(|e| e.bytes() == [0xF8])
+        .count();
+    assert!(clock > 0, "clock went out");
     let recorded = std::iter::from_fn(|| rx.pop().ok()).count();
     assert!(recorded >= 24 * 3 - 1, "{recorded}");
 }

@@ -307,8 +307,21 @@ impl TimelineSnapshot {
                 ClipContent::Midi(m) => {
                     let clip_end = clip.start + m.length;
                     let end = tl.to_samples(clip_end, sr);
-                    let mut events = Vec::with_capacity(m.notes.len() * 2);
-                    for n in &m.notes {
+                    let points: usize = m.controllers.iter().map(|l| l.points.len()).sum();
+                    let mut events = Vec::with_capacity(m.notes.len() * 2 + points);
+                    for lane in &m.controllers {
+                        for p in &lane.points {
+                            let at = clip.start + p.time;
+                            if at >= clip_end {
+                                break;
+                            }
+                            events.push((
+                                tl.to_samples(at, sr),
+                                lane.controller.event(lane.channel, p.value),
+                            ));
+                        }
+                    }
+                    for n in m.notes.iter().filter(|n| !n.muted) {
                         let on_pos = clip.start + n.start;
                         if on_pos >= clip_end {
                             continue;
@@ -333,7 +346,17 @@ impl TimelineSnapshot {
                             },
                         ));
                     }
-                    events.sort_by_key(|(t, e)| (*t, !matches!(e, MidiEvent::NoteOff { .. })));
+                    // At equal times: note-offs, then controllers (a pedal or
+                    // bend set at a note's start applies to it), then
+                    // note-ons.
+                    events.sort_by_key(|(t, e)| {
+                        let order = match e {
+                            MidiEvent::NoteOff { .. } => 0,
+                            MidiEvent::NoteOn { .. } => 2,
+                            _ => 1,
+                        };
+                        (*t, order)
+                    });
                     lanes.entry(clip.track).or_default().midi.push(MidiRegion {
                         start,
                         end,

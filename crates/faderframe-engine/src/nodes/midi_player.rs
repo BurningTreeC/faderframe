@@ -1,14 +1,43 @@
 use crate::context::EngineContext;
 use faderframe_audio_graph::{NodeIo, ProcessContext, Processor};
 use faderframe_core::TrackId;
-use faderframe_midi::{NoteTracker, TimedMidiEvent};
+use faderframe_midi::{MidiBuffer, MidiEvent, NoteTracker, TimedMidiEvent};
+
+/// Controller slots per channel: 128 CCs, pitch bend, channel pressure.
+const SLOTS: usize = 130;
+const PB: usize = 128;
+const AT: usize = 129;
+
+fn slot(ev: MidiEvent) -> Option<(usize, usize)> {
+    match ev {
+        MidiEvent::ControlChange {
+            channel,
+            controller,
+            ..
+        } => Some(((channel & 15) as usize, (controller & 127) as usize)),
+        MidiEvent::PitchBend { channel, .. } => Some(((channel & 15) as usize, PB)),
+        MidiEvent::ChannelPressure { channel, .. } => Some(((channel & 15) as usize, AT)),
+        _ => None,
+    }
+}
 
 /// Emits the MIDI events of one track's MIDI regions with exact sample
-/// offsets. On every transport discontinuity (stop, locate, loop wrap) the
-/// notes it started are released at offset 0, so nothing hangs.
+/// offsets.
+///
+/// On every transport discontinuity (stop, locate, loop wrap) the notes it
+/// started are released at offset 0, so nothing hangs; controllers are
+/// *chased*: playback starting mid-clip first sends the value each
+/// controller has at that point (a held sustain pedal, a bend, the mod
+/// wheel), and controllers the player moved go back to rest (sustain off,
+/// bend centred) when playback jumps or stops. All state is fixed-size.
 pub struct MidiClipPlayer {
     track: TrackId,
     tracker: NoteTracker,
+    /// Value last sent per channel and controller slot.
+    sent: Box<[[Option<MidiEvent>; SLOTS]; 16]>,
+    /// Scratch for chasing.
+    chase: Box<[[Option<MidiEvent>; SLOTS]; 16]>,
+    was_playing: bool,
 }
 
 impl MidiClipPlayer {
@@ -16,6 +45,68 @@ impl MidiClipPlayer {
         Self {
             track,
             tracker: NoteTracker::default(),
+            sent: Box::new([[None; SLOTS]; 16]),
+            chase: Box::new([[None; SLOTS]; 16]),
+            was_playing: false,
+        }
+    }
+
+    /// Put moved controllers back to rest (pedals up, bend centred).
+    fn rest(&mut self, out: &mut MidiBuffer) {
+        for (ch, slots) in self.sent.iter_mut().enumerate() {
+            for (i, s) in slots.iter_mut().enumerate() {
+                let Some(ev) = s.take() else { continue };
+                let rest = match (i, ev) {
+                    (PB, _) => MidiEvent::PitchBend {
+                        channel: ch as u8,
+                        value: 8192,
+                    },
+                    (AT, _) => MidiEvent::ChannelPressure {
+                        channel: ch as u8,
+                        pressure: 0,
+                    },
+                    // Switches (sustain, sostenuto, soft pedal, …) off; other
+                    // CCs keep their value (volume, pan, mod wheel …).
+                    (64..=69, _) => MidiEvent::ControlChange {
+                        channel: ch as u8,
+                        controller: i as u8,
+                        value: 0,
+                    },
+                    _ => continue,
+                };
+                let _ = out.push(TimedMidiEvent::new(0, rest));
+            }
+        }
+    }
+
+    /// Send the controller values in effect at `pos` (realtime-safe).
+    fn chase_to(&mut self, cx: &EngineContext, pos: i64, out: &mut MidiBuffer) {
+        let Some(lane) = cx.timeline.lane(self.track) else {
+            return;
+        };
+        for slots in self.chase.iter_mut() {
+            slots.fill(None);
+        }
+        let upto = lane.midi.partition_point(|r| r.start <= pos);
+        for region in lane.midi[..upto].iter().filter(|r| r.end > pos) {
+            for &(time, ev) in &region.events {
+                if time >= pos {
+                    break;
+                }
+                if let Some((ch, i)) = slot(ev) {
+                    self.chase[ch][i] = Some(ev);
+                }
+            }
+        }
+        for ch in 0..16 {
+            for i in 0..SLOTS {
+                if let Some(ev) = self.chase[ch][i]
+                    && self.sent[ch][i] != Some(ev)
+                    && out.push(TimedMidiEvent::new(0, ev)).is_ok()
+                {
+                    self.sent[ch][i] = Some(ev);
+                }
+            }
         }
     }
 }
@@ -25,17 +116,23 @@ impl Processor<EngineContext> for MidiClipPlayer {
         let Some(out) = io.events_out.first_mut() else {
             return;
         };
-        if cx.data.discontinuity {
-            self.tracker.release_all(out, 0);
-        }
         let t = &cx.data.transport;
+        if cx.data.discontinuity || (self.was_playing && !t.playing) {
+            self.tracker.release_all(out, 0);
+            self.rest(out);
+        }
+        let started = t.playing && (!self.was_playing || cx.data.discontinuity);
+        self.was_playing = t.playing;
         if !t.playing {
             return;
+        }
+        let pos = t.sample_position;
+        if started {
+            self.chase_to(cx.data, pos, out);
         }
         let Some(lane) = cx.data.timeline.lane(self.track) else {
             return;
         };
-        let pos = t.sample_position;
         let end = pos + io.frames as i64;
         let upto = lane.midi.partition_point(|r| r.start < end);
         for region in lane.midi[..upto].iter().filter(|r| r.end >= pos) {
@@ -49,6 +146,9 @@ impl Processor<EngineContext> for MidiClipPlayer {
                     .is_ok()
                 {
                     self.tracker.observe(event);
+                    if let Some((ch, i)) = slot(event) {
+                        self.sent[ch][i] = Some(event);
+                    }
                 }
             }
         }
@@ -56,5 +156,9 @@ impl Processor<EngineContext> for MidiClipPlayer {
 
     fn reset(&mut self) {
         self.tracker = NoteTracker::default();
+        for slots in self.sent.iter_mut() {
+            slots.fill(None);
+        }
+        self.was_playing = false;
     }
 }

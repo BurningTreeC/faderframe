@@ -13,4 +13,5 @@ workspace = true
 [dependencies]
 faderframe-midi.workspace = true
 midir.workspace = true
+rtrb.workspace = true
 tracing.workspace = true

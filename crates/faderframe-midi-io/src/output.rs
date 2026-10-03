@@ -1,0 +1,328 @@
+//! MIDI output devices and the sender thread.
+//!
+//! The engine queues messages with the time they are due (the moment the
+//! audio of the same callback is heard); [`MidiOutputs`] runs a thread that
+//! keeps them in time order and sends each when it is due, to every enabled
+//! output port (ALSA sequencer via `midir`) or a virtual capture port.
+
+use crate::{CLIENT_NAME, port_identity};
+use faderframe_midi::{MidiClock, MidiOutputEvent, MidiOutputQueue, midi_output_queue};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+/// Messages queued between the engine and the sender thread.
+pub const OUTPUT_CAPACITY: usize = 8192;
+
+/// One known output port.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MidiOutputPort {
+    pub key: String,
+    pub name: String,
+    pub index: u16,
+    pub enabled: bool,
+    pub connected: bool,
+    pub is_virtual: bool,
+}
+
+/// What a virtual output received: (time sent on the [`MidiClock`], bytes).
+pub type Captured = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
+
+enum Sink {
+    Device(midir::MidiOutputConnection),
+    Capture(Captured),
+}
+
+impl Sink {
+    fn send(&mut self, now: u64, bytes: &[u8]) {
+        match self {
+            Sink::Device(c) => {
+                let _ = c.send(bytes);
+            }
+            Sink::Capture(c) => {
+                if let Ok(mut v) = c.lock() {
+                    v.push((now, bytes.to_vec()));
+                }
+            }
+        }
+    }
+}
+
+type Sinks = Arc<Mutex<HashMap<u16, Sink>>>;
+
+/// A queued message: (due, sequence, port, length, bytes).
+type Pending = (u64, u64, u16, u8, [u8; 3]);
+
+struct Known {
+    key: String,
+    name: String,
+    is_virtual: bool,
+}
+
+pub struct MidiOutputs {
+    known: Vec<Known>,
+    by_key: HashMap<String, u16>,
+    sinks: Sinks,
+    disabled: HashSet<String>,
+    lister: Option<midir::MidiOutput>,
+    clock: MidiClock,
+    queues: Sender<rtrb::Consumer<MidiOutputEvent>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+fn run(
+    sinks: Sinks,
+    clock: MidiClock,
+    queues: Receiver<rtrb::Consumer<MidiOutputEvent>>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut rx: Option<rtrb::Consumer<MidiOutputEvent>> = None;
+    // (due, sequence) keeps equal-time messages in arrival order.
+    let mut pending: BinaryHeap<Reverse<Pending>> = BinaryHeap::new();
+    let mut seq = 0u64;
+    while !stop.load(Ordering::Relaxed) {
+        loop {
+            match queues.try_recv() {
+                Ok(q) => rx = Some(q),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
+            }
+        }
+        if let Some(rx) = rx.as_mut() {
+            while let Ok(m) = rx.pop() {
+                seq += 1;
+                pending.push(Reverse((m.due_ns, seq, m.port, m.len, m.bytes)));
+            }
+        }
+        let now = clock.now_ns();
+        if let Ok(mut s) = sinks.lock() {
+            while let Some(Reverse((due, _, port, len, bytes))) = pending.peek().copied() {
+                // Within 200 µs is on time.
+                if due > now + 200_000 {
+                    break;
+                }
+                pending.pop();
+                if let Some(sink) = s.get_mut(&port) {
+                    sink.send(now, &bytes[..len as usize]);
+                }
+            }
+        }
+        let wait = pending.peek().map_or(1_000_000, |Reverse((due, ..))| {
+            due.saturating_sub(now).min(1_000_000)
+        });
+        std::thread::sleep(Duration::from_nanos(wait.max(100_000)));
+    }
+}
+
+impl MidiOutputs {
+    /// Outputs on `clock` (shared with the inputs and the engine), with a
+    /// running sender thread.
+    pub fn new(clock: MidiClock) -> Self {
+        let sinks: Sinks = Arc::new(Mutex::new(HashMap::new()));
+        let (queues, rx) = channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let (sinks, stop) = (Arc::clone(&sinks), Arc::clone(&stop));
+            std::thread::Builder::new()
+                .name("midi-out".into())
+                .spawn(move || run(sinks, clock, rx, stop))
+                .ok()
+        };
+        Self {
+            known: Vec::new(),
+            by_key: HashMap::new(),
+            sinks,
+            disabled: HashSet::new(),
+            lister: None,
+            clock,
+            queues,
+            stop,
+            thread,
+        }
+    }
+
+    /// A fresh engine-side queue; the sender reads from it from now on.
+    pub fn renew_queue(&self) -> MidiOutputQueue {
+        let (q, rx) = midi_output_queue(OUTPUT_CAPACITY, self.clock);
+        let _ = self.queues.send(rx);
+        q
+    }
+
+    fn index_for(&mut self, key: &str, name: &str, is_virtual: bool) -> u16 {
+        if let Some(&i) = self.by_key.get(key) {
+            return i;
+        }
+        let i = self.known.len() as u16;
+        self.known.push(Known {
+            key: key.into(),
+            name: name.into(),
+            is_virtual,
+        });
+        self.by_key.insert(key.into(), i);
+        i
+    }
+
+    /// An output that records what it is sent (tests, monitoring).
+    pub fn virtual_output(&mut self, name: &str) -> (u16, Captured) {
+        let key = format!("virtual:{name}");
+        let index = self.index_for(&key, name, true);
+        let captured: Captured = Arc::default();
+        if let Ok(mut s) = self.sinks.lock() {
+            s.insert(index, Sink::Capture(Arc::clone(&captured)));
+        }
+        (index, captured)
+    }
+
+    pub fn start_system(&mut self) {
+        if self.lister.is_none() {
+            match midir::MidiOutput::new(CLIENT_NAME) {
+                Ok(l) => self.lister = Some(l),
+                Err(e) => tracing::warn!("MIDI output is unavailable: {e}"),
+            }
+        }
+        self.refresh();
+    }
+
+    pub fn stop_system(&mut self) {
+        self.lister = None;
+        if let Ok(mut s) = self.sinks.lock() {
+            s.retain(|_, sink| matches!(sink, Sink::Capture(_)));
+        }
+    }
+
+    pub fn set_disabled(&mut self, keys: impl IntoIterator<Item = String>) {
+        self.disabled = keys.into_iter().collect();
+        self.refresh();
+    }
+
+    /// Connect new enabled ports, drop vanished or disabled ones.
+    pub fn refresh(&mut self) -> bool {
+        let Some(lister) = &self.lister else {
+            return false;
+        };
+        let mut present = Vec::new();
+        for p in lister.ports() {
+            let Ok(full) = lister.port_name(&p) else {
+                continue;
+            };
+            if full.starts_with(CLIENT_NAME) {
+                continue;
+            }
+            let (key, name) = port_identity(&full);
+            present.push((key, name, p));
+        }
+        let mut changed = false;
+        let keys: HashSet<String> = present.iter().map(|(k, _, _)| k.clone()).collect();
+        let disabled = self.disabled.clone();
+        let indices: Vec<(String, u16)> = self
+            .known
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| !k.is_virtual)
+            .map(|(i, k)| (k.key.clone(), i as u16))
+            .collect();
+        if let Ok(mut s) = self.sinks.lock() {
+            for (key, i) in &indices {
+                if s.contains_key(i) && (!keys.contains(key) || disabled.contains(key)) {
+                    s.remove(i);
+                    changed = true;
+                }
+            }
+        }
+        for (key, name, port) in present {
+            let index = self.index_for(&key, &name, false);
+            let connected = self.sinks.lock().is_ok_and(|s| s.contains_key(&index));
+            if connected || self.disabled.contains(&key) {
+                continue;
+            }
+            let out = match midir::MidiOutput::new(CLIENT_NAME) {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::warn!("MIDI output {name}: {e}");
+                    continue;
+                }
+            };
+            match out.connect(&port, &format!("{CLIENT_NAME} out: {key}")) {
+                Ok(conn) => {
+                    tracing::info!("MIDI output connected: {name}");
+                    if let Ok(mut s) = self.sinks.lock() {
+                        s.insert(index, Sink::Device(conn));
+                    }
+                    changed = true;
+                }
+                Err(e) => tracing::warn!("MIDI output {name}: {e}"),
+            }
+        }
+        changed
+    }
+
+    pub fn ports(&self) -> Vec<MidiOutputPort> {
+        let sinks = self.sinks.lock();
+        self.known
+            .iter()
+            .enumerate()
+            .map(|(i, k)| MidiOutputPort {
+                key: k.key.clone(),
+                name: k.name.clone(),
+                index: i as u16,
+                enabled: !self.disabled.contains(&k.key),
+                connected: sinks.as_ref().is_ok_and(|s| s.contains_key(&(i as u16))),
+                is_virtual: k.is_virtual,
+            })
+            .collect()
+    }
+
+    pub fn port_index(&self, key: &str) -> Option<u16> {
+        self.by_key.get(key).copied()
+    }
+}
+
+impl Drop for MidiOutputs {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn messages_are_sent_when_due_in_time_order() {
+        let clock = MidiClock::new();
+        let mut outs = MidiOutputs::new(clock);
+        let (port, captured) = outs.virtual_output("Monitor");
+        let mut q = outs.renew_queue();
+        let now = clock.now_ns();
+        let ms = 1_000_000;
+        // Queued out of order: sent by due time.
+        for (due, key) in [
+            (now + 30 * ms, 64u8),
+            (now + 10 * ms, 60),
+            (now + 20 * ms, 62),
+        ] {
+            q.producer
+                .push(MidiOutputEvent::new(port, due, &[0x90, key, 100]).unwrap())
+                .unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(captured.lock().unwrap().is_empty(), "not yet due");
+        std::thread::sleep(Duration::from_millis(60));
+        let got = captured.lock().unwrap().clone();
+        let keys: Vec<u8> = got.iter().map(|(_, b)| b[1]).collect();
+        assert_eq!(keys, vec![60, 62, 64]);
+        // Each was sent close to its due time (scheduling slack allowed).
+        let first = got[0].0;
+        assert!(first + 2 * ms >= now + 10 * ms, "not early");
+        assert!(first <= now + 25 * ms, "not very late");
+        assert!(outs.ports().iter().any(|p| p.is_virtual && p.connected));
+    }
+}

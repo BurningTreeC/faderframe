@@ -205,6 +205,9 @@ pub fn page(app: &Rc<AppState>, row: impl Fn(&gtk::Grid, i32, &str, &gtk::Widget
          float WAV into the project's Audio folder and compensated for input and output latency.",
     ));
     help.set_wrap(true);
+    // Bounded line length: consistent height-for-width measuring.
+    help.set_max_width_chars(80);
+    help.set_natural_wrap_mode(gtk::NaturalWrapMode::Word);
     help.set_xalign(0.0);
     help.add_css_class("dim-label");
     g.attach(&help, 0, 5, 2, 1);

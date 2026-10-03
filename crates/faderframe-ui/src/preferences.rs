@@ -360,8 +360,8 @@ pub fn open(app: &Rc<AppState>, page: Option<&str>) {
     let win = gtk::Window::builder()
         .application(&app.app)
         .title("Preferences — FaderFrame")
-        .default_width(760)
-        .default_height(480)
+        .default_width(820)
+        .default_height(640)
         .build();
     if let Some(main) = app.window.borrow().as_ref() {
         win.set_transient_for(Some(main));
@@ -370,6 +370,9 @@ pub fn open(app: &Rc<AppState>, page: Option<&str>) {
     let alive = Rc::new(std::cell::Cell::new(true));
     let stack = gtk::Stack::new();
     stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+    // Size by the visible page only (hidden pages are not measured).
+    stack.set_hhomogeneous(false);
+    stack.set_vhomogeneous(false);
     stack.add_titled(&audio_page(app, &alive), Some("audio"), "Audio");
     stack.add_titled(&editing_page(app), Some("editing"), "Editing");
     stack.add_titled(

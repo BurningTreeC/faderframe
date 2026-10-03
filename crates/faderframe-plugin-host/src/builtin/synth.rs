@@ -32,6 +32,9 @@ struct Voice {
     k: f32,
     control_counter: u32,
     age: u64,
+    /// Released while the sustain pedal was down: keeps sounding until the
+    /// pedal goes up.
+    pedal_held: bool,
 }
 
 impl Voice {
@@ -48,6 +51,31 @@ impl Voice {
         k: 1.4,
         control_counter: 0,
         age: 0,
+        pedal_held: false,
+    };
+}
+
+/// Pitch-bend range in semitones.
+const BEND_RANGE: f32 = 2.0;
+/// Full mod wheel: vibrato depth in semitones, at this rate.
+const VIBRATO_DEPTH: f32 = 0.5;
+const VIBRATO_HZ: f32 = 5.5;
+
+/// Per-channel controller state.
+#[derive(Clone, Copy, Debug)]
+struct ChannelState {
+    sustain: bool,
+    /// Semitones.
+    bend: f32,
+    /// 0..=1.
+    modulation: f32,
+}
+
+impl ChannelState {
+    const REST: ChannelState = ChannelState {
+        sustain: false,
+        bend: 0.0,
+        modulation: 0.0,
     };
 }
 
@@ -65,12 +93,16 @@ struct Settings {
     detune: f32,
 }
 
-/// Polyphonic two-oscillator subtractive synth (16 voices).
+/// Polyphonic two-oscillator subtractive synth (16 voices) with sustain
+/// pedal, pitch bend (±2 semitones) and mod-wheel vibrato.
 pub struct SynthProcessor {
     params: ParamValues,
     sample_rate: f32,
     voices: [Voice; VOICES],
     counter: u64,
+    channels: [ChannelState; 16],
+    /// Vibrato LFO phase (0..1).
+    lfo: f32,
 }
 
 impl SynthProcessor {
@@ -80,6 +112,8 @@ impl SynthProcessor {
             sample_rate: config.sample_rate as f32,
             voices: [Voice::IDLE; VOICES],
             counter: 0,
+            channels: [ChannelState::REST; 16],
+            lfo: 0.0,
         }
     }
 
@@ -137,13 +171,33 @@ impl SynthProcessor {
     }
 
     fn note_off(&mut self, channel: u8, key: u8) {
+        let pedal = self.channels[(channel & 15) as usize].sustain;
         for v in &mut self.voices {
             if v.key == key
                 && v.channel == channel
                 && v.stage != Stage::Idle
                 && v.stage != Stage::Release
             {
-                v.stage = Stage::Release;
+                if pedal {
+                    v.pedal_held = true;
+                } else {
+                    v.stage = Stage::Release;
+                }
+            }
+        }
+    }
+
+    fn set_sustain(&mut self, channel: u8, on: bool) {
+        let c = (channel & 15) as usize;
+        self.channels[c].sustain = on;
+        if !on {
+            for v in &mut self.voices {
+                if v.channel == channel && v.pedal_held {
+                    v.pedal_held = false;
+                    if v.stage != Stage::Idle {
+                        v.stage = Stage::Release;
+                    }
+                }
             }
         }
     }
@@ -168,7 +222,24 @@ impl SynthProcessor {
                 if controller == MidiEvent::CC_ALL_NOTES_OFF
                     || controller == MidiEvent::CC_ALL_SOUND_OFF =>
             {
+                for ch in 0..16 {
+                    self.set_sustain(ch, false);
+                }
                 self.all_off()
+            }
+            MidiEvent::ControlChange {
+                channel,
+                controller: 64,
+                value,
+            } => self.set_sustain(channel, value >= 64),
+            MidiEvent::ControlChange {
+                channel,
+                controller: 1,
+                value,
+            } => self.channels[(channel & 15) as usize].modulation = value as f32 / 127.0,
+            MidiEvent::PitchBend { channel, value } => {
+                self.channels[(channel & 15) as usize].bend =
+                    (value as f32 - 8192.0) / 8192.0 * BEND_RANGE
             }
             _ => {}
         }
@@ -185,8 +256,14 @@ impl SynthProcessor {
     ) {
         let sr = self.sample_rate;
         let nyquist_guard = sr * 0.45;
+        // Vibrato at the segment's start (segments are at most a block).
+        let lfo = (self.lfo * 2.0 * PI).sin();
+        self.lfo = (self.lfo + (end - start) as f32 * VIBRATO_HZ / sr).fract();
+        let channels = self.channels;
         for v in self.voices.iter_mut().filter(|v| v.stage != Stage::Idle) {
-            let base = 440.0 * 2f32.powf((v.key as f32 - 69.0) / 12.0);
+            let ch = channels[(v.channel & 15) as usize];
+            let semis = v.key as f32 - 69.0 + ch.bend + lfo * ch.modulation * VIBRATO_DEPTH;
+            let base = 440.0 * 2f32.powf(semis / 12.0);
             let freqs = [base * (1.0 - s.detune), base * (1.0 + s.detune)];
             let dts = [freqs[0] / sr, freqs[1] / sr];
             for i in start..end {
@@ -314,5 +391,6 @@ impl PluginProcessor for SynthProcessor {
 
     fn reset(&mut self) {
         self.voices = [Voice::IDLE; VOICES];
+        self.channels = [ChannelState::REST; 16];
     }
 }

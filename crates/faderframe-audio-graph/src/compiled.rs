@@ -483,6 +483,19 @@ impl<C> CompiledGraph<C> {
         }
     }
 
+    /// Visit event-output nodes' first event output (audio thread, after
+    /// [`Self::process`]).
+    #[inline]
+    pub fn read_event_outputs(&self, mut read: impl FnMut(u16, &MidiBuffer)) {
+        for node in &self.nodes {
+            if let NodeRole::EventOutput { port } = node.role
+                && let Some(buf) = node.events_out.first()
+            {
+                read(port, buf);
+            }
+        }
+    }
+
     /// Run every node once (audio thread). Realtime-safe.
     pub fn process(&mut self, cx: &ProcessContext<'_, C>) {
         let frames = cx.frames.min(self.config.max_block_size);

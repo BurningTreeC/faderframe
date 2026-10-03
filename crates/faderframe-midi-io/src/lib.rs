@@ -14,6 +14,10 @@
 
 #![forbid(unsafe_code)]
 
+mod output;
+
+pub use output::{Captured, MidiOutputPort, MidiOutputs, OUTPUT_CAPACITY};
+
 use faderframe_midi::MidiInputSender;
 use std::collections::{HashMap, HashSet};
 

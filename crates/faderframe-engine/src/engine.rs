@@ -62,6 +62,7 @@ enum Message {
     BeginRecord(Box<Recorder>),
     EndRecord,
     MidiInput(Box<faderframe_midi::MidiInputQueue>),
+    MidiOutput(Box<faderframe_midi::MidiOutputQueue>),
     BeginMidiRecord(Box<crate::midi::MidiRecorder>),
     EndMidiRecord,
 }
@@ -72,6 +73,7 @@ enum Garbage {
     Timeline(#[allow(dead_code)] Box<TimelineSnapshot>),
     Recorder(#[allow(dead_code)] Box<Recorder>),
     MidiQueue(#[allow(dead_code)] Box<faderframe_midi::MidiInputQueue>),
+    MidiOutQueue(#[allow(dead_code)] Box<faderframe_midi::MidiOutputQueue>),
     MidiRecorder(#[allow(dead_code)] Box<crate::midi::MidiRecorder>),
 }
 
@@ -101,6 +103,10 @@ pub struct EngineShared {
     /// (session too slow).
     midi_dropped: AtomicU64,
     midi_record_overruns: AtomicU64,
+    /// MIDI output messages lost (sender thread too slow).
+    midi_out_dropped: AtomicU64,
+    /// Auditioning, mapped controls, clock outputs.
+    pub midi: Arc<crate::midi::MidiShared>,
 }
 
 /// Create a connected controller/processor pair.
@@ -119,8 +125,10 @@ pub fn create_with_epoch(
     let (gtx, grx) = RingBuffer::new(config.queue_capacity.max(64));
     let (graph_tx, graph_rx) = mailbox();
     let (timeline_tx, timeline_rx) = mailbox();
+    let shared_midi = Arc::new(crate::midi::MidiShared::default());
     let shared = Arc::new(EngineShared {
         epoch,
+        midi: Arc::clone(&shared_midi),
         ..EngineShared::default()
     });
     shared
@@ -153,6 +161,9 @@ pub fn create_with_epoch(
         click: Click::default(),
         midi: crate::midi::MidiInputState::new(),
         midi_recorder: None,
+        midi_out: None,
+        clock: crate::midi::ClockGen::default(),
+        output_latency: 0,
     };
     let controller = EngineController {
         config,
@@ -172,7 +183,10 @@ pub fn create_with_epoch(
         warnings: Vec::new(),
         plan: Arc::new(StreamPlan::default()),
         suspended_lanes: Default::default(),
-        midi_ports: Default::default(),
+        midi_routing: crate::build::MidiRouting {
+            shared: Arc::clone(&shared_midi),
+            ..Default::default()
+        },
         midi_live: Default::default(),
     };
     (controller, processor)
@@ -194,6 +208,10 @@ pub struct EngineProcessor {
     click: Click,
     midi: crate::midi::MidiInputState,
     midi_recorder: Option<Box<crate::midi::MidiRecorder>>,
+    midi_out: Option<Box<faderframe_midi::MidiOutputQueue>>,
+    clock: crate::midi::ClockGen,
+    /// Frames from a callback to its audio being heard (buffer + device).
+    output_latency: u32,
 }
 
 impl EngineProcessor {
@@ -248,6 +266,11 @@ impl EngineProcessor {
                         self.retire(Garbage::MidiQueue(old));
                     }
                 }
+                Message::MidiOutput(q) => {
+                    if let Some(old) = self.midi_out.replace(q) {
+                        self.retire(Garbage::MidiOutQueue(old));
+                    }
+                }
                 Message::BeginMidiRecord(r) => {
                     if let Some(old) = self.midi_recorder.replace(r) {
                         self.retire(Garbage::MidiRecorder(old));
@@ -291,6 +314,7 @@ impl EngineProcessor {
             .max(1);
 
         self.midi.take(frames, rate, &self.shared.midi_dropped);
+        let callback_ns = self.midi_out.as_ref().map_or(0, |q| q.clock.now_ns());
 
         let mut offset = 0;
         while offset < frames {
@@ -314,6 +338,7 @@ impl EngineProcessor {
                     pos,
                     n,
                     &self.shared.midi_record_overruns,
+                    &self.shared.midi.consumed,
                 );
             }
             if info.playing
@@ -324,6 +349,28 @@ impl EngineProcessor {
                 self.shared
                     .recorded_frames
                     .fetch_add(got as u64, Ordering::Relaxed);
+            }
+            let clock_ports = self.shared.midi.clock_ports.load(Ordering::Relaxed);
+            if clock_ports != 0
+                && let Some(q) = self.midi_out.as_deref_mut()
+            {
+                let ns_per_frame = 1e9 / rate.max(1.0);
+                let latency = self.output_latency as usize + offset;
+                let dropped = &self.shared.midi_out_dropped;
+                self.clock
+                    .chunk(&info, self.ctx.discontinuity, n, |o, bytes| {
+                        let due =
+                            callback_ns + ((latency + o as usize) as f64 * ns_per_frame) as u64;
+                        for port in 0..64u16 {
+                            if clock_ports & (1u64 << port) != 0
+                                && let Some(m) =
+                                    faderframe_midi::MidiOutputEvent::new(port, due, bytes)
+                                && q.producer.push(m).is_err()
+                            {
+                                dropped.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    });
             }
             if graph_ok && let Some(graph) = self.graph.as_deref_mut() {
                 let ins = io.input_channels();
@@ -343,6 +390,32 @@ impl EngineProcessor {
                     sample_rate: rate,
                     data: &self.ctx,
                 });
+                // External MIDI: due when this callback's audio is heard.
+                if let Some(q) = self.midi_out.as_deref_mut() {
+                    let base = callback_ns;
+                    let latency = self.output_latency as usize + offset;
+                    let ns_per_frame = 1e9 / rate.max(1.0);
+                    let dropped = &self.shared.midi_out_dropped;
+                    graph.read_event_outputs(|port, buf| {
+                        if port == crate::midi::NO_PORT {
+                            return;
+                        }
+                        for ev in buf.iter() {
+                            let (bytes, len) = ev.event.to_bytes();
+                            let due = base
+                                + ((latency + ev.sample_offset as usize) as f64 * ns_per_frame)
+                                    as u64;
+                            let Some(m) =
+                                faderframe_midi::MidiOutputEvent::new(port, due, &bytes[..len])
+                            else {
+                                continue;
+                            };
+                            if q.producer.push(m).is_err() {
+                                dropped.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    });
+                }
                 let outs = io.output_channels();
                 graph.read_device_outputs(|first, buf| {
                     for c in 0..buf.num_channels() {
@@ -391,6 +464,7 @@ impl EngineProcessor {
 impl AudioCallback for EngineProcessor {
     fn prepare(&mut self, info: &StreamInfo) {
         self.stream_rate = info.sample_rate;
+        self.output_latency = info.buffer_size + info.output_latency;
         self.shared
             .stream_sample_rate
             .store(info.sample_rate, Ordering::Relaxed);
@@ -443,8 +517,8 @@ pub struct EngineController {
     plan: Arc<StreamPlan>,
     /// Automation lanes being written (they do not drive their parameter).
     suspended_lanes: std::collections::HashSet<faderframe_core::AutomationLaneId>,
-    /// MIDI port keys → indices in MIDI events.
-    midi_ports: std::collections::HashMap<String, u16>,
+    /// MIDI port maps and shared MIDI state for graph builds.
+    midi_routing: crate::build::MidiRouting,
     /// Tracks taking live MIDI input.
     midi_live: std::collections::HashSet<faderframe_core::TrackId>,
 }
@@ -720,7 +794,7 @@ impl EngineController {
             &mut self.slots,
             &mut self.plugins,
             &prepare,
-            &self.midi_ports,
+            &self.midi_routing,
         )?;
         let compiled = built.builder.compile(&prepare)?;
         // Parameters must be valid before the new graph's processors read them.
@@ -812,11 +886,38 @@ impl EngineController {
     /// Port keys → port indices of the MIDI input (a change needs a graph
     /// rebuild to reach tracks routed to a named port).
     pub fn set_midi_ports(&mut self, ports: std::collections::HashMap<String, u16>) {
-        self.midi_ports = ports;
+        self.midi_routing.inputs = ports;
     }
 
     pub fn midi_ports(&self) -> &std::collections::HashMap<String, u16> {
-        &self.midi_ports
+        &self.midi_routing.inputs
+    }
+
+    /// Output port keys → indices (a change needs a graph rebuild).
+    pub fn set_midi_output_ports(&mut self, ports: std::collections::HashMap<String, u16>) {
+        self.midi_routing.outputs = ports;
+    }
+
+    pub fn midi_output_ports(&self) -> &std::collections::HashMap<String, u16> {
+        &self.midi_routing.outputs
+    }
+
+    /// Send MIDI to external devices through this queue.
+    pub fn set_midi_output(
+        &mut self,
+        queue: faderframe_midi::MidiOutputQueue,
+    ) -> Result<(), EngineError> {
+        self.send(Message::MidiOutput(Box::new(queue)))
+    }
+
+    /// Auditioning, mapped controls and clock outputs.
+    pub fn midi_shared(&self) -> &Arc<crate::midi::MidiShared> {
+        &self.shared.midi
+    }
+
+    /// MIDI output messages lost because the sender fell behind.
+    pub fn midi_output_dropped(&self) -> u64 {
+        self.shared.midi_out_dropped.load(Ordering::Relaxed)
     }
 
     /// Which tracks take live MIDI input (applied with the next parameter

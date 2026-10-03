@@ -438,6 +438,7 @@ version = "0.1.0"
 dependencies = [
  "faderframe-midi",
  "midir",
+ "rtrb",
  "tracing",
 ]
 
@@ -482,6 +483,7 @@ dependencies = [
  "faderframe-audio-files",
  "faderframe-automation",
  "faderframe-core",
+ "faderframe-midi",
  "faderframe-timeline",
  "faderframe-workspace",
  "serde",

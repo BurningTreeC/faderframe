@@ -27,6 +27,10 @@ pub struct Preferences {
     pub record_latency_offset: i64,
     /// MIDI inputs (port keys) not to use.
     pub midi_disabled_inputs: Vec<String>,
+    /// MIDI outputs not to use.
+    pub midi_disabled_outputs: Vec<String>,
+    /// MIDI outputs that get MIDI clock.
+    pub midi_clock_outputs: Vec<String>,
 }
 
 impl Default for Preferences {
@@ -43,6 +47,8 @@ impl Default for Preferences {
             preroll_bars: 0,
             record_latency_offset: 0,
             midi_disabled_inputs: Vec::new(),
+            midi_disabled_outputs: Vec::new(),
+            midi_clock_outputs: Vec::new(),
         }
     }
 }

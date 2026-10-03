@@ -246,6 +246,7 @@ pub fn demo_project(sample_rate: u32) -> Project {
                 key,
                 velocity: if start.fract() == 0.0 { 104 } else { 86 },
                 channel: 0,
+                muted: false,
             });
         }
     }
@@ -259,6 +260,7 @@ pub fn demo_project(sample_rate: u32) -> Project {
         content: ClipContent::Midi(MidiClip {
             length: bar4,
             notes,
+            controllers: Vec::new(),
         }),
     };
     keys.clips.push(melody.id);

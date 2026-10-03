@@ -14,6 +14,7 @@
 mod buffer;
 mod event;
 mod input;
+mod output;
 mod tracker;
 
 pub use buffer::{MidiBuffer, MidiBufferFull};
@@ -22,4 +23,5 @@ pub use input::{
     MAX_MIDI_PORTS, MidiClock, MidiControlFeed, MidiInputEvent, MidiInputQueue, MidiInputSender,
     midi_input_queue,
 };
+pub use output::{MidiOutputEvent, MidiOutputQueue, midi_output_queue};
 pub use tracker::NoteTracker;

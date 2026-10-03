@@ -1548,6 +1548,18 @@ impl ArrangerView {
                 items.push(if i == 0 { item.separated() } else { item });
             }
         }
+        // External MIDI device (MIDI tracks).
+        if t.kind == TrackKind::Midi {
+            for (i, c) in model.midi_output_choices(t.id).into_iter().enumerate() {
+                let item =
+                    MenuItem::new(format!("MIDI Out: {}", c.label), c.action).checked(c.checked);
+                items.push(if i == 0 || c.group_start {
+                    item.separated()
+                } else {
+                    item
+                });
+            }
+        }
         // MIDI learn for the strip controls.
         if t.kind != TrackKind::Midi {
             for (i, (target, name)) in [

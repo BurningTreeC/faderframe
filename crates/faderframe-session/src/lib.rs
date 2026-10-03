@@ -18,6 +18,7 @@ pub mod automation;
 pub mod media;
 mod meters;
 pub mod midi;
+pub mod notes;
 pub mod performance;
 pub use performance::{Load, PerformanceReport, PluginPerformance, TrackPerformance};
 pub mod record;
@@ -50,7 +51,10 @@ use faderframe_workspace::{
     DockAreaId, LayoutError, ViewId, WindowGeometry, WindowId, WorkspaceSet,
 };
 pub use media::{ImportJob, ImportTarget};
-pub use midi::{KEYBOARD_PORT, LiveNote, MidiPortStatus, MidiPreferences};
+pub use midi::{
+    KEYBOARD_PORT, LiveNote, MidiOutputStatus, MidiPortStatus, MidiPreferences, StepInput,
+};
+pub use notes::{KeyFold, NoteLength, NoteOp, PianoRollSettings};
 pub use record::{LiveTake, LoopRecordMode, RecordMode, RecordSettings, RecordedTake};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -211,6 +215,75 @@ pub enum Action {
     },
     /// Clear performance peaks, history and callback statistics.
     ResetPerformance,
+    // --- piano roll (ids allocated by the session) ---
+    AddNotes {
+        clip: ClipId,
+        notes: Vec<MidiNote>,
+    },
+    /// A chord of the piano roll's chord kind on `key`.
+    AddChord {
+        clip: ClipId,
+        start: MusicalTime,
+        length: MusicalTime,
+        key: u8,
+        velocity: u8,
+    },
+    /// Copies moved by `offset` (`None`: right after them) and `keys`.
+    DuplicateNotes {
+        clip: ClipId,
+        notes: Vec<NoteId>,
+        offset: Option<MusicalTime>,
+        keys: i32,
+    },
+    SplitNotes {
+        clip: ClipId,
+        notes: Vec<NoteId>,
+        at: MusicalTime,
+    },
+    RemoveNotes {
+        clip: ClipId,
+        notes: Vec<NoteId>,
+    },
+    /// Apply an operation to notes (all notes of the clip when empty).
+    NoteOperation {
+        clip: ClipId,
+        notes: Vec<NoteId>,
+        op: NoteOp,
+    },
+    CopyNotes {
+        clip: ClipId,
+        notes: Vec<NoteId>,
+    },
+    CutNotes {
+        clip: ClipId,
+        notes: Vec<NoteId>,
+    },
+    PasteNotes {
+        clip: ClipId,
+        at: MusicalTime,
+    },
+    SetControllerPoints {
+        clip: ClipId,
+        controller: faderframe_project::MidiController,
+        channel: u8,
+        from: MusicalTime,
+        to: MusicalTime,
+        points: Vec<faderframe_project::ControllerPoint>,
+    },
+    SetMidiClipLength {
+        clip: ClipId,
+        length: MusicalTime,
+    },
+    /// Play a note on a track's instrument (until `AuditionOff`).
+    Audition {
+        track: TrackId,
+        key: u8,
+        velocity: u8,
+        channel: u8,
+    },
+    AuditionOff,
+    SetStepInput(Option<midi::StepInput>),
+    SetPianoRoll(PianoRollSettings),
     /// Map the next control moved on a MIDI device to this target.
     MidiLearn(faderframe_project::MappingTarget),
     CancelMidiLearn,
@@ -269,6 +342,8 @@ pub struct EditorSettings {
     pub grid: GridDivision,
     pub snap: bool,
     pub follow_playhead: bool,
+    /// Scale, chords, note length, audition … of the piano roll.
+    pub piano: PianoRollSettings,
 }
 
 impl Default for EditorSettings {
@@ -277,6 +352,7 @@ impl Default for EditorSettings {
             grid: GridDivision::Beat,
             snap: true,
             follow_playhead: true,
+            piano: PianoRollSettings::default(),
         }
     }
 }
@@ -392,6 +468,8 @@ pub struct Session {
     presets: Vec<PresetEntry>,
     automation_writer: automation::AutomationWriter,
     ui_requests: Vec<UiRequest>,
+    /// Notes copied in the piano roll (relative to the earliest).
+    note_clipboard: Vec<MidiNote>,
     perf: performance::PerformanceMonitor,
     midi: midi::MidiState,
 }
@@ -481,7 +559,9 @@ impl Session {
             faderframe_engine::create_with_epoch(config, Arc::clone(&epoch));
         let (midi, midi_queue) = midi::MidiState::new();
         engine.set_midi_input(midi_queue)?;
+        engine.set_midi_output(midi.renew_output_queue())?;
         engine.set_midi_ports(midi.port_map());
+        engine.set_midi_output_ports(midi.output_port_map());
         let loader = media::DiskLoader::start(
             Arc::new(StreamPlan::default()),
             engine.shared(),
@@ -525,6 +605,7 @@ impl Session {
             presets: Vec::new(),
             automation_writer: Default::default(),
             ui_requests: Vec::new(),
+            note_clipboard: Vec::new(),
             perf: Default::default(),
             midi,
         };
@@ -765,8 +846,17 @@ impl Session {
             faderframe_engine::create_with_epoch(self.engine_config, Arc::clone(&self.epoch));
         self.engine = engine;
         self.engine.set_midi_input(self.midi.renew_queue())?;
+        self.engine
+            .set_midi_output(self.midi.renew_output_queue())?;
         self.engine.set_midi_ports(self.midi.port_map());
+        self.engine
+            .set_midi_output_ports(self.midi.output_port_map());
         self.engine.set_midi_live(self.midi.live().clone());
+        self.midi.reset_engine_tables();
+        self.engine
+            .midi_shared()
+            .clock_ports
+            .store(self.midi.clock_mask(), std::sync::atomic::Ordering::Relaxed);
         self.engine
             .sync(&self.project, &self.sources, Impact::Graph)?;
         self.engine.transport(TransportCommand::Locate(position))?;
@@ -1567,6 +1657,7 @@ impl Session {
                     content: ClipContent::Midi(MidiClip {
                         length: length.max(MusicalTime(1)),
                         notes: Vec::new(),
+                        controllers: Vec::new(),
                     }),
                 };
                 self.edit(Command::AddClip {
@@ -1590,6 +1681,7 @@ impl Session {
                     key,
                     velocity,
                     channel: 0,
+                    muted: false,
                 };
                 self.edit(Command::AddNote { clip, note })?;
                 self.selection.select_notes(&[id], SelectMode::Replace);
@@ -1628,6 +1720,57 @@ impl Session {
             }
             Action::ResetPerformance => self.reset_performance(),
             Action::MidiLearn(target) => self.start_midi_learn(target),
+            Action::AddNotes { clip, notes } => {
+                self.add_notes(clip, &notes)?;
+            }
+            Action::AddChord {
+                clip,
+                start,
+                length,
+                key,
+                velocity,
+            } => {
+                self.add_chord(clip, start, length, key, velocity)?;
+            }
+            Action::DuplicateNotes {
+                clip,
+                notes,
+                offset,
+                keys,
+            } => {
+                self.duplicate_notes(clip, &notes, offset, keys)?;
+            }
+            Action::SplitNotes { clip, notes, at } => self.split_notes(clip, &notes, at)?,
+            Action::RemoveNotes { clip, notes } => self.remove_notes(clip, &notes)?,
+            Action::NoteOperation { clip, notes, op } => self.note_operation(clip, &notes, &op)?,
+            Action::CopyNotes { clip, notes } => self.copy_notes(clip, &notes)?,
+            Action::CutNotes { clip, notes } => self.cut_notes(clip, &notes)?,
+            Action::PasteNotes { clip, at } => {
+                self.paste_notes(clip, at)?;
+            }
+            Action::SetControllerPoints {
+                clip,
+                controller,
+                channel,
+                from,
+                to,
+                points,
+            } => self.set_controller_points(clip, controller, channel, from, to, &points)?,
+            Action::SetMidiClipLength { clip, length } => {
+                self.set_midi_clip_length(clip, length)?
+            }
+            Action::Audition {
+                track,
+                key,
+                velocity,
+                channel,
+            } => self.audition(track, key, velocity, channel),
+            Action::AuditionOff => self.audition_off(),
+            Action::SetStepInput(step) => self.set_step_input(step),
+            Action::SetPianoRoll(p) => {
+                self.editor.piano = p;
+                self.revision += 1;
+            }
             Action::CancelMidiLearn => self.cancel_midi_learn(),
             Action::OpenPluginEditor {
                 track,

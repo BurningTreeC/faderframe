@@ -368,15 +368,14 @@ impl Browser {
         vendor.set_xalign(0.0);
         self.detail.append(&vendor);
         if !e.features.is_empty() {
-            let chips = gtk::FlowBox::new();
-            chips.set_selection_mode(gtk::SelectionMode::None);
-            chips.set_max_children_per_line(6);
+            // (A grid: FlowBox mis-measures in this pane.)
+            let chips = gtk::Grid::new();
             chips.set_row_spacing(4);
             chips.set_column_spacing(4);
-            for f in &e.features {
+            for (i, f) in e.features.iter().enumerate() {
                 let c = gtk::Label::new(Some(f));
                 c.add_css_class("chip");
-                chips.insert(&c, -1);
+                chips.attach(&c, (i % 3) as i32, (i / 3) as i32, 1, 1);
             }
             self.detail.append(&chips);
         }

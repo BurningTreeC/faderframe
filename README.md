@@ -22,7 +22,15 @@ hosting, an analogue-console-style mixer and dockable, detachable editors.
   faders with a console fader law, segmented peak meters, routing menus,
   any number of sends per channel (rows grow, ◂ ▸ pages through banks),
   scribble strips, pinned master section.
-* Piano roll: draw, move, resize, delete notes, velocity lane, transpose.
+* Piano roll: select/draw/erase/split/mute tools, rubber-band selection,
+  moving and Alt-copying with snap (Shift: free), resizing from either edge,
+  chords (fixed or scale-aware), scales with highlighting, snap and folding,
+  quantize (strength, swing, ends), humanize, legato, reverse, invert,
+  velocity stems and line ramps, controller lanes (mod wheel, pitch bend,
+  sustain, any CC: freehand, lines, erase), ghost notes of the track's other
+  clips, auditioning, step input from a MIDI keyboard, copy/paste/duplicate,
+  clip-length handle, inspector with numeric entry, live keys on the
+  keyboard.
 * Docking: mixer / piano roll / automation tabs in a bottom dock, detach any
   view into its own window and dock it back, workspaces (Recording, Editing,
   Mixing, MIDI, Mastering), layouts saved with the project.
@@ -65,8 +73,12 @@ hosting, an analogue-console-style mixer and dockable, detachable editors.
   track (track menu → MIDI In). Record MIDI into clips (takes or replace,
   loop recording). MIDI learn: right-click a fader, pan, mute, send,
   automation lane or plugin parameter → MIDI Learn and move a knob; pads
-  can toggle switches or run transport functions. Inputs and mappings in
-  Preferences → MIDI.
+  can toggle switches or run transport functions; soft takeover and
+  endless encoders (relative modes); mapped controls don't reach the
+  instrument. Mod wheel, pitch bend, sustain and aftertouch are recorded
+  into clips and chased on playback. MIDI tracks play external instruments
+  (track menu → MIDI Out) in time with the audio, and MIDI clock can sync
+  external gear. Inputs, outputs, clock and mappings in Preferences → MIDI.
 * Performance meter (F8, or click the DSP readout in the status bar): total
   DSP load with a 60 s history and a breakdown into plugins, mixing and
   engine work; load per track and per plugin instance (average and peak,

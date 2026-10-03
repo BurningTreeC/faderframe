@@ -119,6 +119,11 @@ pub enum Command {
         track: TrackId,
         mode: MonitorMode,
     },
+    /// Play a MIDI track on an external MIDI device (or stop doing so).
+    SetTrackMidiOutput {
+        track: TrackId,
+        output: Option<crate::MidiOutputRouting>,
+    },
     SetTrackPhaseInvert {
         track: TrackId,
         on: bool,
@@ -313,6 +318,10 @@ pub enum Command {
     RemoveMidiMapping {
         mapping: faderframe_core::MidiMappingId,
     },
+    /// Replace a mapping (same id), e.g. its mode.
+    UpdateMidiMapping {
+        mapping: crate::MidiMapping,
+    },
     RenameProject {
         name: String,
     },
@@ -446,6 +455,7 @@ impl Command {
             SetTrackSolo { .. } => "Toggle Solo".into(),
             SetTrackRecordArm { .. } => "Toggle Record Arm".into(),
             SetTrackMonitor { .. } => "Change Monitoring".into(),
+            SetTrackMidiOutput { .. } => "Change MIDI Output".into(),
             SetTrackPhaseInvert { .. } => "Toggle Phase Invert".into(),
             RenameTrack { .. } => "Rename Track".into(),
             SetTrackColor { .. } => "Change Track Colour".into(),
@@ -488,6 +498,7 @@ impl Command {
             RemoveMarker { .. } => "Remove Marker".into(),
             AddMidiMapping { .. } => "MIDI Learn".into(),
             RemoveMidiMapping { .. } => "Remove MIDI Mapping".into(),
+            UpdateMidiMapping { .. } => "Change MIDI Mapping".into(),
             RenameProject { .. } => "Rename Project".into(),
             Batch { label, .. } => label.clone(),
         }
@@ -529,6 +540,7 @@ impl Command {
             | RemoveMarker { .. }
             | AddMidiMapping { .. }
             | RemoveMidiMapping { .. }
+            | UpdateMidiMapping { .. }
             | SetPunch { .. }
             | RenameProject { .. }
             | RenameClip { .. } => Impact::None,
@@ -551,6 +563,7 @@ impl Command {
             | SetLoop { .. } => Impact::Timeline,
             SetTrackRecordArm { .. }
             | SetTrackMonitor { .. }
+            | SetTrackMidiOutput { .. }
             | SetTrackOutput { .. }
             | SetTrackInput { .. }
             | SetTrackLayout { .. }
@@ -616,6 +629,11 @@ impl Command {
                 }
                 let old = std::mem::replace(&mut t.record_arm, on);
                 SetTrackRecordArm { track, on: old }
+            }
+            SetTrackMidiOutput { track, output } => {
+                let t = track_mut(p, track)?;
+                let old = std::mem::replace(&mut t.midi_output, output);
+                SetTrackMidiOutput { track, output: old }
             }
             SetTrackMonitor { track, mode } => {
                 let old = std::mem::replace(&mut track_mut(p, track)?.monitor, mode);
@@ -1137,6 +1155,18 @@ impl Command {
                     .insert(index.min(p.midi_mappings.len()), mapping);
                 RemoveMidiMapping { mapping: id }
             }
+            UpdateMidiMapping { mapping } => {
+                let m = p
+                    .midi_mappings
+                    .iter_mut()
+                    .find(|m| m.id == mapping.id)
+                    .ok_or_else(|| {
+                        EditError::Invalid(format!("unknown MIDI mapping {}", mapping.id))
+                    })?;
+                UpdateMidiMapping {
+                    mapping: std::mem::replace(m, mapping),
+                }
+            }
             RemoveMidiMapping { mapping } => {
                 let index = p
                     .midi_mappings
@@ -1249,6 +1279,31 @@ fn split_clip(
                 if n.end() > rel {
                     n.length = rel - n.start;
                 }
+            }
+            // Controller values continue across the cut.
+            for (rl, ll) in r.controllers.iter_mut().zip(l.controllers.iter_mut()) {
+                let carried = ll.value_at(rel);
+                rl.points = ll
+                    .points
+                    .iter()
+                    .filter(|p| p.time >= rel)
+                    .map(|p| crate::ControllerPoint {
+                        time: p.time - rel,
+                        value: p.value,
+                    })
+                    .collect();
+                if let Some(v) = carried
+                    && rl.points.first().is_none_or(|p| p.time > MusicalTime::ZERO)
+                {
+                    rl.points.insert(
+                        0,
+                        crate::ControllerPoint {
+                            time: MusicalTime::ZERO,
+                            value: v,
+                        },
+                    );
+                }
+                ll.points.retain(|p| p.time < rel);
             }
         }
         _ => return Err(EditError::Invalid("inconsistent clip content".into())),

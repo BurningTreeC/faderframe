@@ -39,11 +39,38 @@ const LEARN_TIMEOUT: Duration = Duration::from_secs(30);
 /// A port shows as active this long after a message.
 const ACTIVITY_HOLD: Duration = Duration::from_millis(180);
 
-/// Which inputs FaderFrame uses (saved by the shell).
+/// Which MIDI devices FaderFrame uses (saved by the shell).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MidiPreferences {
-    /// Port keys not to connect.
+    /// Input port keys not to connect.
     pub disabled_inputs: Vec<String>,
+    /// Output port keys not to connect.
+    pub disabled_outputs: Vec<String>,
+    /// Output port keys that get MIDI clock.
+    pub clock_outputs: Vec<String>,
+}
+
+/// A MIDI output as shown in preferences and menus.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MidiOutputStatus {
+    pub key: String,
+    pub name: String,
+    pub enabled: bool,
+    pub connected: bool,
+    pub is_virtual: bool,
+    /// Sends MIDI clock (24 ppqn, start/stop/song position).
+    pub clock: bool,
+}
+
+/// Step input: notes played on a MIDI keyboard are entered at the cursor
+/// of the clip open in the piano roll (a chord when keys overlap), then the
+/// cursor moves on by one step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StepInput {
+    pub clip: faderframe_core::ClipId,
+    /// Clip-relative.
+    pub cursor: faderframe_timeline::MusicalTime,
+    pub step: faderframe_timeline::MusicalTime,
 }
 
 /// A MIDI input as shown in preferences and menus.
@@ -90,8 +117,14 @@ pub(crate) struct MidiTake {
     pub shift: i64,
     open: Vec<HeldNotes>,
     pub notes: Vec<Vec<RecNote>>,
+    /// Controller moves per track: (position, controller, channel, value,
+    /// pass).
+    pub controllers: Vec<Vec<RecController>>,
     pub last: i64,
 }
+
+/// A recorded controller move: (position, controller, channel, value, pass).
+pub(crate) type RecController = (i64, faderframe_project::MidiController, u8, u16, u32);
 
 impl MidiTake {
     pub(crate) fn new(rx: rtrb::Consumer<RecordedMidi>, tracks: Vec<TrackId>, shift: i64) -> Self {
@@ -102,6 +135,7 @@ impl MidiTake {
             shift,
             open: vec![HashMap::new(); n],
             notes: vec![Vec::new(); n],
+            controllers: vec![Vec::new(); n],
             last: i64::MIN,
         }
     }
@@ -126,6 +160,13 @@ impl MidiTake {
                         self.close(t, start, pos, key, vel, channel, pass);
                     }
                     self.open[t].insert((channel, key), (pos, velocity, r.pass));
+                }
+                ev @ (MidiEvent::ControlChange { .. }
+                | MidiEvent::PitchBend { .. }
+                | MidiEvent::ChannelPressure { .. }) => {
+                    if let Some((c, ch, v)) = faderframe_project::MidiController::of_event(ev) {
+                        self.controllers[t].push((pos, c, ch, v, r.pass));
+                    }
                 }
                 MidiEvent::NoteOn { channel, key, .. }
                 | MidiEvent::NoteOff { channel, key, .. } => {
@@ -203,6 +244,8 @@ impl MidiTake {
 
 pub(crate) struct MidiState {
     pub(crate) hub: MidiHub,
+    pub(crate) outputs: faderframe_midi_io::MidiOutputs,
+    clock_outputs: HashSet<String>,
     sender: MidiInputSender,
     feed: MidiControlFeed,
     keyboard: VirtualMidiInput,
@@ -214,6 +257,20 @@ pub(crate) struct MidiState {
     /// Last CC value per (port, channel, controller), for button edges.
     cc_last: HashMap<(u16, u8, u8), u8>,
     live: HashSet<TrackId>,
+    /// Keys held on the inputs, per channel (for keyboards on screen).
+    held: [u128; 16],
+    /// The note being auditioned: (track, channel, key).
+    audition: Option<(TrackId, u8, u8)>,
+    /// Soft takeover: per mapping, whether the control has picked the
+    /// parameter up, and the value it last set.
+    pickup: HashMap<faderframe_core::MidiMappingId, (bool, f64)>,
+    /// Mappings the engine's consumed-controls table was built from
+    /// (`None`: not built for this engine yet).
+    consumed_for: Option<Vec<MidiMapping>>,
+    step: Option<StepInput>,
+    /// Keys of the chord being entered by step input (and how many are down).
+    step_chord: Vec<(u8, u8, u8)>,
+    step_down: usize,
 }
 
 impl MidiState {
@@ -221,9 +278,12 @@ impl MidiState {
         let (sender, queue, feed) = faderframe_midi::midi_input_queue(4096);
         let mut hub = MidiHub::new(sender.clone());
         let keyboard = hub.virtual_input(KEYBOARD_PORT);
+        let outputs = faderframe_midi_io::MidiOutputs::new(sender.clock());
         (
             Self {
                 hub,
+                outputs,
+                clock_outputs: HashSet::new(),
                 sender,
                 feed,
                 keyboard,
@@ -233,9 +293,43 @@ impl MidiState {
                 gesture: None,
                 cc_last: HashMap::new(),
                 live: HashSet::new(),
+                held: [0; 16],
+                audition: None,
+                pickup: HashMap::new(),
+                consumed_for: None,
+                step: None,
+                step_chord: Vec::new(),
+                step_down: 0,
             },
             queue,
         )
+    }
+
+    /// An output queue for a new engine.
+    pub(crate) fn renew_output_queue(&self) -> faderframe_midi::MidiOutputQueue {
+        self.outputs.renew_queue()
+    }
+
+    pub(crate) fn output_port_map(&self) -> HashMap<String, u16> {
+        self.outputs
+            .ports()
+            .into_iter()
+            .map(|p| (p.key, p.index))
+            .collect()
+    }
+
+    /// A new engine has empty tables: rebuild them on the next tick.
+    pub(crate) fn reset_engine_tables(&mut self) {
+        self.consumed_for = None;
+    }
+
+    /// Bit mask of output indices that send clock.
+    pub(crate) fn clock_mask(&self) -> u64 {
+        self.outputs
+            .ports()
+            .iter()
+            .filter(|p| p.index < 64 && self.clock_outputs.contains(&p.key))
+            .fold(0, |m, p| m | (1u64 << p.index))
     }
 
     /// A queue for a new engine (every input keeps sending, into it).
@@ -288,7 +382,7 @@ fn control_of(ev: MidiEvent) -> Option<(u8, MidiControl, f64)> {
 impl Session {
     // --- devices ----------------------------------------------------------------------
 
-    /// Connect the system's MIDI inputs (the shell calls this at start-up).
+    /// Connect the system's MIDI devices (the shell calls this at start-up).
     pub fn start_midi(&mut self, prefs: &MidiPreferences) {
         self.midi
             .hub
@@ -298,12 +392,18 @@ impl Session {
             let e = e.to_string();
             self.notify(NoticeLevel::Warning, e);
         }
+        self.midi
+            .outputs
+            .set_disabled(prefs.disabled_outputs.iter().cloned());
+        self.midi.outputs.start_system();
+        self.midi.clock_outputs = prefs.clock_outputs.iter().cloned().collect();
         self.midi.last_scan = Some(Instant::now());
         self.midi_ports_changed();
     }
 
     pub fn stop_midi(&mut self) {
         self.midi.hub.stop_system();
+        self.midi.outputs.stop_system();
     }
 
     /// Every input known so far (the virtual keyboard first).
@@ -319,6 +419,23 @@ impl Session {
                     .activity
                     .get(&p.index)
                     .is_some_and(|t| now.duration_since(*t) < ACTIVITY_HOLD),
+                key: p.key,
+                name: p.name,
+                enabled: p.enabled,
+                connected: p.connected,
+                is_virtual: p.is_virtual,
+            })
+            .collect()
+    }
+
+    /// Every output known so far.
+    pub fn midi_outputs(&self) -> Vec<MidiOutputStatus> {
+        self.midi
+            .outputs
+            .ports()
+            .into_iter()
+            .map(|p| MidiOutputStatus {
+                clock: self.midi.clock_outputs.contains(&p.key),
                 key: p.key,
                 name: p.name,
                 enabled: p.enabled,
@@ -347,6 +464,19 @@ impl Session {
                 .filter(|p| !p.enabled)
                 .map(|p| p.key)
                 .collect(),
+            disabled_outputs: self
+                .midi
+                .outputs
+                .ports()
+                .into_iter()
+                .filter(|p| !p.enabled)
+                .map(|p| p.key)
+                .collect(),
+            clock_outputs: {
+                let mut v: Vec<String> = self.midi.clock_outputs.iter().cloned().collect();
+                v.sort();
+                v
+            },
         }
     }
 
@@ -362,22 +492,61 @@ impl Session {
         self.revision += 1;
     }
 
+    /// Use (or ignore) an output device.
+    pub fn set_midi_output_enabled(&mut self, key: &str, enabled: bool) {
+        let mut disabled = self.midi_preferences().disabled_outputs;
+        disabled.retain(|k| k != key);
+        if !enabled {
+            disabled.push(key.to_string());
+        }
+        self.midi.outputs.set_disabled(disabled);
+        self.midi_ports_changed();
+        self.revision += 1;
+    }
+
+    /// Send MIDI clock to an output (or stop).
+    pub fn set_midi_clock_output(&mut self, key: &str, on: bool) {
+        if on {
+            self.midi.clock_outputs.insert(key.to_string());
+        } else {
+            self.midi.clock_outputs.remove(key);
+        }
+        self.engine
+            .midi_shared()
+            .clock_ports
+            .store(self.midi.clock_mask(), std::sync::atomic::Ordering::Relaxed);
+        self.revision += 1;
+    }
+
     /// The virtual keyboard input (computer keyboard, on-screen keys, tests).
     pub fn midi_keyboard(&self) -> &VirtualMidiInput {
         &self.midi.keyboard
     }
 
-    fn midi_ports_changed(&mut self) {
-        let map = self.midi.port_map();
-        if map == *self.engine.midi_ports() {
+    /// A capture output (tests, monitoring): every message sent to it.
+    pub fn add_virtual_midi_output(&mut self, name: &str) -> faderframe_midi_io::Captured {
+        let (_, captured) = self.midi.outputs.virtual_output(name);
+        self.midi_ports_changed();
+        captured
+    }
+
+    /// Port maps and clock outputs to the engine (graph rebuild when a
+    /// track uses a named port).
+    pub(crate) fn midi_ports_changed(&mut self) {
+        self.engine
+            .midi_shared()
+            .clock_ports
+            .store(self.midi.clock_mask(), std::sync::atomic::Ordering::Relaxed);
+        let inputs = self.midi.port_map();
+        let outputs = self.midi.output_port_map();
+        if inputs == *self.engine.midi_ports() && outputs == *self.engine.midi_output_ports() {
             return;
         }
-        self.engine.set_midi_ports(map);
-        let named = self
-            .project
-            .tracks
-            .iter()
-            .any(|t| matches!(t.input, InputRouting::Midi { port: Some(_), .. }));
+        self.engine.set_midi_ports(inputs);
+        self.engine.set_midi_output_ports(outputs);
+        let named = self.project.tracks.iter().any(|t| {
+            matches!(t.input, InputRouting::Midi { port: Some(_), .. }) || t.midi_output.is_some()
+        });
         if named
             && let Err(e) = self.engine.sync(
                 &self.project,
@@ -387,6 +556,195 @@ impl Session {
         {
             self.notify(NoticeLevel::Error, e.to_string());
         }
+    }
+
+    /// MIDI output choices of a MIDI track: none, or a device (and channel).
+    pub fn midi_output_choices(&self, track: TrackId) -> Vec<InputChoice> {
+        use faderframe_project::MidiOutputRouting;
+        let Some(t) = self.project.track(track) else {
+            return Vec::new();
+        };
+        let cur = t.midi_output.clone();
+        let set = |output: Option<MidiOutputRouting>| {
+            Action::Edit(Command::SetTrackMidiOutput { track, output })
+        };
+        let mut out = vec![InputChoice {
+            label: "No External MIDI Output".into(),
+            action: set(None),
+            checked: cur.is_none(),
+            group_start: true,
+        }];
+        let mut ports: Vec<(String, String)> = self
+            .midi_outputs()
+            .into_iter()
+            .filter(|p| p.enabled && !p.is_virtual)
+            .map(|p| (p.key, p.name))
+            .collect();
+        if let Some(c) = &cur
+            && !ports.iter().any(|(k, _)| *k == c.port)
+        {
+            ports.push((
+                c.port.clone(),
+                format!(
+                    "{} (not connected)",
+                    faderframe_project::midi_port_display(&c.port)
+                ),
+            ));
+        }
+        let channel = cur.as_ref().and_then(|c| c.channel);
+        for (i, (key, name)) in ports.into_iter().enumerate() {
+            out.push(InputChoice {
+                label: name,
+                action: set(Some(MidiOutputRouting {
+                    port: key.clone(),
+                    channel,
+                })),
+                checked: cur.as_ref().is_some_and(|c| c.port == key),
+                group_start: i == 0,
+            });
+        }
+        if let Some(c) = cur {
+            for ch in std::iter::once(None).chain((0..16u8).map(Some)) {
+                out.push(InputChoice {
+                    label: ch.map_or_else(
+                        || "Channel: as played".into(),
+                        |n| format!("Channel {}", n + 1),
+                    ),
+                    action: set(Some(MidiOutputRouting {
+                        port: c.port.clone(),
+                        channel: ch,
+                    })),
+                    checked: c.channel == ch,
+                    group_start: ch.is_none(),
+                });
+            }
+        }
+        out
+    }
+
+    // --- auditioning and the on-screen keyboard -------------------------------------
+
+    /// Play `key` on `track`'s instrument (piano roll keys, drawn notes),
+    /// whatever its live state; stops the previous audition note.
+    pub fn audition(&mut self, track: TrackId, key: u8, velocity: u8, channel: u8) {
+        self.audition_off();
+        self.engine
+            .midi_shared()
+            .audition_track
+            .store(track.raw(), std::sync::atomic::Ordering::Relaxed);
+        let ch = channel & 15;
+        self.midi.sender.send(
+            faderframe_engine::midi::AUDITION_PORT,
+            &[0x90 | ch, key & 127, velocity.clamp(1, 127)],
+        );
+        self.midi.audition = Some((track, ch, key));
+    }
+
+    pub fn audition_off(&mut self) {
+        if let Some((_, ch, key)) = self.midi.audition.take() {
+            self.midi
+                .sender
+                .send(faderframe_engine::midi::AUDITION_PORT, &[0x80 | ch, key, 0]);
+        }
+    }
+
+    /// Keys held on the MIDI inputs right now (any channel).
+    pub fn held_midi_keys(&self) -> u128 {
+        self.midi.held.iter().fold(0, |m, c| m | c)
+    }
+
+    // --- step input ------------------------------------------------------------------
+
+    pub fn step_input(&self) -> Option<StepInput> {
+        self.midi.step
+    }
+
+    /// Turn step input on for the clip in the editor (cursor at `cursor`,
+    /// notes `step` long), or off.
+    pub fn set_step_input(&mut self, step: Option<StepInput>) {
+        self.midi.step = step;
+        self.midi.step_chord.clear();
+        self.midi.step_down = 0;
+        self.revision += 1;
+    }
+
+    fn step_input_event(&mut self, ev: MidiEvent) {
+        let Some(st) = self.midi.step else { return };
+        match ev {
+            MidiEvent::NoteOn {
+                channel,
+                key,
+                velocity,
+            } if velocity > 0 => {
+                self.midi.step_down += 1;
+                self.midi.step_chord.push((channel, key, velocity));
+            }
+            MidiEvent::NoteOn { .. } | MidiEvent::NoteOff { .. } => {
+                self.midi.step_down = self.midi.step_down.saturating_sub(1);
+                if self.midi.step_down == 0 && !self.midi.step_chord.is_empty() {
+                    let chord = std::mem::take(&mut self.midi.step_chord);
+                    let fits = self
+                        .project
+                        .clip(st.clip)
+                        .and_then(|c| c.as_midi())
+                        .is_some_and(|m| st.cursor < m.length);
+                    if !fits {
+                        return;
+                    }
+                    let notes: Vec<faderframe_project::MidiNote> = chord
+                        .into_iter()
+                        .map(|(channel, key, velocity)| faderframe_project::MidiNote {
+                            id: faderframe_core::NoteId(0),
+                            start: st.cursor,
+                            length: st.step,
+                            key,
+                            velocity,
+                            channel,
+                            muted: false,
+                        })
+                        .collect();
+                    if let Err(e) = self.add_notes(st.clip, &notes) {
+                        self.notify(NoticeLevel::Warning, format!("step input: {e}"));
+                    }
+                    self.midi.step = Some(StepInput {
+                        cursor: st.cursor + st.step,
+                        ..st
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Engine table of controls taken by mappings (rebuilt when mappings
+    /// change).
+    fn update_consumed(&mut self) {
+        if self.midi.consumed_for.as_ref() == Some(&self.project.midi_mappings) {
+            return;
+        }
+        use faderframe_engine::midi::ConsumedControl as C;
+        let list: Vec<(Option<u16>, u8, C)> = self
+            .project
+            .midi_mappings
+            .iter()
+            .map(|m| {
+                let port = m.source.port.as_ref().map(|k| {
+                    self.midi
+                        .hub
+                        .port_index(k)
+                        .unwrap_or(faderframe_engine::midi::NO_PORT)
+                });
+                let c = match m.source.control {
+                    MidiControl::Cc { number } => C::Cc(number),
+                    MidiControl::Note { key } => C::Note(key),
+                    MidiControl::PitchBend => C::PitchBend,
+                    MidiControl::ChannelPressure => C::ChannelPressure,
+                };
+                (port, m.source.channel, c)
+            })
+            .collect();
+        self.engine.midi_shared().consumed.set(&list);
+        self.midi.consumed_for = Some(self.project.midi_mappings.clone());
     }
 
     // --- live play -------------------------------------------------------------------
@@ -430,11 +788,14 @@ impl Session {
                 .is_none_or(|t| now.duration_since(t) >= RESCAN)
         {
             self.midi.last_scan = Some(now);
-            if self.midi.hub.refresh() {
+            let inputs = self.midi.hub.refresh();
+            let outputs = self.midi.outputs.refresh();
+            if inputs || outputs {
                 self.midi_ports_changed();
                 self.revision += 1;
             }
         }
+        self.update_consumed();
         let live = self.compute_midi_live();
         if live != self.midi.live {
             self.midi.live = live.clone();
@@ -446,8 +807,27 @@ impl Session {
         }
         let events = self.midi.feed.drain();
         if !events.is_empty() {
+            let events: Vec<MidiInputEvent> = events
+                .into_iter()
+                .filter(|e| e.port != faderframe_engine::midi::AUDITION_PORT)
+                .collect();
             for ev in &events {
                 self.midi.activity.insert(ev.port, now);
+                if let Some(e) = ev.event() {
+                    let ch = (e.channel() & 15) as usize;
+                    match e {
+                        MidiEvent::NoteOn { key, velocity, .. } if velocity > 0 => {
+                            self.midi.held[ch] |= 1u128 << (key & 127);
+                        }
+                        MidiEvent::NoteOn { key, .. } | MidiEvent::NoteOff { key, .. } => {
+                            self.midi.held[ch] &= !(1u128 << (key & 127));
+                        }
+                        _ => {}
+                    }
+                    if self.midi.step.is_some() {
+                        self.step_input_event(e);
+                    }
+                }
             }
             self.handle_midi_controls(&events);
             self.revision += 1;
@@ -580,15 +960,15 @@ impl Session {
                 }
                 continue;
             }
-            let mapped: Vec<MappingTarget> = self
+            let mapped: Vec<MidiMapping> = self
                 .project
                 .midi_mappings
                 .iter()
                 .filter(|m| m.source.matches(port_key.as_deref(), channel, control))
-                .map(|m| m.target)
+                .cloned()
                 .collect();
-            for target in mapped {
-                match target {
+            for m in mapped {
+                match m.target {
                     MappingTarget::Transport { control: tc } => {
                         if pressed {
                             transport.push(tc);
@@ -599,9 +979,49 @@ impl Session {
                             self.is_toggle_target(&MappingTarget::Parameter { track, target });
                         if toggle && matches!(control, MidiControl::Note { .. }) {
                             toggles.push((track, target));
-                        } else {
+                            continue;
+                        }
+                        // Where the parameter is now (pending moves of this
+                        // tick included), as a lane position.
+                        let current = values
+                            .iter()
+                            .find(|(t, a, _)| *t == track && *a == target)
+                            .map(|(_, _, v)| *v)
+                            .or_else(|| {
+                                let p = self.automation_param(track, target)?;
+                                Some(p.to_normal(self.display_value(track, target)?))
+                            })
+                            .unwrap_or(0.0);
+                        let next = match (m.mode, control) {
+                            (mode, MidiControl::Cc { .. }) if mode.is_relative() => {
+                                let ticks = mode.ticks((value * 127.0).round() as u8);
+                                // 1/128 of the range per encoder tick.
+                                Some((current + ticks as f64 / 128.0).clamp(0.0, 1.0))
+                            }
+                            (faderframe_project::MappingMode::Pickup, _) => {
+                                let (picked, last) = self
+                                    .midi
+                                    .pickup
+                                    .get(&m.id)
+                                    .copied()
+                                    .unwrap_or((false, -1.0));
+                                // Moved elsewhere since we last set it: pick
+                                // it up again.
+                                let picked = picked && (current - last).abs() < 0.01;
+                                let near = (value - current).abs() < 0.03;
+                                if picked || near {
+                                    self.midi.pickup.insert(m.id, (true, value));
+                                    Some(value)
+                                } else {
+                                    self.midi.pickup.insert(m.id, (false, last));
+                                    None
+                                }
+                            }
+                            _ => Some(value),
+                        };
+                        if let Some(n) = next {
                             values.retain(|(t, a, _)| !(*t == track && *a == target));
-                            values.push((track, target, value));
+                            values.push((track, target, n));
                         }
                     }
                 }
@@ -640,7 +1060,12 @@ impl Session {
         );
         commands.push(Command::AddMidiMapping {
             index: usize::MAX,
-            mapping: MidiMapping { id, source, target },
+            mapping: MidiMapping {
+                id,
+                source,
+                target,
+                mode: faderframe_project::MappingMode::Absolute,
+            },
         });
         match self.edit(Command::Batch {
             label: "MIDI Learn".into(),
@@ -832,12 +1257,19 @@ impl Session {
                 continue;
             };
             let mut notes = take.notes[i].clone();
+            let mut ccs = take.controllers[i].clone();
+            let last_pass = notes
+                .iter()
+                .map(|n| n.pass)
+                .chain(ccs.iter().map(|c| c.4))
+                .max();
             if self.record.loop_mode == crate::LoopRecordMode::LastPass
-                && let Some(last) = notes.iter().map(|n| n.pass).max()
+                && let Some(last) = last_pass
             {
                 notes.retain(|n| n.pass == last);
+                ccs.retain(|c| c.4 == last);
             }
-            if notes.is_empty() {
+            if notes.is_empty() && ccs.is_empty() {
                 continue;
             }
             notes.sort_by_key(|n| (n.start, n.key));
@@ -845,8 +1277,18 @@ impl Session {
                 notes.iter().map(|_| self.project.ids.allocate()).collect();
             let to_musical = |s: i64| self.engine.samples_to_musical(&self.project, s.max(0));
             let meter = &self.project.timeline.meter;
-            let first = notes.iter().map(|n| n.start).min().unwrap_or(0);
-            let last = notes.iter().map(|n| n.end).max().unwrap_or(first);
+            let first = notes
+                .iter()
+                .map(|n| n.start)
+                .chain(ccs.iter().map(|c| c.0))
+                .min()
+                .unwrap_or(0);
+            let last = notes
+                .iter()
+                .map(|n| n.end)
+                .chain(ccs.iter().map(|c| c.0))
+                .max()
+                .unwrap_or(first);
             let start = meter.bar_start(meter.bar_at(to_musical(first)));
             let end = meter.bar_start(meter.bar_at(to_musical(last)) + 1);
             let midi_notes: Vec<MidiNote> = notes
@@ -861,9 +1303,32 @@ impl Session {
                         key: n.key,
                         velocity: n.velocity.max(1),
                         channel: n.channel,
+                        muted: false,
                     }
                 })
                 .collect();
+            // Controller moves become lanes (one per controller and channel).
+            let mut lanes: Vec<faderframe_project::ControllerLane> = Vec::new();
+            for &(pos, c, ch, v, _) in &ccs {
+                let time = (to_musical(pos) - start).max(faderframe_timeline::MusicalTime::ZERO);
+                let i = match lanes
+                    .iter()
+                    .position(|l| l.controller == c && l.channel == ch)
+                {
+                    Some(i) => i,
+                    None => {
+                        lanes.push(faderframe_project::ControllerLane::new(c, ch));
+                        lanes.len() - 1
+                    }
+                };
+                lanes[i]
+                    .points
+                    .push(faderframe_project::ControllerPoint { time, value: v });
+            }
+            for l in &mut lanes {
+                l.normalize();
+            }
+            lanes.sort_by_key(|l| (l.controller, l.channel));
             if self.record.mode == crate::RecordMode::Replace {
                 commands.extend(crate::record::carve_midi(
                     &mut self.project,
@@ -890,6 +1355,7 @@ impl Session {
                     content: ClipContent::Midi(MidiClip {
                         length: end - start,
                         notes: midi_notes,
+                        controllers: lanes,
                     }),
                 }),
             });

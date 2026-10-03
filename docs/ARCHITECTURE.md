@@ -237,8 +237,34 @@ expressions are planned as additional event types.
   Mapped values go through the same `Command`s as the mouse inside a
   gesture that closes after 400 ms of rest — one undo step per twist, and
   Touch/Latch automation writing records controller moves. Mapping
-  commands are undoable and saved with the project. Mapped controls also
-  still reach a live instrument (pass-through).
+  commands are undoable and saved with the project. Modes
+  (`MappingMode`): absolute, soft takeover (the parameter follows only once
+  the control reaches it, and again after the mouse moved it) and three
+  relative-encoder encodings. Mapped controls are *consumed*: an atomic
+  bitmap per port and channel (`ConsumedControls`) keeps them from
+  instruments and recordings.
+* **Controllers in clips.** `MidiClip::controllers` holds step lanes per
+  controller and channel (CC, pitch bend, channel pressure). Recording puts
+  controller moves there; playback sends them with the notes (at equal
+  times: note-offs, controllers, note-ons). The clip player *chases*:
+  starting or jumping mid-clip first sends each controller's current value,
+  and on stop or jump moved controllers return to rest (pedals up, bend
+  centred). Splitting a clip carries the values across the cut. MPE input
+  passes through with its channels and records as per-channel lanes.
+* **Auditioning and step input.** The editor plays notes on a track's
+  instrument through a reserved port (`AUDITION_PORT`) that the track's
+  `MidiInputNode` takes whatever its live state, never recorded. Step input
+  turns MIDI-keyboard notes (via the control feed) into notes at a cursor
+  of the open clip — overlapping keys make a chord, the release advances.
+* **MIDI output.** `Track::midi_output` sends a MIDI track (clips and live
+  input, optionally on another channel) to an external device. Output
+  nodes have the graph role `EventOutput`; after each chunk the processor
+  reads them and queues messages stamped with the time this callback's
+  audio is heard (buffer + output latency). `faderframe-midi-io::MidiOutputs`
+  runs a sender thread that orders them by due time and sends each when
+  due (ALSA via midir; virtual capture outputs for tests). MIDI clock (24
+  ppqn, Start/Continue with Song Position, Stop, re-sync on loop wraps) is
+  generated on the audio thread for the outputs selected in preferences.
 
 ## 8. Plugins
 
@@ -522,6 +548,32 @@ HiDPI and fractional scaling are handled entirely by GTK; views never assume
 96 DPI. On Wayland the app is a native Wayland client (the status bar shows
 the GDK backend).
 
+### Piano roll
+
+`faderframe-view-pianoroll` edits the clip in `Session::editor_clip`:
+toolbar (tools, grid and snap, note length, default velocity, scale, fold,
+chord, quantize and its settings, ghost notes, audition, step input,
+inspector with numeric velocity entry), ruler (bars, loop, clip-end handle,
+step cursor, playhead; click/drag locates), keyboard (names, scale and root
+marks, live keys of the input when the track is live, click/drag to
+listen), note grid and the lane below (velocity stems and line ramps, or a
+controller lane per controller and channel: freehand, Shift = line, Alt =
+erase). Tools: select (rubber band, double-click adds), draw (drag sets the
+length; chords stamp the chosen chord, scale-aware), erase and mute
+(sweep), split. Dragging notes previews and commits once on release
+(`NoteOp::Move` / `Resize`, Alt copies via `DuplicateNotes`, Shift skips
+snap, auto-scroll at the edges). Keys: Delete, Ctrl+A/C/X/V/D/L, Q, M,
+arrows (Shift: octave or fine; Ctrl+arrows: length; in-scale transposing
+with scale snap), 1–5 tools, +/−/F zoom, Esc. Ctrl+wheel zooms time,
+Ctrl+Shift+wheel the rows; folding shows only scale or used keys. The
+musical settings (`PianoRollSettings`: scale, chord, length, velocity,
+fold, quantize, lane, ghosts, audition) live in `EditorSettings`; every
+edit is a session `Action` (`NoteOperation`, `AddNotes`, `AddChord`,
+`DuplicateNotes`, `SplitNotes`, `PasteNotes`, `SetControllerPoints`, …) —
+one undo step each, ids allocated by the session. Pure note operations
+(quantize with strength/swing/ends, humanize, legato, reverse, invert,
+velocity ramps, scales and chords) are in `faderframe_project::midi_ops`.
+
 ### Docking
 
 `faderframe_workspace` models layouts independently of GTK: per window a tree
@@ -638,15 +690,20 @@ MIDI keyboards and controllers: device management with hotplug, live play
 with constant-latency scheduling, MIDI recording into clips, MIDI learn for
 every automatable parameter and transport functions.
 
-Requested next: a best-in-class piano roll; VST3 hosting after that.
+Piano roll (see §11) and the rest of the MIDI work: controller lanes in
+clips (recorded, edited, chased), MIDI output to external devices with MIDI
+clock, soft takeover and relative encoders, consumed mapped controls,
+auditioning, step input, sustain/bend/vibrato in the built-in synth.
+
+Requested next: VST3 hosting.
 
 Next, in order:
 
 1. ~~CLAP hosting~~ (done; still open: writing automation from plugin GUI
    gestures, note expressions, plugin-side preset browsing).
-2. ~~MIDI input, live play, MIDI learn~~ (done; still open: MIDI output to
-   external devices, MIDI clock/MTC, MPE, relative encoders and soft
-   takeover, consuming mapped controls instead of passing them through).
+2. ~~MIDI input and output, live play, MIDI learn, MIDI clock~~ (done;
+   still open: MTC and incoming clock sync, editing per-note MPE
+   expression, SysEx).
 3. ~~Automation lanes~~ (done) in the arranger, sample-accurate parameter events.
 4. Dependency-aware multicore scheduler.
 5. VST3, PipeWire-native backend, Windows and macOS ports.

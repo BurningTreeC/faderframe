@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 faderframe-core.workspace = true
+faderframe-midi.workspace = true
 faderframe-timeline.workspace = true
 faderframe-automation.workspace = true
 faderframe-workspace.workspace = true

@@ -30,6 +30,9 @@ pub enum NodeRole {
     /// The driver copies its first audio input to device output channels
     /// starting at `first_channel` after the graph runs.
     DeviceOutput { first_channel: u16 },
+    /// The driver sends its first event output to MIDI output `port` after
+    /// the graph runs.
+    EventOutput { port: u16 },
 }
 
 /// Port configuration and metadata of a node.

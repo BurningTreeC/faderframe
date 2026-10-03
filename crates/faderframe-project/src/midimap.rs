@@ -109,11 +109,83 @@ pub enum MappingTarget {
     },
 }
 
+/// How a control's values drive the target.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MappingMode {
+    /// The parameter jumps to the control's position.
+    #[default]
+    Absolute,
+    /// Soft takeover: the parameter follows only once the control has
+    /// reached its current value (no jumps after the mouse moved it).
+    Pickup,
+    /// Endless encoder, 1–63 up / 65–127 down (two's complement, 127 = −1).
+    RelativeTwosComplement,
+    /// Endless encoder around 64 (65 = +1, 63 = −1).
+    RelativeBinaryOffset,
+    /// Endless encoder, bit 6 = down (1 = +1, 65 = −1).
+    RelativeSignMagnitude,
+}
+
+impl MappingMode {
+    pub const ALL: [MappingMode; 5] = [
+        MappingMode::Absolute,
+        MappingMode::Pickup,
+        MappingMode::RelativeTwosComplement,
+        MappingMode::RelativeBinaryOffset,
+        MappingMode::RelativeSignMagnitude,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MappingMode::Absolute => "Absolute",
+            MappingMode::Pickup => "Soft Takeover",
+            MappingMode::RelativeTwosComplement => "Relative (2's complement)",
+            MappingMode::RelativeBinaryOffset => "Relative (offset 64)",
+            MappingMode::RelativeSignMagnitude => "Relative (sign bit)",
+        }
+    }
+
+    pub fn is_relative(self) -> bool {
+        matches!(
+            self,
+            MappingMode::RelativeTwosComplement
+                | MappingMode::RelativeBinaryOffset
+                | MappingMode::RelativeSignMagnitude
+        )
+    }
+
+    /// Encoder ticks of a relative CC value (0 for absolute modes).
+    pub fn ticks(self, value: u8) -> i32 {
+        let v = (value & 127) as i32;
+        match self {
+            MappingMode::RelativeTwosComplement => {
+                if v < 64 {
+                    v
+                } else {
+                    v - 128
+                }
+            }
+            MappingMode::RelativeBinaryOffset => v - 64,
+            MappingMode::RelativeSignMagnitude => {
+                if v & 64 != 0 {
+                    -(v & 63)
+                } else {
+                    v & 63
+                }
+            }
+            _ => 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MidiMapping {
     pub id: MidiMappingId,
     pub source: MidiSource,
     pub target: MappingTarget,
+    #[serde(default)]
+    pub mode: MappingMode,
 }
 
 #[cfg(test)]
@@ -153,8 +225,22 @@ mod tests {
             target: MappingTarget::Transport {
                 control: TransportControl::PlayStop,
             },
+            mode: MappingMode::Absolute,
         };
         let json = serde_json::to_string(&m).unwrap();
         assert_eq!(serde_json::from_str::<MidiMapping>(&json).unwrap(), m);
+    }
+
+    #[test]
+    fn relative_encodings() {
+        use MappingMode::*;
+        assert_eq!(RelativeTwosComplement.ticks(1), 1);
+        assert_eq!(RelativeTwosComplement.ticks(127), -1);
+        assert_eq!(RelativeTwosComplement.ticks(120), -8);
+        assert_eq!(RelativeBinaryOffset.ticks(65), 1);
+        assert_eq!(RelativeBinaryOffset.ticks(60), -4);
+        assert_eq!(RelativeSignMagnitude.ticks(3), 3);
+        assert_eq!(RelativeSignMagnitude.ticks(67), -3);
+        assert_eq!(Absolute.ticks(100), 0);
     }
 }
