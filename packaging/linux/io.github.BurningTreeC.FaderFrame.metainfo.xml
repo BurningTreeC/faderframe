@@ -67,6 +67,19 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.2.0" date="2026-10-04">
+      <description>
+        <p>Plugins, performance and mastering.</p>
+        <ul>
+          <li>Sandboxed plugins: each CLAP, VST3 or Audio Unit instance can run in a process of its own on Linux, Windows and macOS; a crash no longer takes FaderFrame down.</li>
+          <li>VST3 program lists, 64-bit plugin processing, SysEx to plugins, native per-note expression for CLAP and VST3.</li>
+          <li>Render-ahead: tracks nobody plays live are processed ahead of the playhead on threads of their own; DSP workers at realtime priority everywhere and in the audio device's workgroup on macOS.</li>
+          <li>Mastering: loudness normalisation, true-peak limiting and noise-shaped dither on export; the album with per-song or album levelling, crossfades, a song's own inserts, ISRC/UPC and credits, a cue sheet and a verified DDP 2.00 CD master with CD-Text.</li>
+          <li>Editing: Quantize and Humanize for audio and MIDI, moving and copying song sections with their content, an Automation tab.</li>
+          <li>Portable mode on every platform and a portable Linux tarball.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-10-04">
       <description>
         <p>First packaged release.</p>
