@@ -1,8 +1,9 @@
 //! FaderFrame's own icons: the symbolic ones and the application icon. They
-//! are written to a cache directory that is added to the icon theme's
-//! search path, so GTK recolours the symbolic ones like the stock icons and
-//! windows show the application icon even when FaderFrame is not
-//! installed.
+//! are written into a `hicolor` theme folder in a cache directory that is
+//! added to the icon theme's search path, so GTK recolours the symbolic ones
+//! like the stock icons and windows show the application icon even when
+//! FaderFrame is not installed. (GTK before 4.16 does not recolour loose
+//! `-symbolic` files on the search path: they must be in a theme.)
 
 use gtk::gdk;
 use gtk::prelude::*;
@@ -23,23 +24,45 @@ const ICONS: &[(&str, &str)] = &[
     (crate::APP_ID, APP_ICON),
 ];
 
+/// Used only where the system has no hicolor theme: search paths added by
+/// the program come last, so an installed theme's index wins.
+const HICOLOR_INDEX: &str = "[Icon Theme]
+Name=Hicolor
+Comment=Fallback icon theme
+Directories=scalable/apps
+
+[scalable/apps]
+Size=16
+MinSize=1
+MaxSize=512
+Type=Scalable
+";
+
+/// Write `contents` to `path` unless it holds them already.
+fn write_if_changed(path: &std::path::Path, contents: &str) {
+    if std::fs::read_to_string(path).ok().as_deref() != Some(contents)
+        && let Err(e) = std::fs::write(path, contents)
+    {
+        tracing::warn!("cannot write {}: {e}", path.display());
+    }
+}
+
 /// Write the icons and register their directory (once, at start-up).
 pub fn install() {
     let Some(display) = gdk::Display::default() else {
         return;
     };
     let dir = crate::paths::cache_dir().join("icons");
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        tracing::warn!("cannot create {}: {e}", dir.display());
+    let apps = dir.join("hicolor").join("scalable").join("apps");
+    if let Err(e) = std::fs::create_dir_all(&apps) {
+        tracing::warn!("cannot create {}: {e}", apps.display());
         return;
     }
+    write_if_changed(&dir.join("hicolor").join("index.theme"), HICOLOR_INDEX);
     for (name, svg) in ICONS {
-        let path = dir.join(format!("{name}.svg"));
-        if std::fs::read_to_string(&path).ok().as_deref() != Some(*svg)
-            && let Err(e) = std::fs::write(&path, svg)
-        {
-            tracing::warn!("cannot write {}: {e}", path.display());
-        }
+        write_if_changed(&apps.join(format!("{name}.svg")), svg);
+        // Earlier versions wrote them loose into the search path.
+        let _ = std::fs::remove_file(dir.join(format!("{name}.svg")));
     }
     gtk::IconTheme::for_display(&display).add_search_path(&dir);
     gtk::Window::set_default_icon_name(crate::APP_ID);
