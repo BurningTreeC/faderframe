@@ -41,6 +41,8 @@ mod imp {
         /// The scrollbars (their margins follow the view's scrolled area).
         pub hbar: RefCell<Option<gtk::Scrollbar>>,
         pub vbar: RefCell<Option<gtk::Scrollbar>>,
+        /// The bars lie over the canvas: they also keep clear of each other.
+        pub overlaid: Cell<bool>,
         pub syncing: Cell<bool>,
     }
 
@@ -628,8 +630,29 @@ impl CanvasWidget {
                 ScrollAxis::Horizontal => imp.hbar.borrow().clone(),
                 ScrollAxis::Vertical => imp.vbar.borrow().clone(),
             };
+            if let Some(bar) = &bar
+                && imp.overlaid.get()
+            {
+                let needed = info.is_some_and(|i| i.content > i.viewport + 1.0);
+                if bar.is_visible() != needed {
+                    bar.set_visible(needed);
+                }
+            }
             if let (Some(bar), Some(i)) = (bar, info) {
-                let (start, end) = (i.start.round() as i32, i.end.round() as i32);
+                // Over the canvas the two bars meet in the bottom-right
+                // corner: the horizontal one stops at the vertical one.
+                let corner = if imp.overlaid.get() && axis == ScrollAxis::Horizontal {
+                    imp.vbar
+                        .borrow()
+                        .as_ref()
+                        .filter(|v| {
+                            v.is_visible() && v.adjustment().upper() > v.adjustment().page_size()
+                        })
+                        .map_or(0.0, |v| v.width() as f32)
+                } else {
+                    0.0
+                };
+                let (start, end) = (i.start.round() as i32, (i.end + corner).round() as i32);
                 match axis {
                     ScrollAxis::Horizontal => {
                         if bar.margin_start() != start {
@@ -757,6 +780,37 @@ impl ViewHost {
             bar
         });
         canvas.bind_scrollbars(hbar, vbar);
+        Self { root, canvas }
+    }
+
+    /// A host whose scrollbars lie over the view's edges instead of beside
+    /// it: the view paints the whole area (the arranger's header column runs
+    /// down to the bottom, its ruler to the right edge) and the bars cover
+    /// only the scrolled part, inset by the view's `ScrollInfo`.
+    pub fn overlaid(app: &Rc<AppState>, view: DynView) -> Self {
+        let canvas = CanvasWidget::new(app, view);
+        let root = gtk::Grid::new();
+        root.set_hexpand(true);
+        root.set_vexpand(true);
+        let overlay = gtk::Overlay::new();
+        overlay.set_hexpand(true);
+        overlay.set_vexpand(true);
+        overlay.set_child(Some(&canvas));
+        let hbar = gtk::Scrollbar::new(
+            gtk::Orientation::Horizontal,
+            Some(&gtk::Adjustment::new(0.0, 0.0, 0.0, 1.0, 1.0, 0.0)),
+        );
+        hbar.set_valign(gtk::Align::End);
+        let vbar = gtk::Scrollbar::new(
+            gtk::Orientation::Vertical,
+            Some(&gtk::Adjustment::new(0.0, 0.0, 0.0, 1.0, 1.0, 0.0)),
+        );
+        vbar.set_halign(gtk::Align::End);
+        overlay.add_overlay(&hbar);
+        overlay.add_overlay(&vbar);
+        root.attach(&overlay, 0, 0, 1, 1);
+        canvas.imp().overlaid.set(true);
+        canvas.bind_scrollbars(Some(hbar), Some(vbar));
         Self { root, canvas }
     }
 }

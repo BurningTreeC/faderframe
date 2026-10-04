@@ -36,11 +36,9 @@ pub struct DockState {
 fn create_view(app: &Rc<AppState>, kind: ViewKind) -> ViewHost {
     let theme = app.theme.borrow().clone();
     let host = match kind {
-        ViewKind::Arranger => ViewHost::new(
+        ViewKind::Arranger => ViewHost::overlaid(
             app,
             Box::new(faderframe_view_arranger::ArrangerView::new(theme)),
-            true,
-            true,
         ),
         ViewKind::Mixer => ViewHost::new(
             app,
