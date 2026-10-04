@@ -1,0 +1,4 @@
+# macOS: room in the binary's header for the longer library paths the app
+# bundle rewrites them to (packaging/macos/bundle_dylibs.py).
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "link-arg=-Wl,-headerpad_max_install_names"]

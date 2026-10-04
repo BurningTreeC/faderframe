@@ -45,7 +45,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: System dependencies
-        run: brew install gtk4 adwaita-icon-theme librsvg dylibbundler pkgconf
+        run: brew install gtk4 adwaita-icon-theme librsvg pkgconf
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
         run: cargo build --release -p faderframe-app

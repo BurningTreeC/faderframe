@@ -59,7 +59,9 @@ dense views.
 application icon (SVG; `icons.py` makes `.ico`/`.icns` from it), the
 desktop entry, AppStream metadata and MIME type with a Linux install
 script, the Flatpak manifest, the macOS app bundle and DMG script (GTK
-bundled with dylibbundler, a launcher pointing GTK at the bundle's data)
+bundled by `bundle_dylibs.py`, which copies every non-system library and
+rewrites the install names, resolving `@rpath` like dyld; a launcher
+pointing GTK at the bundle's data)
 and the Windows bundle script with its Inno Setup installer. The *Release*
 workflow runs them for `v*` tags.
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Build dist/FaderFrame.app and dist/FaderFrame-<version>-macos-<arch>.dmg
 # from a release build, with Homebrew's GTK 4 and its dependencies copied
-# into the bundle (dylibbundler rewrites the library paths).
+# into the bundle (bundle_dylibs.py rewrites the library paths).
 #
-#   brew install gtk4 adwaita-icon-theme librsvg dylibbundler pkgconf
+#   brew install gtk4 adwaita-icon-theme librsvg pkgconf
 #   cargo build --release -p faderframe-app
 #   packaging/macos/bundle.sh
 #
@@ -56,12 +56,8 @@ if [ ${#loaders[@]} -gt 0 ]; then
 fi
 
 # Every non-system library the binary and the loaders use.
-extra=()
-for so in "$loader_dir"/loaders/*.so; do
-    extra+=(-x "$so")
-done
-dylibbundler -of -b -cd -ns -x "$contents/MacOS/faderframe" "${extra[@]}" \
-    -d "$contents/Frameworks" -p @executable_path/../Frameworks/
+python3 packaging/macos/bundle_dylibs.py "$contents/Frameworks" \
+    "$contents/MacOS/faderframe" "$loader_dir"/loaders/*.so
 
 # Ad-hoc signatures (install_name_tool invalidated the original ones).
 find "$contents/Frameworks" "$loader_dir/loaders" -type f \( -name '*.dylib' -o -name '*.so' \) \
