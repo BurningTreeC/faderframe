@@ -957,6 +957,99 @@ fn the_stock_devices_do_not_allocate() {
             0,
             (-50.0, -10.0),
         ),
+        (
+            builtin::SATURATOR,
+            vec![
+                set(1, 1.0),
+                set(2, 0.4),
+                set(3, 0.5),
+                set(7, 3.0),
+                set(8, 80.0),
+                set(9, 9_000.0),
+                set(4, 0.6),
+            ],
+            false,
+            0,
+            (0.0, 30.0),
+        ),
+        (
+            builtin::SATURATOR,
+            vec![set(1, 4.0), set(7, 0.0), set(6, 0.0)],
+            false,
+            1,
+            (0.0, 5.0),
+        ),
+        (
+            builtin::GAIN,
+            vec![
+                set(3, 1.0),
+                set(5, 1.0),
+                set(7, 3.0),
+                set(8, 1.0),
+                set(1, -0.3),
+            ],
+            false,
+            2,
+            (0.0, 2.0),
+        ),
+        (builtin::GAIN, vec![set(9, 0.0)], false, 3, (0.0, 1.0)),
+        (
+            builtin::ECHO,
+            vec![
+                set(9, 0.5),
+                set(10, 0.6),
+                set(12, 0.7),
+                set(15, 1.0),
+                set(8, 200.0),
+                set(7, 0.2),
+            ],
+            false,
+            0,
+            (20.0, 800.0),
+        ),
+        (
+            builtin::ECHO,
+            vec![set(5, 1.0), set(4, 2.0), set(15, 2.0), set(14, 1.0)],
+            false,
+            1,
+            (0.2, 1.05),
+        ),
+        (
+            builtin::REVERB,
+            vec![set(0, 2.0), set(15, 0.5), set(11, 200.0), set(12, 6_000.0)],
+            false,
+            1,
+            (0.0, 1.0),
+        ),
+        (
+            builtin::REVERB,
+            vec![set(0, 4.0), set(14, 1.0)],
+            false,
+            2,
+            (0.2, 8.0),
+        ),
+        (
+            builtin::MODULATION,
+            vec![set(0, 3.0), set(5, 0.6), set(8, 5.0)],
+            false,
+            4,
+            (0.0, 1.0),
+        ),
+        (
+            builtin::MODULATION,
+            vec![set(0, 1.0), set(2, 1.0)],
+            false,
+            6,
+            (2.0, 20.0),
+        ),
+        (
+            builtin::MODULATION,
+            vec![set(0, 2.0), set(5, -0.7), set(11, 5.0)],
+            false,
+            1,
+            (0.1, 8.0),
+        ),
+        (builtin::TUNER, vec![set(1, 1.0)], false, 0, (430.0, 450.0)),
     ];
     let mut ids = Vec::new();
     for (i, (plugin, parameters, keyed, target, (lo, hi))) in devices.into_iter().enumerate() {
@@ -1024,6 +1117,6 @@ fn the_stock_devices_do_not_allocate() {
     });
     assert_eq!(allocs, 0, "allocations in the stock devices");
     for t in &taps {
-        assert!(t.output.written() > 0, "an editor's rings were fed");
+        assert!(t.input.written() > 0, "an editor's rings were fed");
     }
 }

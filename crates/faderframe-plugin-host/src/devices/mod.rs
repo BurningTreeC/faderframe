@@ -8,10 +8,16 @@
 
 pub mod compressor;
 pub mod deesser;
+pub mod delay;
 pub mod gate;
 pub mod limiter;
+pub mod modulation;
+pub mod reverb;
 #[cfg(test)]
 pub(crate) mod rig;
+pub mod saturator;
+pub mod tuner;
+pub mod utility;
 
 use crate::{ParameterInfo, ParameterUnit};
 use faderframe_core::ParameterId;

@@ -156,6 +156,11 @@ Contrast:
   sidechain), a true-peak lookahead limiter that never passes its ceiling,
   a gate/expander/ducker with hysteresis and hold, and a split-band
   de-esser with relative detection.
+* Stock effects: an oversampled saturator (six curves), a utility (width,
+  balance, mono bass, polarity, channel modes, vectorscope), a tempo-synced
+  delay (ping-pong, tape and analog styles, freeze, ducking), an
+  algorithmic reverb (five types, 16-line network, frequency-dependent
+  decay), chorus/ensemble/flanger/phaser/vibrato, and a tuner.
 * EQ in the spirit of FabFilter Pro-Q 4: 24 bands (bell, shelves, cuts of
   any slope from 0 to 96 dB/oct and brickwall, notch, band pass, tilt, flat
   tilt, all pass) whose curves keep their analog shape up to Nyquist; zero
@@ -217,7 +222,7 @@ Contrast:
   armed and live tracks, tracks with a plugin editor open, faders and
   sends stay immediate. With 64 tracks of six effects at 64-frame buffers
   the audio thread's worst callback went from 1.3 ms to 81 µs.
-* Plugins: built-in synth/echo/gain, EQ, Program EQ and the stock dynamics, CLAP and VST3 effects and
+* Plugins: built-in synth, EQ, Program EQ and the stock devices, CLAP and VST3 effects and
   instruments on every platform and Audio Units on macOS, found by a
   crash-safe background scan (Audio Units: the system's registry) and
   picked in a plugin browser (click an

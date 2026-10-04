@@ -82,8 +82,8 @@ fn registry_lists_and_instantiates_builtins() {
 fn state_round_trip_and_parameter_clamping() {
     let f = BuiltinFactory;
     let mut a = f.instantiate(builtin::ECHO).unwrap();
-    a.set_parameter(ParameterId(1), 5.0).unwrap(); // clamped to 0.95
-    assert!((a.parameter(ParameterId(1)).unwrap() - 0.95).abs() < 1e-6);
+    a.set_parameter(ParameterId(1), 5.0).unwrap(); // clamped to 1.1
+    assert!((a.parameter(ParameterId(1)).unwrap() - 1.1).abs() < 1e-6);
     a.set_parameter(ParameterId(0), 250.0).unwrap();
     let state = a.save_state().unwrap();
     let mut b = f.instantiate(builtin::ECHO).unwrap();

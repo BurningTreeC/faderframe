@@ -387,7 +387,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-    use crate::devices::rig::{Rig, SR, level, silence, tone};
+    use crate::devices::rig::{Rig, SR, bin_db, level, silence, tone};
 
     fn rig(set: &[(u32, f64)]) -> Rig<DeesserProcessor> {
         Rig::with(parameters(), TAP_VALUES, set, DeesserProcessor::new)
@@ -403,18 +403,6 @@ mod tests {
         }
     }
 
-    fn band_level(x: &[f32], f: f64) -> f64 {
-        // The component at f (DFT over the tail).
-        let tail = &x[x.len() / 2..];
-        let w = std::f64::consts::TAU * f / SR;
-        let (mut re, mut im) = (0.0, 0.0);
-        for (k, v) in tail.iter().enumerate() {
-            re += f64::from(*v) * (w * k as f64).cos();
-            im += f64::from(*v) * (w * k as f64).sin();
-        }
-        20.0 * (2.0 * re.hypot(im) / tail.len() as f64).log10()
-    }
-
     #[test]
     fn split_mode_takes_the_sibilance_and_leaves_the_voice() {
         let mut r = rig(&[
@@ -423,8 +411,8 @@ mod tests {
             (id::RANGE, 10.0),
         ]);
         let (l, _) = r.run(1.0, voice(0.3), silence);
-        let ess = band_level(&l, 7_500.0);
-        let body = band_level(&l, 300.0);
+        let ess = bin_db(&l, 7_500.0);
+        let body = bin_db(&l, 300.0);
         assert!(ess < 20.0 * 0.3f64.log10() - 7.0, "sibilance: {ess:.2}");
         assert!(
             (body - 20.0 * 0.3f64.log10()).abs() < 0.3,
@@ -442,11 +430,11 @@ mod tests {
             (id::RANGE, 10.0),
         ]);
         let (l, _) = r.run(1.0, voice(0.3), silence);
-        let body = band_level(&l, 300.0);
+        let body = bin_db(&l, 300.0);
         assert!(body < 20.0 * 0.3f64.log10() - 7.0, "body: {body:.2}");
         let mut r = rig(&[(id::DETECTION, 1.0), (id::THRESHOLD, -30.0)]);
         let (l, _) = r.run(1.0, voice(0.005), silence);
-        assert!((band_level(&l, 7_500.0) - 20.0 * 0.005f64.log10()).abs() < 0.3);
+        assert!((bin_db(&l, 7_500.0) - 20.0 * 0.005f64.log10()).abs() < 0.3);
     }
 
     #[test]
@@ -480,9 +468,9 @@ mod tests {
     fn listening_plays_the_band() {
         let mut r = rig(&[(id::LISTEN, 1.0)]);
         let (l, _) = r.run(0.5, voice(0.3), silence);
-        assert!(band_level(&l, 300.0) < -40.0, "{}", band_level(&l, 300.0));
+        assert!(bin_db(&l, 300.0) < -40.0, "{}", bin_db(&l, 300.0));
         // 7.5 kHz is close over the 6.5 kHz edge (24 dB/oct).
-        let ess = band_level(&l, 7_500.0) - 20.0 * 0.3f64.log10();
+        let ess = bin_db(&l, 7_500.0) - 20.0 * 0.3f64.log10();
         assert!(ess < 0.1 && ess > -4.0, "{ess}");
         let mut r = rig(&[
             (id::LISTEN, 1.0),
@@ -490,7 +478,7 @@ mod tests {
             (id::FREQUENCY, 7_500.0),
         ]);
         let (l, _) = r.run(0.5, voice(0.3), silence);
-        assert!((band_level(&l, 7_500.0) - 20.0 * 0.3f64.log10()).abs() < 0.3);
+        assert!((bin_db(&l, 7_500.0) - 20.0 * 0.3f64.log10()).abs() < 0.3);
         let _ = (level(&l, 300.0), tone(1.0, 0.0));
     }
 }

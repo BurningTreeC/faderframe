@@ -718,14 +718,8 @@ impl<F: Face> DeviceView<F> {
         }
         if info.automatable {
             items.push(
-                MenuItem::new(
-                    "Show Automation",
-                    Action::ShowAutomation {
-                        track,
-                        target,
-                    },
-                )
-                .separated(),
+                MenuItem::new("Show Automation", Action::ShowAutomation { track, target })
+                    .separated(),
             );
             items.push(MenuItem::new(
                 "Learn MIDI Controller",

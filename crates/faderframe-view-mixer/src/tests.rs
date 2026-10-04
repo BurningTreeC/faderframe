@@ -180,7 +180,7 @@ fn routing_and_insert_clicks_open_menus() {
         panic!("expected the insert menu");
     };
     assert_eq!(items[0].label, "Browse Plugins…");
-    assert!(items.iter().any(|i| i.label.contains("Echo")));
+    assert!(items.iter().any(|i| i.label.contains("Delay")));
 }
 
 #[test]

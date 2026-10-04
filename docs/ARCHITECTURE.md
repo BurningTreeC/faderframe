@@ -538,10 +538,11 @@ handles RPN 0 bend range, the MPE zone message, pressure and CC 74).
 
 Neither trait assumes the plugin is in-process; a sandboxed plugin is a proxy
 pair speaking IPC with shared-memory audio (see *Sandboxed plugins* below).
-`PluginHost` (engine) owns one instance per slot. Built-ins: synth, echo, gain, latency probe
-(used to test PDC end to end), the EQ, the Program EQ and the stock
-dynamics — compressor, limiter, gate and de-esser (see *Built-in
-devices*). Failed plugins
+`PluginHost` (engine) owns one instance per slot. Built-ins: synth, latency probe (used to
+test PDC end to end), the EQ, the Program EQ and the stock devices —
+compressor, limiter, gate, de-esser, saturator, utility (id
+`faderframe.gain`), delay (id `faderframe.echo`), reverb, modulation and
+tuner (see *Built-in devices*). Failed plugins
 are bypassed and flagged; missing formats pass audio through with a
 warning.
 
@@ -708,6 +709,55 @@ covered by `the_stock_devices_do_not_allocate`.
   release, link, lookahead, listen. Editor: the spectrum with the
   detector's band and the cut it makes now (drag the frequency, wheel the
   width) and a history.
+* **Saturator** (`devices::saturator`): low cut → drive → one of six
+  curves of unit slope at zero (soft `tanh`, tape arctangent with a head
+  bump and high-frequency loss, asymmetric tube, transistor's hard knee,
+  sine fold, hard clip) with bias, run at 1–8× through the halfband
+  oversampler (latency, the dry signal held back as long) → DC blocker →
+  tilt round 1 kHz → high cut; auto gain is static (what the curve does to
+  a −12 dBFS sine), so the curve's dynamics stay. Editor: the curve as set
+  with the input's reach and the spectrum in and out.
+* **Utility** (`devices::utility`, the built-in Gain's id and parameter
+  0): one ramped 2 × 2 matrix for channel choice (stereo, left, right,
+  swap, mid, side), polarity, width, balance, gain and mute — at rest the
+  identity times the gain, so old projects sound the same — plus a DC
+  filter and mono bass (Linkwitz–Riley split of the side; the mid through
+  the same crossover's all pass, so above it both stay in phase;
+  crossfaded on and off). Editor: vectorscope, correlation and balance.
+* **Delay** (`devices::delay`, the built-in Echo's id; its five
+  parameters keep their meaning): stereo, ping-pong or mono; free or
+  synced (note divisions), stereo offset, feedback to 110 % into a loop
+  that is linear to full scale and then rounds off; per pass the Echo's
+  damping, a low cut, saturation and a style (digital; tape: arctangent,
+  head bump, high-frequency loss, wow; analog: a bucket brigade's 4.5 kHz
+  band limit); wow and flutter; time changes glide; ducking, width,
+  freeze. Editor: the repeats on a timeline (drag for the time) and one
+  pass's spectrum.
+* **Reverb** (`devices::reverb`): pre-delay; early reflections (a type's
+  12-tap pattern scaled by the size); four allpass diffusers a side into a
+  16-line FDN with Hadamard mixing (orthogonal), line lengths spread
+  geometrically over the type's range and gliding with the size, slowly
+  modulated taps, and per line a three-band decay (one-pole splits at
+  250 Hz and the damping frequency, each band's gain exactly what its
+  decay time asks for the line's length: bass × the bass multiplier,
+  highs a third); orthogonal output taps for decorrelated sides. Types
+  Room, Hall, Plate, Chamber, Ambience; early/late balance, width, wet
+  cuts, freeze (lossless, modulation off), ducking. Tests measure RT60
+  (Schroeder integration) within 12 %. Editor: the decay picture (pre-
+  delay, reflections, bass/middle/high tails; drag for the decay) and the
+  decay time across the spectrum.
+* **Modulation** (`devices::modulation`): chorus (1–4 voices a side),
+  ensemble (three voices, slow and fast LFOs), flanger (feedback ±95 %),
+  phaser (2–12 first-order allpass stages swept exponentially round the
+  centre, feedback) and vibrato; free or synced LFO in six shapes with a
+  stereo spread; wet high cut and width. Editor: the LFO with each side's
+  position, and the voices on the delay or the comb or notches right now
+  between the sweep's extremes.
+* **Tuner** (`devices::tuner`): passes or mutes; the pitch is found in
+  the editor (`view-devices::tuner`: McLeod's normalised square
+  difference over 4096 frames by FFT, parabolic peak, clarity ≥ 0.8,
+  median of five), within a cent from 25 Hz to 4.2 kHz; needle or strobe,
+  reference A4 400–480 Hz.
 
 * **Automation from plugin editors.** Formats report the user's moves in a
   plugin's own GUI as `EditorEdit`s (begin, value, end): CLAP from the

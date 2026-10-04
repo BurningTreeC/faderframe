@@ -6,11 +6,17 @@
 mod common;
 mod compressor;
 mod deesser;
+mod delay;
 pub mod eq;
 mod gate;
 mod kit;
 mod limiter;
+mod modulation;
 pub mod program_eq;
+mod reverb;
+mod saturator;
+mod tuner;
+mod utility;
 mod values;
 
 use faderframe_core::{PluginInstanceId, builtin};
@@ -34,6 +40,36 @@ pub fn editor_for(
             plugin,
             theme,
             limiter::LimiterFace::new(theme),
+        ))),
+        builtin::TUNER => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            tuner::TunerFace::new(theme),
+        ))),
+        builtin::MODULATION => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            modulation::ModulationFace::new(theme),
+        ))),
+        builtin::REVERB => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            reverb::ReverbFace::new(theme),
+        ))),
+        builtin::ECHO => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            delay::DelayFace::new(theme),
+        ))),
+        builtin::GAIN => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            utility::UtilityFace::new(theme),
+        ))),
+        builtin::SATURATOR => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            saturator::SaturatorFace::new(theme),
         ))),
         builtin::DEESSER => Some(Box::new(kit::DeviceView::new(
             plugin,
@@ -59,6 +95,12 @@ pub fn editor_size(plugin_id: &str) -> Option<(i32, i32)> {
         builtin::EQ => Some((1180, 700)),
         builtin::COMPRESSOR => Some((1040, 520 + HEADER_BAR)),
         builtin::LIMITER => Some((900, 480 + HEADER_BAR)),
+        builtin::TUNER => Some((620, 440 + HEADER_BAR)),
+        builtin::MODULATION => Some((1060, 520 + HEADER_BAR)),
+        builtin::REVERB => Some((1120, 520 + HEADER_BAR)),
+        builtin::ECHO => Some((1120, 520 + HEADER_BAR)),
+        builtin::GAIN => Some((900, 500 + HEADER_BAR)),
+        builtin::SATURATOR => Some((960, 520 + HEADER_BAR)),
         builtin::DEESSER => Some((1000, 520 + HEADER_BAR)),
         builtin::GATE => Some((1000, 520 + HEADER_BAR)),
         // The panel at 1.2 times its size, under the window's header bar.

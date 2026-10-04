@@ -1,8 +1,6 @@
 //! Plugins shipped with FaderFrame, implemented on the same
 //! [`PluginInstance`]/[`PluginProcessor`] API that external formats use.
 
-mod echo;
-mod gain;
 mod latency;
 mod synth;
 
@@ -25,15 +23,23 @@ enum Kind {
     Eq,
     ProgramEq,
     Limiter,
+    Tuner,
+    Modulation,
+    Reverb,
+    Saturator,
     Deesser,
     Gate,
 }
 
 impl Kind {
-    const ALL: [Kind; 10] = [
+    const ALL: [Kind; 14] = [
         Kind::Eq,
         Kind::ProgramEq,
         Kind::Limiter,
+        Kind::Tuner,
+        Kind::Modulation,
+        Kind::Reverb,
+        Kind::Saturator,
         Kind::Deesser,
         Kind::Gate,
         Kind::Synth,
@@ -53,6 +59,10 @@ impl Kind {
             builtin::EQ => Kind::Eq,
             builtin::PROGRAM_EQ => Kind::ProgramEq,
             builtin::LIMITER => Kind::Limiter,
+            builtin::TUNER => Kind::Tuner,
+            builtin::MODULATION => Kind::Modulation,
+            builtin::REVERB => Kind::Reverb,
+            builtin::SATURATOR => Kind::Saturator,
             builtin::DEESSER => Kind::Deesser,
             builtin::GATE => Kind::Gate,
             _ => return None,
@@ -78,14 +88,14 @@ impl Kind {
             ),
             Kind::Gain => (
                 builtin::GAIN,
-                "Gain",
+                "Utility",
                 PluginCategory::Utility,
                 vec![stereo],
                 0,
             ),
             Kind::Echo => (
                 builtin::ECHO,
-                "Echo",
+                "Delay",
                 PluginCategory::Effect,
                 vec![stereo],
                 0,
@@ -122,6 +132,34 @@ impl Kind {
                 builtin::DEESSER,
                 "De-esser",
                 PluginCategory::Effect,
+                vec![stereo],
+                0,
+            ),
+            Kind::Saturator => (
+                builtin::SATURATOR,
+                "Saturator",
+                PluginCategory::Effect,
+                vec![stereo],
+                0,
+            ),
+            Kind::Reverb => (
+                builtin::REVERB,
+                "Reverb",
+                PluginCategory::Effect,
+                vec![stereo],
+                0,
+            ),
+            Kind::Modulation => (
+                builtin::MODULATION,
+                "Modulation",
+                PluginCategory::Effect,
+                vec![stereo],
+                0,
+            ),
+            Kind::Tuner => (
+                builtin::TUNER,
+                "Tuner",
+                PluginCategory::Utility,
                 vec![stereo],
                 0,
             ),
@@ -167,21 +205,16 @@ impl Kind {
         };
         use ParameterUnit::*;
         match self {
-            Kind::Gain => vec![p(0, "Gain", -60.0, 24.0, 0.0, Decibels)],
+            Kind::Gain => crate::devices::utility::parameters(),
             Kind::Compressor => crate::devices::compressor::parameters(),
             Kind::Limiter => crate::devices::limiter::parameters(),
+            Kind::Tuner => crate::devices::tuner::parameters(),
+            Kind::Modulation => crate::devices::modulation::parameters(),
+            Kind::Reverb => crate::devices::reverb::parameters(),
+            Kind::Saturator => crate::devices::saturator::parameters(),
             Kind::Deesser => crate::devices::deesser::parameters(),
             Kind::Gate => crate::devices::gate::parameters(),
-            Kind::Echo => vec![
-                p(0, "Time", 10.0, 2000.0, 401.0, Milliseconds),
-                p(1, "Feedback", 0.0, 0.95, 0.38, Percent),
-                p(2, "Damping", 0.0, 1.0, 0.35, Percent),
-                p(3, "Mix", 0.0, 1.0, 1.0, Percent),
-                ParameterInfo {
-                    stepped: true,
-                    ..p(4, "Ping-Pong", 0.0, 1.0, 1.0, None)
-                },
-            ],
+            Kind::Echo => crate::devices::delay::parameters(),
             Kind::Synth => vec![
                 p(0, "Volume", -48.0, 6.0, -6.0, Decibels),
                 p(1, "Cutoff", 40.0, 16_000.0, 2_400.0, Hertz),
@@ -209,6 +242,12 @@ impl Kind {
             Kind::Eq => Some(crate::eq::TAP_VALUES),
             Kind::Compressor => Some(crate::devices::compressor::TAP_VALUES),
             Kind::Limiter => Some(crate::devices::limiter::TAP_VALUES),
+            Kind::Tuner => Some(crate::devices::tuner::TAP_VALUES),
+            Kind::Modulation => Some(crate::devices::modulation::TAP_VALUES),
+            Kind::Reverb => Some(crate::devices::reverb::TAP_VALUES),
+            Kind::Echo => Some(crate::devices::delay::TAP_VALUES),
+            Kind::Gain => Some(crate::devices::utility::TAP_VALUES),
+            Kind::Saturator => Some(crate::devices::saturator::TAP_VALUES),
             Kind::Deesser => Some(crate::devices::deesser::TAP_VALUES),
             Kind::Gate => Some(crate::devices::gate::TAP_VALUES),
             Kind::ProgramEq => Some(0),
@@ -255,6 +294,12 @@ impl PluginInstance for BuiltinInstance {
             Kind::ProgramEq => crate::program_eq::format(id, value),
             Kind::Compressor => crate::devices::compressor::format(id, value),
             Kind::Limiter => crate::devices::limiter::format(id, value),
+            Kind::Tuner => crate::devices::tuner::format(id, value),
+            Kind::Modulation => crate::devices::modulation::format(id, value),
+            Kind::Reverb => crate::devices::reverb::format(id, value),
+            Kind::Echo => crate::devices::delay::format(id, value),
+            Kind::Gain => crate::devices::utility::format(id, value),
+            Kind::Saturator => crate::devices::saturator::format(id, value),
             Kind::Deesser => crate::devices::deesser::format(id, value),
             Kind::Gate => crate::devices::gate::format(id, value),
             _ => None,
@@ -314,6 +359,10 @@ impl PluginInstance for BuiltinInstance {
             Kind::Eq => crate::eq::latency(&self.params),
             Kind::Compressor => crate::devices::compressor::latency(&self.params, self.rate),
             Kind::Limiter => crate::devices::limiter::latency(&self.params, self.rate),
+            Kind::Tuner => crate::devices::tuner::latency(&self.params, self.rate),
+            Kind::Modulation => crate::devices::modulation::latency(&self.params, self.rate),
+            Kind::Reverb => crate::devices::reverb::latency(&self.params, self.rate),
+            Kind::Saturator => crate::devices::saturator::latency(&self.params, self.rate),
             Kind::Deesser => crate::devices::deesser::latency(&self.params, self.rate),
             Kind::Gate => crate::devices::gate::latency(&self.params, self.rate),
             _ => 0,
@@ -329,11 +378,16 @@ impl PluginInstance for BuiltinInstance {
 
     fn tail(&self) -> TailLength {
         match self.kind {
-            Kind::Echo => TailLength::Infinite,
+            Kind::Echo | Kind::Reverb => TailLength::Infinite,
+            Kind::Modulation => TailLength::Samples(4_096),
             Kind::Synth => TailLength::Samples(48_000 * 5),
-            Kind::Gain | Kind::Compressor | Kind::Limiter | Kind::Gate | Kind::Deesser => {
-                TailLength::None
-            }
+            Kind::Gain
+            | Kind::Compressor
+            | Kind::Limiter
+            | Kind::Gate
+            | Kind::Deesser
+            | Kind::Saturator
+            | Kind::Tuner => TailLength::None,
             // The longest ring of a resonant cut near 10 Hz.
             Kind::Eq => TailLength::Samples(48_000),
             Kind::ProgramEq => TailLength::Samples(24_000),
@@ -361,13 +415,37 @@ impl PluginInstance for BuiltinInstance {
                 .ok_or_else(|| PluginError::Failed("no tap".into()))
         };
         Ok(match self.kind {
-            Kind::Gain => Box::new(gain::GainProcessor::new(params)),
+            Kind::Gain => Box::new(crate::devices::utility::UtilityProcessor::new(
+                params,
+                tap()?,
+                config,
+            )),
             Kind::Compressor => Box::new(crate::devices::compressor::CompressorProcessor::new(
                 params,
                 tap()?,
                 config,
             )),
             Kind::Limiter => Box::new(crate::devices::limiter::LimiterProcessor::new(
+                params,
+                tap()?,
+                config,
+            )),
+            Kind::Tuner => Box::new(crate::devices::tuner::TunerProcessor::new(
+                params,
+                tap()?,
+                config,
+            )),
+            Kind::Modulation => Box::new(crate::devices::modulation::ModulationProcessor::new(
+                params,
+                tap()?,
+                config,
+            )),
+            Kind::Reverb => Box::new(crate::devices::reverb::ReverbProcessor::new(
+                params,
+                tap()?,
+                config,
+            )),
+            Kind::Saturator => Box::new(crate::devices::saturator::SaturatorProcessor::new(
                 params,
                 tap()?,
                 config,
@@ -382,7 +460,11 @@ impl PluginInstance for BuiltinInstance {
                 tap()?,
                 config,
             )),
-            Kind::Echo => Box::new(echo::EchoProcessor::new(params, config)),
+            Kind::Echo => Box::new(crate::devices::delay::DelayProcessor::new(
+                params,
+                tap()?,
+                config,
+            )),
             Kind::Synth => Box::new(synth::SynthProcessor::new(params, config)),
             Kind::LatencyProbe => Box::new(latency::LatencyProcessor::new(self.latency_samples())),
             Kind::Eq => {

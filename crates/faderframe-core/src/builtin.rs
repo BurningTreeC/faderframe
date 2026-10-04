@@ -15,7 +15,15 @@ pub const LIMITER: &str = "faderframe.limiter";
 pub const GATE: &str = "faderframe.gate";
 /// De-esser: split or wide, relative or absolute (effect).
 pub const DEESSER: &str = "faderframe.deesser";
-/// Utility gain (effect).
+/// Saturator: six curves, oversampled (effect).
+pub const SATURATOR: &str = "faderframe.saturator";
+/// Algorithmic reverb: five types, a 16-line network (effect).
+pub const REVERB: &str = "faderframe.reverb";
+/// Chorus, ensemble, flanger, phaser and vibrato (effect).
+pub const MODULATION: &str = "faderframe.modulation";
+/// Tuner (utility).
+pub const TUNER: &str = "faderframe.tuner";
+/// Utility: gain, balance, width, mono bass, polarity, channels (effect).
 pub const GAIN: &str = "faderframe.gain";
 /// Pure delay that reports its delay as latency (testing PDC).
 pub const LATENCY_PROBE: &str = "faderframe.latency-probe";
@@ -27,5 +35,18 @@ pub const PROGRAM_EQ: &str = "faderframe.program-eq";
 
 /// Built-ins with an editor of their own (others get the generic one).
 pub fn has_editor(id: &str) -> bool {
-    matches!(id, EQ | PROGRAM_EQ | COMPRESSOR | LIMITER | DEESSER | GATE)
+    matches!(
+        id,
+        EQ | PROGRAM_EQ
+            | TUNER
+            | COMPRESSOR
+            | LIMITER
+            | SATURATOR
+            | DEESSER
+            | GATE
+            | GAIN
+            | ECHO
+            | MODULATION
+            | REVERB
+    )
 }

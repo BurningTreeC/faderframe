@@ -89,7 +89,8 @@ fn a_gesture_is_one_undo_step() {
 fn values_out_of_range_are_clamped_by_the_plugin() {
     let (mut s, t, plugin) = session_with_echo();
     set(&mut s, t, plugin, 5.0);
-    assert_value(&mut s, plugin, 0.95);
+    // The Delay's feedback goes to 110 %.
+    assert_value(&mut s, plugin, 1.1);
 }
 
 #[test]
@@ -110,12 +111,12 @@ fn editors_are_requested_from_the_shell() {
             generic: true
         }]
     );
-    // Built-ins have no GUI of their own and do not pop up on insertion.
+    // Built-ins without an editor of their own do not pop up on insertion.
     assert!(s.plugin_editor(plugin).is_none());
     s.place_plugin(
         t,
         PluginTarget::Insert(1),
-        PluginRef::builtin(builtin::GAIN, "Gain"),
+        PluginRef::builtin(builtin::LATENCY_PROBE, "Latency Probe"),
     )
     .unwrap();
     assert!(s.take_ui_requests().is_empty());

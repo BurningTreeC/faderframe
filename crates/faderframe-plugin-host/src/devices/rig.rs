@@ -129,6 +129,22 @@ pub fn level(x: &[f32], f: f64) -> f64 {
     10.0 * (2.0 * ms).max(1e-30).log10()
 }
 
+/// The level (dB, of a sine's amplitude) at `f`: a Hann-windowed DFT of
+/// the second half.
+pub fn bin_db(x: &[f32], f: f64) -> f64 {
+    let tail = &x[x.len() / 2..];
+    let n = tail.len() as f64;
+    let w = std::f64::consts::TAU * f / SR;
+    let (mut re, mut im, mut sum) = (0.0, 0.0, 0.0);
+    for (k, v) in tail.iter().enumerate() {
+        let win = 0.5 - 0.5 * (std::f64::consts::TAU * k as f64 / n).cos();
+        re += f64::from(*v) * win * (w * k as f64).cos();
+        im += f64::from(*v) * win * (w * k as f64).sin();
+        sum += win;
+    }
+    20.0 * (2.0 * re.hypot(im) / sum).max(1e-15).log10()
+}
+
 pub fn peak_db(x: &[f32]) -> f64 {
     let p = x.iter().fold(0.0f64, |m, v| m.max(f64::from(v.abs())));
     20.0 * p.max(1e-15).log10()
