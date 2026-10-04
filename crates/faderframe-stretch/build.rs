@@ -6,6 +6,7 @@ fn main() {
     println!("cargo::rerun-if-changed=src/count_new.cpp");
     println!("cargo::rerun-if-changed=vendor");
     println!("cargo::rerun-if-env-changed=FADERFRAME_CHECK_ONLY");
+    println!("cargo::rustc-check-cfg=cfg(ff_cpp_count)");
     // `cargo check` for a target without a C++ toolchain (cross-checking
     // the Windows and macOS code paths): nothing is linked, so skip it.
     if std::env::var_os("FADERFRAME_CHECK_ONLY").is_some() {
@@ -23,7 +24,6 @@ fn main() {
     // The allocation counter replaces the global operator new in the test
     // binaries. MinGW's linker resolves libraries before a raw object, so
     // Windows tests go without it (they still run the stretcher).
-    println!("cargo::rustc-check-cfg=cfg(ff_cpp_count)");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         return;
     }

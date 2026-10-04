@@ -113,23 +113,25 @@ fn clip_sysex_goes_out_when_its_time_comes() {
 #[test]
 fn looped_sysex_goes_out_once_per_pass() {
     let (mut s, captured, _) = setup();
-    // A one-second loop with the message in the middle.
+    // A two-second loop; the message is half a second in.
     s.dispatch(Action::Transport(TransportAction::SetLoop(
-        faderframe_project::MusicalRange::new(MusicalTime::ZERO, MusicalTime::from_quarters_i(2)),
+        faderframe_project::MusicalRange::new(MusicalTime::ZERO, MusicalTime::from_quarters_i(4)),
     )))
     .unwrap();
     assert!(s.project().loop_enabled);
     audio(&mut s);
     s.dispatch(Action::Transport(TransportAction::Play))
         .unwrap();
-    let got = until_sent(&mut s, &captured, 3, Duration::from_secs(8));
+    let got = until_sent(&mut s, &captured, 3, Duration::from_secs(12));
     s.stop_audio();
     assert!(got.len() >= 3, "{got:?}");
-    // Never twice in a pass (slow machines may be late, never doubled).
+    // Never twice in a pass. The dummy device catches up after oversleeping
+    // (up to 500 ms of audio at once on a busy machine), which brings two
+    // passes closer on the wall clock — but not to within a second.
     for pair in got.windows(2) {
         let apart = pair[1].0.saturating_sub(pair[0].0);
         assert!(
-            apart > 700_000_000,
+            apart > 1_000_000_000,
             "sent {} ms apart: {got:?}",
             apart / 1_000_000
         );

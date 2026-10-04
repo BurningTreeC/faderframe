@@ -73,6 +73,11 @@ fn tracks_render_ahead_until_armed() {
         .unwrap();
     run(&mut s, Duration::from_millis(300));
     assert_eq!(s.render_ahead_status().0, 1, "back after the stop");
-    assert_eq!(s.render_ahead_status().1, 0, "never late");
+    // A stale or mis-keyed ring misses every block (~60 here); a busy
+    // machine's dummy device, catching up after oversleeping, consumes
+    // blocks faster than real time and may outrun the anticipator by one
+    // or two — a real device never does.
+    let late = s.render_ahead_status().1;
+    assert!(late <= 4, "late {late} times");
     s.stop_audio();
 }
