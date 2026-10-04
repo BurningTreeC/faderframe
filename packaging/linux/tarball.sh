@@ -60,7 +60,21 @@ for so in "$pixbuf_dir"/*.so; do
     cp -L "$so" "$loaders/loaders/"
     copy_deps "$so"
 done
-gdk-pixbuf-query-loaders "$loaders"/loaders/*.so |
+# On PATH (Arch, Fedora) or beside the loaders (Debian, Ubuntu).
+query=""
+for candidate in "$(command -v gdk-pixbuf-query-loaders || true)" \
+    "$(pkg-config --variable=gdk_pixbuf_query_loaders gdk-pixbuf-2.0 || true)" \
+    "$(dirname "$(dirname "$pixbuf_dir")")/gdk-pixbuf-query-loaders"; do
+    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+        query=$candidate
+        break
+    fi
+done
+if [ -z "$query" ]; then
+    echo "gdk-pixbuf-query-loaders not found" >&2
+    exit 1
+fi
+"$query" "$loaders"/loaders/*.so |
     sed "s|$root/$out|@ROOT@|g" >"$loaders/loaders.cache.in"
 # No GIO modules from the system (built against its own GLib).
 mkdir -p "$out/lib/gio/modules"
