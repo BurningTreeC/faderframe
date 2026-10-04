@@ -12,6 +12,7 @@ mod automation;
 mod clip_edit;
 pub mod edit_bar;
 mod global;
+mod harmony;
 mod header;
 
 pub use automation::AUTO_LANE_H;
@@ -2425,7 +2426,7 @@ impl ArrangerView {
     }
 
     fn release(&mut self, model: &Session, size: Size, cx: &mut EventCx<'_, Action>) {
-        if self.global_release(model, cx) {
+        if self.global_release(model, size, cx) {
             return;
         }
         if self.auto_release(model, cx) {

@@ -20,6 +20,7 @@ pub mod demo;
 mod edit;
 mod expression;
 pub mod file;
+pub mod harmony;
 mod history;
 pub mod midi_ops;
 mod midimap;
@@ -35,6 +36,7 @@ pub use clip::{
 };
 pub use edit::{CoalesceKey, Command, EditError, Impact, MAX_LEVEL_DB, RemovedTrack};
 pub use expression::{ExpressionKind, ExpressionPoint, MpeConfig, NoteExpression};
+pub use harmony::{ChordEvent, KeyChange};
 pub use history::{History, Replayed};
 pub use midimap::{
     MappingMode, MappingTarget, MidiControl, MidiMapping, MidiSource, TransportControl,

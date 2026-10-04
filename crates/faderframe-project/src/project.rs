@@ -122,6 +122,12 @@ pub struct Project {
     /// The album: songs and how they are delivered.
     #[serde(default, skip_serializing_if = "crate::album::Album::is_default")]
     pub album: crate::album::Album,
+    /// Key changes, by position (empty: no key set).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<crate::KeyChange>,
+    /// The chord track, by start.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chords: Vec<crate::ChordEvent>,
     #[serde(default)]
     pub ids: IdAllocator,
 }
@@ -153,6 +159,8 @@ impl Project {
             groups: Vec::new(),
             sections: Vec::new(),
             album: crate::album::Album::default(),
+            keys: Vec::new(),
+            chords: Vec::new(),
             ids,
         }
     }

@@ -13,7 +13,7 @@
 //!
 //! [`Command::SetArrangement`]: crate::Command::SetArrangement
 
-use crate::{Clip, ClipContent, Marker, MusicalRange, Project, Section};
+use crate::{ChordEvent, Clip, ClipContent, KeyChange, Marker, MusicalRange, Project, Section};
 use faderframe_automation::{AutomationPoint, AutomationSet};
 use faderframe_core::{AutomationLaneId, ClipId, IdAllocator, SectionId, TrackId};
 use faderframe_timeline::{
@@ -31,6 +31,8 @@ pub struct Arrangement {
     pub tracks: Vec<(TrackId, Vec<ClipId>, AutomationSet)>,
     pub markers: Vec<Marker>,
     pub sections: Vec<Section>,
+    pub keys: Vec<KeyChange>,
+    pub chords: Vec<ChordEvent>,
     pub loop_range: Option<MusicalRange>,
     pub loop_enabled: bool,
     pub punch_range: Option<MusicalRange>,
@@ -49,6 +51,8 @@ impl Arrangement {
                 .collect(),
             markers: p.markers.clone(),
             sections: p.sections.clone(),
+            keys: p.keys.clone(),
+            chords: p.chords.clone(),
             loop_range: p.loop_range,
             loop_enabled: p.loop_enabled,
             punch_range: p.punch_range,
@@ -74,6 +78,8 @@ impl Arrangement {
             tracks,
             markers: std::mem::replace(&mut p.markers, self.markers),
             sections: std::mem::replace(&mut p.sections, self.sections),
+            keys: std::mem::replace(&mut p.keys, self.keys),
+            chords: std::mem::replace(&mut p.chords, self.chords),
             loop_range: std::mem::replace(&mut p.loop_range, self.loop_range),
             loop_enabled: std::mem::replace(&mut p.loop_enabled, self.loop_enabled),
             punch_range: std::mem::replace(&mut p.punch_range, self.punch_range),
@@ -98,6 +104,10 @@ pub struct TimeSlice {
     meter: Vec<(i32, TimeSignature)>,
     markers: Vec<Marker>,
     sections: Vec<Section>,
+    /// Key changes from the start (the key in effect there at 0).
+    keys: Vec<KeyChange>,
+    /// Chords, cut to the span.
+    chords: Vec<ChordEvent>,
 }
 
 const TICK: MusicalTime = MusicalTime(1);
@@ -307,6 +317,23 @@ pub fn copy_span(p: &Project, a: MusicalTime, b: MusicalTime) -> TimeSlice {
                 ..s.clone()
             })
             .collect(),
+        keys: p
+            .key_at(a)
+            .map(|key| KeyChange { at: a, key })
+            .into_iter()
+            .chain(p.keys.iter().copied().filter(|k| k.at > a && k.at < b))
+            .map(|k| KeyChange { at: k.at - a, ..k })
+            .collect(),
+        chords: p
+            .chords
+            .iter()
+            .filter(|c| c.end > a && c.start < b)
+            .map(|c| ChordEvent {
+                start: c.start.max(a) - a,
+                end: c.end.min(b) - a,
+                chord: c.chord,
+            })
+            .collect(),
     }
 }
 
@@ -484,6 +511,30 @@ pub fn remove_span(p: &mut Project, a: MusicalTime, b: MusicalTime) {
             m.position -= len;
         }
     }
+    // The key reached inside the cut carries on from where it was.
+    let last_inside = p.keys.iter().rev().find(|k| k.at >= a && k.at < b).copied();
+    p.keys.retain(|k| k.at < a || k.at >= b);
+    for k in &mut p.keys {
+        if k.at >= b {
+            k.at -= len;
+        }
+    }
+    if let Some(k) = last_inside
+        && !p.keys.iter().any(|x| x.at == a)
+    {
+        p.keys.push(KeyChange { at: a, key: k.key });
+    }
+    crate::harmony::normalize_keys(&mut p.keys);
+    p.chords
+        .retain_mut(|c| match range_after_cut(c.start, c.end, a, b) {
+            Some((start, end)) => {
+                c.start = start;
+                c.end = end;
+                true
+            }
+            None => false,
+        });
+    crate::harmony::normalize_chords(&mut p.chords);
     p.sections
         .retain_mut(|s| match range_after_cut(s.start, s.end, a, b) {
             Some((start, end)) => {
@@ -707,6 +758,51 @@ pub fn insert_span(p: &mut Project, at: MusicalTime, slice: &TimeSlice, keep_ids
         });
     }
     p.sections.sort_by_key(|s| s.start);
+    // The slice's keys, and the key from before going on after it.
+    let before = p.key_at(at);
+    for k in &mut p.keys {
+        if k.at >= at {
+            k.at += len;
+        }
+    }
+    p.keys.extend(slice.keys.iter().map(|k| KeyChange {
+        at: at + k.at,
+        ..*k
+    }));
+    if let Some(key) = before
+        && !slice.keys.is_empty()
+        && !p.keys.iter().any(|k| k.at == at + len)
+    {
+        p.keys.push(KeyChange { at: at + len, key });
+    }
+    crate::harmony::normalize_keys(&mut p.keys);
+    // Chords across the insertion point split round the new span.
+    let mut chords = Vec::with_capacity(p.chords.len() + slice.chords.len() + 1);
+    for c in &p.chords {
+        if c.start >= at {
+            chords.push(ChordEvent {
+                start: c.start + len,
+                end: c.end + len,
+                chord: c.chord,
+            });
+        } else if c.end > at {
+            chords.push(ChordEvent { end: at, ..*c });
+            chords.push(ChordEvent {
+                start: at + len,
+                end: c.end + len,
+                chord: c.chord,
+            });
+        } else {
+            chords.push(*c);
+        }
+    }
+    chords.extend(slice.chords.iter().map(|c| ChordEvent {
+        start: at + c.start,
+        end: at + c.end,
+        chord: c.chord,
+    }));
+    crate::harmony::normalize_chords(&mut chords);
+    p.chords = chords;
     let shift = |r: MusicalRange| {
         let (start, end) = range_after_insert(r.start, r.end, at, len, true);
         MusicalRange { start, end }
@@ -1031,5 +1127,100 @@ mod tests {
         undo.swap_into(&mut p);
         assert_eq!(order(&p), "ABCD");
         assert_eq!(p.clips.len(), before.clips.len());
+    }
+}
+
+#[cfg(test)]
+mod harmony_tests {
+    use super::*;
+    use crate::harmony::{Chord, Key, Scale};
+
+    fn bars(n: i64) -> MusicalTime {
+        MusicalTime::from_quarters(4.0 * n as f64)
+    }
+
+    /// Four one-bar sections A B C D with a chord each (C Am F G), in C
+    /// major turning to A minor at C.
+    fn song() -> (Project, Vec<SectionId>) {
+        let mut p = Project::new("Song", 48_000);
+        let mut ids = Vec::new();
+        for (i, (name, chord)) in [("A", "C"), ("B", "Am"), ("C", "F"), ("D", "G")]
+            .iter()
+            .enumerate()
+        {
+            let id: SectionId = p.ids.allocate();
+            p.sections.push(Section {
+                id,
+                name: (*name).into(),
+                start: bars(i as i64),
+                end: bars(i as i64 + 1),
+                color: crate::TrackColor::palette(i),
+            });
+            p.chords.push(ChordEvent {
+                start: bars(i as i64),
+                end: bars(i as i64 + 1),
+                chord: Chord::parse(chord).unwrap_or(Chord::new(0, crate::harmony::Quality::Major)),
+            });
+            ids.push(id);
+        }
+        p.keys = vec![
+            KeyChange {
+                at: bars(0),
+                key: Key::new(0, Scale::Major),
+            },
+            KeyChange {
+                at: bars(2),
+                key: Key::new(9, Scale::Minor),
+            },
+        ];
+        (p, ids)
+    }
+
+    fn chords(p: &Project) -> Vec<String> {
+        p.chords.iter().map(|c| c.chord.name(false)).collect()
+    }
+
+    #[test]
+    fn moving_a_section_takes_its_chords_and_key() {
+        let (mut p, ids) = song();
+        assert!(move_section(&mut p, ids[0], bars(4)));
+        assert_eq!(chords(&p), ["Am", "F", "G", "C"]);
+        assert_eq!(p.chords[3].start, bars(3));
+        // B stays in C major, C and D in A minor, the moved A back in C
+        // major, and A minor again after it.
+        let keys: Vec<(MusicalTime, String)> =
+            p.keys.iter().map(|k| (k.at, k.key.name())).collect();
+        assert_eq!(
+            keys,
+            vec![
+                (bars(0), "C Major".to_string()),
+                (bars(1), "A Minor".to_string()),
+                (bars(3), "C Major".to_string()),
+                (bars(4), "A Minor".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn deleting_and_copying_sections_keep_the_harmony_in_place() {
+        let (mut p, ids) = song();
+        // Deleting C (where A minor starts): D is still in A minor.
+        assert!(delete_section(&mut p, ids[2]));
+        assert_eq!(chords(&p), ["C", "Am", "G"]);
+        assert_eq!(p.key_at(bars(2)).map(|k| k.name()), Some("A Minor".into()));
+        assert_eq!(p.key_at(bars(1)).map(|k| k.name()), Some("C Major".into()));
+        // Copying B to the end.
+        let (mut p, ids) = song();
+        assert!(copy_section(&mut p, ids[1], bars(4)).is_some());
+        assert_eq!(chords(&p), ["C", "Am", "F", "G", "Am"]);
+        assert_eq!(p.key_at(bars(4)).map(|k| k.name()), Some("C Major".into()));
+        // A chord across an insertion point is split round it.
+        let (mut p, ids) = song();
+        p.chords[0].end = bars(2);
+        p.chords.remove(1);
+        let slice = copy_span(&p, bars(3), bars(4));
+        insert_span(&mut p, bars(1), &slice, false);
+        assert_eq!(chords(&p), ["C", "G", "C", "F", "G"]);
+        let _ = ids;
     }
 }

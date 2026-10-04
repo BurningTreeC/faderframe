@@ -607,6 +607,7 @@ name = "faderframe-midi"
 version = "0.3.0"
 dependencies = [
  "rtrb",
+ "serde",
 ]
 
 [[package]]

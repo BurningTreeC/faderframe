@@ -1,5 +1,6 @@
-//! The global lanes under the ruler: markers, arrangement sections, time
-//! signature changes and the tempo map.
+//! The global lanes under the ruler: markers, arrangement sections, the
+//! key and the chord track (see [`crate::harmony`]), time signature
+//! changes and the tempo map.
 
 use super::*;
 use faderframe_core::{MarkerId, SectionId};
@@ -13,6 +14,8 @@ fn lane_height(lane: GlobalLane) -> f32 {
     match lane {
         GlobalLane::Markers => 18.0,
         GlobalLane::Arranger => 22.0,
+        GlobalLane::Key => 18.0,
+        GlobalLane::Chords => 24.0,
         GlobalLane::Signature => 17.0,
         GlobalLane::Tempo => 46.0,
     }
@@ -53,6 +56,10 @@ pub enum GlobalHit {
     Signature(i32),
     /// Tempo point index.
     Tempo(usize),
+    /// A key change (its index).
+    Key(usize),
+    /// A chord on the chord track (its index).
+    Chord(usize, SectionPart),
 }
 
 #[derive(Clone, Debug)]
@@ -88,6 +95,19 @@ pub(crate) enum GlobalDrag {
         /// Locked to vertical (tempo) or horizontal (position) once moved.
         axis: Option<bool>,
     },
+    NewChord {
+        anchor: MusicalTime,
+        to: MusicalTime,
+    },
+    Chord {
+        index: usize,
+        part: SectionPart,
+        grab: MusicalTime,
+        origin: Point,
+        start: MusicalTime,
+        end: MusicalTime,
+        moved: bool,
+    },
 }
 
 impl ArrangerView {
@@ -113,7 +133,7 @@ impl ArrangerView {
         lanes.shown().map(lane_height).sum()
     }
 
-    fn lane_rect(&self, lane: GlobalLane, size: Size) -> Option<Rect> {
+    pub(crate) fn lane_rect(&self, lane: GlobalLane, size: Size) -> Option<Rect> {
         self.global_lanes()
             .into_iter()
             .find(|(l, ..)| *l == lane)
@@ -196,6 +216,8 @@ impl ArrangerView {
                     })
                     .map_or(GlobalHit::Empty(lane, at), |c| GlobalHit::Signature(c.bar))
             }
+            GlobalLane::Key => self.key_hit(pos, at, model),
+            GlobalLane::Chords => self.chord_hit(pos, r, at, model),
             GlobalLane::Tempo => {
                 let range = Self::tempo_range(model);
                 p.timeline
@@ -232,6 +254,8 @@ impl ArrangerView {
             match lane {
                 GlobalLane::Markers => self.paint_markers(p, r, model),
                 GlobalLane::Arranger => self.paint_sections(p, r, model),
+                GlobalLane::Key => self.paint_keys(p, r, model),
+                GlobalLane::Chords => self.paint_chords(p, r, model),
                 GlobalLane::Signature => self.paint_signatures(p, r, model),
                 GlobalLane::Tempo => self.paint_tempo(p, r, model),
             }
@@ -560,6 +584,9 @@ impl ArrangerView {
                     });
                 }
             }
+            GlobalHit::Empty(GlobalLane::Key | GlobalLane::Chords, _)
+            | GlobalHit::Key(_)
+            | GlobalHit::Chord(..) => self.harmony_press(hit, pos, clicks, mods, size, model, cx),
             GlobalHit::Empty(..) => {}
         }
         cx.redraw();
@@ -592,6 +619,9 @@ impl ArrangerView {
                 }
             }
             GlobalDrag::NewSection { to, .. } => *to = self.snap(t_at, model, mods),
+            GlobalDrag::NewChord { .. } | GlobalDrag::Chord { .. } => {
+                self.chord_drag(&mut drag, pos, mods, model, cx);
+            }
             GlobalDrag::Section {
                 section,
                 part,
@@ -684,11 +714,19 @@ impl ArrangerView {
         true
     }
 
-    pub(crate) fn global_release(&mut self, model: &Session, cx: &mut EventCx<'_, Action>) -> bool {
+    pub(crate) fn global_release(
+        &mut self,
+        model: &Session,
+        size: Size,
+        cx: &mut EventCx<'_, Action>,
+    ) -> bool {
         let Some(drag) = self.global_drag.take() else {
             return false;
         };
         match drag {
+            d @ (GlobalDrag::NewChord { .. } | GlobalDrag::Chord { .. }) => {
+                self.chord_release(d, size, model, cx);
+            }
             GlobalDrag::Marker { marker, moved, .. } => {
                 if moved {
                     cx.emit(Action::Edit(Command::UpdateMarker { marker }));
@@ -915,6 +953,20 @@ impl ArrangerView {
                     ),
                 ],
             },
+            GlobalHit::Key(i) => match p.keys.get(i) {
+                Some(k) => Self::key_menu(model, k.at, true, pos),
+                None => Self::lanes_menu(model, GlobalLane::Key, pos),
+            },
+            GlobalHit::Empty(GlobalLane::Key, t) => {
+                let at = if p.keys.is_empty() {
+                    MusicalTime::ZERO
+                } else {
+                    p.timeline.meter.bar_start(p.timeline.meter.bar_at(t))
+                };
+                Self::key_menu(model, at, false, pos)
+            }
+            GlobalHit::Chord(i, _) => Self::chord_menu(model, i, pos),
+            GlobalHit::Empty(GlobalLane::Chords, _) => Self::chords_lane_menu(pos),
             GlobalHit::Empty(lane, _) => Self::lanes_menu(model, lane, pos),
         }
     }
@@ -1099,6 +1151,11 @@ impl ArrangerView {
                     pt.bpm,
                     format_bbt(&p.timeline, pt.position)
                 )
+            }
+            GlobalHit::Key(_)
+            | GlobalHit::Chord(..)
+            | GlobalHit::Empty(GlobalLane::Key | GlobalLane::Chords, _) => {
+                return self.harmony_tooltip(hit, model);
             }
         })
     }

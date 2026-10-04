@@ -907,6 +907,22 @@ pub fn install(app: &Rc<AppState>) {
                 commands,
             }));
         }),
+        // Development aids: `detect-key:x`, `detect-chords:x` (from the
+        // selected MIDI clips, else all), `set-key:<key>` (from the start).
+        named("detect-key", |a, _| a.dispatch(Action::DetectKey)),
+        named("detect-chords", |a, _| a.dispatch(Action::DetectChords)),
+        named("set-key", |a, arg| {
+            let Some(key) = faderframe_project::harmony::Key::parse(arg) else {
+                tracing::warn!("set-key: '{arg}' is not a key");
+                return;
+            };
+            let keys = faderframe_project::harmony::set_key(
+                &a.session.borrow().project().keys,
+                faderframe_timeline::MusicalTime::ZERO,
+                Some(key),
+            );
+            a.dispatch(Action::Edit(faderframe_project::Command::SetKeys { keys }));
+        }),
         // Development aid: `set-instrument:<plugin id>` makes the plugin the
         // instrument of the selected (or first) instrument track.
         named("set-instrument", |a, id| {

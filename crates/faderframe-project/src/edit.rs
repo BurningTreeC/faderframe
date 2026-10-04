@@ -345,6 +345,14 @@ pub enum Command {
     SetTimeline {
         timeline: Box<Timeline>,
     },
+    /// Replace the key changes (normalised: sorted, no repeats).
+    SetKeys {
+        keys: Vec<crate::KeyChange>,
+    },
+    /// Replace the chord track (normalised: sorted, no overlaps).
+    SetChords {
+        chords: Vec<crate::ChordEvent>,
+    },
     /// Replace everything that lives in time (clips, automation, tempo and
     /// meter, markers, sections, loop and punch) at once: section moves,
     /// copies and deletes (see [`crate::arrange`]).
@@ -607,6 +615,8 @@ impl Command {
             UpdateNote { .. } => "Edit Note".into(),
             SetTempo { .. } => "Change Tempo".into(),
             SetTimeline { .. } => "Change Tempo Map".into(),
+            SetKeys { .. } => "Change Key".into(),
+            SetChords { .. } => "Edit Chords".into(),
             SetArrangement { .. } => "Rearrange".into(),
             SetAlbum { .. } => "Edit Album".into(),
             SetSongInserts { .. } => "Change Song Inserts".into(),
@@ -695,6 +705,8 @@ impl Command {
             | UpdateNote { .. }
             | SetTempo { .. }
             | SetTimeline { .. }
+            | SetKeys { .. }
+            | SetChords { .. }
             | SetArrangement { .. }
             | SetTimeSignature { .. }
             | SetLoop { .. } => Impact::Timeline,
@@ -1394,6 +1406,18 @@ impl Command {
                 let old = std::mem::replace(&mut p.timeline, *timeline);
                 SetTimeline {
                     timeline: Box::new(old),
+                }
+            }
+            SetKeys { mut keys } => {
+                crate::harmony::normalize_keys(&mut keys);
+                SetKeys {
+                    keys: std::mem::replace(&mut p.keys, keys),
+                }
+            }
+            SetChords { mut chords } => {
+                crate::harmony::normalize_chords(&mut chords);
+                SetChords {
+                    chords: std::mem::replace(&mut p.chords, chords),
                 }
             }
             SetArrangement { arrangement } => SetArrangement {

@@ -1,6 +1,6 @@
-//! The arranger's global lanes: markers, arrangement sections, time
-//! signature changes and the tempo map. Edits go through commands (one
-//! undo step each; drags inside a gesture merge).
+//! The arranger's global lanes: markers, arrangement sections, the key,
+//! the chord track, time signature changes and the tempo map. Edits go
+//! through commands (one undo step each; drags inside a gesture merge).
 
 use crate::{Result, Session, SessionError};
 use faderframe_core::{MarkerId, SectionId};
@@ -12,14 +12,18 @@ use faderframe_timeline::{MusicalTime, TempoCurve, TempoMap, TempoPoint};
 pub enum GlobalLane {
     Markers,
     Arranger,
+    Key,
+    Chords,
     Signature,
     Tempo,
 }
 
 impl GlobalLane {
-    pub const ALL: [GlobalLane; 4] = [
+    pub const ALL: [GlobalLane; 6] = [
         GlobalLane::Markers,
         GlobalLane::Arranger,
+        GlobalLane::Key,
+        GlobalLane::Chords,
         GlobalLane::Signature,
         GlobalLane::Tempo,
     ];
@@ -28,6 +32,8 @@ impl GlobalLane {
         match self {
             GlobalLane::Markers => "Markers",
             GlobalLane::Arranger => "Arranger",
+            GlobalLane::Key => "Key",
+            GlobalLane::Chords => "Chords",
             GlobalLane::Signature => "Signature",
             GlobalLane::Tempo => "Tempo",
         }
@@ -39,6 +45,8 @@ impl GlobalLane {
 pub struct GlobalLanes {
     pub markers: bool,
     pub arranger: bool,
+    pub key: bool,
+    pub chords: bool,
     pub signature: bool,
     pub tempo: bool,
 }
@@ -48,6 +56,8 @@ impl Default for GlobalLanes {
         Self {
             markers: true,
             arranger: true,
+            key: true,
+            chords: true,
             signature: true,
             tempo: true,
         }
@@ -59,6 +69,8 @@ impl GlobalLanes {
         match lane {
             GlobalLane::Markers => self.markers,
             GlobalLane::Arranger => self.arranger,
+            GlobalLane::Key => self.key,
+            GlobalLane::Chords => self.chords,
             GlobalLane::Signature => self.signature,
             GlobalLane::Tempo => self.tempo,
         }
@@ -68,6 +80,8 @@ impl GlobalLanes {
         match lane {
             GlobalLane::Markers => self.markers = on,
             GlobalLane::Arranger => self.arranger = on,
+            GlobalLane::Key => self.key = on,
+            GlobalLane::Chords => self.chords = on,
             GlobalLane::Signature => self.signature = on,
             GlobalLane::Tempo => self.tempo = on,
         }
@@ -85,6 +99,99 @@ const SECTION_NAMES: [&str; 8] = [
 ];
 
 impl Session {
+    /// The notes of `clips` (all MIDI clips when empty) as they sound on
+    /// the timeline, within their clips.
+    pub(crate) fn sounding_notes(
+        &self,
+        clips: &[faderframe_core::ClipId],
+    ) -> Vec<faderframe_project::harmony::Sounding> {
+        let p = &self.project;
+        let all: Vec<faderframe_core::ClipId>;
+        let ids: &[faderframe_core::ClipId] = if clips.is_empty() {
+            all = p.clips.keys().copied().collect();
+            &all
+        } else {
+            clips
+        };
+        let mut out = Vec::new();
+        for id in ids {
+            let Some(clip) = p.clips.get(id) else {
+                continue;
+            };
+            if clip.muted {
+                continue;
+            }
+            if let faderframe_project::ClipContent::Midi(m) = &clip.content {
+                for n in m.notes.iter().filter(|n| !n.muted && n.start < m.length) {
+                    out.push(faderframe_project::harmony::Sounding {
+                        start: clip.start + n.start,
+                        end: clip.start + (n.start + n.length).min(m.length),
+                        key: n.key,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Fill the chord track from the selected MIDI clips (else every MIDI
+    /// clip), a chord a beat at most, over the edit range or what the
+    /// notes cover. One undo step.
+    pub(crate) fn detect_chords(&mut self) -> Result<()> {
+        let clips: Vec<faderframe_core::ClipId> = self.selection.clips.iter().copied().collect();
+        let notes = self.sounding_notes(&clips);
+        if notes.is_empty() {
+            return Err(SessionError::Other(
+                "select MIDI clips with notes to find their chords".into(),
+            ));
+        }
+        let (start, end) = match self.selection.range {
+            Some(r) if !r.is_empty() => (r.start, r.end),
+            _ => (
+                notes
+                    .iter()
+                    .map(|n| n.start)
+                    .min()
+                    .unwrap_or(MusicalTime::ZERO),
+                notes
+                    .iter()
+                    .map(|n| n.end)
+                    .max()
+                    .unwrap_or(MusicalTime::ZERO),
+            ),
+        };
+        let found =
+            faderframe_project::harmony::detect_chords(&notes, start, end, MusicalTime::QUARTER);
+        // Over the range the found chords replace what was there.
+        let mut chords =
+            faderframe_project::harmony::set_chord(&self.project.chords, start, end, None);
+        chords.extend(found);
+        self.edit(Command::Batch {
+            label: "Detect Chords".into(),
+            commands: vec![Command::SetChords { chords }],
+        })
+    }
+
+    /// Set the key the project starts in from the notes of the selected
+    /// MIDI clips (else every MIDI clip). One undo step.
+    pub(crate) fn detect_key(&mut self) -> Result<faderframe_project::harmony::Key> {
+        let clips: Vec<faderframe_core::ClipId> = self.selection.clips.iter().copied().collect();
+        let notes = self.sounding_notes(&clips);
+        let key = faderframe_project::harmony::detect_key(&notes)
+            .ok_or_else(|| SessionError::Other("no notes to find a key in".into()))?;
+        let at = self
+            .project
+            .keys
+            .first()
+            .map_or(MusicalTime::ZERO, |k| k.at.min(MusicalTime::ZERO));
+        let keys = faderframe_project::harmony::set_key(&self.project.keys, at, Some(key));
+        self.edit(Command::Batch {
+            label: "Detect Key".into(),
+            commands: vec![Command::SetKeys { keys }],
+        })?;
+        Ok(key)
+    }
+
     /// Add a marker (named "Marker N").
     pub(crate) fn add_marker(&mut self, at: MusicalTime) -> Result<MarkerId> {
         let id: MarkerId = self.project.ids.allocate();

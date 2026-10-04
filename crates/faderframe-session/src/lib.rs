@@ -263,6 +263,10 @@ pub enum Action {
         ramp: bool,
     },
     ShowGlobalLane(lanes::GlobalLane, bool),
+    /// Fill the chord track from the selected MIDI clips (or all of them).
+    DetectChords,
+    /// Set the project's key from the selected MIDI clips (or all of them).
+    DetectKey,
     /// Analyse this track in the Tools view (`None`: the master).
     SetAnalysisSource(Option<TrackId>),
     /// Start a new loudness measurement.
@@ -2465,6 +2469,11 @@ impl Session {
             Action::ShowGlobalLane(lane, on) => {
                 self.editor.lanes.set(lane, on);
                 self.revision += 1;
+            }
+            Action::DetectChords => self.detect_chords()?,
+            Action::DetectKey => {
+                let key = self.detect_key()?;
+                self.notify(NoticeLevel::Info, format!("the key is {}", key.name()));
             }
             Action::SetAnalysisSource(track) => {
                 self.set_analysis_source(track);

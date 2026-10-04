@@ -12,3 +12,4 @@ workspace = true
 
 [dependencies]
 rtrb.workspace = true
+serde.workspace = true

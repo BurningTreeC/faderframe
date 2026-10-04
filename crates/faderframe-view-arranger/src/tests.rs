@@ -891,7 +891,7 @@ fn global_lanes_add_markers_sections_and_change_the_tempo() {
     let mut p = RecordingPainter::new();
     view.paint(&mut p, size, &s, &theme);
     let lanes = view.global_lanes();
-    assert_eq!(lanes.len(), 4);
+    assert_eq!(lanes.len(), 6);
     let lane = |l: GlobalLane| {
         let (_, y, h) = lanes.iter().copied().find(|(x, ..)| *x == l).unwrap();
         y + h / 2.0
@@ -990,5 +990,103 @@ fn global_lanes_add_markers_sections_and_change_the_tempo() {
     else {
         panic!("lanes menu")
     };
-    assert_eq!(items.len(), 4);
+    assert_eq!(items.len(), 6);
+}
+
+#[test]
+fn the_chord_and_key_lanes_take_typed_chords_moves_and_keys() {
+    use faderframe_project::harmony::{Chord, Key, Scale};
+    use faderframe_session::lanes::GlobalLane;
+    let mut s = session();
+    let theme = Theme::default();
+    let mut view = ArrangerView::new(theme.clone());
+    let size = Size::new(1400.0, 700.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    let lanes = view.global_lanes();
+    let lane = |l: GlobalLane| {
+        let (_, y, h) = lanes.iter().copied().find(|(x, ..)| *x == l).unwrap();
+        y + h / 2.0
+    };
+    let x_at = |view: &ArrangerView, q: f64| view.x_of(MusicalTime::from_quarters(q));
+    let q = MusicalTime::from_quarters;
+
+    // Drag across the chord lane over bar 2, then type the chord.
+    let y = lane(GlobalLane::Chords);
+    let (a, b) = (
+        Point::new(x_at(&view, 4.05), y),
+        Point::new(x_at(&view, 8.0), y),
+    );
+    run(&mut view, down(a), size, &s);
+    run(&mut view, mv(b), size, &s);
+    let (_, req) = run(&mut view, up(b), size, &s);
+    let Some(HostRequest::TextInput { commit, .. }) = req
+        .into_iter()
+        .find(|r| matches!(r, HostRequest::TextInput { .. }))
+    else {
+        panic!("type the chord")
+    };
+    assert!(commit("H9").is_none(), "not a chord");
+    s.dispatch(commit("Am7").unwrap()).unwrap();
+    let c = s.project().chords[0];
+    assert_eq!(
+        (c.start, c.end, c.chord),
+        (q(4.0), q(8.0), Chord::parse("Am7").unwrap())
+    );
+
+    // Drag it a bar later by its body.
+    view.paint(&mut p, size, &s, &theme);
+    let body = Point::new(x_at(&view, 6.0), y);
+    assert!(matches!(
+        view.hit_test(body, size, &s),
+        Some(Hit::Global(GlobalHit::Chord(0, _)))
+    ));
+    let (x8, x10) = (x_at(&view, 8.0), x_at(&view, 10.0));
+    drag(
+        &mut view,
+        &mut s,
+        size,
+        body,
+        &[Point::new(x8, y), Point::new(x10, y)],
+        Modifiers::NONE,
+    );
+    let c = s.project().chords[0];
+    assert_eq!((c.start, c.end), (q(8.0), q(12.0)));
+
+    // Its menu offers the key's chords: set the key first (C major).
+    let ky = lane(GlobalLane::Key);
+    let at = Point::new(x_at(&view, 1.0), ky);
+    let (_, req) = run(&mut view, down(at), size, &s);
+    let Some(HostRequest::ContextMenu { items, .. }) = req
+        .into_iter()
+        .find(|r| matches!(r, HostRequest::ContextMenu { .. }))
+    else {
+        panic!("the key menu")
+    };
+    let c_major = items
+        .iter()
+        .find(|i| i.label == "C Major")
+        .and_then(|i| i.action.clone())
+        .unwrap();
+    s.dispatch(c_major).unwrap();
+    assert_eq!(s.project().key_at(q(0.0)), Some(Key::new(0, Scale::Major)));
+    view.paint(&mut p, size, &s, &theme);
+    let req = view.global_menu(
+        GlobalHit::Chord(0, crate::global::SectionPart::Body),
+        &s,
+        body,
+    );
+    let HostRequest::ContextMenu { items, .. } = req else {
+        panic!("the chord menu")
+    };
+    assert!(items[0].label.contains("vi7"), "{}", items[0].label);
+    let f = items
+        .iter()
+        .find(|i| i.label.starts_with("F "))
+        .and_then(|i| i.action.clone())
+        .unwrap();
+    s.dispatch(f).unwrap();
+    assert_eq!(s.project().chords[0].chord.name(false), "F");
+    s.dispatch(Action::Undo).unwrap();
+    assert_eq!(s.project().chords[0].chord.name(false), "Am7");
 }

@@ -1206,6 +1206,33 @@ adds to a song through `PluginTarget::Song`, the details form is
 `UiRequest::AlbumDetails`); file and folder choosers are a
 `HostRequest::ChooseFiles` the GTK host answers with `gtk::FileDialog`.
 
+### Harmony: the key and the chord track
+
+`faderframe_midi::theory` is the music theory everything shares: pitch
+classes and their spelling, 14 scales, keys (`Key`: contains, snap to the
+nearest note of the key, step by scale degrees, the diatonic triad or
+seventh on a degree), 24 chord qualities, chords (`Chord`: root, quality,
+another bass; named, parsed from what people type — "Am7", "F#m7b5",
+"Bb/D", "CΔ7" —, voiced in close position, recognised from notes with
+inversions over their bass, Roman numerals in a key) and key detection
+(Krumhansl–Kessler profiles against a duration-weighted pitch-class
+histogram). The project (`faderframe_project::harmony`) keeps key changes
+(`Project::keys`) and the chord track (`Project::chords`) as sorted lists
+edited whole (`Command::SetKeys`/`SetChords`, normalised on apply: no
+repeats, no overlaps; impact Timeline); section moves, copies and deletes
+carry them (`arrange`: the key in effect at a moved section's start goes
+with it and the key from before resumes after it; chords across an
+insertion point split round it). `session::lanes` detects chords (a beat
+at most, from the pitches sounding at least a quarter of each window;
+equal neighbours join) and the key from the selected MIDI clips
+(`Action::DetectChords`/`DetectKey`, one undo step each). In the arranger
+(`view-arranger/src/harmony.rs`) the Key lane shows spans named after
+their key (click: roots and scales, double-click: type one) and the
+Chords lane the chord track (drag across for a chord and type it,
+double-click for one a bar, drag to move, edges to resize, right-click for
+the key's diatonic chords with their numerals; colours by root round the
+circle of fifths).
+
 ### Freezing and bouncing
 
 Both render a track after its inserts and before its fader
