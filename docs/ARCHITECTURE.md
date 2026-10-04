@@ -914,8 +914,9 @@ the event loop. DAW work surfaces are **custom-rendered views**:
   (light), Midnight, Frost, Neon and High Contrast. Besides colours a theme
   has a `ConsoleLook`: skirted knobs (with or without a value ring), flat
   or glossy controls, brushed-metal panel grain, screws, walnut cheeks
-  framing the mixer, and the meter kind — LED ladder, continuous bar or an
-  edgewise VU meter (0 VU = −18 dBFS, voltage-proportional scale). The
+  framing the mixer, and the meter kind — LED ladder, continuous bar,
+  plasma bar graph (a glowing column with cell lines) or an edgewise VU
+  meter (0 VU = −18 dBFS, voltage-proportional scale). The
   shell switches skins live (`AppState::set_theme`: every canvas view gets
   `CanvasView::set_theme`, GTK's stylesheet is regenerated from the theme
   as `@define-color`s, and the Adwaita light/dark variant follows the

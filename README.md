@@ -31,7 +31,7 @@ phase and spectrum):
 
 Seven skins, switched live (View → Theme or Preferences → General → Theme):
 Studio, Vintage Console (walnut cheeks, enamel panels, skirted knobs,
-edgewise VU meters), Daylight (light), Midnight, Frost, Neon and High
+plasma bar-graph meters), Daylight (light), Midnight, Frost, Neon and High
 Contrast:
 
 ![The seven skins](docs/screenshots/themes.png)

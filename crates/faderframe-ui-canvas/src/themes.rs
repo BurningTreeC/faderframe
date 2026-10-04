@@ -318,7 +318,7 @@ pub fn daylight() -> Theme {
 }
 
 /// "Vintage": a 1970s console — enamel panels, bakelite skirted knobs,
-/// edgewise VU meters, walnut cheeks, amber displays.
+/// plasma bar-graph meters, walnut cheeks, amber displays.
 pub fn vintage() -> Theme {
     build(Spec {
         id: "vintage",
@@ -345,7 +345,8 @@ pub fn vintage() -> Theme {
         knob_caps: [0x3f6ea8, 0x9a9488, 0xa8352d],
         fader: [0x0a0807, 0xf3efe6, 0x9b9385, 0xe6dcc3],
         fader_caps: [0xefe7d6, 0x3f6ea8, 0x5f9a6a, 0xb53a31],
-        meter: ([0x0c0a08, 0x69c46b, 0xe9c049, 0xef8b3a, 0xe8442f], 0.14),
+        // Neon-orange plasma: amber low, brighter towards 0 dBFS, red over.
+        meter: ([0x100806, 0xe9732a, 0xff9a3c, 0xffc35e, 0xff3b24], 0.13),
         leds: [0xf0b33a, 0x69c46b, 0xff4b3b, 0x6fb1e8, 0xcf9be8],
         led_off: [0x3b342c, 0xe8dcc0, 0x0c0a08],
         scribble: (0xefe2bd, 0x2a2114),
@@ -364,7 +365,7 @@ pub fn vintage() -> Theme {
             brushed: 0.45,
             screws: true,
             wood: Some((c(0x8a5530), c(0x4f2d17))),
-            meter: MeterKind::Edgewise,
+            meter: MeterKind::Plasma,
             engrave: Color::rgba(0.0, 0.0, 0.0, 0.6),
             flat: false,
         },

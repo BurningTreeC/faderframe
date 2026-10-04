@@ -498,6 +498,7 @@ pub fn meter(p: &mut dyn Painter, rect: Rect, levels: &[MeterLevel], theme: &The
         MeterKind::Ladder => ladder_meter(p, rect, levels, theme),
         MeterKind::Bar => bar_meter(p, rect, levels, theme),
         MeterKind::Edgewise => vu_meter(p, rect, levels, theme),
+        MeterKind::Plasma => plasma_meter(p, rect, levels, theme),
     }
 }
 
@@ -569,6 +570,51 @@ fn bar_meter(p: &mut dyn Painter, rect: Rect, levels: &[MeterLevel], theme: &The
         if hold > 0.01 {
             let y = body.bottom() - body.h * hold;
             p.fill(Rect::new(body.x, y - 1.0, body.w, 2.0), m.peak);
+        }
+    }
+}
+
+/// Gas-plasma bar graphs: each channel a glowing column up to its level
+/// (zone colours from the theme), with fine dark lines across it like the
+/// discharge cells of a plasma display, a dimly lit unlit part and a peak
+/// hold mark.
+fn plasma_meter(p: &mut dyn Painter, rect: Rect, levels: &[MeterLevel], theme: &Theme) {
+    let m = &theme.console.meter;
+    p.fill_rounded(rect, 2.0, &Paint::Solid(m.background));
+    let y = |db: f32| 1.0 - meter_scale(db);
+    for (lv, (clip, body)) in levels.iter().zip(meter_columns(rect, levels.len())) {
+        clip_led(p, clip, lv.clipped, theme);
+        let zones = vec![
+            (0.0, m.red),
+            (y(-2.0), m.orange),
+            (y(-18.0), m.yellow),
+            (1.0, m.green),
+        ];
+        // The unlit cells glow faintly.
+        let dim: Vec<(f32, Color)> = zones
+            .iter()
+            .map(|(t, c)| (*t, c.mix(m.background, 1.0 - m.unlit)))
+            .collect();
+        p.fill_rect(body, &Paint::vertical_stops(body, dim));
+        let lit = meter_scale(lv.level_db);
+        if lit > 0.0 {
+            let top = body.bottom() - body.h * lit;
+            let fill = Rect::new(body.x, top, body.w, body.bottom() - top);
+            p.shadow(fill, 1.0, m.orange.with_alpha(0.45), 0.0, 0.0, 4.0);
+            p.fill_rect(fill, &Paint::vertical_stops(body, zones));
+        }
+        // Cell lines.
+        let pitch = (m.segment + m.gap).max(2.0);
+        let line = m.background.with_alpha(0.55);
+        let mut yy = body.bottom() - pitch;
+        while yy > body.y {
+            p.fill(Rect::new(body.x, yy, body.w, m.gap.clamp(0.6, 1.2)), line);
+            yy -= pitch;
+        }
+        let hold = meter_scale(lv.hold_db);
+        if hold > 0.01 {
+            let yh = body.bottom() - body.h * hold;
+            p.fill(Rect::new(body.x, yh - 1.0, body.w, 2.0), m.peak);
         }
     }
 }

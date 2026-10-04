@@ -88,6 +88,8 @@ pub enum MeterKind {
     Bar,
     /// Edgewise moving-coil VU meter (0 VU = −18 dBFS).
     Edgewise,
+    /// Gas-plasma bar graph: a glowing column with fine lines across it.
+    Plasma,
 }
 
 /// How console controls are drawn beyond their colours.
