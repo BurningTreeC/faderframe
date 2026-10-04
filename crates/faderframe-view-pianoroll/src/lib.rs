@@ -483,11 +483,15 @@ impl faderframe_ui_canvas::CanvasView<Session, faderframe_session::Action> for P
                 content: (m.length.quarters() as f32 + 8.0) * self.ppq,
                 viewport: g.w,
                 offset: self.scroll_x,
+                start: g.x,
+                end: (size.w - g.right()).max(0.0),
             },
             faderframe_ui_canvas::ScrollAxis::Vertical => faderframe_ui_canvas::ScrollInfo {
                 content: self.content_h(),
                 viewport: g.h,
                 offset: self.scroll_y,
+                start: g.y,
+                end: (size.h - g.bottom()).max(0.0),
             },
         })
     }

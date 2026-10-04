@@ -3016,6 +3016,8 @@ impl CanvasView<Session, Action> for ArrangerView {
                 content: self.content_quarters(model) as f32 * self.ppq,
                 viewport: (size.w - self.header_w()).max(0.0),
                 offset: self.scroll_x as f32,
+                start: self.header_w(),
+                end: 0.0,
             },
             ScrollAxis::Vertical => ScrollInfo {
                 content: if self.rows.len() > 1 {
@@ -3025,6 +3027,8 @@ impl CanvasView<Session, Action> for ArrangerView {
                 },
                 viewport: (size.h - self.ruler_h()).max(0.0),
                 offset: self.scroll_y,
+                start: self.ruler_h(),
+                end: 0.0,
             },
         })
     }

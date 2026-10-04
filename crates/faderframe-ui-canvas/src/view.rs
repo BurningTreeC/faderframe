@@ -113,6 +113,11 @@ pub struct ScrollInfo {
     pub viewport: f32,
     /// Current offset in pixels.
     pub offset: f32,
+    /// Where the scrolled area begins and ends, in pixels from the view's
+    /// leading and trailing edges (track headers, a ruler, a pinned
+    /// section): the host's scrollbar spans only the scrolled part.
+    pub start: f32,
+    pub end: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

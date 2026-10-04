@@ -1917,6 +1917,9 @@ impl CanvasView<Session, Action> for MixerView {
             content: self.content_w(Self::channel_tracks(model).len()),
             viewport: self.viewport_w(size),
             offset: self.scroll_x,
+            // The strips: after the cheek, before the pinned master.
+            start: self.cheek(),
+            end: (size.w - self.cheek() - self.viewport_w(size)).max(0.0),
         })
     }
 

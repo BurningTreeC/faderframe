@@ -38,6 +38,9 @@ mod imp {
         pub last_cursor: Cell<Option<Cursor>>,
         pub hadj: RefCell<Option<gtk::Adjustment>>,
         pub vadj: RefCell<Option<gtk::Adjustment>>,
+        /// The scrollbars (their margins follow the view's scrolled area).
+        pub hbar: RefCell<Option<gtk::Scrollbar>>,
+        pub vbar: RefCell<Option<gtk::Scrollbar>>,
         pub syncing: Cell<bool>,
     }
 
@@ -571,7 +574,11 @@ impl CanvasWidget {
     }
 
     /// Attach native scrollbars driven by the view's scroll state.
-    pub fn bind_scrollbars(&self, hadj: Option<gtk::Adjustment>, vadj: Option<gtk::Adjustment>) {
+    pub fn bind_scrollbars(&self, hbar: Option<gtk::Scrollbar>, vbar: Option<gtk::Scrollbar>) {
+        let hadj = hbar.as_ref().map(|b| b.adjustment());
+        let vadj = vbar.as_ref().map(|b| b.adjustment());
+        *self.imp().hbar.borrow_mut() = hbar;
+        *self.imp().vbar.borrow_mut() = vbar;
         for (adj, axis) in [
             (hadj.as_ref(), ScrollAxis::Horizontal),
             (vadj.as_ref(), ScrollAxis::Vertical),
@@ -616,6 +623,32 @@ impl CanvasWidget {
                 .borrow()
                 .as_ref()
                 .and_then(|v| v.scroll_info(axis, size, &session));
+            // The bar spans the scrolled part only.
+            let bar = match axis {
+                ScrollAxis::Horizontal => imp.hbar.borrow().clone(),
+                ScrollAxis::Vertical => imp.vbar.borrow().clone(),
+            };
+            if let (Some(bar), Some(i)) = (bar, info) {
+                let (start, end) = (i.start.round() as i32, i.end.round() as i32);
+                match axis {
+                    ScrollAxis::Horizontal => {
+                        if bar.margin_start() != start {
+                            bar.set_margin_start(start);
+                        }
+                        if bar.margin_end() != end {
+                            bar.set_margin_end(end);
+                        }
+                    }
+                    ScrollAxis::Vertical => {
+                        if bar.margin_top() != start {
+                            bar.set_margin_top(start);
+                        }
+                        if bar.margin_bottom() != end {
+                            bar.set_margin_bottom(end);
+                        }
+                    }
+                }
+            }
             match info {
                 Some(i) if i.content > i.viewport + 1.0 => {
                     let upper = i.content as f64;
@@ -711,19 +744,19 @@ impl ViewHost {
         root.set_hexpand(true);
         root.set_vexpand(true);
         root.attach(&canvas, 0, 0, 1, 1);
-        let hadj = horizontal.then(|| {
+        let hbar = horizontal.then(|| {
             let adj = gtk::Adjustment::new(0.0, 0.0, 0.0, 1.0, 1.0, 0.0);
             let bar = gtk::Scrollbar::new(gtk::Orientation::Horizontal, Some(&adj));
             root.attach(&bar, 0, 1, 1, 1);
-            adj
+            bar
         });
-        let vadj = vertical.then(|| {
+        let vbar = vertical.then(|| {
             let adj = gtk::Adjustment::new(0.0, 0.0, 0.0, 1.0, 1.0, 0.0);
             let bar = gtk::Scrollbar::new(gtk::Orientation::Vertical, Some(&adj));
             root.attach(&bar, 1, 0, 1, 1);
-            adj
+            bar
         });
-        canvas.bind_scrollbars(hadj, vadj);
+        canvas.bind_scrollbars(hbar, vbar);
         Self { root, canvas }
     }
 }

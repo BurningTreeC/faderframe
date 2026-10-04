@@ -1104,6 +1104,8 @@ impl CanvasView<Session, Action> for PerformanceView {
             content: self.content_height(report),
             viewport: l.table.h,
             offset: self.scroll,
+            start: l.table.y,
+            end: (size.h - l.table.bottom()).max(0.0),
         })
     }
 
