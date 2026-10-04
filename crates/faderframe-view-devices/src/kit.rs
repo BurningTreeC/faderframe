@@ -16,7 +16,6 @@ use crate::common::Device;
 use crate::values::{ms_text, parse_db, parse_freq, parse_ms, parse_ratio, parse_value};
 use faderframe_automation::AutomationTarget;
 use faderframe_core::{ParameterId, PluginInstanceId};
-use faderframe_plugin_host::devices::samples::{self, SampleDoc};
 use faderframe_plugin_host::tap::{AnalysisTap, db, db_power};
 use faderframe_plugin_host::{ParameterInfo, ParameterUnit};
 use faderframe_project::{Command, MappingTarget};
@@ -208,6 +207,10 @@ pub(crate) struct Ctx<'a> {
     pub accent: Color,
     /// Seconds since the last frame (for falling meters and histories).
     pub dt: f32,
+    /// Files are being dragged over the view here.
+    pub drop: Option<Point>,
+    /// Samples are being loaded into the device.
+    pub loading: bool,
 }
 
 impl Ctx<'_> {
@@ -260,73 +263,50 @@ impl Edit<'_, '_> {
         self.end();
     }
 
-    /// Replace the samples a sampler plays (one undo step).
-    pub fn set_samples(&mut self, doc: &SampleDoc) {
-        if let Some(action) = samples_action(self.model, self.device.plugin, doc) {
-            self.cx.emit(action);
-        }
+    /// Clear one of a sampler's slots (one undo step).
+    pub fn clear_sample(&mut self, slot: usize) {
+        self.cx.emit(Action::LoadDeviceSamples {
+            plugin: self.device.plugin,
+            slot,
+            files: Vec::new(),
+        });
     }
 
     /// Offer a file chooser; the files picked go into the samples from
     /// `slot` on (one each).
-    pub fn choose_samples(&mut self, doc: SampleDoc, slot: usize, title: &str, sfz: bool) {
+    pub fn choose_samples(&mut self, slot: usize, title: &str, sfz: bool) {
         let plugin = self.device.plugin;
-        let Some(tap) = self.device.tap(self.model) else {
-            return;
-        };
-        let Some((track, owner)) = self.model.plugin_owner(plugin) else {
-            return;
-        };
-        let params = tap.params.save();
-        let parameters = owner.parameters.clone();
-        let mut patterns: Vec<String> = faderframe_audio_files::decode::SUPPORTED_EXTENSIONS
-            .iter()
-            .flat_map(|e| [format!("*.{e}"), format!("*.{}", e.to_ascii_uppercase())])
-            .collect();
-        let mut filters = Vec::new();
-        if sfz {
-            patterns.extend(["*.sfz".into(), "*.SFZ".into()]);
-            filters.push(("Samples and SFZ instruments".to_string(), patterns));
-        } else {
-            filters.push(("Samples".to_string(), patterns));
-        }
-        filters.push(("All files".to_string(), vec!["*".to_string()]));
         self.cx.request(HostRequest::ChooseFiles {
             choice: faderframe_ui_canvas::FileChoice::Open {
                 title: title.into(),
-                filters,
+                filters: sample_filters(sfz),
             },
-            commit: Box::new(move |paths| {
-                let mut doc = doc.clone();
-                for (k, p) in paths.iter().enumerate() {
-                    doc.set(slot + k, Some(p.to_string_lossy().into_owned()));
-                }
-                Some(Action::Edit(Command::SetPluginState {
-                    track,
+            commit: Box::new(move |files| {
+                Some(Action::LoadDeviceSamples {
                     plugin,
-                    state: Some(faderframe_session::encode_plugin_state(&samples::pack(
-                        &params, &doc,
-                    ))),
-                    parameters: parameters.clone(),
-                }))
+                    slot,
+                    files,
+                })
             }),
         });
     }
 }
 
-/// The edit that gives a sampler `doc` with its parameters as they are.
-fn samples_action(model: &Session, plugin: PluginInstanceId, doc: &SampleDoc) -> Option<Action> {
-    let tap = model.plugin_tap(plugin)?;
-    let (track, owner) = model.plugin_owner(plugin)?;
-    Some(Action::Edit(Command::SetPluginState {
-        track,
-        plugin,
-        state: Some(faderframe_session::encode_plugin_state(&samples::pack(
-            &tap.params.save(),
-            doc,
-        ))),
-        parameters: owner.parameters.clone(),
-    }))
+/// File chooser filters for samples (and SFZ instruments).
+fn sample_filters(sfz: bool) -> Vec<(String, Vec<String>)> {
+    let mut patterns: Vec<String> = faderframe_audio_files::decode::SUPPORTED_EXTENSIONS
+        .iter()
+        .flat_map(|e| [format!("*.{e}"), format!("*.{}", e.to_ascii_uppercase())])
+        .collect();
+    let mut filters = Vec::new();
+    if sfz {
+        patterns.extend(["*.sfz".into(), "*.SFZ".into()]);
+        filters.push(("Samples and SFZ instruments".to_string(), patterns));
+    } else {
+        filters.push(("Samples".to_string(), patterns));
+    }
+    filters.push(("All files".to_string(), vec!["*".to_string()]));
+    filters
 }
 
 /// A device's part of its editor.
@@ -355,6 +335,11 @@ pub(crate) trait Face {
         None
     }
     fn min_size(&self) -> Size;
+    /// The sample slot files dropped at `pos` in the display go into (and
+    /// whether SFZ instruments are taken), or `None` where nothing is.
+    fn drop_slot(&self, _pos: Point, _display: Rect) -> Option<(usize, bool)> {
+        None
+    }
 }
 
 /// A value by its parameter's unit.
@@ -414,6 +399,8 @@ pub(crate) struct DeviceView<F: Face> {
     last: Option<Instant>,
     /// Falling meter peaks per meter and channel.
     peaks: Vec<[f32; 2]>,
+    /// Where files are dragged over the view.
+    drop: Option<Point>,
 }
 
 impl<F: Face> DeviceView<F> {
@@ -426,6 +413,7 @@ impl<F: Face> DeviceView<F> {
             hover: None,
             last: None,
             peaks: Vec::new(),
+            drop: None,
         }
     }
 
@@ -460,6 +448,8 @@ impl<F: Face> DeviceView<F> {
             theme,
             accent: self.face.accent(),
             dt,
+            drop: self.drop,
+            loading: model.loading_samples(self.device.plugin),
         }
     }
 
@@ -1163,6 +1153,40 @@ impl<F: Face> CanvasView<Session, Action> for DeviceView<F> {
 
     fn min_size(&self) -> Size {
         self.face.min_size()
+    }
+
+    fn drag_files(&mut self, pos: Option<Point>, size: Size, _model: &Session) -> bool {
+        let display = self.face.panel(size).display;
+        let target = pos
+            .zip(display)
+            .and_then(|(p, d)| self.face.drop_slot(p, d));
+        self.drop = target.and(pos);
+        target.is_some()
+    }
+
+    fn drop_files(
+        &mut self,
+        files: &[std::path::PathBuf],
+        pos: Point,
+        size: Size,
+        _model: &Session,
+    ) -> Option<Action> {
+        self.drop = None;
+        let display = self.face.panel(size).display?;
+        let (slot, sfz) = self.face.drop_slot(pos, display)?;
+        let files: Vec<std::path::PathBuf> = files
+            .iter()
+            .filter(|f| {
+                faderframe_audio_files::decode::is_supported(f)
+                    || (sfz && faderframe_plugin_host::devices::samples::is_sfz(f))
+            })
+            .cloned()
+            .collect();
+        (!files.is_empty()).then_some(Action::LoadDeviceSamples {
+            plugin: self.device.plugin,
+            slot,
+            files,
+        })
     }
 }
 

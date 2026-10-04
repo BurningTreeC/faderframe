@@ -789,8 +789,18 @@ covered by `the_stock_devices_do_not_allocate`.
   pass and velocity, four layers a pad. Editors: waveform with draggable
   start/loop markers and a keyboard with the zones; the pad grid (lit on
   hits, double-click to load, several files fill the pads) with the
-  picked pad's waveform and controls. Sample paths are absolute in the
-  state for now.
+  picked pad's waveform and controls; files can be dropped on the
+  sampler or a pad. Samples are the project's (`session::samples`): picked
+  or dropped files are copied into `<media>/Samples` (an SFZ instrument is
+  referenced where it lies, with its samples) and decoded on a worker
+  thread into a process-wide cache (`samples::load_cached`, shared while
+  anyone holds a sample — offline renders reuse the live ones), then one
+  "Load Samples" undo step sets the state and the instance loads from the
+  cache at once; concurrent loads merge into the document as it is when
+  each lands. In memory the paths are absolute; the project file stores
+  them relative to itself (`samples::map_states` in `save_as`/`open`), and
+  the first save moves the scratch folder's samples with the media
+  (`media_moves`, also applied to states brought back by undo).
 
 * **Automation from plugin editors.** Formats report the user's moves in a
   plugin's own GUI as `EditorEdit`s (begin, value, end): CLAP from the
@@ -1726,8 +1736,11 @@ sample-accurate transport, loops and scrubbing; a 24 band EQ in the spirit
 of Pro-Q 4 (zero latency, natural and linear phase; dynamic and spectral
 bands triggered by their region, free cuts or the sidechain; EQ Match,
 Sketch, Spectrum Grab, an analyser with collisions, the instance list), the Program
-EQ (PultEQFx's circuit-modelled passive tube EQ with its panel); built-in synth, echo,
-compressor, gain and latency probe; offline render and export (stems,
+EQ (PultEQFx's circuit-modelled passive tube EQ with its panel), the stock
+devices with editors of their own (compressor, true-peak limiter,
+gate/expander/ducker, de-esser, saturator, utility, delay, algorithmic
+reverb, chorus/flanger/phaser, tuner; a virtual analogue synth, a sampler
+with SFZ import and a drum sampler); offline render and export (stems,
 normalise, dither); freeze and bounce in place. Audio: native PipeWire,
 JACK, the system API (WASAPI, CoreAudio, ALSA), ASIO (opt-in) and a dummy
 device. Render-ahead (anticipative processing) of every track nobody plays
@@ -1774,10 +1787,7 @@ and packages for all three platforms (see §14).
 Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
 2024–2026):
 
-1. **Stock devices** (wave 1, under way — the EQ and Program EQ are done):
-   algorithmic reverb, true-peak limiter, gate/expander, saturator,
-   de-esser, chorus/phaser, tuner; a multi-sample sampler (SFZ import) and
-   a drum sampler.
+1. ~~**Stock devices** (wave 1)~~ — done (see *Built-in devices*).
 2. **Composition**: project key/scale and a chord track, a scale-aware
    piano roll, MIDI effects before the instrument (arpeggiator, chord,
    scale, note echo), MIDI transformations and generators, always-on

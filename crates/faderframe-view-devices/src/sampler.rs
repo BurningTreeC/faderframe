@@ -207,6 +207,11 @@ impl Face for SamplerFace {
                 .unwrap_or_else(|| "Load a sample, or an SFZ instrument".into()),
             None => String::new(),
         };
+        let detail = if cx.loading {
+            "Loading…".to_string()
+        } else {
+            detail
+        };
         let err = set.is_some_and(|s| !s.errors.is_empty());
         p.text(
             &detail,
@@ -224,6 +229,9 @@ impl Face for SamplerFace {
         // The waveform: the single sample, or the zone playing (else the
         // first).
         p.fill_rounded(wave, 3.0, &Paint::Solid(th.device.display.darken(0.12)));
+        if cx.drop.is_some() {
+            p.stroke_rounded(wave, 3.0, 2.0, self.accent);
+        }
         let voices = cx.published(value::VOICES);
         let zone_now = cx.published(value::ZONE);
         let shown = set.and_then(|s| {
@@ -235,7 +243,10 @@ impl Face for SamplerFace {
                 } else {
                     0
                 };
-                s.zones.get(z).and_then(|z| s.samples.get(z.sample))
+                s.zones
+                    .get(z)
+                    .and_then(|z| s.samples.get(z.sample))
+                    .map(|x| x.as_ref())
             }
         });
         if let Some(sample) = shown {
@@ -279,7 +290,7 @@ impl Face for SamplerFace {
             }
         } else {
             p.text(
-                "Drop in a sample or an SFZ instrument with Load…",
+                "Drop a sample or an SFZ instrument here, or Load…",
                 wave,
                 &TextStyle::new(th.fonts.normal, th.ui.text_faint).center(),
             );
@@ -345,14 +356,11 @@ impl Face for SamplerFace {
         edit: &mut Edit<'_, '_>,
     ) -> bool {
         let (_, button, wave, _) = Self::split(r);
-        let doc = Self::contents(cx)
-            .map(|c| c.doc.clone())
-            .unwrap_or_default();
         let single =
             Self::contents(cx).is_some_and(|c| c.set.zones.is_empty() && c.set.slot(0).is_some());
         match *ev {
             ViewEvent::PointerDown { pos, .. } if button.contains(pos) => {
-                edit.choose_samples(doc, 0, "Load a Sample or SFZ Instrument", true);
+                edit.choose_samples(0, "Load a Sample or SFZ Instrument", true);
                 true
             }
             ViewEvent::PointerDown { pos, .. } if single && wave.contains(pos) => {
@@ -407,6 +415,10 @@ impl Face for SamplerFace {
 
     fn format(&self, id: ParameterId, v: f64) -> Option<String> {
         smp::format(id, v)
+    }
+
+    fn drop_slot(&self, pos: faderframe_ui_canvas::Point, display: Rect) -> Option<(usize, bool)> {
+        display.contains(pos).then_some((0, true))
     }
 
     fn tip(&self, pid: ParameterId) -> Option<&'static str> {

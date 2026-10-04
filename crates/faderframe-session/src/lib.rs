@@ -32,6 +32,7 @@ mod groups;
 pub mod lanes;
 mod programs;
 mod redraw;
+pub mod samples;
 mod sandbox;
 pub use groups::GroupMenuEntry;
 mod midifile;
@@ -273,6 +274,14 @@ pub enum Action {
     /// Start a plugin again from its slot (after a crash, or to move it
     /// into or out of a sandbox).
     ReloadPlugin(faderframe_core::PluginInstanceId),
+    /// Give a built-in sampler `files` from `slot` on (one each; copied
+    /// into the project, decoded in the background; no files: clear the
+    /// slot). One undo step once loaded.
+    LoadDeviceSamples {
+        plugin: faderframe_core::PluginInstanceId,
+        slot: usize,
+        files: Vec<PathBuf>,
+    },
     /// Every plugin of the project.
     ReloadAllPlugins,
     /// Switch a plugin to one of its own programs (one undo step).
@@ -854,6 +863,7 @@ pub struct Session {
     missing: HashSet<AudioSourceId>,
     imports: Vec<ImportJob>,
     peak_jobs: Vec<media::PeakJob>,
+    sample_jobs: Vec<samples::SampleJob>,
     pub record: RecordSettings,
     recording: Option<ActiveRecording>,
     finishing: Vec<ActiveRecording>,
@@ -1048,6 +1058,7 @@ impl Session {
             missing: HashSet::new(),
             imports: Vec::new(),
             peak_jobs: Vec::new(),
+            sample_jobs: Vec::new(),
             record: RecordSettings::default(),
             recording: None,
             finishing: Vec::new(),
@@ -1773,6 +1784,19 @@ impl Session {
             }
         }
         let mut i = 0;
+        while i < self.sample_jobs.len() {
+            if self.sample_jobs[i].is_finished() {
+                let job = self.sample_jobs.swap_remove(i);
+                if let Some(loaded) = job.join()
+                    && let Err(e) = self.finish_samples(loaded)
+                {
+                    self.notify(NoticeLevel::Error, format!("loading samples failed: {e}"));
+                }
+            } else {
+                i += 1;
+            }
+        }
+        let mut i = 0;
         while i < self.imports.len() {
             if self.imports[i].is_finished() {
                 let job = self.imports.remove(i);
@@ -1783,6 +1807,92 @@ impl Session {
                 i += 1;
             }
         }
+    }
+
+    /// Start loading samples into a sampler (or clear one of its slots).
+    fn load_device_samples(
+        &mut self,
+        plugin: faderframe_core::PluginInstanceId,
+        slot: usize,
+        files: Vec<PathBuf>,
+    ) -> Result<()> {
+        let Some((_, owner)) = self.plugin_owner(plugin) else {
+            return Err(SessionError::Other("no such plugin".into()));
+        };
+        if files.is_empty() {
+            let mut doc = samples::doc_of(owner);
+            doc.set(slot, None);
+            return self.apply_samples(plugin, &doc);
+        }
+        let media = self.media_dir.clone();
+        self.sample_jobs
+            .push(samples::SampleJob::spawn(plugin, slot, files, media));
+        self.revision += 1;
+        Ok(())
+    }
+
+    /// Whether samples are being loaded for `plugin`.
+    pub fn loading_samples(&self, plugin: faderframe_core::PluginInstanceId) -> bool {
+        self.sample_jobs.iter().any(|j| j.plugin == plugin)
+    }
+
+    fn finish_samples(&mut self, loaded: samples::Loaded) -> Result<()> {
+        for n in &loaded.notes {
+            self.notify(NoticeLevel::Warning, n.clone());
+        }
+        // Into the document as it is now (other loads may have finished
+        // since this one started).
+        let Some((_, owner)) = self.plugin_owner(loaded.plugin) else {
+            return Ok(());
+        };
+        let mut doc = samples::doc_of(owner);
+        for (slot, file) in &loaded.assigned {
+            doc.set(*slot, Some(file.clone()));
+        }
+        if loaded.assigned.is_empty() {
+            return Ok(());
+        }
+        // The decoded samples stay in the cache (held here) until the
+        // instance has loaded them.
+        let held = Arc::clone(&loaded.set);
+        let r = self.apply_samples(loaded.plugin, &doc);
+        drop(held);
+        r
+    }
+
+    /// The edit giving a sampler `doc` (its parameters as they are).
+    fn apply_samples(
+        &mut self,
+        plugin: faderframe_core::PluginInstanceId,
+        doc: &faderframe_plugin_host::devices::samples::SampleDoc,
+    ) -> Result<()> {
+        let Some((track, owner)) = self.plugin_owner(plugin) else {
+            return Ok(());
+        };
+        let parameters = owner.parameters.clone();
+        let params = match self.plugin_tap(plugin) {
+            Some(tap) => tap.params.save(),
+            None => owner
+                .state
+                .as_deref()
+                .and_then(faderframe_engine::decode_state)
+                .and_then(|b| {
+                    faderframe_plugin_host::devices::samples::unpack(&b).map(|(p, _)| p.to_vec())
+                })
+                .unwrap_or_default(),
+        };
+        let state = faderframe_engine::encode_state(
+            &faderframe_plugin_host::devices::samples::pack(&params, doc),
+        );
+        self.edit(Command::Batch {
+            label: "Load Samples".into(),
+            commands: vec![Command::SetPluginState {
+                track,
+                plugin,
+                state: Some(state),
+                parameters,
+            }],
+        })
     }
 
     /// Start importing `files` in the background.
@@ -2013,6 +2123,7 @@ impl Session {
                 *p = media::resolve(p, dir.as_deref());
             }
         }
+        samples::map_states(&mut project, |p| media::resolve(p, dir.as_deref()));
         self.discard_unsaved_media();
         self.path = Some(path.clone());
         self.media_dir = dir.unwrap_or_default().join(MEDIA_FOLDER);
@@ -2042,6 +2153,7 @@ impl Session {
                 *p = media::to_stored(p, Some(&dir));
             }
         }
+        samples::map_states(&mut stored, |p| media::to_stored(p, Some(&dir)));
         file::save(&path, &stored, Some(&self.workspace))?;
         self.media_dir = project_media;
         self.unsaved_media = false;
@@ -2076,12 +2188,24 @@ impl Session {
                 ),
             }
         }
+        match samples::move_folder(&self.media_dir, to) {
+            Ok(moves) => self.media_moves.extend(moves),
+            Err(err) => self.notify(
+                NoticeLevel::Error,
+                format!("could not move the samples into the project: {err}"),
+            ),
+        }
         for s in self.project.sources.values_mut() {
             if let SourceSpec::File { path, .. } = &mut s.spec
                 && let Some(new) = self.media_moves.get(path.as_path())
             {
                 *path = new.clone();
             }
+        }
+        if self.remap_sample_paths()
+            && let Err(e) = self.sync(Impact::Params)
+        {
+            self.notify(NoticeLevel::Error, e.to_string());
         }
         let _ = std::fs::remove_dir_all(&self.media_dir);
     }
@@ -2097,7 +2221,23 @@ impl Session {
 
     // --- actions -----------------------------------------------------------------
 
+    /// Re-point samplers at samples a save moved (also after undo or redo
+    /// brings back a state from before the save). Returns whether any
+    /// changed (a `Params` sync makes the engine reload them).
+    fn remap_sample_paths(&mut self) -> bool {
+        if self.media_moves.is_empty() {
+            return false;
+        }
+        let moves = &self.media_moves;
+        samples::map_states(&mut self.project, |p| {
+            moves.get(p).cloned().unwrap_or_else(|| p.to_path_buf())
+        })
+    }
+
     fn sync(&mut self, mut impact: Impact) -> Result<()> {
+        if impact >= Impact::Params {
+            self.remap_sample_paths();
+        }
         // The monitored album song is gone (removed, undone): stop hearing
         // its inserts.
         if self
@@ -2336,6 +2476,11 @@ impl Session {
             }
             Action::Album(a) => self.album_action(a)?,
             Action::ReloadPlugin(plugin) => self.reload_plugins(&[plugin])?,
+            Action::LoadDeviceSamples {
+                plugin,
+                slot,
+                files,
+            } => self.load_device_samples(plugin, slot, files)?,
             Action::SelectPluginProgram { plugin, index } => {
                 self.select_plugin_program(plugin, index)?;
             }

@@ -187,7 +187,11 @@ impl Face for DrumsFace {
                     &Paint::Solid(self.accent.with_alpha(0.75 * self.glow[pad].sqrt())),
                 );
             }
-            let edge = if pad == self.selected {
+            let dropping = cx.drop.is_some_and(|d| rect.contains(d));
+            if dropping {
+                p.fill_rounded(*rect, 6.0, &Paint::Solid(self.accent.with_alpha(0.35)));
+            }
+            let edge = if pad == self.selected || dropping {
                 self.accent
             } else {
                 th.device.section_edge
@@ -248,7 +252,12 @@ impl Face for DrumsFace {
                 s.rate / 1000.0
             ),
             (None, Some(f)) => format!("Missing: {f}"),
-            (None, None) => "Empty: double-click the pad or Load…".into(),
+            (None, None) => "Empty: drop a sample here, double-click the pad or Load…".into(),
+        };
+        let detail = if cx.loading {
+            "Loading…".to_string()
+        } else {
+            detail
         };
         p.text(
             &detail,
@@ -274,30 +283,25 @@ impl Face for DrumsFace {
         &mut self,
         ev: &ViewEvent,
         r: Rect,
-        cx: &Ctx<'_>,
+        _cx: &Ctx<'_>,
         edit: &mut Edit<'_, '_>,
     ) -> bool {
         let (pads, wave, load, clear) = Self::split(r);
-        let doc = Self::contents(cx)
-            .map(|c| c.doc.clone())
-            .unwrap_or_default();
         match *ev {
             ViewEvent::PointerDown { pos, clicks, .. } => {
                 if let Some(pad) = pads.iter().position(|p| p.contains(pos)) {
                     self.selected = pad;
                     if clicks >= 2 {
-                        edit.choose_samples(doc, pad, "Load Pad Samples", false);
+                        edit.choose_samples(pad, "Load Pad Samples", false);
                     }
                     return true;
                 }
                 if load.contains(pos) {
-                    edit.choose_samples(doc, self.selected, "Load Pad Samples", false);
+                    edit.choose_samples(self.selected, "Load Pad Samples", false);
                     return true;
                 }
                 if clear.contains(pos) {
-                    let mut doc = doc;
-                    doc.set(self.selected, None);
-                    edit.set_samples(&doc);
+                    edit.clear_sample(self.selected);
                     return true;
                 }
                 if wave.contains(pos) {
@@ -313,6 +317,14 @@ impl Face for DrumsFace {
 
     fn format(&self, id: ParameterId, v: f64) -> Option<String> {
         drm::format(id, v)
+    }
+
+    fn drop_slot(&self, pos: faderframe_ui_canvas::Point, display: Rect) -> Option<(usize, bool)> {
+        let (pads, wave, _, _) = Self::split(display);
+        if let Some(pad) = pads.iter().position(|p| p.contains(pos)) {
+            return Some((pad, false));
+        }
+        wave.contains(pos).then_some((self.selected, false))
     }
 
     fn tip(&self, pid: ParameterId) -> Option<&'static str> {

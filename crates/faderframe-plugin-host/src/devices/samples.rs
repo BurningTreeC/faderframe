@@ -158,6 +158,54 @@ pub fn load_audio(path: &Path) -> Result<Sample, String> {
     ))
 }
 
+/// Decoded samples by file, while anyone holds them (and the file has
+/// not changed since): a preload on a worker thread makes the instance's
+/// own load instant, and offline renders share the live one's samples.
+/// Each file's decoded sample (while held) and when the file changed.
+type Cache = std::sync::Mutex<
+    std::collections::HashMap<PathBuf, (Option<std::time::SystemTime>, std::sync::Weak<Sample>)>,
+>;
+
+fn cache() -> &'static Cache {
+    static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Decode an audio file, or share it if it is decoded already.
+pub fn load_cached(path: &Path) -> Result<Arc<Sample>, String> {
+    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    if let Ok(c) = cache().lock()
+        && let Some((when, weak)) = c.get(path)
+        && *when == modified
+        && let Some(s) = weak.upgrade()
+    {
+        return Ok(s);
+    }
+    let s = Arc::new(load_audio(path)?);
+    if let Ok(mut c) = cache().lock() {
+        c.retain(|_, (_, w)| w.strong_count() > 0);
+        c.insert(path.to_path_buf(), (modified, Arc::downgrade(&s)));
+    }
+    Ok(s)
+}
+
+/// A packed state with every file of its document mapped by `f` (`None`
+/// for a plain parameter block).
+pub fn map_paths(state: &[u8], f: impl Fn(&Path) -> PathBuf) -> Option<Vec<u8>> {
+    let (params, mut doc) = unpack(state)?;
+    for file in doc.files.iter_mut().flatten() {
+        *file = f(Path::new(file.as_str())).to_string_lossy().into_owned();
+    }
+    Some(pack(params, &doc))
+}
+
+/// Whether a file is an SFZ instrument (referenced where it lies, with its
+/// samples, rather than copied).
+pub fn is_sfz(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("sfz"))
+}
+
 /// How a zone loops.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoopMode {
@@ -246,7 +294,7 @@ impl Zone {
 pub struct SampleSet {
     /// Per document slot, the sample loaded there (drums: one per pad).
     pub slots: Vec<Option<usize>>,
-    pub samples: Vec<Sample>,
+    pub samples: Vec<Arc<Sample>>,
     /// Instrument zones (an SFZ's regions); empty when a slot plays its
     /// sample by the device's own settings.
     pub zones: Vec<Zone>,
@@ -259,7 +307,7 @@ impl SampleSet {
             .get(slot)
             .copied()
             .flatten()
-            .map(|i| &self.samples[i])
+            .map(|i| self.samples[i].as_ref())
     }
 }
 
@@ -359,10 +407,7 @@ pub fn load(doc: &SampleDoc) -> SampleSet {
             continue;
         };
         let path = PathBuf::from(file);
-        let sfz = path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("sfz"));
-        if sfz {
+        if is_sfz(&path) {
             match std::fs::read_to_string(&path) {
                 Ok(text) => {
                     let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -376,7 +421,7 @@ pub fn load(doc: &SampleDoc) -> SampleSet {
             }
             continue;
         }
-        match load_audio(&path) {
+        match load_cached(&path) {
             Ok(s) => {
                 set.slots.push(Some(set.samples.len()));
                 set.samples.push(s);
@@ -528,7 +573,7 @@ pub fn load_sfz(set: &mut SampleSet, text: &str, base: &Path) {
                 let index =
                     *loaded
                         .entry(path.clone())
-                        .or_insert_with(|| match load_audio(&path) {
+                        .or_insert_with(|| match load_cached(&path) {
                             Ok(s) => {
                                 set.samples.push(s);
                                 Some(set.samples.len() - 1)
@@ -653,6 +698,9 @@ mod tests {
         let (params, back) = unpack(&packed).unwrap();
         assert_eq!(params, &[1, 2, 3]);
         assert_eq!(back, doc);
+        let moved = map_paths(&packed, |p| Path::new("/y").join(p.file_name().unwrap())).unwrap();
+        assert_eq!(unpack(&moved).unwrap().1.file(2), Some("/y/kick.wav"));
+        assert_eq!(unpack(&moved).unwrap().0, &[1, 2, 3]);
         assert!(unpack(&[0; 12]).is_none(), "a plain parameter block");
         doc.set(2, None);
         assert!(doc.files.is_empty());

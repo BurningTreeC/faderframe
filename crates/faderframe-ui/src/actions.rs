@@ -944,37 +944,21 @@ pub fn install(app: &Rc<AppState>) {
         // Development aid: `device-samples:<slot>=<path>[|<slot>=<path>…]`
         // loads samples into the device editor opened last.
         named("device-samples", |a, arg| {
-            use faderframe_plugin_host::devices::samples::{SampleDoc, pack};
             let Some(plugin) = crate::plugin_window::latest_device() else {
                 tracing::warn!("device-samples: no device editor is open");
                 return;
             };
-            let action = {
-                let s = a.session.borrow();
-                let (Some(tap), Some((track, slot))) =
-                    (s.plugin_tap(plugin), s.plugin_owner(plugin))
-                else {
-                    return;
-                };
-                let mut doc = SampleDoc::default();
-                for kv in arg.split('|') {
-                    if let Some((k, v)) = kv.split_once('=')
-                        && let Ok(k) = k.trim().parse::<usize>()
-                    {
-                        doc.set(k, Some(v.trim().to_string()));
-                    }
+            for kv in arg.split('|') {
+                if let Some((k, v)) = kv.split_once('=')
+                    && let Ok(slot) = k.trim().parse::<usize>()
+                {
+                    a.dispatch(Action::LoadDeviceSamples {
+                        plugin,
+                        slot,
+                        files: vec![std::path::PathBuf::from(v.trim())],
+                    });
                 }
-                Action::Edit(faderframe_project::Command::SetPluginState {
-                    track,
-                    plugin,
-                    state: Some(faderframe_session::encode_plugin_state(&pack(
-                        &tap.params.save(),
-                        &doc,
-                    ))),
-                    parameters: slot.parameters.clone(),
-                })
-            };
-            a.dispatch(action);
+            }
         }),
         // Development aid: `reload-plugins:x` starts every plugin again (a
         // crashed one, or after switching sandboxing).
