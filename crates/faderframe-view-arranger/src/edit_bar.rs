@@ -23,6 +23,8 @@ pub enum Item {
     Triplet,
     Dotted,
     Nudge,
+    /// Quantize / Humanize of the selected clips and their settings.
+    Groove,
     Flag(EditFlag),
     Sensitivity,
     Counter(usize),
@@ -205,6 +207,7 @@ impl EditToolbarView {
             false,
             92.0,
         );
+        add(&mut flow, Item::Groove, "Quantize ▾".into(), false, 74.0);
         flow.group();
         for (flag, label, on, w) in [
             (
@@ -372,6 +375,7 @@ impl EditToolbarView {
             }
             Item::Flag(EditFlag::EditToolbar) => String::new(),
             Item::Sensitivity => "Transient detection sensitivity".into(),
+            Item::Groove => "Quantize (Q) or Humanize the selected clips — audio by its transients, MIDI by its notes — and their settings".into(),
             Item::Counter(_) => "Edit selection (click: change units)".into(),
             Item::Zoom(ZoomRequest::In) => "Zoom in (Ctrl+])".into(),
             Item::Zoom(ZoomRequest::Out) => "Zoom out (Ctrl+[)".into(),
@@ -442,6 +446,32 @@ impl EditToolbarView {
                     EditFlag::EditToolbar => e.show_edit_toolbar,
                 };
                 cx.emit(Action::SetEditFlag(f, !on));
+            }
+            Item::Groove => {
+                let clips: Vec<_> = s.selection.clips.iter().copied().collect();
+                let mut items = if clips.is_empty() {
+                    vec![
+                        MenuItem::disabled("Quantize Selected Clips (Q)"),
+                        MenuItem::disabled("Humanize Selected Clips"),
+                    ]
+                } else {
+                    vec![
+                        MenuItem::new(
+                            "Quantize Selected Clips (Q)",
+                            Action::QuantizeClips(clips.clone()),
+                        ),
+                        MenuItem::new("Humanize Selected Clips", Action::HumanizeClips(clips)),
+                    ]
+                };
+                for (i, e) in s.groove_settings_menu().into_iter().enumerate() {
+                    let item = MenuItem::new(e.label, e.action).checked(e.checked);
+                    items.push(if e.separated || i == 0 {
+                        item.separated()
+                    } else {
+                        item
+                    });
+                }
+                cx.request(HostRequest::ContextMenu { at, items });
             }
             Item::Sensitivity => {
                 let items = [0.1f32, 0.25, 0.4, 0.5, 0.6, 0.75, 0.9, 1.0]

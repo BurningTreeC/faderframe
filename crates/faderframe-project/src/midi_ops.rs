@@ -312,6 +312,16 @@ fn quantize_point(t: MusicalTime, q: &QuantizeSettings, meter: &TimeSignatureMap
     bar_start + MusicalTime(target)
 }
 
+/// Where quantize moves a time: towards its grid point (swing applied) by
+/// the strength.
+pub fn quantize_target(
+    t: MusicalTime,
+    q: &QuantizeSettings,
+    meter: &TimeSignatureMap,
+) -> MusicalTime {
+    towards(t, quantize_point(t, q, meter), q.strength)
+}
+
 fn towards(from: MusicalTime, to: MusicalTime, strength: f32) -> MusicalTime {
     let s = strength.clamp(0.0, 1.0) as f64;
     MusicalTime(from.ticks() + ((to.ticks() - from.ticks()) as f64 * s).round() as i64)
@@ -345,10 +355,15 @@ pub fn quantize(
 }
 
 /// Small deterministic random numbers (xorshift) for humanize.
-struct Rng(u64);
+pub struct Rng(u64);
 
 impl Rng {
-    fn next(&mut self) -> f64 {
+    pub fn new(seed: u64) -> Self {
+        Self(seed | 1)
+    }
+
+    /// Uniform in −1..1.
+    pub fn signed(&mut self) -> f64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
@@ -358,11 +373,11 @@ impl Rng {
 
 /// Random offsets up to `timing` and `velocity` (deterministic per seed).
 pub fn humanize(notes: &mut [MidiNote], timing: MusicalTime, velocity: u8, seed: u64) {
-    let mut rng = Rng(seed | 1);
+    let mut rng = Rng::new(seed);
     for n in notes {
-        let dt = (rng.next() * timing.ticks() as f64).round() as i64;
+        let dt = (rng.signed() * timing.ticks() as f64).round() as i64;
         n.start = (n.start + MusicalTime(dt)).max(MusicalTime::ZERO);
-        let dv = (rng.next() * velocity as f64).round() as i32;
+        let dv = (rng.signed() * velocity as f64).round() as i32;
         n.velocity = (n.velocity as i32 + dv).clamp(1, 127) as u8;
     }
 }

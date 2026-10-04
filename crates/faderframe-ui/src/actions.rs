@@ -482,7 +482,7 @@ pub fn install(app: &Rc<AppState>) {
     // `edit-tool:<smart|trim|stretch|select|grab|separate|scrub|pencil|zoom>`,
     // `edit-flag:<warp|transients|tab-transients|link|insertion-follows|follow>`
     // (toggles), `edit:<separate|trim|clear|silence|copy|cut|paste|duplicate|
-    // quantize|separate-transients|unwarp>`, and the development aid
+    // quantize|humanize|separate-transients|unwarp>`, and the development aid
     // `select-clip:<track>` (adds the track's first clip to the selection).
     let named = |name: &'static str, f: fn(&Rc<AppState>, &str)| {
         let weak = Rc::downgrade(app);
@@ -550,7 +550,8 @@ pub fn install(app: &Rc<AppState>) {
                 "cut" => Action::CutRange,
                 "paste" => Action::PasteRange,
                 "duplicate" => Action::RepeatRange(1),
-                "quantize" => Action::QuantizeWarp(clips),
+                "quantize" => Action::QuantizeClips(clips),
+                "humanize" => Action::HumanizeClips(clips),
                 "separate-transients" => Action::SeparateAtTransients(clips),
                 "unwarp" => Action::ClearWarp(clips),
                 _ => return tracing::warn!("edit: unknown '{arg}'"),

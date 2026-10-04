@@ -1115,10 +1115,11 @@ impl PianoRollView {
                 },
             )
         };
-        let q = QuantizeSettings {
-            grid: model.editor.grid,
-            ..pr.quantize
-        };
+        let q = model.editor.quantize_settings();
+        let start = model
+            .project()
+            .clip(clip)
+            .map_or(MusicalTime::ZERO, |c| c.start);
         let mut items = vec![
             op("Quantize (Q)", NoteOp::Quantize(q)),
             op(
@@ -1129,13 +1130,7 @@ impl PianoRollView {
                     ..q
                 }),
             ),
-            op(
-                "Humanize",
-                NoteOp::Humanize {
-                    timing: MusicalTime::from_quarters(1.0 / 64.0),
-                    velocity: 12,
-                },
-            ),
+            op("Humanize", model.humanize_op(start)),
             op("Legato (Ctrl+L)", NoteOp::Legato).separated(),
             op("Remove Overlaps", NoteOp::RemoveOverlaps),
             op("Transpose +1 Octave", NoteOp::Transpose(12)).separated(),
@@ -1234,10 +1229,7 @@ impl PianoRollView {
             None => {
                 let at =
                     self.snap_floor_rel(self.time_at(pos.x).max(MusicalTime::ZERO), c.start, model);
-                let q = QuantizeSettings {
-                    grid: model.editor.grid,
-                    ..model.editor.piano.quantize
-                };
+                let q = model.editor.quantize_settings();
                 let mut items = vec![];
                 if !model.note_clipboard().is_empty() {
                     items.push(MenuItem::new("Paste Here", Action::PasteNotes { clip, at }));
@@ -1373,10 +1365,7 @@ impl PianoRollView {
                 'q' => cx.emit(Action::NoteOperation {
                     clip,
                     notes: sel.clone(),
-                    op: NoteOp::Quantize(QuantizeSettings {
-                        grid: model.editor.grid,
-                        ..pr.quantize
-                    }),
+                    op: NoteOp::Quantize(model.editor.quantize_settings()),
                 }),
                 'm' => op(cx, NoteOp::ToggleMuted),
                 'f' => {

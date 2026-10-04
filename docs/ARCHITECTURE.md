@@ -1035,12 +1035,18 @@ arrows (Shift: octave or fine; Ctrl+arrows: length; in-scale transposing
 with scale snap), 1–5 tools, +/−/F zoom, Esc. Ctrl+wheel zooms time,
 Ctrl+Shift+wheel the rows; folding shows only scale or used keys. The
 musical settings (`PianoRollSettings`: scale, chord, length, velocity,
-fold, quantize, lane, ghosts, audition) live in `EditorSettings`; every
+fold, lane, ghosts, audition) live in `EditorSettings`, next to the
+`quantize` and `humanize` settings the arranger shares; every
 edit is a session `Action` (`NoteOperation`, `AddNotes`, `AddChord`,
 `DuplicateNotes`, `SplitNotes`, `PasteNotes`, `SetControllerPoints`, …) —
 one undo step each, ids allocated by the session. Pure note operations
 (quantize with strength/swing/ends, humanize, legato, reverse, invert,
 velocity ramps, scales and chords) are in `faderframe_project::midi_ops`.
+`session::groove` applies Quantize and Humanize to whole clips in one undo
+step (`QuantizeClips`, `HumanizeClips`): MIDI clips through `NoteOp`s,
+audio clips by pinning each detected transient with a warp marker where
+it should play (`quantize_target`: the grid point with swing, by the
+strength; humanize: random offsets up to the timing in samples).
 
 ### Editing and elastic audio
 
@@ -1291,17 +1297,14 @@ and packages for all three platforms (see §14).
 
 **Next**, roughly in order:
 
-1. **Editing**: Quantize and Humanize tools for audio transients and
-   MIDI alike (selected clips, strength, swing, humanize timing and
-   velocity).
-2. **Ports**: the CoreAudio IO workgroup for DSP workers, signed and
+1. **Ports**: the CoreAudio IO workgroup for DSP workers, signed and
    notarised packages, a Flathub submission (vendored crates).
-3. **Plugins**: note expressions (CLAP, VST3), VST3 program lists and
+2. **Plugins**: note expressions (CLAP, VST3), VST3 program lists and
    64-bit processing, sandboxed plugins (out-of-process with shared-memory
    audio), SysEx to plugins.
-4. **MIDI**: MTC output, varispeed chase without a shared word clock.
-5. **Performance**: anticipative processing of tracks that are not
+3. **MIDI**: MTC output, varispeed chase without a shared word clock.
+4. **Performance**: anticipative processing of tracks that are not
    monitored live, job affinity for cache locality, an optional wgpu
    painter for dense views.
-6. **Mastering**: DDP export, ISRC/UPC metadata, crossfades between album
+5. **Mastering**: DDP export, ISRC/UPC metadata, crossfades between album
    songs, a song's own inserts on the album.

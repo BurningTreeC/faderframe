@@ -82,8 +82,11 @@ Contrast:
   elastic audio: Warp view shows transients and warp markers — double-click
   adds a marker, dragging a transient moves just that hit (its neighbours
   stay pinned), dragging inside a selection warps only that range,
-  Ctrl-drag telescopes; Quantize Transients to Grid, Separate at Transients
-  and time-compression trims. Warped clips play pitch-preserving
+  Ctrl-drag telescopes; Separate at Transients and time-compression trims.
+  Quantize (Q) and Humanize work on the selected clips, audio by its
+  transients and MIDI by its notes alike: quantize strength and swing,
+  note ends, humanize timing (ms) and velocity — set in the edit
+  toolbar's Quantize menu or the piano roll's quantize settings. Warped clips play pitch-preserving
   (Polyphonic or Rhythmic, via Signalsmith Stretch) or as Varispeed.
 * Transport: tap tempo (the TAP pad in the display), editable time
   signature (click it; right-click for common meters and meter changes),

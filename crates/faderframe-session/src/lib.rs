@@ -26,6 +26,7 @@ pub mod analysis;
 pub mod delivery;
 pub mod editing;
 mod freeze;
+pub mod groove;
 mod groups;
 pub mod lanes;
 mod redraw;
@@ -61,6 +62,7 @@ use faderframe_engine::{
     EngineConfig, EngineController, EngineError, EngineProcessor, Source, SourceMap, StreamPlan,
 };
 use faderframe_project::file::{self, FileError};
+use faderframe_project::midi_ops::QuantizeSettings;
 use faderframe_project::{
     AudioClip, AudioSource, AuxSend, Clip, ClipContent, Command, EditError, History, Impact,
     MidiClip, MidiNote, MusicalRange, PluginRef, PluginSlot, Project, SendTap, SourceSpec, Track,
@@ -467,6 +469,14 @@ pub enum Action {
     AuditionOff,
     SetStepInput(Option<midi::StepInput>),
     SetPianoRoll(PianoRollSettings),
+    /// Strength, swing and note ends of Quantize.
+    SetQuantize(QuantizeSettings),
+    SetHumanize(groove::HumanizeSettings),
+    /// Quantize whole clips: audio by its transients, MIDI by its notes
+    /// (one undo step).
+    QuantizeClips(Vec<ClipId>),
+    /// Humanize whole clips: transients and notes in time, note velocities.
+    HumanizeClips(Vec<ClipId>),
     /// Map the next control moved on a MIDI device to this target.
     MidiLearn(faderframe_project::MappingTarget),
     CancelMidiLearn,
@@ -669,6 +679,11 @@ pub struct EditorSettings {
     pub zoom_request: (u64, ZoomRequest),
     /// Lanes under the arranger's ruler.
     pub lanes: lanes::GlobalLanes,
+    /// How Quantize moves notes and transients (its grid is the edit
+    /// grid's).
+    pub quantize: QuantizeSettings,
+    /// How far Humanize moves notes and transients.
+    pub humanize: groove::HumanizeSettings,
 }
 
 impl Default for EditorSettings {
@@ -692,11 +707,21 @@ impl Default for EditorSettings {
             transient_sensitivity: 0.5,
             zoom_request: (0, ZoomRequest::Fit),
             lanes: lanes::GlobalLanes::default(),
+            quantize: QuantizeSettings::default(),
+            humanize: groove::HumanizeSettings::default(),
         }
     }
 }
 
 impl EditorSettings {
+    /// The quantize settings with the edit grid.
+    pub fn quantize_settings(&self) -> QuantizeSettings {
+        QuantizeSettings {
+            grid: self.grid,
+            ..self.quantize
+        }
+    }
+
     /// Snap `pos` to the grid if snapping is on.
     pub fn snap(
         &self,
@@ -2583,6 +2608,16 @@ impl Session {
                 drag,
             } => self.warp_to(clip, source, to, drag)?,
             Action::RemoveWarpMarker { clip, source } => self.remove_warp_marker(clip, source)?,
+            Action::SetQuantize(q) => {
+                self.editor.quantize = q;
+                self.revision += 1;
+            }
+            Action::SetHumanize(h) => {
+                self.editor.humanize = h;
+                self.revision += 1;
+            }
+            Action::QuantizeClips(clips) => self.quantize_clips(&clips)?,
+            Action::HumanizeClips(clips) => self.humanize_clips(&clips)?,
             Action::QuantizeWarp(clips) => {
                 for c in clips {
                     self.quantize_warp(c)?;

@@ -9,8 +9,9 @@
 use crate::editing::{ClipEdge, EditMode};
 use crate::{Result, Session, SessionError};
 use faderframe_core::ClipId;
+use faderframe_project::midi_ops::quantize_target;
 use faderframe_project::{AudioClip, Clip, ClipContent, Command, Warp, WarpAlgorithm, WarpMarker};
-use faderframe_timeline::{MusicalTime, snap_nearest};
+use faderframe_timeline::MusicalTime;
 
 /// How a warp drag treats the audio around the dragged point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,7 +31,7 @@ pub enum WarpDrag {
 /// Shortest clip a stretch or warp leaves (frames).
 const MIN_FRAMES: i64 = 64;
 
-fn audio(c: &Clip) -> Result<AudioClip> {
+pub(crate) fn audio(c: &Clip) -> Result<AudioClip> {
     match &c.content {
         ClipContent::Audio(a) => Ok(a.clone()),
         _ => Err(SessionError::Other("only audio clips can be warped".into())),
@@ -38,7 +39,7 @@ fn audio(c: &Clip) -> Result<AudioClip> {
 }
 
 /// The warp map of `a` (an identity map when it has none).
-fn warp_of(a: &AudioClip) -> Warp {
+pub(crate) fn warp_of(a: &AudioClip) -> Warp {
     a.warp.clone().unwrap_or_else(|| Warp::uniform(a.length))
 }
 
@@ -58,7 +59,13 @@ impl Session {
         Ok(self.gesture_base.entry(clip).or_insert(current).clone())
     }
 
-    fn set_audio(&mut self, label: &str, c: &Clip, start: MusicalTime, a: AudioClip) -> Result<()> {
+    pub(crate) fn set_audio(
+        &mut self,
+        label: &str,
+        c: &Clip,
+        start: MusicalTime,
+        a: AudioClip,
+    ) -> Result<()> {
         self.batch(
             label,
             vec![Command::SetClipContent {
@@ -163,15 +170,26 @@ impl Session {
         self.set_audio("Remove Warp Marker", &c, c.start, a)
     }
 
-    /// Move the clip's transients to the nearest grid lines.
+    /// The detected transients of a source (an error while detection is
+    /// still running).
+    pub(crate) fn transients_for_warp(
+        &self,
+        source: faderframe_core::AudioSourceId,
+    ) -> Result<Vec<i64>> {
+        self.source_transients(source).ok_or_else(|| {
+            SessionError::Other("transients are still being detected — try again shortly".into())
+        })
+    }
+
+    /// Move the clip's transients towards the grid (the editor's quantize
+    /// strength and swing).
     pub fn quantize_warp(&mut self, clip: ClipId) -> Result<()> {
         let c = self.gesture_clip(clip)?;
         let mut a = audio(&c)?;
         let (off, len) = (a.source_offset, a.length);
         let w = warp_of(&a);
-        let hits = self.source_transients(a.source).ok_or_else(|| {
-            SessionError::Other("transients are still being detected — try again shortly".into())
-        })?;
+        let hits = self.transients_for_warp(a.source)?;
+        let quantize = self.editor.quantize_settings();
         let p = &self.project;
         let rate = p.sample_rate as f64;
         let base = p.timeline.to_samples(c.start, rate);
@@ -187,7 +205,7 @@ impl Session {
         {
             let out = w.output_of(off, len, s);
             let t = p.timeline.to_musical(base + out, rate);
-            let snapped = snap_nearest(t, self.editor.grid, &p.timeline.meter);
+            let snapped = quantize_target(t, &quantize, &p.timeline.meter);
             let at = p.timeline.to_samples(snapped, rate) - base;
             if at > last && at < len {
                 q.markers.push(WarpMarker { at, source: s });

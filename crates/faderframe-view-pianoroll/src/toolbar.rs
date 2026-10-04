@@ -4,7 +4,7 @@
 
 use crate::{PianoRollView, Tool, note_name};
 use faderframe_project::MidiNote;
-use faderframe_project::midi_ops::{ChordKind, PITCH_NAMES, QuantizeSettings, Scale, ScaleKind};
+use faderframe_project::midi_ops::{ChordKind, PITCH_NAMES, Scale, ScaleKind};
 use faderframe_session::{
     Action, KeyFold, NoteLength, NoteOp, PianoRollSettings, Session, StepInput,
 };
@@ -275,7 +275,7 @@ impl PianoRollView {
             Item::Fold => "Show all keys, only the scale, or only used keys".into(),
             Item::Chord => "Draw chords instead of single notes".into(),
             Item::Quantize => "Quantize the selection (or all notes) — Q".into(),
-            Item::QuantizeMenu => "Quantize settings".into(),
+            Item::QuantizeMenu => "Quantize and Humanize settings".into(),
             Item::Ghosts => "Show the track's other clips behind".into(),
             Item::Audition => "Hear notes while drawing, moving and on the keys".into(),
             Item::Step => "Step input: play notes on your MIDI keyboard to enter them".into(),
@@ -445,48 +445,31 @@ impl PianoRollView {
                     cx.emit(Action::NoteOperation {
                         clip,
                         notes,
-                        op: NoteOp::Quantize(QuantizeSettings {
-                            grid: model.editor.grid,
-                            ..pr.quantize
-                        }),
+                        op: NoteOp::Quantize(model.editor.quantize_settings()),
                     });
                 }
             }
             Item::QuantizeMenu => {
-                let q = pr.quantize;
-                let mut entries = Vec::new();
-                for (i, s) in [1.0f32, 0.75, 0.5, 0.25].into_iter().enumerate() {
-                    entries.push((
-                        format!("Strength {:.0} %", s * 100.0),
-                        PianoRollSettings {
-                            quantize: QuantizeSettings { strength: s, ..q },
-                            ..pr
-                        },
-                        (q.strength - s).abs() < 1e-3,
-                        i == 0,
-                    ));
+                let mut items = groove_settings(model);
+                if let Some((clip, c, m)) = clip {
+                    let notes: Vec<_> = Self::selected(m, model).iter().map(|n| n.id).collect();
+                    items.push(
+                        MenuItem::new(
+                            if notes.is_empty() {
+                                "Humanize All Notes"
+                            } else {
+                                "Humanize Selected Notes"
+                            },
+                            Action::NoteOperation {
+                                clip,
+                                notes,
+                                op: model.humanize_op(c.start),
+                            },
+                        )
+                        .separated(),
+                    );
                 }
-                for (i, s) in [0.0f32, 0.25, 0.5, 0.66].into_iter().enumerate() {
-                    entries.push((
-                        format!("Swing {:.0} %", s * 100.0),
-                        PianoRollSettings {
-                            quantize: QuantizeSettings { swing: s, ..q },
-                            ..pr
-                        },
-                        (q.swing - s).abs() < 1e-3,
-                        i == 0,
-                    ));
-                }
-                entries.push((
-                    "Quantize note ends too".into(),
-                    PianoRollSettings {
-                        quantize: QuantizeSettings { ends: !q.ends, ..q },
-                        ..pr
-                    },
-                    q.ends,
-                    true,
-                ));
-                cx.request(Self::settings_menu(at, entries));
+                cx.request(HostRequest::ContextMenu { at, items });
             }
             Item::Ghosts => cx.emit(Action::SetPianoRoll(PianoRollSettings {
                 ghost_notes: !pr.ghost_notes,
@@ -535,4 +518,16 @@ impl PianoRollView {
         }
         cx.redraw();
     }
+}
+
+/// Quantize and Humanize settings as menu items.
+pub fn groove_settings(model: &Session) -> Vec<MenuItem<Action>> {
+    model
+        .groove_settings_menu()
+        .into_iter()
+        .map(|e| {
+            let item = MenuItem::new(e.label, e.action).checked(e.checked);
+            if e.separated { item.separated() } else { item }
+        })
+        .collect()
 }

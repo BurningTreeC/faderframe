@@ -1535,6 +1535,9 @@ impl ArrangerView {
             Key::F(9) => Action::SetEditTool(EditTool::Scrub),
             Key::F(10) => Action::SetEditTool(EditTool::Pencil),
             Key::Char('b' | 'B') if !ctrl && !mods.alt => Action::Separate,
+            Key::Char('q' | 'Q') if !ctrl && !mods.alt && !selected.is_empty() => {
+                Action::QuantizeClips(selected.clone())
+            }
             Key::Char('c' | 'C') if ctrl && has_range => Action::CopyRange,
             Key::Char('x' | 'X') if ctrl && has_range => Action::CutRange,
             Key::Char('v' | 'V') if ctrl => Action::PasteRange,
@@ -1915,18 +1918,21 @@ impl ArrangerView {
                 }
             }
         }
+        items.push(
+            MenuItem::new("Quantize (Q)", Action::QuantizeClips(targets.clone())).separated(),
+        );
+        items.push(MenuItem::new(
+            "Humanize",
+            Action::HumanizeClips(targets.clone()),
+        ));
         if !audio.is_empty() {
             items.push(
                 MenuItem::new(
-                    "Quantize Transients to Grid",
-                    Action::QuantizeWarp(audio.clone()),
+                    "Separate at Transients",
+                    Action::SeparateAtTransients(audio.clone()),
                 )
                 .separated(),
             );
-            items.push(MenuItem::new(
-                "Separate at Transients",
-                Action::SeparateAtTransients(audio.clone()),
-            ));
             let current = match &c.content {
                 ClipContent::Audio(a) => a.warp.as_ref().map(|w| w.algorithm),
                 _ => None,

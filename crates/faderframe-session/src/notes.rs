@@ -118,7 +118,6 @@ pub struct PianoRollSettings {
     /// Play notes while drawing, moving and clicking keys.
     pub audition: bool,
     pub fold: KeyFold,
-    pub quantize: QuantizeSettings,
     /// The lane under the notes: velocity (`None`) or a controller on a
     /// channel.
     pub lane: Option<(MidiController, u8)>,
@@ -137,7 +136,6 @@ impl Default for PianoRollSettings {
             ghost_notes: true,
             audition: true,
             fold: KeyFold::Off,
-            quantize: QuantizeSettings::default(),
             lane: None,
             expression: None,
         }
