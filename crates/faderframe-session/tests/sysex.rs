@@ -100,14 +100,20 @@ fn clip_sysex_goes_out_when_its_time_comes() {
 fn stopping_before_it_cancels_scheduled_sysex() {
     let (mut s, captured, _) = setup();
     audio(&mut s);
-    // Start 450 ms before the message, stop after 420 ms: it was already
-    // scheduled (100 ms ahead) but must not go out.
+    // Start 450 ms before the message, stop 50 ms before it (by the
+    // transport, not by sleeping, which overshoots on busy machines): it
+    // was already scheduled (100 ms ahead) but must not go out.
     let start = MusicalTime::from_quarters(1.0 - 0.9);
     s.dispatch(Action::Transport(TransportAction::Locate(start)))
         .unwrap();
     s.dispatch(Action::Transport(TransportAction::Play))
         .unwrap();
-    run(&mut s, Duration::from_millis(420));
+    let stop_at = (0.1 * 0.5 * 48_000.0 + 0.4 * 48_000.0) as i64;
+    let begun = std::time::Instant::now();
+    while s.transport().position < stop_at && begun.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(2));
+        s.tick(0.002);
+    }
     s.dispatch(Action::Transport(TransportAction::Stop))
         .unwrap();
     run(&mut s, Duration::from_millis(300));

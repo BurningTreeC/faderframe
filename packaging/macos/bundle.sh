@@ -26,7 +26,9 @@ contents=$app/Contents
 res=$contents/Resources
 rm -rf "$app"
 mkdir -p "$contents/MacOS" "$contents/Frameworks" "$res/share/glib-2.0/schemas" "$res/share/icons"
-cp "$bin" "$contents/MacOS/faderframe"
+# The program and its launcher (the bundle's executable). Distinct names
+# beyond case: macOS file systems usually ignore case.
+cp "$bin" "$contents/MacOS/faderframe-bin"
 install -m755 packaging/macos/launcher.sh "$contents/MacOS/FaderFrame"
 sed "s/@VERSION@/$version/g" packaging/macos/Info.plist >"$contents/Info.plist"
 python3 packaging/icons.py icns packaging/icons/io.github.BurningTreeC.FaderFrame.svg "$res/FaderFrame.icns"
@@ -57,12 +59,12 @@ fi
 
 # Every non-system library the binary and the loaders use.
 python3 packaging/macos/bundle_dylibs.py "$contents/Frameworks" \
-    "$contents/MacOS/faderframe" "$loader_dir"/loaders/*.so
+    "$contents/MacOS/faderframe-bin" "$loader_dir"/loaders/*.so
 
 # Ad-hoc signatures (install_name_tool invalidated the original ones).
 find "$contents/Frameworks" "$loader_dir/loaders" -type f \( -name '*.dylib' -o -name '*.so' \) \
     -exec codesign --force --sign - {} \;
-codesign --force --sign - "$contents/MacOS/faderframe"
+codesign --force --sign - "$contents/MacOS/faderframe-bin"
 codesign --force --sign - "$app"
 
 dmg=$dist/FaderFrame-$version-macos-$arch.dmg

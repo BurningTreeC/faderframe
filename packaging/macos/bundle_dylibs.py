@@ -28,9 +28,22 @@ def run(*args: str) -> str:
     return subprocess.run(args, check=True, capture_output=True, text=True).stdout
 
 
+MACH_O = {0xFEEDFACE, 0xFEEDFACF, 0xCEFAEDFE, 0xCFFAEDFE, 0xCAFEBABE, 0xBEBAFECA}
+
+
+def is_mach_o(path: str) -> bool:
+    with open(path, "rb") as f:
+        head = f.read(4)
+    return len(head) == 4 and int.from_bytes(head, "big") in MACH_O
+
+
 def install_names(path: str) -> list[str]:
     lines = run("otool", "-L", path).splitlines()[1:]
-    return [line.strip().split(" (compatibility")[0].strip() for line in lines if line.strip()]
+    return [
+        line.strip().split(" (compatibility")[0].strip()
+        for line in lines
+        if line.strip()
+    ]
 
 
 @functools.cache
@@ -62,7 +75,10 @@ def resolve(name: str, origin: str, executable: str) -> str | None:
             rp = rp.replace("@loader_path", loader).replace("@executable_path", exe_dir)
             candidates.append(os.path.join(rp, rest))
         brew = os.environ.get("HOMEBREW_PREFIX", "/opt/homebrew")
-        candidates += [os.path.join(brew, "lib", rest), os.path.join("/usr/local/lib", rest)]
+        candidates += [
+            os.path.join(brew, "lib", rest),
+            os.path.join("/usr/local/lib", rest),
+        ]
     elif name.startswith("@loader_path/"):
         candidates.append(os.path.join(loader, name[len("@loader_path/") :]))
     elif name.startswith("@executable_path/"):
@@ -79,6 +95,9 @@ def main() -> None:
     if len(sys.argv) < 3:
         sys.exit(__doc__)
     frameworks, binaries = sys.argv[1], sys.argv[2:]
+    for b in binaries:
+        if not is_mach_o(b):
+            sys.exit(f"{b}: not a Mach-O binary")
     executable = binaries[0]
     os.makedirs(frameworks, exist_ok=True)
     # file to patch -> its real origin (for @loader_path / @rpath)

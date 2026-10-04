@@ -23,6 +23,8 @@ out=dist/FaderFrame
 rm -rf "$out"
 mkdir -p "$out/bin" "$out/share/glib-2.0/schemas" "$out/share/icons" "$out/lib"
 cp "$exe" "$out/bin/"
+# Release builds carry debug info (for profiling): not for distribution.
+strip "$out/bin/faderframe.exe"
 
 # The DLLs a binary needs from the MSYS2 prefix (ldd lists them all).
 copy_deps() {

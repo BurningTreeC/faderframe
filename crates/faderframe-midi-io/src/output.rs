@@ -398,17 +398,18 @@ mod tests {
             0xF0, 0x41, 0x10, 0x42, 0x12, 0x40, 0x00, 0x7F, 0x00, 0x41, 0xF7,
         ];
         outs.send_sysex(port, now + 15 * ms, dump.clone());
-        outs.send_sysex(port, now + 400 * ms, vec![0xF0, 1, 0xF7]);
-        std::thread::sleep(Duration::from_millis(5));
-        assert!(captured.lock().unwrap().is_empty(), "not yet due");
-        std::thread::sleep(Duration::from_millis(40));
+        outs.send_sysex(port, now + 1000 * ms, vec![0xF0, 1, 0xF7]);
+        // (Early sends show in the send times: sleeping can overshoot.)
+        std::thread::sleep(Duration::from_millis(60));
         let got = captured.lock().unwrap().clone();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].1, dump);
         assert!(got[0].0 + 2 * ms >= now + 15 * ms, "not early");
         // The transport stopped: the later one never goes out.
         outs.cancel_sysex();
-        std::thread::sleep(Duration::from_millis(450));
+        while clock.now_ns() < now + 1100 * ms {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert_eq!(captured.lock().unwrap().len(), 1);
         // New messages after a cancel are sent.
         outs.send_sysex(port, clock.now_ns(), vec![0xF0, 2, 0xF7]);

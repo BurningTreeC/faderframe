@@ -37,8 +37,11 @@ fn master_and_track_analysis_while_playing() {
     let [left, right] = s.analysis_levels();
     assert!(left.peak > -40.0 && right.peak > -40.0);
     assert!(s.analyzer().phase.correlation() > 0.0);
-    let (hz, db) = s.analyzer().spectrum.loudest();
-    assert!(hz > 20.0 && db > -60.0, "{hz} Hz {db} dB");
+    // The spectrum's held peaks show music above 20 Hz (the loudest bin of
+    // the last frame depends on where in the drum loop it falls).
+    let (_, peaks) = s.analyzer().spectrum.curve(64, 20.0, 20_000.0);
+    let top = peaks.iter().copied().fold(f32::MIN, f32::max);
+    assert!(top > -60.0, "spectrum peaks above 20 Hz: {top} dB");
 
     // A silent track: nothing but the floor.
     let pad = s

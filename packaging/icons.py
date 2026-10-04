@@ -27,7 +27,15 @@ def ico(svg: str, out: str) -> None:
     for size, image in zip(sizes, images):
         # Width/height 0 means 256.
         entries += struct.pack(
-            "<BBBBHHII", size % 256, size % 256, 0, 0, 1, 32, len(image), offset + len(data)
+            "<BBBBHHII",
+            size % 256,
+            size % 256,
+            0,
+            0,
+            1,
+            32,
+            len(image),
+            offset + len(data),
         )
         data += image
     with open(out, "wb") as f:

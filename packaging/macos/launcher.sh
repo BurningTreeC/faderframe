@@ -19,4 +19,4 @@ for arg in "$@"; do
     *) set -- "$@" "$arg" ;;
     esac
 done
-exec "$here/faderframe" "$@"
+exec "$here/faderframe-bin" "$@"
