@@ -1589,6 +1589,14 @@ impl Session {
         self.engine.collect_garbage();
         let was_playing = self.transport.playing;
         self.transport = self.engine.transport_snapshot();
+        if self.album_state.is_playing() {
+            // The project started playing: it has the outputs back.
+            if !was_playing && self.transport.playing {
+                self.album_stop_playing();
+            }
+            // The album's playhead moves.
+            self.revision += 1;
+        }
         let plugin_poll = self.engine.poll_plugins();
         if plugin_poll.restart {
             // Latency or ports changed: rebuild (re-activates the plugin).
@@ -3791,6 +3799,8 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.cancel_imports();
+        // The album rendered to play it.
+        self.album_state.discard_preview();
         // Scratch media of a project that was never saved is discarded with
         // it (the shell asks before closing unsaved work).
         self.discard_unsaved_media();

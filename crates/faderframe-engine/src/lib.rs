@@ -27,6 +27,7 @@ pub mod midi;
 pub mod nodes;
 pub mod offline;
 mod plugins;
+pub mod preview;
 pub mod record;
 mod slots;
 mod snapshot;

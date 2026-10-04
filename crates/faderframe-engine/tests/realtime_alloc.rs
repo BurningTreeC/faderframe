@@ -1297,3 +1297,64 @@ fn the_instruments_do_not_allocate() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Album playback: taking the file, playing, locating, pausing and giving
+/// it back allocate nothing on the audio thread.
+#[test]
+fn album_playback_does_not_allocate() {
+    let _serial = serial();
+    use faderframe_audio_files::{PAGE_FRAMES, StreamSource, WavFormat, write_wav};
+    use faderframe_realtime::{Epoch, Reclaimer};
+    const SR: u32 = 48_000;
+    let n = PAGE_FRAMES * 3;
+    let x: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin() * 0.3).collect();
+    let dir = std::env::temp_dir().join(format!("ff-alloc-preview-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("album.wav");
+    write_wav(&path, &[x.clone(), x], SR, WavFormat::Float32, false).unwrap();
+    let src = StreamSource::open(&path).unwrap();
+    src.ensure(
+        src.page_range(0, n as i64),
+        &Epoch::new(),
+        &mut Reclaimer::default(),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    let project = demo_project(SR);
+    let sources = render_generated_sources(&project, SR);
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&project, &sources, config, 256, 2).unwrap();
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    for _ in 0..8 {
+        r.processor.process_device(&mut bufs);
+    }
+    r.controller.set_preview(Some(src)).unwrap();
+    r.controller.preview().play(true);
+    let (_, allocs) = armed(|| {
+        for i in 0..200 {
+            if i == 50 {
+                r.controller.preview().locate(PAGE_FRAMES as i64 - 10);
+            }
+            if i == 80 {
+                r.controller.preview().play(false);
+            }
+            if i == 90 {
+                r.controller.preview().play(true);
+            }
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations in album playback");
+    r.controller.set_preview(None).unwrap();
+    let (_, allocs) = armed(|| {
+        for _ in 0..4 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "handing the file back allocates nothing");
+    let _ = std::fs::remove_dir_all(&dir);
+}

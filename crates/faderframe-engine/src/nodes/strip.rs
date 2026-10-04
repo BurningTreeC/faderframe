@@ -189,7 +189,10 @@ impl Processor<EngineContext> for ChannelStrip {
             return;
         };
         // The analysed track feeds the scope (mono: both sides alike).
-        if cx.data.scope.source() == Some(self.track.raw()) && post.num_channels() > 0 {
+        if !cx.data.preview_active
+            && cx.data.scope.source() == Some(self.track.raw())
+            && post.num_channels() > 0
+        {
             let l = &post.channel(0)[..n];
             let r = &post.channel(post.num_channels().min(2) - 1)[..n];
             cx.data.scope.push(self.track.raw(), l, r);

@@ -89,6 +89,30 @@ pub enum AlbumAction {
     Analyse,
     Export,
     Cancel,
+    /// Play the album as it will be delivered (prepared first if the album
+    /// or the project changed), from a song or from where it was.
+    Play(Option<SongId>),
+    Pause,
+    /// Back to the project.
+    StopPlaying,
+    /// The previous (−1) or next (+1) song.
+    Skip(i32),
+    /// To a point of the album (seconds).
+    Seek(f64),
+}
+
+/// Album playback as the view shows it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AlbumPlayback {
+    /// The album is being rendered to play (fraction 0–1).
+    pub preparing: Option<f64>,
+    pub playing: bool,
+    /// Seconds into the album, and its length.
+    pub position: f64,
+    pub length: f64,
+    /// The song playing (index) and seconds into it.
+    pub song: Option<usize>,
+    pub in_song: f64,
 }
 
 /// How a song measured.
@@ -115,6 +139,23 @@ pub struct Delivered {
 pub enum AlbumTask {
     Analyse,
     Export,
+    /// Render the album as it will be delivered, to play it.
+    Prepare,
+}
+
+/// The album as it will be delivered (levelled, limited, with its pauses
+/// and crossfades; float, undithered), ready to play, and where each song
+/// starts in it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlbumPreview {
+    pub path: PathBuf,
+    pub rate: u32,
+    pub frames: u64,
+    /// Each song's start (frames), in album order.
+    pub songs: Vec<(SongId, u64)>,
+    /// What it was made from: the album and the project's revision.
+    pub album: Album,
+    pub revision: u64,
 }
 
 /// A running album job.
@@ -148,6 +189,29 @@ pub(crate) struct AlbumState {
     last_export: Option<AlbumExport>,
     /// Progress last shown (redraws while it moves).
     shown: Option<(usize, u32)>,
+    /// The album rendered to play, the file playing (if one is), and the
+    /// song to start from once it is prepared.
+    preview: Option<AlbumPreview>,
+    playing: Option<Arc<faderframe_audio_files::StreamSource>>,
+    play_after: Option<Option<SongId>>,
+    preview_dir: Option<PathBuf>,
+}
+
+impl AlbumState {
+    fn preview_dir(&mut self) -> PathBuf {
+        self.preview_dir.get_or_insert_with(new_preview_dir).clone()
+    }
+
+    /// Remove what was rendered to play (the session goes).
+    pub(crate) fn discard_preview(&mut self) {
+        if let Some(d) = self.preview_dir.take() {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    pub(crate) fn is_playing(&self) -> bool {
+        self.playing.is_some()
+    }
 }
 
 /// What a song's audio is made from (prepared on the control thread).
@@ -183,6 +247,7 @@ struct Job {
 struct Outcome {
     analyses: Vec<(SongId, std::result::Result<SongAnalysis, String>)>,
     export: Option<std::result::Result<AlbumExport, String>>,
+    preview: Option<std::result::Result<AlbumPreview, String>>,
     cancelled: bool,
 }
 
@@ -194,6 +259,14 @@ struct Plan {
     rate: u32,
     folder: PathBuf,
     name: String,
+}
+
+/// A folder to render the album to play it in (one per session, removed
+/// with it).
+fn new_preview_dir() -> PathBuf {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("faderframe-album-{}-{n}", std::process::id()))
 }
 
 /// The loudness of songs played one after another (energy mean weighted
@@ -359,9 +432,24 @@ fn export_files(
 ) -> std::result::Result<AlbumExport, String> {
     let io = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
     std::fs::create_dir_all(&plan.folder).map_err(|e| io(&plan.folder, e))?;
+    let (temps, gains) = render_songs(plan, shared, out, &plan.folder)?;
+    let result = check_cd_tracks(plan, out).and_then(|()| deliver(plan, shared, &temps, &gains));
+    for t in &temps {
+        let _ = std::fs::remove_file(t);
+    }
+    result
+}
+
+/// Pass 1: every song once, to a temporary file in `dir`, measured on its
+/// own and as part of the album; the gains the settings give them.
+fn render_songs(
+    plan: &Plan,
+    shared: &Shared,
+    out: &mut Outcome,
+    dir: &Path,
+) -> std::result::Result<(Vec<PathBuf>, Vec<f64>), String> {
+    let io = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
     let rate = plan.rate;
-    // Pass 1: every song once, to a temporary file, measured on its own
-    // and as part of the album.
     let mut temps: Vec<PathBuf> = Vec::new();
     let cleanup = |temps: &[PathBuf]| {
         for t in temps {
@@ -394,7 +482,7 @@ fn export_files(
             }),
         ));
         reports.push(report);
-        let temp = plan.folder.join(format!(".faderframe-album-{i}.tmp.wav"));
+        let temp = dir.join(format!(".faderframe-album-{i}.tmp.wav"));
         if let Err(e) = write_wav_with(&temp, &audio, rate, WavFormat::Float32, Dither::Off) {
             cleanup(&temps);
             return Err(io(&temp, e));
@@ -402,9 +490,84 @@ fn export_files(
         temps.push(temp);
     }
     let gains = gains(&plan.settings, &reports, album.report().integrated);
-    let result = check_cd_tracks(plan, out).and_then(|()| deliver(plan, shared, &temps, &gains));
-    cleanup(&temps);
-    result
+    Ok((temps, gains))
+}
+
+/// A song at its gain, its true peak limited as the settings ask; the
+/// gain and limiting applied (dB).
+fn level(audio: &mut [Vec<f32>], s: &AlbumSettings, rate: u32, gain: f64) -> (f64, f64) {
+    match s.ceiling.map(f64::from) {
+        Some(c) if s.level == AlbumLevel::PerSong && s.limit && s.loudness.is_some() => {
+            let target = s.loudness.map_or(0.0, f64::from);
+            let n = normalize_loudness(audio, rate, target, c, PeakHandling::Limit);
+            (n.gain_db, n.limited_db)
+        }
+        Some(c) => (gain, gain_and_limit(audio, rate, gain, c)),
+        None => {
+            apply_gain(audio, gain);
+            (gain, 0.0)
+        }
+    }
+}
+
+/// Render the album to play it: pass 1, then the songs levelled and
+/// limited as they will be delivered, joined after their pauses or into
+/// their crossfades, into one float file in `dir`.
+fn prepare(plan: &Plan, shared: &Shared, dir: &Path, revision: u64) -> Outcome {
+    let mut out = Outcome::default();
+    let result = (|| {
+        let io = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
+        std::fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
+        let (temps, gains) = render_songs(plan, shared, &mut out, dir)?;
+        let path = dir.join("album.wav");
+        let rate = plan.rate;
+        let mut writer = WavWriter::create_with(&path, 2, rate, WavFormat::Float32, Dither::Off)
+            .map_err(|e| io(&path, e))?;
+        let n = plan.items.len();
+        let (marks, frames) = {
+            let mut sink = |_: &[Mark], _: u64, planes: &[&[f32]]| {
+                writer
+                    .write_planar(planes, planes[0].len())
+                    .map_err(|e| e.to_string())
+            };
+            let mut assembler = Assembler::new(rate);
+            for (i, item) in plan.items.iter().enumerate() {
+                shared.song.store(n + i, Ordering::Relaxed);
+                if cancelled(shared) {
+                    return Err("cancelled".to_string());
+                }
+                let mut audio = read_wav(&temps[i]).map_err(|e| io(&temps[i], e))?.channels;
+                level(&mut audio, &plan.settings, rate, gains[i]);
+                let pause = if i == 0 { 0.0 } else { item.song.pause };
+                let keep = plan.items.get(i + 1).map_or(0.0, |x| x.song.crossfade);
+                assembler.add(&audio, pause, item.song.crossfade, keep, &mut sink)?;
+            }
+            assembler.finish(&mut sink)?
+        };
+        writer.finish().map_err(|e| io(&path, e))?;
+        for t in &temps {
+            let _ = std::fs::remove_file(t);
+        }
+        Ok(AlbumPreview {
+            path,
+            rate,
+            frames,
+            songs: plan
+                .items
+                .iter()
+                .zip(&marks)
+                .map(|(item, m)| (item.song.id, m.start))
+                .collect(),
+            album: plan.album.clone(),
+            revision,
+        })
+    })();
+    if cancelled(shared) {
+        out.cancelled = true;
+    } else {
+        out.preview = Some(result);
+    }
+    out
 }
 
 /// With a CD master: every track (song to the next song's start) lasts
@@ -497,19 +660,7 @@ fn deliver(
                 return Err("cancelled".into());
             }
             let mut audio = read_wav(&temps[i]).map_err(|e| io(&temps[i], e))?.channels;
-            let gain = gains[i];
-            let (gain_db, limited_db) = match s.ceiling.map(f64::from) {
-                Some(c) if s.level == AlbumLevel::PerSong && s.limit && s.loudness.is_some() => {
-                    let target = s.loudness.map_or(0.0, f64::from);
-                    let n = normalize_loudness(&mut audio, rate, target, c, PeakHandling::Limit);
-                    (n.gain_db, n.limited_db)
-                }
-                Some(c) => (gain, gain_and_limit(&mut audio, rate, gain, c)),
-                None => {
-                    apply_gain(&mut audio, gain);
-                    (gain, 0.0)
-                }
-            };
+            let (gain_db, limited_db) = level(&mut audio, s, rate, gains[i]);
             let report = measure(&audio, rate);
             if !gapless {
                 write_wav_with(&paths[i], &audio, rate, s.format, s.dither)
@@ -724,6 +875,20 @@ impl Session {
                 }
                 return Ok(());
             }
+            AlbumAction::Play(from) => return self.album_play(from),
+            AlbumAction::Pause => {
+                self.album_pause();
+                return Ok(());
+            }
+            AlbumAction::StopPlaying => {
+                self.album_stop_playing();
+                return Ok(());
+            }
+            AlbumAction::Skip(d) => return self.album_skip(d),
+            AlbumAction::Seek(t) => {
+                self.album_seek(t);
+                return Ok(());
+            }
         }
         if album == self.project.album {
             return Ok(());
@@ -846,7 +1011,7 @@ impl Session {
         let song = j.shared.song.load(Ordering::Relaxed);
         let steps = match j.task {
             AlbumTask::Analyse => j.songs,
-            AlbumTask::Export => j.songs * 2,
+            AlbumTask::Export | AlbumTask::Prepare => j.songs * 2,
         }
         .max(1);
         let within = if song < j.songs {
@@ -915,10 +1080,17 @@ impl Session {
             items,
             album: album.clone(),
             settings: album.settings.clone(),
-            rate: self.album_rate(),
+            // Playback renders at the engine's rate (it plays as it is).
+            rate: if task == AlbumTask::Prepare {
+                self.engine.sample_rate()
+            } else {
+                self.album_rate()
+            },
             folder: self.album_folder(),
             name: self.project.name.clone(),
         };
+        let preview_dir = self.album_state.preview_dir();
+        let revision = self.history.revision();
         let shared = Arc::new(Shared {
             song: AtomicUsize::new(0),
             render: RenderProgress::default(),
@@ -929,6 +1101,7 @@ impl Session {
             .spawn(move || match task {
                 AlbumTask::Analyse => analyse(&plan, &s),
                 AlbumTask::Export => export(&plan, &s),
+                AlbumTask::Prepare => prepare(&plan, &s, &preview_dir, revision),
             })
             .map_err(|e| SessionError::Other(e.to_string()))?;
         self.album_state.job = Some(Job {
@@ -978,8 +1151,26 @@ impl Session {
             }
         }
         if outcome.cancelled {
+            self.album_state.play_after = None;
             self.notify(NoticeLevel::Info, "album job cancelled");
             return;
+        }
+        match outcome.preview {
+            Some(Ok(p)) => {
+                self.album_state.preview = Some(p);
+                if let Some(from) = self.album_state.play_after.take()
+                    && let Err(e) = self.album_play(from)
+                {
+                    self.notify(NoticeLevel::Error, e.to_string());
+                }
+                return;
+            }
+            Some(Err(e)) => {
+                self.album_state.play_after = None;
+                self.notify(NoticeLevel::Error, format!("album playback: {e}"));
+                return;
+            }
+            None => {}
         }
         match outcome.export {
             Some(Ok(done)) => {
@@ -1023,6 +1214,145 @@ impl Session {
             ),
             None => {}
         }
+    }
+
+    /// Whether the prepared album is still the album (and the project) it
+    /// was made from.
+    fn preview_fresh(&self) -> bool {
+        self.album_state.preview.as_ref().is_some_and(|p| {
+            p.album == self.project.album
+                && p.revision == self.history.revision()
+                && p.rate == self.engine.sample_rate()
+        })
+    }
+
+    /// Play the album as it will be delivered, from `from` (or where it
+    /// was, or the start).
+    pub(crate) fn album_play(&mut self, from: Option<SongId>) -> Result<()> {
+        if !self.preview_fresh() {
+            // (Re)render it first; playback starts once it is ready.
+            self.album_stop_playing();
+            self.album_state.play_after = Some(from);
+            return self.start_album_job(AlbumTask::Prepare);
+        }
+        let Some(p) = self.album_state.preview.clone() else {
+            return Ok(());
+        };
+        if self.album_state.playing.is_none() {
+            let source = faderframe_audio_files::StreamSource::open(&p.path)
+                .map_err(|e| SessionError::Other(format!("{}: {e}", p.path.display())))?;
+            // The project stops: the album plays instead.
+            if self.transport.playing {
+                self.dispatch(crate::Action::Transport(crate::TransportAction::Stop))?;
+            }
+            self.engine.set_preview(Some(Arc::clone(&source)))?;
+            self.loader.set_preview(Some(Arc::clone(&source)));
+            self.album_state.playing = Some(source);
+        }
+        let preview = self.engine.preview();
+        if let Some(id) = from
+            && let Some((_, start)) = p.songs.iter().find(|(s, _)| *s == id)
+        {
+            preview.locate(*start as i64);
+        }
+        preview.play(true);
+        self.revision += 1;
+        Ok(())
+    }
+
+    pub(crate) fn album_pause(&mut self) {
+        self.engine.preview().play(false);
+        self.revision += 1;
+    }
+
+    /// Back to the project (the prepared album is kept).
+    pub(crate) fn album_stop_playing(&mut self) {
+        if self.album_state.playing.take().is_some() {
+            let _ = self.engine.set_preview(None);
+            self.loader.set_preview(None);
+            self.revision += 1;
+        }
+    }
+
+    pub(crate) fn album_skip(&mut self, delta: i32) -> Result<()> {
+        let Some(pb) = self.album_playback() else {
+            return Ok(());
+        };
+        let Some(p) = self.album_state.preview.as_ref() else {
+            return Ok(());
+        };
+        let now = pb.song.unwrap_or(0) as i64;
+        // Back within the first seconds of a song: the one before;
+        // otherwise its start.
+        let target = if delta < 0 && pb.in_song > 3.0 {
+            now
+        } else {
+            now + i64::from(delta)
+        };
+        let target = target.clamp(0, p.songs.len() as i64 - 1) as usize;
+        let start = p.songs[target].1;
+        self.engine.preview().locate(start as i64);
+        self.revision += 1;
+        Ok(())
+    }
+
+    pub(crate) fn album_seek(&mut self, seconds: f64) {
+        if let Some(p) = &self.album_state.preview {
+            self.engine
+                .preview()
+                .locate((seconds.max(0.0) * f64::from(p.rate)) as i64);
+            self.revision += 1;
+        }
+    }
+
+    /// Where each song of the prepared album starts and how long it is
+    /// (seconds; while it plays).
+    pub fn album_marks(&self) -> Option<(Vec<(SongId, f64)>, f64)> {
+        self.album_state.playing.as_ref()?;
+        let p = self.album_state.preview.as_ref()?;
+        let rate = f64::from(p.rate.max(1));
+        Some((
+            p.songs
+                .iter()
+                .map(|(id, f)| (*id, *f as f64 / rate))
+                .collect(),
+            p.frames as f64 / rate,
+        ))
+    }
+
+    /// Album playback now (`None`: neither playing nor being prepared).
+    pub fn album_playback(&self) -> Option<AlbumPlayback> {
+        let preparing = self
+            .album_state
+            .job
+            .as_ref()
+            .filter(|j| j.task == AlbumTask::Prepare)
+            .and_then(|_| self.album_progress())
+            .map(|p| p.fraction);
+        if self.album_state.playing.is_none() {
+            return preparing.map(|f| AlbumPlayback {
+                preparing: Some(f),
+                playing: false,
+                position: 0.0,
+                length: 0.0,
+                song: None,
+                in_song: 0.0,
+            });
+        }
+        let p = self.album_state.preview.as_ref()?;
+        let rate = f64::from(p.rate.max(1));
+        let shared = self.engine.preview();
+        let pos = shared.position().max(0) as u64;
+        let song = p.songs.iter().rposition(|(_, start)| *start <= pos);
+        let in_song = song.map_or(0.0, |i| (pos - p.songs[i].1) as f64 / rate);
+        Some(AlbumPlayback {
+            preparing,
+            playing: shared.is_playing(),
+            position: pos as f64 / rate,
+            length: p.frames as f64 / rate,
+            song,
+            in_song,
+        })
     }
 
     /// Wait for a running album job (tests and shutdown).

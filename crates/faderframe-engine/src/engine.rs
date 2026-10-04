@@ -75,6 +75,8 @@ enum Message {
     MidiOutput(Box<faderframe_midi::MidiOutputQueue>),
     BeginMidiRecord(Box<crate::midi::MidiRecorder>),
     EndMidiRecord,
+    /// Play this file instead of the project (album playback), or no more.
+    Preview(Option<Box<crate::preview::Preview>>),
     /// Locate so that `position` is where playback would be at `at_ns` (on
     /// the MIDI clock), compensating for the time until the command is
     /// applied, and play or stop.
@@ -96,6 +98,7 @@ enum Garbage {
     MidiQueue(#[allow(dead_code)] Box<faderframe_midi::MidiInputQueue>),
     MidiOutQueue(#[allow(dead_code)] Box<faderframe_midi::MidiOutputQueue>),
     MidiRecorder(#[allow(dead_code)] Box<crate::midi::MidiRecorder>),
+    Preview(#[allow(dead_code)] Box<crate::preview::Preview>),
 }
 
 /// When a callback started (MIDI clock) and the transport position then,
@@ -174,6 +177,8 @@ pub struct EngineShared {
     output_latency: AtomicU32,
     /// Auditioning, mapped controls, clock outputs.
     pub midi: Arc<crate::midi::MidiShared>,
+    /// Album playback (see [`crate::preview`]).
+    pub preview: crate::preview::PreviewShared,
 }
 
 /// Create a connected controller/processor pair.
@@ -196,6 +201,7 @@ pub fn create_with_epoch(
     let shared = Arc::new(EngineShared {
         epoch,
         midi: Arc::clone(&shared_midi),
+        preview: Default::default(),
         ..EngineShared::default()
     });
     shared
@@ -224,6 +230,7 @@ pub fn create_with_epoch(
                 crate::midi::MIDI_INPUT_CAPACITY,
             ),
             ahead_seq: 0,
+            preview_active: false,
         },
         transport: TransportState::default(),
         shared: Arc::clone(&shared),
@@ -237,6 +244,7 @@ pub fn create_with_epoch(
         output_latency: 0,
         pool: None,
         ahead: None,
+        preview: None,
     };
     let controller = EngineController {
         config,
@@ -301,6 +309,8 @@ pub struct EngineProcessor {
     /// Render-ahead: the current sequence and transport changes on their
     /// way to the anticipator.
     ahead: Option<Box<crate::ahead::AheadLink>>,
+    /// Album playback's file.
+    preview: Option<Box<crate::preview::Preview>>,
 }
 
 impl EngineProcessor {
@@ -338,6 +348,11 @@ impl EngineProcessor {
                     link.begin(&self.transport);
                     if let Some(old) = self.ahead.replace(link) {
                         self.retire(Garbage::AheadLink(old));
+                    }
+                }
+                Message::Preview(p) => {
+                    if let Some(old) = std::mem::replace(&mut self.preview, p) {
+                        self.retire(Garbage::Preview(old));
                     }
                 }
                 Message::AheadOff => {
@@ -437,6 +452,7 @@ impl EngineProcessor {
         for c in 0..io.output_channels() {
             io.output(c).fill(0.0);
         }
+        self.ctx.preview_active = self.preview.is_some() && self.shared.preview.is_active();
         let rate = self.stream_rate as f64;
         let graph_ok = self
             .graph
@@ -616,6 +632,17 @@ impl EngineProcessor {
             }
             self.transport.advance(n);
             offset += n;
+        }
+        if self.ctx.preview_active
+            && let Some(p) = self.preview.as_deref_mut()
+        {
+            // The album instead of the project, on the meters too.
+            p.render(
+                &self.shared.preview,
+                io,
+                &self.ctx.scope,
+                self.ctx.scope.source(),
+            );
         }
         self.shared.transport.publish(&self.transport);
         // Single writer: a plain load and store.
@@ -1059,6 +1086,24 @@ impl EngineController {
         &self.scope
     }
 
+    /// Play `source` instead of the project (album playback; paused at
+    /// its start), or the project again.
+    pub fn set_preview(
+        &mut self,
+        source: Option<Arc<faderframe_audio_files::StreamSource>>,
+    ) -> Result<(), EngineError> {
+        self.shared
+            .preview
+            .set(source.as_ref().map(|s| s.frames() as i64));
+        let msg = Message::Preview(source.map(|s| Box::new(crate::preview::Preview::new(s))));
+        self.tx.push(msg).map_err(|_| EngineError::QueueFull)
+    }
+
+    /// Album playback's state (play, pause, locate, where it is).
+    pub fn preview(&self) -> &crate::preview::PreviewShared {
+        &self.shared.preview
+    }
+
     /// The track whose post-fader output the scope receives.
     pub fn set_analysis_source(&self, track: Option<TrackId>) {
         self.scope.set_source(track.map(|t| t.raw()));
@@ -1410,6 +1455,7 @@ impl EngineController {
             scope: Arc::clone(&self.scope),
             midi_input: crate::midi::MidiInputBlock::with_capacity(0),
             ahead_seq: 0,
+            preview_active: false,
         };
         let (anticipator, link) = crate::ahead::start(
             ctx,

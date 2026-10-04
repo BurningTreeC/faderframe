@@ -45,6 +45,8 @@ const TOOLBAR_H: f32 = 32.0;
 const HEADER_H: f32 = 22.0;
 const ROW_H: f32 = 28.0;
 const FOOTER_H: f32 = 28.0;
+/// Album playback's strip under the toolbar.
+const PLAYER_H: f32 = 34.0;
 const PAD: f32 = 8.0;
 const DRAG_THRESHOLD: f32 = 4.0;
 const FORMATS: [WavFormat; 3] = [WavFormat::Pcm16, WavFormat::Pcm24, WavFormat::Float32];
@@ -69,6 +71,11 @@ pub enum Button {
     Analyse,
     Export,
     Cancel,
+    /// Album playback.
+    Previous,
+    PlayPause,
+    Next,
+    BackToProject,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +118,8 @@ const TITLE_MAX: f32 = 420.0;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Hit {
     Button(Button),
+    /// The album's position bar (0–1 across it).
+    Seek(f32),
     Cell(usize, Column),
     /// Below the last song.
     Empty,
@@ -120,6 +129,9 @@ pub enum Hit {
 
 struct Layout {
     buttons: Vec<(Button, Rect)>,
+    /// Album playback's strip and its position bar.
+    player: Rect,
+    seek: Rect,
     header: Rect,
     list: Rect,
     footer: Rect,
@@ -216,6 +228,14 @@ impl AlbumView {
     fn button_label(b: Button, model: &Session) -> String {
         let s = &model.project().album.settings;
         match b {
+            Button::Previous => "|◀".into(),
+            Button::Next => "▶|".into(),
+            Button::PlayPause => match model.album_playback() {
+                Some(pb) if pb.playing => "⏸  Pause".into(),
+                Some(pb) if pb.preparing.is_some() && pb.length == 0.0 => "…".into(),
+                _ => "▶  Play Album".into(),
+            },
+            Button::BackToProject => "Back to Project".into(),
             Button::AddSections => "+ Sections".into(),
             Button::AddProject => "+ This Project".into(),
             Button::AddFiles => "+ Files…".into(),
@@ -298,7 +318,23 @@ impl AlbumView {
             buttons.push((*b, Rect::new(rx.max(x), y, w, 22.0)));
             rx -= 6.0;
         }
-        let header = Rect::new(0.0, TOOLBAR_H, size.w, HEADER_H);
+        // The player: previous, play/pause, next, back to the project,
+        // then what plays and the position bar.
+        let player = Rect::new(0.0, TOOLBAR_H, size.w, PLAYER_H);
+        let py = player.y + (PLAYER_H - 24.0) / 2.0;
+        let mut px = PAD;
+        for (b, w) in [
+            (Button::Previous, 30.0),
+            (Button::PlayPause, 92.0),
+            (Button::Next, 30.0),
+            (Button::BackToProject, 118.0),
+        ] {
+            buttons.push((b, Rect::new(px, py, w, 24.0)));
+            px += w + 6.0;
+        }
+        let seek_x = px + 300.0;
+        let seek = Rect::new(seek_x, py + 7.0, (size.w - seek_x - PAD).max(0.0), 10.0);
+        let header = Rect::new(0.0, player.bottom(), size.w, HEADER_H);
         let list = Rect::new(
             0.0,
             header.bottom(),
@@ -327,6 +363,8 @@ impl AlbumView {
             .collect();
         Layout {
             buttons,
+            player,
+            seek,
             header,
             list,
             footer,
@@ -362,6 +400,9 @@ impl AlbumView {
         let l = self.layout(size, model);
         if let Some((b, _)) = l.buttons.iter().find(|(_, r)| r.contains(pos)) {
             return Hit::Button(*b);
+        }
+        if l.seek.inset_xy(0.0, -6.0).contains(pos) && model.album_marks().is_some() {
+            return Hit::Seek(((pos.x - l.seek.x) / l.seek.w.max(1.0)).clamp(0.0, 1.0));
         }
         if l.folder.contains(pos) {
             return Hit::Folder;
@@ -670,12 +711,18 @@ impl AlbumView {
         let songs = &model.project().album.songs;
         let song = songs.get(i)?;
         let mv = |to: usize| Action::Album(AlbumAction::Move { song: song.id, to });
-        let mut items = Vec::new();
-        items.push(if i > 0 {
-            MenuItem::new("Move Up", mv(i - 1))
-        } else {
-            MenuItem::disabled("Move Up")
-        });
+        let mut items = vec![MenuItem::new(
+            "Play from Here",
+            Action::Album(AlbumAction::Play(Some(song.id))),
+        )];
+        items.push(
+            if i > 0 {
+                MenuItem::new("Move Up", mv(i - 1))
+            } else {
+                MenuItem::disabled("Move Up")
+            }
+            .separated(),
+        );
         items.push(if i + 1 < songs.len() {
             MenuItem::new("Move Down", mv(i + 1))
         } else {
@@ -878,6 +925,92 @@ impl AlbumView {
             Button::Analyse => cx.emit(Action::Album(AlbumAction::Analyse)),
             Button::Export => cx.emit(Action::Album(AlbumAction::Export)),
             Button::Cancel => cx.emit(Action::Album(AlbumAction::Cancel)),
+            Button::PlayPause => {
+                let pb = model.album_playback();
+                cx.emit(Action::Album(match pb {
+                    Some(pb) if pb.playing => AlbumAction::Pause,
+                    // Resume where it was, or start from the selected song.
+                    Some(pb) if pb.preparing.is_none() => AlbumAction::Play(None),
+                    _ => AlbumAction::Play(self.selected),
+                }));
+            }
+            Button::Previous => cx.emit(Action::Album(AlbumAction::Skip(-1))),
+            Button::Next => cx.emit(Action::Album(AlbumAction::Skip(1))),
+            Button::BackToProject => cx.emit(Action::Album(AlbumAction::StopPlaying)),
+        }
+    }
+
+    /// The player strip: its buttons are drawn with the others; here what
+    /// plays, the times and the position bar with the songs on it.
+    fn paint_player(&self, p: &mut dyn Painter, l: &Layout, model: &Session) {
+        let th = &self.theme;
+        p.fill(l.player, th.ui.surface.darken(0.06));
+        p.hline(0.0, l.player.right(), l.player.bottom() - 0.5, th.ui.border);
+        let pb = model.album_playback();
+        let songs = &model.project().album.songs;
+        let info_x = l
+            .buttons
+            .iter()
+            .find(|(b, _)| *b == Button::BackToProject)
+            .map_or(PAD, |(_, r)| r.right() + 12.0);
+        let info = Rect::new(info_x, l.player.y, l.seek.x - info_x - 12.0, PLAYER_H);
+        let style = TextStyle::new(th.fonts.small, th.ui.text);
+        match pb {
+            Some(pb) if pb.preparing.is_some() && pb.length == 0.0 => {
+                let f = pb.preparing.unwrap_or(0.0);
+                p.text(
+                    &format!(
+                        "Preparing the album as it will be delivered… {:.0} %",
+                        f * 100.0
+                    ),
+                    info,
+                    &style,
+                );
+                let bar = l.seek;
+                p.fill_rounded(bar, 3.0, &Paint::Solid(th.ui.surface_alt));
+                p.fill_rounded(
+                    Rect::new(bar.x, bar.y, bar.w * f as f32, bar.h),
+                    3.0,
+                    &Paint::Solid(th.ui.accent.with_alpha(0.5)),
+                );
+            }
+            Some(pb) => {
+                let title = pb
+                    .song
+                    .and_then(|i| songs.get(i))
+                    .map_or("", |s| s.title.as_str());
+                let n = pb.song.map_or(0, |i| i + 1);
+                p.text(
+                    &format!(
+                        "{n}  {title}   {} / {}",
+                        duration(pb.position),
+                        duration(pb.length)
+                    ),
+                    info,
+                    &style.bold(),
+                );
+                let bar = l.seek;
+                p.fill_rounded(bar, 3.0, &Paint::Solid(th.ui.surface_alt));
+                let f = (pb.position / pb.length.max(1e-9)).clamp(0.0, 1.0) as f32;
+                p.fill_rounded(
+                    Rect::new(bar.x, bar.y, bar.w * f, bar.h),
+                    3.0,
+                    &Paint::Solid(th.ui.accent),
+                );
+                if let Some((marks, length)) = model.album_marks() {
+                    for (_, at) in marks.iter().skip(1) {
+                        let x = bar.x + bar.w * (at / length.max(1e-9)) as f32;
+                        p.vline(x, bar.y - 3.0, bar.bottom() + 3.0, th.ui.text_dim);
+                    }
+                }
+            }
+            None => {
+                p.text(
+                    "Play the album as it will be delivered: levelled, limited, with its pauses and crossfades",
+                    Rect::new(info.x, info.y, l.player.right() - info.x - PAD, info.h),
+                    &TextStyle::new(th.fonts.small, th.ui.text_faint),
+                );
+            }
         }
     }
 
@@ -909,7 +1042,22 @@ impl AlbumView {
         let s = &model.project().album.settings;
         for (b, r) in &l.buttons {
             let label = Self::button_label(*b, model);
-            let on = (*b == Button::AlbumFile && s.album_file) || (*b == Button::Cd && s.ddp);
+            let playing = model
+                .album_playback()
+                .is_some_and(|pb| pb.playing || pb.length > 0.0);
+            let on = (*b == Button::AlbumFile && s.album_file)
+                || (*b == Button::Cd && s.ddp)
+                || (*b == Button::PlayPause && model.album_playback().is_some_and(|pb| pb.playing));
+            if matches!(b, Button::Previous | Button::Next | Button::BackToProject) && !playing {
+                // Nothing to skip in or leave: drawn faint.
+                p.fill_rounded(*r, 4.0, &Paint::Solid(th.ui.surface_alt.with_alpha(0.5)));
+                p.text(
+                    &label,
+                    *r,
+                    &TextStyle::new(th.fonts.small, th.ui.text_faint).center(),
+                );
+                continue;
+            }
             let strong = matches!(b, Button::Export);
             self.paint_button(p, *r, &label, on, strong);
         }
@@ -949,6 +1097,8 @@ impl AlbumView {
             );
         }
         let progress = model.album_progress();
+        let playback = model.album_playback();
+        let marks = model.album_marks();
         let settings = &model.project().album.settings;
         for (i, song) in songs.iter().enumerate() {
             let r = self.row_rect(l, i);
@@ -971,6 +1121,19 @@ impl AlbumView {
             }
             if progress.is_some_and(|pr| pr.song == i) {
                 p.fill(Rect::new(0.0, r.y, 3.0, r.h), th.ui.accent);
+            }
+            // The song playing: a bar and how far it is.
+            if let (Some(pb), Some((marks, length))) = (playback, marks.as_ref())
+                && pb.song == Some(i)
+            {
+                p.fill(Rect::new(0.0, r.y, 4.0, r.h), th.ui.accent);
+                let start = marks.get(i).map_or(0.0, |m| m.1);
+                let end = marks.get(i + 1).map_or(*length, |m| m.1);
+                let f = ((pb.position - start) / (end - start).max(1e-9)).clamp(0.0, 1.0) as f32;
+                p.fill(
+                    Rect::new(0.0, r.bottom() - 2.0, r.w * f, 2.0),
+                    th.ui.accent.with_alpha(0.8),
+                );
             }
             p.hline(0.0, r.w, r.bottom() - 0.5, th.ui.border.with_alpha(0.5));
             let text = |p: &mut dyn Painter, c: Column, s: &str, color: Color, bold: bool| {
@@ -1162,6 +1325,7 @@ impl AlbumView {
             let verb = match pr.task {
                 AlbumTask::Analyse => "Analysing",
                 AlbumTask::Export => "Exporting",
+                AlbumTask::Prepare => "Preparing playback:",
             };
             p.text(
                 &format!("{verb} song {} of {}…", pr.song + 1, pr.songs),
@@ -1209,6 +1373,7 @@ impl CanvasView<Session, Action> for AlbumView {
         p.fill(Rect::from_size(size), self.theme.ui.background);
         self.paint_rows(p, &l, model);
         self.paint_header(p, &l);
+        self.paint_player(p, &l, model);
         self.paint_toolbar(p, &l, size, model);
         self.paint_footer(p, &l, model);
     }
@@ -1246,6 +1411,11 @@ impl CanvasView<Session, Action> for AlbumView {
             } => {
                 cx.request(HostRequest::GrabFocus);
                 match self.hit(*pos, size, model) {
+                    Hit::Seek(f) => {
+                        if let Some((_, length)) = model.album_marks() {
+                            cx.emit(Action::Album(AlbumAction::Seek(f64::from(f) * length)));
+                        }
+                    }
                     Hit::Button(b) => {
                         let at = l
                             .buttons
@@ -1458,7 +1628,12 @@ impl CanvasView<Session, Action> for AlbumView {
                     Button::Analyse => "Render and measure every song",
                     Button::Export => "Write every song (and the album file) to the export folder",
                     Button::Cancel => "Stop the analysis or export",
+                    Button::PlayPause => "Play the album as it will be delivered (levelled, limited, with its pauses and crossfades), from the selected song — it is rendered first when it changed",
+                    Button::Previous => "The start of this song, or the one before",
+                    Button::Next => "The next song",
+                    Button::BackToProject => "Stop the album and hear the project again",
                 },
+                Hit::Seek(_) => "Click to go there in the album",
                 Hit::Folder => "Click to choose the export folder",
                 Hit::Cell(_, Column::Number) => "Drag to reorder",
                 Hit::Cell(_, Column::Title) => "Double-click to rename, drag to reorder",

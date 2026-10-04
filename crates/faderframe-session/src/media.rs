@@ -153,6 +153,8 @@ struct LoaderState {
     engine: Arc<EngineShared>,
     loop_range: Option<(i64, i64)>,
     sample_rate: u32,
+    /// Album playback's file (kept resident round its own position).
+    preview: Option<Arc<StreamSource>>,
 }
 
 struct LoaderShared {
@@ -179,6 +181,7 @@ impl DiskLoader {
                 engine,
                 loop_range: None,
                 sample_rate,
+                preview: None,
             }),
             wake: Condvar::new(),
             stop: AtomicBool::new(false),
@@ -202,7 +205,7 @@ impl DiskLoader {
             // Every engine of a session shares one epoch (see
             // `faderframe_engine::create_with_epoch`), so retired pages stay
             // valid across engine replacement.
-            let (plan, engine, loop_range, rate) = {
+            let (plan, engine, loop_range, rate, preview) = {
                 let Ok(guard) = shared.state.lock() else {
                     return;
                 };
@@ -212,8 +215,27 @@ impl DiskLoader {
                     Arc::clone(&st.engine),
                     st.loop_range,
                     st.sample_rate,
+                    st.preview.clone(),
                 )
             };
+            if let Some(src) = &preview {
+                let pos = engine.preview.position();
+                let ahead = (AHEAD_SECONDS * f64::from(src.sample_rate().max(1))) as i64;
+                let range = src.page_range(pos - PAGE_FRAMES as i64, pos + ahead);
+                match src.ensure(range.clone(), &engine.epoch, &mut reclaimer, &mut scratch) {
+                    Ok(n) => {
+                        shared.pages_loaded.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        shared.errors.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!("album playback: {e}");
+                    }
+                }
+                if tick.is_multiple_of(10) {
+                    let keep = range.start.saturating_sub(1)..range.end + 1;
+                    src.evict_except(&[keep], &engine.epoch, &mut reclaimer);
+                }
+            }
             if !plan.is_empty() {
                 let pos = engine.transport.snapshot().position;
                 let ahead = (AHEAD_SECONDS * rate as f64) as i64;
@@ -269,6 +291,14 @@ impl DiskLoader {
     }
 
     pub fn wake(&self) {
+        self.shared.wake.notify_all();
+    }
+
+    /// Keep album playback's file resident (or stop).
+    pub fn set_preview(&self, preview: Option<Arc<StreamSource>>) {
+        if let Ok(mut st) = self.shared.state.lock() {
+            st.preview = preview;
+        }
         self.shared.wake.notify_all();
     }
 

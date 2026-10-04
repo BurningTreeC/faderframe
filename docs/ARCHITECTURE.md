@@ -1192,6 +1192,25 @@ filesets recorded there (`crates/faderframe-disc/tests/reference`).
 `Session::album_delivered` previews the gains from the analyses (album
 loudness approximated from the songs' loudness and length).
 
+**Album playback** plays the album as it will be delivered.
+`AlbumTask::Prepare` runs export's first pass (every song rendered and
+measured) and levels and limits each song as delivery does
+(`album::level`), joining them through the `Assembler` (pauses,
+crossfades) into one float file at the engine's rate in a per-session
+temporary folder (`AlbumPreview`: the file, each song's start, and the
+album and project revision it was made from — playing again re-renders
+only when either changed). The engine plays the file instead of the
+project (`faderframe_engine::preview`: `EngineController::set_preview`,
+play/pause/locate through `PreviewShared`'s atomics; the audio thread
+reads it wait-free and feeds the Tools meters as if it were the master,
+whose strip then stays off the scope; the disk loader keeps its pages
+resident round the playback position). The Album view's player strip
+plays and pauses (from the selected song), skips, seeks on its bar (songs
+ticked on it) and goes back to the project; the playing song's row shows
+its progress; playing the project hands the outputs back. Tested in
+`engine/tests/preview.rs` (sample-exact, pause, locate, end) and
+`album_playback_does_not_allocate`.
+
 A song's inserts are ordinary `PluginSlot`s (`Command::SetSongInserts`,
 `Session::song_insert`/`plugin_owner`); the plugin commands
 (`SetPluginBypass`, `SetPluginParameter`, `SetPluginState`) find them when
@@ -1839,8 +1858,7 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
    and lyrics transcription track (Whisper, MIT). Stem separation waits
    for permissively licensed model weights.
 6. **Performance and control**: a clip launcher with scenes recorded into
-   the arrangement, control surfaces (Mackie Control/HUI, OSC), playing
-   the album itself.
+   the arrangement, control surfaces (Mackie Control/HUI, OSC).
 7. **Ports**: signed and notarised packages, a Flathub submission
    (vendored crates), sandboxed plugins' audio threads in the device's
    workgroup (macOS: needs the workgroup's Mach port in the helper).

@@ -169,3 +169,60 @@ fn a_missing_section_is_reported_not_rendered() {
     assert!(s.album_analysis(&song).is_none());
     assert!(s.album_error(song.id).unwrap().contains("section"));
 }
+
+#[test]
+fn the_album_plays_as_it_will_be_delivered() {
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    for (a, b) in [(0.0, 16.0), (16.0, 32.0)] {
+        s.dispatch(Action::AddSection {
+            start: MusicalTime::from_quarters(a),
+            end: MusicalTime::from_quarters(b),
+        })
+        .unwrap();
+    }
+    album(&mut s, AlbumAction::AddSections);
+    let songs = s.project().album.songs.clone();
+    assert!(s.album_playback().is_none());
+    // Play: prepared first, then playing from the first song.
+    album(&mut s, AlbumAction::Play(None));
+    assert!(s.album_playback().unwrap().preparing.is_some());
+    s.wait_album();
+    let pb = s.album_playback().unwrap();
+    assert!(pb.playing && pb.preparing.is_none(), "{pb:?}");
+    assert_eq!(pb.song, Some(0));
+    let (marks, length) = s.album_marks().unwrap();
+    assert_eq!(marks.len(), 2);
+    assert_eq!(marks[0], (songs[0].id, 0.0));
+    // The second song starts after the first (its section and the tail
+    // of its effects) and its pause (2 s).
+    let first = 16.0 * 60.0 / 112.0;
+    assert!(marks[1].1 >= first + 2.0 - 0.01, "{marks:?}");
+    let before = marks[1].1;
+    assert!(length > marks[1].1);
+    // Next song, seek, pause.
+    album(&mut s, AlbumAction::Skip(1));
+    assert_eq!(s.album_playback().unwrap().song, Some(1));
+    album(&mut s, AlbumAction::Seek(1.0));
+    let pb = s.album_playback().unwrap();
+    assert_eq!(pb.song, Some(0));
+    assert!((pb.position - 1.0).abs() < 0.01);
+    album(&mut s, AlbumAction::Pause);
+    assert!(!s.album_playback().unwrap().playing);
+    // Playing again with nothing changed starts at once.
+    album(&mut s, AlbumAction::Play(Some(songs[1].id)));
+    let pb = s.album_playback().unwrap();
+    assert!(pb.playing && pb.preparing.is_none() && pb.song == Some(1));
+    // A change to the album: prepared again.
+    album(&mut s, AlbumAction::StopPlaying);
+    assert!(s.album_playback().is_none());
+    let mut song = songs[1].clone();
+    song.pause = 0.5;
+    album(&mut s, AlbumAction::Update(song));
+    album(&mut s, AlbumAction::Play(None));
+    assert!(s.album_playback().unwrap().preparing.is_some());
+    s.wait_album();
+    let (marks, _) = s.album_marks().unwrap();
+    assert!((before - marks[1].1 - 1.5).abs() < 0.03, "{before} → {marks:?}");
+    album(&mut s, AlbumAction::StopPlaying);
+    assert!(s.album_playback().is_none());
+}

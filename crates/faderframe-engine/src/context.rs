@@ -26,4 +26,7 @@ pub struct EngineContext {
     /// The render-ahead sequence this block belongs to (0 without
     /// anticipation).
     pub ahead_seq: u64,
+    /// The album plays instead of the project: the strips do not feed the
+    /// scope.
+    pub preview_active: bool,
 }

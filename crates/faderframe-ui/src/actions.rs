@@ -666,6 +666,9 @@ pub fn install(app: &Rc<AppState>) {
                 "project" => AA::AddThisProject,
                 "analyse" => AA::Analyse,
                 "export" => AA::Export,
+                "play" => AA::Play(None),
+                "pause" => AA::Pause,
+                "next" => AA::Skip(1),
                 "details" => AA::Details(None),
                 // The CD master on (with demo codes when there are none).
                 "ddp" => {

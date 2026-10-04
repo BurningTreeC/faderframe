@@ -135,7 +135,8 @@ Contrast:
   LUFS) with a short-term history; crest factor and DR value; peak/RMS levels in dBFS or K-12/14/20;
   goniometer and correlation; an FFT spectrum with peak hold — for the
   master or any track.
-* Album (bottom dock, next to Tools): songs in release order — the
+* Album (bottom dock, next to Tools; plays the album as it will be
+  delivered — levelled, limited, with its pauses and crossfades): songs in release order — the
   project's sections, the whole project, other FaderFrame projects or
   finished mixes — with a pause or an equal-power crossfade, trim, fades,
   ISRC, credits and the song's own plugin inserts (heard on the master
