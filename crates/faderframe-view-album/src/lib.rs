@@ -956,14 +956,19 @@ impl AlbumView {
                 continue;
             }
             let selected = self.selected == Some(song.id);
-            let bg = if selected {
-                th.ui.selection
-            } else if i % 2 == 1 {
+            let bg = if i % 2 == 1 {
                 th.ui.surface.with_alpha(0.5)
             } else {
                 th.ui.background
             };
             p.fill(r, bg);
+            if selected {
+                // A tint under the text (as everywhere else): a solid
+                // selection colour — sand, cyan — would swallow the light
+                // text of dark skins.
+                p.fill(r, th.ui.selection.with_alpha(0.28));
+                p.stroke_rounded(r.inset(0.5), 2.0, 1.0, th.ui.selection.with_alpha(0.85));
+            }
             if progress.is_some_and(|pr| pr.song == i) {
                 p.fill(Rect::new(0.0, r.y, 3.0, r.h), th.ui.accent);
             }
