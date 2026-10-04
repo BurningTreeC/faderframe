@@ -370,8 +370,8 @@ pub fn open(app: &Rc<AppState>) {
     grid.attach(&progress, 0, 11, 2, 1);
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     actions.set_halign(gtk::Align::End);
-    let cancel = gtk::Button::with_label("Cancel");
-    cancel.set_sensitive(false);
+    // Closes the window, or stops a running render.
+    let cancel = gtk::Button::with_label("Close");
     let render = gtk::Button::with_label("Render");
     render.add_css_class("suggested-action");
     actions.append(&cancel);
@@ -500,9 +500,12 @@ pub fn open(app: &Rc<AppState>) {
     let job: Rc<RefCell<Option<RenderJob>>> = Rc::new(RefCell::new(None));
     {
         let job = Rc::clone(&job);
+        let win_weak = win.downgrade();
         cancel.connect_clicked(move |_| {
             if let Some(j) = job.borrow().as_ref() {
                 j.cancel();
+            } else if let Some(win) = win_weak.upgrade() {
+                win.close();
             }
         });
     }
@@ -533,7 +536,7 @@ pub fn open(app: &Rc<AppState>) {
                 Ok(j) => {
                     *job.borrow_mut() = Some(j);
                     button.set_sensitive(false);
-                    cancel.set_sensitive(true);
+                    cancel.set_label("Stop");
                     progress.set_fraction(0.0);
                     progress.set_text(Some("Rendering…"));
                     let job = Rc::clone(&job);
@@ -558,7 +561,7 @@ pub fn open(app: &Rc<AppState>) {
                             return glib::ControlFlow::Break;
                         };
                         button.set_sensitive(true);
-                        cancel.set_sensitive(false);
+                        cancel.set_label("Close");
                         let (level, text) = match j.join() {
                             Ok(files) => {
                                 progress.set_fraction(1.0);
