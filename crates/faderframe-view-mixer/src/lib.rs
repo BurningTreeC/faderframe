@@ -120,6 +120,10 @@ pub struct MixerView {
     insert_slots: usize,
     /// The project has groups or VCAs: strips show a tag row.
     show_tags: bool,
+    /// Only the master strip, filling the view (the side panel).
+    master_only: bool,
+    /// The side panel shows the master: this mixer leaves it out.
+    hide_master: bool,
 }
 
 fn fader_cap_color(kind: TrackKind, theme: &Theme) -> Color {
@@ -184,6 +188,17 @@ impl MixerView {
             max_sends: 0,
             insert_slots: faderframe_session::DEFAULT_INSERT_SLOTS as usize,
             show_tags: false,
+            master_only: false,
+            hide_master: false,
+        }
+    }
+
+    /// The master strip alone, filling the view: the panel at the window's
+    /// right edge.
+    pub fn master_only(theme: Theme) -> Self {
+        Self {
+            master_only: true,
+            ..Self::new(theme)
         }
     }
 
@@ -210,12 +225,27 @@ impl MixerView {
     }
 
     fn master_rect(&self, size: Size) -> Rect {
+        let cheek = self.cheek();
+        if self.master_only {
+            return Rect::new(cheek, 0.0, (size.w - 2.0 * cheek).max(0.0), size.h);
+        }
+        if self.hide_master {
+            // Out of sight (and out of reach of the pointer).
+            return Rect::new(size.w + MASTER_GAP + 1.0, 0.0, 0.0, size.h);
+        }
         let w = self.theme.console.master_width;
-        Rect::new(size.w - w - self.cheek(), 0.0, w, size.h)
+        Rect::new(size.w - w - cheek, 0.0, w, size.h)
     }
 
     fn viewport_w(&self, size: Size) -> f32 {
-        (size.w - self.theme.console.master_width - MASTER_GAP - 2.0 * self.cheek()).max(0.0)
+        let cheeks = 2.0 * self.cheek();
+        if self.master_only {
+            0.0
+        } else if self.hide_master {
+            (size.w - cheeks).max(0.0)
+        } else {
+            (size.w - self.theme.console.master_width - MASTER_GAP - cheeks).max(0.0)
+        }
     }
 
     fn content_w(&self, count: usize) -> f32 {
@@ -260,6 +290,7 @@ impl MixerView {
     /// Size the send section for the track with the most sends (always
     /// leaving one free slot to add another).
     fn update_sends(&mut self, model: &Session) {
+        self.hide_master = !self.master_only && model.master_panel();
         self.insert_slots = model.mixer_insert_slots();
         let p = model.project();
         self.show_tags = !p.groups.is_empty() || p.tracks.iter().any(|t| t.kind == TrackKind::Vca);
@@ -289,7 +320,9 @@ impl MixerView {
             .visible_range(tracks.len(), size)
             .map(|i| (self.strip_rect(i, size), tracks[i]))
             .collect();
-        if let Some(m) = model.project().master() {
+        if let Some(m) = model.project().master()
+            && !self.hide_master
+        {
             out.push((self.master_rect(size), m));
         }
         out
@@ -1678,10 +1711,14 @@ impl CanvasView<Session, Action> for MixerView {
         p.pop_clip();
         // Gap and master section.
         let master = self.master_rect(size);
-        let gap = Rect::new(master.x - MASTER_GAP, 0.0, MASTER_GAP, size.h);
-        p.fill(gap, theme.ui.border);
-        p.shadow(master, 0.0, Color::rgba(0.0, 0.0, 0.0, 0.6), -2.0, 0.0, 6.0);
-        if let Some(m) = model.project().master() {
+        if !self.master_only && !self.hide_master {
+            let gap = Rect::new(master.x - MASTER_GAP, 0.0, MASTER_GAP, size.h);
+            p.fill(gap, theme.ui.border);
+            p.shadow(master, 0.0, Color::rgba(0.0, 0.0, 0.0, 0.6), -2.0, 0.0, 6.0);
+        }
+        if let Some(m) = model.project().master()
+            && !self.hide_master
+        {
             self.paint_strip(p, master, m, 0, model);
         }
         if cheek > 0.0 {
@@ -1909,11 +1946,14 @@ impl CanvasView<Session, Action> for MixerView {
     }
 
     fn min_size(&self) -> Size {
+        if self.master_only {
+            return Size::new(self.theme.console.master_width + 2.0 * self.cheek(), 330.0);
+        }
         Size::new(self.theme.console.master_width + self.pitch() * 2.0, 330.0)
     }
 
     fn scroll_info(&self, axis: ScrollAxis, size: Size, model: &Session) -> Option<ScrollInfo> {
-        (axis == ScrollAxis::Horizontal).then(|| ScrollInfo {
+        (axis == ScrollAxis::Horizontal && !self.master_only).then(|| ScrollInfo {
             content: self.content_w(Self::channel_tracks(model).len()),
             viewport: self.viewport_w(size),
             offset: self.scroll_x,

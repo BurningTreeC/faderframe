@@ -146,6 +146,9 @@ pub enum WorkspaceAction {
     ToggleArea(DockAreaId),
     Switch(usize),
     ResetActive,
+    /// Show or hide the master strip at the window's right edge (this
+    /// workspace).
+    ToggleMasterPanel,
 }
 
 /// Everything an editor view can ask the session to do.
@@ -1019,6 +1022,12 @@ impl Session {
 
     pub fn project(&self) -> &Project {
         &self.project
+    }
+
+    /// The master strip is shown at the window's right edge (the active
+    /// workspace's layout).
+    pub fn master_panel(&self) -> bool {
+        self.workspace.active().layout.master_panel
     }
 
     pub fn workspace(&self) -> &WorkspaceSet {
@@ -2707,6 +2716,7 @@ impl Session {
                 self.workspace.switch_to(i);
             }
             WorkspaceAction::ResetActive => self.workspace.reset_active(),
+            WorkspaceAction::ToggleMasterPanel => layout.master_panel = !layout.master_panel,
         }
         self.layout_revision += 1;
         Ok(())

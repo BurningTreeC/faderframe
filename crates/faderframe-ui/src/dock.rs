@@ -29,6 +29,8 @@ use std::rc::Rc;
 pub struct DockState {
     pub hosts: HashMap<ViewId, (ViewKind, ViewHost)>,
     pub main_slot: Option<gtk::Box>,
+    /// The master strip at the window's right edge (shown per workspace).
+    pub master_panel: Option<gtk::Widget>,
     pub floating: HashMap<WindowId, gtk::ApplicationWindow>,
     pub rebuilding: Rc<Cell<bool>>,
 }
@@ -425,5 +427,19 @@ pub fn realize(app: &Rc<AppState>) {
         win.present();
     }
     rebuilding.set(false);
+    // The master panel follows the workspace.
+    let panel = app.dock.borrow().master_panel.clone();
+    if let Some(panel) = panel
+        && panel.is_visible() != layout.master_panel
+    {
+        panel.set_visible(layout.master_panel);
+    }
+    if let Some(a) = app
+        .app
+        .lookup_action("master-panel")
+        .and_then(|a| a.downcast::<gtk::gio::SimpleAction>().ok())
+    {
+        a.set_state(&layout.master_panel.to_variant());
+    }
     app.redraw_all();
 }

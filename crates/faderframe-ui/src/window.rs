@@ -427,6 +427,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             ("Tools (Loudness, Level, Phase, Spectrum)", "app.show-tools"),
             ("Performance Meter", "app.show-performance"),
             ("Show / Hide Bottom Dock", "app.toggle-dock"),
+            ("Master Strip at the Side", "app.master-panel"),
         ]),
     );
     view.append_section(
@@ -597,7 +598,25 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
     let slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
     slot.set_hexpand(true);
     slot.set_vexpand(true);
-    content.append(&slot);
+    // The dock beside the master panel (between the toolbars and the
+    // status bar).
+    let middle = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    middle.set_vexpand(true);
+    middle.append(&slot);
+    let master = crate::canvas::ViewHost::new(
+        app,
+        Box::new(faderframe_view_mixer::MixerView::master_only(
+            app.theme.borrow().clone(),
+        )),
+        false,
+        false,
+    );
+    master.root.set_hexpand(false);
+    master.root.add_css_class("master-panel");
+    master.root.set_visible(app.session.borrow().master_panel());
+    app.register_canvas(&master.canvas);
+    middle.append(&master.root);
+    content.append(&middle);
 
     let status = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     status.add_css_class("statusbar");
@@ -653,6 +672,7 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
     window.set_child(Some(&overlay));
 
     app.dock.borrow_mut().main_slot = Some(slot);
+    app.dock.borrow_mut().master_panel = Some(master.root.clone().upcast());
     *app.chrome.borrow_mut() = Some(Chrome {
         display,
         play,

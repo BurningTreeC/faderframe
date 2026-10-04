@@ -1074,7 +1074,12 @@ turns the active layout into `gtk::Paned` / `gtk::Notebook` /
 `gtk::ApplicationWindow`s. Every view has exactly one persistent host widget
 that is only re-parented, so detaching a view never copies state. Divider
 positions, tab switches and window sizes are written back into the model and
-saved with the project.
+saved with the project. A layout's `master_panel` flag (on in the Mastering
+preset; View → Master Strip at the Side, `WorkspaceAction::ToggleMasterPanel`)
+shows a master-only `MixerView` at the main window's right edge, between
+the toolbars and the status bar; the dock's mixer then leaves its pinned
+master out. The arranger's host lays its scrollbars over the canvas
+(`ViewHost::overlaid`) so its header column and ruler reach the edges.
 
 ## 12. Metering and metrics
 

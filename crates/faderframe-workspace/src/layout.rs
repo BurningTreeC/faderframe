@@ -331,6 +331,10 @@ pub struct WorkspaceLayout {
     pub home: BTreeMap<ViewId, DockAreaId>,
     #[serde(default)]
     next_window: u32,
+    /// The master strip sits at the window's right edge, beside every view
+    /// (the mixer then leaves its own master out).
+    #[serde(default)]
+    pub master_panel: bool,
 }
 
 impl WorkspaceLayout {
@@ -342,6 +346,7 @@ impl WorkspaceLayout {
             floating: Vec::new(),
             home: BTreeMap::new(),
             next_window: 1,
+            master_panel: false,
         };
         // Initial homes: wherever a view starts out.
         let mut homes = Vec::new();

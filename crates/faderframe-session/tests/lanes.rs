@@ -237,3 +237,27 @@ fn sections_move_copy_and_delete_with_their_content() {
     }
     assert_eq!(layout(&s), ("IVC".into(), vec![60, 61, 62]));
 }
+
+#[test]
+fn the_master_panel_is_a_workspace_setting() {
+    use faderframe_session::WorkspaceAction;
+    let mut s = session();
+    let mastering = s
+        .workspace()
+        .workspaces
+        .iter()
+        .position(|w| w.name == "Mastering")
+        .unwrap();
+    assert!(!s.master_panel(), "off where the project starts");
+    s.dispatch(Action::Workspace(WorkspaceAction::Switch(mastering)))
+        .unwrap();
+    assert!(s.master_panel(), "on in Mastering");
+    s.dispatch(Action::Workspace(WorkspaceAction::ToggleMasterPanel))
+        .unwrap();
+    assert!(!s.master_panel());
+    s.dispatch(Action::Workspace(WorkspaceAction::Switch(0)))
+        .unwrap();
+    s.dispatch(Action::Workspace(WorkspaceAction::ToggleMasterPanel))
+        .unwrap();
+    assert!(s.master_panel(), "each workspace has its own");
+}

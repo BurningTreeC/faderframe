@@ -68,7 +68,10 @@ impl Preset {
                 ..TabGroup::new(Some(DockAreaId::bottom()), bottom_views)
             }),
         );
-        WorkspaceLayout::new(views, main)
+        let mut layout = WorkspaceLayout::new(views, main);
+        // Mastering keeps the master fader in view whatever is shown.
+        layout.master_panel = self == Preset::Mastering;
+        layout
     }
 }
 
@@ -92,6 +95,9 @@ mod tests {
         assert!(!layouts[1].is_showing(&ViewId::piano_roll()));
         assert!(layouts[3].is_showing(&ViewId::piano_roll()));
         assert_ne!(layouts[0], layouts[2]);
+        // The master strip at the side: Mastering only, by default.
+        let panel: Vec<bool> = layouts.iter().map(|l| l.master_panel).collect();
+        assert_eq!(panel, [false, false, false, false, true]);
     }
 
     #[test]

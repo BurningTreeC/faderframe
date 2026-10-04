@@ -70,6 +70,7 @@ popover.ff-menu > contents { padding: 4px; }
 popover.ff-menu button { padding: 3px 12px; min-height: 24px; }
 scrollbar { background-color: @ff_bg; }
 .audio-settings { padding: 16px; }
+.master-panel { border-left: 1px solid @ff_border; }
 
 /* Plugin browser */
 .plugin-browser searchentry { min-height: 30px; }

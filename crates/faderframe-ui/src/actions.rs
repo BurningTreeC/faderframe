@@ -925,6 +925,20 @@ pub fn install(app: &Rc<AppState>) {
         })
         .build();
     app.app.add_action_entries([theme]);
+    // View → Master Strip at the Side (per workspace; a checkbox).
+    let weak = Rc::downgrade(app);
+    let shown = app.session.borrow().master_panel();
+    let master_panel = gio::ActionEntry::builder("master-panel")
+        .state(shown.to_variant())
+        .activate(move |_, _, _| {
+            if let Some(a) = weak.upgrade() {
+                a.dispatch(Action::Workspace(
+                    faderframe_session::WorkspaceAction::ToggleMasterPanel,
+                ));
+            }
+        })
+        .build();
+    app.app.add_action_entries([master_panel]);
     app.app.add_action_entries([
         insert,
         midi,

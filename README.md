@@ -123,7 +123,9 @@ Contrast:
 * Docking: mixer / Tools / piano roll / automation / performance tabs in a
   bottom dock, detach any view into its own window and dock it back,
   workspaces (Recording, Editing, Mixing, MIDI, Mastering), layouts saved
-  with the project.
+  with the project. View → Master Strip at the Side keeps the master fader
+  at the window's right edge, full height, whatever view is shown (per
+  workspace; on in Mastering).
 * Mastering meters (Tools, F12; the Mastering workspace opens on them): EBU
   R128 loudness — integrated, short-term and momentary, loudness range,
   true peak and PLR against a delivery target (−14, −16, −23, −24 or −9
