@@ -261,6 +261,62 @@ Preferences → Audio → Processing threads, `--threads`).
   thread count and how many threads were busy at once; free capacity is
   counted over all threads.
 
+### Render ahead (anticipative processing)
+
+Tracks nobody plays live are rendered ahead of the playhead on a thread of
+their own (`faderframe_engine::ahead`; Preferences → Audio → Render ahead,
+default 200 ms), so a heavy plugin chain no longer has to finish within one
+device buffer and spikes are absorbed by the lookahead.
+
+* **What.** An audio or instrument track with plugins that is not frozen
+  or armed, has no input monitoring, live MIDI, external MIDI output,
+  sidechain input or pre-FX send, is not fed by another track and has no
+  plugin editor open (`build::ahead_eligible`, the session's open
+  editors): its sources, instrument and inserts go into a second graph
+  ending in an `AheadWriter`; the realtime graph keeps an `AheadReader`
+  with the chain's latency (delay compensation unchanged) in front of its
+  strip, so faders, pan, mute, solo and sends stay immediate. Buses,
+  masters and everything live stay on the audio thread.
+* **Prediction.** The anticipator runs its own copy of the transport
+  (`TransportState` is plain data), so it renders exactly the positions
+  the audio thread will ask for, loop wraps and scrub snippets included.
+  A command that changes them starts a new *sequence*: the audio thread
+  hands the commanded state over (`AheadLink::command`, wait-free) and
+  carries on until the rings hold two blocks of it (`ready`), at most
+  250 ms, then switches — play, stop and locate take effect a few
+  milliseconds later, without a gap. Commands that change nothing (the
+  loop range sent again with every timeline update) start none;
+  recording on/off is applied at once.
+* **Rings** (`AheadRing`, one per track, kept across rebuilds) carry
+  interleaved frames and segments tagged (sequence, position, playing).
+  The reader skips older sequences and passed positions, waits (silence,
+  a counted miss) for audio not there yet and never reads a sequence it
+  has not switched to. Both ends sit in `TryCell`s shared by successive
+  graphs.
+* **The anticipator** owns the ahead graph (adopting processor state
+  across rebuilds like the audio thread) and its own context (the
+  timeline snapshot is an `Arc` shared with the audio thread; both hand
+  their old ones back to the control thread), renders in the engine's
+  block size while the rings hold less than the lookahead, in parallel on
+  a pool of its own (normal priority), and sleeps a millisecond otherwise.
+* **Changes.** What is heard of an anticipated track was rendered up to
+  the lookahead earlier: edits to its clips, automation and plugins
+  arrive that much later — so opening a plugin's editor moves its track to
+  the audio thread. A track that becomes live (armed, selected for live
+  play, editor opened) moves at once (its plugins jump back by up to the
+  lookahead); one that stops being live stays on the audio thread until
+  playback stops (moving it while playing would leave a gap), then the
+  session rebuilds (`ahead_wants_rebuild`). Stateful effects have
+  processed the lookahead's worth of audio a locate discards: their tails
+  differ briefly from a render without anticipation.
+* **Numbers.** 64 tracks × 6 echoes at 64-frame buffers (4 threads,
+  paced): audio-thread callbacks mean 187 → 34 µs, p99 635 → 50 µs, max
+  1345 → 81 µs, deadline misses 1 → 0, no late blocks
+  (`faderframe-bench --ahead 200`). Tests: `engine/tests/ahead.rs` (output
+  identical sample for sample through playback, a locate and loop wraps,
+  no late blocks), `realtime_alloc.rs` (the audio thread's side does not
+  allocate), `session/tests/render_ahead.rs`.
+
 ### Engine graph per track
 
 ```text
@@ -1383,7 +1439,8 @@ sample-accurate transport, loops and scrubbing; built-in synth, echo,
 compressor, gain and latency probe; offline render and export (stems,
 normalise, dither); freeze and bounce in place. Audio: native PipeWire,
 JACK, the system API (WASAPI, CoreAudio, ALSA), ASIO (opt-in) and a dummy
-device.
+device. Render-ahead (anticipative processing) of every track nobody plays
+live.
 Recording with punch, pre-roll, metronome, take folders and comping.
 Automation of every automatable parameter, written from controls, MIDI
 controllers and plugin editors. Media import (Symphonia, rubato) and
@@ -1426,8 +1483,8 @@ and packages for all three platforms (see §14).
    (vendored crates), sandboxed plugins' audio threads in the device's
    workgroup (macOS: needs the workgroup's Mach port in the helper).
 2. **MIDI**: MTC output, varispeed chase without a shared word clock.
-3. **Performance**: anticipative processing of tracks that are not
-   monitored live, job affinity for cache locality, an optional wgpu
-   painter for dense views.
+3. **Performance**: render-ahead for buses whose inputs are all rendered
+   ahead, job affinity for cache locality, an optional wgpu painter for
+   dense views.
 4. **Mastering**: DDP export, ISRC/UPC metadata, crossfades between album
    songs, a song's own inserts on the album.

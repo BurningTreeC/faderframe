@@ -47,6 +47,8 @@ struct Args {
     /// Wait for each callback's deadline like a sound card (idle time
     /// between callbacks: workers sleep and must be woken).
     paced: bool,
+    /// Render tracks ahead by this many milliseconds (implies `paced`).
+    ahead: Option<u64>,
 }
 
 fn parse() -> Result<Args, String> {
@@ -63,6 +65,7 @@ fn parse() -> Result<Args, String> {
         fx: 0,
         plugin: None,
         paced: false,
+        ahead: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -87,6 +90,10 @@ fn parse() -> Result<Args, String> {
             }
             "--fx" => a.fx = num("--fx")?.parse().map_err(|_| "bad --fx")?,
             "--paced" => a.paced = true,
+            "--ahead" => {
+                a.ahead = Some(num("--ahead")?.parse().map_err(|_| "bad --ahead")?);
+                a.paced = true;
+            }
             "--plugin" => {
                 let v = num("--plugin")?;
                 let (format, id) = v
@@ -105,7 +112,7 @@ fn parse() -> Result<Args, String> {
             }
             "-h" | "--help" => {
                 println!(
-                    "faderframe-bench [--tracks N] [--block FRAMES] [--rate HZ] [--seconds S] [--buses N] [--no-inserts] [--no-sends] [--measure-nodes] [--threads N] [--fx N] [--plugin clap:<id>|vst3:<id>] [--paced]"
+                    "faderframe-bench [--tracks N] [--block FRAMES] [--rate HZ] [--seconds S] [--buses N] [--no-inserts] [--no-sends] [--measure-nodes] [--threads N] [--fx N] [--plugin clap:<id>|vst3:<id>] [--paced] [--ahead MS]"
                 );
                 std::process::exit(0);
             }
@@ -301,14 +308,37 @@ fn main() {
     if !failed.is_empty() {
         eprintln!("faderframe-bench: plugins failed to load: {failed:?}");
     }
+    let budget_ns = args.block as f64 * 1e9 / args.rate as f64;
+    let mut bufs = OwnedBuffers::new(2, 2, args.block);
+    if let Some(ms) = args.ahead {
+        // The anticipator gets the cores the audio thread's pool leaves.
+        let helpers = faderframe_realtime::physical_cores()
+            .saturating_sub(args.threads)
+            .max(1);
+        r.controller
+            .set_render_ahead(Some(std::time::Duration::from_millis(ms)), helpers);
+        if let Err(e) = r
+            .controller
+            .sync(&project, &sources, faderframe_project::Impact::Graph)
+        {
+            eprintln!("faderframe-bench: {e}");
+            std::process::exit(1);
+        }
+        // Let it start before playing.
+        for _ in 0..(0.2 * args.rate as f64 / args.block as f64) as usize {
+            r.processor.process_device(&mut bufs);
+            std::thread::sleep(std::time::Duration::from_nanos(budget_ns as u64));
+        }
+    }
     let stats = r.controller.graph_stats().clone();
     let _ = r.play_from(0);
-    let mut bufs = OwnedBuffers::new(2, 2, args.block);
     let callbacks = (args.seconds * args.rate as f64 / args.block as f64) as usize;
-    let budget_ns = args.block as f64 * 1e9 / args.rate as f64;
     // Warm up caches and branch predictors.
     for _ in 0..64 {
         r.processor.process_device(&mut bufs);
+        if args.paced {
+            std::thread::sleep(std::time::Duration::from_nanos(budget_ns as u64));
+        }
     }
     r.controller.reset_metrics();
     let mut times = Vec::with_capacity(callbacks);
@@ -396,4 +426,13 @@ fn main() {
         m.p99_ns as f64 / 1000.0,
         m.deadline_misses
     );
+    if let Some(ms) = args.ahead {
+        println!(
+            "  render ahead: {} ms, {} of {} tracks, {} late blocks",
+            ms,
+            r.controller.ahead_tracks().len(),
+            project.tracks.len(),
+            r.controller.ahead_misses()
+        );
+    }
 }

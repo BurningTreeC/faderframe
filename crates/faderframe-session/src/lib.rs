@@ -864,6 +864,10 @@ pub struct Session {
     album_state: album::AlbumState,
     /// Plugin failures noticed, sandboxed plugins' unsaved state.
     plugin_care: sandbox::PluginCare,
+    /// Render tracks nobody plays live this far ahead (`None`: off).
+    render_ahead: Option<std::time::Duration>,
+    /// Tracks with a plugin editor open.
+    edited_tracks: std::collections::HashSet<TrackId>,
     /// Selected programs whose new state is not recorded yet.
     pending_programs: Vec<programs::PendingProgram>,
     /// The Tools view's meters.
@@ -1042,6 +1046,8 @@ impl Session {
             bounces: Vec::new(),
             album_state: album::AlbumState::default(),
             plugin_care: sandbox::PluginCare::default(),
+            render_ahead: None,
+            edited_tracks: Default::default(),
             pending_programs: Vec::new(),
             analysis: analysis::AnalysisState::new(config.sample_rate),
             follow_base: HashMap::new(),
@@ -1307,6 +1313,9 @@ impl Session {
         self.engine
             .set_midi_output_ports(self.midi.output_port_map());
         self.engine.set_midi_live(self.midi.live().clone());
+        self.engine
+            .set_render_ahead(self.render_ahead, render_ahead_threads());
+        self.engine.set_edited_tracks(self.edited_tracks.clone());
         self.midi.reset_engine_tables();
         self.engine
             .midi_shared()
@@ -1411,6 +1420,60 @@ impl Session {
         self.pool.clone()
     }
 
+    /// Render tracks nobody plays live this far ahead of the playhead, on
+    /// threads of their own (`None`: everything on the audio thread). See
+    /// `faderframe_engine::ahead`.
+    pub fn set_render_ahead(&mut self, lookahead: Option<std::time::Duration>) -> Result<()> {
+        if lookahead == self.render_ahead {
+            return Ok(());
+        }
+        self.render_ahead = lookahead;
+        self.engine
+            .set_render_ahead(lookahead, render_ahead_threads());
+        self.sync(Impact::Graph)
+    }
+
+    pub fn render_ahead(&self) -> Option<std::time::Duration> {
+        self.render_ahead
+    }
+
+    /// The plugins whose editors are open (the UI says so every tick): their
+    /// tracks play on the audio thread while rendering ahead, so what is
+    /// turned is heard at once.
+    pub fn set_plugins_being_edited(
+        &mut self,
+        plugins: &std::collections::HashSet<faderframe_core::PluginInstanceId>,
+    ) {
+        if self.render_ahead.is_none() {
+            return;
+        }
+        let tracks: std::collections::HashSet<TrackId> = self
+            .project
+            .tracks
+            .iter()
+            .filter(|t| {
+                t.inserts
+                    .iter()
+                    .chain(t.instrument.iter())
+                    .any(|s| plugins.contains(&s.id))
+            })
+            .map(|t| t.id)
+            .collect();
+        if tracks == self.edited_tracks {
+            return;
+        }
+        self.edited_tracks = tracks.clone();
+        self.engine.set_edited_tracks(tracks);
+        if let Err(e) = self.engine.update_params(&self.project) {
+            self.notify(NoticeLevel::Error, e.to_string());
+        }
+    }
+
+    /// Tracks rendered ahead now, and blocks in which their audio was late.
+    pub fn render_ahead_status(&self) -> (usize, u64) {
+        (self.engine.ahead_tracks().len(), self.engine.ahead_misses())
+    }
+
     /// Threads processing the graph (the audio thread plus workers).
     pub fn processing_threads(&self) -> usize {
         1 + self.pool.as_ref().map_or(0, |p| p.threads())
@@ -1510,6 +1573,14 @@ impl Session {
             // Stopped (by the user, the end of a bounce, a dropped stream):
             // Latch/Write automation ends here.
             self.automation_play_stopped();
+        }
+        // Stopped: tracks kept on the audio thread while playing go back to
+        // being rendered ahead.
+        if !self.transport.playing
+            && self.engine.ahead_wants_rebuild(&self.project)
+            && let Err(e) = self.sync(Impact::Graph)
+        {
+            self.notify(NoticeLevel::Error, e.to_string());
         }
         for t in &self.project.tracks {
             if let Some(m) = self.engine.take_meter(t.id) {
@@ -3468,6 +3539,13 @@ impl Drop for Session {
         // it (the shell asks before closing unsaved work).
         self.discard_unsaved_media();
     }
+}
+
+/// Worker threads of the render-ahead graph besides its own thread.
+fn render_ahead_threads() -> usize {
+    faderframe_realtime::physical_cores()
+        .saturating_sub(1)
+        .min(8)
 }
 
 #[cfg(test)]

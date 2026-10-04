@@ -556,3 +556,60 @@ fn warped_playback_does_not_allocate() {
     });
     assert_eq!(n, 0, "allocations/frees while playing warped audio");
 }
+
+#[test]
+fn rendering_ahead_does_not_allocate_on_the_audio_thread() {
+    let _serial = serial();
+    const SR: u32 = 48_000;
+    const BLOCK: usize = 256;
+    let mut project = demo_project(SR);
+    // Something to render ahead on the audio tracks.
+    for (i, name) in ["Drums", "Bass", "Pluck"].iter().enumerate() {
+        let t = project.tracks.iter_mut().find(|t| t.name == *name).unwrap();
+        t.inserts.push(faderframe_project::PluginSlot {
+            id: faderframe_core::PluginInstanceId(9_100 + i as u64),
+            plugin: faderframe_project::PluginRef::builtin(faderframe_core::builtin::ECHO, "Echo"),
+            bypass: false,
+            parameters: Vec::new(),
+            state: None,
+            sidechain: None,
+        });
+    }
+    let sources = render_generated_sources(&project, SR);
+    let config = EngineConfig {
+        sample_rate: SR,
+        max_block_size: BLOCK,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&project, &sources, config, BLOCK, 2).unwrap();
+    r.controller
+        .set_render_ahead(Some(std::time::Duration::from_millis(100)), 1);
+    r.controller
+        .sync(&project, &sources, faderframe_project::Impact::Graph)
+        .unwrap();
+    assert!(!r.controller.ahead_tracks().is_empty());
+    let mut bufs = OwnedBuffers::new(2, 2, BLOCK);
+    let pace = std::time::Duration::from_secs_f64(BLOCK as f64 / SR as f64);
+    // Warm up (the link arrives, the first sequence starts).
+    for _ in 0..30 {
+        r.processor.process_device(&mut bufs);
+        std::thread::sleep(pace);
+    }
+    let mut total = 0;
+    for cmd in [
+        TransportCommand::Play,
+        TransportCommand::Locate(96_000),
+        TransportCommand::Stop,
+        TransportCommand::Play,
+    ] {
+        r.controller.transport(cmd).unwrap();
+        for _ in 0..40 {
+            let (_, n) = armed(|| r.processor.process_device(&mut bufs));
+            total += n;
+            std::thread::sleep(pace);
+        }
+        r.controller.collect_garbage();
+    }
+    assert_eq!(total, 0, "allocations/frees on the audio thread");
+    assert_eq!(r.controller.ahead_misses(), 0);
+}

@@ -65,6 +65,9 @@ impl Default for EngineConfig {
 /// edits can never overflow it with stale structures.
 enum Message {
     Transport(TransportCommand),
+    /// Render ahead from now on (the audio thread's end of it), or no more.
+    Ahead(Box<crate::ahead::AheadLink>),
+    AheadOff,
     ResetProcessors,
     BeginRecord(Box<Recorder>),
     EndRecord,
@@ -85,7 +88,10 @@ enum Message {
 /// Objects retired by the audio thread, dropped on the control thread.
 enum Garbage {
     Graph(#[allow(dead_code)] Box<CompiledGraph<EngineContext>>),
-    Timeline(#[allow(dead_code)] Box<TimelineSnapshot>),
+    // The mailbox's box, handed back whole: the audio thread frees nothing.
+    #[allow(clippy::redundant_allocation)]
+    Timeline(#[allow(dead_code)] Box<Arc<TimelineSnapshot>>),
+    AheadLink(#[allow(dead_code)] Box<crate::ahead::AheadLink>),
     Recorder(#[allow(dead_code)] Box<Recorder>),
     MidiQueue(#[allow(dead_code)] Box<faderframe_midi::MidiInputQueue>),
     MidiOutQueue(#[allow(dead_code)] Box<faderframe_midi::MidiOutputQueue>),
@@ -209,7 +215,7 @@ pub fn create_with_epoch(
         ctx: EngineContext {
             transport: Default::default(),
             discontinuity: false,
-            timeline: Box::new(TimelineSnapshot::empty(config.sample_rate as f64)),
+            timeline: Arc::new(TimelineSnapshot::empty(config.sample_rate as f64)),
             params: Arc::clone(&params),
             readback: Arc::clone(&readback),
             meters: Arc::clone(&meters),
@@ -217,6 +223,7 @@ pub fn create_with_epoch(
             midi_input: crate::midi::MidiInputBlock::with_capacity(
                 crate::midi::MIDI_INPUT_CAPACITY,
             ),
+            ahead_seq: 0,
         },
         transport: TransportState::default(),
         shared: Arc::clone(&shared),
@@ -229,6 +236,7 @@ pub fn create_with_epoch(
         clock: crate::midi::ClockGen::default(),
         output_latency: 0,
         pool: None,
+        ahead: None,
     };
     let controller = EngineController {
         config,
@@ -256,6 +264,13 @@ pub fn create_with_epoch(
             ..Default::default()
         },
         midi_live: Default::default(),
+        edited: Default::default(),
+        timeline: Arc::new(TimelineSnapshot::empty(config.sample_rate as f64)),
+        ahead: None,
+        ahead_setting: None,
+        ahead_rings: Default::default(),
+        ahead_tracks: Default::default(),
+        ahead_misses: Arc::new(AtomicU64::new(0)),
     };
     (controller, processor)
 }
@@ -265,7 +280,7 @@ pub fn create_with_epoch(
 pub struct EngineProcessor {
     rx: Consumer<Message>,
     graph_rx: MailboxReceiver<CompiledGraph<EngineContext>>,
-    timeline_rx: MailboxReceiver<TimelineSnapshot>,
+    timeline_rx: MailboxReceiver<Arc<TimelineSnapshot>>,
     garbage: Producer<Garbage>,
     graph: Option<Box<CompiledGraph<EngineContext>>>,
     ctx: EngineContext,
@@ -282,6 +297,9 @@ pub struct EngineProcessor {
     output_latency: u32,
     /// DSP worker threads for the graph (none: serial on the audio thread).
     pool: Option<Arc<WorkerPool>>,
+    /// Render-ahead: the current sequence and transport changes on their
+    /// way to the anticipator.
+    ahead: Option<Box<crate::ahead::AheadLink>>,
 }
 
 impl EngineProcessor {
@@ -305,14 +323,27 @@ impl EngineProcessor {
             self.graph = Some(new);
             self.shared.graphs_installed.fetch_add(1, Ordering::Relaxed);
         }
-        if let Some(t) = self.timeline_rx.take() {
-            let old = std::mem::replace(&mut self.ctx.timeline, t);
-            self.retire(Garbage::Timeline(old));
+        if let Some(mut t) = self.timeline_rx.take() {
+            // The box goes back holding the old snapshot: nothing is freed
+            // here.
+            std::mem::swap(&mut self.ctx.timeline, &mut *t);
+            self.retire(Garbage::Timeline(t));
         }
         for _ in 0..Self::MAX_MESSAGES_PER_CALLBACK {
             let Ok(msg) = self.rx.pop() else { break };
             match msg {
-                Message::Transport(cmd) => self.transport.apply(cmd),
+                Message::Transport(cmd) => self.transport_command(cmd),
+                Message::Ahead(mut link) => {
+                    link.begin(&self.transport);
+                    if let Some(old) = self.ahead.replace(link) {
+                        self.retire(Garbage::AheadLink(old));
+                    }
+                }
+                Message::AheadOff => {
+                    if let Some(old) = self.ahead.take() {
+                        self.retire(Garbage::AheadLink(old));
+                    }
+                }
                 Message::ResetProcessors => {
                     if let Some(g) = &mut self.graph {
                         g.reset_all();
@@ -360,14 +391,23 @@ impl EngineProcessor {
                     let late = now as f64 - at_ns as f64;
                     let rate = self.stream_rate as f64;
                     let adjusted = position + if play { (late * rate / 1e9) as i64 } else { 0 };
-                    self.transport.apply(TransportCommand::Locate(adjusted));
-                    self.transport.apply(if play {
+                    self.transport_command(TransportCommand::Locate(adjusted));
+                    self.transport_command(if play {
                         TransportCommand::Play
                     } else {
                         TransportCommand::Stop
                     });
                 }
             }
+        }
+    }
+
+    /// A transport command: at once, or — rendering ahead — when the
+    /// anticipator has the new state ready.
+    fn transport_command(&mut self, cmd: TransportCommand) {
+        match self.ahead.as_deref_mut() {
+            Some(link) => link.command(&mut self.transport, cmd),
+            None => self.transport.apply(cmd),
         }
     }
 
@@ -410,6 +450,10 @@ impl EngineProcessor {
             .map_or(1024, |g| g.config().max_block_size)
             .max(1);
 
+        if let Some(link) = self.ahead.as_deref_mut() {
+            link.poll(&mut self.transport, frames);
+        }
+        self.ctx.ahead_seq = self.ahead.as_deref().map_or(0, |l| l.seq());
         self.midi.take(frames, rate, &self.shared.midi_dropped);
         let callback_ns = self.midi_out.as_ref().map_or(0, |q| q.clock.now_ns());
 
@@ -635,7 +679,7 @@ pub struct EngineController {
     config: EngineConfig,
     tx: Producer<Message>,
     graph_tx: MailboxSender<CompiledGraph<EngineContext>>,
-    timeline_tx: MailboxSender<TimelineSnapshot>,
+    timeline_tx: MailboxSender<Arc<TimelineSnapshot>>,
     garbage: Consumer<Garbage>,
     shared: Arc<EngineShared>,
     params: Arc<ParamTable>,
@@ -656,9 +700,20 @@ pub struct EngineController {
     midi_routing: crate::build::MidiRouting,
     /// Tracks taking live MIDI input.
     midi_live: std::collections::HashSet<faderframe_core::TrackId>,
+    /// Tracks whose plugins are being edited (kept on the audio thread).
+    edited: std::collections::HashSet<faderframe_core::TrackId>,
     /// Stretcher voices per track in the installed graph (a timeline edit
     /// that changes them rebuilds the graph).
     voices: Vec<(faderframe_core::TrackId, crate::nodes::StretchVoices)>,
+    /// The latest timeline snapshot (handed to an anticipator that starts).
+    timeline: Arc<TimelineSnapshot>,
+    /// Render-ahead: the anticipator, its lookahead, the rings by track,
+    /// the tracks rendered ahead in the installed graph, reader misses.
+    ahead: Option<crate::ahead::Anticipator>,
+    ahead_setting: Option<std::time::Duration>,
+    ahead_rings: std::collections::HashMap<faderframe_core::TrackId, Arc<crate::ahead::AheadRing>>,
+    ahead_tracks: std::collections::HashSet<faderframe_core::TrackId>,
+    ahead_misses: Arc<AtomicU64>,
 }
 
 /// Voices every audio track needs.
@@ -1049,6 +1104,11 @@ impl EngineController {
         while self.garbage.pop().is_ok() {
             n += 1;
         }
+        if let Some(a) = &mut self.ahead {
+            while a.garbage.pop().is_ok() {
+                n += 1;
+            }
+        }
         n
     }
 
@@ -1080,6 +1140,10 @@ impl EngineController {
     }
 
     pub fn update_params(&mut self, project: &Project) -> Result<(), EngineError> {
+        // A track became live or armed: out of the render-ahead graph.
+        if self.ahead.is_some() && self.ahead_plan(project) != self.ahead_tracks {
+            self.rebuild_graph(project)?;
+        }
         self.slots.write_params(
             project,
             &self.params,
@@ -1097,14 +1161,36 @@ impl EngineController {
             PrepareConfig::new(self.config.sample_rate as f64, self.config.max_block_size);
         prepare.measure_nodes = self.config.measure_nodes;
         prepare.parallel_min_ns = self.config.parallel_min_ns;
+        let ahead_tracks = self.ahead_plan(project);
+        let lookahead = self.ahead.as_ref().map(|a| a.lookahead);
+        let plan = lookahead.map(|lookahead| crate::build::AheadPlan {
+            tracks: &ahead_tracks,
+            rings: &mut self.ahead_rings,
+            ring_frames: crate::ahead::ring_frames(lookahead, self.config.max_block_size),
+            misses: Arc::clone(&self.ahead_misses),
+        });
         let built = build_graph(
             project,
             &mut self.slots,
             &mut self.plugins,
             &prepare,
             &self.midi_routing,
+            plan,
         )?;
         let compiled = built.builder.compile(&prepare)?;
+        if let (Some(a), Some((builder, rings))) = (&self.ahead, built.ahead) {
+            let mut ahead_prepare = prepare;
+            // Not on the audio thread: never worth staying serial.
+            ahead_prepare.parallel_min_ns = 0;
+            ahead_prepare.measure_nodes = false;
+            let graph = builder.compile(&ahead_prepare)?;
+            drop(a.graph_tx.send(Box::new(crate::ahead::AheadGraph {
+                graph: Box::new(graph),
+                rings,
+            })));
+        }
+        self.ahead_rings.retain(|t, _| ahead_tracks.contains(t));
+        self.ahead_tracks = ahead_tracks;
         self.voices = voice_needs(project);
         // Parameters must be valid before the new graph's processors read them.
         self.slots.write_params(
@@ -1147,8 +1233,13 @@ impl EngineController {
             &self.suspended_lanes,
         );
         self.plan = Arc::new(snapshot.stream_plan());
-        // A snapshot the audio thread never picked up is dropped right here.
-        drop(self.timeline_tx.send(Box::new(snapshot)));
+        let snapshot = Arc::new(snapshot);
+        // A snapshot a thread never picked up is dropped right here.
+        drop(self.timeline_tx.send(Box::new(Arc::clone(&snapshot))));
+        if let Some(a) = &self.ahead {
+            drop(a.timeline_tx.send(Box::new(Arc::clone(&snapshot))));
+        }
+        self.timeline = snapshot;
         let range = project.loop_range.and_then(|r| {
             LoopRange::new(
                 self.musical_to_samples(project, r.start),
@@ -1244,6 +1335,93 @@ impl EngineController {
     /// update).
     pub fn set_midi_live(&mut self, tracks: std::collections::HashSet<faderframe_core::TrackId>) {
         self.midi_live = tracks;
+    }
+
+    /// Tracks whose plugins are being edited: they play on the audio thread
+    /// (changes are heard at once). Applied by [`Self::update_params`].
+    pub fn set_edited_tracks(
+        &mut self,
+        tracks: std::collections::HashSet<faderframe_core::TrackId>,
+    ) {
+        self.edited = tracks;
+    }
+
+    /// Render tracks nobody plays live `lookahead` ahead of the playhead on
+    /// threads of their own (`None`: everything on the audio thread). The
+    /// caller rebuilds the graph ([`Self::sync`] with [`Impact::Graph`]).
+    pub fn set_render_ahead(&mut self, lookahead: Option<std::time::Duration>, threads: usize) {
+        if lookahead == self.ahead_setting {
+            return;
+        }
+        self.ahead_setting = lookahead;
+        if self.ahead.take().is_some() {
+            let _ = self.send(Message::AheadOff);
+        }
+        self.ahead_rings.clear();
+        self.ahead_tracks.clear();
+        let Some(lookahead) = lookahead else { return };
+        let ctx = EngineContext {
+            transport: Default::default(),
+            discontinuity: false,
+            timeline: Arc::clone(&self.timeline),
+            params: Arc::clone(&self.params),
+            readback: Arc::clone(&self.readback),
+            meters: Arc::clone(&self.meters),
+            scope: Arc::clone(&self.scope),
+            midi_input: crate::midi::MidiInputBlock::with_capacity(0),
+            ahead_seq: 0,
+        };
+        let (anticipator, link) = crate::ahead::start(
+            ctx,
+            self.config.sample_rate as f64,
+            self.config.max_block_size,
+            lookahead,
+            threads,
+        );
+        if self.send(Message::Ahead(Box::new(link))).is_ok() {
+            self.ahead = Some(anticipator);
+        }
+    }
+
+    pub fn render_ahead(&self) -> Option<std::time::Duration> {
+        self.ahead_setting
+    }
+
+    /// Tracks rendered ahead in the installed graph.
+    pub fn ahead_tracks(&self) -> &std::collections::HashSet<faderframe_core::TrackId> {
+        &self.ahead_tracks
+    }
+
+    /// Blocks in which a rendered-ahead track's audio was not there yet.
+    pub fn ahead_misses(&self) -> u64 {
+        self.ahead_misses.load(Ordering::Relaxed)
+    }
+
+    /// The tracks to render ahead: those that can, but while playing none
+    /// that plays on the audio thread now (moving it there would leave a
+    /// gap); a stop brings them back ([`Self::ahead_wants_rebuild`]).
+    fn ahead_plan(&self, project: &Project) -> std::collections::HashSet<faderframe_core::TrackId> {
+        if self.ahead.is_none() {
+            return Default::default();
+        }
+        let playing = self.shared.transport.snapshot().playing;
+        let fed = crate::build::fed_tracks(project);
+        project
+            .tracks
+            .iter()
+            .filter(|t| !self.edited.contains(&t.id))
+            .filter(|t| crate::build::ahead_eligible(project, t, &self.midi_live, &fed))
+            .filter(|t| !playing || self.ahead_tracks.contains(&t.id))
+            .map(|t| t.id)
+            .collect()
+    }
+
+    /// Stopped with tracks that could be rendered ahead but are not: a
+    /// graph rebuild moves them.
+    pub fn ahead_wants_rebuild(&self, project: &Project) -> bool {
+        self.ahead.is_some()
+            && !self.shared.transport.snapshot().playing
+            && self.ahead_plan(project) != self.ahead_tracks
     }
 
     pub fn midi_live(&self) -> &std::collections::HashSet<faderframe_core::TrackId> {
