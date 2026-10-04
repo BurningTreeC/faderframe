@@ -21,6 +21,8 @@
 #![forbid(unsafe_code)]
 
 pub mod builtin;
+pub mod devices;
+pub mod dsp;
 pub mod eq;
 mod params;
 pub mod program_eq;

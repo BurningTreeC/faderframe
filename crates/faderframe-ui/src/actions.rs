@@ -853,6 +853,33 @@ pub fn install(app: &Rc<AppState>) {
                 crate::plugin_window::click_device(x, y, button);
             }
         }),
+        // Development aid: `device-set:<id>=<value>[/<id>=<value>…]` sets
+        // parameters of the device editor opened last.
+        named("device-set", |a, arg| {
+            let Some(plugin) = crate::plugin_window::latest_device() else {
+                tracing::warn!("device-set: no device editor is open");
+                return;
+            };
+            let Some(track) = a.session.borrow().plugin_owner(plugin).map(|(t, _)| t) else {
+                return;
+            };
+            let commands = arg
+                .split('/')
+                .filter_map(|kv| {
+                    let (k, v) = kv.split_once('=')?;
+                    Some(faderframe_project::Command::SetPluginParameter {
+                        track,
+                        plugin,
+                        parameter: faderframe_core::ParameterId(k.trim().parse().ok()?),
+                        value: Some(v.trim().parse().ok()?),
+                    })
+                })
+                .collect();
+            a.dispatch(Action::Edit(faderframe_project::Command::Batch {
+                label: "Device Set".into(),
+                commands,
+            }));
+        }),
         // Development aid: `reload-plugins:x` starts every plugin again (a
         // crashed one, or after switching sandboxing).
         named("reload-plugins", |a, _| {

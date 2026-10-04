@@ -29,7 +29,7 @@
 //! * Every change is a parameter edit of the plugin slot, so it is
 //!   undoable and automatable like any other.
 
-mod analyser;
+pub(crate) mod analyser;
 mod bars;
 mod edit;
 mod geometry;

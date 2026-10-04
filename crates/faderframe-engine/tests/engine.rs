@@ -353,8 +353,9 @@ fn sidechain_keys_a_compressor_from_a_muted_track_and_refuses_loops() {
         id: comp,
         plugin: PluginRef::builtin(builtin::COMPRESSOR, "Compressor"),
         bypass: false,
-        // -20 dB threshold, 20:1, fast attack and release.
-        parameters: vec![p(0, -20.0), p(1, 20.0), p(2, 0.1), p(3, 5.0)],
+        // -20 dB threshold, 20:1, fast attack and release, peak detection
+        // (the Punch style).
+        parameters: vec![p(0, -20.0), p(1, 20.0), p(2, 0.1), p(3, 5.0), p(6, 1.0)],
         state: None,
         sidechain: None,
     });

@@ -154,8 +154,8 @@ impl List {
     ) {
         let r = Self::rect(l);
         p.shadow(r, 8.0, Color::rgba(0.0, 0.0, 0.0, 0.5), 0.0, 4.0, 18.0);
-        p.fill_rounded(r, 8.0, &Paint::Solid(th.eq.panel.with_alpha(0.98)));
-        p.stroke_rounded(r, 8.0, 1.0, th.eq.panel_edge);
+        p.fill_rounded(r, 8.0, &Paint::Solid(th.device.panel.with_alpha(0.98)));
+        p.stroke_rounded(r, 8.0, 1.0, th.device.panel_edge);
         p.text(
             "INSTANCES",
             Rect::new(r.x + 14.0, r.y + 8.0, 200.0, 18.0),
@@ -202,15 +202,15 @@ impl List {
             line.feed(&tap.output, &mut self.scratch, 40.0, false);
             let here = id == this;
             let referenced = s.external && s.source == Source::Instance(id);
-            p.fill_rounded(row, 6.0, &Paint::Solid(th.eq.display));
+            p.fill_rounded(row, 6.0, &Paint::Solid(th.device.display));
             p.stroke_rounded(
                 row,
                 6.0,
                 1.0,
                 if here {
-                    th.eq.curve.with_alpha(0.7)
+                    th.device.curve.with_alpha(0.7)
                 } else {
-                    th.eq.panel_edge
+                    th.device.panel_edge
                 },
             );
             let swatch = Rect::new(row.x + 10.0, row.y + 10.0, 10.0, 10.0);
@@ -228,18 +228,18 @@ impl List {
                 p.text(
                     "this EQ",
                     Rect::new(row.x + 26.0, row.y + 24.0, 150.0, 14.0),
-                    &TextStyle::new(th.fonts.tiny, th.eq.curve),
+                    &TextStyle::new(th.fonts.tiny, th.device.curve),
                 );
             } else if referenced {
                 p.text(
                     "external spectrum",
                     Rect::new(row.x + 26.0, row.y + 24.0, 150.0, 14.0),
-                    &TextStyle::new(th.fonts.tiny, th.eq.external),
+                    &TextStyle::new(th.fonts.tiny, th.device.external),
                 );
             }
             // Its spectrum and curve.
             let g = Rect::new(row.x + 180.0, row.y + 6.0, row.w - 290.0, row.h - 12.0);
-            p.fill_rounded(g, 4.0, &Paint::Solid(th.eq.display.darken(0.15)));
+            p.fill_rounded(g, 4.0, &Paint::Solid(th.device.display.darken(0.15)));
             let freqs = sweep(&axis, (g.w / 3.0).max(24.0) as usize);
             let levels: Vec<f32> = line
                 .curve(&freqs)
@@ -258,7 +258,7 @@ impl List {
                 fill.line_to(Point::new(last.x, g.bottom()))
                     .line_to(Point::new(first.x, g.bottom()))
                     .close();
-                p.fill_path(&fill, th.eq.post.with_alpha(0.18));
+                p.fill_path(&fill, th.device.post.with_alpha(0.18));
             }
             // Collisions with this EQ's output.
             if !here && let Some(here_tap) = &here_tap {
@@ -275,7 +275,7 @@ impl List {
                             let x = pts[i].x;
                             p.fill(
                                 Rect::new(x - 1.5, pts[i].y, 3.0, g.bottom() - pts[i].y),
-                                th.eq.collision.with_alpha(0.5 * k),
+                                th.device.collision.with_alpha(0.5 * k),
                             );
                         }
                     }
@@ -307,7 +307,11 @@ impl List {
                     )
                 })
                 .collect();
-            p.stroke_path(&Path::polyline(&curve), 1.6, th.eq.curve.with_alpha(0.9));
+            p.stroke_path(
+                &Path::polyline(&curve),
+                1.6,
+                th.device.curve.with_alpha(0.9),
+            );
             for (make, name, br) in Self::buttons(&row) {
                 let on = matches!(make(id), Hit::Reference(_)) && referenced;
                 if here && !matches!(make(id), Hit::Open(_)) {
@@ -317,7 +321,7 @@ impl List {
                     br,
                     3.0,
                     &Paint::Solid(if on {
-                        th.eq.external.with_alpha(0.35)
+                        th.device.external.with_alpha(0.35)
                     } else {
                         th.ui.surface_alt
                     }),

@@ -231,8 +231,8 @@ impl Match {
     ) {
         let r = Self::rect(l);
         p.shadow(r, 6.0, Color::rgba(0.0, 0.0, 0.0, 0.45), 0.0, 3.0, 14.0);
-        p.fill_rounded(r, 6.0, &Paint::Solid(th.eq.panel.with_alpha(0.97)));
-        p.stroke_rounded(r, 6.0, 1.0, th.eq.panel_edge);
+        p.fill_rounded(r, 6.0, &Paint::Solid(th.device.panel.with_alpha(0.97)));
+        p.stroke_rounded(r, 6.0, 1.0, th.device.panel_edge);
         let reference = Reference::of(model, plugin);
         let status = if self.result.is_some() {
             "Matched: adjust the number of bands, then apply".to_string()
@@ -263,7 +263,7 @@ impl Match {
                 ir,
                 4.0,
                 &Paint::Solid(if on {
-                    th.eq.dyn_range.with_alpha(0.4)
+                    th.device.dyn_range.with_alpha(0.4)
                 } else {
                     th.ui.surface_alt
                 }),
@@ -357,13 +357,13 @@ impl Match {
                     Point::new(axis.x(g, *f), gains.y(g, d as f32))
                 })
                 .collect();
-            super::paint::dashed(p, &pts, 2.0, th.eq.curve);
+            super::paint::dashed(p, &pts, 2.0, th.device.curve);
             for b in bands {
                 let at = Point::new(
                     axis.x(g, b.freq),
                     gains.y(g, (b.gain as f32).clamp(-gains.range, gains.range)),
                 );
-                p.stroke_path(&Path::circle(at, 6.0), 1.4, th.eq.curve);
+                p.stroke_path(&Path::circle(at, 6.0), 1.4, th.device.curve);
             }
         }
     }

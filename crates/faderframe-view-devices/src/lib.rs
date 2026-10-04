@@ -4,8 +4,14 @@
 //! own for a plugin whose id [`editor_for`] knows.
 
 mod common;
+mod compressor;
+mod deesser;
 pub mod eq;
+mod gate;
+mod kit;
+mod limiter;
 pub mod program_eq;
+mod values;
 
 use faderframe_core::{PluginInstanceId, builtin};
 use faderframe_session::{Action, Session};
@@ -19,6 +25,26 @@ pub fn editor_for(
 ) -> Option<Box<dyn CanvasView<Session, Action>>> {
     match plugin_id {
         builtin::EQ => Some(Box::new(eq::EqView::new(plugin, theme))),
+        builtin::COMPRESSOR => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            compressor::CompressorFace::new(theme),
+        ))),
+        builtin::LIMITER => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            limiter::LimiterFace::new(theme),
+        ))),
+        builtin::DEESSER => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            deesser::DeesserFace::new(theme),
+        ))),
+        builtin::GATE => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            gate::GateFace::new(theme),
+        ))),
         builtin::PROGRAM_EQ => Some(Box::new(program_eq::ProgramEqView::new(plugin, theme))),
         _ => None,
     }
@@ -31,6 +57,10 @@ const HEADER_BAR: i32 = 46;
 pub fn editor_size(plugin_id: &str) -> Option<(i32, i32)> {
     match plugin_id {
         builtin::EQ => Some((1180, 700)),
+        builtin::COMPRESSOR => Some((1040, 520 + HEADER_BAR)),
+        builtin::LIMITER => Some((900, 480 + HEADER_BAR)),
+        builtin::DEESSER => Some((1000, 520 + HEADER_BAR)),
+        builtin::GATE => Some((1000, 520 + HEADER_BAR)),
         // The panel at 1.2 times its size, under the window's header bar.
         builtin::PROGRAM_EQ => Some((
             (program_eq::PANEL_W * 1.2) as i32,

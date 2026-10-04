@@ -836,3 +836,194 @@ fn the_equalisers_do_not_allocate() {
     assert!(tap.output.written() > 0, "the analyser was fed");
     assert!(tap.sidechain.written() > 0, "the sidechain reached the EQ");
 }
+
+/// The stock devices (each with a few of its options on, one parameter
+/// automated, an editor watching, keyed by a sidechain where it has one).
+#[test]
+fn the_stock_devices_do_not_allocate() {
+    let _serial = serial();
+    use faderframe_audio_files::AudioData;
+    use faderframe_automation::{
+        AutomationCurve, AutomationLane, AutomationMode, AutomationPoint, AutomationTarget,
+        CurveShape,
+    };
+    use faderframe_core::{ChannelLayout, ParameterId, builtin};
+    use faderframe_project::{PluginRef, PluginSlot, SavedParameter, TrackKind};
+    use faderframe_timeline::MusicalTime;
+
+    const SR: u32 = 48_000;
+    let mut tp = common::TestProject::new(SR);
+    // Bursts of a tone with a bright edge (something to compress, gate,
+    // de-ess and limit).
+    let frames = 200_000;
+    let burst = |f: f64, amp: f64| -> Vec<f32> {
+        (0..frames)
+            .map(|n| {
+                let t = n as f64 / f64::from(SR);
+                let on = (n / 6_000) % 2 == 0;
+                let x = amp * (std::f64::consts::TAU * f * t).sin()
+                    + 0.3 * amp * (std::f64::consts::TAU * 7_000.0 * t).sin();
+                if on { x as f32 } else { (x * 0.01) as f32 }
+            })
+            .collect()
+    };
+    let key_track = tp.track(TrackKind::Audio, "Key", ChannelLayout::Stereo);
+    let key = tp.source(AudioData::from_channels(
+        SR,
+        vec![burst(60.0, 0.8), burst(60.0, 0.8)],
+    ));
+    tp.clip(key_track, key, MusicalTime::ZERO, frames as i64);
+    let set = |id: u32, value: f64| SavedParameter {
+        id: ParameterId(id),
+        value,
+    };
+    // A device, its parameters, whether keyed, an automated parameter and
+    // its range.
+    type Device = (&'static str, Vec<SavedParameter>, bool, u32, (f64, f64));
+    let devices: Vec<Device> = vec![
+        (
+            builtin::COMPRESSOR,
+            vec![
+                set(0, -30.0),
+                set(6, 2.0),
+                set(10, 2.0),
+                set(18, 0.5),
+                set(7, 1.0),
+                set(8, 1.0),
+            ],
+            true,
+            0,
+            (-40.0, -10.0),
+        ),
+        (
+            builtin::COMPRESSOR,
+            vec![
+                set(0, -20.0),
+                set(6, 4.0),
+                set(11, 1.0),
+                set(13, 0.0),
+                set(16, 1.0),
+            ],
+            false,
+            1,
+            (2.0, 20.0),
+        ),
+        (
+            builtin::LIMITER,
+            vec![set(0, 12.0), set(4, 1.0), set(6, 0.5)],
+            false,
+            1,
+            (-6.0, -0.3),
+        ),
+        (
+            builtin::LIMITER,
+            vec![set(0, 6.0), set(5, 0.0), set(8, 1.0), set(7, 0.0)],
+            false,
+            2,
+            (5.0, 500.0),
+        ),
+        (
+            builtin::GATE,
+            vec![set(0, -30.0), set(8, 3.0)],
+            true,
+            0,
+            (-60.0, -10.0),
+        ),
+        (
+            builtin::GATE,
+            vec![set(2, 1.0), set(9, 0.0)],
+            false,
+            3,
+            (1.5, 8.0),
+        ),
+        (
+            builtin::GATE,
+            vec![set(2, 2.0), set(10, 100.0), set(11, 2_000.0)],
+            true,
+            1,
+            (-30.0, -3.0),
+        ),
+        (
+            builtin::DEESSER,
+            vec![set(0, -40.0), set(10, 2.0), set(8, 0.0)],
+            false,
+            2,
+            (3_000.0, 9_000.0),
+        ),
+        (
+            builtin::DEESSER,
+            vec![set(3, 1.0), set(4, 1.0), set(5, 1.0)],
+            false,
+            0,
+            (-50.0, -10.0),
+        ),
+    ];
+    let mut ids = Vec::new();
+    for (i, (plugin, parameters, keyed, target, (lo, hi))) in devices.into_iter().enumerate() {
+        let t = tp.track(TrackKind::Audio, &format!("T{i}"), ChannelLayout::Stereo);
+        let src = tp.source(AudioData::from_channels(
+            SR,
+            vec![burst(220.0, 0.5), burst(330.0, 0.5)],
+        ));
+        tp.clip(t, src, MusicalTime::ZERO, frames as i64);
+        let id = tp.project.ids.allocate();
+        let lane = tp.project.ids.allocate();
+        let track = tp.project.track_mut(t).unwrap();
+        track.inserts.push(PluginSlot {
+            id,
+            plugin: PluginRef::builtin(plugin, plugin),
+            bypass: false,
+            parameters,
+            state: None,
+            sidechain: keyed.then_some(key_track),
+        });
+        track.automation.lanes.push(AutomationLane {
+            id: lane,
+            target: AutomationTarget::PluginParameter {
+                plugin: id,
+                parameter: ParameterId(target),
+            },
+            curve: AutomationCurve::from_points(
+                (0..20)
+                    .map(|i| AutomationPoint {
+                        time: MusicalTime::from_quarters(i as f64 * 0.25),
+                        value: if i % 2 == 0 { lo } else { hi },
+                        shape: CurveShape::Smooth,
+                    })
+                    .collect(),
+            ),
+            mode: AutomationMode::Read,
+            visible: true,
+        });
+        ids.push(id);
+    }
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 2).unwrap();
+    let taps: Vec<_> = ids
+        .iter()
+        .map(|id| {
+            r.controller
+                .plugin_tap(*id)
+                .expect("a stock device has a tap")
+        })
+        .collect();
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    for _ in 0..8 {
+        taps.iter().for_each(|t| t.watch());
+        r.processor.process_device(&mut bufs);
+    }
+    let (_, allocs) = armed(|| {
+        for _ in 0..400 {
+            taps.iter().for_each(|t| t.watch());
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations in the stock devices");
+    for t in &taps {
+        assert!(t.output.written() > 0, "an editor's rings were fed");
+    }
+}

@@ -36,8 +36,9 @@ pub use paint::{Image, Paint, Path, PathCmd};
 pub use painter::{DrawOp, Painter, RecordingPainter};
 pub use text::{Align, FontFamily, FontWeight, TextStyle};
 pub use theme::{
-    ArrangerTheme, ConsoleLook, ConsoleTheme, FaderStyle, KnobStyle, LedStyle, MeterKind,
-    MeterStyle, PerformanceTheme, PianoRollTheme, Theme, ToolsTheme, Typography, UiPalette,
+    Accent, ArrangerTheme, ConsoleLook, ConsoleTheme, DeviceTheme, FaderStyle, KnobStyle, LedStyle,
+    MeterKind, MeterStyle, PerformanceTheme, PianoRollTheme, Theme, ToolsTheme, Typography,
+    UiPalette,
 };
 pub use view::{
     CanvasView, EventCx, FileChoice, FilesCommit, HostRequest, MenuItem, ScrollAxis, ScrollInfo,

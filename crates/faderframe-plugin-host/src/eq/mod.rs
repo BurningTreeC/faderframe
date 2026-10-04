@@ -875,30 +875,7 @@ const BYPASS_RAMP: f64 = 0.01;
 /// enough to keep the coefficient steps inaudible.
 const DYN_SMOOTH: f64 = 0.001;
 
-#[derive(Clone, Copy, Default)]
-pub(crate) struct State {
-    z1: f64,
-    z2: f64,
-}
-
-impl State {
-    #[inline]
-    pub(crate) fn run(&mut self, c: &Coefs, x: f64) -> f64 {
-        let y = c.b0 * x + self.z1;
-        self.z1 = c.b1 * x - c.a1 * y + self.z2;
-        self.z2 = c.b2 * x - c.a2 * y;
-        y
-    }
-
-    pub(crate) fn flush(&mut self) {
-        if self.z1.abs() < 1e-25 {
-            self.z1 = 0.0;
-        }
-        if self.z2.abs() < 1e-25 {
-            self.z2 = 0.0;
-        }
-    }
-}
+pub(crate) use crate::dsp::filter::State;
 
 /// What makes a band's sections a different structure (changing it fades).
 #[derive(Clone, Copy, Debug, PartialEq)]

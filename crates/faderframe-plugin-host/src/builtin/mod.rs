@@ -1,7 +1,6 @@
 //! Plugins shipped with FaderFrame, implemented on the same
 //! [`PluginInstance`]/[`PluginProcessor`] API that external formats use.
 
-mod compressor;
 mod echo;
 mod gain;
 mod latency;
@@ -25,12 +24,18 @@ enum Kind {
     LatencyProbe,
     Eq,
     ProgramEq,
+    Limiter,
+    Deesser,
+    Gate,
 }
 
 impl Kind {
-    const ALL: [Kind; 7] = [
+    const ALL: [Kind; 10] = [
         Kind::Eq,
         Kind::ProgramEq,
+        Kind::Limiter,
+        Kind::Deesser,
+        Kind::Gate,
         Kind::Synth,
         Kind::Echo,
         Kind::Compressor,
@@ -47,6 +52,9 @@ impl Kind {
             builtin::LATENCY_PROBE => Kind::LatencyProbe,
             builtin::EQ => Kind::Eq,
             builtin::PROGRAM_EQ => Kind::ProgramEq,
+            builtin::LIMITER => Kind::Limiter,
+            builtin::DEESSER => Kind::Deesser,
+            builtin::GATE => Kind::Gate,
             _ => return None,
         })
     }
@@ -103,6 +111,27 @@ impl Kind {
                 vec![stereo, sidechain],
                 0,
             ),
+            Kind::Gate => (
+                builtin::GATE,
+                "Gate",
+                PluginCategory::Effect,
+                vec![stereo, sidechain],
+                0,
+            ),
+            Kind::Deesser => (
+                builtin::DEESSER,
+                "De-esser",
+                PluginCategory::Effect,
+                vec![stereo],
+                0,
+            ),
+            Kind::Limiter => (
+                builtin::LIMITER,
+                "Limiter",
+                PluginCategory::Effect,
+                vec![stereo],
+                0,
+            ),
             Kind::ProgramEq => (
                 builtin::PROGRAM_EQ,
                 "Program EQ",
@@ -139,13 +168,10 @@ impl Kind {
         use ParameterUnit::*;
         match self {
             Kind::Gain => vec![p(0, "Gain", -60.0, 24.0, 0.0, Decibels)],
-            Kind::Compressor => vec![
-                p(0, "Threshold", -60.0, 0.0, -20.0, Decibels),
-                p(1, "Ratio", 1.0, 20.0, 4.0, None),
-                p(2, "Attack", 0.1, 200.0, 10.0, Milliseconds),
-                p(3, "Release", 5.0, 2000.0, 150.0, Milliseconds),
-                p(4, "Makeup", 0.0, 24.0, 0.0, Decibels),
-            ],
+            Kind::Compressor => crate::devices::compressor::parameters(),
+            Kind::Limiter => crate::devices::limiter::parameters(),
+            Kind::Deesser => crate::devices::deesser::parameters(),
+            Kind::Gate => crate::devices::gate::parameters(),
             Kind::Echo => vec![
                 p(0, "Time", 10.0, 2000.0, 401.0, Milliseconds),
                 p(1, "Feedback", 0.0, 0.95, 0.38, Percent),
@@ -181,6 +207,10 @@ impl Kind {
     fn tap_values(self) -> Option<usize> {
         match self {
             Kind::Eq => Some(crate::eq::TAP_VALUES),
+            Kind::Compressor => Some(crate::devices::compressor::TAP_VALUES),
+            Kind::Limiter => Some(crate::devices::limiter::TAP_VALUES),
+            Kind::Deesser => Some(crate::devices::deesser::TAP_VALUES),
+            Kind::Gate => Some(crate::devices::gate::TAP_VALUES),
             Kind::ProgramEq => Some(0),
             _ => None,
         }
@@ -197,6 +227,9 @@ pub struct BuiltinInstance {
     reported: Option<u32>,
     /// The program last selected.
     program: Option<usize>,
+    /// The sample rate of the last processor (latencies in samples depend
+    /// on it).
+    rate: f64,
 }
 
 impl PluginInstance for BuiltinInstance {
@@ -220,6 +253,10 @@ impl PluginInstance for BuiltinInstance {
         match self.kind {
             Kind::Eq => crate::eq::format(id, value),
             Kind::ProgramEq => crate::program_eq::format(id, value),
+            Kind::Compressor => crate::devices::compressor::format(id, value),
+            Kind::Limiter => crate::devices::limiter::format(id, value),
+            Kind::Deesser => crate::devices::deesser::format(id, value),
+            Kind::Gate => crate::devices::gate::format(id, value),
             _ => None,
         }
     }
@@ -275,6 +312,10 @@ impl PluginInstance for BuiltinInstance {
             Kind::LatencyProbe => self.params.get(0).max(0.0) as u32,
             Kind::ProgramEq => crate::program_eq::LATENCY,
             Kind::Eq => crate::eq::latency(&self.params),
+            Kind::Compressor => crate::devices::compressor::latency(&self.params, self.rate),
+            Kind::Limiter => crate::devices::limiter::latency(&self.params, self.rate),
+            Kind::Deesser => crate::devices::deesser::latency(&self.params, self.rate),
+            Kind::Gate => crate::devices::gate::latency(&self.params, self.rate),
             _ => 0,
         }
     }
@@ -290,7 +331,9 @@ impl PluginInstance for BuiltinInstance {
         match self.kind {
             Kind::Echo => TailLength::Infinite,
             Kind::Synth => TailLength::Samples(48_000 * 5),
-            Kind::Gain | Kind::Compressor => TailLength::None,
+            Kind::Gain | Kind::Compressor | Kind::Limiter | Kind::Gate | Kind::Deesser => {
+                TailLength::None
+            }
             // The longest ring of a resonant cut near 10 Hz.
             Kind::Eq => TailLength::Samples(48_000),
             Kind::ProgramEq => TailLength::Samples(24_000),
@@ -311,9 +354,34 @@ impl PluginInstance for BuiltinInstance {
         config: &ProcessConfig,
     ) -> Result<Box<dyn PluginProcessor>, PluginError> {
         let params = self.params.clone();
+        self.rate = config.sample_rate.max(1.0);
+        let tap = || {
+            self.tap
+                .clone()
+                .ok_or_else(|| PluginError::Failed("no tap".into()))
+        };
         Ok(match self.kind {
             Kind::Gain => Box::new(gain::GainProcessor::new(params)),
-            Kind::Compressor => Box::new(compressor::CompressorProcessor::new(params, config)),
+            Kind::Compressor => Box::new(crate::devices::compressor::CompressorProcessor::new(
+                params,
+                tap()?,
+                config,
+            )),
+            Kind::Limiter => Box::new(crate::devices::limiter::LimiterProcessor::new(
+                params,
+                tap()?,
+                config,
+            )),
+            Kind::Deesser => Box::new(crate::devices::deesser::DeesserProcessor::new(
+                params,
+                tap()?,
+                config,
+            )),
+            Kind::Gate => Box::new(crate::devices::gate::GateProcessor::new(
+                params,
+                tap()?,
+                config,
+            )),
             Kind::Echo => Box::new(echo::EchoProcessor::new(params, config)),
             Kind::Synth => Box::new(synth::SynthProcessor::new(params, config)),
             Kind::LatencyProbe => Box::new(latency::LatencyProcessor::new(self.latency_samples())),
@@ -362,6 +430,7 @@ impl PluginFactory for BuiltinFactory {
             tap,
             reported: None,
             program: None,
+            rate: 48_000.0,
         }))
     }
 }

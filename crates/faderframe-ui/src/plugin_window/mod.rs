@@ -324,6 +324,19 @@ fn presets_button(app: &Rc<AppState>, plugin: PluginInstanceId) -> gtk::MenuButt
 
 /// Deliver a click at `(x, y)` (view pixels) to the newest device editor
 /// (development aid for scripted checks).
+/// The plugin of the device editor opened last (dev actions).
+pub fn latest_device() -> Option<PluginInstanceId> {
+    EDITORS.with(|e| {
+        let devices = e.devices.borrow();
+        e.opened
+            .borrow()
+            .iter()
+            .rev()
+            .find(|p| devices.contains_key(p))
+            .copied()
+    })
+}
+
 pub fn click_device(x: f32, y: f32, button: faderframe_ui_canvas::PointerButton) {
     use faderframe_ui_canvas::{Modifiers, Point, ViewEvent};
     let canvas = EDITORS.with(|e| {

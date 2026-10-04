@@ -280,6 +280,21 @@ impl AnalysisTap {
         }
     }
 
+    /// Raise a non-negative value to at least `v` (a peak the editor takes
+    /// with [`AnalysisTap::take_value`], so none is missed between frames).
+    pub fn raise_value(&self, i: usize, v: f32) {
+        if let Some(slot) = self.values.get(i) {
+            slot.fetch_max_non_negative(magnitude(v), Ordering::Relaxed);
+        }
+    }
+
+    /// A raised value, reset to zero.
+    pub fn take_value(&self, i: usize) -> f32 {
+        self.values
+            .get(i)
+            .map_or(0.0, |slot| slot.swap(0.0, Ordering::Relaxed))
+    }
+
     /// The band to hear on its own, if any.
     pub fn listen(&self) -> Option<usize> {
         usize::try_from(self.listen.load(Ordering::Relaxed)).ok()

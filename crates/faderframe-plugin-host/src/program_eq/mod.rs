@@ -14,7 +14,6 @@
 mod channel;
 pub mod network;
 mod nodal;
-mod oversample;
 mod tube;
 
 pub use channel::{CROSSFADE, Channel, LATENCY, WARM_UP};

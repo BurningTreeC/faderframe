@@ -538,9 +538,10 @@ handles RPN 0 bend range, the MPE zone message, pressure and CC 74).
 
 Neither trait assumes the plugin is in-process; a sandboxed plugin is a proxy
 pair speaking IPC with shared-memory audio (see *Sandboxed plugins* below).
-`PluginHost` (engine) owns one instance per slot. Built-ins: synth, echo, compressor (with a sidechain
-input), gain, latency probe (used to test PDC end to end), the EQ and the
-Program EQ (see *Built-in devices*). Failed plugins
+`PluginHost` (engine) owns one instance per slot. Built-ins: synth, echo, gain, latency probe
+(used to test PDC end to end), the EQ, the Program EQ and the stock
+dynamics — compressor, limiter, gate and de-esser (see *Built-in
+devices*). Failed plugins
 are bypassed and flagged; missing formats pass audio through with a
 warning.
 
@@ -655,6 +656,58 @@ bypass, automation, listening).
   `crates/faderframe-view-devices/assets/program-eq`) through
   `Painter::image` — filmstrip frames, never a rotated picture, each tinted
   by its distance from the panel's lamp.
+
+**Stock devices.** The other built-ins with editors live in
+`plugin_host::devices` (one module each: parameter ids — stable, never
+reused —, `parameters`, `format`, `latency`, published values and the
+processor; tests with the shared `devices::rig`) on a common DSP toolkit,
+`plugin_host::dsp`: the EQ's matched designs as `dsp::filter::Filter`, TPT
+state-variable and one-pole filters, DC blocker, PultEQFx's halfband
+oversampler, a Hermite-interpolated delay line, envelope followers
+(peak, mean square, a programme-dependent `DualRelease`), tempo-synced
+LFOs, parameter smoothing and a BS.1770 4× true-peak meter. Their editors
+are `view-devices::kit` faces: a `Face` lays out a display and a deck of
+titled sections whose controls are bound to parameter ids
+(knob/small knob/toggle/choice/segments; drag, Shift fine, wheel,
+double-click to type a value, Ctrl-click default, right-click for
+default/automation/MIDI learn; every drag one undo step), meters for in,
+out and reduction, and `kit::History`/`kit::Spectrum` for the scrolling
+level history and the analyser. Peaks a face shows travel through
+`AnalysisTap::raise_value`/`take_value` (held until the editor takes
+them), so a 40 fps history misses no transient. Their real-time safety is
+covered by `the_stock_devices_do_not_allocate`.
+
+* **Compressor** (`devices::compressor`): five styles — Clean (feed
+  forward, RMS), Punch (peak), Opto (feedback, programme-dependent
+  release), Vintage (feedback, fast, colour), Bus (glue) —; the feedback
+  styles' slope is compensated so the ratio knob reads true; threshold,
+  ratio up to ∞, soft knee, attack, release with auto release, range,
+  auto makeup, lookahead (latency), RMS or peak detection, stereo link,
+  colour (saturation), mix, an external sidechain (on by default once one
+  is routed) with high/low cuts and listen. Editor: the transfer curve
+  with the level moving on it (drag to set the threshold) and a history.
+* **Limiter** (`devices::limiter`): a lookahead limiter that guarantees
+  its ceiling — per channel the minimum needed gain over the lookahead
+  window, averaged over an attack window no longer than the lookahead
+  (Transparent: all of it, Punchy: a half, Aggressive: a quarter), so the
+  gain is down before the peak arrives; release (auto: slower while
+  limiting goes on); stereo link; a true-peak mode measuring the 4×
+  oversampled output (6 samples more latency); unity gain listening.
+  Editor: history of in, out and reduction with the ceiling, held readouts
+  of the reduction and the output's (true) peak.
+* **Gate** (`devices::gate`): gate (with hysteresis and hold, opening and
+  closing in dB at the attack/release rates), downward expander (ratio,
+  range) and ducker; key from the input or the sidechain through high and
+  low cuts, listen, lookahead. Editor: the curve with both thresholds
+  (drag), the history and an open strip.
+* **De-esser** (`devices::deesser`): the detector hears above the
+  frequency (24 dB/oct) or round it; absolute or relative detection (the
+  threshold follows the take's smoothed level: it reads as set for a take
+  peaking at −18 dB); split mode turns down only the band (a dynamic high
+  shelf or bell, the EQ's designs), wide mode everything; range, attack,
+  release, link, lookahead, listen. Editor: the spectrum with the
+  detector's band and the cut it makes now (drag the frequency, wheel the
+  width) and a history.
 
 * **Automation from plugin editors.** Formats report the user's moves in a
   plugin's own GUI as `EditorEdit`s (begin, value, end): CLAP from the

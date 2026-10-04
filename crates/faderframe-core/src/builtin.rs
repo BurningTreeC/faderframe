@@ -7,8 +7,14 @@
 pub const SYNTH: &str = "faderframe.synth";
 /// Stereo feedback delay (effect).
 pub const ECHO: &str = "faderframe.echo";
-/// Compressor with a sidechain (key) input (effect).
+/// Compressor in five styles with a sidechain (key) input (effect).
 pub const COMPRESSOR: &str = "faderframe.compressor";
+/// Lookahead true peak limiter (effect).
+pub const LIMITER: &str = "faderframe.limiter";
+/// Gate, expander and ducker with a sidechain (effect).
+pub const GATE: &str = "faderframe.gate";
+/// De-esser: split or wide, relative or absolute (effect).
+pub const DEESSER: &str = "faderframe.deesser";
 /// Utility gain (effect).
 pub const GAIN: &str = "faderframe.gain";
 /// Pure delay that reports its delay as latency (testing PDC).
@@ -21,5 +27,5 @@ pub const PROGRAM_EQ: &str = "faderframe.program-eq";
 
 /// Built-ins with an editor of their own (others get the generic one).
 pub fn has_editor(id: &str) -> bool {
-    matches!(id, EQ | PROGRAM_EQ)
+    matches!(id, EQ | PROGRAM_EQ | COMPRESSOR | LIMITER | DEESSER | GATE)
 }

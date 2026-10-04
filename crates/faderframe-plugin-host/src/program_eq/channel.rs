@@ -4,8 +4,8 @@
 //! From PultEQFx by Simon Huber, used in FaderFrame under the MIT licence.
 
 use super::network::{Controls, PassiveNetwork};
-use super::oversample::Oversampler;
 use super::tube::TubeStage;
+use crate::dsp::oversample::Oversampler;
 
 /// Latency the plugin reports, in samples at the host rate. It is the round
 /// trip through the longest oversampling cascade; shorter settings are padded

@@ -289,14 +289,19 @@ impl EqView {
         let th = &self.theme;
         let color = Self::band_color(band);
         p.shadow(r, 8.0, Color::rgba(0.0, 0.0, 0.0, 0.45), 0.0, 3.0, 16.0);
-        p.fill_rounded(r, 8.0, &Paint::Solid(th.eq.panel.with_alpha(0.97)));
-        p.stroke_rounded(r, 8.0, 1.0, th.eq.panel_edge);
+        p.fill_rounded(r, 8.0, &Paint::Solid(th.device.panel.with_alpha(0.97)));
+        p.stroke_rounded(r, 8.0, 1.0, th.device.panel_edge);
         p.fill(
             Rect::new(r.x + 12.0, r.y, r.w - 24.0, 2.0),
             color.with_alpha(0.9),
         );
         if bp.dynamic() && bp.custom {
-            p.hline(r.x + 10.0, r.right() - 10.0, r.y + ROW1_H, th.eq.panel_edge);
+            p.hline(
+                r.x + 10.0,
+                r.right() - 10.0,
+                r.y + ROW1_H,
+                th.device.panel_edge,
+            );
         }
         let scale = Self::scale(tap);
         let piano = self.settings(model).piano;
@@ -306,7 +311,7 @@ impl EqView {
         for (item, ir) in self.panel_items(&r, &bp) {
             match item {
                 PanelItem::Bypass => {
-                    self.button_tinted(p, ir, "", !bp.enabled, th.eq.dyn_range);
+                    self.button_tinted(p, ir, "", !bp.enabled, th.device.dyn_range);
                     power_icon(
                         p,
                         ir.center(),
@@ -314,7 +319,7 @@ impl EqView {
                         if bp.enabled {
                             th.ui.text
                         } else {
-                            th.eq.dyn_range
+                            th.device.dyn_range
                         },
                     );
                 }
@@ -337,15 +342,15 @@ impl EqView {
                 PanelItem::Expand => {
                     self.button(p, ir, if bp.custom { "<<" } else { ">>" }, bp.custom)
                 }
-                PanelItem::Spectral => self.button_tinted(p, ir, "S", bp.spectral, th.eq.side),
+                PanelItem::Spectral => self.button_tinted(p, ir, "S", bp.spectral, th.device.side),
                 PanelItem::DynBypass => {
-                    self.button_tinted(p, ir, "", bp.dyn_bypass, th.eq.dyn_range);
+                    self.button_tinted(p, ir, "", bp.dyn_bypass, th.device.dyn_range);
                     power_icon(
                         p,
                         ir.center(),
                         4.5,
                         if bp.dyn_bypass {
-                            th.eq.dyn_range
+                            th.device.dyn_range
                         } else {
                             th.ui.text_dim
                         },
@@ -414,7 +419,7 @@ impl EqView {
                         ir,
                         to_normalized(Field::Threshold, thr),
                         Some(to_normalized(Field::Threshold, level)),
-                        th.eq.dyn_range,
+                        th.device.dyn_range,
                         auto,
                     );
                 }
@@ -424,9 +429,9 @@ impl EqView {
                         Rect::new(ir.x, ir.y - 16.0, ir.w, 14.0),
                         &dim_text,
                     );
-                    self.slider(p, ir, bp.density as f32, None, th.eq.side, false);
+                    self.slider(p, ir, bp.density as f32, None, th.device.side, false);
                 }
-                PanelItem::Key => self.button_tinted(p, ir, "SC", bp.external, th.eq.external),
+                PanelItem::Key => self.button_tinted(p, ir, "SC", bp.external, th.device.external),
                 PanelItem::Tilt => self.button(p, ir, "Tilt", bp.spectral_tilt),
                 PanelItem::Trigger => self.button(
                     p,
@@ -457,12 +462,12 @@ impl EqView {
     ) {
         let th = &self.theme;
         let track = Rect::new(r.x, r.y + r.h / 2.0 - 3.0, r.w, 6.0);
-        p.fill_rounded(track, 3.0, &Paint::Solid(th.eq.display));
+        p.fill_rounded(track, 3.0, &Paint::Solid(th.device.display));
         if let Some(l) = level {
             p.fill_rounded(
                 Rect::new(track.x, track.y, track.w * l.clamp(0.0, 1.0), track.h),
                 3.0,
-                &Paint::Solid(th.eq.dyn_live.with_alpha(0.55)),
+                &Paint::Solid(th.device.dyn_live.with_alpha(0.55)),
             );
         }
         let x = track.x + track.w * t.clamp(0.0, 1.0);
@@ -476,7 +481,7 @@ impl EqView {
             p.text(
                 "A",
                 knob.inset_xy(-2.0, 0.0),
-                &TextStyle::new(th.fonts.tiny, th.eq.node_text)
+                &TextStyle::new(th.fonts.tiny, th.device.node_text)
                     .bold()
                     .center(),
             );
@@ -550,7 +555,7 @@ impl EqView {
             let angle = |db: f64| controls::knob_angle(to_normalized(Field::Gain, db));
             let mut track = Path::new();
             track.arc(c, ring, angle(-30.0), angle(30.0), false);
-            p.stroke_path(&track, 3.0, th.eq.display);
+            p.stroke_path(&track, 3.0, th.device.display);
             if bp.dynamic() {
                 let (a, b) = (angle(value), angle(value + bp.range));
                 let mut arc = Path::new();
@@ -558,7 +563,7 @@ impl EqView {
                 p.stroke_path(
                     &arc,
                     3.0,
-                    th.eq
+                    th.device
                         .dyn_range
                         .with_alpha(if bp.dyn_bypass { 0.35 } else { 0.95 }),
                 );
@@ -567,7 +572,7 @@ impl EqView {
                     let m = angle(value + moved);
                     let mut live = Path::new();
                     live.arc(c, ring - 0.5, a.min(m), a.max(m), false);
-                    p.stroke_path(&live, 3.0, th.eq.dyn_live);
+                    p.stroke_path(&live, 3.0, th.device.dyn_live);
                 }
             }
             p.text(

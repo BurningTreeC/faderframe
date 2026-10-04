@@ -257,7 +257,13 @@ fn build(s: Spec) -> Theme {
             readout: c(s.text),
             toolbar_height: 32.0,
         },
-        eq: EqTheme {
+        device: DeviceTheme {
+            deck: c(s.bg),
+            section: surface,
+            section_edge: c(s.border),
+            reduction: c(m[3]),
+            wave: c(s.selection),
+            accents: DEVICE_ACCENTS,
             display: c(s.well),
             grid: line(0.06),
             grid_strong: line(0.18),

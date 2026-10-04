@@ -272,7 +272,7 @@ impl EqView {
         self.update_grab(model, &l, &s);
         // The display.
         let g = l.graph;
-        p.fill(g, th.eq.display);
+        p.fill(g, th.device.display);
         self.paint_grid(p, &l, model, &s);
         p.push_clip(g);
         self.paint_analyser(p, &l, model, &s);
@@ -308,7 +308,7 @@ impl EqView {
         let g = &l.graph;
         let axis = self.axis(model);
         let gains = self.gain_axis(model);
-        let line = th.eq.grid;
+        let line = th.device.grid;
         let label = TextStyle::new(th.fonts.tiny, th.ui.text_faint);
         // Vertical lines at 1-2-5 steps (and the decades between, faint).
         let mut decade = 1.0;
@@ -346,7 +346,11 @@ impl EqView {
                 g.x,
                 g.right(),
                 y,
-                if v == 0.0 { th.eq.grid_strong } else { line },
+                if v == 0.0 {
+                    th.device.grid_strong
+                } else {
+                    line
+                },
             );
             let text = if v > 0.0 {
                 format!("+{v:.0}")
@@ -356,7 +360,7 @@ impl EqView {
             p.text(
                 &text.replace('-', "−"),
                 Rect::new(2.0, y - 7.0, g.x - 6.0, 14.0),
-                &label.right().color(th.eq.curve.with_alpha(0.8)),
+                &label.right().color(th.device.curve.with_alpha(0.8)),
             );
             v += step;
         }
@@ -412,14 +416,14 @@ impl EqView {
                     &fill,
                     &Paint::vertical(
                         *g,
-                        th.eq.post.with_alpha(0.20 * dim),
-                        th.eq.post.with_alpha(0.05),
+                        th.device.post.with_alpha(0.20 * dim),
+                        th.device.post.with_alpha(0.05),
                     ),
                 );
                 p.stroke_path(
                     &Path::polyline(&post),
                     1.0,
-                    th.eq.post.with_alpha(0.45 * dim),
+                    th.device.post.with_alpha(0.45 * dim),
                 );
             }
             // Collisions with the external spectrum: a red glow along the
@@ -456,8 +460,8 @@ impl EqView {
                                 (a1.x - a0.x).max(1.0),
                                 DEPTH + (a0.y - a1.y).abs(),
                             ),
-                            th.eq.collision.with_alpha(0.7 * k),
-                            th.eq.collision.with_alpha(0.0),
+                            th.device.collision.with_alpha(0.7 * k),
+                            th.device.collision.with_alpha(0.0),
                         ),
                     );
                 }
@@ -467,14 +471,14 @@ impl EqView {
             p.stroke_path(
                 &Path::polyline(&shape(&levels(&a.pre))),
                 1.0,
-                th.eq.pre.with_alpha(0.55),
+                th.device.pre.with_alpha(0.55),
             );
         }
         if s.external {
             p.stroke_path(
                 &Path::polyline(&shape(&levels(&a.ext))),
                 1.4,
-                th.eq.external.with_alpha(0.75),
+                th.device.external.with_alpha(0.75),
             );
         }
     }
@@ -562,7 +566,13 @@ impl EqView {
                 .as_ref()
                 .map(|v| v.iter().zip(&stereo).map(|(a, b)| a + b).collect())
         };
-        let colors = [th.eq.curve, th.eq.left, th.eq.right, th.eq.mid, th.eq.side];
+        let colors = [
+            th.device.curve,
+            th.device.left,
+            th.device.right,
+            th.device.mid,
+            th.device.side,
+        ];
         let split = sums[1..].iter().any(Option::is_some);
         for (k, color) in colors.iter().enumerate().skip(1) {
             if let Some(v) = with(k) {
@@ -574,7 +584,7 @@ impl EqView {
             p.stroke_path(
                 &Path::polyline(&to_points(&stereo)),
                 2.2,
-                th.eq.curve.with_alpha(alpha),
+                th.device.curve.with_alpha(alpha),
             );
         }
     }
@@ -612,7 +622,7 @@ impl EqView {
                     .iter()
                     .map(|(f, d)| Point::new(axis.x(g, *f), gains.y(g, *d as f32)))
                     .collect();
-                dashed(p, &pts, 1.4, th.eq.curve.with_alpha(0.8));
+                dashed(p, &pts, 1.4, th.device.curve.with_alpha(0.8));
             }
             None => {
                 // A faint preview of the band a click would add.
@@ -623,9 +633,9 @@ impl EqView {
                     let db = analog_db(&shape, freqs);
                     let pts = to_points(&db);
                     if self.selected.is_empty() {
-                        p.stroke_path(&Path::polyline(&pts), 1.0, th.eq.curve.with_alpha(0.25));
+                        p.stroke_path(&Path::polyline(&pts), 1.0, th.device.curve.with_alpha(0.25));
                     } else {
-                        dashed(p, &pts, 1.0, th.eq.curve.with_alpha(0.25));
+                        dashed(p, &pts, 1.0, th.device.curve.with_alpha(0.25));
                     }
                 }
             }
@@ -659,7 +669,7 @@ impl EqView {
             if let Some(h) = self.range_handle(model, l, tap, band) {
                 p.line(at, h, 1.0, color.with_alpha(0.5));
                 let square = Rect::new(h.x - 3.5, h.y - 3.5, 7.0, 7.0);
-                p.fill_rounded(square, 1.5, &Paint::Solid(th.eq.dyn_range));
+                p.fill_rounded(square, 1.5, &Paint::Solid(th.device.dyn_range));
                 if c.moved.abs() > 0.05 && !band.is_spectral() {
                     let live = gains.y(
                         g,
@@ -669,9 +679,9 @@ impl EqView {
                         at,
                         Point::new(at.x, live),
                         2.4,
-                        th.eq.dyn_live.with_alpha(0.9),
+                        th.device.dyn_live.with_alpha(0.9),
                     );
-                    p.circle(Point::new(at.x, live), 2.8, th.eq.dyn_live);
+                    p.circle(Point::new(at.x, live), 2.8, th.device.dyn_live);
                 }
             }
             if matches!(self.hover, Some(Hit::Node(h)) if h == b) || selected {
@@ -681,12 +691,16 @@ impl EqView {
                 p.circle(at, r, color);
                 p.circle(at, r - 1.4, color.lighten(0.15));
             } else {
-                p.circle(at, r, th.eq.display);
+                p.circle(at, r, th.device.display);
                 p.stroke_path(&Path::circle(at, r - 0.6), 1.2, color.with_alpha(0.7));
             }
             let text = TextStyle::new(
                 th.fonts.tiny,
-                if band.enabled { th.eq.node_text } else { color },
+                if band.enabled {
+                    th.device.node_text
+                } else {
+                    color
+                },
             )
             .weight(FontWeight::Bold)
             .center();
@@ -739,7 +753,7 @@ impl EqView {
         let (r, parts, _) = self.value_box(l, at, &band);
         let color = Self::band_color(b);
         p.shadow(r, 4.0, Color::rgba(0.0, 0.0, 0.0, 0.35), 0.0, 2.0, 8.0);
-        p.fill_rounded(r, 4.0, &Paint::Solid(th.eq.panel.with_alpha(0.95)));
+        p.fill_rounded(r, 4.0, &Paint::Solid(th.device.panel.with_alpha(0.95)));
         p.stroke_rounded(r, 4.0, 1.0, color.with_alpha(0.75));
         let scale = Self::scale(tap);
         let piano = self.settings(model).piano;
@@ -777,7 +791,7 @@ impl EqView {
                             if band.enabled {
                                 th.ui.text_dim
                             } else {
-                                th.eq.dyn_range
+                                th.device.dyn_range
                             },
                         ),
                         NodeButton::Solo => headphones_icon(
@@ -785,7 +799,7 @@ impl EqView {
                             c,
                             5.5,
                             if self.listening {
-                                th.eq.curve
+                                th.device.curve
                             } else {
                                 th.ui.text_dim
                             },
@@ -857,8 +871,12 @@ impl EqView {
         for (i, (f, d)) in peaks.iter().enumerate() {
             let at = Point::new(axis.x(g, *f), analyser_y(g, *d, s.range));
             let hot = matches!(self.hover, Some(Hit::Peak(hf, _)) if (hf - f).abs() < 1e-9);
-            p.circle(at, if hot { 6.0 } else { 4.5 }, th.eq.post.with_alpha(0.9));
-            p.circle(at, 2.0, th.eq.display);
+            p.circle(
+                at,
+                if hot { 6.0 } else { 4.5 },
+                th.device.post.with_alpha(0.9),
+            );
+            p.circle(at, 2.0, th.device.display);
             if i < 6 || hot {
                 let text = if s.piano {
                     note_label(*f)
@@ -919,7 +937,7 @@ impl EqView {
         {
             let f = axis.f(g, pos.x);
             let r = Rect::new(pos.x - 30.0, a.y + 1.0, 60.0, a.h - 2.0);
-            p.fill_rounded(r, 3.0, &Paint::Solid(th.eq.panel));
+            p.fill_rounded(r, 3.0, &Paint::Solid(th.device.panel));
             p.text(
                 &format_hz(f),
                 r,
@@ -940,7 +958,7 @@ impl EqView {
         let g = &l.graph;
         let a = &l.axis;
         let axis = self.axis(model);
-        p.fill(*a, th.eq.key_black.darken(0.2));
+        p.fill(*a, th.device.key_black.darken(0.2));
         let lo = note_of(axis.lo).floor() as i32;
         let hi = note_of(axis.hi).ceil() as i32;
         let hover_note = self
@@ -957,29 +975,29 @@ impl EqView {
             let on_piano = (21..=108).contains(&n);
             let hovered = hover_note == Some(n);
             let (color, h) = if is_black(n) {
-                (th.eq.key_black, a.h * 0.62)
+                (th.device.key_black, a.h * 0.62)
             } else {
-                (th.eq.key_white, a.h)
+                (th.device.key_white, a.h)
             };
             let color = if hovered {
-                th.eq.curve
+                th.device.curve
             } else if on_piano {
                 color
             } else {
-                color.mix(th.eq.display, 0.6)
+                color.mix(th.device.display, 0.6)
             };
             p.fill(Rect::new(x0 + 0.5, a.y, (x1 - x0 - 1.0).max(0.5), h), color);
             if n.rem_euclid(12) == 0 && x1 - x0 > 3.0 {
                 p.text(
                     &note_name(n),
                     Rect::new(x0 - 8.0, a.y + a.h - 12.0, 28.0, 11.0),
-                    &TextStyle::new(th.fonts.tiny - 1.0, th.eq.key_black).center(),
+                    &TextStyle::new(th.fonts.tiny - 1.0, th.device.key_black).center(),
                 );
             }
         }
         if let (Some(n), Some(pos)) = (hover_note, self.pointer) {
             let r = Rect::new(pos.x - 22.0, a.y - 16.0, 44.0, 14.0);
-            p.fill_rounded(r, 3.0, &Paint::Solid(th.eq.panel));
+            p.fill_rounded(r, 3.0, &Paint::Solid(th.device.panel));
             p.text(
                 &note_name(n),
                 r,
@@ -1007,7 +1025,7 @@ impl EqView {
     ) {
         let th = &self.theme;
         let r = l.meter;
-        p.fill_rounded(r, 2.0, &Paint::Solid(th.eq.display));
+        p.fill_rounded(r, 2.0, &Paint::Solid(th.device.display));
         let w = (r.w - 1.0) / 2.0;
         for c in 0..2 {
             let peak = db(tap.meter_out.take_peak(c));

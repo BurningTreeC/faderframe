@@ -271,7 +271,7 @@ impl EqView {
                     self.button(p, r, &label, false);
                     if s.freeze {
                         // A line over the button while frozen.
-                        p.fill(Rect::new(r.x + 4.0, r.y, r.w - 8.0, 2.0), th.eq.side);
+                        p.fill(Rect::new(r.x + 4.0, r.y, r.w - 8.0, 2.0), th.device.side);
                     }
                 }
                 BottomItem::Character => {
@@ -282,7 +282,13 @@ impl EqView {
                     self.button(p, r, "Auto Gain", v(global::AUTO_GAIN) >= 0.5);
                 }
                 BottomItem::Bypass => {
-                    self.button_tinted(p, r, "Bypass", v(global::BYPASS) >= 0.5, th.eq.dyn_range);
+                    self.button_tinted(
+                        p,
+                        r,
+                        "Bypass",
+                        v(global::BYPASS) >= 0.5,
+                        th.device.dyn_range,
+                    );
                 }
                 BottomItem::Output => {
                     let mut label = format!(
@@ -305,8 +311,8 @@ impl EqView {
         let th = &self.theme;
         let r = self.output_rect(l);
         p.shadow(r, 6.0, Color::rgba(0.0, 0.0, 0.0, 0.45), 0.0, 3.0, 14.0);
-        p.fill_rounded(r, 6.0, &Paint::Solid(th.eq.panel));
-        p.stroke_rounded(r, 6.0, 1.0, th.eq.panel_edge);
+        p.fill_rounded(r, 6.0, &Paint::Solid(th.device.panel));
+        p.stroke_rounded(r, 6.0, 1.0, th.device.panel_edge);
         p.text(
             "OUTPUT",
             Rect::new(r.x + 14.0, r.y + 6.0, 120.0, 16.0),
@@ -336,7 +342,7 @@ impl EqView {
                             true,
                         )
                     };
-                    self.small_knob(p, ir, label, &value, t, bipolar, th.eq.curve);
+                    self.small_knob(p, ir, label, &value, t, bipolar, th.device.curve);
                 }
                 OutputItem::Invert => self.button(p, ir, "Phase Invert", v(global::INVERT) >= 0.5),
                 OutputItem::AutoGain => {
@@ -365,7 +371,7 @@ impl EqView {
                     p.fill_rounded(
                         Rect::new(track.x, track.y, track.w * t, track.h),
                         2.0,
-                        &Paint::Solid(th.eq.curve.with_alpha(0.8)),
+                        &Paint::Solid(th.device.curve.with_alpha(0.8)),
                     );
                     p.circle(
                         Point::new(track.x + track.w * t, track.y + 2.0),

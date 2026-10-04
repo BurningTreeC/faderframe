@@ -304,9 +304,53 @@ pub struct PianoRollTheme {
     pub toolbar_height: f32,
 }
 
-/// The EQ editor.
+/// The devices' colours: dynamics, limiting, gating, de-essing,
+/// saturation, space, time, modulation.
+pub const DEVICE_ACCENTS: [Color; 8] = [
+    Color::hex(0xf0a24a),
+    Color::hex(0xf06a5a),
+    Color::hex(0x6cc77a),
+    Color::hex(0xe07aa8),
+    Color::hex(0xf2c94c),
+    Color::hex(0x6aa8f0),
+    Color::hex(0x4fc3b8),
+    Color::hex(0xa98af0),
+];
+
+/// Which of [`DeviceTheme::accents`] a device wears.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Accent {
+    Dynamics,
+    Limiter,
+    Gate,
+    DeEsser,
+    Saturation,
+    Space,
+    Time,
+    Modulation,
+}
+
+impl DeviceTheme {
+    pub fn accent(&self, a: Accent) -> Color {
+        self.accents[a as usize]
+    }
+}
+
+/// The built-in devices' editors (the EQ, dynamics, effects, instruments).
 #[derive(Clone, Debug)]
-pub struct EqTheme {
+pub struct DeviceTheme {
+    /// The control deck under a device's display, the sections on it and
+    /// their edges.
+    pub deck: Color,
+    pub section: Color,
+    pub section_edge: Color,
+    /// Gain reduction (meters, histories).
+    pub reduction: Color,
+    /// A signal's waveform or level history.
+    pub wave: Color,
+    /// Each device's own colour (knob rings, highlights), by
+    /// [`DeviceTheme::accent`].
+    pub accents: [Color; 8],
     /// The display behind the curves, and its grid.
     pub display: Color,
     pub grid: Color,
@@ -352,7 +396,7 @@ pub struct Theme {
     pub piano: PianoRollTheme,
     pub perf: PerformanceTheme,
     pub tools: ToolsTheme,
-    pub eq: EqTheme,
+    pub device: DeviceTheme,
 }
 
 impl Default for Theme {
@@ -558,7 +602,13 @@ impl Theme {
                 readout: Color::hex(0xf2efe8),
                 toolbar_height: 32.0,
             },
-            eq: EqTheme {
+            device: DeviceTheme {
+                deck: Color::hex(0x1c1e23),
+                section: Color::hex(0x23262c),
+                section_edge: Color::hex(0x30343b),
+                reduction: Color::hex(0xf0784a),
+                wave: Color::hex(0x8fb4d8),
+                accents: DEVICE_ACCENTS,
                 display: Color::hex(0x131519),
                 grid: Color::rgba(1.0, 1.0, 1.0, 0.055),
                 grid_strong: Color::rgba(1.0, 1.0, 1.0, 0.16),

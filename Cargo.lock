@@ -885,6 +885,7 @@ name = "faderframe-view-devices"
 version = "0.2.0"
 dependencies = [
  "faderframe-analysis",
+ "faderframe-automation",
  "faderframe-core",
  "faderframe-engine",
  "faderframe-plugin-host",
