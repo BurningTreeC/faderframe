@@ -21,6 +21,18 @@
 //! * Exactly one loader mutates a given table at a time.
 //! * Retired pages are freed only via [`Retired::try_free`] /
 //!   [`Reclaimer`], which checks the epoch.
+//!
+//! # Ordering
+//!
+//! The slot load and the epoch increment of the reader, and the unlinking
+//! swap and the epoch read of the loader, are sequentially consistent. With
+//! acquire/release alone the loader's epoch read may return a stale count:
+//! a page the reader loaded in its current cycle would then look safe one
+//! cycle early and be freed while it is read (seen as torn pages on
+//! Apple Silicon). In the single total order, a reader load that still saw
+//! the old pointer precedes the unlink, so the epoch read after it sees at
+//! least every increment before that load. Loads cost the same as acquire
+//! loads on x86 and ARMv8; the increment happens once per callback.
 
 use std::ptr;
 use std::sync::Arc;
@@ -40,13 +52,13 @@ impl Epoch {
     /// Reader: a processing cycle is complete (no page references are held).
     #[inline]
     pub fn advance(&self) {
-        self.done.fetch_add(1, Ordering::Release);
+        self.done.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Number of completed reader cycles.
     #[inline]
     pub fn completed(&self) -> u64 {
-        self.done.load(Ordering::Acquire)
+        self.done.load(Ordering::SeqCst)
     }
 }
 
@@ -130,7 +142,7 @@ impl<T: Send + Sync> PageTable<T> {
         let p = self
             .slots
             .get(i)
-            .map_or(ptr::null_mut(), |s| s.load(Ordering::Acquire));
+            .map_or(ptr::null_mut(), |s| s.load(Ordering::SeqCst));
         // SAFETY: a non-null pointer was installed from `Box::into_raw` and
         // is only freed after the reader completes a cycle following its
         // removal (see the module protocol); the reference cannot escape `f`.
@@ -141,14 +153,14 @@ impl<T: Send + Sync> PageTable<T> {
     /// Loader: install page `i`. Returns the previous page, retired.
     pub fn install(&self, i: usize, page: Box<T>, epoch: &Epoch) -> Option<Retired<T>> {
         let slot = self.slots.get(i)?;
-        let old = slot.swap(Box::into_raw(page), Ordering::AcqRel);
+        let old = slot.swap(Box::into_raw(page), Ordering::SeqCst);
         Self::retire(old, epoch)
     }
 
     /// Loader: remove page `i`.
     pub fn evict(&self, i: usize, epoch: &Epoch) -> Option<Retired<T>> {
         let slot = self.slots.get(i)?;
-        let old = slot.swap(ptr::null_mut(), Ordering::AcqRel);
+        let old = slot.swap(ptr::null_mut(), Ordering::SeqCst);
         Self::retire(old, epoch)
     }
 

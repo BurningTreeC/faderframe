@@ -69,9 +69,15 @@ static PROCESSING: AtomicBool = AtomicBool::new(false);
 /// expression type id, value). Recorded only into reserved room —
 /// processing must not allocate.
 static SEEN: Mutex<Vec<(u32, i32, i32, f64)>> = Mutex::new(Vec::new());
+/// Set once SEEN has room: before that the mutex is not touched while
+/// processing (its first lock allocates on macOS).
+static RECORDING: AtomicBool = AtomicBool::new(false);
 
 fn record(e: &Event) {
     use Event_::EventTypes_::*;
+    if !RECORDING.load(Ordering::Acquire) {
+        return;
+    }
     let t = e.r#type as u32;
     // SAFETY: the union member read matches the event type.
     let entry = unsafe {
@@ -822,6 +828,7 @@ fn hosts_a_plugin_with_separate_controller() {
     // Notes carry ids; note expressions address them (pressure as poly
     // pressure), normalised the VST3 way.
     *SEEN.lock().unwrap() = Vec::with_capacity(64);
+    RECORDING.store(true, Ordering::Release);
     let expr = |at, key, kind, v| TimedMidiEvent {
         sample_offset: at,
         event: MidiEvent::NoteExpression {
