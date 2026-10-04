@@ -38,7 +38,7 @@ pub use engine::{
     EngineConfig, EngineController, EngineProcessor, EngineShared, GraphProfile, TrackMeter,
     create, create_with_epoch,
 };
-pub use plugins::{ActivatedPlugin, PluginHost};
+pub use plugins::{ActivatedPlugin, PluginHost, decode_state, encode_state};
 pub use record::{RecordBlock, RecordStreams, RecordTarget};
 pub use slots::{SlotRegistry, SlotsExhausted, StripSlots};
 pub use snapshot::{

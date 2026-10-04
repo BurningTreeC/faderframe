@@ -1,6 +1,6 @@
 //! The stock devices: dynamics (compressor, limiter, gate, de-esser),
 //! effects (saturator, reverb, delay, modulation), utilities (utility,
-//! tuner). Each module has its parameters (ids stable once released), how
+//! tuner) and instruments (synth, sampler, drum sampler). Each module has its parameters (ids stable once released), how
 //! it shows their values, what it publishes through the [`AnalysisTap`],
 //! its latency and its processor.
 //!
@@ -9,13 +9,17 @@
 pub mod compressor;
 pub mod deesser;
 pub mod delay;
+pub mod drums;
 pub mod gate;
 pub mod limiter;
 pub mod modulation;
 pub mod reverb;
 #[cfg(test)]
 pub(crate) mod rig;
+pub mod sampler;
+pub mod samples;
 pub mod saturator;
+pub mod synth;
 pub mod tuner;
 pub mod utility;
 
@@ -67,6 +71,18 @@ pub(crate) fn on_off(v: f64) -> String {
 /// The `i`th of `names` (clamped).
 pub(crate) fn pick(names: &[&str], v: f64) -> String {
     names[(v.round().max(0.0) as usize).min(names.len() - 1)].into()
+}
+
+/// A MIDI note's name (`60` = "C4").
+pub fn note_name(n: i32) -> String {
+    const NAMES: [&str; 12] = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ];
+    format!(
+        "{}{}",
+        NAMES[n.rem_euclid(12) as usize],
+        n.div_euclid(12) - 1
+    )
 }
 
 /// Copy a processor's main input to its output (or silence it).

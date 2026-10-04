@@ -17,6 +17,7 @@ faderframe-audio-graph.workspace = true
 faderframe-transport.workspace = true
 faderframe-automation.workspace = true
 faderframe-realtime.workspace = true
+faderframe-audio-files.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

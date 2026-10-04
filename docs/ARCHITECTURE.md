@@ -538,11 +538,12 @@ handles RPN 0 bend range, the MPE zone message, pressure and CC 74).
 
 Neither trait assumes the plugin is in-process; a sandboxed plugin is a proxy
 pair speaking IPC with shared-memory audio (see *Sandboxed plugins* below).
-`PluginHost` (engine) owns one instance per slot. Built-ins: synth, latency probe (used to
-test PDC end to end), the EQ, the Program EQ and the stock devices —
-compressor, limiter, gate, de-esser, saturator, utility (id
-`faderframe.gain`), delay (id `faderframe.echo`), reverb, modulation and
-tuner (see *Built-in devices*). Failed plugins
+`PluginHost` (engine) owns one instance per slot. Built-ins: latency probe (used to test PDC
+end to end), the EQ, the Program EQ and the stock devices — compressor,
+limiter, gate, de-esser, saturator, utility (id `faderframe.gain`),
+delay (id `faderframe.echo`), reverb, modulation, tuner, and the
+instruments synth, sampler and drum sampler (see *Built-in devices*).
+Failed plugins
 are bypassed and flagged; missing formats pass audio through with a
 warning.
 
@@ -758,6 +759,38 @@ covered by `the_stock_devices_do_not_allocate`.
   difference over 4096 frames by FFT, parabolic peak, clarity ≥ 0.8,
   median of five), within a cent from 25 Hz to 4.2 kHz; needle or strobe,
   reference A4 400–480 Hz.
+* **Synth** (`devices::synth`; the first nine parameters, the MIDI
+  handling — pedal, bend with RPN 0, MPE zones, pressure, CC 74, mod-wheel
+  vibrato — and per-note expressions are the first Synth's): two PolyBLEP
+  oscillators (saw, square with pulse width, triangle, sine; octave,
+  semitone, level), up to seven unison copies (detuned, spread across the
+  width), sub and noise; drive into a state-variable filter (12/24 dB low
+  pass, band, high) with key tracking, velocity and its own envelope or
+  the amplifier's; an LFO (free or synced, six shapes) to pitch, cutoff,
+  level and pulse width; poly (up to 32 voices), mono or legato with
+  glide. Editor: two decks of sections under the oscillator cycles, the
+  filter's response and reach, and both envelopes.
+* **Sampler** and **Drum Sampler** (`devices::{sampler, drums}`): what
+  they play is a `samples::SampleDoc` (a file per slot) packed into the
+  plugin state after the parameter block (`samples::pack`: `FFSD`, length,
+  parameters, JSON), so it saves, undoes (`Command::SetPluginState`) and
+  travels with presets. Loading (`samples::load`: the importer's decoder,
+  any rate — playback steps by the ratio; SFZ files parsed into zones:
+  key/velocity ranges, roots, tune, volume, pan, loops, `ampeg_*`, release
+  triggers, `group`/`off_by`, round robins, random layers) happens on the
+  control thread; the set is swapped into a `TryCell` the processor only
+  ever `try_lock`s (voices of an older generation stop; the old set is
+  dropped on the control thread) and handed to the editor through
+  `AnalysisTap::set_assets`. Sampler: one sample across the keys (root,
+  loop off/forward/while held with a crossfade, start, reverse, key
+  tracking) or an SFZ; ADSR, filter with envelope, velocity, up to 64
+  voices. Drum sampler: 16 pads from a first note, each with level, pan,
+  tune, attack, decay, start, choke group, reverse, one-shot or gate, low
+  pass and velocity, four layers a pad. Editors: waveform with draggable
+  start/loop markers and a keyboard with the zones; the pad grid (lit on
+  hits, double-click to load, several files fill the pads) with the
+  picked pad's waveform and controls. Sample paths are absolute in the
+  state for now.
 
 * **Automation from plugin editors.** Formats report the user's moves in a
   plugin's own GUI as `EditorEdit`s (begin, value, end): CLAP from the

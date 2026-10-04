@@ -42,6 +42,10 @@ mod selection;
 pub mod sync;
 mod sysex;
 mod transients;
+/// A plugin state as projects store it (and back).
+pub use faderframe_engine::{
+    decode_state as decode_plugin_state, encode_state as encode_plugin_state,
+};
 pub use midifile::is_midi_file;
 pub mod warping;
 pub use editing::{

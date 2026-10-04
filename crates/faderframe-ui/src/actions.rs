@@ -428,6 +428,33 @@ pub fn install(app: &Rc<AppState>) {
             .find(|t| t.inserts.len() > n)
             .map(|t| t.inserts[n].id)
     }
+    // Development aid: `show-instrument:x` opens the editor of the selected
+    // (or first) instrument track's instrument.
+    let weak = Rc::downgrade(app);
+    let show_instrument = gio::ActionEntry::builder("show-instrument")
+        .parameter_type(Some(&String::static_variant_type()))
+        .activate(move |_, _, _| {
+            let Some(a) = weak.upgrade() else { return };
+            let found = {
+                let s = a.session.borrow();
+                let p = s.project();
+                s.selection
+                    .tracks
+                    .iter()
+                    .filter_map(|t| p.track(*t))
+                    .chain(p.tracks.iter())
+                    .find_map(|t| t.instrument.as_ref().map(|i| (t.id, i.id)))
+            };
+            match found {
+                Some((track, plugin)) => a.dispatch(Action::OpenPluginEditor {
+                    track,
+                    plugin,
+                    generic: false,
+                }),
+                None => tracing::warn!("show-instrument: no instrument"),
+            }
+        })
+        .build();
     let show = |name: &'static str, generic: bool| {
         let weak = Rc::downgrade(app);
         gio::ActionEntry::builder(name)
@@ -880,6 +907,75 @@ pub fn install(app: &Rc<AppState>) {
                 commands,
             }));
         }),
+        // Development aid: `set-instrument:<plugin id>` makes the plugin the
+        // instrument of the selected (or first) instrument track.
+        named("set-instrument", |a, id| {
+            let found = {
+                let s = a.session.borrow();
+                let plugin = s
+                    .available_plugins()
+                    .into_iter()
+                    .find(|p| p.plugin.id == id);
+                let p = s.project();
+                let track = s
+                    .selection
+                    .tracks
+                    .iter()
+                    .filter_map(|t| p.track(*t))
+                    .chain(p.tracks.iter())
+                    .find(|t| t.kind == TrackKind::Instrument)
+                    .map(|t| t.id);
+                plugin.zip(track)
+            };
+            let Some((plugin, track)) = found else {
+                tracing::warn!("set-instrument: no plugin '{id}' or no instrument track");
+                return;
+            };
+            let placed = a.session.borrow_mut().place_plugin(
+                track,
+                faderframe_session::PluginTarget::Instrument,
+                plugin.plugin,
+            );
+            if let Err(e) = placed {
+                a.report(e, false);
+            }
+            a.after_change();
+        }),
+        // Development aid: `device-samples:<slot>=<path>[|<slot>=<path>…]`
+        // loads samples into the device editor opened last.
+        named("device-samples", |a, arg| {
+            use faderframe_plugin_host::devices::samples::{SampleDoc, pack};
+            let Some(plugin) = crate::plugin_window::latest_device() else {
+                tracing::warn!("device-samples: no device editor is open");
+                return;
+            };
+            let action = {
+                let s = a.session.borrow();
+                let (Some(tap), Some((track, slot))) =
+                    (s.plugin_tap(plugin), s.plugin_owner(plugin))
+                else {
+                    return;
+                };
+                let mut doc = SampleDoc::default();
+                for kv in arg.split('|') {
+                    if let Some((k, v)) = kv.split_once('=')
+                        && let Ok(k) = k.trim().parse::<usize>()
+                    {
+                        doc.set(k, Some(v.trim().to_string()));
+                    }
+                }
+                Action::Edit(faderframe_project::Command::SetPluginState {
+                    track,
+                    plugin,
+                    state: Some(faderframe_session::encode_plugin_state(&pack(
+                        &tap.params.save(),
+                        &doc,
+                    ))),
+                    parameters: slot.parameters.clone(),
+                })
+            };
+            a.dispatch(action);
+        }),
         // Development aid: `reload-plugins:x` starts every plugin again (a
         // crashed one, or after switching sandboxing).
         named("reload-plugins", |a, _| {
@@ -1254,6 +1350,7 @@ pub fn install(app: &Rc<AppState>) {
         note_expression_demo,
         show("show-insert", false),
         show("show-insert-params", true),
+        show_instrument,
     ]);
 
     let accels: &[(&str, &[&str])] = &[

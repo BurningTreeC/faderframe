@@ -161,6 +161,10 @@ Contrast:
   delay (ping-pong, tape and analog styles, freeze, ducking), an
   algorithmic reverb (five types, 16-line network, frequency-dependent
   decay), chorus/ensemble/flanger/phaser/vibrato, and a tuner.
+* Stock instruments: a virtual analogue synth (unison, sub, noise, four
+  filter types, two envelopes, LFO, mono/legato with glide), a sampler
+  that plays a sample across the keys or an SFZ instrument, and a
+  sixteen-pad drum sampler with choke groups.
 * EQ in the spirit of FabFilter Pro-Q 4: 24 bands (bell, shelves, cuts of
   any slope from 0 to 96 dB/oct and brickwall, notch, band pass, tilt, flat
   tilt, all pass) whose curves keep their analog shape up to Nyquist; zero

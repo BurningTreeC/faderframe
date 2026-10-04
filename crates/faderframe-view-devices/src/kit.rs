@@ -16,6 +16,7 @@ use crate::common::Device;
 use crate::values::{ms_text, parse_db, parse_freq, parse_ms, parse_ratio, parse_value};
 use faderframe_automation::AutomationTarget;
 use faderframe_core::{ParameterId, PluginInstanceId};
+use faderframe_plugin_host::devices::samples::{self, SampleDoc};
 use faderframe_plugin_host::tap::{AnalysisTap, db, db_power};
 use faderframe_plugin_host::{ParameterInfo, ParameterUnit};
 use faderframe_project::{Command, MappingTarget};
@@ -258,6 +259,74 @@ impl Edit<'_, '_> {
         self.set(id, v);
         self.end();
     }
+
+    /// Replace the samples a sampler plays (one undo step).
+    pub fn set_samples(&mut self, doc: &SampleDoc) {
+        if let Some(action) = samples_action(self.model, self.device.plugin, doc) {
+            self.cx.emit(action);
+        }
+    }
+
+    /// Offer a file chooser; the files picked go into the samples from
+    /// `slot` on (one each).
+    pub fn choose_samples(&mut self, doc: SampleDoc, slot: usize, title: &str, sfz: bool) {
+        let plugin = self.device.plugin;
+        let Some(tap) = self.device.tap(self.model) else {
+            return;
+        };
+        let Some((track, owner)) = self.model.plugin_owner(plugin) else {
+            return;
+        };
+        let params = tap.params.save();
+        let parameters = owner.parameters.clone();
+        let mut patterns: Vec<String> = faderframe_audio_files::decode::SUPPORTED_EXTENSIONS
+            .iter()
+            .flat_map(|e| [format!("*.{e}"), format!("*.{}", e.to_ascii_uppercase())])
+            .collect();
+        let mut filters = Vec::new();
+        if sfz {
+            patterns.extend(["*.sfz".into(), "*.SFZ".into()]);
+            filters.push(("Samples and SFZ instruments".to_string(), patterns));
+        } else {
+            filters.push(("Samples".to_string(), patterns));
+        }
+        filters.push(("All files".to_string(), vec!["*".to_string()]));
+        self.cx.request(HostRequest::ChooseFiles {
+            choice: faderframe_ui_canvas::FileChoice::Open {
+                title: title.into(),
+                filters,
+            },
+            commit: Box::new(move |paths| {
+                let mut doc = doc.clone();
+                for (k, p) in paths.iter().enumerate() {
+                    doc.set(slot + k, Some(p.to_string_lossy().into_owned()));
+                }
+                Some(Action::Edit(Command::SetPluginState {
+                    track,
+                    plugin,
+                    state: Some(faderframe_session::encode_plugin_state(&samples::pack(
+                        &params, &doc,
+                    ))),
+                    parameters: parameters.clone(),
+                }))
+            }),
+        });
+    }
+}
+
+/// The edit that gives a sampler `doc` with its parameters as they are.
+fn samples_action(model: &Session, plugin: PluginInstanceId, doc: &SampleDoc) -> Option<Action> {
+    let tap = model.plugin_tap(plugin)?;
+    let (track, owner) = model.plugin_owner(plugin)?;
+    Some(Action::Edit(Command::SetPluginState {
+        track,
+        plugin,
+        state: Some(faderframe_session::encode_plugin_state(&samples::pack(
+            &tap.params.save(),
+            doc,
+        ))),
+        parameters: owner.parameters.clone(),
+    }))
 }
 
 /// A device's part of its editor.
@@ -1436,4 +1505,53 @@ impl Spectrum {
             );
         }
     }
+}
+
+/// A sample's waveform across `r` (from its overview), the part from
+/// `from` to `to` (0–1) of it.
+pub(crate) fn waveform(
+    p: &mut dyn Painter,
+    r: Rect,
+    sample: &faderframe_plugin_host::devices::samples::Sample,
+    color: Color,
+) {
+    let o = &sample.overview;
+    if o.is_empty() {
+        return;
+    }
+    let mid = r.y + r.h / 2.0;
+    let scale = r.h * 0.48 / sample.peak.max(0.05);
+    let n = (r.w as usize).max(2);
+    let mut top = Vec::with_capacity(n);
+    let mut bottom = Vec::with_capacity(n);
+    for i in 0..n {
+        let a = i * o.len() / n;
+        let b = ((i + 1) * o.len() / n).max(a + 1).min(o.len());
+        let (lo, hi) = o[a..b]
+            .iter()
+            .fold((0.0f32, 0.0f32), |(l, h), (x, y)| (l.min(*x), h.max(*y)));
+        let x = r.x + r.w * i as f32 / (n - 1) as f32;
+        top.push(Point::new(x, mid - hi * scale));
+        bottom.push(Point::new(x, mid - lo * scale));
+    }
+    let mut path = faderframe_ui_canvas::Path::polyline(&top);
+    for q in bottom.iter().rev() {
+        path.line_to(*q);
+    }
+    path.close();
+    p.fill_path(&path, color.with_alpha(0.55));
+    p.hline(r.x, r.right(), mid, color.with_alpha(0.3));
+}
+
+/// A button drawn in a display: a rounded box with its label.
+pub(crate) fn display_button(p: &mut dyn Painter, r: Rect, label: &str, accent: Color, th: &Theme) {
+    p.fill_rounded(r, 4.0, &Paint::Solid(accent.with_alpha(0.18)));
+    p.stroke_rounded(r, 4.0, 1.0, accent.with_alpha(0.6));
+    p.text(
+        label,
+        r,
+        &TextStyle::new(th.fonts.tiny + 1.0, th.ui.text)
+            .bold()
+            .center(),
+    );
 }

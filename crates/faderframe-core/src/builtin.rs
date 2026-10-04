@@ -23,6 +23,10 @@ pub const REVERB: &str = "faderframe.reverb";
 pub const MODULATION: &str = "faderframe.modulation";
 /// Tuner (utility).
 pub const TUNER: &str = "faderframe.tuner";
+/// Sampler: one sample across the keys, or an SFZ instrument (instrument).
+pub const SAMPLER: &str = "faderframe.sampler";
+/// Drum sampler: sixteen pads (instrument).
+pub const DRUMS: &str = "faderframe.drums";
 /// Utility: gain, balance, width, mono bass, polarity, channels (effect).
 pub const GAIN: &str = "faderframe.gain";
 /// Pure delay that reports its delay as latency (testing PDC).
@@ -38,6 +42,9 @@ pub fn has_editor(id: &str) -> bool {
     matches!(
         id,
         EQ | PROGRAM_EQ
+            | DRUMS
+            | SAMPLER
+            | SYNTH
             | TUNER
             | COMPRESSOR
             | LIMITER

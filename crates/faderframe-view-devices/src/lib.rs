@@ -7,6 +7,7 @@ mod common;
 mod compressor;
 mod deesser;
 mod delay;
+mod drums;
 pub mod eq;
 mod gate;
 mod kit;
@@ -14,7 +15,9 @@ mod limiter;
 mod modulation;
 pub mod program_eq;
 mod reverb;
+mod sampler;
 mod saturator;
+mod synth;
 mod tuner;
 mod utility;
 mod values;
@@ -40,6 +43,21 @@ pub fn editor_for(
             plugin,
             theme,
             limiter::LimiterFace::new(theme),
+        ))),
+        builtin::DRUMS => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            drums::DrumsFace::new(theme),
+        ))),
+        builtin::SAMPLER => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            sampler::SamplerFace::new(theme),
+        ))),
+        builtin::SYNTH => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            synth::SynthFace::new(theme),
         ))),
         builtin::TUNER => Some(Box::new(kit::DeviceView::new(
             plugin,
@@ -95,6 +113,9 @@ pub fn editor_size(plugin_id: &str) -> Option<(i32, i32)> {
         builtin::EQ => Some((1180, 700)),
         builtin::COMPRESSOR => Some((1040, 520 + HEADER_BAR)),
         builtin::LIMITER => Some((900, 480 + HEADER_BAR)),
+        builtin::DRUMS => Some((1120, 600 + HEADER_BAR)),
+        builtin::SAMPLER => Some((1240, 560 + HEADER_BAR)),
+        builtin::SYNTH => Some((1300, 640 + HEADER_BAR)),
         builtin::TUNER => Some((620, 440 + HEADER_BAR)),
         builtin::MODULATION => Some((1060, 520 + HEADER_BAR)),
         builtin::REVERB => Some((1120, 520 + HEADER_BAR)),

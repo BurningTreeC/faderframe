@@ -659,6 +659,7 @@ dependencies = [
 name = "faderframe-plugin-host"
 version = "0.2.0"
 dependencies = [
+ "faderframe-audio-files",
  "faderframe-audio-graph",
  "faderframe-automation",
  "faderframe-core",
@@ -885,6 +886,7 @@ name = "faderframe-view-devices"
 version = "0.2.0"
 dependencies = [
  "faderframe-analysis",
+ "faderframe-audio-files",
  "faderframe-automation",
  "faderframe-core",
  "faderframe-engine",

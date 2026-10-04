@@ -1120,3 +1120,180 @@ fn the_stock_devices_do_not_allocate() {
         assert!(t.input.written() > 0, "an editor's rings were fed");
     }
 }
+
+/// The instruments (the synth with everything on, the sampler and the drum
+/// sampler with samples), played live with editors watching.
+#[test]
+fn the_instruments_do_not_allocate() {
+    let _serial = serial();
+    use faderframe_core::{ChannelLayout, ParameterId, builtin};
+    use faderframe_plugin_host::ParamValues;
+    use faderframe_plugin_host::devices::samples::{SampleDoc, pack};
+    use faderframe_project::{Impact, PluginRef, PluginSlot, SavedParameter, TrackKind};
+    use std::collections::HashSet;
+
+    const SR: u32 = 48_000;
+    let dir = std::env::temp_dir().join(format!("ff-alloc-samples-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut files = Vec::new();
+    for (i, f) in [110.0f64, 220.0, 330.0, 4_000.0].iter().enumerate() {
+        let x: Vec<f32> = (0..SR as usize / 2)
+            .map(|n| (0.4 * (std::f64::consts::TAU * f * n as f64 / f64::from(SR)).sin()) as f32)
+            .collect();
+        let path = dir.join(format!("{i}.wav"));
+        faderframe_audio_files::write_wav(
+            &path,
+            &[x],
+            SR,
+            faderframe_audio_files::WavFormat::Pcm16,
+            false,
+        )
+        .unwrap();
+        files.push(path.to_string_lossy().into_owned());
+    }
+    let state = |id: &str, set: &[(u32, f64)], doc: &SampleDoc| {
+        let params = ParamValues::new(
+            faderframe_plugin_host::builtin::BuiltinFactory
+                .instantiate(id)
+                .unwrap()
+                .parameters()
+                .to_vec(),
+        );
+        for (k, v) in set {
+            params.set_by_id(ParameterId(*k), *v).unwrap();
+        }
+        faderframe_engine::encode_state(&pack(&params.save(), doc))
+    };
+    let set = |id: u32, value: f64| SavedParameter {
+        id: ParameterId(id),
+        value,
+    };
+    let mut tp = common::TestProject::new(SR);
+    let mut sampler_doc = SampleDoc::default();
+    sampler_doc.set(0, Some(files[1].clone()));
+    let mut drum_doc = SampleDoc::default();
+    for (pad, f) in files.iter().enumerate() {
+        drum_doc.set(pad, Some(f.clone()));
+    }
+    use faderframe_plugin_host::PluginFactory;
+    let instruments = [
+        (
+            builtin::SYNTH,
+            None,
+            vec![
+                set(19, 7.0),
+                set(17, 0.5),
+                set(18, 0.2),
+                set(22, 1.0),
+                set(23, 0.5),
+                set(26, 1.0),
+                set(36, 2.0),
+                set(38, 0.3),
+                set(9, 1.0),
+                set(39, 0.0),
+                set(40, 50.0),
+            ],
+        ),
+        (
+            builtin::SAMPLER,
+            Some(state(
+                builtin::SAMPLER,
+                &[
+                    (13, 1.0),
+                    (14, 0.2),
+                    (15, 0.8),
+                    (9, 1.0),
+                    (7, 2_000.0),
+                    (10, 0.5),
+                ],
+                &sampler_doc,
+            )),
+            vec![],
+        ),
+        (
+            builtin::DRUMS,
+            Some(state(
+                builtin::DRUMS,
+                &[
+                    (1, 48.0),
+                    (106, 1.0),
+                    (122, 1.0),
+                    (109, 3_000.0),
+                    (107, 1.0),
+                ],
+                &drum_doc,
+            )),
+            vec![],
+        ),
+    ];
+    let mut tracks = HashSet::new();
+    let mut ids = Vec::new();
+    for (i, (plugin, state, parameters)) in instruments.into_iter().enumerate() {
+        let t = tp.track(
+            TrackKind::Instrument,
+            &format!("I{i}"),
+            ChannelLayout::Stereo,
+        );
+        let id = tp.project.ids.allocate();
+        tp.project.track_mut(t).unwrap().instrument = Some(PluginSlot {
+            id,
+            plugin: PluginRef::builtin(plugin, plugin),
+            bypass: false,
+            parameters,
+            state,
+            sidechain: None,
+        });
+        tracks.insert(t);
+        ids.push(id);
+    }
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 2).unwrap();
+    let taps: Vec<_> = ids
+        .iter()
+        .map(|id| {
+            r.controller
+                .plugin_tap(*id)
+                .expect("an instrument with a tap")
+        })
+        .collect();
+    let (tx, q, _feed) = faderframe_midi::midi_input_queue(256);
+    r.controller.set_midi_input(q).unwrap();
+    r.controller.set_midi_live(tracks);
+    r.controller
+        .sync(&tp.project, &tp.sources, Impact::Params)
+        .unwrap();
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    for _ in 0..4 {
+        taps.iter().for_each(|t| t.watch());
+        r.processor.process_device(&mut bufs);
+    }
+    let mut total = 0;
+    for key in 44..80u8 {
+        tx.send(0, &[0x90, key, 40 + key]);
+        let (_, n) = armed(|| {
+            for _ in 0..4 {
+                taps.iter().for_each(|t| t.watch());
+                r.processor.process_device(&mut bufs);
+            }
+        });
+        total += n;
+        if key % 3 != 0 {
+            tx.send(0, &[0x80, key, 0]);
+        }
+    }
+    let (_, n) = armed(|| {
+        for _ in 0..40 {
+            taps.iter().for_each(|t| t.watch());
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(total + n, 0, "allocations in the instruments");
+    for t in &taps {
+        assert!(t.output.written() > 0, "an editor's rings were fed");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

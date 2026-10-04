@@ -2,7 +2,6 @@
 //! [`PluginInstance`]/[`PluginProcessor`] API that external formats use.
 
 mod latency;
-mod synth;
 
 use crate::tap::AnalysisTap;
 use crate::{
@@ -23,6 +22,8 @@ enum Kind {
     Eq,
     ProgramEq,
     Limiter,
+    Drums,
+    Sampler,
     Tuner,
     Modulation,
     Reverb,
@@ -32,10 +33,12 @@ enum Kind {
 }
 
 impl Kind {
-    const ALL: [Kind; 14] = [
+    const ALL: [Kind; 16] = [
         Kind::Eq,
         Kind::ProgramEq,
         Kind::Limiter,
+        Kind::Drums,
+        Kind::Sampler,
         Kind::Tuner,
         Kind::Modulation,
         Kind::Reverb,
@@ -59,6 +62,8 @@ impl Kind {
             builtin::EQ => Kind::Eq,
             builtin::PROGRAM_EQ => Kind::ProgramEq,
             builtin::LIMITER => Kind::Limiter,
+            builtin::DRUMS => Kind::Drums,
+            builtin::SAMPLER => Kind::Sampler,
             builtin::TUNER => Kind::Tuner,
             builtin::MODULATION => Kind::Modulation,
             builtin::REVERB => Kind::Reverb,
@@ -163,6 +168,20 @@ impl Kind {
                 vec![stereo],
                 0,
             ),
+            Kind::Sampler => (
+                builtin::SAMPLER,
+                "Sampler",
+                PluginCategory::Instrument,
+                vec![],
+                1,
+            ),
+            Kind::Drums => (
+                builtin::DRUMS,
+                "Drum Sampler",
+                PluginCategory::Instrument,
+                vec![],
+                1,
+            ),
             Kind::Limiter => (
                 builtin::LIMITER,
                 "Limiter",
@@ -208,6 +227,8 @@ impl Kind {
             Kind::Gain => crate::devices::utility::parameters(),
             Kind::Compressor => crate::devices::compressor::parameters(),
             Kind::Limiter => crate::devices::limiter::parameters(),
+            Kind::Drums => crate::devices::drums::parameters(),
+            Kind::Sampler => crate::devices::sampler::parameters(),
             Kind::Tuner => crate::devices::tuner::parameters(),
             Kind::Modulation => crate::devices::modulation::parameters(),
             Kind::Reverb => crate::devices::reverb::parameters(),
@@ -215,17 +236,7 @@ impl Kind {
             Kind::Deesser => crate::devices::deesser::parameters(),
             Kind::Gate => crate::devices::gate::parameters(),
             Kind::Echo => crate::devices::delay::parameters(),
-            Kind::Synth => vec![
-                p(0, "Volume", -48.0, 6.0, -6.0, Decibels),
-                p(1, "Cutoff", 40.0, 16_000.0, 2_400.0, Hertz),
-                p(2, "Resonance", 0.0, 1.0, 0.25, Percent),
-                p(3, "Env Amount", 0.0, 1.0, 0.5, Percent),
-                p(4, "Attack", 0.5, 2_000.0, 5.0, Milliseconds),
-                p(5, "Decay", 5.0, 4_000.0, 300.0, Milliseconds),
-                p(6, "Sustain", 0.0, 1.0, 0.6, Percent),
-                p(7, "Release", 5.0, 5_000.0, 350.0, Milliseconds),
-                p(8, "Detune", 0.0, 50.0, 9.0, None),
-            ],
+            Kind::Synth => crate::devices::synth::parameters(),
             Kind::LatencyProbe => vec![ParameterInfo {
                 stepped: true,
                 automatable: false,
@@ -242,6 +253,9 @@ impl Kind {
             Kind::Eq => Some(crate::eq::TAP_VALUES),
             Kind::Compressor => Some(crate::devices::compressor::TAP_VALUES),
             Kind::Limiter => Some(crate::devices::limiter::TAP_VALUES),
+            Kind::Drums => Some(crate::devices::drums::TAP_VALUES),
+            Kind::Sampler => Some(crate::devices::sampler::TAP_VALUES),
+            Kind::Synth => Some(crate::devices::synth::TAP_VALUES),
             Kind::Tuner => Some(crate::devices::tuner::TAP_VALUES),
             Kind::Modulation => Some(crate::devices::modulation::TAP_VALUES),
             Kind::Reverb => Some(crate::devices::reverb::TAP_VALUES),
@@ -269,6 +283,8 @@ pub struct BuiltinInstance {
     /// The sample rate of the last processor (latencies in samples depend
     /// on it).
     rate: f64,
+    /// The samplers' samples.
+    samples: Option<crate::devices::samples::SampleHost>,
 }
 
 impl PluginInstance for BuiltinInstance {
@@ -294,6 +310,9 @@ impl PluginInstance for BuiltinInstance {
             Kind::ProgramEq => crate::program_eq::format(id, value),
             Kind::Compressor => crate::devices::compressor::format(id, value),
             Kind::Limiter => crate::devices::limiter::format(id, value),
+            Kind::Drums => crate::devices::drums::format(id, value),
+            Kind::Sampler => crate::devices::sampler::format(id, value),
+            Kind::Synth => crate::devices::synth::format(id, value),
             Kind::Tuner => crate::devices::tuner::format(id, value),
             Kind::Modulation => crate::devices::modulation::format(id, value),
             Kind::Reverb => crate::devices::reverb::format(id, value),
@@ -343,6 +362,10 @@ impl PluginInstance for BuiltinInstance {
         // The EQ's phase mode, resolution and spectral bands change its
         // latency: the graph must be rebuilt (with a processor for the new
         // mode).
+        if let Some(h) = &mut self.samples {
+            // Samples the processor kept us from swapping in.
+            h.flush();
+        }
         let now = self.latency_samples();
         let restart = self.reported.is_some_and(|r| r != now);
         self.reported = Some(now);
@@ -381,6 +404,7 @@ impl PluginInstance for BuiltinInstance {
             Kind::Echo | Kind::Reverb => TailLength::Infinite,
             Kind::Modulation => TailLength::Samples(4_096),
             Kind::Synth => TailLength::Samples(48_000 * 5),
+            Kind::Sampler | Kind::Drums => TailLength::Samples(48_000 * 20),
             Kind::Gain
             | Kind::Compressor
             | Kind::Limiter
@@ -396,11 +420,23 @@ impl PluginInstance for BuiltinInstance {
     }
 
     fn save_state(&mut self) -> Result<Vec<u8>, PluginError> {
-        Ok(self.params.save())
+        Ok(match &self.samples {
+            Some(h) => crate::devices::samples::pack(&self.params.save(), &h.doc),
+            None => self.params.save(),
+        })
     }
 
     fn load_state(&mut self, data: &[u8]) -> Result<(), PluginError> {
-        self.params.load(data)
+        match crate::devices::samples::unpack(data) {
+            Some((params, doc)) => {
+                self.params.load(params)?;
+                if let Some(h) = &mut self.samples {
+                    h.set_doc(doc, self.tap.as_deref());
+                }
+                Ok(())
+            }
+            None => self.params.load(data),
+        }
     }
 
     fn create_processor(
@@ -429,6 +465,22 @@ impl PluginInstance for BuiltinInstance {
                 params,
                 tap()?,
                 config,
+            )),
+            Kind::Drums => Box::new(crate::devices::drums::DrumsProcessor::new(
+                params,
+                self.tap.clone(),
+                config,
+                self.samples
+                    .as_ref()
+                    .map_or_else(crate::devices::samples::empty, |h| Arc::clone(&h.shared)),
+            )),
+            Kind::Sampler => Box::new(crate::devices::sampler::SamplerProcessor::new(
+                params,
+                self.tap.clone(),
+                config,
+                self.samples
+                    .as_ref()
+                    .map_or_else(crate::devices::samples::empty, |h| Arc::clone(&h.shared)),
             )),
             Kind::Tuner => Box::new(crate::devices::tuner::TunerProcessor::new(
                 params,
@@ -465,7 +517,11 @@ impl PluginInstance for BuiltinInstance {
                 tap()?,
                 config,
             )),
-            Kind::Synth => Box::new(synth::SynthProcessor::new(params, config)),
+            Kind::Synth => Box::new(crate::devices::synth::SynthProcessor::new(
+                params,
+                self.tap.clone(),
+                config,
+            )),
             Kind::LatencyProbe => Box::new(latency::LatencyProcessor::new(self.latency_samples())),
             Kind::Eq => {
                 let tap = self
@@ -505,6 +561,14 @@ impl PluginFactory for BuiltinFactory {
         let tap = kind
             .tap_values()
             .map(|n| Arc::new(AnalysisTap::new(params.clone(), n)));
+        let samples = matches!(kind, Kind::Sampler | Kind::Drums).then(|| {
+            let mut host = crate::devices::samples::SampleHost::default();
+            host.set_doc(
+                crate::devices::samples::SampleDoc::default(),
+                tap.as_deref(),
+            );
+            host
+        });
         Ok(Box::new(BuiltinInstance {
             kind,
             descriptor: kind.descriptor(),
@@ -513,6 +577,7 @@ impl PluginFactory for BuiltinFactory {
             reported: None,
             program: None,
             rate: 48_000.0,
+            samples,
         }))
     }
 }

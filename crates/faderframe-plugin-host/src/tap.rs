@@ -246,6 +246,10 @@ pub struct AnalysisTap {
     /// A band the editor wants to hear on its own (`-1`: none).
     listen: AtomicI32,
     heartbeat: AtomicU32,
+    /// What a device's editor shows of its content (the samples it
+    /// plays, …): set by the instance and read by the editor, both on the
+    /// control thread (the audio thread never touches it).
+    assets: std::sync::Mutex<Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>>,
 }
 
 impl AnalysisTap {
@@ -260,7 +264,22 @@ impl AnalysisTap {
             values: (0..values).map(|_| AtomicF32::new(0.0)).collect(),
             listen: AtomicI32::new(-1),
             heartbeat: AtomicU32::new(0),
+            assets: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Hand the editor what it shows (control thread only).
+    pub fn set_assets(&self, assets: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        if let Ok(mut a) = self.assets.lock() {
+            *a = Some(assets);
+        }
+    }
+
+    /// What the instance handed the editor, if of type `T` (control
+    /// thread only).
+    pub fn assets<T: std::any::Any + Send + Sync>(&self) -> Option<std::sync::Arc<T>> {
+        let a = self.assets.lock().ok()?.clone()?;
+        a.downcast::<T>().ok()
     }
 
     /// The editor is looking (call every frame).
