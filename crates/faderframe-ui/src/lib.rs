@@ -21,7 +21,7 @@ pub mod painter;
 mod paths;
 mod plugin_browser;
 mod plugin_window;
-mod plugins;
+pub mod plugins;
 mod preferences;
 pub mod prefs;
 mod recent;

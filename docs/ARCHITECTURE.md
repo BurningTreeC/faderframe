@@ -462,8 +462,8 @@ handles RPN 0 bend range, the MPE zone message, pressure and CC 74).
   (no allocating `Result` on RT), `reset()`.
 
 Neither trait assumes the plugin is in-process; a sandboxed plugin is a proxy
-pair speaking IPC with shared-memory audio. `PluginHost` (engine) owns one
-instance per slot. Built-ins: synth, echo, compressor (with a sidechain
+pair speaking IPC with shared-memory audio (see *Sandboxed plugins* below).
+`PluginHost` (engine) owns one instance per slot. Built-ins: synth, echo, compressor (with a sidechain
 input), gain, latency probe (used to test PDC end to end). Failed plugins
 are bypassed and flagged; missing formats pass audio through with a
 warning.
@@ -501,6 +501,48 @@ Opt-in tests run installed plugins end to end:
 tracks audible, instruments play a clip) and the same with
 `-p faderframe-session` (live session: inserting while playing with the
 editor opening, instruments playing live MIDI as instrument and insert).
+
+### Sandboxed plugins
+
+`faderframe-plugin-sandbox` runs each CLAP/VST3 instance in a helper
+process of its own: the application's own binary started as
+`faderframe --plugin-sandbox`, which hosts the plugin with the in-process
+factories (`faderframe_ui::plugins::in_process_registry`).
+`SandboxedFactory` wraps a format's factory and, while sandboxing is on
+(`set_enabled`, from `Preferences::sandbox_plugins`), instantiates through a
+helper; the engine only sees ordinary `PluginInstance`/`PluginProcessor`s.
+
+* **Control** goes over a Unix socket (`wire`: JSON plus a binary payload
+  for states and preset files, framed with a magic number and size limits).
+  The host answers what the UI reads every frame (parameter values, editor
+  requests and edits, latency) from a cache that the per-tick `Poll`
+  refreshes with the changes only.
+* **Audio**: per activation the host creates a named shared-memory block
+  (`shm::Block`: a header with sync words, the block's shapes, transport,
+  parameter events, MIDI and note expressions both ways as fixed-layout
+  `Wire*` records — never Rust enums —, then the audio) and unlinks the
+  name once the helper has mapped it. Per block the audio thread writes
+  the request, bumps `seq`, writes a byte into the helper's pipe and waits
+  (`poll`) for `done == seq`; the helper's audio thread (copying the host
+  audio thread's scheduling, flush-to-zero) runs the real processor on
+  reused buffers and answers with a byte. Whatever the helper wrote is
+  decoded defensively (counts clamped, unknown events dropped, non-finite
+  samples zeroed). A round trip costs about 9 µs.
+* **Failure**: a dead helper closes its pipe (noticed at once); one that
+  misses `BLOCK_TIMEOUT` (250 ms) is given up and killed by the next poll.
+  The processor then returns `ProcessStatus::Error`, so the engine bypasses
+  the plugin; the session reports it once (`session::sandbox`) and
+  `Action::ReloadPlugin` drops the instance and builds it again from its
+  slot. Sandboxed plugins that report unsaved state have it taken into
+  their slots every 5 s, so a reload restores recent settings.
+* **Editors** run in the helper, whose main thread `poll`s the control
+  socket together with the plugin GUI's descriptors and timers. On X11 they
+  embed into FaderFrame's parent window across processes (X11 window ids
+  are global); resize and close requests arrive with the poll.
+* **Tests**: `faderframe-plugin-sandbox/tests/sandbox.rs` starts its own
+  test binary as the helper and compares sandboxed built-ins with
+  in-process ones bit for bit, lets one helper die mid-block and another
+  hang; `round_trip_cost` (ignored) measures the overhead.
 
 ### CLAP
 
@@ -1227,8 +1269,9 @@ for its editor.
     `faderframe-audio-pipewire` (the raw `pw_filter` API),
     `faderframe-plugin-clap` (loading plugin libraries, window handles for
     editors), `faderframe-plugin-vst3` (COM bindings, module loading),
-    `faderframe-stretch` (the C shim of the vendored stretcher) and
-    `faderframe-ui` (GObject subclassing macros).
+    `faderframe-plugin-sandbox` (pipes, `poll`, shared memory, descriptors
+    for helper processes), `faderframe-stretch` (the C shim of the vendored
+    stretcher) and `faderframe-ui` (GObject subclassing macros).
 12. Vendored C/C++ code is listed in `THIRD_PARTY_LICENSES.md` and its
     realtime entry points are proven allocation-free by counting C++
     allocations in tests (`faderframe-stretch/tests/stretch.rs`; the Rust
@@ -1314,8 +1357,8 @@ and packages for all three platforms (see §14).
 
 1. **Ports**: the CoreAudio IO workgroup for DSP workers, signed and
    notarised packages, a Flathub submission (vendored crates).
-2. **Plugins**: VST3 program lists and 64-bit processing, sandboxed plugins (out-of-process with shared-memory
-   audio), SysEx to plugins.
+2. **Plugins**: sandboxing on Windows and macOS, VST3 program lists and
+   64-bit processing, SysEx to plugins.
 3. **MIDI**: MTC output, varispeed chase without a shared word clock.
 4. **Performance**: anticipative processing of tracks that are not
    monitored live, job affinity for cache locality, an optional wgpu

@@ -502,12 +502,15 @@ impl MixerView {
                             .sidechain
                             .and_then(|k| model.project().track(k))
                             .map_or(String::new(), |k| format!(" ⟵ {}", k.name));
-                        let text = if s.bypass {
+                        let failed = model.plugin_failed(s.id);
+                        let text = if failed {
+                            format!("⚠ {name}")
+                        } else if s.bypass {
                             format!("({name}{key})")
                         } else {
                             format!("{name}{key}")
                         };
-                        controls::well_label(p, *slot, &text, s.bypass, th);
+                        controls::well_label(p, *slot, &text, s.bypass || failed, th);
                     }
                     None => controls::well_label(p, *slot, "—", true, th),
                 }
@@ -870,6 +873,12 @@ impl MixerView {
             Some(s) => {
                 items.push(MenuItem::disabled(s.plugin.name.clone()));
                 let builtin = s.plugin.format == faderframe_project::PluginFormat::Builtin;
+                if model.plugin_failed(s.id) {
+                    items.push(MenuItem::new(
+                        "Reload Plugin (it stopped working)",
+                        Action::ReloadPlugin(s.id),
+                    ));
+                }
                 items.push(MenuItem::new(
                     if builtin {
                         "Show Editor"
@@ -948,6 +957,16 @@ impl MixerView {
                     )
                     .separated(),
                 );
+                if !builtin && !model.plugin_failed(s.id) {
+                    items.push(MenuItem::new(
+                        if model.plugin_sandboxed(s.id) {
+                            "Reload Plugin (runs in its own process)"
+                        } else {
+                            "Reload Plugin"
+                        },
+                        Action::ReloadPlugin(s.id),
+                    ));
+                }
                 items.push(MenuItem::new(
                     "Remove",
                     Action::Edit(Command::RemovePlugin {

@@ -48,7 +48,10 @@ pub use meters::{MeterBank, MeterRange, MeterReading};
 pub use metrics::{CallbackMetrics, MetricsSnapshot};
 pub use pages::{Epoch, PageTable, Reclaimer, Retired};
 pub use params::{ParamSlot, ParamTable};
-pub use pool::{PoolConfig, PoolJob, WorkerPool, default_worker_count, physical_cores};
+pub use pool::{
+    PoolConfig, PoolJob, WorkerPool, apply_thread_scheduling, default_worker_count, physical_cores,
+    thread_scheduling,
+};
 pub use scope::ScopeRing;
 pub use slots::SlotAllocator;
 pub use trycell::{TryCell, TryCellGuard};

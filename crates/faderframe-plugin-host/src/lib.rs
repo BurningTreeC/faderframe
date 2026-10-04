@@ -294,6 +294,11 @@ pub trait PluginInstance {
     fn note_expressions(&self) -> Option<Vec<faderframe_midi::NoteExpressionKind>> {
         None
     }
+    /// Runs in a helper process (`faderframe-plugin-sandbox`): a crash
+    /// costs only the instance, and its state is worth saving often.
+    fn sandboxed(&self) -> bool {
+        false
+    }
     /// Counts (re)activations. Processors of different activations are not
     /// interchangeable: after a restart the old one is dead, so the engine
     /// must not keep it in place of the new one (it is part of the node's

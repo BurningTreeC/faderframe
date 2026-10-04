@@ -662,6 +662,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "faderframe-plugin-sandbox"
+version = "0.1.0"
+dependencies = [
+ "faderframe-audio-graph",
+ "faderframe-automation",
+ "faderframe-core",
+ "faderframe-midi",
+ "faderframe-plugin-host",
+ "faderframe-realtime",
+ "faderframe-timeline",
+ "faderframe-transport",
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
 name = "faderframe-plugin-vst3"
 version = "0.1.0"
 dependencies = [
@@ -771,6 +790,7 @@ dependencies = [
  "faderframe-plugin-au",
  "faderframe-plugin-clap",
  "faderframe-plugin-host",
+ "faderframe-plugin-sandbox",
  "faderframe-plugin-vst3",
  "faderframe-project",
  "faderframe-session",

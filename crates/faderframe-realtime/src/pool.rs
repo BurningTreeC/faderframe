@@ -154,6 +154,18 @@ mod wait {
     }
 }
 
+/// The calling thread's scheduling, packed (`0` = unknown) with a
+/// platform extra (macOS: the time-constraint computation); a sandboxed
+/// plugin's audio thread copies it from the host's audio thread.
+pub fn thread_scheduling() -> (u64, u64) {
+    sched::current()
+}
+
+/// Apply scheduling packed by [`thread_scheduling`] to the calling thread.
+pub fn apply_thread_scheduling(packed: u64, extra: u64) -> bool {
+    packed != 0 && sched::apply(packed, extra)
+}
+
 #[cfg(target_os = "linux")]
 mod sched {
     /// This thread's policy and priority, packed (0 = unknown).

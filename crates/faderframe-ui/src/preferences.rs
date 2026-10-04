@@ -292,6 +292,33 @@ fn general_page(app: &Rc<AppState>) -> gtk::Widget {
     let storage = note(&storage);
     storage.set_wrap(true);
     row(&g, 4, "Data", &storage);
+    let sandbox = gtk::CheckButton::with_label(
+        "Run each plugin in its own process (a crashing plugin cannot take FaderFrame down)",
+    );
+    sandbox.set_active(prefs.sandbox_plugins && faderframe_plugin_sandbox::AVAILABLE);
+    sandbox.set_sensitive(faderframe_plugin_sandbox::AVAILABLE);
+    row(&g, 5, "Plugins", &sandbox);
+    let sandbox_note = note(if faderframe_plugin_sandbox::AVAILABLE {
+        "CLAP and VST3 plugins. Changing this restarts the loaded plugins (their settings are kept)."
+    } else {
+        "Not available on this platform yet: plugins run inside FaderFrame."
+    });
+    sandbox_note.set_wrap(true);
+    g.attach(&sandbox_note, 1, 6, 1, 1);
+    {
+        let weak = Rc::downgrade(app);
+        sandbox.connect_toggled(move |b| {
+            let mut p = Preferences::load();
+            p.sandbox_plugins = b.is_active();
+            if let Err(e) = p.save() {
+                tracing::warn!("cannot save preferences: {e}");
+            }
+            faderframe_plugin_sandbox::set_enabled(b.is_active());
+            if let Some(app) = weak.upgrade() {
+                app.dispatch(faderframe_session::Action::ReloadAllPlugins);
+            }
+        });
+    }
     {
         let weak = Rc::downgrade(app);
         theme.connect_selected_notify(move |d| {

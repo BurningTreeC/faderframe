@@ -42,6 +42,8 @@ struct Hosted {
 pub struct PluginHost {
     registry: PluginRegistry,
     instances: HashMap<PluginInstanceId, Hosted>,
+    /// Plugins that reported unsaved state since the last `take_dirty`.
+    dirty: HashSet<PluginInstanceId>,
 }
 
 impl Default for PluginHost {
@@ -64,6 +66,7 @@ impl PluginHost {
         Self {
             registry,
             instances: HashMap::new(),
+            dirty: HashSet::new(),
         }
     }
 
@@ -108,10 +111,41 @@ impl PluginHost {
     /// Let every instance handle its requests; the merged result says
     /// whether the graph must be rebuilt.
     pub fn poll(&mut self) -> faderframe_plugin_host::PluginPoll {
-        self.instances.values_mut().map(|h| h.instance.poll()).fold(
-            faderframe_plugin_host::PluginPoll::default(),
-            faderframe_plugin_host::PluginPoll::merge,
-        )
+        let mut all = faderframe_plugin_host::PluginPoll::default();
+        for (id, h) in &mut self.instances {
+            let p = h.instance.poll();
+            if p.state_dirty {
+                self.dirty.insert(*id);
+            }
+            all = all.merge(p);
+        }
+        all
+    }
+
+    /// Plugins that reported unsaved state since the last call.
+    pub fn take_dirty(&mut self) -> Vec<PluginInstanceId> {
+        self.dirty.drain().collect()
+    }
+
+    /// Runs in a helper process.
+    pub fn is_sandboxed(&self, plugin: PluginInstanceId) -> bool {
+        self.instances
+            .get(&plugin)
+            .is_some_and(|h| h.instance.sandboxed())
+    }
+
+    /// Stopped working (crashed, hung or failed while processing).
+    pub fn is_failed(&self, plugin: PluginInstanceId) -> bool {
+        self.instances
+            .get(&plugin)
+            .is_some_and(|h| h.failed.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Drop the instance: the next graph build creates it again from its
+    /// slot (state and explicit values). `false` if it was not loaded.
+    pub fn reload(&mut self, plugin: PluginInstanceId) -> bool {
+        self.dirty.remove(&plugin);
+        self.instances.remove(&plugin).is_some()
     }
 
     /// Parameter moves made in plugins' own editors since the last call.

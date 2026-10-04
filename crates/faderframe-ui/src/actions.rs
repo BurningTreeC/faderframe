@@ -630,6 +630,11 @@ pub fn install(app: &Rc<AppState>) {
             };
             a.dispatch(Action::Album(action));
         }),
+        // Development aid: `reload-plugins:x` starts every plugin again (a
+        // crashed one, or after switching sandboxing).
+        named("reload-plugins", |a, _| {
+            a.dispatch(Action::ReloadAllPlugins);
+        }),
         // Development aid: `render-preset:<n>` opens Render / Export with
         // delivery preset n (1-based).
         named("render-preset", |a, arg| {

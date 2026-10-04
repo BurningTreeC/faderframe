@@ -17,6 +17,7 @@ asio = ["faderframe-audio-cpal/asio"]
 [dependencies]
 faderframe-plugin-clap.workspace = true
 faderframe-plugin-vst3.workspace = true
+faderframe-plugin-sandbox.workspace = true
 faderframe-plugin-host.workspace = true
 gtk.workspace = true
 faderframe-core.workspace = true

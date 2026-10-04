@@ -202,6 +202,12 @@ Contrast:
   plugin's own GUI writes automation like FaderFrame's controls do. Presets:
   save and load your own for any plugin (insert menu or the parameter
   window's Presets menu), and VST3 factory presets are listed too.
+  Sandboxing (Preferences → General, on by default on Linux): each CLAP
+  and VST3 plugin runs in a process of its own, so a plugin that crashes or
+  hangs costs only itself — its track plays on dry, FaderFrame says so, and
+  Reload Plugin (insert or instrument menu) starts it again with its recent
+  settings. Editors still open in FaderFrame's windows; audio passes
+  through shared memory (about 9 µs per plugin and block).
 * MIDI files: File → Import MIDI File… (a track per MIDI track or channel,
   with controllers and SysEx; tempo and meter too when the project is
   empty) and File → Export MIDI File… (all MIDI tracks, or the selected

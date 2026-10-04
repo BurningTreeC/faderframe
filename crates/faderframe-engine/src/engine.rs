@@ -702,6 +702,27 @@ impl EngineController {
         self.plugins.failed()
     }
 
+    /// The plugin stopped working (crashed, hung or failed processing).
+    pub fn plugin_failed(&self, plugin: faderframe_core::PluginInstanceId) -> bool {
+        self.plugins.is_failed(plugin)
+    }
+
+    /// The plugin runs in a helper process.
+    pub fn plugin_sandboxed(&self, plugin: faderframe_core::PluginInstanceId) -> bool {
+        self.plugins.is_sandboxed(plugin)
+    }
+
+    /// Plugins that reported unsaved state since the last call.
+    pub fn take_dirty_plugins(&mut self) -> Vec<faderframe_core::PluginInstanceId> {
+        self.plugins.take_dirty()
+    }
+
+    /// Forget the plugin's instance: the next graph sync creates it again
+    /// from its slot. `false` if it was not loaded.
+    pub fn reload_plugin(&mut self, plugin: faderframe_core::PluginInstanceId) -> bool {
+        self.plugins.reload(plugin)
+    }
+
     /// Measure every graph node (per-track and per-plugin load). Costs a
     /// clock read per node and callback, so it is only on while wanted;
     /// the total DSP load is always measured.

@@ -101,6 +101,18 @@ fn main() -> ExitCode {
     // Plugin scan helper (run by FaderFrame itself; a crashing plugin only
     // takes this process down).
     let args: Vec<String> = std::env::args().collect();
+    // Plugin sandbox helper: hosts one plugin for FaderFrame.
+    if args.get(1).map(String::as_str) == Some("--plugin-sandbox") {
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_writer(std::io::stderr)
+            .init();
+        let code = faderframe_ui::plugins::sandbox_helper();
+        return ExitCode::from(code.clamp(0, 255) as u8);
+    }
     if args.get(1).map(String::as_str) == Some("--scan-clap")
         && let Some(bundle) = args.get(2)
     {

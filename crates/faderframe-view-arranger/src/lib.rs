@@ -1221,7 +1221,17 @@ impl ArrangerView {
             let plug = t
                 .instrument
                 .as_ref()
-                .map(|s| format!(" · {}", s.plugin.name.trim_start_matches("FaderFrame ")))
+                .map(|s| {
+                    let mark = if model.plugin_failed(s.id) {
+                        "⚠ "
+                    } else {
+                        ""
+                    };
+                    format!(
+                        " · {mark}{}",
+                        s.plugin.name.trim_start_matches("FaderFrame ")
+                    )
+                })
                 .unwrap_or_default();
             let input = if t.kind == TrackKind::Audio {
                 format!(" · {}", model.input_label(t))
@@ -1760,6 +1770,16 @@ impl ArrangerView {
                         generic: false,
                     },
                 ));
+                if slot.plugin.format != faderframe_project::PluginFormat::Builtin {
+                    items.push(MenuItem::new(
+                        if model.plugin_failed(slot.id) {
+                            format!("Reload {} (it stopped working)", slot.plugin.name)
+                        } else {
+                            format!("Reload {}", slot.plugin.name)
+                        },
+                        Action::ReloadPlugin(slot.id),
+                    ));
+                }
             }
         }
         // Editors of the inserts.

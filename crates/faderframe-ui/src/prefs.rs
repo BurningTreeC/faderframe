@@ -50,6 +50,8 @@ pub struct Preferences {
     pub sync_port: Option<String>,
     /// MTC timecode of the project start.
     pub mtc_offset: String,
+    /// Run each CLAP/VST3 plugin in a helper process of its own.
+    pub sandbox_plugins: bool,
 }
 
 impl Default for Preferences {
@@ -77,6 +79,7 @@ impl Default for Preferences {
             sync_source: "internal".into(),
             sync_port: None,
             mtc_offset: "00:00:00:00".into(),
+            sandbox_plugins: true,
         }
     }
 }

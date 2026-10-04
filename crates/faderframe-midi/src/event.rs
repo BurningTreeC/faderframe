@@ -46,6 +46,15 @@ impl ExpressionValue {
     pub fn get(self) -> f64 {
         self.0 as f64 / 1e6
     }
+
+    /// The fixed-point representation (for shared memory).
+    pub fn raw(self) -> i32 {
+        self.0
+    }
+
+    pub fn from_raw(raw: i32) -> Self {
+        Self(raw)
+    }
 }
 
 /// A channel-voice MIDI message (channels are 0-based, 0..=15), or a

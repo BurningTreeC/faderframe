@@ -30,6 +30,7 @@ pub mod groove;
 mod groups;
 pub mod lanes;
 mod redraw;
+mod sandbox;
 pub use groups::GroupMenuEntry;
 mod midifile;
 pub mod presets;
@@ -263,6 +264,11 @@ pub enum Action {
     SetLevelScale(analysis::LevelScale),
     /// Album songs, settings, analysis and export.
     Album(album::AlbumAction),
+    /// Start a plugin again from its slot (after a crash, or to move it
+    /// into or out of a sandbox).
+    ReloadPlugin(faderframe_core::PluginInstanceId),
+    /// Every plugin of the project.
+    ReloadAllPlugins,
     SetResetOnPlay(bool),
     /// Group the selected tracks.
     GroupSelectedTracks,
@@ -850,6 +856,8 @@ pub struct Session {
     bounces: Vec<freeze::PendingBounce>,
     /// Album analyses and the running album job.
     album_state: album::AlbumState,
+    /// Plugin failures noticed, sandboxed plugins' unsaved state.
+    plugin_care: sandbox::PluginCare,
     /// The Tools view's meters.
     analysis: analysis::AnalysisState,
     /// Where tracks following a multi-track fader/pan/send move started
@@ -1025,6 +1033,7 @@ impl Session {
             gesture_base: HashMap::new(),
             bounces: Vec::new(),
             album_state: album::AlbumState::default(),
+            plugin_care: sandbox::PluginCare::default(),
             analysis: analysis::AnalysisState::new(config.sample_rate),
             follow_base: HashMap::new(),
             user_edit: false,
@@ -1476,6 +1485,7 @@ impl Session {
         } else if plugin_poll.params_changed {
             self.revision += 1;
         }
+        self.care_for_plugins();
         // Moves in plugins' own editors write automation like ours do.
         let edits = self.engine.take_plugin_edits();
         self.plugin_editor_edits(edits);
@@ -2208,6 +2218,18 @@ impl Session {
                 self.update_analysis_settings(|s| s.target_lufs = lufs);
             }
             Action::Album(a) => self.album_action(a)?,
+            Action::ReloadPlugin(plugin) => self.reload_plugins(&[plugin])?,
+            Action::ReloadAllPlugins => {
+                let all: Vec<_> = self
+                    .project
+                    .tracks
+                    .iter()
+                    .flat_map(|t| t.instrument.iter().chain(t.inserts.iter()))
+                    .filter(|s| s.plugin.format != faderframe_project::PluginFormat::Builtin)
+                    .map(|s| s.id)
+                    .collect();
+                self.reload_plugins(&all)?;
+            }
             Action::SetLevelScale(scale) => self.update_analysis_settings(|s| s.scale = scale),
             Action::SetResetOnPlay(on) => self.update_analysis_settings(|s| s.reset_on_play = on),
             Action::GroupSelectedTracks => {
@@ -3042,23 +3064,29 @@ impl Session {
             .map(|s| s.id)
             .collect();
         for id in slots {
-            let state = self.engine.plugin_state(id);
-            for t in &mut self.project.tracks {
-                for s in t.instrument.iter_mut().chain(t.inserts.iter_mut()) {
-                    if s.id != id {
-                        continue;
-                    }
-                    if let Some(state) = &state {
-                        s.state = Some(state.clone());
-                        self.engine.note_plugin_state(id, state);
-                    }
-                    // Explicit values follow what the plugin's own editor
-                    // did since (they are applied after the state on load).
-                    for p in &mut s.parameters {
-                        if let Some(v) = self.engine.plugin_parameter_value(id, p.id) {
-                            p.value = v;
-                            self.engine.note_plugin_parameter(id, p.id, v);
-                        }
+            self.capture_plugin_state(id);
+        }
+    }
+
+    /// Take one plugin's current state (and the values its own editor set)
+    /// into its slot.
+    pub(crate) fn capture_plugin_state(&mut self, id: faderframe_core::PluginInstanceId) {
+        let state = self.engine.plugin_state(id);
+        for t in &mut self.project.tracks {
+            for s in t.instrument.iter_mut().chain(t.inserts.iter_mut()) {
+                if s.id != id {
+                    continue;
+                }
+                if let Some(state) = &state {
+                    s.state = Some(state.clone());
+                    self.engine.note_plugin_state(id, state);
+                }
+                // Explicit values follow what the plugin's own editor did
+                // since (they are applied after the state on load).
+                for p in &mut s.parameters {
+                    if let Some(v) = self.engine.plugin_parameter_value(id, p.id) {
+                        p.value = v;
+                        self.engine.note_plugin_parameter(id, p.id, v);
                     }
                 }
             }
