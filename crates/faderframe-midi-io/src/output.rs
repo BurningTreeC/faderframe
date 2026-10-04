@@ -198,6 +198,11 @@ impl MidiOutputs {
         let _ = self.sysex.send((due_ns, self.sysex_seq, port, g, data));
     }
 
+    /// How many SysEx messages were handed to the sender so far.
+    pub fn sysex_scheduled(&self) -> u64 {
+        self.sysex_seq
+    }
+
     /// Drop every SysEx message scheduled so far that is not sent yet.
     pub fn cancel_sysex(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);

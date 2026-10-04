@@ -239,6 +239,11 @@ impl Session {
     }
 
     /// Send SysEx to an output port now (e.g. a `.syx` file to a synth).
+    /// SysEx messages handed to the output sender so far (diagnostics).
+    pub fn sysex_scheduled(&self) -> u64 {
+        self.midi.outputs.sysex_scheduled()
+    }
+
     pub fn send_sysex(&mut self, output: &str, messages: Vec<Vec<u8>>) -> Result<()> {
         let port = self
             .midi
