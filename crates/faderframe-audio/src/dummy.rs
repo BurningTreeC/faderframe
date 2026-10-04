@@ -18,6 +18,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+/// How far the device clock may fall behind before it gives up catching up.
+const CATCH_UP: Duration = Duration::from_millis(500);
+
 pub const DEFAULT_SAMPLE_RATE: u32 = 48_000;
 pub const DEFAULT_BUFFER_SIZE: u32 = 256;
 
@@ -155,9 +158,11 @@ impl AudioBackend for DummyBackend {
                         let now = Instant::now();
                         if next > now {
                             std::thread::sleep(next - now);
-                        } else if now - next > period * 4 {
+                        } else if now - next > (period * 4).max(CATCH_UP) {
                             // Fell far behind (system suspend, debugger): count
-                            // it like an xrun and resynchronise.
+                            // it like an xrun and resynchronise. Shorter delays
+                            // (a busy machine oversleeping) are caught up, so
+                            // audio time keeps pace with the wall clock.
                             monitor.record_xrun();
                             next = now;
                         }

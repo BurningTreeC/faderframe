@@ -150,6 +150,7 @@ impl Session {
     /// Feed the audio that arrived since the last tick (from `tick`).
     pub(crate) fn poll_analysis(&mut self, dt: f32) {
         let rate = self.engine.sample_rate();
+        let source = self.analysis_source();
         let a = &mut self.analysis;
         if a.analyzer.sample_rate() != rate {
             a.analyzer = Analyzer::new(rate);
@@ -161,11 +162,16 @@ impl Session {
         a.was_playing = playing;
         a.left.clear();
         a.right.clear();
-        let (pos, _lost) = self
-            .engine
-            .scope()
-            .read_since(a.pos, &mut a.left, &mut a.right);
-        a.pos = pos;
+        let scope = self.engine.scope();
+        // Only the analysed track's own frames: right after a switch the
+        // newest ones may still be the previous source's.
+        match source.and_then(|t| scope.run_of(t.raw())) {
+            Some(since) => {
+                let (pos, _lost) = scope.read_since(a.pos.max(since), &mut a.left, &mut a.right);
+                a.pos = pos;
+            }
+            None => a.pos = scope.written(),
+        }
         a.analyzer.process(&a.left, &a.right, playing);
         a.analyzer.spectrum.decay_peaks(dt * 12.0);
         a.levels = a.analyzer.level.read(dt);

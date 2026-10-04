@@ -134,6 +134,8 @@ fn lanes_show_hide_and_drive_the_displayed_value() {
 }
 
 fn play_for(s: &mut Session, ms: u64, mut each: impl FnMut(&mut Session, f32)) {
+    // The first step at 0 (sleeping may overshoot on busy machines).
+    each(s, 0.0);
     let start = Instant::now();
     let total = Duration::from_millis(ms);
     while start.elapsed() < total {

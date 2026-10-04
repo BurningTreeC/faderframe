@@ -77,21 +77,35 @@ pub fn sweep_stale_scratch(max_age: std::time::Duration) -> usize {
     removed
 }
 
-/// Resolve a stored media path against the project directory.
+/// Resolve a stored media path against the project directory. Relative
+/// paths use `/` (projects move between systems); a `\` from a file
+/// written on Windows is read as a separator too.
 pub fn resolve(stored: &Path, project_dir: Option<&Path>) -> PathBuf {
     if stored.is_absolute() {
+        return stored.to_path_buf();
+    }
+    let text = stored.to_string_lossy();
+    let portable = if cfg!(windows) || !text.contains('\\') {
         stored.to_path_buf()
-    } else if let Some(dir) = project_dir {
-        dir.join(stored)
     } else {
-        stored.to_path_buf()
+        PathBuf::from(text.replace('\\', "/"))
+    };
+    match project_dir {
+        Some(dir) => dir.join(portable),
+        None => portable,
     }
 }
 
-/// Store paths inside the project directory relatively.
+/// Store paths inside the project directory relatively, with `/` as the
+/// separator on every system.
 pub fn to_stored(path: &Path, project_dir: Option<&Path>) -> PathBuf {
     match project_dir.and_then(|d| path.strip_prefix(d).ok()) {
-        Some(rel) => rel.to_path_buf(),
+        Some(rel) => PathBuf::from(
+            rel.components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/"),
+        ),
         None => path.to_path_buf(),
     }
 }
@@ -443,4 +457,29 @@ pub fn open_file_sources(
         }
     }
     missing
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_paths_are_portable() {
+        let dir = std::env::temp_dir().join("ff-project");
+        let file = dir.join("Audio").join("Kick.wav");
+        let stored = to_stored(&file, Some(&dir));
+        assert_eq!(stored.to_string_lossy(), "Audio/Kick.wav");
+        assert_eq!(
+            resolve(&stored, Some(&dir)),
+            dir.join("Audio").join("Kick.wav")
+        );
+        // Written on Windows before paths were portable.
+        assert_eq!(
+            resolve(Path::new("Audio\\Kick.wav"), Some(&dir)),
+            dir.join("Audio").join("Kick.wav")
+        );
+        // Outside the project: kept as they are.
+        let elsewhere = std::env::temp_dir().join("other.wav");
+        assert_eq!(to_stored(&elsewhere, Some(&dir)), elsewhere);
+    }
 }

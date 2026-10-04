@@ -82,8 +82,12 @@ fn auditioning_sounds_without_live_input() {
     let playing = level(&s, t);
     assert!(playing > -40.0, "audition sounds: {playing}");
     s.dispatch(Action::AuditionOff).unwrap();
-    // Released: the (smoothed) meter falls far below the playing level.
-    run(&mut s, Duration::from_millis(1500));
+    // Released: the (smoothed) meter falls far below the playing level
+    // (within a few seconds even where the device clock lags).
+    let start = Instant::now();
+    while level(&s, t) >= playing - 30.0 && start.elapsed() < Duration::from_secs(5) {
+        run(&mut s, Duration::from_millis(100));
+    }
     assert!(level(&s, t) < playing - 30.0, "and stops: {}", level(&s, t));
     s.stop_audio();
 }

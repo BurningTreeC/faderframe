@@ -17,6 +17,11 @@ pub struct ScopeRing {
     written: AtomicU64,
     /// Which source writes: an id + 1 (0: none).
     source: AtomicU64,
+    /// The source of the newest frames (id + 1) and the frame its run of
+    /// frames began at: a block begun before a source switch may still
+    /// land after it, and readers skip such frames.
+    writer: AtomicU64,
+    writer_since: AtomicU64,
 }
 
 impl ScopeRing {
@@ -30,6 +35,8 @@ impl ScopeRing {
             mask: n as u64 - 1,
             written: AtomicU64::new(0),
             source: AtomicU64::new(0),
+            writer: AtomicU64::new(0),
+            writer_since: AtomicU64::new(0),
         }
     }
 
@@ -48,10 +55,15 @@ impl ScopeRing {
             .store(id.map_or(0, |i| i + 1), Ordering::Relaxed);
     }
 
-    /// Append frames (realtime-safe; one writer at a time).
+    /// Append frames of source `id` (realtime-safe; one writer at a time).
     #[inline]
-    pub fn push(&self, left: &[f32], right: &[f32]) {
+    pub fn push(&self, id: u64, left: &[f32], right: &[f32]) {
         let start = self.written.load(Ordering::Relaxed);
+        if self.writer.load(Ordering::Relaxed) != id + 1 {
+            // Published with the frames (by the release store below).
+            self.writer_since.store(start, Ordering::Relaxed);
+            self.writer.store(id + 1, Ordering::Relaxed);
+        }
         for (i, (l, r)) in left.iter().zip(right).enumerate() {
             let at = ((start + i as u64) & self.mask) as usize;
             self.left[at].store(l.to_bits(), Ordering::Relaxed);
@@ -64,6 +76,15 @@ impl ScopeRing {
     /// Frames written so far.
     pub fn written(&self) -> u64 {
         self.written.load(Ordering::Acquire)
+    }
+
+    /// Where the newest run of frames from source `id` begins, if the
+    /// newest frames are `id`'s (`None`: another source wrote last, or
+    /// nobody yet). Frames before it belong to other sources.
+    pub fn run_of(&self, id: u64) -> Option<u64> {
+        let _ = self.written();
+        (self.writer.load(Ordering::Relaxed) == id + 1)
+            .then(|| self.writer_since.load(Ordering::Relaxed))
     }
 
     /// Append the frames written since `from` to `left`/`right`; returns
@@ -94,7 +115,7 @@ mod tests {
     fn reads_what_was_written_and_counts_losses() {
         let ring = ScopeRing::new(16);
         assert_eq!(ring.capacity(), 16);
-        ring.push(&[1.0, 2.0, 3.0], &[-1.0, -2.0, -3.0]);
+        ring.push(7, &[1.0, 2.0, 3.0], &[-1.0, -2.0, -3.0]);
         let (mut l, mut r) = (Vec::new(), Vec::new());
         let (pos, lost) = ring.read_since(0, &mut l, &mut r);
         assert_eq!((pos, lost), (3, 0));
@@ -104,7 +125,7 @@ mod tests {
         );
         // Lapped: only the newest frames (minus headroom) remain.
         let block: Vec<f32> = (0..40).map(|i| i as f32).collect();
-        ring.push(&block, &block);
+        ring.push(7, &block, &block);
         l.clear();
         r.clear();
         let (pos, lost) = ring.read_since(pos, &mut l, &mut r);
@@ -116,5 +137,21 @@ mod tests {
         assert_eq!(ring.source(), Some(7));
         ring.set_source(None);
         assert_eq!(ring.source(), None);
+    }
+
+    #[test]
+    fn runs_tell_sources_apart() {
+        let ring = ScopeRing::new(64);
+        assert_eq!(ring.run_of(1), None, "nothing written");
+        ring.push(1, &[0.5; 10], &[0.5; 10]);
+        assert_eq!(ring.run_of(1), Some(0));
+        // A block of the previous source lands after a switch to source 2.
+        ring.push(1, &[0.5; 4], &[0.5; 4]);
+        assert_eq!(ring.run_of(2), None, "source 2 has not written yet");
+        ring.push(2, &[0.0; 6], &[0.0; 6]);
+        assert_eq!(ring.run_of(2), Some(14));
+        assert_eq!(ring.run_of(1), None);
+        ring.push(2, &[0.0; 6], &[0.0; 6]);
+        assert_eq!(ring.run_of(2), Some(14), "a run continues");
     }
 }

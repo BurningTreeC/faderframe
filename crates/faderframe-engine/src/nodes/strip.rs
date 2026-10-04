@@ -192,7 +192,7 @@ impl Processor<EngineContext> for ChannelStrip {
         if cx.data.scope.source() == Some(self.track.raw()) && post.num_channels() > 0 {
             let l = &post.channel(0)[..n];
             let r = &post.channel(post.num_channels().min(2) - 1)[..n];
-            cx.data.scope.push(l, r);
+            cx.data.scope.push(self.track.raw(), l, r);
         }
         let out_ch = post.num_channels().min(MAX_CHANNELS);
         for c in 0..out_ch {

@@ -147,14 +147,14 @@ fn the_delay_echoes_an_impulse() {
 }
 
 #[test]
-fn automation_reaches_the_unit_sample_accurately() {
+fn automation_reaches_the_unit() {
     let mut inst = instantiate(LOWPASS);
     let cutoff = param(&*inst, "cutoff");
     let mut p = inst.create_processor(&CONFIG).unwrap();
     let mut rig = Rig::new();
-    // White-ish noise through the filter.
-    let noise = |i: usize| (((i * 7919 + 13) % 1000) as f32 / 500.0) - 1.0;
-    rig.input(noise);
+    // A 6 kHz tone (eight samples a period: continuous from block to block,
+    // no DC) through the filter.
+    rig.input(|i| (i as f32 * std::f32::consts::TAU / 8.0).sin());
     let open = ParameterEvent {
         parameter: cutoff,
         value: 20_000.0,

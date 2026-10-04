@@ -176,10 +176,17 @@ mod tests {
         for i in 0..14 {
             push(&mut l, Path::new(&format!("/p/song{i}.ffproj")));
         }
+        // Stored absolute (on Windows with the current drive).
+        let abs = |p: &str| {
+            std::path::absolute(p)
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        };
         assert_eq!(l.len(), MAX_RECENT);
-        assert_eq!(l[0], "/p/song13.ffproj");
+        assert_eq!(l[0], abs("/p/song13.ffproj"));
         push(&mut l, Path::new("/p/song8.ffproj"));
-        assert_eq!(l[0], "/p/song8.ffproj");
+        assert_eq!(l[0], abs("/p/song8.ffproj"));
         assert_eq!(l.iter().filter(|p| p.ends_with("song8.ffproj")).count(), 1);
         assert_eq!(label("/x/my_song.ffproj"), "my__song — /x");
     }
