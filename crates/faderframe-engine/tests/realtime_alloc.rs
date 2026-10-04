@@ -64,6 +64,15 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
+/// The counter and the workers' flag are process-wide: the tests of this
+/// file take turns, or one test would count another's allocations (a pool
+/// shutting down while another test is armed).
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn armed<R>(f: impl FnOnce() -> R) -> (R, usize) {
     let before = EVENTS.load(Ordering::Relaxed);
     ARMED.with(|a| a.set(true));
@@ -76,6 +85,7 @@ fn armed<R>(f: impl FnOnce() -> R) -> (R, usize) {
 
 #[test]
 fn counting_allocator_detects_allocations() {
+    let _serial = serial();
     let (v, n) = armed(|| std::hint::black_box(Vec::<u64>::with_capacity(16)));
     drop(v);
     assert_eq!(n, 1);
@@ -83,6 +93,7 @@ fn counting_allocator_detects_allocations() {
 
 #[test]
 fn processing_does_not_allocate() {
+    let _serial = serial();
     const SR: u32 = 48_000;
     const BLOCK: usize = 256;
     let mut project = demo_project(SR);
@@ -177,6 +188,7 @@ fn processing_does_not_allocate() {
 
 #[test]
 fn parallel_processing_does_not_allocate() {
+    let _serial = serial();
     use faderframe_realtime::{PoolConfig, WorkerPool};
     use std::sync::Arc;
     const SR: u32 = 48_000;
@@ -211,6 +223,7 @@ fn parallel_processing_does_not_allocate() {
 
 #[test]
 fn streamed_playback_does_not_allocate() {
+    let _serial = serial();
     use faderframe_audio_files::{PAGE_FRAMES, WavFormat, write_wav};
     use faderframe_core::ChannelLayout;
     use faderframe_project::TrackKind;
@@ -257,6 +270,7 @@ fn streamed_playback_does_not_allocate() {
 
 #[test]
 fn recording_and_metronome_do_not_allocate() {
+    let _serial = serial();
     use faderframe_core::ChannelLayout;
     use faderframe_engine::{MetronomeMode, RecordTarget};
     use faderframe_project::TrackKind;
@@ -303,6 +317,7 @@ fn recording_and_metronome_do_not_allocate() {
 
 #[test]
 fn automation_does_not_allocate() {
+    let _serial = serial();
     use faderframe_automation::{
         AutomationCurve, AutomationLane, AutomationMode, AutomationPoint, AutomationTarget,
         CurveShape,
@@ -384,6 +399,7 @@ fn automation_does_not_allocate() {
 
 #[test]
 fn live_midi_input_and_midi_recording_do_not_allocate() {
+    let _serial = serial();
     use faderframe_engine::midi::{MidiFilter, MidiRecordTarget};
     use faderframe_project::Impact;
     use faderframe_transport::TransportCommand;
@@ -472,6 +488,7 @@ fn live_midi_input_and_midi_recording_do_not_allocate() {
 
 #[test]
 fn warped_playback_does_not_allocate() {
+    let _serial = serial();
     use faderframe_project::{ClipContent, Warp, WarpAlgorithm, WarpMarker};
     const SR: u32 = 48_000;
     const BLOCK: usize = 256;
