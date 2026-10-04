@@ -11,6 +11,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+faderframe-realtime.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 rtrb.workspace = true

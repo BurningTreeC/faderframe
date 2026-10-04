@@ -481,6 +481,7 @@ dependencies = [
 name = "faderframe-audio"
 version = "0.1.0"
 dependencies = [
+ "faderframe-realtime",
  "rtrb",
  "thiserror 2.0.21",
  "tracing",
@@ -492,6 +493,7 @@ version = "0.1.0"
 dependencies = [
  "cpal",
  "faderframe-audio",
+ "faderframe-realtime",
  "rtrb",
  "tracing",
 ]

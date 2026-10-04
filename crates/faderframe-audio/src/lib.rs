@@ -264,6 +264,12 @@ pub trait AudioStream: Send {
     fn request_buffer_size(&mut self, _frames: u32) -> Result<(), AudioError> {
         Err(AudioError::Unsupported("changing the buffer size"))
     }
+
+    /// The device's audio workgroup (macOS: CoreAudio's IO thread is in
+    /// it), for threads that do part of the callback's work to join.
+    fn io_workgroup(&self) -> Option<faderframe_realtime::Workgroup> {
+        None
+    }
 }
 
 /// A family of audio devices/servers (JACK, ALSA, WASAPI, ...).

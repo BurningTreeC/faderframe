@@ -1365,6 +1365,10 @@ impl Session {
             match backend.open_stream(config, Box::new(processor)) {
                 Ok(stream) => {
                     let info = stream.info();
+                    // macOS: the workers join the device's audio workgroup.
+                    if let Some(pool) = &self.pool {
+                        pool.set_workgroup(stream.io_workgroup());
+                    }
                     self.audio = Some(ActiveAudio {
                         stream,
                         backend: backend.id(),
@@ -1463,6 +1467,9 @@ impl Session {
     /// Close the stream (the engine processor goes with it).
     pub fn stop_audio(&mut self) {
         self.audio = None;
+        if let Some(pool) = &self.pool {
+            pool.set_workgroup(None);
+        }
     }
 
     pub fn request_buffer_size(&mut self, frames: u32) -> Result<()> {

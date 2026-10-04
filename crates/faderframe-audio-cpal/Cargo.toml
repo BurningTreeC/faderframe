@@ -18,6 +18,7 @@ asio = ["cpal/asio"]
 
 [dependencies]
 faderframe-audio.workspace = true
+faderframe-realtime.workspace = true
 cpal.workspace = true
 rtrb.workspace = true
 tracing.workspace = true

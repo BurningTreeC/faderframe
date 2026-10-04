@@ -173,8 +173,8 @@ impl AudioBackend for CpalBackend {
         let thread = std::thread::Builder::new()
             .name("audio-control".into())
             .spawn(move || match open(api, &config, callback) {
-                Ok((streams, info, monitor)) => {
-                    let _ = ready_tx.send(Ok((info, monitor)));
+                Ok((streams, info, monitor, workgroup)) => {
+                    let _ = ready_tx.send(Ok((info, monitor, workgroup)));
                     // Keep the streams until asked to stop.
                     let _ = stop_rx.recv();
                     drop(streams);
@@ -184,7 +184,7 @@ impl AudioBackend for CpalBackend {
                 }
             })
             .map_err(stream_err)?;
-        let (info, monitor) = match ready_rx.recv_timeout(Duration::from_secs(10)) {
+        let (info, monitor, workgroup) = match ready_rx.recv_timeout(Duration::from_secs(10)) {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
                 let _ = thread.join();
@@ -198,16 +198,26 @@ impl AudioBackend for CpalBackend {
             stop: stop_tx,
             info,
             monitor,
+            workgroup,
         }))
     }
 }
+
+/// What `open` returns: the streams to keep, their description, the
+/// stream monitor and the device's audio workgroup.
+type Opened = (
+    Vec<cpal::Stream>,
+    StreamInfo,
+    Arc<StreamMonitor>,
+    Option<faderframe_realtime::Workgroup>,
+);
 
 /// Open playback (and capture) on the calling thread.
 fn open(
     api: Api,
     config: &StreamConfig,
     callback: Box<dyn AudioCallback>,
-) -> Result<(Vec<cpal::Stream>, StreamInfo, Arc<StreamMonitor>), AudioError> {
+) -> Result<Opened, AudioError> {
     let host = api.host()?;
     let device = match &config.device {
         Some(id) => host
@@ -327,7 +337,16 @@ fn open(
     output.play().map_err(stream_err)?;
     streams.push(output);
     monitor.set_running(true);
-    Ok((streams, info, monitor))
+    // CoreAudio: the device's IO-thread workgroup (cpal's device id is the
+    // CoreAudio UID), for the DSP workers.
+    let workgroup = device
+        .id()
+        .ok()
+        .and_then(|id| faderframe_realtime::Workgroup::of_device(id.id()));
+    if workgroup.is_some() {
+        tracing::debug!("the DSP workers join the device's audio workgroup");
+    }
+    Ok((streams, info, monitor, workgroup))
 }
 
 fn on_error(monitor: &StreamMonitor, e: cpal::Error) {
@@ -493,6 +512,7 @@ struct CpalStream {
     stop: mpsc::Sender<()>,
     info: StreamInfo,
     monitor: Arc<StreamMonitor>,
+    workgroup: Option<faderframe_realtime::Workgroup>,
 }
 
 impl AudioStream for CpalStream {
@@ -505,6 +525,10 @@ impl AudioStream for CpalStream {
 
     fn status(&self) -> StreamStatus {
         self.monitor.status()
+    }
+
+    fn io_workgroup(&self) -> Option<faderframe_realtime::Workgroup> {
+        self.workgroup.clone()
     }
 }
 

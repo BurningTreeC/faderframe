@@ -238,8 +238,12 @@ Preferences → Audio → Processing threads, `--threads`).
   sleep on a futex; one non-blocking `FUTEX_WAKE` wakes as many as the
   graph can use. Workers run at the audio thread's urgency — on Linux its
   scheduling policy and priority (`SCHED_FIFO` under JACK/PipeWire), on
-  macOS its Mach time-constraint policy, on Windows MMCSS's "Pro Audio"
-  task (elsewhere they park/unpark) — and flush denormals, as does
+  macOS its Mach time-constraint policy and the device's audio workgroup
+  (`Workgroup`: the CoreAudio device's `IOThreadOSWorkgroup`, found by
+  cpal's device UID and handed to `WorkerPool::set_workgroup`; each worker
+  joins before its next job, so the scheduler sees one realtime workload
+  with the IO thread's deadline — on Apple silicon performance cores), on
+  Windows MMCSS's "Pro Audio" task (elsewhere they park/unpark) — and flush denormals, as does
   the audio thread for every callback (`ScopedFlushDenormals`). Without
   realtime scheduling a preempted worker would stall the cycle, so the pool
   then stays within the physical cores.
@@ -1351,7 +1355,7 @@ Platform specifics are isolated in backends and the GTK shell:
 | CLAP / VST3 | ✓, editors embedded via XWayland | ✓, editors embedded (Win32) | ✓, editors embedded (Cocoa) |
 | Audio Units | | | ✓ (AUv2 API, AUv3 through it) |
 | Packages | Flatpak, install script | Inno Setup installer, zip | app bundle in a DMG |
-| DSP threads | futex wake-up, the audio thread's `SCHED_FIFO` | `park`/`unpark`, MMCSS "Pro Audio" | `park`/`unpark`, the IO thread's Mach time constraint |
+| DSP threads | futex wake-up, the audio thread's `SCHED_FIFO` | `park`/`unpark`, MMCSS "Pro Audio" | `park`/`unpark`, the IO thread's Mach time constraint and audio workgroup |
 
 * JACK and PipeWire are Linux-only dependencies; their crates are empty
   elsewhere. CLAP's posix-fd extension (plugin GUI event loops) exists on
@@ -1418,8 +1422,9 @@ and packages for all three platforms (see §14).
 
 **Next**, roughly in order:
 
-1. **Ports**: the CoreAudio IO workgroup for DSP workers, signed and
-   notarised packages, a Flathub submission (vendored crates).
+1. **Ports**: signed and notarised packages, a Flathub submission
+   (vendored crates), sandboxed plugins' audio threads in the device's
+   workgroup (macOS: needs the workgroup's Mach port in the helper).
 2. **MIDI**: MTC output, varispeed chase without a shared word clock.
 3. **Performance**: anticipative processing of tracks that are not
    monitored live, job affinity for cache locality, an optional wgpu

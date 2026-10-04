@@ -19,13 +19,16 @@
 //!   wake-up, the audio thread's priority) and [`TaskCells`], the per-cycle
 //!   pending/running/done cells a parallel graph executor works on.
 //! * [`ScopedFlushDenormals`] — flush-to-zero on DSP threads.
+//! * [`Workgroup`] — the audio device's `os_workgroup` (macOS) the DSP
+//!   workers join.
 //!
 //! The pool's wake-up is the only syscall made on the audio thread besides
 //! reading the clock (`FUTEX_WAKE`, which never blocks). `unsafe` code is
 //! confined to `mailbox` and `pages` (pointer ownership transfer through
 //! `AtomicPtr`s), `cells` (interior mutability guarded by atomic states),
-//! `pool` (scoped job pointer, futex, thread scheduling) and `denormals`
-//! (the FP control register), with invariants documented inline.
+//! `pool` (scoped job pointer, futex, thread scheduling), `denormals`
+//! (the FP control register) and `workgroup` (CoreAudio and
+//! `os_workgroup` calls), with invariants documented inline.
 
 mod atomic;
 mod cells;
@@ -39,6 +42,7 @@ mod pool;
 mod scope;
 mod slots;
 mod trycell;
+mod workgroup;
 
 pub use atomic::AtomicF32;
 pub use cells::{Claim, TaskCells};
@@ -55,3 +59,4 @@ pub use pool::{
 pub use scope::ScopeRing;
 pub use slots::SlotAllocator;
 pub use trycell::{TryCell, TryCellGuard};
+pub use workgroup::{Membership, Workgroup};

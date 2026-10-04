@@ -16,15 +16,17 @@
 //!   by ordinary threads while the audio thread waits for them: on Linux
 //!   they adopt its scheduling policy and priority (`SCHED_FIFO` under
 //!   JACK/PipeWire), on macOS its Mach time-constraint policy (CoreAudio's
-//!   IO thread has one), on Windows they join MMCSS's "Pro Audio" task like
-//!   the WASAPI thread; and they flush denormals like it.
+//!   IO thread has one) and join the device's audio workgroup
+//!   ([`WorkerPool::set_workgroup`]), on Windows they join MMCSS's "Pro
+//!   Audio" task like the WASAPI thread; and they flush denormals like it.
 //!
 //! The pool may be shared (e.g. by an engine and its replacement), but only
 //! one `run` executes at a time; a concurrent caller runs its job alone.
 
 use crate::denormals::flush_denormals_on_this_thread;
-use std::sync::Arc;
+use crate::workgroup::{Membership, Workgroup};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -110,6 +112,11 @@ struct Shared {
     sched_extra: AtomicU64,
     sched_failures: AtomicU64,
     runs: AtomicU64,
+    /// The audio workgroup to join (macOS), and its changes.
+    workgroup: Mutex<Option<Workgroup>>,
+    workgroup_changes: AtomicU32,
+    /// Workers in the workgroup now.
+    members: AtomicU32,
     #[cfg(not(target_os = "linux"))]
     threads: std::sync::OnceLock<Vec<std::thread::Thread>>,
 }
@@ -347,12 +354,22 @@ fn worker(shared: Arc<Shared>, on_start: Option<fn()>) {
     }
     let mut seen = shared.generation.load(Ordering::Acquire);
     let mut applied = 0u64;
+    // The workgroup this thread is in, and the change it reflects.
+    let mut joined: Option<(Workgroup, Membership)> = None;
+    let mut workgroup_seen = 0u32;
+    let leave = |joined: &mut Option<(Workgroup, Membership)>| {
+        if let Some((wg, m)) = joined.take() {
+            wg.leave(m);
+            shared.members.fetch_sub(1, Ordering::Relaxed);
+        }
+    };
     loop {
         // Wait for the next run: spin briefly, then sleep.
         let idle_since = Instant::now();
         let mut spins = 0u32;
         loop {
             if shared.stop.load(Ordering::Relaxed) {
+                leave(&mut joined);
                 return;
             }
             let g = shared.generation.load(Ordering::Acquire);
@@ -373,6 +390,23 @@ fn worker(shared: Arc<Shared>, on_start: Option<fn()>) {
             } else {
                 std::hint::spin_loop();
             }
+        }
+        // A new workgroup: leave the old one, join the new (rare: when the
+        // audio device changes; never blocks — tried again next time).
+        let changes = shared.workgroup_changes.load(Ordering::Acquire);
+        if changes != workgroup_seen
+            && let Ok(current) = shared.workgroup.try_lock()
+        {
+            let next = current.clone();
+            drop(current);
+            leave(&mut joined);
+            if let Some(wg) = next
+                && let Some(m) = wg.join()
+            {
+                shared.members.fetch_add(1, Ordering::Relaxed);
+                joined = Some((wg, m));
+            }
+            workgroup_seen = changes;
         }
         let s = shared.sched.load(Ordering::Relaxed);
         if s != applied && s != 0 {
@@ -410,6 +444,9 @@ impl WorkerPool {
             sched_extra: AtomicU64::new(0),
             sched_failures: AtomicU64::new(0),
             runs: AtomicU64::new(0),
+            workgroup: Mutex::new(None),
+            workgroup_changes: AtomicU32::new(0),
+            members: AtomicU32::new(0),
             #[cfg(not(target_os = "linux"))]
             threads: std::sync::OnceLock::new(),
         });
@@ -433,6 +470,23 @@ impl WorkerPool {
     /// Number of worker threads (not counting the caller of `run`).
     pub fn threads(&self) -> usize {
         self.handles.len()
+    }
+
+    /// The audio device's workgroup (macOS: CoreAudio's IO thread is in
+    /// it) for the workers to join, or none. Control thread; the workers
+    /// change membership before their next job.
+    pub fn set_workgroup(&self, workgroup: Option<Workgroup>) {
+        if let Ok(mut g) = self.shared.workgroup.lock() {
+            *g = workgroup;
+        }
+        self.shared
+            .workgroup_changes
+            .fetch_add(1, Ordering::Release);
+    }
+
+    /// Workers in the workgroup now.
+    pub fn workgroup_members(&self) -> usize {
+        self.shared.members.load(Ordering::Relaxed) as usize
     }
 
     /// Times a worker could not take the audio thread's scheduling (e.g. no
@@ -556,6 +610,39 @@ mod tests {
                 }
                 self.done.fetch_add(1, Ordering::Relaxed);
             }
+        }
+    }
+
+    /// Workers join an audio workgroup before their next job and leave it
+    /// when it is withdrawn (a work interval of our own: CI machines may
+    /// have no audio device). The default output device's workgroup, when
+    /// there is one, takes a thread too.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn workers_join_and_leave_an_audio_workgroup() {
+        let job = || Counter {
+            next: AtomicUsize::new(0),
+            total: 1000,
+            done: AtomicUsize::new(0),
+            threads_seen: AtomicUsize::new(0),
+        };
+        let wait_for = |pool: &WorkerPool, members: usize| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while pool.workgroup_members() != members && Instant::now() < deadline {
+                pool.run(&job(), 2);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            pool.workgroup_members()
+        };
+        let wg = Workgroup::new_interval(c"faderframe-test").expect("a work interval");
+        let pool = WorkerPool::new(PoolConfig::new(2));
+        pool.set_workgroup(Some(wg));
+        assert_eq!(wait_for(&pool, 2), 2);
+        pool.set_workgroup(None);
+        assert_eq!(wait_for(&pool, 0), 0);
+        if let Some(device) = Workgroup::of_default_output() {
+            let m = device.join().expect("joins the device's workgroup");
+            device.leave(m);
         }
     }
 
