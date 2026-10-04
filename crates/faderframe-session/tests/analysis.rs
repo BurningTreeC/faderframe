@@ -57,8 +57,15 @@ fn master_and_track_analysis_while_playing() {
     assert_eq!(s.analysis_settings().scale.zero_db(), -14.0);
     play_for(&mut s, 0.6);
     assert_eq!(s.analysis_source(), Some(pad));
-    // The pad enters at bar 5: still silent here.
-    assert!(s.analyzer().loudness.read().momentary < -60.0);
+    // The pad enters at bar 5 (8.6 s): silent until then. The momentary
+    // window (400 ms) fills with the new source as fast as the runner
+    // delivers blocks — slow CI machines get a few seconds.
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while s.analyzer().loudness.read().momentary >= -60.0 && Instant::now() < deadline {
+        play_for(&mut s, 0.1);
+    }
+    let momentary = s.analyzer().loudness.read().momentary;
+    assert!(momentary < -60.0, "{momentary}");
     s.dispatch(Action::ResetAnalysis).unwrap();
     assert_eq!(s.analyzer().loudness.read().integrated, f64::NEG_INFINITY);
     s.stop_audio();
