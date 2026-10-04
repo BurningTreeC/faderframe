@@ -701,6 +701,18 @@ status (rate change, server shutdown). `render::start` runs offline bounces
 (master or stems, range, rate, channels, tail, normalise, dither) on a
 worker thread through the same engine path.
 
+Delivery (`session::delivery`, on `faderframe_analysis::delivery`): a
+render's `Finish` normalises the whole file to an integrated loudness
+target and keeps the true peak under a ceiling — a lookahead limiter
+(min-hold of the needed gain over 1.5 ms, then a box filter of the same
+length, so the gain is down in time and ramps smoothly; 60 ms release;
+repeated where the reconstructed signal still overshoots), the gain refined
+until the limited result meets the target — and every written file is
+measured (`Rendered::finished`). Dither (`faderframe_audio_files::Dither`)
+is TPDF or TPDF with Lipshitz's 5-tap E-weighted error feedback (44.1 and
+48 kHz). `DELIVERY_PRESETS` bundle target, ceiling, format, rate and
+dither.
+
 ### Freezing and bouncing
 
 Both render a track after its inserts and before its fader

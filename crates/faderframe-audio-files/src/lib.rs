@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 pub mod decode;
+pub mod dither;
 mod generate;
 pub mod import;
 pub mod onsets;
@@ -21,10 +22,11 @@ pub mod stream;
 pub mod wav;
 pub mod wavstream;
 
+pub use dither::Dither;
 pub use generate::{GeneratorSpec, generate};
 pub use peaks::{PeakBuilder, PeakCache, PeakLevel};
 pub use stream::{PAGE_FRAMES, Page, StreamSource};
-pub use wav::{WavData, WavFormat, read_wav, write_wav};
+pub use wav::{WavData, WavFormat, read_wav, write_wav, write_wav_with};
 
 /// Decoded, non-interleaved audio in memory. Immutable once shared, so the
 /// realtime thread may read it through an `Arc` without synchronisation.

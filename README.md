@@ -219,9 +219,12 @@ Contrast:
   engine work; load per track and per plugin instance (average and peak,
   sortable, latency and bypass shown); xruns, late callbacks and late disk
   reads.
-* Render / export to WAV (16/24-bit with TPDF dither, 32-bit float): master
-  or stems, project/loop/bar range, any sample rate, mono or stereo, tail,
-  normalisation.
+* Render / export to WAV (16/24-bit with TPDF or noise-shaped dither,
+  32-bit float): master or stems, project/loop/bar range, any sample rate,
+  mono or stereo, tail, peak normalisation. Delivery: loudness
+  normalisation to a target (BS.1770 integrated loudness) with a true-peak
+  lookahead limiter, presets for streaming, Apple Music, CD, EBU R128 and
+  ATSC A/85, and each written file's loudness, range and true peak.
 * Preferences (start-up project, audio system, sample rate, buffer size,
   live DSP statistics, editing defaults), undo/redo, versioned project
   files (`.ffproj`). A new start opens the last project, a new one or the

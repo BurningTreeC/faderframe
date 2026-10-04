@@ -4,6 +4,7 @@
 //! formats (FLAC, AIFF, compressed) is planned via Symphonia behind the same
 //! source abstraction.
 
+use crate::dither::{Dither, Quantizer};
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -37,30 +38,26 @@ impl WavFormat {
     }
 }
 
-/// Triangular-PDF dither noise generator (deterministic).
-struct Tpdf(u64);
-
-impl Tpdf {
-    fn uniform(&mut self) -> f32 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        (self.0 >> 40) as f32 / (1u64 << 24) as f32 - 0.5
-    }
-
-    /// Noise in LSB units, range (-1, 1).
-    fn next(&mut self) -> f32 {
-        self.uniform() + self.uniform()
-    }
-}
-
-/// Write non-interleaved `channels` (equal lengths) to `path`.
+/// Write non-interleaved `channels` (equal lengths) to `path`, with TPDF
+/// dither for integer formats when `dither` is set.
 pub fn write_wav(
     path: &Path,
     channels: &[Vec<f32>],
     sample_rate: u32,
     format: WavFormat,
     dither: bool,
+) -> io::Result<()> {
+    let dither = if dither { Dither::Tpdf } else { Dither::Off };
+    write_wav_with(path, channels, sample_rate, format, dither)
+}
+
+/// [`write_wav`] with a choice of [`Dither`] (integer formats only).
+pub fn write_wav_with(
+    path: &Path,
+    channels: &[Vec<f32>],
+    sample_rate: u32,
+    format: WavFormat,
+    dither: Dither,
 ) -> io::Result<()> {
     let n_ch = channels.len().max(1) as u16;
     let frames = channels.iter().map(Vec::len).min().unwrap_or(0);
@@ -83,23 +80,17 @@ pub fn write_wav(
     w.write_all(&format.bits().to_le_bytes())?;
     w.write_all(b"data")?;
     w.write_all(&(data_len as u32).to_le_bytes())?;
-    let mut noise = Tpdf(0x2545_f491_4f6c_dd1d);
+    let mut quantizer = Quantizer::new(format.bits(), channels.len(), sample_rate, dither);
     for i in 0..frames {
-        for ch in channels {
+        for (c, ch) in channels.iter().enumerate() {
             let s = ch[i];
             match format {
                 WavFormat::Float32 => w.write_all(&s.to_le_bytes())?,
                 WavFormat::Pcm16 => {
-                    let d = if dither { noise.next() } else { 0.0 };
-                    let v = (s * 32767.0 + d).round().clamp(-32768.0, 32767.0) as i16;
-                    w.write_all(&v.to_le_bytes())?;
+                    w.write_all(&(quantizer.quantize(c, s) as i16).to_le_bytes())?;
                 }
                 WavFormat::Pcm24 => {
-                    let d = if dither { noise.next() } else { 0.0 };
-                    let v = (s * 8_388_607.0 + d)
-                        .round()
-                        .clamp(-8_388_608.0, 8_388_607.0) as i32;
-                    w.write_all(&v.to_le_bytes()[..3])?;
+                    w.write_all(&quantizer.quantize(c, s).to_le_bytes()[..3])?;
                 }
             }
         }

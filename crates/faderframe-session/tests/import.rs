@@ -166,12 +166,13 @@ fn import_onto_selected_track_at_position_and_bounce() {
             source: RenderSource::Master,
             format: WavFormat::Float32,
             tail_seconds: 0.0,
-            dither: false,
+            dither: faderframe_audio_files::Dither::Off,
             ..RenderSettings::defaults_for(s.project(), out.clone())
         })
         .unwrap();
     let written = job.join().unwrap();
-    assert_eq!(written, vec![out.clone()]);
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0].path, out);
     let f = WavFile::open(&out).unwrap();
     let mut l = vec![0.0f32; f.frames() as usize];
     f.read(0, &mut [&mut l], &mut Vec::new()).unwrap();

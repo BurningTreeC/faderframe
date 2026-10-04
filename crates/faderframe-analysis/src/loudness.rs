@@ -89,7 +89,7 @@ impl KWeighting {
 
 /// 4× oversampling peak detector (windowed-sinc polyphase interpolator).
 #[derive(Clone, Debug)]
-struct TruePeak {
+pub(crate) struct TruePeak {
     /// Taps per phase.
     phases: [[f64; TP_TAPS]; 4],
     history: [f64; TP_TAPS],
@@ -98,8 +98,13 @@ struct TruePeak {
 
 const TP_TAPS: usize = 12;
 
+/// [`TruePeak::run`] for input sample `n` returns the interpolated peak
+/// between samples `n - TP_LATENCY` and `n - TP_LATENCY + 1` (the
+/// interpolation filter is 48 taps long at 4×, centred 5.875 samples back).
+pub(crate) const TP_LATENCY: usize = 6;
+
 impl TruePeak {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let n = TP_TAPS * 4;
         let mut phases = [[0.0; TP_TAPS]; 4];
         let centre = (n - 1) as f64 / 2.0;
@@ -131,7 +136,7 @@ impl TruePeak {
 
     /// Peak of the interpolated signal around the new sample.
     #[inline]
-    fn run(&mut self, x: f32) -> f64 {
+    pub(crate) fn run(&mut self, x: f32) -> f64 {
         self.history[self.pos] = x as f64;
         self.pos = (self.pos + 1) % TP_TAPS;
         let mut peak = 0.0f64;

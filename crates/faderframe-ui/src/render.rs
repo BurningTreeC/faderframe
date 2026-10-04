@@ -2,13 +2,15 @@
 
 use crate::state::AppState;
 use faderframe_audio::{STANDARD_SAMPLE_RATES, format_sample_rate};
-use faderframe_audio_files::WavFormat;
+use faderframe_audio_files::{Dither, WavFormat};
 use faderframe_session::NoticeLevel;
+use faderframe_session::delivery::{DELIVERY_PRESETS, Finish, PeakHandling, describe};
 use faderframe_session::render::{
     RenderChannels, RenderJob, RenderRange, RenderSettings, RenderSource, resolve_range,
 };
 use gtk::prelude::*;
 use gtk::{gio, glib};
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -20,7 +22,15 @@ thread_local! {
 
 const FORMATS: [WavFormat; 3] = [WavFormat::Pcm24, WavFormat::Pcm16, WavFormat::Float32];
 
+/// Level choices (the `level` drop-down's order; 0 leaves it unchanged).
+const LEVEL_PEAK: u32 = 1;
+const LEVEL_CEILING: u32 = 2;
+const LEVEL_LOUDNESS: u32 = 3;
+
 struct Form {
+    preset: gtk::DropDown,
+    /// Set while a preset fills the form (its changes keep the preset).
+    applying: Cell<bool>,
     range: gtk::DropDown,
     bar_from: gtk::SpinButton,
     bar_to: gtk::SpinButton,
@@ -29,9 +39,13 @@ struct Form {
     rate: gtk::DropDown,
     channels: gtk::DropDown,
     tail: gtk::SpinButton,
-    normalize: gtk::CheckButton,
-    normalize_db: gtk::SpinButton,
-    dither: gtk::CheckButton,
+    level: gtk::DropDown,
+    peak_db: gtk::SpinButton,
+    lufs: gtk::SpinButton,
+    ceiling: gtk::SpinButton,
+    peaks: gtk::DropDown,
+    level_parts: Vec<(gtk::Widget, &'static [u32])>,
+    dither: gtk::DropDown,
     output: gtk::Entry,
     info: gtk::Label,
 }
@@ -77,12 +91,73 @@ impl Form {
                 RenderChannels::Stereo
             },
             tail_seconds: self.tail.value() as f32,
-            normalize_db: self
-                .normalize
-                .is_active()
-                .then(|| self.normalize_db.value() as f32),
-            dither: self.dither.is_active(),
+            normalize_db: (self.level.selected() == LEVEL_PEAK)
+                .then(|| self.peak_db.value() as f32),
+            finish: self.finish(),
+            dither: Dither::ALL[self.dither.selected() as usize % Dither::ALL.len()],
+            report: true,
             output: PathBuf::from(self.output.text().as_str()),
+        }
+    }
+
+    fn finish(&self) -> Finish {
+        let ceiling = Some(self.ceiling.value() as f32);
+        match self.level.selected() {
+            LEVEL_CEILING => Finish {
+                ceiling,
+                ..Finish::default()
+            },
+            LEVEL_LOUDNESS => Finish {
+                loudness: Some(self.lufs.value() as f32),
+                ceiling,
+                peaks: if self.peaks.selected() == 1 {
+                    PeakHandling::LowerGain
+                } else {
+                    PeakHandling::Limit
+                },
+            },
+            _ => Finish::default(),
+        }
+    }
+
+    /// Fill the form from delivery preset `i` (0 = custom: nothing).
+    fn apply_preset(&self, i: u32, project_rate: u32) {
+        let Some(p) = (i as usize)
+            .checked_sub(1)
+            .and_then(|i| DELIVERY_PRESETS.get(i))
+        else {
+            return;
+        };
+        self.applying.set(true);
+        if let Some(f) = FORMATS.iter().position(|f| *f == p.format) {
+            self.format.set_selected(f as u32);
+        }
+        let rate = p.sample_rate.filter(|r| *r != project_rate);
+        let rate_index = rate
+            .and_then(|r| STANDARD_SAMPLE_RATES.iter().position(|s| *s == r))
+            .map_or(0, |i| i as u32 + 1);
+        self.rate.set_selected(rate_index);
+        if let Some(d) = Dither::ALL.iter().position(|d| *d == p.dither) {
+            self.dither.set_selected(d as u32);
+        }
+        if let Some(c) = p.finish.ceiling {
+            self.ceiling.set_value(c as f64);
+        }
+        match p.finish.loudness {
+            Some(l) => {
+                self.lufs.set_value(l as f64);
+                self.level.set_selected(LEVEL_LOUDNESS);
+            }
+            None => self.level.set_selected(LEVEL_CEILING),
+        }
+        self.peaks.set_selected(0);
+        self.applying.set(false);
+    }
+
+    /// A choice changed by hand: the preset no longer describes the form.
+    fn edited(&self) {
+        if !self.applying.get() {
+            self.preset.set_selected(0);
         }
     }
 
@@ -93,7 +168,10 @@ impl Form {
         self.bar_from.set_sensitive(self.range.selected() == 2);
         self.bar_to.set_sensitive(self.range.selected() == 2);
         self.dither.set_sensitive(settings.format.is_integer());
-        self.normalize_db.set_sensitive(self.normalize.is_active());
+        let level = self.level.selected();
+        for (w, modes) in &self.level_parts {
+            w.set_visible(modes.contains(&level));
+        }
         let text = match resolve_range(p, settings.range) {
             Ok((a, b)) => {
                 let secs = p.timeline.tempo.musical_to_seconds(b)
@@ -146,6 +224,18 @@ fn labelled(grid: &gtk::Grid, y: i32, label: &str, w: &impl IsA<gtk::Widget>) {
     grid.attach(w, 1, y, 1, 1);
 }
 
+thread_local! {
+    static FORM: RefCell<Option<std::rc::Weak<Form>>> = const { RefCell::new(None) };
+}
+
+/// Open the window with delivery preset `preset` (1-based; 0 = custom).
+pub fn open_with_preset(app: &Rc<AppState>, preset: u32) {
+    open(app);
+    if let Some(form) = FORM.with(|f| f.borrow().as_ref().and_then(std::rc::Weak::upgrade)) {
+        form.preset.set_selected(preset);
+    }
+}
+
 pub fn open(app: &Rc<AppState>) {
     if let Some(win) = OPEN.with(|o| o.borrow().as_ref().and_then(|w| w.upgrade())) {
         win.present();
@@ -165,6 +255,12 @@ pub fn open(app: &Rc<AppState>) {
     grid.set_column_spacing(14);
     grid.add_css_class("audio-settings");
 
+    let mut preset_names = vec!["Custom"];
+    preset_names.extend(DELIVERY_PRESETS.iter().map(|p| p.name));
+    let preset = gtk::DropDown::from_strings(&preset_names);
+    preset.set_tooltip_text(Some(
+        "Fills in format, sample rate, dither and level for a destination",
+    ));
     let range = gtk::DropDown::from_strings(&["Entire project", "Loop range", "Bars"]);
     let bars = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let bar_from = gtk::SpinButton::with_range(1.0, 9999.0, 1.0);
@@ -186,13 +282,14 @@ pub fn open(app: &Rc<AppState>) {
     let range_box = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     range_box.append(&range);
     range_box.append(&bars);
-    labelled(&grid, 0, "Range", &range_box);
+    labelled(&grid, 0, "Delivery", &preset);
+    labelled(&grid, 1, "Range", &range_box);
 
     let source = gtk::DropDown::from_strings(&["Master mix", "Stems (one file per track)"]);
-    labelled(&grid, 1, "Source", &source);
+    labelled(&grid, 2, "Source", &source);
     let format_names: Vec<&str> = FORMATS.iter().map(|f| f.label()).collect();
     let format = gtk::DropDown::from_strings(&format_names);
-    labelled(&grid, 2, "Format", &format);
+    labelled(&grid, 3, "Format", &format);
     let project_rate = app.session.borrow().project().sample_rate;
     let mut rates = vec![format!(
         "Project rate ({})",
@@ -201,28 +298,59 @@ pub fn open(app: &Rc<AppState>) {
     rates.extend(STANDARD_SAMPLE_RATES.iter().map(|r| format_sample_rate(*r)));
     let rate_refs: Vec<&str> = rates.iter().map(String::as_str).collect();
     let rate = gtk::DropDown::from_strings(&rate_refs);
-    labelled(&grid, 3, "Sample rate", &rate);
+    labelled(&grid, 4, "Sample rate", &rate);
     let channels = gtk::DropDown::from_strings(&["Stereo", "Mono (summed)"]);
-    labelled(&grid, 4, "Channels", &channels);
+    labelled(&grid, 5, "Channels", &channels);
     let tail = gtk::SpinButton::with_range(0.0, 60.0, 0.5);
     tail.set_digits(1);
     tail.set_value(2.0);
     tail.set_tooltip_text(Some(
         "Extra seconds rendered after the range so echo/reverb tails ring out",
     ));
-    labelled(&grid, 5, "Tail (seconds)", &tail);
-    let norm_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let normalize = gtk::CheckButton::with_label("Normalise peak to");
-    let normalize_db = gtk::SpinButton::with_range(-24.0, 0.0, 0.1);
-    normalize_db.set_digits(1);
-    normalize_db.set_value(-1.0);
-    norm_box.append(&normalize);
-    norm_box.append(&normalize_db);
-    norm_box.append(&gtk::Label::new(Some("dBFS")));
-    labelled(&grid, 6, "Level", &norm_box);
-    let dither = gtk::CheckButton::with_label("TPDF dither (integer formats)");
-    dither.set_active(true);
-    labelled(&grid, 7, "Dither", &dither);
+    labelled(&grid, 6, "Tail (seconds)", &tail);
+    let level_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let level = gtk::DropDown::from_strings(&[
+        "Unchanged",
+        "Normalise peak",
+        "Limit true peak",
+        "Loudness target",
+    ]);
+    let spin = |lo: f64, hi: f64, step: f64, value: f64| {
+        let b = gtk::SpinButton::with_range(lo, hi, step);
+        b.set_digits(1);
+        b.set_value(value);
+        b
+    };
+    let peak_db = spin(-24.0, 0.0, 0.1, -1.0);
+    let lufs = spin(-36.0, -5.0, 0.5, -14.0);
+    let ceiling = spin(-6.0, 0.0, 0.1, -1.0);
+    let peaks = gtk::DropDown::from_strings(&["limit peaks", "use less gain"]);
+    peaks.set_tooltip_text(Some(
+        "When the gain would push the true peak over the ceiling: limit the peaks (the loudness reaches the target) or use less gain (it stays below)",
+    ));
+    let unit = |t: &str| gtk::Label::new(Some(t)).upcast::<gtk::Widget>();
+    level_box.append(&level);
+    let level_parts: Vec<(gtk::Widget, &'static [u32])> = vec![
+        (peak_db.clone().upcast(), &[LEVEL_PEAK]),
+        (unit("dBFS"), &[LEVEL_PEAK]),
+        (lufs.clone().upcast(), &[LEVEL_LOUDNESS]),
+        (unit("LUFS, true peak ≤"), &[LEVEL_LOUDNESS]),
+        (unit("true peak ≤"), &[LEVEL_CEILING]),
+        (ceiling.clone().upcast(), &[LEVEL_CEILING, LEVEL_LOUDNESS]),
+        (unit("dBTP"), &[LEVEL_CEILING, LEVEL_LOUDNESS]),
+        (peaks.clone().upcast(), &[LEVEL_LOUDNESS]),
+    ];
+    for (w, _) in &level_parts {
+        level_box.append(w);
+    }
+    labelled(&grid, 7, "Level", &level_box);
+    let dither_names: Vec<&str> = Dither::ALL.iter().map(|d| d.label()).collect();
+    let dither = gtk::DropDown::from_strings(&dither_names);
+    dither.set_selected(1);
+    dither.set_tooltip_text(Some(
+        "Integer formats only. Noise shaping (at 44.1 and 48 kHz) moves the dither noise out of the ear's most sensitive range — for 16-bit delivery",
+    ));
+    labelled(&grid, 8, "Dither", &dither);
     let out_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let output = gtk::Entry::new();
     output.set_text(&default_output(app).to_string_lossy());
@@ -230,15 +358,16 @@ pub fn open(app: &Rc<AppState>) {
     let choose = gtk::Button::with_label("Choose…");
     out_box.append(&output);
     out_box.append(&choose);
-    labelled(&grid, 8, "Output", &out_box);
+    labelled(&grid, 9, "Output", &out_box);
     let info = gtk::Label::new(None);
     info.set_xalign(0.0);
     info.set_wrap(true);
+    info.set_selectable(true);
     info.add_css_class("dim-label");
-    grid.attach(&info, 0, 9, 2, 1);
+    grid.attach(&info, 0, 10, 2, 1);
     let progress = gtk::ProgressBar::new();
     progress.set_show_text(true);
-    grid.attach(&progress, 0, 10, 2, 1);
+    grid.attach(&progress, 0, 11, 2, 1);
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     actions.set_halign(gtk::Align::End);
     let cancel = gtk::Button::with_label("Cancel");
@@ -247,10 +376,12 @@ pub fn open(app: &Rc<AppState>) {
     render.add_css_class("suggested-action");
     actions.append(&cancel);
     actions.append(&render);
-    grid.attach(&actions, 0, 11, 2, 1);
+    grid.attach(&actions, 0, 12, 2, 1);
     win.set_child(Some(&grid));
 
     let form = Rc::new(Form {
+        preset,
+        applying: Cell::new(false),
         range,
         bar_from,
         bar_to,
@@ -259,8 +390,12 @@ pub fn open(app: &Rc<AppState>) {
         rate,
         channels,
         tail,
-        normalize,
-        normalize_db,
+        level,
+        peak_db,
+        lufs,
+        ceiling,
+        peaks,
+        level_parts,
         dither,
         output,
         info,
@@ -277,9 +412,36 @@ pub fn open(app: &Rc<AppState>) {
             }
         }
     };
-    for dd in [&form.range, &form.format, &form.rate, &form.channels] {
+    for dd in [&form.range, &form.channels] {
         let r = refresh.clone();
         dd.connect_selected_notify(move |_| r());
+    }
+    // What a preset sets: changed by hand, the form is custom again.
+    for dd in [
+        &form.format,
+        &form.rate,
+        &form.level,
+        &form.peaks,
+        &form.dither,
+    ] {
+        let r = refresh.clone();
+        let f = Rc::clone(&form);
+        dd.connect_selected_notify(move |_| {
+            f.edited();
+            r();
+        });
+    }
+    for sb in [&form.lufs, &form.ceiling] {
+        let f = Rc::clone(&form);
+        sb.connect_value_changed(move |_| f.edited());
+    }
+    {
+        let r = refresh.clone();
+        let f = Rc::clone(&form);
+        form.preset.connect_selected_notify(move |d| {
+            f.apply_preset(d.selected(), project_rate);
+            r();
+        });
     }
     {
         let r = refresh.clone();
@@ -301,10 +463,6 @@ pub fn open(app: &Rc<AppState>) {
     for sb in [&form.bar_from, &form.bar_to, &form.tail] {
         let r = refresh.clone();
         sb.connect_value_changed(move |_| r());
-    }
-    {
-        let r = refresh.clone();
-        form.normalize.connect_toggled(move |_| r());
     }
 
     {
@@ -405,14 +563,25 @@ pub fn open(app: &Rc<AppState>) {
                             Ok(files) => {
                                 progress.set_fraction(1.0);
                                 progress.set_text(Some("Done"));
-                                let list: Vec<String> =
-                                    files.iter().map(|f| f.display().to_string()).collect();
+                                let list: Vec<String> = files
+                                    .iter()
+                                    .map(|f| {
+                                        let name = f.path.file_name().map_or_else(
+                                            || f.path.display().to_string(),
+                                            |n| n.to_string_lossy().to_string(),
+                                        );
+                                        match &f.finished {
+                                            Some(done) => format!("{name}: {}", describe(done)),
+                                            None => name,
+                                        }
+                                    })
+                                    .collect();
                                 (
                                     NoticeLevel::Info,
                                     format!(
-                                        "Rendered {} file(s): {}",
+                                        "Rendered {} file(s)\n{}",
                                         files.len(),
-                                        list.join(", ")
+                                        list.join("\n")
                                     ),
                                 )
                             }
@@ -442,5 +611,6 @@ pub fn open(app: &Rc<AppState>) {
         });
     }
     OPEN.with(|o| *o.borrow_mut() = Some(win.downgrade()));
+    FORM.with(|f| *f.borrow_mut() = Some(Rc::downgrade(&form)));
     win.present();
 }

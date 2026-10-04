@@ -22,6 +22,7 @@ pub mod notes;
 pub mod performance;
 pub use performance::{Load, PerformanceReport, PluginPerformance, TrackPerformance};
 pub mod analysis;
+pub mod delivery;
 pub mod editing;
 mod freeze;
 mod groups;

@@ -84,7 +84,8 @@ impl Session {
             tail_seconds: TAIL_SECONDS,
             normalize_db: None,
             format: WavFormat::Float32,
-            dither: false,
+            dither: faderframe_audio_files::Dither::Off,
+            report: false,
             ..RenderSettings::defaults_for(&copy, path.clone())
         };
         let job = render::start(copy, settings).map_err(|e| SessionError::Other(e.to_string()))?;

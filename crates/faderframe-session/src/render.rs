@@ -5,7 +5,8 @@
 //! than realtime. The project is cloned for the job, so editing can continue
 //! while it runs.
 
-use faderframe_audio_files::{WavFormat, write_wav};
+use crate::delivery::{Finish, Finished};
+use faderframe_audio_files::{Dither, WavFormat, write_wav_with};
 use faderframe_core::{TrackId, db_to_gain};
 use faderframe_engine::offline::OfflineRenderer;
 use faderframe_engine::{EngineConfig, render_generated_sources};
@@ -58,10 +59,14 @@ pub struct RenderSettings {
     pub channels: RenderChannels,
     /// Extra time after the range for reverb/echo tails.
     pub tail_seconds: f32,
-    /// Normalise to this peak level (dBFS).
+    /// Normalise to this peak level (dBFS; when `finish` does nothing).
     pub normalize_db: Option<f32>,
-    /// TPDF dither for integer formats.
-    pub dither: bool,
+    /// Loudness normalisation and true-peak limiting for delivery.
+    pub finish: Finish,
+    /// Dither for integer formats.
+    pub dither: Dither,
+    /// Measure every written file (loudness, true peak).
+    pub report: bool,
     /// File for a master render, directory for stems.
     pub output: PathBuf,
 }
@@ -76,7 +81,9 @@ impl RenderSettings {
             channels: RenderChannels::Stereo,
             tail_seconds: 2.0,
             normalize_db: None,
-            dither: true,
+            finish: Finish::default(),
+            dither: Dither::Tpdf,
+            report: true,
             output,
         }
     }
@@ -120,9 +127,18 @@ impl RenderProgress {
     }
 }
 
+/// One written file.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Rendered {
+    pub path: PathBuf,
+    /// What finishing did and how the file measures (`None` without
+    /// [`RenderSettings::report`] and finishing).
+    pub finished: Option<Finished>,
+}
+
 pub struct RenderJob {
     pub progress: Arc<RenderProgress>,
-    handle: Option<JoinHandle<Result<Vec<PathBuf>, RenderError>>>,
+    handle: Option<JoinHandle<Result<Vec<Rendered>, RenderError>>>,
 }
 
 impl RenderJob {
@@ -135,7 +151,7 @@ impl RenderJob {
     }
 
     /// Wait for the result (call after `is_finished`, or to block).
-    pub fn join(mut self) -> Result<Vec<PathBuf>, RenderError> {
+    pub fn join(mut self) -> Result<Vec<Rendered>, RenderError> {
         match self.handle.take().map(JoinHandle::join) {
             Some(Ok(r)) => r,
             Some(Err(_)) => Err(RenderError::Cancelled),
@@ -232,7 +248,7 @@ fn finish(
     mut audio: Vec<Vec<f32>>,
     settings: &RenderSettings,
     path: &Path,
-) -> Result<(), RenderError> {
+) -> Result<Rendered, RenderError> {
     if settings.channels == RenderChannels::First {
         audio.truncate(1);
     }
@@ -244,23 +260,43 @@ fn finish(
             .collect();
         audio = vec![mono];
     }
-    if let Some(target) = settings.normalize_db {
-        let peak = audio.iter().flatten().fold(0.0f32, |m, s| m.max(s.abs()));
-        if peak > 1e-9 {
-            let g = db_to_gain(target) / peak;
-            for ch in &mut audio {
-                for s in ch.iter_mut() {
-                    *s *= g;
+    let rate = settings.sample_rate;
+    let finished = if !settings.finish.is_none() {
+        Some(settings.finish.apply(&mut audio, rate))
+    } else {
+        let mut gain_db = 0.0;
+        if let Some(target) = settings.normalize_db {
+            let peak = audio.iter().flatten().fold(0.0f32, |m, s| m.max(s.abs()));
+            if peak > 1e-9 {
+                let g = db_to_gain(target) / peak;
+                gain_db = 20.0 * (g as f64).log10();
+                for ch in &mut audio {
+                    for s in ch.iter_mut() {
+                        *s *= g;
+                    }
                 }
             }
         }
-    }
-    let dither = settings.dither && settings.format.is_integer();
-    write_wav(path, &audio, settings.sample_rate, settings.format, dither).map_err(|source| {
+        settings.report.then(|| Finished {
+            gain_db,
+            limited_db: 0.0,
+            report: faderframe_analysis::delivery::measure(&audio, rate),
+        })
+    };
+    let dither = if settings.format.is_integer() {
+        settings.dither
+    } else {
+        Dither::Off
+    };
+    write_wav_with(path, &audio, rate, settings.format, dither).map_err(|source| {
         RenderError::Io {
             path: path.to_path_buf(),
             source,
         }
+    })?;
+    Ok(Rendered {
+        path: path.to_path_buf(),
+        finished,
     })
 }
 
@@ -343,7 +379,7 @@ pub fn start(project: Project, settings: RenderSettings) -> Result<RenderJob, Re
     let p = Arc::clone(&progress);
     let handle = std::thread::Builder::new()
         .name("faderframe-render".into())
-        .spawn(move || -> Result<Vec<PathBuf>, RenderError> {
+        .spawn(move || -> Result<Vec<Rendered>, RenderError> {
             // File paths are absolute here (see `Session::render`). Streams
             // are opened afresh: their page tables must not be shared with
             // the live engine.
@@ -354,8 +390,7 @@ pub fn start(project: Project, settings: RenderSettings) -> Result<RenderJob, Re
             let mut written = Vec::new();
             if stems.is_empty() {
                 let audio = render_one(&project, &settings, &sources, start, frames, &p)?;
-                finish(audio, &settings, &settings.output)?;
-                written.push(settings.output.clone());
+                written.push(finish(audio, &settings, &settings.output)?);
             } else {
                 std::fs::create_dir_all(&settings.output).map_err(|source| RenderError::Io {
                     path: settings.output.clone(),
@@ -372,8 +407,7 @@ pub fn start(project: Project, settings: RenderSettings) -> Result<RenderJob, Re
                         sanitize(&project.name),
                         sanitize(name)
                     ));
-                    finish(audio, &settings, &path)?;
-                    written.push(path);
+                    written.push(finish(audio, &settings, &path)?);
                 }
             }
             Ok(written)
@@ -412,7 +446,10 @@ mod tests {
         };
         let job = start(project.clone(), settings).unwrap();
         let files = job.join().unwrap();
-        assert_eq!(files, vec![path.clone()]);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, path);
+        let report = files[0].finished.unwrap().report;
+        assert!((report.sample_peak - -1.0).abs() < 1e-3, "{report:?}");
         let wav = read_wav(&path).unwrap();
         assert_eq!(wav.sample_rate, 44_100);
         assert_eq!(wav.channels.len(), 1);
@@ -446,7 +483,7 @@ mod tests {
             .join()
             .unwrap();
         assert_eq!(files.len(), stem_tracks(&project).len());
-        assert!(files.iter().all(|f| f.exists()));
+        assert!(files.iter().all(|f| f.path.exists()));
         std::fs::remove_dir_all(&dir).unwrap();
 
         let long = RenderSettings {
@@ -458,6 +495,28 @@ mod tests {
         let job = start(project, long).unwrap();
         job.cancel();
         assert!(matches!(job.join(), Err(RenderError::Cancelled)));
+    }
+
+    #[test]
+    fn delivery_renders_reach_the_loudness_target() {
+        let project = faderframe_project::demo::demo_project(48_000);
+        let path = tmp("delivery.wav");
+        let settings = RenderSettings {
+            range: RenderRange::Bars { start: 4, end: 8 },
+            finish: crate::delivery::DELIVERY_PRESETS[0].finish,
+            format: WavFormat::Pcm16,
+            dither: Dither::Shaped,
+            ..RenderSettings::defaults_for(&project, path.clone())
+        };
+        let files = start(project, settings).unwrap().join().unwrap();
+        let f = files[0].finished.unwrap();
+        assert!((f.report.integrated - -14.0).abs() < 0.1, "{f:?}");
+        assert!(f.report.true_peak <= -0.98, "{f:?}");
+        // The file holds what was measured (16-bit, dithered).
+        let wav = read_wav(&path).unwrap();
+        let again = faderframe_analysis::delivery::measure(&wav.channels, wav.sample_rate);
+        assert!((again.integrated - f.report.integrated).abs() < 0.05);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

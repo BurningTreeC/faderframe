@@ -605,6 +605,11 @@ pub fn install(app: &Rc<AppState>) {
                 });
             }
         }),
+        // Development aid: `render-preset:<n>` opens Render / Export with
+        // delivery preset n (1-based).
+        named("render-preset", |a, arg| {
+            crate::render::open_with_preset(a, arg.trim().parse().unwrap_or(0));
+        }),
         // Development aid: `log-levels:x` logs every track's meter (peak
         // dBFS, left/right) — scripted checks that a track makes sound.
         named("log-levels", |a, _| {

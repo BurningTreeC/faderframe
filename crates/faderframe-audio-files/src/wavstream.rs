@@ -4,6 +4,7 @@
 //! streamer can read any frame range with a single positional read
 //! (no decoder state, no seeking tables).
 
+use crate::dither::{Dither, Quantizer};
 use crate::wav::WavFormat;
 use std::fs::File;
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
@@ -13,22 +14,6 @@ fn bad(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
-/// Triangular-PDF dither noise in LSB units (deterministic xorshift).
-struct Tpdf(u64);
-
-impl Tpdf {
-    fn uniform(&mut self) -> f32 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        (self.0 >> 40) as f32 / (1u64 << 24) as f32 - 0.5
-    }
-
-    fn next(&mut self) -> f32 {
-        self.uniform() + self.uniform()
-    }
-}
-
 /// Incrementally written WAV file; sizes are patched in [`WavWriter::finish`].
 pub struct WavWriter {
     out: BufWriter<File>,
@@ -36,7 +21,7 @@ pub struct WavWriter {
     channels: u16,
     sample_rate: u32,
     format: WavFormat,
-    dither: Option<Tpdf>,
+    quantizer: Quantizer,
     frames: u64,
     scratch: Vec<u8>,
 }
@@ -57,7 +42,12 @@ impl WavWriter {
             channels: channels.max(1),
             sample_rate,
             format,
-            dither: (dither && format.is_integer()).then_some(Tpdf(0x2545_f491_4f6c_dd1d)),
+            quantizer: Quantizer::new(
+                format.bits(),
+                channels.max(1) as usize,
+                sample_rate,
+                if dither { Dither::Tpdf } else { Dither::Off },
+            ),
             frames: 0,
             scratch: Vec::new(),
         })
@@ -124,16 +114,11 @@ impl WavWriter {
                 match self.format {
                     WavFormat::Float32 => self.scratch.extend_from_slice(&s.to_le_bytes()),
                     WavFormat::Pcm16 => {
-                        let d = self.dither.as_mut().map_or(0.0, Tpdf::next);
-                        let v = (s * 32767.0 + d).round().clamp(-32768.0, 32767.0) as i16;
+                        let v = self.quantizer.quantize(c, s) as i16;
                         self.scratch.extend_from_slice(&v.to_le_bytes());
                     }
                     WavFormat::Pcm24 => {
-                        let d = self.dither.as_mut().map_or(0.0, Tpdf::next);
-                        let v = (s * 8_388_607.0 + d)
-                            .round()
-                            .clamp(-8_388_608.0, 8_388_607.0)
-                            as i32;
+                        let v = self.quantizer.quantize(c, s);
                         self.scratch.extend_from_slice(&v.to_le_bytes()[..3]);
                     }
                 }
