@@ -15,7 +15,7 @@ that keep it that way.
 ```text
 faderframe-app            binary: CLI parsing, logging, starts the GTK app
   └─ faderframe-ui        GTK 4 shell: windows, menus, dialogs, docking, canvas host
-       ├─ faderframe-view-arranger / -mixer / -pianoroll / -performance / -tools   (GTK-free views)
+       ├─ faderframe-view-arranger / -mixer / -pianoroll / -performance / -tools / -automation   (GTK-free views)
        │    └─ faderframe-ui-canvas   Painter trait, events, CanvasView, theme, console controls
        ├─ faderframe-audio-pipewire   native PipeWire backend (pw_filter, Linux)
        ├─ faderframe-audio-jack       JACK backend (JACK2 / pipewire-jack, Linux)
@@ -889,6 +889,17 @@ lanes are layout state, saved with the project). Lane header: parameter
 picker, mode, close. In the lane: click adds a point, drag moves it
 (snapped; Alt for free), double-click deletes, Ctrl+drag draws freehand,
 right-click sets segment shapes, clears the lane or changes the mode.
+
+**Automation view** (`faderframe-view-automation`, the bottom dock's
+Automation tab): a list of every automatable track with its lanes (mode,
+point count, arranger visibility; "+" adds a lane; "Selected Tracks"
+filters; All Read / All Off is one `SetAutomationModes` undo step) and a
+full-width editor for the selected lane over the whole song (value scale
+from the parameter's `AutomationParam`, bar ruler, loop, edit selection,
+playhead; Ctrl+wheel zooms). Point edits use `SetAutomationLane` inside
+gestures like the arranger's lanes; Write Value puts the control's value
+at the playhead or over the edit selection (with jumps at its edges),
+Thin drops points within half a percent of the lane's height.
 
 ### Track presets
 

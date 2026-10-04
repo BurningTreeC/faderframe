@@ -163,7 +163,13 @@ Contrast:
 * Automation for every automatable parameter — volume, pan, mute, sends,
   plugin parameters and bypass: lanes under each track (A button / A key),
   point editing and freehand drawing with curve shapes, Read / Touch /
-  Latch / Write modes; faders follow the automation while playing.
+  Latch / Write modes; faders follow the automation while playing. The
+  Automation tab in the bottom dock lists every lane of the project by
+  track (modes, point counts, shown in the arranger or not; "+" adds a
+  lane; all lanes to Read or Off at once) and edits the selected lane at
+  full width over the whole song — add, drag and delete points, curve
+  shapes, Write Value at the playhead or over the edit selection, Thin,
+  Clear, Delete.
 * Multicore engine: tracks, buses and plugins are processed in parallel on
   all cores (critical path first, realtime priority, flush-to-zero), with
   output bit-identical to single-threaded processing; Preferences → Audio

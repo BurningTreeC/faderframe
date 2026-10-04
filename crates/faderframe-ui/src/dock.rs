@@ -56,9 +56,8 @@ fn create_view(app: &Rc<AppState>, kind: ViewKind) -> ViewHost {
         ),
         ViewKind::Automation => ViewHost::new(
             app,
-            Box::new(crate::placeholder::PlaceholderView::new(
-                "Automation",
-                "Automation lanes are edited in the arranger: press A (or a track's A button) to show them.",
+            Box::new(faderframe_view_automation::AutomationView::new(
+                theme.clone(),
             )),
             false,
             false,

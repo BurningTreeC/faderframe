@@ -19,7 +19,6 @@ mod icons;
 mod midi_prefs;
 pub mod painter;
 mod paths;
-mod placeholder;
 mod plugin_browser;
 mod plugin_window;
 mod plugins;

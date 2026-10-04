@@ -475,6 +475,26 @@ impl Session {
         })
     }
 
+    /// Set the mode of several lanes as one undo step.
+    pub(crate) fn set_lane_modes(
+        &mut self,
+        lanes: &[(TrackId, AutomationLaneId)],
+        mode: AutomationMode,
+    ) -> Result<()> {
+        let commands: Vec<Command> = lanes
+            .iter()
+            .filter_map(|&(track, id)| {
+                let t = self.project.track(track)?;
+                let l = t.automation.lanes.iter().find(|l| l.id == id)?;
+                (l.mode != mode).then(|| Command::SetAutomationLane {
+                    track,
+                    lane: Box::new(AutomationLane { mode, ..l.clone() }),
+                })
+            })
+            .collect();
+        self.batch("Automation Mode", commands)
+    }
+
     // --- writing -----------------------------------------------------------------------
 
     /// The lane (and its mode) a command would write, if writing applies.

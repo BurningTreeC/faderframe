@@ -355,6 +355,11 @@ pub enum Action {
         lane: faderframe_core::AutomationLaneId,
         mode: AutomationMode,
     },
+    /// One mode for several lanes (one undo step).
+    SetAutomationModes {
+        lanes: Vec<(TrackId, faderframe_core::AutomationLaneId)>,
+        mode: AutomationMode,
+    },
     /// Clear performance peaks, history and callback statistics.
     ResetPerformance,
     // --- piano roll (ids allocated by the session) ---
@@ -2402,6 +2407,7 @@ impl Session {
             }
             Action::HideAutomationLane(lane) => self.hide_automation(lane),
             Action::ToggleTrackAutomation(track) => self.toggle_track_automation(track)?,
+            Action::SetAutomationModes { lanes, mode } => self.set_lane_modes(&lanes, mode)?,
             Action::SetAutomationMode { track, lane, mode } => {
                 self.set_lane_mode(track, lane, mode)?
             }
