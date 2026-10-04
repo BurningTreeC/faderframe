@@ -74,7 +74,7 @@ struct Scrub {
 }
 
 /// Realtime transport state (audio thread).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TransportState {
     playing: bool,
     recording: bool,

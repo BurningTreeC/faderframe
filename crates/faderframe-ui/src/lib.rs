@@ -119,6 +119,11 @@ fn build_session(options: &RunOptions, prefs: &prefs::Preferences) -> (Session, 
     if let Err(e) = session.set_plugin_double_precision(prefs.plugin_double_precision) {
         tracing::warn!("plugin precision: {e}");
     }
+    let ahead = (prefs.render_ahead_ms > 0)
+        .then(|| std::time::Duration::from_millis(u64::from(prefs.render_ahead_ms)));
+    if let Err(e) = session.set_render_ahead(ahead) {
+        tracing::warn!("render ahead: {e}");
+    }
     if let Some(p) = gone {
         session.notify(
             faderframe_session::NoticeLevel::Warning,

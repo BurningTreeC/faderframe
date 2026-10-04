@@ -11,7 +11,9 @@ pub struct EngineContext {
     /// Playback jumped (stop, locate or loop wrap) at the start of this
     /// block; note generators must release sounding notes.
     pub discontinuity: bool,
-    pub timeline: Box<TimelineSnapshot>,
+    /// Shared with the anticipator (see [`crate::ahead`]); dropped only on
+    /// the control thread.
+    pub timeline: Arc<TimelineSnapshot>,
     pub params: Arc<ParamTable>,
     /// Automated values of strip/send parameters (same slots as `params`),
     /// written by the processors for the UI.
@@ -21,4 +23,7 @@ pub struct EngineContext {
     pub scope: Arc<faderframe_realtime::ScopeRing>,
     /// Live MIDI input of this chunk (see [`crate::midi`]).
     pub midi_input: crate::midi::MidiInputBlock,
+    /// The render-ahead sequence this block belongs to (0 without
+    /// anticipation).
+    pub ahead_seq: u64,
 }

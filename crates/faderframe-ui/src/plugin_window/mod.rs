@@ -445,6 +445,19 @@ pub fn tick(app: &Rc<AppState>) {
     if n.is_multiple_of(30) {
         track_positions(app);
     }
+    // Plugins being edited play on the audio thread (not rendered ahead):
+    // what is turned is heard at once.
+    let edited: std::collections::HashSet<PluginInstanceId> = EDITORS.with(|e| {
+        e.native
+            .borrow()
+            .iter()
+            .map(|n| n.plugin)
+            .chain(e.generic.borrow().keys().copied())
+            .collect()
+    });
+    if let Ok(mut s) = app.session.try_borrow_mut() {
+        s.set_plugins_being_edited(&edited);
+    }
     let natives: Vec<(PluginInstanceId, Host, bool)> = EDITORS.with(|e| {
         e.native
             .borrow()

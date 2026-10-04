@@ -726,6 +726,16 @@ pub fn install(app: &Rc<AppState>) {
                 s.plugin_current_program(plugin)
             );
         }),
+        // Development aid: `log-ahead:x` logs which tracks are rendered
+        // ahead and how many of their blocks were late.
+        named("log-ahead", |a, _| {
+            let s = a.session.borrow();
+            let (tracks, late) = s.render_ahead_status();
+            tracing::info!(
+                "render ahead {:?}: {tracks} tracks, {late} late blocks",
+                s.render_ahead()
+            );
+        }),
         // Development aid: `plugin-precision:<0|1>` (64-bit processing).
         named("plugin-precision", |a, arg| {
             let on = arg.trim() == "1";

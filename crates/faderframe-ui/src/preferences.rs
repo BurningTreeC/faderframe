@@ -116,14 +116,52 @@ fn audio_page(app: &Rc<AppState>, alive: &Rc<std::cell::Cell<bool>>) -> gtk::Wid
     }
     row(&g, 4, "Plugin precision", &precision);
 
+    // Render ahead: applies at once.
+    const AHEAD: [(u32, &str); 4] = [
+        (0, "Off: every track on the audio thread"),
+        (100, "100 ms"),
+        (200, "200 ms (recommended)"),
+        (500, "500 ms"),
+    ];
+    let ahead_names: Vec<&str> = AHEAD.iter().map(|(_, n)| *n).collect();
+    let ahead = gtk::DropDown::from_strings(&ahead_names);
+    let now_ms = app
+        .session
+        .borrow()
+        .render_ahead()
+        .map_or(0, |d| d.as_millis() as u32);
+    ahead.set_selected(AHEAD.iter().position(|(ms, _)| *ms == now_ms).unwrap_or(0) as u32);
+    ahead.set_tooltip_text(Some(
+        "Tracks nobody plays live are rendered this far ahead on threads of their own, so \
+         heavy plugins need not finish within one buffer. Armed and live tracks and tracks \
+         with a plugin editor open play immediately; changes to the others' plugins and clips \
+         are heard after this time.",
+    ));
+    {
+        let weak = Rc::downgrade(app);
+        ahead.connect_selected_notify(move |d| {
+            let ms = AHEAD[(d.selected() as usize).min(AHEAD.len() - 1)].0;
+            let mut p = Preferences::load();
+            p.render_ahead_ms = ms;
+            if let Err(e) = p.save() {
+                tracing::warn!("cannot save preferences: {e}");
+            }
+            if let Some(app) = weak.upgrade() {
+                let lookahead = (ms > 0).then(|| Duration::from_millis(u64::from(ms)));
+                app.with_session(|s| s.set_render_ahead(lookahead));
+            }
+        });
+    }
+    row(&g, 5, "Render ahead", &ahead);
+
     let status = gtk::Label::new(None);
     status.set_xalign(0.0);
     status.set_selectable(true);
-    row(&g, 5, "Stream", &status);
+    row(&g, 6, "Stream", &status);
     let stats = gtk::Label::new(None);
     stats.set_xalign(0.0);
     stats.add_css_class("monospace");
-    row(&g, 6, "DSP load", &stats);
+    row(&g, 7, "DSP load", &stats);
 
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let apply = gtk::Button::with_label("Apply & Restart Audio");
@@ -136,7 +174,7 @@ fn audio_page(app: &Rc<AppState>, alive: &Rc<std::cell::Cell<bool>>) -> gtk::Wid
     buttons.append(&apply);
     buttons.append(&live);
     buttons.append(&reset);
-    g.attach(&buttons, 1, 7, 1, 1);
+    g.attach(&buttons, 1, 8, 1, 1);
     g.attach(
         &note(
             "JACK and PipeWire own the sample rate: FaderFrame follows whatever the server runs at \
@@ -146,7 +184,7 @@ fn audio_page(app: &Rc<AppState>, alive: &Rc<std::cell::Cell<bool>>) -> gtk::Wid
              the audio thread's priority.",
         ),
         0,
-        8,
+        9,
         2,
         1,
     );
@@ -237,8 +275,14 @@ fn audio_page(app: &Rc<AppState>, alive: &Rc<std::cell::Cell<bool>>) -> gtk::Wid
         let m = s.metrics();
         let us = |ns: u64| ns as f64 / 1000.0;
         let (resident, disk_misses) = s.streaming_stats();
+        let (ahead_tracks, ahead_late) = s.render_ahead_status();
+        let ahead = if s.render_ahead().is_some() {
+            format!("\nrendered ahead: {ahead_tracks} tracks · {ahead_late} late blocks")
+        } else {
+            String::new()
+        };
         stats.set_text(&format!(
-            "p50 {:.0} µs · p95 {:.0} µs · p99 {:.0} µs · max {:.0} µs\n{} callbacks · {} deadline misses · {} xruns · budget {:.0} µs\ndisk: {:.1} MiB resident · {} late reads\n{} processing thread{}{}",
+            "p50 {:.0} µs · p95 {:.0} µs · p99 {:.0} µs · max {:.0} µs\n{} callbacks · {} deadline misses · {} xruns · budget {:.0} µs\ndisk: {:.1} MiB resident · {} late reads\n{} processing thread{}{}{ahead}",
             us(m.p50_ns),
             us(m.p95_ns),
             us(m.p99_ns),

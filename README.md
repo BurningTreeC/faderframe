@@ -186,6 +186,12 @@ Contrast:
   all cores (critical path first, realtime priority, flush-to-zero), with
   output bit-identical to single-threaded processing; Preferences → Audio
   → Processing threads.
+* Render ahead (anticipative processing, on by default): tracks nobody
+  plays live are rendered 200 ms ahead of the playhead on threads of their
+  own, so heavy plugin chains need not finish within one tiny buffer —
+  armed and live tracks, tracks with a plugin editor open, faders and
+  sends stay immediate. With 64 tracks of six effects at 64-frame buffers
+  the audio thread's worst callback went from 1.3 ms to 81 µs.
 * Plugins: built-in synth/echo/compressor/gain, CLAP and VST3 effects and
   instruments on every platform and Audio Units on macOS, found by a
   crash-safe background scan (Audio Units: the system's registry) and
