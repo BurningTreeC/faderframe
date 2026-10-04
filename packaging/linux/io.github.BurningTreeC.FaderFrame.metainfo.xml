@@ -77,6 +77,7 @@
           <li>Effects: an oversampled saturator, a utility with vectorscope, a tempo-synced delay with tape and analogue styles, an algorithmic reverb in five types, chorus, ensemble, flanger, phaser and vibrato, and a tuner.</li>
           <li>Instruments: a virtual analogue synth with unison, two envelopes and an LFO, a sampler that plays a sample across the keys or an SFZ instrument, and a sixteen-pad drum sampler; their samples are copied into the project.</li>
           <li>Every device has an editor of its own with automation and MIDI learn from its controls.</li>
+          <li>Mastering meters: crest factor and the DR value next to the loudness range and PLR.</li>
         </ul>
       </description>
     </release>

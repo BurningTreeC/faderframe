@@ -699,7 +699,8 @@ mod tests {
         assert_eq!(params, &[1, 2, 3]);
         assert_eq!(back, doc);
         let moved = map_paths(&packed, |p| Path::new("/y").join(p.file_name().unwrap())).unwrap();
-        assert_eq!(unpack(&moved).unwrap().1.file(2), Some("/y/kick.wav"));
+        let want = Path::new("/y").join("kick.wav");
+        assert_eq!(unpack(&moved).unwrap().1.file(2), want.to_str());
         assert_eq!(unpack(&moved).unwrap().0, &[1, 2, 3]);
         assert!(unpack(&[0; 12]).is_none(), "a plain parameter block");
         doc.set(2, None);
