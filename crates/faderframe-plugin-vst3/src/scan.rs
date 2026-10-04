@@ -18,16 +18,33 @@ use vst3::Steinberg::{
 /// The VST3 class category of processors.
 const AUDIO_MODULE_CLASS: &str = "Audio Module Class";
 
-/// Standard VST3 locations, `$VST3_PATH` first.
+/// Standard VST3 locations of this platform, `$VST3_PATH` and a portable
+/// installation's `Plug-Ins/VST3` first.
 pub fn default_paths() -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = std::env::var_os("VST3_PATH")
         .map(|v| std::env::split_paths(&v).collect())
         .unwrap_or_default();
-    if let Some(h) = std::env::var_os("HOME").map(PathBuf::from) {
-        out.push(h.join(".vst3"));
+    out.extend(faderframe_core::paths::portable_plugins("VST3"));
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if cfg!(windows) {
+        if let Some(p) = std::env::var_os("COMMONPROGRAMFILES") {
+            out.push(PathBuf::from(p).join("VST3"));
+        }
+        if let Some(p) = std::env::var_os("LOCALAPPDATA") {
+            out.push(PathBuf::from(p).join("Programs/Common/VST3"));
+        }
+    } else if cfg!(target_os = "macos") {
+        if let Some(h) = &home {
+            out.push(h.join("Library/Audio/Plug-Ins/VST3"));
+        }
+        out.push("/Library/Audio/Plug-Ins/VST3".into());
+    } else {
+        if let Some(h) = &home {
+            out.push(h.join(".vst3"));
+        }
+        out.push("/usr/lib/vst3".into());
+        out.push("/usr/local/lib/vst3".into());
     }
-    out.push("/usr/lib/vst3".into());
-    out.push("/usr/local/lib/vst3".into());
     out
 }
 

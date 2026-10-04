@@ -1,0 +1,23 @@
+#!/bin/sh
+# Runs FaderFrame from this folder: the bundled GTK libraries, schemas,
+# icons and image loaders are used, the system's are left alone. With a
+# "FaderFrame Data" folder next to this script FaderFrame is portable (its
+# settings and data stay in there).
+here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+export LD_LIBRARY_PATH="$here/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export XDG_DATA_DIRS="$here/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+export GSETTINGS_SCHEMA_DIR="$here/share/glib-2.0/schemas"
+# No GIO modules of the system's GLib; GTK's own settings stay in memory.
+export GIO_MODULE_DIR="$here/lib/gio/modules"
+export GSETTINGS_BACKEND=memory
+loaders="$here/lib/gdk-pixbuf-2.0/2.10.0"
+if [ -f "$loaders/loaders.cache.in" ]; then
+    cache="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/faderframe-loaders-$(id -u).cache"
+    sed "s|@ROOT@|$here|g" "$loaders/loaders.cache.in" >"$cache" &&
+        export GDK_PIXBUF_MODULE_FILE="$cache"
+fi
+# Portable: the graphics driver's shader cache stays in the folder too.
+if [ -d "$here/FaderFrame Data" ]; then
+    export MESA_SHADER_CACHE_DIR="$here/FaderFrame Data/Cache/mesa"
+fi
+exec "$here/bin/faderframe" "$@"

@@ -278,6 +278,20 @@ fn general_page(app: &Rc<AppState>) -> gtk::Widget {
     let current = app.theme.borrow().id;
     theme.set_selected(themes.iter().position(|t| t.id == current).unwrap_or(0) as u32);
     row(&g, 3, "Theme", &theme);
+    let storage = match faderframe_core::paths::portable_root() {
+        Some(dir) => format!(
+            "Portable: settings, caches, presets and unsaved recordings are kept in {}",
+            dir.display()
+        ),
+        None => format!(
+            "In your profile ({}). Put a folder named “{}” next to the program to make a copy portable.",
+            crate::paths::config_dir().display(),
+            faderframe_core::paths::PORTABLE_FOLDER
+        ),
+    };
+    let storage = note(&storage);
+    storage.set_wrap(true);
+    row(&g, 4, "Data", &storage);
     {
         let weak = Rc::downgrade(app);
         theme.connect_selected_notify(move |d| {

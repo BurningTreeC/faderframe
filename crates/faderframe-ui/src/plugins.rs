@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 fn cache_path(name: &str) -> PathBuf {
-    gtk::glib::user_cache_dir().join("faderframe").join(name)
+    crate::paths::cache_dir().join(name)
 }
 
 const CLAP_CACHE: &str = "clap-scan.json";

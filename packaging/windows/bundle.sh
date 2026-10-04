@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Build dist/FaderFrame (a relocatable folder: bin/ with the program and
 # every DLL it needs, share/ with GTK's schemas and icons, lib/ with the
-# image loaders), dist/FaderFrame-<version>-windows-x64.zip and, when Inno
-# Setup is installed, the installer. Run in an MSYS2 UCRT64 shell:
+# image loaders), the installer (when Inno Setup is installed) and
+# dist/FaderFrame-<version>-windows-x64-portable.zip — the folder with a
+# "FaderFrame Data" folder, which makes it portable. Run in an MSYS2 UCRT64 shell:
 #
 #   pacman -S mingw-w64-ucrt-x86_64-{gtk4,rust,pkgconf,gcc,librsvg,python,adwaita-icon-theme} zip
 #   cargo build --release -p faderframe-app
@@ -56,11 +57,8 @@ fi
 cp LICENSE THIRD_PARTY_LICENSES.md "$out/"
 python3 packaging/icons.py ico packaging/icons/io.github.BurningTreeC.FaderFrame.svg "$out/faderframe.ico"
 
-zip_name=FaderFrame-$version-windows-x64.zip
-rm -f "dist/$zip_name"
-(cd dist && zip -qr "$zip_name" FaderFrame)
-echo "dist/$zip_name"
-
+# The installer first (an installed copy uses the user's profile), then
+# the portable zip with its data folder.
 iscc=${ISCC:-"/c/Program Files (x86)/Inno Setup 6/ISCC.exe"}
 if [ -x "$iscc" ]; then
     "$iscc" -Q "-DVersion=$version" "-DSource=$(cygpath -w "$root/$out")" \
@@ -69,3 +67,10 @@ if [ -x "$iscc" ]; then
 else
     echo "Inno Setup not found ($iscc): no installer built"
 fi
+
+mkdir -p "$out/FaderFrame Data"
+cp packaging/windows/README.txt "$out/README.txt"
+zip_name=FaderFrame-$version-windows-x64-portable.zip
+rm -f "dist/$zip_name"
+(cd dist && zip -qr "$zip_name" FaderFrame)
+echo "dist/$zip_name"

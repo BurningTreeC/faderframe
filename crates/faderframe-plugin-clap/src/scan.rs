@@ -10,11 +10,13 @@ use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Standard CLAP search paths (the CLAP spec's list), `$CLAP_PATH` first.
+/// Standard CLAP search paths (the CLAP spec's list), `$CLAP_PATH` and a
+/// portable installation's `Plug-Ins/CLAP` first.
 pub fn default_paths() -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = std::env::var_os("CLAP_PATH")
         .map(|v| std::env::split_paths(&v).collect())
         .unwrap_or_default();
+    out.extend(faderframe_core::paths::portable_plugins("CLAP"));
     let home = std::env::var_os("HOME").map(PathBuf::from);
     if cfg!(target_os = "linux") {
         if let Some(h) = &home {

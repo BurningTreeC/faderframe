@@ -11,6 +11,7 @@ pub mod channel;
 pub mod gain;
 pub mod id;
 pub mod pan;
+pub mod paths;
 
 pub use channel::ChannelLayout;
 pub use gain::{Decibels, FaderLaw, db_to_gain, gain_to_db};

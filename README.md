@@ -278,13 +278,24 @@ of them for a `v*` tag and attaches them to the GitHub release.
 
 | Platform | Package | How |
 |---|---|---|
+| Linux | portable tarball (GTK bundled; runs in place, `install.sh` installs it) | `cargo build --release && packaging/linux/tarball.sh` |
 | Linux | Flatpak (GNOME 51 runtime) | `flatpak-builder --user --install build-dir packaging/flatpak/io.github.BurningTreeC.FaderFrame.yml` |
-| Linux | system install (binary, desktop entry, AppStream, MIME type, icon) | `cargo build --release && sudo packaging/linux/install.sh /usr/local` |
+| Linux | system install from source (binary, desktop entry, AppStream, MIME type, icon) | `cargo build --release && sudo packaging/linux/install.sh /usr/local` |
 | macOS | `FaderFrame.app` in a DMG (GTK bundled, ad-hoc signed) | `brew install gtk4 adwaita-icon-theme librsvg pkgconf && packaging/macos/bundle.sh` |
 | Windows | installer (Inno Setup) and portable zip | in MSYS2 UCRT64: `packaging/windows/bundle.sh` |
 
 The macOS app is not notarised: open it the first time with right-click →
 Open.
+
+**Portable mode.** With a folder named `FaderFrame Data` next to the
+program, FaderFrame keeps everything it would put into your profile in
+there — settings, plugin caches, presets, recordings of unsaved projects —
+and also loads CLAP and VST3 plugins from its `Plug-Ins/CLAP` and
+`Plug-Ins/VST3`. The Linux tarball and the Windows zip come with the
+folder, so they run from a USB stick as they are; on macOS put the folder
+next to `FaderFrame.app` (after moving the app out of the download
+folder, which macOS runs from a read-only copy). Preferences → General
+shows where the data goes.
 
 ### Shortcuts
 

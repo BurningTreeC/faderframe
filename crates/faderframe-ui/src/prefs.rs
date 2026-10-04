@@ -1,9 +1,9 @@
-//! User preferences persisted in `$XDG_CONFIG_HOME/faderframe/preferences.json`.
+//! User preferences persisted in `$XDG_CONFIG_HOME/faderframe/preferences.json`
+//! (portable mode: the portable folder's `Settings`).
 
 use crate::state::BackendChoice;
 use faderframe_engine::MetronomeMode;
 use faderframe_session::{LoopRecordMode, RecordMode, RecordSettings};
-use gtk::glib;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -99,9 +99,7 @@ impl Preferences {
     }
 
     pub fn path() -> PathBuf {
-        glib::user_config_dir()
-            .join("faderframe")
-            .join("preferences.json")
+        crate::paths::config_dir().join("preferences.json")
     }
 
     pub fn load() -> Self {

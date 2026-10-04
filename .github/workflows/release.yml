@@ -1,7 +1,8 @@
 name: Release
 
-# Packages FaderFrame: a Flatpak bundle (Linux), DMGs (macOS on Apple
-# Silicon and Intel), an installer and a portable zip (Windows). A tag
+# Packages FaderFrame: a Flatpak bundle and a portable tarball (Linux),
+# DMGs (macOS on Apple Silicon and Intel), an installer and a portable zip
+# (Windows). A tag
 # `v*` publishes them as a GitHub release; a manual run keeps them as
 # workflow artifacts.
 
@@ -30,6 +31,28 @@ jobs:
           bundle: FaderFrame-linux-x86_64.flatpak
           manifest-path: packaging/flatpak/io.github.BurningTreeC.FaderFrame.yml
           cache-key: flatpak-builder-${{ github.sha }}
+
+  linux-tarball:
+    name: Linux tarball
+    # The oldest GTK 4.14 distribution: the tarball runs on anything newer.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev pkg-config libjack-jackd2-dev libasound2-dev \
+            libpipewire-0.3-dev libclang-dev librsvg2-common adwaita-icon-theme
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release -p faderframe-app
+      - name: Portable tarball
+        run: packaging/linux/tarball.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-tarball
+          path: dist/*.tar.xz
 
   macos:
     name: macOS (${{ matrix.arch }})
@@ -97,7 +120,7 @@ jobs:
   release:
     name: Publish
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [flatpak, macos, windows]
+    needs: [flatpak, linux-tarball, macos, windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write

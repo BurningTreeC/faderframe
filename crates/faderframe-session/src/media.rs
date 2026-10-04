@@ -15,8 +15,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-/// Per-user data directory (`$XDG_DATA_HOME/faderframe` on Linux).
+/// Per-user data directory (`$XDG_DATA_HOME/faderframe` on Linux; the
+/// portable folder's `Data` in portable mode).
 pub fn data_dir() -> PathBuf {
+    if let Some(dir) = faderframe_core::paths::portable("Data") {
+        return dir;
+    }
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())

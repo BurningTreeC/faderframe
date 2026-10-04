@@ -62,8 +62,20 @@ script, the Flatpak manifest, the macOS app bundle and DMG script (GTK
 bundled by `bundle_dylibs.py`, which copies every non-system library and
 rewrites the install names, resolving `@rpath` like dyld; a launcher
 pointing GTK at the bundle's data)
-and the Windows bundle script with its Inno Setup installer. The *Release*
-workflow runs them for `v*` tags.
+the Windows bundle script with its Inno Setup installer and portable zip,
+and the portable Linux tarball (`tarball.sh`: the program, GTK and the
+libraries it needs except the C runtime, graphics drivers, display and
+audio server clients and fonts, schemas, icon themes and image loaders;
+a launcher that runs it in place and an `install.sh` for a per-user or
+system-wide installation). The *Release* workflow runs them for `v*` tags.
+
+Portable mode (`faderframe_core::paths`): a `FaderFrame Data` folder next
+to the executable, one level up (the `bin/` layouts) or beside
+`FaderFrame.app` — or `FADERFRAME_DATA_DIR` — takes every per-user file:
+`Settings` (preferences), `Cache` (plugin scans, generated icons; the Linux
+launcher also points Mesa's shader cache there), `Data` (presets, track
+presets, unsaved recordings) and `Plug-Ins/{CLAP,VST3}`, searched before
+the standard plugin folders.
 
 ## 2. Control world vs realtime world
 

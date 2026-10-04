@@ -4,8 +4,8 @@
 //! windows show the application icon even when FaderFrame is not
 //! installed.
 
+use gtk::gdk;
 use gtk::prelude::*;
-use gtk::{gdk, glib};
 
 const METRONOME: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
 <path fill="#2e3436" fill-rule="evenodd" d="M5.6 1h4.8l3 14H2.6zM6.6 2.6 4.4 13.5h7.2L9.4 2.6z"/>
@@ -28,7 +28,7 @@ pub fn install() {
     let Some(display) = gdk::Display::default() else {
         return;
     };
-    let dir = glib::user_cache_dir().join("faderframe").join("icons");
+    let dir = crate::paths::cache_dir().join("icons");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::warn!("cannot create {}: {e}", dir.display());
         return;
