@@ -414,7 +414,12 @@ pub fn build_graph(
             used_rings.push(Arc::clone(&ring));
             let reader = b.add_node(
                 NodeSpec::new(format!("{} · Ahead", t.name))
-                    .key(node_key(t.id, Role::Ahead, u64::from(latency), &[layout]))
+                    .key(node_key(
+                        t.id,
+                        Role::Ahead,
+                        u64::from(latency) ^ ring.identity().rotate_left(17),
+                        &[layout],
+                    ))
                     .group(gi)
                     .audio_out(layout),
                 Box::new(AheadReader::new(ring, latency, Arc::clone(&plan.misses))),
@@ -826,7 +831,7 @@ fn build_ahead_chain(
     }
     let writer = ab.add_node(
         NodeSpec::new(format!("{} · To Ring", t.name))
-            .key(node_key(t.id, Role::Ahead, 1, &[layout]))
+            .key(node_key(t.id, Role::Ahead, 1 ^ ring.identity(), &[layout]))
             .audio_in(layout),
         Box::new(AheadWriter::new(Arc::clone(ring))),
     );

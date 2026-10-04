@@ -196,3 +196,37 @@ fn a_track_played_live_leaves_the_ahead_graph() {
     assert!(ahead.r.controller.ahead_tracks().contains(&synth));
     ahead.run(4, false);
 }
+
+#[test]
+fn changing_the_lookahead_keeps_every_track_sounding() {
+    let project = stateless_project();
+    let sources = render_generated_sources(&project, SR);
+    let mut plain = Run::new(&project, false);
+    let mut ahead = Run::new(&project, true);
+    ahead.run(20, true);
+    let tracks = ahead.r.controller.ahead_tracks().len();
+    assert!(tracks > 0);
+    // A longer lookahead while stopped: new rings, a new anticipator, the
+    // same tracks rendered ahead.
+    ahead
+        .r
+        .controller
+        .set_render_ahead(Some(Duration::from_millis(300)), 2);
+    ahead
+        .r
+        .controller
+        .sync(&project, &sources, Impact::Graph)
+        .unwrap();
+    assert_eq!(ahead.r.controller.ahead_tracks().len(), tracks);
+    ahead.run(20, true);
+    for run in [&mut plain, &mut ahead] {
+        run.command(TransportCommand::Play);
+    }
+    let blocks = 2 * SR as usize / BLOCK;
+    plain.run(blocks, false);
+    ahead.run(blocks, true);
+    let (both, differ) = compare(&plain, &ahead);
+    assert!(both > SR as usize, "heard together: {both}");
+    assert_eq!(differ, 0, "{differ} of {both} samples differ");
+    assert_eq!(ahead.r.controller.ahead_misses(), 0, "never late");
+}

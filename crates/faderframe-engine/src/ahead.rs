@@ -106,6 +106,12 @@ impl AheadRing {
         self.capacity
     }
 
+    /// Tells rings apart in node keys: a new ring needs new nodes (an
+    /// adopted reader would keep reading the old one).
+    pub fn identity(self: &Arc<Self>) -> u64 {
+        Arc::as_ptr(self) as usize as u64
+    }
+
     /// Frames the writer can add now (0 while it is busy).
     fn free_frames(&self) -> usize {
         self.writer.try_lock().map_or(0, |w| {
@@ -172,6 +178,9 @@ pub struct AheadReader {
     ring: Arc<AheadRing>,
     latency: u32,
     misses: Arc<AtomicU64>,
+    /// Has played audio: from then on missing audio is late (before, the
+    /// anticipator is still starting on this track).
+    started: bool,
 }
 
 impl AheadReader {
@@ -180,6 +189,7 @@ impl AheadReader {
             ring,
             latency,
             misses,
+            started: false,
         }
     }
 }
@@ -270,6 +280,7 @@ impl Processor<EngineContext> for AheadReader {
                 }
             }
             chunk.commit_all();
+            self.started = true;
             // More output channels than the ring has: repeat them.
             for c in ch..outs {
                 for i in done..done + k {
@@ -293,8 +304,8 @@ impl Processor<EngineContext> for AheadReader {
             for c in 0..out.num_channels() {
                 out.channel_mut(c)[done..n].fill(0.0);
             }
-            // Sequence 0: rendering ahead is only starting.
-            if seq > 0 {
+            // Sequence 0 or no audio yet: rendering ahead is only starting.
+            if seq > 0 && self.started {
                 self.misses.fetch_add(1, Ordering::Relaxed);
             }
         }
