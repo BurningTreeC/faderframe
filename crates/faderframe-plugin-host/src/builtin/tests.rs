@@ -13,6 +13,7 @@ fn config() -> ProcessConfig {
         sample_rate: SR,
         max_block_size: BLOCK as u32,
         sidechain: false,
+        double_precision: false,
     }
 }
 

@@ -215,6 +215,8 @@ pub struct MidiRegion {
     pub end: i64,
     /// Absolute-sample events, sorted (note-offs first at equal times).
     pub events: Vec<(i64, MidiEvent)>,
+    /// SysEx messages (`F0 … F7`) for the track's plugins, sorted.
+    pub sysex: Vec<(i64, Box<[u8]>)>,
 }
 
 #[derive(Debug, Default)]
@@ -699,10 +701,23 @@ impl TimelineSnapshot {
                     // bend set at a note's start applies to it), then
                     // note-ons, then the expressions addressed to them.
                     events.sort_by_key(|(t, e)| (*t, e.same_time_priority()));
+                    let mut sysex: Vec<(i64, Box<[u8]>)> = m
+                        .sysex
+                        .iter()
+                        .filter(|e| e.time < m.length && !e.data.is_empty())
+                        .map(|e| {
+                            (
+                                tl.to_samples(clip.start + e.time, sr),
+                                e.data.clone().into(),
+                            )
+                        })
+                        .collect();
+                    sysex.sort_by_key(|(t, _)| *t);
                     lanes.entry(clip.track).or_default().midi.push(MidiRegion {
                         start,
                         end,
                         events,
+                        sysex,
                     });
                 }
             }

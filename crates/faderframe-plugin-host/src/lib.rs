@@ -115,6 +115,9 @@ pub struct ProcessConfig {
     /// The host feeds the plugin's second audio input (its sidechain) as
     /// the processor's second graph input.
     pub sidechain: bool,
+    /// Process in 64-bit floating point where the plugin can (the graph's
+    /// audio stays 32-bit; the format layer converts around the plugin).
+    pub double_precision: bool,
 }
 
 /// Outcome of one `process` call. Kept `Copy` and allocation-free; detailed
@@ -285,6 +288,25 @@ pub trait PluginInstance {
         Err(PluginError::InvalidState(
             "this plugin has no preset files".into(),
         ))
+    }
+    /// The plugin's own programs (a VST3 program list), by name. Selecting
+    /// one makes the plugin load its settings.
+    fn programs(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// The program selected now, as the plugin reports it.
+    fn current_program(&self) -> Option<usize> {
+        None
+    }
+    /// Switch to program `index`; it takes effect with the processor's next
+    /// block (see [`Self::changes_pending`]).
+    fn select_program(&mut self, _index: usize) -> Result<(), PluginError> {
+        Err(PluginError::Failed("the plugin has no programs".into()))
+    }
+    /// Changes sent to the processor that it has not taken yet (its state
+    /// does not show them).
+    fn changes_pending(&self) -> bool {
+        false
     }
     /// Parameter moves made in the plugin's own editor since the last call
     /// (for automation writing).

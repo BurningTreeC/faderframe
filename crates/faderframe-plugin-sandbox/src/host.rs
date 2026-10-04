@@ -148,6 +148,11 @@ pub struct RemoteInstance {
     note_expressions: Option<Vec<NoteExpressionKind>>,
     has_editor: bool,
     editor_open: bool,
+    programs: Vec<String>,
+    program: Option<usize>,
+    /// The helper's processor has changes to take (as of the last poll, or
+    /// since a program was selected).
+    pending: bool,
     requests: EditorRequests,
     edits: Vec<EditorEdit>,
     config: Option<ProcessConfig>,
@@ -196,6 +201,9 @@ impl RemoteInstance {
             note_expressions: None,
             has_editor: false,
             editor_open: false,
+            programs: Vec::new(),
+            program: None,
+            pending: false,
             requests: EditorRequests::default(),
             edits: Vec::new(),
             config: None,
@@ -220,6 +228,7 @@ impl RemoteInstance {
                     .note_expressions
                     .map(|v| v.into_iter().filter_map(wire::expression_kind).collect());
                 inst.has_editor = i.has_editor;
+                inst.programs = i.programs;
                 tracing::info!(
                     "{} runs in a sandbox (process {})",
                     inst.descriptor.name,
@@ -394,6 +403,26 @@ impl PluginInstance for RemoteInstance {
         }
     }
 
+    fn programs(&self) -> Vec<String> {
+        self.programs.clone()
+    }
+
+    fn current_program(&self) -> Option<usize> {
+        self.program
+    }
+
+    fn select_program(&mut self, index: usize) -> Result<(), PluginError> {
+        self.done(&Request::SelectProgram { index }, &[], LOAD_TIMEOUT)?;
+        self.program = Some(index);
+        // Until the next poll says the helper's processor has it.
+        self.pending = true;
+        Ok(())
+    }
+
+    fn changes_pending(&self) -> bool {
+        self.pending && !self.dead.load(Ordering::Relaxed)
+    }
+
     fn take_editor_edits(&mut self) -> Vec<EditorEdit> {
         std::mem::take(&mut self.edits)
     }
@@ -445,6 +474,11 @@ impl PluginInstance for RemoteInstance {
         if let Some(t) = p.tail {
             self.tail = t.into();
         }
+        if let Some(programs) = p.programs {
+            self.programs = programs;
+        }
+        self.program = p.program;
+        self.pending = p.pending;
         let latency_changed = p.latency != self.latency;
         self.latency = p.latency;
         self.edits.extend(p.edits.into_iter().map(EditorEdit::from));
@@ -507,6 +541,7 @@ impl PluginInstance for RemoteInstance {
                 sidechain: config.sidechain,
                 shm: block.name().to_string(),
                 shm_size: block.size() as u64,
+                double_precision: config.double_precision,
             };
             let latency = match self.request(&req, &[], LOAD_TIMEOUT)? {
                 (Response::Activated { latency }, _) => latency,

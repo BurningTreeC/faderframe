@@ -313,40 +313,117 @@ impl IEventListTrait for EventList {
 }
 
 /// Buffers of all buses of one direction, with the pointer arrays VST3
-/// reads them through.
+/// reads them through: 32-bit, or 64-bit when the plugin processes in
+/// double precision (the graph's audio is converted in and out).
 pub(crate) struct Buses {
     bufs: Vec<Vec<Vec<f32>>>,
     ptrs: Vec<Vec<*mut f32>>,
+    bufs64: Vec<Vec<Vec<f64>>>,
+    ptrs64: Vec<Vec<*mut f64>>,
     abb: Vec<AudioBusBuffers>,
+    double: bool,
 }
 
 impl Buses {
-    pub(crate) fn new(channels: &[u16], max_frames: usize) -> Self {
-        let mut bufs: Vec<Vec<Vec<f32>>> = channels
-            .iter()
-            .map(|&c| (0..c).map(|_| vec![0.0; max_frames]).collect())
+    pub(crate) fn new(channels: &[u16], max_frames: usize, double: bool) -> Self {
+        let shape = |len: usize| -> Vec<Vec<usize>> {
+            channels.iter().map(|&c| vec![len; c as usize]).collect()
+        };
+        let (n32, n64) = if double {
+            (0, max_frames)
+        } else {
+            (max_frames, 0)
+        };
+        let mut bufs: Vec<Vec<Vec<f32>>> = shape(n32)
+            .into_iter()
+            .map(|bus| bus.into_iter().map(|n| vec![0.0; n]).collect())
             .collect();
-        let mut ptrs: Vec<Vec<*mut f32>> = bufs
+        let mut bufs64: Vec<Vec<Vec<f64>>> = shape(n64)
+            .into_iter()
+            .map(|bus| bus.into_iter().map(|n| vec![0.0; n]).collect())
+            .collect();
+        let ptrs: Vec<Vec<*mut f32>> = bufs
             .iter_mut()
             .map(|bus| bus.iter_mut().map(|ch| ch.as_mut_ptr()).collect())
             .collect();
-        let abb = ptrs
+        let ptrs64: Vec<Vec<*mut f64>> = bufs64
             .iter_mut()
-            .map(|p| {
-                // SAFETY: plain C struct; the union is set right after.
+            .map(|bus| bus.iter_mut().map(|ch| ch.as_mut_ptr()).collect())
+            .collect();
+        let abb = channels
+            .iter()
+            .map(|&c| {
+                // SAFETY: plain C struct; the buffer pointers are set before
+                // every block (`arm`).
                 let mut b: AudioBusBuffers = unsafe { std::mem::zeroed() };
-                b.numChannels = p.len() as int32;
-                b.__field0.channelBuffers32 = p.as_mut_ptr();
+                b.numChannels = c as int32;
                 b
             })
             .collect();
-        // The heap blocks behind `bufs` and `ptrs` never move from here on
-        // (the vectors are never resized), so the pointers stay valid.
-        Self { bufs, ptrs, abb }
+        // The heap blocks behind the buffers and pointer arrays never move
+        // from here on (the vectors are never resized), so the pointers
+        // stay valid.
+        Self {
+            bufs,
+            ptrs,
+            bufs64,
+            ptrs64,
+            abb,
+            double,
+        }
     }
 
     fn count(&self) -> int32 {
         self.abb.len() as int32
+    }
+
+    fn channels(&self, bus: usize) -> usize {
+        self.abb.get(bus).map_or(0, |b| b.numChannels as usize)
+    }
+
+    /// Fill channel `c` of bus `b` from `src` (`None`: silence).
+    fn load(&mut self, b: usize, c: usize, src: Option<&[f32]>, n: usize) {
+        if self.double {
+            let dst = &mut self.bufs64[b][c][..n];
+            match src {
+                Some(src) => {
+                    for (d, s) in dst.iter_mut().zip(&src[..n]) {
+                        *d = f64::from(*s);
+                    }
+                }
+                None => dst.fill(0.0),
+            }
+        } else {
+            let dst = &mut self.bufs[b][c][..n];
+            match src {
+                Some(src) => dst.copy_from_slice(&src[..n]),
+                None => dst.fill(0.0),
+            }
+        }
+    }
+
+    /// Copy channel `c` of bus `b` to `dst`.
+    fn store(&self, b: usize, c: usize, dst: &mut [f32], n: usize) {
+        if self.double {
+            for (d, s) in dst[..n].iter_mut().zip(&self.bufs64[b][c][..n]) {
+                *d = *s as f32;
+            }
+        } else {
+            dst[..n].copy_from_slice(&self.bufs[b][c][..n]);
+        }
+    }
+
+    /// Point the bus structs at the buffers (the plugin may have changed
+    /// the pointers or flags last block).
+    fn arm(&mut self) {
+        for (b, abb) in self.abb.iter_mut().enumerate() {
+            abb.silenceFlags = 0;
+            if self.double {
+                abb.__field0.channelBuffers64 = self.ptrs64[b].as_mut_ptr();
+            } else {
+                abb.__field0.channelBuffers32 = self.ptrs[b].as_mut_ptr();
+            }
+        }
     }
 
     fn as_mut_ptr(&mut self) -> *mut AudioBusBuffers {
@@ -377,6 +454,8 @@ pub(crate) struct Active {
     note_ids: Box<NoteIds>,
     /// The note expressions the plugin lists.
     note_expressions: [bool; 7],
+    /// The program-change parameter and its last program's index.
+    program: Option<(ParamID, u32)>,
     continuous: i64,
     max_frames: usize,
 }
@@ -388,6 +467,8 @@ pub(crate) struct Active {
 unsafe impl Send for Active {}
 
 pub(crate) struct ActiveConfig {
+    /// Process in 64-bit floating point.
+    pub double: bool,
     pub inputs: Vec<u16>,
     pub outputs: Vec<u16>,
     pub has_event_input: bool,
@@ -396,6 +477,9 @@ pub(crate) struct ActiveConfig {
     pub midi: Option<Box<MidiMap>>,
     /// The note expressions the plugin lists (others are not sent).
     pub note_expressions: Vec<NoteExpressionKind>,
+    /// The program-change parameter and its last program's index (MIDI
+    /// program changes select programs).
+    pub program: Option<(ParamID, u32)>,
 }
 
 impl Active {
@@ -407,8 +491,8 @@ impl Active {
     ) -> Self {
         Self {
             processor,
-            inputs: Buses::new(&c.inputs, c.max_frames),
-            outputs: Buses::new(&c.outputs, c.max_frames),
+            inputs: Buses::new(&c.inputs, c.max_frames, c.double),
+            outputs: Buses::new(&c.outputs, c.max_frames, c.double),
             in_params: ComWrapper::new(ParamChanges::new()),
             out_params: ComWrapper::new(ParamChanges::new()),
             in_events: ComWrapper::new(EventList::new()),
@@ -422,6 +506,7 @@ impl Active {
             midi: c.midi,
             note_ids: Box::new(NoteIds::new()),
             note_expressions: NoteExpressionKind::ALL.map(|k| c.note_expressions.contains(&k)),
+            program: c.program,
             continuous: 0,
             max_frames: c.max_frames,
         }
@@ -624,13 +709,40 @@ impl Active {
                         self.in_params.add(id, t, value.min(16383) as f64 / 16383.0);
                     }
                 }
-                MidiEvent::ProgramChange { .. } => {}
+                // SysEx: a data event pointing at the bytes in the graph's
+                // buffer (valid for this block).
+                MidiEvent::SysEx(r) => {
+                    use vst3::Steinberg::Vst::DataEvent_::DataTypes_::kMidiSysEx;
+                    if let Some(bytes) = midi.sysex(&r) {
+                        self.in_events.push(note_event(t, kDataEvent as u16, |e| {
+                            e.__field0.data = vst3::Steinberg::Vst::DataEvent {
+                                size: bytes.len() as u32,
+                                r#type: kMidiSysEx as _,
+                                bytes: bytes.as_ptr(),
+                            }
+                        }));
+                    }
+                }
+                // VST3 has no program change events: it selects the
+                // program-change parameter's program (and the controller
+                // follows, so menus show it).
+                MidiEvent::ProgramChange { program, .. } => {
+                    if let Some((id, last)) = self.program
+                        && last > 0
+                        && u32::from(program) <= last
+                    {
+                        let n = f64::from(program) / f64::from(last);
+                        self.in_params.add(id, t, n);
+                        let _ = self.out_tx.push((id, n));
+                    }
+                }
             }
         }
     }
 
     fn process(&mut self, ctx: &PluginProcessContext<'_>, io: &mut NodeIo<'_>) -> ProcessStatus {
-        use vst3::Steinberg::Vst::{ProcessModes_::kRealtime, SymbolicSampleSizes_::kSample32};
+        use vst3::Steinberg::Vst::ProcessModes_::kRealtime;
+        use vst3::Steinberg::Vst::SymbolicSampleSizes_::{kSample32, kSample64};
         let n = io.frames.min(self.max_frames);
         let last = n.saturating_sub(1) as i32;
         self.in_params.clear();
@@ -659,25 +771,19 @@ impl Active {
 
         // Audio: graph input `b` into bus `b` (the main input, then the
         // sidechain when connected), other buses silent.
-        for (b, bus) in self.inputs.bufs.iter_mut().enumerate() {
-            for (c, ch) in bus.iter_mut().enumerate() {
-                match io.audio_in.get(b) {
+        for b in 0..self.inputs.abb.len() {
+            for c in 0..self.inputs.channels(b) {
+                let src = match io.audio_in.get(b) {
                     Some(inp) if inp.num_channels() > 0 => {
-                        let s = inp.channel(c.min(inp.num_channels() - 1));
-                        ch[..n].copy_from_slice(&s[..n]);
+                        Some(inp.channel(c.min(inp.num_channels() - 1)))
                     }
-                    _ => ch[..n].fill(0.0),
-                }
+                    _ => None,
+                };
+                self.inputs.load(b, c, src, n);
             }
         }
-        for (b, abb) in self.inputs.abb.iter_mut().enumerate() {
-            abb.silenceFlags = 0;
-            abb.__field0.channelBuffers32 = self.inputs.ptrs[b].as_mut_ptr();
-        }
-        for (b, abb) in self.outputs.abb.iter_mut().enumerate() {
-            abb.silenceFlags = 0;
-            abb.__field0.channelBuffers32 = self.outputs.ptrs[b].as_mut_ptr();
-        }
+        self.inputs.arm();
+        self.outputs.arm();
         fill_context(&mut self.context, ctx.transport, self.continuous);
 
         let as_changes = |c: &ComWrapper<ParamChanges>| {
@@ -690,7 +796,11 @@ impl Active {
         };
         let mut data = ProcessData {
             processMode: kRealtime as int32,
-            symbolicSampleSize: kSample32 as int32,
+            symbolicSampleSize: if self.inputs.double {
+                kSample64
+            } else {
+                kSample32
+            } as int32,
             numSamples: n as int32,
             numInputs: self.inputs.count(),
             numOutputs: self.outputs.count(),
@@ -754,11 +864,11 @@ impl Active {
 
         // Main output bus to the graph (no output bus: pass through).
         if let Some(out) = io.audio_out.first_mut() {
-            match self.outputs.bufs.first() {
-                Some(main) if !main.is_empty() => {
+            match self.outputs.channels(0) {
+                main if main > 0 => {
                     for c in 0..out.num_channels() {
-                        let src = &main[c.min(main.len() - 1)];
-                        out.channel_mut(c)[..n].copy_from_slice(&src[..n]);
+                        self.outputs
+                            .store(0, c.min(main - 1), out.channel_mut(c), n);
                     }
                 }
                 _ => match io.audio_in.first() {

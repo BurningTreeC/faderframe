@@ -57,8 +57,31 @@ impl ExpressionValue {
     }
 }
 
-/// A channel-voice MIDI message (channels are 0-based, 0..=15), or a
-/// per-note expression for hosted plugins.
+/// A system exclusive message held by a [`MidiBuffer`](crate::MidiBuffer):
+/// where its bytes are in that buffer. Only the buffer that holds the bytes
+/// can resolve it ([`MidiBuffer::sysex`](crate::MidiBuffer::sysex)); copy
+/// such events between buffers with
+/// [`MidiBuffer::push_from`](crate::MidiBuffer::push_from).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SysexRef {
+    pub(crate) buffer: u32,
+    pub(crate) start: u32,
+    pub(crate) len: u32,
+}
+
+impl SysexRef {
+    /// Bytes in the message (`F0 … F7`).
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// A channel-voice MIDI message (channels are 0-based, 0..=15), a per-note
+/// expression for hosted plugins, or a system exclusive message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MidiEvent {
     NoteOn {
@@ -103,6 +126,10 @@ pub enum MidiEvent {
         kind: NoteExpressionKind,
         value: ExpressionValue,
     },
+    /// A system exclusive message (`F0 … F7`) for hosted plugins; its bytes
+    /// are in the buffer holding the event. External MIDI outputs get clip
+    /// SysEx from the control side instead and drop it here.
+    SysEx(SysexRef),
 }
 
 impl MidiEvent {
@@ -204,12 +231,14 @@ impl MidiEvent {
                 ],
                 3,
             ),
-            MidiEvent::NoteExpression { .. } => ([0; 3], 0),
+            MidiEvent::NoteExpression { .. } | MidiEvent::SysEx(_) => ([0; 3], 0),
         }
     }
 
+    /// The channel (SysEx has none: 0).
     pub fn channel(self) -> u8 {
         match self {
+            MidiEvent::SysEx(_) => 0,
             MidiEvent::NoteOn { channel, .. }
             | MidiEvent::NoteOff { channel, .. }
             | MidiEvent::PolyPressure { channel, .. }

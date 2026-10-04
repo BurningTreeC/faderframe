@@ -29,6 +29,7 @@ mod freeze;
 pub mod groove;
 mod groups;
 pub mod lanes;
+mod programs;
 mod redraw;
 mod sandbox;
 pub use groups::GroupMenuEntry;
@@ -269,6 +270,11 @@ pub enum Action {
     ReloadPlugin(faderframe_core::PluginInstanceId),
     /// Every plugin of the project.
     ReloadAllPlugins,
+    /// Switch a plugin to one of its own programs (one undo step).
+    SelectPluginProgram {
+        plugin: faderframe_core::PluginInstanceId,
+        index: usize,
+    },
     SetResetOnPlay(bool),
     /// Group the selected tracks.
     GroupSelectedTracks,
@@ -858,6 +864,8 @@ pub struct Session {
     album_state: album::AlbumState,
     /// Plugin failures noticed, sandboxed plugins' unsaved state.
     plugin_care: sandbox::PluginCare,
+    /// Selected programs whose new state is not recorded yet.
+    pending_programs: Vec<programs::PendingProgram>,
     /// The Tools view's meters.
     analysis: analysis::AnalysisState,
     /// Where tracks following a multi-track fader/pan/send move started
@@ -1034,6 +1042,7 @@ impl Session {
             bounces: Vec::new(),
             album_state: album::AlbumState::default(),
             plugin_care: sandbox::PluginCare::default(),
+            pending_programs: Vec::new(),
             analysis: analysis::AnalysisState::new(config.sample_rate),
             follow_base: HashMap::new(),
             user_edit: false,
@@ -1486,6 +1495,7 @@ impl Session {
             self.revision += 1;
         }
         self.care_for_plugins();
+        self.tick_programs();
         // Moves in plugins' own editors write automation like ours do.
         let edits = self.engine.take_plugin_edits();
         self.plugin_editor_edits(edits);
@@ -2219,6 +2229,9 @@ impl Session {
             }
             Action::Album(a) => self.album_action(a)?,
             Action::ReloadPlugin(plugin) => self.reload_plugins(&[plugin])?,
+            Action::SelectPluginProgram { plugin, index } => {
+                self.select_plugin_program(plugin, index)?;
+            }
             Action::ReloadAllPlugins => {
                 let all: Vec<_> = self
                     .project

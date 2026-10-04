@@ -925,6 +925,26 @@ impl MixerView {
                         presets.len() - 24
                     )));
                 }
+                // The plugin's own programs (VST3 program lists).
+                let programs = model.plugin_programs(s.id);
+                let current = model.plugin_current_program(s.id);
+                for (i, name) in programs.iter().enumerate().take(32) {
+                    let item = MenuItem::new(
+                        format!("Program: {name}"),
+                        Action::SelectPluginProgram {
+                            plugin: s.id,
+                            index: i,
+                        },
+                    )
+                    .checked(current == Some(i));
+                    items.push(if i == 0 { item.separated() } else { item });
+                }
+                if programs.len() > 32 {
+                    items.push(MenuItem::disabled(format!(
+                        "… {} more programs in the parameter window",
+                        programs.len() - 32
+                    )));
+                }
                 // Sidechain: which track's pre-fader signal keys the plugin.
                 if model.plugin_has_sidechain(s.id) {
                     let set = |source| {

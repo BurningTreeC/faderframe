@@ -902,6 +902,13 @@ impl Session {
         let system = self.midi.feed.drain_system();
         for ev in &system {
             self.midi.activity.insert(ev.port, now);
+            // SysEx to the plugins of the tracks playing live from the port.
+            if let faderframe_midi::SystemMessage::SysEx(data) = &ev.message
+                && !self.midi.live.is_empty()
+                && !self.engine.send_live_sysex(ev.port, data)
+            {
+                tracing::debug!("live SysEx of {} bytes dropped", data.len());
+            }
         }
         let clock_now = self.midi.sender.clock().now_ns();
         self.tick_sync(&system, clock_now);

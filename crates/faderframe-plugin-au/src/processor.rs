@@ -354,6 +354,13 @@ impl PluginProcessor for AuProcessor {
                 && let Some(midi) = io.events_in.first()
             {
                 for ev in midi.iter() {
+                    if let faderframe_midi::MidiEvent::SysEx(r) = ev.event {
+                        // No sample offset: it applies from the block start.
+                        if let Some(bytes) = midi.sysex(&r) {
+                            MusicDeviceSysEx(unit, bytes.as_ptr(), bytes.len() as u32);
+                        }
+                        continue;
+                    }
                     let (b, len) = ev.event.to_bytes();
                     if len == 0 {
                         continue;

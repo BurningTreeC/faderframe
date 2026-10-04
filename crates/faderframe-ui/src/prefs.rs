@@ -52,6 +52,8 @@ pub struct Preferences {
     pub mtc_offset: String,
     /// Run each CLAP/VST3 plugin in a helper process of its own.
     pub sandbox_plugins: bool,
+    /// Process plugins in 64-bit floating point where they can.
+    pub plugin_double_precision: bool,
 }
 
 impl Default for Preferences {
@@ -80,6 +82,7 @@ impl Default for Preferences {
             sync_port: None,
             mtc_offset: "00:00:00:00".into(),
             sandbox_plugins: true,
+            plugin_double_precision: false,
         }
     }
 }

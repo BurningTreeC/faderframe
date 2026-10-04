@@ -201,7 +201,10 @@ Contrast:
   Plugin state, parameters and automation are saved too. Moving a knob in a
   plugin's own GUI writes automation like FaderFrame's controls do. Presets:
   save and load your own for any plugin (insert menu or the parameter
-  window's Presets menu), and VST3 factory presets are listed too.
+  window's Presets menu), and VST3 factory presets are listed too, as are
+  VST3 program lists (selecting a program is one undo step; MIDI program
+  changes select VST3 programs). Plugins that offer it can process in
+  64-bit floating point (Preferences → Audio).
   Sandboxing (Preferences → General, on by default): each CLAP and VST3
   plugin (and Audio Unit on macOS) runs in a process of its own, so a
   plugin that crashes or hangs costs only itself — its track plays on dry,
@@ -221,8 +224,9 @@ Contrast:
   to plugin instruments (CLAP note expressions, VST3 note expression values
   and poly pressure, the built-in synth) or as MPE on member channels
   (track menu → MPE: pitch, pressure, timbre). SysEx is recorded,
-  sent to external devices with the clip, imported from and sent as `.syx`
-  files.
+  sent to external devices and to the track's plugins with the clip (and
+  from a live keyboard to the instrument playing it), imported from and
+  sent as `.syx` files.
 * MIDI keyboards and controllers: every MIDI input (ALSA sequencer incl.
   PipeWire, CoreMIDI, WinMM; hotplug) — instrument tracks play what you play while armed or
   selected, with constant low latency; choose the input and channel per

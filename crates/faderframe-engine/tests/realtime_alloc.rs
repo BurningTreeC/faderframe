@@ -116,6 +116,14 @@ fn processing_does_not_allocate() {
                     e
                 })
                 .collect();
+            // SysEx for the instruments: bytes copied through the graph's
+            // buffers, never allocated.
+            for q in [0.1, 0.3, 0.7, 1.5] {
+                m.sysex.push(faderframe_project::SysexEvent {
+                    time: faderframe_timeline::MusicalTime::from_quarters(q),
+                    data: vec![0xF0, 0x7D, 0x01, 0x02, 0xF7],
+                });
+            }
         }
     }
     let sources = render_generated_sources(&project, SR);
@@ -460,6 +468,8 @@ fn live_midi_input_and_midi_recording_do_not_allocate() {
         // not realtime code).
         tx.send(0, &[0x90, key, 100]);
         tx.send(0, &[0xB0, 1, key]);
+        // Live SysEx to the synth (it plays from every port).
+        assert!(r.controller.send_live_sysex(0, &[0xF0, 0x7D, key, 0xF7]));
         let (_, n) = armed(|| {
             for _ in 0..3 {
                 r.processor.process_device(&mut bufs);
@@ -476,7 +486,7 @@ fn live_midi_input_and_midi_recording_do_not_allocate() {
     assert_eq!(
         total + n,
         0,
-        "allocations/frees with live MIDI, recording and MIDI clock"
+        "allocations/frees with live MIDI and SysEx, recording and MIDI clock"
     );
     let clock = std::iter::from_fn(|| orx.pop().ok())
         .filter(|e| e.bytes() == [0xF8])

@@ -50,6 +50,7 @@ impl PluginFactory for Broken {
         vec![
             broken_descriptor("test.crash"),
             broken_descriptor("test.hang"),
+            broken_descriptor("test.sysex"),
         ]
     }
     fn instantiate(&self, id: &str) -> Result<Box<dyn PluginInstance>, PluginError> {
@@ -86,6 +87,9 @@ impl PluginInstance for BrokenInstance {
         &mut self,
         _c: &ProcessConfig,
     ) -> Result<Box<dyn PluginProcessor>, PluginError> {
+        if self.0.id == "test.sysex" {
+            return Ok(Box::new(SysexSum));
+        }
         Ok(Box::new(BrokenProcessor(self.0.id == "test.crash")))
     }
 }
@@ -100,6 +104,31 @@ impl PluginProcessor for BrokenProcessor {
         loop {
             std::thread::sleep(Duration::from_secs(1));
         }
+    }
+    fn reset(&mut self) {}
+}
+
+/// Writes each SysEx message's byte sum to the left output at its offset.
+struct SysexSum;
+
+impl PluginProcessor for SysexSum {
+    fn process(&mut self, _ctx: &PluginProcessContext<'_>, io: &mut NodeIo<'_>) -> ProcessStatus {
+        let out = &mut io.audio_out[0];
+        out.clear();
+        if let Some(midi) = io.events_in.first() {
+            for e in midi.iter() {
+                if let MidiEvent::SysEx(r) = e.event {
+                    let sum: u32 = midi
+                        .sysex(&r)
+                        .unwrap_or(&[])
+                        .iter()
+                        .map(|&b| u32::from(b))
+                        .sum();
+                    out.channel_mut(0)[e.sample_offset as usize] = sum as f32;
+                }
+            }
+        }
+        ProcessStatus::Continue
     }
     fn reset(&mut self) {}
 }
@@ -132,6 +161,7 @@ const CONFIG: ProcessConfig = ProcessConfig {
     sample_rate: 48_000.0,
     max_block_size: FRAMES as u32,
     sidechain: false,
+    double_precision: false,
 };
 
 /// Run `blocks` blocks of a sine (and `events` in the first) through `p`;
@@ -197,6 +227,54 @@ fn remote(format: PluginFormat, id: &str) -> Box<dyn PluginInstance> {
 }
 
 // --- the tests -------------------------------------------------------------------------
+
+#[test]
+fn sysex_crosses_into_the_helper() {
+    let mut inst = remote(PluginFormat::Vst3, "test.sysex");
+    let mut p = inst.create_processor(&CONFIG).unwrap();
+    let small = [0xF0, 1, 2, 3, 0xF7];
+    let mut big = vec![0x10u8; 9000];
+    (big[0], big[8999]) = (0xF0, 0xF7);
+    let mut midi = MidiBuffer::with_capacity(16);
+    midi.push_sysex(10, &small).unwrap();
+    midi.push(TimedMidiEvent::new(
+        20,
+        MidiEvent::NoteOn {
+            channel: 0,
+            key: 60,
+            velocity: 100,
+        },
+    ))
+    .unwrap();
+    midi.push_sysex(30, &big).unwrap();
+    let mut input = AudioBuffer::new(ChannelLayout::Stereo, FRAMES);
+    input.set_len(FRAMES);
+    let mut output = AudioBuffer::new(ChannelLayout::Stereo, FRAMES);
+    output.set_len(FRAMES);
+    let inputs = [input];
+    let mut outputs = [output];
+    let events = [midi];
+    let transport = TransportInfo::default();
+    let mut io = NodeIo {
+        frames: FRAMES,
+        audio_in: &inputs,
+        audio_out: &mut outputs,
+        events_in: &events,
+        events_out: &mut [],
+    };
+    p.process(
+        &PluginProcessContext {
+            transport: &transport,
+            param_events: &[],
+        },
+        &mut io,
+    );
+    let out = outputs[0].channel(0);
+    let sum = |b: &[u8]| b.iter().map(|&x| x as u32).sum::<u32>() as f32;
+    assert_eq!(out[10], sum(&small));
+    assert_eq!(out[30], sum(&big));
+    assert_eq!(out.iter().filter(|v| **v != 0.0).count(), 2);
+}
 
 #[test]
 fn a_sandboxed_gain_matches_the_one_in_process() {

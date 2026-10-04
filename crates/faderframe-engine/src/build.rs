@@ -277,12 +277,14 @@ pub fn build_graph(
     let midi_ports = &routing.inputs;
     let mut b = GraphBuilder::<EngineContext>::new();
     let mut warnings = Vec::new();
+    let double_precision = plugins.double_precision();
     let mut pcx = PluginCx {
         plugins,
         process: ProcessConfig {
             sample_rate: config.sample_rate,
             max_block_size: config.max_block_size as u32,
             sidechain: false,
+            double_precision,
         },
         warnings: &mut warnings,
     };

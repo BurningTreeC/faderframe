@@ -19,7 +19,7 @@ mod output;
 mod tracker;
 
 pub use buffer::{MidiBuffer, MidiBufferFull};
-pub use event::{ExpressionValue, MidiEvent, NoteExpressionKind, TimedMidiEvent};
+pub use event::{ExpressionValue, MidiEvent, NoteExpressionKind, SysexRef, TimedMidiEvent};
 pub use input::{
     MAX_MIDI_PORTS, MidiClock, MidiControlFeed, MidiInputEvent, MidiInputQueue, MidiInputSender,
     MidiSystemEvent, SystemMessage, midi_input_queue,

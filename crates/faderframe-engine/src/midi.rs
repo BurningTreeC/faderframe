@@ -18,7 +18,7 @@
 use crate::EngineContext;
 use faderframe_audio_graph::{NodeIo, ProcessContext, Processor};
 use faderframe_core::TrackId;
-use faderframe_midi::{MidiEvent, MidiInputQueue, NoteTracker, TimedMidiEvent};
+use faderframe_midi::{MidiBuffer, MidiEvent, MidiInputQueue, NoteTracker, TimedMidiEvent};
 use faderframe_realtime::ParamSlot;
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::sync::Arc;
@@ -123,15 +123,38 @@ pub struct MidiShared {
 }
 
 /// Input events of the current chunk: (port, event at a chunk offset).
+/// SysEx events refer to bytes kept here ([`Self::sysex`]).
 #[derive(Debug)]
 pub struct MidiInputBlock {
     events: Vec<(u16, TimedMidiEvent)>,
+    /// Holds the bytes of the chunk's SysEx messages.
+    bytes: MidiBuffer,
 }
+
+/// Live SysEx messages per callback, and bytes for them.
+const LIVE_SYSEX: usize = 32;
 
 impl MidiInputBlock {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             events: Vec::with_capacity(capacity),
+            bytes: MidiBuffer::with_capacities(LIVE_SYSEX, MidiBuffer::DEFAULT_SYSEX_CAPACITY),
+        }
+    }
+
+    /// The bytes of one of this block's SysEx events.
+    pub fn sysex(&self, r: &faderframe_midi::SysexRef) -> Option<&[u8]> {
+        self.bytes.sysex(r)
+    }
+
+    /// Realtime-safe: dropped when there is no room.
+    fn push_sysex(&mut self, port: u16, offset: u32, bytes: &[u8]) -> bool {
+        if self.events.len() >= self.events.capacity() {
+            return false;
+        }
+        match self.bytes.push_sysex(offset, bytes) {
+            Ok(r) => self.push(port, TimedMidiEvent::new(offset, MidiEvent::SysEx(r))),
+            Err(_) => false,
         }
     }
 
@@ -145,6 +168,7 @@ impl MidiInputBlock {
 
     fn clear(&mut self) {
         self.events.clear();
+        self.bytes.clear();
     }
 
     /// Realtime-safe: never grows past the capacity.
@@ -158,18 +182,84 @@ impl MidiInputBlock {
     }
 }
 
+/// Bytes of live SysEx on their way to the audio thread.
+pub(crate) const LIVE_SYSEX_RING: usize = 64 * 1024;
+/// A live SysEx frame: port (2 bytes), length (4), then the message.
+const FRAME_HEADER: usize = 6;
+
+/// The control side's end of the live SysEx ring.
+pub(crate) struct LiveSysexSender(rtrb::Producer<u8>);
+
+impl LiveSysexSender {
+    /// Queue one message from input `port` as a whole frame (or not at all
+    /// when the ring is full or the message too long).
+    pub(crate) fn send(&mut self, port: u16, bytes: &[u8]) -> bool {
+        let total = FRAME_HEADER + bytes.len();
+        if bytes.is_empty() || bytes.len() > MidiBuffer::DEFAULT_SYSEX_CAPACITY {
+            return false;
+        }
+        let Ok(chunk) = self.0.write_chunk_uninit(total) else {
+            return false;
+        };
+        let header = port
+            .to_le_bytes()
+            .into_iter()
+            .chain((bytes.len() as u32).to_le_bytes());
+        // All bytes become visible to the reader at once.
+        chunk.fill_from_iter(header.chain(bytes.iter().copied()));
+        true
+    }
+}
+
 /// Device-callback-level input (owned by the processor).
 pub(crate) struct MidiInputState {
     queue: Option<Box<MidiInputQueue>>,
     /// Offsets relative to the device callback.
     events: MidiInputBlock,
+    /// Live SysEx from the control side, and room to put one together.
+    sysex: rtrb::Consumer<u8>,
+    scratch: Vec<u8>,
 }
 
 impl MidiInputState {
-    pub(crate) fn new() -> Self {
-        Self {
-            queue: None,
-            events: MidiInputBlock::with_capacity(MIDI_INPUT_CAPACITY),
+    pub(crate) fn new() -> (Self, LiveSysexSender) {
+        let (tx, rx) = rtrb::RingBuffer::new(LIVE_SYSEX_RING);
+        (
+            Self {
+                queue: None,
+                events: MidiInputBlock::with_capacity(MIDI_INPUT_CAPACITY),
+                sysex: rx,
+                scratch: Vec::with_capacity(MidiBuffer::DEFAULT_SYSEX_CAPACITY),
+            },
+            LiveSysexSender(tx),
+        )
+    }
+
+    /// Live SysEx at the callback start (audio thread, allocation-free).
+    fn take_sysex(&mut self, dropped: &AtomicU64) {
+        while self.sysex.slots() >= FRAME_HEADER {
+            let Ok(head) = self.sysex.read_chunk(FRAME_HEADER) else {
+                return;
+            };
+            let mut h = [0u8; FRAME_HEADER];
+            for (d, s) in h.iter_mut().zip(head) {
+                *d = s;
+            }
+            let port = u16::from_le_bytes([h[0], h[1]]);
+            let len = u32::from_le_bytes([h[2], h[3], h[4], h[5]]) as usize;
+            // Frames are committed whole by the sender.
+            let Ok(body) = self.sysex.read_chunk(len.min(self.sysex.slots())) else {
+                return;
+            };
+            self.scratch.clear();
+            if len <= self.scratch.capacity() {
+                self.scratch.extend(body);
+            } else {
+                body.commit_all();
+            }
+            if self.scratch.len() == len && !self.events.push_sysex(port, 0, &self.scratch) {
+                dropped.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -189,10 +279,11 @@ impl MidiInputState {
     /// Drain the queue for a callback of `frames` at `rate` (audio thread).
     pub(crate) fn take(&mut self, frames: usize, rate: f64, dropped: &AtomicU64) {
         self.events.clear();
-        let Some(q) = &mut self.queue else { return };
         if frames == 0 {
             return;
         }
+        self.take_sysex(dropped);
+        let Some(q) = &mut self.queue else { return };
         let now = q.clock.now_ns();
         let block_ns = frames as f64 * 1e9 / rate.max(1.0);
         while let Ok(raw) = q.consumer.pop() {
@@ -226,7 +317,17 @@ impl MidiInputState {
         let (a, b) = (offset as u32, (offset + frames) as u32);
         for &(port, ev) in self.events.iter() {
             if ev.sample_offset >= a && ev.sample_offset < b {
-                out.push(port, TimedMidiEvent::new(ev.sample_offset - a, ev.event));
+                let at = ev.sample_offset - a;
+                match ev.event {
+                    MidiEvent::SysEx(r) => {
+                        if let Some(bytes) = self.events.sysex(&r) {
+                            out.push_sysex(port, at, bytes);
+                        }
+                    }
+                    e => {
+                        out.push(port, TimedMidiEvent::new(at, e));
+                    }
+                }
             }
         }
     }
@@ -287,6 +388,18 @@ impl Processor<EngineContext> for MidiInputNode {
         }
         let audition = self.shared.audition_track.load(Ordering::Relaxed) == self.track;
         for &(port, ev) in cx.data.midi_input.iter() {
+            // SysEx from the track's input port (it has no channel).
+            if let MidiEvent::SysEx(r) = ev.event {
+                if live
+                    && self
+                        .filter
+                        .is_some_and(|f| f.port.is_none_or(|p| p == port))
+                    && let Some(bytes) = cx.data.midi_input.sysex(&r)
+                {
+                    let _ = out.push_sysex(ev.sample_offset, bytes);
+                }
+                continue;
+            }
             if port == AUDITION_PORT {
                 if audition {
                     let _ = out.push(ev);
@@ -362,6 +475,7 @@ fn on_channel(ev: MidiEvent, ch: u8) -> MidiEvent {
             kind,
             value,
         },
+        MidiEvent::SysEx(r) => MidiEvent::SysEx(r),
     }
 }
 
@@ -371,8 +485,12 @@ impl Processor<EngineContext> for MidiOutputSink {
             return;
         };
         for ev in input.iter() {
-            if matches!(ev.event, MidiEvent::NoteExpression { .. }) {
-                // No MIDI form.
+            if matches!(
+                ev.event,
+                MidiEvent::NoteExpression { .. } | MidiEvent::SysEx(_)
+            ) {
+                // No MIDI form (expressions), or sent from the control side
+                // (clip SysEx: `session::sysex`).
                 continue;
             }
             let e = match self.channel {
@@ -483,9 +601,47 @@ mod tests {
     }
 
     #[test]
+    fn live_sysex_arrives_whole_and_reaches_its_chunk() {
+        let (mut st, mut tx) = MidiInputState::new();
+        let dropped = AtomicU64::new(0);
+        let big = {
+            let mut v = vec![0x22u8; 9000];
+            (v[0], v[8999]) = (0xF0, 0xF7);
+            v
+        };
+        assert!(tx.send(3, &[0xF0, 1, 2, 0xF7]));
+        assert!(tx.send(5, &big));
+        assert!(!tx.send(5, &[]), "nothing to send");
+        st.take(256, 48_000.0, &dropped);
+        let got: Vec<(u16, Vec<u8>)> = st
+            .events
+            .iter()
+            .filter_map(|(p, e)| match e.event {
+                MidiEvent::SysEx(r) => st.events.sysex(&r).map(|b| (*p, b.to_vec())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(got, vec![(3, vec![0xF0, 1, 2, 0xF7]), (5, big.clone())]);
+        // The first chunk carries them (bytes copied), the next none.
+        let mut chunk = MidiInputBlock::with_capacity(8);
+        st.chunk(0, 128, &mut chunk);
+        let sizes: Vec<usize> = chunk
+            .iter()
+            .filter_map(|(_, e)| match e.event {
+                MidiEvent::SysEx(r) => chunk.sysex(&r).map(<[u8]>::len),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sizes, vec![4, 9000]);
+        st.chunk(128, 128, &mut chunk);
+        assert!(chunk.is_empty());
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn events_are_placed_by_arrival_time() {
         let (tx, q, _feed) = faderframe_midi::midi_input_queue(16);
-        let mut st = MidiInputState::new();
+        let (mut st, _) = MidiInputState::new();
         st.replace_queue(Some(Box::new(q)));
         let dropped = AtomicU64::new(0);
         // 48 kHz, 480 frames = 10 ms. An event sent 5 ms before the callback
@@ -508,7 +664,7 @@ mod tests {
         st.take(480, 48_000.0, &dropped);
         assert_eq!(st.events.iter().next().map(|e| e.1.sample_offset), Some(0));
         // Chunks see their share, shifted.
-        let mut st2 = MidiInputState::new();
+        let (mut st2, _) = MidiInputState::new();
         st2.events.push(
             0,
             TimedMidiEvent::new(10, MidiEvent::from_bytes(&note(1)).unwrap()),

@@ -420,15 +420,29 @@ handles RPN 0 bend range, the MPE zone message, pressure and CC 74).
   undoable edit — when the master starts or stops, never while playing
   (running audio clips would jump). Settings (source, port, MTC offset)
   are per machine (preferences).
-* **SysEx.** Variable-length data stays out of the realtime path.
-  `MidiClip::sysex` holds messages at musical times; SysEx arriving on a
-  recording track's input is placed where it was heard and becomes part of
-  the take. For tracks with an external MIDI output the session schedules
-  the messages 100 ms ahead to the output sender with exact due times from
-  the engine's time-to-position mapping, following loop wraps; a locate or
-  stop (the engine is not where it was predicted) cancels what was
-  scheduled (a generation counter in `MidiOutputs`). `.syx` files can be
-  imported into clips and sent to any output from the preferences.
+* **SysEx.** `MidiClip::sysex` holds messages at musical times; SysEx
+  arriving on a recording track's input is placed where it was heard and
+  becomes part of the take. For tracks with an external MIDI output the
+  session schedules the messages 100 ms ahead to the output sender with
+  exact due times from the engine's time-to-position mapping; each window
+  continues in the timeline where the last one ended (position estimates
+  wobble between ticks) and is split into timeline segments at loop wraps;
+  a locate or stop (the engine is not where it was predicted) cancels what
+  was scheduled (a generation counter in `MidiOutputs`). `.syx` files can
+  be imported into clips and sent to any output from the preferences.
+  **To plugins** SysEx travels the realtime path without allocating: a
+  `MidiBuffer` keeps a preallocated byte area (16 KiB per block) and
+  `MidiEvent::SysEx(SysexRef)` refers into it, tagged with the buffer's id
+  — `push_sysex` copies bytes in, `push_from`/`merge_from` copy events with
+  their bytes to another buffer, and a plain `push` of another buffer's
+  SysEx is dropped, never misread. Clip SysEx is in the snapshot
+  (`MidiRegion::sysex`, played by the MIDI clip player); live SysEx from an
+  input port goes from the control side through a byte ring
+  (`EngineController::send_live_sysex`, whole frames) to the tracks playing
+  live from that port. CLAP gets `CLAP_EVENT_MIDI_SYSEX`, VST3 a
+  `kMidiSysEx` data event, Audio Units `MusicDeviceSysEx`, sandboxed
+  plugins the bytes in their block (`sysex_in`); MIDI outputs drop it there
+  (the control side sends clip SysEx to devices).
 * **Auditioning and step input.** The editor plays notes on a track's
   instrument through a reserved port (`AUDITION_PORT`) that the track's
   `MidiInputNode` takes whatever its live state, never recorded. Step input
@@ -482,6 +496,20 @@ warning.
   too and loaded into the plugin's state. Loading is
   `Command::SetPluginState` — one undo step; the engine follows a changed
   slot state.
+* **Programs** (`PluginInstance::programs`/`select_program`; VST3 program
+  lists) are listed with the presets. Selecting one changes the plugin's
+  whole state, so `session::programs` makes it one undo step like a
+  preset: the state from before is captured, the program selected, and
+  once the processor has taken it (`changes_pending`, at the latest after
+  a second) the new state is recorded as "Select Program". The program
+  itself is not stored (reapplying it on load would overwrite later
+  tweaks). Lists of numbered slots only ("Program 3", "ProgramChange 12" —
+  u-he, Arturia) are MIDI program change targets and not shown.
+* **Precision.** `ProcessConfig::double_precision` (Preferences → Audio,
+  applied at once: the plugins are reactivated) gives plugins that offer it
+  64-bit buffers — VST3 `kSample64`, CLAP ports with `SUPPORTS_64BITS` —
+  converted around the plugin from preallocated double buffers; the
+  graph stays 32-bit.
 * **Inserts** move and copy between slots and tracks
   (`Action::MovePlugin`/`CopyPlugin`: a copy gets a new id and the
   original's captured state).
@@ -651,6 +679,10 @@ SDK headers); FaderFrame implements the host side itself.
   `IPlugFrame` and Linux `IRunLoop`. Its callbacks only record (edits,
   restart flags, resize requests, fd/timer registrations); the control
   thread acts on them when it polls — callbacks may come from any thread.
+* **Programs** come from the program-change parameter (`kIsProgramChange`,
+  often hidden): the names of its unit's program list (`IUnitInfo`), else
+  the parameter's own value texts; selecting one sets that parameter in
+  the controller and the processor.
 * **Parameters** are normalised in VST3. FaderFrame shows continuous ones as
   0–1 and stepped ones as integers 0…steps, converting at the boundary; the
   plugin formats values (`getParamStringByValue`). Hidden parameters and the
@@ -658,15 +690,17 @@ SDK headers); FaderFrame implements the host side itself.
   targets (JUCE, u-he: 16 × 130) are not listed. Unit names prefix
   parameter names ("Unit/Name") like CLAP modules.
 * **Processing.** Activation activates the main audio buses and the first
-  event input, confirms the plugin's own arrangements, sets up 32-bit
-  processing and hands an `Active` (processor, all bus buffers, the host's
+  event input, confirms the plugin's own arrangements, sets up 32-bit (or,
+  when asked and offered, 64-bit) processing and hands an `Active` (processor, all bus buffers, the host's
   `IParameterChanges`/`IEventList` objects and the process context, all
   preallocated) to a `TryCell` like CLAP. Per block: UI and editor changes
   (offset 0, from a wait-free queue; they wait when the 512 queues of a
   block are taken), then automation (sample offsets), then MIDI: notes and
   poly pressure become events, CC/pitch bend/channel pressure become
   parameter changes through the plugin's `IMidiMapping` (VST3 has no CC
-  events; the table is built at activation). Values the processor reports
+  events; the table is built at activation), a program change selects the
+  program-change parameter's program (the controller follows), SysEx is a
+  `kMidiSysEx` data event. Values the processor reports
   in `outputParameterChanges` go back to the controller; note output goes to
   the graph's event output. `reset()` is a `setProcessing` off/on cycle.
   The processor is `Send` and runs on whichever thread processes its node.
@@ -1353,11 +1387,13 @@ lock-free disk streaming.
 
 MIDI: devices with hotplug, live play with constant latency, recording,
 MIDI learn, MIDI output and clock, clock/MTC sync, MPE and native note
-expressions for CLAP and VST3 instruments, SysEx, Standard
-MIDI File import and export, and a full piano roll.
+expressions for CLAP and VST3 instruments, SysEx to devices and plugins,
+Standard MIDI File import and export, and a full piano roll.
 
 Plugins: CLAP and VST3 hosting with crash-safe scanning and Audio Units on
-macOS, a plugin browser, embedded editors on all three platforms, generic
+macOS, sandboxed instances (a process each) on all three platforms, VST3
+program lists, optional 64-bit processing, a plugin browser, embedded
+editors on all three platforms, generic
 parameter windows, presets (user, VST3 factory, `.aupreset`), inserts that
 move and copy between tracks, sidechain inputs.
 
@@ -1384,11 +1420,9 @@ and packages for all three platforms (see §14).
 
 1. **Ports**: the CoreAudio IO workgroup for DSP workers, signed and
    notarised packages, a Flathub submission (vendored crates).
-2. **Plugins**: VST3 program lists and 64-bit processing, SysEx to
-   plugins.
-3. **MIDI**: MTC output, varispeed chase without a shared word clock.
-4. **Performance**: anticipative processing of tracks that are not
+2. **MIDI**: MTC output, varispeed chase without a shared word clock.
+3. **Performance**: anticipative processing of tracks that are not
    monitored live, job affinity for cache locality, an optional wgpu
    painter for dense views.
-5. **Mastering**: DDP export, ISRC/UPC metadata, crossfades between album
+4. **Mastering**: DDP export, ISRC/UPC metadata, crossfades between album
    songs, a song's own inserts on the album.

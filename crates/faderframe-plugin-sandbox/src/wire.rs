@@ -358,6 +358,9 @@ pub struct Instantiated {
     /// say).
     pub note_expressions: Option<Vec<u8>>,
     pub has_editor: bool,
+    /// The plugin's program list.
+    #[serde(default)]
+    pub programs: Vec<String>,
 }
 
 /// What happened in the helper since the last poll.
@@ -375,6 +378,15 @@ pub struct Polled {
     pub params: Option<Vec<Param>>,
     pub latency: u32,
     pub tail: Option<Tail>,
+    /// The selected program.
+    #[serde(default)]
+    pub program: Option<usize>,
+    /// The program list, when the parameters changed.
+    #[serde(default)]
+    pub programs: Option<Vec<String>>,
+    /// Changes the processor has not taken yet.
+    #[serde(default)]
+    pub pending: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -423,6 +435,9 @@ pub enum Request {
     PresetFiles,
     /// Payload: the file.
     StateFromPresetFile,
+    SelectProgram {
+        index: usize,
+    },
     Poll,
     /// Activate for processing with the shared memory block `shm`.
     Activate {
@@ -431,6 +446,8 @@ pub enum Request {
         sidechain: bool,
         shm: String,
         shm_size: u64,
+        #[serde(default)]
+        double_precision: bool,
     },
     Deactivate,
     Editor(EditorCall),

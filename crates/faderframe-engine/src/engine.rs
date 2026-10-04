@@ -199,6 +199,7 @@ pub fn create_with_epoch(
     let readback = Arc::new(ParamTable::new(config.param_capacity));
     let meters = Arc::new(MeterBank::new(config.meter_capacity));
     let scope = Arc::new(faderframe_realtime::ScopeRing::new(SCOPE_FRAMES));
+    let (midi_input, live_sysex) = crate::midi::MidiInputState::new();
     let processor = EngineProcessor {
         rx,
         graph_rx,
@@ -222,7 +223,7 @@ pub fn create_with_epoch(
         stream_rate: config.sample_rate,
         recorder: None,
         click: Click::default(),
-        midi: crate::midi::MidiInputState::new(),
+        midi: midi_input,
         midi_recorder: None,
         midi_out: None,
         clock: crate::midi::ClockGen::default(),
@@ -231,6 +232,7 @@ pub fn create_with_epoch(
     };
     let controller = EngineController {
         config,
+        live_sysex,
         readback,
         tx,
         graph_tx,
@@ -628,6 +630,8 @@ pub struct GraphProfile {
 }
 
 pub struct EngineController {
+    /// Live SysEx to the tracks playing from an input port.
+    live_sysex: crate::midi::LiveSysexSender,
     config: EngineConfig,
     tx: Producer<Message>,
     graph_tx: MailboxSender<CompiledGraph<EngineContext>>,
@@ -859,6 +863,33 @@ impl EngineController {
         self.plugins.state_from_preset_file(plugin, data)
     }
 
+    /// The plugin's own programs (a VST3 program list), by name.
+    pub fn plugin_programs(&self, plugin: faderframe_core::PluginInstanceId) -> Vec<String> {
+        self.plugins.programs(plugin)
+    }
+
+    pub fn plugin_current_program(
+        &self,
+        plugin: faderframe_core::PluginInstanceId,
+    ) -> Option<usize> {
+        self.plugins.current_program(plugin)
+    }
+
+    /// Switch the plugin to one of its programs (it takes effect with the
+    /// processor's next block).
+    pub fn select_plugin_program(
+        &mut self,
+        plugin: faderframe_core::PluginInstanceId,
+        index: usize,
+    ) -> Result<(), faderframe_plugin_host::PluginError> {
+        self.plugins.select_program(plugin, index)
+    }
+
+    /// Changes the plugin's processor has not taken yet.
+    pub fn plugin_changes_pending(&self, plugin: faderframe_core::PluginInstanceId) -> bool {
+        self.plugins.changes_pending(plugin)
+    }
+
     /// The slot state was captured from the running plugin.
     pub fn note_plugin_state(&mut self, plugin: faderframe_core::PluginInstanceId, state: &str) {
         self.plugins.note_state(plugin, state);
@@ -936,6 +967,16 @@ impl EngineController {
     }
 
     /// Encoded state of a plugin instance (for saving into the project).
+    /// Process plugins in 64-bit floating point where they can; `true` when
+    /// it changed (the caller rebuilds the graph to reactivate them).
+    pub fn set_plugin_double_precision(&mut self, on: bool) -> bool {
+        self.plugins.set_double_precision(on)
+    }
+
+    pub fn plugin_double_precision(&self) -> bool {
+        self.plugins.double_precision()
+    }
+
     pub fn plugin_state(&mut self, plugin: faderframe_core::PluginInstanceId) -> Option<String> {
         self.plugins.capture_state(plugin)
     }
@@ -1148,6 +1189,13 @@ impl EngineController {
     }
 
     /// Feed live MIDI from this queue (replaces the previous one).
+    /// SysEx that arrived on MIDI input `port`: the tracks playing live
+    /// from that port get it with the next callback (their plugins).
+    /// `false` when it does not fit.
+    pub fn send_live_sysex(&mut self, port: u16, bytes: &[u8]) -> bool {
+        self.live_sysex.send(port, bytes)
+    }
+
     pub fn set_midi_input(
         &mut self,
         queue: faderframe_midi::MidiInputQueue,

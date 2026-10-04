@@ -58,7 +58,13 @@ static GLOBAL: Counting = Counting;
 const GAIN: ParamID = 1;
 const MODE: ParamID = 2;
 const METER: ParamID = 3;
+/// Hidden program change: three programs setting the gain.
+const PROGRAM: ParamID = 4;
+const PROGRAMS: [(&str, f64); 3] = [("Soft", 0.25), ("Unity", 0.5), ("Loud", 1.0)];
+const PROGRAM_LIST: i32 = 7;
 const LATENCY: u32 = 64;
+/// The sample size of the last processed block.
+static SAMPLE_SIZE: AtomicI64 = AtomicI64::new(-1);
 
 /// What the processor got through its connection point.
 static MESSAGE_VALUE: AtomicI64 = AtomicI64::new(0);
@@ -97,6 +103,13 @@ fn record(e: &Event) {
             x if x == kPolyPressureEvent as u32 => {
                 let n = e.__field0.polyPressure;
                 (t, n.noteId, n.pitch as i32, n.pressure as f64)
+            }
+            // SysEx: (type, size, data type, byte sum).
+            x if x == kDataEvent as u32 => {
+                let d = e.__field0.data;
+                let bytes = std::slice::from_raw_parts(d.bytes, d.size as usize);
+                let sum: f64 = bytes.iter().map(|&b| b as f64).sum();
+                (t, d.size as i32, d.r#type as i32, sum)
             }
             _ => return,
         }
@@ -226,7 +239,9 @@ impl IAudioProcessorTrait for TestProcessor {
         kResultOk
     }
     unsafe fn canProcessSampleSize(&self, size: i32) -> tresult {
-        if size == SymbolicSampleSizes_::kSample32 as i32 {
+        if size == SymbolicSampleSizes_::kSample32 as i32
+            || size == SymbolicSampleSizes_::kSample64 as i32
+        {
             kResultOk
         } else {
             kResultFalse
@@ -253,7 +268,18 @@ impl IAudioProcessorTrait for TestProcessor {
                 let Some(q) = (unsafe { ComRef::from_raw(changes.getParameterData(i)) }) else {
                     continue;
                 };
-                if unsafe { q.getParameterId() } != GAIN {
+                let id = unsafe { q.getParameterId() };
+                if id == PROGRAM {
+                    // A program: its gain from the start of the block.
+                    let (mut o, mut v) = (0, 0.0);
+                    let last = unsafe { q.getPointCount() } - 1;
+                    if last >= 0 && unsafe { q.getPoint(last, &mut o, &mut v) } == kResultTrue {
+                        let p = (v * 2.0).round().clamp(0.0, 2.0) as usize;
+                        self.gain.set(PROGRAMS[p].1);
+                    }
+                    continue;
+                }
+                if id != GAIN {
                     continue;
                 }
                 for p in 0..unsafe { q.getPointCount() } {
@@ -289,10 +315,28 @@ impl IAudioProcessorTrait for TestProcessor {
         }
         let ins = unsafe { std::slice::from_raw_parts(d.inputs, 1) };
         let outs = unsafe { std::slice::from_raw_parts(d.outputs, 1) };
+        SAMPLE_SIZE.store(d.symbolicSampleSize as i64, Ordering::Relaxed);
+        let double = d.symbolicSampleSize == SymbolicSampleSizes_::kSample64 as i32;
         let mut peak = 0.0f32;
         for ch in 0..2 {
-            let i = unsafe { *ins[0].__field0.channelBuffers32.add(ch) };
-            let o = unsafe { *outs[0].__field0.channelBuffers32.add(ch) };
+            // 64-bit: the same arithmetic in double precision.
+            let (i, o, i64_, o64) = unsafe {
+                if double {
+                    (
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        *ins[0].__field0.channelBuffers64.add(ch),
+                        *outs[0].__field0.channelBuffers64.add(ch),
+                    )
+                } else {
+                    (
+                        *ins[0].__field0.channelBuffers32.add(ch),
+                        *outs[0].__field0.channelBuffers32.add(ch),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                }
+            };
             let (mut gain, mut held) = (self.gain.get(), self.held.get());
             let (mut pi, mut ni) = (0, 0);
             for s in 0..n {
@@ -304,8 +348,15 @@ impl IAudioProcessorTrait for TestProcessor {
                     held += notes[ni].1;
                     ni += 1;
                 }
-                let v = unsafe { *i.add(s) } * (2.0 * gain) as f32 + 0.25 * held as f32;
-                unsafe { *o.add(s) = v };
+                let v = if double {
+                    let v = unsafe { *i64_.add(s) } * (2.0 * gain) + 0.25 * held as f64;
+                    unsafe { *o64.add(s) = v };
+                    v as f32
+                } else {
+                    let v = unsafe { *i.add(s) } * (2.0 * gain) as f32 + 0.25 * held as f32;
+                    unsafe { *o.add(s) = v };
+                    v
+                };
                 peak = peak.max(v.abs());
             }
             if ch == 1 {
@@ -358,7 +409,7 @@ impl IConnectionPointTrait for TestProcessor {
 }
 
 struct TestController {
-    values: Mutex<[f64; 4]>,
+    values: Mutex<[f64; 5]>,
     host: Mutex<Option<ComPtr<IHostApplication>>>,
     ui_size: Mutex<u32>,
 }
@@ -369,7 +420,92 @@ impl Class for TestController {
         IConnectionPoint,
         IMidiMapping,
         INoteExpressionController,
+        IUnitInfo,
     );
+}
+
+impl IUnitInfoTrait for TestController {
+    unsafe fn getUnitCount(&self) -> int32 {
+        1
+    }
+    unsafe fn getUnitInfo(&self, index: int32, info: *mut UnitInfo) -> tresult {
+        if index != 0 || info.is_null() {
+            return kInvalidArgument;
+        }
+        let info = unsafe { &mut *info };
+        info.id = kRootUnitId;
+        info.parentUnitId = kNoParentUnitId;
+        util::write_wstr(&mut info.name, "");
+        info.programListId = PROGRAM_LIST;
+        kResultOk
+    }
+    unsafe fn getProgramListCount(&self) -> int32 {
+        1
+    }
+    unsafe fn getProgramListInfo(&self, index: int32, info: *mut ProgramListInfo) -> tresult {
+        if index != 0 || info.is_null() {
+            return kInvalidArgument;
+        }
+        let info = unsafe { &mut *info };
+        info.id = PROGRAM_LIST;
+        util::write_wstr(&mut info.name, "Factory");
+        info.programCount = PROGRAMS.len() as int32;
+        kResultOk
+    }
+    unsafe fn getProgramName(&self, list: int32, index: int32, name: *mut String128) -> tresult {
+        match PROGRAMS.get(index as usize) {
+            Some((n, _)) if list == PROGRAM_LIST && !name.is_null() => {
+                util::write_wstr(unsafe { &mut *name }, n);
+                kResultOk
+            }
+            _ => kInvalidArgument,
+        }
+    }
+    unsafe fn getProgramInfo(
+        &self,
+        _list: int32,
+        _index: int32,
+        _attribute: vst3::Steinberg::Vst::CString,
+        _value: *mut String128,
+    ) -> tresult {
+        kResultFalse
+    }
+    unsafe fn hasProgramPitchNames(&self, _list: int32, _index: int32) -> tresult {
+        kResultFalse
+    }
+    unsafe fn getProgramPitchName(
+        &self,
+        _list: int32,
+        _index: int32,
+        _pitch: int16,
+        _name: *mut String128,
+    ) -> tresult {
+        kResultFalse
+    }
+    unsafe fn getSelectedUnit(&self) -> UnitID {
+        kRootUnitId
+    }
+    unsafe fn selectUnit(&self, _unit: UnitID) -> tresult {
+        kResultOk
+    }
+    unsafe fn getUnitByBus(
+        &self,
+        _type: MediaType,
+        _dir: BusDirection,
+        _bus: int32,
+        _channel: int32,
+        _unit: *mut UnitID,
+    ) -> tresult {
+        kResultFalse
+    }
+    unsafe fn setUnitProgramData(
+        &self,
+        _list: int32,
+        _index: int32,
+        _data: *mut IBStream,
+    ) -> tresult {
+        kResultFalse
+    }
 }
 
 /// The note expressions the test plugin lists (not vibrato).
@@ -511,7 +647,7 @@ impl IEditControllerTrait for TestController {
         kResultOk
     }
     unsafe fn getParameterCount(&self) -> i32 {
-        3
+        4
     }
     unsafe fn getParameterInfo(&self, index: i32, info: *mut ParameterInfo) -> tresult {
         use ParameterInfo_::ParameterFlags_::*;
@@ -520,6 +656,12 @@ impl IEditControllerTrait for TestController {
             0 => (GAIN, "Gain", 0, kCanAutomate),
             1 => (MODE, "Mode", 2, kCanAutomate | kIsList),
             2 => (METER, "Meter", 0, kIsReadOnly),
+            3 => (
+                PROGRAM,
+                "Program",
+                2,
+                kIsProgramChange | kIsList | kIsHidden,
+            ),
             _ => return kInvalidArgument,
         };
         info.id = id;
@@ -609,7 +751,7 @@ impl IPluginFactoryTrait for TestFactory {
             .to_com_ptr::<FUnknown>()
         } else if cid == TestController::CID {
             ComWrapper::new(TestController {
-                values: Mutex::new([0.0, 0.5, 0.0, 0.0]),
+                values: Mutex::new([0.0, 0.5, 0.0, 0.0, 0.5]),
                 host: Mutex::new(None),
                 ui_size: Mutex::new(0),
             })
@@ -723,6 +865,7 @@ const CONFIG: ProcessConfig = ProcessConfig {
     sample_rate: 48_000.0,
     max_block_size: BLOCK as u32,
     sidechain: false,
+    double_precision: false,
 };
 
 #[test]
@@ -737,8 +880,12 @@ fn scanning_describes_buses_and_categories() {
     assert_eq!(p.id, util::tuid_hex(&TestProcessor::CID));
 }
 
+/// One test at a time: they share the test plugin's statics.
+static SERIAL: Mutex<()> = Mutex::new(());
+
 #[test]
 fn hosts_a_plugin_with_separate_controller() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut inst = instantiate();
     // The controller greeted the processor through a host message.
     assert_eq!(MESSAGE_VALUE.load(Ordering::Relaxed), 42);
@@ -868,6 +1015,9 @@ fn hosts_a_plugin_with_separate_controller() {
     ] {
         rig.events[0].push(e).unwrap();
     }
+    rig.events[0]
+        .push_sysex(7, &[0xF0, 0x7E, 0x01, 0xF7])
+        .unwrap();
     rig.run(proc.as_mut(), &[]);
     {
         use Event_::EventTypes_::*;
@@ -893,6 +1043,9 @@ fn hosts_a_plugin_with_separate_controller() {
         assert_eq!((pressure.1, pressure.3), (b, 0.5));
         assert_eq!(find(kNoteOffEvent as u32, 70).1, a);
         assert_eq!(find(kNoteOffEvent as u32, 72).1, b);
+        // SysEx as a data event (kMidiSysEx = 0) with its bytes.
+        let sysex = find(kDataEvent as u32, 0);
+        assert_eq!((sysex.1, sysex.3), (4, (0xF0 + 0x7E + 0x01 + 0xF7) as f64));
         assert!(
             !seen
                 .iter()
@@ -948,6 +1101,78 @@ fn hosts_a_plugin_with_separate_controller() {
     drop(proc);
     drop(inst);
     assert!(!PROCESSING.load(Ordering::Relaxed));
+}
+
+#[test]
+fn programs_and_double_precision() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut inst = instantiate();
+    // The hidden program-change parameter names its programs through the
+    // unit's program list; it is not an ordinary parameter.
+    assert_eq!(inst.programs(), vec!["Soft", "Unity", "Loud"]);
+    assert!(!inst.parameters().iter().any(|p| p.id.0 == PROGRAM));
+    assert_eq!(inst.current_program(), Some(1));
+    let mut proc = inst.create_processor(&CONFIG).unwrap();
+    let mut rig = Rig::new();
+    assert_eq!(rig.run(proc.as_mut(), &[])[0], 1.0);
+    assert_eq!(
+        SAMPLE_SIZE.load(Ordering::Relaxed),
+        SymbolicSampleSizes_::kSample32 as i64
+    );
+
+    // Selecting a program: pending until the processor's next block.
+    inst.select_program(2).unwrap();
+    assert!(inst.changes_pending());
+    assert_eq!(inst.current_program(), Some(2));
+    assert_eq!(rig.run(proc.as_mut(), &[])[0], 2.0, "Loud: gain 1.0");
+    assert!(!inst.changes_pending());
+    assert!(inst.select_program(3).is_err());
+    // The program's settings are in the state now.
+    let state = inst.save_state().unwrap();
+    drop(proc);
+    drop(inst);
+    let mut other = instantiate();
+    other.load_state(&state).unwrap();
+    let mut proc = other.create_processor(&CONFIG).unwrap();
+    assert_eq!(rig.run(proc.as_mut(), &[])[0], 2.0);
+
+    // 64-bit processing (a new activation): the graph's audio converted
+    // around the plugin, automation still sample accurate.
+    let double = ProcessConfig {
+        double_precision: true,
+        ..CONFIG
+    };
+    drop(proc);
+    let mut proc = other.create_processor(&double).unwrap();
+    ALLOCS.store(0, Ordering::Relaxed);
+    let ev = [ParameterEvent {
+        sample_offset: 32,
+        parameter: ParameterId(GAIN),
+        value: 0.25,
+    }];
+    let out = rig.run(proc.as_mut(), &ev);
+    assert_eq!(
+        SAMPLE_SIZE.load(Ordering::Relaxed),
+        SymbolicSampleSizes_::kSample64 as i64
+    );
+    assert_eq!((out[31], out[32]), (2.0, 0.5));
+    assert_eq!(ALLOCS.load(Ordering::Relaxed), 0, "no allocation");
+
+    // A MIDI program change selects a program; the controller follows.
+    rig.events[0]
+        .push(TimedMidiEvent {
+            sample_offset: 0,
+            event: MidiEvent::ProgramChange {
+                channel: 0,
+                program: 1,
+            },
+        })
+        .unwrap();
+    assert_eq!(rig.run(proc.as_mut(), &[])[0], 1.0, "Unity: gain 0.5");
+    other.poll();
+    assert_eq!(other.current_program(), Some(1));
+    drop(proc);
+    drop(other);
 }
 
 /// `FADERFRAME_TEST_VST3=/path/to/Plugin.vst3 cargo test -p

@@ -3,6 +3,10 @@
 //! shared library): parameters, state, activation and processing with
 //! sample-accurate parameter events.
 
+use clack_extensions::audio_ports::{
+    AudioPortFlags, AudioPortInfo, AudioPortInfoWriter, AudioPortType, PluginAudioPorts,
+    PluginAudioPortsImpl,
+};
 use clack_extensions::params::{
     ParamDisplayWriter, ParamInfo, ParamInfoFlags, ParamInfoWriter, PluginAudioProcessorParams,
     PluginMainThreadParams, PluginParams,
@@ -24,6 +28,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Note events the test plugin received: (what, note id, key, value).
 static NOTES: Mutex<Vec<(String, i32, i16, f64)>> = Mutex::new(Vec::new());
+/// The sample width of the last block the test plugin processed (32/64).
+static WIDTH: AtomicU64 = AtomicU64::new(0);
+/// The tests share the statics above: one at a time.
+static SERIAL: Mutex<()> = Mutex::new(());
 
 // --- the test plugin -------------------------------------------------------------
 
@@ -55,6 +63,18 @@ impl GainShared {
                 Some(CoreEventSpace::NoteOff(n)) => note("off".into(), n.pckn(), 0.0),
                 Some(CoreEventSpace::NoteExpression(x)) => {
                     note(format!("{:?}", x.expression_type()), x.pckn(), x.value())
+                }
+                // SysEx: ("sysex", size, second byte, byte sum).
+                Some(CoreEventSpace::MidiSysEx(m)) => {
+                    // SAFETY: the host keeps the bytes alive for the call.
+                    let data = unsafe { m.data() };
+                    let sum: f64 = data.iter().map(|&b| f64::from(b)).sum();
+                    NOTES.lock().unwrap().push((
+                        "sysex".into(),
+                        data.len() as i32,
+                        data.get(1).copied().unwrap_or(0) as i16,
+                        sum,
+                    ));
                 }
                 _ => {}
             }
@@ -112,6 +132,26 @@ impl PluginMainThreadParams for GainMain<'_> {
     }
 }
 
+/// One stereo port each way, 64-bit capable.
+impl PluginAudioPortsImpl for GainMain<'_> {
+    fn count(&self, _is_input: bool) -> u32 {
+        1
+    }
+
+    fn get(&self, index: u32, is_input: bool, writer: &mut AudioPortInfoWriter) {
+        if index == 0 {
+            writer.set(&AudioPortInfo {
+                id: ClapId::new(0),
+                name: if is_input { b"In" } else { b"Out" },
+                channel_count: 2,
+                flags: AudioPortFlags::IS_MAIN | AudioPortFlags::SUPPORTS_64BITS,
+                port_type: Some(AudioPortType::STEREO),
+                in_place_pair: None,
+            });
+        }
+    }
+}
+
 impl PluginStateImpl for GainMain<'_> {
     fn save(&self, output: &mut OutputStream) -> Result<(), PluginError> {
         output.write_all(&self.shared.get().to_le_bytes())?;
@@ -149,10 +189,35 @@ impl<'a> PluginAudioProcessor<'a, GainShared, GainMain<'a>> for GainProcessor<'a
         self.shared.apply(events.input);
         let gain = db_to_gain(self.shared.get() as f32);
         let mut port = audio.port_pair(0).ok_or(PluginError::Message("no port"))?;
-        let mut channels = port
-            .channels()?
-            .into_f32()
-            .ok_or(PluginError::Message("not f32"))?;
+        let channels = port.channels()?;
+        let mut channels = match channels.into_f64() {
+            Some(mut channels) => {
+                WIDTH.store(64, Ordering::Relaxed);
+                let gain = f64::from(gain);
+                for pair in channels.iter_mut() {
+                    match pair {
+                        ChannelPair::InputOutput(i, o) => {
+                            for (o, i) in o.iter_mut().zip(i.iter()) {
+                                *o = *i * gain;
+                            }
+                        }
+                        ChannelPair::InPlace(b) => {
+                            for s in b.iter_mut() {
+                                *s *= gain;
+                            }
+                        }
+                        ChannelPair::OutputOnly(o) => o.fill(0.0),
+                        ChannelPair::InputOnly(_) => {}
+                    }
+                }
+                return Ok(ProcessStatus::Continue);
+            }
+            None => port
+                .channels()?
+                .into_f32()
+                .ok_or(PluginError::Message("not f32"))?,
+        };
+        WIDTH.store(32, Ordering::Relaxed);
         for pair in channels.iter_mut() {
             match pair {
                 ChannelPair::InputOutput(i, o) => {
@@ -185,7 +250,10 @@ impl Plugin for TestGain {
     type MainThread<'a> = GainMain<'a>;
 
     fn declare_extensions(builder: &mut PluginExtensions<Self>, _shared: Option<&GainShared>) {
-        builder.register::<PluginParams>().register::<PluginState>();
+        builder
+            .register::<PluginParams>()
+            .register::<PluginState>()
+            .register::<PluginAudioPorts>();
     }
 }
 
@@ -266,6 +334,7 @@ fn run_block(
 
 #[test]
 fn notes_carry_ids_and_note_expressions_reach_their_keys() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     use faderframe_midi::{
         ExpressionValue, MidiBuffer, MidiEvent, NoteExpressionKind, TimedMidiEvent,
     };
@@ -276,6 +345,7 @@ fn notes_carry_ids_and_note_expressions_reach_their_keys() {
             sample_rate: 48_000.0,
             max_block_size: 64,
             sidechain: false,
+            double_precision: false,
         })
         .unwrap();
     NOTES.lock().unwrap().clear();
@@ -322,6 +392,8 @@ fn notes_carry_ids_and_note_expressions_reach_their_keys() {
     ] {
         midi.push(e).unwrap();
     }
+    midi.push_sysex(3, &[0xF0, 0x7E, 0x7F, 0x06, 0x01, 0xF7])
+        .unwrap();
     let input = {
         let mut b = AudioBuffer::new(ChannelLayout::Stereo, 64);
         b.set_len(64);
@@ -369,10 +441,17 @@ fn notes_carry_ids_and_note_expressions_reach_their_keys() {
     let pan = id_of("Some(Pan)", 62);
     assert_eq!((pan.1, pan.3), (-1, 0.75));
     assert_eq!(id_of("off", 60).1, a);
+    // SysEx with its bytes (an identity request).
+    let sysex = id_of("sysex", 0x7E);
+    assert_eq!(
+        (sysex.1, sysex.3),
+        (6, f64::from(0xF0u32 + 0x7E + 0x7F + 0x06 + 0x01 + 0xF7))
+    );
 }
 
 #[test]
 fn parameters_state_and_processing() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let f = factory();
     assert_eq!(f.scan().len(), 1);
     let mut inst = f.instantiate("org.faderframe.test-gain").unwrap();
@@ -397,6 +476,7 @@ fn parameters_state_and_processing() {
         sample_rate: 48_000.0,
         max_block_size: 256,
         sidechain: false,
+        double_precision: false,
     };
     let mut proc = inst.create_processor(&config).unwrap();
     let out = run_block(proc.as_mut(), &[], 256);
@@ -433,6 +513,7 @@ fn parameters_state_and_processing() {
             sample_rate: 96_000.0,
             max_block_size: 512,
             sidechain: false,
+            double_precision: false,
         })
         .unwrap();
     let out = run_block(proc.as_mut(), &[], 64);
@@ -445,6 +526,33 @@ fn parameters_state_and_processing() {
         out.iter().all(|v| *v == 0.0),
         "after the instance is gone the node is silent"
     );
+}
+
+#[test]
+fn double_precision_where_the_ports_take_it() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let f = factory();
+    let mut inst = f.instantiate("org.faderframe.test-gain").unwrap();
+    inst.set_parameter(ParameterId(0), -6.0).unwrap();
+    let config = ProcessConfig {
+        sample_rate: 48_000.0,
+        max_block_size: 256,
+        sidechain: false,
+        double_precision: true,
+    };
+    let mut proc = inst.create_processor(&config).unwrap();
+    let out = run_block(proc.as_mut(), &[], 256);
+    assert_eq!(WIDTH.load(Ordering::Relaxed), 64);
+    assert!((out[100] - 0.5 * db_to_gain(-6.0)).abs() < 1e-6);
+    // Back to 32-bit: a new activation.
+    let mut proc = inst
+        .create_processor(&ProcessConfig {
+            double_precision: false,
+            ..config
+        })
+        .unwrap();
+    run_block(proc.as_mut(), &[], 256);
+    assert_eq!(WIDTH.load(Ordering::Relaxed), 32);
 }
 
 /// Host a real installed plugin end to end (opt-in):
@@ -475,6 +583,7 @@ fn hosts_an_installed_plugin() {
                 sample_rate: 48_000.0,
                 max_block_size: 512,
                 sidechain: false,
+                double_precision: false,
             })
             .unwrap();
         let mut peak = 0.0f32;

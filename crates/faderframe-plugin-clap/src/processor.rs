@@ -11,8 +11,9 @@
 
 use crate::host::FfHost;
 use clack_host::events::event_types::{
-    MidiEvent as ClapMidi, NoteExpressionEvent, NoteExpressionType, NoteOffEvent, NoteOnEvent,
-    ParamGestureBeginEvent, ParamGestureEndEvent, ParamValueEvent, TransportEvent, TransportFlags,
+    MidiEvent as ClapMidi, MidiSysExEvent, NoteExpressionEvent, NoteExpressionType, NoteOffEvent,
+    NoteOnEvent, ParamGestureBeginEvent, ParamGestureEndEvent, ParamValueEvent, TransportEvent,
+    TransportFlags,
 };
 use clack_host::events::{EventFlags, EventHeader, Match, Pckn};
 use clack_host::prelude::*;
@@ -36,6 +37,11 @@ pub(crate) struct RtState {
     pub proc: Option<RtProc>,
     in_bufs: Vec<Vec<Vec<f32>>>,
     out_bufs: Vec<Vec<Vec<f32>>>,
+    /// The port buffers in 64-bit (processing in double precision; the
+    /// 32-bit ones are then empty).
+    in_bufs64: Vec<Vec<Vec<f64>>>,
+    out_bufs64: Vec<Vec<Vec<f64>>>,
+    double: bool,
     ports_in: AudioPorts,
     ports_out: AudioPorts,
     events_in: EventBuffer,
@@ -81,13 +87,25 @@ impl RtState {
         inputs: &[u16],
         outputs: &[u16],
         max_frames: usize,
+        double: bool,
         params_rx: rtrb::Consumer<(u32, f64)>,
         edits_tx: rtrb::Producer<(u8, u32, f64)>,
     ) -> Self {
+        let (n32, n64) = if double {
+            (0, max_frames)
+        } else {
+            (max_frames, 0)
+        };
         let bufs = |ports: &[u16]| -> Vec<Vec<Vec<f32>>> {
             ports
                 .iter()
-                .map(|&c| (0..c).map(|_| vec![0.0; max_frames]).collect())
+                .map(|&c| (0..c).map(|_| vec![0.0; n32]).collect())
+                .collect()
+        };
+        let bufs64 = |ports: &[u16]| -> Vec<Vec<Vec<f64>>> {
+            ports
+                .iter()
+                .map(|&c| (0..c).map(|_| vec![0.0; n64]).collect())
                 .collect()
         };
         let total = |ports: &[u16]| ports.iter().map(|&c| c as usize).sum::<usize>();
@@ -95,6 +113,9 @@ impl RtState {
             proc: Some(RtProc::Stopped(proc)),
             in_bufs: bufs(inputs),
             out_bufs: bufs(outputs),
+            in_bufs64: bufs64(inputs),
+            out_bufs64: bufs64(outputs),
+            double,
             ports_in: AudioPorts::with_capacity(total(inputs), inputs.len()),
             ports_out: AudioPorts::with_capacity(total(outputs), outputs.len()),
             events_in: EventBuffer::with_capacity(EVENT_CAPACITY),
@@ -253,6 +274,15 @@ impl PluginProcessor for ClapProcessor {
                         st.events_in
                             .push(&NoteExpressionEvent::new(t, pckn, kind, value));
                     }
+                    MidiEvent::SysEx(r) => {
+                        if let Some(bytes) = midi.sysex(&r) {
+                            // SAFETY: the bytes live in the graph's input
+                            // buffer, borrowed for this whole call; the
+                            // event list is cleared before the next block.
+                            let e = unsafe { MidiSysExEvent::new(t, 0, bytes) };
+                            st.events_in.push(&e);
+                        }
+                    }
                     other => {
                         let (bytes, _) = other.to_bytes();
                         st.events_in.push(&ClapMidi::new(t, 0, bytes));
@@ -264,15 +294,36 @@ impl PluginProcessor for ClapProcessor {
 
         // Audio: graph input `p` into port `p` (the main input, then the
         // sidechain when connected), other ports silent.
-        for (p, port) in st.in_bufs.iter_mut().enumerate() {
-            for (c, ch) in port.iter_mut().enumerate() {
-                let src = io.audio_in.get(p);
-                match src {
+        let ports = st.in_bufs.len().max(st.in_bufs64.len());
+        for p in 0..ports {
+            let channels = if st.double {
+                st.in_bufs64[p].len()
+            } else {
+                st.in_bufs[p].len()
+            };
+            for c in 0..channels {
+                let src = match io.audio_in.get(p) {
                     Some(inp) if inp.num_channels() > 0 => {
-                        let s = inp.channel(c.min(inp.num_channels() - 1));
-                        ch[..n].copy_from_slice(&s[..n]);
+                        Some(&inp.channel(c.min(inp.num_channels() - 1))[..n])
                     }
-                    _ => ch[..n].fill(0.0),
+                    _ => None,
+                };
+                if st.double {
+                    let ch = &mut st.in_bufs64[p][c][..n];
+                    match src {
+                        Some(s) => {
+                            for (d, s) in ch.iter_mut().zip(s) {
+                                *d = f64::from(*s);
+                            }
+                        }
+                        None => ch.fill(0.0),
+                    }
+                } else {
+                    let ch = &mut st.in_bufs[p][c][..n];
+                    match src {
+                        Some(s) => ch.copy_from_slice(s),
+                        None => ch.fill(0.0),
+                    }
                 }
             }
         }
@@ -281,6 +332,9 @@ impl PluginProcessor for ClapProcessor {
             let RtState {
                 in_bufs,
                 out_bufs,
+                in_bufs64,
+                out_bufs64,
+                double,
                 ports_in,
                 ports_out,
                 events_in,
@@ -288,30 +342,60 @@ impl PluginProcessor for ClapProcessor {
                 steady,
                 ..
             } = st;
-            let inputs = ports_in.with_input_buffers(in_bufs.iter_mut().map(|port| {
-                AudioPortBuffer {
-                    latency: 0,
-                    channels: AudioPortBufferType::f32_input_only(
-                        port.iter_mut()
-                            .map(|ch| InputChannel::variable(&mut ch[..n])),
-                    ),
-                }
-            }));
-            let mut outputs =
-                ports_out.with_output_buffers(out_bufs.iter_mut().map(|port| AudioPortBuffer {
-                    latency: 0,
-                    channels: AudioPortBufferType::f32_output_only(
-                        port.iter_mut().map(|ch| &mut ch[..n]),
-                    ),
+            if *double {
+                let inputs = ports_in.with_input_buffers(in_bufs64.iter_mut().map(|port| {
+                    AudioPortBuffer {
+                        latency: 0,
+                        channels: AudioPortBufferType::f64_input_only(
+                            port.iter_mut()
+                                .map(|ch| InputChannel::variable(&mut ch[..n])),
+                        ),
+                    }
                 }));
-            started.process(
-                &inputs,
-                &mut outputs,
-                &events_in.as_input(),
-                &mut events_out.as_output(),
-                Some(*steady),
-                Some(&transport),
-            )
+                let mut outputs =
+                    ports_out.with_output_buffers(out_bufs64.iter_mut().map(|port| {
+                        AudioPortBuffer {
+                            latency: 0,
+                            channels: AudioPortBufferType::f64_output_only(
+                                port.iter_mut().map(|ch| &mut ch[..n]),
+                            ),
+                        }
+                    }));
+                started.process(
+                    &inputs,
+                    &mut outputs,
+                    &events_in.as_input(),
+                    &mut events_out.as_output(),
+                    Some(*steady),
+                    Some(&transport),
+                )
+            } else {
+                let inputs = ports_in.with_input_buffers(in_bufs.iter_mut().map(|port| {
+                    AudioPortBuffer {
+                        latency: 0,
+                        channels: AudioPortBufferType::f32_input_only(
+                            port.iter_mut()
+                                .map(|ch| InputChannel::variable(&mut ch[..n])),
+                        ),
+                    }
+                }));
+                let mut outputs = ports_out.with_output_buffers(out_bufs.iter_mut().map(|port| {
+                    AudioPortBuffer {
+                        latency: 0,
+                        channels: AudioPortBufferType::f32_output_only(
+                            port.iter_mut().map(|ch| &mut ch[..n]),
+                        ),
+                    }
+                }));
+                started.process(
+                    &inputs,
+                    &mut outputs,
+                    &events_in.as_input(),
+                    &mut events_out.as_output(),
+                    Some(*steady),
+                    Some(&transport),
+                )
+            }
         };
         st.steady += n as u64;
         // Parameter moves the plugin made itself (its editor), for the host.
@@ -333,11 +417,23 @@ impl PluginProcessor for ClapProcessor {
 
         // Main output port to the graph (no output ports: pass through).
         if let Some(out) = io.audio_out.first_mut() {
-            match st.out_bufs.first() {
-                Some(main) if !main.is_empty() => {
+            let main = if st.double {
+                st.out_bufs64.first().map_or(0, Vec::len)
+            } else {
+                st.out_bufs.first().map_or(0, Vec::len)
+            };
+            match main {
+                main if main > 0 => {
                     for c in 0..out.num_channels() {
-                        let src = &main[c.min(main.len() - 1)];
-                        out.channel_mut(c)[..n].copy_from_slice(&src[..n]);
+                        let dst = &mut out.channel_mut(c)[..n];
+                        let src = c.min(main - 1);
+                        if st.double {
+                            for (d, s) in dst.iter_mut().zip(&st.out_bufs64[0][src][..n]) {
+                                *d = *s as f32;
+                            }
+                        } else {
+                            dst.copy_from_slice(&st.out_bufs[0][src][..n]);
+                        }
                     }
                 }
                 _ => match io.audio_in.first() {

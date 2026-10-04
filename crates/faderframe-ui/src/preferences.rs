@@ -91,14 +91,39 @@ fn audio_page(app: &Rc<AppState>, alive: &Rc<std::cell::Cell<bool>>) -> gtk::Wid
     ));
     row(&g, 3, "Processing threads", &threads);
 
+    // Plugin precision: applies at once (the plugins are reactivated).
+    let precision = gtk::CheckButton::with_label(
+        "Process plugins in 64-bit floating point where they support it",
+    );
+    precision.set_active(app.session.borrow().plugin_double_precision());
+    precision.set_tooltip_text(Some(
+        "VST3 and CLAP plugins that offer double precision get 64-bit buffers; \
+         FaderFrame's own mixing stays 32-bit",
+    ));
+    {
+        let weak = Rc::downgrade(app);
+        precision.connect_toggled(move |b| {
+            let on = b.is_active();
+            let mut p = Preferences::load();
+            p.plugin_double_precision = on;
+            if let Err(e) = p.save() {
+                tracing::warn!("cannot save preferences: {e}");
+            }
+            if let Some(app) = weak.upgrade() {
+                app.with_session(|s| s.set_plugin_double_precision(on));
+            }
+        });
+    }
+    row(&g, 4, "Plugin precision", &precision);
+
     let status = gtk::Label::new(None);
     status.set_xalign(0.0);
     status.set_selectable(true);
-    row(&g, 4, "Stream", &status);
+    row(&g, 5, "Stream", &status);
     let stats = gtk::Label::new(None);
     stats.set_xalign(0.0);
     stats.add_css_class("monospace");
-    row(&g, 5, "DSP load", &stats);
+    row(&g, 6, "DSP load", &stats);
 
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let apply = gtk::Button::with_label("Apply & Restart Audio");
@@ -111,7 +136,7 @@ fn audio_page(app: &Rc<AppState>, alive: &Rc<std::cell::Cell<bool>>) -> gtk::Wid
     buttons.append(&apply);
     buttons.append(&live);
     buttons.append(&reset);
-    g.attach(&buttons, 1, 6, 1, 1);
+    g.attach(&buttons, 1, 7, 1, 1);
     g.attach(
         &note(
             "JACK and PipeWire own the sample rate: FaderFrame follows whatever the server runs at \
@@ -121,7 +146,7 @@ fn audio_page(app: &Rc<AppState>, alive: &Rc<std::cell::Cell<bool>>) -> gtk::Wid
              the audio thread's priority.",
         ),
         0,
-        7,
+        8,
         2,
         1,
     );

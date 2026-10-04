@@ -1,6 +1,7 @@
 //! The shared memory of one activation ([`Block`]): a [`Header`] — sync
 //! words, the block's size and buffer shapes, transport, parameter events,
-//! MIDI events both ways — followed by the audio, [`MAX_BUFFERS`] buffers
+//! MIDI events both ways, the bytes of incoming SysEx — followed by the
+//! audio, [`MAX_BUFFERS`] buffers
 //! of [`MAX_CHANNELS`] channels of `max_frames` samples each way.
 //!
 //! Every value crosses as a plain fixed-layout record (`Wire*`), never as
@@ -27,8 +28,13 @@ pub const MAX_BUFFERS: usize = 4;
 pub const MAX_CHANNELS: usize = 16;
 pub const MAX_EVENTS: usize = 1024;
 pub const MAX_PARAMS: usize = 1024;
+/// Bytes of SysEx per block (to the plugin).
+pub const MAX_SYSEX: usize = 16 * 1024;
 const MAGIC: u32 = 0x4646_5348;
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
+/// A SysEx event: `value` holds the start of its bytes in `sysex_in`
+/// (low 16 bits) and their count (high 16 bits).
+const SYSEX_KIND: u8 = 9;
 
 /// A MIDI event or note expression at a frame offset.
 #[repr(C)]
@@ -66,6 +72,8 @@ impl WireEvent {
             } => {
                 (w.kind, w.a, w.b, w.value) = (8, key, expression_index(kind), value.raw());
             }
+            // Its bytes go along separately (`Block::write_request`).
+            MidiEvent::SysEx(_) => {}
         }
         w
     }
@@ -230,6 +238,9 @@ pub struct Header {
     pub params: [WireParam; MAX_PARAMS],
     pub events_in: [WireEvent; MAX_EVENTS],
     pub events_out: [WireEvent; MAX_EVENTS],
+    /// Bytes used in `sysex_in`.
+    pub n_sysex_in: u32,
+    pub sysex_in: [u8; MAX_SYSEX],
 }
 
 /// Bytes of the header, rounded up to a cache line.
@@ -362,7 +373,8 @@ impl Block {
         let n_in = audio_in.len().min(MAX_BUFFERS);
         let n_out = out_channels.len().min(MAX_BUFFERS);
         // SAFETY: the host owns the request part until it bumps `seq`; all
-        // writes stay within the header and the audio areas.
+        // writes stay within the header (SysEx bytes within `sysex_in`,
+        // checked) and the audio areas.
         unsafe {
             addr_of_mut!((*h).frames).write_volatile(frames as u32);
             addr_of_mut!((*h).n_in).write_volatile(n_in as u32);
@@ -389,13 +401,35 @@ impl Block {
                 });
             }
             addr_of_mut!((*h).n_params).write_volatile(np as u32);
-            let mut ne = 0;
+            let (mut ne, mut sysex) = (0, 0usize);
             if let Some(ev) = events_in {
                 for e in ev.iter().take(MAX_EVENTS) {
-                    addr_of_mut!((*h).events_in[ne]).write_volatile(WireEvent::encode(e));
+                    let w = match e.event {
+                        MidiEvent::SysEx(r) => {
+                            let Some(bytes) = ev.sysex(&r) else {
+                                continue;
+                            };
+                            if sysex + bytes.len() > MAX_SYSEX {
+                                continue;
+                            }
+                            let dst = addr_of_mut!((*h).sysex_in).cast::<u8>().add(sysex);
+                            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+                            let w = WireEvent {
+                                offset: e.sample_offset,
+                                kind: SYSEX_KIND,
+                                value: ((bytes.len() as i32) << 16) | sysex as i32,
+                                ..WireEvent::default()
+                            };
+                            sysex += bytes.len();
+                            w
+                        }
+                        _ => WireEvent::encode(e),
+                    };
+                    addr_of_mut!((*h).events_in[ne]).write_volatile(w);
                     ne += 1;
                 }
             }
+            addr_of_mut!((*h).n_sysex_in).write_volatile(sysex as u32);
             addr_of_mut!((*h).has_events_in).write_volatile(events_in.is_some() as u32);
             addr_of_mut!((*h).n_events_in).write_volatile(ne as u32);
             addr_of_mut!((*h).has_events_out).write_volatile(events_out as u32);
@@ -451,7 +485,9 @@ impl Block {
     pub fn read_request(&self, io: &mut HelperIo) -> usize {
         let h = self.h();
         // SAFETY: the host posted the request; reads stay within the
-        // mapping, counts are clamped.
+        // mapping, counts and SysEx ranges are clamped to what the header
+        // holds, and SysEx bytes are copied into `scratch`'s spare capacity
+        // (checked) before its length is set.
         unsafe {
             let frames = (addr_of!((*h).frames).read_volatile() as usize).min(self.max_frames);
             let n_in = (addr_of!((*h).n_in).read_volatile() as usize).min(MAX_BUFFERS);
@@ -498,8 +534,23 @@ impl Block {
                     .unwrap_or_else(|| MidiBuffer::with_capacity(MAX_EVENTS));
                 buf.clear();
                 let n = (addr_of!((*h).n_events_in).read_volatile() as usize).min(MAX_EVENTS);
+                let used = (addr_of!((*h).n_sysex_in).read_volatile() as usize).min(MAX_SYSEX);
                 for i in 0..n {
-                    if let Some(e) = addr_of!((*h).events_in[i]).read_volatile().decode() {
+                    let w = addr_of!((*h).events_in[i]).read_volatile();
+                    if w.kind == SYSEX_KIND {
+                        // Bytes the host wrote, copied out of the block.
+                        let v = w.value as u32;
+                        let (start, len) = ((v & 0xFFFF) as usize, (v >> 16) as usize);
+                        if len > 0 && start + len <= used && io.scratch.capacity() >= len {
+                            let src = addr_of!((*h).sysex_in).cast::<u8>().add(start);
+                            io.scratch.clear();
+                            std::ptr::copy_nonoverlapping(src, io.scratch.as_mut_ptr(), len);
+                            io.scratch.set_len(len);
+                            let _ = buf.push_sysex(w.offset, &io.scratch);
+                        }
+                        continue;
+                    }
+                    if let Some(e) = w.decode() {
                         let _ = buf.push(e);
                     }
                 }
@@ -565,6 +616,8 @@ pub struct HelperIo {
     pub transport: TransportInfo,
     spare_events: Option<MidiBuffer>,
     spare_out_events: Option<MidiBuffer>,
+    /// SysEx bytes on their way out of the block.
+    scratch: Vec<u8>,
 }
 
 impl Default for HelperIo {
@@ -578,6 +631,7 @@ impl Default for HelperIo {
             transport: TransportInfo::default(),
             spare_events: None,
             spare_out_events: None,
+            scratch: Vec::with_capacity(MAX_SYSEX),
         }
     }
 }

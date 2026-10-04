@@ -44,6 +44,8 @@ pub struct PluginHost {
     instances: HashMap<PluginInstanceId, Hosted>,
     /// Plugins that reported unsaved state since the last `take_dirty`.
     dirty: HashSet<PluginInstanceId>,
+    /// Activate plugins for 64-bit processing where they can.
+    double_precision: bool,
 }
 
 impl Default for PluginHost {
@@ -67,7 +69,18 @@ impl PluginHost {
             registry,
             instances: HashMap::new(),
             dirty: HashSet::new(),
+            double_precision: false,
         }
+    }
+
+    /// Process plugins in 64-bit floating point where they can (applies
+    /// with the next graph build); `true` when it changed.
+    pub fn set_double_precision(&mut self, on: bool) -> bool {
+        std::mem::replace(&mut self.double_precision, on) != on
+    }
+
+    pub fn double_precision(&self) -> bool {
+        self.double_precision
     }
 
     pub fn registry(&self) -> &PluginRegistry {
@@ -139,6 +152,36 @@ impl PluginHost {
         self.instances
             .get(&plugin)
             .is_some_and(|h| h.failed.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// The plugin's own programs, by name.
+    pub fn programs(&self, plugin: PluginInstanceId) -> Vec<String> {
+        self.instances
+            .get(&plugin)
+            .map_or_else(Vec::new, |h| h.instance.programs())
+    }
+
+    pub fn current_program(&self, plugin: PluginInstanceId) -> Option<usize> {
+        self.instances.get(&plugin)?.instance.current_program()
+    }
+
+    pub fn select_program(
+        &mut self,
+        plugin: PluginInstanceId,
+        index: usize,
+    ) -> Result<(), PluginError> {
+        self.instances
+            .get_mut(&plugin)
+            .ok_or_else(|| PluginError::NotFound(format!("{plugin}")))?
+            .instance
+            .select_program(index)
+    }
+
+    /// Changes the plugin's processor has not taken yet.
+    pub fn changes_pending(&self, plugin: PluginInstanceId) -> bool {
+        self.instances
+            .get(&plugin)
+            .is_some_and(|h| h.instance.changes_pending())
     }
 
     /// Drop the instance: the next graph build creates it again from its

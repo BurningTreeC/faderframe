@@ -82,6 +82,28 @@ impl ClapInstance {
         self.instance.access_shared_handler(|s| s.ext())
     }
 
+    /// Every audio port takes 64-bit buffers.
+    fn supports_64bit(&mut self) -> bool {
+        use clack_extensions::audio_ports::{AudioPortFlags, AudioPortInfoBuffer};
+        let Some(ports) = self.ext().audio_ports else {
+            return false;
+        };
+        let handle = self.instance.plugin_handle();
+        let mut buffer = AudioPortInfoBuffer::new();
+        let mut any = false;
+        for is_input in [true, false] {
+            for i in 0..ports.count(&handle, is_input) {
+                match ports.get(&handle, i, is_input, &mut buffer) {
+                    Some(info) if info.flags.contains(AudioPortFlags::SUPPORTS_64BITS) => {
+                        any = true;
+                    }
+                    _ => return false,
+                }
+            }
+        }
+        any
+    }
+
     fn query_params(&mut self) {
         let Some(params) = self.ext().params else {
             self.params.clear();
@@ -387,11 +409,18 @@ impl FfInstance for ClapInstance {
                 .map_err(|e| PluginError::Failed(format!("{}: {e}", self.scanned.name)))?;
             let (tx, rx) = rtrb::RingBuffer::new(1024);
             let (edits_tx, edits_rx) = rtrb::RingBuffer::new(1024);
+            let double = config.double_precision && self.supports_64bit();
+            tracing::debug!(
+                "{}: processing in {}-bit floating point",
+                self.scanned.name,
+                if double { 64 } else { 32 }
+            );
             let state = RtState::new(
                 stopped,
                 &self.scanned.audio_inputs,
                 &self.scanned.audio_outputs,
                 config.max_block_size.max(1) as usize,
+                double,
                 rx,
                 edits_tx,
             );

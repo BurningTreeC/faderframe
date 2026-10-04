@@ -167,6 +167,14 @@ impl Processor<EngineContext> for MidiClipPlayer {
         let end = pos + io.frames as i64;
         let upto = lane.midi.partition_point(|r| r.start < end);
         for region in lane.midi[..upto].iter().filter(|r| r.end >= pos) {
+            // SysEx for the track's plugins (bytes copied into the buffer).
+            let first = region.sysex.partition_point(|(time, _)| *time < pos);
+            for (time, bytes) in &region.sysex[first..] {
+                if *time >= end {
+                    break;
+                }
+                let _ = out.push_sysex((*time - pos) as u32, bytes);
+            }
             let first = region.events.partition_point(|(time, _)| *time < pos);
             for &(time, event) in &region.events[first..] {
                 if time >= end {

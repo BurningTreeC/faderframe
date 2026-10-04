@@ -115,6 +115,10 @@ pub struct Vst3Instance {
     editor_edits: Vec<faderframe_plugin_host::EditorEdit>,
     /// The note expressions the plugin lists (queried once).
     note_expressions: Vec<NoteExpressionKind>,
+    /// The program-change parameter (and its step count) with the names of
+    /// its programs.
+    program: Option<(ParamID, u32)>,
+    programs: Vec<String>,
     view: Option<ComPtr<IPlugView>>,
     view_open: bool,
     /// Editor edits forwarded since the last poll (for "dirty").
@@ -182,6 +186,8 @@ impl Vst3Instance {
             activations: 0,
             editor_edits: Vec::new(),
             note_expressions: Vec::new(),
+            program: None,
+            programs: Vec::new(),
             view: None,
             view_open: false,
             edited: false,
@@ -263,12 +269,19 @@ impl Vst3Instance {
             .unwrap_or_default();
         let mut out = Vec::new();
         let mut steps = Vec::new();
+        // The program-change parameter (often hidden): (id, unit, steps).
+        let mut program = None;
         // SAFETY: plain queries with valid out pointers.
         unsafe {
             for i in 0..ctrl.getParameterCount().clamp(0, 65536) {
                 let mut info: vst3::Steinberg::Vst::ParameterInfo = std::mem::zeroed();
-                if ctrl.getParameterInfo(i, &mut info) != kResultOk
-                    || info.flags & kIsHidden != 0
+                if ctrl.getParameterInfo(i, &mut info) != kResultOk {
+                    continue;
+                }
+                if info.flags & kIsProgramChange != 0 && program.is_none() {
+                    program = Some((info.id, info.unitId, info.stepCount.max(0) as u32));
+                }
+                if info.flags & kIsHidden != 0
                     || (info.flags & kCanAutomate == 0 && proxies.contains(&info.id))
                 {
                     continue;
@@ -297,6 +310,94 @@ impl Vst3Instance {
         }
         self.params = out;
         self.map = Arc::new(ParamMap::new(steps));
+        self.programs = program.map_or_else(Vec::new, |(id, unit, steps)| {
+            self.program_names(id, unit, steps)
+        });
+        self.program = program
+            .filter(|_| !self.programs.is_empty())
+            .map(|(id, _, steps)| (id, steps));
+    }
+
+    /// The names of the programs that parameter `id` (of `unit`, with
+    /// `steps` steps) selects: the unit's program list, else the
+    /// parameter's own value texts.
+    fn program_names(&self, id: ParamID, unit: i32, steps: u32) -> Vec<String> {
+        use vst3::Steinberg::Vst::{ProgramListInfo, kNoProgramListId};
+        let Some(ctrl) = self.controller.as_ref() else {
+            return Vec::new();
+        };
+        if let Some(units) = ctrl.cast::<IUnitInfo>() {
+            // SAFETY: plain queries with valid out pointers.
+            unsafe {
+                let mut list = None;
+                for i in 0..units.getUnitCount().clamp(0, 4096) {
+                    let mut info: UnitInfo = std::mem::zeroed();
+                    if units.getUnitInfo(i, &mut info) == kResultOk && info.id == unit {
+                        list =
+                            (info.programListId != kNoProgramListId).then_some(info.programListId);
+                        break;
+                    }
+                }
+                let lists = units.getProgramListCount().clamp(0, 1024);
+                for i in 0..lists {
+                    let mut info: ProgramListInfo = std::mem::zeroed();
+                    if units.getProgramListInfo(i, &mut info) != kResultOk {
+                        continue;
+                    }
+                    // The unit's list, or the only one there is.
+                    if list.is_some_and(|l| l != info.id) || (list.is_none() && lists != 1) {
+                        continue;
+                    }
+                    let names: Vec<String> = (0..info.programCount.clamp(0, 16384))
+                        .map(|p| {
+                            let mut name: String128 = std::mem::zeroed();
+                            match units.getProgramName(info.id, p, &mut name) {
+                                r if r == kResultOk => wstr(&name),
+                                _ => format!("Program {}", p + 1),
+                            }
+                        })
+                        .collect();
+                    if !names.is_empty() {
+                        return names;
+                    }
+                }
+            }
+        }
+        // No list: what the parameter calls its values.
+        (0..=steps.min(16383))
+            .filter(|_| steps > 0)
+            .map(|i| {
+                let n = f64::from(i) / f64::from(steps);
+                // SAFETY: plain query into a valid string buffer.
+                unsafe {
+                    let mut text: String128 = std::mem::zeroed();
+                    match ctrl.getParamStringByValue(id, n, &mut text) {
+                        r if r == kResultOk => wstr(&text),
+                        _ => format!("Program {}", i + 1),
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// The normalised value that selects program `index`.
+    fn program_value(&self, index: usize) -> Option<(ParamID, ParamValue)> {
+        let (id, steps) = self.program?;
+        let last = if steps > 0 {
+            steps as usize
+        } else {
+            self.programs.len().saturating_sub(1)
+        };
+        (index <= last && index < self.programs.len().max(1)).then(|| {
+            (
+                id,
+                if last == 0 {
+                    0.0
+                } else {
+                    index as f64 / last as f64
+                },
+            )
+        })
     }
 
     /// The standard note expressions the plugin lists (bus 0, channel 0),
@@ -519,6 +620,47 @@ impl FfInstance for Vst3Instance {
         crate::presets::state(data, &self.scanned.id)
     }
 
+    fn programs(&self) -> Vec<String> {
+        self.programs.clone()
+    }
+
+    fn current_program(&self) -> Option<usize> {
+        let (id, steps) = self.program?;
+        let last = if steps > 0 {
+            steps as usize
+        } else {
+            self.programs.len().saturating_sub(1)
+        };
+        // SAFETY: plain query.
+        let n = unsafe { self.controller.as_ref()?.getParamNormalized(id) };
+        Some(
+            ((n.clamp(0.0, 1.0) * last as f64).round() as usize)
+                .min(self.programs.len().saturating_sub(1)),
+        )
+    }
+
+    fn select_program(&mut self, index: usize) -> Result<(), PluginError> {
+        let Some((id, n)) = self.program_value(index) else {
+            return Err(PluginError::Failed(format!(
+                "{}: no program {}",
+                self.scanned.name,
+                index + 1
+            )));
+        };
+        if let Some(ctrl) = &self.controller {
+            // SAFETY: plain call.
+            unsafe { ctrl.setParamNormalized(id, n) };
+        }
+        self.send(id, n);
+        Ok(())
+    }
+
+    fn changes_pending(&self) -> bool {
+        self.to_rt
+            .as_ref()
+            .is_some_and(|tx| tx.slots() < tx.buffer().capacity())
+    }
+
     fn take_editor_edits(&mut self) -> Vec<faderframe_plugin_host::EditorEdit> {
         std::mem::take(&mut self.editor_edits)
     }
@@ -693,19 +835,27 @@ impl FfInstance for Vst3Instance {
             self.needs_restart = false;
             self.deactivate();
             let fail = |what: &str| PluginError::Failed(format!("{}: {what}", self.scanned.name));
-            use vst3::Steinberg::Vst::{ProcessModes_::kRealtime, SymbolicSampleSizes_::kSample32};
+            use vst3::Steinberg::Vst::ProcessModes_::kRealtime;
+            use vst3::Steinberg::Vst::SymbolicSampleSizes_::{kSample32, kSample64};
             let max = config.max_block_size.max(1);
-            // SAFETY: activation sequence on the control thread while
-            // inactive (no processor is running).
-            unsafe {
-                if self.processor.canProcessSampleSize(kSample32 as i32) != kResultOk {
-                    return Err(fail("32-bit float processing is not supported"));
-                }
+            // SAFETY: plain queries on the control thread while inactive (no
+            // processor is running).
+            let can = |size: u32| unsafe { self.processor.canProcessSampleSize(size as i32) } == kResultOk;
+            let (single, double) = (can(kSample32 as u32), can(kSample64 as u32));
+            if !single && !double {
+                return Err(fail("neither 32- nor 64-bit float processing is supported"));
             }
+            // 64-bit when asked for (or the only choice).
+            let double = double && (config.double_precision || !single);
+            tracing::debug!(
+                "{}: processing in {}-bit floating point",
+                self.scanned.name,
+                if double { 64 } else { 32 }
+            );
             let (inputs, outputs, events) = self.set_bus_states(config.sidechain);
             let mut setup = ProcessSetup {
                 processMode: kRealtime as i32,
-                symbolicSampleSize: kSample32 as i32,
+                symbolicSampleSize: if double { kSample64 } else { kSample32 } as i32,
                 maxSamplesPerBlock: max as i32,
                 sampleRate: config.sample_rate,
             };
@@ -733,6 +883,7 @@ impl FfInstance for Vst3Instance {
             let active = Active::new(
                 self.processor.clone(),
                 ActiveConfig {
+                    double,
                     inputs,
                     outputs,
                     has_event_input: events,
@@ -740,6 +891,14 @@ impl FfInstance for Vst3Instance {
                     map: Arc::clone(&self.map),
                     midi: self.midi_map(),
                     note_expressions: self.note_expressions.clone(),
+                    program: self.program.map(|(id, steps)| {
+                        let last = if steps > 0 {
+                            steps
+                        } else {
+                            self.programs.len().saturating_sub(1) as u32
+                        };
+                        (id, last)
+                    }),
                 },
                 rx,
                 out_tx,

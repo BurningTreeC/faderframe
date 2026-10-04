@@ -13,6 +13,7 @@ workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 faderframe-core.workspace = true
 faderframe-audio-graph.workspace = true
+faderframe-midi.workspace = true
 faderframe-plugin-host.workspace = true
 faderframe-realtime.workspace = true
 faderframe-transport.workspace = true
@@ -21,4 +22,3 @@ tracing.workspace = true
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 faderframe-automation.workspace = true
-faderframe-midi.workspace = true

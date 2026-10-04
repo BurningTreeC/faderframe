@@ -270,11 +270,13 @@ impl Helper {
                 sidechain,
                 shm,
                 shm_size,
+                double_precision,
             } => self.activate(
                 ProcessConfig {
                     sample_rate,
                     max_block_size: max_block,
                     sidechain,
+                    double_precision,
                 },
                 &shm,
                 shm_size as usize,
@@ -309,6 +311,10 @@ impl Helper {
                         Err(e) => failed(e),
                     },
                     Request::PresetFiles => (Response::Paths(inst.preset_files()), Vec::new()),
+                    Request::SelectProgram { index } => match inst.select_program(index) {
+                        Ok(()) => (Response::Done, Vec::new()),
+                        Err(e) => failed(e),
+                    },
                     Request::StateFromPresetFile => match inst.state_from_preset_file(&payload) {
                         Ok(bytes) => (Response::Bytes, bytes),
                         Err(e) => failed(e),
@@ -343,6 +349,7 @@ impl Helper {
                 .note_expressions()
                 .map(|v| v.into_iter().map(wire::expression_index).collect()),
             has_editor: inst.editor().is_some(),
+            programs: inst.programs(),
         };
         self.instance = Some(inst);
         (Response::Instantiated(Box::new(info)), Vec::new())
@@ -397,6 +404,9 @@ impl Helper {
             params,
             latency: inst.latency_samples(),
             tail: Some(inst.tail().into()),
+            program: inst.current_program(),
+            programs: p.params_changed.then(|| inst.programs()),
+            pending: inst.changes_pending(),
         };
         (Response::Polled(Box::new(polled)), Vec::new())
     }

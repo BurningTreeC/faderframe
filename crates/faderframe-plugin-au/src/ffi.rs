@@ -385,6 +385,8 @@ unsafe extern "C" {
         data2: u32,
         offset: u32,
     ) -> OSStatus;
+    /// A SysEx message (`F0 … F7`), taken before the next render.
+    pub fn MusicDeviceSysEx(unit: AudioUnit, data: *const u8, length: u32) -> OSStatus;
 
     pub fn AUEventListenerCreate(
         proc_: AUEventListenerProc,

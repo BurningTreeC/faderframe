@@ -116,6 +116,9 @@ fn build_session(options: &RunOptions, prefs: &prefs::Preferences) -> (Session, 
             s
         }
     };
+    if let Err(e) = session.set_plugin_double_precision(prefs.plugin_double_precision) {
+        tracing::warn!("plugin precision: {e}");
+    }
     if let Some(p) = gone {
         session.notify(
             faderframe_session::NoticeLevel::Warning,

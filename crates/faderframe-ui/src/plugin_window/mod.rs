@@ -894,6 +894,26 @@ fn open_generic(app: &Rc<AppState>, plugin: PluginInstanceId) {
             list.append_item(&item);
         }
         menu.append_section(None, &list);
+        // The plugin's own programs.
+        let (programs, current) = {
+            let s = app.session.borrow();
+            (s.plugin_programs(plugin), s.plugin_current_program(plugin))
+        };
+        if !programs.is_empty() {
+            let section = gtk::gio::Menu::new();
+            for (i, name) in programs.iter().enumerate() {
+                let mark = if current == Some(i) { "● " } else { "" };
+                let label = format!("{mark}{name}").replace('_', "__");
+                let item = gtk::gio::MenuItem::new(Some(&label), None);
+                let target = format!("{}\n{i}", plugin.raw());
+                item.set_action_and_target_value(
+                    Some("app.select-program"),
+                    Some(&target.to_variant()),
+                );
+                section.append_item(&item);
+            }
+            menu.append_section(Some("Programs"), &section);
+        }
         button.set_menu_model(Some(&menu));
     });
     header.pack_start(&presets);

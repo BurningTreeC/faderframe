@@ -416,6 +416,18 @@ pub fn install(app: &Rc<AppState>) {
         .build();
     // Development aid: `show-insert:<n>` / `show-insert-params:<n>` open the
     // editor of insert n of the selected (or first audio) track.
+    /// Insert `n` of the selected (or the first audio) track.
+    fn insert_of(a: &AppState, n: usize) -> Option<faderframe_core::PluginInstanceId> {
+        let s = a.session.borrow();
+        let p = s.project();
+        s.selection
+            .tracks
+            .iter()
+            .filter_map(|t| p.track(*t))
+            .chain(p.tracks.iter().filter(|t| t.kind == TrackKind::Audio))
+            .find(|t| t.inserts.len() > n)
+            .map(|t| t.inserts[n].id)
+    }
     let show = |name: &'static str, generic: bool| {
         let weak = Rc::downgrade(app);
         gio::ActionEntry::builder(name)
@@ -463,15 +475,20 @@ pub fn install(app: &Rc<AppState>) {
                 .filter(|t| !t.is_empty())
                 .filter_map(|t| u8::from_str_radix(t, 16).ok())
                 .collect();
-            // A status byte starts each message.
+            // A status byte starts each message (a SysEx runs to its F7).
             let s = a.session.borrow();
             let mut msg: Vec<u8> = Vec::new();
             for b in bytes {
-                if b >= 0x80 && !msg.is_empty() {
+                let in_sysex = msg.first() == Some(&0xF0);
+                if b >= 0x80 && !msg.is_empty() && !(in_sysex && b == 0xF7) {
                     s.midi_keyboard().send(&msg);
                     msg.clear();
                 }
                 msg.push(b);
+                if in_sysex && b == 0xF7 {
+                    s.midi_keyboard().send(&msg);
+                    msg.clear();
+                }
             }
             if !msg.is_empty() {
                 s.midi_keyboard().send(&msg);
@@ -672,6 +689,47 @@ pub fn install(app: &Rc<AppState>) {
                     path: std::path::PathBuf::from(path),
                 });
             }
+        }),
+        // A plugin's own program (menus): `select-program:<plugin id>\n<index>`.
+        named("select-program", |a, arg| {
+            if let Some((id, index)) = arg.split_once('\n')
+                && let (Ok(id), Ok(index)) = (id.parse::<u64>(), index.parse::<usize>())
+            {
+                a.dispatch(Action::SelectPluginProgram {
+                    plugin: faderframe_core::PluginInstanceId(id),
+                    index,
+                });
+            }
+        }),
+        // Development aids on insert n of the selected (or first audio)
+        // track: `insert-program:<n>:<program>`, `log-programs:<n>`.
+        named("insert-program", |a, arg| {
+            let mut it = arg.split(':').map(|v| v.trim().parse::<usize>());
+            let (Some(Ok(n)), Some(Ok(index))) = (it.next(), it.next()) else {
+                return;
+            };
+            match insert_of(a, n) {
+                Some(plugin) => a.dispatch(Action::SelectPluginProgram { plugin, index }),
+                None => tracing::warn!("insert-program: no insert {n}"),
+            }
+        }),
+        named("log-programs", |a, arg| {
+            let n = arg.trim().parse::<usize>().unwrap_or(0);
+            let Some(plugin) = insert_of(a, n) else {
+                tracing::warn!("log-programs: no insert {n}");
+                return;
+            };
+            let s = a.session.borrow();
+            tracing::info!(
+                "programs of insert {n}: {:?}, selected {:?}",
+                s.plugin_programs(plugin),
+                s.plugin_current_program(plugin)
+            );
+        }),
+        // Development aid: `plugin-precision:<0|1>` (64-bit processing).
+        named("plugin-precision", |a, arg| {
+            let on = arg.trim() == "1";
+            a.with_session(|s| s.set_plugin_double_precision(on));
         }),
         // Development aids: `import-midi-from:<path>` / `export-midi-to:<path>`.
         named("import-midi-from", |a, arg| {
