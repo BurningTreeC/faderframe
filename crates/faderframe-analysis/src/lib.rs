@@ -10,9 +10,11 @@
 #![forbid(unsafe_code)]
 
 pub mod delivery;
+mod dynamics;
 mod loudness;
 mod spectrum;
 
+pub use dynamics::{Dynamics, DynamicsMeter};
 pub use loudness::{Loudness, LoudnessMeter};
 pub use spectrum::{FLOOR_DB, Spectrum, fft};
 
@@ -177,6 +179,8 @@ impl PhaseMeter {
 #[derive(Clone, Debug)]
 pub struct Analyzer {
     pub loudness: LoudnessMeter,
+    /// Crest factor and DR value of what was measured.
+    pub dynamics: DynamicsMeter,
     pub level: LevelMeter,
     pub phase: PhaseMeter,
     pub spectrum: Spectrum,
@@ -186,6 +190,7 @@ impl Analyzer {
     pub fn new(sample_rate: u32) -> Self {
         Self {
             loudness: LoudnessMeter::new(sample_rate),
+            dynamics: DynamicsMeter::new(sample_rate),
             level: LevelMeter::new(sample_rate),
             phase: PhaseMeter::default(),
             spectrum: Spectrum::new(sample_rate, 8192),
@@ -200,6 +205,9 @@ impl Analyzer {
     /// loudness, range and maxima.
     pub fn process(&mut self, left: &[f32], right: &[f32], measuring: bool) {
         self.loudness.process(left, right, measuring);
+        if measuring {
+            self.dynamics.process(left, right);
+        }
         self.level.process(left, right);
         self.phase.process(left, right);
         self.spectrum.process(left, right);
@@ -208,6 +216,7 @@ impl Analyzer {
     /// Start a new measurement.
     pub fn reset(&mut self) {
         self.loudness.reset();
+        self.dynamics.reset();
         self.level.reset();
         self.spectrum.reset_peaks();
     }

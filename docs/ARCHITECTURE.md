@@ -1618,8 +1618,14 @@ cases):
   (absolute −70 LUFS, relative −10 LU), loudness range (EBU Tech 3342: 10th
   to 95th percentile of gated short-term values), maximum momentary and
   short-term values and true peak (4× oversampling, polyphase windowed
-  sinc). The measurement accumulates while playing; it restarts when
+  sinc), and the peak-to-loudness ratio (PLR: true peak over integrated
+  loudness). The measurement accumulates while playing; it restarts when
   playback starts (optional) or on demand.
+* **Dynamics** of the same measurement (`DynamicsMeter`): the crest factor
+  (sample peak over RMS) and the DR value after the Pleasurize Music
+  Foundation's TT Dynamic Range Meter (3 s blocks; per channel the second
+  highest block peak over the RMS × √2 of the loudest 20 % of blocks, the
+  channels averaged, shown rounded as "DR8" and coloured 1–7 / 8–13 / 14+).
 * **Level**: sample peak with hold and 300 ms RMS per channel, in dBFS or on
   a K-System scale (K-12/14/20).
 * **Phase**: correlation (−1 … +1, ~100 ms) and goniometer points.
@@ -1765,7 +1771,8 @@ move and copy between tracks, sidechain inputs.
 Mixing: an analogue-console mixer, sends in banks, track groups with
 linked controls, VCAs, relative edits of every selected track, track
 presets, and the Tools view for mastering (EBU R128 loudness and true peak,
-levels with K-System scales, phase, spectrum). Delivery: loudness
+loudness range, PLR, crest factor and DR value, levels with K-System
+scales, phase, spectrum). Delivery: loudness
 normalisation and true-peak limiting on export, noise-shaped dither,
 delivery presets, and the album (songs analysed and exported with album or
 per-song levelling, pauses or crossfades, a song's own inserts heard on

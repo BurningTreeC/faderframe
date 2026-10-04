@@ -132,7 +132,7 @@ Contrast:
 * Mastering meters (Tools, F12; the Mastering workspace opens on them): EBU
   R128 loudness — integrated, short-term and momentary, loudness range,
   true peak and PLR against a delivery target (−14, −16, −23, −24 or −9
-  LUFS) with a short-term history; peak/RMS levels in dBFS or K-12/14/20;
+  LUFS) with a short-term history; crest factor and DR value; peak/RMS levels in dBFS or K-12/14/20;
   goniometer and correlation; an FFT spectrum with peak hold — for the
   master or any track.
 * Album (bottom dock, next to Tools): songs in release order — the

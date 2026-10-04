@@ -1,9 +1,10 @@
 //! The Tools view: mastering meters for one source (the master unless
 //! another track is chosen).
 //!
-//! * Loudness — EBU R128 integrated, short-term and momentary loudness,
-//!   loudness range, true peak and PLR against a delivery target, with a
-//!   short-term history.
+//! * Loudness — EBU R128 integrated, short-term and momentary loudness and
+//!   true peak against a delivery target, with a short-term history; the
+//!   dynamics of the measurement: loudness range (LRA), peak-to-loudness
+//!   ratio (PLR), crest factor and the DR value.
 //! * Level — sample peak with hold and RMS per channel, in dBFS or on a
 //!   K-System scale.
 //! * Phase — goniometer (mid up, side across) and correlation.
@@ -259,46 +260,87 @@ impl ToolsView {
         } else {
             tt.readout
         };
+        let d = model.analyzer().dynamics.read();
         let plr = if l.integrated.is_finite() && l.true_peak.is_finite() {
             format!("{:.1} LU", l.true_peak - l.integrated)
         } else {
             "—".into()
         };
-        let rows: [(&str, String, Color); 6] = [
-            (
+        let lra = if l.integrated.is_finite() {
+            format!("{:.1} LU", l.range)
+        } else {
+            "—".into()
+        };
+        let crest = d.crest.map_or_else(|| "—".into(), |c| format!("{c:.1} dB"));
+        // The DR value in the colours its meters use: 1–7 squashed, 8–13
+        // moderate, 14 and up open.
+        let (dr, dr_color) = match (d.dr_value(), d.dr) {
+            (Some(v), Some(x)) => (
+                format!("DR{v}  ({x:.1} dB)"),
+                if v <= 7 {
+                    tt.level_over
+                } else if v <= 13 {
+                    tt.level_warn
+                } else {
+                    tt.level_ok
+                },
+            ),
+            _ => ("—".into(), t.ui.text_dim),
+        };
+        enum Row {
+            Value(&'static str, String, Color),
+            Heading(&'static str),
+        }
+        let rows = [
+            Row::Value(
                 "Short-term",
                 format!("{} LUFS", format_lufs(l.short_term)),
                 tt.readout,
             ),
-            (
+            Row::Value(
                 "Momentary",
                 format!("{} LUFS", format_lufs(l.momentary)),
                 tt.readout,
             ),
-            (
+            Row::Value(
                 "Max short-term",
                 format!("{} LUFS", format_lufs(l.max_short_term)),
                 t.ui.text_dim,
             ),
-            ("Loudness range", format!("{:.1} LU", l.range), tt.readout),
-            (
+            Row::Value(
                 "True peak",
                 format!("{} dBTP", format_lufs(l.true_peak)),
                 tp_color,
             ),
-            ("PLR", plr, t.ui.text_dim),
+            Row::Heading("DYNAMICS"),
+            Row::Value("Loudness range (LRA)", lra, tt.readout),
+            Row::Value("Peak to loudness (PLR)", plr, tt.readout),
+            Row::Value("Crest factor", crest, tt.readout),
+            Row::Value("Dynamic range", dr, dr_color),
         ];
         let row_h = 15.0;
         let (table, graph) = rest.split_top((rows.len() as f32 * row_h + 6.0).min(rest.h));
-        for (i, (name, value, color)) in rows.iter().enumerate() {
+        for (i, row) in rows.iter().enumerate() {
             let y = table.y + i as f32 * row_h;
-            let row = Rect::new(table.x, y, table.w, row_h);
-            p.text(name, row, &TextStyle::new(t.fonts.small, t.ui.text_dim));
-            p.text(
-                value,
-                row,
-                &TextStyle::new(t.fonts.small, *color).right().bold(),
-            );
+            let r = Rect::new(table.x, y, table.w, row_h);
+            match row {
+                Row::Value(name, value, color) => {
+                    p.text(name, r, &TextStyle::new(t.fonts.small, t.ui.text_dim));
+                    p.text(
+                        value,
+                        r,
+                        &TextStyle::new(t.fonts.small, *color).right().bold(),
+                    );
+                }
+                Row::Heading(title) => {
+                    p.hline(r.x, r.right(), r.y + 3.0, t.ui.border);
+                    p.text(
+                        title,
+                        Rect::new(r.x, r.y + 3.0, r.w, row_h - 3.0),
+                        &TextStyle::new(t.fonts.tiny, t.ui.text_faint).bold(),
+                    );
+                }
+            }
         }
         if graph.h > 30.0 {
             self.paint_history(p, graph, model, target, l.integrated);
