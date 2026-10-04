@@ -86,6 +86,27 @@ fn processing_does_not_allocate() {
     const SR: u32 = 48_000;
     const BLOCK: usize = 256;
     let mut project = demo_project(SR);
+    // Every melody note glides, swells and pans: native note expressions
+    // reach the built-in synth through the realtime path.
+    for clip in project.clips.values_mut() {
+        if let faderframe_project::ClipContent::Midi(m) = &mut clip.content {
+            let point = |q: f64, value: f32| faderframe_project::ExpressionPoint {
+                time: faderframe_timeline::MusicalTime::from_quarters(q),
+                value,
+            };
+            m.expressions = m
+                .notes
+                .iter()
+                .map(|n| {
+                    let mut e = faderframe_project::NoteExpression::new(n.id);
+                    e.pitch = vec![point(0.0, -1.0), point(0.25, 0.0)];
+                    e.volume = vec![point(0.0, -12.0), point(0.5, 0.0)];
+                    e.pan = vec![point(0.0, -0.5), point(0.5, 0.5)];
+                    e
+                })
+                .collect();
+        }
+    }
     let sources = render_generated_sources(&project, SR);
     let config = EngineConfig {
         sample_rate: SR,

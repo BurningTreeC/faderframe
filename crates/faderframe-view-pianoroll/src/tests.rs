@@ -514,3 +514,46 @@ fn toolbar_wraps_in_narrow_views() {
         "four or more rows when narrow: {grid_tops:?}"
     );
 }
+
+#[test]
+fn volume_and_pan_lanes_draw_in_their_units() {
+    use faderframe_project::ExpressionKind;
+    let mut s = session();
+    let mut view = PianoRollView::new(Theme::default());
+    let mut pr = s.editor.piano;
+    pr.expression = Some(ExpressionKind::Volume);
+    s.dispatch(Action::SetPianoRoll(pr)).unwrap();
+    paint(&mut view, &s);
+    let n = notes(&s)[0];
+    let l = view.layout(SIZE);
+    let area = PianoRollView::lane_value_rect(l.lane);
+    // From the bottom (−24 dB) to the top (+12 dB) over the first note.
+    let shift = Modifiers {
+        shift: true,
+        ..Modifiers::NONE
+    };
+    let a = Point::new(view.x_of(n.start) + 1.0, area.bottom());
+    let b = Point::new(view.x_of(n.end()) - 1.0, area.y);
+    run(&mut view, down(a, shift, 1), &mut s);
+    run(&mut view, drag(b, shift), &mut s);
+    run(&mut view, up(b, shift), &mut s);
+    let id = s.editor_clip().unwrap();
+    let m = s.project().clip(id).unwrap().as_midi().unwrap().clone();
+    let e = m.expression(n.id).expect("expression on the note");
+    assert!((e.value_at(ExpressionKind::Volume, MusicalTime::ZERO) + 24.0).abs() < 1.0);
+    assert!(e.value_at(ExpressionKind::Volume, n.length) > 11.0);
+    assert!(e.pitch.is_empty(), "only the volume curve");
+    // The tooltip reads the lane in dB; the centre of the pan lane is C.
+    let tip = view
+        .tooltip(Point::new(a.x, area.y + 1.0), SIZE, &s)
+        .unwrap();
+    assert!(tip.starts_with("Volume +1"), "{tip}");
+    let mut pr = s.editor.piano;
+    pr.expression = Some(ExpressionKind::Pan);
+    s.dispatch(Action::SetPianoRoll(pr)).unwrap();
+    paint(&mut view, &s);
+    let tip = view
+        .tooltip(Point::new(a.x, area.center().y), SIZE, &s)
+        .unwrap();
+    assert!(tip.starts_with("Pan C"), "{tip}");
+}

@@ -229,10 +229,16 @@ pub struct Lane {
     pub mpe: Option<MpeConfig>,
 }
 
-/// One MIDI value of a note's expression on its channel.
-fn expression_event(kind: ExpressionKind, channel: u8, value: f32, cfg: MpeConfig) -> MidiEvent {
+/// One MIDI value of a note's expression on its channel (`None` for what
+/// MPE does not carry).
+fn expression_event(
+    kind: ExpressionKind,
+    channel: u8,
+    value: f32,
+    cfg: MpeConfig,
+) -> Option<MidiEvent> {
     let seven = |v: f32| (v.clamp(0.0, 1.0) * 127.0).round() as u8;
-    match kind {
+    Some(match kind {
         ExpressionKind::Pitch => MidiEvent::PitchBend {
             channel,
             value: (8192.0 + value / cfg.bend_range.max(1) as f32 * 8192.0)
@@ -248,6 +254,51 @@ fn expression_event(kind: ExpressionKind, channel: u8, value: f32, cfg: MpeConfi
             controller: 74,
             value: seven(value),
         },
+        ExpressionKind::Volume
+        | ExpressionKind::Pan
+        | ExpressionKind::Vibrato
+        | ExpressionKind::Expression => return None,
+    })
+}
+
+/// Native note expression: the curves of a note's expression as
+/// [`MidiEvent::NoteExpression`]s for hosted plugins — the value at the
+/// note-on (sorted after it), then sampled every 1/128 quarter and sent
+/// where it moves by the kind's resolution or more.
+fn native_expression_events(
+    e: &faderframe_project::NoteExpression,
+    note: (u8, u8),
+    on_pos: faderframe_timeline::MusicalTime,
+    length: faderframe_timeline::MusicalTime,
+    to_samples: impl Fn(faderframe_timeline::MusicalTime) -> i64,
+    events: &mut Vec<(i64, MidiEvent)>,
+) {
+    use faderframe_midi::ExpressionValue;
+    use faderframe_timeline::MusicalTime;
+    let (channel, key) = note;
+    let step = MusicalTime(faderframe_timeline::TICKS_PER_QUARTER / 128);
+    let event = |kind: ExpressionKind, v: f32| MidiEvent::NoteExpression {
+        channel,
+        key,
+        kind: kind.native(),
+        value: ExpressionValue::new(v as f64),
+    };
+    for kind in ExpressionKind::ALL {
+        if e.curve(kind).is_empty() {
+            continue;
+        }
+        let threshold = kind.resolution();
+        let mut last = e.value_at(kind, MusicalTime::ZERO);
+        events.push((to_samples(on_pos), event(kind, last)));
+        let mut t = step;
+        while t < length {
+            let v = e.value_at(kind, t);
+            if (v - last).abs() >= threshold {
+                events.push((to_samples(on_pos + t), event(kind, v)));
+                last = v;
+            }
+            t += step;
+        }
     }
 }
 
@@ -292,11 +343,10 @@ fn mpe_note_events(
         let channel = ch as u8;
         let expr = m.expression(n.id);
         let value = |k: ExpressionKind, t: MusicalTime| expr.map_or(k.rest(), |e| e.value_at(k, t));
-        for k in ExpressionKind::ALL {
-            events.push((
-                on,
-                expression_event(k, channel, value(k, MusicalTime::ZERO), cfg),
-            ));
+        for k in ExpressionKind::MPE {
+            if let Some(ev) = expression_event(k, channel, value(k, MusicalTime::ZERO), cfg) {
+                events.push((on, ev));
+            }
         }
         events.push((
             on,
@@ -308,7 +358,7 @@ fn mpe_note_events(
         ));
         if let Some(e) = expr {
             let length = off_pos - on_pos;
-            for k in ExpressionKind::ALL {
+            for k in ExpressionKind::MPE {
                 if e.curve(k).is_empty() {
                     continue;
                 }
@@ -316,8 +366,10 @@ fn mpe_note_events(
                 let mut t = step;
                 while t < length {
                     let ev = expression_event(k, channel, value(k, t), cfg);
-                    if ev != last {
-                        events.push((to_samples(on_pos + t), ev));
+                    if ev != last
+                        && let Some(e) = ev
+                    {
+                        events.push((to_samples(on_pos + t), e));
                         last = ev;
                     }
                     t += step;
@@ -632,18 +684,21 @@ impl TimelineSnapshot {
                                 velocity: 0,
                             },
                         ));
+                        if let Some(e) = m.expression(n.id) {
+                            native_expression_events(
+                                e,
+                                (n.channel, n.key),
+                                on_pos,
+                                off_pos - on_pos,
+                                |t| tl.to_samples(t, sr),
+                                &mut events,
+                            );
+                        }
                     }
                     // At equal times: note-offs, then controllers (a pedal or
                     // bend set at a note's start applies to it), then
-                    // note-ons.
-                    events.sort_by_key(|(t, e)| {
-                        let order = match e {
-                            MidiEvent::NoteOff { .. } => 0,
-                            MidiEvent::NoteOn { .. } => 2,
-                            _ => 1,
-                        };
-                        (*t, order)
-                    });
+                    // note-ons, then the expressions addressed to them.
+                    events.sort_by_key(|(t, e)| (*t, e.same_time_priority()));
                     lanes.entry(clip.track).or_default().midi.push(MidiRegion {
                         start,
                         end,

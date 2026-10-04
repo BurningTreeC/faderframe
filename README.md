@@ -207,9 +207,12 @@ Contrast:
   empty) and File → Export MIDI File… (all MIDI tracks, or the selected
   clips).
 * MIDI sync: follow an external MIDI clock (tempo too) or MIDI time code
-  (Preferences → MIDI → Sync). MPE: per-note pitch, pressure and timbre —
-  recorded from MPE controllers, drawn in the piano roll's expression
-  lanes, played on member channels (track menu → MPE). SysEx is recorded,
+  (Preferences → MIDI → Sync). Per-note expression: pitch, pressure,
+  timbre, volume, pan, vibrato and expression per note — drawn in the piano
+  roll's expression lanes, recorded from MPE controllers, played natively
+  to plugin instruments (CLAP note expressions, VST3 note expression values
+  and poly pressure, the built-in synth) or as MPE on member channels
+  (track menu → MPE: pitch, pressure, timbre). SysEx is recorded,
   sent to external devices with the clip, imported from and sent as `.syx`
   files.
 * MIDI keyboards and controllers: every MIDI input (ALSA sequencer incl.

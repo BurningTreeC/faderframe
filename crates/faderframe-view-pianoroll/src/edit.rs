@@ -1026,13 +1026,24 @@ impl PianoRollView {
             MenuItem::new("Velocity", set(None))
                 .checked(pr.lane.is_none() && pr.expression.is_none()),
         ];
-        // Per-note expression (MPE).
+        // Per-note expression: native for plugins, pitch/pressure/timbre
+        // also over MPE.
+        let mpe = model
+            .project()
+            .clip(clip)
+            .and_then(|c| model.project().track(c.track))
+            .is_some_and(|t| t.mpe.is_some());
         for (i, k) in faderframe_project::ExpressionKind::ALL
             .into_iter()
             .enumerate()
         {
+            let label = if mpe && !faderframe_project::ExpressionKind::MPE.contains(&k) {
+                format!("Note {} (not over MPE)", k.label())
+            } else {
+                format!("Note {}", k.label())
+            };
             let item = MenuItem::new(
-                format!("{} Expression", k.label()),
+                label,
                 Action::SetPianoRoll(PianoRollSettings {
                     expression: Some(k),
                     ..pr
@@ -1495,7 +1506,7 @@ impl PianoRollView {
             ));
         }
         if l.lane_header.contains(pos) {
-            return Some("Choose the lane: velocity or a controller".into());
+            return Some("Choose the lane: velocity, a controller or a per-note expression".into());
         }
         if l.lane.contains(pos) {
             return Some(match self.lane {
@@ -1507,8 +1518,13 @@ impl PianoRollView {
                     c.label()
                 ),
                 LaneKind::Expression(k) => format!(
-                    "{} of the selected notes (else those under the pointer): drag to draw · Shift-drag: line · Alt-drag: erase",
-                    k.label()
+                    "{} {} · per note: the selected notes (else those under the pointer) · drag to draw · Shift-drag: line · Alt-drag: erase",
+                    k.label(),
+                    k.format(crate::expression_value(
+                        Self::lane_value_rect(l.lane),
+                        k,
+                        pos.y
+                    ))
                 ),
             });
         }

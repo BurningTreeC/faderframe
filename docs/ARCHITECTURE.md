@@ -370,13 +370,27 @@ handles RPN 0 bend range, the MPE zone message, pressure and CC 74).
   starting or jumping mid-clip first sends each controller's current value,
   and on stop or jump moved controllers return to rest (pedals up, bend
   centred). Splitting a clip carries the values across the cut.
-* **MPE (per-note expression).** Expression is stored with the notes, not
-  the channels: `MidiClip::expressions` holds a `NoteExpression` per note
-  (pitch in semitones, pressure and timbre 0–1; points relative to the
-  note's start, linear between them), so notes can be moved, transposed,
-  copied, split and deleted with their expression (the session's note
-  operations carry it; clip splits move it with the notes). A track with
-  `Track::mpe` (`MpeConfig`: member channels, bend range ±48) plays MPE:
+* **Per-note expression and MPE.** Expression is stored with the notes,
+  not the channels: `MidiClip::expressions` holds a `NoteExpression` per
+  note (pitch in semitones, pressure, timbre, vibrato and expression 0–1,
+  volume in dB, pan −1…1; points relative to the note's start, linear
+  between them), so notes can be moved, transposed, copied, split and
+  deleted with their expression (the session's note operations carry it;
+  clip splits move it with the notes). On a plain track the snapshot sends
+  the curves to the instrument natively: `MidiEvent::NoteExpression`
+  (fixed-point plain value, sorted after its note-on, sampled every 1/128
+  quarter where it moves by the kind's resolution). The CLAP processor
+  gives every note-on a note id (`faderframe_midi::NoteIds`) and sends
+  `CLAP_EVENT_NOTE_EXPRESSION` addressed by key and channel (id −1: u-he
+  Diva matches only those); the VST3 processor sends
+  `NoteExpressionValueEvent`s for the types the plugin lists through
+  `INoteExpressionController` (normalised: volume 0.25 = 0 dB, tuning ±120
+  around 0.5) and pressure as `PolyPressureEvent`, both addressed by note
+  id; the built-in synth applies them per voice; MIDI outputs drop them.
+  `PluginInstance::note_expressions` reports what an instrument accepts
+  (the piano roll says when it does not take a lane's kind). A track with
+  `Track::mpe` (`MpeConfig`: member channels, bend range ±48) plays MPE
+  instead (pitch, pressure and timbre only):
   the timeline snapshot gives each note its own member channel (the least
   recently used free one, else the one freeing first), sends the initial
   values right before the note-on and samples the curves every 1/128
@@ -1268,7 +1282,8 @@ controllers and plugin editors. Media import (Symphonia, rubato) and
 lock-free disk streaming.
 
 MIDI: devices with hotplug, live play with constant latency, recording,
-MIDI learn, MIDI output and clock, clock/MTC sync, MPE, SysEx, Standard
+MIDI learn, MIDI output and clock, clock/MTC sync, MPE and native note
+expressions for CLAP and VST3 instruments, SysEx, Standard
 MIDI File import and export, and a full piano roll.
 
 Plugins: CLAP and VST3 hosting with crash-safe scanning and Audio Units on
@@ -1299,8 +1314,7 @@ and packages for all three platforms (see §14).
 
 1. **Ports**: the CoreAudio IO workgroup for DSP workers, signed and
    notarised packages, a Flathub submission (vendored crates).
-2. **Plugins**: note expressions (CLAP, VST3), VST3 program lists and
-   64-bit processing, sandboxed plugins (out-of-process with shared-memory
+2. **Plugins**: VST3 program lists and 64-bit processing, sandboxed plugins (out-of-process with shared-memory
    audio), SysEx to plugins.
 3. **MIDI**: MTC output, varispeed chase without a shared word clock.
 4. **Performance**: anticipative processing of tracks that are not

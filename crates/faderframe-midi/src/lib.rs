@@ -14,14 +14,16 @@
 mod buffer;
 mod event;
 mod input;
+mod note_ids;
 mod output;
 mod tracker;
 
 pub use buffer::{MidiBuffer, MidiBufferFull};
-pub use event::{MidiEvent, TimedMidiEvent};
+pub use event::{ExpressionValue, MidiEvent, NoteExpressionKind, TimedMidiEvent};
 pub use input::{
     MAX_MIDI_PORTS, MidiClock, MidiControlFeed, MidiInputEvent, MidiInputQueue, MidiInputSender,
     MidiSystemEvent, SystemMessage, midi_input_queue,
 };
+pub use note_ids::NoteIds;
 pub use output::{MidiOutputEvent, MidiOutputQueue, midi_output_queue};
 pub use tracker::NoteTracker;

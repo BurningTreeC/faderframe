@@ -177,6 +177,13 @@ impl PluginInstance for BuiltinInstance {
         }
     }
 
+    fn note_expressions(&self) -> Option<Vec<faderframe_midi::NoteExpressionKind>> {
+        match self.kind {
+            Kind::Synth => Some(faderframe_midi::NoteExpressionKind::ALL.to_vec()),
+            _ => Some(Vec::new()),
+        }
+    }
+
     fn tail(&self) -> TailLength {
         match self.kind {
             Kind::Echo => TailLength::Infinite,

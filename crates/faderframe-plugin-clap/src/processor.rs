@@ -11,14 +11,14 @@
 
 use crate::host::FfHost;
 use clack_host::events::event_types::{
-    MidiEvent as ClapMidi, NoteOffEvent, NoteOnEvent, ParamGestureBeginEvent, ParamGestureEndEvent,
-    ParamValueEvent, TransportEvent, TransportFlags,
+    MidiEvent as ClapMidi, NoteExpressionEvent, NoteExpressionType, NoteOffEvent, NoteOnEvent,
+    ParamGestureBeginEvent, ParamGestureEndEvent, ParamValueEvent, TransportEvent, TransportFlags,
 };
 use clack_host::events::{EventFlags, EventHeader, Match, Pckn};
 use clack_host::prelude::*;
 use clack_host::utils::{BeatTime, SecondsTime};
 use faderframe_audio_graph::NodeIo;
-use faderframe_midi::MidiEvent;
+use faderframe_midi::{MidiEvent, NoteExpressionKind, NoteIds};
 use faderframe_plugin_host::{PluginProcessContext, PluginProcessor, ProcessStatus as FfStatus};
 use faderframe_realtime::TryCell;
 use std::sync::Arc;
@@ -46,6 +46,33 @@ pub(crate) struct RtState {
     edits_tx: rtrb::Producer<(u8, u32, f64)>,
     steady: u64,
     max_frames: usize,
+    /// Ids of the sounding notes (note expressions address them).
+    note_ids: Box<NoteIds>,
+}
+
+/// A note expression as CLAP has it (volume: linear gain up to 4 = +12 dB;
+/// pan: 0 left … 0.5 centre … 1 right; tuning in semitones).
+fn clap_expression(kind: NoteExpressionKind, plain: f64) -> (NoteExpressionType, f64) {
+    match kind {
+        NoteExpressionKind::Volume => (
+            NoteExpressionType::Volume,
+            10f64.powf(plain / 20.0).clamp(0.0, 4.0),
+        ),
+        NoteExpressionKind::Pan => (
+            NoteExpressionType::Pan,
+            ((plain + 1.0) / 2.0).clamp(0.0, 1.0),
+        ),
+        NoteExpressionKind::Tuning => (NoteExpressionType::Tuning, plain.clamp(-120.0, 120.0)),
+        NoteExpressionKind::Vibrato => (NoteExpressionType::Vibrato, plain.clamp(0.0, 1.0)),
+        NoteExpressionKind::Expression => (NoteExpressionType::Expression, plain.clamp(0.0, 1.0)),
+        NoteExpressionKind::Brightness => (NoteExpressionType::Brightness, plain.clamp(0.0, 1.0)),
+        NoteExpressionKind::Pressure => (NoteExpressionType::Pressure, plain.clamp(0.0, 1.0)),
+    }
+}
+
+/// The note a note id addresses (any note on the key when there is none).
+fn note_match(id: i32) -> Match<u32> {
+    u32::try_from(id).map_or(Match::All, Match::Specific)
 }
 
 impl RtState {
@@ -76,6 +103,7 @@ impl RtState {
             edits_tx,
             steady: 0,
             max_frames,
+            note_ids: Box::new(NoteIds::new()),
         }
     }
 }
@@ -195,7 +223,8 @@ impl PluginProcessor for ClapProcessor {
                         key,
                         velocity,
                     } => {
-                        let pckn = Pckn::new(0u16, channel as u16, key as u16, Match::All);
+                        let id = note_match(st.note_ids.start(channel, key));
+                        let pckn = Pckn::new(0u16, channel as u16, key as u16, id);
                         st.events_in
                             .push(&NoteOnEvent::new(t, pckn, velocity as f64 / 127.0));
                     }
@@ -204,9 +233,25 @@ impl PluginProcessor for ClapProcessor {
                         key,
                         velocity,
                     } => {
-                        let pckn = Pckn::new(0u16, channel as u16, key as u16, Match::All);
+                        let id = note_match(st.note_ids.end(channel, key));
+                        let pckn = Pckn::new(0u16, channel as u16, key as u16, id);
                         st.events_in
                             .push(&NoteOffEvent::new(t, pckn, velocity as f64 / 127.0));
+                    }
+                    MidiEvent::NoteExpression {
+                        channel,
+                        key,
+                        kind,
+                        value,
+                    } => {
+                        // Addressed by key and channel (note id −1): plugins
+                        // that do not keep the host's note ids (u-he Diva)
+                        // only match those, and FaderFrame never has two
+                        // notes on one key and channel.
+                        let pckn = Pckn::new(0u16, channel as u16, key as u16, Match::All);
+                        let (kind, value) = clap_expression(kind, value.get());
+                        st.events_in
+                            .push(&NoteExpressionEvent::new(t, pckn, kind, value));
                     }
                     other => {
                         let (bytes, _) = other.to_bytes();

@@ -1,7 +1,7 @@
 use crate::{ParamValues, PluginProcessContext, PluginProcessor, ProcessConfig, ProcessStatus};
 use faderframe_audio_graph::NodeIo;
 use faderframe_core::db_to_gain;
-use faderframe_midi::MidiEvent;
+use faderframe_midi::{MidiEvent, NoteExpressionKind};
 use std::f32::consts::PI;
 
 const VOICES: usize = 16;
@@ -35,6 +35,16 @@ struct Voice {
     /// Released while the sustain pedal was down: keeps sounding until the
     /// pedal goes up.
     pedal_held: bool,
+    /// Per-note expression: semitones, linear gain (volume × expression),
+    /// pan −1..1, vibrato 0..1, brightness 0..1 (0.5 as played), pressure
+    /// 0..1.
+    tuning: f32,
+    volume: f32,
+    expression: f32,
+    pan: f32,
+    vibrato: f32,
+    brightness: f32,
+    pressure: f32,
 }
 
 impl Voice {
@@ -52,7 +62,27 @@ impl Voice {
         control_counter: 0,
         age: 0,
         pedal_held: false,
+        tuning: 0.0,
+        volume: 1.0,
+        expression: 1.0,
+        pan: 0.0,
+        vibrato: 0.0,
+        brightness: 0.5,
+        pressure: 0.0,
     };
+
+    /// Apply a note expression (plain units, see `NoteExpressionKind`).
+    fn express(&mut self, kind: NoteExpressionKind, v: f32) {
+        match kind {
+            NoteExpressionKind::Volume => self.volume = 10f32.powf(v.min(12.0) / 20.0),
+            NoteExpressionKind::Pan => self.pan = v.clamp(-1.0, 1.0),
+            NoteExpressionKind::Tuning => self.tuning = v.clamp(-120.0, 120.0),
+            NoteExpressionKind::Vibrato => self.vibrato = v.clamp(0.0, 1.0),
+            NoteExpressionKind::Expression => self.expression = v.clamp(0.0, 1.0),
+            NoteExpressionKind::Brightness => self.brightness = v.clamp(0.0, 1.0),
+            NoteExpressionKind::Pressure => self.pressure = v.clamp(0.0, 1.0),
+        }
+    }
 }
 
 /// Default pitch-bend range in semitones (RPN 0 changes it per channel).
@@ -108,8 +138,9 @@ struct Settings {
 
 /// Polyphonic two-oscillator subtractive synth (16 voices) with sustain
 /// pedal, pitch bend (±2 semitones; RPN 0 sets the range per channel),
-/// MPE (member channels at ±48, pressure louder, CC 74 brighter) and
-/// mod-wheel vibrato.
+/// MPE (member channels at ±48, pressure louder, CC 74 brighter),
+/// per-note expressions (tuning, volume, pan, vibrato, expression,
+/// brightness, pressure) and mod-wheel vibrato.
 pub struct SynthProcessor {
     params: ParamValues,
     sample_rate: f32,
@@ -279,6 +310,20 @@ impl SynthProcessor {
                 controller: 6,
                 value,
             } => self.data_entry(channel & 15, value),
+            MidiEvent::NoteExpression {
+                channel,
+                key,
+                kind,
+                value,
+            } => {
+                for v in self
+                    .voices
+                    .iter_mut()
+                    .filter(|v| v.stage != Stage::Idle && v.channel == channel && v.key == key)
+                {
+                    v.express(kind, value.get() as f32);
+                }
+            }
             _ => {}
         }
     }
@@ -314,7 +359,12 @@ impl SynthProcessor {
         let channels = self.channels;
         for v in self.voices.iter_mut().filter(|v| v.stage != Stage::Idle) {
             let ch = channels[(v.channel & 15) as usize];
-            let semis = v.key as f32 - 69.0 + ch.bend + lfo * ch.modulation * VIBRATO_DEPTH;
+            let semis = v.key as f32 - 69.0
+                + ch.bend
+                + v.tuning
+                + lfo * (ch.modulation + v.vibrato) * VIBRATO_DEPTH;
+            // Balance: the far side fades as the note pans.
+            let (pan_l, pan_r) = ((1.0 - v.pan).min(1.0), (1.0 + v.pan).min(1.0));
             let base = 440.0 * 2f32.powf(semis / 12.0);
             let freqs = [base * (1.0 - s.detune), base * (1.0 + s.detune)];
             let dts = [freqs[0] / sr, freqs[1] / sr];
@@ -350,7 +400,10 @@ impl SynthProcessor {
                 // Filter coefficients at control rate (cutoff follows env).
                 if v.control_counter == 0 {
                     let fc = (s.cutoff
-                        * 2f32.powf(s.env_octaves * v.env * v.velocity + (ch.timbre - 0.5) * 4.0))
+                        * 2f32.powf(
+                            s.env_octaves * v.env * v.velocity
+                                + (ch.timbre - 0.5 + v.brightness - 0.5) * 4.0,
+                        ))
                     .clamp(20.0, nyquist_guard);
                     v.g = (PI * fc / sr).tan();
                     v.k = s.k;
@@ -359,7 +412,13 @@ impl SynthProcessor {
                 let a1 = 1.0 / (1.0 + v.g * (v.g + v.k));
                 let a2 = v.g * a1;
                 let a3 = v.g * a2;
-                let amp = v.env * v.velocity * s.gain * 0.35 * (1.0 + 0.5 * ch.pressure);
+                let amp = v.env
+                    * v.velocity
+                    * s.gain
+                    * 0.35
+                    * (1.0 + 0.5 * (ch.pressure + v.pressure))
+                    * v.volume
+                    * v.expression;
                 let mut side = [0.0f32; 2];
                 for o in 0..2 {
                     // PolyBLEP sawtooth.
@@ -388,8 +447,8 @@ impl SynthProcessor {
                 match out_r.as_deref_mut() {
                     // Oscillators spread slightly left/right for width.
                     Some(r) => {
-                        out_l[i] += side[0] * 0.8 + side[1] * 0.2;
-                        r[i] += side[1] * 0.8 + side[0] * 0.2;
+                        out_l[i] += (side[0] * 0.8 + side[1] * 0.2) * pan_l;
+                        r[i] += (side[1] * 0.8 + side[0] * 0.2) * pan_r;
                     }
                     None => out_l[i] += 0.5 * (side[0] + side[1]),
                 }

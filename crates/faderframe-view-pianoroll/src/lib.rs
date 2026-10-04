@@ -505,11 +505,17 @@ impl faderframe_ui_canvas::CanvasView<Session, faderframe_session::Action> for P
     }
 }
 
-/// Values the expression lane shows (pitch: ±12 semitones).
+/// Values the expression lane shows (pitch: ±12 semitones; volume −24 to
+/// +12 dB).
 pub(crate) fn expression_span(kind: ExpressionKind) -> (f32, f32) {
     match kind {
         ExpressionKind::Pitch => (-12.0, 12.0),
-        ExpressionKind::Pressure | ExpressionKind::Timbre => (0.0, 1.0),
+        ExpressionKind::Volume => (-24.0, 12.0),
+        ExpressionKind::Pan => (-1.0, 1.0),
+        ExpressionKind::Pressure
+        | ExpressionKind::Timbre
+        | ExpressionKind::Vibrato
+        | ExpressionKind::Expression => (0.0, 1.0),
     }
 }
 
@@ -521,10 +527,12 @@ pub(crate) fn expression_y(area: Rect, kind: ExpressionKind, v: f32) -> f32 {
 pub(crate) fn expression_value(area: Rect, kind: ExpressionKind, y: f32) -> f32 {
     let (lo, hi) = expression_span(kind);
     let v = lo + (hi - lo) * ((area.bottom() - y) / area.h.max(1.0)).clamp(0.0, 1.0);
-    // Pitch snaps to whole semitones near them.
-    if kind == ExpressionKind::Pitch && (v - v.round()).abs() < 0.12 {
-        v.round()
-    } else {
-        v
+    // Pitch snaps to whole semitones near them, volume to 0 dB, pan to the
+    // centre.
+    match kind {
+        ExpressionKind::Pitch if (v - v.round()).abs() < 0.12 => v.round(),
+        ExpressionKind::Volume if v.abs() < 0.4 => 0.0,
+        ExpressionKind::Pan if v.abs() < 0.03 => 0.0,
+        _ => v,
     }
 }

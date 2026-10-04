@@ -285,3 +285,58 @@ fn synth_bend_range_follows_rpn_and_the_mpe_zone() {
     ]);
     assert!((mpe / plain - 2.0).abs() < 0.03, "{mpe}");
 }
+
+#[test]
+fn synth_voices_follow_their_note_expressions() {
+    use faderframe_midi::{ExpressionValue, NoteExpressionKind};
+    // Play A2 with expressions addressed to it (or to another key) right
+    // after the note-on; returns the left channel and its RMS.
+    let play = |exprs: &[(u8, NoteExpressionKind, f64)]| {
+        let mut inst = BuiltinFactory.instantiate(builtin::SYNTH).unwrap();
+        let mut p = inst.create_processor(&config()).unwrap();
+        let mut rig = Rig::new();
+        rig.ev_in[0]
+            .push(TimedMidiEvent::new(
+                1,
+                MidiEvent::NoteOn {
+                    channel: 0,
+                    key: 45,
+                    velocity: 120,
+                },
+            ))
+            .unwrap();
+        for &(key, kind, v) in exprs {
+            rig.ev_in[0]
+                .push(TimedMidiEvent::new(
+                    1,
+                    MidiEvent::NoteExpression {
+                        channel: 0,
+                        key,
+                        kind,
+                        value: ExpressionValue::new(v),
+                    },
+                ))
+                .unwrap();
+        }
+        record(p.as_mut(), &mut rig, 40);
+        let x = record(p.as_mut(), &mut rig, 64);
+        let rms = (x.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / x.len() as f64).sqrt();
+        (x, rms)
+    };
+    let (x, level) = play(&[]);
+    let plain = fundamental(&x);
+    assert!((plain - 110.0).abs() < 2.0, "{plain}");
+    // Tuning: an octave up — for this note only.
+    let up = fundamental(&play(&[(45, NoteExpressionKind::Tuning, 12.0)]).0);
+    assert!((up / plain - 2.0).abs() < 0.03, "{up}");
+    let other = fundamental(&play(&[(47, NoteExpressionKind::Tuning, 12.0)]).0);
+    assert!((other - plain).abs() < 1.0, "{other}");
+    // Volume −12 dB: a quarter of the level.
+    let (_, quiet) = play(&[(45, NoteExpressionKind::Volume, -12.0)]);
+    assert!((quiet / level - 0.25).abs() < 0.03, "{}", quiet / level);
+    // Pan hard right: the left side falls silent; hard left keeps it.
+    let (_, right) = play(&[(45, NoteExpressionKind::Pan, 1.0)]);
+    let (_, left) = play(&[(45, NoteExpressionKind::Pan, -1.0)]);
+    assert!(right < level * 0.01, "{right}");
+    assert!((left / level - 1.0).abs() < 0.02, "{left}");
+}

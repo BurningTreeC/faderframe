@@ -2993,6 +2993,16 @@ impl Session {
     }
 
     /// Plugins that can be inserted (effects) or used as instruments.
+    /// The per-note expressions the track's instrument accepts (`None`:
+    /// no instrument, or it does not say).
+    pub fn instrument_note_expressions(
+        &self,
+        track: TrackId,
+    ) -> Option<Vec<faderframe_midi::NoteExpressionKind>> {
+        let slot = self.project.track(track)?.instrument.as_ref()?;
+        self.engine.plugin_note_expressions(slot.id)
+    }
+
     pub fn available_plugins(&self) -> Vec<AvailablePlugin> {
         use faderframe_plugin_host::{PluginCategory, PluginFormat as F};
         self.engine

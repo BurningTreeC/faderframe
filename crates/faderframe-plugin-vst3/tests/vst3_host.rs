@@ -10,7 +10,7 @@
 use faderframe_audio_graph::{AudioBuffer, NodeIo};
 use faderframe_automation::ParameterEvent;
 use faderframe_core::{ChannelLayout, ParameterId};
-use faderframe_midi::{MidiBuffer, MidiEvent, TimedMidiEvent};
+use faderframe_midi::{ExpressionValue, MidiBuffer, MidiEvent, NoteExpressionKind, TimedMidiEvent};
 use faderframe_plugin_host::{
     PluginFactory, PluginInstance, PluginProcessContext, PluginProcessor, ProcessConfig,
 };
@@ -65,6 +65,42 @@ static MESSAGE_VALUE: AtomicI64 = AtomicI64::new(0);
 /// The controller's component handler (the test plays the editor).
 static HANDLER: Mutex<Option<ComPtr<IComponentHandler>>> = Mutex::new(None);
 static PROCESSING: AtomicBool = AtomicBool::new(false);
+/// Note events the test processor received: (event type, note id, pitch or
+/// expression type id, value). Recorded only into reserved room —
+/// processing must not allocate.
+static SEEN: Mutex<Vec<(u32, i32, i32, f64)>> = Mutex::new(Vec::new());
+
+fn record(e: &Event) {
+    use Event_::EventTypes_::*;
+    let t = e.r#type as u32;
+    // SAFETY: the union member read matches the event type.
+    let entry = unsafe {
+        match t {
+            x if x == kNoteOnEvent as u32 => {
+                let n = e.__field0.noteOn;
+                (t, n.noteId, n.pitch as i32, n.velocity as f64)
+            }
+            x if x == kNoteOffEvent as u32 => {
+                let n = e.__field0.noteOff;
+                (t, n.noteId, n.pitch as i32, 0.0)
+            }
+            x if x == kNoteExpressionValueEvent as u32 => {
+                let n = e.__field0.noteExpressionValue;
+                (t, n.noteId, n.typeId as i32, n.value)
+            }
+            x if x == kPolyPressureEvent as u32 => {
+                let n = e.__field0.polyPressure;
+                (t, n.noteId, n.pitch as i32, n.pressure as f64)
+            }
+            _ => return,
+        }
+    };
+    if let Ok(mut v) = SEEN.lock()
+        && v.len() < v.capacity()
+    {
+        v.push(entry);
+    }
+}
 
 fn read_f64(stream: *mut IBStream) -> Option<f64> {
     let s = unsafe { ComRef::from_raw(stream) }?;
@@ -230,6 +266,7 @@ impl IAudioProcessorTrait for TestProcessor {
             for i in 0..unsafe { events.getEventCount() } {
                 let mut e: Event = unsafe { std::mem::zeroed() };
                 unsafe { events.getEvent(i, &mut e) };
+                record(&e);
                 let delta = match e.r#type as u32 {
                     t if t == Event_::EventTypes_::kNoteOnEvent as u32 => 1,
                     t if t == Event_::EventTypes_::kNoteOffEvent as u32 => -1,
@@ -321,7 +358,61 @@ struct TestController {
 }
 
 impl Class for TestController {
-    type Interfaces = (IEditController, IConnectionPoint, IMidiMapping);
+    type Interfaces = (
+        IEditController,
+        IConnectionPoint,
+        IMidiMapping,
+        INoteExpressionController,
+    );
+}
+
+/// The note expressions the test plugin lists (not vibrato).
+const LISTED: [u32; 3] = [
+    NoteExpressionTypeIDs_::kVolumeTypeID as u32,
+    NoteExpressionTypeIDs_::kPanTypeID as u32,
+    NoteExpressionTypeIDs_::kTuningTypeID as u32,
+];
+
+impl INoteExpressionControllerTrait for TestController {
+    unsafe fn getNoteExpressionCount(&self, bus: int32, _channel: int16) -> int32 {
+        if bus == 0 { LISTED.len() as int32 } else { 0 }
+    }
+    unsafe fn getNoteExpressionInfo(
+        &self,
+        bus: int32,
+        _channel: int16,
+        index: int32,
+        info: *mut NoteExpressionTypeInfo,
+    ) -> tresult {
+        match LISTED.get(index as usize) {
+            Some(&id) if bus == 0 && !info.is_null() => {
+                // SAFETY: the host passes a valid struct.
+                unsafe { (*info).typeId = id as _ };
+                kResultOk
+            }
+            _ => kInvalidArgument,
+        }
+    }
+    unsafe fn getNoteExpressionStringByValue(
+        &self,
+        _bus: int32,
+        _channel: int16,
+        _id: NoteExpressionTypeID,
+        _value: NoteExpressionValue,
+        _string: *mut String128,
+    ) -> tresult {
+        kResultFalse
+    }
+    unsafe fn getNoteExpressionValueByString(
+        &self,
+        _bus: int32,
+        _channel: int16,
+        _id: NoteExpressionTypeID,
+        _string: *const TChar,
+        _value: *mut NoteExpressionValue,
+    ) -> tresult {
+        kResultFalse
+    }
 }
 
 impl TestController {
@@ -727,6 +818,88 @@ fn hosts_a_plugin_with_separate_controller() {
     let out = rig.run(proc.as_mut(), &[]);
     assert_eq!(out[0], 0.25, "gain 0 + one held note");
     assert_eq!(out[5], 0.0);
+
+    // Notes carry ids; note expressions address them (pressure as poly
+    // pressure), normalised the VST3 way.
+    *SEEN.lock().unwrap() = Vec::with_capacity(64);
+    let expr = |at, key, kind, v| TimedMidiEvent {
+        sample_offset: at,
+        event: MidiEvent::NoteExpression {
+            channel: 0,
+            key,
+            kind,
+            value: ExpressionValue::new(v),
+        },
+    };
+    let note = |at, key, on: bool| TimedMidiEvent {
+        sample_offset: at,
+        event: if on {
+            MidiEvent::NoteOn {
+                channel: 0,
+                key,
+                velocity: 100,
+            }
+        } else {
+            MidiEvent::NoteOff {
+                channel: 0,
+                key,
+                velocity: 0,
+            }
+        },
+    };
+    for e in [
+        note(0, 70, true),
+        note(0, 72, true),
+        expr(1, 70, NoteExpressionKind::Tuning, 12.0),
+        expr(2, 70, NoteExpressionKind::Volume, 0.0),
+        expr(3, 72, NoteExpressionKind::Pressure, 0.5),
+        expr(4, 72, NoteExpressionKind::Pan, -1.0),
+        // Not listed by the plugin: not sent.
+        expr(4, 72, NoteExpressionKind::Vibrato, 0.5),
+        note(5, 70, false),
+        note(6, 72, false),
+    ] {
+        rig.events[0].push(e).unwrap();
+    }
+    rig.run(proc.as_mut(), &[]);
+    {
+        use Event_::EventTypes_::*;
+        use NoteExpressionTypeIDs_::*;
+        let seen = SEEN.lock().unwrap().clone();
+        let find = |t: u32, id_or_key: i32| {
+            seen.iter()
+                .find(|e| e.0 == t && (e.2 == id_or_key))
+                .copied()
+                .unwrap_or_else(|| panic!("{t} {id_or_key}: {seen:?}"))
+        };
+        let a = find(kNoteOnEvent as u32, 70).1;
+        let b = find(kNoteOnEvent as u32, 72).1;
+        assert!(a >= 0 && b >= 0 && a != b, "{seen:?}");
+        let tuning = find(kNoteExpressionValueEvent as u32, kTuningTypeID as i32);
+        assert_eq!(tuning.1, a);
+        assert!((tuning.3 - 0.55).abs() < 1e-9, "{tuning:?}");
+        let volume = find(kNoteExpressionValueEvent as u32, kVolumeTypeID as i32);
+        assert_eq!((volume.1, volume.3), (a, 0.25), "0 dB is a quarter");
+        let pan = find(kNoteExpressionValueEvent as u32, kPanTypeID as i32);
+        assert_eq!((pan.1, pan.3), (b, 0.0));
+        let pressure = find(kPolyPressureEvent as u32, 72);
+        assert_eq!((pressure.1, pressure.3), (b, 0.5));
+        assert_eq!(find(kNoteOffEvent as u32, 70).1, a);
+        assert_eq!(find(kNoteOffEvent as u32, 72).1, b);
+        assert!(
+            !seen
+                .iter()
+                .any(|e| e.0 == kNoteExpressionValueEvent as u32 && e.2 == kVibratoTypeID as i32),
+            "unlisted expressions are not sent"
+        );
+    }
+    let listed = inst.note_expressions().unwrap();
+    assert!(listed.contains(&NoteExpressionKind::Tuning));
+    assert!(
+        listed.contains(&NoteExpressionKind::Pressure),
+        "as poly pressure"
+    );
+    assert!(!listed.contains(&NoteExpressionKind::Vibrato));
     assert_eq!(
         ALLOCS.load(Ordering::Relaxed),
         0,

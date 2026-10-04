@@ -354,6 +354,14 @@ fn on_channel(ev: MidiEvent, ch: u8) -> MidiEvent {
             pressure,
         },
         MidiEvent::PitchBend { value, .. } => MidiEvent::PitchBend { channel: ch, value },
+        MidiEvent::NoteExpression {
+            key, kind, value, ..
+        } => MidiEvent::NoteExpression {
+            channel: ch,
+            key,
+            kind,
+            value,
+        },
     }
 }
 
@@ -363,6 +371,10 @@ impl Processor<EngineContext> for MidiOutputSink {
             return;
         };
         for ev in input.iter() {
+            if matches!(ev.event, MidiEvent::NoteExpression { .. }) {
+                // No MIDI form.
+                continue;
+            }
             let e = match self.channel {
                 Some(ch) => on_channel(ev.event, ch),
                 None => ev.event,

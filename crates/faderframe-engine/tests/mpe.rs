@@ -140,3 +140,70 @@ fn notes_get_member_channels_and_play_their_expression() {
             == 3
     );
 }
+
+#[test]
+fn without_mpe_expression_goes_to_plugins_as_note_expressions() {
+    use faderframe_midi::NoteExpressionKind;
+    let (mut tp, t) = project(None);
+    // A volume curve too (not something MPE can carry).
+    if let Some(c) = tp.project.clips.values_mut().next()
+        && let ClipContent::Midi(m) = &mut c.content
+    {
+        m.expressions[0].volume = vec![ExpressionPoint {
+            time: MusicalTime::ZERO,
+            value: -6.0,
+        }];
+    }
+    let ev = events(&tp, t);
+    let on = ev
+        .iter()
+        .position(|&(_, e)| matches!(e, MidiEvent::NoteOn { key: 60, .. }))
+        .unwrap();
+    let exprs: Vec<(i64, NoteExpressionKind, f64)> = ev
+        .iter()
+        .filter_map(|&(time, e)| match e {
+            MidiEvent::NoteExpression {
+                channel: 0,
+                key: 60,
+                kind,
+                value,
+            } => Some((time, kind, value.get())),
+            MidiEvent::NoteExpression { key, .. } => panic!("only note 60 has expression: {key}"),
+            _ => None,
+        })
+        .collect();
+    // Starting values right after the note-on, at its time.
+    let first = ev
+        .iter()
+        .position(|&(_, e)| matches!(e, MidiEvent::NoteExpression { .. }))
+        .unwrap();
+    assert!(first > on);
+    assert_eq!(ev[first].0, ev[on].0);
+    let at_start = |k| exprs.iter().find(|e| e.1 == k).map(|e| (e.0, e.2)).unwrap();
+    assert_eq!(at_start(NoteExpressionKind::Pressure), (ev[on].0, 0.5));
+    assert_eq!(at_start(NoteExpressionKind::Volume), (ev[on].0, -6.0));
+    // The glide: tuning rising to two semitones.
+    let tuning: Vec<f64> = exprs
+        .iter()
+        .filter(|e| e.1 == NoteExpressionKind::Tuning)
+        .map(|e| e.2)
+        .collect();
+    assert!(tuning.len() > 50, "{}", tuning.len());
+    assert!(tuning.windows(2).all(|w| w[1] > w[0]));
+    assert!((tuning.last().unwrap() - 2.0).abs() < 0.03);
+    // MPE tracks play pitch and pressure over MPE; volume has no MPE form.
+    let (mut tp, t) = project(Some(MpeConfig::default()));
+    if let Some(c) = tp.project.clips.values_mut().next()
+        && let ClipContent::Midi(m) = &mut c.content
+    {
+        m.expressions[0].volume = vec![ExpressionPoint {
+            time: MusicalTime::ZERO,
+            value: -6.0,
+        }];
+    }
+    let ev = events(&tp, t);
+    assert!(
+        !ev.iter()
+            .any(|&(_, e)| matches!(e, MidiEvent::NoteExpression { .. }))
+    );
+}

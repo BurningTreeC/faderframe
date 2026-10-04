@@ -478,6 +478,10 @@ impl EngineProcessor {
                         }
                         for ev in buf.iter() {
                             let (bytes, len) = ev.event.to_bytes();
+                            if len == 0 {
+                                // Note expressions have no MIDI form.
+                                continue;
+                            }
                             let due = base
                                 + ((latency + ev.sample_offset as usize) as f64 * ns_per_frame)
                                     as u64;
@@ -683,6 +687,14 @@ impl EngineController {
     /// Latency of a hosted plugin instance (samples).
     pub fn plugin_latency(&self, plugin: faderframe_core::PluginInstanceId) -> Option<u32> {
         self.plugins.latency(plugin)
+    }
+
+    /// The note expressions a hosted plugin accepts (`None`: unknown).
+    pub fn plugin_note_expressions(
+        &self,
+        plugin: faderframe_core::PluginInstanceId,
+    ) -> Option<Vec<faderframe_midi::NoteExpressionKind>> {
+        self.plugins.note_expressions(plugin)
     }
 
     /// Plugin instances that reported a processing failure.

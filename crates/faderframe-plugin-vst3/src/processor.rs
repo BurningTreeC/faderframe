@@ -9,7 +9,7 @@
 //! silent. Nothing here allocates, locks or frees.
 
 use faderframe_audio_graph::NodeIo;
-use faderframe_midi::{MidiEvent, TimedMidiEvent};
+use faderframe_midi::{MidiEvent, NoteExpressionKind, NoteIds, TimedMidiEvent};
 use faderframe_plugin_host::{PluginProcessContext, PluginProcessor, ProcessStatus};
 use faderframe_realtime::TryCell;
 use std::cell::Cell;
@@ -17,8 +17,8 @@ use std::sync::Arc;
 use vst3::Steinberg::Vst::{
     AudioBusBuffers, Event, IAudioProcessor, IAudioProcessorTrait, IEventList, IEventListTrait,
     IParamValueQueue, IParamValueQueueTrait, IParameterChanges, IParameterChangesTrait,
-    NoteOffEvent, NoteOnEvent, ParamID, ParamValue, PolyPressureEvent, ProcessContext, ProcessData,
-    kNoParamId,
+    NoteExpressionValueEvent, NoteOffEvent, NoteOnEvent, ParamID, ParamValue, PolyPressureEvent,
+    ProcessContext, ProcessData, kNoParamId,
 };
 use vst3::Steinberg::{int32, kInvalidArgument, kResultFalse, kResultOk, kResultTrue, tresult};
 use vst3::{Class, ComPtr, ComWrapper};
@@ -373,6 +373,10 @@ pub(crate) struct Active {
     out_tx: rtrb::Producer<(ParamID, ParamValue)>,
     map: Arc<ParamMap>,
     midi: Option<Box<MidiMap>>,
+    /// Ids of the sounding notes (note expressions address them).
+    note_ids: Box<NoteIds>,
+    /// The note expressions the plugin lists.
+    note_expressions: [bool; 7],
     continuous: i64,
     max_frames: usize,
 }
@@ -390,6 +394,8 @@ pub(crate) struct ActiveConfig {
     pub max_frames: usize,
     pub map: Arc<ParamMap>,
     pub midi: Option<Box<MidiMap>>,
+    /// The note expressions the plugin lists (others are not sent).
+    pub note_expressions: Vec<NoteExpressionKind>,
 }
 
 impl Active {
@@ -414,10 +420,30 @@ impl Active {
             out_tx,
             map: c.map,
             midi: c.midi,
+            note_ids: Box::new(NoteIds::new()),
+            note_expressions: NoteExpressionKind::ALL.map(|k| c.note_expressions.contains(&k)),
             continuous: 0,
             max_frames: c.max_frames,
         }
     }
+}
+
+/// A note expression as VST3 has it: the standard type id and the
+/// normalised value (volume: 0.25 = 0 dB, 1 = +12 dB; pan and tuning: 0.5 =
+/// centre, tuning ±120 semitones). Pressure is a poly-pressure event
+/// instead (`None`).
+fn vst3_expression(kind: NoteExpressionKind, plain: f64) -> Option<(u32, f64)> {
+    use vst3::Steinberg::Vst::NoteExpressionTypeIDs_::*;
+    let (id, norm) = match kind {
+        NoteExpressionKind::Volume => (kVolumeTypeID, 10f64.powf(plain / 20.0) / 4.0),
+        NoteExpressionKind::Pan => (kPanTypeID, (plain + 1.0) / 2.0),
+        NoteExpressionKind::Tuning => (kTuningTypeID, 0.5 + plain / 240.0),
+        NoteExpressionKind::Vibrato => (kVibratoTypeID, plain),
+        NoteExpressionKind::Expression => (kExpressionTypeID, plain),
+        NoteExpressionKind::Brightness => (kBrightnessTypeID, plain),
+        NoteExpressionKind::Pressure => return None,
+    };
+    Some((id as _, norm.clamp(0.0, 1.0)))
 }
 
 pub(crate) type SharedRt = Arc<TryCell<Option<Active>>>;
@@ -499,6 +525,7 @@ impl Active {
                     key,
                     velocity,
                 } if velocity > 0 => {
+                    let id = self.note_ids.start(channel, key);
                     self.in_events.push(note_event(t, kNoteOnEvent as u16, |e| {
                         e.__field0.noteOn = NoteOnEvent {
                             channel: channel as i16,
@@ -506,7 +533,7 @@ impl Active {
                             tuning: 0.0,
                             velocity: velocity as f32 / 127.0,
                             length: 0,
-                            noteId: -1,
+                            noteId: id,
                         }
                     }));
                 }
@@ -516,13 +543,14 @@ impl Active {
                         MidiEvent::NoteOff { velocity, .. } => velocity,
                         _ => 64,
                     };
+                    let id = self.note_ids.end(channel, key);
                     self.in_events
                         .push(note_event(t, kNoteOffEvent as u16, |e| {
                             e.__field0.noteOff = NoteOffEvent {
                                 channel: channel as i16,
                                 pitch: key as i16,
                                 velocity: velocity as f32 / 127.0,
-                                noteId: -1,
+                                noteId: id,
                                 tuning: 0.0,
                             }
                         }));
@@ -538,9 +566,44 @@ impl Active {
                                 channel: channel as i16,
                                 pitch: key as i16,
                                 pressure: pressure as f32 / 127.0,
-                                noteId: -1,
+                                noteId: self.note_ids.get(channel, key),
                             }
                         }));
+                }
+                MidiEvent::NoteExpression {
+                    channel,
+                    key,
+                    kind,
+                    value,
+                } => {
+                    let id = self.note_ids.get(channel, key);
+                    let listed = NoteExpressionKind::ALL
+                        .iter()
+                        .position(|k| *k == kind)
+                        .is_some_and(|i| self.note_expressions[i]);
+                    if id == NoteIds::NONE || !listed {
+                        continue;
+                    }
+                    let event = match vst3_expression(kind, value.get()) {
+                        Some((type_id, norm)) => {
+                            note_event(t, kNoteExpressionValueEvent as u16, |e| {
+                                e.__field0.noteExpressionValue = NoteExpressionValueEvent {
+                                    typeId: type_id,
+                                    noteId: id,
+                                    value: norm,
+                                }
+                            })
+                        }
+                        None => note_event(t, kPolyPressureEvent as u16, |e| {
+                            e.__field0.polyPressure = PolyPressureEvent {
+                                channel: channel as i16,
+                                pitch: key as i16,
+                                pressure: value.get().clamp(0.0, 1.0) as f32,
+                                noteId: id,
+                            }
+                        }),
+                    };
+                    self.in_events.push(event);
                 }
                 MidiEvent::ControlChange {
                     channel,

@@ -20,6 +20,7 @@ use crate::processor::{
 };
 use crate::util::{parse_tuid, wstr};
 use faderframe_core::ParameterId;
+use faderframe_midi::NoteExpressionKind;
 use faderframe_plugin_host::scan::ScannedPlugin;
 use faderframe_plugin_host::{
     EditorRequests, ParameterInfo, ParameterUnit, ParentWindow, PluginDescriptor, PluginEditor,
@@ -112,6 +113,8 @@ pub struct Vst3Instance {
     activations: u64,
     /// Editor gestures and values for automation writing.
     editor_edits: Vec<faderframe_plugin_host::EditorEdit>,
+    /// The note expressions the plugin lists (queried once).
+    note_expressions: Vec<NoteExpressionKind>,
     view: Option<ComPtr<IPlugView>>,
     view_open: bool,
     /// Editor edits forwarded since the last poll (for "dirty").
@@ -178,6 +181,7 @@ impl Vst3Instance {
             needs_restart: false,
             activations: 0,
             editor_edits: Vec::new(),
+            note_expressions: Vec::new(),
             view: None,
             view_open: false,
             edited: false,
@@ -216,6 +220,7 @@ impl Vst3Instance {
             }
         }
         s.query_params();
+        s.note_expressions = s.listed_note_expressions();
         Ok(s)
     }
 
@@ -292,6 +297,45 @@ impl Vst3Instance {
         }
         self.params = out;
         self.map = Arc::new(ParamMap::new(steps));
+    }
+
+    /// The standard note expressions the plugin lists (bus 0, channel 0),
+    /// plus pressure (always as poly pressure).
+    fn listed_note_expressions(&self) -> Vec<NoteExpressionKind> {
+        use vst3::Steinberg::Vst::NoteExpressionTypeIDs_::*;
+        use vst3::Steinberg::Vst::{
+            INoteExpressionController, INoteExpressionControllerTrait, NoteExpressionTypeInfo,
+        };
+        let mut out = vec![NoteExpressionKind::Pressure];
+        let Some(nec) = self
+            .controller
+            .as_ref()
+            .and_then(|c| c.cast::<INoteExpressionController>())
+        else {
+            return out;
+        };
+        // SAFETY: plain queries with valid out pointers.
+        let count = unsafe { nec.getNoteExpressionCount(0, 0) };
+        for i in 0..count.max(0) {
+            // SAFETY: plain C struct, filled by the plugin.
+            let mut info: NoteExpressionTypeInfo = unsafe { std::mem::zeroed() };
+            if unsafe { nec.getNoteExpressionInfo(0, 0, i, &mut info) } != kResultOk {
+                continue;
+            }
+            let kind = match info.typeId as u32 {
+                t if t == kVolumeTypeID as u32 => NoteExpressionKind::Volume,
+                t if t == kPanTypeID as u32 => NoteExpressionKind::Pan,
+                t if t == kTuningTypeID as u32 => NoteExpressionKind::Tuning,
+                t if t == kVibratoTypeID as u32 => NoteExpressionKind::Vibrato,
+                t if t == kExpressionTypeID as u32 => NoteExpressionKind::Expression,
+                t if t == kBrightnessTypeID as u32 => NoteExpressionKind::Brightness,
+                _ => continue,
+            };
+            if !out.contains(&kind) {
+                out.push(kind);
+            }
+        }
+        out
     }
 
     fn midi_map(&self) -> Option<Box<MidiMap>> {
@@ -477,6 +521,10 @@ impl FfInstance for Vst3Instance {
 
     fn take_editor_edits(&mut self) -> Vec<faderframe_plugin_host::EditorEdit> {
         std::mem::take(&mut self.editor_edits)
+    }
+
+    fn note_expressions(&self) -> Option<Vec<NoteExpressionKind>> {
+        Some(self.note_expressions.clone())
     }
 
     fn activation(&self) -> u64 {
@@ -691,6 +739,7 @@ impl FfInstance for Vst3Instance {
                     max_frames: max as usize,
                     map: Arc::clone(&self.map),
                     midi: self.midi_map(),
+                    note_expressions: self.note_expressions.clone(),
                 },
                 rx,
                 out_tx,

@@ -1,7 +1,55 @@
-/// A channel-voice MIDI message. Channels are 0-based (0..=15).
-///
-/// MPE and per-note expressions are expected to be added as further variants
-/// (or a parallel note-expression stream) once plugin hosting needs them.
+/// A dimension of per-note expression: the set CLAP and VST3 share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum NoteExpressionKind {
+    /// dB (0 = unchanged; at most +12).
+    Volume,
+    /// −1 (left) … 1 (right).
+    Pan,
+    /// Semitones (−120 … 120).
+    Tuning,
+    /// 0 … 1.
+    Vibrato,
+    /// 0 … 1.
+    Expression,
+    /// 0 … 1.
+    Brightness,
+    /// 0 … 1.
+    Pressure,
+}
+
+impl NoteExpressionKind {
+    pub const ALL: [NoteExpressionKind; 7] = [
+        Self::Volume,
+        Self::Pan,
+        Self::Tuning,
+        Self::Vibrato,
+        Self::Expression,
+        Self::Brightness,
+        Self::Pressure,
+    ];
+}
+
+/// The plain value of a note expression in millionths (fixed point keeps
+/// [`MidiEvent`] `Eq` and `Hash`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ExpressionValue(i32);
+
+impl ExpressionValue {
+    pub fn new(plain: f64) -> Self {
+        Self(
+            (plain * 1e6)
+                .round()
+                .clamp(i32::MIN as f64, i32::MAX as f64) as i32,
+        )
+    }
+
+    pub fn get(self) -> f64 {
+        self.0 as f64 / 1e6
+    }
+}
+
+/// A channel-voice MIDI message (channels are 0-based, 0..=15), or a
+/// per-note expression for hosted plugins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MidiEvent {
     NoteOn {
@@ -36,6 +84,15 @@ pub enum MidiEvent {
     PitchBend {
         channel: u8,
         value: u16,
+    },
+    /// Per-note expression of the sounding note `key` on `channel` (CLAP
+    /// note expressions, VST3 note expression values). Not a MIDI message:
+    /// MIDI outputs drop it.
+    NoteExpression {
+        channel: u8,
+        key: u8,
+        kind: NoteExpressionKind,
+        value: ExpressionValue,
     },
 }
 
@@ -99,7 +156,8 @@ impl MidiEvent {
         })
     }
 
-    /// Encode to raw bytes; returns the buffer and the number of valid bytes.
+    /// Encode to raw bytes; returns the buffer and the number of valid bytes
+    /// (0 for a note expression, which has no MIDI form).
     pub fn to_bytes(self) -> ([u8; 3], usize) {
         let ch = |c: u8| c & 0x0F;
         match self {
@@ -137,6 +195,7 @@ impl MidiEvent {
                 ],
                 3,
             ),
+            MidiEvent::NoteExpression { .. } => ([0; 3], 0),
         }
     }
 
@@ -148,17 +207,21 @@ impl MidiEvent {
             | MidiEvent::ControlChange { channel, .. }
             | MidiEvent::ProgramChange { channel, .. }
             | MidiEvent::ChannelPressure { channel, .. }
-            | MidiEvent::PitchBend { channel, .. } => channel,
+            | MidiEvent::PitchBend { channel, .. }
+            | MidiEvent::NoteExpression { channel, .. } => channel,
         }
     }
 
     /// Ordering priority for events sharing a sample offset: note-offs go
-    /// first so a retriggered note at the same instant is not cut off.
+    /// first so a retriggered note at the same instant is not cut off;
+    /// note expressions follow their note-on (they address a sounding
+    /// note).
     #[inline]
-    pub(crate) fn same_time_priority(self) -> u8 {
+    pub fn same_time_priority(self) -> u8 {
         match self {
             MidiEvent::NoteOff { .. } => 0,
             MidiEvent::NoteOn { .. } => 2,
+            MidiEvent::NoteExpression { .. } => 3,
             _ => 1,
         }
     }
@@ -189,6 +252,29 @@ impl TimedMidiEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn note_expressions_are_fixed_point_and_have_no_midi_form() {
+        let v = ExpressionValue::new(-1.234_567_8);
+        assert!((v.get() - -1.234_568).abs() < 1e-9);
+        let e = MidiEvent::NoteExpression {
+            channel: 2,
+            key: 64,
+            kind: NoteExpressionKind::Tuning,
+            value: v,
+        };
+        assert_eq!(e.to_bytes().1, 0);
+        assert_eq!(e.channel(), 2);
+        assert!(
+            e.same_time_priority()
+                > MidiEvent::NoteOn {
+                    channel: 2,
+                    key: 64,
+                    velocity: 1
+                }
+                .same_time_priority()
+        );
+    }
 
     #[test]
     fn byte_round_trip() {

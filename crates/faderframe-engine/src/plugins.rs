@@ -321,6 +321,14 @@ impl PluginHost {
     }
 
     /// Latency a hosted plugin reports (samples).
+    /// The note expressions an instantiated plugin accepts (`None`: unknown).
+    pub fn note_expressions(
+        &self,
+        plugin: PluginInstanceId,
+    ) -> Option<Vec<faderframe_midi::NoteExpressionKind>> {
+        self.instances.get(&plugin)?.instance.note_expressions()
+    }
+
     pub fn latency(&self, plugin: PluginInstanceId) -> Option<u32> {
         self.instances
             .get(&plugin)

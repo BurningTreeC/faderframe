@@ -781,7 +781,10 @@ impl PianoRollView {
         use faderframe_project::ExpressionKind;
         let th = &self.theme;
         let pr = &th.piano;
-        if kind == ExpressionKind::Pitch {
+        if matches!(
+            kind,
+            ExpressionKind::Pitch | ExpressionKind::Volume | ExpressionKind::Pan
+        ) {
             p.hline(
                 area.x,
                 area.right(),
@@ -835,13 +838,48 @@ impl PianoRollView {
                 }
             }
         }
-        let mpe = model
-            .project()
-            .track(clip.track)
-            .is_some_and(|t| t.mpe.is_some());
-        if !mpe {
+        // Instruments get every dimension as note expressions; MIDI outputs
+        // only pitch, pressure and timbre, over MPE.
+        let hint = model.project().track(clip.track).and_then(|t| {
+            if t.mpe.is_some() {
+                (!ExpressionKind::MPE.contains(&kind)).then(|| {
+                    format!(
+                        "MPE carries pitch, pressure and timbre — {} plays only without MPE, on plugin instruments",
+                        kind.label()
+                    )
+                })
+            } else if let Some(slot) = &t.instrument {
+                // Plugins that list what they accept (VST3) may not take
+                // this one.
+                let accepted = model.instrument_note_expressions(t.id)?;
+                if accepted.contains(&kind.native()) {
+                    return None;
+                }
+                let takes: Vec<&str> = ExpressionKind::ALL
+                    .iter()
+                    .filter(|k| accepted.contains(&k.native()))
+                    .map(|k| k.label())
+                    .collect();
+                Some(if takes.is_empty() {
+                    format!("{} takes no per-note expression", slot.plugin.name)
+                } else {
+                    format!(
+                        "{} does not take per-note {} — it takes {}",
+                        slot.plugin.name,
+                        kind.label().to_lowercase(),
+                        takes.join(", ").to_lowercase()
+                    )
+                })
+            } else {
+                Some(
+                    "A MIDI output plays per-note expression over MPE only (lane menu: MPE for this track)"
+                        .to_string(),
+                )
+            }
+        });
+        if let Some(hint) = hint {
             p.text(
-                "Turn on MPE for the track (lane menu) to hear per-note expression",
+                &hint,
                 Rect::new(area.x, area.y, area.w, 14.0),
                 &TextStyle::new(th.fonts.tiny, th.ui.text_faint).center(),
             );

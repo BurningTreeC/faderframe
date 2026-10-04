@@ -859,7 +859,8 @@ pub fn install(app: &Rc<AppState>) {
             }
         })
         .build();
-    // Development aid: `piano-lane:<velocity|pitch|pressure|timbre>` picks
+    // Development aid: `piano-lane:<velocity|pitch|pressure|timbre|volume|
+    // pan|vibrato|expression>` picks
     // the piano roll's lane; `mpe-demo` turns MPE on for the edited clip's
     // track and gives its first notes glides and swells.
     let weak = Rc::downgrade(app);
@@ -883,51 +884,19 @@ pub fn install(app: &Rc<AppState>) {
     let weak = Rc::downgrade(app);
     let mpe_demo = gio::ActionEntry::builder("mpe-demo")
         .activate(move |_, _, _| {
-            use faderframe_project::{ExpressionKind, ExpressionPoint};
-            use faderframe_timeline::MusicalTime;
-            let Some(a) = weak.upgrade() else { return };
-            let found = {
-                let s = a.session.borrow();
-                s.editor_clip().and_then(|c| {
-                    let clip = s.project().clip(c)?;
-                    let notes: Vec<_> = clip.as_midi()?.notes.iter().take(4).copied().collect();
-                    Some((c, clip.track, notes))
-                })
-            };
-            let Some((clip, track, notes)) = found else {
-                tracing::warn!("mpe-demo: no MIDI clip in the editor");
-                return;
-            };
-            a.dispatch(Action::Edit(faderframe_project::Command::SetTrackMpe {
-                track,
-                mpe: Some(faderframe_project::MpeConfig::default()),
-            }));
-            let pt = |q: f64, value: f32| ExpressionPoint {
-                time: MusicalTime::from_quarters(q),
-                value,
-            };
-            for (i, n) in notes.iter().enumerate() {
-                let len = n.length.ticks() as f64 / faderframe_timeline::TICKS_PER_QUARTER as f64;
-                let glide = [2.0, -1.0, 3.0, -2.0][i % 4];
-                for (kind, points) in [
-                    (
-                        ExpressionKind::Pitch,
-                        vec![pt(0.0, 0.0), pt(len * 0.4, 0.0), pt(len, glide)],
-                    ),
-                    (
-                        ExpressionKind::Pressure,
-                        vec![pt(0.0, 0.2), pt(len * 0.5, 0.9), pt(len, 0.4)],
-                    ),
-                ] {
-                    a.dispatch(Action::SetNoteExpression {
-                        clip,
-                        note: n.id,
-                        kind,
-                        from: MusicalTime::ZERO,
-                        to: n.length + MusicalTime(1),
-                        points,
-                    });
-                }
+            if let Some(a) = weak.upgrade() {
+                expression_demo(&a, true);
+            }
+        })
+        .build();
+    // Development aid: `expression-demo` gives the edited clip's first notes
+    // glides, swells, pan sweeps and pressure as native note expressions
+    // (the track stays a plain one).
+    let weak = Rc::downgrade(app);
+    let note_expression_demo = gio::ActionEntry::builder("expression-demo")
+        .activate(move |_, _, _| {
+            if let Some(a) = weak.upgrade() {
+                expression_demo(&a, false);
             }
         })
         .build();
@@ -976,6 +945,7 @@ pub fn install(app: &Rc<AppState>) {
         window_size,
         lane,
         mpe_demo,
+        note_expression_demo,
         show("show-insert", false),
         show("show-insert-params", true),
     ]);
@@ -1059,6 +1029,71 @@ pub fn install_window_keys(app: &Rc<AppState>, window: &impl IsA<gtk::Widget>) {
 }
 
 /// `<n>@<quarters>`: move (or copy) section n with its content there.
+/// Glides and pressure swells on the edited clip's first notes; with `mpe`
+/// the track plays them over MPE, else as native note expressions (with a
+/// volume swell and a pan sweep too).
+fn expression_demo(a: &Rc<AppState>, mpe: bool) {
+    use faderframe_project::{ExpressionKind, ExpressionPoint};
+    use faderframe_timeline::MusicalTime;
+    let found = {
+        let s = a.session.borrow();
+        s.editor_clip().and_then(|c| {
+            let clip = s.project().clip(c)?;
+            let notes: Vec<_> = clip.as_midi()?.notes.iter().take(4).copied().collect();
+            Some((c, clip.track, notes))
+        })
+    };
+    let Some((clip, track, notes)) = found else {
+        tracing::warn!("expression demo: no MIDI clip in the editor");
+        return;
+    };
+    if mpe {
+        a.dispatch(Action::Edit(faderframe_project::Command::SetTrackMpe {
+            track,
+            mpe: Some(faderframe_project::MpeConfig::default()),
+        }));
+    }
+    let pt = |q: f64, value: f32| ExpressionPoint {
+        time: MusicalTime::from_quarters(q),
+        value,
+    };
+    for (i, n) in notes.iter().enumerate() {
+        let len = n.length.ticks() as f64 / faderframe_timeline::TICKS_PER_QUARTER as f64;
+        let glide = [2.0, -1.0, 3.0, -2.0][i % 4];
+        let mut curves = vec![
+            (
+                ExpressionKind::Pitch,
+                vec![pt(0.0, 0.0), pt(len * 0.4, 0.0), pt(len, glide)],
+            ),
+            (
+                ExpressionKind::Pressure,
+                vec![pt(0.0, 0.2), pt(len * 0.5, 0.9), pt(len, 0.4)],
+            ),
+        ];
+        if !mpe {
+            curves.push((
+                ExpressionKind::Volume,
+                vec![pt(0.0, -18.0), pt(len * 0.6, 0.0)],
+            ));
+            let side = if i % 2 == 0 { 1.0 } else { -1.0 };
+            curves.push((
+                ExpressionKind::Pan,
+                vec![pt(0.0, -0.8 * side), pt(len, 0.8 * side)],
+            ));
+        }
+        for (kind, points) in curves {
+            a.dispatch(Action::SetNoteExpression {
+                clip,
+                note: n.id,
+                kind,
+                from: MusicalTime::ZERO,
+                to: n.length + MusicalTime(1),
+                points,
+            });
+        }
+    }
+}
+
 fn section_op(app: &Rc<AppState>, arg: &str, copy: bool) {
     let Some((n, at)) = arg.split_once('@') else {
         return tracing::warn!("section: expected <n>@<quarters>, got '{arg}'");

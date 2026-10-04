@@ -289,6 +289,11 @@ pub trait PluginInstance {
     fn take_editor_edits(&mut self) -> Vec<EditorEdit> {
         Vec::new()
     }
+    /// The per-note expressions the plugin accepts (`None`: it does not say
+    /// — CLAP plugins ignore what they do not support).
+    fn note_expressions(&self) -> Option<Vec<faderframe_midi::NoteExpressionKind>> {
+        None
+    }
     /// Counts (re)activations. Processors of different activations are not
     /// interchangeable: after a restart the old one is dead, so the engine
     /// must not keep it in place of the new one (it is part of the node's

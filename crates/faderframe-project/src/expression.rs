@@ -1,12 +1,18 @@
-//! Per-note expression (MPE).
+//! Per-note expression.
 //!
-//! With MPE each sounding note gets a MIDI channel of its own, so pitch
-//! bend, channel pressure and CC 74 ("timbre", "slide") shape that one
-//! note. FaderFrame stores the shapes with the notes — a [`NoteExpression`]
-//! per note in [`MidiClip::expressions`](crate::MidiClip), times relative to
-//! the note's start — and assigns channels only when playing (tracks with
-//! an [`MpeConfig`]). Notes can therefore be moved, copied, transposed and
-//! split freely; their expression goes with them.
+//! FaderFrame stores the shapes with the notes — a [`NoteExpression`] per
+//! note in [`MidiClip::expressions`](crate::MidiClip), times relative to the
+//! note's start — so notes can be moved, copied, transposed and split
+//! freely; their expression goes with them. How they are played depends on
+//! the track:
+//!
+//! * MPE (tracks with an [`MpeConfig`]): each sounding note gets a MIDI
+//!   channel of its own, so pitch bend, channel pressure and CC 74
+//!   ("timbre", "slide") shape that one note. MPE carries pitch, pressure
+//!   and timbre ([`ExpressionKind::MPE`]).
+//! * Otherwise every dimension goes to hosted plugins natively as note
+//!   expressions (CLAP note expressions, VST3 note expression values and
+//!   poly pressure), addressed to the note itself.
 
 use faderframe_core::NoteId;
 use faderframe_timeline::MusicalTime;
@@ -19,34 +25,96 @@ pub enum ExpressionKind {
     Pitch,
     /// 0–1 (channel pressure).
     Pressure,
-    /// 0–1 (CC 74).
+    /// 0–1 (CC 74; brightness for plugins).
     Timbre,
+    /// dB (0 = as played).
+    Volume,
+    /// −1 (left) … 1 (right).
+    Pan,
+    /// 0–1.
+    Vibrato,
+    /// 0–1.
+    Expression,
 }
 
 impl ExpressionKind {
-    pub const ALL: [ExpressionKind; 3] = [Self::Pitch, Self::Pressure, Self::Timbre];
+    pub const ALL: [ExpressionKind; 7] = [
+        Self::Pitch,
+        Self::Pressure,
+        Self::Timbre,
+        Self::Volume,
+        Self::Pan,
+        Self::Vibrato,
+        Self::Expression,
+    ];
+    /// What MPE carries (pitch bend, channel pressure, CC 74).
+    pub const MPE: [ExpressionKind; 3] = [Self::Pitch, Self::Pressure, Self::Timbre];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Pitch => "Pitch",
             Self::Pressure => "Pressure",
             Self::Timbre => "Timbre",
+            Self::Volume => "Volume",
+            Self::Pan => "Pan",
+            Self::Vibrato => "Vibrato",
+            Self::Expression => "Expression",
+        }
+    }
+
+    /// The smallest change worth sending to a plugin (pitch: half a cent).
+    pub fn resolution(self) -> f32 {
+        match self {
+            Self::Pitch => 0.005,
+            Self::Volume => 0.05,
+            Self::Pan => 1.0 / 512.0,
+            Self::Pressure | Self::Timbre | Self::Vibrato | Self::Expression => 1.0 / 1024.0,
+        }
+    }
+
+    /// The value for display ("+2.00 st", "−3.0 dB", "L 30", "0.50").
+    pub fn format(self, v: f32) -> String {
+        let s = match self {
+            Self::Pitch => format!("{v:+.2} st"),
+            Self::Volume => format!("{v:+.1} dB"),
+            Self::Pan if v.abs() < 0.005 => "C".to_string(),
+            Self::Pan if v < 0.0 => format!("L {:.0}", -v * 100.0),
+            Self::Pan => format!("R {:.0}", v * 100.0),
+            _ => format!("{v:.2}"),
+        };
+        s.replace('-', "−")
+    }
+
+    /// The dimension hosted plugins receive.
+    pub fn native(self) -> faderframe_midi::NoteExpressionKind {
+        use faderframe_midi::NoteExpressionKind as N;
+        match self {
+            Self::Pitch => N::Tuning,
+            Self::Pressure => N::Pressure,
+            Self::Timbre => N::Brightness,
+            Self::Volume => N::Volume,
+            Self::Pan => N::Pan,
+            Self::Vibrato => N::Vibrato,
+            Self::Expression => N::Expression,
         }
     }
 
     /// Value before any point (and of notes without expression).
     pub fn rest(self) -> f32 {
         match self {
-            Self::Pitch | Self::Pressure => 0.0,
             Self::Timbre => 0.5,
+            _ => 0.0,
         }
     }
 
-    /// Range of values (pitch: the MPE maximum of ±96 semitones).
+    /// Range of values (pitch: the MPE maximum of ±96 semitones; volume up
+    /// to the +12 dB plugins accept).
     pub fn range(self) -> (f32, f32) {
         match self {
             Self::Pitch => (-96.0, 96.0),
-            Self::Pressure | Self::Timbre => (0.0, 1.0),
+            Self::Volume => (-60.0, 12.0),
+            Self::Pan => (-1.0, 1.0),
+            Self::Pressure | Self::Timbre | Self::Vibrato | Self::Expression => (0.0, 1.0),
         }
     }
 }
@@ -70,6 +138,14 @@ pub struct NoteExpression {
     pub pressure: Vec<ExpressionPoint>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub timbre: Vec<ExpressionPoint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volume: Vec<ExpressionPoint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pan: Vec<ExpressionPoint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vibrato: Vec<ExpressionPoint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expression: Vec<ExpressionPoint>,
 }
 
 impl NoteExpression {
@@ -79,6 +155,10 @@ impl NoteExpression {
             pitch: Vec::new(),
             pressure: Vec::new(),
             timbre: Vec::new(),
+            volume: Vec::new(),
+            pan: Vec::new(),
+            vibrato: Vec::new(),
+            expression: Vec::new(),
         }
     }
 
@@ -87,6 +167,10 @@ impl NoteExpression {
             ExpressionKind::Pitch => &self.pitch,
             ExpressionKind::Pressure => &self.pressure,
             ExpressionKind::Timbre => &self.timbre,
+            ExpressionKind::Volume => &self.volume,
+            ExpressionKind::Pan => &self.pan,
+            ExpressionKind::Vibrato => &self.vibrato,
+            ExpressionKind::Expression => &self.expression,
         }
     }
 
@@ -95,11 +179,17 @@ impl NoteExpression {
             ExpressionKind::Pitch => &mut self.pitch,
             ExpressionKind::Pressure => &mut self.pressure,
             ExpressionKind::Timbre => &mut self.timbre,
+            ExpressionKind::Volume => &mut self.volume,
+            ExpressionKind::Pan => &mut self.pan,
+            ExpressionKind::Vibrato => &mut self.vibrato,
+            ExpressionKind::Expression => &mut self.expression,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pitch.is_empty() && self.pressure.is_empty() && self.timbre.is_empty()
+        ExpressionKind::ALL
+            .iter()
+            .all(|k| self.curve(*k).is_empty())
     }
 
     /// The curve's value at `time` (from the note's start).

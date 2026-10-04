@@ -19,7 +19,11 @@ use faderframe_plugin_clap::scan::ScannedPlugin;
 use faderframe_plugin_host::{PluginFactory, PluginProcessContext, ProcessConfig};
 use std::ffi::CStr;
 use std::io::{Read, Write as _};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Note events the test plugin received: (what, note id, key, value).
+static NOTES: Mutex<Vec<(String, i32, i16, f64)>> = Mutex::new(Vec::new());
 
 // --- the test plugin -------------------------------------------------------------
 
@@ -38,9 +42,21 @@ impl GainShared {
             .store(v.clamp(-60.0, 12.0).to_bits(), Ordering::Relaxed);
     }
     fn apply(&self, events: &InputEvents) {
+        let note = |what: String, p: clack_plugin::events::Pckn, v: f64| {
+            NOTES
+                .lock()
+                .unwrap()
+                .push((what, p.raw_note_id(), p.raw_key(), v));
+        };
         for e in events {
-            if let Some(CoreEventSpace::ParamValue(p)) = e.as_core_event() {
-                self.set(p.value());
+            match e.as_core_event() {
+                Some(CoreEventSpace::ParamValue(p)) => self.set(p.value()),
+                Some(CoreEventSpace::NoteOn(n)) => note("on".into(), n.pckn(), n.velocity()),
+                Some(CoreEventSpace::NoteOff(n)) => note("off".into(), n.pckn(), 0.0),
+                Some(CoreEventSpace::NoteExpression(x)) => {
+                    note(format!("{:?}", x.expression_type()), x.pckn(), x.value())
+                }
+                _ => {}
             }
         }
     }
@@ -246,6 +262,113 @@ fn run_block(
     let status = proc.process(&ctx, &mut io);
     assert_ne!(status, faderframe_plugin_host::ProcessStatus::Error);
     outputs[0].channel(0).to_vec()
+}
+
+#[test]
+fn notes_carry_ids_and_note_expressions_reach_their_keys() {
+    use faderframe_midi::{
+        ExpressionValue, MidiBuffer, MidiEvent, NoteExpressionKind, TimedMidiEvent,
+    };
+    let f = factory();
+    let mut inst = f.instantiate("org.faderframe.test-gain").unwrap();
+    let mut proc = inst
+        .create_processor(&ProcessConfig {
+            sample_rate: 48_000.0,
+            max_block_size: 64,
+            sidechain: false,
+        })
+        .unwrap();
+    NOTES.lock().unwrap().clear();
+    let expr = |at, key, kind, v| {
+        TimedMidiEvent::new(
+            at,
+            MidiEvent::NoteExpression {
+                channel: 0,
+                key,
+                kind,
+                value: ExpressionValue::new(v),
+            },
+        )
+    };
+    let mut midi = MidiBuffer::with_capacity(16);
+    for e in [
+        TimedMidiEvent::new(
+            0,
+            MidiEvent::NoteOn {
+                channel: 0,
+                key: 60,
+                velocity: 127,
+            },
+        ),
+        TimedMidiEvent::new(
+            0,
+            MidiEvent::NoteOn {
+                channel: 0,
+                key: 62,
+                velocity: 127,
+            },
+        ),
+        expr(0, 60, NoteExpressionKind::Tuning, 2.0),
+        expr(10, 60, NoteExpressionKind::Volume, -6.0),
+        expr(10, 62, NoteExpressionKind::Pan, 0.5),
+        TimedMidiEvent::new(
+            20,
+            MidiEvent::NoteOff {
+                channel: 0,
+                key: 60,
+                velocity: 0,
+            },
+        ),
+    ] {
+        midi.push(e).unwrap();
+    }
+    let input = {
+        let mut b = AudioBuffer::new(ChannelLayout::Stereo, 64);
+        b.set_len(64);
+        b
+    };
+    let mut outputs = [{
+        let mut b = AudioBuffer::new(ChannelLayout::Stereo, 64);
+        b.set_len(64);
+        b
+    }];
+    let inputs = [input];
+    let events = [midi];
+    let mut io = NodeIo {
+        frames: 64,
+        audio_in: &inputs,
+        audio_out: &mut outputs,
+        events_in: &events,
+        events_out: &mut [],
+    };
+    let transport = faderframe_transport::TransportInfo::default();
+    proc.process(
+        &PluginProcessContext {
+            transport: &transport,
+            param_events: &[],
+        },
+        &mut io,
+    );
+    let seen = NOTES.lock().unwrap().clone();
+    let id_of = |what: &str, key: i16| {
+        seen.iter()
+            .find(|n| n.0 == what && n.2 == key)
+            .unwrap_or_else(|| panic!("{what} {key}: {seen:?}"))
+            .clone()
+    };
+    let (a, b) = (id_of("on", 60).1, id_of("on", 62).1);
+    assert!(a >= 0 && b >= 0 && a != b, "{seen:?}");
+    // Expressions address their note by key and channel (note id −1).
+    let tuning = id_of("Some(Tuning)", 60);
+    assert_eq!((tuning.1, tuning.3), (-1, 2.0));
+    let volume = id_of("Some(Volume)", 60);
+    assert!(
+        (volume.3 - db_to_gain(-6.0) as f64).abs() < 1e-3,
+        "{volume:?}"
+    );
+    let pan = id_of("Some(Pan)", 62);
+    assert_eq!((pan.1, pan.3), (-1, 0.75));
+    assert_eq!(id_of("off", 60).1, a);
 }
 
 #[test]
