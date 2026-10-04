@@ -92,6 +92,44 @@ enum Garbage {
     MidiRecorder(#[allow(dead_code)] Box<crate::midi::MidiRecorder>),
 }
 
+/// When a callback started (MIDI clock) and the transport position then,
+/// written together by the audio thread and read as a consistent pair: a
+/// sequence lock over atomics (a torn pair would put the position one
+/// callback off).
+#[derive(Debug, Default)]
+struct CallbackStamp {
+    seq: AtomicU32,
+    ns: AtomicU64,
+    position: AtomicI64,
+}
+
+impl CallbackStamp {
+    /// The audio thread (the only writer); wait-free.
+    fn store(&self, ns: u64, position: i64) {
+        let s = self.seq.load(Ordering::Relaxed);
+        self.seq.store(s.wrapping_add(1), Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Release);
+        self.ns.store(ns, Ordering::Relaxed);
+        self.position.store(position, Ordering::Relaxed);
+        self.seq.store(s.wrapping_add(2), Ordering::Release);
+    }
+
+    fn load(&self) -> (u64, i64) {
+        loop {
+            let s = self.seq.load(Ordering::Acquire);
+            if s & 1 == 0 {
+                let ns = self.ns.load(Ordering::Relaxed);
+                let position = self.position.load(Ordering::Relaxed);
+                std::sync::atomic::fence(Ordering::Acquire);
+                if self.seq.load(Ordering::Relaxed) == s {
+                    return (ns, position);
+                }
+            }
+            std::hint::spin_loop();
+        }
+    }
+}
+
 /// State shared between the processor and the controller (atomics only).
 #[derive(Debug, Default)]
 pub struct EngineShared {
@@ -125,8 +163,7 @@ pub struct EngineShared {
     graph_wall_ns: AtomicU64,
     /// Start of the last callback on the MIDI clock (0: no MIDI clock) and
     /// the transport position then: where playback is at any moment.
-    callback_ns: AtomicU64,
-    callback_position: AtomicI64,
+    callback: CallbackStamp,
     /// Frames between processing and hearing (buffer + device).
     output_latency: AtomicU32,
     /// Auditioning, mapped controls, clock outputs.
@@ -376,11 +413,8 @@ impl EngineProcessor {
 
         if let Some(clock) = self.midi.clock() {
             self.shared
-                .callback_ns
-                .store(clock.now_ns(), Ordering::Relaxed);
-            self.shared
-                .callback_position
-                .store(self.transport.position(), Ordering::Relaxed);
+                .callback
+                .store(clock.now_ns(), self.transport.position());
         }
         let mut graph_ns = 0u64;
         let mut offset = 0;
@@ -766,11 +800,10 @@ impl EngineController {
     /// (extrapolated from the last callback while playing); `None` before
     /// the first callback with a MIDI clock.
     pub fn position_at(&self, t_ns: u64) -> Option<i64> {
-        let cb = self.shared.callback_ns.load(Ordering::Relaxed);
+        let (cb, pos) = self.shared.callback.load();
         if cb == 0 {
             return None;
         }
-        let pos = self.shared.callback_position.load(Ordering::Relaxed);
         if !self.shared.transport.snapshot().playing {
             return Some(pos);
         }

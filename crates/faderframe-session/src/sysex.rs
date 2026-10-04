@@ -9,9 +9,12 @@
 //!   heard when it arrived and becomes part of the take.
 //! * Playback: SysEx in the clips of tracks with an external MIDI output is
 //!   scheduled ahead (100 ms) to the output sender with exact due times,
-//!   derived from the engine's position at each callback. Loop wraps are
-//!   followed; a locate or stop is noticed (the engine is not where it was
-//!   predicted to be) and cancels what was scheduled.
+//!   derived from the engine's position at each callback. Each window
+//!   continues in the timeline where the last one ended (position estimates
+//!   wobble a little between ticks; going by the clock alone could repeat
+//!   or skip a message at the seam). Loop wraps are followed; a locate or
+//!   stop is noticed (the engine is not where it was predicted to be) and
+//!   cancels what was scheduled.
 //! * Editing: messages can be added (e.g. from a `.syx` file), removed and
 //!   sent straight to an output.
 
@@ -29,6 +32,8 @@ const LOOKAHEAD_NS: u64 = 100_000_000;
 pub(crate) struct SysexPlayback {
     /// Real time (MIDI clock) up to which messages have been scheduled.
     until_ns: u64,
+    /// The timeline position (looped) where that window ended.
+    until_pos: i64,
     /// (time, engine position) at the last tick, to notice jumps.
     last: Option<(u64, i64)>,
 }
@@ -98,7 +103,9 @@ impl Session {
                 )
             })
             .filter(|(a, b)| b > a);
-        let wrap = |p: i64| match loop_range {
+        // Playback wraps at the loop's end only when it is still before it.
+        let looping = |from: i64| loop_range.filter(|&(_, b)| from < b);
+        let wrap = |from: i64, p: i64| match looping(from) {
             Some((a, b)) if p >= b => a + (p - b) % (b - a),
             _ => p,
         };
@@ -106,7 +113,7 @@ impl Session {
         let jumped = match self.midi.sysex.last {
             None => true,
             Some((t, p)) => {
-                let predicted = wrap(p + ((now_ns - t) as f64 * rate / 1e9) as i64);
+                let predicted = wrap(p, p + ((now_ns - t) as f64 * rate / 1e9) as i64);
                 (predicted - pos_now).abs() as f64 > rate * 0.02
             }
         };
@@ -115,6 +122,7 @@ impl Session {
                 self.midi.outputs.cancel_sysex();
             }
             self.midi.sysex.until_ns = now_ns;
+            self.midi.sysex.until_pos = pos_now;
         }
         self.midi.sysex.last = Some((now_ns, pos_now));
         let from_ns = self.midi.sysex.until_ns.max(now_ns);
@@ -123,9 +131,24 @@ impl Session {
             return;
         }
         self.midi.sysex.until_ns = to_ns;
-        // The window in playback order, unwrapped: [p0, p1).
+        // The window in playback order, unwrapped (relative to `pos_now`):
+        // [p0, p1). It starts where the last one ended — the stored
+        // position, unwrapped to the pass the clock says it is in.
         let to_pos = |t: u64| pos_now + ((t as f64 - now_ns as f64) * rate / 1e9) as i64;
-        let (p0, p1) = (to_pos(from_ns), to_pos(to_ns));
+        let estimate = to_pos(from_ns);
+        let end = self.midi.sysex.until_pos;
+        let p0 = match looping(pos_now) {
+            Some((a, b)) => {
+                let len = b - a;
+                end + ((estimate - end) as f64 / len as f64).round() as i64 * len
+            }
+            None => end,
+        };
+        let p1 = to_pos(to_ns);
+        if p1 <= p0 {
+            return;
+        }
+        self.midi.sysex.until_pos = wrap(pos_now, p1);
         let latency_ns = self.engine.output_latency() as f64 / rate * 1e9;
         let due = |unwrapped: i64| {
             now_ns.saturating_add_signed(
@@ -133,14 +156,18 @@ impl Session {
             )
         };
         // Segments of the timeline played in the window: (start, end,
-        // offset from timeline to unwrapped positions).
+        // offset from timeline to unwrapped positions); a short loop may
+        // wrap more than once.
         let mut segments = Vec::new();
-        match loop_range {
-            Some((a, b)) if pos_now < b && p1 > b => {
-                segments.push((wrap(p0), b, p0 - wrap(p0)));
-                segments.push((a, a + (p1 - b), b - a));
-            }
-            _ => segments.push((wrap(p0), wrap(p0) + (p1 - p0), p0 - wrap(p0))),
+        let mut u = p0;
+        while u < p1 && segments.len() < 64 {
+            let t = wrap(pos_now, u);
+            let span = match looping(pos_now) {
+                Some((_, b)) => (b - t).min(p1 - u),
+                None => p1 - u,
+            };
+            segments.push((t, t + span, u - t));
+            u += span;
         }
         let mut sends = Vec::new();
         for t in &self.project.tracks {
