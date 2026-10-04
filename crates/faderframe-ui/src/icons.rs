@@ -1,6 +1,8 @@
-//! FaderFrame's own symbolic icons. They are written to a cache directory
-//! that is added to the icon theme's search path, so GTK recolours them
-//! like the stock symbolic icons.
+//! FaderFrame's own icons: the symbolic ones and the application icon. They
+//! are written to a cache directory that is added to the icon theme's
+//! search path, so GTK recolours the symbolic ones like the stock icons and
+//! windows show the application icon even when FaderFrame is not
+//! installed.
 
 use gtk::prelude::*;
 use gtk::{gdk, glib};
@@ -13,7 +15,13 @@ const METRONOME: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" h
 </svg>
 "##;
 
-const ICONS: &[(&str, &str)] = &[("faderframe-metronome-symbolic", METRONOME)];
+const APP_ICON: &str =
+    include_str!("../../../packaging/icons/io.github.BurningTreeC.FaderFrame.svg");
+
+const ICONS: &[(&str, &str)] = &[
+    ("faderframe-metronome-symbolic", METRONOME),
+    (crate::APP_ID, APP_ICON),
+];
 
 /// Write the icons and register their directory (once, at start-up).
 pub fn install() {
@@ -34,6 +42,7 @@ pub fn install() {
         }
     }
     gtk::IconTheme::for_display(&display).add_search_path(&dir);
+    gtk::Window::set_default_icon_name(crate::APP_ID);
 }
 
 /// An icon, or `fallback` text when it is not available.

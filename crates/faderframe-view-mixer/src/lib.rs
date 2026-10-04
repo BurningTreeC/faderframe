@@ -31,6 +31,8 @@ use faderframe_ui_canvas::{
 };
 
 const MASTER_GAP: f32 = 8.0;
+/// Wooden end cheeks (themes with wood).
+const CHEEK_W: f32 = 22.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Hit {
@@ -198,13 +200,22 @@ impl MixerView {
             .collect()
     }
 
+    /// Width of the wooden end cheeks (0 without wood).
+    fn cheek(&self) -> f32 {
+        if self.theme.console.look.wood.is_some() {
+            CHEEK_W
+        } else {
+            0.0
+        }
+    }
+
     fn master_rect(&self, size: Size) -> Rect {
         let w = self.theme.console.master_width;
-        Rect::new(size.w - w, 0.0, w, size.h)
+        Rect::new(size.w - w - self.cheek(), 0.0, w, size.h)
     }
 
     fn viewport_w(&self, size: Size) -> f32 {
-        (size.w - self.theme.console.master_width - MASTER_GAP).max(0.0)
+        (size.w - self.theme.console.master_width - MASTER_GAP - 2.0 * self.cheek()).max(0.0)
     }
 
     fn content_w(&self, count: usize) -> f32 {
@@ -226,7 +237,7 @@ impl MixerView {
 
     fn strip_rect(&self, index: usize, size: Size) -> Rect {
         Rect::new(
-            index as f32 * self.pitch() - self.scroll_x,
+            self.cheek() + index as f32 * self.pitch() - self.scroll_x,
             0.0,
             self.theme.console.strip_width,
             size.h,
@@ -291,7 +302,9 @@ impl MixerView {
                 continue;
             }
             // Channel strips are clipped by the master section.
-            if t.kind != TrackKind::Master && pos.x >= master.x - MASTER_GAP {
+            if t.kind != TrackKind::Master
+                && (pos.x >= master.x - MASTER_GAP || pos.x < self.cheek())
+            {
                 continue;
             }
             let l = self.layout_for(rect, t);
@@ -1637,12 +1650,17 @@ impl MixerView {
 }
 
 impl CanvasView<Session, Action> for MixerView {
+    fn set_theme(&mut self, theme: &Theme) {
+        self.theme = theme.clone();
+    }
+
     fn paint(&mut self, p: &mut dyn Painter, size: Size, model: &Session, theme: &Theme) {
         self.update_sends(model);
         let tracks = Self::channel_tracks(model);
         self.clamp_scroll(tracks.len(), size);
         p.fill(Rect::from_size(size), theme.ui.background);
-        let viewport = Rect::new(0.0, 0.0, self.viewport_w(size), size.h);
+        let cheek = self.cheek();
+        let viewport = Rect::new(cheek, 0.0, self.viewport_w(size), size.h);
         p.push_clip(viewport);
         for i in self.visible_range(tracks.len(), size) {
             self.paint_strip(p, self.strip_rect(i, size), tracks[i], i + 1, model);
@@ -1665,6 +1683,10 @@ impl CanvasView<Session, Action> for MixerView {
         p.shadow(master, 0.0, Color::rgba(0.0, 0.0, 0.0, 0.6), -2.0, 0.0, 6.0);
         if let Some(m) = model.project().master() {
             self.paint_strip(p, master, m, 0, model);
+        }
+        if cheek > 0.0 {
+            controls::wood_cheek(p, Rect::new(0.0, 0.0, cheek, size.h), theme);
+            controls::wood_cheek(p, Rect::new(size.w - cheek, 0.0, cheek, size.h), theme);
         }
         self.paint_insert_drag(p, size, model);
     }

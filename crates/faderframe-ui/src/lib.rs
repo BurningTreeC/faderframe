@@ -243,7 +243,9 @@ pub fn run(options: RunOptions) -> glib::ExitCode {
         .build();
     let holder: Rc<RefCell<Option<Rc<AppState>>>> = Rc::default();
     app.connect_startup(|_| {
-        style::install();
+        style::install(&faderframe_ui_canvas::Theme::by_id(
+            &prefs::Preferences::load().theme,
+        ));
         icons::install();
     });
     {

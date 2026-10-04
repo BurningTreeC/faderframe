@@ -36,7 +36,7 @@ jobs:
       - name: Build application
         run: cargo build -p faderframe-app
       - name: Tests
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
 
   windows:
     name: Windows (MSYS2 UCRT64)
@@ -58,4 +58,18 @@ jobs:
       - name: Build application
         run: cargo build -p faderframe-app
       - name: Tests
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
+
+  asio:
+    name: ASIO (Windows MSVC)
+    # The opt-in ASIO backend: asio-sys downloads the ASIO SDK and runs
+    # bindgen (LLVM is on the runner). GTK is not needed for this crate.
+    runs-on: windows-latest
+    env:
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the ASIO backend
+        run: cargo clippy -p faderframe-audio-cpal --features asio --all-targets -- -D warnings

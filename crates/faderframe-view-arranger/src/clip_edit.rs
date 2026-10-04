@@ -1817,15 +1817,15 @@ impl ArrangerView {
                         (x1 - x0).max(2.0),
                         self.base_h(model, *track) - 6.0,
                     );
-                    p.stroke_rounded(r, 3.0, 1.5, Color::rgba(1.0, 1.0, 1.0, 0.8));
-                    p.fill(r, Color::rgba(1.0, 1.0, 1.0, 0.1));
+                    p.stroke_rounded(r, 3.0, 1.5, self.theme.ui.text.with_alpha(0.8));
+                    p.fill(r, self.theme.ui.text.with_alpha(0.1));
                 }
             }
             Some(EditDrag::Zoom { from, to, .. }) => {
                 let (a, b) = (from.min(*to), from.max(*to));
                 p.fill(
                     Rect::new(a, lanes.y, b - a, lanes.h),
-                    Color::rgba(1.0, 1.0, 1.0, 0.12),
+                    self.theme.ui.selection.with_alpha(0.18),
                 );
             }
             Some(EditDrag::Pencil { track, from, to }) => {
@@ -1836,7 +1836,7 @@ impl ArrangerView {
                         Rect::new(x0, row.y + 3.0, x1 - x0, self.base_h(model, *track) - 6.0),
                         3.0,
                         1.5,
-                        Color::rgba(1.0, 1.0, 1.0, 0.7),
+                        self.theme.ui.text.with_alpha(0.7),
                     );
                 }
             }

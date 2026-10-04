@@ -922,6 +922,10 @@ impl PerformanceView {
 }
 
 impl CanvasView<Session, Action> for PerformanceView {
+    fn set_theme(&mut self, theme: &Theme) {
+        self.theme = theme.clone();
+    }
+
     fn paint(&mut self, p: &mut dyn Painter, size: Size, model: &Session, theme: &Theme) {
         // Reading the report keeps per-node measurement on while visible.
         let report = model.performance();

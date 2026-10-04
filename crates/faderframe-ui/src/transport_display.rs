@@ -12,10 +12,6 @@ use faderframe_ui_canvas::{
 };
 use std::time::{Duration, Instant};
 
-const LCD_BG: Color = Color::hex(0x0d100e);
-const LCD_TEXT: Color = Color::hex(0xf0c46a);
-const LCD_DIM: Color = Color::hex(0x6f5a33);
-
 /// Taps further apart than this start a new measurement.
 const TAP_RESET: Duration = Duration::from_millis(2500);
 /// Taps averaged.
@@ -169,8 +165,9 @@ fn meter_menu(s: &Session, at: Point) -> HostRequest<Action> {
 
 impl CanvasView<Session, Action> for TransportDisplay {
     fn paint(&mut self, p: &mut dyn Painter, size: Size, s: &Session, theme: &Theme) {
+        let (lcd_bg, lcd_text, lcd_dim) = (theme.ui.lcd_bg, theme.ui.lcd_text, theme.ui.lcd_dim);
         let r = Rect::from_size(size);
-        p.fill_rounded(r, 6.0, &Paint::vertical(r, LCD_BG.lighten(0.04), LCD_BG));
+        p.fill_rounded(r, 6.0, &Paint::vertical(r, lcd_bg.lighten(0.04), lcd_bg));
         p.inset_shadow(r, 6.0, Color::rgba(0.0, 0.0, 0.0, 0.9), 0.0, 1.5, 4.0);
         p.stroke_rounded(r, 6.0, 1.0, Color::rgba(1.0, 1.0, 1.0, 0.06));
         let z = zones(size);
@@ -181,24 +178,24 @@ impl CanvasView<Session, Action> for TransportDisplay {
         p.text(
             &project.timeline.format_bbt(pos),
             z.bbt,
-            &mono(theme.fonts.display - 2.0, LCD_TEXT).bold(),
+            &mono(theme.fonts.display - 2.0, lcd_text).bold(),
         );
         let secs = s.transport().position as f64 / s.sample_rate().max(1) as f64;
         p.text(
             &format_seconds(secs),
             z.time,
-            &mono(theme.fonts.small, LCD_TEXT.with_alpha(0.75)),
+            &mono(theme.fonts.small, lcd_text.with_alpha(0.75)),
         );
         let bpm = project.timeline.tempo.bpm_at(pos);
         p.text(
             &format!("{bpm:.2}"),
             z.tempo,
-            &mono(theme.fonts.large, LCD_TEXT).align(Align::End),
+            &mono(theme.fonts.large, lcd_text).align(Align::End),
         );
         p.text(
             "BPM",
             z.bpm,
-            &small(LCD_TEXT.with_alpha(0.7)).align(Align::End),
+            &small(lcd_text.with_alpha(0.7)).align(Align::End),
         );
         // The tap pad.
         let lit = self.flashing();
@@ -206,19 +203,19 @@ impl CanvasView<Session, Action> for TransportDisplay {
             z.tap,
             3.0,
             &Paint::Solid(if lit {
-                LCD_TEXT.with_alpha(0.85)
+                lcd_text.with_alpha(0.85)
             } else {
-                LCD_TEXT.with_alpha(0.08)
+                lcd_text.with_alpha(0.08)
             }),
         );
-        p.stroke_rounded(z.tap, 3.0, 1.0, LCD_TEXT.with_alpha(0.35));
+        p.stroke_rounded(z.tap, 3.0, 1.0, lcd_text.with_alpha(0.35));
         p.text(
             "TAP",
             z.tap,
             &small(if lit {
-                LCD_BG
+                lcd_bg
             } else {
-                LCD_TEXT.with_alpha(0.8)
+                lcd_text.with_alpha(0.8)
             })
             .center(),
         );
@@ -226,19 +223,19 @@ impl CanvasView<Session, Action> for TransportDisplay {
         p.text(
             &sig.to_string(),
             z.meter,
-            &mono(theme.fonts.large, LCD_TEXT).align(Align::Center),
+            &mono(theme.fonts.large, lcd_text).align(Align::Center),
         );
         p.text(
             "METER",
             z.meter_label,
-            &small(LCD_TEXT.with_alpha(0.7)).center(),
+            &small(lcd_text.with_alpha(0.7)).center(),
         );
         let t = s.transport();
         let flag = |p: &mut dyn Painter, rect: Rect, label: &str, on: bool, color: Color| {
             p.text(
                 label,
                 rect,
-                &small(if on { color } else { LCD_DIM }).center(),
+                &small(if on { color } else { lcd_dim }).center(),
             );
         };
         let (f1, f2) = z.flags.split_top(z.flags.h / 2.0);

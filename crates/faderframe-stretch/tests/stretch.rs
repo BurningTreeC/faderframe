@@ -4,14 +4,24 @@
 
 use faderframe_stretch::{Preset, Stretcher};
 
+#[cfg(ff_cpp_count)]
 unsafe extern "C" {
     /// C++ heap allocations so far (the test-only `operator new`).
     fn ff_stretch_cpp_allocations() -> u64;
 }
 
+/// C++ allocations so far (always 0 where the counter is not linked, i.e.
+/// Windows; the realtime check runs on the other platforms).
 fn cpp_allocations() -> u64 {
-    // SAFETY: reads an atomic counter defined in count_new.cpp.
-    unsafe { ff_stretch_cpp_allocations() }
+    #[cfg(ff_cpp_count)]
+    {
+        // SAFETY: reads an atomic counter defined in count_new.cpp.
+        unsafe { ff_stretch_cpp_allocations() }
+    }
+    #[cfg(not(ff_cpp_count))]
+    {
+        0
+    }
 }
 
 const SR: f64 = 48_000.0;
@@ -155,7 +165,9 @@ fn processing_never_allocates() {
         run(s, true);
     }
     // Configuring does allocate (the counter works).
-    let before = cpp_allocations();
-    drop(Stretcher::new(2, SR, Preset::Polyphonic));
-    assert!(cpp_allocations() > before);
+    if cfg!(ff_cpp_count) {
+        let before = cpp_allocations();
+        drop(Stretcher::new(2, SR, Preset::Polyphonic));
+        assert!(cpp_allocations() > before);
+    }
 }

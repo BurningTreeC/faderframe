@@ -1,6 +1,9 @@
 //! `faderframe` — the FaderFrame DAW.
 
 #![forbid(unsafe_code)]
+// Release builds on Windows are GUI programs: no console window (also none
+// for the plugin-scan helper processes).
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use faderframe_ui::{BackendChoice, RunOptions};
 use std::path::PathBuf;
@@ -13,9 +16,10 @@ USAGE:
     faderframe [OPTIONS] [PROJECT.ffproj]
 
 OPTIONS:
-    --backend <auto|pipewire|jack|system|dummy>
+    --backend <auto|pipewire|jack|system|asio|dummy>
                                  Audio system (default: from preferences, else auto;
-                                 system: ALSA, WASAPI or CoreAudio)
+                                 system: ALSA, WASAPI or CoreAudio; asio: Windows
+                                 builds with the `asio` feature)
     --sample-rate <HZ>            Requested sample rate (44100, 48000, 96000, 192000, …)
     --buffer-size <FRAMES>        Requested buffer size (32, 64, 128, 256, 512, …)
     --threads <N>                 Processing threads incl. the audio thread (default: one per core)
@@ -50,6 +54,9 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<RunOptions>, Strin
                     "jack" => BackendChoice::Jack,
                     "pipewire" | "pw" => BackendChoice::PipeWire,
                     "system" | "alsa" | "wasapi" | "coreaudio" => BackendChoice::System,
+                    "asio" if BackendChoice::available().contains(&BackendChoice::Asio) => {
+                        BackendChoice::Asio
+                    }
                     "dummy" | "none" => BackendChoice::Dummy,
                     other => return Err(format!("unknown backend '{other}'")),
                 }
@@ -170,7 +177,12 @@ mod tests {
             o.import,
             vec![PathBuf::from("a.wav"), PathBuf::from("b.flac")]
         );
-        assert!(parse(args(&["--backend", "asio"])).is_err());
+        assert_eq!(
+            parse(args(&["--backend", "asio"])).is_ok(),
+            BackendChoice::available().contains(&BackendChoice::Asio),
+            "ASIO only where the build has it"
+        );
+        assert!(parse(args(&["--backend", "directsound"])).is_err());
         assert!(
             parse(args(&["--sample-rate", "12"])).is_ok(),
             "rate alone is validated by the backend"

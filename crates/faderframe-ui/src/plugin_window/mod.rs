@@ -1,20 +1,38 @@
 //! Plugin editor windows.
 //!
-//! Native CLAP editors on Linux embed into an X11 window. FaderFrame is a
-//! Wayland client, so that parent comes from a separate X11 connection
-//! (XWayland): a plain top-level window the plugin puts its GUI into.
-//! Plugins that cannot embed but can open their own window do that
-//! (floating). Everything else — built-ins, plugins without a GUI, no X
-//! server — gets the generic parameter window, which also exists for every
-//! plugin on request.
+//! Native editors (CLAP, VST3) embed into a plain top-level window of the
+//! platform's own window system — an X11 window on Linux (through XWayland:
+//! `x11.rs`), a Win32 window on Windows (`win32.rs`), an `NSWindow`'s
+//! content view on macOS (`cocoa.rs`). Each backend offers the same
+//! `Parents` API;
+//! everything else here is shared. Plugins that cannot embed but can open
+//! their own window do that (floating). Everything else — built-ins,
+//! plugins without a GUI, no X server — gets the generic parameter window,
+//! which also exists for every plugin on request.
 //!
-//! Plugin GUIs run on the host's main loop through the CLAP posix-fd and
-//! timer extensions: registered descriptors become glib fd sources, timers
-//! glib timeouts, reconciled with what the plugins registered every UI tick.
+//! Plugin GUIs run on the host's main loop: on Linux through the CLAP
+//! posix-fd and timer extensions (registered descriptors become glib fd
+//! sources, timers glib timeouts, reconciled with what the plugins
+//! registered every UI tick); on Windows and macOS GTK's main loop also
+//! dispatches the native window messages the plugin windows receive.
+
+#[cfg(target_os = "macos")]
+mod cocoa;
+#[cfg(windows)]
+mod win32;
+#[cfg(all(unix, not(target_os = "macos")))]
+mod x11;
+
+#[cfg(target_os = "macos")]
+use cocoa::Parents;
+#[cfg(windows)]
+use win32::Parents;
+#[cfg(all(unix, not(target_os = "macos")))]
+use x11::Parents;
 
 use crate::state::AppState;
 use faderframe_core::{PluginInstanceId, TrackId};
-use faderframe_plugin_host::{ParameterInfo, ParameterUnit, PluginFd};
+use faderframe_plugin_host::{ParameterInfo, ParameterUnit, PluginFd, WindowApi};
 use faderframe_project::Command;
 use faderframe_session::{Action, PluginParameterView};
 use gtk::glib;
@@ -23,12 +41,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
-use x11rb::connection::Connection;
-use x11rb::properties::{WmSizeHints, WmSizeHintsSpecification};
-use x11rb::protocol::Event;
-use x11rb::protocol::xproto::{self, ConnectionExt as _};
-use x11rb::rust_connection::RustConnection;
-use x11rb::wrapper::ConnectionExt as _;
 
 thread_local! {
     static EDITORS: Editors = Editors::default();
@@ -36,8 +48,9 @@ thread_local! {
 
 #[derive(Default)]
 struct Editors {
-    /// Lazily connected; a failure is remembered (and reported once).
-    x11: RefCell<Option<Result<X11, String>>>,
+    /// The platform's parent windows: lazily connected; a failure is
+    /// remembered (and reported once).
+    parents: RefCell<Option<Result<Parents, String>>>,
     native: RefCell<Vec<NativeEditor>>,
     generic: RefCell<HashMap<PluginInstanceId, gtk::Window>>,
     #[cfg(unix)]
@@ -46,285 +59,23 @@ struct Editors {
     ticks: Cell<u64>,
 }
 
-// --- X11 parent windows -------------------------------------------------------------
-
-struct Atoms {
-    wm_protocols: xproto::Atom,
-    wm_delete_window: xproto::Atom,
-    net_wm_name: xproto::Atom,
-    utf8_string: xproto::Atom,
-    net_wm_window_type: xproto::Atom,
-    net_wm_window_type_dialog: xproto::Atom,
-    net_wm_pid: xproto::Atom,
-}
-
-struct X11 {
-    conn: RustConnection,
-    root: xproto::Window,
-    black: u32,
-    atoms: Atoms,
-}
-
-fn x_err(e: impl std::fmt::Display) -> String {
-    format!("X11: {e}")
-}
-
-impl X11 {
-    fn connect() -> Result<Self, String> {
-        let (conn, screen) = x11rb::connect(None).map_err(x_err)?;
-        let (root, black) = {
-            let s = &conn.setup().roots[screen];
-            (s.root, s.black_pixel)
-        };
-        let atom = |name: &[u8]| -> Result<xproto::Atom, String> {
-            Ok(conn
-                .intern_atom(false, name)
-                .map_err(x_err)?
-                .reply()
-                .map_err(x_err)?
-                .atom)
-        };
-        let atoms = Atoms {
-            wm_protocols: atom(b"WM_PROTOCOLS")?,
-            wm_delete_window: atom(b"WM_DELETE_WINDOW")?,
-            net_wm_name: atom(b"_NET_WM_NAME")?,
-            utf8_string: atom(b"UTF8_STRING")?,
-            net_wm_window_type: atom(b"_NET_WM_WINDOW_TYPE")?,
-            net_wm_window_type_dialog: atom(b"_NET_WM_WINDOW_TYPE_DIALOG")?,
-            net_wm_pid: atom(b"_NET_WM_PID")?,
-        };
-        Ok(Self {
-            conn,
-            root,
-            black,
-            atoms,
-        })
-    }
-
-    fn size_hints(
-        &self,
-        win: xproto::Window,
-        (w, h): (u32, u32),
-        resizable: bool,
-        pos: Option<(i32, i32)>,
-    ) {
-        let mut hints = WmSizeHints::new();
-        // A user-specified position: window managers keep it.
-        hints.position = pos.map(|(x, y)| (WmSizeHintsSpecification::UserSpecified, x, y));
-        if !resizable {
-            // Fixed size: window managers float it instead of tiling.
-            hints.min_size = Some((w as i32, h as i32));
-            hints.max_size = Some((w as i32, h as i32));
-        }
-        let _ = hints.set_normal_hints(&self.conn, win);
-    }
-
-    fn create_window(
-        &self,
-        title: &str,
-        size: (u32, u32),
-        resizable: bool,
-        pos: (i32, i32),
-    ) -> Result<xproto::Window, String> {
-        let win = self.conn.generate_id().map_err(x_err)?;
-        let a = &self.atoms;
-        self.conn
-            .create_window(
-                x11rb::COPY_DEPTH_FROM_PARENT,
-                win,
-                self.root,
-                pos.0.clamp(-32_000, 32_000) as i16,
-                pos.1.clamp(-32_000, 32_000) as i16,
-                size.0.clamp(1, 16_000) as u16,
-                size.1.clamp(1, 16_000) as u16,
-                0,
-                xproto::WindowClass::INPUT_OUTPUT,
-                x11rb::COPY_FROM_PARENT,
-                &xproto::CreateWindowAux::new()
-                    .background_pixel(self.black)
-                    .event_mask(xproto::EventMask::STRUCTURE_NOTIFY),
-            )
-            .map_err(x_err)?;
-        let replace = xproto::PropMode::REPLACE;
-        let _ = self.conn.change_property8(
-            replace,
-            win,
-            xproto::AtomEnum::WM_NAME,
-            xproto::AtomEnum::STRING,
-            title.as_bytes(),
-        );
-        let _ = self.conn.change_property8(
-            replace,
-            win,
-            a.net_wm_name,
-            a.utf8_string,
-            title.as_bytes(),
-        );
-        let _ = self.conn.change_property8(
-            replace,
-            win,
-            xproto::AtomEnum::WM_CLASS,
-            xproto::AtomEnum::STRING,
-            b"faderframe-plugin\0FaderFrame\0",
-        );
-        let _ = self.conn.change_property32(
-            replace,
-            win,
-            a.wm_protocols,
-            xproto::AtomEnum::ATOM,
-            &[a.wm_delete_window],
-        );
-        let _ = self.conn.change_property32(
-            replace,
-            win,
-            a.net_wm_window_type,
-            xproto::AtomEnum::ATOM,
-            &[a.net_wm_window_type_dialog],
-        );
-        let _ = self.conn.change_property32(
-            replace,
-            win,
-            a.net_wm_pid,
-            xproto::AtomEnum::CARDINAL,
-            &[std::process::id()],
-        );
-        self.size_hints(win, size, resizable, Some(pos));
-        self.conn.flush().map_err(x_err)?;
-        Ok(win)
-    }
-
-    /// Map at `pos` (asked again after mapping: some window managers only
-    /// honour a configure request).
-    fn map_at(&self, win: xproto::Window, pos: (i32, i32)) {
-        let _ = self.conn.map_window(win);
-        let _ = self
-            .conn
-            .configure_window(win, &xproto::ConfigureWindowAux::new().x(pos.0).y(pos.1));
-        let _ = self.conn.flush();
-    }
-
-    /// Monitors as the X server sees them: (connector name, x, y, w, h).
-    /// With XWayland these can differ from the Wayland (logical) layout,
-    /// e.g. physical pixels when the compositor disables XWayland scaling.
-    fn monitors(&self) -> Vec<(String, (i32, i32, i32, i32))> {
-        use x11rb::protocol::randr::ConnectionExt as _;
-        let Ok(Ok(reply)) = self
-            .conn
-            .randr_get_monitors(self.root, true)
-            .map(|c| c.reply())
-        else {
-            return Vec::new();
-        };
-        reply
-            .monitors
-            .iter()
-            .map(|m| {
-                let name = self
-                    .conn
-                    .get_atom_name(m.name)
-                    .ok()
-                    .and_then(|c| c.reply().ok())
-                    .map(|r| String::from_utf8_lossy(&r.name).into_owned())
-                    .unwrap_or_default();
-                (
-                    name,
-                    (
-                        i32::from(m.x),
-                        i32::from(m.y),
-                        i32::from(m.width),
-                        i32::from(m.height),
-                    ),
-                )
-            })
-            .collect()
-    }
-
-    /// Top-left corner on the screen.
-    fn position(&self, win: xproto::Window) -> Option<(i32, i32)> {
-        let r = self
-            .conn
-            .translate_coordinates(win, self.root, 0, 0)
-            .ok()?
-            .reply()
-            .ok()?;
-        Some((i32::from(r.dst_x), i32::from(r.dst_y)))
-    }
-
-    fn unmap(&self, win: xproto::Window) {
-        let _ = self.conn.unmap_window(win);
-        let _ = self.conn.flush();
-    }
-
-    fn raise(&self, win: xproto::Window) {
-        let _ = self.conn.map_window(win);
-        let _ = self.conn.configure_window(
-            win,
-            &xproto::ConfigureWindowAux::new().stack_mode(xproto::StackMode::ABOVE),
-        );
-        let _ = self.conn.flush();
-    }
-
-    fn resize(&self, win: xproto::Window, size: (u32, u32), resizable: bool) {
-        self.size_hints(win, size, resizable, None);
-        let _ = self.conn.configure_window(
-            win,
-            &xproto::ConfigureWindowAux::new()
-                .width(size.0.max(1))
-                .height(size.1.max(1)),
-        );
-        let _ = self.conn.flush();
-    }
-
-    fn destroy(&self, win: xproto::Window) {
-        let _ = self.conn.destroy_window(win);
-        let _ = self.conn.flush();
-    }
-}
-
-impl X11 {
-    /// The window's pixels (including the embedded plugin GUI).
-    fn capture(
-        &self,
-        win: xproto::Window,
-        (w, h): (u32, u32),
-    ) -> Result<gtk::gdk::MemoryTexture, String> {
-        let reply = self
-            .conn
-            .get_image(
-                xproto::ImageFormat::Z_PIXMAP,
-                win,
-                0,
-                0,
-                w as u16,
-                h as u16,
-                !0,
-            )
-            .map_err(x_err)?
-            .reply()
-            .map_err(x_err)?;
-        if reply.depth != 24 && reply.depth != 32 {
-            return Err(format!("X11: unsupported depth {}", reply.depth));
-        }
-        let stride = reply.data.len() / h.max(1) as usize;
-        Ok(gtk::gdk::MemoryTexture::new(
-            w as i32,
-            h as i32,
-            gtk::gdk::MemoryFormat::B8g8r8x8,
-            &glib::Bytes::from_owned(reply.data),
-            stride,
-        ))
-    }
+/// What a backend reports about its windows.
+enum ParentEvent {
+    /// The user closed the window.
+    Close(u64),
+    /// The window's content area has a new size.
+    Resized(u64, (u32, u32)),
 }
 
 /// Save every embedded plugin editor next to `path` (`<stem>-plugin<n>.png`);
 /// part of the `screenshot` action.
 pub fn screenshot(path: &std::path::Path) {
-    let editors: Vec<(xproto::Window, (u32, u32))> = EDITORS.with(|e| {
+    let editors: Vec<(u64, (u32, u32))> = EDITORS.with(|e| {
         e.native
             .borrow()
             .iter()
             .filter_map(|n| match n.host {
-                Host::X11(win) => Some((win, n.size)),
+                Host::Parent(win) => Some((win, n.size)),
                 Host::Floating => None,
             })
             .collect()
@@ -334,7 +85,7 @@ pub fn screenshot(path: &std::path::Path) {
         .map_or_else(String::new, |s| s.to_string_lossy().to_string());
     for (i, (win, size)) in editors.into_iter().enumerate() {
         let file = path.with_file_name(format!("{stem}-plugin{}.png", i + 1));
-        match with_x11(|x| x.capture(win, size)) {
+        match with_parents(|x| x.capture(win, size)) {
             Some(Ok(tex)) => match tex.save_to_png(&file) {
                 Ok(()) => tracing::info!("screenshot saved to {}", file.display()),
                 Err(e) => tracing::warn!("plugin editor screenshot failed: {e}"),
@@ -349,7 +100,8 @@ pub fn screenshot(path: &std::path::Path) {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Host {
-    X11(xproto::Window),
+    /// A window of ours (the backend's id).
+    Parent(u64),
     /// The plugin's own top-level window.
     Floating,
 }
@@ -359,15 +111,15 @@ struct NativeEditor {
     host: Host,
     size: (u32, u32),
     resizable: bool,
-    /// Last known top-left corner (X11 editors).
+    /// Last known top-left corner (embedded editors).
     pos: Option<(i32, i32)>,
 }
 
 type Rect = (i32, i32, i32, i32);
 
-/// Monitor rectangles in X11 screen coordinates and the one showing the
-/// main window. The X server's own (RandR) geometry is matched to the
-/// Wayland monitor by connector name; GDK's logical geometry is the
+/// Monitor rectangles in the backend's screen coordinates and the one
+/// showing the main window (X11: the X server's own RandR geometry matched
+/// to the Wayland monitor by connector name). GDK's logical geometry is the
 /// fallback.
 fn monitors(app: &AppState) -> (Vec<Rect>, Option<Rect>) {
     let Some(display) = gtk::gdk::Display::default() else {
@@ -379,17 +131,14 @@ fn monitors(app: &AppState) -> (Vec<Rect>, Option<Rect>) {
         .as_ref()
         .and_then(|w| w.surface())
         .and_then(|s| display.monitor_at_surface(&s));
-    let x_monitors = with_x11(|x| x.monitors()).unwrap_or_default();
-    if !x_monitors.is_empty() {
-        let connector = main
-            .as_ref()
-            .and_then(|m| m.connector())
-            .map(|c| c.to_string());
-        let main_rect = x_monitors
-            .iter()
-            .find(|(name, _)| Some(name) == connector.as_ref())
-            .map(|(_, r)| *r);
-        return (x_monitors.into_iter().map(|(_, r)| r).collect(), main_rect);
+    let connector = main
+        .as_ref()
+        .and_then(|m| m.connector())
+        .map(|c| c.to_string());
+    if let Some((all, main_rect)) = with_parents(|x| x.monitors(connector.as_deref()))
+        && !all.is_empty()
+    {
+        return (all, main_rect);
     }
     let rect = |m: &gtk::gdk::Monitor| {
         let g = m.geometry();
@@ -450,16 +199,16 @@ fn store_position(app: &Rc<AppState>, plugin: PluginInstanceId, pos: (i32, i32))
     }
 }
 
-fn with_x11<R>(f: impl FnOnce(&X11) -> R) -> Option<R> {
-    EDITORS.with(|e| match e.x11.borrow().as_ref() {
+fn with_parents<R>(f: impl FnOnce(&Parents) -> R) -> Option<R> {
+    EDITORS.with(|e| match e.parents.borrow().as_ref() {
         Some(Ok(x)) => Some(f(x)),
         _ => None,
     })
 }
 
 fn drop_host(host: Host) {
-    if let Host::X11(win) = host {
-        with_x11(|x| x.destroy(win));
+    if let Host::Parent(win) = host {
+        with_parents(|x| x.destroy(win));
     }
 }
 
@@ -493,8 +242,8 @@ fn open_native(app: &Rc<AppState>, plugin: PluginInstanceId) -> bool {
             .map(|n| n.host)
     });
     if let Some(host) = existing {
-        if let Host::X11(win) = host {
-            with_x11(|x| x.raise(win));
+        if let Host::Parent(win) = host {
+            with_parents(|x| x.raise(win));
         }
         return true;
     }
@@ -502,10 +251,10 @@ fn open_native(app: &Rc<AppState>, plugin: PluginInstanceId) -> bool {
         return false;
     };
     EDITORS.with(|e| {
-        e.x11.borrow_mut().get_or_insert_with(|| {
-            let r = X11::connect();
+        e.parents.borrow_mut().get_or_insert_with(|| {
+            let r = Parents::connect();
             if let Err(err) = &r {
-                tracing::warn!("no X11 display for plugin editors ({err}); using generic editors");
+                tracing::warn!("no windows for plugin editors ({err}); using generic editors");
             }
             r
         });
@@ -520,15 +269,16 @@ fn open_native(app: &Rc<AppState>, plugin: PluginInstanceId) -> bool {
             return false;
         };
         let mut opened = None;
-        let (embed, float) = (ed.can_embed_x11(), ed.can_float());
-        tracing::debug!("{title}: editor embeds in X11: {embed}, floats: {float}");
+        let api = WindowApi::NATIVE;
+        let (embed, float) = (ed.can_embed(api), ed.can_float(api));
+        tracing::debug!("{title}: editor embeds ({api:?}): {embed}, floats: {float}");
         if embed {
             let embedded = EDITORS.with(|e| {
-                let x11 = e.x11.borrow();
-                let Some(Ok(x)) = x11.as_ref() else {
+                let parents = e.parents.borrow();
+                let Some(Ok(x)) = parents.as_ref() else {
                     return None;
                 };
-                let size = match ed.open_embedded() {
+                let size = match ed.open_embedded(api, x.scale()) {
                     Ok(size) => size,
                     Err(err) => {
                         failure = Some(err.to_string());
@@ -545,13 +295,13 @@ fn open_native(app: &Rc<AppState>, plugin: PluginInstanceId) -> bool {
                         return None;
                     }
                 };
-                match ed.attach_x11(u64::from(win)) {
+                match ed.attach(x.parent(win)) {
                     Ok(()) => {
                         x.map_at(win, pos);
                         tracing::debug!("plugin editor {plugin}: {size:?} placed at {pos:?}");
                         Some(NativeEditor {
                             plugin,
-                            host: Host::X11(win),
+                            host: Host::Parent(win),
                             size,
                             resizable,
                             pos: Some(pos),
@@ -567,7 +317,7 @@ fn open_native(app: &Rc<AppState>, plugin: PluginInstanceId) -> bool {
             opened = embedded;
         }
         if opened.is_none() && float {
-            match ed.open_floating(&title) {
+            match ed.open_floating(api, &title) {
                 Ok(()) => {
                     opened = Some(NativeEditor {
                         plugin,
@@ -609,8 +359,8 @@ fn close_native(app: &Rc<AppState>, plugin: PluginInstanceId) {
         Some(native.remove(i).host)
     });
     let Some(host) = host else { return };
-    if let Host::X11(win) = host
-        && let Some(Some(pos)) = with_x11(|x| x.position(win))
+    if let Host::Parent(win) = host
+        && let Some(Some(pos)) = with_parents(|x| x.position(win))
     {
         store_position(app, plugin, pos);
     }
@@ -622,42 +372,29 @@ fn close_native(app: &Rc<AppState>, plugin: PluginInstanceId) {
     drop_host(host);
 }
 
-/// The X11 events of the parent windows: close buttons and resizes.
-fn pump_x11(app: &Rc<AppState>) {
-    let mut events = Vec::new();
-    with_x11(|x| {
-        while let Ok(Some(ev)) = x.conn.poll_for_event() {
-            events.push(ev);
-        }
-    });
-    let delete = with_x11(|x| (x.atoms.wm_protocols, x.atoms.wm_delete_window));
+/// The parent windows' events: close buttons and resizes.
+fn pump_parents(app: &Rc<AppState>) {
+    let events = with_parents(|x| x.events()).unwrap_or_default();
     for ev in events {
-        let find = |win: xproto::Window| {
+        let find = |win: u64| {
             EDITORS.with(|e| {
                 e.native
                     .borrow()
                     .iter()
-                    .find(|n| n.host == Host::X11(win))
+                    .find(|n| n.host == Host::Parent(win))
                     .map(|n| (n.plugin, n.size, n.resizable))
             })
         };
         match ev {
-            Event::ClientMessage(m) => {
-                let Some((protocols, del)) = delete else {
-                    continue;
-                };
-                if m.type_ == protocols
-                    && m.data.as_data32()[0] == del
-                    && let Some((plugin, ..)) = find(m.window)
-                {
+            ParentEvent::Close(win) => {
+                if let Some((plugin, ..)) = find(win) {
                     close_native(app, plugin);
                 }
             }
-            Event::ConfigureNotify(c) => {
-                let Some((plugin, size, resizable)) = find(c.window) else {
+            ParentEvent::Resized(win, new) => {
+                let Some((plugin, size, resizable)) = find(win) else {
                     continue;
                 };
-                let new = (u32::from(c.width), u32::from(c.height));
                 if !resizable || new == size || new.0 == 0 || new.1 == 0 {
                     continue;
                 }
@@ -679,18 +416,17 @@ fn pump_x11(app: &Rc<AppState>) {
                 if let Some(a) = applied
                     && a != new
                 {
-                    with_x11(|x| x.resize(c.window, a, true));
+                    with_parents(|x| x.resize(win, a, true));
                 }
             }
-            _ => {}
         }
     }
 }
 
-/// Per UI frame: plugin GUI requests, X11 events, fd and timer sources,
-/// windows of removed plugins.
+/// Per UI frame: plugin GUI requests, parent window events, fd and timer
+/// sources, windows of removed plugins.
 pub fn tick(app: &Rc<AppState>) {
-    pump_x11(app);
+    pump_parents(app);
     // Follow where the user moves editors (twice a second).
     let n = EDITORS.with(|e| {
         let n = e.ticks.get() + 1;
@@ -726,9 +462,9 @@ pub fn tick(app: &Rc<AppState>) {
             close_native(app, plugin);
             continue;
         }
-        if let Host::X11(win) = host {
+        if let Host::Parent(win) = host {
             if let Some(size) = requests.resize {
-                with_x11(|x| x.resize(win, size, resizable));
+                with_parents(|x| x.resize(win, size, resizable));
                 EDITORS.with(|e| {
                     if let Some(n) = e
                         .native
@@ -741,10 +477,10 @@ pub fn tick(app: &Rc<AppState>) {
                 });
             }
             if requests.hide {
-                with_x11(|x| x.unmap(win));
+                with_parents(|x| x.unmap(win));
             }
             if requests.show {
-                with_x11(|x| x.raise(win));
+                with_parents(|x| x.raise(win));
             }
         }
     }
@@ -767,19 +503,19 @@ pub fn tick(app: &Rc<AppState>) {
 }
 
 fn track_positions(app: &Rc<AppState>) {
-    type Open = (PluginInstanceId, xproto::Window, Option<(i32, i32)>);
+    type Open = (PluginInstanceId, u64, Option<(i32, i32)>);
     let open: Vec<Open> = EDITORS.with(|e| {
         e.native
             .borrow()
             .iter()
             .filter_map(|n| match n.host {
-                Host::X11(win) => Some((n.plugin, win, n.pos)),
+                Host::Parent(win) => Some((n.plugin, win, n.pos)),
                 Host::Floating => None,
             })
             .collect()
     });
     for (plugin, win, last) in open {
-        let Some(Some(pos)) = with_x11(|x| x.position(win)) else {
+        let Some(Some(pos)) = with_parents(|x| x.position(win)) else {
             continue;
         };
         if Some(pos) == last {

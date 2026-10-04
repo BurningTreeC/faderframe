@@ -10,12 +10,15 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Steinberg ASIO drivers on Windows (see faderframe-audio-cpal).
+asio = ["faderframe-audio-cpal/asio"]
+
 [dependencies]
 faderframe-plugin-clap.workspace = true
 faderframe-plugin-vst3.workspace = true
 faderframe-plugin-host.workspace = true
 gtk.workspace = true
-x11rb.workspace = true
 faderframe-core.workspace = true
 faderframe-automation.workspace = true
 faderframe-project.workspace = true
@@ -39,6 +42,19 @@ faderframe-audio-files.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 glib-unix.workspace = true
+
+# Plugin editor parent windows: X11 (Linux/BSD), Win32, Cocoa.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+x11rb.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+faderframe-plugin-au.workspace = true
+objc2.workspace = true
+objc2-foundation = { workspace = true, features = ["NSGeometry", "NSString"] }
+objc2-app-kit = { workspace = true, features = ["NSGraphics", "NSResponder", "NSScreen", "NSView", "NSWindow"] }
 
 # Audio servers of Linux desktops.
 [target.'cfg(target_os = "linux")'.dependencies]

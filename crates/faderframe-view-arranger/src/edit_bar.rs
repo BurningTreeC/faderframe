@@ -7,7 +7,7 @@ use faderframe_session::{
 };
 use faderframe_timeline::{GridDivision, MusicalTime, format_seconds};
 use faderframe_ui_canvas::{
-    CanvasView, Color, EventCx, Flow, FlowMetrics, HostRequest, MenuItem, Paint, Painter, Point,
+    CanvasView, EventCx, Flow, FlowMetrics, HostRequest, MenuItem, Paint, Painter, Point,
     PointerButton, Rect, Size, TextStyle, Theme, ViewEvent,
 };
 
@@ -471,6 +471,10 @@ impl EditToolbarView {
 }
 
 impl CanvasView<Session, Action> for EditToolbarView {
+    fn set_theme(&mut self, theme: &Theme) {
+        self.theme = theme.clone();
+    }
+
     fn paint(&mut self, p: &mut dyn Painter, size: Size, s: &Session, _theme: &Theme) {
         let th = &self.theme;
         let pr = &th.piano;
@@ -479,11 +483,11 @@ impl CanvasView<Session, Action> for EditToolbarView {
         p.hline(r.x, r.right(), r.bottom() - 0.5, th.ui.border);
         for (item, rect, label, on) in self.items(size, s) {
             if let Item::Counter(_) = item {
-                p.fill_rounded(rect, 3.0, &Paint::Solid(Color::hex(0x0d100e)));
+                p.fill_rounded(rect, 3.0, &Paint::Solid(th.ui.lcd_bg));
                 p.text(
                     &label,
                     rect.inset_xy(6.0, 0.0),
-                    &TextStyle::new(th.fonts.small, Color::hex(0xf0c46a))
+                    &TextStyle::new(th.fonts.small, th.ui.lcd_text)
                         .family(faderframe_ui_canvas::FontFamily::Mono),
                 );
                 continue;

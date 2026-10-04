@@ -19,9 +19,10 @@ faderframe-app            binary: CLI parsing, logging, starts the GTK app
        │    └─ faderframe-ui-canvas   Painter trait, events, CanvasView, theme, console controls
        ├─ faderframe-audio-pipewire   native PipeWire backend (pw_filter, Linux)
        ├─ faderframe-audio-jack       JACK backend (JACK2 / pipewire-jack, Linux)
-       ├─ faderframe-audio-cpal       system backend through cpal: WASAPI, CoreAudio, ALSA
+       ├─ faderframe-audio-cpal       system backend through cpal: WASAPI, ASIO (opt-in), CoreAudio, ALSA
        ├─ faderframe-plugin-clap      CLAP host (clack-host): scan helper, instances, editors
        ├─ faderframe-plugin-vst3      VST3 host (vst3 bindings): modules, scan helper, instances, editors
+       ├─ faderframe-plugin-au        Audio Unit host (AudioToolbox C API, macOS): registry scan, instances, Cocoa views
        ├─ faderframe-midi-io          MIDI devices (midir: ALSA sequencer, CoreMIDI, WinMM), virtual ports
        └─ faderframe-session          control-world hub (GTK-free)
             ├─ faderframe-analysis     loudness (EBU R128), true peak, levels, phase, FFT spectrum
@@ -47,11 +48,20 @@ on GTK**, and only the backend crates name an audio API (JACK, PipeWire,
 cpal). The engine, session and views build and run headless (tests, CI,
 offline rendering, the benchmark).
 
-`faderframe-plugin-clap` and `faderframe-plugin-vst3` implement the
-`faderframe-plugin-host` traits and are registered by the shell
-(`set_default_registry`), so the engine never names a plugin format.
-Planned crates (not created yet, to avoid empty boilerplate): an ASIO
-backend, Audio Unit hosting, and an optional wgpu painter for dense views.
+`faderframe-plugin-clap`, `faderframe-plugin-vst3` and
+`faderframe-plugin-au` implement the `faderframe-plugin-host` traits and are
+registered by the shell (`set_default_registry`), so the engine never names
+a plugin format. ASIO is a host of the cpal backend behind its `asio`
+feature, not a crate of its own. Planned: an optional wgpu painter for
+dense views.
+
+`packaging/` holds what turns a release build into packages: the
+application icon (SVG; `icons.py` makes `.ico`/`.icns` from it), the
+desktop entry, AppStream metadata and MIME type with a Linux install
+script, the Flatpak manifest, the macOS app bundle and DMG script (GTK
+bundled with dylibbundler, a launcher pointing GTK at the bundle's data)
+and the Windows bundle script with its Inno Setup installer. The *Release*
+workflow runs them for `v*` tags.
 
 ## 2. Control world vs realtime world
 
@@ -493,9 +503,11 @@ editor opening, instruments playing live MIDI as instrument and insert).
   values are refreshed from the plugin, so changes made in its own GUI win.
 * **State** is the plugin's own blob, base64 in the slot, captured before
   save/render/engine rebuild and before edits that remove plugins.
-* **Editors.** On Linux CLAP GUIs embed into an X11 window. FaderFrame is a
-  Wayland client, so the parent is a top-level window on a separate X11
-  connection (`x11rb`, XWayland): created at the editor's size, with
+* **Editors.** CLAP GUIs embed into a host window of the platform's own
+  window system (`gui` API `x11`, `win32` or `cocoa`; see *Editor windows*
+  below). On Windows the editor's scale is set from the display's DPI. On
+  Linux FaderFrame is a Wayland client, so the parent is a top-level window
+  on a separate X11 connection (`x11rb`, XWayland): created at the editor's size, with
   fixed-size hints for non-resizable editors (window managers float them),
   `WM_DELETE_WINDOW` closing the editor, configure events resizing
   resizable ones and `request_resize` resizing the parent. Plugins that
@@ -508,7 +520,7 @@ editor opening, instruments playing live MIDI as instrument and insert).
   registered through `posix-fd` become glib fd sources and `timer`
   registrations glib timeouts, reconciled every UI tick.
 * **Generic editor.** Every plugin (built-ins, plugins without a GUI, no X
-  server, Windows and macOS for now) has a GTK parameter window with a
+  server) has a GTK parameter window with a
   presets menu: filter, module sections from CLAP's
   "Module/Name" paths, the plugin's own value text (`value_to_text`),
   sliders and switches, double-click to reset, live follow of automation
@@ -564,10 +576,65 @@ SDK headers); FaderFrame implements the host side itself.
 * **State** is `FFV3` + length-prefixed component state + controller state;
   foreign blobs are taken as component state. Loading also feeds the
   component state to the controller (`setComponentState`).
-* **Editors** use the same XWayland parent windows as CLAP
-  (`X11EmbedWindowID`); `resizeView` is answered with `onSize`, and run-loop
-  file descriptors and timers become glib sources. VST3 has no floating
-  editors.
+* **Editors** use the same parent windows as CLAP (`X11EmbedWindowID`,
+  `HWND` or `NSView`; Windows editors get the display scale through
+  `IPlugViewContentScaleSupport`); `resizeView` is answered with `onSize`,
+  and Linux run-loop file descriptors and timers become glib sources. VST3
+  has no floating editors.
+
+### Audio Units
+
+macOS only (the crate is empty elsewhere). Hand-written declarations of the
+AUv2 C API (`ffi.rs`, layouts checked by a test) — AUv3 extensions are
+reached through it too.
+
+* **Listing** reads the component registry (`AudioComponentFindNext` for
+  effects, music effects and instruments) without instantiating anything,
+  so it runs in-process and needs no scan cache. Ids are
+  `type:subtype:manufacturer` four-character codes (`aufx:dely:appl`).
+* **Instances** set non-interleaved `f32` stream formats (stereo, else
+  mono), the maximum slice size, an input render callback that reads the
+  block's input from a preallocated feed, and host callbacks (beat and
+  tempo, musical time, transport state) that read a per-block transport
+  copy; then `AudioUnitInitialize`. Parameters come from
+  `kAudioUnitProperty_ParameterList`/`ParameterInfo` (meters skipped,
+  value strings when the unit has them). State is the `ClassInfo`
+  property list (binary plist bytes); `.aupreset` files are the same
+  property list, listed from `~/Library/Audio/Presets/<vendor>/<name>`.
+  Latency and parameter-list changes arrive through property listeners and
+  become restarts/parameter refreshes on the next poll.
+* **Processing** (`AuProcessor`, in a `TryCell` like the other formats):
+  automation as scheduled immediate parameter events (or set at the block
+  start for units that do not schedule), MIDI through
+  `MusicDeviceMIDIEvent` with sample offsets, `AudioUnitRender` into
+  preallocated buffers. The instance takes the cell before uninitialising
+  the unit; a busy or empty cell renders silence.
+* **Editors** are the unit's Cocoa view (`kAudioUnitProperty_CocoaUI`: a
+  view factory class in a bundle) or CoreAudioKit's `AUGenericView`, added
+  to the host window's content view. Moves in the editor reach automation
+  through an `AUEventListener` on the main run loop; FaderFrame's own
+  parameter changes notify the editor (`AUParameterListenerNotify`, with
+  its own listener excluded).
+* Tests (`tests/apple_units.rs`, run on the macOS CI runners) host Apple's
+  AUDelay, AULowpass and DLSMusicDevice: listing, an echoed impulse,
+  sample-accurate cutoff automation, a state round trip and notes into the
+  synth.
+
+### Editor windows
+
+`faderframe-ui/src/plugin_window/` keeps the shared logic (opening,
+placement, positions saved per instance, resize requests, closing, fd and
+timer sources, the generic window) apart from three backends with the same
+`Parents` API: `x11.rs` (XWayland top-level windows, RandR monitor
+geometry, the screenshot capture), `win32.rs` (plain top-level Win32
+windows with `WS_CLIPCHILDREN`; GTK's main loop dispatches their messages,
+the window procedure records close requests and resizes for the next UI
+tick; positions in physical pixels from the monitors' work areas) and
+`cocoa.rs` (an `NSWindow` per editor, released only on destroy; closes and
+content-size changes are noticed by polling on the UI tick; positions are
+converted between GDK's top-left and Cocoa's bottom-left origin). The
+plugin-host trait is platform-neutral: `can_embed(WindowApi)`,
+`open_embedded(api, scale)`, `attach(ParentWindow)`.
 
 ## 9. Audio backends
 
@@ -596,12 +663,16 @@ shutdown) is shared through lock-free `StreamMonitor` atomics.
   (macOS), ALSA (Linux). Playback drives the engine; capture arrives
   through a lock-free ring (a few milliseconds of extra input latency);
   `f32`, `i32` and `i16` devices. The streams live on a control thread, so
-  the stream handle is `Send` everywhere.
+  the stream handle is `Send` everywhere. With the `asio` feature
+  (Windows) the same backend drives ASIO drivers (`Api::Asio`), taking
+  capture from the driver itself. It is opt-in because it compiles
+  Steinberg's ASIO SDK, whose licence (proprietary or GPLv3) then applies
+  to the binary; the *Ports* workflow checks it with MSVC.
 * `DummyBackend` — timer-driven, silent; used when no audio device exists
   and in CI.
 
 *Automatic* tries PipeWire, JACK, ALSA, then the dummy device on Linux, and
-the system API, then the dummy device elsewhere.
+ASIO (where built in), the system API, then the dummy device elsewhere.
 
 ## 10. Session
 
@@ -831,9 +902,22 @@ the event loop. DAW work surfaces are **custom-rendered views**:
   virtualised (only visible rows/strips/clips are visited); waveforms are one
   filled path per clip channel from a multi-resolution `PeakCache`.
 * The mixer is drawn as an analogue console from `controls` (panel, knob,
-  fader, segmented meter, LED buttons, scribble strips) using a `Theme`
-  (skins replace the theme, not the views). Track headers reuse the same
+  fader, meter, LED buttons, scribble strips) using a `Theme` (skins
+  replace the theme, not the views). Track headers reuse the same
   controls.
+* **Skins.** `Theme::all()` lists seven (`themes.rs` derives each from a
+  compact `Spec` of base colours): Studio, Vintage Console, Daylight
+  (light), Midnight, Frost, Neon and High Contrast. Besides colours a theme
+  has a `ConsoleLook`: skirted knobs (with or without a value ring), flat
+  or glossy controls, brushed-metal panel grain, screws, walnut cheeks
+  framing the mixer, and the meter kind — LED ladder, continuous bar or an
+  edgewise VU meter (0 VU = −18 dBFS, voltage-proportional scale). The
+  shell switches skins live (`AppState::set_theme`: every canvas view gets
+  `CanvasView::set_theme`, GTK's stylesheet is regenerated from the theme
+  as `@define-color`s, and the Adwaita light/dark variant follows the
+  skin, overriding a dark desktop theme for light skins); the choice is a
+  preference. Overlays drawn over editor backgrounds derive from the
+  theme's text and selection colours so they work on light skins too.
 
 The arranger has **global lanes** under the ruler (shown or hidden from
 their titles): markers (double-click adds, drag moves, double-click
@@ -1064,7 +1148,10 @@ Platform specifics are isolated in backends and the GTK shell:
 |---|---|---|---|
 | Audio | PipeWire, JACK, ALSA (cpal) | WASAPI (cpal) | CoreAudio (cpal) |
 | MIDI | ALSA sequencer (midir) | WinMM (midir) | CoreMIDI (midir) |
-| CLAP / VST3 | ✓, editors embedded via XWayland | ✓, generic parameter windows | ✓, generic parameter windows |
+| Audio (opt-in) | | ASIO (cpal, `asio` feature) | |
+| CLAP / VST3 | ✓, editors embedded via XWayland | ✓, editors embedded (Win32) | ✓, editors embedded (Cocoa) |
+| Audio Units | | | ✓ (AUv2 API, AUv3 through it) |
+| Packages | Flatpak, install script | Inno Setup installer, zip | app bundle in a DMG |
 | DSP threads | futex wake-up, the audio thread's `SCHED_FIFO` | `park`/`unpark`, normal priority | `park`/`unpark`, normal priority |
 
 * JACK and PipeWire are Linux-only dependencies; their crates are empty
@@ -1080,9 +1167,9 @@ Platform specifics are isolated in backends and the GTK shell:
   `macos-15-intel`, GTK from Homebrew) and Windows (MSYS2 UCRT64 with its
   GTK 4 and Rust packages).
 
-Still open for the ports: embedding plugin editors (HWND on Windows,
-NSView on macOS), realtime priority for DSP workers (MMCSS, Mach time
-constraints), ASIO, Audio Units, and packaging (app bundle, installer).
+Still open for the ports: realtime priority for DSP workers (MMCSS, Mach
+time constraints), Developer ID signing and notarisation of the macOS app,
+and a signed Windows installer.
 
 ## Status and roadmap
 
@@ -1091,7 +1178,8 @@ sidechains; multicore scheduling with measured critical-path ranks;
 sample-accurate transport, loops and scrubbing; built-in synth, echo,
 compressor, gain and latency probe; offline render and export (stems,
 normalise, dither); freeze and bounce in place. Audio: native PipeWire,
-JACK, the system API (WASAPI, CoreAudio, ALSA) and a dummy device.
+JACK, the system API (WASAPI, CoreAudio, ALSA), ASIO (opt-in) and a dummy
+device.
 Recording with punch, pre-roll, metronome, take folders and comping.
 Automation of every automatable parameter, written from controls, MIDI
 controllers and plugin editors. Media import (Symphonia, rubato) and
@@ -1101,9 +1189,10 @@ MIDI: devices with hotplug, live play with constant latency, recording,
 MIDI learn, MIDI output and clock, clock/MTC sync, MPE, SysEx, Standard
 MIDI File import and export, and a full piano roll.
 
-Plugins: CLAP and VST3 hosting with crash-safe scanning, a plugin browser,
-embedded editors (Linux), generic parameter windows, presets (user and VST3
-factory), inserts that move and copy between tracks, sidechain inputs.
+Plugins: CLAP and VST3 hosting with crash-safe scanning and Audio Units on
+macOS, a plugin browser, embedded editors on all three platforms, generic
+parameter windows, presets (user, VST3 factory, `.aupreset`), inserts that
+move and copy between tracks, sidechain inputs.
 
 Mixing: an analogue-console mixer, sends in banks, track groups with
 linked controls, VCAs, relative edits of every selected track, track
@@ -1117,8 +1206,9 @@ sections, time signatures and the tempo map, and track colours from a
 colour chooser.
 
 Shell: docking and detaching, workspaces (Recording, Editing, Mixing,
-MIDI, Mastering), performance meter, preferences, recent projects and
-start-up choice. Windows and macOS builds (see §14).
+MIDI, Mastering), seven skins switched live, performance meter,
+preferences, recent projects and start-up choice. Windows and macOS builds
+and packages for all three platforms (see §14).
 
 **Next**, roughly in order:
 
@@ -1128,9 +1218,8 @@ start-up choice. Windows and macOS builds (see §14).
 2. **Mastering**: offline loudness analysis per song and loudness
    normalisation on export, dithering and true-peak limiting for delivery
    formats, an album/sequence view.
-3. **Ports**: plugin editors on Windows (HWND) and macOS (NSView),
-   realtime DSP worker priority there, ASIO, Audio Units, packaging
-   (Flatpak, macOS app bundle, Windows installer).
+3. **Ports**: realtime DSP worker priority on Windows and macOS, signed
+   and notarised packages, a Flathub submission (vendored crates).
 4. **Plugins**: note expressions (CLAP, VST3), VST3 program lists and
    64-bit processing, sandboxed plugins (out-of-process with shared-memory
    audio), SysEx to plugins.

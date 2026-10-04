@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>FaderFrame</string>
+    <key>CFBundleIdentifier</key>
+    <string>io.github.BurningTreeC.FaderFrame</string>
+    <key>CFBundleName</key>
+    <string>FaderFrame</string>
+    <key>CFBundleDisplayName</key>
+    <string>FaderFrame</string>
+    <key>CFBundleIconFile</key>
+    <string>FaderFrame</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@VERSION@</string>
+    <key>CFBundleVersion</key>
+    <string>@VERSION@</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.music</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>FaderFrame records audio from your interface's inputs.</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>MIT licence. See LICENSE and THIRD_PARTY_LICENSES.md.</string>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>FaderFrame project</string>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>CFBundleTypeIconFile</key>
+            <string>FaderFrame</string>
+            <key>CFBundleTypeExtensions</key>
+            <array>
+                <string>ffproj</string>
+            </array>
+            <key>LSHandlerRank</key>
+            <string>Owner</string>
+        </dict>
+    </array>
+</dict>
+</plist>

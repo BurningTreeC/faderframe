@@ -1,0 +1,24 @@
+[package]
+name = "faderframe-plugin-au"
+description = "Audio Unit hosting for FaderFrame (macOS)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+faderframe-core.workspace = true
+faderframe-audio-graph.workspace = true
+faderframe-plugin-host.workspace = true
+faderframe-realtime.workspace = true
+faderframe-transport.workspace = true
+objc2 = { workspace = true, features = ["relax-void-encoding"] }
+tracing.workspace = true
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+faderframe-automation.workspace = true
+faderframe-midi.workspace = true

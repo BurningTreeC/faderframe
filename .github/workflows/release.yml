@@ -1,0 +1,117 @@
+name: Release
+
+# Packages FaderFrame: a Flatpak bundle (Linux), DMGs (macOS on Apple
+# Silicon and Intel), an installer and a portable zip (Windows). A tag
+# `v*` publishes them as a GitHub release; a manual run keeps them as
+# workflow artifacts.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  flatpak:
+    name: Flatpak
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-51
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v5
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: FaderFrame-linux-x86_64.flatpak
+          manifest-path: packaging/flatpak/io.github.BurningTreeC.FaderFrame.yml
+          cache-key: flatpak-builder-${{ github.sha }}
+
+  macos:
+    name: macOS (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: System dependencies
+        run: brew install gtk4 adwaita-icon-theme librsvg dylibbundler pkgconf
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release -p faderframe-app
+      - name: App bundle and disk image
+        run: packaging/macos/bundle.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: dist/*.dmg
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-adwaita-icon-theme
+            mingw-w64-ucrt-x86_64-librsvg
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-rust
+            mingw-w64-ucrt-x86_64-python
+            zip
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+      - name: Build
+        run: cargo build --release -p faderframe-app
+      - name: Folder, zip and installer
+        run: packaging/windows/bundle.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: |
+            dist/*.zip
+            dist/*-setup.exe
+
+  release:
+    name: Publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [flatpak, macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l artifacts
+          gh release create "$GITHUB_REF_NAME" artifacts/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "FaderFrame ${GITHUB_REF_NAME#v}" \
+            --generate-notes

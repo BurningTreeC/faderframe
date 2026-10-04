@@ -25,6 +25,8 @@ pub enum BackendChoice {
     Jack,
     /// The operating system's API: WASAPI, CoreAudio or ALSA.
     System,
+    /// Steinberg ASIO drivers (Windows builds with the `asio` feature).
+    Asio,
     Dummy,
 }
 
@@ -36,6 +38,13 @@ impl BackendChoice {
                 BackendChoice::Auto,
                 BackendChoice::PipeWire,
                 BackendChoice::Jack,
+                BackendChoice::System,
+                BackendChoice::Dummy,
+            ]
+        } else if faderframe_audio_cpal::ASIO {
+            vec![
+                BackendChoice::Auto,
+                BackendChoice::Asio,
                 BackendChoice::System,
                 BackendChoice::Dummy,
             ]
@@ -53,6 +62,9 @@ impl BackendChoice {
             BackendChoice::Auto if cfg!(target_os = "linux") => {
                 "Automatic (PipeWire, else JACK, else ALSA, else silent)"
             }
+            BackendChoice::Auto if faderframe_audio_cpal::ASIO => {
+                "Automatic (ASIO, else WASAPI, else silent)"
+            }
             BackendChoice::Auto if cfg!(windows) => "Automatic (WASAPI, else silent)",
             BackendChoice::Auto => "Automatic (CoreAudio, else silent)",
             BackendChoice::PipeWire => "PipeWire (native)",
@@ -60,12 +72,26 @@ impl BackendChoice {
             BackendChoice::System if cfg!(windows) => "WASAPI",
             BackendChoice::System if cfg!(target_os = "macos") => "CoreAudio",
             BackendChoice::System => "ALSA (direct)",
+            BackendChoice::Asio => "ASIO",
             BackendChoice::Dummy => "No audio device (silent)",
         }
     }
 
     pub fn backends(self) -> Vec<Box<dyn AudioBackend>> {
-        let system = || Box::new(faderframe_audio_cpal::CpalBackend) as Box<dyn AudioBackend>;
+        let system =
+            || Box::new(faderframe_audio_cpal::CpalBackend::default()) as Box<dyn AudioBackend>;
+        // ASIO devices first where the build has them (none otherwise).
+        #[cfg(not(target_os = "linux"))]
+        let asio = || -> Vec<Box<dyn AudioBackend>> {
+            #[cfg(all(windows, feature = "asio"))]
+            {
+                vec![Box::new(faderframe_audio_cpal::CpalBackend::new(
+                    faderframe_audio_cpal::Api::Asio,
+                ))]
+            }
+            #[cfg(not(all(windows, feature = "asio")))]
+            Vec::new()
+        };
         // FADERFRAME_DUMMY_TONE=<Hz> feeds a test tone to the dummy
         // device's inputs (for trying out recording without hardware).
         let tone = std::env::var("FADERFRAME_DUMMY_TONE")
@@ -86,17 +112,23 @@ impl BackendChoice {
                 BackendChoice::Auto => vec![pipewire(), jack(), system(), dummy()],
                 BackendChoice::PipeWire => vec![pipewire()],
                 BackendChoice::Jack => vec![jack()],
-                BackendChoice::System => vec![system()],
+                BackendChoice::System | BackendChoice::Asio => vec![system()],
                 BackendChoice::Dummy => vec![dummy()],
             }
         }
         #[cfg(not(target_os = "linux"))]
         match self {
             BackendChoice::Dummy => vec![dummy()],
-            BackendChoice::System | BackendChoice::PipeWire | BackendChoice::Jack => {
-                vec![system()]
+            BackendChoice::Asio if faderframe_audio_cpal::ASIO => asio(),
+            BackendChoice::System
+            | BackendChoice::Asio
+            | BackendChoice::PipeWire
+            | BackendChoice::Jack => vec![system()],
+            BackendChoice::Auto => {
+                let mut all = asio();
+                all.extend([system(), dummy()]);
+                all
             }
-            BackendChoice::Auto => vec![system(), dummy()],
         }
     }
 }
@@ -121,7 +153,8 @@ pub struct RunOptions {
 pub struct AppState {
     pub app: gtk::Application,
     pub session: RefCell<Session>,
-    pub theme: Theme,
+    /// The active skin (Preferences → General → Theme, View → Theme).
+    pub theme: RefCell<Theme>,
     pub options: RefCell<RunOptions>,
     pub dock: RefCell<DockState>,
     pub window: RefCell<Option<gtk::ApplicationWindow>>,
@@ -148,7 +181,7 @@ impl AppState {
             layout_rev: Cell::new(session.layout_revision()),
             shown_rev: Cell::new(session.revision()),
             session: RefCell::new(session),
-            theme: Theme::studio(),
+            theme: RefCell::new(Theme::by_id(&crate::prefs::Preferences::load().theme)),
             options: RefCell::new(options),
             dock: RefCell::new(DockState::default()),
             window: RefCell::new(None),
@@ -168,6 +201,33 @@ impl AppState {
 
     pub fn register_canvas(&self, c: &CanvasWidget) {
         self.canvases.borrow_mut().push(c.downgrade());
+    }
+
+    /// Switch the skin: GTK's CSS and every canvas follow at once, and the
+    /// choice is remembered.
+    pub fn set_theme(&self, id: &str) {
+        let theme = Theme::by_id(id);
+        crate::style::install(&theme);
+        self.canvases.borrow_mut().retain(|w| match w.upgrade() {
+            Some(c) => {
+                c.set_theme(&theme);
+                true
+            }
+            None => false,
+        });
+        *self.theme.borrow_mut() = theme;
+        if let Some(a) = self
+            .app
+            .lookup_action("theme")
+            .and_then(|a| a.downcast::<gio::SimpleAction>().ok())
+        {
+            a.set_state(&id.to_variant());
+        }
+        let mut prefs = crate::prefs::Preferences::load();
+        prefs.theme = id.into();
+        if let Err(e) = prefs.save() {
+            tracing::warn!("cannot save preferences: {e}");
+        }
     }
 
     pub fn redraw_all(&self) {

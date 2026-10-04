@@ -1,5 +1,8 @@
 //! The operating system's own audio API through cpal: WASAPI on Windows,
-//! CoreAudio on macOS, ALSA on Linux.
+//! CoreAudio on macOS, ALSA on Linux — and Steinberg ASIO drivers on
+//! Windows when built with the `asio` feature (opt-in: it compiles the ASIO
+//! SDK, whose licence — Steinberg's own or GPLv3 — then applies to the
+//! binary; see the README).
 //!
 //! cpal opens playback and capture as separate streams. The playback
 //! callback drives the engine; captured frames reach it through a lock-free
@@ -27,10 +30,57 @@ use std::time::Duration;
 /// Seconds of capture the input ring holds.
 const INPUT_RING_SECONDS: f32 = 0.5;
 
-#[derive(Debug, Default)]
-pub struct CpalBackend;
+/// Which of cpal's audio APIs a backend uses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Api {
+    /// The platform's default (WASAPI, CoreAudio or ALSA).
+    #[default]
+    System,
+    /// Steinberg ASIO drivers.
+    #[cfg(all(windows, feature = "asio"))]
+    Asio,
+}
 
-/// The platform's API name.
+impl Api {
+    pub fn name(self) -> &'static str {
+        match self {
+            Api::System => api_name(),
+            #[cfg(all(windows, feature = "asio"))]
+            Api::Asio => "ASIO",
+        }
+    }
+
+    fn host(self) -> Result<cpal::Host, AudioError> {
+        match self {
+            Api::System => Ok(cpal::default_host()),
+            #[cfg(all(windows, feature = "asio"))]
+            Api::Asio => cpal::host_from_id(cpal::HostId::Asio)
+                .map_err(|e| AudioError::BackendUnavailable(e.to_string())),
+        }
+    }
+
+    /// Capture comes from the playback device itself (an ASIO driver is
+    /// one duplex device), not from the system's default input.
+    fn duplex(self) -> bool {
+        self != Api::System
+    }
+}
+
+/// This build can drive ASIO devices.
+pub const ASIO: bool = cfg!(all(windows, feature = "asio"));
+
+#[derive(Debug, Default)]
+pub struct CpalBackend {
+    api: Api,
+}
+
+impl CpalBackend {
+    pub fn new(api: Api) -> Self {
+        Self { api }
+    }
+}
+
+/// The platform's default API name.
 pub fn api_name() -> &'static str {
     if cfg!(windows) {
         "WASAPI"
@@ -69,19 +119,25 @@ fn rates(ranges: &[cpal::SupportedStreamConfigRange]) -> Vec<u32> {
 
 impl AudioBackend for CpalBackend {
     fn id(&self) -> &'static str {
-        "system"
+        match self.api {
+            Api::System => "system",
+            #[cfg(all(windows, feature = "asio"))]
+            Api::Asio => "asio",
+        }
     }
 
     fn display_name(&self) -> &'static str {
-        api_name()
+        self.api.name()
     }
 
     fn is_available(&self) -> bool {
-        cpal::default_host().default_output_device().is_some()
+        self.api
+            .host()
+            .is_ok_and(|h| h.default_output_device().is_some())
     }
 
     fn enumerate_devices(&self) -> Result<Vec<DeviceInfo>, AudioError> {
-        let host = cpal::default_host();
+        let host = self.api.host()?;
         let default = host.default_output_device().map(|d| device_id(&d));
         let devices = host
             .output_devices()
@@ -113,9 +169,10 @@ impl AudioBackend for CpalBackend {
     ) -> Result<Box<dyn AudioStream>, AudioError> {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let api = self.api;
         let thread = std::thread::Builder::new()
             .name("audio-control".into())
-            .spawn(move || match open(&config, callback) {
+            .spawn(move || match open(api, &config, callback) {
                 Ok((streams, info, monitor)) => {
                     let _ = ready_tx.send(Ok((info, monitor)));
                     // Keep the streams until asked to stop.
@@ -135,7 +192,7 @@ impl AudioBackend for CpalBackend {
             }
             Err(_) => return Err(AudioError::Stream("the device did not open in time".into())),
         };
-        tracing::info!("{} stream open: {info}", api_name());
+        tracing::info!("{} stream open: {info}", self.api.name());
         Ok(Box::new(CpalStream {
             thread: Some(thread),
             stop: stop_tx,
@@ -147,10 +204,11 @@ impl AudioBackend for CpalBackend {
 
 /// Open playback (and capture) on the calling thread.
 fn open(
+    api: Api,
     config: &StreamConfig,
     callback: Box<dyn AudioCallback>,
 ) -> Result<(Vec<cpal::Stream>, StreamInfo, Arc<StreamMonitor>), AudioError> {
-    let host = cpal::default_host();
+    let host = api.host()?;
     let device = match &config.device {
         Some(id) => host
             .output_devices()
@@ -205,12 +263,18 @@ fn open(
     };
     let monitor = StreamMonitor::new(wanted_rate, nominal);
 
-    // Capture: the default input device at the same rate, if any.
+    // Capture: the default input device (or the duplex device itself) at
+    // the same rate, if any.
     let mut streams = Vec::new();
     let mut input_channels = 0u16;
     let mut input_rx = None;
+    let input = if api.duplex() {
+        Some(device.clone())
+    } else {
+        host.default_input_device()
+    };
     if config.input_channels > 0
-        && let Some(input) = host.default_input_device()
+        && let Some(input) = input
         && let Ok(in_default) = input.default_input_config()
     {
         let in_config = cpal::StreamConfig {
@@ -227,12 +291,12 @@ fn open(
                 input_rx = Some(rx);
                 streams.push(s);
             }
-            Err(e) => tracing::warn!("{}: no capture ({e})", api_name()),
+            Err(e) => tracing::warn!("{}: no capture ({e})", api.name()),
         }
     }
 
     let info = StreamInfo {
-        backend: "system",
+        backend: if api.duplex() { "asio" } else { "system" },
         device: device_name(&device),
         sample_rate: wanted_rate,
         buffer_size: nominal,

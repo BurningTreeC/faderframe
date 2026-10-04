@@ -23,7 +23,7 @@ impl AudioCallback for Count {
 
 #[test]
 fn the_default_device_runs_and_closes() {
-    let mut backend = CpalBackend;
+    let mut backend = CpalBackend::default();
     if std::env::var_os("CI").is_some() || !backend.is_available() {
         eprintln!("no audio device: skipped");
         return;

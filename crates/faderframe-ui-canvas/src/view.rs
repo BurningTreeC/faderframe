@@ -133,6 +133,9 @@ pub trait CanvasView<M, A> {
     /// Handle an event; return `true` if it was consumed.
     fn event(&mut self, ev: &ViewEvent, size: Size, model: &M, cx: &mut EventCx<'_, A>) -> bool;
 
+    /// The skin changed (views that keep a copy of the theme replace it).
+    fn set_theme(&mut self, _theme: &Theme) {}
+
     /// Should the host keep redrawing every frame (meters, playhead)?
     fn wants_frames(&self, _model: &M) -> bool {
         false

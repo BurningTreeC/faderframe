@@ -456,6 +456,13 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
         heights.append(Some(name), Some(&format!("app.track-height-{i}")));
     }
     view.append_submenu(Some("Track Height (all tracks · Alt+wheel)"), &heights);
+    let themes = gio::Menu::new();
+    for t in faderframe_ui_canvas::Theme::all() {
+        let item = gio::MenuItem::new(Some(t.name), None);
+        item.set_action_and_target_value(Some("app.theme"), Some(&t.id.to_variant()));
+        themes.append_item(&item);
+    }
+    view.append_submenu(Some("Theme"), &themes);
     menu.append_submenu(Some("_View"), &view);
 
     let audio = gio::Menu::new();
@@ -578,7 +585,7 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
     let edit_bar = CanvasWidget::new(
         app,
         Box::new(faderframe_view_arranger::edit_bar::EditToolbarView::new(
-            app.theme.clone(),
+            app.theme.borrow().clone(),
         )),
     );
     edit_bar.set_size_request(-1, 36);
@@ -655,7 +662,7 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
         edit_button,
         edit_bar,
         edit_bar_layout: faderframe_view_arranger::edit_bar::EditToolbarView::new(
-            app.theme.clone(),
+            app.theme.borrow().clone(),
         ),
         notice,
         toast,

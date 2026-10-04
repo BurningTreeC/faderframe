@@ -33,6 +33,7 @@ faderframe-audio-files = { path = "crates/faderframe-audio-files" }
 faderframe-plugin-host = { path = "crates/faderframe-plugin-host" }
 faderframe-plugin-clap = { path = "crates/faderframe-plugin-clap" }
 faderframe-plugin-vst3 = { path = "crates/faderframe-plugin-vst3" }
+faderframe-plugin-au = { path = "crates/faderframe-plugin-au" }
 faderframe-engine = { path = "crates/faderframe-engine" }
 faderframe-session = { path = "crates/faderframe-session" }
 faderframe-ui-canvas = { path = "crates/faderframe-ui-canvas" }
@@ -48,6 +49,10 @@ faderframe-ui = { path = "crates/faderframe-ui" }
 gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
 x11rb = { version = "0.14", default-features = false, features = ["randr"] }
 glib-unix = "0.22"
+windows-sys = "0.61"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std"] }
 # Audio backends. `jack` loads libjack at runtime (dynamic_loading), so the
 # application still starts on machines without JACK/pipewire-jack.
 jack = "0.13"

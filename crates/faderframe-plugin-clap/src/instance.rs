@@ -11,11 +11,11 @@ use clack_host::events::event_types::ParamValueEvent;
 use clack_host::prelude::*;
 use faderframe_core::ParameterId;
 use faderframe_plugin_host::{
-    ParameterInfo, ParameterUnit, PluginDescriptor, PluginError, PluginFormat,
-    PluginInstance as FfInstance, PluginProcessor, ProcessConfig, TailLength,
+    ParameterInfo, ParameterUnit, ParentWindow, PluginDescriptor, PluginError, PluginFormat,
+    PluginInstance as FfInstance, PluginProcessor, ProcessConfig, TailLength, WindowApi,
 };
 use faderframe_realtime::TryCell;
-use std::ffi::CString;
+use std::ffi::{CString, c_void};
 use std::sync::Arc;
 
 pub struct ClapInstance {
@@ -418,41 +418,48 @@ impl Drop for ClapInstance {
     }
 }
 
-fn gui_config(floating: bool) -> GuiConfiguration<'static> {
+fn gui_config(api: WindowApi, floating: bool) -> GuiConfiguration<'static> {
     GuiConfiguration {
-        api_type: GuiApiType::X11,
+        api_type: match api {
+            WindowApi::X11 => GuiApiType::X11,
+            WindowApi::Win32 => GuiApiType::WIN32,
+            WindowApi::Cocoa => GuiApiType::COCOA,
+        },
         is_floating: floating,
     }
 }
 
 impl faderframe_plugin_host::PluginEditor for ClapInstance {
-    fn can_embed_x11(&mut self) -> bool {
+    fn can_embed(&mut self, api: WindowApi) -> bool {
         let Some(gui) = self.ext().gui else {
             return false;
         };
         let h = self.instance.plugin_handle();
-        gui.is_api_supported(&h, gui_config(false))
+        gui.is_api_supported(&h, gui_config(api, false))
     }
 
-    fn can_float(&mut self) -> bool {
+    fn can_float(&mut self, api: WindowApi) -> bool {
         let Some(gui) = self.ext().gui else {
             return false;
         };
         let h = self.instance.plugin_handle();
-        gui.is_api_supported(&h, gui_config(true))
+        gui.is_api_supported(&h, gui_config(api, true))
     }
 
-    fn open_embedded(&mut self) -> Result<(u32, u32), PluginError> {
+    fn open_embedded(&mut self, api: WindowApi, scale: f64) -> Result<(u32, u32), PluginError> {
         self.close();
         let gui = self
             .ext()
             .gui
             .ok_or_else(|| PluginError::Failed("no editor".into()))?;
         let h = self.instance.plugin_handle();
-        gui.create(&h, gui_config(false))
+        gui.create(&h, gui_config(api, false))
             .map_err(|e| PluginError::Failed(format!("editor: {e:?}")))?;
-        // X11: plugins take the scale from the system; this is a hint.
-        let _ = gui.set_scale(&h, 1.0);
+        // Cocoa sizes are in points (the system scales); X11 plugins take
+        // the scale from the system too, so it is only a hint there.
+        if api != WindowApi::Cocoa {
+            let _ = gui.set_scale(&h, scale);
+        }
         self.gui_open = true;
         let size = gui.get_size(&h).unwrap_or(GuiSize {
             width: 640,
@@ -461,17 +468,27 @@ impl faderframe_plugin_host::PluginEditor for ClapInstance {
         Ok((size.width.max(1), size.height.max(1)))
     }
 
-    fn attach_x11(&mut self, parent: u64) -> Result<(), PluginError> {
+    fn attach(&mut self, parent: ParentWindow) -> Result<(), PluginError> {
         let gui = self
             .ext()
             .gui
             .ok_or_else(|| PluginError::Failed("no editor".into()))?;
         let fail = |e: GuiError| PluginError::Failed(format!("editor: {e:?}"));
         let h = self.instance.plugin_handle();
+        let window = match parent.api {
+            WindowApi::X11 => Window::from_x11_handle(parent.handle as std::ffi::c_ulong),
+            // SAFETY: the handle is a live HWND / NSView of the host.
+            WindowApi::Win32 => unsafe {
+                Window::from_win32_hwnd(parent.handle as usize as *mut c_void)
+            },
+            // SAFETY: as above.
+            WindowApi::Cocoa => unsafe {
+                Window::from_cocoa_nsview(parent.handle as usize as *mut c_void)
+            },
+        };
         // SAFETY: the parent window outlives the editor: the host closes the
         // editor (destroy) before destroying its window.
-        let attached =
-            unsafe { gui.set_parent(&h, Window::from_x11_handle(parent as std::ffi::c_ulong)) };
+        let attached = unsafe { gui.set_parent(&h, window) };
         if let Err(e) = attached.and_then(|()| gui.show(&h)) {
             self.close();
             return Err(fail(e));
@@ -479,7 +496,7 @@ impl faderframe_plugin_host::PluginEditor for ClapInstance {
         Ok(())
     }
 
-    fn open_floating(&mut self, title: &str) -> Result<(), PluginError> {
+    fn open_floating(&mut self, api: WindowApi, title: &str) -> Result<(), PluginError> {
         self.close();
         let gui = self
             .ext()
@@ -487,7 +504,7 @@ impl faderframe_plugin_host::PluginEditor for ClapInstance {
             .ok_or_else(|| PluginError::Failed("no editor".into()))?;
         let fail = |e: GuiError| PluginError::Failed(format!("editor: {e:?}"));
         let h = self.instance.plugin_handle();
-        gui.create(&h, gui_config(true)).map_err(fail)?;
+        gui.create(&h, gui_config(api, true)).map_err(fail)?;
         if let Ok(t) = CString::new(title) {
             gui.suggest_title(&h, &t);
         }

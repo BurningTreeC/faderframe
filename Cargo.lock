@@ -59,6 +59,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 
 [[package]]
+name = "asio-sys"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "477f1cf5b65679fc2e5422af426f87becba79d1cfa2cd77eff3433e36c8021b9"
+dependencies = [
+ "bindgen",
+ "cc",
+ "num-derive",
+ "num-traits",
+ "walkdir",
+]
+
+[[package]]
 name = "audio-codec-algorithms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -114,6 +127,8 @@ dependencies = [
  "cexpr",
  "clang-sys",
  "itertools",
+ "log",
+ "prettyplease",
  "proc-macro2",
  "quote",
  "regex",
@@ -368,6 +383,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6f02e8d0327b42d3e2e4ab2119af397344eb9fc54a34bf0ddeaa1277af8681f1"
 dependencies = [
  "alsa",
+ "asio-sys",
  "block2",
  "coreaudio-rs",
  "dasp_sample",
@@ -595,6 +611,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "faderframe-plugin-au"
+version = "0.1.0"
+dependencies = [
+ "faderframe-audio-graph",
+ "faderframe-automation",
+ "faderframe-core",
+ "faderframe-midi",
+ "faderframe-plugin-host",
+ "faderframe-realtime",
+ "faderframe-transport",
+ "objc2",
+ "tracing",
+]
+
+[[package]]
 name = "faderframe-plugin-clap"
 version = "0.1.0"
 dependencies = [
@@ -736,6 +767,7 @@ dependencies = [
  "faderframe-automation",
  "faderframe-core",
  "faderframe-engine",
+ "faderframe-plugin-au",
  "faderframe-plugin-clap",
  "faderframe-plugin-host",
  "faderframe-plugin-vst3",
@@ -752,9 +784,13 @@ dependencies = [
  "faderframe-workspace",
  "glib-unix",
  "gtk4",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "serde",
  "serde_json",
  "tracing",
+ "windows-sys 0.61.2",
  "x11rb",
 ]
 
@@ -1641,6 +1677,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-app-kit"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d49e936b501e5c5bf01fda3a9452ff86dc3ea98ad5f283e1455153142d97518c"
+dependencies = [
+ "bitflags 2.13.2",
+ "objc2",
+ "objc2-foundation",
+]
+
+[[package]]
 name = "objc2-audio-toolbox"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1809,6 +1856,16 @@ name = "pkg-config"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
+
+[[package]]
+name = "prettyplease"
+version = "0.2.37"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
+dependencies = [
+ "proc-macro2",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "primal-check"

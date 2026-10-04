@@ -20,6 +20,14 @@ fn main() {
         .flag_if_supported("-ffp-contract=fast")
         .warnings(false)
         .compile("faderframe_stretch");
+    // The allocation counter replaces the global operator new in the test
+    // binaries. MinGW's linker resolves libraries before a raw object, so
+    // Windows tests go without it (they still run the stretcher).
+    println!("cargo::rustc-check-cfg=cfg(ff_cpp_count)");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        return;
+    }
+    println!("cargo::rustc-cfg=ff_cpp_count");
     let objects = cc::Build::new()
         .cpp(true)
         .std("c++17")

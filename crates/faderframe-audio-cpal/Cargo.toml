@@ -10,6 +10,12 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Steinberg ASIO on Windows. Opt-in: building it needs the ASIO SDK
+# (CPAL_ASIO_DIR, or downloaded by asio-sys) and LLVM/clang for bindgen, and
+# the SDK's licence (Steinberg's or GPLv3) then applies to the binary.
+asio = ["cpal/asio"]
+
 [dependencies]
 faderframe-audio.workspace = true
 cpal.workspace = true

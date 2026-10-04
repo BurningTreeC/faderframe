@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.BurningTreeC.FaderFrame</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>FaderFrame</name>
+  <summary>Record, edit, mix and master multitrack audio and MIDI</summary>
+  <developer id="io.github.burningtreec">
+    <name>BurningTreeC</name>
+  </developer>
+  <description>
+    <p>
+      FaderFrame is a digital audio workstation for recording, editing, mixing
+      and mastering. It routes audio through a realtime graph with buses, aux
+      sends, sidechains, groups and VCAs, processes it on all cores with
+      automatic plugin delay compensation, and hosts CLAP and VST3 plugins.
+    </p>
+    <ul>
+      <li>Arranger with Pro Tools style edit modes, take comping, warping and fades</li>
+      <li>Analogue console style mixer with inserts, sends and metering</li>
+      <li>Piano roll, MIDI recording, MPE, MIDI clock and MTC sync</li>
+      <li>Automation with Touch, Latch and Write modes</li>
+      <li>Mastering tools: EBU R128 loudness, true peak, phase and spectrum</li>
+      <li>Native PipeWire and JACK on Linux</li>
+      <li>Skins from dark studio consoles to a light theme</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.BurningTreeC.FaderFrame.desktop</launchable>
+  <url type="homepage">https://github.com/BurningTreeC/faderframe</url>
+  <url type="bugtracker">https://github.com/BurningTreeC/faderframe/issues</url>
+  <url type="vcs-browser">https://github.com/BurningTreeC/faderframe</url>
+  <screenshots>
+    <screenshot type="default">
+      <caption>The demo session playing in the Mixing workspace</caption>
+      <image>https://raw.githubusercontent.com/BurningTreeC/faderframe/main/docs/screenshots/mixing.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>The piano roll editing a MIDI clip</caption>
+      <image>https://raw.githubusercontent.com/BurningTreeC/faderframe/main/docs/screenshots/piano-roll.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Mastering with loudness, level, phase and spectrum tools</caption>
+      <image>https://raw.githubusercontent.com/BurningTreeC/faderframe/main/docs/screenshots/mastering.png</image>
+    </screenshot>
+  </screenshots>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+  </categories>
+  <keywords>
+    <keyword>DAW</keyword>
+    <keyword>recording</keyword>
+    <keyword>mixing</keyword>
+    <keyword>mastering</keyword>
+    <keyword>MIDI</keyword>
+  </keywords>
+  <provides>
+    <binary>faderframe</binary>
+    <mediatype>application/x-faderframe-project</mediatype>
+  </provides>
+  <requires>
+    <display_length compare="ge">1024</display_length>
+  </requires>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-10-04">
+      <description>
+        <p>First packaged release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

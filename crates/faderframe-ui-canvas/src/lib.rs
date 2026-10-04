@@ -25,6 +25,7 @@ mod paint;
 mod painter;
 mod text;
 mod theme;
+mod themes;
 mod view;
 
 pub use color::Color;
@@ -35,7 +36,7 @@ pub use paint::{Paint, Path, PathCmd};
 pub use painter::{DrawOp, Painter, RecordingPainter};
 pub use text::{Align, FontFamily, FontWeight, TextStyle};
 pub use theme::{
-    ArrangerTheme, ConsoleTheme, FaderStyle, KnobStyle, LedStyle, MeterStyle, PerformanceTheme,
-    PianoRollTheme, Theme, ToolsTheme, Typography, UiPalette,
+    ArrangerTheme, ConsoleLook, ConsoleTheme, FaderStyle, KnobStyle, LedStyle, MeterKind,
+    MeterStyle, PerformanceTheme, PianoRollTheme, Theme, ToolsTheme, Typography, UiPalette,
 };
 pub use view::{CanvasView, EventCx, HostRequest, MenuItem, ScrollAxis, ScrollInfo, TextCommit};

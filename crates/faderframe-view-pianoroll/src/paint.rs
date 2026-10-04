@@ -588,7 +588,7 @@ impl PianoRollView {
                 v.x,
                 v.right(),
                 area.bottom() - area.h * frac,
-                Color::rgba(1.0, 1.0, 1.0, 0.04),
+                self.theme.ui.text.with_alpha(0.05),
             );
         }
         p.push_clip(v);
@@ -667,7 +667,7 @@ impl PianoRollView {
                 area.x,
                 area.right(),
                 y_of(8192),
-                Color::rgba(1.0, 1.0, 1.0, 0.12),
+                self.theme.ui.text.with_alpha(0.14),
             );
         }
         let lane = m.lane(c, self.lane_channel);
@@ -786,7 +786,7 @@ impl PianoRollView {
                 area.x,
                 area.right(),
                 crate::expression_y(area, kind, 0.0),
-                Color::rgba(1.0, 1.0, 1.0, 0.14),
+                th.ui.text.with_alpha(0.16),
             );
         }
         let (a, b) = (self.time_at(area.x), self.time_at(area.right()));

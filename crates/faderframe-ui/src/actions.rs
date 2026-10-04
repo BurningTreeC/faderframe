@@ -908,6 +908,19 @@ pub fn install(app: &Rc<AppState>) {
         })
         .build();
     app.app.add_action_entries([open_recent]);
+    // View → Theme (radio items; also `theme:<id>` in start-up scripts).
+    let weak = Rc::downgrade(app);
+    let current = app.theme.borrow().id.to_string();
+    let theme = gio::ActionEntry::builder("theme")
+        .parameter_type(Some(&String::static_variant_type()))
+        .state(current.to_variant())
+        .activate(move |_, _, param| {
+            if let (Some(a), Some(id)) = (weak.upgrade(), param.and_then(|p| p.get::<String>())) {
+                a.set_theme(&id);
+            }
+        })
+        .build();
+    app.app.add_action_entries([theme]);
     app.app.add_action_entries([
         insert,
         midi,

@@ -1,0 +1,58 @@
+# Flatpak build of FaderFrame.
+#
+#   flatpak-builder --user --install --force-clean build-dir \
+#       packaging/flatpak/io.github.BurningTreeC.FaderFrame.yml
+#
+# Cargo fetches the crates during the build (network access in the build
+# sandbox). A Flathub submission would vendor them instead
+# (flatpak-cargo-generator) and drop `--share=network`.
+app-id: io.github.BurningTreeC.FaderFrame
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  - org.freedesktop.Sdk.Extension.llvm22
+command: faderframe
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # Audio: PipeWire natively, PulseAudio/ALSA through the system API.
+  - --socket=pulseaudio
+  - --filesystem=xdg-run/pipewire-0
+  # MIDI devices (ALSA sequencer) and audio interfaces.
+  - --device=all
+  # Projects, audio files and plugin folders (~/.clap, ~/.vst3).
+  - --filesystem=home
+  - --filesystem=/usr/lib/clap:ro
+  - --filesystem=/usr/lib/vst3:ro
+  # Realtime scheduling for the audio threads.
+  - --system-talk-name=org.freedesktop.RealtimeKit1
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm22/bin
+  prepend-ld-library-path: /usr/lib/sdk/llvm22/lib
+  env:
+    CARGO_HOME: /run/build/faderframe/cargo
+    CARGO_INCREMENTAL: '0'
+# The runtime's PipeWire provides libjack and jack.pc (jack-sys links it at
+# build time; FaderFrame loads it at run time), so JACK works too.
+modules:
+  - name: faderframe
+    buildsystem: simple
+    build-options:
+      build-args:
+        - --share=network
+    build-commands:
+      - cargo build --release --locked -p faderframe-app
+      - install -Dm755 target/release/faderframe /app/bin/faderframe
+      - packaging/linux/install.sh --data-only /app
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - target
+          - dist
+          - build-dir
+          - .flatpak-builder

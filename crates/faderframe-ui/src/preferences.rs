@@ -272,6 +272,24 @@ fn general_page(app: &Rc<AppState>) -> gtk::Widget {
     recent.append(&count);
     recent.append(&clear);
     row(&g, 2, "Recent projects", &recent);
+    let themes = faderframe_ui_canvas::Theme::all();
+    let names: Vec<&str> = themes.iter().map(|t| t.name).collect();
+    let theme = gtk::DropDown::from_strings(&names);
+    let current = app.theme.borrow().id;
+    theme.set_selected(themes.iter().position(|t| t.id == current).unwrap_or(0) as u32);
+    row(&g, 3, "Theme", &theme);
+    {
+        let weak = Rc::downgrade(app);
+        theme.connect_selected_notify(move |d| {
+            let themes = faderframe_ui_canvas::Theme::all();
+            let t = &themes[(d.selected() as usize).min(themes.len() - 1)];
+            if let Some(app) = weak.upgrade()
+                && app.theme.borrow().id != t.id
+            {
+                app.set_theme(t.id);
+            }
+        });
+    }
     startup.connect_selected_notify(|d| {
         let mut p = Preferences::load();
         let choice =

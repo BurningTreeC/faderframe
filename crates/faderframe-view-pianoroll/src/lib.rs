@@ -430,6 +430,10 @@ fn track_color(model: &Session, clip: &Clip) -> Color {
 }
 
 impl faderframe_ui_canvas::CanvasView<Session, faderframe_session::Action> for PianoRollView {
+    fn set_theme(&mut self, theme: &Theme) {
+        self.theme = theme.clone();
+    }
+
     fn paint(
         &mut self,
         p: &mut dyn faderframe_ui_canvas::Painter,

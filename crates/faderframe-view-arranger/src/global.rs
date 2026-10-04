@@ -217,9 +217,11 @@ impl ArrangerView {
         for (lane, y, h) in self.global_lanes() {
             let label = Rect::new(0.0, y, self.header_w(), h);
             let r = Rect::new(self.header_w(), y, size.w - self.header_w(), h);
-            p.fill(label, a.ruler_bg.darken(0.12));
+            // Recessed below the ruler (less so on light skins).
+            let depth = if th.dark { 1.0 } else { 0.3 };
+            p.fill(label, a.ruler_bg.darken(0.12 * depth));
             controls::engraved(p, lane.title(), label.inset_xy(10.0, 0.0), th, Align::Start);
-            p.fill(r, a.ruler_bg.darken(0.22));
+            p.fill(r, a.ruler_bg.darken(0.22 * depth));
             p.push_clip(r);
             match lane {
                 GlobalLane::Markers => self.paint_markers(p, r, model),

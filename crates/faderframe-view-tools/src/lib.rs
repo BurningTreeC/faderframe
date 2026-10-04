@@ -679,6 +679,10 @@ impl ToolsView {
 }
 
 impl CanvasView<Session, Action> for ToolsView {
+    fn set_theme(&mut self, theme: &Theme) {
+        self.theme = theme.clone();
+    }
+
     fn paint(&mut self, p: &mut dyn Painter, size: Size, model: &Session, theme: &Theme) {
         let l = self.layout(size);
         p.fill(Rect::from_size(size), theme.tools.background);

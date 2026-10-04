@@ -22,9 +22,9 @@ use crate::util::{parse_tuid, wstr};
 use faderframe_core::ParameterId;
 use faderframe_plugin_host::scan::ScannedPlugin;
 use faderframe_plugin_host::{
-    EditorRequests, ParameterInfo, ParameterUnit, PluginDescriptor, PluginEditor, PluginError,
-    PluginEventSources, PluginFd, PluginFormat, PluginInstance as FfInstance, PluginPoll,
-    PluginProcessor, ProcessConfig, TailLength,
+    EditorRequests, ParameterInfo, ParameterUnit, ParentWindow, PluginDescriptor, PluginEditor,
+    PluginError, PluginEventSources, PluginFd, PluginFormat, PluginInstance as FfInstance,
+    PluginPoll, PluginProcessor, ProcessConfig, TailLength, WindowApi,
 };
 use faderframe_realtime::TryCell;
 use std::collections::HashMap;
@@ -37,8 +37,9 @@ use vst3::Steinberg::Vst::{
     SpeakerArrangement, String128, UnitInfo, kNoParamId,
 };
 use vst3::Steinberg::{
-    IPlugFrame, IPlugView, IPlugViewTrait, IPluginBaseTrait, IPluginFactoryTrait, TUID, ViewRect,
-    kPlatformTypeX11EmbedWindowID, kResultOk, kResultTrue,
+    IPlugFrame, IPlugView, IPlugViewContentScaleSupport, IPlugViewContentScaleSupportTrait,
+    IPlugViewTrait, IPluginBaseTrait, IPluginFactoryTrait, TUID, ViewRect, kPlatformTypeHWND,
+    kPlatformTypeNSView, kPlatformTypeX11EmbedWindowID, kResultOk, kResultTrue,
 };
 use vst3::{ComPtr, ComWrapper, Interface};
 
@@ -731,19 +732,28 @@ impl Drop for Vst3Instance {
     }
 }
 
+/// The VST3 platform type of a window system.
+fn platform_type(api: WindowApi) -> vst3::Steinberg::FIDString {
+    match api {
+        WindowApi::X11 => kPlatformTypeX11EmbedWindowID,
+        WindowApi::Win32 => kPlatformTypeHWND,
+        WindowApi::Cocoa => kPlatformTypeNSView,
+    }
+}
+
 impl PluginEditor for Vst3Instance {
-    fn can_embed_x11(&mut self) -> bool {
+    fn can_embed(&mut self, api: WindowApi) -> bool {
         self.ensure_view().is_some_and(|v| {
             // SAFETY: plain query.
-            unsafe { v.isPlatformTypeSupported(kPlatformTypeX11EmbedWindowID) == kResultTrue }
+            unsafe { v.isPlatformTypeSupported(platform_type(api)) == kResultTrue }
         })
     }
 
-    fn can_float(&mut self) -> bool {
+    fn can_float(&mut self, _api: WindowApi) -> bool {
         false
     }
 
-    fn open_embedded(&mut self) -> Result<(u32, u32), PluginError> {
+    fn open_embedded(&mut self, _api: WindowApi, scale: f64) -> Result<(u32, u32), PluginError> {
         if self.view_open {
             self.close();
         }
@@ -761,6 +771,13 @@ impl PluginEditor for Vst3Instance {
             if let Some(frame) = self.host.as_com_ref::<IPlugFrame>() {
                 view.setFrame(frame.as_ptr());
             }
+            // Windows editors scale themselves when told (optional
+            // interface; macOS and X11 take it from the system).
+            if cfg!(windows)
+                && let Some(s) = view.cast::<IPlugViewContentScaleSupport>()
+            {
+                s.setContentScaleFactor(scale as f32);
+            }
             view.getSize(&mut rect);
         }
         Ok((
@@ -769,7 +786,7 @@ impl PluginEditor for Vst3Instance {
         ))
     }
 
-    fn attach_x11(&mut self, parent: u64) -> Result<(), PluginError> {
+    fn attach(&mut self, parent: ParentWindow) -> Result<(), PluginError> {
         let view = self
             .view
             .clone()
@@ -778,8 +795,8 @@ impl PluginEditor for Vst3Instance {
         // `removed` (close) before destroying its window.
         let r = unsafe {
             view.attached(
-                parent as usize as *mut c_void,
-                kPlatformTypeX11EmbedWindowID,
+                parent.handle as usize as *mut c_void,
+                platform_type(parent.api),
             )
         };
         if r != kResultOk {
@@ -790,7 +807,7 @@ impl PluginEditor for Vst3Instance {
         Ok(())
     }
 
-    fn open_floating(&mut self, _title: &str) -> Result<(), PluginError> {
+    fn open_floating(&mut self, _api: WindowApi, _title: &str) -> Result<(), PluginError> {
         Err(PluginError::Failed("VST3 editors are embedded only".into()))
     }
 

@@ -374,9 +374,9 @@ mod tests {
                 .push(MidiOutputEvent::new(port, due, &[0x90, key, 100]).unwrap())
                 .unwrap();
         }
-        std::thread::sleep(Duration::from_millis(5));
-        assert!(captured.lock().unwrap().is_empty(), "not yet due");
-        std::thread::sleep(Duration::from_millis(60));
+        // (Whether anything went out early is judged from the send times
+        // below: sleeping can overshoot on some systems.)
+        std::thread::sleep(Duration::from_millis(65));
         let got = captured.lock().unwrap().clone();
         let keys: Vec<u8> = got.iter().map(|(_, b)| b[1]).collect();
         assert_eq!(keys, vec![60, 62, 64]);

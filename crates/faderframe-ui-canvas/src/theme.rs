@@ -1,10 +1,10 @@
 //! Visual themes ("skins").
 //!
 //! All colours, sizes and typographic choices of the custom surfaces live
-//! here instead of being scattered through the views, so alternative skins
-//! (classic British/American console feel, light studio …) can be added by
-//! constructing a different [`Theme`]. The default is an original design
-//! inspired by general analogue-console principles — no brand is imitated.
+//! here instead of being scattered through the views; [`ConsoleLook`] also
+//! decides how console controls are drawn (knob skirts, brushed panels,
+//! wooden cheeks, VU needles, flat controls). [`Theme::all`] lists the
+//! built-in skins; each is an original design — no brand is imitated.
 
 use crate::Color;
 
@@ -30,6 +30,10 @@ pub struct UiPalette {
     pub accent: Color,
     /// Selection highlight.
     pub selection: Color,
+    /// LCD-style displays (transport counter, edit counters).
+    pub lcd_bg: Color,
+    pub lcd_text: Color,
+    pub lcd_dim: Color,
 }
 
 #[derive(Clone, Debug)]
@@ -70,6 +74,58 @@ pub struct MeterStyle {
     pub clip: Color,
     pub segment: f32,
     pub gap: f32,
+    /// Edgewise VU meters: the backlit scale and the needle.
+    pub vu_face: Color,
+    pub vu_needle: Color,
+}
+
+/// How meters are drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeterKind {
+    /// Segmented LED ladder.
+    Ladder,
+    /// Continuous bar.
+    Bar,
+    /// Edgewise moving-coil VU meter (0 VU = −18 dBFS).
+    Edgewise,
+}
+
+/// How console controls are drawn beyond their colours.
+#[derive(Clone, Debug)]
+pub struct ConsoleLook {
+    /// Knobs sit on a skirt of this colour with a printed scale.
+    pub knob_skirt: Option<Color>,
+    /// Knobs show their value as an illuminated ring.
+    pub knob_ring: bool,
+    /// Strength of the panels' sheen bands (0: none).
+    pub sheen: f32,
+    /// Strength of brushed-metal grain on panels (0: none).
+    pub brushed: f32,
+    /// Panel screws (on the mixer's cheeks and the master section).
+    pub screws: bool,
+    /// Wooden end cheeks around the mixer (light, dark).
+    pub wood: Option<(Color, Color)>,
+    pub meter: MeterKind,
+    /// The shadow under engraved legends (transparent: none).
+    pub engrave: Color,
+    /// Flat controls: no bevels or gradients.
+    pub flat: bool,
+}
+
+impl Default for ConsoleLook {
+    fn default() -> Self {
+        Self {
+            knob_skirt: None,
+            knob_ring: true,
+            sheen: 1.0,
+            brushed: 0.0,
+            screws: false,
+            wood: None,
+            meter: MeterKind::Ladder,
+            engrave: Color::rgba(0.0, 0.0, 0.0, 0.55),
+            flat: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -115,6 +171,7 @@ pub struct ConsoleTheme {
     pub scribble_bg: Color,
     pub scribble_text: Color,
     pub selected_glow: Color,
+    pub look: ConsoleLook,
 }
 
 #[derive(Clone, Debug)]
@@ -247,7 +304,11 @@ pub struct PianoRollTheme {
 
 #[derive(Clone, Debug)]
 pub struct Theme {
+    /// Stable identifier (saved in the preferences).
+    pub id: &'static str,
     pub name: &'static str,
+    /// Dark surfaces (GTK uses its dark variant).
+    pub dark: bool,
     pub fonts: Typography,
     pub ui: UiPalette,
     pub console: ConsoleTheme,
@@ -268,7 +329,9 @@ impl Theme {
     pub fn studio() -> Self {
         let accent = Color::hex(0xff6a3d);
         Self {
+            id: "studio",
             name: "Studio",
+            dark: true,
             fonts: Typography {
                 tiny: 8.5,
                 small: 10.0,
@@ -286,6 +349,9 @@ impl Theme {
                 text_faint: Color::hex(0x5f6266),
                 accent,
                 selection: Color::hex(0x6fc3ff),
+                lcd_bg: Color::hex(0x0d100e),
+                lcd_text: Color::hex(0xf0c46a),
+                lcd_dim: Color::hex(0x6f5a33),
             },
             console: ConsoleTheme {
                 strip_width: 92.0,
@@ -341,6 +407,8 @@ impl Theme {
                     clip: Color::hex(0xff2a2a),
                     segment: 2.0,
                     gap: 1.0,
+                    vu_face: Color::hex(0xf3dfa8),
+                    vu_needle: Color::hex(0x1a1410),
                 },
                 led: LedStyle {
                     mute: Color::hex(0xf2b134),
@@ -356,6 +424,7 @@ impl Theme {
                 scribble_bg: Color::hex(0xe9e3d1),
                 scribble_text: Color::hex(0x1f1d19),
                 selected_glow: Color::hex(0x6fc3ff).with_alpha(0.55),
+                look: ConsoleLook::default(),
             },
             arranger: ArrangerTheme {
                 background: Color::hex(0x191a1d),

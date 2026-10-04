@@ -801,7 +801,9 @@ fn hosts_an_installed_plugin() {
         eprintln!("  state {} bytes", state.len());
         inst.load_state(&state).unwrap();
         rig.run(proc.as_mut(), &[]);
-        let editor = inst.editor().map(|e| e.can_embed_x11());
+        let editor = inst
+            .editor()
+            .map(|e| e.can_embed(faderframe_plugin_host::WindowApi::X11));
         eprintln!("  editor: {editor:?}");
     }
 }

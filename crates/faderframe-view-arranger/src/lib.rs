@@ -1197,7 +1197,7 @@ impl ArrangerView {
             l.row.x,
             l.row.right(),
             l.row.y,
-            Color::rgba(1.0, 1.0, 1.0, 0.04),
+            self.theme.ui.text.with_alpha(0.05),
         );
 
         p.text(
@@ -2453,6 +2453,10 @@ impl ArrangerView {
 }
 
 impl CanvasView<Session, Action> for ArrangerView {
+    fn set_theme(&mut self, theme: &Theme) {
+        self.theme = theme.clone();
+    }
+
     fn paint(&mut self, p: &mut dyn Painter, size: Size, model: &Session, theme: &Theme) {
         self.update_header_width(model);
         self.update_rows(model);

@@ -29,6 +29,13 @@ phase and spectrum):
 
 ![Mastering workspace with loudness, level, phase and spectrum meters](docs/screenshots/mastering.png)
 
+Seven skins, switched live (View → Theme or Preferences → General → Theme):
+Studio, Vintage Console (walnut cheeks, enamel panels, skirted knobs,
+edgewise VU meters), Daylight (light), Midnight, Frost, Neon and High
+Contrast:
+
+![The seven skins](docs/screenshots/themes.png)
+
 ## What works today
 
 * GTK 4 application, native on Wayland, HiDPI/fractional scaling via GTK.
@@ -122,10 +129,12 @@ phase and spectrum):
   built-in synth, echo, compressor, gain and latency-probe plugins,
   realtime-safe (verified by an allocation-counting test).
 * Audio: native PipeWire (one node with a port per channel, linked to your
-  default devices), JACK (JACK2 or PipeWire-JACK), ALSA, WASAPI (Windows),
-  CoreAudio (macOS) and a silent dummy device; *Automatic* picks PipeWire,
-  then JACK, then ALSA on Linux. All common sample rates (44.1 – 192 kHz)
-  and buffer sizes (16 – 8192 frames).
+  default devices), JACK (JACK2 or PipeWire-JACK), ALSA, WASAPI and ASIO
+  (Windows; ASIO in builds with the `asio` feature, see below), CoreAudio
+  (macOS) and a silent dummy device; *Automatic* picks PipeWire, then JACK,
+  then ALSA on Linux, and ASIO before WASAPI where it is built in. All
+  common sample rates (44.1 – 192 kHz) and buffer sizes (16 – 8192
+  frames).
 * Audio import: WAV, AIFF, CAF, FLAC, MP3, Ogg Vorbis, AAC/M4A, ALAC — via
   File → Import Audio (Ctrl+I) or drag & drop onto the arranger. Files are
   converted to the project rate once and streamed from disk during playback
@@ -153,8 +162,10 @@ phase and spectrum):
   all cores (critical path first, realtime priority, flush-to-zero), with
   output bit-identical to single-threaded processing; Preferences → Audio
   → Processing threads.
-* Plugins: built-in synth/echo/compressor/gain and CLAP and VST3 effects and
-  instruments, found by a crash-safe background scan and picked in a plugin browser (click an
+* Plugins: built-in synth/echo/compressor/gain, CLAP and VST3 effects and
+  instruments on every platform and Audio Units on macOS, found by a
+  crash-safe background scan (Audio Units: the system's registry) and
+  picked in a plugin browser (click an
   empty insert slot or Track → Plugin Browser…). New instrument tracks
   start empty and open the browser to choose their instrument (an
   instrument picked for an empty instrument track's insert slot becomes
@@ -224,9 +235,16 @@ build time):
 `pacman -S mingw-w64-ucrt-x86_64-gtk4 mingw-w64-ucrt-x86_64-pkgconf
 mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-rust`.
 
-On Windows and macOS, plugins open in FaderFrame's parameter window for
-now (their own GUIs embed on Linux only), and the audio API is WASAPI or
-CoreAudio (no ASIO yet). CI builds and tests all three platforms.
+Plugin GUIs embed natively everywhere: X11 windows on Linux (through
+XWayland), Win32 windows on Windows, Cocoa views on macOS. CI builds and
+tests all three platforms.
+
+**ASIO** (Windows) is opt-in: `cargo build --release --features
+faderframe-app/asio` compiles Steinberg's ASIO SDK (downloaded by `asio-sys`,
+or taken from `CPAL_ASIO_DIR`; bindgen needs LLVM — CI checks the backend
+with the MSVC toolchain). The SDK's licence — Steinberg's proprietary one
+or GPLv3 — then applies to that binary, which is why the default builds
+leave it out.
 
 ```bash
 cargo build --release
@@ -236,7 +254,7 @@ cargo run --release -p faderframe-app -- --demo   # starts with the demo session
 The binary is `target/release/faderframe`:
 
 ```text
-faderframe [--backend auto|pipewire|jack|system|dummy] [--sample-rate HZ]
+faderframe [--backend auto|pipewire|jack|system|asio|dummy] [--sample-rate HZ]
            [--buffer-size FRAMES] [--threads N] [--empty | --demo]
            [--import FILE]... [PROJECT.ffproj]
 ```
@@ -246,6 +264,21 @@ Preferences → General → On start-up says (the last project by default).
 `system` is ALSA, WASAPI or CoreAudio. JACK clients connect to the PipeWire
 graph directly when `pipewire-jack` is installed; the native PipeWire
 backend needs no JACK at all.
+
+### Packages
+
+`packaging/` builds installable packages; the *Release* workflow builds all
+of them for a `v*` tag and attaches them to the GitHub release.
+
+| Platform | Package | How |
+|---|---|---|
+| Linux | Flatpak (GNOME 51 runtime) | `flatpak-builder --user --install build-dir packaging/flatpak/io.github.BurningTreeC.FaderFrame.yml` |
+| Linux | system install (binary, desktop entry, AppStream, MIME type, icon) | `cargo build --release && sudo packaging/linux/install.sh /usr/local` |
+| macOS | `FaderFrame.app` in a DMG (GTK bundled, ad-hoc signed) | `brew install gtk4 adwaita-icon-theme librsvg dylibbundler pkgconf && packaging/macos/bundle.sh` |
+| Windows | installer (Inno Setup) and portable zip | in MSYS2 UCRT64: `packaging/windows/bundle.sh` |
+
+The macOS app is not notarised: open it the first time with right-click →
+Open.
 
 ### Shortcuts
 

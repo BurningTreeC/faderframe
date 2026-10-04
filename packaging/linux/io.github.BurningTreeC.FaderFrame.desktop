@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=FaderFrame
+GenericName=Digital Audio Workstation
+Comment=Record, edit, mix and master multitrack audio and MIDI
+Exec=faderframe %f
+Icon=io.github.BurningTreeC.FaderFrame
+Terminal=false
+Categories=AudioVideo;Audio;Midi;Mixer;Recorder;Sequencer;
+Keywords=DAW;audio;recording;mixing;mastering;MIDI;CLAP;VST3;multitrack;
+MimeType=application/x-faderframe-project;
+StartupNotify=true
+StartupWMClass=io.github.BurningTreeC.FaderFrame

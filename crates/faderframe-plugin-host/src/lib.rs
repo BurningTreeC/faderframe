@@ -206,20 +206,52 @@ pub struct EditorRequests {
     pub closed: bool,
 }
 
+/// The windowing system an editor runs in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WindowApi {
+    /// X11 (Linux/BSD; through XWayland on Wayland desktops).
+    X11,
+    /// Win32 `HWND`s.
+    Win32,
+    /// Cocoa `NSView`s (macOS).
+    Cocoa,
+}
+
+impl WindowApi {
+    /// The one this platform's editors use.
+    pub const NATIVE: WindowApi = if cfg!(windows) {
+        WindowApi::Win32
+    } else if cfg!(target_os = "macos") {
+        WindowApi::Cocoa
+    } else {
+        WindowApi::X11
+    };
+}
+
+/// A host window an editor embeds into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParentWindow {
+    pub api: WindowApi,
+    /// The X11 window id, the `HWND` or the `NSView` pointer.
+    pub handle: u64,
+}
+
 /// A plugin's own editor GUI (control/UI thread).
 pub trait PluginEditor {
-    /// Can embed into an X11 window (Linux/BSD).
-    fn can_embed_x11(&mut self) -> bool;
-    /// Can open its own top-level window.
-    fn can_float(&mut self) -> bool;
-    /// Create the embedded (X11) editor; returns its size in pixels. The
-    /// host then creates a parent window of that size and calls
-    /// [`attach_x11`](Self::attach_x11).
-    fn open_embedded(&mut self) -> Result<(u32, u32), PluginError>;
-    /// Put the created editor into X11 window `parent` and show it.
-    fn attach_x11(&mut self, parent: u64) -> Result<(), PluginError>;
+    /// Can embed into a host window of `api`.
+    fn can_embed(&mut self, api: WindowApi) -> bool;
+    /// Can open its own top-level window of `api`.
+    fn can_float(&mut self, api: WindowApi) -> bool;
+    /// Create the embedded editor; returns its size in pixels (points on
+    /// macOS). `scale` is the display's scale factor (Windows editors draw
+    /// at it; X11 and Cocoa editors take it from the system). The host then
+    /// creates a parent window of that size and calls
+    /// [`attach`](Self::attach).
+    fn open_embedded(&mut self, api: WindowApi, scale: f64) -> Result<(u32, u32), PluginError>;
+    /// Put the created editor into `parent` and show it.
+    fn attach(&mut self, parent: ParentWindow) -> Result<(), PluginError>;
     /// Open as the plugin's own window.
-    fn open_floating(&mut self, title: &str) -> Result<(), PluginError>;
+    fn open_floating(&mut self, api: WindowApi, title: &str) -> Result<(), PluginError>;
     fn close(&mut self);
     fn is_open(&self) -> bool;
     fn can_resize(&mut self) -> bool;

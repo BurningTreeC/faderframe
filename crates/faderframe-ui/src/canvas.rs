@@ -68,7 +68,7 @@ mod imp {
             let w: &gtk::Widget = widget.upcast_ref();
             let mut painter = SnapshotPainter::new(snapshot, w, &self.text_cache);
             if let Some(view) = self.view.borrow_mut().as_mut() {
-                view.paint(&mut painter, size, &session, &app.theme);
+                view.paint(&mut painter, size, &session, &app.theme.borrow());
             }
             snapshot.pop();
         }
@@ -159,6 +159,15 @@ fn cursor_name(c: Cursor) -> &'static str {
 }
 
 impl CanvasWidget {
+    /// The skin changed: the view takes the new theme and repaints.
+    pub fn set_theme(&self, theme: &faderframe_ui_canvas::Theme) {
+        if let Some(view) = self.imp().view.borrow_mut().as_mut() {
+            view.set_theme(theme);
+        }
+        self.queue_resize();
+        self.queue_draw();
+    }
+
     pub fn new(app: &Rc<AppState>, view: DynView) -> Self {
         let w: Self = glib::Object::new();
         let imp = w.imp();
@@ -196,7 +205,7 @@ impl CanvasWidget {
         {
             let mut painter = SnapshotPainter::new(&snapshot, w, &imp.text_cache);
             if let Some(view) = imp.view.borrow_mut().as_mut() {
-                view.paint(&mut painter, size, &session, &app.theme);
+                view.paint(&mut painter, size, &session, &app.theme.borrow());
             }
         }
         snapshot.pop();

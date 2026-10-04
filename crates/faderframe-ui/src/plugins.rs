@@ -1,5 +1,6 @@
 //! Plugin formats available to the application: CLAP and VST3 (scanned in
-//! helper processes, cached) next to the built-ins.
+//! helper processes, cached) next to the built-ins, and Audio Units on
+//! macOS (listed from the system's component registry).
 
 use faderframe_plugin_host::scan::{ScanCache, ScannedPlugin};
 use faderframe_project::PluginFormat;
@@ -21,6 +22,8 @@ pub fn install() {
         let mut r = faderframe_plugin_host::PluginRegistry::with_builtins();
         r.add_factory(Box::new(faderframe_plugin_clap::ClapFactory::new()));
         r.add_factory(Box::new(faderframe_plugin_vst3::Vst3Factory::new()));
+        #[cfg(target_os = "macos")]
+        r.add_factory(Box::new(faderframe_plugin_au::AuFactory::new()));
         r
     });
     let clap = ScanCache::load(&cache_path(CLAP_CACHE));
@@ -31,8 +34,11 @@ pub fn install() {
 
 /// Changes whenever a catalog changes (views refresh on change).
 pub fn catalog_generation() -> u64 {
-    faderframe_plugin_clap::catalog_generation()
-        .wrapping_add(faderframe_plugin_vst3::catalog_generation() << 32)
+    let g = faderframe_plugin_clap::catalog_generation()
+        .wrapping_add(faderframe_plugin_vst3::catalog_generation() << 32);
+    #[cfg(target_os = "macos")]
+    let g = g.wrapping_add(faderframe_plugin_au::catalog_generation() << 48);
+    g
 }
 
 /// What the scan found about a CLAP or VST3 plugin.
@@ -40,6 +46,8 @@ pub fn scanned(format: PluginFormat, id: &str) -> Option<ScannedPlugin> {
     let catalog = match format {
         PluginFormat::Clap => faderframe_plugin_clap::catalog(),
         PluginFormat::Vst3 => faderframe_plugin_vst3::catalog(),
+        #[cfg(target_os = "macos")]
+        PluginFormat::AudioUnit => faderframe_plugin_au::catalog(),
         _ => return None,
     };
     catalog.into_iter().find(|p| p.id == id)

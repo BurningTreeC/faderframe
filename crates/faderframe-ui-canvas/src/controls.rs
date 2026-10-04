@@ -7,7 +7,8 @@
 //! device-pixel ratio.
 
 use crate::{
-    Align, Color, FontFamily, FontWeight, Paint, Painter, Path, Point, Rect, TextStyle, Theme,
+    Align, Color, FontFamily, FontWeight, MeterKind, Paint, Painter, Path, Point, Rect, TextStyle,
+    Theme,
 };
 use std::f32::consts::PI;
 
@@ -25,9 +26,25 @@ pub fn knob_angle(value: f32) -> f32 {
     KNOB_START + KNOB_SWEEP * value.clamp(0.0, 1.0)
 }
 
+/// A stable pseudo-random value in 0..1 for `i` (panel grain, wood).
+fn grain(i: u32) -> f32 {
+    let mut x = i.wrapping_mul(0x9e37_79b9) ^ 0x85eb_ca6b;
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x2c1b_3c6d);
+    x ^= x >> 12;
+    (x & 0xffff) as f32 / 65535.0
+}
+
 /// Brushed-panel background with bevelled edges.
 pub fn panel(p: &mut dyn Painter, rect: Rect, top: Color, bottom: Color, theme: &Theme) {
     let c = &theme.console;
+    let look = &c.look;
+    if look.flat {
+        p.fill(rect, top.mix(bottom, 0.5));
+        p.vline(rect.x, rect.y, rect.bottom(), c.panel_edge_light);
+        p.vline(rect.right() - 1.0, rect.y, rect.bottom(), c.panel_edge_dark);
+        return;
+    }
     p.fill_rect(
         rect,
         &Paint::vertical_stops(
@@ -41,12 +58,31 @@ pub fn panel(p: &mut dyn Painter, rect: Rect, top: Color, bottom: Color, theme: 
         ),
     );
     // A few soft horizontal sheen bands suggest brushed metal.
-    for (i, a) in [(0.18f32, 0.025f32), (0.42, 0.018), (0.71, 0.022)] {
-        let y = rect.y + rect.h * i;
-        p.fill(
-            Rect::new(rect.x, y, rect.w, rect.h * 0.06),
-            Color::rgba(1.0, 1.0, 1.0, a),
-        );
+    if look.sheen > 0.0 {
+        for (i, a) in [(0.18f32, 0.025f32), (0.42, 0.018), (0.71, 0.022)] {
+            let y = rect.y + rect.h * i;
+            p.fill(
+                Rect::new(rect.x, y, rect.w, rect.h * 0.06),
+                Color::rgba(1.0, 1.0, 1.0, a * look.sheen),
+            );
+        }
+    }
+    // Brushed grain: fine horizontal hairlines.
+    if look.brushed > 0.0 {
+        let seed = (rect.x.to_bits() >> 8) ^ (rect.w as u32) << 3;
+        let mut y = rect.y + 1.0;
+        let mut i = 0u32;
+        while y < rect.bottom() {
+            let g = grain(seed.wrapping_add(i));
+            let color = if g > 0.5 {
+                Color::rgba(1.0, 1.0, 1.0, look.brushed * 0.05 * (g - 0.5) * 2.0)
+            } else {
+                Color::rgba(0.0, 0.0, 0.0, look.brushed * 0.08 * (0.5 - g) * 2.0)
+            };
+            p.hline(rect.x + 1.0, rect.right() - 1.0, y, color);
+            y += 2.0 + grain(seed ^ i.wrapping_mul(7)) * 2.0;
+            i += 1;
+        }
     }
     p.vline(rect.x, rect.y, rect.bottom(), c.panel_edge_light);
     p.vline(
@@ -71,11 +107,10 @@ pub fn engraved(p: &mut dyn Painter, text: &str, rect: Rect, theme: &Theme, alig
         .weight(FontWeight::Bold)
         .align(align)
         .tracking(0.6);
-    p.text(
-        text,
-        rect.translate(0.0, 1.0),
-        &style.color(Color::rgba(0.0, 0.0, 0.0, 0.55)),
-    );
+    let shadow = theme.console.look.engrave;
+    if shadow.a > 0.0 {
+        p.text(text, rect.translate(0.0, 1.0), &style.color(shadow));
+    }
     p.text(text, rect, &style);
 }
 
@@ -116,7 +151,9 @@ pub struct KnobLook {
     pub ring: Color,
 }
 
-/// A rotary control with an LED-ring style value arc.
+/// A rotary control: an illuminated value ring around a knob, a vintage
+/// knob on a skirt with a printed scale, or a flat disc — as the theme's
+/// [`crate::ConsoleLook`] says.
 pub fn knob(
     p: &mut dyn Painter,
     rect: Rect,
@@ -126,58 +163,140 @@ pub fn knob(
     theme: &Theme,
 ) {
     let k = &theme.console.knob;
+    let style = &theme.console.look;
     let c = rect.center();
     let r = rect.w.min(rect.h) * 0.5;
     if r < 4.0 {
         return;
     }
+    if let Some(skirt) = style.knob_skirt {
+        skirted_knob(p, c, r, value, look.cap, skirt, theme);
+        return;
+    }
     let ring_r = r - 1.6;
-    let mut track = Path::new();
-    track.arc(c, ring_r, KNOB_START, KNOB_START + KNOB_SWEEP, false);
-    p.stroke_path(&track, 2.4, k.ring_track);
-    let (a0, a1) = if bipolar {
-        let mid = KNOB_START + KNOB_SWEEP * 0.5;
-        let a = knob_angle(value);
-        (mid.min(a), mid.max(a))
-    } else {
-        (KNOB_START, knob_angle(value))
-    };
-    if a1 - a0 > 0.01 {
-        let mut arc = Path::new();
-        arc.arc(c, ring_r, a0, a1, false);
-        p.stroke_path(&arc, 2.4, look.ring);
+    if style.knob_ring {
+        let mut track = Path::new();
+        track.arc(c, ring_r, KNOB_START, KNOB_START + KNOB_SWEEP, false);
+        p.stroke_path(&track, 2.4, k.ring_track);
+        let (a0, a1) = if bipolar {
+            let mid = KNOB_START + KNOB_SWEEP * 0.5;
+            let a = knob_angle(value);
+            (mid.min(a), mid.max(a))
+        } else {
+            (KNOB_START, knob_angle(value))
+        };
+        if a1 - a0 > 0.01 {
+            let mut arc = Path::new();
+            arc.arc(c, ring_r, a0, a1, false);
+            p.stroke_path(&arc, 2.4, look.ring);
+        }
     }
 
     let body_r = r - 4.6;
     let body = Rect::new(c.x - body_r, c.y - body_r, body_r * 2.0, body_r * 2.0);
-    p.shadow(body, body_r, k.shadow, 0.0, 1.6, 3.5);
-    p.fill_rounded(
-        body,
-        body_r,
-        &Paint::Radial {
-            center: Point::new(c.x - body_r * 0.35, c.y - body_r * 0.45),
-            radius: body_r * 1.6,
-            stops: vec![(0.0, k.body_light), (1.0, k.body_dark)],
-        },
-    );
     let cap_r = body_r * 0.74;
     let cap = Rect::new(c.x - cap_r, c.y - cap_r, cap_r * 2.0, cap_r * 2.0);
-    p.fill_rounded(
-        cap,
-        cap_r,
-        &Paint::vertical(
+    if style.flat {
+        p.fill_rounded(body, body_r, &Paint::Solid(k.body_light));
+        p.fill_rounded(cap, cap_r, &Paint::Solid(k.cap_top.mix(look.cap, 0.5)));
+    } else {
+        p.shadow(body, body_r, k.shadow, 0.0, 1.6, 3.5);
+        p.fill_rounded(
+            body,
+            body_r,
+            &Paint::Radial {
+                center: Point::new(c.x - body_r * 0.35, c.y - body_r * 0.45),
+                radius: body_r * 1.6,
+                stops: vec![(0.0, k.body_light), (1.0, k.body_dark)],
+            },
+        );
+        p.fill_rounded(
             cap,
-            k.cap_top.mix(look.cap, 0.55).lighten(0.08),
-            k.cap_bottom.mix(look.cap, 0.35),
-        ),
-    );
-    p.stroke_rounded(cap, cap_r, 0.8, Color::rgba(0.0, 0.0, 0.0, 0.45));
+            cap_r,
+            &Paint::vertical(
+                cap,
+                k.cap_top.mix(look.cap, 0.55).lighten(0.08),
+                k.cap_bottom.mix(look.cap, 0.35),
+            ),
+        );
+        p.stroke_rounded(cap, cap_r, 0.8, Color::rgba(0.0, 0.0, 0.0, 0.45));
+    }
     let a = knob_angle(value);
     let (s, co) = (a.sin(), a.cos());
     p.line(
         Point::new(c.x + co * cap_r * 0.2, c.y + s * cap_r * 0.2),
         Point::new(c.x + co * (body_r - 1.2), c.y + s * (body_r - 1.2)),
         2.0,
+        k.pointer,
+    );
+}
+
+/// A vintage knob: a coloured cap with a pointer line on a dark skirt
+/// printed with eleven scale marks.
+fn skirted_knob(
+    p: &mut dyn Painter,
+    c: Point,
+    r: f32,
+    value: f32,
+    cap_color: Color,
+    skirt: Color,
+    theme: &Theme,
+) {
+    let k = &theme.console.knob;
+    let label = theme.console.panel_label;
+    // The scale printed around the skirt.
+    for i in 0..=10 {
+        let a = KNOB_START + KNOB_SWEEP * i as f32 / 10.0;
+        let (s, co) = (a.sin(), a.cos());
+        let inner = if i % 5 == 0 { r - 3.6 } else { r - 2.4 };
+        p.line(
+            Point::new(c.x + co * inner, c.y + s * inner),
+            Point::new(c.x + co * (r - 0.4), c.y + s * (r - 0.4)),
+            if i % 5 == 0 { 1.4 } else { 0.9 },
+            label.with_alpha(0.85),
+        );
+    }
+    let skirt_r = r - 3.0;
+    let disc = Rect::new(c.x - skirt_r, c.y - skirt_r, skirt_r * 2.0, skirt_r * 2.0);
+    p.shadow(disc, skirt_r, k.shadow, 0.0, 2.0, 4.0);
+    p.fill_rounded(
+        disc,
+        skirt_r,
+        &Paint::Radial {
+            center: Point::new(c.x - skirt_r * 0.3, c.y - skirt_r * 0.4),
+            radius: skirt_r * 1.5,
+            stops: vec![(0.0, skirt.lighten(0.22)), (1.0, skirt.darken(0.25))],
+        },
+    );
+    // The skirt's own fine scale.
+    for i in 0..=20 {
+        let a = KNOB_START + KNOB_SWEEP * i as f32 / 20.0;
+        let (s, co) = (a.sin(), a.cos());
+        p.line(
+            Point::new(c.x + co * (skirt_r - 2.0), c.y + s * (skirt_r - 2.0)),
+            Point::new(c.x + co * (skirt_r - 0.6), c.y + s * (skirt_r - 0.6)),
+            0.7,
+            Color::rgba(1.0, 1.0, 1.0, 0.35),
+        );
+    }
+    let cap_r = skirt_r * 0.66;
+    let cap = Rect::new(c.x - cap_r, c.y - cap_r, cap_r * 2.0, cap_r * 2.0);
+    p.fill_rounded(
+        cap,
+        cap_r,
+        &Paint::vertical(cap, cap_color.lighten(0.3), cap_color.darken(0.25)),
+    );
+    p.stroke_rounded(cap, cap_r, 0.8, Color::rgba(0.0, 0.0, 0.0, 0.5));
+    // A highlight across the cap's top edge.
+    let mut glint = Path::new();
+    glint.arc(c, cap_r - 1.2, PI * 1.15, PI * 1.85, false);
+    p.stroke_path(&glint, 1.0, Color::rgba(1.0, 1.0, 1.0, 0.35));
+    let a = knob_angle(value);
+    let (s, co) = (a.sin(), a.cos());
+    p.line(
+        Point::new(c.x + co * cap_r * 0.15, c.y + s * cap_r * 0.15),
+        Point::new(c.x + co * (skirt_r - 0.8), c.y + s * (skirt_r - 0.8)),
+        1.8,
         k.pointer,
     );
 }
@@ -284,6 +403,20 @@ pub fn fader(
     }
     // Cap.
     let cap = geo.cap_rect(pos);
+    if theme.console.look.flat {
+        let fill = f.cap_top.mix(cap_color, 0.5);
+        p.fill_rounded(cap, 2.0, &Paint::Solid(fill));
+        p.stroke_rounded(cap, 2.0, 1.0, fill.darken(0.45));
+        p.fill(
+            Rect::new(cap.x + 2.0, cap.center().y - 1.0, cap.w - 4.0, 2.0),
+            if fill.luminance() > 0.5 {
+                Color::hex(0x111111)
+            } else {
+                Color::WHITE
+            },
+        );
+        return;
+    }
     p.shadow(cap, 3.0, Color::rgba(0.0, 0.0, 0.0, 0.65), 0.0, 4.0, 7.0);
     let top = f.cap_top.mix(cap_color, 0.45);
     let bottom = f.cap_bottom.mix(cap_color, 0.35);
@@ -358,8 +491,142 @@ pub struct MeterLevel {
     pub clipped: bool,
 }
 
-/// Segmented LED-ladder meter with peak hold and clip indicators.
+/// A level meter with peak hold and clip indicators, drawn as the theme
+/// says: a segmented LED ladder, a continuous bar or edgewise VU meters.
 pub fn meter(p: &mut dyn Painter, rect: Rect, levels: &[MeterLevel], theme: &Theme) {
+    match theme.console.look.meter {
+        MeterKind::Ladder => ladder_meter(p, rect, levels, theme),
+        MeterKind::Bar => bar_meter(p, rect, levels, theme),
+        MeterKind::Edgewise => vu_meter(p, rect, levels, theme),
+    }
+}
+
+/// VU deflection (0..1) of a level: 0 VU = −18 dBFS, scale −20…+3 VU,
+/// deflection proportional to voltage like a moving-coil meter.
+pub fn vu_scale(dbfs: f32) -> f32 {
+    let vu = (dbfs + 18.0).clamp(-20.0, 3.0);
+    let v = |db: f32| 10f32.powf(db / 20.0);
+    (v(vu) - v(-20.0)) / (v(3.0) - v(-20.0))
+}
+
+/// Columns of a meter: (clip LED, body) per channel.
+fn meter_columns(rect: Rect, n: usize) -> Vec<(Rect, Rect)> {
+    let inner = rect.inset(2.0);
+    let n = n.max(1) as f32;
+    let col_gap = 1.5;
+    let col_w = (inner.w - col_gap * (n - 1.0)) / n;
+    let clip_h = 4.0;
+    (0..n as usize)
+        .map(|i| {
+            let x = inner.x + i as f32 * (col_w + col_gap);
+            (
+                Rect::new(x, inner.y, col_w, clip_h),
+                Rect::new(x, inner.y + clip_h + 2.0, col_w, inner.h - clip_h - 2.0),
+            )
+        })
+        .collect()
+}
+
+fn clip_led(p: &mut dyn Painter, r: Rect, clipped: bool, theme: &Theme) {
+    let m = &theme.console.meter;
+    p.fill(
+        r,
+        if clipped {
+            m.clip
+        } else {
+            m.clip.mix(m.background, 0.82)
+        },
+    );
+}
+
+/// A continuous bar coloured by zone, with a hold line.
+fn bar_meter(p: &mut dyn Painter, rect: Rect, levels: &[MeterLevel], theme: &Theme) {
+    let m = &theme.console.meter;
+    p.fill_rounded(rect, 2.0, &Paint::Solid(m.background));
+    for (lv, (clip, body)) in levels.iter().zip(meter_columns(rect, levels.len())) {
+        clip_led(p, clip, lv.clipped, theme);
+        p.fill(body, m.green.mix(m.background, 1.0 - m.unlit));
+        let lit = meter_scale(lv.level_db);
+        if lit > 0.0 {
+            let top = body.bottom() - body.h * lit;
+            let fill = Rect::new(body.x, top, body.w, body.bottom() - top);
+            let y = |db: f32| 1.0 - meter_scale(db);
+            p.fill_rect(
+                fill,
+                &Paint::vertical_stops(
+                    body,
+                    vec![
+                        (0.0, m.red),
+                        (y(-2.0), m.orange),
+                        (y(-6.0), m.yellow),
+                        (y(-18.0), m.green),
+                        (1.0, m.green.darken(0.2)),
+                    ],
+                ),
+            );
+        }
+        let hold = meter_scale(lv.hold_db);
+        if hold > 0.01 {
+            let y = body.bottom() - body.h * hold;
+            p.fill(Rect::new(body.x, y - 1.0, body.w, 2.0), m.peak);
+        }
+    }
+}
+
+/// Edgewise moving-coil VU meters: a backlit scale with a red zone above
+/// 0 VU and a needle across it.
+fn vu_meter(p: &mut dyn Painter, rect: Rect, levels: &[MeterLevel], theme: &Theme) {
+    let m = &theme.console.meter;
+    p.fill_rounded(rect, 2.0, &Paint::Solid(m.background));
+    for (lv, (clip, face)) in levels.iter().zip(meter_columns(rect, levels.len())) {
+        clip_led(p, clip, lv.clipped, theme);
+        // The backlit face: brightest in the middle.
+        p.fill_rect(
+            face,
+            &Paint::vertical_stops(
+                face,
+                vec![
+                    (0.0, m.vu_face.darken(0.25)),
+                    (0.45, m.vu_face),
+                    (1.0, m.vu_face.darken(0.35)),
+                ],
+            ),
+        );
+        let y_of = |dbfs: f32| face.bottom() - face.h * vu_scale(dbfs);
+        // Red zone above 0 VU.
+        let zero = y_of(-18.0);
+        p.fill(
+            Rect::new(face.x, face.y, face.w, zero - face.y),
+            m.red.with_alpha(0.35),
+        );
+        // Scale marks: −20, −10, −7, −5, −3, −2, −1, 0, +1, +2, +3 VU.
+        for vu in [
+            -20.0f32, -10.0, -7.0, -5.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0,
+        ] {
+            let y = y_of(vu - 18.0);
+            let major = vu == 0.0 || vu == -10.0 || vu == -20.0 || vu == 3.0;
+            let w = if major { face.w * 0.4 } else { face.w * 0.22 };
+            let color = if vu > 0.0 {
+                m.red.darken(0.3)
+            } else {
+                m.vu_needle
+            };
+            p.hline(face.x, face.x + w, y, color.with_alpha(0.4));
+        }
+        // The needle: a dark bar across the face with a soft shadow below,
+        // resting on its stop at the bottom when there is no signal.
+        let y = y_of(lv.level_db).clamp(face.y + 1.5, face.bottom() - 1.5);
+        p.fill(
+            Rect::new(face.x, y + 1.0, face.w, 2.5),
+            Color::rgba(0.0, 0.0, 0.0, 0.22),
+        );
+        p.fill(Rect::new(face.x, y - 1.25, face.w, 2.5), m.vu_needle);
+        p.inset_shadow(face, 1.0, Color::rgba(0.0, 0.0, 0.0, 0.55), 0.0, 1.0, 3.0);
+    }
+}
+
+/// Segmented LED-ladder meter with peak hold and clip indicators.
+fn ladder_meter(p: &mut dyn Painter, rect: Rect, levels: &[MeterLevel], theme: &Theme) {
     let m = &theme.console.meter;
     p.fill_rounded(rect, 2.0, &Paint::Solid(m.background));
     p.inset_shadow(rect, 2.0, Color::rgba(0.0, 0.0, 0.0, 0.9), 0.0, 1.0, 2.0);
@@ -487,6 +754,62 @@ pub fn readout(p: &mut dyn Painter, rect: Rect, text: &str, theme: &Theme) {
         .family(FontFamily::Mono)
         .center();
     p.text(text, inner, &style);
+}
+
+/// A walnut cheek (the wooden end panel of a console), with screws when
+/// the theme has them.
+pub fn wood_cheek(p: &mut dyn Painter, rect: Rect, theme: &Theme) {
+    let look = &theme.console.look;
+    let Some((light, dark)) = look.wood else {
+        p.fill(rect, theme.ui.background);
+        return;
+    };
+    p.fill_rect(
+        rect,
+        &Paint::Linear {
+            start: Point::new(rect.x, rect.y),
+            end: Point::new(rect.right(), rect.y),
+            stops: vec![
+                (0.0, dark),
+                (0.25, light),
+                (0.7, light.mix(dark, 0.4)),
+                (1.0, dark.darken(0.2)),
+            ],
+        },
+    );
+    // Grain: long, slightly wavy lines of varying darkness.
+    let seed = rect.x.to_bits() >> 4;
+    for i in 0..((rect.w / 2.2) as u32) {
+        let x0 = rect.x + 1.0 + i as f32 * 2.2 + grain(seed + i) * 1.2;
+        let a = 0.08 + grain(seed ^ (i * 31)) * 0.18;
+        let mut path = Path::new();
+        let mut y = rect.y;
+        path.move_to(Point::new(x0, y));
+        while y < rect.bottom() {
+            y += 40.0;
+            let dx = (grain(seed + i * 7 + y as u32) - 0.5) * 1.6;
+            path.line_to(Point::new(x0 + dx, y.min(rect.bottom())));
+        }
+        p.stroke_path(&path, 0.8, dark.darken(0.4).with_alpha(a));
+    }
+    p.vline(
+        rect.x,
+        rect.y,
+        rect.bottom(),
+        Color::rgba(0.0, 0.0, 0.0, 0.6),
+    );
+    p.vline(
+        rect.right() - 1.0,
+        rect.y,
+        rect.bottom(),
+        Color::rgba(0.0, 0.0, 0.0, 0.6),
+    );
+    if look.screws && rect.w > 10.0 {
+        let x = rect.center().x;
+        for y in [rect.y + 14.0, rect.bottom() - 14.0] {
+            screw(p, Point::new(x, y), 3.2, theme);
+        }
+    }
 }
 
 /// Decorative panel screw.

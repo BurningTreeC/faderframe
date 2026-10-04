@@ -34,7 +34,7 @@ pub struct DockState {
 }
 
 fn create_view(app: &Rc<AppState>, kind: ViewKind) -> ViewHost {
-    let theme = app.theme.clone();
+    let theme = app.theme.borrow().clone();
     let host = match kind {
         ViewKind::Arranger => ViewHost::new(
             app,

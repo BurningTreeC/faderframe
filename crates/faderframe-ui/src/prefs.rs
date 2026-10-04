@@ -10,7 +10,7 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Preferences {
-    /// "auto", "pipewire", "jack", "system" or "dummy".
+    /// "auto", "pipewire", "jack", "system", "asio" or "dummy".
     pub backend: String,
     pub sample_rate: Option<u32>,
     pub buffer_size: Option<u32>,
@@ -22,6 +22,8 @@ pub struct Preferences {
     pub startup_project: String,
     /// Recently used projects, most recent first (absolute paths).
     pub recent_projects: Vec<String>,
+    /// The skin (`Theme::id`).
+    pub theme: String,
     pub snap: bool,
     pub follow_playhead: bool,
     /// "takes" or "replace".
@@ -60,6 +62,7 @@ impl Default for Preferences {
             show_edit_toolbar: false,
             startup_project: crate::recent::StartupProject::default().id().into(),
             recent_projects: Vec::new(),
+            theme: "studio".into(),
             snap: true,
             follow_playhead: true,
             record_mode: RecordMode::default().id().into(),
@@ -143,6 +146,7 @@ impl Preferences {
             "jack" => BackendChoice::Jack,
             "pipewire" => BackendChoice::PipeWire,
             "system" => BackendChoice::System,
+            "asio" => BackendChoice::Asio,
             "dummy" => BackendChoice::Dummy,
             _ => BackendChoice::Auto,
         }
@@ -154,6 +158,7 @@ impl Preferences {
             BackendChoice::Jack => "jack",
             BackendChoice::PipeWire => "pipewire",
             BackendChoice::System => "system",
+            BackendChoice::Asio => "asio",
             BackendChoice::Dummy => "dummy",
         }
         .into();
