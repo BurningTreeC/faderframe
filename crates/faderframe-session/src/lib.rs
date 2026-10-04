@@ -498,6 +498,12 @@ pub enum Action {
         track: TrackId,
         target: PluginTarget,
     },
+    /// A built-in device editor's own setting (its analyser, its display):
+    /// kept for the session, not part of the project or the undo history.
+    SetDeviceView {
+        plugin: faderframe_core::PluginInstanceId,
+        values: Vec<(String, f64)>,
+    },
     /// Ask the shell to show a plugin's editor: its own GUI, or (`generic`,
     /// or when it has none) the generic parameter window.
     OpenPluginEditor {
@@ -853,6 +859,8 @@ pub struct Session {
     presets: Vec<PresetEntry>,
     automation_writer: automation::AutomationWriter,
     ui_requests: Vec<UiRequest>,
+    /// Device editors' own settings ([`Action::SetDeviceView`]).
+    device_views: HashMap<(faderframe_core::PluginInstanceId, String), f64>,
     /// Notes copied in the piano roll (relative to the earliest).
     note_clipboard: Vec<MidiNote>,
     range_clipboard: editing::RangeClipboard,
@@ -1044,6 +1052,7 @@ impl Session {
             presets: Vec::new(),
             automation_writer: Default::default(),
             ui_requests: Vec::new(),
+            device_views: HashMap::new(),
             note_clipboard: Vec::new(),
             range_clipboard: editing::RangeClipboard::default(),
             play_started_at: None,
@@ -2536,6 +2545,12 @@ impl Session {
                 self.revision += 1;
             }
             Action::CancelMidiLearn => self.cancel_midi_learn(),
+            Action::SetDeviceView { plugin, values } => {
+                for (key, value) in values {
+                    self.device_views.insert((plugin, key), value);
+                }
+                self.revision += 1;
+            }
             Action::OpenPluginEditor {
                 track,
                 plugin,
@@ -3051,6 +3066,11 @@ impl Session {
         plugin: faderframe_core::PluginInstanceId,
     ) -> Option<(&faderframe_project::album::Song, &PluginSlot)> {
         self.project.album.insert(plugin)
+    }
+
+    /// A device editor's own setting, if it has been set.
+    pub fn device_view(&self, plugin: faderframe_core::PluginInstanceId, key: &str) -> Option<f64> {
+        self.device_views.get(&(plugin, key.to_string())).copied()
     }
 
     /// A plugin's slot and the track its commands name: its own, or the

@@ -53,8 +53,10 @@ struct Editors {
     parents: RefCell<Option<Result<Parents, String>>>,
     native: RefCell<Vec<NativeEditor>>,
     generic: RefCell<HashMap<PluginInstanceId, gtk::Window>>,
-    /// Built-in devices' own editors (canvas views).
+    /// Built-in devices' own editors (canvas views), and the order they
+    /// opened in (the last is where `device-click` clicks).
     devices: RefCell<HashMap<PluginInstanceId, gtk::Window>>,
+    opened: RefCell<Vec<PluginInstanceId>>,
     #[cfg(unix)]
     fds: RefCell<HashMap<(PluginInstanceId, i32), FdWatch>>,
     timers: RefCell<HashMap<(PluginInstanceId, u32), (u32, glib::SourceId)>>,
@@ -325,10 +327,12 @@ fn presets_button(app: &Rc<AppState>, plugin: PluginInstanceId) -> gtk::MenuButt
 pub fn click_device(x: f32, y: f32, button: faderframe_ui_canvas::PointerButton) {
     use faderframe_ui_canvas::{Modifiers, Point, ViewEvent};
     let canvas = EDITORS.with(|e| {
-        e.devices
+        let devices = e.devices.borrow();
+        e.opened
             .borrow()
-            .values()
-            .last()
+            .iter()
+            .rev()
+            .find_map(|p| devices.get(p))
             .and_then(|w| w.child())
             .and_then(|c| c.downcast::<crate::canvas::CanvasWidget>().ok())
     });
@@ -420,7 +424,12 @@ fn open_device(app: &Rc<AppState>, plugin: PluginInstanceId) -> bool {
         EDITORS.with(|e| e.devices.borrow_mut().remove(&plugin));
         glib::Propagation::Proceed
     });
-    EDITORS.with(|e| e.devices.borrow_mut().insert(plugin, window.clone()));
+    EDITORS.with(|e| {
+        e.devices.borrow_mut().insert(plugin, window.clone());
+        let mut opened = e.opened.borrow_mut();
+        opened.retain(|p| *p != plugin);
+        opened.push(plugin);
+    });
     window.present();
     canvas.grab_focus();
     true

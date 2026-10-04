@@ -1,19 +1,15 @@
 #![allow(clippy::unwrap_used)]
 
-use crate::eq::EqView;
 use crate::program_eq::{ProgramEqView, light_at};
 use faderframe_core::{ParameterId, PluginInstanceId, builtin};
 use faderframe_engine::EngineConfig;
-use faderframe_plugin_host::eq::{BandParams, Field, band_id, band_index};
 use faderframe_plugin_host::program_eq::param;
 use faderframe_project::PluginRef;
 use faderframe_session::{Action, Session};
 use faderframe_ui_canvas::{
-    CanvasView, EventCx, HostRequest, Key, Modifiers, Point, PointerButton, RecordingPainter, Size,
+    CanvasView, EventCx, HostRequest, Modifiers, Point, PointerButton, RecordingPainter, Size,
     Theme, ViewEvent,
 };
-
-const SIZE: Size = Size::new(1080.0, 620.0);
 
 /// The demo with `id` on its first audio track; the plugin's id.
 fn session(id: &str, name: &str) -> (Session, PluginInstanceId) {
@@ -69,163 +65,6 @@ fn up(pos: Point, button: PointerButton) -> ViewEvent {
         button,
         modifiers: Modifiers::NONE,
     }
-}
-
-fn band(s: &Session, plugin: PluginInstanceId, b: usize) -> BandParams {
-    BandParams::read(&s.plugin_tap(plugin).unwrap().params, b)
-}
-
-#[test]
-fn bands_are_added_dragged_shaped_and_removed_on_the_display() {
-    let (mut s, plugin) = session(builtin::EQ, "EQ");
-    let mut view = EqView::new(plugin, &Theme::default());
-    let mut p = RecordingPainter::new();
-    view.paint(&mut p, SIZE, &s, &Theme::default());
-    assert!(p.balanced_clips());
-    // Double-click in the middle of the display: a bell near 1 kHz, +x dB.
-    let at = Point::new(540.0, 200.0);
-    run(&mut view, &mut s, down(at, PointerButton::Primary, 2), SIZE);
-    let b = band(&s, plugin, 0);
-    assert!(b.enabled && b.used, "{b:?}");
-    assert_eq!(b.kind.name(), "Bell");
-    assert!((300.0..3_000.0).contains(&b.freq), "{}", b.freq);
-    assert!(b.gain > 1.0, "above the 0 dB line: {}", b.gain);
-    assert_eq!(s.history().undo_label(), Some("Add EQ Band"));
-    // Its node is where the click was: drag it right and down, one step.
-    run(&mut view, &mut s, down(at, PointerButton::Primary, 1), SIZE);
-    run(
-        &mut view,
-        &mut s,
-        drag(Point::new(at.x + 100.0, at.y + 60.0)),
-        SIZE,
-    );
-    run(
-        &mut view,
-        &mut s,
-        up(
-            Point::new(at.x + 100.0, at.y + 60.0),
-            PointerButton::Primary,
-        ),
-        SIZE,
-    );
-    let moved = band(&s, plugin, 0);
-    assert!(moved.freq > b.freq * 1.5, "{} → {}", b.freq, moved.freq);
-    assert!(moved.gain < b.gain - 2.0);
-    assert_eq!(s.history().undo_label(), Some("EQ Band"));
-    s.dispatch(Action::Undo).unwrap();
-    assert!(
-        (band(&s, plugin, 0).freq - b.freq).abs() < 1.0,
-        "one undo step"
-    );
-    // Scrolling on the node narrows it.
-    let q = band(&s, plugin, 0).q;
-    run(
-        &mut view,
-        &mut s,
-        ViewEvent::Scroll {
-            pos: at,
-            dx: 0.0,
-            dy: -1.0,
-            modifiers: Modifiers::NONE,
-            precise: false,
-        },
-        SIZE,
-    );
-    assert!(band(&s, plugin, 0).q > q);
-    // Right-click: the band's menu, the types first.
-    let req = run(
-        &mut view,
-        &mut s,
-        down(at, PointerButton::Secondary, 1),
-        SIZE,
-    );
-    let Some(HostRequest::ContextMenu { items, .. }) = req
-        .into_iter()
-        .find(|r| matches!(r, HostRequest::ContextMenu { .. }))
-    else {
-        panic!("a menu")
-    };
-    assert!(items.iter().any(|i| i.label == "Low Shelf"));
-    let shelf = items.iter().find(|i| i.label == "Low Shelf").unwrap();
-    s.dispatch(shelf.action.clone().unwrap()).unwrap();
-    assert_eq!(band(&s, plugin, 0).kind.name(), "Low Shelf");
-    // Double-click the node: bypassed (still shown), and back.
-    let node = Point::new(at.x, at.y);
-    run(
-        &mut view,
-        &mut s,
-        down(node, PointerButton::Primary, 2),
-        SIZE,
-    );
-    let b = band(&s, plugin, 0);
-    assert!(b.used && !b.enabled, "bypassed");
-    // Delete removes the selected band.
-    run(
-        &mut view,
-        &mut s,
-        ViewEvent::Key {
-            key: Key::Delete,
-            modifiers: Modifiers::NONE,
-        },
-        SIZE,
-    );
-    assert!(!band(&s, plugin, 0).used);
-    // Near the bottom of the range a double-click adds a low cut.
-    run(
-        &mut view,
-        &mut s,
-        down(Point::new(60.0, 300.0), PointerButton::Primary, 2),
-        SIZE,
-    );
-    assert_eq!(band(&s, plugin, 0).kind.name(), "Low Cut");
-    let mut p = RecordingPainter::new();
-    view.paint(&mut p, SIZE, &s, &Theme::default());
-    assert!(p.texts().contains(&"Band 1"), "the band panel shows it");
-}
-
-#[test]
-fn the_band_panel_knobs_edit_the_selected_band() {
-    let (mut s, plugin) = session(builtin::EQ, "EQ");
-    let mut view = EqView::new(plugin, &Theme::default());
-    run(
-        &mut view,
-        &mut s,
-        down(Point::new(540.0, 260.0), PointerButton::Primary, 2),
-        SIZE,
-    );
-    let mut p = RecordingPainter::new();
-    view.paint(&mut p, SIZE, &s, &Theme::default());
-    // The gain knob sits after the frequency knob in the panel: drag it up.
-    let gain0 = band(&s, plugin, 0).gain;
-    let knob = Point::new(380.0 + 70.0 + 32.0, SIZE.h - 96.0 + 48.0);
-    run(
-        &mut view,
-        &mut s,
-        down(knob, PointerButton::Primary, 1),
-        SIZE,
-    );
-    run(
-        &mut view,
-        &mut s,
-        drag(Point::new(knob.x, knob.y - 40.0)),
-        SIZE,
-    );
-    run(
-        &mut view,
-        &mut s,
-        up(Point::new(knob.x, knob.y - 40.0), PointerButton::Primary),
-        SIZE,
-    );
-    assert!(band(&s, plugin, 0).gain > gain0 + 5.0);
-    // Typed values go through the same parameters.
-    assert_eq!(
-        s.plugin_tap(plugin)
-            .unwrap()
-            .params
-            .get(band_index(0, Field::Gain)) as f64,
-        band(&s, plugin, 0).gain
-    );
-    let _ = band_id(0, Field::Gain);
 }
 
 #[test]

@@ -257,6 +257,27 @@ fn build(s: Spec) -> Theme {
             readout: c(s.text),
             toolbar_height: 32.0,
         },
+        eq: EqTheme {
+            display: c(s.well),
+            grid: line(0.06),
+            grid_strong: line(0.18),
+            curve: accent,
+            left: c(s.text),
+            right: c(s.leds[2]),
+            mid: c(m[1]),
+            side: c(s.selection),
+            pre: c(s.text_dim),
+            post: c(s.text),
+            external: c(s.leds[2]).mix(c(s.text), 0.35),
+            collision: c(m[4]),
+            dyn_range: c(m[4]),
+            dyn_live: accent,
+            panel: surface,
+            panel_edge: c(s.border),
+            node_text: if s.dark { c(s.bg) } else { c(s.text) },
+            key_white: c(s.keys[0]),
+            key_black: c(s.keys[2]),
+        },
     }
 }
 

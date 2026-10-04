@@ -1,6 +1,6 @@
 //! What a built-in plugin's editor sees of its processor, without locks:
 //! the live parameter values (automation included), the audio going in and
-//! coming out (for analysers), input and output level meters, and a few
+//! coming out and its sidechain (for analysers), input and output level meters, and a few
 //! values the processor publishes (a dynamic band's gain). The editor also
 //! talks back through it (the band it wants to hear on its own).
 //!
@@ -234,9 +234,11 @@ const WATCH_TIMEOUT: f64 = 1.0;
 pub struct AnalysisTap {
     /// The live parameter values, shared with the processor.
     pub params: ParamValues,
-    /// The audio arriving at the plugin and leaving it.
+    /// The audio arriving at the plugin and leaving it, and its sidechain
+    /// input (when connected).
     pub input: AudioRing,
     pub output: AudioRing,
+    pub sidechain: AudioRing,
     pub meter_in: Meter,
     pub meter_out: Meter,
     /// Values the processor publishes (meaning per plugin).
@@ -252,6 +254,7 @@ impl AnalysisTap {
             params,
             input: AudioRing::default(),
             output: AudioRing::default(),
+            sidechain: AudioRing::default(),
             meter_in: Meter::default(),
             meter_out: Meter::default(),
             values: (0..values).map(|_| AtomicF32::new(0.0)).collect(),

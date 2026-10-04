@@ -304,6 +304,40 @@ pub struct PianoRollTheme {
     pub toolbar_height: f32,
 }
 
+/// The EQ editor.
+#[derive(Clone, Debug)]
+pub struct EqTheme {
+    /// The display behind the curves, and its grid.
+    pub display: Color,
+    pub grid: Color,
+    pub grid_strong: Color,
+    /// The overall response, and the result curves of the bands that work
+    /// on the left, right, mid and side only.
+    pub curve: Color,
+    pub left: Color,
+    pub right: Color,
+    pub mid: Color,
+    pub side: Color,
+    /// The analyser: what goes in (a line), what comes out (filled), the
+    /// external spectrum (outlined).
+    pub pre: Color,
+    pub post: Color,
+    pub external: Color,
+    /// Where the output and the external spectrum collide.
+    pub collision: Color,
+    /// A dynamic band's range, and how far it moves right now.
+    pub dyn_range: Color,
+    pub dyn_live: Color,
+    /// The floating controls.
+    pub panel: Color,
+    pub panel_edge: Color,
+    /// Text on a band's node.
+    pub node_text: Color,
+    /// The piano display's keys.
+    pub key_white: Color,
+    pub key_black: Color,
+}
+
 #[derive(Clone, Debug)]
 pub struct Theme {
     /// Stable identifier (saved in the preferences).
@@ -318,6 +352,7 @@ pub struct Theme {
     pub piano: PianoRollTheme,
     pub perf: PerformanceTheme,
     pub tools: ToolsTheme,
+    pub eq: EqTheme,
 }
 
 impl Default for Theme {
@@ -522,6 +557,27 @@ impl Theme {
                 goniometer: Color::hex(0x7fe0a0),
                 readout: Color::hex(0xf2efe8),
                 toolbar_height: 32.0,
+            },
+            eq: EqTheme {
+                display: Color::hex(0x131519),
+                grid: Color::rgba(1.0, 1.0, 1.0, 0.055),
+                grid_strong: Color::rgba(1.0, 1.0, 1.0, 0.16),
+                curve: Color::hex(0xf2c94c),
+                left: Color::hex(0xece8df),
+                right: Color::hex(0xf05a4f),
+                mid: Color::hex(0x5fd07a),
+                side: Color::hex(0x5aa8f0),
+                pre: Color::hex(0x8796ad),
+                post: Color::hex(0xc8d2df),
+                external: Color::hex(0xf0806e),
+                collision: Color::hex(0xff3b30),
+                dyn_range: Color::hex(0xd8473b),
+                dyn_live: Color::hex(0xf2c94c),
+                panel: Color::hex(0x23262c),
+                panel_edge: Color::hex(0x3c414a),
+                node_text: Color::hex(0x101114),
+                key_white: Color::hex(0xd9d6cf),
+                key_black: Color::hex(0x24262b),
             },
         }
     }

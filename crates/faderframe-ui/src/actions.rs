@@ -710,15 +710,17 @@ pub fn install(app: &Rc<AppState>) {
             };
             a.dispatch(Action::Album(action));
         }),
-        // Development aid: `device-demo:<eq|program-eq>` puts the device on
-        // the first audio track, set up to show what it does, and opens its
-        // editor.
+        // Development aid: `device-demo:<eq|eq-sc|program-eq>` puts the
+        // device on the first audio track, set up to show what it does, and
+        // opens its editor (`eq-sc`: keyed from the next audio track, which
+        // the analyser shows too).
         named("device-demo", |a, arg| {
             use faderframe_core::{ParameterId, builtin};
             use faderframe_plugin_host::eq::{Field, band_id};
             use faderframe_project::{Command, PluginRef};
+            let keyed = arg.trim() == "eq-sc";
             let (id, name) = match arg.trim() {
-                "eq" => (builtin::EQ, "EQ"),
+                "eq" | "eq-sc" => (builtin::EQ, "EQ"),
                 "program-eq" => (builtin::PROGRAM_EQ, "Program EQ"),
                 other => {
                     tracing::warn!("device-demo: unknown '{other}'");
@@ -755,15 +757,17 @@ pub fn install(app: &Rc<AppState>) {
             else {
                 return;
             };
+            let mut commands = Vec::new();
             let values: Vec<(ParameterId, f64)> = if id == builtin::EQ {
                 let mut v = Vec::new();
                 // (type, freq, gain, q, slope, placement, range)
                 for (b, band) in [
-                    (3.0, 35.0, 0.0, 0.707, 3.0, 0.0, 0.0),
-                    (0.0, 240.0, -3.5, 1.4, 1.0, 0.0, 0.0),
-                    (0.0, 3_200.0, 4.0, 0.8, 1.0, 0.0, -5.0),
-                    (2.0, 9_000.0, 3.0, 0.707, 1.0, 3.0, 0.0),
-                    (5.0, 1_150.0, 0.0, 6.0, 1.0, 4.0, 0.0),
+                    (3.0, 35.0, 0.0, 0.707, 24.0, 0.0, 0.0),
+                    (0.0, 240.0, -3.5, 1.4, 12.0, 0.0, 0.0),
+                    (0.0, 3_200.0, 4.0, 0.8, 12.0, 0.0, -5.0),
+                    (2.0, 9_000.0, 3.0, 0.707, 12.0, 3.0, 0.0),
+                    (5.0, 1_150.0, 0.0, 6.0, 12.0, 4.0, 0.0),
+                    (0.0, 6_500.0, 0.0, 1.2, 12.0, 0.0, -6.0),
                 ]
                 .into_iter()
                 .enumerate()
@@ -776,11 +780,42 @@ pub fn install(app: &Rc<AppState>) {
                         (Field::Slope, band.4),
                         (Field::Placement, band.5),
                         (Field::Range, band.6),
-                        (Field::Threshold, -42.0),
                         (Field::Enabled, 1.0),
                     ] {
                         v.push((band_id(b, f), x));
                     }
+                }
+                // Band 6 is spectral; band 3 has its own threshold.
+                v.push((band_id(5, Field::Spectral), 1.0));
+                v.push((band_id(2, Field::Dynamics), 1.0));
+                v.push((band_id(2, Field::Threshold), -42.0));
+                if keyed {
+                    // Keyed from the next audio track, shown as the
+                    // external spectrum.
+                    v.push((band_id(2, Field::Key), 1.0));
+                    let source = a
+                        .session
+                        .borrow()
+                        .project()
+                        .tracks
+                        .iter()
+                        .filter(|t| t.kind == TrackKind::Audio && t.id != track)
+                        .map(|t| t.id)
+                        .next();
+                    if let Some(source) = source {
+                        commands.push(Command::SetPluginSidechain {
+                            track,
+                            plugin,
+                            source: Some(source),
+                        });
+                    }
+                    a.dispatch(Action::SetDeviceView {
+                        plugin,
+                        values: vec![
+                            ("eq.analyser.external".into(), 1.0),
+                            ("eq.analyser.source".into(), -1.0),
+                        ],
+                    });
                 }
                 v
             } else {
@@ -790,15 +825,14 @@ pub fn install(app: &Rc<AppState>) {
                     .map(|(p, x)| (ParameterId(*p as u32), *x))
                     .collect()
             };
-            let commands = values
-                .into_iter()
-                .map(|(parameter, value)| Command::SetPluginParameter {
+            commands.extend(values.into_iter().map(|(parameter, value)| {
+                Command::SetPluginParameter {
                     track,
                     plugin,
                     parameter,
                     value: Some(value),
-                })
-                .collect();
+                }
+            }));
             a.dispatch(Action::Edit(Command::Batch {
                 label: "Device Demo".into(),
                 commands,

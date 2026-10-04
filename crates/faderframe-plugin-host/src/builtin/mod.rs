@@ -180,7 +180,7 @@ impl Kind {
     /// Values the processor publishes through the tap.
     fn tap_values(self) -> Option<usize> {
         match self {
-            Kind::Eq => Some(crate::eq::BANDS),
+            Kind::Eq => Some(crate::eq::TAP_VALUES),
             Kind::ProgramEq => Some(0),
             _ => None,
         }
@@ -258,8 +258,9 @@ impl PluginInstance for BuiltinInstance {
     }
 
     fn poll(&mut self) -> crate::PluginPoll {
-        // The EQ's phase mode and quality change its latency: the graph
-        // must be rebuilt (with a processor for the new mode).
+        // The EQ's phase mode, resolution and spectral bands change its
+        // latency: the graph must be rebuilt (with a processor for the new
+        // mode).
         let now = self.latency_samples();
         let restart = self.reported.is_some_and(|r| r != now);
         self.reported = Some(now);
@@ -273,9 +274,7 @@ impl PluginInstance for BuiltinInstance {
         match self.kind {
             Kind::LatencyProbe => self.params.get(0).max(0.0) as u32,
             Kind::ProgramEq => crate::program_eq::LATENCY,
-            Kind::Eq if crate::eq::linear::wanted(&self.params) => {
-                crate::eq::linear::latency(crate::eq::linear::quality(&self.params))
-            }
+            Kind::Eq => crate::eq::latency(&self.params),
             _ => 0,
         }
     }

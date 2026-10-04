@@ -30,7 +30,7 @@ const HEADER_BAR: i32 = 46;
 /// The editor window's size when it opens (logical pixels).
 pub fn editor_size(plugin_id: &str) -> Option<(i32, i32)> {
     match plugin_id {
-        builtin::EQ => Some((1080, 620)),
+        builtin::EQ => Some((1180, 700)),
         // The panel at 1.2 times its size, under the window's header bar.
         builtin::PROGRAM_EQ => Some((
             (program_eq::PANEL_W * 1.2) as i32,

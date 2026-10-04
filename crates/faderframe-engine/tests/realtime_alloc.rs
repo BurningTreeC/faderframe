@@ -622,7 +622,7 @@ fn the_equalisers_do_not_allocate() {
         CurveShape,
     };
     use faderframe_core::{ChannelLayout, ParameterId, builtin};
-    use faderframe_plugin_host::eq::{Field, band_id};
+    use faderframe_plugin_host::eq::{Field, PhaseMode, band_id, global, global_id, listen_key};
     use faderframe_project::{PluginRef, PluginSlot, SavedParameter, TrackKind};
     use faderframe_timeline::MusicalTime;
 
@@ -631,51 +631,83 @@ fn the_equalisers_do_not_allocate() {
     let t = tp.track(TrackKind::Audio, "A", ChannelLayout::Stereo);
     let src = tp.dc(2, 0.3, 200_000);
     tp.clip(t, src, MusicalTime::ZERO, 200_000);
+    // A track keying the EQs' sidechains.
+    let key_track = tp.track(TrackKind::Audio, "Key", ChannelLayout::Stereo);
+    let key_src = tp.dc(2, 0.5, 200_000);
+    tp.clip(key_track, key_src, MusicalTime::ZERO, 200_000);
     let set = |id: ParameterId, value: f64| SavedParameter { id, value };
-    // Every kind of band: dynamic, mid/side, a steep cut, a tilt.
+    let band = |b: usize, f: Field, v: f64| set(band_id(b, f), v);
+    // Every kind of band: dynamic (auto, custom, keyed by the sidechain,
+    // freely triggered), spectral, mid/side, steep, fractional and
+    // brickwall cuts, tilts, an all pass.
     let mut bands = Vec::new();
-    for (b, kind, placement, range) in [
-        (0, 0.0, 0.0, -6.0),
-        (1, 1.0, 3.0, 0.0),
-        (2, 3.0, 0.0, 0.0),
-        (3, 7.0, 4.0, 4.0),
-        (4, 5.0, 1.0, 0.0),
+    for (b, kind, placement, range, slope) in [
+        (0, 0.0, 0.0, -6.0, 12.0),
+        (1, 1.0, 3.0, 0.0, 24.0),
+        (2, 3.0, 0.0, 0.0, 96.0),
+        (3, 7.0, 4.0, 4.0, 12.0),
+        (4, 5.0, 1.0, 0.0, 36.0),
+        (5, 4.0, 2.0, 0.0, 15.5),
+        (6, 3.0, 0.0, 0.0, 100.0),
+        (7, 8.0, 0.0, 3.0, 12.0),
+        (8, 9.0, 0.0, 0.0, 24.0),
+        (9, 0.0, 0.0, -9.0, 12.0),
+        (10, 2.0, 3.0, -4.0, 12.0),
     ] {
         bands.extend([
-            set(band_id(b, Field::Enabled), 1.0),
-            set(band_id(b, Field::Type), kind),
-            set(band_id(b, Field::Placement), placement),
-            set(band_id(b, Field::Range), range),
-            set(band_id(b, Field::Gain), 4.0),
-            set(band_id(b, Field::Slope), 7.0),
+            band(b, Field::Enabled, 1.0),
+            band(b, Field::Type, kind),
+            band(b, Field::Placement, placement),
+            band(b, Field::Range, range),
+            band(b, Field::Gain, 4.0),
+            band(b, Field::Slope, slope),
         ]);
     }
-    bands.push(set(ParameterId(1), 1.0)); // auto gain
+    bands.extend([
+        // Band 9 spectral, keyed by the sidechain.
+        band(9, Field::Spectral, 1.0),
+        band(9, Field::Dynamics, 1.0),
+        band(9, Field::Key, 1.0),
+        band(9, Field::Threshold, -30.0),
+        // Band 10 custom, freely triggered from the sidechain.
+        band(10, Field::Dynamics, 1.0),
+        band(10, Field::Key, 1.0),
+        band(10, Field::Trigger, 1.0),
+        band(10, Field::TriggerLow, 300.0),
+        band(10, Field::TriggerHigh, 4_000.0),
+        band(10, Field::Attack, 0.2),
+        // Band 0 custom with its own threshold.
+        band(0, Field::Dynamics, 1.0),
+        band(0, Field::Threshold, -24.0),
+        set(global_id(global::AUTO_GAIN), 1.0),
+        set(global_id(global::CHARACTER), 2.0),
+        set(global_id(global::PAN), 0.3),
+        set(global_id(global::PAN_MODE), 1.0),
+        set(global_id(global::GAIN_Q), 1.0),
+    ]);
     let eq = tp.project.ids.allocate();
     let program = tp.project.ids.allocate();
     let linear_eq = tp.project.ids.allocate();
-    // A second EQ in linear phase: its kernels arrive from the design
-    // thread while the band below is automated.
+    let natural_eq = tp.project.ids.allocate();
+    // EQs in linear and natural phase: their kernels arrive from the
+    // design thread while a band is automated.
     let mut linear = bands.clone();
-    linear.push(set(ParameterId(3), 1.0));
-    linear.push(set(ParameterId(4), 0.0));
+    linear.push(set(global_id(global::PHASE), PhaseMode::Linear.value()));
+    linear.push(set(global_id(global::QUALITY), 0.0));
+    let mut natural = bands.clone();
+    natural.push(set(global_id(global::PHASE), PhaseMode::Natural.value()));
+    natural.push(set(global_id(global::CHARACTER), 1.0));
     let track = tp.project.track_mut(t).unwrap();
-    track.inserts.push(PluginSlot {
-        id: linear_eq,
-        plugin: PluginRef::builtin(builtin::EQ, "EQ"),
-        bypass: false,
-        parameters: linear,
-        state: None,
-        sidechain: None,
-    });
-    track.inserts.push(PluginSlot {
-        id: eq,
-        plugin: PluginRef::builtin(builtin::EQ, "EQ"),
-        bypass: false,
-        parameters: bands,
-        state: None,
-        sidechain: None,
-    });
+    for (id, parameters) in [(linear_eq, linear), (natural_eq, natural), (eq, bands)] {
+        track.inserts.push(PluginSlot {
+            id,
+            plugin: PluginRef::builtin(builtin::EQ, "EQ"),
+            bypass: false,
+            parameters,
+            state: None,
+            sidechain: Some(key_track),
+        });
+    }
     track.inserts.push(PluginSlot {
         id: program,
         plugin: PluginRef::builtin(builtin::PROGRAM_EQ, "Program EQ"),
@@ -728,6 +760,34 @@ fn the_equalisers_do_not_allocate() {
             },
             ramp(-12.0, 12.0),
         ),
+        (
+            AutomationTarget::PluginParameter {
+                plugin: natural_eq,
+                parameter: band_id(3, Field::Freq),
+            },
+            ramp(300.0, 3_000.0),
+        ),
+        (
+            AutomationTarget::PluginParameter {
+                plugin: eq,
+                parameter: band_id(5, Field::Slope),
+            },
+            ramp(9.0, 40.0),
+        ),
+        (
+            AutomationTarget::PluginParameter {
+                plugin: eq,
+                parameter: global_id(global::BYPASS),
+            },
+            ramp(0.0, 1.0),
+        ),
+        (
+            AutomationTarget::PluginParameter {
+                plugin: eq,
+                parameter: global_id(global::CHARACTER),
+            },
+            ramp(0.0, 2.0),
+        ),
     ] {
         let id = tp.project.ids.allocate();
         tp.project
@@ -760,7 +820,11 @@ fn the_equalisers_do_not_allocate() {
             // An editor watching: the analyser rings fill; one band heard
             // on its own for a while.
             tap.watch();
-            tap.set_listen((100..200).contains(&i).then_some(1));
+            tap.set_listen(match i {
+                100..200 => Some(1),
+                200..260 => Some(listen_key(10)),
+                _ => None,
+            });
             r.processor.process_device(&mut bufs);
             // Give the linear phase design thread time to send kernels.
             if i % 40 == 0 {
@@ -770,4 +834,5 @@ fn the_equalisers_do_not_allocate() {
     });
     assert_eq!(allocs, 0, "allocations in the equalisers");
     assert!(tap.output.written() > 0, "the analyser was fed");
+    assert!(tap.sidechain.written() > 0, "the sidechain reached the EQ");
 }

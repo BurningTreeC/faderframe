@@ -151,12 +151,18 @@ Contrast:
   buses, auxes, sends, sidechains, solo-in-place, sample-accurate loops,
   built-in synth, echo, compressor, gain and latency-probe plugins,
   realtime-safe (verified by an allocation-counting test).
-* EQ: 24 bands (bell, shelves, cuts from 6 to 96 dB/oct, notch, band pass,
-  tilt) whose curves keep their analog shape up to Nyquist, per band
-  stereo, left, right, mid or side, dynamic bands keyed by their own region
-  or a sidechain, auto gain, a linear phase mode (exact analog curves), a
-  live pre/post analyser, nodes dragged on the curve, any band heard on its
-  own.
+* EQ in the spirit of FabFilter Pro-Q 4: 24 bands (bell, shelves, cuts of
+  any slope from 0 to 96 dB/oct and brickwall, notch, band pass, tilt, flat
+  tilt, all pass) whose curves keep their analog shape up to Nyquist; zero
+  latency, natural phase (analog magnitude and phase at 128 samples) and
+  linear phase; per band stereo, left, right, mid or side; dynamic bands
+  (auto or custom threshold, attack and release, soft knee) triggered by
+  their region, free low/high cuts or the sidechain, and spectral dynamics
+  that act per frequency; character (subtle transformer, warm tube),
+  output pan, phase invert, auto gain; an analyser with pre, post and an
+  external spectrum (the sidechain or another EQ) and collision detection;
+  EQ Match, EQ Sketch, Spectrum Grab, a piano display, A/B, the instance
+  list, typed values ("1k", "A4").
 * Program EQ: PultEQFx's circuit-modelled passive tube program equaliser
   (the low end trick falls out of the circuit), with its hardware panel,
   input and output meters, drive and oversampling.

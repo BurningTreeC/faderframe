@@ -551,36 +551,96 @@ The EQ and the Program EQ are built-ins with editors of their own
 window with the usual Bypass/Presets header). A built-in instance can hand
 out an `AnalysisTap` (`PluginInstance::tap`, `Session::plugin_tap`): its
 live `ParamValues` (so the editor follows automation), lock-free stereo
-rings of the audio going in and out (filled only while an editor calls
-`watch()` each frame), PultEQFx's level meters (peak taken per frame, held
-peak, 300 ms RMS and a 200 ms figure), published values (a dynamic band's
-gain) and the band the editor wants to hear alone. Edits are ordinary
+rings of the audio going in, coming out and arriving at the sidechain
+(filled only while an editor calls `watch()` each frame), PultEQFx's level
+meters (peak taken per frame, held peak, 300 ms RMS and a 200 ms figure),
+published values (per band: dynamic gain, trigger level, threshold, and a
+spectral band's gain at 64 frequencies) and what the editor wants to hear
+alone (a band's region, or a band's trigger). Edits are ordinary
 `SetPluginParameter` commands in gestures, so they undo and automate like
-any other. Real-time safety of both is covered by
-`engine/tests/realtime_alloc.rs` (dynamic, mid/side and steep bands,
-automation, listening, linear phase).
+any other; an editor's own settings (analyser, display, the external
+spectrum's source) are `Action::SetDeviceView` values the session keeps per
+instance, outside the project and the undo history (the EQ's band
+clipboard lives there too, so menus and other EQs reach it). Real-time
+safety of both devices is covered by `engine/tests/realtime_alloc.rs`
+(dynamic, sidechain-keyed, freely triggered, spectral, mid/side, steep,
+fractional and brickwall bands, linear and natural phase, character,
+bypass, automation, listening).
 
-* **EQ** (`plugin_host::eq`): 24 bands — bell, low/high shelf, low/high cut
-  (6–96 dB/oct, Butterworth cascades with the Q on the sharpest section),
-  notch, band pass, tilt — each in state unused/on/bypassed, with a
-  stereo placement (stereo, left, right, mid, side) and a dynamic range
-  keyed from its own region (or the sidechain input). `eq::design` turns
-  the analog prototypes into biquads that keep their shape to Nyquist:
-  poles by impulse invariance (Vicanek, *Matched Second Order Digital
-  Filters*), numerators exact where the shape is defined (DC, centre or
-  corner) and least-squares fitted to the analog magnitude up to Nyquist;
-  first order sections likewise; notches solve their damping for the
-  analog −3 dB edge; below ~0.001 rad/sample sections are bilinear. The
-  processor glides frequency, gain and Q (15 ms), fades a band in and out
-  when it is switched or changes type, slope or placement, and runs auto
-  gain (pink-noise loudness, recomputed at most every 8 control steps).
-  **Linear phase** (`eq::linear`): the static bands' *analog* magnitudes
-  as zero-phase FIRs of 4096–32768 taps (a 2 × 2 set when mid/side differ),
-  uniformly partitioned convolution in 256-sample blocks (latency
-  `N/2 + 256`), kernels designed on a thread that watches the parameters
-  and crossfaded in; dynamic bands stay minimum phase after the FIR. Phase
-  mode and quality change the latency, so they are not automatable and
-  the instance asks for a restart (graph rebuild) when they change.
+* **EQ** (`plugin_host::eq`), after FabFilter Pro-Q 4's feature set: 24
+  bands, each unused/on/bypassed with a stereo placement (stereo, left,
+  right, mid, side). Shapes: bell, low/high shelf, low/high cut, notch,
+  band pass, tilt shelf, flat tilt and all pass. Slopes: cuts take any
+  slope from 0 to 96 dB/oct (whole Butterworth orders plus, for a fraction,
+  a ladder of first order steps an octave apart) and brickwall (order 32);
+  shelves and tilts are Butterworth shelving filters of any order
+  (Holters & Zölzer); notches and band passes cascade sections that keep
+  the −3 dB edges; all passes go from first order up. Parameter ids are
+  stable: the first version's band ids keep their meaning, new fields use
+  a second id block (`BAND_BASE2`), retired ids are never reused.
+  `eq::design` builds every shape as a cascade of analog sections and
+  turns each into a biquad that keeps its shape to Nyquist: poles by
+  impulse invariance (Vicanek, *Matched Second Order Digital Filters*),
+  numerators exact where the shape is defined (DC, centre or corner) and
+  least-squares fitted to the analog magnitude up to Nyquist; first order
+  sections likewise (fitted from DC when their corner is past Nyquist);
+  notches solve their damping for the analog −3 dB edge; below ~0.001
+  rad/sample sections are bilinear. The same cascade gives the analog
+  magnitude and phase (`AnalogBand`) the FIR modes are designed from.
+  **Processing modes** (not automatable: they change the latency, and the
+  instance asks for a graph rebuild): *zero latency* (the matched
+  sections); *natural phase* (`eq::natural`): the sections followed by a
+  1024-tap correction FIR — per frequency the analog response over the
+  digital one (a 2 × 2 system when bands work on one side, regularised
+  where the digital one has nothing), 64 samples ahead of its main tap —
+  so magnitude and phase are the analog filter's at a latency of 128
+  samples; *linear phase* (`eq::linear`): the static bands' analog
+  magnitudes as zero-phase FIRs of 4096–65536 taps. Both FIRs are uniformly
+  partitioned convolutions (`eq::fir`) whose kernels a design thread
+  builds when the parameters move and the audio thread crossfades to.
+  **Dynamics** (`eq::dynamics`): a band moves by its range as its trigger
+  rises over the threshold, through a 6 dB soft knee; the trigger is the
+  input or the sidechain (per band), filtered to the band's region (a band
+  pass round a bell, a shelf's side) or by free 24 dB/oct low and high
+  cuts, and the trigger can be heard on its own. Auto mode sets attack and
+  release from the band's frequency and puts the threshold a little over
+  the trigger's own long-term level; custom mode scales the times (50 % =
+  automatic) and takes the band's threshold. The detectors run where the
+  sections run, fed by the input and the sidechain delayed to match.
+  **Spectral dynamics** (`eq::spectral`): a short-time Fourier stage
+  (square-root Hann, 75 % overlap, 1024–4096 frames, which is also its
+  latency) where each spectral band acts per frequency: the trigger's
+  power, optionally tilted by 3 dB/oct, smoothed across frequency by the
+  density and over time by attack and release, against the threshold or
+  (auto) the region's octave-smoothed level; the gain is weighted by the
+  band's normalised shape and added to its static gain (spectral bands are
+  linear phase). **Output**: character (`eq::character`: clean; a
+  transformer's low-end saturation; a tube's asymmetric curve driven below
+  the top octave, its harmonics DC-blocked), gain, pan (left/right or
+  mid/side), phase invert, auto gain (pink-noise loudness), a gain scale,
+  gain-Q interaction and a 10 ms bypass ramp against the input delayed by
+  the latency. Frequency, gain, Q and a cut's fractional slope glide
+  (15 ms); a band whose structure changes fades out and back in; a band
+  not heard yet starts where it is set. **EQ Match** (`eq::matching`):
+  the reference-minus-input spectrum smoothed to a third of an octave and
+  centred, bands placed where most is left (bells at the extremes, shelves
+  at the ends) and refined by pattern search.
+  The editor (`view-devices::eq`): a display with the analyser (pre, post
+  and an external spectrum — the sidechain or any other EQ's output — with
+  resolution, speed, range, tilt and freeze; collisions glow red), every
+  band's curve (a dynamic band's reach shaded, spectral movement per
+  frequency) and the overall response per part of the signal (stereo,
+  left, right, mid, side); floating band controls under the band in focus
+  (the gain knob carries the dynamic range ring; ">>" opens threshold,
+  sidechain, attack, release, trigger and spectral settings); values next
+  to a band to drag, scroll or type ("1k", "A4", "C#2+13", "2x"); multi-
+  selection, rectangle selection, copy and paste; EQ Sketch (a drawn curve
+  turned into bands, `eq::sketch`); Spectrum Grab (rest on the spectrum,
+  drag a peak into a bell); the piano display; a zoomable frequency scale;
+  A/B; the sidechain source picked in the editor; the instance list (every
+  EQ in the project with its spectrum and collisions; reference, open,
+  match) and EQ Match (reference: the sidechain, another EQ, or the input
+  recorded earlier).
 * **Program EQ** (`plugin_host::program_eq`): PultEQFx by Simon Huber,
   used under the MIT licence — the passive LC/RC network of the classic
   tube program equaliser solved by nodal analysis (trapezoidal companion
@@ -1526,8 +1586,10 @@ signed Windows installer.
 
 **Implemented.** The engine: routing graph with PDC, state adoption and
 sidechains; multicore scheduling with measured critical-path ranks;
-sample-accurate transport, loops and scrubbing; a 24 band dynamic EQ with
-matched (analog-shaped) and linear phase modes and an analyser, the Program
+sample-accurate transport, loops and scrubbing; a 24 band EQ in the spirit
+of Pro-Q 4 (zero latency, natural and linear phase; dynamic and spectral
+bands triggered by their region, free cuts or the sidechain; EQ Match,
+Sketch, Spectrum Grab, an analyser with collisions, the instance list), the Program
 EQ (PultEQFx's circuit-modelled passive tube EQ with its panel); built-in synth, echo,
 compressor, gain and latency probe; offline render and export (stems,
 normalise, dither); freeze and bounce in place. Audio: native PipeWire,
