@@ -12,13 +12,13 @@ use crate::painter::{SnapshotPainter, TextCache};
 use crate::state::AppState;
 use faderframe_session::{Action, Session};
 use faderframe_ui_canvas::{
-    CanvasView, Cursor, EventCx, HostRequest, Key, MenuItem, Modifiers, Point, PointerButton,
-    ScrollAxis, Size, ViewEvent,
+    CanvasView, Cursor, EventCx, FileChoice, HostRequest, Key, MenuItem, Modifiers, Point,
+    PointerButton, ScrollAxis, Size, ViewEvent,
 };
-use gtk::glib;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::{gdk, graphene};
+use gtk::{gio, glib};
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 
@@ -300,6 +300,58 @@ impl CanvasWidget {
                 popover.popup();
                 entry.grab_focus();
                 entry.select_region(0, -1);
+            }
+            HostRequest::ChooseFiles { choice, commit } => {
+                let window = self.root().and_downcast::<gtk::Window>();
+                let weak_app = Rc::downgrade(app);
+                let finish = move |paths: Vec<std::path::PathBuf>| {
+                    if paths.is_empty() {
+                        return;
+                    }
+                    if let (Some(action), Some(app)) = (commit(paths), weak_app.upgrade()) {
+                        app.dispatch(action);
+                    }
+                };
+                match choice {
+                    FileChoice::Open { title, filters } => {
+                        let list = gio::ListStore::new::<gtk::FileFilter>();
+                        for (name, patterns) in &filters {
+                            let f = gtk::FileFilter::new();
+                            f.set_name(Some(name));
+                            for p in patterns {
+                                f.add_pattern(p);
+                            }
+                            list.append(&f);
+                        }
+                        let dialog = gtk::FileDialog::builder()
+                            .title(title.as_str())
+                            .modal(true)
+                            .filters(&list)
+                            .build();
+                        dialog.open_multiple(window.as_ref(), gio::Cancellable::NONE, move |res| {
+                            let Ok(files) = res else { return };
+                            let paths = (0..files.n_items())
+                                .filter_map(|i| files.item(i).and_downcast::<gio::File>())
+                                .filter_map(|f| f.path())
+                                .collect();
+                            finish(paths);
+                        });
+                    }
+                    FileChoice::Folder { title, initial } => {
+                        let dialog = gtk::FileDialog::builder()
+                            .title(title.as_str())
+                            .modal(true)
+                            .build();
+                        if let Some(dir) = initial.filter(|d| d.is_dir()) {
+                            dialog.set_initial_folder(Some(&gio::File::for_path(dir)));
+                        }
+                        dialog.select_folder(window.as_ref(), gio::Cancellable::NONE, move |res| {
+                            if let Some(p) = res.ok().and_then(|f| f.path()) {
+                                finish(vec![p]);
+                            }
+                        });
+                    }
+                }
             }
         }
     }

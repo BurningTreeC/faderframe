@@ -120,8 +120,8 @@ Contrast:
   clips, auditioning, step input from a MIDI keyboard, copy/paste/duplicate,
   clip-length handle, inspector with numeric entry, live keys on the
   keyboard.
-* Docking: mixer / Tools / piano roll / automation / performance tabs in a
-  bottom dock, detach any view into its own window and dock it back,
+* Docking: mixer / Tools / album / piano roll / automation / performance
+  tabs in a bottom dock, detach any view into its own window and dock it back,
   workspaces (Recording, Editing, Mixing, MIDI, Mastering), layouts saved
   with the project. View → Master Strip at the Side keeps the master fader
   at the window's right edge, full height, whatever view is shown (per
@@ -132,6 +132,13 @@ Contrast:
   LUFS) with a short-term history; peak/RMS levels in dBFS or K-12/14/20;
   goniometer and correlation; an FFT spectrum with peak hold — for the
   master or any track.
+* Album (bottom dock, next to Tools): songs in release order — the
+  project's sections, the whole project, other FaderFrame projects or
+  finished mixes — with pause, trim and fades per song; offline analysis
+  (integrated loudness, range, true peak) and a preview of how each song
+  will be delivered; export with one gain for the album (the songs keep
+  their balance) or per-song levelling, true-peak limiting, dither, one
+  file per song and optionally the whole album with a CUE sheet.
 * Engine: routing graph with cycle detection and plugin delay compensation,
   buses, auxes, sends, sidechains, solo-in-place, sample-accurate loops,
   built-in synth, echo, compressor, gain and latency-probe plugins,

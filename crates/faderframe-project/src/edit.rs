@@ -351,6 +351,10 @@ pub enum Command {
     SetArrangement {
         arrangement: Box<crate::arrange::Arrangement>,
     },
+    /// Replace the album (songs and delivery settings).
+    SetAlbum {
+        album: Box<crate::album::Album>,
+    },
     /// Set (`Some`) or remove (`None`) the time signature change at `bar`.
     SetTimeSignature {
         bar: i32,
@@ -580,6 +584,7 @@ impl Command {
             SetTempo { .. } => "Change Tempo".into(),
             SetTimeline { .. } => "Change Tempo Map".into(),
             SetArrangement { .. } => "Rearrange".into(),
+            SetAlbum { .. } => "Edit Album".into(),
             SetTimeSignature { .. } => "Change Time Signature".into(),
             SetLoop { .. } => "Change Loop".into(),
             SetPunch { .. } => "Change Punch Range".into(),
@@ -647,7 +652,8 @@ impl Command {
             | AddGroup { .. }
             | RemoveGroup { .. }
             | UpdateGroup { .. }
-            | SetTrackGroup { .. } => Impact::None,
+            | SetTrackGroup { .. }
+            | SetAlbum { .. } => Impact::None,
             AddSource { .. }
             | RemoveSource { .. }
             | AddAutomationLane { .. }
@@ -1372,6 +1378,9 @@ impl Command {
             }
             SetArrangement { arrangement } => SetArrangement {
                 arrangement: Box::new(arrangement.swap_into(p)),
+            },
+            SetAlbum { album } => SetAlbum {
+                album: Box::new(std::mem::replace(&mut p.album, *album)),
             },
             SetLoop { range, enabled } => {
                 let old_range = std::mem::replace(&mut p.loop_range, range);

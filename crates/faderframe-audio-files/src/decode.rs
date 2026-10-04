@@ -128,3 +128,45 @@ pub fn decode_file(
     }
     Ok(info)
 }
+
+/// Decode `path` completely into memory (planar) at `rate`, resampling
+/// when the file has another rate.
+pub fn decode_at_rate(
+    path: &Path,
+    rate: u32,
+    cancel: &AtomicBool,
+) -> Result<Vec<Vec<f32>>, ImportError> {
+    use crate::resample::StreamResampler;
+    use std::cell::RefCell;
+    let out: RefCell<Vec<Vec<f32>>> = RefCell::new(Vec::new());
+    let resampler: RefCell<Option<StreamResampler>> = RefCell::new(None);
+    let append = |planes: &[&[f32]], n: usize| -> Result<(), ImportError> {
+        for (o, p) in out.borrow_mut().iter_mut().zip(planes) {
+            o.extend_from_slice(&p[..n.min(p.len())]);
+        }
+        Ok(())
+    };
+    decode_file(
+        path,
+        cancel,
+        |info| {
+            *out.borrow_mut() = vec![Vec::new(); info.channels.max(1)];
+            if info.sample_rate != rate {
+                *resampler.borrow_mut() =
+                    Some(StreamResampler::new(info.sample_rate, rate, info.channels)?);
+            }
+            Ok(())
+        },
+        |planes, frames| match resampler.borrow_mut().as_mut() {
+            Some(r) => r.push(planes, frames, &mut |p: &[&[f32]], n| append(p, n)),
+            None => {
+                let slices: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
+                append(&slices, frames)
+            }
+        },
+    )?;
+    if let Some(r) = resampler.into_inner() {
+        r.finish(&mut |p: &[&[f32]], n| append(p, n))?;
+    }
+    Ok(out.into_inner())
+}

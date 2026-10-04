@@ -777,6 +777,7 @@ dependencies = [
  "faderframe-timeline",
  "faderframe-transport",
  "faderframe-ui-canvas",
+ "faderframe-view-album",
  "faderframe-view-arranger",
  "faderframe-view-automation",
  "faderframe-view-mixer",
@@ -799,6 +800,20 @@ dependencies = [
 [[package]]
 name = "faderframe-ui-canvas"
 version = "0.1.0"
+
+[[package]]
+name = "faderframe-view-album"
+version = "0.1.0"
+dependencies = [
+ "faderframe-audio",
+ "faderframe-audio-files",
+ "faderframe-core",
+ "faderframe-engine",
+ "faderframe-project",
+ "faderframe-session",
+ "faderframe-timeline",
+ "faderframe-ui-canvas",
+]
 
 [[package]]
 name = "faderframe-view-arranger"

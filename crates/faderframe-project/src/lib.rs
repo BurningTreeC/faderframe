@@ -13,6 +13,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod album;
 pub mod arrange;
 mod clip;
 pub mod demo;

@@ -21,6 +21,7 @@ pub mod midi;
 pub mod notes;
 pub mod performance;
 pub use performance::{Load, PerformanceReport, PluginPerformance, TrackPerformance};
+pub mod album;
 pub mod analysis;
 pub mod delivery;
 pub mod editing;
@@ -258,6 +259,8 @@ pub enum Action {
     ResetAnalysis,
     SetLoudnessTarget(f32),
     SetLevelScale(analysis::LevelScale),
+    /// Album songs, settings, analysis and export.
+    Album(album::AlbumAction),
     SetResetOnPlay(bool),
     /// Group the selected tracks.
     GroupSelectedTracks,
@@ -820,6 +823,8 @@ pub struct Session {
     transients: transients::TransientCache,
     /// Track renders for freezing and bouncing.
     bounces: Vec<freeze::PendingBounce>,
+    /// Album analyses and the running album job.
+    album_state: album::AlbumState,
     /// The Tools view's meters.
     analysis: analysis::AnalysisState,
     /// Where tracks following a multi-track fader/pan/send move started
@@ -994,6 +999,7 @@ impl Session {
             transients: transients::TransientCache::default(),
             gesture_base: HashMap::new(),
             bounces: Vec::new(),
+            album_state: album::AlbumState::default(),
             analysis: analysis::AnalysisState::new(config.sample_rate),
             follow_base: HashMap::new(),
             user_edit: false,
@@ -1393,7 +1399,13 @@ impl Session {
         &mut self,
         settings: render::RenderSettings,
     ) -> std::result::Result<render::RenderJob, render::RenderError> {
-        // The render thread creates its own plugin instances from the slots.
+        render::start(self.render_copy(), settings)
+    }
+
+    /// The project as a render needs it: plugin states captured (the render
+    /// thread creates its own instances from the slots), media paths
+    /// absolute.
+    pub(crate) fn render_copy(&mut self) -> Project {
         self.capture_plugin_states();
         let mut project = self.project.clone();
         let dir = self.project_dir();
@@ -1402,7 +1414,7 @@ impl Session {
                 *path = self.resolve_media(path, dir.as_deref());
             }
         }
-        render::start(project, settings)
+        project
     }
 
     /// Close the stream (the engine processor goes with it).
@@ -1423,6 +1435,7 @@ impl Session {
     pub fn tick(&mut self, dt: f32) {
         self.poll_jobs();
         self.poll_bounces();
+        self.poll_album();
         self.poll_analysis(dt);
         self.pump_idle();
         self.poll_recording();
@@ -2169,6 +2182,7 @@ impl Session {
             Action::SetLoudnessTarget(lufs) => {
                 self.update_analysis_settings(|s| s.target_lufs = lufs);
             }
+            Action::Album(a) => self.album_action(a)?,
             Action::SetLevelScale(scale) => self.update_analysis_settings(|s| s.scale = scale),
             Action::SetResetOnPlay(on) => self.update_analysis_settings(|s| s.reset_on_play = on),
             Action::GroupSelectedTracks => {

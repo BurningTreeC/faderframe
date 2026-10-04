@@ -43,6 +43,25 @@ impl<A> MenuItem<A> {
 /// Turns committed text into an action (or nothing).
 pub type TextCommit<A> = Box<dyn Fn(&str) -> Option<A>>;
 
+/// Turns chosen paths into an action (or nothing).
+pub type FilesCommit<A> = Box<dyn Fn(Vec<std::path::PathBuf>) -> Option<A>>;
+
+/// What a file chooser asks for.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FileChoice {
+    /// Existing files (several), offered by filters: (name, patterns like
+    /// `*.wav`).
+    Open {
+        title: String,
+        filters: Vec<(String, Vec<String>)>,
+    },
+    /// A folder.
+    Folder {
+        title: String,
+        initial: Option<std::path::PathBuf>,
+    },
+}
+
 /// Things only the toolkit host can do on a view's behalf (native popovers,
 /// text entry). Keeps views free of toolkit types.
 pub enum HostRequest<A> {
@@ -57,6 +76,11 @@ pub enum HostRequest<A> {
         commit: TextCommit<A>,
     },
     GrabFocus,
+    /// A native file or folder chooser.
+    ChooseFiles {
+        choice: FileChoice,
+        commit: FilesCommit<A>,
+    },
 }
 
 /// Collects what a view wants done in response to an event.

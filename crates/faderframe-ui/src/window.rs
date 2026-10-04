@@ -425,6 +425,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             ("Piano Roll", "app.show-piano-roll"),
             ("Automation", "app.show-automation"),
             ("Tools (Loudness, Level, Phase, Spectrum)", "app.show-tools"),
+            ("Album (Songs, Loudness, Delivery)", "app.show-album"),
             ("Performance Meter", "app.show-performance"),
             ("Show / Hide Bottom Dock", "app.toggle-dock"),
             ("Master Strip at the Side", "app.master-panel"),

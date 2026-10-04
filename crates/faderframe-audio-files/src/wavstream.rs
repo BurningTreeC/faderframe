@@ -34,6 +34,18 @@ impl WavWriter {
         format: WavFormat,
         dither: bool,
     ) -> io::Result<Self> {
+        let dither = if dither { Dither::Tpdf } else { Dither::Off };
+        Self::create_with(path, channels, sample_rate, format, dither)
+    }
+
+    /// [`WavWriter::create`] with a choice of [`Dither`].
+    pub fn create_with(
+        path: &Path,
+        channels: u16,
+        sample_rate: u32,
+        format: WavFormat,
+        dither: Dither,
+    ) -> io::Result<Self> {
         let mut out = BufWriter::with_capacity(1 << 20, File::create(path)?);
         Self::write_header(&mut out, channels.max(1), sample_rate, format, 0)?;
         Ok(Self {
@@ -46,7 +58,11 @@ impl WavWriter {
                 format.bits(),
                 channels.max(1) as usize,
                 sample_rate,
-                if dither { Dither::Tpdf } else { Dither::Off },
+                if format.is_integer() {
+                    dither
+                } else {
+                    Dither::Off
+                },
             ),
             frames: 0,
             scratch: Vec::new(),

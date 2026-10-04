@@ -14,16 +14,19 @@ pub enum ViewKind {
     Performance,
     /// Mastering meters: loudness, level, phase, spectrum.
     Tools,
+    /// Songs in release order, their loudness and delivery.
+    Album,
 }
 
 impl ViewKind {
-    pub const ALL: [ViewKind; 6] = [
+    pub const ALL: [ViewKind; 7] = [
         ViewKind::Arranger,
         ViewKind::Mixer,
         ViewKind::PianoRoll,
         ViewKind::Automation,
         ViewKind::Performance,
         ViewKind::Tools,
+        ViewKind::Album,
     ];
 
     /// The kind whose default view has this id (views added after a layout
@@ -40,6 +43,7 @@ impl ViewKind {
             ViewKind::Automation => "Automation",
             ViewKind::Performance => "Performance",
             ViewKind::Tools => "Tools",
+            ViewKind::Album => "Album",
         }
     }
 
@@ -51,6 +55,7 @@ impl ViewKind {
             ViewKind::Automation => ViewId::automation(),
             ViewKind::Performance => ViewId::performance(),
             ViewKind::Tools => ViewId::tools(),
+            ViewKind::Album => ViewId::album(),
         }
     }
 }
@@ -720,6 +725,7 @@ mod tests {
         let bottom_views = [
             ViewId::mixer(),
             ViewId::tools(),
+            ViewId::album(),
             ViewId::piano_roll(),
             ViewId::automation(),
             ViewId::performance(),

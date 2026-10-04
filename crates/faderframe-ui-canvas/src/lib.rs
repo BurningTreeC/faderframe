@@ -39,4 +39,7 @@ pub use theme::{
     ArrangerTheme, ConsoleLook, ConsoleTheme, FaderStyle, KnobStyle, LedStyle, MeterKind,
     MeterStyle, PerformanceTheme, PianoRollTheme, Theme, ToolsTheme, Typography, UiPalette,
 };
-pub use view::{CanvasView, EventCx, HostRequest, MenuItem, ScrollAxis, ScrollInfo, TextCommit};
+pub use view::{
+    CanvasView, EventCx, FileChoice, FilesCommit, HostRequest, MenuItem, ScrollAxis, ScrollInfo,
+    TextCommit,
+};

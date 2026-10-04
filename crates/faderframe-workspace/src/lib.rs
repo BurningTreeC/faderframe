@@ -68,6 +68,10 @@ impl ViewId {
     pub fn tools() -> Self {
         Self::new("tools")
     }
+
+    pub fn album() -> Self {
+        Self::new("album")
+    }
 }
 
 impl fmt::Debug for ViewId {

@@ -119,6 +119,9 @@ pub struct Project {
     /// Track groups (members name theirs in `Track::group`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<crate::TrackGroup>,
+    /// The album: songs and how they are delivered.
+    #[serde(default, skip_serializing_if = "crate::album::Album::is_default")]
+    pub album: crate::album::Album,
     #[serde(default)]
     pub ids: IdAllocator,
 }
@@ -149,6 +152,7 @@ impl Project {
             midi_mappings: Vec::new(),
             groups: Vec::new(),
             sections: Vec::new(),
+            album: crate::album::Album::default(),
             ids,
         }
     }

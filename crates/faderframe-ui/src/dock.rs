@@ -68,6 +68,12 @@ fn create_view(app: &Rc<AppState>, kind: ViewKind) -> ViewHost {
             false,
             true,
         ),
+        ViewKind::Album => ViewHost::new(
+            app,
+            Box::new(faderframe_view_album::AlbumView::new(theme)),
+            false,
+            false,
+        ),
         ViewKind::Tools => ViewHost::new(
             app,
             Box::new(faderframe_view_tools::ToolsView::new(theme)),

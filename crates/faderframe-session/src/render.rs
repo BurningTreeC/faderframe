@@ -183,7 +183,7 @@ pub fn resolve_range(
     Ok((a, b))
 }
 
-fn sanitize(name: &str) -> String {
+pub(crate) fn sanitize(name: &str) -> String {
     name.chars()
         .map(|c| {
             if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' {
@@ -206,16 +206,51 @@ fn stem_tracks(project: &Project) -> Vec<(TrackId, String)> {
         .collect()
 }
 
+/// Render `project` (absolute media paths) from `a` to `b` plus `tail`
+/// seconds at `sample_rate`, in stereo, on the calling thread (the album's
+/// worker). `progress` counts frames.
+pub(crate) fn render_span(
+    project: &Project,
+    sample_rate: u32,
+    a: MusicalTime,
+    b: MusicalTime,
+    tail: f32,
+    progress: &RenderProgress,
+) -> Result<Vec<Vec<f32>>, RenderError> {
+    let mut unlooped;
+    let project = if project.loop_enabled {
+        unlooped = project.clone();
+        unlooped.loop_enabled = false;
+        &unlooped
+    } else {
+        project
+    };
+    let sr = sample_rate as f64;
+    let start = project.timeline.to_samples(a, sr);
+    let end = project.timeline.to_samples(b, sr) + (tail.max(0.0) as f64 * sr) as i64;
+    let frames = (end - start).max(0) as usize;
+    if frames == 0 {
+        return Err(RenderError::EmptyRange);
+    }
+    progress.done.store(0, Ordering::Relaxed);
+    progress.total.store(frames as u64, Ordering::Relaxed);
+    let mut sources = render_generated_sources(project, sample_rate);
+    for (_, path, e) in crate::media::open_file_sources(project, None, &mut sources) {
+        tracing::warn!("render: {}: {e}", path.display());
+    }
+    render_one(project, sample_rate, &sources, start, frames, progress)
+}
+
 fn render_one(
     project: &Project,
-    settings: &RenderSettings,
+    sample_rate: u32,
     sources: &faderframe_engine::SourceMap,
     start: i64,
     frames: usize,
     progress: &RenderProgress,
 ) -> Result<Vec<Vec<f32>>, RenderError> {
     let config = EngineConfig {
-        sample_rate: settings.sample_rate,
+        sample_rate,
         max_block_size: 1024,
         measure_nodes: false,
         ..EngineConfig::default()
@@ -389,7 +424,8 @@ pub fn start(project: Project, settings: RenderSettings) -> Result<RenderJob, Re
             }
             let mut written = Vec::new();
             if stems.is_empty() {
-                let audio = render_one(&project, &settings, &sources, start, frames, &p)?;
+                let audio =
+                    render_one(&project, settings.sample_rate, &sources, start, frames, &p)?;
                 written.push(finish(audio, &settings, &settings.output)?);
             } else {
                 std::fs::create_dir_all(&settings.output).map_err(|source| RenderError::Io {
@@ -401,7 +437,8 @@ pub fn start(project: Project, settings: RenderSettings) -> Result<RenderJob, Re
                     for t in &mut stem.tracks {
                         t.solo = t.id == *track;
                     }
-                    let audio = render_one(&stem, &settings, &sources, start, frames, &p)?;
+                    let audio =
+                        render_one(&stem, settings.sample_rate, &sources, start, frames, &p)?;
                     let path = settings.output.join(format!(
                         "{} - {}.wav",
                         sanitize(&project.name),

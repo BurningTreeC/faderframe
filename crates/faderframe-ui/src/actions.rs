@@ -309,6 +309,11 @@ pub fn install(app: &Rc<AppState>) {
         ),
         dispatch(
             app,
+            "show-album",
+            A::Workspace(W::ShowView(ViewId::album())),
+        ),
+        dispatch(
+            app,
             "detach-tools",
             A::Workspace(W::Detach(ViewId::tools())),
         ),
@@ -604,6 +609,25 @@ pub fn install(app: &Rc<AppState>) {
                     drag: faderframe_session::warping::WarpDrag::Transients,
                 });
             }
+        }),
+        // Development aid: `album:<sections|project|analyse|export>` drives
+        // the album (`album:file=<path>` adds a file).
+        named("album", |a, arg| {
+            use faderframe_session::album::AlbumAction as AA;
+            let action = match arg.trim() {
+                "sections" => AA::AddSections,
+                "project" => AA::AddThisProject,
+                "analyse" => AA::Analyse,
+                "export" => AA::Export,
+                other => match other.strip_prefix("file=") {
+                    Some(path) => AA::AddFiles(vec![std::path::PathBuf::from(path)]),
+                    None => {
+                        tracing::warn!("album: unknown '{other}'");
+                        return;
+                    }
+                },
+            };
+            a.dispatch(Action::Album(action));
         }),
         // Development aid: `render-preset:<n>` opens Render / Export with
         // delivery preset n (1-based).

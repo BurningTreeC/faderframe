@@ -50,6 +50,7 @@ impl Preset {
         let bottom_views = vec![
             ViewId::mixer(),
             ViewId::tools(),
+            ViewId::album(),
             ViewId::piano_roll(),
             ViewId::automation(),
             ViewId::performance(),

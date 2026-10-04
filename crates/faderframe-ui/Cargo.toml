@@ -32,6 +32,7 @@ faderframe-view-mixer.workspace = true
 faderframe-view-performance.workspace = true
 faderframe-view-tools.workspace = true
 faderframe-view-automation.workspace = true
+faderframe-view-album.workspace = true
 faderframe-view-pianoroll.workspace = true
 faderframe-timeline.workspace = true
 faderframe-transport.workspace = true

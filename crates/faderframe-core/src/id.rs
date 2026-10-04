@@ -75,6 +75,10 @@ define_id!(
     MarkerId, "marker#"
 );
 define_id!(
+    /// A song of the album.
+    SongId, "song#"
+);
+define_id!(
     /// An automation lane.
     AutomationLaneId, "lane#"
 );

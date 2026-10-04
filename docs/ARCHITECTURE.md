@@ -713,6 +713,25 @@ is TPDF or TPDF with Lipshitz's 5-tap E-weighted error feedback (44.1 and
 48 kHz). `DELIVERY_PRESETS` bundle target, ceiling, format, rate and
 dither.
 
+The album (`faderframe_project::album`, saved in `Project::album`, edited
+as a whole through `Command::SetAlbum`) lists songs — a section, this
+project, another project file or an audio file — with pause, trim and
+fades, and the delivery settings (album or per-song levelling, target,
+ceiling, limit or less gain, format, rate, dither, folder, album file).
+`session::album` runs Analyse and Export on a worker: each song is
+rendered at the album rate (`render::render_span`; a section without the
+clips that start after it, so the next song does not ring into its tail;
+other projects load with their media resolved against their folder) or
+decoded (`decode_at_rate`), made stereo, faded and trimmed, and measured.
+Export writes the songs to temporary float files while one `Measurement`
+measures the whole album, then levels (album gain = target − album
+loudness; per song through `normalize_loudness`), limits, dithers and
+writes `NN Title.wav`, appending to the album file (pauses as CUE
+pregaps). `Session::album_delivered` previews the gains from the analyses
+(album loudness approximated from the songs' loudness and length). The
+Album view is `faderframe-view-album`; file and folder choosers are a
+`HostRequest::ChooseFiles` the GTK host answers with `gtk::FileDialog`.
+
 ### Freezing and bouncing
 
 Both render a track after its inserts and before its fader
@@ -1080,7 +1099,7 @@ full width under the header by `faderframe-ui`, wrapped into rows by
 of `Split`s and `TabGroup`s; named dock areas (`main`, `bottom`) persist when
 empty so detached views have a home; floating windows; geometry; presets
 (Recording, Editing, Mixing, MIDI, Mastering — the bottom dock holds the
-mixer, Tools, piano roll, automation and performance views; Mastering opens
+mixer, Tools, album, piano roll, automation and performance views; Mastering opens
 on Tools). Views added after a layout was saved register on first use. `faderframe_ui::dock::realize`
 turns the active layout into `gtk::Paned` / `gtk::Notebook` /
 `gtk::ApplicationWindow`s. Every view has exactly one persistent host widget
@@ -1254,7 +1273,10 @@ move and copy between tracks, sidechain inputs.
 Mixing: an analogue-console mixer, sends in banks, track groups with
 linked controls, VCAs, relative edits of every selected track, track
 presets, and the Tools view for mastering (EBU R128 loudness and true peak,
-levels with K-System scales, phase, spectrum).
+levels with K-System scales, phase, spectrum). Delivery: loudness
+normalisation and true-peak limiting on export, noise-shaped dither,
+delivery presets, and the album (songs analysed and exported with album or
+per-song levelling and a CUE sheet).
 
 Editing: Pro Tools-style edit modes and tools, edit-selection ranges, clip
 gain, shaped fades, transient detection, warp markers and pitch-preserving
@@ -1269,9 +1291,9 @@ and packages for all three platforms (see §14).
 
 **Next**, roughly in order:
 
-1. **Mastering**: offline loudness analysis per song and loudness
-   normalisation on export, dithering and true-peak limiting for delivery
-   formats, an album/sequence view.
+1. **Editing**: Quantize and Humanize tools for audio transients and
+   MIDI alike (selected clips, strength, swing, humanize timing and
+   velocity).
 2. **Ports**: the CoreAudio IO workgroup for DSP workers, signed and
    notarised packages, a Flathub submission (vendored crates).
 3. **Plugins**: note expressions (CLAP, VST3), VST3 program lists and
@@ -1281,3 +1303,5 @@ and packages for all three platforms (see §14).
 5. **Performance**: anticipative processing of tracks that are not
    monitored live, job affinity for cache locality, an optional wgpu
    painter for dense views.
+6. **Mastering**: DDP export, ISRC/UPC metadata, crossfades between album
+   songs, a song's own inserts on the album.
