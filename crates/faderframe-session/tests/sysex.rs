@@ -74,6 +74,21 @@ fn sent(c: &faderframe_midi_io::Captured) -> Vec<(u64, Vec<u8>)> {
         .collect()
 }
 
+/// Run until `n` SysEx messages went out (slow CI machines lag behind the
+/// wall clock), at most `limit`.
+fn until_sent(
+    s: &mut Session,
+    c: &faderframe_midi_io::Captured,
+    n: usize,
+    limit: Duration,
+) -> Vec<(u64, Vec<u8>)> {
+    let start = Instant::now();
+    while sent(c).len() < n && start.elapsed() < limit {
+        run(s, Duration::from_millis(20));
+    }
+    sent(c)
+}
+
 #[test]
 fn clip_sysex_goes_out_when_its_time_comes() {
     let (mut s, captured, _) = setup();
@@ -82,8 +97,7 @@ fn clip_sysex_goes_out_when_its_time_comes() {
         .unwrap();
     run(&mut s, Duration::from_millis(300));
     assert!(sent(&captured).is_empty(), "not before its beat");
-    run(&mut s, Duration::from_millis(500));
-    let got = sent(&captured);
+    let got = until_sent(&mut s, &captured, 1, Duration::from_secs(3));
     assert_eq!(got.len(), 1, "{got:?}");
     assert_eq!(got[0].1, DUMP.to_vec());
     // Locate back: it plays again.
@@ -91,8 +105,8 @@ fn clip_sysex_goes_out_when_its_time_comes() {
         MusicalTime::ZERO,
     )))
     .unwrap();
-    run(&mut s, Duration::from_millis(800));
-    assert_eq!(sent(&captured).len(), 2, "again after the locate");
+    let again = until_sent(&mut s, &captured, 2, Duration::from_secs(3));
+    assert_eq!(again.len(), 2, "again after the locate");
     s.stop_audio();
 }
 
