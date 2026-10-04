@@ -59,6 +59,17 @@ pub enum PathCmd {
     Close,
 }
 
+/// A bitmap compiled into the program (a PNG), drawn with
+/// [`crate::Painter::image`]. `key` names it for the backend's texture
+/// cache; `width` and `height` are its pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Image {
+    pub key: &'static str,
+    pub png: &'static [u8],
+    pub width: u32,
+    pub height: u32,
+}
+
 /// A vector path built from lines and cubic Béziers. Arcs are converted to
 /// cubics here, so painter backends only need move/line/cubic/close.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -180,6 +191,37 @@ impl Path {
             true,
         );
         p.close();
+        p
+    }
+
+    /// An axis-aligned ellipse.
+    pub fn ellipse(center: Point, rx: f32, ry: f32) -> Self {
+        // Four cubic quarter arcs.
+        const K: f32 = 0.552_284_8;
+        let (cx, cy) = (center.x, center.y);
+        let mut p = Path::new();
+        p.move_to(Point::new(cx + rx, cy))
+            .cubic_to(
+                Point::new(cx + rx, cy + K * ry),
+                Point::new(cx + K * rx, cy + ry),
+                Point::new(cx, cy + ry),
+            )
+            .cubic_to(
+                Point::new(cx - K * rx, cy + ry),
+                Point::new(cx - rx, cy + K * ry),
+                Point::new(cx - rx, cy),
+            )
+            .cubic_to(
+                Point::new(cx - rx, cy - K * ry),
+                Point::new(cx - K * rx, cy - ry),
+                Point::new(cx, cy - ry),
+            )
+            .cubic_to(
+                Point::new(cx + K * rx, cy - ry),
+                Point::new(cx + rx, cy - K * ry),
+                Point::new(cx + rx, cy),
+            )
+            .close();
         p
     }
 

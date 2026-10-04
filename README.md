@@ -151,6 +151,15 @@ Contrast:
   buses, auxes, sends, sidechains, solo-in-place, sample-accurate loops,
   built-in synth, echo, compressor, gain and latency-probe plugins,
   realtime-safe (verified by an allocation-counting test).
+* EQ: 24 bands (bell, shelves, cuts from 6 to 96 dB/oct, notch, band pass,
+  tilt) whose curves keep their analog shape up to Nyquist, per band
+  stereo, left, right, mid or side, dynamic bands keyed by their own region
+  or a sidechain, auto gain, a linear phase mode (exact analog curves), a
+  live pre/post analyser, nodes dragged on the curve, any band heard on its
+  own.
+* Program EQ: PultEQFx's circuit-modelled passive tube program equaliser
+  (the low end trick falls out of the circuit), with its hardware panel,
+  input and output meters, drive and oversampling.
 * Audio: native PipeWire (one node with a port per channel, linked to your
   default devices), JACK (JACK2 or PipeWire-JACK), ALSA, WASAPI and ASIO
   (Windows; ASIO in builds with the `asio` feature, see below), CoreAudio
@@ -197,7 +206,7 @@ Contrast:
   armed and live tracks, tracks with a plugin editor open, faders and
   sends stay immediate. With 64 tracks of six effects at 64-frame buffers
   the audio thread's worst callback went from 1.3 ms to 81 µs.
-* Plugins: built-in synth/echo/compressor/gain, CLAP and VST3 effects and
+* Plugins: built-in synth/echo/compressor/gain/EQ/Program EQ, CLAP and VST3 effects and
   instruments on every platform and Audio Units on macOS, found by a
   crash-safe background scan (Audio Units: the system's registry) and
   picked in a plugin browser (click an

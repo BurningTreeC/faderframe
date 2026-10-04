@@ -780,6 +780,15 @@ impl EngineController {
         self.profile.clone()
     }
 
+    /// A built-in plugin's tap: its live parameters, the audio going in and
+    /// out for an analyser, its meters.
+    pub fn plugin_tap(
+        &self,
+        plugin: faderframe_core::PluginInstanceId,
+    ) -> Option<Arc<faderframe_plugin_host::tap::AnalysisTap>> {
+        self.plugins.tap(plugin)
+    }
+
     /// Host `slot`'s plugin (instantiate it) outside the graph; `false`
     /// when it cannot be loaded.
     pub fn host_plugin(&mut self, slot: &faderframe_project::PluginSlot) -> bool {

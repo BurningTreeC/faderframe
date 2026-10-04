@@ -710,6 +710,115 @@ pub fn install(app: &Rc<AppState>) {
             };
             a.dispatch(Action::Album(action));
         }),
+        // Development aid: `device-demo:<eq|program-eq>` puts the device on
+        // the first audio track, set up to show what it does, and opens its
+        // editor.
+        named("device-demo", |a, arg| {
+            use faderframe_core::{ParameterId, builtin};
+            use faderframe_plugin_host::eq::{Field, band_id};
+            use faderframe_project::{Command, PluginRef};
+            let (id, name) = match arg.trim() {
+                "eq" => (builtin::EQ, "EQ"),
+                "program-eq" => (builtin::PROGRAM_EQ, "Program EQ"),
+                other => {
+                    tracing::warn!("device-demo: unknown '{other}'");
+                    return;
+                }
+            };
+            let Some((track, index)) = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.kind == TrackKind::Audio)
+                .map(|t| (t.id, t.inserts.len()))
+            else {
+                return;
+            };
+            let placed = a.session.borrow_mut().place_plugin(
+                track,
+                faderframe_session::PluginTarget::Insert(index),
+                PluginRef::builtin(id, name),
+            );
+            if let Err(e) = placed {
+                a.report(e, false);
+                return;
+            }
+            let Some(plugin) = a
+                .session
+                .borrow()
+                .project()
+                .track(track)
+                .and_then(|t| t.inserts.get(index))
+                .map(|s| s.id)
+            else {
+                return;
+            };
+            let values: Vec<(ParameterId, f64)> = if id == builtin::EQ {
+                let mut v = Vec::new();
+                // (type, freq, gain, q, slope, placement, range)
+                for (b, band) in [
+                    (3.0, 35.0, 0.0, 0.707, 3.0, 0.0, 0.0),
+                    (0.0, 240.0, -3.5, 1.4, 1.0, 0.0, 0.0),
+                    (0.0, 3_200.0, 4.0, 0.8, 1.0, 0.0, -5.0),
+                    (2.0, 9_000.0, 3.0, 0.707, 1.0, 3.0, 0.0),
+                    (5.0, 1_150.0, 0.0, 6.0, 1.0, 4.0, 0.0),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    for (f, x) in [
+                        (Field::Type, band.0),
+                        (Field::Freq, band.1),
+                        (Field::Gain, band.2),
+                        (Field::Q, band.3),
+                        (Field::Slope, band.4),
+                        (Field::Placement, band.5),
+                        (Field::Range, band.6),
+                        (Field::Threshold, -42.0),
+                        (Field::Enabled, 1.0),
+                    ] {
+                        v.push((band_id(b, f), x));
+                    }
+                }
+                v
+            } else {
+                faderframe_plugin_host::program_eq::PRESETS[0]
+                    .1
+                    .iter()
+                    .map(|(p, x)| (ParameterId(*p as u32), *x))
+                    .collect()
+            };
+            let commands = values
+                .into_iter()
+                .map(|(parameter, value)| Command::SetPluginParameter {
+                    track,
+                    plugin,
+                    parameter,
+                    value: Some(value),
+                })
+                .collect();
+            a.dispatch(Action::Edit(Command::Batch {
+                label: "Device Demo".into(),
+                commands,
+            }));
+        }),
+        // Development aid: `device-click:<x>/<y>[/right|middle]` clicks into
+        // the open device editor (view pixels below its header bar).
+        named("device-click", |_, arg| {
+            let mut parts = arg.split('/').map(str::trim);
+            let x = parts.next().and_then(|v| v.parse::<f32>().ok());
+            let y = parts.next().and_then(|v| v.parse::<f32>().ok());
+            let button = match parts.next() {
+                Some("right") => faderframe_ui_canvas::PointerButton::Secondary,
+                Some("middle") => faderframe_ui_canvas::PointerButton::Middle,
+                _ => faderframe_ui_canvas::PointerButton::Primary,
+            };
+            if let (Some(x), Some(y)) = (x, y) {
+                crate::plugin_window::click_device(x, y, button);
+            }
+        }),
         // Development aid: `reload-plugins:x` starts every plugin again (a
         // crashed one, or after switching sandboxing).
         named("reload-plugins", |a, _| {

@@ -59,7 +59,7 @@ impl Rig {
 fn registry_lists_and_instantiates_builtins() {
     let reg = PluginRegistry::with_builtins();
     let list = reg.scan();
-    assert_eq!(list.len(), 5);
+    assert_eq!(list.len(), 7);
     assert!(
         list.iter()
             .any(|d| d.category == PluginCategory::Instrument)

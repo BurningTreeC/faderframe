@@ -20,3 +20,5 @@ faderframe-realtime.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+realfft.workspace = true
+rtrb.workspace = true

@@ -13,3 +13,13 @@ pub const COMPRESSOR: &str = "faderframe.compressor";
 pub const GAIN: &str = "faderframe.gain";
 /// Pure delay that reports its delay as latency (testing PDC).
 pub const LATENCY_PROBE: &str = "faderframe.latency-probe";
+/// 24 band parametric and dynamic equaliser (effect).
+pub const EQ: &str = "faderframe.eq";
+/// Circuit modelled passive program equaliser with a tube make-up stage,
+/// from PultEQFx (effect).
+pub const PROGRAM_EQ: &str = "faderframe.program-eq";
+
+/// Built-ins with an editor of their own (others get the generic one).
+pub fn has_editor(id: &str) -> bool {
+    matches!(id, EQ | PROGRAM_EQ)
+}

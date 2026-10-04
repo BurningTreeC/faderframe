@@ -665,6 +665,8 @@ dependencies = [
  "faderframe-midi",
  "faderframe-realtime",
  "faderframe-transport",
+ "realfft",
+ "rtrb",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -814,6 +816,7 @@ dependencies = [
  "faderframe-view-album",
  "faderframe-view-arranger",
  "faderframe-view-automation",
+ "faderframe-view-devices",
  "faderframe-view-mixer",
  "faderframe-view-performance",
  "faderframe-view-pianoroll",
@@ -874,6 +877,19 @@ dependencies = [
  "faderframe-project",
  "faderframe-session",
  "faderframe-timeline",
+ "faderframe-ui-canvas",
+]
+
+[[package]]
+name = "faderframe-view-devices"
+version = "0.2.0"
+dependencies = [
+ "faderframe-analysis",
+ "faderframe-core",
+ "faderframe-engine",
+ "faderframe-plugin-host",
+ "faderframe-project",
+ "faderframe-session",
  "faderframe-ui-canvas",
 ]
 

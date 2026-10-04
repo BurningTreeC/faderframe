@@ -321,6 +321,14 @@ impl PluginHost {
         }
     }
 
+    /// A built-in plugin's tap (live parameters, analyser audio, meters).
+    pub fn tap(
+        &self,
+        plugin: PluginInstanceId,
+    ) -> Option<Arc<faderframe_plugin_host::tap::AnalysisTap>> {
+        self.instances.get(&plugin)?.instance.tap()
+    }
+
     /// The plugin's own editor, if it has one.
     pub fn editor(&mut self, plugin: PluginInstanceId) -> Option<&mut dyn PluginEditor> {
         self.instances.get_mut(&plugin)?.instance.editor()

@@ -21,8 +21,11 @@
 #![forbid(unsafe_code)]
 
 pub mod builtin;
+pub mod eq;
 mod params;
+pub mod program_eq;
 pub mod scan;
+pub mod tap;
 
 pub use params::ParamValues;
 
@@ -322,6 +325,11 @@ pub trait PluginInstance {
     /// costs only the instance, and its state is worth saving often.
     fn sandboxed(&self) -> bool {
         false
+    }
+    /// What a built-in plugin's own editor reads (live parameters,
+    /// analyser audio, meters); `None` for other plugins.
+    fn tap(&self) -> Option<std::sync::Arc<tap::AnalysisTap>> {
+        None
     }
     /// Counts (re)activations. Processors of different activations are not
     /// interchangeable: after a restart the old one is dead, so the engine

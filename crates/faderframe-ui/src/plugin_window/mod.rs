@@ -53,6 +53,8 @@ struct Editors {
     parents: RefCell<Option<Result<Parents, String>>>,
     native: RefCell<Vec<NativeEditor>>,
     generic: RefCell<HashMap<PluginInstanceId, gtk::Window>>,
+    /// Built-in devices' own editors (canvas views).
+    devices: RefCell<HashMap<PluginInstanceId, gtk::Window>>,
     #[cfg(unix)]
     fds: RefCell<HashMap<(PluginInstanceId, i32), FdWatch>>,
     timers: RefCell<HashMap<(PluginInstanceId, u32), (u32, glib::SourceId)>>,
@@ -229,10 +231,199 @@ fn title_of(app: &AppState, plugin: PluginInstanceId) -> Option<(TrackId, String
 
 /// Show `plugin`'s editor: its own GUI unless `generic` (or it has none).
 pub fn open(app: &Rc<AppState>, plugin: PluginInstanceId, generic: bool) {
-    if !generic && open_native(app, plugin) {
+    if !generic && (open_device(app, plugin) || open_native(app, plugin)) {
         return;
     }
     open_generic(app, plugin);
+}
+
+/// The Bypass toggle of an editor window's header.
+fn bypass_button(
+    app: &Rc<AppState>,
+    plugin: PluginInstanceId,
+    track: TrackId,
+    bypassed: bool,
+) -> gtk::ToggleButton {
+    let bypass = gtk::ToggleButton::with_label("Bypass");
+    bypass.set_active(bypassed);
+    bypass.add_css_class("bypass-toggle");
+    let weak = Rc::downgrade(app);
+    bypass.connect_toggled(move |b| {
+        if let Some(a) = weak.upgrade() {
+            a.dispatch(Action::Edit(Command::SetPluginBypass {
+                track,
+                plugin,
+                bypass: b.is_active(),
+            }));
+        }
+    });
+    bypass
+}
+
+/// The Presets menu of an editor window's header (rebuilt each time it
+/// opens): save, the user's and factory presets, the plugin's programs.
+fn presets_button(app: &Rc<AppState>, plugin: PluginInstanceId) -> gtk::MenuButton {
+    let presets = gtk::MenuButton::new();
+    presets.set_label("Presets");
+    let weak = Rc::downgrade(app);
+    presets.set_create_popup_func(move |button| {
+        let Some(app) = weak.upgrade() else { return };
+        let menu = gtk::gio::Menu::new();
+        let save = gtk::gio::Menu::new();
+        let item = gtk::gio::MenuItem::new(Some("Save Preset…"), None);
+        item.set_action_and_target_value(
+            Some("app.save-preset"),
+            Some(&plugin.raw().to_string().to_variant()),
+        );
+        save.append_item(&item);
+        menu.append_section(None, &save);
+        let list = gtk::gio::Menu::new();
+        let found = app.session.borrow().plugin_presets(plugin);
+        if found.is_empty() {
+            list.append(Some("No presets yet"), None);
+        }
+        for p in found {
+            let label = if p.factory {
+                format!("{} (factory)", p.name)
+            } else {
+                p.name.clone()
+            }
+            .replace('_', "__");
+            let item = gtk::gio::MenuItem::new(Some(&label), None);
+            let target = format!("{}\n{}", plugin.raw(), p.path.display());
+            item.set_action_and_target_value(Some("app.load-preset"), Some(&target.to_variant()));
+            list.append_item(&item);
+        }
+        menu.append_section(None, &list);
+        // The plugin's own programs.
+        let (programs, current) = {
+            let s = app.session.borrow();
+            (s.plugin_programs(plugin), s.plugin_current_program(plugin))
+        };
+        if !programs.is_empty() {
+            let section = gtk::gio::Menu::new();
+            for (i, name) in programs.iter().enumerate() {
+                let mark = if current == Some(i) { "● " } else { "" };
+                let label = format!("{mark}{name}").replace('_', "__");
+                let item = gtk::gio::MenuItem::new(Some(&label), None);
+                let target = format!("{}\n{i}", plugin.raw());
+                item.set_action_and_target_value(
+                    Some("app.select-program"),
+                    Some(&target.to_variant()),
+                );
+                section.append_item(&item);
+            }
+            menu.append_section(Some("Programs"), &section);
+        }
+        button.set_menu_model(Some(&menu));
+    });
+    presets
+}
+
+/// Deliver a click at `(x, y)` (view pixels) to the newest device editor
+/// (development aid for scripted checks).
+pub fn click_device(x: f32, y: f32, button: faderframe_ui_canvas::PointerButton) {
+    use faderframe_ui_canvas::{Modifiers, Point, ViewEvent};
+    let canvas = EDITORS.with(|e| {
+        e.devices
+            .borrow()
+            .values()
+            .last()
+            .and_then(|w| w.child())
+            .and_then(|c| c.downcast::<crate::canvas::CanvasWidget>().ok())
+    });
+    let Some(canvas) = canvas else {
+        tracing::warn!("device-click: no device editor is open");
+        return;
+    };
+    let pos = Point::new(x, y);
+    canvas.deliver(ViewEvent::PointerDown {
+        pos,
+        button,
+        modifiers: Modifiers::NONE,
+        clicks: 1,
+    });
+    canvas.deliver(ViewEvent::PointerUp {
+        pos,
+        button,
+        modifiers: Modifiers::NONE,
+    });
+}
+
+/// A built-in device's own editor (the EQ, the Program EQ): its canvas view
+/// in a window with the usual header. `false` when the plugin has none.
+fn open_device(app: &Rc<AppState>, plugin: PluginInstanceId) -> bool {
+    let (plugin_id, name, track, bypassed) = {
+        let Ok(s) = app.session.try_borrow() else {
+            return false;
+        };
+        let Some((track, slot)) = s.plugin_owner(plugin) else {
+            return false;
+        };
+        if slot.plugin.format != faderframe_project::PluginFormat::Builtin {
+            return false;
+        }
+        (
+            slot.plugin.id.clone(),
+            slot.plugin.name.clone(),
+            track,
+            slot.bypass,
+        )
+    };
+    if let Some(w) = EDITORS.with(|e| e.devices.borrow().get(&plugin).cloned()) {
+        w.present();
+        return true;
+    }
+    let theme = app.theme.borrow().clone();
+    let Some(view) = faderframe_view_devices::editor_for(&plugin_id, plugin, &theme) else {
+        return false;
+    };
+    let (w, h) = faderframe_view_devices::editor_size(&plugin_id).unwrap_or((900, 600));
+    let title = title_of(app, plugin).map_or_else(|| name.clone(), |(_, t)| t);
+    let window = gtk::Window::builder()
+        .application(&app.app)
+        .title(&title)
+        .default_width(w)
+        .default_height(h)
+        .build();
+    window.add_css_class("plugin-editor");
+    if let Some(main) = app.window.borrow().as_ref() {
+        window.set_transient_for(Some(main));
+    }
+    let header = gtk::HeaderBar::new();
+    let heading = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let name_label = gtk::Label::new(Some(&name));
+    name_label.add_css_class("title");
+    let sub = gtk::Label::new(Some(title.rsplit(" — ").next().unwrap_or_default()));
+    sub.add_css_class("subtitle");
+    heading.append(&name_label);
+    heading.append(&sub);
+    header.set_title_widget(Some(&heading));
+    header.pack_start(&bypass_button(app, plugin, track, bypassed));
+    header.pack_start(&presets_button(app, plugin));
+    let params = gtk::Button::with_label("Parameters");
+    params.set_tooltip_text(Some("Every parameter in a list"));
+    {
+        let weak = Rc::downgrade(app);
+        params.connect_clicked(move |_| {
+            if let Some(a) = weak.upgrade() {
+                open_generic(&a, plugin);
+            }
+        });
+    }
+    header.pack_end(&params);
+    window.set_titlebar(Some(&header));
+    let canvas = crate::canvas::CanvasWidget::new(app, view);
+    app.register_canvas(&canvas);
+    window.set_child(Some(&canvas));
+    window.connect_close_request(move |_| {
+        EDITORS.with(|e| e.devices.borrow_mut().remove(&plugin));
+        glib::Propagation::Proceed
+    });
+    EDITORS.with(|e| e.devices.borrow_mut().insert(plugin, window.clone()));
+    window.present();
+    canvas.grab_focus();
+    true
 }
 
 /// Whether the plugin has a GUI of its own.
@@ -531,6 +722,21 @@ pub fn tick(app: &Rc<AppState>) {
     });
     for p in stale {
         if let Some(w) = EDITORS.with(|e| e.generic.borrow_mut().remove(&p)) {
+            w.close();
+        }
+    }
+    // Device editors of plugins that are gone.
+    let stale: Vec<PluginInstanceId> = EDITORS.with(|e| {
+        let s = app.session.try_borrow();
+        e.devices
+            .borrow()
+            .keys()
+            .filter(|p| s.as_ref().is_ok_and(|s| s.plugin_owner(**p).is_none()))
+            .copied()
+            .collect()
+    });
+    for p in stale {
+        if let Some(w) = EDITORS.with(|e| e.devices.borrow_mut().remove(&p)) {
             w.close();
         }
     }
@@ -870,78 +1076,8 @@ fn open_generic(app: &Rc<AppState>, plugin: PluginInstanceId) {
     heading.append(&sub);
     header.set_title_widget(Some(&heading));
 
-    let bypass = gtk::ToggleButton::with_label("Bypass");
-    bypass.set_active(bypassed);
-    bypass.add_css_class("bypass-toggle");
-    {
-        let weak = Rc::downgrade(app);
-        bypass.connect_toggled(move |b| {
-            if let Some(a) = weak.upgrade() {
-                a.dispatch(Action::Edit(Command::SetPluginBypass {
-                    track,
-                    plugin,
-                    bypass: b.is_active(),
-                }));
-            }
-        });
-    }
-    header.pack_start(&bypass);
-    // Presets: rebuilt each time the menu opens.
-    let presets = gtk::MenuButton::new();
-    presets.set_label("Presets");
-    let weak = Rc::downgrade(app);
-    presets.set_create_popup_func(move |button| {
-        let Some(app) = weak.upgrade() else { return };
-        let menu = gtk::gio::Menu::new();
-        let save = gtk::gio::Menu::new();
-        let item = gtk::gio::MenuItem::new(Some("Save Preset…"), None);
-        item.set_action_and_target_value(
-            Some("app.save-preset"),
-            Some(&plugin.raw().to_string().to_variant()),
-        );
-        save.append_item(&item);
-        menu.append_section(None, &save);
-        let list = gtk::gio::Menu::new();
-        let found = app.session.borrow().plugin_presets(plugin);
-        if found.is_empty() {
-            list.append(Some("No presets yet"), None);
-        }
-        for p in found {
-            let label = if p.factory {
-                format!("{} (factory)", p.name)
-            } else {
-                p.name.clone()
-            }
-            .replace('_', "__");
-            let item = gtk::gio::MenuItem::new(Some(&label), None);
-            let target = format!("{}\n{}", plugin.raw(), p.path.display());
-            item.set_action_and_target_value(Some("app.load-preset"), Some(&target.to_variant()));
-            list.append_item(&item);
-        }
-        menu.append_section(None, &list);
-        // The plugin's own programs.
-        let (programs, current) = {
-            let s = app.session.borrow();
-            (s.plugin_programs(plugin), s.plugin_current_program(plugin))
-        };
-        if !programs.is_empty() {
-            let section = gtk::gio::Menu::new();
-            for (i, name) in programs.iter().enumerate() {
-                let mark = if current == Some(i) { "● " } else { "" };
-                let label = format!("{mark}{name}").replace('_', "__");
-                let item = gtk::gio::MenuItem::new(Some(&label), None);
-                let target = format!("{}\n{i}", plugin.raw());
-                item.set_action_and_target_value(
-                    Some("app.select-program"),
-                    Some(&target.to_variant()),
-                );
-                section.append_item(&item);
-            }
-            menu.append_section(Some("Programs"), &section);
-        }
-        button.set_menu_model(Some(&menu));
-    });
-    header.pack_start(&presets);
+    header.pack_start(&bypass_button(app, plugin, track, bypassed));
+    header.pack_start(&presets_button(app, plugin));
     if has_native(app, plugin) {
         let native = gtk::Button::with_label("Plugin GUI");
         native.set_tooltip_text(Some("Open the plugin's own editor"));

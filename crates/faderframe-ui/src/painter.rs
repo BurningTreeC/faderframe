@@ -6,7 +6,7 @@
 //! pixels, so HiDPI is handled entirely by GTK.
 
 use faderframe_ui_canvas::{
-    Align, Color, FontFamily, FontWeight, Paint, Painter, Path, PathCmd, Rect, TextStyle,
+    Align, Color, FontFamily, FontWeight, Image, Paint, Painter, Path, PathCmd, Rect, TextStyle,
 };
 use gtk::prelude::*;
 use gtk::{gdk, graphene, gsk, pango};
@@ -43,6 +43,25 @@ fn gsk_path(path: &Path) -> gsk::Path {
         }
     }
     b.to_path()
+}
+
+thread_local! {
+    /// Decoded images by key (they live as long as the program).
+    static TEXTURES: RefCell<HashMap<&'static str, Option<gdk::Texture>>> =
+        RefCell::new(HashMap::new());
+}
+
+fn texture(image: &Image) -> Option<gdk::Texture> {
+    TEXTURES.with(|t| {
+        t.borrow_mut()
+            .entry(image.key)
+            .or_insert_with(|| {
+                gdk::Texture::from_bytes(&gtk::glib::Bytes::from_static(image.png))
+                    .map_err(|e| tracing::warn!("image {}: {e}", image.key))
+                    .ok()
+            })
+            .clone()
+    })
 }
 
 /// Cache key of a shaped text layout.
@@ -244,6 +263,65 @@ impl Painter for SnapshotPainter<'_> {
         stroke.set_line_join(gsk::LineJoin::Round);
         self.snapshot
             .append_stroke(&gsk_path(path), &stroke, &rgba(color));
+    }
+
+    fn fill_path_paint(&mut self, path: &Path, paint: &Paint) {
+        if path.is_empty() {
+            return;
+        }
+        if let Paint::Solid(c) = paint {
+            return self.fill_path(path, *c);
+        }
+        let p = gsk_path(path);
+        let Some(bounds) = p.bounds() else {
+            return;
+        };
+        self.snapshot.push_fill(&p, gsk::FillRule::Winding);
+        let r = Rect::new(bounds.x(), bounds.y(), bounds.width(), bounds.height());
+        self.fill_paint(r, paint);
+        self.snapshot.pop();
+    }
+
+    fn image(&mut self, image: &Image, src: Rect, dst: Rect, brightness: f32) {
+        if dst.is_empty() || src.is_empty() {
+            return;
+        }
+        let Some(tex) = texture(image) else {
+            return;
+        };
+        // The whole image placed so that `src` lands on `dst`.
+        let (sx, sy) = (dst.w / src.w, dst.h / src.h);
+        let full = Rect::new(
+            dst.x - src.x * sx,
+            dst.y - src.y * sy,
+            image.width as f32 * sx,
+            image.height as f32 * sy,
+        );
+        let s = self.snapshot;
+        s.push_clip(&grect(dst));
+        let dim = brightness < 0.999;
+        if dim {
+            let b = brightness.clamp(0.0, 1.0);
+            let m = graphene::Matrix::from_float([
+                b, 0.0, 0.0, 0.0, 0.0, b, 0.0, 0.0, 0.0, 0.0, b, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ]);
+            s.push_color_matrix(&m, &graphene::Vec4::new(0.0, 0.0, 0.0, 0.0));
+        }
+        s.append_scaled_texture(&tex, gsk::ScalingFilter::Trilinear, &grect(full));
+        if dim {
+            s.pop();
+        }
+        s.pop();
+    }
+
+    fn push_transform(&mut self, dx: f32, dy: f32, scale: f32) {
+        self.snapshot.save();
+        self.snapshot.translate(&graphene::Point::new(dx, dy));
+        self.snapshot.scale(scale, scale);
+    }
+
+    fn pop_transform(&mut self) {
+        self.snapshot.restore();
     }
 
     fn shadow(&mut self, rect: Rect, radius: f32, color: Color, dx: f32, dy: f32, blur: f32) {

@@ -2915,7 +2915,8 @@ impl Session {
         target: PluginTarget,
         plugin: PluginRef,
     ) -> Result<()> {
-        let hosted = plugin.format != faderframe_project::PluginFormat::Builtin;
+        let hosted = plugin.format != faderframe_project::PluginFormat::Builtin
+            || faderframe_core::builtin::has_editor(&plugin.id);
         // An instrument picked for an insert slot of an instrument track
         // that has none becomes its instrument.
         let target =
@@ -3033,6 +3034,15 @@ impl Session {
                 },
             ],
         )
+    }
+
+    /// A built-in plugin's tap: its live parameters (automation included),
+    /// the audio going in and out for an analyser, its meters.
+    pub fn plugin_tap(
+        &self,
+        plugin: faderframe_core::PluginInstanceId,
+    ) -> Option<std::sync::Arc<faderframe_plugin_host::tap::AnalysisTap>> {
+        self.engine.plugin_tap(plugin)
     }
 
     /// An album song's insert and its song.

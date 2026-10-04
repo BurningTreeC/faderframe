@@ -15,7 +15,7 @@ that keep it that way.
 ```text
 faderframe-app            binary: CLI parsing, logging, starts the GTK app
   └─ faderframe-ui        GTK 4 shell: windows, menus, dialogs, docking, canvas host
-       ├─ faderframe-view-arranger / -mixer / -pianoroll / -performance / -tools / -automation   (GTK-free views)
+       ├─ faderframe-view-arranger / -mixer / -pianoroll / -performance / -tools / -automation / -devices   (GTK-free views)
        │    └─ faderframe-ui-canvas   Painter trait, events, CanvasView, theme, console controls
        ├─ faderframe-audio-pipewire   native PipeWire backend (pw_filter, Linux)
        ├─ faderframe-audio-jack       JACK backend (JACK2 / pipewire-jack, Linux)
@@ -539,9 +539,62 @@ handles RPN 0 bend range, the MPE zone message, pressure and CC 74).
 Neither trait assumes the plugin is in-process; a sandboxed plugin is a proxy
 pair speaking IPC with shared-memory audio (see *Sandboxed plugins* below).
 `PluginHost` (engine) owns one instance per slot. Built-ins: synth, echo, compressor (with a sidechain
-input), gain, latency probe (used to test PDC end to end). Failed plugins
+input), gain, latency probe (used to test PDC end to end), the EQ and the
+Program EQ (see *Built-in devices*). Failed plugins
 are bypassed and flagged; missing formats pass audio through with a
 warning.
+
+### Built-in devices
+
+The EQ and the Program EQ are built-ins with editors of their own
+(`faderframe-view-devices`, opened by `plugin_window::open_device` in a
+window with the usual Bypass/Presets header). A built-in instance can hand
+out an `AnalysisTap` (`PluginInstance::tap`, `Session::plugin_tap`): its
+live `ParamValues` (so the editor follows automation), lock-free stereo
+rings of the audio going in and out (filled only while an editor calls
+`watch()` each frame), PultEQFx's level meters (peak taken per frame, held
+peak, 300 ms RMS and a 200 ms figure), published values (a dynamic band's
+gain) and the band the editor wants to hear alone. Edits are ordinary
+`SetPluginParameter` commands in gestures, so they undo and automate like
+any other. Real-time safety of both is covered by
+`engine/tests/realtime_alloc.rs` (dynamic, mid/side and steep bands,
+automation, listening, linear phase).
+
+* **EQ** (`plugin_host::eq`): 24 bands — bell, low/high shelf, low/high cut
+  (6–96 dB/oct, Butterworth cascades with the Q on the sharpest section),
+  notch, band pass, tilt — each in state unused/on/bypassed, with a
+  stereo placement (stereo, left, right, mid, side) and a dynamic range
+  keyed from its own region (or the sidechain input). `eq::design` turns
+  the analog prototypes into biquads that keep their shape to Nyquist:
+  poles by impulse invariance (Vicanek, *Matched Second Order Digital
+  Filters*), numerators exact where the shape is defined (DC, centre or
+  corner) and least-squares fitted to the analog magnitude up to Nyquist;
+  first order sections likewise; notches solve their damping for the
+  analog −3 dB edge; below ~0.001 rad/sample sections are bilinear. The
+  processor glides frequency, gain and Q (15 ms), fades a band in and out
+  when it is switched or changes type, slope or placement, and runs auto
+  gain (pink-noise loudness, recomputed at most every 8 control steps).
+  **Linear phase** (`eq::linear`): the static bands' *analog* magnitudes
+  as zero-phase FIRs of 4096–32768 taps (a 2 × 2 set when mid/side differ),
+  uniformly partitioned convolution in 256-sample blocks (latency
+  `N/2 + 256`), kernels designed on a thread that watches the parameters
+  and crossfaded in; dynamic bands stay minimum phase after the FIR. Phase
+  mode and quality change the latency, so they are not automatable and
+  the instance asks for a restart (graph rebuild) when they change.
+* **Program EQ** (`plugin_host::program_eq`): PultEQFx by Simon Huber,
+  used under the MIT licence — the passive LC/RC network of the classic
+  tube program equaliser solved by nodal analysis (trapezoidal companion
+  models, Cholesky factorised at control rate), the push-pull tube make-up
+  stage and its transformers, halfband oversampling (1–8×, switchable
+  while running) and a fixed 74-sample latency (the dry signal is held
+  back as long with the power off). Its "Low End Punch" preset is a
+  program of the built-in (`PluginInstance::programs`), selected as one
+  undo step. The panel (`view-devices::program_eq`) draws PultEQFx's
+  faceplate, lettering, light and meters with FaderFrame's painter and
+  uses its renders (knob filmstrip, switch knob, lamp, screws:
+  `crates/faderframe-view-devices/assets/program-eq`) through
+  `Painter::image` — filmstrip frames, never a rotated picture, each tinted
+  by its distance from the panel's lamp.
 
 * **Automation from plugin editors.** Formats report the user's moves in a
   plugin's own GUI as `EditorEdit`s (begin, value, end): CLAP from the
@@ -707,7 +760,8 @@ pagefile-backed file mapping, all named in the helper's environment).
   with the project. Plugin GUIs run on the GTK main loop: descriptors
   registered through `posix-fd` become glib fd sources and `timer`
   registrations glib timeouts, reconciled every UI tick.
-* **Generic editor.** Every plugin (built-ins, plugins without a GUI, no X
+* **Generic editor.** Every plugin (built-ins — the EQ and Program EQ
+  also have editors of their own —, plugins without a GUI, no X
   server) has a GTK parameter window with a
   presets menu: filter, module sections from CLAP's
   "Module/Name" paths, the plugin's own value text (`value_to_text`),
@@ -1472,7 +1526,9 @@ signed Windows installer.
 
 **Implemented.** The engine: routing graph with PDC, state adoption and
 sidechains; multicore scheduling with measured critical-path ranks;
-sample-accurate transport, loops and scrubbing; built-in synth, echo,
+sample-accurate transport, loops and scrubbing; a 24 band dynamic EQ with
+matched (analog-shaped) and linear phase modes and an analyser, the Program
+EQ (PultEQFx's circuit-modelled passive tube EQ with its panel); built-in synth, echo,
 compressor, gain and latency probe; offline render and export (stems,
 normalise, dither); freeze and bounce in place. Audio: native PipeWire,
 JACK, the system API (WASAPI, CoreAudio, ALSA), ASIO (opt-in) and a dummy
@@ -1516,15 +1572,39 @@ MIDI, Mastering), seven skins switched live, performance meter,
 preferences, recent projects and start-up choice. Windows and macOS builds
 and packages for all three platforms (see §14).
 
-**Next**, roughly in order:
+**Next**, roughly in order (waves from a survey of what Live, Bitwig,
+Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
+2024–2026):
 
-1. **Ports**: signed and notarised packages, a Flathub submission
+1. **Stock devices** (wave 1, under way — the EQ and Program EQ are done):
+   algorithmic reverb, true-peak limiter, gate/expander, saturator,
+   de-esser, chorus/phaser, tuner; a multi-sample sampler (SFZ import) and
+   a drum sampler.
+2. **Composition**: project key/scale and a chord track, a scale-aware
+   piano roll, MIDI effects before the instrument (arpeggiator, chord,
+   scale, note echo), MIDI transformations and generators, always-on
+   retrospective MIDI capture.
+3. **Organisation**: folder tracks, clip aliases, project versions
+   (snapshots to compare and restore), a command palette with a shortcut
+   editor, an undo history view.
+4. **Modulation**: modulators (LFO, envelope follower, steps, random,
+   macros) on any parameter, FX containers with parallel chains, CLAP's
+   non-destructive and polyphonic parameter modulation.
+5. **Vocals and audio intelligence**: native pitch editing (on the warp
+   and transient machinery and the Stretch engine's pitch and formant
+   shifting), audio-to-MIDI (basic-pitch, Apache-2.0), tempo and key
+   detection, per-clip effects rendered offline, ARA 2 hosting, a speech
+   and lyrics transcription track (Whisper, MIT). Stem separation waits
+   for permissively licensed model weights.
+6. **Performance and control**: a clip launcher with scenes recorded into
+   the arrangement, control surfaces (Mackie Control/HUI, OSC), playing
+   the album itself.
+7. **Ports**: signed and notarised packages, a Flathub submission
    (vendored crates), sandboxed plugins' audio threads in the device's
    workgroup (macOS: needs the workgroup's Mach port in the helper).
-2. **MIDI**: MTC output, varispeed chase without a shared word clock.
-3. **Performance**: render-ahead for buses whose inputs are all rendered
+8. **MIDI**: MTC output, varispeed chase without a shared word clock.
+9. **Performance**: render-ahead for buses whose inputs are all rendered
    ahead, job affinity for cache locality, an optional wgpu painter for
    dense views.
-4. **Mastering**: playing the album itself (songs from files and other
-   projects, through their inserts and crossfades), multiple CD-Text
-   languages, a DDP player/import.
+10. **Mastering**: multiple CD-Text languages, a DDP player/import;
+    surround beds and panning before any object-based format.

@@ -1,4 +1,4 @@
-use crate::{Color, Paint, Path, Point, Rect, TextStyle};
+use crate::{Color, Image, Paint, Path, Point, Rect, TextStyle};
 
 /// Drawing backend used by every custom view.
 ///
@@ -12,6 +12,18 @@ pub trait Painter {
     fn stroke_rounded(&mut self, rect: Rect, radius: f32, width: f32, color: Color);
     fn fill_path(&mut self, path: &Path, color: Color);
     fn stroke_path(&mut self, path: &Path, width: f32, color: Color);
+    /// Fill a path with a gradient (or a solid paint).
+    fn fill_path_paint(&mut self, path: &Path, paint: &Paint);
+
+    /// Draw the `src` part of `image` (its pixels) into `dst`, its colour
+    /// scaled by `brightness` (1: as it is; alpha untouched).
+    fn image(&mut self, image: &Image, src: Rect, dst: Rect, brightness: f32);
+
+    /// Draw what follows translated by `(dx, dy)` and then scaled by
+    /// `scale` (a view laid out in its own coordinates), until
+    /// [`Painter::pop_transform`].
+    fn push_transform(&mut self, dx: f32, dy: f32, scale: f32);
+    fn pop_transform(&mut self);
 
     /// Soft drop shadow outside a rounded rectangle.
     fn shadow(&mut self, rect: Rect, radius: f32, color: Color, dx: f32, dy: f32, blur: f32);
@@ -69,6 +81,9 @@ pub enum DrawOp {
     Text(String, Rect),
     Clip(Rect),
     PopClip,
+    Image(&'static str, Rect),
+    Transform(f32, f32, f32),
+    PopTransform,
 }
 
 /// A painter that records operations instead of drawing. Text width is
@@ -114,6 +129,20 @@ impl Painter for RecordingPainter {
     }
     fn stroke_path(&mut self, _path: &Path, _width: f32, _color: Color) {
         self.ops.push(DrawOp::Path);
+    }
+    fn fill_path_paint(&mut self, _path: &Path, _paint: &Paint) {
+        self.ops.push(DrawOp::Path);
+    }
+    fn image(&mut self, image: &Image, _src: Rect, dst: Rect, _brightness: f32) {
+        self.ops.push(DrawOp::Image(image.key, dst));
+    }
+    fn push_transform(&mut self, dx: f32, dy: f32, scale: f32) {
+        self.clips += 1;
+        self.ops.push(DrawOp::Transform(dx, dy, scale));
+    }
+    fn pop_transform(&mut self) {
+        self.clips = self.clips.saturating_sub(1);
+        self.ops.push(DrawOp::PopTransform);
     }
     fn shadow(&mut self, rect: Rect, _r: f32, _c: Color, _dx: f32, _dy: f32, _blur: f32) {
         self.ops.push(DrawOp::Shadow(rect));

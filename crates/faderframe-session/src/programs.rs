@@ -116,10 +116,17 @@ impl Session {
             let Some(state) = self.engine.plugin_state(plugin) else {
                 continue;
             };
-            let Some(parameters) = self.plugin_owner(plugin).map(|(_, s)| s.parameters.clone())
+            let Some(mut parameters) = self.plugin_owner(plugin).map(|(_, s)| s.parameters.clone())
             else {
                 continue;
             };
+            // Explicit values are applied after the state when it loads:
+            // they must be the program's, not what they were before.
+            for p in &mut parameters {
+                if let Some(v) = self.engine.plugin_parameter_value(plugin, p.id) {
+                    p.value = v;
+                }
+            }
             // The plugin has this state already: nothing to load.
             self.engine.note_plugin_state(plugin, &state);
             let step = Command::Batch {

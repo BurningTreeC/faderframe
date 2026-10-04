@@ -42,6 +42,7 @@ faderframe-ui-canvas = { path = "crates/faderframe-ui-canvas" }
 faderframe-view-arranger = { path = "crates/faderframe-view-arranger" }
 faderframe-view-mixer = { path = "crates/faderframe-view-mixer" }
 faderframe-view-tools = { path = "crates/faderframe-view-tools" }
+faderframe-view-devices = { path = "crates/faderframe-view-devices" }
 faderframe-view-automation = { path = "crates/faderframe-view-automation" }
 faderframe-view-album = { path = "crates/faderframe-view-album" }
 faderframe-view-performance = { path = "crates/faderframe-view-performance" }

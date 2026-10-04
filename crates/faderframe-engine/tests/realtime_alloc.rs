@@ -613,3 +613,161 @@ fn rendering_ahead_does_not_allocate_on_the_audio_thread() {
     assert_eq!(total, 0, "allocations/frees on the audio thread");
     assert_eq!(r.controller.ahead_misses(), 0);
 }
+
+#[test]
+fn the_equalisers_do_not_allocate() {
+    let _serial = serial();
+    use faderframe_automation::{
+        AutomationCurve, AutomationLane, AutomationMode, AutomationPoint, AutomationTarget,
+        CurveShape,
+    };
+    use faderframe_core::{ChannelLayout, ParameterId, builtin};
+    use faderframe_plugin_host::eq::{Field, band_id};
+    use faderframe_project::{PluginRef, PluginSlot, SavedParameter, TrackKind};
+    use faderframe_timeline::MusicalTime;
+
+    const SR: u32 = 48_000;
+    let mut tp = common::TestProject::new(SR);
+    let t = tp.track(TrackKind::Audio, "A", ChannelLayout::Stereo);
+    let src = tp.dc(2, 0.3, 200_000);
+    tp.clip(t, src, MusicalTime::ZERO, 200_000);
+    let set = |id: ParameterId, value: f64| SavedParameter { id, value };
+    // Every kind of band: dynamic, mid/side, a steep cut, a tilt.
+    let mut bands = Vec::new();
+    for (b, kind, placement, range) in [
+        (0, 0.0, 0.0, -6.0),
+        (1, 1.0, 3.0, 0.0),
+        (2, 3.0, 0.0, 0.0),
+        (3, 7.0, 4.0, 4.0),
+        (4, 5.0, 1.0, 0.0),
+    ] {
+        bands.extend([
+            set(band_id(b, Field::Enabled), 1.0),
+            set(band_id(b, Field::Type), kind),
+            set(band_id(b, Field::Placement), placement),
+            set(band_id(b, Field::Range), range),
+            set(band_id(b, Field::Gain), 4.0),
+            set(band_id(b, Field::Slope), 7.0),
+        ]);
+    }
+    bands.push(set(ParameterId(1), 1.0)); // auto gain
+    let eq = tp.project.ids.allocate();
+    let program = tp.project.ids.allocate();
+    let linear_eq = tp.project.ids.allocate();
+    // A second EQ in linear phase: its kernels arrive from the design
+    // thread while the band below is automated.
+    let mut linear = bands.clone();
+    linear.push(set(ParameterId(3), 1.0));
+    linear.push(set(ParameterId(4), 0.0));
+    let track = tp.project.track_mut(t).unwrap();
+    track.inserts.push(PluginSlot {
+        id: linear_eq,
+        plugin: PluginRef::builtin(builtin::EQ, "EQ"),
+        bypass: false,
+        parameters: linear,
+        state: None,
+        sidechain: None,
+    });
+    track.inserts.push(PluginSlot {
+        id: eq,
+        plugin: PluginRef::builtin(builtin::EQ, "EQ"),
+        bypass: false,
+        parameters: bands,
+        state: None,
+        sidechain: None,
+    });
+    track.inserts.push(PluginSlot {
+        id: program,
+        plugin: PluginRef::builtin(builtin::PROGRAM_EQ, "Program EQ"),
+        bypass: false,
+        parameters: vec![
+            set(ParameterId(1), 6.0),
+            set(ParameterId(2), 7.0),
+            set(ParameterId(12), 3.0),
+        ],
+        state: None,
+        sidechain: None,
+    });
+    let ramp = |lo: f64, hi: f64| {
+        AutomationCurve::from_points(
+            (0..20)
+                .map(|i| AutomationPoint {
+                    time: MusicalTime::from_quarters(i as f64 * 0.25),
+                    value: if i % 2 == 0 { lo } else { hi },
+                    shape: CurveShape::Smooth,
+                })
+                .collect(),
+        )
+    };
+    for (target, curve) in [
+        (
+            AutomationTarget::PluginParameter {
+                plugin: eq,
+                parameter: band_id(0, Field::Freq),
+            },
+            ramp(200.0, 8_000.0),
+        ),
+        (
+            AutomationTarget::PluginParameter {
+                plugin: eq,
+                parameter: band_id(1, Field::Gain),
+            },
+            ramp(-12.0, 12.0),
+        ),
+        (
+            AutomationTarget::PluginParameter {
+                plugin: program,
+                parameter: ParameterId(5),
+            },
+            ramp(0.0, 10.0),
+        ),
+        (
+            AutomationTarget::PluginParameter {
+                plugin: linear_eq,
+                parameter: band_id(1, Field::Gain),
+            },
+            ramp(-12.0, 12.0),
+        ),
+    ] {
+        let id = tp.project.ids.allocate();
+        tp.project
+            .track_mut(t)
+            .unwrap()
+            .automation
+            .lanes
+            .push(AutomationLane {
+                id,
+                target,
+                curve,
+                mode: AutomationMode::Read,
+                visible: true,
+            });
+    }
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 2).unwrap();
+    let tap = r.controller.plugin_tap(eq).expect("the EQ has a tap");
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    for _ in 0..8 {
+        tap.watch();
+        r.processor.process_device(&mut bufs);
+    }
+    let (_, allocs) = armed(|| {
+        for i in 0..400 {
+            // An editor watching: the analyser rings fill; one band heard
+            // on its own for a while.
+            tap.watch();
+            tap.set_listen((100..200).contains(&i).then_some(1));
+            r.processor.process_device(&mut bufs);
+            // Give the linear phase design thread time to send kernels.
+            if i % 40 == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    });
+    assert_eq!(allocs, 0, "allocations in the equalisers");
+    assert!(tap.output.written() > 0, "the analyser was fed");
+}

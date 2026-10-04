@@ -215,3 +215,60 @@ fn selecting_a_program_is_one_undo_step() {
     );
     s.stop_audio();
 }
+
+/// A built-in's preset (the Program EQ's "Low End Punch") is a program:
+/// it wins over values set on the panel before, also after a rebuild,
+/// and undo brings those back.
+#[test]
+fn a_built_in_preset_overrides_the_panel_and_undoes() {
+    use faderframe_core::builtin;
+    use faderframe_plugin_host::program_eq::param;
+    use faderframe_project::Command;
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let bass = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.name == "Bass")
+        .unwrap()
+        .id;
+    s.dispatch(Action::InsertPlugin {
+        track: bass,
+        index: 0,
+        plugin: PluginRef::builtin(builtin::PROGRAM_EQ, "Program EQ"),
+    })
+    .unwrap();
+    let plugin = s.project().track(bass).unwrap().inserts[0].id;
+    let low_boost = ParameterId(param::LOW_BOOST as u32);
+    s.dispatch(Action::Edit(Command::SetPluginParameter {
+        track: bass,
+        plugin,
+        parameter: low_boost,
+        value: Some(2.0),
+    }))
+    .unwrap();
+    let live = |s: &Session| f64::from(s.plugin_tap(plugin).unwrap().params.get(param::LOW_BOOST));
+    assert_eq!(live(&s), 2.0);
+    assert_eq!(s.plugin_programs(plugin), vec!["Low End Punch".to_string()]);
+    s.dispatch(Action::SelectPluginProgram { plugin, index: 0 })
+        .unwrap();
+    let begun = Instant::now();
+    while s.history().undo_label() != Some("Select Program") && begun.elapsed().as_secs() < 3 {
+        run(&mut s, 0.02);
+    }
+    assert_eq!(s.history().undo_label(), Some("Select Program"));
+    assert_eq!(live(&s), 6.0);
+    // A rebuild applies the slot again: the preset's value holds.
+    s.dispatch(Action::Edit(Command::SetPluginBypass {
+        track: bass,
+        plugin,
+        bypass: true,
+    }))
+    .unwrap();
+    run(&mut s, 0.05);
+    assert_eq!(live(&s), 6.0);
+    s.dispatch(Action::Undo).unwrap();
+    s.dispatch(Action::Undo).unwrap();
+    run(&mut s, 0.05);
+    assert_eq!(live(&s), 2.0, "undo: the panel as it was");
+}
