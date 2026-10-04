@@ -381,12 +381,26 @@ pub struct Polled {
 pub enum EditorCall {
     CanEmbed(Api),
     CanFloat(Api),
-    OpenEmbedded { api: Api, scale: f64 },
-    Attach { api: Api, handle: u64 },
-    OpenFloating { api: Api, title: String },
+    OpenEmbedded {
+        api: Api,
+        scale: f64,
+    },
+    Attach {
+        api: Api,
+        handle: u64,
+    },
+    OpenFloating {
+        api: Api,
+        title: String,
+    },
     Close,
+    /// Bring the editor's window to the front (one the helper owns).
+    Raise,
     CanResize,
-    SetSize { width: u32, height: u32 },
+    SetSize {
+        width: u32,
+        height: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

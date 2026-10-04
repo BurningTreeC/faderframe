@@ -4,7 +4,7 @@
 //! memory and waits for it with a deadline.
 
 use crate::shm::{Block, BlockIn, MAX_BUFFERS, block_size};
-use crate::sys::{self, Ready};
+use crate::sys::{self, Control, Ready, Signal, Waiter};
 use crate::wire::{self, EditorCall, Request, Response};
 use crate::{BLOCK_TIMEOUT, Launcher};
 use faderframe_audio_graph::NodeIo;
@@ -17,30 +17,19 @@ use faderframe_plugin_host::{
 };
 use faderframe_realtime::TryCell;
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::net::UnixStream;
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-
-/// Where the helper finds its descriptors.
-pub(crate) const CONTROL_FD: i32 = 3;
-/// The helper reads a byte here per block.
-pub(crate) const GO_FD: i32 = 4;
-/// The helper writes a byte here per finished block.
-pub(crate) const DONE_FD: i32 = 5;
-/// Set in a helper's environment.
-pub(crate) const ENV_HELPER: &str = "FADERFRAME_PLUGIN_SANDBOX";
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Loading a plugin, its state or a preset can take a while.
 const LOAD_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The two wake-up pipes of a helper (our ends, non-blocking).
+/// Our ends of a helper's per-block wake-ups.
 struct Pipes {
-    go: OwnedFd,
-    done: OwnedFd,
+    go: Signal,
+    done: Waiter,
 }
 
 /// One activation as the audio thread uses it.
@@ -93,24 +82,19 @@ impl Channel {
             silence(io);
             ProcessStatus::Error
         };
-        if !sys::signal(self.pipes.go.as_raw_fd()) {
+        if !self.pipes.go.signal() {
             return fail(io);
         }
-        let done = self.pipes.done.as_raw_fd();
         let deadline = Instant::now() + BLOCK_TIMEOUT;
         while h.done.load(Ordering::Acquire) != self.seq {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return fail(io);
             }
-            match sys::wait_readable(done, Some(left)) {
-                Ready::Readable => {
-                    if !sys::drain(done) && h.done.load(Ordering::Acquire) != self.seq {
-                        return fail(io);
-                    }
-                }
-                Ready::HungUp => return fail(io),
-                Ready::TimedOut => {}
+            if self.pipes.done.wait(Some(left)) == Ready::HungUp
+                && h.done.load(Ordering::Acquire) != self.seq
+            {
+                return fail(io);
             }
         }
         self.block
@@ -153,7 +137,7 @@ impl PluginProcessor for RemoteProcessor {
 /// A plugin instance in a helper process.
 pub struct RemoteInstance {
     child: Child,
-    control: UnixStream,
+    control: Control,
     pipes: Arc<Pipes>,
     dead: Arc<AtomicBool>,
     descriptor: PluginDescriptor,
@@ -183,34 +167,14 @@ fn failed(e: impl std::fmt::Display) -> PluginError {
 impl RemoteInstance {
     /// Start a helper and instantiate `id` of `format` in it.
     pub fn spawn(launcher: &Launcher, format: PluginFormat, id: &str) -> Result<Self, PluginError> {
-        let (ours, theirs) = UnixStream::pair().map_err(failed)?;
-        let (go_r, go_w) = sys::pipe().map_err(failed)?;
-        let (done_r, done_w) = sys::pipe().map_err(failed)?;
-        sys::set_nonblocking(go_w.as_raw_fd()).map_err(failed)?;
-        sys::set_nonblocking(done_r.as_raw_fd()).map_err(failed)?;
-        let mut cmd = Command::new(&launcher.exe);
-        cmd.args(&launcher.args)
-            .envs(launcher.env.iter().map(|(k, v)| (k, v)))
-            .env(ENV_HELPER, "1")
-            .stdin(Stdio::null());
-        sys::place_fds(
-            &mut cmd,
-            vec![
-                (theirs.as_raw_fd(), CONTROL_FD),
-                (go_r.as_raw_fd(), GO_FD),
-                (done_w.as_raw_fd(), DONE_FD),
-            ],
-        );
-        let child = cmd
-            .spawn()
+        let link = sys::spawn(launcher)
             .map_err(|e| failed(format!("cannot start the plugin process: {e}")))?;
-        drop((theirs, go_r, done_w));
         let mut inst = Self {
-            child,
-            control: ours,
+            child: link.child,
+            control: link.control,
             pipes: Arc::new(Pipes {
-                go: go_w,
-                done: done_r,
+                go: link.go,
+                done: link.done,
             }),
             dead: Arc::new(AtomicBool::new(false)),
             descriptor: PluginDescriptor {
@@ -343,7 +307,7 @@ impl RemoteInstance {
             if let Some(c) = ch.lock_blocking(10_000) {
                 c.block.header().quit.store(1, Ordering::Release);
             }
-            sys::signal(self.pipes.go.as_raw_fd());
+            self.pipes.go.signal();
             let _ = self.done(&Request::Deactivate, &[], REQUEST_TIMEOUT);
         }
     }
@@ -619,6 +583,12 @@ impl PluginEditor for RemoteInstance {
             }
             Some(Response::Failed(e)) => Err(PluginError::Failed(e)),
             _ => Err(failed("the editor did not open")),
+        }
+    }
+
+    fn raise(&mut self) {
+        if self.editor_open {
+            self.editor_call(EditorCall::Raise);
         }
     }
 

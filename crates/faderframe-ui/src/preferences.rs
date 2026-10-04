@@ -299,7 +299,11 @@ fn general_page(app: &Rc<AppState>) -> gtk::Widget {
     sandbox.set_sensitive(faderframe_plugin_sandbox::AVAILABLE);
     row(&g, 5, "Plugins", &sandbox);
     let sandbox_note = note(if faderframe_plugin_sandbox::AVAILABLE {
-        "CLAP and VST3 plugins. Changing this restarts the loaded plugins (their settings are kept)."
+        if cfg!(target_os = "macos") {
+            "CLAP, VST3 and Audio Unit plugins; their editors open in windows of their own. Changing this restarts the loaded plugins (their settings are kept)."
+        } else {
+            "CLAP and VST3 plugins. Changing this restarts the loaded plugins (their settings are kept)."
+        }
     } else {
         "Not available on this platform yet: plugins run inside FaderFrame."
     });

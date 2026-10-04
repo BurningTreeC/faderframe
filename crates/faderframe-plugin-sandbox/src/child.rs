@@ -1,22 +1,21 @@
 //! The helper process: hosts one plugin instance with the application's
 //! own (in-process) factories, answers FaderFrame's requests, services the
-//! plugin GUI's descriptors and timers in a `poll` loop on its main thread,
-//! and runs the audio blocks on an audio thread of its own (which copies
-//! the scheduling of FaderFrame's audio thread). It ends when FaderFrame
-//! says so or goes away.
+//! plugin GUI's descriptors and timers on its main thread (Unix: a `poll`
+//! loop, which on macOS also hands AppKit its events; Windows: a message
+//! loop woken by a thread reading the control pipe), and runs the audio
+//! blocks on an audio thread of its own (which copies the scheduling of
+//! FaderFrame's audio thread). It ends when FaderFrame says so or goes
+//! away.
 
-use crate::host::{CONTROL_FD, DONE_FD, ENV_HELPER, GO_FD};
 use crate::shm::{Block, HelperIo};
-use crate::sys::{self, Ready};
+use crate::sys::{self, Connected, Control, Ready, Signal, Waiter};
 use crate::wire::{self, EditorCall, Instantiated, Param, Polled, Request, Response};
 use faderframe_audio_graph::NodeIo;
 use faderframe_plugin_host::{
-    ParentWindow, PluginFd, PluginFormat, PluginInstance, PluginProcessContext, PluginProcessor,
+    ParentWindow, PluginFormat, PluginInstance, PluginProcessContext, PluginProcessor,
     PluginRegistry, ProcessConfig,
 };
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
@@ -24,7 +23,7 @@ use std::time::{Duration, Instant};
 
 /// This process was started as a plugin helper.
 pub fn is_helper() -> bool {
-    std::env::var_os(ENV_HELPER).is_some()
+    std::env::var_os(sys::ENV_HELPER).is_some()
 }
 
 struct Audio {
@@ -36,26 +35,22 @@ struct Helper {
     registry: PluginRegistry,
     instance: Option<Box<dyn PluginInstance>>,
     audio: Option<Audio>,
-    go: Arc<OwnedFd>,
-    done: Arc<OwnedFd>,
+    go: Arc<Waiter>,
+    done: Arc<Signal>,
     /// Parameter values as FaderFrame last heard them.
     sent: HashMap<u32, f64>,
+    /// The window of our own the editor sits in (macOS: views do not
+    /// embed across processes).
+    #[cfg(target_os = "macos")]
+    window: Option<crate::mac::EditorWindow>,
 }
 
 /// Serve FaderFrame until it says quit or goes away; returns the exit code.
 pub fn run(registry: PluginRegistry) -> i32 {
-    let (Some(control), Some(go), Some(done)) = (
-        sys::take_fd(CONTROL_FD),
-        sys::take_fd(GO_FD),
-        sys::take_fd(DONE_FD),
-    ) else {
-        eprintln!("faderframe plugin helper: started without its descriptors");
+    let Some(Connected { control, go, done }) = sys::connect() else {
+        eprintln!("faderframe plugin helper: started without its connections");
         return 2;
     };
-    // The audio thread must never block on these.
-    let _ = sys::set_nonblocking(go.as_raw_fd());
-    let _ = sys::set_nonblocking(done.as_raw_fd());
-    let mut control = UnixStream::from(control);
     let mut h = Helper {
         registry,
         instance: None,
@@ -63,27 +58,75 @@ pub fn run(registry: PluginRegistry) -> i32 {
         go: Arc::new(go),
         done: Arc::new(done),
         sent: HashMap::new(),
+        #[cfg(target_os = "macos")]
+        window: None,
     };
-    // The plugin's timers: id → (period in ms, next due).
-    let mut timers: HashMap<u32, (u32, Instant)> = HashMap::new();
+    serve(&mut h, control);
+    h.stop_audio();
+    #[cfg(target_os = "macos")]
+    {
+        h.window = None;
+    }
+    h.instance = None;
+    0
+}
+
+/// The plugin's timers: id → (period in ms, next due).
+#[derive(Default)]
+struct Timers(HashMap<u32, (u32, Instant)>);
+
+impl Timers {
+    fn update(&mut self, timers: &[(u32, u32)]) {
+        self.0
+            .retain(|id, (period, _)| timers.contains(&(*id, *period)));
+        for &(id, period) in timers {
+            self.0
+                .entry(id)
+                .or_insert((period, Instant::now() + period_of(period)));
+        }
+    }
+
+    /// Until the next one is due (`None`: no timers).
+    fn timeout(&self) -> Option<Duration> {
+        let now = Instant::now();
+        self.0
+            .values()
+            .map(|(_, due)| due.saturating_duration_since(now))
+            .min()
+    }
+
+    fn fire(&mut self, inst: &mut dyn PluginInstance) {
+        let now = Instant::now();
+        for (id, (period, due)) in self.0.iter_mut() {
+            if *due <= now {
+                inst.on_timer(*id);
+                *due = now + period_of(*period);
+            }
+        }
+    }
+}
+
+/// Unix: `poll` the control socket and the plugin's descriptors.
+#[cfg(unix)]
+fn serve(h: &mut Helper, mut control: Control) {
+    use faderframe_plugin_host::PluginFd;
+    use std::os::fd::AsRawFd;
+    let mut timers = Timers::default();
     loop {
         let sources = h
             .instance
             .as_ref()
             .map(|i| i.event_sources())
             .unwrap_or_default();
-        timers.retain(|id, (period, _)| sources.timers.contains(&(*id, *period)));
-        for &(id, period) in &sources.timers {
-            timers
-                .entry(id)
-                .or_insert((period, Instant::now() + period_of(period)));
-        }
-        let now = Instant::now();
-        let timeout = timers
-            .values()
-            .map(|(_, due)| due.saturating_duration_since(now))
-            .min()
-            .map_or(-1, |d| d.as_millis().min(i32::MAX as u128) as i32);
+        timers.update(&sources.timers);
+        let timeout = timers.timeout();
+        // AppKit and the run loop get their turn at least this often.
+        #[cfg(target_os = "macos")]
+        let timeout = {
+            let cap = Duration::from_millis(if h.window.is_some() { 10 } else { 50 });
+            Some(timeout.map_or(cap, |t| t.min(cap)))
+        };
+        let timeout = timeout.map_or(-1, |d| d.as_millis().min(i32::MAX as u128) as i32);
         let mut fds = vec![libc::pollfd {
             fd: control.as_raw_fd(),
             events: libc::POLLIN,
@@ -104,17 +147,17 @@ pub fn run(registry: PluginRegistry) -> i32 {
             });
         }
         if sys::poll(&mut fds, timeout).is_err() {
-            break;
+            return;
         }
         if fds[0].revents != 0 {
             match wire::recv::<Request>(&mut control) {
                 Ok((req, payload)) => {
                     if !h.handle(req, payload, &mut control) {
-                        break;
+                        return;
                     }
                 }
                 // FaderFrame is gone (or broke the protocol).
-                Err(_) => break,
+                Err(_) => return,
             }
         }
         if let Some(inst) = h.instance.as_mut() {
@@ -129,18 +172,69 @@ pub fn run(registry: PluginRegistry) -> i32 {
                     error: p.revents & (libc::POLLERR | libc::POLLHUP) != 0,
                 });
             }
-            let now = Instant::now();
-            for (id, (period, due)) in timers.iter_mut() {
-                if *due <= now {
-                    inst.on_timer(*id);
-                    *due = now + period_of(*period);
+            timers.fire(inst.as_mut());
+        }
+        #[cfg(target_os = "macos")]
+        crate::mac::pump(h.window.is_some());
+    }
+}
+
+/// Windows: a thread reads the requests and wakes the main thread, which
+/// waits in `MsgWaitForMultipleObjectsEx` so the editor's window messages
+/// keep flowing.
+#[cfg(windows)]
+fn serve(h: &mut Helper, mut control: Control) {
+    sys::ui::prepare();
+    let Ok(wake) = sys::event(None) else {
+        return;
+    };
+    let wake = Arc::new(wake);
+    let (tx, rx) = std::sync::mpsc::channel::<Option<(Request, Vec<u8>)>>();
+    let Ok(mut reader) = control.try_clone() else {
+        return;
+    };
+    let woken = Arc::clone(&wake);
+    let spawned = std::thread::Builder::new()
+        .name("faderframe-sandbox-control".into())
+        .spawn(move || {
+            loop {
+                let msg = wire::recv::<Request>(&mut reader).ok();
+                let end = msg.is_none();
+                if tx.send(msg).is_err() {
+                    break;
+                }
+                sys::set_event(&woken);
+                if end {
+                    break;
                 }
             }
+        });
+    if spawned.is_err() {
+        return;
+    }
+    let mut timers = Timers::default();
+    loop {
+        let sources = h
+            .instance
+            .as_ref()
+            .map(|i| i.event_sources())
+            .unwrap_or_default();
+        timers.update(&sources.timers);
+        sys::ui::wait(&wake, timers.timeout());
+        sys::ui::pump();
+        while let Ok(msg) = rx.try_recv() {
+            // `None`: FaderFrame is gone (or broke the protocol).
+            let Some((req, payload)) = msg else {
+                return;
+            };
+            if !h.handle(req, payload, &mut control) {
+                return;
+            }
+        }
+        if let Some(inst) = h.instance.as_mut() {
+            timers.fire(inst.as_mut());
         }
     }
-    h.stop_audio();
-    h.instance = None;
-    0
 }
 
 fn period_of(ms: u32) -> Duration {
@@ -153,7 +247,7 @@ fn failed(e: impl std::fmt::Display) -> (Response, Vec<u8>) {
 
 impl Helper {
     /// Answer one request; `false` to quit.
-    fn handle(&mut self, req: Request, payload: Vec<u8>, control: &mut UnixStream) -> bool {
+    fn handle(&mut self, req: Request, payload: Vec<u8>, control: &mut Control) -> bool {
         let quit = req == Request::Quit;
         let (resp, out) = self.answer(req, payload);
         wire::send(control, &resp, &out).is_ok() && !quit
@@ -185,6 +279,7 @@ impl Helper {
                 &shm,
                 shm_size as usize,
             ),
+            Request::Editor(call) => self.editor(call),
             other => {
                 let Some(inst) = self.instance.as_mut() else {
                     return failed("no plugin");
@@ -219,7 +314,6 @@ impl Helper {
                         Err(e) => failed(e),
                     },
                     Request::Poll => self.poll(),
-                    Request::Editor(call) => editor(inst.as_mut(), call),
                     _ => failed("unexpected request"),
                 }
             }
@@ -265,7 +359,18 @@ impl Helper {
             .map(wire::Edit::from)
             .collect();
         let (editor_open, editor) = match inst.editor() {
-            Some(e) if e.is_open() => (true, e.take_requests().into()),
+            Some(e) if e.is_open() => {
+                #[allow(unused_mut)]
+                let mut r = e.take_requests();
+                #[cfg(target_os = "macos")]
+                if let Some(w) = self.window.as_mut() {
+                    own_window_requests(e, w, &mut r);
+                    if r.closed {
+                        self.window = None;
+                    }
+                }
+                (true, r.into())
+            }
             _ => (false, Default::default()),
         };
         let params: Option<Vec<Param>> = p
@@ -335,44 +440,136 @@ impl Helper {
     }
 }
 
-fn editor(inst: &mut dyn PluginInstance, call: EditorCall) -> (Response, Vec<u8>) {
-    let Some(ed) = inst.editor() else {
-        return failed("the plugin has no editor");
-    };
-    let resp = match call {
-        EditorCall::CanEmbed(api) => Response::Flag(ed.can_embed(api.into())),
-        EditorCall::CanFloat(api) => Response::Flag(ed.can_float(api.into())),
-        EditorCall::OpenEmbedded { api, scale } => match ed.open_embedded(api.into(), scale) {
-            Ok(size) => Response::Size(Some(size)),
-            Err(e) => Response::Failed(e.to_string()),
-        },
-        EditorCall::Attach { api, handle } => match ed.attach(ParentWindow {
-            api: api.into(),
-            handle,
-        }) {
-            Ok(()) => Response::Done,
-            Err(e) => Response::Failed(e.to_string()),
-        },
-        EditorCall::OpenFloating { api, title } => match ed.open_floating(api.into(), &title) {
-            Ok(()) => Response::Done,
-            Err(e) => Response::Failed(e.to_string()),
-        },
-        EditorCall::Close => {
-            ed.close();
-            Response::Done
+impl Helper {
+    fn editor(&mut self, call: EditorCall) -> (Response, Vec<u8>) {
+        let Some(inst) = self.instance.as_mut() else {
+            return failed("no plugin");
+        };
+        let Some(ed) = inst.editor() else {
+            return failed("the plugin has no editor");
+        };
+        // A view cannot go into FaderFrame's windows: the editor floats,
+        // in a window of ours unless the plugin brings its own.
+        #[cfg(target_os = "macos")]
+        match call {
+            EditorCall::CanEmbed(_) => return (Response::Flag(false), Vec::new()),
+            EditorCall::CanFloat(api) => {
+                let api = api.into();
+                return (
+                    Response::Flag(ed.can_embed(api) || ed.can_float(api)),
+                    Vec::new(),
+                );
+            }
+            EditorCall::OpenFloating { api, ref title } if ed.can_embed(api.into()) => {
+                let (resp, window) = own_window(ed, api.into(), title);
+                self.window = window;
+                return (resp, Vec::new());
+            }
+            EditorCall::Close => {
+                ed.close();
+                self.window = None;
+                return (Response::Done, Vec::new());
+            }
+            EditorCall::Raise => {
+                if let Some(w) = self.window.as_mut() {
+                    w.show();
+                }
+                return (Response::Done, Vec::new());
+            }
+            _ => {}
         }
-        EditorCall::CanResize => Response::Flag(ed.can_resize()),
-        EditorCall::SetSize { width, height } => Response::Size(ed.set_size(width, height)),
+        let resp = match call {
+            EditorCall::CanEmbed(api) => Response::Flag(ed.can_embed(api.into())),
+            EditorCall::CanFloat(api) => Response::Flag(ed.can_float(api.into())),
+            EditorCall::OpenEmbedded { api, scale } => match ed.open_embedded(api.into(), scale) {
+                Ok(size) => Response::Size(Some(size)),
+                Err(e) => Response::Failed(e.to_string()),
+            },
+            EditorCall::Attach { api, handle } => match ed.attach(ParentWindow {
+                api: api.into(),
+                handle,
+            }) {
+                Ok(()) => Response::Done,
+                Err(e) => Response::Failed(e.to_string()),
+            },
+            EditorCall::OpenFloating { api, title } => match ed.open_floating(api.into(), &title) {
+                Ok(()) => Response::Done,
+                Err(e) => Response::Failed(e.to_string()),
+            },
+            EditorCall::Close => {
+                ed.close();
+                Response::Done
+            }
+            EditorCall::Raise => Response::Done,
+            EditorCall::CanResize => Response::Flag(ed.can_resize()),
+            EditorCall::SetSize { width, height } => Response::Size(ed.set_size(width, height)),
+        };
+        (resp, Vec::new())
+    }
+}
+
+/// Open the editor embedded into a window of the helper's own.
+#[cfg(target_os = "macos")]
+fn own_window(
+    ed: &mut dyn faderframe_plugin_host::PluginEditor,
+    api: faderframe_plugin_host::WindowApi,
+    title: &str,
+) -> (Response, Option<crate::mac::EditorWindow>) {
+    let size = match ed.open_embedded(api, 1.0) {
+        Ok(size) => size,
+        Err(e) => return (Response::Failed(e.to_string()), None),
     };
-    (resp, Vec::new())
+    let resizable = ed.can_resize();
+    let Some(mut w) = crate::mac::EditorWindow::new(title, size, resizable) else {
+        ed.close();
+        return (Response::Failed("no window for the editor".into()), None);
+    };
+    if let Err(e) = ed.attach(ParentWindow {
+        api,
+        handle: w.view(),
+    }) {
+        ed.close();
+        return (Response::Failed(e.to_string()), None);
+    }
+    w.show();
+    (Response::Done, Some(w))
+}
+
+/// What the editor asked of its window, and what the user did to it:
+/// handled here (FaderFrame only hears that it was closed).
+#[cfg(target_os = "macos")]
+fn own_window_requests(
+    ed: &mut dyn faderframe_plugin_host::PluginEditor,
+    w: &mut crate::mac::EditorWindow,
+    r: &mut faderframe_plugin_host::EditorRequests,
+) {
+    if let Some(size) = r.resize.take() {
+        w.resize(size);
+    }
+    if std::mem::take(&mut r.show) {
+        w.show();
+    }
+    if std::mem::take(&mut r.hide) {
+        w.hide();
+    }
+    if let Some(size) = w.dragged()
+        && let Some(applied) = ed.set_size(size.0, size.1)
+        && applied != size
+    {
+        w.resize(applied);
+    }
+    if w.closed() {
+        ed.close();
+        r.closed = true;
+    }
 }
 
 /// The helper's audio thread: one block per wake-up byte.
 fn audio_loop(
     mut processor: Box<dyn PluginProcessor>,
     block: Arc<Block>,
-    go: Arc<OwnedFd>,
-    done: Arc<OwnedFd>,
+    go: Arc<Waiter>,
+    done: Arc<Signal>,
 ) {
     faderframe_realtime::flush_denormals_on_this_thread();
     let h = block.header();
@@ -384,12 +581,10 @@ fn audio_loop(
         if h.quit.load(Ordering::Acquire) != 0 {
             break;
         }
-        match sys::wait_readable(go.as_raw_fd(), Some(Duration::from_millis(100))) {
+        match go.wait(Some(Duration::from_millis(100))) {
             // FaderFrame is gone.
             Ready::HungUp => break,
-            Ready::Readable => {
-                sys::drain(go.as_raw_fd());
-            }
+            Ready::Woken => {}
             Ready::TimedOut => continue,
         }
         if h.quit.load(Ordering::Acquire) != 0 {
@@ -434,7 +629,7 @@ fn audio_loop(
         };
         block.write_response(frames, status, &mut io);
         h.done.store(seq, Ordering::Release);
-        if !sys::signal(done.as_raw_fd()) {
+        if !done.signal() {
             break;
         }
     }

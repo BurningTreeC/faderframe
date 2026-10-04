@@ -242,8 +242,17 @@ fn open_native(app: &Rc<AppState>, plugin: PluginInstanceId) -> bool {
             .map(|n| n.host)
     });
     if let Some(host) = existing {
-        if let Host::Parent(win) = host {
-            with_parents(|x| x.raise(win));
+        match host {
+            Host::Parent(win) => {
+                with_parents(|x| x.raise(win));
+            }
+            Host::Floating => {
+                if let Ok(mut s) = app.session.try_borrow_mut()
+                    && let Some(ed) = s.plugin_editor(plugin)
+                {
+                    ed.raise();
+                }
+            }
         }
         return true;
     }

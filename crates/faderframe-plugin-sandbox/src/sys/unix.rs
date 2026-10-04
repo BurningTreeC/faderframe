@@ -1,13 +1,118 @@
-//! The system calls the sandbox needs (Unix): pipes, `poll`, named shared
-//! memory, and descriptors at fixed numbers in a child process.
+//! Unix: a socket pair for control, a pipe each way for the per-block
+//! wake-ups (at fixed descriptor numbers in the helper), POSIX shared
+//! memory, `poll`.
 
+use super::{Connected, ENV_HELPER, Link, Ready, unique_name};
+use crate::Launcher;
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// Where the helper finds its descriptors.
+const CONTROL_FD: RawFd = 3;
+/// The helper reads a byte here per block.
+const GO_FD: RawFd = 4;
+/// The helper writes a byte here per finished block.
+const DONE_FD: RawFd = 5;
+
+/// The control stream: framed messages both ways, with timeouts.
+pub type Control = UnixStream;
+
+/// Wakes the other side: a byte into a non-blocking pipe.
+pub struct Signal(OwnedFd);
+
+impl Signal {
+    /// `false` when the other side is gone. Wait-free.
+    pub fn signal(&self) -> bool {
+        signal(self.0.as_raw_fd())
+    }
+}
+
+/// Waits for the other side's wake-up (the read end of its pipe).
+pub struct Waiter(OwnedFd);
+
+impl Waiter {
+    /// Wait at most `timeout` (`None`: as long as it takes); no allocation.
+    pub fn wait(&self, timeout: Option<Duration>) -> Ready {
+        let fd = self.0.as_raw_fd();
+        match wait_readable(fd, timeout) {
+            Ready::Woken if !drain(fd) => Ready::HungUp,
+            r => r,
+        }
+    }
+}
+
+/// Start a helper: control at descriptor 3, the wake-up pipes at 4 and 5.
+pub fn spawn(launcher: &Launcher) -> io::Result<Link> {
+    let (ours, theirs) = UnixStream::pair()?;
+    let (go_r, go_w) = pipe()?;
+    let (done_r, done_w) = pipe()?;
+    set_nonblocking(go_w.as_raw_fd())?;
+    set_nonblocking(done_r.as_raw_fd())?;
+    let mut cmd = Command::new(&launcher.exe);
+    cmd.args(&launcher.args)
+        .envs(launcher.env.iter().map(|(k, v)| (k, v)))
+        .env(ENV_HELPER, "1")
+        .stdin(Stdio::null());
+    place_fds(
+        &mut cmd,
+        vec![
+            (theirs.as_raw_fd(), CONTROL_FD),
+            (go_r.as_raw_fd(), GO_FD),
+            (done_w.as_raw_fd(), DONE_FD),
+        ],
+    );
+    let child = cmd.spawn()?;
+    drop((theirs, go_r, done_w));
+    Ok(Link {
+        child,
+        control: ours,
+        go: Signal(go_w),
+        done: Waiter(done_r),
+    })
+}
+
+/// In a helper: take the descriptors FaderFrame placed, and end this
+/// process should FaderFrame go away while a plugin holds the main thread.
+pub fn connect() -> Option<Connected> {
+    let (Some(control), Some(go), Some(done)) =
+        (take_fd(CONTROL_FD), take_fd(GO_FD), take_fd(DONE_FD))
+    else {
+        return None;
+    };
+    // The audio thread must never block on these.
+    set_nonblocking(go.as_raw_fd()).ok()?;
+    set_nonblocking(done.as_raw_fd()).ok()?;
+    watch_parent();
+    Some(Connected {
+        control: UnixStream::from(control),
+        go: Waiter(go),
+        done: Signal(done),
+    })
+}
+
+/// Exit once the parent process is gone (reparented).
+fn watch_parent() {
+    // SAFETY: plain query.
+    let parent = unsafe { libc::getppid() };
+    let _ = std::thread::Builder::new()
+        .name("faderframe-sandbox-watch".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(500));
+                // SAFETY: plain query.
+                if unsafe { libc::getppid() } != parent {
+                    // SAFETY: ends the process at once, running nothing a
+                    // stuck plugin might hold a lock in.
+                    unsafe { libc::_exit(0) };
+                }
+            }
+        });
+}
 
 fn check(r: libc::c_int) -> io::Result<libc::c_int> {
     if r < 0 {
@@ -26,7 +131,7 @@ fn set_fd_flag(fd: RawFd, get: libc::c_int, set: libc::c_int, flag: libc::c_int)
 }
 
 /// A pipe: (read end, write end), both close-on-exec.
-pub fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `fds` holds the two descriptors the call writes.
     check(unsafe { libc::pipe(fds.as_mut_ptr()) })?;
@@ -43,13 +148,13 @@ pub fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     Ok((r, w))
 }
 
-pub fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     set_fd_flag(fd, libc::F_GETFL, libc::F_SETFL, libc::O_NONBLOCK)
 }
 
 /// Write one byte to a non-blocking pipe; a full pipe is fine (the reader
 /// has a wake-up pending). `false` when the reader is gone.
-pub fn signal(fd: RawFd) -> bool {
+fn signal(fd: RawFd) -> bool {
     let b = 1u8;
     // SAFETY: writes one byte from a valid buffer.
     let r = unsafe { libc::write(fd, (&b as *const u8).cast(), 1) };
@@ -58,7 +163,7 @@ pub fn signal(fd: RawFd) -> bool {
 
 /// Read and discard what waits in a non-blocking pipe. `false` at end of
 /// file (the writer is gone).
-pub fn drain(fd: RawFd) -> bool {
+fn drain(fd: RawFd) -> bool {
     let mut buf = [0u8; 64];
     loop {
         // SAFETY: reads into a valid buffer of its length.
@@ -75,17 +180,8 @@ pub fn drain(fd: RawFd) -> bool {
     }
 }
 
-/// What waiting for a descriptor ended with.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Ready {
-    Readable,
-    /// The other end is gone.
-    HungUp,
-    TimedOut,
-}
-
 /// Wait until `fd` is readable, at most `timeout` (`None`: forever).
-pub fn wait_readable(fd: RawFd, timeout: Option<Duration>) -> Ready {
+fn wait_readable(fd: RawFd, timeout: Option<Duration>) -> Ready {
     let deadline = timeout.map(|t| Instant::now() + t);
     loop {
         let ms = match deadline {
@@ -115,7 +211,7 @@ pub fn wait_readable(fd: RawFd, timeout: Option<Duration>) -> Ready {
             continue;
         }
         if p.revents & libc::POLLIN != 0 {
-            return Ready::Readable;
+            return Ready::Woken;
         }
         if p.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
             return Ready::HungUp;
@@ -140,14 +236,18 @@ pub fn poll(fds: &mut [libc::pollfd], timeout_ms: i32) -> io::Result<usize> {
 }
 
 /// Make the child of `cmd` find each `(fd, number)` at `number` (the
-/// descriptors stay close-on-exec in this process).
-pub fn place_fds(cmd: &mut Command, fds: Vec<(RawFd, RawFd)>) {
+/// descriptors stay close-on-exec in this process). On Linux the child is
+/// also killed should FaderFrame die.
+fn place_fds(cmd: &mut Command, fds: Vec<(RawFd, RawFd)>) {
     let above = fds.iter().map(|&(_, n)| n).max().unwrap_or(2) + 1;
-    // SAFETY: the closure runs between fork and exec and only calls fcntl
-    // and dup2, which are async-signal-safe. Each descriptor is first moved
-    // above every target number, so placing one cannot clobber another.
+    // SAFETY: the closure runs between fork and exec and only calls fcntl,
+    // dup2, close and prctl, which are async-signal-safe. Each descriptor
+    // is first moved above every target number, so placing one cannot
+    // clobber another.
     unsafe {
         cmd.pre_exec(move || {
+            #[cfg(target_os = "linux")]
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
             let mut temp = [0 as libc::c_int; 8];
             for (i, &(fd, _)) in fds.iter().enumerate().take(temp.len()) {
                 temp[i] = check(libc::fcntl(fd, libc::F_DUPFD, above))?;
@@ -162,14 +262,12 @@ pub fn place_fds(cmd: &mut Command, fds: Vec<(RawFd, RawFd)>) {
 }
 
 /// Take descriptor `number` (placed by [`place_fds`]) if it is open.
-pub fn take_fd(number: RawFd) -> Option<OwnedFd> {
+fn take_fd(number: RawFd) -> Option<OwnedFd> {
     // SAFETY: only asks whether the descriptor exists.
     let open = unsafe { libc::fcntl(number, libc::F_GETFD) } >= 0;
     // SAFETY: the parent placed it for this process; nothing else owns it.
     open.then(|| unsafe { OwnedFd::from_raw_fd(number) })
 }
-
-static SHM_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// A named POSIX shared memory object, mapped read-write.
 pub struct Shm {
@@ -190,12 +288,7 @@ unsafe impl Sync for Shm {}
 impl Shm {
     /// A new object of `len` bytes (zeroed) under a fresh name.
     pub fn create(len: usize) -> io::Result<Self> {
-        let n = SHM_COUNT.fetch_add(1, Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
-        // At most 31 characters (macOS).
-        let name = format!("/ffsb.{}.{n}.{:x}", std::process::id(), nanos & 0xFFFF);
+        let name = format!("/{}", unique_name());
         let cname = CString::new(name).map_err(io::Error::other)?;
         // SAFETY: a valid C string; flags and mode are plain integers.
         let fd = check(unsafe {
@@ -321,7 +414,7 @@ mod tests {
             Ready::TimedOut
         );
         assert!(signal(w.as_raw_fd()));
-        assert_eq!(wait_readable(r.as_raw_fd(), None), Ready::Readable);
+        assert_eq!(wait_readable(r.as_raw_fd(), None), Ready::Woken);
         assert!(drain(r.as_raw_fd()));
         drop(w);
         assert_eq!(wait_readable(r.as_raw_fd(), None), Ready::HungUp);

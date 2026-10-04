@@ -253,6 +253,8 @@ pub trait PluginEditor {
     /// Open as the plugin's own window.
     fn open_floating(&mut self, api: WindowApi, title: &str) -> Result<(), PluginError>;
     fn close(&mut self);
+    /// Bring a floating editor's window to the front.
+    fn raise(&mut self) {}
     fn is_open(&self) -> bool;
     fn can_resize(&mut self) -> bool;
     /// Ask for a new size; returns the size actually applied.

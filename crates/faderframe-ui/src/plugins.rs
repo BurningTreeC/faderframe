@@ -1,7 +1,7 @@
 //! Plugin formats available to the application: CLAP and VST3 (scanned in
 //! helper processes, cached) next to the built-ins, and Audio Units on
-//! macOS (listed from the system's component registry). CLAP and VST3
-//! instances run in helper processes while sandboxing is on
+//! macOS (listed from the system's component registry). CLAP, VST3 and
+//! Audio Unit instances run in helper processes while sandboxing is on
 //! (`faderframe-plugin-sandbox`; Preferences → General); a helper is this
 //! program started as `faderframe --plugin-sandbox` ([`sandbox_helper`]).
 
@@ -35,8 +35,8 @@ fn load_catalogs() {
     faderframe_plugin_vst3::set_catalog(vst3.plugins().cloned().collect());
 }
 
-/// Install the plugin registry (built-ins in process; CLAP and VST3 in
-/// helper processes while sandboxing is on) and publish the cached
+/// Install the plugin registry (built-ins in process; CLAP, VST3 and Audio
+/// Units in helper processes while sandboxing is on) and publish the cached
 /// catalogs. Must run before the first engine is created.
 pub fn install() {
     use faderframe_plugin_sandbox::SandboxedFactory;
@@ -49,7 +49,9 @@ pub fn install() {
             faderframe_plugin_vst3::Vst3Factory::new(),
         ))));
         #[cfg(target_os = "macos")]
-        r.add_factory(Box::new(faderframe_plugin_au::AuFactory::new()));
+        r.add_factory(Box::new(SandboxedFactory::new(Box::new(
+            faderframe_plugin_au::AuFactory::new(),
+        ))));
         r
     });
     load_catalogs();
@@ -67,15 +69,7 @@ pub fn install() {
 /// returns the exit code.
 pub fn sandbox_helper() -> i32 {
     load_catalogs();
-    #[cfg(unix)]
-    {
-        faderframe_plugin_sandbox::child::run(in_process_registry())
-    }
-    #[cfg(not(unix))]
-    {
-        eprintln!("plugin sandboxing is not available on this platform yet");
-        2
-    }
+    faderframe_plugin_sandbox::child::run(in_process_registry())
 }
 
 /// Changes whenever a catalog changes (views refresh on change).

@@ -9,27 +9,27 @@
 //! and, while sandboxing is on, instantiates through a helper instead.
 //!
 //! * **Control** — instantiate, parameters, state, presets, the editor, a
-//!   poll per UI tick — goes over a Unix socket as framed messages
+//!   poll per UI tick — goes over a socket (Windows: a named pipe) as
+//!   framed messages
 //!   ([`wire`]). What the UI reads often (parameter values, editor requests,
 //!   edits made in the plugin's editor) arrives with the poll and is read
 //!   from a cache.
 //! * **Audio** goes through shared memory, one block of it per activation
 //!   (`shm`): the host's audio thread writes the block's inputs, MIDI and
 //!   note expressions, parameter events and transport, wakes the helper's
-//!   audio thread with a byte through a pipe and waits for the byte back,
-//!   then reads the outputs. Everything the helper writes is validated
+//!   audio thread (a byte through a pipe; Windows: an event) and waits for
+//!   its answer, then reads the outputs. Everything the helper writes is validated
 //!   (counts, event kinds, finite samples) — the host never trusts it.
-//! * **Failure**: a helper that dies closes its pipe (noticed at once); one
-//!   that does not answer within [`BLOCK_TIMEOUT`] is given up. Either way
+//! * **Failure**: a helper that dies is noticed at once (its pipe closes;
+//!   Windows: its process handle is signalled); one that does not answer within [`BLOCK_TIMEOUT`] is given up. Either way
 //!   the processor reports [`ProcessStatus::Error`] (the engine bypasses
 //!   the plugin) and the instance answers from its cache until it is
 //!   reloaded.
-//! * **Editors** run in the helper. On X11 they embed into FaderFrame's
-//!   own editor window across processes (window ids are global); resize
-//!   and close requests come back with the poll.
-//!
-//! Linux for now ([`AVAILABLE`]); elsewhere the factory always hosts in
-//! process.
+//! * **Editors** run in the helper. On X11 and Windows they embed into
+//!   FaderFrame's own editor window across processes (window ids and
+//!   handles are global); on macOS, where views cannot cross processes,
+//!   the helper shows them in a window of its own. Resize and close
+//!   requests come back with the poll.
 //!
 //! [`PluginInstance`]: faderframe_plugin_host::PluginInstance
 //! [`PluginProcessor`]: faderframe_plugin_host::PluginProcessor
@@ -37,13 +37,11 @@
 
 pub mod wire;
 
-#[cfg(unix)]
 pub mod child;
-#[cfg(unix)]
 mod host;
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
+mod mac;
 mod shm;
-#[cfg(unix)]
 mod sys;
 
 use faderframe_plugin_host::{PluginDescriptor, PluginError, PluginFactory, PluginFormat};
@@ -53,7 +51,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Sandboxing works on this platform.
-pub const AVAILABLE: bool = cfg!(target_os = "linux");
+pub const AVAILABLE: bool = cfg!(any(target_os = "linux", target_os = "macos", windows));
 
 /// How long the host's audio thread waits for a helper's block before it
 /// gives the plugin up.
@@ -117,7 +115,6 @@ impl PluginFactory for SandboxedFactory {
         &self,
         id: &str,
     ) -> Result<Box<dyn faderframe_plugin_host::PluginInstance>, PluginError> {
-        #[cfg(unix)]
         if let (true, Some(launcher)) = (enabled(), launcher()) {
             return Ok(Box::new(host::RemoteInstance::spawn(
                 launcher,
@@ -131,7 +128,6 @@ impl PluginFactory for SandboxedFactory {
 
 /// Instantiate `id` of `format` in a helper started by `launcher`,
 /// whatever the switch says (tests, tools).
-#[cfg(unix)]
 pub fn instantiate_sandboxed(
     launcher: &Launcher,
     format: PluginFormat,

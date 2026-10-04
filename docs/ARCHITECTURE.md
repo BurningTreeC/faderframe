@@ -504,16 +504,22 @@ editor opening, instruments playing live MIDI as instrument and insert).
 
 ### Sandboxed plugins
 
-`faderframe-plugin-sandbox` runs each CLAP/VST3 instance in a helper
-process of its own: the application's own binary started as
+`faderframe-plugin-sandbox` runs each CLAP/VST3 (and, on macOS, Audio
+Unit) instance in a helper process of its own: the application's own binary started as
 `faderframe --plugin-sandbox`, which hosts the plugin with the in-process
 factories (`faderframe_ui::plugins::in_process_registry`).
 `SandboxedFactory` wraps a format's factory and, while sandboxing is on
 (`set_enabled`, from `Preferences::sandbox_plugins`), instantiates through a
 helper; the engine only sees ordinary `PluginInstance`/`PluginProcessor`s.
+The operating system's part is `sys` (one interface; `unix.rs`:
+socketpair, pipes at fixed descriptor numbers in the helper, POSIX shared
+memory, `poll`, `PR_SET_PDEATHSIG` on Linux; `windows.rs`: a
+single-instance local named pipe with overlapped I/O, auto-reset events, a
+pagefile-backed file mapping, all named in the helper's environment).
 
-* **Control** goes over a Unix socket (`wire`: JSON plus a binary payload
-  for states and preset files, framed with a magic number and size limits).
+* **Control** goes over the socket or pipe (`wire`: JSON plus a binary
+  payload for states and preset files, framed with a magic number and size
+  limits).
   The host answers what the UI reads every frame (parameter values, editor
   requests and edits, latency) from a cache that the per-tick `Poll`
   refreshes with the changes only.
@@ -522,27 +528,48 @@ helper; the engine only sees ordinary `PluginInstance`/`PluginProcessor`s.
   parameter events, MIDI and note expressions both ways as fixed-layout
   `Wire*` records — never Rust enums —, then the audio) and unlinks the
   name once the helper has mapped it. Per block the audio thread writes
-  the request, bumps `seq`, writes a byte into the helper's pipe and waits
-  (`poll`) for `done == seq`; the helper's audio thread (copying the host
-  audio thread's scheduling, flush-to-zero) runs the real processor on
-  reused buffers and answers with a byte. Whatever the helper wrote is
+  the request, bumps `seq`, wakes the helper (`Signal`: a byte into its
+  pipe, or `SetEvent`) and waits (`Waiter`) for `done == seq`; the helper's
+  audio thread (copying the host audio thread's scheduling — SCHED_FIFO,
+  Mach time constraints or MMCSS —, flush-to-zero) runs the real processor
+  on reused buffers and answers the same way. Whatever the helper wrote is
   decoded defensively (counts clamped, unknown events dropped, non-finite
-  samples zeroed). A round trip costs about 9 µs.
-* **Failure**: a dead helper closes its pipe (noticed at once); one that
-  misses `BLOCK_TIMEOUT` (250 ms) is given up and killed by the next poll.
+  samples zeroed). A round trip costs 7–9 µs.
+* **Failure**: a dead helper is noticed at once (its pipe closes; on
+  Windows the wait includes its process handle); one that misses
+  `BLOCK_TIMEOUT` (250 ms) is given up and killed by the next poll.
   The processor then returns `ProcessStatus::Error`, so the engine bypasses
   the plugin; the session reports it once (`session::sandbox`) and
   `Action::ReloadPlugin` drops the instance and builds it again from its
   slot. Sandboxed plugins that report unsaved state have it taken into
   their slots every 5 s, so a reload restores recent settings.
-* **Editors** run in the helper, whose main thread `poll`s the control
-  socket together with the plugin GUI's descriptors and timers. On X11 they
-  embed into FaderFrame's parent window across processes (X11 window ids
-  are global); resize and close requests arrive with the poll.
+* **Editors** run in the helper. Its main thread services the plugin
+  GUI's descriptors and timers along with the control stream: Unix `poll`s
+  them (macOS also hands AppKit its events and run loop every 10 ms while
+  an editor is open, 50 ms otherwise); Windows reads the pipe on a thread
+  that wakes a `MsgWaitForMultipleObjectsEx` message loop. On X11 and
+  Windows editors embed into FaderFrame's parent window across processes
+  (window ids and handles are global). A Windows child window sends its
+  parent messages synchronously (on creation, resizing, destruction), so
+  FaderFrame handles sent messages while it waits for the helper's answer
+  (`wait_two_pumping`; posted messages stay queued) — otherwise both sides
+  block. On macOS views cannot cross processes: the helper reports
+  "floats", shows the editor in an `NSWindow` of its own (`mac.rs`; an
+  accessory app, no Dock icon), handles resizes and the close button
+  itself and reports closing with the poll; opening it again raises it
+  (`PluginEditor::raise`). A helper exits when FaderFrame goes away
+  (Linux: death signal; macOS: a watchdog on the parent pid; Windows: a
+  thread waiting on FaderFrame's process), even with a plugin stuck on
+  its main thread.
 * **Tests**: `faderframe-plugin-sandbox/tests/sandbox.rs` starts its own
   test binary as the helper and compares sandboxed built-ins with
   in-process ones bit for bit, lets one helper die mid-block and another
   hang; `round_trip_cost` (ignored) measures the overhead.
+  `tests/editor_windows.rs` (Windows) embeds a helper's child window into
+  one of the test's and fails if that deadlocks. Both run on the Ports
+  runners, and locally as Windows binaries under Wine:
+  `CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine PKG_CONFIG_ALLOW_CROSS=1
+  cargo test -p faderframe-plugin-sandbox --target x86_64-pc-windows-gnu`.
 
 ### CLAP
 
@@ -1270,7 +1297,7 @@ for its editor.
     `faderframe-plugin-clap` (loading plugin libraries, window handles for
     editors), `faderframe-plugin-vst3` (COM bindings, module loading),
     `faderframe-plugin-sandbox` (pipes, `poll`, shared memory, descriptors
-    for helper processes), `faderframe-stretch` (the C shim of the vendored
+    for helper processes, Win32 pipes/events/mappings, AppKit windows), `faderframe-stretch` (the C shim of the vendored
     stretcher) and `faderframe-ui` (GObject subclassing macros).
 12. Vendored C/C++ code is listed in `THIRD_PARTY_LICENSES.md` and its
     realtime entry points are proven allocation-free by counting C++
@@ -1357,8 +1384,8 @@ and packages for all three platforms (see §14).
 
 1. **Ports**: the CoreAudio IO workgroup for DSP workers, signed and
    notarised packages, a Flathub submission (vendored crates).
-2. **Plugins**: sandboxing on Windows and macOS, VST3 program lists and
-   64-bit processing, SysEx to plugins.
+2. **Plugins**: VST3 program lists and 64-bit processing, SysEx to
+   plugins.
 3. **MIDI**: MTC output, varispeed chase without a shared word clock.
 4. **Performance**: anticipative processing of tracks that are not
    monitored live, job affinity for cache locality, an optional wgpu

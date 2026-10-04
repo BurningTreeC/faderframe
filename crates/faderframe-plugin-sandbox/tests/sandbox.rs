@@ -3,8 +3,6 @@
 //! again as a helper — against the same plugins in process; a plugin that
 //! crashes and one that hangs.
 
-#![cfg(target_os = "linux")]
-
 use faderframe_audio_graph::{AudioBuffer, NodeIo};
 use faderframe_automation::ParameterEvent;
 use faderframe_core::{ChannelLayout, ParameterId, builtin};
