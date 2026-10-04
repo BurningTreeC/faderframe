@@ -67,6 +67,19 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.3.0" date="2026-10-04">
+      <description>
+        <p>Stock devices.</p>
+        <ul>
+          <li>The FaderFrame EQ: 24 bands with analogue-shaped curves to Nyquist, zero latency, natural or linear phase, dynamic and spectral bands keyed by their region or a sidechain, EQ Match, EQ Sketch, Spectrum Grab and an instance list.</li>
+          <li>The Program EQ: a circuit-modelled passive tube program equaliser with its own panel.</li>
+          <li>Dynamics: a compressor in five styles with a filtered sidechain, a true-peak lookahead limiter, a gate, expander and ducker, and a de-esser.</li>
+          <li>Effects: an oversampled saturator, a utility with vectorscope, a tempo-synced delay with tape and analogue styles, an algorithmic reverb in five types, chorus, ensemble, flanger, phaser and vibrato, and a tuner.</li>
+          <li>Instruments: a virtual analogue synth with unison, two envelopes and an LFO, a sampler that plays a sample across the keys or an SFZ instrument, and a sixteen-pad drum sampler; their samples are copied into the project.</li>
+          <li>Every device has an editor of its own with automation and MIDI learn from its controls.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-10-04">
       <description>
         <p>Plugins, performance and mastering.</p>
