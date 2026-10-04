@@ -224,8 +224,10 @@ Preferences → Audio → Processing threads, `--threads`).
   reading it, and the caller waits for zero before returning. Idle workers
   spin ~100 µs (consecutive chunks of a callback catch them awake), then
   sleep on a futex; one non-blocking `FUTEX_WAKE` wakes as many as the
-  graph can use. Workers take the audio thread's scheduling policy and
-  priority (`SCHED_FIFO` under JACK/PipeWire) and flush denormals, as does
+  graph can use. Workers run at the audio thread's urgency — on Linux its
+  scheduling policy and priority (`SCHED_FIFO` under JACK/PipeWire), on
+  macOS its Mach time-constraint policy, on Windows MMCSS's "Pro Audio"
+  task (elsewhere they park/unpark) — and flush denormals, as does
   the audio thread for every callback (`ScopedFlushDenormals`). Without
   realtime scheduling a preempted worker would stall the cycle, so the pool
   then stays within the physical cores.
@@ -1154,7 +1156,7 @@ Platform specifics are isolated in backends and the GTK shell:
 | CLAP / VST3 | ✓, editors embedded via XWayland | ✓, editors embedded (Win32) | ✓, editors embedded (Cocoa) |
 | Audio Units | | | ✓ (AUv2 API, AUv3 through it) |
 | Packages | Flatpak, install script | Inno Setup installer, zip | app bundle in a DMG |
-| DSP threads | futex wake-up, the audio thread's `SCHED_FIFO` | `park`/`unpark`, normal priority | `park`/`unpark`, normal priority |
+| DSP threads | futex wake-up, the audio thread's `SCHED_FIFO` | `park`/`unpark`, MMCSS "Pro Audio" | `park`/`unpark`, the IO thread's Mach time constraint |
 
 * JACK and PipeWire are Linux-only dependencies; their crates are empty
   elsewhere. CLAP's posix-fd extension (plugin GUI event loops) exists on
@@ -1169,9 +1171,10 @@ Platform specifics are isolated in backends and the GTK shell:
   `macos-15-intel`, GTK from Homebrew) and Windows (MSYS2 UCRT64 with its
   GTK 4 and Rust packages).
 
-Still open for the ports: realtime priority for DSP workers (MMCSS, Mach
-time constraints), Developer ID signing and notarisation of the macOS app,
-and a signed Windows installer.
+Still open for the ports: joining CoreAudio's IO workgroup
+(`os_workgroup`, which keeps workers on performance cores on Apple
+Silicon), Developer ID signing and notarisation of the macOS app, and a
+signed Windows installer.
 
 ## Status and roadmap
 
@@ -1220,8 +1223,8 @@ and packages for all three platforms (see §14).
 2. **Mastering**: offline loudness analysis per song and loudness
    normalisation on export, dithering and true-peak limiting for delivery
    formats, an album/sequence view.
-3. **Ports**: realtime DSP worker priority on Windows and macOS, signed
-   and notarised packages, a Flathub submission (vendored crates).
+3. **Ports**: the CoreAudio IO workgroup for DSP workers, signed and
+   notarised packages, a Flathub submission (vendored crates).
 4. **Plugins**: note expressions (CLAP, VST3), VST3 program lists and
    64-bit processing, sandboxed plugins (out-of-process with shared-memory
    audio), SysEx to plugins.

@@ -12,10 +12,12 @@
 //! * idle workers spin for a short while after a run (consecutive chunks of
 //!   a callback catch them awake), then sleep on a futex — one non-blocking
 //!   `FUTEX_WAKE` from the audio thread wakes as many as needed;
-//! * workers adopt the scheduling policy and priority of the thread that
-//!   runs jobs (`SCHED_FIFO` under JACK/PipeWire), so they are not
-//!   preempted by ordinary threads while the audio thread waits for them,
-//!   and flush denormals like it.
+//! * workers run at the audio thread's urgency, so they are not preempted
+//!   by ordinary threads while the audio thread waits for them: on Linux
+//!   they adopt its scheduling policy and priority (`SCHED_FIFO` under
+//!   JACK/PipeWire), on macOS its Mach time-constraint policy (CoreAudio's
+//!   IO thread has one), on Windows they join MMCSS's "Pro Audio" task like
+//!   the WASAPI thread; and they flush denormals like it.
 //!
 //! The pool may be shared (e.g. by an engine and its replacement), but only
 //! one `run` executes at a time; a concurrent caller runs its job alone.
@@ -102,8 +104,10 @@ struct Shared {
     stop: AtomicBool,
     busy: AtomicBool,
     spin_ns: u64,
-    /// Caller's scheduling (`(policy << 32 | priority) + 1`; 0 = unknown).
+    /// Caller's scheduling as `sched::current` packs it (0 = unknown) and
+    /// the second word some platforms need.
     sched: AtomicU64,
+    sched_extra: AtomicU64,
     sched_failures: AtomicU64,
     runs: AtomicU64,
     #[cfg(not(target_os = "linux"))]
@@ -153,20 +157,23 @@ mod wait {
 #[cfg(target_os = "linux")]
 mod sched {
     /// This thread's policy and priority, packed (0 = unknown).
-    pub fn current() -> u64 {
+    pub fn current() -> (u64, u64) {
         let mut policy = 0;
         // SAFETY: plain query on the calling thread with valid out pointers.
         let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
         let r =
             unsafe { libc::pthread_getschedparam(libc::pthread_self(), &mut policy, &mut param) };
         if r != 0 {
-            return 0;
+            return (0, 0);
         }
-        (((policy as u32 as u64) << 32) | param.sched_priority as u32 as u64) + 1
+        (
+            (((policy as u32 as u64) << 32) | param.sched_priority as u32 as u64) + 1,
+            0,
+        )
     }
 
     /// Apply a packed policy/priority to this thread.
-    pub fn apply(packed: u64) -> bool {
+    pub fn apply(packed: u64, _: u64) -> bool {
         let v = packed - 1;
         let policy = (v >> 32) as i32;
         let param = libc::sched_param {
@@ -175,15 +182,149 @@ mod sched {
         // SAFETY: sets the calling thread's scheduling with a valid param.
         unsafe { libc::pthread_setschedparam(libc::pthread_self(), policy, &param) == 0 }
     }
+
+    /// Whether packed scheduling is a realtime policy.
+    pub fn is_realtime(packed: u64) -> bool {
+        let policy = packed.checked_sub(1).map(|v| (v >> 32) as i32);
+        matches!(policy, Some(libc::SCHED_FIFO | libc::SCHED_RR))
+    }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 mod sched {
-    pub fn current() -> u64 {
-        0
+    //! Mach time-constraint scheduling: CoreAudio's IO thread has a policy
+    //! (period, computation, constraint in absolute-time units); workers
+    //! copy it.
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct TimeConstraint {
+        period: u32,
+        computation: u32,
+        constraint: u32,
+        preemptible: u32,
     }
-    pub fn apply(_: u64) -> bool {
+
+    const THREAD_TIME_CONSTRAINT_POLICY: u32 = 2;
+    const COUNT: u32 = 4;
+
+    unsafe extern "C" {
+        fn pthread_mach_thread_np(thread: libc::pthread_t) -> u32;
+        fn thread_policy_get(
+            thread: u32,
+            flavor: u32,
+            info: *mut TimeConstraint,
+            count: *mut u32,
+            get_default: *mut u32,
+        ) -> i32;
+        fn thread_policy_set(
+            thread: u32,
+            flavor: u32,
+            info: *const TimeConstraint,
+            count: u32,
+        ) -> i32;
+    }
+
+    /// This thread's time constraint, packed (0: it has none).
+    pub fn current() -> (u64, u64) {
+        let mut tc = TimeConstraint::default();
+        let mut count = COUNT;
+        let mut get_default = 0u32;
+        // SAFETY: queries the calling thread's policy into `tc` (room for
+        // `count` integers).
+        let r = unsafe {
+            thread_policy_get(
+                pthread_mach_thread_np(libc::pthread_self()),
+                THREAD_TIME_CONSTRAINT_POLICY,
+                &mut tc,
+                &mut count,
+                &mut get_default,
+            )
+        };
+        if r != 0 || get_default != 0 || tc.period == 0 {
+            return (0, 0);
+        }
+        (
+            ((u64::from(tc.period) << 32) | u64::from(tc.computation)) + 1,
+            (u64::from(tc.preemptible) << 32) | u64::from(tc.constraint),
+        )
+    }
+
+    pub fn apply(packed: u64, extra: u64) -> bool {
+        let v = packed - 1;
+        let tc = TimeConstraint {
+            period: (v >> 32) as u32,
+            computation: v as u32,
+            constraint: extra as u32,
+            preemptible: (extra >> 32) as u32,
+        };
+        // SAFETY: sets the calling thread's policy from a valid struct.
+        unsafe {
+            thread_policy_set(
+                pthread_mach_thread_np(libc::pthread_self()),
+                THREAD_TIME_CONSTRAINT_POLICY,
+                &tc,
+                COUNT,
+            ) == 0
+        }
+    }
+
+    pub fn is_realtime(packed: u64) -> bool {
+        packed != 0
+    }
+}
+
+#[cfg(windows)]
+mod sched {
+    //! MMCSS: the WASAPI thread runs in the "Pro Audio" task (cpal puts it
+    //! there); workers join the same task at high priority.
+    use windows_sys::Win32::System::Threading::{
+        AVRT_PRIORITY_HIGH, AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority,
+    };
+
+    /// "Pro Audio", NUL-terminated UTF-16.
+    const TASK: [u16; 10] = [
+        b'P' as u16,
+        b'r' as u16,
+        b'o' as u16,
+        b' ' as u16,
+        b'A' as u16,
+        b'u' as u16,
+        b'd' as u16,
+        b'i' as u16,
+        b'o' as u16,
+        0,
+    ];
+
+    pub fn current() -> (u64, u64) {
+        (1, 0)
+    }
+
+    pub fn apply(_: u64, _: u64) -> bool {
+        let mut index = 0u32;
+        // SAFETY: a NUL-terminated task name and a valid out pointer; the
+        // registration lasts for the thread's life.
+        unsafe {
+            let task = AvSetMmThreadCharacteristicsW(TASK.as_ptr(), &mut index);
+            !task.is_null() && AvSetMmThreadPriority(task, AVRT_PRIORITY_HIGH) != 0
+        }
+    }
+
+    pub fn is_realtime(packed: u64) -> bool {
+        packed != 0
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+mod sched {
+    pub fn current() -> (u64, u64) {
+        (0, 0)
+    }
+    pub fn apply(_: u64, _: u64) -> bool {
         true
+    }
+    pub fn is_realtime(_: u64) -> bool {
+        false
     }
 }
 
@@ -223,7 +364,7 @@ fn worker(shared: Arc<Shared>, on_start: Option<fn()>) {
         }
         let s = shared.sched.load(Ordering::Relaxed);
         if s != applied && s != 0 {
-            if !sched::apply(s) {
+            if !sched::apply(s, shared.sched_extra.load(Ordering::Relaxed)) {
                 shared.sched_failures.fetch_add(1, Ordering::Relaxed);
             }
             applied = s;
@@ -254,6 +395,7 @@ impl WorkerPool {
             busy: AtomicBool::new(false),
             spin_ns: config.spin.as_nanos() as u64,
             sched: AtomicU64::new(0),
+            sched_extra: AtomicU64::new(0),
             sched_failures: AtomicU64::new(0),
             runs: AtomicU64::new(0),
             #[cfg(not(target_os = "linux"))]
@@ -288,17 +430,13 @@ impl WorkerPool {
     }
 
     /// Workers worth using for one run. With realtime scheduling (audio
-    /// thread and workers `SCHED_FIFO`/`SCHED_RR`) every worker helps, SMT
-    /// siblings included. Without it a worker may be preempted while it
-    /// holds a job and the whole cycle waits, so the pool stays within the
-    /// physical cores, leaving the SMT siblings to the rest of the system.
+    /// thread and workers `SCHED_FIFO`/`SCHED_RR`, time-constrained or in
+    /// MMCSS) every worker helps, SMT siblings included. Without it a worker
+    /// may be preempted while it holds a job and the whole cycle waits, so
+    /// the pool stays within the physical cores, leaving the SMT siblings
+    /// to the rest of the system.
     pub fn useful_helpers(&self) -> usize {
-        let packed = self.shared.sched.load(Ordering::Relaxed);
-        let policy = packed.checked_sub(1).map(|v| (v >> 32) as i32);
-        #[cfg(target_os = "linux")]
-        let realtime = matches!(policy, Some(libc::SCHED_FIFO | libc::SCHED_RR));
-        #[cfg(not(target_os = "linux"))]
-        let realtime = policy.is_some();
+        let realtime = sched::is_realtime(self.shared.sched.load(Ordering::Relaxed));
         if realtime && self.priority_failures() == 0 {
             self.handles.len()
         } else {
@@ -339,7 +477,9 @@ impl WorkerPool {
             .fetch_add(1, Ordering::Relaxed)
             .is_multiple_of(4096)
         {
-            self.shared.sched.store(sched::current(), Ordering::Relaxed);
+            let (packed, extra) = sched::current();
+            self.shared.sched_extra.store(extra, Ordering::Relaxed);
+            self.shared.sched.store(packed, Ordering::Relaxed);
         }
         let r = JobRef(job);
         self.shared
