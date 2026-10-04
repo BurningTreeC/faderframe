@@ -574,6 +574,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "faderframe-disc"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "faderframe-engine"
 version = "0.1.0"
 dependencies = [
@@ -737,6 +744,7 @@ dependencies = [
  "faderframe-audio-graph",
  "faderframe-automation",
  "faderframe-core",
+ "faderframe-disc",
  "faderframe-engine",
  "faderframe-midi",
  "faderframe-midi-io",

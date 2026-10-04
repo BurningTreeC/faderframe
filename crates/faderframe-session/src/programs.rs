@@ -70,8 +70,8 @@ impl Session {
         index: usize,
     ) -> Result<()> {
         let track = self
-            .plugin_slot(plugin)
-            .map(|(t, _)| t.id)
+            .plugin_owner(plugin)
+            .map(|(t, _)| t)
             .ok_or_else(|| SessionError::Other(format!("no plugin {plugin}")))?;
         // One at a time: an earlier selection is recorded first.
         self.finish_programs(true);
@@ -116,7 +116,7 @@ impl Session {
             let Some(state) = self.engine.plugin_state(plugin) else {
                 continue;
             };
-            let Some(parameters) = self.plugin_slot(plugin).map(|(_, s)| s.parameters.clone())
+            let Some(parameters) = self.plugin_owner(plugin).map(|(_, s)| s.parameters.clone())
             else {
                 continue;
             };

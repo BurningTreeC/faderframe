@@ -22,6 +22,7 @@ pub mod notes;
 pub mod performance;
 pub use performance::{Load, PerformanceReport, PluginPerformance, TrackPerformance};
 pub mod album;
+mod album_master;
 pub mod analysis;
 pub mod delivery;
 pub mod editing;
@@ -894,6 +895,8 @@ pub enum PluginTarget {
     /// Insert slot (index in the insert chain).
     Insert(usize),
     Instrument,
+    /// The end of an album song's inserts (the track is ignored).
+    Song(faderframe_core::SongId),
 }
 
 /// Things views ask the toolkit shell to show (polled every frame).
@@ -910,6 +913,9 @@ pub enum UiRequest {
     },
     /// Pick a `.syx` file and add its messages to `clip` at `at`.
     ImportSysex { clip: ClipId, at: MusicalTime },
+    /// Edit the release's details (`None`) or a song's: titles, credits,
+    /// UPC/EAN and ISRC.
+    AlbumDetails(Option<faderframe_core::SongId>),
     /// Ask for a name and save the plugin's settings as a preset.
     SavePluginPreset {
         plugin: faderframe_core::PluginInstanceId,
@@ -2078,7 +2084,17 @@ impl Session {
 
     // --- actions -----------------------------------------------------------------
 
-    fn sync(&mut self, impact: Impact) -> Result<()> {
+    fn sync(&mut self, mut impact: Impact) -> Result<()> {
+        // The monitored album song is gone (removed, undone): stop hearing
+        // its inserts.
+        if self
+            .engine
+            .album_monitor()
+            .is_some_and(|id| self.project.album.song(id).is_none())
+        {
+            self.engine.set_album_monitor(None);
+            impact = Impact::Graph;
+        }
         if impact >= Impact::Timeline {
             self.open_media();
         }
@@ -2925,11 +2941,19 @@ impl Session {
                 track,
                 plugin: Some(plugin),
             })?,
+            // Shows its editor itself.
+            PluginTarget::Song(song) => {
+                return self.dispatch(Action::Album(album::AlbumAction::AddInsert {
+                    song,
+                    plugin,
+                }));
+            }
         }
         // Like most DAWs: a newly placed hosted plugin shows its editor.
         let placed = self.project.track(track).and_then(|t| match target {
             PluginTarget::Insert(i) => t.inserts.get(i.min(t.inserts.len().saturating_sub(1))),
             PluginTarget::Instrument => t.instrument.as_ref(),
+            PluginTarget::Song(_) => None,
         });
         if hosted && let Some(slot) = placed {
             self.ui_requests.push(UiRequest::PluginEditor {
@@ -3011,6 +3035,27 @@ impl Session {
         )
     }
 
+    /// An album song's insert and its song.
+    pub fn song_insert(
+        &self,
+        plugin: faderframe_core::PluginInstanceId,
+    ) -> Option<(&faderframe_project::album::Song, &PluginSlot)> {
+        self.project.album.insert(plugin)
+    }
+
+    /// A plugin's slot and the track its commands name: its own, or the
+    /// master for an album song's insert (the commands find it there).
+    pub fn plugin_owner(
+        &self,
+        plugin: faderframe_core::PluginInstanceId,
+    ) -> Option<(TrackId, &PluginSlot)> {
+        if let Some((t, s)) = self.plugin_slot(plugin) {
+            return Some((t.id, s));
+        }
+        let (_, s) = self.project.album.insert(plugin)?;
+        Some((self.project.master_id()?, s))
+    }
+
     /// The slot of a plugin instance and its track.
     pub fn plugin_slot(
         &self,
@@ -3030,6 +3075,7 @@ impl Session {
         &mut self,
         plugin: faderframe_core::PluginInstanceId,
     ) -> Vec<PluginParameterView> {
+        self.host_song_insert(plugin);
         let infos = self
             .engine
             .plugin_parameters(plugin)
@@ -3037,7 +3083,9 @@ impl Session {
             .unwrap_or_default();
         let explicit: Vec<faderframe_core::ParameterId> = self
             .plugin_slot(plugin)
-            .map(|(_, s)| s.parameters.iter().map(|p| p.id).collect())
+            .map(|(_, s)| s)
+            .or_else(|| self.project.album.insert(plugin).map(|(_, s)| s))
+            .map(|s| s.parameters.iter().map(|p| p.id).collect())
             .unwrap_or_default();
         infos
             .into_iter()
@@ -3080,7 +3128,19 @@ impl Session {
         &mut self,
         plugin: faderframe_core::PluginInstanceId,
     ) -> Option<&mut dyn faderframe_plugin_host::PluginEditor> {
+        self.host_song_insert(plugin);
         self.engine.plugin_editor(plugin)
+    }
+
+    /// An album song's insert that is not hosted yet (its song came back
+    /// by undo) gets its instance.
+    fn host_song_insert(&mut self, plugin: faderframe_core::PluginInstanceId) {
+        if self.engine.plugin_latency(plugin).is_none()
+            && let Some((_, slot)) = self.project.album.insert(plugin)
+        {
+            let slot = slot.clone();
+            self.engine.host_plugin(&slot);
+        }
     }
 
     /// File descriptors and timers plugins registered for the UI main loop.
@@ -3151,6 +3211,7 @@ impl Session {
             .tracks
             .iter()
             .flat_map(|t| t.instrument.iter().chain(t.inserts.iter()))
+            .chain(self.project.album.inserts())
             .filter(|s| s.plugin.format != faderframe_project::PluginFormat::Builtin)
             .map(|s| s.id)
             .collect();
@@ -3163,22 +3224,29 @@ impl Session {
     /// into its slot.
     pub(crate) fn capture_plugin_state(&mut self, id: faderframe_core::PluginInstanceId) {
         let state = self.engine.plugin_state(id);
-        for t in &mut self.project.tracks {
-            for s in t.instrument.iter_mut().chain(t.inserts.iter_mut()) {
-                if s.id != id {
-                    continue;
-                }
-                if let Some(state) = &state {
-                    s.state = Some(state.clone());
-                    self.engine.note_plugin_state(id, state);
-                }
-                // Explicit values follow what the plugin's own editor did
-                // since (they are applied after the state on load).
-                for p in &mut s.parameters {
-                    if let Some(v) = self.engine.plugin_parameter_value(id, p.id) {
-                        p.value = v;
-                        self.engine.note_plugin_parameter(id, p.id, v);
-                    }
+        let project = &mut self.project;
+        let slots = project
+            .tracks
+            .iter_mut()
+            .flat_map(|t| t.instrument.iter_mut().chain(t.inserts.iter_mut()))
+            .chain(
+                project
+                    .album
+                    .songs
+                    .iter_mut()
+                    .flat_map(|s| s.inserts.iter_mut()),
+            );
+        for s in slots.filter(|s| s.id == id) {
+            if let Some(state) = &state {
+                s.state = Some(state.clone());
+                self.engine.note_plugin_state(id, state);
+            }
+            // Explicit values follow what the plugin's own editor did
+            // since (they are applied after the state on load).
+            for p in &mut s.parameters {
+                if let Some(v) = self.engine.plugin_parameter_value(id, p.id) {
+                    p.value = v;
+                    self.engine.note_plugin_parameter(id, p.id, v);
                 }
             }
         }

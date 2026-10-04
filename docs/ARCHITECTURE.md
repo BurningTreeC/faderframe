@@ -26,6 +26,7 @@ faderframe-app            binary: CLI parsing, logging, starts the GTK app
        ├─ faderframe-midi-io          MIDI devices (midir: ALSA sequencer, CoreMIDI, WinMM), virtual ports
        └─ faderframe-session          control-world hub (GTK-free)
             ├─ faderframe-analysis     loudness (EBU R128), true peak, levels, phase, FFT spectrum
+            ├─ faderframe-disc         Red Book CD masters: DDP 2.00 filesets, CD-Text, cue sheets, ISRC/UPC
             ├─ faderframe-engine       project→graph compiler, RT processor, controller, offline render
             │    ├─ faderframe-audio-graph   generic DSP graph: ports, edges, PDC, compile, executor
             │    ├─ faderframe-plugin-host   plugin abstraction + built-in plugins
@@ -892,21 +893,57 @@ dither.
 
 The album (`faderframe_project::album`, saved in `Project::album`, edited
 as a whole through `Command::SetAlbum`) lists songs — a section, this
-project, another project file or an audio file — with pause, trim and
-fades, and the delivery settings (album or per-song levelling, target,
-ceiling, limit or less gain, format, rate, dither, folder, album file).
+project, another project file or an audio file — with pause or crossfade
+(from the previous song, equal power), trim, fades, ISRC, credits and its
+own inserts, the release information (`AlbumInfo`: title, credits,
+UPC/EAN) and the delivery settings (album or per-song levelling, target,
+ceiling, limit or less gain, format, rate, dither, folder, album file, CD
+master with or without CD-Text, digital copy permitted). Codes are checked
+and normalised when they are entered (`faderframe_disc::normalize_isrc`,
+`normalize_upc` with the EAN check digit).
 `session::album` runs Analyse and Export on a worker: each song is
 rendered at the album rate (`render::render_span`; a section without the
 clips that start after it, so the next song does not ring into its tail;
 other projects load with their media resolved against their folder) or
-decoded (`decode_at_rate`), made stereo, faded and trimmed, and measured.
+decoded (`decode_at_rate`), made stereo, trimmed, run through its inserts
+(`render::process_through`: a one-track project with the chain on its
+master and the song as an in-memory source; latency taken off, the tail
+kept until it falls silent), faded and measured.
 Export writes the songs to temporary float files while one `Measurement`
 measures the whole album, then levels (album gain = target − album
 loudness; per song through `normalize_loudness`), limits, dithers and
-writes `NN Title.wav`, appending to the album file (pauses as CUE
-pregaps). `Session::album_delivered` previews the gains from the analyses
-(album loudness approximated from the songs' loudness and length). The
-Album view is `faderframe-view-album`; file and folder choosers are a
+writes `NN Title.wav`. `session::album_master::Assembler` joins the
+finished songs into the album stream — after their pause, rounded up so
+every track mark lies on a CD frame (1/75 s), or overlapping the previous
+song — and feeds the album file, the CD master and, when songs crossfade,
+`Gapless`, which cuts the song files from the stream at the marks. The
+cue sheet (`faderframe_disc::cue`) carries CATALOG, titles and credits,
+ISRC, FLAGS and the indexes (pauses as pregaps). The CD master
+(`CdMaster`: resampled to 44.1 kHz with `StreamResampler`, quantised to 16
+bits with the album's dither, after track 1's 2 s pregap) is a DDP 2.00
+fileset written by `faderframe_disc::ddp::DdpWriter` — `IMAGE.DAT`, the
+`DDPID`, `DDPMS` and PQ descriptor packets, `CDTEXT.BIN` (packs with
+CRC-16 and size information) and `CHECKSUM.MD5`/`CHECKSUM.TXT` — and read
+back with `ddp::read` (sizes, PQ against the image, CD-Text CRCs, the Red
+Book rules, every checksum) before the export reports success. The layout
+follows the open description of the ddp-reverse-eng project (MIT); the
+crate's tests compare every descriptor file byte for byte with reference
+filesets recorded there (`crates/faderframe-disc/tests/reference`).
+`Session::album_delivered` previews the gains from the analyses (album
+loudness approximated from the songs' loudness and length).
+
+A song's inserts are ordinary `PluginSlot`s (`Command::SetSongInserts`,
+`Session::song_insert`/`plugin_owner`); the plugin commands
+(`SetPluginBypass`, `SetPluginParameter`, `SetPluginState`) find them when
+they name a track that does not own them (the UI names the master), so
+editors, generic parameter windows, presets and programs work unchanged.
+The engine hosts every song's inserts (`PluginHost::retain_project` and
+`sync_parameters` include them) and runs the monitored song's
+(`EngineController::set_album_monitor`, `AlbumAction::Monitor`) after the
+master strip, post fader as the album renders it; offline renders never
+monitor. The Album view is `faderframe-view-album` (the plugin browser
+adds to a song through `PluginTarget::Song`, the details form is
+`UiRequest::AlbumDetails`); file and folder choosers are a
 `HostRequest::ChooseFiles` the GTK host answers with `gtk::FileDialog`.
 
 ### Freezing and bouncing
@@ -1464,7 +1501,9 @@ presets, and the Tools view for mastering (EBU R128 loudness and true peak,
 levels with K-System scales, phase, spectrum). Delivery: loudness
 normalisation and true-peak limiting on export, noise-shaped dither,
 delivery presets, and the album (songs analysed and exported with album or
-per-song levelling and a CUE sheet).
+per-song levelling, pauses or crossfades, a song's own inserts heard on
+the master, ISRC/UPC and credits, a cue sheet and a verified DDP 2.00 CD
+master with CD-Text).
 
 Editing: Pro Tools-style edit modes and tools, edit-selection ranges, clip
 gain, shaped fades, transient detection, warp markers and pitch-preserving
@@ -1486,5 +1525,6 @@ and packages for all three platforms (see §14).
 3. **Performance**: render-ahead for buses whose inputs are all rendered
    ahead, job affinity for cache locality, an optional wgpu painter for
    dense views.
-4. **Mastering**: DDP export, ISRC/UPC metadata, crossfades between album
-   songs, a song's own inserts on the album.
+4. **Mastering**: playing the album itself (songs from files and other
+   projects, through their inserts and crossfades), multiple CD-Text
+   languages, a DDP player/import.

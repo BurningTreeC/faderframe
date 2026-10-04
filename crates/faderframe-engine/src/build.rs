@@ -350,6 +350,7 @@ pub fn build_graph(
     config: &PrepareConfig,
     routing: &MidiRouting,
     mut ahead: Option<AheadPlan<'_>>,
+    monitor: &[PluginSlot],
 ) -> Result<BuiltGraph, EngineError> {
     let midi_ports = &routing.inputs;
     let mut b = GraphBuilder::<EngineContext>::new();
@@ -646,6 +647,22 @@ pub fn build_graph(
             continue;
         }
         let Some(strip) = tn.strip else { continue };
+        // A monitored album song's inserts after the master strip (post
+        // fader, as the album renders the song).
+        let mut out = strip;
+        if t.kind == TrackKind::Master {
+            let layout = destination_layout(project, t);
+            for slot in monitor {
+                let spec = NodeSpec::new(format!("Album · {}", slot.plugin.name))
+                    .group(gi)
+                    .audio_in(layout)
+                    .audio_out(layout);
+                let (node, _) = pcx.node(&mut b, slot, t, spec, Role::Insert);
+                own(&mut owners, node, t.id, Some(slot.id), NodeWork::Insert);
+                b.connect_audio(out, 0, node, 0)?;
+                out = node;
+            }
+        }
         match t.output {
             OutputRouting::Master | OutputRouting::Track { .. } => {
                 if let Some(dst) = project
@@ -653,12 +670,12 @@ pub fn build_graph(
                     .and_then(|d| nodes.get(&d))
                     .and_then(|n| n.input)
                 {
-                    b.connect_audio(strip, 0, dst, 0)?;
+                    b.connect_audio(out, 0, dst, 0)?;
                 }
             }
             OutputRouting::Hardware { first_channel } => {
                 let dest = destination_layout(project, t);
-                let out = b.add_node(
+                let hw = b.add_node(
                     NodeSpec::new(format!("{} · Hardware Out", t.name))
                         .key(node_key(
                             t.id,
@@ -671,8 +688,8 @@ pub fn build_graph(
                         .audio_in(dest),
                     Box::new(DeviceOutputSink),
                 );
-                own(&mut owners, out, t.id, None, NodeWork::HardwareOut);
-                b.connect_audio(strip, 0, out, 0)?;
+                own(&mut owners, hw, t.id, None, NodeWork::HardwareOut);
+                b.connect_audio(out, 0, hw, 0)?;
             }
             OutputRouting::None => {}
         }

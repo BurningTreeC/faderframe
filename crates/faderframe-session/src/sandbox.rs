@@ -38,7 +38,7 @@ impl Default for PluginCare {
 
 impl Session {
     fn slot_name(&self, id: PluginInstanceId) -> String {
-        self.plugin_slot(id)
+        self.plugin_owner(id)
             .map_or_else(|| "A plugin".into(), |(_, s)| s.plugin.name.clone())
     }
 

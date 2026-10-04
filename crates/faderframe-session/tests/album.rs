@@ -130,7 +130,13 @@ fn songs_are_analysed_and_exported_as_an_album() {
         .iter()
         .map(|(_, p, _)| read_wav(p).unwrap().channels[0].len())
         .sum();
-    assert_eq!(whole.channels[0].len(), lengths + 2 * 2 * 48_000);
+    // Each pause runs on to the next CD frame (1/75 s), so the track marks
+    // lie on CD frames.
+    let paused = whole.channels[0].len() - lengths;
+    assert!(
+        (2 * 2 * 48_000..2 * 2 * 48_000 + 2 * 640).contains(&paused),
+        "{paused}"
+    );
     let cue = std::fs::read_to_string(done.cue.as_ref().unwrap()).unwrap();
     assert!(cue.contains("TRACK 03 AUDIO"), "{cue}");
     assert!(cue.contains("INDEX 00"), "pauses are pregaps: {cue}");

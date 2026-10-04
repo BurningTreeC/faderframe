@@ -628,8 +628,10 @@ pub fn install(app: &Rc<AppState>) {
                 });
             }
         }),
-        // Development aid: `album:<sections|project|analyse|export>` drives
-        // the album (`album:file=<path>` adds a file).
+        // Development aid: `album:<sections|project|analyse|export|details|
+        // ddp>` drives the album; `album:file=<path>` adds a file,
+        // `crossfade=<s>@<n>`, `monitor=<n>` and `insert=<n>:<plugin id>`
+        // work on song n (1-based).
         named("album", |a, arg| {
             use faderframe_session::album::AlbumAction as AA;
             let action = match arg.trim() {
@@ -637,13 +639,74 @@ pub fn install(app: &Rc<AppState>) {
                 "project" => AA::AddThisProject,
                 "analyse" => AA::Analyse,
                 "export" => AA::Export,
-                other => match other.strip_prefix("file=") {
-                    Some(path) => AA::AddFiles(vec![std::path::PathBuf::from(path)]),
-                    None => {
+                "details" => AA::Details(None),
+                // The CD master on (with demo codes when there are none).
+                "ddp" => {
+                    let (mut settings, mut info) = {
+                        let s = a.session.borrow();
+                        let album = &s.project().album;
+                        (album.settings.clone(), album.info.clone())
+                    };
+                    if info.upc.is_empty() {
+                        info.upc = "0036000291452".into();
+                        a.dispatch(Action::Album(AA::Info(info)));
+                    }
+                    settings.ddp = true;
+                    AA::Settings(settings)
+                }
+                other => {
+                    if let Some(path) = other.strip_prefix("file=") {
+                        AA::AddFiles(vec![std::path::PathBuf::from(path)])
+                    } else if let Some((n, rest)) = other
+                        .strip_prefix("crossfade=")
+                        .and_then(|r| r.split_once('@'))
+                    {
+                        // `crossfade=<seconds>@<song n>` (1-based).
+                        let s = a.session.borrow();
+                        let song = n.parse::<f32>().ok().zip(
+                            rest.parse::<usize>()
+                                .ok()
+                                .and_then(|i| s.project().album.songs.get(i.wrapping_sub(1))),
+                        );
+                        let Some((seconds, song)) = song else {
+                            tracing::warn!("album: bad '{other}'");
+                            return;
+                        };
+                        let mut song = song.clone();
+                        song.crossfade = seconds;
+                        AA::Update(song)
+                    } else if let Some(n) = other.strip_prefix("monitor=") {
+                        // `monitor=<song n>` hears its inserts (0: none).
+                        let s = a.session.borrow();
+                        let id = n
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|i| s.project().album.songs.get(i.wrapping_sub(1)))
+                            .map(|x| x.id);
+                        AA::Monitor(id)
+                    } else if let Some(rest) = other.strip_prefix("insert=") {
+                        // `insert=<song n>:<plugin id>` (shows its editor).
+                        let s = a.session.borrow();
+                        let parsed = rest.split_once(':').and_then(|(n, id)| {
+                            let i = n.parse::<usize>().ok()?;
+                            let song = s.project().album.songs.get(i.wrapping_sub(1))?;
+                            let plugin = s
+                                .available_plugins()
+                                .into_iter()
+                                .find(|p| p.plugin.id == id)?
+                                .plugin;
+                            Some((song.id, plugin))
+                        });
+                        let Some((song, plugin)) = parsed else {
+                            tracing::warn!("album: bad '{other}'");
+                            return;
+                        };
+                        AA::AddInsert { song, plugin }
+                    } else {
                         tracing::warn!("album: unknown '{other}'");
                         return;
                     }
-                },
+                }
             };
             a.dispatch(Action::Album(action));
         }),

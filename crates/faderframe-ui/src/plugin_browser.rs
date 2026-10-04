@@ -418,17 +418,11 @@ impl Browser {
         let track_name = self
             .app
             .upgrade()
-            .and_then(|a| {
-                a.session
-                    .borrow()
-                    .project()
-                    .track(*self.track.borrow())
-                    .map(|t| t.name.clone())
-            })
+            .map(|a| target_name(&a, *self.track.borrow(), target))
             .unwrap_or_default();
         let label = match target {
             PluginTarget::Instrument => format!("Use as Instrument on {track_name}"),
-            PluginTarget::Insert(_) => format!("Insert on {track_name}"),
+            PluginTarget::Insert(_) | PluginTarget::Song(_) => format!("Insert on {track_name}"),
         };
         let place = gtk::Button::with_label(&label);
         place.add_css_class("suggested-action");
@@ -476,22 +470,37 @@ impl Browser {
         let name = self
             .app
             .upgrade()
-            .and_then(|a| {
-                a.session
-                    .borrow()
-                    .project()
-                    .track(track)
-                    .map(|t| t.name.clone())
-            })
+            .map(|a| target_name(&a, track, target))
             .unwrap_or_default();
         self.subtitle.set_text(&match target {
             PluginTarget::Instrument => format!("Choose an instrument for {name}"),
             PluginTarget::Insert(i) => format!("Insert slot {} on {name}", i + 1),
+            PluginTarget::Song(_) => format!("Add an insert to {name}"),
         });
         self.set_kind(match target {
             PluginTarget::Instrument => Kind::Instruments,
-            PluginTarget::Insert(_) => Kind::Effects,
+            PluginTarget::Insert(_) | PluginTarget::Song(_) => Kind::Effects,
         });
+    }
+}
+
+/// What a plugin goes onto: the track's name, or the album song's.
+fn target_name(app: &AppState, track: TrackId, target: PluginTarget) -> String {
+    let Ok(s) = app.session.try_borrow() else {
+        return String::new();
+    };
+    match target {
+        PluginTarget::Song(song) => s
+            .project()
+            .album
+            .song(song)
+            .map(|x| format!("the song “{}”", x.title))
+            .unwrap_or_default(),
+        _ => s
+            .project()
+            .track(track)
+            .map(|t| t.name.clone())
+            .unwrap_or_default(),
     }
 }
 

@@ -380,7 +380,7 @@ pub fn save_preset(app: &Rc<AppState>, plugin: faderframe_core::PluginInstanceId
     let plugin_name = app
         .session
         .borrow()
-        .plugin_slot(plugin)
+        .plugin_owner(plugin)
         .map(|(_, s)| s.plugin.name.clone())
         .unwrap_or_default();
     name_prompt(
@@ -466,6 +466,164 @@ fn name_prompt(
         if let Some(app) = weak.upgrade() {
             app.dispatch(action(name));
         }
+        w.close();
+    });
+    win.present();
+}
+
+/// The release's details (`None`: title, credits, UPC/EAN) or a song's
+/// (title, ISRC, credits) for the cue sheet, CD-Text and the CD master's
+/// codes. Codes are checked before anything is changed.
+pub fn album_details(app: &Rc<AppState>, song: Option<faderframe_core::SongId>) {
+    use faderframe_project::album::Credits;
+    use faderframe_session::album::{AlbumAction, normalize_isrc, normalize_upc};
+    let Some(main) = app.window.borrow().clone() else {
+        return;
+    };
+    let (title, credits, code, heading) = {
+        let s = app.session.borrow();
+        let album = &s.project().album;
+        match song.and_then(|id| album.song(id)) {
+            Some(x) => (
+                x.title.clone(),
+                x.credits.clone(),
+                x.isrc.clone(),
+                format!("Song — {}", x.title),
+            ),
+            None if song.is_some() => return,
+            None => (
+                album.info.title.clone(),
+                album.info.credits.clone(),
+                album.info.upc.clone(),
+                "Release".to_string(),
+            ),
+        }
+    };
+    let project_name = app.session.borrow().project().name.clone();
+    let win = gtk::Window::builder()
+        .application(&app.app)
+        .title(format!("{heading} — Details"))
+        .modal(true)
+        .transient_for(&main)
+        .resizable(false)
+        .default_width(440)
+        .build();
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    body.set_margin_top(14);
+    body.set_margin_bottom(14);
+    body.set_margin_start(14);
+    body.set_margin_end(14);
+    let grid = gtk::Grid::new();
+    grid.set_row_spacing(6);
+    grid.set_column_spacing(10);
+    let code_label = if song.is_some() { "ISRC" } else { "UPC / EAN" };
+    let fields = [
+        ("Title", title.as_str()),
+        (code_label, code.as_str()),
+        ("Performer", credits.performer.as_str()),
+        ("Songwriter", credits.songwriter.as_str()),
+        ("Composer", credits.composer.as_str()),
+        ("Arranger", credits.arranger.as_str()),
+        ("Message", credits.message.as_str()),
+    ];
+    let mut entries = Vec::new();
+    for (row, (label, value)) in fields.iter().enumerate() {
+        let l = gtk::Label::new(Some(label));
+        l.set_halign(gtk::Align::End);
+        let e = gtk::Entry::new();
+        e.set_text(value);
+        e.set_hexpand(true);
+        e.set_activates_default(true);
+        grid.attach(&l, 0, row as i32, 1, 1);
+        grid.attach(&e, 1, row as i32, 1, 1);
+        entries.push(e);
+    }
+    if song.is_none() {
+        entries[0].set_placeholder_text(Some(&project_name));
+        entries[1].set_placeholder_text(Some("12 or 13 digits"));
+    } else {
+        entries[1].set_placeholder_text(Some("CC-XXX-YY-NNNNN"));
+    }
+    let note = gtk::Label::new(Some(
+        "Written to the cue sheet and, as CD-Text and PQ codes, to the CD master.",
+    ));
+    note.add_css_class("dim-label");
+    note.set_wrap(true);
+    note.set_xalign(0.0);
+    let error = gtk::Label::new(None);
+    error.add_css_class("error");
+    error.set_wrap(true);
+    error.set_xalign(0.0);
+    body.append(&grid);
+    body.append(&note);
+    body.append(&error);
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    buttons.set_halign(gtk::Align::End);
+    let cancel = gtk::Button::with_label("Cancel");
+    let confirm = gtk::Button::with_label("Save");
+    confirm.add_css_class("suggested-action");
+    buttons.append(&cancel);
+    buttons.append(&confirm);
+    body.append(&buttons);
+    win.set_child(Some(&body));
+    win.set_default_widget(Some(&confirm));
+    let w = win.clone();
+    cancel.connect_clicked(move |_| w.close());
+    let weak = Rc::downgrade(app);
+    let w = win.clone();
+    confirm.connect_clicked(move |_| {
+        let Some(app) = weak.upgrade() else {
+            return;
+        };
+        let text: Vec<String> = entries
+            .iter()
+            .map(|e| e.text().trim().to_string())
+            .collect();
+        let code = match (&text[1], song) {
+            (c, _) if c.is_empty() => Ok(String::new()),
+            (c, Some(_)) => normalize_isrc(c),
+            (c, None) => normalize_upc(c),
+        };
+        let code = match code {
+            Ok(c) => c,
+            Err(e) => {
+                error.set_text(&e.to_string());
+                entries[1].grab_focus();
+                return;
+            }
+        };
+        let credits = Credits {
+            performer: text[2].clone(),
+            songwriter: text[3].clone(),
+            composer: text[4].clone(),
+            arranger: text[5].clone(),
+            message: text[6].clone(),
+        };
+        let action = {
+            let s = app.session.borrow();
+            let album = &s.project().album;
+            match song {
+                Some(id) => {
+                    let Some(mut x) = album.song(id).cloned() else {
+                        return;
+                    };
+                    if !text[0].is_empty() {
+                        x.title = text[0].clone();
+                    }
+                    x.isrc = code;
+                    x.credits = credits;
+                    AlbumAction::Update(x)
+                }
+                None => {
+                    let mut info = album.info.clone();
+                    info.title = text[0].clone();
+                    info.upc = code;
+                    info.credits = credits;
+                    AlbumAction::Info(info)
+                }
+            }
+        };
+        app.dispatch(faderframe_session::Action::Album(action));
         w.close();
     });
     win.present();

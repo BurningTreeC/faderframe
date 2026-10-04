@@ -4,14 +4,23 @@
 //! Every song is rendered (a section — without the clips that start after
 //! it, so the next song does not ring into its tail —, this project or
 //! another project file) or decoded (an audio file) at the album's rate,
-//! made stereo, faded and trimmed. *Analyse* measures each song. *Export*
-//! writes the songs to temporary files while measuring the whole album,
-//! then levels them (one gain for the album, or one per song), limits the
-//! true peak, dithers and writes `NN Title.wav` — and, when asked, the
-//! album as one file with a CUE sheet (pauses as pregaps).
+//! made stereo, trimmed, run through its own inserts and faded. *Analyse*
+//! measures each song. *Export* writes the songs to temporary files while
+//! measuring the whole album, then levels them (one gain for the album, or
+//! one per song), limits the true peak, dithers and writes `NN Title.wav`
+//! — and, when asked, the album as one file with a cue sheet and a CD
+//! master (DDP fileset). Songs follow each other after their pause or
+//! crossfade into each other ([`crate::album_master`]); with crossfades
+//! the song files are cut from the album at the track marks, so they play
+//! gaplessly.
+//!
+//! A song's inserts are hosted by the engine like any track's (editors,
+//! parameters, state); the monitored song's run after the master strip, so
+//! they can be heard on the project.
 
+use crate::album_master::{Assembler, CdMaster, Gapless, Mark, check_codes, disc};
 use crate::delivery::{Finished, LoudnessReport, PeakHandling};
-use crate::render::{RenderProgress, render_span, sanitize};
+use crate::render::{RenderProgress, process_through, render_span, sanitize};
 use crate::{NoticeLevel, Result, Session, SessionError};
 use faderframe_analysis::delivery::{
     Measurement, apply_gain, gain_and_limit, measure, normalize_loudness,
@@ -19,15 +28,18 @@ use faderframe_analysis::delivery::{
 use faderframe_audio_files::decode::decode_at_rate;
 use faderframe_audio_files::wavstream::WavWriter;
 use faderframe_audio_files::{Dither, WavFormat, read_wav, write_wav_with};
-use faderframe_core::SongId;
-use faderframe_project::album::{Album, AlbumLevel, AlbumSettings, Song, SongSource};
-use faderframe_project::{Command, Project, SourceSpec};
+use faderframe_core::{PluginInstanceId, SongId};
+use faderframe_disc::MIN_PREGAP;
+use faderframe_project::album::{Album, AlbumInfo, AlbumLevel, AlbumSettings, Song, SongSource};
+use faderframe_project::{Command, PluginRef, PluginSlot, Project, SourceSpec};
 use faderframe_timeline::MusicalTime;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
+
+pub use faderframe_disc::{normalize_isrc, normalize_upc};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AlbumAction {
@@ -43,9 +55,37 @@ pub enum AlbumAction {
         song: SongId,
         to: usize,
     },
-    /// Title, trim, pause and fades.
+    /// Title, trim, pause, crossfade, fades, ISRC and credits (an ISRC is
+    /// checked and normalised).
     Update(Song),
     Settings(AlbumSettings),
+    /// Title, credits and UPC/EAN of the release (the code is checked).
+    Info(AlbumInfo),
+    /// Append a plugin to a song's inserts (a hosted one shows its editor).
+    AddInsert {
+        song: SongId,
+        plugin: PluginRef,
+    },
+    RemoveInsert {
+        song: SongId,
+        plugin: PluginInstanceId,
+    },
+    /// Move an insert to position `to` of its song's chain.
+    MoveInsert {
+        song: SongId,
+        plugin: PluginInstanceId,
+        to: usize,
+    },
+    BypassInsert {
+        song: SongId,
+        plugin: PluginInstanceId,
+        bypass: bool,
+    },
+    /// Hear a song's inserts after the master strip (`None`: no song's).
+    Monitor(Option<SongId>),
+    /// Ask the shell for the details form of the release (`None`) or a
+    /// song.
+    Details(Option<SongId>),
     Analyse,
     Export,
     Cancel,
@@ -95,6 +135,9 @@ pub struct AlbumExport {
     pub files: Vec<(SongId, PathBuf, Finished)>,
     pub album_file: Option<PathBuf>,
     pub cue: Option<PathBuf>,
+    /// The CD master's folder (DDP fileset, read back and verified) and
+    /// its length in CD frames (1/75 s).
+    pub ddp: Option<(PathBuf, u32)>,
 }
 
 #[derive(Default)]
@@ -145,6 +188,8 @@ struct Outcome {
 
 struct Plan {
     items: Vec<Item>,
+    /// Songs (with their inserts' current state), settings, release.
+    album: Album,
     settings: AlbumSettings,
     rate: u32,
     folder: PathBuf,
@@ -265,8 +310,12 @@ fn song_audio(
         Input::Missing(why) => return Err(why.clone()),
     };
     stereo(&mut audio);
-    fade(&mut audio, rate, item.song.fade_in, item.song.fade_out);
     apply_gain(&mut audio, item.song.gain_db as f64);
+    if item.song.inserts.iter().any(|s| !s.bypass) {
+        audio = process_through(audio, rate, &item.song.inserts, tail, progress)
+            .map_err(|e| format!("its inserts: {e}"))?;
+    }
+    fade(&mut audio, rate, item.song.fade_in, item.song.fade_out);
     Ok(audio)
 }
 
@@ -292,16 +341,6 @@ fn analyse(plan: &Plan, shared: &Shared) -> Outcome {
     out
 }
 
-/// "mm:ss:ff" in CD frames (75 per second).
-fn cue_time(frames: u64, rate: u32) -> String {
-    let f = frames * 75 / rate.max(1) as u64;
-    format!("{:02}:{:02}:{:02}", f / 75 / 60, f / 75 % 60, f % 75)
-}
-
-fn quoted(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', "'"))
-}
-
 fn export(plan: &Plan, shared: &Shared) -> Outcome {
     let mut out = Outcome::default();
     let result = export_files(plan, shared, &mut out);
@@ -321,7 +360,6 @@ fn export_files(
     let io = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
     std::fs::create_dir_all(&plan.folder).map_err(|e| io(&plan.folder, e))?;
     let rate = plan.rate;
-    let n = plan.items.len();
     // Pass 1: every song once, to a temporary file, measured on its own
     // and as part of the album.
     let mut temps: Vec<PathBuf> = Vec::new();
@@ -364,117 +402,184 @@ fn export_files(
         temps.push(temp);
     }
     let gains = gains(&plan.settings, &reports, album.report().integrated);
-    // Pass 2: level, limit, dither and write.
-    let s = &plan.settings;
-    let mut whole = match s.album_file {
-        true => {
-            let path = plan
-                .folder
-                .join(format!("{} (Album).wav", sanitize(&plan.name)));
-            match WavWriter::create_with(&path, 2, rate, s.format, s.dither) {
-                Ok(w) => Some((w, path)),
-                Err(e) => {
-                    cleanup(&temps);
-                    return Err(io(&path, e));
-                }
-            }
-        }
-        false => None,
-    };
-    let mut cue = format!(
-        "TITLE {}\nFILE {} WAVE\n",
-        quoted(&plan.name),
-        quoted(&format!("{} (Album).wav", sanitize(&plan.name)))
-    );
-    let mut at: u64 = 0;
-    let mut files = Vec::new();
-    for (i, item) in plan.items.iter().enumerate() {
-        shared.song.store(n + i, Ordering::Relaxed);
-        if cancelled(shared) {
-            cleanup(&temps);
-            return Err("cancelled".into());
-        }
-        let mut audio = match read_wav(&temps[i]) {
-            Ok(w) => w.channels,
-            Err(e) => {
-                cleanup(&temps);
-                return Err(io(&temps[i], e));
-            }
-        };
-        let gain = gains[i];
-        let (gain_db, limited_db) = match s.ceiling.map(f64::from) {
-            Some(c) if s.level == AlbumLevel::PerSong && s.limit && s.loudness.is_some() => {
-                let target = s.loudness.map_or(0.0, f64::from);
-                let n = normalize_loudness(&mut audio, rate, target, c, PeakHandling::Limit);
-                (n.gain_db, n.limited_db)
-            }
-            Some(c) => (gain, gain_and_limit(&mut audio, rate, gain, c)),
-            None => {
-                apply_gain(&mut audio, gain);
-                (gain, 0.0)
-            }
-        };
-        let report = measure(&audio, rate);
-        let path = plan
-            .folder
-            .join(format!("{:02} {}.wav", i + 1, sanitize(&item.song.title)));
-        if let Err(e) = write_wav_with(&path, &audio, rate, s.format, s.dither) {
-            cleanup(&temps);
-            return Err(io(&path, e));
-        }
-        if let Some((w, path)) = whole.as_mut() {
-            let pause = if i == 0 {
-                0
-            } else {
-                (item.song.pause.max(0.0) as f64 * rate as f64) as usize
-            };
-            cue += &format!(
-                "  TRACK {:02} AUDIO\n    TITLE {}\n",
-                i + 1,
-                quoted(&item.song.title)
-            );
-            if pause > 0 {
-                cue += &format!("    INDEX 00 {}\n", cue_time(at, rate));
-                let silence = vec![0.0f32; pause];
-                if let Err(e) = w.write_planar(&[&silence, &silence], pause) {
-                    cleanup(&temps);
-                    return Err(io(path, e));
-                }
-                at += pause as u64;
-            }
-            cue += &format!("    INDEX 01 {}\n", cue_time(at, rate));
-            let frames = audio[0].len();
-            if let Err(e) = w.write_planar(&[&audio[0], &audio[1]], frames) {
-                cleanup(&temps);
-                return Err(io(path, e));
-            }
-            at += frames as u64;
-        }
-        files.push((
-            item.song.id,
-            path,
-            Finished {
-                gain_db,
-                limited_db,
-                report,
-            },
-        ));
-    }
+    let result = check_cd_tracks(plan, out).and_then(|()| deliver(plan, shared, &temps, &gains));
     cleanup(&temps);
-    let (album_file, cue_file) = match whole {
-        Some((w, path)) => {
+    result
+}
+
+/// With a CD master: every track (song to the next song's start) lasts
+/// the 4 s a CD track needs.
+fn check_cd_tracks(plan: &Plan, out: &Outcome) -> std::result::Result<(), String> {
+    if !plan.settings.ddp {
+        return Ok(());
+    }
+    let seconds: Vec<f64> = out
+        .analyses
+        .iter()
+        .map(|(_, a)| a.as_ref().map_or(0.0, |a| a.seconds))
+        .collect();
+    for (i, item) in plan.items.iter().enumerate() {
+        let next = plan.items.get(i + 1).map_or(0.0, |n| {
+            if n.song.crossfade > 0.0 {
+                -f64::from(n.song.crossfade)
+            } else {
+                f64::from(n.song.pause.max(0.0))
+            }
+        });
+        let length = seconds.get(i).copied().unwrap_or(0.0) + next;
+        if length < 4.0 {
+            return Err(format!(
+                "“{}” would be a {length:.1} s CD track; a CD track lasts at least 4 s",
+                item.song.title
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Pass 2: level, limit, dither and write the songs, the album file, its
+/// cue sheet and the CD master.
+fn deliver(
+    plan: &Plan,
+    shared: &Shared,
+    temps: &[PathBuf],
+    gains: &[f64],
+) -> std::result::Result<AlbumExport, String> {
+    let io = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
+    let (s, rate, n) = (&plan.settings, plan.rate, plan.items.len());
+    let name = sanitize(&plan.name);
+    let paths: Vec<PathBuf> = plan
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            plan.folder
+                .join(format!("{:02} {}.wav", i + 1, sanitize(&item.song.title)))
+        })
+        .collect();
+    // Overlapping songs: the song files are cut from the album stream.
+    let gapless = plan.items.iter().skip(1).any(|i| i.song.crossfade > 0.0);
+    let album_path = s
+        .album_file
+        .then(|| plan.folder.join(format!("{name} (Album).wav")));
+    let ddp_dir = s.ddp.then(|| plan.folder.join(format!("{name} (DDP)")));
+    let mut whole = match &album_path {
+        Some(p) => {
+            Some(WavWriter::create_with(p, 2, rate, s.format, s.dither).map_err(|e| io(p, e))?)
+        }
+        None => None,
+    };
+    let mut cd = match &ddp_dir {
+        Some(d) => Some(CdMaster::create(d, rate, s.dither)?),
+        None => None,
+    };
+    let mut cut = gapless.then(|| Gapless::new(paths.clone(), rate, s.format, s.dither));
+    let streaming = whole.is_some() || cd.is_some() || cut.is_some();
+    let mut files = Vec::new();
+    let (marks, length) = {
+        let mut sink = |marks: &[Mark], pos: u64, planes: &[&[f32]]| {
+            if let Some(w) = whole.as_mut() {
+                w.write_planar(planes, planes[0].len())
+                    .map_err(|e| e.to_string())?;
+            }
+            if let Some(c) = cd.as_mut() {
+                c.write(planes)?;
+            }
+            if let Some(g) = cut.as_mut() {
+                g.write(marks, pos, planes)?;
+            }
+            Ok(())
+        };
+        let mut assembler = Assembler::new(rate);
+        for (i, item) in plan.items.iter().enumerate() {
+            shared.song.store(n + i, Ordering::Relaxed);
+            if cancelled(shared) {
+                return Err("cancelled".into());
+            }
+            let mut audio = read_wav(&temps[i]).map_err(|e| io(&temps[i], e))?.channels;
+            let gain = gains[i];
+            let (gain_db, limited_db) = match s.ceiling.map(f64::from) {
+                Some(c) if s.level == AlbumLevel::PerSong && s.limit && s.loudness.is_some() => {
+                    let target = s.loudness.map_or(0.0, f64::from);
+                    let n = normalize_loudness(&mut audio, rate, target, c, PeakHandling::Limit);
+                    (n.gain_db, n.limited_db)
+                }
+                Some(c) => (gain, gain_and_limit(&mut audio, rate, gain, c)),
+                None => {
+                    apply_gain(&mut audio, gain);
+                    (gain, 0.0)
+                }
+            };
+            let report = measure(&audio, rate);
+            if !gapless {
+                write_wav_with(&paths[i], &audio, rate, s.format, s.dither)
+                    .map_err(|e| io(&paths[i], e))?;
+            }
+            if streaming {
+                let pause = if i == 0 { 0.0 } else { item.song.pause };
+                let keep = plan.items.get(i + 1).map_or(0.0, |x| x.song.crossfade);
+                assembler.add(&audio, pause, item.song.crossfade, keep, &mut sink)?;
+            }
+            files.push((
+                item.song.id,
+                paths[i].clone(),
+                Finished {
+                    gain_db,
+                    limited_db,
+                    report,
+                },
+            ));
+        }
+        assembler.finish(&mut sink)?
+    };
+    if let Some(g) = cut {
+        g.finish()?;
+    }
+    let (album_file, cue) = match (whole, album_path) {
+        (Some(w), Some(path)) => {
             w.finish().map_err(|e| io(&path, e))?;
+            let file = path
+                .file_name()
+                .map_or_else(String::new, |f| f.to_string_lossy().to_string());
+            let sheet = disc(&plan.album, &plan.name, &marks, (rate, length), 0, true);
             let cue_path = path.with_extension("cue");
-            std::fs::write(&cue_path, cue).map_err(|e| io(&cue_path, e))?;
+            std::fs::write(
+                &cue_path,
+                faderframe_disc::cue::cue_sheet(&sheet, &file, "WAVE", 0),
+            )
+            .map_err(|e| io(&cue_path, e))?;
             (Some(path), Some(cue_path))
         }
-        None => (None, None),
+        _ => (None, None),
+    };
+    let ddp = match (cd, ddp_dir) {
+        (Some(c), Some(dir)) => {
+            let master = disc(
+                &plan.album,
+                &plan.name,
+                &marks,
+                (rate, length),
+                MIN_PREGAP,
+                s.cd_text,
+            );
+            let written = c.finish(&master)?;
+            // Read back what a plant will read: descriptors, CD-Text,
+            // checksums of every file.
+            let back = faderframe_disc::ddp::read(&dir)
+                .map_err(|e| format!("the DDP fileset does not read back: {e}"))?;
+            if back.checksums != Some(true) || back.disc != written.disc {
+                return Err("the DDP fileset does not read back as written".into());
+            }
+            Some((dir, written.disc.sectors))
+        }
+        _ => None,
     };
     Ok(AlbumExport {
         folder: plan.folder.clone(),
         files,
         album_file,
-        cue: cue_file,
+        cue,
+        ddp,
     })
 }
 
@@ -529,11 +634,88 @@ impl Session {
                 let s = album.songs.remove(from);
                 album.songs.insert(to.min(album.songs.len()), s);
             }
-            AlbumAction::Update(song) => match album.song_mut(song.id) {
-                Some(s) => *s = song,
-                None => return Ok(()),
-            },
+            AlbumAction::Update(mut song) => {
+                song.isrc = match song.isrc.trim() {
+                    "" => String::new(),
+                    code => faderframe_disc::normalize_isrc(code)
+                        .map_err(|e| SessionError::Other(e.to_string()))?,
+                };
+                song.crossfade = song.crossfade.max(0.0);
+                match album.song_mut(song.id) {
+                    Some(s) => *s = song,
+                    None => return Ok(()),
+                }
+            }
             AlbumAction::Settings(settings) => album.settings = settings,
+            AlbumAction::Info(mut info) => {
+                info.upc = match info.upc.trim() {
+                    "" => String::new(),
+                    code => faderframe_disc::normalize_upc(code)
+                        .map_err(|e| SessionError::Other(e.to_string()))?,
+                };
+                album.info = info;
+            }
+            AlbumAction::AddInsert { song, plugin } => {
+                let Some(s) = album.song(song) else {
+                    return Ok(());
+                };
+                let id: PluginInstanceId = self.project.ids.allocate();
+                let hosted = plugin.format != faderframe_project::PluginFormat::Builtin;
+                let mut inserts = s.inserts.clone();
+                inserts.push(PluginSlot {
+                    id,
+                    plugin,
+                    bypass: false,
+                    parameters: Vec::new(),
+                    state: None,
+                    sidechain: None,
+                });
+                self.edit(Command::SetSongInserts { song, inserts })?;
+                // Like an insert on a track: a hosted plugin shows its editor.
+                if hosted && let Some(track) = self.project.master_id() {
+                    self.ui_requests.push(crate::UiRequest::PluginEditor {
+                        track,
+                        plugin: id,
+                        generic: false,
+                    });
+                }
+                return Ok(());
+            }
+            AlbumAction::RemoveInsert { song, plugin } => {
+                return self.edit_song_inserts(song, |v| v.retain(|s| s.id != plugin));
+            }
+            AlbumAction::MoveInsert { song, plugin, to } => {
+                return self.edit_song_inserts(song, |v| {
+                    if let Some(from) = v.iter().position(|s| s.id == plugin) {
+                        let slot = v.remove(from);
+                        v.insert(to.min(v.len()), slot);
+                    }
+                });
+            }
+            AlbumAction::BypassInsert {
+                song,
+                plugin,
+                bypass,
+            } => {
+                return self.edit_song_inserts(song, |v| {
+                    for s in v.iter_mut().filter(|s| s.id == plugin) {
+                        s.bypass = bypass;
+                    }
+                });
+            }
+            AlbumAction::Details(song) => {
+                self.ui_requests.push(crate::UiRequest::AlbumDetails(song));
+                self.revision += 1;
+                return Ok(());
+            }
+            AlbumAction::Monitor(song) => {
+                let song = song.filter(|id| self.project.album.song(*id).is_some());
+                if song != self.engine.album_monitor() {
+                    self.engine.set_album_monitor(song);
+                    self.sync(faderframe_project::Impact::Graph)?;
+                }
+                return Ok(());
+            }
             AlbumAction::Analyse => return self.start_album_job(AlbumTask::Analyse),
             AlbumAction::Export => return self.start_album_job(AlbumTask::Export),
             AlbumAction::Cancel => {
@@ -549,6 +731,30 @@ impl Session {
         self.edit(Command::SetAlbum {
             album: Box::new(album),
         })
+    }
+
+    /// Change a song's inserts (one undo step; nothing when unchanged).
+    fn edit_song_inserts(
+        &mut self,
+        song: SongId,
+        change: impl FnOnce(&mut Vec<PluginSlot>),
+    ) -> Result<()> {
+        let Some(s) = self.project.album.song(song) else {
+            return Ok(());
+        };
+        let mut inserts = s.inserts.clone();
+        change(&mut inserts);
+        if inserts == s.inserts {
+            return Ok(());
+        }
+        self.edit(Command::SetSongInserts { song, inserts })
+    }
+
+    /// The song whose inserts run after the master strip.
+    pub fn album_monitor(&self) -> Option<SongId> {
+        self.engine
+            .album_monitor()
+            .filter(|id| self.project.album.song(*id).is_some())
     }
 
     /// The album's sample rate.
@@ -667,11 +873,15 @@ impl Session {
                 "the album is being analysed or exported already".into(),
             ));
         }
-        let album: Album = self.project.album.clone();
-        if album.songs.is_empty() {
+        if self.project.album.songs.is_empty() {
             return Err(SessionError::Other("the album has no songs".into()));
         }
+        if task == AlbumTask::Export {
+            check_codes(&self.project.album).map_err(SessionError::Other)?;
+        }
+        // Takes the plugins' current state (song inserts too) first.
         let project = Arc::new(self.render_copy());
+        let album: Album = project.album.clone();
         let items = album
             .songs
             .iter()
@@ -703,6 +913,7 @@ impl Session {
             .collect();
         let plan = Plan {
             items,
+            album: album.clone(),
             settings: album.settings.clone(),
             rate: self.album_rate(),
             folder: self.album_folder(),
@@ -772,19 +983,37 @@ impl Session {
         }
         match outcome.export {
             Some(Ok(done)) => {
+                let mut extras = Vec::new();
+                if done.album_file.is_some() {
+                    extras.push("the album file and its cue sheet".to_string());
+                }
+                if let Some((_, sectors)) = &done.ddp {
+                    extras.push(format!(
+                        "a verified CD master (DDP, {})",
+                        faderframe_disc::msf_colon(*sectors)
+                    ));
+                }
                 self.notify(
                     NoticeLevel::Info,
                     format!(
-                        "Album exported: {} song(s){} to {}",
+                        "Album exported: {} song(s){}{} to {}",
                         done.files.len(),
-                        if done.album_file.is_some() {
-                            ", the album file and its CUE sheet"
-                        } else {
-                            ""
-                        },
+                        if extras.is_empty() { "" } else { ", " },
+                        extras.join(", "),
                         done.folder.display()
                     ),
                 );
+                // Blank CD-Rs and most plants take 79:57 at most.
+                if done
+                    .ddp
+                    .as_ref()
+                    .is_some_and(|(_, s)| *s > (79 * 60 + 57) * 75)
+                {
+                    self.notify(
+                        NoticeLevel::Warning,
+                        "the CD master is longer than 79:57 — check with the plant",
+                    );
+                }
                 self.album_state.last_export = Some(done);
             }
             Some(Err(e)) => self.notify(NoticeLevel::Error, format!("album export: {e}")),
@@ -858,6 +1087,5 @@ mod tests {
         // No target: no gain.
         s.loudness = None;
         assert_eq!(gains(&s, &songs, whole), vec![0.0, 0.0]);
-        assert_eq!(cue_time(48_000 * 61 + 24_000, 48_000), "01:01:37");
     }
 }

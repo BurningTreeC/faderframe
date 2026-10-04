@@ -69,7 +69,7 @@ fn file_name(name: &str) -> String {
 
 impl Session {
     fn plugin_ref(&self, plugin: PluginInstanceId) -> Result<PluginRef> {
-        self.plugin_slot(plugin)
+        self.plugin_owner(plugin)
             .map(|(_, s)| s.plugin.clone())
             .ok_or_else(|| SessionError::Other(format!("no plugin {plugin}")))
     }
@@ -140,7 +140,7 @@ impl Session {
     pub fn save_plugin_preset(&mut self, plugin: PluginInstanceId, name: &str) -> Result<PathBuf> {
         self.capture_plugin_states();
         let (_, slot) = self
-            .plugin_slot(plugin)
+            .plugin_owner(plugin)
             .ok_or_else(|| SessionError::Other(format!("no plugin {plugin}")))?;
         let slot = slot.clone();
         let parameters = if slot.state.is_some() {
@@ -185,8 +185,8 @@ impl Session {
     /// Load a preset (one undo step).
     pub fn load_plugin_preset(&mut self, plugin: PluginInstanceId, path: &Path) -> Result<()> {
         let (track, plugin_ref) = self
-            .plugin_slot(plugin)
-            .map(|(t, s)| (t.id, s.plugin.clone()))
+            .plugin_owner(plugin)
+            .map(|(t, s)| (t, s.plugin.clone()))
             .ok_or_else(|| SessionError::Other(format!("no plugin {plugin}")))?;
         let bytes = std::fs::read(path)
             .map_err(|e| SessionError::Other(format!("{}: {e}", path.display())))?;

@@ -434,6 +434,12 @@ impl Project {
                 }
             }
         }
+        for s in &self.album.songs {
+            max_id = max_id.max(s.id.raw());
+            for p in &s.inserts {
+                max_id = max_id.max(p.id.raw());
+            }
+        }
         max_id = max_id
             .max(self.sources.keys().map(|k| k.raw()).max().unwrap_or(0))
             .max(self.markers.iter().map(|m| m.id.raw()).max().unwrap_or(0));

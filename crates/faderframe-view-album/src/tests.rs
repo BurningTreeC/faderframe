@@ -175,3 +175,85 @@ fn numbers_accept_typed_variants() {
     assert_eq!(db(-0.01), "0.0 dB");
     assert_eq!(db(-1.26), "−1.3 dB");
 }
+
+fn menu(req: Vec<HostRequest<Action>>) -> Vec<MenuItem<Action>> {
+    match req
+        .into_iter()
+        .find(|r| matches!(r, HostRequest::ContextMenu { .. }))
+    {
+        Some(HostRequest::ContextMenu { items, .. }) => items,
+        _ => panic!("a menu"),
+    }
+}
+
+fn pick(items: &[MenuItem<Action>], label: &str) -> Action {
+    items
+        .iter()
+        .find(|i| i.label.contains(label))
+        .and_then(|i| i.action.clone())
+        .unwrap_or_else(|| panic!("{label}"))
+}
+
+fn type_into(view: &mut AlbumView, s: &mut Session, at: Point, text: &str) {
+    let req = run(view, s, down(at, 2));
+    let Some(HostRequest::TextInput { commit, .. }) = req
+        .into_iter()
+        .find(|r| matches!(r, HostRequest::TextInput { .. }))
+    else {
+        panic!("text input")
+    };
+    s.dispatch(commit(text).unwrap()).unwrap();
+}
+
+#[test]
+fn codes_crossfades_inserts_and_the_cd_master() {
+    let mut s = session();
+    let mut view = AlbumView::new(Theme::default());
+    let l = view.layout(SIZE, &s);
+    // A typed ISRC is normalised; "×2" crossfades, a number pauses.
+    let isrc = view.cell(&l, 0, Column::Isrc).center();
+    type_into(&mut view, &mut s, isrc, "gb-xyz-26-00042");
+    assert_eq!(s.project().album.songs[0].isrc, "GBXYZ2600042");
+    let pause = view.cell(&l, 1, Column::Pause).center();
+    type_into(&mut view, &mut s, pause, "×2");
+    assert_eq!(s.project().album.songs[1].crossfade, 2.0);
+    type_into(&mut view, &mut s, pause, "1.5");
+    let song = &s.project().album.songs[1];
+    assert_eq!((song.pause, song.crossfade), (1.5, 0.0));
+    // The inserts cell: add one (the plugin browser for the song), then
+    // hear them on the master.
+    let id = s.project().album.songs[0].id;
+    let cell = view.cell(&l, 0, Column::Inserts).center();
+    let items = menu(run(&mut view, &mut s, down(cell, 1)));
+    assert!(matches!(
+        pick(&items, "Add Insert"),
+        Action::OpenPluginBrowser {
+            target: PluginTarget::Song(x),
+            ..
+        } if x == id
+    ));
+    let master = s.project().master_id().unwrap();
+    s.place_plugin(
+        master,
+        PluginTarget::Song(id),
+        faderframe_project::PluginRef::builtin(faderframe_core::builtin::GAIN, "Gain"),
+    )
+    .unwrap();
+    assert_eq!(s.project().album.songs[0].inserts.len(), 1);
+    let items = menu(run(&mut view, &mut s, down(cell, 1)));
+    s.dispatch(pick(&items, "Hear Them")).unwrap();
+    assert_eq!(s.album_monitor(), Some(id));
+    s.dispatch(pick(&items, "Bypass")).unwrap();
+    assert!(s.project().album.songs[0].inserts[0].bypass);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, SIZE, &s, &Theme::default());
+    // The CD master menu and the release details.
+    let items = menu(press(&mut view, &mut s, Button::Cd));
+    s.dispatch(pick(&items, "Write a CD Master")).unwrap();
+    assert!(s.project().album.settings.ddp);
+    press(&mut view, &mut s, Button::Release);
+    assert!(
+        s.take_ui_requests()
+            .contains(&faderframe_session::UiRequest::AlbumDetails(None))
+    );
+}

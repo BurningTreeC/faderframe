@@ -357,6 +357,9 @@ impl AppState {
                 faderframe_session::UiRequest::ImportSysex { clip, at } => {
                     crate::dialogs::import_sysex(self, clip, at);
                 }
+                faderframe_session::UiRequest::AlbumDetails(song) => {
+                    crate::dialogs::album_details(self, song);
+                }
                 faderframe_session::UiRequest::SavePluginPreset { plugin } => {
                     crate::dialogs::save_preset(self, plugin);
                 }

@@ -137,11 +137,16 @@ Contrast:
   master or any track.
 * Album (bottom dock, next to Tools): songs in release order — the
   project's sections, the whole project, other FaderFrame projects or
-  finished mixes — with pause, trim and fades per song; offline analysis
-  (integrated loudness, range, true peak) and a preview of how each song
-  will be delivered; export with one gain for the album (the songs keep
-  their balance) or per-song levelling, true-peak limiting, dither, one
-  file per song and optionally the whole album with a CUE sheet.
+  finished mixes — with a pause or an equal-power crossfade, trim, fades,
+  ISRC, credits and the song's own plugin inserts (heard on the master
+  while editing) per song, and the release's title, credits and UPC/EAN;
+  offline analysis (integrated loudness, range, true peak) and a preview of
+  how each song will be delivered; export with one gain for the album (the
+  songs keep their balance) or per-song levelling, true-peak limiting,
+  dither, one file per song (cut gaplessly when songs crossfade), the whole
+  album with a cue sheet and a CD master for replication: a DDP 2.00
+  fileset (44.1 kHz/16-bit, PQ codes, CD-Text, checksums) verified after
+  writing.
 * Engine: routing graph with cycle detection and plugin delay compensation,
   buses, auxes, sends, sidechains, solo-in-place, sample-accurate loops,
   built-in synth, echo, compressor, gain and latency-probe plugins,

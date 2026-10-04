@@ -34,6 +34,7 @@ faderframe-plugin-host = { path = "crates/faderframe-plugin-host" }
 faderframe-plugin-clap = { path = "crates/faderframe-plugin-clap" }
 faderframe-plugin-vst3 = { path = "crates/faderframe-plugin-vst3" }
 faderframe-plugin-sandbox = { path = "crates/faderframe-plugin-sandbox" }
+faderframe-disc = { path = "crates/faderframe-disc" }
 faderframe-plugin-au = { path = "crates/faderframe-plugin-au" }
 faderframe-engine = { path = "crates/faderframe-engine" }
 faderframe-session = { path = "crates/faderframe-session" }

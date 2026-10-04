@@ -2,11 +2,15 @@
 //!
 //! A song is a section of this project, the whole project, another
 //! FaderFrame project (rendered from its saved state) or a finished mix (an
-//! audio file). Paths are absolute. The album is edited as a whole through
-//! [`crate::Command::SetAlbum`].
+//! audio file). Paths are absolute. Songs follow each other after a pause
+//! or overlap in a crossfade. The release information (title, performer,
+//! credits, UPC/EAN and per song ISRC) goes into the cue sheet, the CD
+//! master (DDP: PQ codes and CD-Text) and the files. The album is edited
+//! as a whole through [`crate::Command::SetAlbum`].
 
+use crate::PluginSlot;
 use faderframe_audio_files::{Dither, WavFormat};
-use faderframe_core::{SectionId, SongId};
+use faderframe_core::{PluginInstanceId, SectionId, SongId};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -46,6 +50,56 @@ fn is_zero(v: &f32) -> bool {
     *v == 0.0
 }
 
+fn is_true(v: &bool) -> bool {
+    *v
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// Credits of the album or a song (CD-Text and file tags; empty: none).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Credits {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub performer: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub songwriter: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub composer: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub arranger: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub message: String,
+}
+
+impl Credits {
+    pub fn is_empty(&self) -> bool {
+        *self == Credits::default()
+    }
+}
+
+/// The release as a whole.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AlbumInfo {
+    /// Empty: the project's name.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(skip_serializing_if = "Credits::is_empty")]
+    pub credits: Credits,
+    /// UPC-A or EAN-13 (the CD's media catalog number); empty: none.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub upc: String,
+}
+
+impl AlbumInfo {
+    pub fn is_empty(&self) -> bool {
+        *self == AlbumInfo::default()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Song {
     pub id: SongId,
@@ -63,6 +117,20 @@ pub struct Song {
     pub fade_in: f32,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub fade_out: f32,
+    /// Overlap with the previous song (seconds, equal-power): when set,
+    /// the song starts this much before the previous one ends instead of
+    /// after a pause.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub crossfade: f32,
+    /// International Standard Recording Code; empty: none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub isrc: String,
+    #[serde(default, skip_serializing_if = "Credits::is_empty")]
+    pub credits: Credits,
+    /// The song's own plugin chain: after its trim, before its fades and
+    /// the album's level processing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inserts: Vec<PluginSlot>,
 }
 
 impl Song {
@@ -75,6 +143,10 @@ impl Song {
             pause: default_pause(),
             fade_in: 0.0,
             fade_out: 0.0,
+            crossfade: 0.0,
+            isrc: String::new(),
+            credits: Credits::default(),
+            inserts: Vec::new(),
         }
     }
 
@@ -84,6 +156,7 @@ impl Song {
             && self.gain_db == other.gain_db
             && self.fade_in == other.fade_in
             && self.fade_out == other.fade_out
+            && self.inserts == other.inserts
     }
 }
 
@@ -118,6 +191,13 @@ pub struct AlbumSettings {
     pub output: Option<PathBuf>,
     /// Also one file of the whole album, with a CUE sheet.
     pub album_file: bool,
+    /// Also a CD master: a DDP 2.00 fileset (44.1 kHz, 16-bit).
+    pub ddp: bool,
+    /// CD-Text on the CD master.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub cd_text: bool,
+    /// The CD's tracks may be copied digitally (the DCP flag).
+    pub copy_permitted: bool,
 }
 
 impl Default for AlbumSettings {
@@ -133,6 +213,9 @@ impl Default for AlbumSettings {
             tail: 2.0,
             output: None,
             album_file: true,
+            ddp: false,
+            cd_text: true,
+            copy_permitted: false,
         }
     }
 }
@@ -142,6 +225,8 @@ impl Default for AlbumSettings {
 pub struct Album {
     pub songs: Vec<Song>,
     pub settings: AlbumSettings,
+    #[serde(skip_serializing_if = "AlbumInfo::is_empty")]
+    pub info: AlbumInfo,
 }
 
 impl Album {
@@ -159,6 +244,25 @@ impl Album {
 
     pub fn index(&self, id: SongId) -> Option<usize> {
         self.songs.iter().position(|s| s.id == id)
+    }
+
+    /// A song's insert and the song.
+    pub fn insert(&self, plugin: PluginInstanceId) -> Option<(&Song, &PluginSlot)> {
+        self.songs
+            .iter()
+            .find_map(|s| s.inserts.iter().find(|p| p.id == plugin).map(|p| (s, p)))
+    }
+
+    pub fn insert_mut(&mut self, plugin: PluginInstanceId) -> Option<&mut PluginSlot> {
+        self.songs
+            .iter_mut()
+            .flat_map(|s| s.inserts.iter_mut())
+            .find(|p| p.id == plugin)
+    }
+
+    /// Every song's inserts.
+    pub fn inserts(&self) -> impl Iterator<Item = &PluginSlot> {
+        self.songs.iter().flat_map(|s| s.inserts.iter())
     }
 
     /// Does the album use this section?
@@ -206,5 +310,15 @@ mod tests {
         // Settings missing in old files take their defaults.
         let old: Album = serde_json::from_str(r#"{"songs":[]}"#).unwrap();
         assert_eq!(old.settings, AlbumSettings::default());
+        assert!(old.settings.cd_text);
+        // Release information round-trips and stays out when empty.
+        album.info.upc = "0123456789012".into();
+        album.info.credits.performer = "The Band".into();
+        album.songs[0].isrc = "USABC2600001".into();
+        album.songs[0].crossfade = 1.5;
+        let json = serde_json::to_string(&album).unwrap();
+        assert!(!json.contains("songwriter"), "{json}");
+        let back: Album = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, album);
     }
 }

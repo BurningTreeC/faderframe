@@ -1,0 +1,13 @@
+TITLE "Disc Title"
+PERFORMER "Disc Performer"
+SONGWRITER "Disc Writer"
+FILE "audio.wav" WAVE
+  TRACK 01 AUDIO
+    TITLE "Track One"
+    PERFORMER "Perf One"
+    SONGWRITER "Writer One"
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    TITLE "Track Two"
+    PERFORMER "Perf Two"
+    INDEX 01 00:10:00

@@ -265,6 +265,7 @@ pub fn create_with_epoch(
         },
         midi_live: Default::default(),
         edited: Default::default(),
+        album_monitor: None,
         timeline: Arc::new(TimelineSnapshot::empty(config.sample_rate as f64)),
         ahead: None,
         ahead_setting: None,
@@ -702,6 +703,8 @@ pub struct EngineController {
     midi_live: std::collections::HashSet<faderframe_core::TrackId>,
     /// Tracks whose plugins are being edited (kept on the audio thread).
     edited: std::collections::HashSet<faderframe_core::TrackId>,
+    /// The album song whose inserts run after the master strip.
+    album_monitor: Option<faderframe_core::SongId>,
     /// Stretcher voices per track in the installed graph (a timeline edit
     /// that changes them rebuilds the graph).
     voices: Vec<(faderframe_core::TrackId, crate::nodes::StretchVoices)>,
@@ -775,6 +778,12 @@ impl EngineController {
     /// Timings of the current graph with what each node does for whom.
     pub fn graph_profile(&self) -> Option<GraphProfile> {
         self.profile.clone()
+    }
+
+    /// Host `slot`'s plugin (instantiate it) outside the graph; `false`
+    /// when it cannot be loaded.
+    pub fn host_plugin(&mut self, slot: &faderframe_project::PluginSlot) -> bool {
+        self.plugins.instance(slot).is_ok()
     }
 
     /// Latency of a hosted plugin instance (samples).
@@ -1169,6 +1178,17 @@ impl EngineController {
             ring_frames: crate::ahead::ring_frames(lookahead, self.config.max_block_size),
             misses: Arc::clone(&self.ahead_misses),
         });
+        // Album songs' inserts are hosted (editors, parameters) even when
+        // they are not monitored.
+        for slot in project.album.inserts() {
+            if let Err(e) = self.plugins.instance(slot) {
+                tracing::warn!("{}: {e}", slot.plugin.name);
+            }
+        }
+        let monitor = self
+            .album_monitor
+            .and_then(|id| project.album.song(id))
+            .map_or(&[][..], |s| &s.inserts[..]);
         let built = build_graph(
             project,
             &mut self.slots,
@@ -1176,6 +1196,7 @@ impl EngineController {
             &prepare,
             &self.midi_routing,
             plan,
+            monitor,
         )?;
         let compiled = built.builder.compile(&prepare)?;
         if let (Some(a), Some((builder, rings))) = (&self.ahead, built.ahead) {
@@ -1344,6 +1365,16 @@ impl EngineController {
         tracks: std::collections::HashSet<faderframe_core::TrackId>,
     ) {
         self.edited = tracks;
+    }
+
+    /// Run an album song's inserts after the master strip, to hear them on
+    /// the project (applies with the next graph build).
+    pub fn set_album_monitor(&mut self, song: Option<faderframe_core::SongId>) {
+        self.album_monitor = song;
+    }
+
+    pub fn album_monitor(&self) -> Option<faderframe_core::SongId> {
+        self.album_monitor
     }
 
     /// Render tracks nobody plays live `lookahead` ahead of the playhead on

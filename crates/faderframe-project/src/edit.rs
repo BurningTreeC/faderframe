@@ -355,6 +355,12 @@ pub enum Command {
     SetAlbum {
         album: Box<crate::album::Album>,
     },
+    /// Replace an album song's inserts (its own plugin chain; the engine
+    /// hosts them, and runs the monitored song's on the master output).
+    SetSongInserts {
+        song: faderframe_core::SongId,
+        inserts: Vec<PluginSlot>,
+    },
     /// Set (`Some`) or remove (`None`) the time signature change at `bar`.
     SetTimeSignature {
         bar: i32,
@@ -413,6 +419,24 @@ pub enum Command {
 
 fn track_mut(p: &mut Project, id: TrackId) -> Result<&mut Track, EditError> {
     p.track_mut(id).ok_or(EditError::UnknownTrack(id))
+}
+
+/// A plugin slot of `track` — or one of an album song's inserts (those
+/// commands name a track, e.g. the master, that does not own them).
+fn plugin_slot_mut(
+    p: &mut Project,
+    track: TrackId,
+    plugin: PluginInstanceId,
+) -> Result<&mut PluginSlot, EditError> {
+    if p.album.insert(plugin).is_some() {
+        return p
+            .album
+            .insert_mut(plugin)
+            .ok_or(EditError::UnknownPlugin(plugin));
+    }
+    track_mut(p, track)?
+        .plugin_mut(plugin)
+        .ok_or(EditError::UnknownPlugin(plugin))
 }
 
 fn clip_mut(p: &mut Project, id: ClipId) -> Result<&mut Clip, EditError> {
@@ -585,6 +609,7 @@ impl Command {
             SetTimeline { .. } => "Change Tempo Map".into(),
             SetArrangement { .. } => "Rearrange".into(),
             SetAlbum { .. } => "Edit Album".into(),
+            SetSongInserts { .. } => "Change Song Inserts".into(),
             SetTimeSignature { .. } => "Change Time Signature".into(),
             SetLoop { .. } => "Change Loop".into(),
             SetPunch { .. } => "Change Punch Range".into(),
@@ -687,6 +712,7 @@ impl Command {
             | InsertPlugin { .. }
             | RemovePlugin { .. }
             | SetPluginBypass { .. }
+            | SetSongInserts { .. }
             | SetInstrument { .. }
             | AddTrack { .. }
             | RemoveTrack { .. }
@@ -899,9 +925,7 @@ impl Command {
                 plugin,
                 bypass,
             } => {
-                let slot = track_mut(p, track)?
-                    .plugin_mut(plugin)
-                    .ok_or(EditError::UnknownPlugin(plugin))?;
+                let slot = plugin_slot_mut(p, track, plugin)?;
                 let old = std::mem::replace(&mut slot.bypass, bypass);
                 SetPluginBypass {
                     track,
@@ -915,9 +939,7 @@ impl Command {
                 parameter,
                 value,
             } => {
-                let slot = track_mut(p, track)?
-                    .plugin_mut(plugin)
-                    .ok_or(EditError::UnknownPlugin(plugin))?;
+                let slot = plugin_slot_mut(p, track, plugin)?;
                 let i = slot.parameters.iter().position(|q| q.id == parameter);
                 let old = i.map(|i| slot.parameters[i].value);
                 match (i, value) {
@@ -1039,9 +1061,7 @@ impl Command {
                 state,
                 parameters,
             } => {
-                let slot = track_mut(p, track)?
-                    .plugin_mut(plugin)
-                    .ok_or(EditError::UnknownPlugin(plugin))?;
+                let slot = plugin_slot_mut(p, track, plugin)?;
                 let old_state = std::mem::replace(&mut slot.state, state);
                 let old_params = std::mem::replace(&mut slot.parameters, parameters);
                 SetPluginState {
@@ -1382,6 +1402,18 @@ impl Command {
             SetAlbum { album } => SetAlbum {
                 album: Box::new(std::mem::replace(&mut p.album, *album)),
             },
+            SetSongInserts { song, inserts } => {
+                let s = p
+                    .album
+                    .songs
+                    .iter_mut()
+                    .find(|s| s.id == song)
+                    .ok_or_else(|| EditError::Invalid("no such song".into()))?;
+                SetSongInserts {
+                    song,
+                    inserts: std::mem::replace(&mut s.inserts, inserts),
+                }
+            }
             SetLoop { range, enabled } => {
                 let old_range = std::mem::replace(&mut p.loop_range, range);
                 let old_enabled =

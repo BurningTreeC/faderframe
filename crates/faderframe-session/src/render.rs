@@ -279,6 +279,124 @@ fn render_one(
     Ok(out)
 }
 
+/// Run stereo `audio` through a chain of plugins (an album song's inserts;
+/// bypassed ones are left out) on the calling thread: as the only track of
+/// a project with the chain on its master. The chain's latency is taken
+/// off the front; up to `tail` seconds of what it rings on are kept, until
+/// it falls silent.
+pub(crate) fn process_through(
+    audio: Vec<Vec<f32>>,
+    sample_rate: u32,
+    inserts: &[faderframe_project::PluginSlot],
+    tail: f32,
+    progress: &RenderProgress,
+) -> Result<Vec<Vec<f32>>, RenderError> {
+    use faderframe_project::{
+        AudioClip, AudioSource, Clip, ClipContent, ClipFades, SourceSpec, StretchSettings, Track,
+        TrackColor,
+    };
+    let chain: Vec<_> = inserts.iter().filter(|s| !s.bypass).cloned().collect();
+    let frames = audio.first().map_or(0, Vec::len);
+    if chain.is_empty() || frames == 0 {
+        return Ok(audio);
+    }
+    let mut p = Project::new("Song", sample_rate);
+    let source = p.ids.allocate();
+    p.sources.insert(
+        source,
+        AudioSource {
+            id: source,
+            name: "Song".into(),
+            // Never opened: the audio is handed over in memory.
+            spec: SourceSpec::File {
+                path: PathBuf::from("song"),
+                channels: 2,
+                frames: frames as i64,
+                sample_rate,
+            },
+        },
+    );
+    let track = p.ids.allocate();
+    let clip = p.ids.allocate();
+    let mut t = Track::new(track, TrackKind::Audio, "Song", TrackColor::palette(0))
+        .with_layout(faderframe_core::ChannelLayout::Stereo);
+    t.clips.push(clip);
+    p.tracks.push(t);
+    p.clips.insert(
+        clip,
+        Clip {
+            id: clip,
+            track,
+            name: "Song".into(),
+            color: None,
+            start: MusicalTime::ZERO,
+            muted: false,
+            content: ClipContent::Audio(AudioClip {
+                source,
+                source_offset: 0,
+                length: frames as i64,
+                gain_db: 0.0,
+                fades: ClipFades::default(),
+                stretch: StretchSettings::Off,
+                reversed: false,
+                warp: None,
+            }),
+        },
+    );
+    if let Some(m) = p.tracks.iter_mut().find(|t| t.kind == TrackKind::Master) {
+        m.inserts = chain.clone();
+    }
+    p.ids
+        .reserve_through(chain.iter().map(|s| s.id.raw()).max().unwrap_or(0));
+    let mut sources = faderframe_engine::SourceMap::new();
+    sources.insert(
+        source,
+        faderframe_engine::Source::Memory(Arc::new(
+            faderframe_audio_files::AudioData::from_channels(sample_rate, audio),
+        )),
+    );
+    let config = EngineConfig {
+        sample_rate,
+        max_block_size: 1024,
+        measure_nodes: false,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&p, &sources, config, 1024, 2)?;
+    let latency: usize = chain
+        .iter()
+        .filter_map(|s| r.controller.plugin_latency(s.id))
+        .map(|l| l as usize)
+        .sum();
+    let tail = (tail.max(0.0) as f64 * sample_rate as f64) as usize;
+    let total = latency + frames + tail;
+    progress.done.store(0, Ordering::Relaxed);
+    progress.total.store(total as u64, Ordering::Relaxed);
+    r.play_from(0)?;
+    let mut out = vec![Vec::with_capacity(total), Vec::with_capacity(total)];
+    while out[0].len() < total {
+        if progress.cancel.load(Ordering::Relaxed) {
+            return Err(RenderError::Cancelled);
+        }
+        let n = (total - out[0].len()).min(16_384);
+        for (o, c) in out.iter_mut().zip(r.render(n)) {
+            o.extend_from_slice(&c);
+        }
+        progress.done.fetch_add(n as u64, Ordering::Relaxed);
+    }
+    // The tail until it falls silent (−120 dBFS).
+    let audible = out
+        .iter()
+        .map(|c| c.iter().rposition(|s| s.abs() > 1e-6).map_or(0, |i| i + 1))
+        .max()
+        .unwrap_or(0);
+    let end = audible.clamp(latency + frames, total);
+    for c in &mut out {
+        c.truncate(end);
+        c.drain(..latency);
+    }
+    Ok(out)
+}
+
 fn finish(
     mut audio: Vec<Vec<f32>>,
     settings: &RenderSettings,

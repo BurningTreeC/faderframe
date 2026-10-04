@@ -9,11 +9,15 @@
 //!   format, rate and dither (delivery presets set them together), and runs
 //!   Analyse and Export (Cancel while one runs).
 //! * A row per song: its number (drag it to reorder), title (double-click
-//!   renames), source, length, the pause before it, its trim and fades
-//!   (drag up/down or double-click to type), how it measured (loudness,
-//!   range, true peak) and how it will be delivered (gain, resulting
-//!   loudness, limiting). Right-click for more; Delete removes the
-//!   selected song.
+//!   renames), source, length, the pause before it or the crossfade into
+//!   it (`×`), its trim and fades (drag up/down or double-click to type),
+//!   its ISRC, its own inserts (click for the menu: add, edit, bypass,
+//!   remove, hear them on the master), how it measured (loudness, range,
+//!   true peak) and how it will be delivered (gain, resulting loudness,
+//!   limiting). Right-click for more; Delete removes the selected song.
+//! * *Release…* edits the album's title, credits and UPC/EAN; *CD master*
+//!   adds a DDP fileset (with CD-Text, optionally digital copy permitted)
+//!   to the export.
 //! * The footer sums the album up, shows the export folder (click to
 //!   choose another) and the progress of a running job.
 //!
@@ -27,7 +31,7 @@ use faderframe_project::album::{AlbumLevel, AlbumSettings, Song, SongSource};
 use faderframe_session::album::{AlbumAction, AlbumTask};
 use faderframe_session::analysis::LOUDNESS_TARGETS;
 use faderframe_session::delivery::DELIVERY_PRESETS;
-use faderframe_session::{Action, Session};
+use faderframe_session::{Action, PluginTarget, Session};
 use faderframe_timeline::MusicalTime;
 use faderframe_ui_canvas::{
     CanvasView, Color, Cursor, EventCx, FileChoice, HostRequest, Key, MenuItem, Paint, Painter,
@@ -60,6 +64,8 @@ pub enum Button {
     Ceiling,
     Format,
     AlbumFile,
+    Cd,
+    Release,
     Analyse,
     Export,
     Cancel,
@@ -74,6 +80,8 @@ pub enum Column {
     Pause,
     Gain,
     Fades,
+    Isrc,
+    Inserts,
     Loudness,
     Range,
     TruePeak,
@@ -81,18 +89,20 @@ pub enum Column {
 }
 
 /// Columns with their header and width (0: takes the rest).
-const COLUMNS: [(Column, &str, f32); 11] = [
+const COLUMNS: [(Column, &str, f32); 13] = [
     (Column::Number, "#", 34.0),
     (Column::Title, "Title", 0.0),
-    (Column::Source, "Source", 170.0),
-    (Column::Length, "Length", 60.0),
-    (Column::Pause, "Pause", 58.0),
-    (Column::Gain, "Trim", 66.0),
-    (Column::Fades, "Fades in / out", 104.0),
-    (Column::Loudness, "Loudness", 92.0),
-    (Column::Range, "LRA", 58.0),
-    (Column::TruePeak, "True peak", 84.0),
-    (Column::Delivered, "Delivered", 210.0),
+    (Column::Source, "Source", 150.0),
+    (Column::Length, "Length", 56.0),
+    (Column::Pause, "Pause", 62.0),
+    (Column::Gain, "Trim", 62.0),
+    (Column::Fades, "Fades in / out", 100.0),
+    (Column::Isrc, "ISRC", 100.0),
+    (Column::Inserts, "Inserts", 130.0),
+    (Column::Loudness, "Loudness", 88.0),
+    (Column::Range, "LRA", 54.0),
+    (Column::TruePeak, "True peak", 80.0),
+    (Column::Delivered, "Delivered", 200.0),
 ];
 const TITLE_MIN: f32 = 140.0;
 /// Wider views leave the rest empty instead of stretching the title.
@@ -128,7 +138,7 @@ enum Drag {
         moved: bool,
     },
     Value {
-        song: Song,
+        song: Box<Song>,
         column: Column,
         start_y: f32,
         began: bool,
@@ -241,6 +251,8 @@ impl AlbumView {
                 )
             }
             Button::AlbumFile => "Album file + CUE".into(),
+            Button::Cd => "CD master (DDP) ▾".into(),
+            Button::Release => "Release…".into(),
             Button::Analyse => "Analyse".into(),
             Button::Export => "Export".into(),
             Button::Cancel => "Cancel".into(),
@@ -261,11 +273,13 @@ impl AlbumView {
             Button::Ceiling,
             Button::Format,
             Button::AlbumFile,
+            Button::Cd,
+            Button::Release,
         ]
         .into_iter()
         .enumerate()
         {
-            if i == 3 {
+            if i == 3 || i == 9 {
                 x += 10.0;
             }
             let w = width(&Self::button_label(b, model));
@@ -546,6 +560,112 @@ impl AlbumView {
         HostRequest::ContextMenu { at, items }
     }
 
+    fn cd_menu(s: &AlbumSettings, at: Point) -> HostRequest<Action> {
+        let items = vec![
+            MenuItem::new(
+                "Write a CD Master (DDP 2.00)",
+                settings_action(AlbumSettings {
+                    ddp: !s.ddp,
+                    ..s.clone()
+                }),
+            )
+            .checked(s.ddp),
+            MenuItem::new(
+                "CD-Text (titles and credits)",
+                settings_action(AlbumSettings {
+                    cd_text: !s.cd_text,
+                    ..s.clone()
+                }),
+            )
+            .checked(s.cd_text)
+            .separated(),
+            MenuItem::new(
+                "Digital Copy Permitted",
+                settings_action(AlbumSettings {
+                    copy_permitted: !s.copy_permitted,
+                    ..s.clone()
+                }),
+            )
+            .checked(s.copy_permitted),
+        ];
+        HostRequest::ContextMenu { at, items }
+    }
+
+    /// A song's inserts: each one's editor, bypass and removal, adding one
+    /// (the plugin browser) and hearing them on the master.
+    fn inserts_menu(model: &Session, song: &Song, at: Point) -> HostRequest<Action> {
+        let mut items = Vec::new();
+        let master = model.project().master_id();
+        let a = |x: AlbumAction| Action::Album(x);
+        for (k, slot) in song.inserts.iter().enumerate() {
+            let name = &slot.plugin.name;
+            let edit = match master {
+                Some(track) => MenuItem::new(
+                    format!("{}. {name}…", k + 1),
+                    Action::OpenPluginEditor {
+                        track,
+                        plugin: slot.id,
+                        generic: false,
+                    },
+                ),
+                None => MenuItem::disabled(format!("{}. {name}", k + 1)),
+            };
+            items.push(if k == 0 { edit } else { edit.separated() });
+            items.push(
+                MenuItem::new(
+                    "    Bypass",
+                    a(AlbumAction::BypassInsert {
+                        song: song.id,
+                        plugin: slot.id,
+                        bypass: !slot.bypass,
+                    }),
+                )
+                .checked(slot.bypass),
+            );
+            if k > 0 {
+                items.push(MenuItem::new(
+                    "    Move Up",
+                    a(AlbumAction::MoveInsert {
+                        song: song.id,
+                        plugin: slot.id,
+                        to: k - 1,
+                    }),
+                ));
+            }
+            items.push(MenuItem::new(
+                "    Remove",
+                a(AlbumAction::RemoveInsert {
+                    song: song.id,
+                    plugin: slot.id,
+                }),
+            ));
+        }
+        let add = match master {
+            Some(track) => MenuItem::new(
+                "Add Insert…",
+                Action::OpenPluginBrowser {
+                    track,
+                    target: PluginTarget::Song(song.id),
+                },
+            ),
+            None => MenuItem::disabled("Add Insert…"),
+        };
+        items.push(if song.inserts.is_empty() {
+            add
+        } else {
+            add.separated()
+        });
+        let monitored = model.album_monitor() == Some(song.id);
+        items.push(
+            MenuItem::new(
+                "Hear Them on the Master",
+                a(AlbumAction::Monitor((!monitored).then_some(song.id))),
+            )
+            .checked(monitored),
+        );
+        HostRequest::ContextMenu { at, items }
+    }
+
     fn row_menu(model: &Session, i: usize, at: Point) -> Option<HostRequest<Action>> {
         let songs = &model.project().album.songs;
         let song = songs.get(i)?;
@@ -579,6 +699,24 @@ impl AlbumView {
             .checked(song.fade_out == fade_out);
             items.push(if k == 0 { item.separated() } else { item });
         }
+        if i > 0 {
+            for (k, crossfade) in [0.0, 1.0, 3.0, 5.0].into_iter().enumerate() {
+                let label = if crossfade == 0.0 {
+                    "No Crossfade (Pause)".to_string()
+                } else {
+                    format!("Crossfade {crossfade:.0} s from the Previous Song")
+                };
+                let item = MenuItem::new(
+                    label,
+                    update(Song {
+                        crossfade,
+                        ..song.clone()
+                    }),
+                )
+                .checked(song.crossfade == crossfade);
+                items.push(if k == 0 { item.separated() } else { item });
+            }
+        }
         items.push(
             MenuItem::new(
                 "Reset Trim",
@@ -588,6 +726,18 @@ impl AlbumView {
                 }),
             )
             .separated(),
+        );
+        items.push(MenuItem::new(
+            "Details (ISRC, Credits)…",
+            Action::Album(AlbumAction::Details(Some(song.id))),
+        ));
+        let monitored = model.album_monitor() == Some(song.id);
+        items.push(
+            MenuItem::new(
+                "Hear Its Inserts on the Master",
+                Action::Album(AlbumAction::Monitor((!monitored).then_some(song.id))),
+            )
+            .checked(monitored),
         );
         items.push(MenuItem::new(
             "Remove from Album",
@@ -629,15 +779,40 @@ impl AlbumView {
                     })
                 }),
             ),
+            // "×1.5": a crossfade; a plain number: a pause.
             Column::Pause => (
-                format!("{:.1}", song.pause),
+                if song.crossfade > 0.0 {
+                    format!("×{:.1}", song.crossfade)
+                } else {
+                    format!("{:.1}", song.pause)
+                },
                 Box::new(move |t: &str| {
+                    let t = t.trim();
+                    let crossfade = t.starts_with(['x', 'X', '×', '*']);
                     number(t).map(|v| {
-                        update(Song {
-                            pause: v.clamp(0.0, 60.0),
-                            ..song.clone()
+                        let v = v.abs().min(60.0);
+                        update(if crossfade {
+                            Song {
+                                crossfade: v,
+                                ..song.clone()
+                            }
+                        } else {
+                            Song {
+                                pause: v,
+                                crossfade: 0.0,
+                                ..song.clone()
+                            }
                         })
                     })
+                }),
+            ),
+            Column::Isrc => (
+                song.isrc.clone(),
+                Box::new(move |t: &str| {
+                    Some(update(Song {
+                        isrc: t.trim().to_string(),
+                        ..song.clone()
+                    }))
                 }),
             ),
             Column::Fades => (
@@ -698,6 +873,8 @@ impl AlbumView {
                 album_file: !s.album_file,
                 ..s.clone()
             })),
+            Button::Cd => cx.request(Self::cd_menu(s, at)),
+            Button::Release => cx.emit(Action::Album(AlbumAction::Details(None))),
             Button::Analyse => cx.emit(Action::Album(AlbumAction::Analyse)),
             Button::Export => cx.emit(Action::Album(AlbumAction::Export)),
             Button::Cancel => cx.emit(Action::Album(AlbumAction::Cancel)),
@@ -732,7 +909,7 @@ impl AlbumView {
         let s = &model.project().album.settings;
         for (b, r) in &l.buttons {
             let label = Self::button_label(*b, model);
-            let on = *b == Button::AlbumFile && s.album_file;
+            let on = (*b == Button::AlbumFile && s.album_file) || (*b == Button::Cd && s.ddp);
             let strong = matches!(b, Button::Export);
             self.paint_button(p, *r, &label, on, strong);
         }
@@ -833,6 +1010,8 @@ impl AlbumView {
             );
             let pause = if i == 0 {
                 "—".to_string()
+            } else if song.crossfade > 0.0 {
+                format!("×{:.1} s", song.crossfade)
             } else {
                 format!("{:.1} s", song.pause)
             };
@@ -845,6 +1024,31 @@ impl AlbumView {
                 format!("{:.1} / {:.1} s", song.fade_in, song.fade_out)
             };
             text(p, Column::Fades, &fades, th.ui.text, false);
+            let isrc = if song.isrc.is_empty() {
+                "—"
+            } else {
+                &song.isrc
+            };
+            text(p, Column::Isrc, isrc, th.ui.text_dim, false);
+            let monitored = model.album_monitor() == Some(song.id);
+            let names: Vec<&str> = song
+                .inserts
+                .iter()
+                .map(|s| s.plugin.name.as_str())
+                .collect();
+            let inserts = match (names.is_empty(), monitored) {
+                (true, _) => "+".to_string(),
+                (false, false) => names.join(", "),
+                (false, true) => format!("◉ {}", names.join(", ")),
+            };
+            let color = if monitored {
+                th.ui.accent
+            } else if song.inserts.iter().all(|s| s.bypass) {
+                th.ui.text_faint
+            } else {
+                th.ui.text
+            };
+            text(p, Column::Inserts, &inserts, color, false);
             if let Some(err) = model
                 .album_error(song.id)
                 .filter(|_| model.album_analysis(song).is_none())
@@ -917,7 +1121,20 @@ impl AlbumView {
             "{} song{} · {}",
             songs.len(),
             if songs.len() == 1 { "" } else { "s" },
-            duration(total + songs.iter().skip(1).map(|s| s.pause as f64).sum::<f64>())
+            duration(
+                total
+                    + songs
+                        .iter()
+                        .skip(1)
+                        .map(|s| {
+                            if s.crossfade > 0.0 {
+                                -(s.crossfade as f64)
+                            } else {
+                                s.pause as f64
+                            }
+                        })
+                        .sum::<f64>()
+            )
         );
         if let Some(r) = model.album_loudness() {
             summary += &format!(
@@ -1054,14 +1271,21 @@ impl CanvasView<Session, Action> for AlbumView {
                             return false;
                         };
                         self.selected = Some(song.id);
-                        if *clicks >= 2 {
+                        if column == Column::Inserts {
+                            let r = self.cell(&l, i, column);
+                            cx.request(Self::inserts_menu(
+                                model,
+                                song,
+                                Point::new(r.x, r.bottom()),
+                            ));
+                        } else if *clicks >= 2 {
                             if let Some(req) = self.text_input(model, &l, i, column) {
                                 cx.request(req);
                             }
                         } else {
                             self.drag = Some(match column {
                                 Column::Pause | Column::Gain => Drag::Value {
-                                    song: song.clone(),
+                                    song: Box::new(song.clone()),
                                     column,
                                     start_y: pos.y,
                                     began: false,
@@ -1122,17 +1346,24 @@ impl CanvasView<Session, Action> for AlbumView {
                         let changed = match column {
                             Column::Gain => Song {
                                 gain_db: ((song.gain_db + dy * 0.1 * fine) * 10.0).round() / 10.0,
-                                ..song.clone()
+                                ..(**song).clone()
+                            },
+                            _ if song.crossfade > 0.0 => Song {
+                                crossfade: ((song.crossfade + dy * 0.05 * fine).max(0.1) * 10.0)
+                                    .round()
+                                    / 10.0,
+                                ..(**song).clone()
                             },
                             _ => Song {
                                 pause: ((song.pause + dy * 0.05 * fine).max(0.0) * 10.0).round()
                                     / 10.0,
-                                ..song.clone()
+                                ..(**song).clone()
                             },
                         };
                         let changed = Song {
                             gain_db: changed.gain_db.clamp(-24.0, 24.0),
                             pause: changed.pause.min(60.0),
+                            crossfade: changed.crossfade.min(60.0),
                             ..changed
                         };
                         cx.emit(update(changed));
@@ -1216,7 +1447,9 @@ impl CanvasView<Session, Action> for AlbumView {
                     Button::Target => "Integrated loudness the album or each song is brought to",
                     Button::Ceiling => "True-peak ceiling, and whether peaks over it are limited or the gain is lowered",
                     Button::Format => "File format, sample rate and dither (or a delivery preset)",
-                    Button::AlbumFile => "Also write the whole album as one file with a CUE sheet (pauses become pregaps)",
+                    Button::AlbumFile => "Also write the whole album as one file with a cue sheet (pauses become pregaps; codes, titles and credits included)",
+                    Button::Cd => "Also write a CD master for replication: a DDP 2.00 fileset at 44.1 kHz/16-bit with PQ codes (ISRC, UPC/EAN), CD-Text and checksums, verified after writing",
+                    Button::Release => "The album's title, performer and other credits, and its UPC/EAN",
                     Button::Analyse => "Render and measure every song",
                     Button::Export => "Write every song (and the album file) to the export folder",
                     Button::Cancel => "Stop the analysis or export",
@@ -1224,7 +1457,9 @@ impl CanvasView<Session, Action> for AlbumView {
                 Hit::Folder => "Click to choose the export folder",
                 Hit::Cell(_, Column::Number) => "Drag to reorder",
                 Hit::Cell(_, Column::Title) => "Double-click to rename, drag to reorder",
-                Hit::Cell(_, Column::Pause) => "Silence before the song in the album — drag up/down (Shift: fine) or double-click to type",
+                Hit::Cell(_, Column::Pause) => "Silence before the song, or (×) how long it crossfades out of the previous one — drag up/down (Shift: fine) or double-click to type (×2 for a crossfade)",
+                Hit::Cell(_, Column::Isrc) => "International Standard Recording Code (CC-XXX-YY-NNNNN) — double-click to type; on the CD master and in the cue sheet",
+                Hit::Cell(_, Column::Inserts) => "The song's own plugins, after its trim and before its fades — click to add, edit, bypass or hear them on the master (◉)",
                 Hit::Cell(_, Column::Gain) => "Trim before levelling — drag up/down (Shift: fine) or double-click to type",
                 Hit::Cell(_, Column::Fades) => "Fade in / out in seconds — double-click to type",
                 Hit::Cell(_, Column::Delivered) => "Loudness after the album's gain, the gain, and how much the limiter will take off the peaks",
