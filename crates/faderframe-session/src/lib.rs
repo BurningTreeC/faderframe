@@ -216,6 +216,23 @@ pub enum Action {
         start: MusicalTime,
         end: MusicalTime,
     },
+    /// Move a section with everything in it (clips, automation, tempo,
+    /// signatures, markers) so that it starts at `to`, or insert a copy
+    /// there (`copy`). The material in between closes up or makes room.
+    MoveSection {
+        section: faderframe_core::SectionId,
+        to: MusicalTime,
+        copy: bool,
+    },
+    /// A copy of the section with its content right after it.
+    DuplicateSection(faderframe_core::SectionId),
+    /// Swap a section (with content) with the one before or after it.
+    SwapSection {
+        section: faderframe_core::SectionId,
+        later: bool,
+    },
+    /// Remove a section and everything in it; what follows moves up.
+    DeleteSectionContent(faderframe_core::SectionId),
     /// A tempo change at this position (keeping the tempo there).
     AddTempoPoint(MusicalTime),
     /// Move tempo point `index` and set its tempo.
@@ -2113,6 +2130,10 @@ impl Session {
             Action::AddSection { start, end } => {
                 self.add_section(start, end)?;
             }
+            Action::MoveSection { section, to, copy } => self.move_section(section, to, copy)?,
+            Action::DuplicateSection(section) => self.duplicate_section(section)?,
+            Action::SwapSection { section, later } => self.swap_section(section, later)?,
+            Action::DeleteSectionContent(section) => self.delete_section_content(section)?,
             Action::AddTempoPoint(at) => self.add_tempo_point(at)?,
             Action::SetTempoPoint {
                 index,

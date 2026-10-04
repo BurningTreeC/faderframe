@@ -73,6 +73,12 @@ pub(crate) enum GlobalDrag {
         grab: MusicalTime,
         origin: Point,
         moved: bool,
+        /// Dragging the body moves the section with its content (`to`: the
+        /// drop point; `copy`: Ctrl, insert a copy); Shift, or an edge,
+        /// only moves or resizes the section itself.
+        content: bool,
+        to: Option<MusicalTime>,
+        copy: bool,
     },
     Tempo {
         index: usize,
@@ -232,6 +238,36 @@ impl ArrangerView {
             p.pop_clip();
             p.hline(0.0, size.w, y + h - 0.5, a.header_border);
         }
+        // Where a section dragged with its content goes.
+        if let Some(GlobalDrag::Section { to: Some(to), .. }) = &self.global_drag
+            && let Some(top) = self.lane_rect(GlobalLane::Arranger, size).map(|r| r.y)
+        {
+            let x = self.x_of(*to);
+            if x >= self.header_w() {
+                p.fill(Rect::new(x - 1.0, top, 2.0, size.h - top), th.ui.accent);
+            }
+        }
+    }
+
+    /// Where a section dropped at `t` goes: the nearest section boundary
+    /// within reach, else the nearest bar line.
+    fn section_drop(&self, model: &Session, t: MusicalTime) -> MusicalTime {
+        let p = model.project();
+        let x = self.x_of(t);
+        let near = p
+            .sections
+            .iter()
+            .flat_map(|s| [s.start, s.end])
+            .map(|b| ((self.x_of(b) - x).abs(), b))
+            .filter(|(d, _)| *d <= 16.0)
+            .min_by(|a, b| a.0.total_cmp(&b.0));
+        if let Some((_, b)) = near {
+            return b;
+        }
+        let meter = &p.timeline.meter;
+        let bar = meter.bar_at(t);
+        let (a, b) = (meter.bar_start(bar), meter.bar_start(bar + 1));
+        if t - a <= b - t { a } else { b }
     }
 
     fn paint_markers(&self, p: &mut dyn Painter, r: Rect, model: &Session) {
@@ -260,19 +296,39 @@ impl ArrangerView {
 
     fn paint_sections(&self, p: &mut dyn Painter, r: Rect, model: &Session) {
         let th = &self.theme;
-        let mut sections: Vec<Section> = model.project().sections.clone();
-        if let Some(GlobalDrag::Section { section, .. }) = &self.global_drag
-            && let Some(s) = sections.iter_mut().find(|s| s.id == section.id)
+        let mut sections: Vec<(Section, f32)> = model
+            .project()
+            .sections
+            .iter()
+            .map(|s| (s.clone(), 0.85))
+            .collect();
+        if let Some(GlobalDrag::Section {
+            section,
+            moved,
+            content,
+            copy,
+            ..
+        }) = &self.global_drag
+            && let Some(i) = sections.iter().position(|(s, _)| s.id == section.id)
         {
-            *s = section.clone();
+            if !*content {
+                sections[i].0 = section.clone();
+            } else if *moved {
+                // The section stays (dimmed unless copied); a ghost follows
+                // the pointer.
+                if !*copy {
+                    sections[i].1 = 0.35;
+                }
+                sections.push((section.clone(), 0.6));
+            }
         }
-        for s in &sections {
+        for (s, alpha) in &sections {
             let rr = self.section_name_rect(s, r);
             if rr.right() < r.x || rr.x > r.right() {
                 continue;
             }
             let c = Color::rgb8(s.color.r, s.color.g, s.color.b);
-            p.fill_rounded(rr, 3.0, &Paint::Solid(c.with_alpha(0.85)));
+            p.fill_rounded(rr, 3.0, &Paint::Solid(c.with_alpha(*alpha)));
             p.stroke_rounded(rr, 3.0, 1.0, c.lighten(0.25));
             let text = Rect::new(
                 rr.x.max(r.x) + 6.0,
@@ -452,6 +508,9 @@ impl ArrangerView {
                         grab: self.time_at(pos.x),
                         origin: pos,
                         moved: false,
+                        content: part == SectionPart::Body && !mods.shift,
+                        to: None,
+                        copy: false,
                     });
                 }
             }
@@ -539,6 +598,9 @@ impl ArrangerView {
                 grab,
                 origin,
                 moved,
+                content,
+                to,
+                copy,
             } => {
                 if *moved || pos.distance(*origin) >= DRAG_THRESHOLD {
                     *moved = true;
@@ -546,6 +608,13 @@ impl ArrangerView {
                     else {
                         return true;
                     };
+                    if *content {
+                        *copy = mods.ctrl;
+                        let drop = self.section_drop(model, t_at);
+                        // Onto itself: nothing to move (a copy may go anywhere).
+                        *to = (*copy || drop < orig.start || drop > orig.end).then_some(drop);
+                        cx.set_cursor(Cursor::Grabbing);
+                    }
                     match part {
                         SectionPart::Body => {
                             let len = orig.end - orig.start;
@@ -637,11 +706,24 @@ impl ArrangerView {
                     cx.emit(Action::Transport(TransportAction::Locate(anchor)));
                 }
             }
-            GlobalDrag::Section { section, moved, .. } => {
-                if moved {
-                    cx.emit(Action::Edit(Command::UpdateSection { section }));
-                } else {
+            GlobalDrag::Section {
+                section,
+                moved,
+                content,
+                to,
+                copy,
+                ..
+            } => {
+                if !moved {
                     cx.emit(Action::Transport(TransportAction::Locate(section.start)));
+                } else if !content {
+                    cx.emit(Action::Edit(Command::UpdateSection { section }));
+                } else if let Some(to) = to {
+                    cx.emit(Action::MoveSection {
+                        section: section.id,
+                        to,
+                        copy,
+                    });
                 }
             }
             GlobalDrag::Tempo {
@@ -740,13 +822,47 @@ impl ArrangerView {
                         .checked(s.color == *c),
                     );
                 }
+                let i = p.sections.iter().position(|x| x.id == id).unwrap_or(0);
+                let earlier = MenuItem::new(
+                    "Move Earlier",
+                    Action::SwapSection {
+                        section: id,
+                        later: false,
+                    },
+                )
+                .separated();
+                let later = MenuItem::new(
+                    "Move Later",
+                    Action::SwapSection {
+                        section: id,
+                        later: true,
+                    },
+                );
+                items.push(if i == 0 {
+                    MenuItem::disabled("Move Earlier").separated()
+                } else {
+                    earlier
+                });
+                items.push(if i + 1 >= p.sections.len() {
+                    MenuItem::disabled("Move Later")
+                } else {
+                    later
+                });
+                items.push(MenuItem::new(
+                    "Duplicate Section",
+                    Action::DuplicateSection(id),
+                ));
                 items.push(
                     MenuItem::new(
-                        "Delete Section",
-                        Action::Edit(Command::RemoveSection { section: id }),
+                        "Delete Section with Content",
+                        Action::DeleteSectionContent(id),
                     )
                     .separated(),
                 );
+                items.push(MenuItem::new(
+                    "Remove Section (Keep Content)",
+                    Action::Edit(Command::RemoveSection { section: id }),
+                ));
                 HostRequest::ContextMenu { at: pos, items }
             }
             GlobalHit::Signature(bar) => Self::signature_menu(model, bar, true, pos),
@@ -960,7 +1076,7 @@ impl ArrangerView {
                 let s = p.sections.iter().find(|s| s.id == id)?;
                 match part {
                     SectionPart::Body => format!(
-                        "{} · {} – {} · Drag to move · Double-click to rename · Right-click for colour, loop, delete",
+                        "{} · {} – {} · Drag to move with its content (Ctrl: copy, Shift: the section only) · Double-click to rename · Right-click for more",
                         s.name,
                         format_bbt(&p.timeline, s.start),
                         format_bbt(&p.timeline, s.end)

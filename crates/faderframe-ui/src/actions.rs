@@ -673,6 +673,10 @@ pub fn install(app: &Rc<AppState>) {
                 });
             }
         }),
+        // `move-section:<n>@<quarters>` / `copy-section:<n>@<quarters>`:
+        // section number n (0-based) with its content.
+        named("move-section", |a, arg| section_op(a, arg, false)),
+        named("copy-section", |a, arg| section_op(a, arg, true)),
         named("add-tempo", |a, arg| {
             if let Ok(q) = arg.parse::<f64>() {
                 a.dispatch(Action::AddTempoPoint(
@@ -1008,4 +1012,22 @@ pub fn install_window_keys(app: &Rc<AppState>, window: &impl IsA<gtk::Widget>) {
         glib::Propagation::Stop
     });
     window.add_controller(keys);
+}
+
+/// `<n>@<quarters>`: move (or copy) section n with its content there.
+fn section_op(app: &Rc<AppState>, arg: &str, copy: bool) {
+    let Some((n, at)) = arg.split_once('@') else {
+        return tracing::warn!("section: expected <n>@<quarters>, got '{arg}'");
+    };
+    let (Ok(n), Ok(at)) = (n.parse::<usize>(), at.parse::<f64>()) else {
+        return tracing::warn!("section: expected <n>@<quarters>, got '{arg}'");
+    };
+    let section = app.session.borrow().project().sections.get(n).map(|s| s.id);
+    if let Some(section) = section {
+        app.dispatch(Action::MoveSection {
+            section,
+            to: faderframe_timeline::MusicalTime::from_quarters(at),
+            copy,
+        });
+    }
 }

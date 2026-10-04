@@ -926,12 +926,23 @@ the event loop. DAW work surfaces are **custom-rendered views**:
 The arranger has **global lanes** under the ruler (shown or hidden from
 their titles): markers (double-click adds, drag moves, double-click
 renames, click locates), the arranger lane of sections (drag to create;
-move, resize, rename, recolour, loop or select a section's range), time
+resize, rename, recolour, loop or select a section's range; drag a section
+to move it with its content, Ctrl-drag to copy, Shift-drag to move only
+the section; menu: duplicate, earlier, later, delete with content), time
 signature changes (pick from a menu or type, per bar) and the tempo map
 (points dragged up/down for the tempo and sideways for the position, typed
 values, step or ramp to the next point). Marker and section edits are
 commands; tempo edits replace the timeline (`SetTimeline`), merged into one
-undo step per drag. The horizontal scroll position is an `f64`, so the
+undo step per drag. Section rearrangements (`faderframe_project::arrange`)
+are built from three operations on a time span — copy it with
+everything in it, cut it out (later material moves up), open it (later
+material moves back) — over clips (split at the edges; audio ends within a
+millisecond of a bar line count as on it), automation (values kept on
+both sides of a cut), tempo points (repeats dropped), time-signature
+changes (whole bars), markers, sections and the loop and punch ranges
+(which grow when material goes in at their start). The session computes
+the result on a copy of the project and applies it as one
+`Command::SetArrangement`, whose inverse is the previous arrangement. The horizontal scroll position is an `f64`, so the
 arranger zooms down to single samples anywhere in a long project; there it
 draws the samples themselves and the Pencil redraws them. Track colours
 come from the palette or a colour chooser (click a track's colour stripe in
@@ -1207,8 +1218,8 @@ levels with K-System scales, phase, spectrum).
 Editing: Pro Tools-style edit modes and tools, edit-selection ranges, clip
 gain, shaped fades, transient detection, warp markers and pitch-preserving
 playback, sample-level waveform redraw, global lanes for markers, song
-sections, time signatures and the tempo map, and track colours from a
-colour chooser.
+sections (moved, copied and deleted with their content), time signatures
+and the tempo map, and track colours from a colour chooser.
 
 Shell: docking and detaching, workspaces (Recording, Editing, Mixing,
 MIDI, Mastering), seven skins switched live, performance meter,
@@ -1217,18 +1228,15 @@ and packages for all three platforms (see §14).
 
 **Next**, roughly in order:
 
-1. **Arrangement editing with sections**: move, copy and delete sections
-   *with their content* (clips, automation, tempo), the way the arranger
-   lane is used for song structure.
-2. **Mastering**: offline loudness analysis per song and loudness
+1. **Mastering**: offline loudness analysis per song and loudness
    normalisation on export, dithering and true-peak limiting for delivery
    formats, an album/sequence view.
-3. **Ports**: the CoreAudio IO workgroup for DSP workers, signed and
+2. **Ports**: the CoreAudio IO workgroup for DSP workers, signed and
    notarised packages, a Flathub submission (vendored crates).
-4. **Plugins**: note expressions (CLAP, VST3), VST3 program lists and
+3. **Plugins**: note expressions (CLAP, VST3), VST3 program lists and
    64-bit processing, sandboxed plugins (out-of-process with shared-memory
    audio), SysEx to plugins.
-5. **MIDI**: MTC output, varispeed chase without a shared word clock.
-6. **Performance**: anticipative processing of tracks that are not
+4. **MIDI**: MTC output, varispeed chase without a shared word clock.
+5. **Performance**: anticipative processing of tracks that are not
    monitored live, job affinity for cache locality, an optional wgpu
    painter for dense views.

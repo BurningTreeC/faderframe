@@ -345,6 +345,12 @@ pub enum Command {
     SetTimeline {
         timeline: Box<Timeline>,
     },
+    /// Replace everything that lives in time (clips, automation, tempo and
+    /// meter, markers, sections, loop and punch) at once: section moves,
+    /// copies and deletes (see [`crate::arrange`]).
+    SetArrangement {
+        arrangement: Box<crate::arrange::Arrangement>,
+    },
     /// Set (`Some`) or remove (`None`) the time signature change at `bar`.
     SetTimeSignature {
         bar: i32,
@@ -573,6 +579,7 @@ impl Command {
             UpdateNote { .. } => "Edit Note".into(),
             SetTempo { .. } => "Change Tempo".into(),
             SetTimeline { .. } => "Change Tempo Map".into(),
+            SetArrangement { .. } => "Rearrange".into(),
             SetTimeSignature { .. } => "Change Time Signature".into(),
             SetLoop { .. } => "Change Loop".into(),
             SetPunch { .. } => "Change Punch Range".into(),
@@ -657,6 +664,7 @@ impl Command {
             | UpdateNote { .. }
             | SetTempo { .. }
             | SetTimeline { .. }
+            | SetArrangement { .. }
             | SetTimeSignature { .. }
             | SetLoop { .. } => Impact::Timeline,
             SetTrackRecordArm { .. }
@@ -1362,6 +1370,9 @@ impl Command {
                     timeline: Box::new(old),
                 }
             }
+            SetArrangement { arrangement } => SetArrangement {
+                arrangement: Box::new(arrangement.swap_into(p)),
+            },
             SetLoop { range, enabled } => {
                 let old_range = std::mem::replace(&mut p.loop_range, range);
                 let old_enabled =

@@ -48,9 +48,15 @@ Contrast:
 * Global lanes under the ruler (click a lane's title to show or hide
   lanes): **markers** (double-click to add, drag to move, double-click to
   rename, click to jump there), the **arranger** lane for song sections
-  (drag to create Intro, Verse, Chorus …; move, resize, rename, recolour,
-  loop or select a section), **time signature** changes and the **tempo**
-  map (drag points up and down or sideways, type values, steps or ramps).
+  (drag to create Intro, Verse, Chorus …; resize, rename, recolour, loop or
+  select a section), **time signature** changes and the **tempo** map (drag
+  points up and down or sideways, type values, steps or ramps).
+* Song arrangement with sections: drag a section to move it *with its
+  content* — clips (split at its edges), automation, tempo and time
+  signature changes, markers — and the song closes up and makes room
+  around it; Ctrl-drag inserts a copy, Shift-drag moves only the section.
+  The section menu duplicates a section, moves it earlier or later, or
+  deletes it with its content. Each is one undo step.
 * Track colours: click a track's colour stripe (arranger) or colour bar
   (mixer) for a colour chooser, or pick from the palette in the track menu.
 * Pro-style editing, with an edit toolbar under the transport (Edit button

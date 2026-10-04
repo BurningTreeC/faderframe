@@ -4,7 +4,7 @@
 
 use crate::{Result, Session, SessionError};
 use faderframe_core::{MarkerId, SectionId};
-use faderframe_project::{Command, Marker, Section, TrackColor};
+use faderframe_project::{Command, Marker, Project, Section, TrackColor, arrange};
 use faderframe_timeline::{MusicalTime, TempoCurve, TempoMap, TempoPoint};
 
 /// One of the lanes under the arranger's ruler.
@@ -145,6 +145,83 @@ impl Session {
     }
 
     /// A tempo change at `at`, keeping the tempo there.
+    /// Apply a rearrangement computed on a copy of the project as one undo
+    /// step (`f` returns false when nothing changes).
+    fn rearrange(&mut self, label: &str, f: impl FnOnce(&mut Project) -> bool) -> Result<()> {
+        let mut copy = self.project.clone();
+        if !f(&mut copy) {
+            return Ok(());
+        }
+        let arrangement = arrange::Arrangement::of(&copy);
+        // Clips were split and renumbered.
+        self.selection.clips.clear();
+        self.selection.range = None;
+        self.batch(
+            label,
+            vec![Command::SetArrangement {
+                arrangement: Box::new(arrangement),
+            }],
+        )
+    }
+
+    pub(crate) fn move_section(
+        &mut self,
+        id: SectionId,
+        to: MusicalTime,
+        copy: bool,
+    ) -> Result<()> {
+        if copy {
+            self.rearrange("Copy Section", |p| {
+                arrange::copy_section(p, id, to).is_some()
+            })
+        } else {
+            self.rearrange("Move Section", |p| arrange::move_section(p, id, to))
+        }
+    }
+
+    pub(crate) fn duplicate_section(&mut self, id: SectionId) -> Result<()> {
+        let Some(end) = self
+            .project
+            .sections
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.end)
+        else {
+            return Ok(());
+        };
+        self.rearrange("Duplicate Section", |p| {
+            arrange::copy_section(p, id, end).is_some()
+        })
+    }
+
+    /// Swap with the neighbouring section (the one before or after it).
+    pub(crate) fn swap_section(&mut self, id: SectionId, later: bool) -> Result<()> {
+        let sections = &self.project.sections;
+        let Some(i) = sections.iter().position(|s| s.id == id) else {
+            return Ok(());
+        };
+        let to = if later {
+            sections.get(i + 1).map(|n| n.end)
+        } else {
+            i.checked_sub(1).map(|j| sections[j].start)
+        };
+        let Some(to) = to else {
+            return Ok(());
+        };
+        self.rearrange(
+            if later {
+                "Move Section Later"
+            } else {
+                "Move Section Earlier"
+            },
+            |p| arrange::move_section(p, id, to),
+        )
+    }
+
+    pub(crate) fn delete_section_content(&mut self, id: SectionId) -> Result<()> {
+        self.rearrange("Delete Section", |p| arrange::delete_section(p, id))
+    }
+
     pub(crate) fn add_tempo_point(&mut self, at: MusicalTime) -> Result<()> {
         let bpm = self.project.timeline.tempo.bpm_at(at);
         self.edit_tempo(|t| {
