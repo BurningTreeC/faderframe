@@ -417,7 +417,8 @@ mod tests {
         assert_eq!(wait_readable(r.as_raw_fd(), None), Ready::Woken);
         assert!(drain(r.as_raw_fd()));
         drop(w);
-        assert_eq!(wait_readable(r.as_raw_fd(), None), Ready::HungUp);
-        assert!(!drain(r.as_raw_fd()));
+        // At the end of the stream Linux reports a hang-up, macOS a
+        // readable descriptor (that reads nothing): a hang-up either way.
+        assert_eq!(Waiter(r).wait(None), Ready::HungUp);
     }
 }

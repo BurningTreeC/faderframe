@@ -466,7 +466,10 @@ impl Helper {
                 return (resp, Vec::new());
             }
             EditorCall::Close => {
-                ed.close();
+                // Already closed when the user closed our window.
+                if ed.is_open() {
+                    ed.close();
+                }
                 self.window = None;
                 return (Response::Done, Vec::new());
             }

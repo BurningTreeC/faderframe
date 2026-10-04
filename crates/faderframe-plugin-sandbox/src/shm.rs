@@ -279,6 +279,9 @@ impl Block {
 
     /// The helper's side: open the block `name` of `size` bytes.
     pub fn open(name: &str, size: usize) -> io::Result<Self> {
+        if size < header_size() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "not a block"));
+        }
         let shm = Shm::open(name, size)?;
         let h = shm.ptr().cast::<Header>();
         // SAFETY: the mapping holds at least a header (checked by size).
@@ -289,7 +292,7 @@ impl Block {
                 addr_of!((*h).max_frames).read_volatile() as usize,
             )
         };
-        if size < header_size() || magic != MAGIC || version != VERSION {
+        if magic != MAGIC || version != VERSION {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "not a block"));
         }
         if block_size(max_frames) > size {
