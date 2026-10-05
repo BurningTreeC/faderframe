@@ -1,6 +1,7 @@
 //! Engine-specific graph processors.
 
 mod clip_player;
+mod crosstalk;
 mod io;
 mod midi_player;
 mod plugin;
@@ -8,6 +9,7 @@ mod send;
 mod strip;
 
 pub use clip_player::{AudioClipPlayer, StretchVoices};
+pub use crosstalk::Crosstalk;
 pub use io::{DeviceInputTap, DeviceOutputSink, MonitorGate};
 pub use midi_player::MidiClipPlayer;
 pub use plugin::PluginNode;

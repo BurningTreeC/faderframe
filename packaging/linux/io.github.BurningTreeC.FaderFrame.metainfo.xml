@@ -67,6 +67,18 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.5.0" date="2026-10-05">
+      <description>
+        <p>Mixer editing, analogue crosstalk and reliable transport shortcuts.</p>
+        <ul>
+          <li>Reorder mixer tracks by dragging their name labels and resize loops by dragging either edge.</li>
+          <li>Newly chosen instruments appear in the visible plugin insert chain.</li>
+          <li>Show both EQ meter bars on mono tracks.</li>
+          <li>Optional project-wide analogue crosstalk between neighbouring mixer channels.</li>
+          <li>Space controls playback and stops recording before focused GTK buttons can consume it, while preserving text input.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.4.0" date="2026-10-05">
       <description>
         <p>Factory presets and smoother playback.</p>

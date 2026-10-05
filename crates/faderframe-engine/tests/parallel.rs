@@ -9,7 +9,8 @@ use std::sync::Arc;
 #[test]
 fn demo_renders_bit_identically_in_parallel() {
     const SR: u32 = 48_000;
-    let project = demo_project(SR);
+    let mut project = demo_project(SR);
+    project.crosstalk = true;
     let sources = render_generated_sources(&project, SR);
     let config = EngineConfig {
         sample_rate: SR,

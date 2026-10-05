@@ -522,13 +522,14 @@ fn engine_page(app: &Rc<AppState>) -> gtk::Widget {
 
 fn project_page(app: &Rc<AppState>) -> gtk::Widget {
     let g = form();
-    let (name, bpm, rate) = {
+    let (name, bpm, rate, crosstalk) = {
         let s = app.session.borrow();
         let p = s.project();
         (
             p.name.clone(),
             p.timeline.tempo.points()[0].bpm,
             p.sample_rate,
+            p.crosstalk,
         )
     };
     let name_entry = gtk::Entry::new();
@@ -548,6 +549,18 @@ fn project_page(app: &Rc<AppState>) -> gtk::Widget {
         2,
         1,
     );
+    let leakage = gtk::CheckButton::with_label("Enable between neighbouring channels");
+    leakage.set_active(crosstalk);
+    leakage.set_tooltip_text(Some("Subtle analogue leakage between adjacent audio and instrument tracks in mixer order. Saved with this project."));
+    row(&g, 4, "Analogue crosstalk", &leakage);
+    let weak = Rc::downgrade(app);
+    leakage.connect_toggled(move |button| {
+        if let Some(app) = weak.upgrade() {
+            app.dispatch(Action::Edit(Command::SetCrosstalk {
+                enabled: button.is_active(),
+            }));
+        }
+    });
     let weak = Rc::downgrade(app);
     name_entry.connect_activate(move |e| {
         if let Some(app) = weak.upgrade() {

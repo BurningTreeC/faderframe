@@ -951,3 +951,36 @@ fn eq_speed() {
         println!("{name:>32}: {:>7.0}× real time", 10.0 / secs);
     }
 }
+
+#[test]
+fn mono_parametric_eq_publishes_both_meter_channels() {
+    let rig = Rig::new();
+    let mut eq = rig.eq;
+    let mut input = AudioBuffer::new(ChannelLayout::Mono, BLOCK);
+    let mut output = AudioBuffer::new(ChannelLayout::Mono, BLOCK);
+    input.set_len(BLOCK);
+    output.set_len(BLOCK);
+    input.channel_mut(0).fill(0.25);
+    let transport = TransportInfo::default();
+    for _ in 0..40 {
+        eq.process(
+            &PluginProcessContext {
+                transport: &transport,
+                param_events: &[],
+            },
+            &mut NodeIo {
+                frames: BLOCK,
+                audio_in: std::slice::from_ref(&input),
+                audio_out: std::slice::from_mut(&mut output),
+                events_in: &[],
+                events_out: &mut [],
+            },
+        );
+    }
+    for meter in [&rig.tap.meter_in, &rig.tap.meter_out] {
+        assert!(meter.held(0) > 0.2);
+        assert_eq!(meter.held(0), meter.held(1));
+        assert_eq!(meter.mean_square(0), meter.mean_square(1));
+        assert_eq!(meter.figure(0), meter.figure(1));
+    }
+}

@@ -118,7 +118,13 @@ fn compare(a: &Run, b: &Run) -> (usize, usize) {
 
 #[test]
 fn rendered_ahead_sounds_the_same() {
-    let project = project();
+    let mut project = project();
+    project.crosstalk = true;
+    for track in &mut project.tracks {
+        if let Some(instrument) = track.instrument.take() {
+            track.inserts.insert(0, instrument);
+        }
+    }
     let mut plain = Run::new(&project, false);
     let mut ahead = Run::new(&project, true);
     // Everything that can be rendered ahead is: the audio tracks with

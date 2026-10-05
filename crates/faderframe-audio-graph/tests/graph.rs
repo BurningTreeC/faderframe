@@ -363,3 +363,46 @@ fn timings_are_published_per_callback_for_nodes_and_groups() {
         "{gp}"
     );
 }
+
+#[test]
+fn optional_dependencies_are_checked_together_without_mutating_graph() {
+    let mut b = GraphBuilder::<Ctx>::new();
+    let a = bus(&mut b, "A");
+    let c = bus(&mut b, "C");
+    assert!(!b.would_cycle_with(&[(a, c)]).unwrap());
+    assert!(b.would_cycle_with(&[(a, c), (c, a)]).unwrap());
+    assert!(b.would_cycle_with(&[(NodeId(99), a)]).is_err());
+    assert_eq!(b.edge_count(), 0);
+    b.connect_audio(a, 0, c, 0).unwrap();
+    assert!(b.would_cycle_with(&[(c, a)]).unwrap());
+    assert_eq!(b.edge_count(), 1);
+    b.compile(&config(64)).unwrap();
+}
+
+#[test]
+fn audio_summing_order_does_not_depend_on_upstream_chain_depth() {
+    let render = |deep: bool| {
+        let mut b = GraphBuilder::<Ctx>::new();
+        let a = if deep {
+            bus(&mut b, "A")
+        } else {
+            source(&mut b, "A", 1e8)
+        };
+        let neg = source(&mut b, "B", -1e8);
+        let small = source(&mut b, "C", 1.0);
+        let sum = bus(&mut b, "Sum");
+        for input in [a, neg, small] {
+            b.connect_audio(input, 0, sum, 0).unwrap();
+        }
+        if deep {
+            let upstream = source(&mut b, "Upstream", 1e8);
+            b.connect_audio(upstream, 0, a, 0).unwrap();
+        }
+        let mut graph = b.compile(&config(64)).unwrap();
+        run(&mut graph, 64);
+        graph.audio_output(sum, 0).unwrap().channel(0).to_vec()
+    };
+    let shallow = render(false);
+    assert!(shallow.iter().all(|&x| x == 1.0));
+    assert_eq!(shallow, render(true));
+}

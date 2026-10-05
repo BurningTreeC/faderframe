@@ -398,13 +398,19 @@ pub(crate) fn compile<C>(
         groups_of.push(spec.group);
     }
 
-    // Attach edges to their destination nodes (sorted for determinism).
+    // Audio summing follows builder node order, not topological position.
+    // Replacing a plugin chain with a render-ahead reader changes schedule
+    // depth; it must not change floating-point addition order at its strip.
+    // Keep event tie ordering in topological order as before.
     let mut sorted_edges = edges.clone();
     sorted_edges.sort_by_key(|e| {
         (
             position[e.to.0 as usize],
             e.to_port,
-            position[e.from.0 as usize],
+            match e.kind {
+                EdgeKind::Audio => e.from.0,
+                EdgeKind::Events => position[e.from.0 as usize],
+            },
             e.from_port,
         )
     });

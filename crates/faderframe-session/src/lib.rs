@@ -2730,16 +2730,39 @@ impl Session {
                 self.revision += 1;
             }
             Action::SetInstrumentPlugin { track, plugin } => {
-                let slot = plugin.map(|plugin| PluginSlot {
-                    id: self.project.ids.allocate(),
-                    plugin,
-                    bypass: false,
-                    parameters: Vec::new(),
-                    state: None,
-                    sidechain: None,
-                });
-                self.edit(Command::SetInstrument { track, slot })?;
+                let t = self
+                    .project
+                    .track(track)
+                    .ok_or_else(|| SessionError::Other("no track".into()))?;
+                let current = self.instrument_slot(t).map(|s| s.id);
+                let index = current
+                    .and_then(|id| t.inserts.iter().position(|s| s.id == id))
+                    .unwrap_or(0);
+                let mut commands = Vec::new();
+                if t.instrument.is_some() {
+                    commands.push(Command::SetInstrument { track, slot: None });
+                } else if let Some(plugin) = current {
+                    commands.push(Command::RemovePlugin { track, plugin });
+                }
+                if let Some(plugin) = plugin {
+                    let slot = PluginSlot {
+                        id: self.project.ids.allocate(),
+                        plugin,
+                        bypass: false,
+                        parameters: Vec::new(),
+                        state: None,
+                        sidechain: None,
+                    };
+                    commands.push(Command::InsertPlugin { track, index, slot });
+                }
+                if !commands.is_empty() {
+                    self.edit(Command::Batch {
+                        label: "Choose Instrument".into(),
+                        commands,
+                    })?;
+                }
             }
+
             Action::AddTrackFromPreset { path } => {
                 self.add_track_from_preset(&path)?;
             }
@@ -3098,21 +3121,6 @@ impl Session {
     ) -> Result<()> {
         let hosted = plugin.format != faderframe_project::PluginFormat::Builtin
             || faderframe_core::builtin::has_editor(&plugin.id);
-        // An instrument picked for an insert slot of an instrument track
-        // that has none becomes its instrument.
-        let target =
-            match target {
-                PluginTarget::Insert(_)
-                    if self.project.track(track).is_some_and(|t| {
-                        t.kind == TrackKind::Instrument && t.instrument.is_none()
-                    }) && self.available_plugins().iter().any(|p| {
-                        p.plugin.id == plugin.id && p.plugin.format == plugin.format && p.instrument
-                    }) =>
-                {
-                    PluginTarget::Instrument
-                }
-                other => other,
-            };
         match target {
             PluginTarget::Insert(index) => self.dispatch(Action::InsertPlugin {
                 track,
@@ -3134,7 +3142,7 @@ impl Session {
         // Like most DAWs: a newly placed hosted plugin shows its editor.
         let placed = self.project.track(track).and_then(|t| match target {
             PluginTarget::Insert(i) => t.inserts.get(i.min(t.inserts.len().saturating_sub(1))),
-            PluginTarget::Instrument => t.instrument.as_ref(),
+            PluginTarget::Instrument => self.instrument_slot(t),
             PluginTarget::Song(_) => None,
         });
         if hosted && let Some(slot) = placed {
@@ -3250,6 +3258,20 @@ impl Session {
         }
         let (_, s) = self.project.album.insert(plugin)?;
         Some((self.project.master_id()?, s))
+    }
+
+    /// The first instrument plugin in the visible insert chain, with support
+    /// for the separate instrument slot stored by older projects.
+    pub fn instrument_slot<'a>(
+        &self,
+        track: &'a faderframe_project::Track,
+    ) -> Option<&'a PluginSlot> {
+        track.instrument.as_ref().or_else(|| {
+            track
+                .inserts
+                .iter()
+                .find(|s| self.engine.plugin_is_instrument(s.id))
+        })
     }
 
     /// The slot of a plugin instance and its track.
@@ -3368,7 +3390,7 @@ impl Session {
         &self,
         track: TrackId,
     ) -> Option<Vec<faderframe_midi::NoteExpressionKind>> {
-        let slot = self.project.track(track)?.instrument.as_ref()?;
+        let slot = self.instrument_slot(self.project.track(track)?)?;
         self.engine.plugin_note_expressions(slot.id)
     }
 

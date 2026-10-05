@@ -307,11 +307,7 @@ fn stock_device(
             plugin: Some(reference),
         })
         .unwrap();
-        s.project()
-            .track(track)
-            .unwrap()
-            .instrument
-            .as_ref()
+        s.instrument_slot(s.project().track(track).unwrap())
             .unwrap()
             .id
     } else {

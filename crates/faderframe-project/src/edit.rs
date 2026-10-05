@@ -253,6 +253,11 @@ pub enum Command {
         parameters: Vec<crate::SavedParameter>,
     },
 
+    /// Enable analogue crosstalk for adjacent mixer channels.
+    SetCrosstalk {
+        enabled: bool,
+    },
+
     // --- track structure -------------------------------------------------
     AddTrack {
         track: Box<Track>,
@@ -598,6 +603,7 @@ impl Command {
             AddTrack { .. } | RestoreTrack(_) => "Add Track".into(),
             RemoveTrack { .. } => "Remove Track".into(),
             MoveTrack { .. } => "Move Track".into(),
+            SetCrosstalk { .. } => "Analogue Crosstalk".into(),
             AddAutomationLane { .. } => "Add Automation Lane".into(),
             RemoveAutomationLane { .. } => "Remove Automation Lane".into(),
             SetAutomationLane { .. } => "Edit Automation".into(),
@@ -671,7 +677,6 @@ impl Command {
             | SetPluginState { .. } => Impact::Params,
             RenameTrack { .. }
             | SetTrackColor { .. }
-            | MoveTrack { .. }
             | AddMarker { .. }
             | RemoveMarker { .. }
             | UpdateMarker { .. }
@@ -710,7 +715,9 @@ impl Command {
             | SetArrangement { .. }
             | SetTimeSignature { .. }
             | SetLoop { .. } => Impact::Timeline,
-            SetTrackRecordArm { .. }
+            SetCrosstalk { .. }
+            | MoveTrack { .. }
+            | SetTrackRecordArm { .. }
             | SetTrackMonitor { .. }
             | SetTrackMidiOutput { .. }
             | SetTrackMpe { .. }
@@ -1182,6 +1189,10 @@ impl Command {
                     }
                 }
                 RemoveTrack { track: id }
+            }
+            SetCrosstalk { enabled } => {
+                let old = std::mem::replace(&mut p.crosstalk, enabled);
+                SetCrosstalk { enabled: old }
             }
             MoveTrack { track, index } => {
                 let from = p.track_index(track).ok_or(EditError::UnknownTrack(track))?;

@@ -471,7 +471,7 @@ impl CanvasWidget {
             glib::Propagation::Proceed,
             move |_, key, _, state| {
                 let k = map_key(key);
-                // Space is the global transport key; let it bubble.
+                // Space belongs to the window transport controller.
                 if k == Key::Space {
                     return glib::Propagation::Proceed;
                 }

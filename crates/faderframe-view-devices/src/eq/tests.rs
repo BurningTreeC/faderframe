@@ -897,3 +897,33 @@ fn a_peak_of_the_spectrum_is_grabbed_into_a_bell() {
     assert_eq!(s.history().undo_label(), Some("Spectrum Grab"));
     assert!(view.grab.is_none(), "it ends with the drag");
 }
+
+#[test]
+fn mono_display_uses_one_meter_reading_for_both_bars() {
+    for layout in [
+        faderframe_core::ChannelLayout::Mono,
+        faderframe_core::ChannelLayout::Stereo,
+    ] {
+        let (mut s, plugin) = session();
+        let track = s.plugin_slot(plugin).unwrap().0.id;
+        s.dispatch(Action::Edit(faderframe_project::Command::SetTrackLayout {
+            track,
+            layout,
+        }))
+        .unwrap();
+        let tap = s.plugin_tap(plugin).unwrap();
+        // One active channel, as a mono meter publishes. A stereo track
+        // with a silent right side must still show independent bars.
+        tap.meter_out.publish(0, 0.5, 0.125);
+        let mut view = EqView::new(plugin, &Theme::default());
+        view.paint_all(&mut RecordingPainter::new(), SIZE, &s);
+        assert!(view.meter[0] > -7.0);
+        if layout == faderframe_core::ChannelLayout::Mono {
+            assert_eq!(view.meter[0], view.meter[1]);
+            view.paint_all(&mut RecordingPainter::new(), SIZE, &s);
+            assert_eq!(view.meter[0], view.meter[1], "decay is shared too");
+        } else {
+            assert!(view.meter[1] < -100.0);
+        }
+    }
+}

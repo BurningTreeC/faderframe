@@ -421,6 +421,12 @@ impl PluginHost {
         self.instances.get(&plugin)?.instance.note_expressions()
     }
 
+    pub fn is_instrument(&self, plugin: PluginInstanceId) -> bool {
+        self.instances.get(&plugin).is_some_and(|h| {
+            h.instance.descriptor().category == faderframe_plugin_host::PluginCategory::Instrument
+        })
+    }
+
     pub fn latency(&self, plugin: PluginInstanceId) -> Option<u32> {
         self.instances
             .get(&plugin)

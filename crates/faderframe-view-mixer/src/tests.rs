@@ -647,3 +647,68 @@ fn inserts_drag_to_reorder_copy_and_alt_click_removes() {
     }
     assert!(names(&s, bass).is_empty());
 }
+
+#[test]
+fn dragging_bottom_names_reorders_tracks_once_and_preserves_contents() {
+    let mut s = session();
+    let mut view = MixerView::new(Theme::default());
+    let size = Size::new(1400.0, 900.0);
+    let channels = MixerView::channel_tracks(&s);
+    let a = channels[0].id;
+    let b = channels[1].id;
+    let original = s.project().tracks.clone();
+    let clips = s.project().clips.clone();
+    let from = view.layout_of(&s, a, size).unwrap().scribble.center();
+    let to = view.layout_of(&s, b, size).unwrap().scribble.center();
+    for action in press_drag_release(&mut view, &s, size, from, to, Modifiers::NONE) {
+        s.dispatch(action).unwrap();
+    }
+    assert_eq!(MixerView::channel_tracks(&s)[0].id, b);
+    assert_eq!(MixerView::channel_tracks(&s)[1].id, a);
+    assert_eq!(s.project().clips, clips);
+    assert_eq!(s.project().track(a), original.iter().find(|t| t.id == a));
+    s.dispatch(Action::Undo).unwrap();
+    assert_eq!(s.project().tracks, original);
+    let actions = press_drag_release(&mut view, &s, size, from, from, Modifiers::NONE);
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, Action::Edit(Command::MoveTrack { .. })))
+    );
+    let (_, req) = run(&mut view, down(from, 2), size, &s);
+    assert!(
+        req.iter()
+            .any(|r| matches!(r, HostRequest::TextInput { .. }))
+    );
+}
+
+#[test]
+fn track_drop_uses_visible_order_with_hidden_midi_tracks_and_a_pinned_master() {
+    let mut s = session();
+    let hidden = s.add_track(TrackKind::Midi).unwrap();
+    s.dispatch(Action::Edit(Command::MoveTrack {
+        track: hidden,
+        index: 1,
+    }))
+    .unwrap();
+    let mut view = MixerView::new(Theme::default());
+    let size = Size::new(1400.0, 900.0);
+    let a = MixerView::channel_tracks(&s)[0].id;
+    let b = MixerView::channel_tracks(&s)[1].id;
+    let from = view.layout_of(&s, b, size).unwrap().scribble.center();
+    let to = Point::new(view.cheek() + 1.0, from.y);
+    for action in press_drag_release(&mut view, &s, size, from, to, Modifiers::NONE) {
+        s.dispatch(action).unwrap();
+    }
+    assert_eq!(MixerView::channel_tracks(&s)[0].id, b);
+    assert_eq!(MixerView::channel_tracks(&s)[1].id, a);
+    assert!(s.project().track(hidden).is_some());
+    let master = s.project().master_id().unwrap();
+    let from = view.layout_of(&s, master, size).unwrap().scribble.center();
+    let actions = press_drag_release(&mut view, &s, size, from, to, Modifiers::NONE);
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, Action::Edit(Command::MoveTrack { .. })))
+    );
+}

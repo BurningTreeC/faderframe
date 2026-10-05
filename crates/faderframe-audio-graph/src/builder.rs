@@ -234,6 +234,29 @@ impl<C> GraphBuilder<C> {
         })
     }
 
+    /// Check prospective dependencies together, without changing this graph.
+    /// Used for optional connections that must not introduce feedback.
+    pub fn would_cycle_with(&self, connections: &[(NodeId, NodeId)]) -> Result<bool, GraphError> {
+        for &(from, to) in connections {
+            for id in [from, to] {
+                if self.spec(id).is_none() {
+                    return Err(GraphError::UnknownNode(id));
+                }
+            }
+        }
+        let edges: Vec<_> = self
+            .edges
+            .iter()
+            .map(|e| (e.from.0 as usize, e.to.0 as usize))
+            .chain(
+                connections
+                    .iter()
+                    .map(|(a, b)| (a.0 as usize, b.0 as usize)),
+            )
+            .collect();
+        Ok(crate::topology::topological_order(self.nodes.len(), &edges).is_err())
+    }
+
     /// Validate, order, latency-compensate and allocate (control thread).
     ///
     /// Calls `prepare` on every processor. On a cycle the error lists the

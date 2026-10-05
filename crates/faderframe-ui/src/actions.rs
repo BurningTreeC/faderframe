@@ -226,11 +226,12 @@ pub fn install(app: &Rc<AppState>) {
                     )
                     .next()
                     .map(|t| {
-                        let target = if t.kind == TrackKind::Instrument && t.instrument.is_none() {
-                            faderframe_session::PluginTarget::Instrument
-                        } else {
-                            faderframe_session::PluginTarget::Insert(t.inserts.len())
-                        };
+                        let target =
+                            if t.kind == TrackKind::Instrument && s.instrument_slot(t).is_none() {
+                                faderframe_session::PluginTarget::Instrument
+                            } else {
+                                faderframe_session::PluginTarget::Insert(t.inserts.len())
+                            };
                         (t.id, target)
                     })
             };
@@ -443,7 +444,7 @@ pub fn install(app: &Rc<AppState>) {
                     .iter()
                     .filter_map(|t| p.track(*t))
                     .chain(p.tracks.iter())
-                    .find_map(|t| t.instrument.as_ref().map(|i| (t.id, i.id)))
+                    .find_map(|t| s.instrument_slot(t).map(|i| (t.id, i.id)))
             };
             match found {
                 Some((track, plugin)) => a.dispatch(Action::OpenPluginEditor {
@@ -1386,8 +1387,8 @@ pub fn install(app: &Rc<AppState>) {
     }
 }
 
-/// Single-key transport shortcuts, handled in the bubble phase so focused
-/// text fields always get their keys first.
+/// Remaining single-key shortcuts run after focused widgets. Space is
+/// captured separately by `transport_keys` before GTK button activation.
 pub fn install_window_keys(app: &Rc<AppState>, window: &impl IsA<gtk::Widget>) {
     let keys = gtk::EventControllerKey::new();
     keys.set_propagation_phase(gtk::PropagationPhase::Bubble);
@@ -1409,7 +1410,6 @@ pub fn install_window_keys(app: &Rc<AppState>, window: &impl IsA<gtk::Widget>) {
             return glib::Propagation::Stop;
         }
         let action = match key {
-            gdk::Key::space => TransportAction::TogglePlay,
             gdk::Key::Home => TransportAction::ReturnToStart,
             gdk::Key::l | gdk::Key::L if !shift => TransportAction::ToggleLoop,
             gdk::Key::k | gdk::Key::K | gdk::Key::KP_7 | gdk::Key::KP_Home if !shift => {

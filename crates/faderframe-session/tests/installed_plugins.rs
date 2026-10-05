@@ -131,7 +131,7 @@ fn instruments_play_live_midi_as_instrument_or_insert() {
             )
             .unwrap();
             // A new instrument track has no instrument; the synth chosen for
-            // its first insert slot becomes the instrument.
+            // its first insert slot remains visible in the insert chain.
             let t = s
                 .add_track(faderframe_project::TrackKind::Instrument)
                 .unwrap();
@@ -139,7 +139,7 @@ fn instruments_play_live_midi_as_instrument_or_insert() {
             s.place_plugin(t, PluginTarget::Insert(0), pref.clone())
                 .unwrap();
             let track = s.project().track(t).unwrap();
-            assert!(track.instrument.is_some() && track.inserts.is_empty());
+            assert!(track.instrument.is_none() && track.inserts.len() == 1);
             // The selected instrument track plays the keyboard.
             run(&mut s, 0.3);
             s.midi_keyboard().send(&[0x90, 60, 110]);

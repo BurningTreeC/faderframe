@@ -1090,3 +1090,62 @@ fn the_chord_and_key_lanes_take_typed_chords_moves_and_keys() {
     s.dispatch(Action::Undo).unwrap();
     assert_eq!(s.project().chords[0].chord.name(false), "Am7");
 }
+
+#[test]
+fn both_loop_edges_resize_without_toggling_and_undo_as_one_gesture() {
+    let mut s = session();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 900.0);
+    let q = MusicalTime::from_quarters_i;
+    let range = MusicalRange::new(q(4), q(12)).unwrap();
+    s.dispatch(Action::Transport(TransportAction::SetLoop(Some(range))))
+        .unwrap();
+    let enabled = s.project().loop_enabled;
+    for (left, target) in [(true, 2), (true, 6), (false, 16), (false, 8)] {
+        let from = Point::new(view.x_of(if left { range.start } else { range.end }), 5.0);
+        let to = Point::new(view.x_of(q(target)), 5.0);
+        assert_eq!(
+            view.hit_test(from, size, &s),
+            Some(if left { Hit::LoopStart } else { Hit::LoopEnd })
+        );
+        for ev in [
+            down(from),
+            mv(Point::new((from.x + to.x) / 2.0, 5.0)),
+            mv(to),
+            up(to),
+        ] {
+            for action in run(&mut view, ev, size, &s).0 {
+                s.dispatch(action).unwrap();
+            }
+        }
+        let resized = s.project().loop_range.unwrap();
+        assert_eq!(
+            Some(resized),
+            if left {
+                MusicalRange::new(q(target), range.end)
+            } else {
+                MusicalRange::new(range.start, q(target))
+            }
+        );
+        assert_eq!(s.project().loop_enabled, enabled);
+        s.dispatch(Action::Undo).unwrap();
+        assert_eq!(s.project().loop_range, Some(range));
+    }
+    let from = Point::new(view.x_of(range.start), 5.0);
+    for ev in [down(from), up(from)] {
+        for action in run(&mut view, ev, size, &s).0 {
+            s.dispatch(action).unwrap();
+        }
+    }
+    assert_eq!(s.project().loop_enabled, enabled);
+    // Edges cannot cross; the untouched end stays fixed.
+    let to = Point::new(view.x_of(q(20)), 5.0);
+    for ev in [down(from), mv(to), up(to)] {
+        for action in run(&mut view, ev, size, &s).0 {
+            s.dispatch(action).unwrap();
+        }
+    }
+    let resized = s.project().loop_range.unwrap();
+    assert_eq!(resized.end, range.end);
+    assert!(resized.start < resized.end);
+}

@@ -73,6 +73,12 @@ enum KnobTarget {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Drag {
+    Track {
+        track: TrackId,
+        origin: Point,
+        pos: Point,
+        moved: bool,
+    },
     Fader {
         track: TrackId,
         start_y: f32,
@@ -1000,7 +1006,7 @@ impl MixerView {
                     "Browse Plugins…",
                     Action::OpenPluginBrowser {
                         track: t.id,
-                        target: match Self::empty_slot_target(t) {
+                        target: match Self::empty_slot_target(model, t) {
                             faderframe_session::PluginTarget::Insert(_) => {
                                 faderframe_session::PluginTarget::Insert(slot.min(t.inserts.len()))
                             }
@@ -1303,8 +1309,8 @@ impl MixerView {
 
     /// What an empty insert slot offers: the instrument for an instrument
     /// track that has none, else the next insert.
-    fn empty_slot_target(t: &Track) -> faderframe_session::PluginTarget {
-        if t.kind == TrackKind::Instrument && t.instrument.is_none() {
+    fn empty_slot_target(model: &Session, t: &Track) -> faderframe_session::PluginTarget {
+        if t.kind == TrackKind::Instrument && model.instrument_slot(t).is_none() {
             faderframe_session::PluginTarget::Instrument
         } else {
             faderframe_session::PluginTarget::Insert(t.inserts.len())
@@ -1327,6 +1333,43 @@ impl MixerView {
             .into_iter()
             .find(|(_, t)| t.id == id)
             .map(|(r, t)| self.layout_for(r, t))
+    }
+
+    /// Insertion boundary in mixer order, and index after removing the
+    /// dragged track from the project (which may also contain MIDI tracks).
+    fn track_drop(
+        &self,
+        model: &Session,
+        size: Size,
+        track: TrackId,
+        pos: Point,
+    ) -> Option<(usize, f32)> {
+        if self.master_only
+            || pos.y < 0.0
+            || pos.y > size.h
+            || pos.x < self.cheek()
+            || pos.x > self.cheek() + self.viewport_w(size)
+        {
+            return None;
+        }
+        let tracks = Self::channel_tracks(model);
+        let boundary = ((pos.x - self.cheek() + self.scroll_x + self.theme.console.strip_gap / 2.0)
+            / self.pitch()
+            + 0.5)
+            .floor()
+            .max(0.0) as usize;
+        let boundary = boundary.min(tracks.len());
+        let project = model.project();
+        let from = project.track_index(track)?;
+        let before = match tracks.get(boundary) {
+            Some(t) => project.track_index(t.id)?,
+            None => project.track_index(tracks.last()?.id)? + 1,
+        };
+        let index = before - usize::from(from < before);
+        Some((
+            index,
+            self.cheek() + boundary as f32 * self.pitch() - self.scroll_x,
+        ))
     }
 
     fn press(
@@ -1522,7 +1565,7 @@ impl MixerView {
                         // without an instrument gets one first).
                         cx.emit(Action::OpenPluginBrowser {
                             track: id,
-                            target: Self::empty_slot_target(t),
+                            target: Self::empty_slot_target(model, t),
                         });
                     } else if mods.alt {
                         // Alt-click: remove.
@@ -1575,6 +1618,16 @@ impl MixerView {
                     tracks: vec![id],
                     mode,
                 });
+                if matches!(hit, Hit::Scribble(_))
+                    && Self::track(model, id).is_some_and(|t| t.kind != TrackKind::Master)
+                {
+                    self.drag = Some(Drag::Track {
+                        track: id,
+                        origin: pos,
+                        pos,
+                        moved: false,
+                    });
+                }
             }
             Hit::Meter(_) => cx.emit(Action::ResetClipIndicators),
         }
@@ -1709,7 +1762,9 @@ impl MixerView {
                 "Pan {} · Click to type (C, L30, R45 or −100…100)",
                 format_pan(model.shown_pan(Self::track(model, id)?))
             ),
-            Hit::Scribble(_) => "Double-click to rename · Right-click for options".into(),
+            Hit::Scribble(_) => {
+                "Drag to reorder · Double-click to rename · Right-click for options".into()
+            }
             Hit::Meter(_) => "Peak meter · Click to clear clip indicators".into(),
             Hit::InsertsGrip(_) => format!(
                 "Drag to show more or fewer insert slots (now {}) · Double-click for {}",
@@ -1729,6 +1784,16 @@ impl CanvasView<Session, Action> for MixerView {
     fn paint(&mut self, p: &mut dyn Painter, size: Size, model: &Session, theme: &Theme) {
         self.update_sends(model);
         let tracks = Self::channel_tracks(model);
+        if let Some(Drag::Track {
+            pos, moved: true, ..
+        }) = self.drag
+        {
+            if pos.x < self.cheek() + 20.0 {
+                self.scroll_x -= 8.0;
+            } else if pos.x > self.cheek() + self.viewport_w(size) - 20.0 {
+                self.scroll_x += 8.0;
+            }
+        }
         self.clamp_scroll(tracks.len(), size);
         p.fill(Rect::from_size(size), theme.ui.background);
         let cheek = self.cheek();
@@ -1736,6 +1801,16 @@ impl CanvasView<Session, Action> for MixerView {
         p.push_clip(viewport);
         for i in self.visible_range(tracks.len(), size) {
             self.paint_strip(p, self.strip_rect(i, size), tracks[i], i + 1, model);
+        }
+        if let Some(Drag::Track {
+            track,
+            pos,
+            moved: true,
+            ..
+        }) = self.drag
+            && let Some((_, x)) = self.track_drop(model, size, track, pos)
+        {
+            p.fill(Rect::new(x - 1.5, 0.0, 3.0, size.h), theme.ui.accent);
         }
         if tracks.is_empty() {
             let style =
@@ -1793,6 +1868,24 @@ impl CanvasView<Session, Action> for MixerView {
                 dragging: true,
             } => {
                 match self.drag {
+                    Some(Drag::Track {
+                        track,
+                        origin,
+                        moved,
+                        ..
+                    }) => {
+                        let moved = moved || pos.distance(origin) >= 4.0;
+                        self.drag = Some(Drag::Track {
+                            track,
+                            origin,
+                            pos,
+                            moved,
+                        });
+                        if moved {
+                            cx.set_cursor(Cursor::Grabbing);
+                        }
+                        cx.redraw();
+                    }
                     Some(Drag::Fader {
                         track,
                         start_y,
@@ -1870,7 +1963,7 @@ impl CanvasView<Session, Action> for MixerView {
                 if hit != self.hover {
                     self.hover = hit;
                     cx.set_cursor(match hit {
-                        Some(Hit::FaderCap(_)) => Cursor::Grab,
+                        Some(Hit::FaderCap(_) | Hit::Scribble(_)) => Cursor::Grab,
                         Some(
                             Hit::FaderTrack(_) | Hit::Pan(_) | Hit::Send(..) | Hit::InsertsGrip(_),
                         ) => Cursor::ResizeVertical,
@@ -1886,6 +1979,17 @@ impl CanvasView<Session, Action> for MixerView {
                 ..
             } => {
                 match self.drag.take() {
+                    Some(Drag::Track {
+                        track, moved: true, ..
+                    }) => {
+                        if let Some((index, _)) = self.track_drop(model, size, track, up_pos)
+                            && model.project().track_index(track) != Some(index)
+                        {
+                            cx.emit(Action::Edit(Command::MoveTrack { track, index }));
+                        }
+                        cx.set_cursor(Cursor::Default);
+                        cx.redraw();
+                    }
                     Some(Drag::Fader { .. } | Drag::Knob { .. }) => {
                         cx.emit(Action::EndGesture);
                         cx.set_cursor(Cursor::Default);
@@ -1911,6 +2015,18 @@ impl CanvasView<Session, Action> for MixerView {
                     }
                     _ => {}
                 }
+                true
+            }
+            ViewEvent::Key {
+                key: faderframe_ui_canvas::Key::Escape,
+                ..
+            }
+            | ViewEvent::FocusLost
+                if matches!(self.drag, Some(Drag::Track { .. })) =>
+            {
+                self.drag = None;
+                cx.set_cursor(Cursor::Default);
+                cx.redraw();
                 true
             }
             ViewEvent::PointerLeave => {
@@ -1976,7 +2092,7 @@ impl CanvasView<Session, Action> for MixerView {
     }
 
     fn wants_frames(&self, model: &Session) -> bool {
-        model.is_animating()
+        model.is_animating() || matches!(self.drag, Some(Drag::Track { moved: true, .. }))
     }
 
     fn tooltip(&self, pos: Point, size: Size, model: &Session) -> Option<String> {

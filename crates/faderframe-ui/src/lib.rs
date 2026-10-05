@@ -31,6 +31,7 @@ mod screenshot;
 pub mod state;
 mod style;
 mod transport_display;
+mod transport_keys;
 mod window;
 
 pub use state::{BackendChoice, RunOptions};
@@ -184,6 +185,7 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
         });
     }
     let state = AppState::new(app, session, options);
+    transport_keys::install(&state);
     let window = window::build(&state);
     actions::install(&state);
     recording::install_actions(&state);

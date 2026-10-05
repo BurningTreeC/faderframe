@@ -34,14 +34,7 @@ fn drums() -> (Session, PluginInstanceId) {
         PluginRef::builtin(builtin::DRUMS, "Drums"),
     )
     .unwrap();
-    let plugin = s
-        .project()
-        .track(t)
-        .unwrap()
-        .instrument
-        .as_ref()
-        .unwrap()
-        .id;
+    let plugin = s.project().track(t).unwrap().inserts[0].id;
     (s, plugin)
 }
 
@@ -156,7 +149,7 @@ fn samples_are_copied_in_undone_saved_relative_and_reopened() {
         .project()
         .tracks
         .iter()
-        .find_map(|tr| tr.instrument.as_ref().map(|i| i.id))
+        .find_map(|tr| t.instrument_slot(tr).map(|i| i.id))
         .unwrap();
     let f = files(&t, plugin);
     assert!(

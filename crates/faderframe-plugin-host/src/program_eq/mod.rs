@@ -323,7 +323,13 @@ impl PluginProcessor for ProgramEqProcessor {
         for e in events {
             self.params.apply_event(e.parameter, e.value);
         }
-        for c in 0..channels {
+        // The panel has two meter bars even on a mono track. Mirror the
+        // measurement before publishing (which clears the accumulated peak).
+        if channels == 1 {
+            self.meters[0][1] = self.meters[0][0];
+            self.meters[1][1] = self.meters[1][0];
+        }
+        for c in 0..if channels == 1 { 2 } else { channels } {
             self.meters[0][c].publish(&self.tap.meter_in, c, frames);
             self.meters[1][c].publish(&self.tap.meter_out, c, frames);
         }

@@ -97,6 +97,7 @@ fn processing_does_not_allocate() {
     const SR: u32 = 48_000;
     const BLOCK: usize = 256;
     let mut project = demo_project(SR);
+    project.crosstalk = true;
     // Every melody note glides, swells and pans: native note expressions
     // reach the built-in synth through the realtime path.
     for clip in project.clips.values_mut() {

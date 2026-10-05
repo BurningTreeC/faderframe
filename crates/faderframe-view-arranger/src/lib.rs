@@ -85,6 +85,8 @@ pub enum Hit {
     /// The markers, arranger, signature and tempo lanes.
     Global(GlobalHit),
     LoopBand(MusicalTime),
+    LoopStart,
+    LoopEnd,
     Ruler(MusicalTime),
     Header(TrackId, HeaderPart),
     Clip {
@@ -125,6 +127,11 @@ enum Drag {
     Loop {
         anchor: MusicalTime,
         moved: bool,
+    },
+    LoopEdge {
+        start: bool,
+        range: MusicalRange,
+        offset: MusicalTime,
     },
     Volume {
         track: TrackId,
@@ -492,6 +499,17 @@ impl ArrangerView {
             return Some(if pos.x < self.header_w() {
                 Hit::Corner
             } else if pos.y < LOOP_BAND {
+                if let Some(range) = model.project().loop_range {
+                    let left = (pos.x - self.x_of(range.start)).abs();
+                    let right = (pos.x - self.x_of(range.end)).abs();
+                    if left.min(right) <= 6.0 {
+                        return Some(if left <= right {
+                            Hit::LoopStart
+                        } else {
+                            Hit::LoopEnd
+                        });
+                    }
+                }
                 Hit::LoopBand(at)
             } else {
                 Hit::Ruler(at)
@@ -1219,9 +1237,8 @@ impl ArrangerView {
                 }
                 OutputRouting::None => " → none".into(),
             };
-            let plug = t
-                .instrument
-                .as_ref()
+            let plug = model
+                .instrument_slot(t)
                 .map(|s| {
                     let mark = if model.plugin_failed(s.id) {
                         "⚠ "
@@ -1375,6 +1392,9 @@ impl ArrangerView {
                 a.loop_off
             };
             p.fill_rounded(r, 2.0, &Paint::Solid(col));
+            let handle = a.ruler_text.with_alpha(0.8);
+            p.fill(Rect::new(x0, band.y + 2.0, 2.0, band.h - 4.0), handle);
+            p.fill(Rect::new(x1 - 2.0, band.y + 2.0, 2.0, band.h - 4.0), handle);
         }
         if let Some(pr) = project.punch_range {
             let x0 = self.x_of(pr.start);
@@ -1748,9 +1768,8 @@ impl ArrangerView {
         }
         // Instrument (instrument tracks): the plugin browser.
         if t.kind == TrackKind::Instrument {
-            let current = t
-                .instrument
-                .as_ref()
+            let current = model
+                .instrument_slot(t)
                 .map_or_else(|| "none".to_string(), |s| s.plugin.name.clone());
             items.push(
                 MenuItem::new(
@@ -1762,7 +1781,7 @@ impl ArrangerView {
                 )
                 .separated(),
             );
-            if let Some(slot) = &t.instrument {
+            if let Some(slot) = model.instrument_slot(t) {
                 items.push(MenuItem::new(
                     format!("Show {} Editor", slot.plugin.name),
                     Action::OpenPluginEditor {
@@ -2149,6 +2168,18 @@ impl ArrangerView {
                     moved: false,
                 });
             }
+            Hit::LoopStart | Hit::LoopEnd => {
+                if let Some(range) = model.project().loop_range {
+                    let start = matches!(hit, Hit::LoopStart);
+                    self.drag = Some(Drag::LoopEdge {
+                        start,
+                        range,
+                        offset: self.time_at(pos.x) - if start { range.start } else { range.end },
+                    });
+                    cx.emit(Action::BeginGesture("Resize Loop".into()));
+                    cx.set_cursor(Cursor::ResizeHorizontal);
+                }
+            }
             Hit::Header(id, part) => {
                 let Some(t) = model.project().track(id) else {
                     return false;
@@ -2363,9 +2394,32 @@ impl ArrangerView {
                 let t = self.snap(self.time_at(pos.x).max(MusicalTime::ZERO), model, mods);
                 if t != anchor {
                     if let Some(Drag::Loop { moved, .. }) = &mut self.drag {
+                        if !*moved {
+                            cx.emit(Action::BeginGesture("Set Loop".into()));
+                        }
                         *moved = true;
                     }
                     let range = MusicalRange::new(anchor.min(t), anchor.max(t));
+                    cx.emit(Action::Transport(TransportAction::SetLoop(range)));
+                }
+            }
+            Some(Drag::LoopEdge {
+                start,
+                range,
+                offset,
+            }) => {
+                let at = self.snap(
+                    (self.time_at(pos.x) - offset).max(MusicalTime::ZERO),
+                    model,
+                    mods,
+                );
+                let tick = MusicalTime::from_ticks(1);
+                let range = if start {
+                    MusicalRange::new(at.min(range.end - tick), range.end)
+                } else {
+                    MusicalRange::new(range.start, at.max(range.start + tick))
+                };
+                if range != model.project().loop_range {
                     cx.emit(Action::Transport(TransportAction::SetLoop(range)));
                 }
             }
@@ -2453,7 +2507,12 @@ impl ArrangerView {
             return;
         }
         match self.drag.take() {
-            Some(Drag::Volume { .. }) | Some(Drag::Pan { .. }) => {
+            Some(
+                Drag::Volume { .. }
+                | Drag::Pan { .. }
+                | Drag::LoopEdge { .. }
+                | Drag::Loop { moved: true, .. },
+            ) => {
                 cx.emit(Action::EndGesture);
             }
             Some(Drag::Loop { moved: false, .. }) => {
@@ -2721,7 +2780,13 @@ impl CanvasView<Session, Action> for ArrangerView {
                             cx.request(Self::clip_menu(model, c, pos));
                         }
                     }
-                    Some(Hit::Corner) | Some(Hit::Ruler(_)) | Some(Hit::LoopBand(_)) => {
+                    Some(
+                        Hit::Corner
+                        | Hit::Ruler(_)
+                        | Hit::LoopBand(_)
+                        | Hit::LoopStart
+                        | Hit::LoopEnd,
+                    ) => {
                         cx.request(Self::grid_menu(model, pos));
                     }
                     Some(Hit::Global(g)) => cx.request(self.global_menu(g, model, pos)),
@@ -2783,6 +2848,7 @@ impl CanvasView<Session, Action> for ArrangerView {
                         Some(Hit::Automation { header: false, .. }) => Cursor::Crosshair,
                         Some(Hit::Automation { header: true, .. }) => Cursor::Pointer,
                         Some(Hit::Ruler(_) | Hit::LoopBand(_)) => Cursor::Pointer,
+                        Some(Hit::LoopStart | Hit::LoopEnd) => Cursor::ResizeHorizontal,
                         Some(Hit::Global(GlobalHit::Section(
                             _,
                             SectionPart::Start | SectionPart::End,
@@ -2971,6 +3037,7 @@ impl CanvasView<Session, Action> for ArrangerView {
             }
             Hit::Ruler(_) => Some("Click or drag to move the playhead".into()),
             Hit::LoopBand(_) => Some("Drag to set the loop range · Click to toggle looping".into()),
+            Hit::LoopStart | Hit::LoopEnd => Some("Drag to resize the loop range".into()),
             Hit::Corner => Some("Grid, snap and follow settings".into()),
             Hit::HeaderEdge => Some("Drag to resize the track headers · Double-click to reset".into()),
             Hit::Header(id, part) => {

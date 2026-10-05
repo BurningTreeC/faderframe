@@ -134,7 +134,7 @@ fn clip_sysex_reaches_the_tracks_instrument() {
         }),
     })
     .unwrap();
-    assert!(s.project().track(t).unwrap().instrument.is_some());
+    assert!(s.instrument_slot(s.project().track(t).unwrap()).is_some());
     s.dispatch(Action::CreateMidiClip {
         track: t,
         start: MusicalTime::ZERO,

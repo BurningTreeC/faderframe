@@ -271,3 +271,41 @@ fn the_processor_boosts_and_meters() {
         "3.2"
     );
 }
+
+#[test]
+fn mono_lights_both_meters_while_stereo_keeps_independent_channels() {
+    for layout in [ChannelLayout::Mono, ChannelLayout::Stereo] {
+        let (_, tap, mut p) = processor();
+        let mut input = AudioBuffer::new(layout, 256);
+        let mut output = AudioBuffer::new(layout, 256);
+        input.set_len(256);
+        output.set_len(256);
+        input.channel_mut(0).fill(0.25);
+        let transport = TransportInfo::default();
+        for _ in 0..20 {
+            p.process(
+                &PluginProcessContext {
+                    transport: &transport,
+                    param_events: &[],
+                },
+                &mut NodeIo {
+                    frames: 256,
+                    audio_in: std::slice::from_ref(&input),
+                    audio_out: std::slice::from_mut(&mut output),
+                    events_in: &[],
+                    events_out: &mut [],
+                },
+            );
+        }
+        for meter in [&tap.meter_in, &tap.meter_out] {
+            assert!(meter.held(0) > 0.1);
+            if layout == ChannelLayout::Mono {
+                assert_eq!(meter.held(0), meter.held(1));
+                assert_eq!(meter.mean_square(0), meter.mean_square(1));
+                assert_eq!(meter.figure(0), meter.figure(1));
+            } else {
+                assert_eq!(meter.held(1), 0.0);
+            }
+        }
+    }
+}

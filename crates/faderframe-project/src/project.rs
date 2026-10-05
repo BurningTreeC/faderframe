@@ -104,6 +104,9 @@ pub struct Project {
     pub punch_range: Option<MusicalRange>,
     #[serde(default)]
     pub punch_enabled: bool,
+    /// Subtle analogue leakage between adjacent mixer audio/instrument channels.
+    #[serde(default)]
+    pub crosstalk: bool,
     /// Display order. Contains exactly one [`TrackKind::Master`].
     pub tracks: Vec<Track>,
     #[serde(default)]
@@ -152,6 +155,7 @@ impl Project {
             loop_enabled: false,
             punch_range: None,
             punch_enabled: false,
+            crosstalk: false,
             tracks: vec![master],
             clips: BTreeMap::new(),
             sources: BTreeMap::new(),

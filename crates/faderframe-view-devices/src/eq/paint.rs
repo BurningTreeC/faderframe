@@ -291,7 +291,10 @@ impl EqView {
         } else {
             self.paint_axis(p, &l, model);
         }
-        self.paint_meter(p, &l, &tap, dt as f32, s.range);
+        let mono = model
+            .plugin_slot(self.device.plugin)
+            .is_some_and(|(track, _)| track.layout == faderframe_core::ChannelLayout::Mono);
+        self.paint_meter(p, &l, &tap, dt as f32, s.range, mono);
         self.paint_top(p, &l, model);
         self.paint_bottom(p, &l, model, &tap);
         self.paint_output(p, &l, &tap);
@@ -1022,19 +1025,29 @@ impl EqView {
         tap: &AnalysisTap,
         dt: f32,
         range: f32,
+        mono: bool,
     ) {
         let th = &self.theme;
         let r = l.meter;
         p.fill_rounded(r, 2.0, &Paint::Solid(th.device.display));
         let w = (r.w - 1.0) / 2.0;
+        // Take each atomic peak once. A mono strip has one measurement;
+        // both bars display that same snapshot, including RMS and decay.
+        let peaks = [
+            db(tap.meter_out.take_peak(0)),
+            db(tap.meter_out.take_peak(1)),
+        ];
         for c in 0..2 {
-            let peak = db(tap.meter_out.take_peak(c));
-            self.meter[c] = if peak > self.meter[c] {
+            let channel = if mono { 0 } else { c };
+            let peak = peaks[channel];
+            self.meter[c] = if mono && c == 1 {
+                self.meter[0]
+            } else if peak > self.meter[c] {
                 peak
             } else {
                 (self.meter[c] - 30.0 * dt).max(FLOOR)
             };
-            let rms = db_power(tap.meter_out.mean_square(c));
+            let rms = db_power(tap.meter_out.mean_square(channel));
             let x = r.x + c as f32 * (w + 1.0);
             let y_of = |v: f32| analyser_y(&r, v, range);
             let rms_y = y_of(rms);

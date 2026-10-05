@@ -338,6 +338,30 @@ snapshot (so VCA automation is sample-accurate on every member). The strip
 of the analysed track (the Tools view) copies its post-fader output into a
 `ScopeRing`.
 
+* **Analogue crosstalk.** `Project::crosstalk` (Preferences → Project) defaults
+  off and is saved/undoable. Adjacent audio/instrument strips in mixer order
+  leak in both directions; bus, aux and VCA strips break adjacency, while
+  hidden MIDI tracks and the pinned master are excluded. Each leak taps the
+  donor after inserts, before its fader, and sums into the recipient before
+  its strip. Donor mute/solo/VCA mute (including automation) gates the leak;
+  the recipient's strip controls the combined signal. Nodes never read
+  another leak, avoiding recursive crossfeed. The graph's normal layout
+  conversion and latency compensation apply. Existing sends or sidechains
+  can make coupling cyclic: both directions of that pair are then omitted
+  and an engine warning names it. Reordering rebuilds these connections.
+  The generic model is resistive plus capacitive coupling,
+  `H(s) = 1e-5 + 10^(-65/20) s/(s + 2π·10000)`, bilinear discretised,
+  approximately −85 dB at 1 kHz, increasing toward −65 dB at high frequencies.
+  This is a chosen generic response, not a measured console emulation.
+  For scale, the [Xone:96 specification](https://www.allen-heath.com/content/uploads/2023/06/AP11645_2_XONE_96_USER_GUIDE.pdf)
+  specifies inter-channel crosstalk below −85 dB at 1 kHz. Processing allocates
+  nothing; independent state per direction/channel resets on locate. Offline
+  export, parallel playback and render-ahead use the same realtime graph
+  coupling. `faderframe-bench --crosstalk` measures its processing cost.
+* **Instrument inserts.** Newly chosen instruments occupy visible insert
+  slots and receive the track's MIDI there. The separate instrument field
+  remains readable for old projects; replacing it through the chooser moves
+  the new instrument into the insert chain as one undoable edit.
 * **Sidechains.** A `PluginSlot::sidechain` names a source track; a plugin
   with a second audio input gets the source's signal *after its inserts and
   before its fader, mute and solo* (a muted "ghost kick" still keys) as

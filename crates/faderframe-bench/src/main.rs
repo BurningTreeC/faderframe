@@ -30,6 +30,7 @@ use std::time::Instant;
 
 struct Args {
     tracks: usize,
+    crosstalk: bool,
     block: usize,
     rate: u32,
     seconds: f64,
@@ -54,6 +55,7 @@ struct Args {
 fn parse() -> Result<Args, String> {
     let mut a = Args {
         tracks: 64,
+        crosstalk: false,
         block: 128,
         rate: 48_000,
         seconds: 10.0,
@@ -78,6 +80,7 @@ fn parse() -> Result<Args, String> {
             "--rate" => a.rate = num("--rate")?.parse().map_err(|_| "bad --rate")?,
             "--seconds" => a.seconds = num("--seconds")?.parse().map_err(|_| "bad --seconds")?,
             "--buses" => a.buses = num("--buses")?.parse().map_err(|_| "bad --buses")?,
+            "--crosstalk" => a.crosstalk = true,
             "--no-inserts" => a.inserts = false,
             "--no-sends" => a.sends = false,
             "--measure-nodes" => a.measure = true,
@@ -112,7 +115,7 @@ fn parse() -> Result<Args, String> {
             }
             "-h" | "--help" => {
                 println!(
-                    "faderframe-bench [--tracks N] [--block FRAMES] [--rate HZ] [--seconds S] [--buses N] [--no-inserts] [--no-sends] [--measure-nodes] [--threads N] [--fx N] [--plugin clap:<id>|vst3:<id>] [--paced] [--ahead MS]"
+                    "faderframe-bench [--tracks N] [--block FRAMES] [--rate HZ] [--seconds S] [--buses N] [--no-inserts] [--no-sends] [--measure-nodes] [--threads N] [--fx N] [--plugin clap:<id>|vst3:<id>] [--paced] [--ahead MS] [--crosstalk]"
                 );
                 std::process::exit(0);
             }
@@ -125,6 +128,7 @@ fn parse() -> Result<Args, String> {
 
 fn build(args: &Args) -> Project {
     let mut p = Project::new("bench", args.rate);
+    p.crosstalk = args.crosstalk;
     let bars = ((args.seconds * 2.0 / 4.0).ceil() as u32).max(1); // 120 BPM
     let drum: faderframe_core::AudioSourceId = p.ids.allocate();
     p.sources.insert(

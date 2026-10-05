@@ -827,6 +827,11 @@ impl EngineController {
         self.plugins.latency(plugin)
     }
 
+    /// Whether the loaded plugin is an instrument.
+    pub fn plugin_is_instrument(&self, plugin: faderframe_core::PluginInstanceId) -> bool {
+        self.plugins.is_instrument(plugin)
+    }
+
     /// The note expressions a hosted plugin accepts (`None`: unknown).
     pub fn plugin_note_expressions(
         &self,

@@ -24,8 +24,8 @@ use crate::ahead::{AheadReader, AheadRing, AheadWriter};
 use crate::context::EngineContext;
 use crate::midi::{MidiFilter, MidiInputNode, MidiOutputSink, MidiShared, NO_PORT};
 use crate::nodes::{
-    AudioClipPlayer, ChannelStrip, DeviceInputTap, DeviceOutputSink, MidiClipPlayer, MonitorGate,
-    PluginNode, SendNode, StretchVoices,
+    AudioClipPlayer, ChannelStrip, Crosstalk, DeviceInputTap, DeviceOutputSink, MidiClipPlayer,
+    MonitorGate, PluginNode, SendNode, StretchVoices,
 };
 use crate::plugins::PluginHost;
 use crate::slots::SlotRegistry;
@@ -161,6 +161,7 @@ enum Role {
     DeviceOut = 8,
     MidiInput = 9,
     Ahead = 10,
+    Crosstalk = 11,
 }
 
 /// Stretcher voices a track's clip player needs: one per pitch-preserving
@@ -729,6 +730,64 @@ pub fn build_graph(
     for (node, src) in sidechains {
         if let Some(tap) = nodes.get(&src).and_then(|n| n.post_fx) {
             b.connect_audio(tap, 0, node, 1)?;
+        }
+    }
+    // Each direction taps the clean post-insert signal, never another leak.
+    // Bus/aux/VCA strips break adjacency; hidden MIDI and the pinned master do not.
+    if project.crosstalk {
+        let visible: Vec<_> = project
+            .tracks
+            .iter()
+            .filter(|t| !matches!(t.kind, TrackKind::Master | TrackKind::Midi))
+            .collect();
+        for pair in visible.windows(2) {
+            let [left, right] = [pair[0], pair[1]];
+            if ![left, right]
+                .iter()
+                .all(|t| matches!(t.kind, TrackKind::Audio | TrackKind::Instrument))
+            {
+                continue;
+            }
+            let (Some(l), Some(r)) = (nodes.get(&left.id), nodes.get(&right.id)) else {
+                continue;
+            };
+            let (Some(l_src), Some(l_dst), Some(r_src), Some(r_dst)) =
+                (l.post_fx, l.strip, r.post_fx, r.strip)
+            else {
+                continue;
+            };
+            // Sends, outputs and sidechains can already link these channels.
+            // Omit both leak directions if they would close a routing cycle.
+            if b.would_cycle_with(&[(l_src, r_dst), (r_src, l_dst)])? {
+                warnings.push(format!(
+                    "Crosstalk skipped between {} and {} to avoid routing feedback",
+                    left.name, right.name
+                ));
+                continue;
+            }
+            for (donor, receiver, from, to) in
+                [(left, right, l_src, r_dst), (right, left, r_src, l_dst)]
+            {
+                let Some(gi) = project.track_index(receiver.id) else {
+                    continue;
+                };
+                let leak = b.add_node(
+                    NodeSpec::new(format!("{} → {} · Crosstalk", donor.name, receiver.name))
+                        .key(node_key(
+                            receiver.id,
+                            Role::Crosstalk,
+                            donor.id.raw(),
+                            &[donor.layout, receiver.layout],
+                        ))
+                        .group(gi as u32)
+                        .audio_in(receiver.layout)
+                        .audio_out(receiver.layout),
+                    Box::new(Crosstalk::new(donor.id, slots.strip(donor.id)?)),
+                );
+                own(&mut owners, leak, receiver.id, None, NodeWork::Strip);
+                b.connect_audio(from, 0, leak, 0)?;
+                b.connect_audio(leak, 0, to, 0)?;
+            }
         }
     }
     Ok(BuiltGraph {

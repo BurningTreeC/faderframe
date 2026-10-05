@@ -603,3 +603,24 @@ fn time_signature_changes_undo() {
     h.undo(&mut p).unwrap();
     assert_same(&p, &before);
 }
+
+#[test]
+fn crosstalk_is_saved_undoable_and_defaults_off_in_older_files() {
+    let mut p = Project::new("Crosstalk", 48_000);
+    assert!(!p.crosstalk);
+    let mut h = History::default();
+    assert_eq!(
+        h.apply(&mut p, Command::SetCrosstalk { enabled: true })
+            .unwrap(),
+        Impact::Graph
+    );
+    let text = file::to_string(&p, None).unwrap();
+    assert!(file::from_str(&text).unwrap().project.crosstalk);
+    h.undo(&mut p).unwrap();
+    assert!(!p.crosstalk);
+    h.redo(&mut p).unwrap();
+    assert!(p.crosstalk);
+    let mut old: serde_json::Value = serde_json::from_str(&text).unwrap();
+    old["project"].as_object_mut().unwrap().remove("crosstalk");
+    assert!(!file::from_str(&old.to_string()).unwrap().project.crosstalk);
+}
