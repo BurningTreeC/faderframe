@@ -222,7 +222,10 @@ fn the_album_plays_as_it_will_be_delivered() {
     assert!(s.album_playback().unwrap().preparing.is_some());
     s.wait_album();
     let (marks, _) = s.album_marks().unwrap();
-    assert!((before - marks[1].1 - 1.5).abs() < 0.03, "{before} → {marks:?}");
+    assert!(
+        (before - marks[1].1 - 1.5).abs() < 0.03,
+        "{before} → {marks:?}"
+    );
     album(&mut s, AlbumAction::StopPlaying);
     assert!(s.album_playback().is_none());
 }
