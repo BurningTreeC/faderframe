@@ -8,7 +8,7 @@
 //! same view state) is re-parented when its view moves between docks and
 //! windows.
 
-use crate::painter::{SnapshotPainter, TextCache};
+use crate::painter::{PathCache, SnapshotPainter, TextCache};
 use crate::state::AppState;
 use faderframe_session::{Action, Session};
 use faderframe_ui_canvas::{
@@ -32,6 +32,7 @@ mod imp {
         pub view: RefCell<Option<DynView>>,
         pub app: RefCell<Weak<AppState>>,
         pub text_cache: RefCell<TextCache>,
+        pub path_cache: RefCell<PathCache>,
         pub dragging: Cell<bool>,
         pub drag_button: Cell<u32>,
         pub drag_origin: Cell<(f64, f64)>,
@@ -69,9 +70,10 @@ mod imp {
             };
             let size = Size::new(widget.width() as f32, widget.height() as f32);
             self.text_cache.borrow_mut().begin_frame();
+            self.path_cache.borrow_mut().begin_frame();
             snapshot.push_clip(&graphene::Rect::new(0.0, 0.0, size.w, size.h));
             let w: &gtk::Widget = widget.upcast_ref();
-            let mut painter = SnapshotPainter::new(snapshot, w, &self.text_cache);
+            let mut painter = SnapshotPainter::new(snapshot, w, &self.text_cache, &self.path_cache);
             if let Some(view) = self.view.borrow_mut().as_mut() {
                 view.paint(&mut painter, size, &session, &app.theme.borrow());
             }
@@ -205,10 +207,11 @@ impl CanvasWidget {
         let snapshot = gtk::Snapshot::new();
         let imp = self.imp();
         imp.text_cache.borrow_mut().begin_frame();
+        imp.path_cache.borrow_mut().begin_frame();
         snapshot.push_clip(&graphene::Rect::new(0.0, 0.0, size.w, size.h));
         let w: &gtk::Widget = self.upcast_ref();
         {
-            let mut painter = SnapshotPainter::new(&snapshot, w, &imp.text_cache);
+            let mut painter = SnapshotPainter::new(&snapshot, w, &imp.text_cache, &imp.path_cache);
             if let Some(view) = imp.view.borrow_mut().as_mut() {
                 view.paint(&mut painter, size, &session, &app.theme.borrow());
             }

@@ -45,6 +45,69 @@ fn gsk_path(path: &Path) -> gsk::Path {
     b.to_path()
 }
 
+/// GSK caches rasterized fills and strokes by path identity, not geometry.
+/// Recreating unchanged paths every frame fills its GPU atlases with copies
+/// of the same knobs and curves, making periodic atlas collection stall the
+/// main loop. Keep the native paths alive across redraws of a canvas.
+#[derive(Default)]
+pub struct PathCache {
+    paths: HashMap<Vec<u32>, (gsk::Path, u64)>,
+    frame: u64,
+    words: usize,
+}
+
+impl PathCache {
+    const MAX_PATHS: usize = 2048;
+    const MAX_WORDS: usize = 64 * 1024;
+
+    pub fn begin_frame(&mut self) {
+        self.frame += 1;
+        // Only retain geometry used in the previous two frames. Animated
+        // curves must not leave an ever-growing history in the cache.
+        let keep_from = self.frame.saturating_sub(2);
+        self.paths.retain(|key, (_, used)| {
+            if *used < keep_from {
+                self.words -= key.len();
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn get(&mut self, path: &Path) -> gsk::Path {
+        let mut key = Vec::new();
+        for cmd in path.commands() {
+            match *cmd {
+                PathCmd::MoveTo(p) => key.extend([0, p.x.to_bits(), p.y.to_bits()]),
+                PathCmd::LineTo(p) => key.extend([1, p.x.to_bits(), p.y.to_bits()]),
+                PathCmd::CubicTo(a, b, p) => key.extend([
+                    2,
+                    a.x.to_bits(),
+                    a.y.to_bits(),
+                    b.x.to_bits(),
+                    b.y.to_bits(),
+                    p.x.to_bits(),
+                    p.y.to_bits(),
+                ]),
+                PathCmd::Close => key.push(3),
+            }
+        }
+        if let Some((native, used)) = self.paths.get_mut(&key) {
+            *used = self.frame;
+            return native.clone();
+        }
+        let native = gsk_path(path);
+        // Bound both the number and size of retained paths, including a
+        // single frame with many tracks or a very detailed waveform.
+        if self.paths.len() < Self::MAX_PATHS && self.words + key.len() <= Self::MAX_WORDS {
+            self.words += key.len();
+            self.paths.insert(key, (native.clone(), self.frame));
+        }
+        native
+    }
+}
+
 thread_local! {
     /// Decoded images by key (they live as long as the program).
     static TEXTURES: RefCell<HashMap<&'static str, Option<gdk::Texture>>> =
@@ -128,6 +191,7 @@ pub struct SnapshotPainter<'a> {
     snapshot: &'a gtk::Snapshot,
     widget: &'a gtk::Widget,
     cache: &'a RefCell<TextCache>,
+    paths: &'a RefCell<PathCache>,
     scale: f32,
 }
 
@@ -136,6 +200,7 @@ impl<'a> SnapshotPainter<'a> {
         snapshot: &'a gtk::Snapshot,
         widget: &'a gtk::Widget,
         cache: &'a RefCell<TextCache>,
+        paths: &'a RefCell<PathCache>,
     ) -> Self {
         let scale = widget
             .native()
@@ -145,6 +210,7 @@ impl<'a> SnapshotPainter<'a> {
             snapshot,
             widget,
             cache,
+            paths,
             scale,
         }
     }
@@ -249,8 +315,9 @@ impl Painter for SnapshotPainter<'_> {
 
     fn fill_path(&mut self, path: &Path, color: Color) {
         if !path.is_empty() {
+            let path = self.paths.borrow_mut().get(path);
             self.snapshot
-                .append_fill(&gsk_path(path), gsk::FillRule::Winding, &rgba(color));
+                .append_fill(&path, gsk::FillRule::Winding, &rgba(color));
         }
     }
 
@@ -261,8 +328,8 @@ impl Painter for SnapshotPainter<'_> {
         let stroke = gsk::Stroke::new(width);
         stroke.set_line_cap(gsk::LineCap::Round);
         stroke.set_line_join(gsk::LineJoin::Round);
-        self.snapshot
-            .append_stroke(&gsk_path(path), &stroke, &rgba(color));
+        let path = self.paths.borrow_mut().get(path);
+        self.snapshot.append_stroke(&path, &stroke, &rgba(color));
     }
 
     fn fill_path_paint(&mut self, path: &Path, paint: &Paint) {
@@ -272,7 +339,7 @@ impl Painter for SnapshotPainter<'_> {
         if let Paint::Solid(c) = paint {
             return self.fill_path(path, *c);
         }
-        let p = gsk_path(path);
+        let p = self.paths.borrow_mut().get(path);
         let Some(bounds) = p.bounds() else {
             return;
         };
@@ -382,5 +449,70 @@ impl Painter for SnapshotPainter<'_> {
 
     fn scale_factor(&self) -> f32 {
         self.scale
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use faderframe_ui_canvas::Point;
+
+    #[test]
+    fn redraws_reuse_native_path_identity() {
+        let mut cache = PathCache::default();
+        let shape = || Path::circle(Point::new(40.0, 40.0), 12.0);
+        let first = cache.get(&shape());
+        // Views rebuild their toolkit-independent geometry on every paint.
+        // Equal-looking GSK paths with different pointers miss its GPU cache.
+        for _ in 0..100 {
+            cache.begin_frame();
+            assert_eq!(first.as_ptr(), cache.get(&shape()).as_ptr());
+        }
+        let changed = Path::circle(Point::new(40.0, 40.0), 13.0);
+        let other = cache.get(&changed);
+        assert_ne!(first.as_ptr(), other.as_ptr());
+        assert_eq!(other.to_string(), gsk_path(&changed).to_string());
+    }
+
+    #[test]
+    fn animated_paths_expire_without_evicting_unchanged_controls() {
+        let mut cache = PathCache::default();
+        let knob = Path::circle(Point::new(40.0, 40.0), 12.0);
+        let first = cache.get(&knob);
+        for frame in 0..100 {
+            cache.begin_frame();
+            assert_eq!(first.as_ptr(), cache.get(&knob).as_ptr());
+            cache.get(&Path::circle(Point::new(frame as f32, 0.0), 1.0));
+            assert!(cache.paths.len() <= 4);
+        }
+        for _ in 0..3 {
+            cache.begin_frame();
+        }
+        assert!(cache.paths.is_empty());
+        assert_eq!(cache.words, 0);
+    }
+
+    #[test]
+    fn oversized_frames_and_paths_do_not_grow_the_cache_without_bound() {
+        let mut cache = PathCache::default();
+        for i in 0..PathCache::MAX_PATHS * 2 {
+            let mut path = Path::new();
+            path.move_to(Point::new(i as f32, 0.0))
+                .line_to(Point::new(i as f32, 1.0));
+            cache.get(&path);
+        }
+        assert!(cache.paths.len() <= PathCache::MAX_PATHS);
+        assert!(cache.words <= PathCache::MAX_WORDS);
+
+        let mut large = Path::new();
+        large.move_to(Point::new(0.0, 0.0));
+        for i in 0..PathCache::MAX_WORDS / 3 {
+            large.line_to(Point::new(i as f32, (i % 2) as f32));
+        }
+        let mut cache = PathCache::default();
+        let native = cache.get(&large);
+        assert_eq!(native.to_string(), gsk_path(&large).to_string());
+        assert!(cache.paths.is_empty());
+        assert_eq!(cache.words, 0);
     }
 }

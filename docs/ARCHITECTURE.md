@@ -1543,6 +1543,13 @@ when the session's revision changed during the tick — finished recordings,
 imports and analyses arrive there, not through a user action. Warnings and
 errors also pop up as a toast at the top of the main window.
 
+Each canvas keeps a bounded `painter::PathCache` alongside its text cache.
+Unchanged geometry must reuse the same `GskPath`: GSK caches rasterized
+fills and strokes by path identity. Rebuilding native paths on every paint
+accumulates duplicate GPU atlas entries and causes periodic main-loop
+stalls when GTK collects them. Paths unused for two frames expire; entry
+and geometry-size limits also bound the cache during animation or zooming.
+
 HiDPI and fractional scaling are handled entirely by GTK; views never assume
 96 DPI. On Wayland the app is a native Wayland client (the status bar shows
 the GDK backend).
