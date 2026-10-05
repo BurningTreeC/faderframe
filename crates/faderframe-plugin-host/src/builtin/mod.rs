@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
+    Preamp(usize),
     Compressor,
     Gain,
     Echo,
@@ -33,7 +34,13 @@ enum Kind {
 }
 
 impl Kind {
-    const ALL: [Kind; 16] = [
+    const ALL: [Kind; 22] = [
+        Kind::Preamp(0),
+        Kind::Preamp(1),
+        Kind::Preamp(2),
+        Kind::Preamp(3),
+        Kind::Preamp(4),
+        Kind::Preamp(5),
         Kind::Eq,
         Kind::ProgramEq,
         Kind::Limiter,
@@ -53,6 +60,9 @@ impl Kind {
     ];
 
     fn from_id(id: &str) -> Option<Self> {
+        if let Some(i) = builtin::preamp_index(id) {
+            return Some(Self::Preamp(i));
+        }
         Some(match id {
             builtin::GAIN => Kind::Gain,
             builtin::COMPRESSOR => Kind::Compressor,
@@ -84,6 +94,13 @@ impl Kind {
             is_main: false,
         };
         let (id, name, category, inputs, notes) = match self {
+            Kind::Preamp(i) => (
+                builtin::PREAMPS[i].0,
+                builtin::PREAMPS[i].1,
+                PluginCategory::Preamp,
+                vec![stereo],
+                0,
+            ),
             Kind::Compressor => (
                 builtin::COMPRESSOR,
                 "Compressor",
@@ -224,6 +241,7 @@ impl Kind {
         };
         use ParameterUnit::*;
         match self {
+            Kind::Preamp(_) => crate::devices::preamp::parameters(),
             Kind::Gain => crate::devices::utility::parameters(),
             Kind::Compressor => crate::devices::compressor::parameters(),
             Kind::Limiter => crate::devices::limiter::parameters(),
@@ -273,6 +291,8 @@ impl Kind {
 /// Control-side instance shared by all built-ins.
 pub struct BuiltinInstance {
     kind: Kind,
+    channels: usize,
+    realtime: bool,
     descriptor: PluginDescriptor,
     params: ParamValues,
     tap: Option<Arc<AnalysisTap>>,
@@ -288,6 +308,12 @@ pub struct BuiltinInstance {
 }
 
 impl PluginInstance for BuiltinInstance {
+    fn configure_channels(&mut self, channels: usize) {
+        self.channels = channels;
+    }
+    fn configure_realtime(&mut self, realtime: bool) {
+        self.realtime = realtime;
+    }
     fn descriptor(&self) -> &PluginDescriptor {
         &self.descriptor
     }
@@ -369,6 +395,10 @@ impl PluginInstance for BuiltinInstance {
 
     fn latency_samples(&self) -> u32 {
         match self.kind {
+            Kind::Preamp(_) => {
+                faderframe_circuit::preamp::Preamp::latency()
+                    + crate::devices::preamp::BUFFER_LATENCY as u32
+            }
             Kind::LatencyProbe => self.params.get(0).max(0.0) as u32,
             Kind::ProgramEq => crate::program_eq::LATENCY,
             Kind::Eq => crate::eq::latency(&self.params),
@@ -393,6 +423,7 @@ impl PluginInstance for BuiltinInstance {
 
     fn tail(&self) -> TailLength {
         match self.kind {
+            Kind::Preamp(_) => TailLength::Samples(48_000),
             Kind::Echo | Kind::Reverb => TailLength::Infinite,
             Kind::Modulation => TailLength::Samples(4_096),
             Kind::Synth => TailLength::Samples(48_000 * 5),
@@ -447,6 +478,13 @@ impl PluginInstance for BuiltinInstance {
                 .ok_or_else(|| PluginError::Failed("no tap".into()))
         };
         Ok(match self.kind {
+            Kind::Preamp(i) => Box::new(crate::devices::preamp::BufferedPreampProcessor::new(
+                i,
+                params,
+                config,
+                self.channels,
+                self.realtime,
+            )?),
             Kind::Gain => Box::new(crate::devices::utility::UtilityProcessor::new(
                 params,
                 tap()?,
@@ -566,6 +604,8 @@ impl PluginFactory for BuiltinFactory {
             host
         });
         Ok(Box::new(BuiltinInstance {
+            channels: 2,
+            realtime: false,
             kind,
             descriptor: kind.descriptor(),
             params,

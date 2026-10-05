@@ -1,0 +1,2049 @@
+//! A circuit, described by name.
+//!
+//! Nodes are named and numbered here rather than by hand, because hand
+//! numbering is where the first version's worst bugs came from and none of
+//! them announced itself. A node nobody connected leaves an empty row in the
+//! matrix; the factorisation then divides by zero and the whole circuit comes
+//! out as `NaN`, silently, with nothing to say which node it was. Two builders
+//! disagreeing about how many nodes a circuit had indexed past the end of the
+//! matrix. Both are mechanical mistakes that a builder can simply refuse to
+//! make.
+//!
+//! So: `netlist.node("plate")` returns the same index every time it is asked
+//! for that name, `ground()` is always the reference, and [`Netlist::build`]
+//! checks the result before anything downstream can trust it.
+
+use std::collections::BTreeMap;
+use std::fmt;
+
+/// The reference node. Never appears in the matrix.
+pub const GROUND: usize = usize::MAX;
+
+/// How a potentiometer's track divides as it turns.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Taper {
+    /// Resistance proportional to rotation.
+    Linear,
+    /// Roughly exponential, which is how a volume control has to behave to
+    /// sound as though it moves evenly.
+    Audio,
+    /// The reverse of each, which is what a pot wired as a rheostat needs.
+    ///
+    /// With the wiper tied to one end the resistance left in circuit is
+    /// `1 - fraction`, so a plain track runs backwards there: the control takes
+    /// resistance *out* as it is turned up. A reverse taper is defined here as
+    /// exactly `1 - forward(p)`, so a rheostat using it has a resistance that
+    /// follows the forward law in the knob's own position.
+    ///
+    /// Both reverses have to mean the same thing. Defining one as `1 - f(p)`
+    /// and the other as `1 - f(1 - p)` gives two controls that look like a
+    /// matched pair and turn opposite ways.
+    ReverseLinear,
+    ReverseAudio,
+    /// A geometric sweep over a stated span, and its reverse.
+    ///
+    /// A control whose effect goes as the *logarithm* of the track -- gain in
+    /// decibels, a filter corner in octaves -- cannot be made to sweep evenly
+    /// by a linear track, and not by an audio one either. A rheostat in series
+    /// with a fixed resistance `Rf` covers a span `k = (Rf + R) / Rf`, and its
+    /// effect in decibels goes as `log(Rf + R·f(p))`. That is even in `p` only
+    /// when `f(p) = (k^p - 1) / (k - 1)`, so the law has to know the span it is
+    /// covering: a track that suits a span of ten is wrong for a span of fifty.
+    ///
+    /// `Audio` is not this law: a volume track is two straight segments rather
+    /// than a curve, and is written out separately.
+    ///
+    /// A span *below* one is the same law running the other way: the track
+    /// then moves quickly at first and slowly at the end. That is what a
+    /// rheostat needs when the thing it is fighting is small -- a 25 k bypass
+    /// pot against a 1.5 k cathode does nothing at all until its last eighth,
+    /// because everything above about 3 k is equally out of circuit.
+    Log {
+        span: f64,
+    },
+    ReverseLog {
+        span: f64,
+    },
+    /// A dual-slope track: the geometric law of `Log` from each end toward the
+    /// middle, meeting at half the track at half the travel.
+    ///
+    /// For a slider whose effect lives at both ends -- a feedback equaliser band
+    /// cuts as the wiper nears one end and boosts as it nears the other -- a
+    /// linear track leaves the middle of the travel doing almost nothing and a
+    /// one-sided law is not flat at the centre.
+    Symmetric {
+        span: f64,
+    },
+    /// A reverse-log track as a pot maker means it -- a "C" taper: the audio
+    /// track wound from the other end, `1 - audio(1 - p)`, so the fraction
+    /// rises fast at first and slowly at the end.
+    ///
+    /// Not `ReverseAudio`, which is `1 - audio(p)` and exists so that a
+    /// rheostat's resistance follows the forward law in the knob's position.
+    /// A drawing that prints "REV LOG" on a pot means this one: the Sunn Model
+    /// T's presence, a 25 k rheostat whose resistance in circuit falls to a
+    /// tenth by half rotation.
+    AntiAudio,
+    /// Not a track at all: a rotary switch picking one of `count` taps, one
+    /// position for each equal share of the knob's travel. The fractions are
+    /// the taps, as a fraction of the whole resistance between the wiper and
+    /// `b`; entries past `count` are unused.
+    ///
+    /// For a circuit whose gain control is a switch rather than a pot -- the
+    /// EMI REDD.47's three-position S1, the Telefunken V76's twelve-position
+    /// gain switch -- so that the one Drive knob, and everything that sweeps
+    /// it, turns the control the hardware has. Several pots on one control
+    /// with the same `count` are the switch's decks. Like every track it is
+    /// kept inside the pot's clamp, so a "zero" tap is a ten-thousandth of the
+    /// resistance.
+    Steps {
+        fractions: [f64; MAX_STEPS],
+        count: usize,
+    },
+}
+
+/// The most positions a `Taper::Steps` switch has: the V76's gain switch.
+pub const MAX_STEPS: usize = 12;
+
+/// A `Taper::Steps` switch of `taps.len()` positions.
+pub const fn steps<const N: usize>(taps: [f64; N]) -> Taper {
+    let mut fractions = [0.0; MAX_STEPS];
+    let mut i = 0;
+    while i < N {
+        fractions[i] = taps[i];
+        i += 1;
+    }
+    Taper::Steps {
+        fractions,
+        count: N,
+    }
+}
+
+/// What an audio track has left in circuit at half rotation.
+///
+/// This is the number an audio-taper potentiometer is specified by, and the
+/// published range is ten to twenty per cent depending on the maker -- Jameco
+/// and ISL both describe the same figure, ISL selling "fast 10 %, medium 20 %,
+/// slow 30 %" as the choice on offer. Ten is the classic.
+const AUDIO_AT_HALF: f64 = 0.10;
+
+impl Taper {
+    /// Fraction of the track between the wiper and the `b` end.
+    pub fn fraction(self, position: f64) -> f64 {
+        let p = position.clamp(0.0, 1.0);
+        match self {
+            Taper::Linear => p,
+            Taper::ReverseLinear => 1.0 - p,
+            Taper::Audio => Self::audio_law(p),
+            Taper::ReverseAudio => 1.0 - Self::audio_law(p),
+            Taper::Log { span } => Self::log_law(p, span),
+            Taper::ReverseLog { span } => 1.0 - Self::log_law(p, span),
+            Taper::Symmetric { span } => {
+                if p <= 0.5 {
+                    0.5 * Self::log_law(2.0 * p, span)
+                } else {
+                    1.0 - 0.5 * Self::log_law(2.0 * (1.0 - p), span)
+                }
+            }
+            Taper::AntiAudio => 1.0 - Self::audio_law(1.0 - p),
+            Taper::Steps { fractions, count } => {
+                let n = count.clamp(1, MAX_STEPS);
+                fractions[((p * n as f64) as usize).min(n - 1)]
+            }
+        }
+    }
+
+    /// A real audio track, which is two straight segments and not a curve.
+    ///
+    /// This was an exponential over a span of a thousand: three per cent of
+    /// the track left at half rotation, where the specification is ten to
+    /// twenty, and under one per cent at a quarter turn. It cost roughly
+    /// sixteen decibels at the middle of every audio control in the catalogue,
+    /// and the Mark IIC+ has two of them in series -- Volume 1 and the Lead
+    /// Drive -- so its lead channel was short of about thirty decibels for no
+    /// reason found on any drawing.
+    ///
+    /// Fixing the span alone was not enough, because the shape was wrong too.
+    /// A log pot is not manufactured as a curve: it is two or three carbon
+    /// segments of different resistivity laid end to end, so the track really
+    /// is piecewise linear with a corner at the middle, and the earlier note
+    /// here treated that corner as an artefact to be smoothed away rather than
+    /// as the thing being modelled. An exponential through the same midpoint
+    /// still sits nearly three times too low at an eighth of a turn, which is
+    /// where a high-gain amplifier's control does all of its work.
+    ///
+    /// So: a straight line from nothing to `AUDIO_AT_HALF` over the first half
+    /// of the rotation, and another from there to the whole track over the
+    /// second.
+    fn audio_law(p: f64) -> f64 {
+        if p <= 0.5 {
+            2.0 * p * AUDIO_AT_HALF
+        } else {
+            AUDIO_AT_HALF + 2.0 * (p - 0.5) * (1.0 - AUDIO_AT_HALF)
+        }
+    }
+
+    /// `(k^p - 1) / (k - 1)`, which is the track that makes a logarithmic
+    /// effect sweep evenly over a span of `k`. A span at or below one has no
+    /// range to shape, so it falls back to a plain track rather than dividing
+    /// by zero.
+    fn log_law(p: f64, span: f64) -> f64 {
+        // Only a span of one -- or a nonsense one -- has no shape to give.
+        if span.is_nan() || span <= 0.0 || (span - 1.0).abs() < 1e-6 {
+            return p;
+        }
+        (span.powf(p) - 1.0) / (span - 1.0)
+    }
+}
+
+/// Saturation drain current, and the gate voltage that pinches it off.
+///
+/// Pinch-off is negative: an n-channel JFET conducts with no bias at all and
+/// is turned *off* by pulling the gate down. That is why these stages are
+/// self-biased by a source resistor rather than by a divider from the rail.
+#[derive(Clone, Copy, Debug)]
+pub struct JfetSpec {
+    pub idss: f64,
+    pub pinch_off: f64,
+}
+
+impl JfetSpec {
+    /// The small-signal part in a great deal of discrete studio equipment.
+    pub const J2N5457: JfetSpec = JfetSpec {
+        idss: 3.0e-3,
+        pinch_off: -1.5,
+    };
+    /// Higher current and a deeper pinch-off, so it swings further before it
+    /// runs out of room.
+    pub const J201: JfetSpec = JfetSpec {
+        idss: 0.6e-3,
+        pinch_off: -0.8,
+    };
+    /// The 2SK117, GR rank: the small-signal JFET of most Japanese studio and
+    /// instrument electronics of the period.
+    ///
+    /// Both numbers come out of Toshiba's sheet rather than being chosen.
+    /// `idss` is the middle of the GR rank's published 2.6-6.5 mA. The
+    /// pinch-off is then *derived* from the sheet's other figure: for a
+    /// square-law JFET the transconductance at zero gate bias is
+    /// `2 Idss / |Vp|`, and the sheet gives `|Yfs| = 15 mS` typical at
+    /// `Vgs = 0`, so `|Vp| = 2 x 4.5 mA / 15 mS = 0.6 V` -- which sits inside
+    /// the sheet's own 0.2-1.5 V spread for the part.
+    pub const J2SK117_GR: JfetSpec = JfetSpec {
+        idss: 4.5e-3,
+        pinch_off: -0.6,
+    };
+    /// The 2SK184: both JFETs of a Roland JC-120's CH-1, and the same part in
+    /// a great many Boss pedals.
+    ///
+    /// DOCUMENTED, and the same two numbers as the 2SK117 above, because
+    /// Toshiba publishes the same two figures for it -- a 2.6-6.5 mA GR rank
+    /// and `|yfs| = 15 mS` typical at `Vgs = 0` -- so the derivation runs
+    /// identically. It is kept separate rather than aliased because the part
+    /// in the amplifier is a 2SK184 and a later datasheet reading should be
+    /// able to move one without moving the other.
+    ///
+    /// The JC-120 sheet checks it: with these numbers the input stage idles
+    /// its drain near the middle of the +VO rail and gives 20.7 dB into the
+    /// tone network, against the 20 dB the sheet's own two test points imply.
+    pub const J2SK184: JfetSpec = JfetSpec {
+        idss: 4.5e-3,
+        pinch_off: -0.6,
+    };
+    /// A large-signal part, for a stage that has to drive something.
+    pub const J113: JfetSpec = JfetSpec {
+        idss: 20.0e-3,
+        pinch_off: -3.0,
+    };
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CoreSpec {
+    /// Inductance below the knee, in henries. Large, so the branch is nearly
+    /// invisible until the flux gets up.
+    pub henry: f64,
+    /// Flux linkage at the knee.
+    pub knee: f64,
+    /// How sharply the core gives up past it. Silicon steel has a hard corner;
+    /// nickel is softer and starts bending sooner.
+    pub sharpness: f64,
+}
+
+impl CoreSpec {
+    /// Silicon steel: takes a lot before it does anything, then does a lot.
+    pub const STEEL: CoreSpec = CoreSpec {
+        henry: 40.0,
+        knee: 0.012,
+        sharpness: 7.0,
+    };
+    /// Nickel: bends earlier and more gently, which is the sound people buy
+    /// input transformers for.
+    pub const NICKEL: CoreSpec = CoreSpec {
+        henry: 90.0,
+        knee: 0.006,
+        sharpness: 3.0,
+    };
+    /// A modern amorphous core: very little of its own until pushed hard.
+    pub const AMORPHOUS: CoreSpec = CoreSpec {
+        henry: 150.0,
+        knee: 0.030,
+        sharpness: 9.0,
+    };
+}
+
+/// A bipolar transistor, by the Ebers-Moll transport model.
+///
+/// Saturation current, forward and reverse current gain, and the Early
+/// voltage that gives the collector its finite output resistance.
+#[derive(Clone, Copy, Debug)]
+pub struct BipolarSpec {
+    pub saturation: f64,
+    pub forward_beta: f64,
+    pub reverse_beta: f64,
+    pub early: f64,
+}
+
+impl BipolarSpec {
+    /// The small-signal NPN in a great deal of Japanese pedal circuitry --
+    /// the 2SC3378 and its relatives. High beta, low noise.
+    pub const NPN_2SC3378: BipolarSpec = BipolarSpec {
+        saturation: 1.0e-14,
+        forward_beta: 320.0,
+        reverse_beta: 4.0,
+        early: 100.0,
+    };
+    /// The 2SC1815, GR rank, and its close relative the 2SC2240 -- the small
+    /// signal NPNs a JC-120 is built out of. Toshiba ranks the part by gain
+    /// and the GR rank is 200-400; this is its middle. The Early voltage and
+    /// the saturation current are the family's, as for the parts above.
+    pub const NPN_2SC1815_GR: BipolarSpec = BipolarSpec {
+        saturation: 1.0e-14,
+        forward_beta: 300.0,
+        reverse_beta: 3.0,
+        early: 100.0,
+    };
+    /// A general purpose small-signal NPN, for where a circuit only needs
+    /// "a transistor".
+    pub const NPN: BipolarSpec = BipolarSpec {
+        saturation: 1.0e-14,
+        forward_beta: 200.0,
+        reverse_beta: 3.0,
+        early: 80.0,
+    };
+    /// The 2SA970, GR rank: Toshiba's low-noise PNP, and the input pair of a
+    /// JC-120's power amplifier. Beta is the middle of the GR rank's published
+    /// 200-400; the Early voltage is the figure a small-signal audio PNP of
+    /// this family carries and is ESTIMATED, which a long-tailed pair's
+    /// common-mode rejection is not sensitive to.
+    pub const PNP_2SA970_GR: BipolarSpec = BipolarSpec {
+        saturation: 1.0e-14,
+        forward_beta: 300.0,
+        reverse_beta: 3.0,
+        early: 120.0,
+    };
+    /// The 2SA1015, GR rank: the complement of the 2SC1815 above, and paired
+    /// with it in the JC-120's voltage amplifier stage. Same ranks, same
+    /// figures mirrored.
+    pub const PNP_2SA1015_GR: BipolarSpec = BipolarSpec {
+        saturation: 1.0e-14,
+        forward_beta: 300.0,
+        reverse_beta: 3.0,
+        early: 100.0,
+    };
+    /// A complementary driver pair, the 2SD669 and 2SB649 of the JC-120's
+    /// output stage. Medium-power parts: beta is lower than a small-signal
+    /// one's and falls with current, which the Early term stands in for here.
+    /// WIDELY REPORTED ranks, 60-320 for the AC grade; the middle of it.
+    pub const NPN_2SD669_AC: BipolarSpec = BipolarSpec {
+        saturation: 2.0e-14,
+        forward_beta: 150.0,
+        reverse_beta: 4.0,
+        early: 80.0,
+    };
+    pub const PNP_2SB649_AC: BipolarSpec = BipolarSpec {
+        saturation: 2.0e-14,
+        forward_beta: 150.0,
+        reverse_beta: 4.0,
+        early: 80.0,
+    };
+    /// The 2SC2229, O rank: the voltage amplifier stage of a JC-120's power
+    /// amplifier. A 160 V part where the 2SC1815 above is a 50 V one, which is
+    /// why it is there -- a VAS swinging between +-40 V rails needs the
+    /// breakdown. WIDELY REPORTED ranks; the O grade's 70-140 taken at its
+    /// middle. Beta matters here rather than being a detail: it sets how hard
+    /// this stage loads the differential pair's collector.
+    pub const NPN_2SC2229_O: BipolarSpec = BipolarSpec {
+        saturation: 1.0e-14,
+        forward_beta: 100.0,
+        reverse_beta: 3.0,
+        early: 100.0,
+    };
+    /// The output pair, 2SC4386 and 2SA1671. Power transistors: a large
+    /// saturation current and a beta of about a hundred, which is what holds
+    /// the drivers' current where the 0.33 ohm emitter resistors need it.
+    /// ESTIMATED from the class of part; the sheet gives the types and no
+    /// curves, and the feedback loop around them is what sets the gain.
+    pub const NPN_2SC4386: BipolarSpec = BipolarSpec {
+        saturation: 1.0e-12,
+        forward_beta: 100.0,
+        reverse_beta: 4.0,
+        early: 60.0,
+    };
+    pub const PNP_2SA1671: BipolarSpec = BipolarSpec {
+        saturation: 1.0e-12,
+        forward_beta: 100.0,
+        reverse_beta: 4.0,
+        early: 60.0,
+    };
+}
+
+/// One part.
+#[derive(Clone, Debug)]
+pub enum Part {
+    Resistor {
+        a: usize,
+        b: usize,
+        ohms: f64,
+    },
+    Capacitor {
+        a: usize,
+        b: usize,
+        farads: f64,
+    },
+    Inductor {
+        a: usize,
+        b: usize,
+        henry: f64,
+    },
+    /// A passive part whose value is set at control rate rather than fixed
+    /// when the circuit is drawn. `slot` indexes `Circuit::adjustables` for the
+    /// value the part starts with and `Simulation::set_value` for the running
+    /// one. It exists for loads that are a *choice* -- a loudspeaker's
+    /// electromechanical equivalent behind a power amplifier -- so one netlist
+    /// can stand for every speaker without a simulation per combination. A
+    /// rebuild carries capacitor voltages and inductor currents across a
+    /// value change exactly as it does across a pot moving.
+    Adjustable {
+        a: usize,
+        b: usize,
+        kind: Adjust,
+        slot: usize,
+    },
+    /// A potentiometer as the two halves of its track. Tie `wiper` to `b` to
+    /// use it as a rheostat.
+    Pot {
+        a: usize,
+        wiper: usize,
+        b: usize,
+        ohms: f64,
+        taper: Taper,
+        control: usize,
+    },
+    /// Where the signal arrives, through the impedance driving it, and the
+    /// direct voltage whatever is driving it sits at.
+    ///
+    /// That voltage is zero almost everywhere: one block hands the next an
+    /// alternating signal through a coupling capacitor. It is not zero when a
+    /// block is *direct* coupled to the one in front of it -- a Hiwatt's phase
+    /// inverter hangs on resistors off the driver's cathode follower, with no
+    /// capacitor anywhere -- and then the direct voltage is not an incidental
+    /// detail but the whole point: it is what holds the grids still when the
+    /// amplifier is driven hard. See `circuits::power` and `circuits::dr103`.
+    Input {
+        node: usize,
+        series: f64,
+        bias: f64,
+        /// Zero is the primary audio input used by `Simulation::process`.
+        /// Positive values identify auxiliary inputs driven independently by
+        /// `Simulation::set_aux_input` / `process_with_aux`.
+        source: usize,
+    },
+    /// A supply rail behind its series resistance, as a Norton source.
+    Supply {
+        node: usize,
+        series: f64,
+        volts: f64,
+    },
+    /// A rectifier valve, conducting from `a` to `k` by Child's law.
+    Rectifier {
+        a: usize,
+        k: usize,
+        spec: RectifierSpec,
+    },
+    /// A junction diode.
+    Diode {
+        a: usize,
+        k: usize,
+        spec: DiodeSpec,
+    },
+    /// A triode: plate, grid, cathode.
+    Triode {
+        p: usize,
+        g: usize,
+        k: usize,
+        spec: TriodeSpec,
+    },
+    /// A beam tetrode or pentode. `s` is the screen, which is a node like any
+    /// other so that the screen resistor's drop -- and the sag behind it --
+    /// falls out of the solve rather than being assumed.
+    ///
+    /// `count` is how many tubes this part stands for. A hundred and twenty
+    /// watt amplifier has two in each side of its push-pull pair, wired in
+    /// parallel and sharing a screen resistor, and two tubes in parallel are
+    /// one tube passing twice the current. Modelling them as one part halves
+    /// the nonlinear work for a difference no measurement here can see: real
+    /// tubes are not matched, but the mismatch is a manufacturing tolerance
+    /// rather than a circuit property, and inventing one would be inventing a
+    /// sound.
+    Pentode {
+        p: usize,
+        g: usize,
+        k: usize,
+        s: usize,
+        count: f64,
+        spec: PentodeSpec,
+        /// The screen returns to a winding rather than to a supply with a
+        /// capacitor on it: an ultra-linear stage's tap. Such a screen keeps
+        /// conducting when a Newton step puts the plate at its edge; see
+        /// `device::Pentode::on_winding`.
+        screen_on_winding: bool,
+    },
+    /// An operational amplifier, holding its inputs together by whatever it
+    /// has to put on its output -- until it runs out of rail.
+    /// An op-amp. `reference` is what its rails are measured from -- ground
+    /// for a split supply, and the bias point for a pedal running off one
+    /// battery, where the whole circuit sits at half the supply.
+    OpAmp {
+        out: usize,
+        plus: usize,
+        minus: usize,
+        reference: usize,
+        rail: f64,
+    },
+    /// An ideal op-amp used only where the modeled hardware section is intended
+    /// to stay inside its rails. Unlike `OpAmp`, this part never switches state,
+    /// so it is genuinely linear and may be eliminated by the exact Schur
+    /// partition. This is useful for large pedal EQ/gyrator networks: a tone
+    /// amplifier that never clips must not make the whole filter a Newton
+    /// boundary merely because another op-amp elsewhere in the pedal does.
+    LinearOpAmp {
+        out: usize,
+        plus: usize,
+        minus: usize,
+    },
+    /// An ideal transformer, `ratio` primary turns to one secondary turn.
+    /// Everything that colours a real one hangs off it as ordinary parts.
+    Transformer {
+        p1: usize,
+        p2: usize,
+        s1: usize,
+        s2: usize,
+        ratio: f64,
+    },
+    /// A junction FET: drain, gate, source.
+    Jfet {
+        d: usize,
+        g: usize,
+        s: usize,
+        spec: JfetSpec,
+    },
+    /// A transformer's magnetising branch, which is the part that saturates.
+    /// Put across a winding, alongside the `Transformer` that sets the ratio.
+    Core {
+        a: usize,
+        b: usize,
+        spec: CoreSpec,
+        /// Apply inexpensive first-order antialiasing to the nonlinear excess
+        /// magnetising current while leaving the linear inductance untouched.
+        antialias: bool,
+    },
+    /// A bipolar transistor: collector, base, emitter. `pnp` mirrors every
+    /// junction and current, which is exactly what a PNP part is.
+    Bipolar {
+        c: usize,
+        b: usize,
+        e: usize,
+        spec: BipolarSpec,
+        pnp: bool,
+    },
+    /// A voltage-controlled current source that runs out of current: into
+    /// `out` (from `reference`) flows `limit * tanh(gm * (v(plus) - v(minus)) /
+    /// limit)`. With a capacitor on `out` it is an op-amp's slow integrating
+    /// stage -- `gm / C` is its gain-bandwidth and `limit / C` its slew rate.
+    Transconductor {
+        plus: usize,
+        minus: usize,
+        out: usize,
+        reference: usize,
+        gm: f64,
+        limit: f64,
+    },
+}
+
+/// What an adjustable part is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Adjust {
+    Resistor,
+    Capacitor,
+    Inductor,
+    /// A resistor whose value may change every sample without rebuilding the
+    /// immutable matrix. It is stamped alongside nonlinear devices so its
+    /// current conductance is present in every Newton and line-search stamp.
+    RealtimeResistor,
+}
+
+/// Saturation current and emission coefficient.
+#[derive(Clone, Copy, Debug)]
+pub struct DiodeSpec {
+    pub saturation: f64,
+    pub emission: f64,
+}
+
+/// A rectifier valve, by the one number its data sheet gives: how many volts it
+/// drops at how much current.
+///
+/// A silicon diode drops the same volt whatever it passes. A valve does not: it
+/// is a space-charge device, so it follows Child's law and its drop goes as the
+/// two-thirds power of the current. That is where "sag" comes from -- a chord
+/// hit hard takes the supply down, and the amplifier goes soft for as long as
+/// the reservoir takes to come back. It is the reason an amplifier with one of
+/// these in it feels different from the same amplifier with diodes, and it is
+/// the reason Mesa put a switch between them on the front panel.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RectifierSpec {
+    /// Volts across one rectifier at `at_amps`.
+    pub drop_volts: f64,
+    pub at_amps: f64,
+}
+
+impl RectifierSpec {
+    /// The perveance Child's law needs: `i = k v^1.5`.
+    pub fn perveance(&self) -> f64 {
+        self.at_amps / self.drop_volts.powf(1.5)
+    }
+
+    /// A GZ34 (5AR4), which is what an AC30 and most Mesas have: about 30 V of
+    /// drop at a quarter of an amp, both plates together.
+    pub const GZ34: RectifierSpec = RectifierSpec {
+        drop_volts: 30.0,
+        at_amps: 0.25,
+    };
+
+    /// A 5U4GB, which is the softer one: about 50 V at the same current. The
+    /// Dual Rectifier's valve setting uses a pair of these.
+    pub const T5U4GB: RectifierSpec = RectifierSpec {
+        drop_volts: 50.0,
+        at_amps: 0.25,
+    };
+}
+
+impl DiodeSpec {
+    pub const SILICON: DiodeSpec = DiodeSpec {
+        saturation: 2.52e-9,
+        emission: 1.752,
+    };
+    /// Conducts at about a third of silicon's forward voltage, so a stage
+    /// leaves its linear region far earlier.
+    pub const GERMANIUM: DiodeSpec = DiodeSpec {
+        saturation: 2.0e-7,
+        emission: 1.2,
+    };
+    /// Needs roughly three times silicon's, so it stays clean where the others
+    /// are already working and then arrives all at once.
+    pub const LED: DiodeSpec = DiodeSpec {
+        saturation: 1.0e-16,
+        emission: 2.0,
+    };
+}
+
+/// Koren's triode parameters: amplification factor, exponent, and the three
+/// shaping constants.
+#[derive(Clone, Copy, Debug)]
+pub struct TriodeSpec {
+    pub mu: f64,
+    pub ex: f64,
+    pub kg1: f64,
+    pub kp: f64,
+    pub kvb: f64,
+}
+
+/// A beam tetrode or pentode, by Koren's equations.
+///
+/// The extra terms over a triode are what a screen grid buys: `mu` becomes the
+/// *screen* amplification factor, the plate's own influence on the cathode
+/// current nearly disappears, and the plate curves flatten into the long
+/// horizontal shelf that makes a power tube a current source rather than a
+/// resistor. That shelf is why a push-pull pair clips the way it does -- hard
+/// at the top, and asymmetrically once the grids start drawing.
+#[derive(Clone, Copy, Debug)]
+pub struct PentodeSpec {
+    /// Screen amplification factor.
+    pub mu: f64,
+    pub ex: f64,
+    pub kg1: f64,
+    pub kp: f64,
+    pub kvb: f64,
+    /// The screen's own current constant. Koren gives the screen a formula of
+    /// its own rather than a share of the cathode current: it follows the same
+    /// `E1^ex` the plate does, but without the plate's knee, because the
+    /// screen collects what it collects whatever the plate is doing.
+    ///
+    /// It is calibrated here against the data sheet rather than copied, and
+    /// the difference matters more than it looks. The figure usually published
+    /// alongside the plate constants gives a screen current around three times
+    /// what a 6L6GC actually draws, and a screen resistor plus a supply
+    /// impedance turn that into volts: the screen node collapses under drive,
+    /// the tubes are starved exactly when they are asked for current, and the
+    /// amplifier makes a few watts instead of a hundred. Nothing about that
+    /// looks like a wrong constant -- it looks like a power stage that runs
+    /// out early, which is what a power stage is supposed to do.
+    pub kg2: f64,
+}
+
+impl PentodeSpec {
+    /// The 6L6GC, which is what nearly every American power amplifier in this
+    /// catalogue runs. Koren's published constants for the type.
+    /// The 6L6GC, fitted against the data sheet at the two points a push-pull
+    /// output stage actually lives between.
+    ///
+    /// Not the constants usually published with Koren's model, and the
+    /// difference is worth recording because it was invisible until the whole
+    /// power stage was built. Those constants land within a couple of
+    /// milliamps at the idle point -- 450 V plate, 400 V screen, −37 V grid,
+    /// 26 mA -- and then give a transfer curve about half as steep as the real
+    /// tube's: 186 mA at zero bias where the sheet shows something over three
+    /// hundred. An amplifier built on them biases perfectly, amplifies, clips,
+    /// and makes a sixth of its rated power, because at full swing the tubes
+    /// simply run out of current. Nothing looks wrong; the power stage just
+    /// gives up early, which is what a power stage is supposed to do.
+    ///
+    /// So `mu` and `kg1` are fitted to hold *both* ends: 26 mA at the idle
+    /// point and something near three hundred at zero bias with the plate
+    /// pulled down to fifty volts, which is where a class AB stage spends its
+    /// loudest moment. `kg2` then follows from the sheet's 2.5 mA of screen
+    /// current at idle.
+    ///
+    /// `mu` here is the screen amplification factor, and eleven is inside the
+    /// range published for the type. This is a measured fit, not a
+    /// transcription, and it is the honest way round: a constant that
+    /// reproduces one operating point and misses the other is not a model of
+    /// the tube, it is a model of that operating point.
+    pub const T6L6GC: PentodeSpec = PentodeSpec {
+        mu: 11.0,
+        ex: 1.35,
+        kg1: 588.0,
+        kp: 48.0,
+        kvb: 12.0,
+        kg2: 3_960.0,
+    };
+    /// The EL34, for the British amplifiers on the roadmap. Higher screen
+    /// amplification and a softer knee than a 6L6.
+    pub const EL34: PentodeSpec = PentodeSpec {
+        mu: 11.0,
+        ex: 1.35,
+        kg1: 650.0,
+        kp: 60.0,
+        kvb: 24.0,
+        kg2: 9_000.0,
+    };
+    /// The 6V6GT, for the American Deluxe. Half a 6L6's current for the same
+    /// plate volts, which is the whole difference between a 22 W amplifier and
+    /// an 85 W one.
+    ///
+    /// Fitted, not transcribed: `tools/tube_fit/fit_6v6gt.py` solves for `kg1`,
+    /// `kp`, `kvb` and `kg2` against two published operating points -- RCA's
+    /// Class A1 row (250 V plate and screen, -12.5 V grid, 45 mA plate, 4.5 mA
+    /// screen) and General Electric's 1955 Class A pentode row (180 V, 180 V,
+    /// -8.5 V, 29 mA, 3 mA, 3700 micromho) -- and meets all five numbers to
+    /// better than 1.5 %.
+    ///
+    /// `ex` is held at 1.35 like every other power tube here, and `mu` is held
+    /// at the published screen amplification factor of 10 rather than fitted:
+    /// the residual surface is flat in it, and a free `mu` lands anywhere
+    /// between 10 and 40 with the same error, which would be buying one
+    /// constant with another.
+    ///
+    /// Checked against a point it was never shown: RCA's RC-30 Class AB1
+    /// push-pull row, 285 V plate and screen at -19 V, 70 mA for the pair. The
+    /// fit gives 35.02 mA in one tube against the published 35.0.
+    ///
+    /// Two known limits, recorded rather than tuned away. The Koren `atan`
+    /// knee puts the small-signal plate resistance at about 29 kohm where the
+    /// sheets say 50 kohm, which is a property of the model form and is shared
+    /// by the other pentodes here. More importantly the zero-bias end is low --
+    /// about 60 mA at 50 V on the plate, where published plate-characteristic
+    /// families suggest nearer 200 mA -- because no zero-bias figure for this
+    /// tube is published in a form that could be cited as a fit target. That
+    /// matters for a hard-driven output stage and is an open question in
+    /// `docs/models/american_deluxe.md`, not a settled number.
+    pub const T6V6GT: PentodeSpec = PentodeSpec {
+        mu: 10.0,
+        ex: 1.35,
+        kg1: 959.523,
+        kp: 47.4261,
+        kvb: 54.1185,
+        kg2: 7165.23,
+    };
+    /// The 6550, for the Sunn Model T (the Oregon 6550 stage).
+    ///
+    /// Fitted, not transcribed: `tools/tube_fit/fit_6550.py` solves for `mu`,
+    /// `kg1`, `kp` and `kvb` against General Electric's "6550-A" sheet of
+    /// April 1972 -- the average characteristics (250 V plate and screen,
+    /// -14 V, 140 mA, 11,000 micromho), the Class A1 row (400 V, 225 V,
+    /// -16.5 V, 87 mA) and the ultra-linear row (450 V on plate and screen at
+    /// -48 V, 75 mA a valve) -- and meets all four exactly. `kg2` then follows
+    /// from the average row's 12 mA of screen current. `ex` is held at 1.35 as
+    /// for every other power valve here.
+    ///
+    /// The ultra-linear row is in the fit because it is the only published
+    /// point with the screen near where a Model T runs it; fitted to the
+    /// pentode rows alone, all at 310 V of screen or less, the constants put a
+    /// Model T's valves at 110 mA each. With it, `mu` comes out at 8.18 without
+    /// being asked -- the sheet's own triode amplification factor is 8.
+    ///
+    /// Held out and checked: the ultra-linear row's screen current (6.05 mA
+    /// against 6.0), the cut-off figure (1.5 mA at -40 V against 1.0), and the
+    /// two push-pull pentode rows (70.7 mA against 75 at 450 V / 310 V, 41.2
+    /// against 50 at 600 V / 300 V). The screen law has no plate term, so the
+    /// Class A1 row's 4 mA, with the plate well above the screen, comes out at
+    /// 7.1: an ultra-linear stage never runs there.
+    pub const T6550: PentodeSpec = PentodeSpec {
+        mu: 8.1806,
+        ex: 1.35,
+        kg1: 439.866,
+        kp: 53.3598,
+        kvb: 49.0405,
+        kg2: 3726.51,
+    };
+    /// The KT66, the British beam tetrode in the Marshall JTM45.
+    ///
+    /// Fitted by `tools/tube_fit/fit_kt66.py` against Marconi's "KT66 Output
+    /// Tetrode" sheet, whose rows are all cathode-biased with their resistors
+    /// given, so each row's grid voltage is its resistor times its current:
+    /// class A at 250 V on plate and screen, 85 mA and 6.3 mA (-15.5 V); AB1 at
+    /// 258 V, 81 mA and 6 mA (-17.4 V); AB1 at 400 V / 300 V, 62.5 mA (-26 V);
+    /// 6.3 mA/V at 250 V / 250 V / -15 V -- every one within 3 % -- and GEC's
+    /// 22.5 kohm of internal resistance, which sets the knee. `kp`, which only
+    /// softens the cut-off and which no row reaches, is held at the 6L6GC's.
+    ///
+    /// GEC's later sheet (M-O Valve, Issue 5, April 1977) disagrees: its AB1
+    /// row at 415 V / 300 V / -27 V gives 52 mA (the fit 59), and its
+    /// ultra-linear row at 425 V / -35 V, 62.5 mA, asks for twice the
+    /// amplification factor its own AB1 row allows (the fit 124). The screen,
+    /// with the plate well above it (the 400 V / 300 V row), draws 4.7 mA
+    /// against Marconi's 2.5: Koren's screen law has no plate term, and the
+    /// JTM45 runs its screens at its plates' voltage, where the fit holds
+    /// 6.34 mA against 6.3.
+    pub const KT66: PentodeSpec = PentodeSpec {
+        mu: 7.7003,
+        ex: 1.35,
+        kg1: 772.728,
+        kp: 48.0,
+        kvb: 45.9822,
+        kg2: 7306.34,
+    };
+    /// The 7027A, the 6L6GC in an octal base with two screen pins and higher
+    /// ratings, for the Ampeg VT-40, whose drawing runs it at 586 V on the
+    /// plate and 589 V on the screen.
+    ///
+    /// Fitted by `tools/tube_fit/fit_7027a.py` against RCA's "7027-A" (8-59):
+    /// its class A row (250 V on plate and screen, -14 V: 72 mA, 6000 umho,
+    /// 22.5 kohm -- the 6L6GC's to the figure) within 2.5 %, the transconductance
+    /// and plate resistance to 1 %, and its three fixed-bias push-pull rows'
+    /// no-signal currents (51, 47.5 and 50 mA a valve at 400 / 300 / -25,
+    /// 450 / 350 / -30 and 540 / 400 / -38) within 13 % -- the rows do not
+    /// agree with each other, the 450 V one drawing less than the 400 V one at
+    /// more drive. Held out, the sheet's curve at 300 V / 300 V: within 10 %
+    /// from -30 V to -10 V, 11 % low at zero bias, and half the curve's 9.5 mA
+    /// at -40 V, where `kp` (held at the 6L6GC's) shapes the cut-off.
+    ///
+    /// Not `T6L6GC`: that fit, made to a different pair of points for the
+    /// amplifiers before this one and held by the frozen baselines, gives 23 mA
+    /// where this sheet gives 50 at 540 / 400 / -38, and at the VT-40's -65 V
+    /// with 589 V of screen it barely conducts.
+    pub const T7027A: PentodeSpec = PentodeSpec {
+        mu: 8.7832,
+        ex: 1.35,
+        kg1: 729.777,
+        kp: 48.0,
+        kvb: 56.0481,
+        kg2: 7585.76,
+    };
+    /// The EF86, the low-noise small pentode at the EMI REDD.47's input.
+    ///
+    /// Fitted by `tools/tube_fit/fit_ef86.py` against Philips's "EF86" of
+    /// January 1970: the typical point (250 V plate, 140 V screen, -2.2 V:
+    /// 3.0 mA, 0.6 mA screen, 2.2 mA/V) to 0.3 %, and the sheet's resistance-
+    /// coupled operating table -- 100 k plate, 390 k screen, 1 k cathode, the
+    /// REDD.47's own V1 -- within 3.5 % from 150 V to 400 V of supply. `mu` is
+    /// the sheet's grid 2 to grid 1 factor, 38, held. Its internal resistance
+    /// comes out at 1.24 Mohm against the sheet's 2.5 (not fitted: the Koren
+    /// knee's limit, as for the 6V6GT). The REDD.47's V1 runs at 1.50 mA from
+    /// 205 V against its drawing's 1.35.
+    pub const EF86: PentodeSpec = PentodeSpec {
+        mu: 38.0,
+        ex: 1.2169,
+        kg1: 823.495,
+        kp: 233.1269,
+        kvb: 24.9017,
+        kg2: 2806.23,
+    };
+    /// The EF804S, the Telefunken low-noise pentode of the V76's first three
+    /// stages: an EF86 for broadcast service, and the same family of figures.
+    ///
+    /// Fitted by `tools/tube_fit/fit_ef804s.py` against Telefunken's sheet:
+    /// the measuring point (250 V, 140 V screen, 500 ohm cathode: 3.2 mA,
+    /// 0.6 mA, 2.0 mA/V) to 0.5 %, and its resistance-coupled table's plate
+    /// currents within 3 %. `mu` is the sheet's 38, held.
+    pub const EF804S: PentodeSpec = PentodeSpec {
+        mu: 38.0,
+        ex: 1.2484,
+        kg1: 1023.258,
+        kp: 177.4464,
+        kvb: 2.4617,
+        kg2: 3480.65,
+    };
+    /// The E83F, the frame-grid output pentode of the V76's second amplifier.
+    ///
+    /// Fitted by `tools/tube_fit/fit_e83f.py` against Philips's December 1968
+    /// sheet: 10.46 mA, 2.11 mA screen, 8.78 mA/V and 0.50 Mohm at 210 V /
+    /// 120 V / 165 ohm against 10 / 2.1 / 9 / 0.5, and 0.49 mA at -5 V against
+    /// 0.5. `ex` sits at the fit's 1.8 bound; see the script.
+    pub const E83F: PentodeSpec = PentodeSpec {
+        mu: 38.0,
+        ex: 1.8,
+        kg1: 295.577,
+        kp: 93.9022,
+        kvb: 12.5293,
+        kg2: 970.63,
+    };
+    /// The EL84, for an AC30.
+    pub const EL84: PentodeSpec = PentodeSpec {
+        mu: 19.4,
+        ex: 1.35,
+        kg1: 650.0,
+        kp: 42.0,
+        kvb: 24.0,
+        kg2: 9_500.0,
+    };
+}
+
+impl TriodeSpec {
+    pub const ECC83: TriodeSpec = TriodeSpec {
+        mu: 100.0,
+        ex: 1.4,
+        kg1: 1060.0,
+        kp: 600.0,
+        kvb: 300.0,
+    };
+    /// A fifth of the amplification, and the commonest swap there is.
+    pub const ECC82: TriodeSpec = TriodeSpec {
+        mu: 21.5,
+        ex: 1.3,
+        kg1: 1180.0,
+        kp: 84.0,
+        kvb: 300.0,
+    };
+    /// 12AT7. Between the other two in amplification and well below the ECC83
+    /// in plate resistance, which is why it is what drives things: a reverb
+    /// transformer's primary in a blackface Fender, and a long-tailed pair
+    /// where the pair has to swing two power tubes' grids.
+    ///
+    /// From the same published Koren set as the two above -- the ECC83 and
+    /// ECC82 figures here are Koren's exactly, so this one is taken from the
+    /// same family rather than mixed in from elsewhere.
+    pub const ECC81: TriodeSpec = TriodeSpec {
+        mu: 60.0,
+        ex: 1.35,
+        kg1: 460.0,
+        kp: 300.0,
+        kvb: 300.0,
+    };
+    /// 12AY7, the medium-mu triode of the 610 console preamp's second stage.
+    ///
+    /// Fitted, not copied: `tools/tube_fit/fit_12ay7.py` solves for `mu`, `ex`,
+    /// `kg1` and `kp` (with `kvb` held at 300 like the others) against RCA's
+    /// "Tentative Data" of 1 April 1953 -- 3 mA at 250 V and -4 V, 1750 micromho,
+    /// 22,800 ohm plate resistance, and 10 microamps at -11 V -- and meets all
+    /// four. `mu` here is Koren's constant, not the small-signal amplification
+    /// factor, which the fit reproduces as the sheet's 40.
+    pub const T12AY7: TriodeSpec = TriodeSpec {
+        mu: 52.907,
+        ex: 1.3328,
+        kg1: 1065.41,
+        kp: 171.87,
+        kvb: 300.0,
+    };
+    /// E88CC, the frame-grid double triode the EMI REDD.47 runs with both
+    /// halves in parallel at its output.
+    ///
+    /// Fitted by `tools/tube_fit/fit_e88cc.py` against Philips's "E88CC S.Q.
+    /// TUBE" of December 1968, at its two published operating points (100 V
+    /// through 680 ohm: 15 mA, 12.5 mA/V, mu 33; 90 V through 120 ohm: 12 mA,
+    /// 11.5 mA/V): 15.2 mA, 12.48 mA/V, mu 33.0 and 11.9 mA, 11.48 mA/V. Held
+    /// out: the REDD.47's drawing puts its pair at 18 mA on 200 ohm, which the
+    /// fit makes about 14 -- the spread of a valve at 3 V of bias.
+    pub const E88CC: TriodeSpec = TriodeSpec {
+        mu: 34.0199,
+        ex: 1.2832,
+        kg1: 217.2316,
+        kp: 200.3105,
+        kvb: 300.0,
+    };
+    /// 12BH7-A, the medium-mu twin that drives the Ampeg SVT's six 6550s: one
+    /// half a gain stage, the other a cathode follower, a side.
+    ///
+    /// Fitted by `tools/tube_fit/fit_12bh7.py` against RCA's "Tentative Data"
+    /// of 1 March 1955 -- 11.5 mA at 250 V and -10.5 V, 3100 micromho, 5300 ohm,
+    /// 4 mA at -14 V, 50 microamps at -23 V: five targets for four constants
+    /// (`kvb` held at 300), all met within 3 %. The small-signal amplification
+    /// factor comes out at 16.0 against the sheet's 16.5.
+    pub const T12BH7: TriodeSpec = TriodeSpec {
+        mu: 17.483,
+        ex: 1.3367,
+        kg1: 1185.58,
+        kp: 101.45,
+        kvb: 300.0,
+    };
+    /// 6CG7, the medium-mu noval twin (a 6SN7 in a smaller bulb): the Ampeg
+    /// VT-40's reverb driver.
+    ///
+    /// Fitted by `tools/tube_fit/fit_6cg7.py` against Tung-Sol's "Tentative
+    /// Data" of 1 December 1959 -- 10 mA and 3000 micromho at 90 V and 0 V;
+    /// 9 mA, 2600 micromho and 7700 ohm at 250 V and -8 V; 1.3 mA at -12.5 V:
+    /// six targets for four constants (`kvb` held at 300), all met within
+    /// 1.1 %. Held out: 7071 ohm against the sheet's 6700 at 90 V; the
+    /// amplification factor comes out at 20.3 against 20.
+    pub const T6CG7: TriodeSpec = TriodeSpec {
+        mu: 21.5659,
+        ex: 1.273,
+        kg1: 1233.33,
+        kp: 141.263,
+        kvb: 300.0,
+    };
+}
+
+impl Part {
+    /// Applies a node renumbering. See `cuthill_mckee`.
+    fn renumber(&mut self, to: &[usize]) {
+        let map = |n: &mut usize| {
+            if *n != GROUND {
+                *n = to[*n];
+            }
+        };
+        match self {
+            Part::Resistor { a, b, .. }
+            | Part::Capacitor { a, b, .. }
+            | Part::Inductor { a, b, .. }
+            | Part::Adjustable { a, b, .. }
+            | Part::Core { a, b, .. } => {
+                map(a);
+                map(b);
+            }
+            Part::Pot { a, wiper, b, .. } => {
+                map(a);
+                map(wiper);
+                map(b);
+            }
+            Part::Input { node, .. } | Part::Supply { node, .. } => map(node),
+            Part::Rectifier { a, k, .. } => {
+                map(a);
+                map(k);
+            }
+            Part::Diode { a, k, .. } => {
+                map(a);
+                map(k);
+            }
+            Part::Triode { p, g, k, .. } => {
+                map(p);
+                map(g);
+                map(k);
+            }
+            Part::Pentode { p, g, k, s, .. } => {
+                map(p);
+                map(g);
+                map(k);
+                map(s);
+            }
+            Part::OpAmp {
+                out,
+                plus,
+                minus,
+                reference,
+                ..
+            } => {
+                map(out);
+                map(plus);
+                map(minus);
+                map(reference);
+            }
+            Part::LinearOpAmp { out, plus, minus } => {
+                map(out);
+                map(plus);
+                map(minus);
+            }
+            Part::Transformer { p1, p2, s1, s2, .. } => {
+                map(p1);
+                map(p2);
+                map(s1);
+                map(s2);
+            }
+            Part::Jfet { d, g, s, .. } => {
+                map(d);
+                map(g);
+                map(s);
+            }
+            Part::Transconductor {
+                plus,
+                minus,
+                out,
+                reference,
+                ..
+            } => {
+                map(plus);
+                map(minus);
+                map(out);
+                map(reference);
+            }
+            Part::Bipolar { c, b, e, .. } => {
+                map(c);
+                map(b);
+                map(e);
+            }
+        }
+    }
+
+    /// Every node this part touches, ground included.
+    pub fn touches(&self) -> Vec<usize> {
+        match *self {
+            Part::Resistor { a, b, .. }
+            | Part::Capacitor { a, b, .. }
+            | Part::Inductor { a, b, .. }
+            | Part::Adjustable { a, b, .. } => vec![a, b],
+            Part::Pot { a, wiper, b, .. } => vec![a, wiper, b],
+            Part::Pentode { p, g, k, s, .. } => vec![p, g, k, s],
+            Part::Input { node, .. } | Part::Supply { node, .. } => vec![node],
+            Part::Diode { a, k, .. } | Part::Rectifier { a, k, .. } => vec![a, k],
+            Part::Triode { p, g, k, .. } => vec![p, g, k],
+            Part::OpAmp {
+                out,
+                plus,
+                minus,
+                reference,
+                ..
+            } => vec![out, plus, minus, reference],
+            Part::LinearOpAmp { out, plus, minus } => vec![out, plus, minus],
+            Part::Transformer { p1, p2, s1, s2, .. } => vec![p1, p2, s1, s2],
+            Part::Jfet { d, g, s, .. } => vec![d, g, s],
+            Part::Core { a, b, .. } => vec![a, b],
+            Part::Bipolar { c, b, e, .. } => vec![c, b, e],
+            Part::Transconductor {
+                plus,
+                minus,
+                out,
+                reference,
+                ..
+            } => vec![plus, minus, out, reference],
+        }
+    }
+
+    /// Whether this part imposes a voltage rather than a conductance, and so
+    /// needs an unknown of its own in the matrix.
+    ///
+    /// A conductance goes on the diagonal and keeps the matrix well behaved.
+    /// A part that says "these two nodes shall differ by this much" cannot be
+    /// written that way at all: it needs its own current as a variable, and
+    /// the row it adds has a zero where the diagonal would be. That is why the
+    /// factorisation has to pivot.
+    pub fn needs_branch(&self) -> bool {
+        matches!(
+            self,
+            Part::OpAmp { .. } | Part::LinearOpAmp { .. } | Part::Transformer { .. }
+        )
+    }
+
+    /// Whether this part has a single frequency response. A device does not,
+    /// so a circuit containing one cannot be handed to the AC solver.
+    pub fn is_linear(&self) -> bool {
+        !matches!(
+            self,
+            Part::Diode { .. }
+                | Part::Rectifier { .. }
+                | Part::Triode { .. }
+                | Part::Pentode { .. }
+                | Part::OpAmp { .. }
+                | Part::Jfet { .. }
+                | Part::Core { .. }
+                | Part::Bipolar { .. }
+                | Part::Transconductor { .. }
+                | Part::Adjustable {
+                    kind: Adjust::RealtimeResistor,
+                    ..
+                }
+        )
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Part::Resistor { .. } => "resistor",
+            Part::Capacitor { .. } => "capacitor",
+            Part::Inductor { .. } => "inductor",
+            Part::Pot { .. } => "pot",
+            Part::Adjustable { .. } => "adjustable part",
+            Part::Input { .. } => "input",
+            Part::Supply { .. } => "supply",
+            Part::Diode { .. } => "diode",
+            Part::Rectifier { .. } => "rectifier valve",
+            Part::Triode { .. } => "triode",
+            Part::Pentode { .. } => "pentode",
+            Part::Jfet { .. } => "JFET",
+            Part::Core { .. } => "core",
+            Part::Bipolar { .. } => "transistor",
+            Part::Transconductor { .. } => "transconductor",
+            Part::OpAmp { .. } => "op-amp",
+            Part::LinearOpAmp { .. } => "linear op-amp",
+            Part::Transformer { .. } => "transformer",
+        }
+    }
+}
+
+/// What a netlist can be wrong about, said in terms of the names you used.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Fault {
+    /// A node nothing is connected to, or connected only once, which leaves a
+    /// row of the matrix empty or unsolvable.
+    Dangling { node: String, connections: usize },
+    /// The output is not reachable from the input through any part, so
+    /// whatever the circuit does cannot arrive anywhere.
+    Unreachable { from: String, to: String },
+    /// No input, or no output, or a part with a value that cannot be stamped.
+    Malformed(String),
+}
+
+impl fmt::Display for Fault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Fault::Dangling { node, connections } => write!(
+                f,
+                "node '{node}' has {connections} connection(s); it needs at least two \
+                 or its row of the matrix is empty and the solve returns NaN"
+            ),
+            Fault::Unreachable { from, to } => {
+                write!(f, "no path from '{from}' to '{to}'")
+            }
+            Fault::Malformed(what) => write!(f, "{what}"),
+        }
+    }
+}
+
+/// A circuit under construction.
+pub struct Netlist {
+    name: &'static str,
+    names: BTreeMap<String, usize>,
+    order: Vec<String>,
+    parts: Vec<Part>,
+    controls: usize,
+    adjustables: Vec<f64>,
+    aux_inputs: usize,
+    initial_voltages: Vec<(usize, f64)>,
+    initial_charges: Vec<(usize, usize, f64)>,
+    resting: Vec<(usize, f64)>,
+}
+
+impl Netlist {
+    pub fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            names: BTreeMap::new(),
+            order: Vec::new(),
+            parts: Vec::new(),
+            controls: 0,
+            adjustables: Vec::new(),
+            aux_inputs: 0,
+            initial_voltages: Vec::new(),
+            initial_charges: Vec::new(),
+            resting: Vec::new(),
+        }
+    }
+
+    /// The index for a named node, allocating it the first time it is asked
+    /// for. Asking twice gives the same answer, which is the whole point.
+    pub fn node(&mut self, name: &str) -> usize {
+        if let Some(&at) = self.names.get(name) {
+            return at;
+        }
+        let at = self.order.len();
+        self.names.insert(name.to_string(), at);
+        self.order.push(name.to_string());
+        at
+    }
+
+    pub fn ground(&self) -> usize {
+        GROUND
+    }
+
+    pub fn resistor(&mut self, a: &str, b: &str, ohms: f64) -> &mut Self {
+        let (a, b) = (self.pin(a), self.pin(b));
+        self.parts.push(Part::Resistor { a, b, ohms });
+        self
+    }
+
+    pub fn capacitor(&mut self, a: &str, b: &str, farads: f64) -> &mut Self {
+        let (a, b) = (self.pin(a), self.pin(b));
+        self.parts.push(Part::Capacitor { a, b, farads });
+        self
+    }
+
+    pub fn inductor(&mut self, a: &str, b: &str, henry: f64) -> &mut Self {
+        let (a, b) = (self.pin(a), self.pin(b));
+        self.parts.push(Part::Inductor { a, b, henry });
+        self
+    }
+
+    /// A resistor, capacitor or inductor whose value can be changed while the
+    /// circuit runs. Returns the slot to pass to `Simulation::set_value`.
+    pub fn adjustable(&mut self, a: &str, b: &str, kind: Adjust, value: f64) -> usize {
+        let (a, b) = (self.pin(a), self.pin(b));
+        let slot = self.adjustables.len();
+        self.adjustables.push(value);
+        self.parts.push(Part::Adjustable { a, b, kind, slot });
+        slot
+    }
+
+    pub fn pot(
+        &mut self,
+        a: &str,
+        wiper: &str,
+        b: &str,
+        ohms: f64,
+        taper: Taper,
+        control: usize,
+    ) -> &mut Self {
+        let (a, wiper, b) = (self.pin(a), self.pin(wiper), self.pin(b));
+        self.controls = self.controls.max(control + 1);
+        self.parts.push(Part::Pot {
+            a,
+            wiper,
+            b,
+            ohms,
+            taper,
+            control,
+        });
+        self
+    }
+
+    pub fn input(&mut self, node: &str, series: f64) -> &mut Self {
+        let node = self.pin(node);
+        self.parts.push(Part::Input {
+            node,
+            series,
+            bias: 0.0,
+            source: 0,
+        });
+        self
+    }
+
+    /// The same, from something sitting at a direct voltage of its own.
+    pub fn input_at(&mut self, node: &str, series: f64, bias: f64) -> &mut Self {
+        let node = self.pin(node);
+        self.parts.push(Part::Input {
+            node,
+            series,
+            bias,
+            source: 0,
+        });
+        self
+    }
+
+    /// Add an independent signal input. The returned slot is zero-based and
+    /// is supplied at runtime without rebuilding the circuit. This is used by
+    /// electromechanical split models such as the AB763 spring tank: the dry
+    /// amplifier remains one electrical circuit while the delayed tank pickup
+    /// re-enters at the recovery-grid jack.
+    pub fn aux_input(&mut self, node: &str, series: f64) -> usize {
+        let node = self.pin(node);
+        let slot = self.aux_inputs;
+        self.aux_inputs += 1;
+        self.parts.push(Part::Input {
+            node,
+            series,
+            bias: 0.0,
+            source: slot + 1,
+        });
+        slot
+    }
+
+    pub fn supply(&mut self, node: &str, series: f64, volts: f64) -> &mut Self {
+        let node = self.pin(node);
+        self.parts.push(Part::Supply {
+            node,
+            series,
+            volts,
+        });
+        self
+    }
+
+    pub fn diode(&mut self, a: &str, k: &str, spec: DiodeSpec) -> &mut Self {
+        let (a, k) = (self.pin(a), self.pin(k));
+        self.parts.push(Part::Diode { a, k, spec });
+        self
+    }
+
+    /// A rectifier valve, from plate to cathode.
+    pub fn rectifier(&mut self, a: &str, k: &str, spec: RectifierSpec) -> &mut Self {
+        let (a, k) = (self.pin(a), self.pin(k));
+        self.parts.push(Part::Rectifier { a, k, spec });
+        self
+    }
+
+    pub fn jfet(&mut self, d: &str, g: &str, s: &str, spec: JfetSpec) -> &mut Self {
+        let (d, g, s_) = (self.pin(d), self.pin(g), self.pin(s));
+        self.parts.push(Part::Jfet { d, g, s: s_, spec });
+        self
+    }
+
+    pub fn bipolar(&mut self, c: &str, b: &str, e: &str, spec: BipolarSpec) -> &mut Self {
+        let (c, b, e) = (self.pin(c), self.pin(b), self.pin(e));
+        self.parts.push(Part::Bipolar {
+            c,
+            b,
+            e,
+            spec,
+            pnp: false,
+        });
+        self
+    }
+
+    /// A PNP transistor: the NPN equations with every junction and current
+    /// mirrored.
+    pub fn bipolar_pnp(&mut self, c: &str, b: &str, e: &str, spec: BipolarSpec) -> &mut Self {
+        let (c, b, e) = (self.pin(c), self.pin(b), self.pin(e));
+        self.parts.push(Part::Bipolar {
+            c,
+            b,
+            e,
+            spec,
+            pnp: true,
+        });
+        self
+    }
+
+    /// A current source controlled by a voltage, saturating at `limit` amps.
+    /// See `Part::Transconductor`.
+    pub fn transconductor(
+        &mut self,
+        plus: &str,
+        minus: &str,
+        out: &str,
+        reference: &str,
+        gm: f64,
+        limit: f64,
+    ) -> &mut Self {
+        let (plus, minus, out, reference) = (
+            self.pin(plus),
+            self.pin(minus),
+            self.pin(out),
+            self.pin(reference),
+        );
+        self.parts.push(Part::Transconductor {
+            plus,
+            minus,
+            out,
+            reference,
+            gm,
+            limit,
+        });
+        self
+    }
+
+    /// The magnetising branch of a winding: what makes iron sound like iron.
+    pub fn core(&mut self, a: &str, b: &str, spec: CoreSpec) -> &mut Self {
+        let (a, b) = (self.pin(a), self.pin(b));
+        self.parts.push(Part::Core {
+            a,
+            b,
+            spec,
+            antialias: false,
+        });
+        self
+    }
+
+    /// The same physical magnetising branch, with antiderivative antialiasing
+    /// on only the nonlinear saturation current. This keeps the expensive MNA
+    /// solve at the host rate while suppressing the high-order fold-back that a
+    /// hard transformer knee can create. The linear inductance is deliberately
+    /// left exact so the small-signal transformer response does not move.
+    pub fn core_antialiased(&mut self, a: &str, b: &str, spec: CoreSpec) -> &mut Self {
+        let (a, b) = (self.pin(a), self.pin(b));
+        self.parts.push(Part::Core {
+            a,
+            b,
+            spec,
+            antialias: true,
+        });
+        self
+    }
+
+    pub fn triode(&mut self, p: &str, g: &str, k: &str, spec: TriodeSpec) -> &mut Self {
+        let (p, g, k) = (self.pin(p), self.pin(g), self.pin(k));
+        self.parts.push(Part::Triode { p, g, k, spec });
+        self
+    }
+
+    /// One power tube, or `count` of them in parallel. See `Part::Pentode`.
+    pub fn pentode(
+        &mut self,
+        p: &str,
+        g: &str,
+        k: &str,
+        screen: &str,
+        count: f64,
+        spec: PentodeSpec,
+    ) -> &mut Self {
+        let (p, g, k, s) = (self.pin(p), self.pin(g), self.pin(k), self.pin(screen));
+        self.parts.push(Part::Pentode {
+            p,
+            g,
+            k,
+            s,
+            count,
+            spec,
+            screen_on_winding: false,
+        });
+        self
+    }
+
+    /// A power tube whose screen returns to a winding -- an ultra-linear
+    /// stage's tap -- rather than to a supply. See `Part::Pentode`.
+    pub fn pentode_on_winding(
+        &mut self,
+        p: &str,
+        g: &str,
+        k: &str,
+        screen: &str,
+        count: f64,
+        spec: PentodeSpec,
+    ) -> &mut Self {
+        let (p, g, k, s) = (self.pin(p), self.pin(g), self.pin(k), self.pin(screen));
+        self.parts.push(Part::Pentode {
+            p,
+            g,
+            k,
+            s,
+            count,
+            spec,
+            screen_on_winding: true,
+        });
+        self
+    }
+
+    /// An op-amp on a split supply, clipping symmetrically about ground.
+    pub fn opamp(&mut self, out: &str, plus: &str, minus: &str, rail: f64) -> &mut Self {
+        let (out, plus, minus) = (self.pin(out), self.pin(plus), self.pin(minus));
+        self.parts.push(Part::OpAmp {
+            out,
+            plus,
+            minus,
+            reference: GROUND,
+            rail,
+        });
+        self
+    }
+
+    /// An ideal op-amp for a stage that is part of the pedal's linear filtering
+    /// network and is not intended to reach a rail. It stamps exactly the
+    /// small-signal op-amp equation used by the AC solver, but because it cannot
+    /// switch to a rail it remains in the passive/linear side of the realtime
+    /// Schur partition instead of enlarging Newton's boundary.
+    pub fn linear_opamp(&mut self, out: &str, plus: &str, minus: &str) -> &mut Self {
+        let (out, plus, minus) = (self.pin(out), self.pin(plus), self.pin(minus));
+        self.parts.push(Part::LinearOpAmp { out, plus, minus });
+        self
+    }
+
+    /// An op-amp on a single supply, clipping about the bias point the whole
+    /// circuit sits at.
+    pub fn opamp_biased(
+        &mut self,
+        out: &str,
+        plus: &str,
+        minus: &str,
+        reference: &str,
+        rail: f64,
+    ) -> &mut Self {
+        let (out, plus, minus, reference) = (
+            self.pin(out),
+            self.pin(plus),
+            self.pin(minus),
+            self.pin(reference),
+        );
+        self.parts.push(Part::OpAmp {
+            out,
+            plus,
+            minus,
+            reference,
+            rail,
+        });
+        self
+    }
+
+    pub fn transformer(&mut self, p1: &str, p2: &str, s1: &str, s2: &str, ratio: f64) -> &mut Self {
+        let (p1, p2, s1, s2) = (self.pin(p1), self.pin(p2), self.pin(s1), self.pin(s2));
+        self.parts.push(Part::Transformer {
+            p1,
+            p2,
+            s1,
+            s2,
+            ratio,
+        });
+        self
+    }
+
+    /// Set an initial voltage on a node for the DC solver. This helps the
+    /// Newton solver find the operating point for circuits with AC-coupled
+    /// floating nodes.
+    pub fn initial_voltage(&mut self, node: &str, volts: f64) -> &mut Self {
+        let node = self.pin(node);
+        self.initial_voltages.push((node, volts));
+        self
+    }
+
+    /// The voltage the capacitor between `a` and `b` starts with, from `a`
+    /// to `b`, instead of the one the operating point implies: SPICE's
+    /// initial condition, and what power-on gives a real circuit.
+    ///
+    /// For an oscillator. A relaxation oscillator's operating point is a
+    /// balance it can only leave by being disturbed -- the op-amp sitting in
+    /// its linear region, its timing capacitor exactly between the
+    /// thresholds -- and a solver that starts there exactly can stay there
+    /// for good, while one that starts a hair away is off in milliseconds.
+    /// Which of the two a given control setting gets is then rounding. The
+    /// hardware is never at the balance: its capacitors start from nothing
+    /// when the battery goes in. A charge stated here is applied every time an
+    /// operating point is taken, so the oscillator starts the same way, from
+    /// the same phase, every time.
+    pub fn charged(&mut self, a: &str, b: &str, volts: f64) -> &mut Self {
+        let (a, b) = (self.pin(a), self.pin(b));
+        self.initial_charges.push((a, b, volts));
+        self
+    }
+
+    /// Where a control sits when nothing turns it.
+    ///
+    /// Not every knob on a front panel reaches the plugin's, and the ones that
+    /// do not still have to be *somewhere*. Left alone they sit at the middle
+    /// of their travel, which is a position no player would choose and, on an
+    /// audio track, is twenty decibels down. A circuit that has such a control
+    /// says here where its player leaves it, and every harness, test and
+    /// instance then agrees without having to remember.
+    pub fn rest(&mut self, control: usize, position: f64) -> &mut Self {
+        self.controls = self.controls.max(control + 1);
+        self.resting.push((control, position.clamp(0.0, 1.0)));
+        self
+    }
+
+    /// `"gnd"` and `"ground"` are the reference; anything else is a node.
+    fn pin(&mut self, name: &str) -> usize {
+        if name == "gnd" || name == "ground" {
+            GROUND
+        } else {
+            self.node(name)
+        }
+    }
+
+    /// Checks the circuit and hands back something the solvers can use.
+    pub fn build(self, output: &str) -> Result<Circuit, Fault> {
+        let Some(&out) = self.names.get(output) else {
+            return Err(Fault::Malformed(format!(
+                "'{}' has no node called '{output}' to take its output from",
+                self.name
+            )));
+        };
+        let input = self
+            .parts
+            .iter()
+            .find_map(|p| match p {
+                Part::Input {
+                    node, source: 0, ..
+                } => Some(*node),
+                _ => None,
+            })
+            .ok_or_else(|| Fault::Malformed(format!("'{}' has no input", self.name)))?;
+
+        for part in &self.parts {
+            let bad = match *part {
+                Part::Resistor { ohms, .. } => ohms <= 0.0,
+                Part::Capacitor { farads, .. } => farads <= 0.0,
+                Part::Inductor { henry, .. } => henry <= 0.0,
+                Part::Pot { ohms, .. } => ohms <= 0.0,
+                Part::Adjustable { slot, .. } => {
+                    let value = self.adjustables.get(slot).copied().unwrap_or(0.0);
+                    value.is_nan() || value <= 0.0
+                }
+                Part::Input { series, .. } | Part::Supply { series, .. } => series <= 0.0,
+                Part::Diode { spec, .. } => spec.saturation <= 0.0 || spec.emission <= 0.0,
+                Part::Rectifier { spec, .. } => spec.drop_volts <= 0.0 || spec.at_amps <= 0.0,
+                Part::Triode { spec, .. } => spec.mu <= 0.0 || spec.kg1 <= 0.0,
+                Part::Pentode { spec, count, .. } => {
+                    spec.mu <= 0.0 || spec.kg1 <= 0.0 || count <= 0.0
+                }
+                // Pinch-off is negative for an n-channel part, and a core with
+                // no knee would saturate at zero signal.
+                Part::Jfet { spec, .. } => spec.idss <= 0.0 || spec.pinch_off >= 0.0,
+                Part::Core { spec, .. } => {
+                    spec.henry <= 0.0 || spec.knee <= 0.0 || spec.sharpness <= 1.0
+                }
+                Part::Bipolar { spec, .. } => {
+                    spec.saturation <= 0.0
+                        || spec.forward_beta <= 0.0
+                        || spec.reverse_beta <= 0.0
+                        || spec.early <= 0.0
+                }
+                Part::OpAmp { rail, .. } => rail <= 0.0,
+                Part::LinearOpAmp { .. } => false,
+                Part::Transconductor { gm, limit, .. } => gm <= 0.0 || limit <= 0.0,
+                Part::Transformer { ratio, .. } => ratio <= 0.0,
+            };
+            if bad {
+                return Err(Fault::Malformed(format!(
+                    "a {} in '{}' has a value of zero or less",
+                    part.name(),
+                    self.name
+                )));
+            }
+        }
+
+        // Every node has to be connected at least twice: once is a dead end
+        // whose row carries a single conductance to nowhere.
+        let mut degree = vec![0usize; self.order.len()];
+        for part in &self.parts {
+            for pin in part.touches() {
+                if pin != GROUND {
+                    degree[pin] += 1;
+                }
+            }
+        }
+        if let Some(at) = degree.iter().position(|&d| d < 2) {
+            return Err(Fault::Dangling {
+                node: self.order[at].clone(),
+                connections: degree[at],
+            });
+        }
+
+        if !self.reaches(input, out) {
+            return Err(Fault::Unreachable {
+                from: self.order[input].clone(),
+                to: output.to_string(),
+            });
+        }
+
+        // Renumber the nodes so the matrix is nearly banded.
+        //
+        // The elimination already stops at each row's last nonzero, which for a
+        // circuit matrix ought to be a large saving -- a part only touches the
+        // nodes it is wired to, so a row holds three or four entries out of
+        // thirty. It was worth seven per cent, because fill-in destroys the
+        // structure almost immediately: eliminating column three can put an
+        // entry in column twenty-nine, and from then on every row reaches the
+        // far edge.
+        //
+        // How much fill-in there is depends entirely on the *order* the nodes
+        // are numbered in, and until now that order was whichever order the
+        // builder happened to mention them. Reverse Cuthill-McKee numbers them
+        // by breadth-first distance from a corner of the graph, which for a
+        // circuit -- a long chain of stages, each touching its neighbours -- is
+        // very nearly the signal path, and leaves the matrix close to banded.
+        //
+        // This is a permutation and nothing else: the same equations in a
+        // different order. What it changes numerically is which pivots the
+        // elimination picks, so results move in the last bits and no further.
+        let nodes = self.order.len();
+        let permutation = cuthill_mckee(&self.parts, nodes);
+        let branches = self.parts.iter().filter(|p| p.needs_branch()).count();
+
+        // Every unknown gets a name, branch rows included -- they are rows in
+        // the matrix like any other and a report that skipped them numbered
+        // its own output wrongly.
+        let mut order = vec![String::new(); nodes + branches];
+        for (old, name) in self.order.into_iter().enumerate() {
+            order[permutation[old]] = name;
+        }
+        // Where each part's own current ended up. Worked out here rather than
+        // counted on demand, because the ordering has interleaved the branch
+        // rows with the nodes and the old "how many branch-carrying parts came
+        // before this one" no longer describes anything.
+        let mut branch_row = vec![usize::MAX; self.parts.len()];
+        let mut next = nodes;
+        for (index, part) in self.parts.iter().enumerate() {
+            if part.needs_branch() {
+                let row = permutation[next];
+                branch_row[index] = row;
+                order[row] = format!("i{}", next - nodes);
+                next += 1;
+            }
+        }
+
+        let mut parts = self.parts;
+        for part in &mut parts {
+            part.renumber(&permutation);
+        }
+        let out = permutation[out];
+        let initial_voltages: Vec<(usize, f64)> = self
+            .initial_voltages
+            .into_iter()
+            .map(|(node, volts)| (permutation[node], volts))
+            .collect();
+        let renumber = |node: usize| {
+            if node == GROUND {
+                GROUND
+            } else {
+                permutation[node]
+            }
+        };
+        let initial_charges: Vec<(usize, usize, f64)> = self
+            .initial_charges
+            .into_iter()
+            .map(|(a, b, volts)| (renumber(a), renumber(b), volts))
+            .collect();
+
+        Ok(Circuit {
+            name: self.name,
+            nodes,
+            branches,
+            names: order,
+            branch_row,
+            parts,
+            output: out,
+            controls: self.controls,
+            adjustables: self.adjustables,
+            aux_inputs: self.aux_inputs,
+            initial_voltages,
+            initial_charges,
+            resting: self.resting,
+        })
+    }
+
+    /// Whether a signal can get from one node to another through any part.
+    /// Ground is not a path: everything touches it.
+    fn reaches(&self, from: usize, to: usize) -> bool {
+        let mut seen = vec![false; self.order.len()];
+        let mut stack = vec![from];
+        seen[from] = true;
+        while let Some(at) = stack.pop() {
+            if at == to {
+                return true;
+            }
+            for part in &self.parts {
+                let pins = part.touches();
+                if !pins.contains(&at) {
+                    continue;
+                }
+                for pin in pins {
+                    if pin != GROUND && !seen[pin] {
+                        seen[pin] = true;
+                        stack.push(pin);
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+/// A checked circuit.
+#[derive(Clone)]
+pub struct Circuit {
+    pub name: &'static str,
+    pub nodes: usize,
+    /// How many parts carry a current of their own as an unknown.
+    pub branches: usize,
+    /// One per unknown: a node's name, or `i(part)` for a branch row.
+    pub names: Vec<String>,
+    /// Where each part's own current unknown sits, or `usize::MAX` for a part
+    /// that has none. See `branch_of`.
+    pub branch_row: Vec<usize>,
+    pub parts: Vec<Part>,
+    pub output: usize,
+    pub controls: usize,
+    /// The starting value of every adjustable part, by slot. See `Part::Adjustable`.
+    pub adjustables: Vec<f64>,
+    /// Number of independently driven auxiliary input ports.
+    pub aux_inputs: usize,
+    /// Initial node voltages for the DC solver. (node_index, voltage)
+    pub initial_voltages: Vec<(usize, f64)>,
+    /// Capacitors that start charged rather than at the operating point.
+    /// (a, b, volts from a to b); see `Netlist::charged`.
+    pub initial_charges: Vec<(usize, usize, f64)>,
+    /// Where the controls nobody turns are left. (control, position)
+    pub resting: Vec<(usize, f64)>,
+}
+
+impl Circuit {
+    /// How big the matrix is: a row for every node, and one more for every
+    /// part that imposes a voltage.
+    pub fn unknowns(&self) -> usize {
+        self.nodes + self.branches
+    }
+
+    /// Where a branch-carrying part's own unknown sits.
+    ///
+    /// Looked up, not counted. Branch rows used to be appended after every
+    /// node in the order the parts were added, which made this a count of the
+    /// branch-carrying parts before it -- and made the matrix's band as wide
+    /// as the matrix on any circuit with a transformer in it. They are now
+    /// ordered along with the nodes, so where one landed is a fact to be
+    /// recorded rather than derived. See `cuthill_mckee`.
+    pub fn branch_of(&self, part: usize) -> usize {
+        self.branch_row[part]
+    }
+
+    /// How many positions `control` has, when it is a rotary switch: every
+    /// pot it moves a `Taper::Steps` of the same count, as the decks of one
+    /// switch are. `None` for a continuous control, or one that moves nothing.
+    pub fn control_steps(&self, control: usize) -> Option<usize> {
+        let mut steps = None;
+        for part in &self.parts {
+            if let Part::Pot {
+                taper, control: c, ..
+            } = *part
+            {
+                if c != control {
+                    continue;
+                }
+                match (taper, steps) {
+                    (Taper::Steps { count, .. }, None) => steps = Some(count),
+                    (Taper::Steps { count, .. }, Some(n)) if n == count => {}
+                    _ => return None,
+                }
+            }
+        }
+        steps
+    }
+
+    /// Whether every part has a frequency response, and therefore whether the
+    /// AC solver can be asked about it.
+    pub fn is_linear(&self) -> bool {
+        self.parts.iter().all(Part::is_linear)
+    }
+
+    /// Where a named node ended up after renumbering, for reading a second
+    /// voltage out of a running simulation. See `Simulation::voltage_at`.
+    pub fn unknown_named(&self, name: &str) -> Option<usize> {
+        self.names.iter().position(|n| n == name)
+    }
+
+    /// What a node is called, for anything that has to report a problem.
+    pub fn node_name(&self, at: usize) -> &str {
+        if at == GROUND {
+            "gnd"
+        } else {
+            &self.names[at]
+        }
+    }
+}
+
+/// Reverse Cuthill-McKee: a node numbering that keeps the matrix near its
+/// diagonal.
+///
+/// The elimination's cost is decided by how far each row reaches to the right,
+/// and that is decided by fill-in, and fill-in is decided by the order the
+/// nodes are numbered in. Numbering them in the order a builder happens to
+/// mention them is arbitrary; numbering them by breadth-first distance from
+/// the least-connected node, then reversing, is the standard way to make a
+/// sparse symmetric-patterned matrix nearly banded.
+///
+/// For these circuits the result is very nearly the signal path, which is what
+/// one would draw by hand: a chain of stages, each touching only its
+/// neighbours.
+fn cuthill_mckee(parts: &[Part], nodes: usize) -> Vec<usize> {
+    // Every unknown, not every node.
+    //
+    // A part that imposes a voltage -- an inductor, a transformer, a source --
+    // carries its own current as an extra row, and those rows used to be
+    // appended after *every* node with no ordering at all. That is fine for a
+    // circuit with none, and ruinous for one with several: a branch row
+    // couples to the nodes its part touches, so wherever those nodes ended up,
+    // the row reaches from there to the far end of the matrix. The elimination
+    // is bounded by that reach, so the band was as wide as the matrix.
+    //
+    // Measured, on the output transformer's stage -- two ideal transformers and
+    // three inductors, 27 unknowns: a band of 23 and 1966 elimination updates,
+    // against the Big Muff's band of 3 and 62 updates for the same 27
+    // unknowns. Thirty-two times the work for the same size, and all of it in
+    // the numbering.
+    //
+    // Put in the graph, the branches are ordered next to the nodes they
+    // constrain: band 23 -> 9, and 1966 updates -> 1174.
+    let branches = parts.iter().filter(|p| p.needs_branch()).count();
+    let total = nodes + branches;
+    if total == 0 {
+        return Vec::new();
+    }
+    // Who touches whom. Ground is not a row in the matrix, so it joins nothing.
+    let mut neighbours: Vec<Vec<usize>> = vec![Vec::new(); total];
+    let mut branch = nodes;
+    for part in parts {
+        let pins: Vec<usize> = part
+            .touches()
+            .into_iter()
+            .filter(|&p| p != GROUND)
+            .collect();
+        for (i, &a) in pins.iter().enumerate() {
+            for &b in &pins[i + 1..] {
+                if a != b {
+                    neighbours[a].push(b);
+                    neighbours[b].push(a);
+                }
+            }
+        }
+        if part.needs_branch() {
+            for &a in &pins {
+                neighbours[branch].push(a);
+                neighbours[a].push(branch);
+            }
+            branch += 1;
+        }
+    }
+    for list in &mut neighbours {
+        list.sort_unstable();
+        list.dedup();
+    }
+
+    // Breadth first from the least connected node, taking each level's
+    // neighbours in ascending degree so the front stays narrow. A circuit can
+    // be several disconnected pieces -- a bias chain that only meets the signal
+    // through a device, say -- so every piece gets a turn.
+    let degree = |n: usize| neighbours[n].len();
+    let mut visited = vec![false; total];
+    let mut sequence = Vec::with_capacity(total);
+    let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    while sequence.len() < total {
+        let start = (0..total)
+            .filter(|&n| !visited[n])
+            .min_by_key(|&n| (degree(n), n))
+            .expect("a node that has not been visited");
+        visited[start] = true;
+        queue.push_back(start);
+        while let Some(node) = queue.pop_front() {
+            sequence.push(node);
+            let mut next: Vec<usize> = neighbours[node]
+                .iter()
+                .copied()
+                .filter(|&n| !visited[n])
+                .collect();
+            next.sort_by_key(|&n| (degree(n), n));
+            for n in next {
+                visited[n] = true;
+                queue.push_back(n);
+            }
+        }
+    }
+
+    // Reversed, which is what makes it *Reverse* Cuthill-McKee: the same
+    // bandwidth, but less fill-in during the elimination.
+    let mut to = vec![0usize; total];
+    for (position, &node) in sequence.iter().rev().enumerate() {
+        to[node] = position;
+    }
+    to
+}

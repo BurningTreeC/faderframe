@@ -171,6 +171,14 @@ impl PluginNode {
 }
 
 impl Processor<EngineContext> for PluginNode {
+    fn preferred_block_size(&self) -> usize {
+        if self.bypass {
+            usize::MAX
+        } else {
+            self.processor.preferred_block_size()
+        }
+    }
+
     fn latency(&self) -> u32 {
         self.latency
     }
@@ -191,7 +199,15 @@ impl Processor<EngineContext> for PluginNode {
             transport: &cx.data.transport,
             param_events: &events,
         };
+        self.processor
+            .set_callback_deadline(cx.data.callback_deadline);
         let status = self.processor.process(&ctx, io);
+        let underruns = self.processor.take_underruns();
+        if underruns != 0 {
+            cx.data
+                .worker_underruns
+                .fetch_add(underruns, Ordering::Relaxed);
+        }
         self.events = events;
         if status == ProcessStatus::Error {
             // Reported to the control side through the shared flag.

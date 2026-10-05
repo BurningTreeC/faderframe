@@ -21,14 +21,19 @@
 //! * [`ScopedFlushDenormals`] — flush-to-zero on DSP threads.
 //! * [`Workgroup`] — the audio device's `os_workgroup` (macOS) the DSP
 //!   workers join.
+//! * [`reservoir`] — GainStageFx's fixed-delay asynchronous DSP worker,
+//!   used for live circuit plugins. Offline/ahead callers use inline DSP.
 //!
-//! The pool's wake-up is the only syscall made on the audio thread besides
-//! reading the clock (`FUTEX_WAKE`, which never blocks). `unsafe` code is
+//! Worker wake-ups and initial scheduling queries are nonblocking. A generic
+//! reservoir may wait for current-call output when its delay is shorter than
+//! the callback, or when the caller runs ahead of real time; see its module.
+//! `unsafe` code is
 //! confined to `mailbox` and `pages` (pointer ownership transfer through
 //! `AtomicPtr`s), `cells` (interior mutability guarded by atomic states),
 //! `pool` (scoped job pointer, futex, thread scheduling), `denormals`
 //! (the FP control register) and `workgroup` (CoreAudio and
-//! `os_workgroup` calls), with invariants documented inline.
+//! `os_workgroup` calls), and the reservoir's single-writer output ring,
+//! with invariants documented inline.
 
 mod atomic;
 mod cells;
@@ -43,6 +48,12 @@ mod scope;
 mod slots;
 mod trycell;
 mod workgroup;
+// GainStageFx's generic DSP reservoir; see faderframe-circuit/UPSTREAM.md.
+#[rustfmt::skip]
+pub mod reservoir;
+#[cfg(test)]
+#[rustfmt::skip]
+mod test_allocations;
 
 pub use atomic::AtomicF32;
 pub use cells::{Claim, TaskCells};

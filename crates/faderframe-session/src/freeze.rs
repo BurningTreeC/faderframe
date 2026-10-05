@@ -124,10 +124,19 @@ impl Session {
                 continue;
             }
             let b = self.bounces.remove(i);
+            let progress = std::sync::Arc::clone(&b.job.progress);
             let result = b.job.join();
             if let Err(e) = result
                 .map_err(|e| SessionError::Other(e.to_string()))
-                .and_then(|_| self.finish_bounce(b.track, b.freeze, b.start, b.path))
+                .and_then(|_| {
+                    self.finish_bounce(
+                        b.track,
+                        b.freeze,
+                        b.start,
+                        b.path,
+                        progress.latency.load(std::sync::atomic::Ordering::Relaxed),
+                    )
+                })
             {
                 self.notify(NoticeLevel::Error, format!("bounce: {e}"));
             }
@@ -141,6 +150,7 @@ impl Session {
         freeze: bool,
         start: MusicalTime,
         path: PathBuf,
+        latency: u32,
     ) -> Result<()> {
         let wav = faderframe_audio_files::wavstream::WavFile::open(&path)
             .map_err(|e| SessionError::Other(format!("{}: {e}", path.display())))?;
@@ -172,6 +182,7 @@ impl Session {
                     source: source_id,
                     start,
                     length: frames,
+                    latency,
                 }),
             });
             self.batch("Freeze Track", cmds)?;
@@ -204,8 +215,8 @@ impl Session {
                     muted: false,
                     content: ClipContent::Audio(AudioClip {
                         source: source_id,
-                        source_offset: 0,
-                        length: frames,
+                        source_offset: i64::from(latency).min(frames),
+                        length: frames.saturating_sub(i64::from(latency)),
                         gain_db: 0.0,
                         fades: ClipFades::default(),
                         stretch: StretchSettings::Off,
@@ -251,6 +262,7 @@ impl Session {
             | Command::UpdateNote { clip, .. } => frozen(track_of_clip(clip)),
             Command::InsertPlugin { track, .. }
             | Command::RemovePlugin { track, .. }
+            | Command::SetPreamp { track, .. }
             | Command::SetInstrument { track, .. }
             | Command::SetPluginState { track, .. } => frozen(Some(*track)),
             _ => None,

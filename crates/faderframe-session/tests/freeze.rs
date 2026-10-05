@@ -52,6 +52,11 @@ fn master(project: &Project, name: &str) -> Vec<f32> {
 fn freezing_keeps_the_sound_and_blocks_edits_until_unfrozen() {
     let mut s = Session::demo(EngineConfig::default()).unwrap();
     let pluck = track(&s, "Pluck");
+    s.dispatch(Action::SetPreamp {
+        track: pluck,
+        model: Some(1),
+    })
+    .unwrap();
     let before = master(s.project(), "before");
     s.dispatch(Action::FreezeTrack(pluck)).unwrap();
     wait(&mut s);

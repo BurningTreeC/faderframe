@@ -200,6 +200,10 @@ pub enum Action {
     DeleteSelection,
     SplitSelectedAtPlayhead,
     /// Insert a plugin into a track's insert chain (the session allocates ids).
+    SetPreamp {
+        track: TrackId,
+        model: Option<usize>,
+    },
     InsertPlugin {
         track: TrackId,
         index: usize,
@@ -987,6 +991,7 @@ fn removes_plugins(cmd: &Command) -> bool {
     match cmd {
         Command::RemovePlugin { .. }
         | Command::RemoveTrack { .. }
+        | Command::SetPreamp { .. }
         | Command::SetInstrument { .. } => true,
         Command::Batch { commands, .. } => commands.iter().any(removes_plugins),
         _ => false,
@@ -1489,6 +1494,7 @@ impl Session {
                 t.inserts
                     .iter()
                     .chain(t.instrument.iter())
+                    .chain(t.preamp.iter())
                     .any(|s| plugins.contains(&s.id))
             })
             .map(|t| t.id)
@@ -2422,11 +2428,40 @@ impl Session {
                 }
             }
             Action::SplitSelectedAtPlayhead => self.split_at_playhead()?,
+            Action::SetPreamp { track, model } => {
+                let slot = if let Some(model) = model {
+                    let &(id, name, _) = faderframe_core::builtin::PREAMPS
+                        .get(model)
+                        .ok_or_else(|| SessionError::Other("Unknown preamp".into()))?;
+                    Some(PluginSlot {
+                        id: self.project.ids.allocate(),
+                        plugin: PluginRef {
+                            format: faderframe_project::PluginFormat::Builtin,
+                            id: id.into(),
+                            name: name.into(),
+                        },
+                        bypass: false,
+                        parameters: Vec::new(),
+                        state: None,
+                        sidechain: None,
+                    })
+                } else {
+                    None
+                };
+                self.edit(Command::SetPreamp { track, slot })?;
+            }
             Action::InsertPlugin {
                 track,
                 index,
                 plugin,
             } => {
+                if plugin.format == faderframe_project::PluginFormat::Builtin
+                    && faderframe_core::builtin::preamp_index(&plugin.id).is_some()
+                {
+                    return Err(SessionError::Other(
+                        "Choose microphone preamps in the dedicated mixer section".into(),
+                    ));
+                }
                 let slot = PluginSlot {
                     id: self.project.ids.allocate(),
                     plugin,
@@ -2506,7 +2541,12 @@ impl Session {
                     .project
                     .tracks
                     .iter()
-                    .flat_map(|t| t.instrument.iter().chain(t.inserts.iter()))
+                    .flat_map(|t| {
+                        t.instrument
+                            .iter()
+                            .chain(t.preamp.iter())
+                            .chain(t.inserts.iter())
+                    })
                     .filter(|s| s.plugin.format != faderframe_project::PluginFormat::Builtin)
                     .map(|s| s.id)
                     .collect();
@@ -3283,6 +3323,7 @@ impl Session {
             t.inserts
                 .iter()
                 .chain(t.instrument.iter())
+                .chain(t.preamp.iter())
                 .find(|s| s.id == plugin)
                 .map(|s| (t, s))
         })
@@ -3399,6 +3440,7 @@ impl Session {
         self.engine
             .available_plugins()
             .into_iter()
+            .filter(|d| d.category != PluginCategory::Preamp)
             .map(|d| AvailablePlugin {
                 plugin: PluginRef {
                     format: match d.format {
@@ -3428,7 +3470,12 @@ impl Session {
             .project
             .tracks
             .iter()
-            .flat_map(|t| t.instrument.iter().chain(t.inserts.iter()))
+            .flat_map(|t| {
+                t.instrument
+                    .iter()
+                    .chain(t.preamp.iter())
+                    .chain(t.inserts.iter())
+            })
             .chain(self.project.album.inserts())
             .filter(|s| s.plugin.format != faderframe_project::PluginFormat::Builtin)
             .map(|s| s.id)
@@ -3446,7 +3493,12 @@ impl Session {
         let slots = project
             .tracks
             .iter_mut()
-            .flat_map(|t| t.instrument.iter_mut().chain(t.inserts.iter_mut()))
+            .flat_map(|t| {
+                t.instrument
+                    .iter_mut()
+                    .chain(t.preamp.iter_mut())
+                    .chain(t.inserts.iter_mut())
+            })
             .chain(
                 project
                     .album

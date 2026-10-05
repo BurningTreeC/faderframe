@@ -712,3 +712,77 @@ fn track_drop_uses_visible_order_with_hidden_midi_tracks_and_a_pinned_master() {
             .any(|a| matches!(a, Action::Edit(Command::MoveTrack { .. })))
     );
 }
+
+#[test]
+fn preamp_chooser_faceplate_controls_and_removal_use_the_dedicated_slot() {
+    let mut s = session();
+    let mut view = MixerView::new(Theme::default());
+    let size = Size::new(1400.0, 900.0);
+    let track = MixerView::channel_tracks(&s)[0].id;
+    view.update_sends(&s);
+    let area = view.layout_of(&s, track, size).unwrap().preamp.unwrap();
+    let (_, requests) = run(&mut view, down(area.center(), 1), size, &s);
+    assert!(matches!(&requests[..], [HostRequest::ContextMenu { items, .. }] if items.len() == 6));
+    s.dispatch(Action::SetPreamp {
+        track,
+        model: Some(0),
+    })
+    .unwrap();
+    view.update_sends(&s);
+    let area = view.layout_of(&s, track, size).unwrap().preamp.unwrap();
+    assert_eq!(area.h, 84.0);
+    let knob = Point::new(area.x + area.w * 0.25, area.y + 30.0);
+    assert_eq!(
+        view.hit_test(knob, size, &s),
+        Some(Hit::PreampKnob(track, 0))
+    );
+    let (mut actions, _) = run(&mut view, down(knob, 1), size, &s);
+    assert_eq!(actions, vec![Action::BeginGesture("Preamp".into())]);
+    let (a, _) = run(
+        &mut view,
+        ViewEvent::PointerMove {
+            pos: Point::new(knob.x, knob.y - 20.0),
+            modifiers: Modifiers::NONE,
+            dragging: true,
+        },
+        size,
+        &s,
+    );
+    actions.extend(a);
+    let (a, _) = run(
+        &mut view,
+        ViewEvent::PointerUp {
+            pos: knob,
+            button: PointerButton::Primary,
+            modifiers: Modifiers::NONE,
+        },
+        size,
+        &s,
+    );
+    actions.extend(a);
+    for a in actions {
+        s.dispatch(a).unwrap();
+    }
+    assert!(
+        preamp::value(
+            s.project().track(track).unwrap().preamp.as_ref().unwrap(),
+            0
+        ) > 0.5
+    );
+    s.dispatch(Action::Undo).unwrap();
+    assert_eq!(
+        preamp::value(
+            s.project().track(track).unwrap().preamp.as_ref().unwrap(),
+            0
+        ),
+        0.5
+    );
+    let mut painter = RecordingPainter::new();
+    view.paint(&mut painter, size, &s, &Theme::default());
+    for text in ["British 73", "Gain", "Master", "Change", "×"] {
+        assert!(painter.texts().contains(&text), "{text}");
+    }
+    let remove = Point::new(area.right() - 10.0, area.bottom() - 10.0);
+    let (a, _) = run(&mut view, down(remove, 1), size, &s);
+    assert_eq!(a, vec![Action::SetPreamp { track, model: None }]);
+}

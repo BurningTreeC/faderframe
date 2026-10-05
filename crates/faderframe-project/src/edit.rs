@@ -206,6 +206,10 @@ pub enum Command {
         parameter: ParameterId,
         value: Option<f64>,
     },
+    SetPreamp {
+        track: TrackId,
+        slot: Option<PluginSlot>,
+    },
     SetInstrument {
         track: TrackId,
         slot: Option<PluginSlot>,
@@ -599,6 +603,7 @@ impl Command {
                 freeze: Some(_), ..
             } => "Freeze Track".into(),
             SetTrackFreeze { freeze: None, .. } => "Unfreeze Track".into(),
+            SetPreamp { .. } => "Change Preamp".into(),
             SetInstrument { .. } => "Change Instrument".into(),
             AddTrack { .. } | RestoreTrack(_) => "Add Track".into(),
             RemoveTrack { .. } => "Remove Track".into(),
@@ -732,6 +737,7 @@ impl Command {
             | RemovePlugin { .. }
             | SetPluginBypass { .. }
             | SetSongInserts { .. }
+            | SetPreamp { .. }
             | SetInstrument { .. }
             | AddTrack { .. }
             | RemoveTrack { .. }
@@ -1089,6 +1095,18 @@ impl Command {
                     state: old_state,
                     parameters: old_params,
                 }
+            }
+            SetPreamp { track, slot } => {
+                let t = track_mut(p, track)?;
+                if let Some(s) = &slot
+                    && (!t.kind.has_audio()
+                        || s.plugin.format != crate::PluginFormat::Builtin
+                        || faderframe_core::builtin::preamp_index(&s.plugin.id).is_none())
+                {
+                    return Err(EditError::Invalid("Invalid microphone preamp slot".into()));
+                }
+                let old = std::mem::replace(&mut t.preamp, slot);
+                SetPreamp { track, slot: old }
             }
             SetInstrument { track, slot } => {
                 let t = track_mut(p, track)?;

@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 mod layout;
+mod preamp;
 
 pub use layout::{INSERT_SLOT_STEP, MAX_SEND_ROWS, SENDS_PER_ROW, StripLayout};
 
@@ -36,6 +37,9 @@ const CHEEK_W: f32 = 22.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Hit {
+    PreampChoose(TrackId),
+    PreampRemove(TrackId),
+    PreampKnob(TrackId, u32),
     FaderCap(TrackId),
     FaderTrack(TrackId),
     Pan(TrackId),
@@ -67,6 +71,7 @@ pub enum Hit {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum KnobTarget {
+    Preamp(u32),
     Pan,
     Send(usize),
 }
@@ -126,6 +131,7 @@ pub struct MixerView {
     insert_slots: usize,
     /// The project has groups or VCAs: strips show a tag row.
     show_tags: bool,
+    expanded_preamps: bool,
     /// Only the master strip, filling the view (the side panel).
     master_only: bool,
     /// The side panel shows the master: this mixer leaves it out.
@@ -194,6 +200,7 @@ impl MixerView {
             max_sends: 0,
             insert_slots: faderframe_session::DEFAULT_INSERT_SLOTS as usize,
             show_tags: false,
+            expanded_preamps: false,
             master_only: false,
             hide_master: false,
         }
@@ -282,7 +289,7 @@ impl MixerView {
 
     fn layout_for(&self, rect: Rect, t: &Track) -> StripLayout {
         let vca = t.kind == TrackKind::Vca;
-        StripLayout::new(
+        StripLayout::with_preamp(
             rect,
             &self.theme,
             matches!(t.kind, TrackKind::Audio | TrackKind::Instrument),
@@ -290,12 +297,18 @@ impl MixerView {
             self.send_rows,
             if vca { 0 } else { self.insert_slots.max(1) },
             self.show_tags,
+            if t.kind.has_audio() {
+                if self.expanded_preamps { 84.0 } else { 20.0 }
+            } else {
+                0.0
+            },
         )
     }
 
     /// Size the send section for the track with the most sends (always
     /// leaving one free slot to add another).
     fn update_sends(&mut self, model: &Session) {
+        self.expanded_preamps = model.project().tracks.iter().any(|t| t.preamp.is_some());
         self.hide_master = !self.master_only && model.master_panel();
         self.insert_slots = model.mixer_insert_slots();
         let p = model.project();
@@ -348,6 +361,11 @@ impl MixerView {
             }
             let l = self.layout_for(rect, t);
             let id = t.id;
+            if let Some(area) = l.preamp
+                && let Some(hit) = self.preamp_hit(area, t, pos)
+            {
+                return Some(hit);
+            }
             let geo = FaderGeometry::new(l.fader, &self.theme);
             let pos_now = self.law.db_to_position(model.shown_volume_db(t));
             // VCAs have only a fader, mute and solo.
@@ -437,6 +455,10 @@ impl MixerView {
         }
         for &y in &l.dividers {
             controls::section_line(p, rect.x + 4.0, rect.right() - 4.0, y, th);
+        }
+
+        if let Some(area) = l.preamp {
+            self.paint_preamp(p, area, t, model);
         }
 
         // Header.
@@ -735,6 +757,10 @@ impl MixerView {
 
     fn knob_value(&self, t: &Track, target: KnobTarget) -> Option<f32> {
         match target {
+            KnobTarget::Preamp(id) => t
+                .preamp
+                .as_ref()
+                .map(|slot| preamp::position(preamp::value(slot, id), id)),
             KnobTarget::Pan => Some((t.pan + 1.0) * 0.5),
             KnobTarget::Send(i) => t.sends.get(i).map(|s| self.law.db_to_position(s.level_db)),
         }
@@ -743,6 +769,12 @@ impl MixerView {
     fn knob_command(&self, t: &Track, target: KnobTarget, value: f32) -> Option<Command> {
         let value = value.clamp(0.0, 1.0);
         match target {
+            KnobTarget::Preamp(id) => t.preamp.as_ref().map(|slot| Command::SetPluginParameter {
+                track: t.id,
+                plugin: slot.id,
+                parameter: faderframe_core::ParameterId(id),
+                value: Some(preamp::plain(value, id)),
+            }),
             KnobTarget::Pan => {
                 // Snap to centre near the middle for convenience.
                 let pan = value * 2.0 - 1.0;
@@ -1390,6 +1422,17 @@ impl MixerView {
         };
         let toggle = |cx: &mut EventCx<'_, Action>, cmd: Command| cx.emit(Action::Edit(cmd));
         match hit {
+            Hit::PreampChoose(id) => {
+                if let Some(t) = Self::track(model, id) {
+                    cx.request(Self::preamp_menu(t, pos));
+                }
+            }
+            Hit::PreampRemove(id) => {
+                cx.emit(Action::SetPreamp {
+                    track: id,
+                    model: None,
+                });
+            }
             Hit::FaderCap(id) | Hit::FaderTrack(id) => {
                 let Some(t) = Self::track(model, id) else {
                     return false;
@@ -1423,11 +1466,12 @@ impl MixerView {
                     (self.send_bank as i64 + delta as i64).clamp(0, pages as i64 - 1) as usize;
                 cx.redraw();
             }
-            Hit::Pan(id) | Hit::Send(id, _) => {
+            Hit::Pan(id) | Hit::Send(id, _) | Hit::PreampKnob(id, _) => {
                 let Some(t) = Self::track(model, id) else {
                     return false;
                 };
                 let target = match hit {
+                    Hit::PreampKnob(_, id) => KnobTarget::Preamp(id),
                     Hit::Send(_, i) => KnobTarget::Send(i),
                     _ => KnobTarget::Pan,
                 };
@@ -1439,6 +1483,9 @@ impl MixerView {
                 };
                 if clicks >= 2 {
                     let reset = match target {
+                        KnobTarget::Preamp(id) => {
+                            preamp::position(if id == 0 { 0.5 } else { 0.0 }, id)
+                        }
                         KnobTarget::Pan => 0.5,
                         KnobTarget::Send(_) => self.law.unity_position(),
                     };
@@ -1448,6 +1495,7 @@ impl MixerView {
                     return true;
                 }
                 cx.emit(Action::BeginGesture(match target {
+                    KnobTarget::Preamp(_) => "Preamp".into(),
                     KnobTarget::Pan => "Pan".into(),
                     KnobTarget::Send(_) => "Send Level".into(),
                 }));
@@ -1645,6 +1693,22 @@ impl MixerView {
             return false;
         };
         let req = match hit {
+            Hit::PreampChoose(id) | Hit::PreampRemove(id) => {
+                Self::track(model, id).map(|t| Self::preamp_menu(t, pos))
+            }
+            Hit::PreampKnob(id, param) => Self::track(model, id).and_then(|t| {
+                t.preamp.as_ref().map(|slot| {
+                    Self::learn_menu(
+                        model,
+                        t,
+                        faderframe_automation::AutomationTarget::PluginParameter {
+                            plugin: slot.id,
+                            parameter: faderframe_core::ParameterId(param),
+                        },
+                        pos,
+                    )
+                })
+            }),
             Hit::Send(id, i) => Self::track(model, id).map(|t| Self::send_menu(model, t, i, pos)),
             Hit::Insert(id, i) => {
                 Self::track(model, id).map(|t| Self::insert_menu(model, t, i, pos))
@@ -1701,6 +1765,28 @@ impl MixerView {
                 .unwrap_or_default()
         };
         Some(match hit {
+            Hit::PreampChoose(_) => "Choose microphone preamplifier".into(),
+            Hit::PreampRemove(_) => "Remove microphone preamplifier".into(),
+            Hit::PreampKnob(id, param) => {
+                let slot = Self::track(model, id)?.preamp.as_ref()?;
+                let v = model
+                    .display_value(
+                        id,
+                        faderframe_automation::AutomationTarget::PluginParameter {
+                            plugin: slot.id,
+                            parameter: faderframe_core::ParameterId(param),
+                        },
+                    )
+                    .unwrap_or_else(|| preamp::value(slot, param));
+                if param == 0 {
+                    format!(
+                        "Gain {:.1}% · Drag or wheel · Double-click to reset",
+                        v * 100.0
+                    )
+                } else {
+                    format!("Master {v:.1} dB · Drag or wheel · Double-click for 0 dB")
+                }
+            }
             Hit::FaderCap(id) | Hit::FaderTrack(id) => {
                 let t = Self::track(model, id)?;
                 format!(
@@ -1965,7 +2051,11 @@ impl CanvasView<Session, Action> for MixerView {
                     cx.set_cursor(match hit {
                         Some(Hit::FaderCap(_) | Hit::Scribble(_)) => Cursor::Grab,
                         Some(
-                            Hit::FaderTrack(_) | Hit::Pan(_) | Hit::Send(..) | Hit::InsertsGrip(_),
+                            Hit::FaderTrack(_)
+                            | Hit::Pan(_)
+                            | Hit::PreampKnob(..)
+                            | Hit::Send(..)
+                            | Hit::InsertsGrip(_),
                         ) => Cursor::ResizeVertical,
                         Some(Hit::Strip(_)) | None => Cursor::Default,
                         Some(_) => Cursor::Pointer,
@@ -2057,8 +2147,9 @@ impl CanvasView<Session, Action> for MixerView {
                         }
                         true
                     }
-                    Some(Hit::Pan(id) | Hit::Send(id, _)) if dx == 0.0 => {
+                    Some(Hit::Pan(id) | Hit::Send(id, _) | Hit::PreampKnob(id, _)) if dx == 0.0 => {
                         let target = match self.hit_test(pos, size, model) {
+                            Some(Hit::PreampKnob(_, id)) => KnobTarget::Preamp(id),
                             Some(Hit::Send(_, i)) => KnobTarget::Send(i),
                             _ => KnobTarget::Pan,
                         };

@@ -221,7 +221,12 @@ impl Session {
                 unit: "dB",
             });
         }
-        for slot in t.instrument.iter().chain(t.inserts.iter()) {
+        for slot in t
+            .instrument
+            .iter()
+            .chain(t.preamp.iter())
+            .chain(t.inserts.iter())
+        {
             let Some(params) = self.engine.plugin_parameters(slot.id) else {
                 continue;
             };
@@ -283,6 +288,7 @@ impl Session {
                 let slot = t
                     .instrument
                     .iter()
+                    .chain(t.preamp.iter())
                     .chain(t.inserts.iter())
                     .find(|s| s.id == plugin)?;
                 match slot.parameters.iter().find(|p| p.id == parameter) {
@@ -300,6 +306,7 @@ impl Session {
                 let slot = t
                     .instrument
                     .iter()
+                    .chain(t.preamp.iter())
                     .chain(t.inserts.iter())
                     .find(|s| s.id == plugin)?;
                 f64::from(u8::from(slot.bypass))

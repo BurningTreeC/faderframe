@@ -219,6 +219,8 @@ pub fn create_with_epoch(
         garbage: gtx,
         graph: None,
         ctx: EngineContext {
+            worker_underruns: AtomicU64::new(0),
+            callback_deadline: None,
             transport: Default::default(),
             discontinuity: false,
             timeline: Arc::new(TimelineSnapshot::empty(config.sample_rate as f64)),
@@ -454,6 +456,12 @@ impl EngineProcessor {
         }
         self.ctx.preview_active = self.preview.is_some() && self.shared.preview.is_active();
         let rate = self.stream_rate as f64;
+        // Buffered DSP shares this device deadline across smaller graph chunks.
+        // Leave 10% (at least 100 us) for downstream work and driver return.
+        let period = std::time::Duration::from_secs_f64(frames as f64 / rate);
+        let reserve = period
+            .mul_f64(0.1)
+            .max(std::time::Duration::from_micros(100));
         let graph_ok = self
             .graph
             .as_ref()
@@ -464,8 +472,12 @@ impl EngineProcessor {
         let max_block = self
             .graph
             .as_ref()
-            .map_or(1024, |g| g.config().max_block_size)
+            .map_or(1024, |g| g.processing_quantum())
             .max(1);
+        // Whole callbacks at or below the reservoir retain its no-wait realtime
+        // policy. Only internal chunks of a larger callback share this budget.
+        self.ctx.callback_deadline =
+            (frames > max_block).then_some(started + period.saturating_sub(reserve));
 
         if let Some(link) = self.ahead.as_deref_mut() {
             link.poll(&mut self.transport, frames);
@@ -657,6 +669,9 @@ impl EngineProcessor {
         self.shared
             .metrics
             .record(started.elapsed().as_nanos() as u64, budget_ns);
+        self.shared
+            .metrics
+            .record_xruns(self.ctx.worker_underruns.swap(0, Ordering::Relaxed));
         // No streamed page reference survives past this point.
         self.shared.epoch.advance();
     }
@@ -1453,6 +1468,8 @@ impl EngineController {
         self.ahead_tracks.clear();
         let Some(lookahead) = lookahead else { return };
         let ctx = EngineContext {
+            worker_underruns: AtomicU64::new(0),
+            callback_deadline: None,
             transport: Default::default(),
             discontinuity: false,
             timeline: Arc::clone(&self.timeline),

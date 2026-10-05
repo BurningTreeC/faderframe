@@ -35,10 +35,12 @@ pub fn doc_of(slot: &PluginSlot) -> SampleDoc {
 /// whose paths do not change are left alone). Returns whether any did.
 pub fn map_states(project: &mut Project, f: impl Fn(&Path) -> PathBuf) -> bool {
     let mut changed = false;
-    let slots = project
-        .tracks
-        .iter_mut()
-        .flat_map(|t| t.instrument.iter_mut().chain(t.inserts.iter_mut()));
+    let slots = project.tracks.iter_mut().flat_map(|t| {
+        t.instrument
+            .iter_mut()
+            .chain(t.preamp.iter_mut())
+            .chain(t.inserts.iter_mut())
+    });
     for slot in slots.filter(|s| is_sampler(s)) {
         let Some(bytes) = slot
             .state

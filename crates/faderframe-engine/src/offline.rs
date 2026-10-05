@@ -37,6 +37,7 @@ impl OfflineRenderer {
         output_channels: usize,
     ) -> Result<Self, EngineError> {
         let (mut controller, mut processor) = create(config);
+        controller.plugins().set_realtime(false);
         faderframe_audio::AudioCallback::prepare(
             &mut processor,
             &faderframe_audio::StreamInfo {

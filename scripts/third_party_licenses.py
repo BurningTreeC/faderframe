@@ -45,6 +45,13 @@ SYSTEM_LIBRARIES = [
 # (name, version, license, source, licence file relative to the repository)
 VENDORED = [
     (
+        "GainStageFx circuit DSP and reservoir",
+        "0.49.0",
+        "MIT OR Apache-2.0",
+        "https://github.com/BurningTreeC/gainstagefx",
+        "crates/faderframe-circuit/LICENSE-MIT",
+    ),
+    (
         "Signalsmith Stretch",
         "1.3.1",
         "MIT",

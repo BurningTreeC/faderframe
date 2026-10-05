@@ -1239,6 +1239,38 @@ pub fn install(app: &Rc<AppState>) {
             }
         })
         .build();
+    // Development aid: select a dedicated preamp on the selected track.
+    let weak = Rc::downgrade(app);
+    let preamp = gio::ActionEntry::builder("set-preamp")
+        .parameter_type(Some(&String::static_variant_type()))
+        .activate(move |_, _, param| {
+            let (Some(a), Some(value)) = (weak.upgrade(), param.and_then(|p| p.get::<String>()))
+            else {
+                return;
+            };
+            let model = if value == "none" {
+                None
+            } else {
+                let Ok(index) = value.parse::<usize>() else {
+                    return;
+                };
+                Some(index)
+            };
+            let track = {
+                let s = a.session.borrow();
+                s.selection
+                    .tracks
+                    .iter()
+                    .find(|id| s.project().track(**id).is_some_and(|t| t.kind.has_audio()))
+                    .copied()
+            };
+            if let Some(track) = track {
+                a.dispatch(Action::SetPreamp { track, model });
+            }
+        })
+        .build();
+    app.app.add_action_entries([preamp]);
+
     // Development aid: `select-track:<name>` selects a track by name.
     let weak = Rc::downgrade(app);
     let select = gio::ActionEntry::builder("select-track")

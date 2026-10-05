@@ -21,6 +21,7 @@ use faderframe_stretch::{MAX_CHANNELS, Preset, Stretcher};
 /// after any jump; with no voice free, a clip falls back to varispeed.
 pub struct AudioClipPlayer {
     track: TrackId,
+    latency: u32,
     voices: Vec<StretchVoice>,
     /// Blocks processed (voices free up when their clip stopped playing).
     cycle: u64,
@@ -168,7 +169,14 @@ impl AudioClipPlayer {
             track,
             voices: Vec::new(),
             cycle: 0,
+            latency: 0,
         }
+    }
+
+    /// Report delay already baked into frozen audio; do not delay it again.
+    pub fn with_latency(mut self, latency: u32) -> Self {
+        self.latency = latency;
+        self
     }
 
     /// With stretcher voices (allocates; control thread).
@@ -194,6 +202,7 @@ impl AudioClipPlayer {
             track,
             voices,
             cycle: 0,
+            latency: 0,
         }
     }
 
@@ -327,6 +336,9 @@ fn play_varispeed(w: &WarpedRegion, out: &mut AudioBuffer, pos: i64, a: i64, b: 
 }
 
 impl Processor<EngineContext> for AudioClipPlayer {
+    fn latency(&self) -> u32 {
+        self.latency
+    }
     fn process(&mut self, cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
         let Some(out) = io.audio_out.first_mut() else {
             return;

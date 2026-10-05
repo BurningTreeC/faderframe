@@ -301,6 +301,9 @@ pub struct Track {
 
     #[serde(default)]
     pub instrument: Option<PluginSlot>,
+    /// Dedicated input stage, after the audio source/instrument and before effects.
+    #[serde(default)]
+    pub preamp: Option<PluginSlot>,
     #[serde(default)]
     pub inserts: Vec<PluginSlot>,
     #[serde(default)]
@@ -397,6 +400,9 @@ pub struct Freeze {
     pub start: faderframe_timeline::MusicalTime,
     /// Project-rate frames.
     pub length: i64,
+    /// Processing delay baked into the file, in project-rate frames.
+    #[serde(default)]
+    pub latency: u32,
 }
 
 impl Track {
@@ -413,6 +419,7 @@ impl Track {
             layout,
             clips: Vec::new(),
             instrument: None,
+            preamp: None,
             inserts: Vec::new(),
             sends: Vec::new(),
             // Instruments play what the keyboard plays.
@@ -461,6 +468,7 @@ impl Track {
         self.inserts
             .iter_mut()
             .chain(self.instrument.iter_mut())
+            .chain(self.preamp.iter_mut())
             .find(|p| p.id == id)
     }
 }

@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 libc.workspace = true
+rtrb.workspace = true
 
 # MMCSS for the DSP workers.
 [target.'cfg(windows)'.dependencies]

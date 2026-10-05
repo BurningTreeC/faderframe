@@ -111,6 +111,8 @@ pub struct TrackPreset {
     #[serde(default)]
     pub instrument: Option<PresetPlugin>,
     #[serde(default)]
+    pub preamp: Option<PresetPlugin>,
+    #[serde(default)]
     pub inserts: Vec<PresetPlugin>,
     #[serde(default)]
     pub sends: Vec<PresetSend>,
@@ -142,6 +144,7 @@ impl TrackPreset {
             phase_invert: track.phase_invert,
             monitor: track.monitor,
             instrument: track.instrument.as_ref().map(PresetPlugin::capture),
+            preamp: track.preamp.as_ref().map(PresetPlugin::capture),
             inserts: track.inserts.iter().map(PresetPlugin::capture).collect(),
             sends: track
                 .sends
@@ -225,6 +228,7 @@ impl TrackPreset {
         t.phase_invert = self.phase_invert;
         t.monitor = self.monitor;
         t.instrument = self.instrument.as_ref().map(|i| i.slot(p));
+        t.preamp = self.preamp.as_ref().map(|i| i.slot(p));
         t.inserts = self.inserts.iter().map(|i| i.slot(p)).collect();
         t.output = self.resolve_output(p, None, &mut notes);
         t.sends = self.resolve_sends(p, None, &mut notes);
@@ -289,6 +293,10 @@ impl TrackPreset {
         for s in &t.sends {
             c.push(Command::RemoveSend { track, send: s.id });
         }
+        c.push(Command::SetPreamp {
+            track,
+            slot: self.preamp.as_ref().map(|i| i.slot(p)),
+        });
         for slot in &t.inserts {
             c.push(Command::RemovePlugin {
                 track,

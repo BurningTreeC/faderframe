@@ -14,7 +14,7 @@ use faderframe_project::{Project, TrackKind};
 use faderframe_timeline::MusicalTime;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,6 +114,8 @@ pub struct RenderProgress {
     pub done: AtomicU64,
     pub total: AtomicU64,
     pub cancel: AtomicBool,
+    /// Delay already present in the rendered audio, at the render rate.
+    pub latency: AtomicU32,
 }
 
 impl RenderProgress {
@@ -256,6 +258,9 @@ fn render_one(
         ..EngineConfig::default()
     };
     let mut r = OfflineRenderer::new(project, sources, config, 1024, 2)?;
+    progress
+        .latency
+        .store(r.controller.graph_stats().output_latency, Ordering::Relaxed);
     // Faster than realtime on every core.
     let workers = faderframe_realtime::default_worker_count();
     if workers > 0 {
@@ -483,6 +488,7 @@ pub fn track_render_project(
             t.mute = false;
             t.phase_invert = false;
             t.inserts.clear();
+            t.preamp = None;
             t.automation.lanes.clear();
         }
         if t.id == track {

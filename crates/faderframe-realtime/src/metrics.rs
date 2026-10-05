@@ -139,6 +139,13 @@ impl CallbackMetrics {
         self.xruns.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Include asynchronous DSP underruns even when callbacks met the deadline.
+    pub fn record_xruns(&self, count: u64) {
+        if count != 0 {
+            self.xruns.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
     /// Highest load of a single callback since the last call (resets it).
     pub fn take_peak_load(&self) -> f64 {
         self.window_peak_ppm.swap(0, Ordering::Relaxed) as f64 / 1e6

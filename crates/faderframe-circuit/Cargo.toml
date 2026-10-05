@@ -1,0 +1,14 @@
+[package]
+name = "faderframe-circuit"
+description = "Reusable analogue circuit solver and microphone preamp models from GainStageFx"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+publish.workspace = true
+license = "MIT OR Apache-2.0"
+
+[lib]
+# Upstream unit tests include its complete guitar-amp catalogue. This extraction
+# is verified by standalone integration tests against the public DSP API.
+test = false
+doctest = false

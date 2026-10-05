@@ -7,6 +7,10 @@ use std::sync::Arc;
 ///
 /// Owned by the realtime processor; processors only read it.
 pub struct EngineContext {
+    /// Underruns concealed by asynchronous plugins, collected after the graph.
+    pub worker_underruns: std::sync::atomic::AtomicU64,
+    /// Bounded device callback budget, unchanged across internal graph chunks.
+    pub callback_deadline: Option<std::time::Instant>,
     pub transport: TransportInfo,
     /// Playback jumped (stop, locate or loop wrap) at the start of this
     /// block; note generators must release sounding notes.

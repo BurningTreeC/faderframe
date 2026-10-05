@@ -11,6 +11,24 @@ fn demo_renders_bit_identically_in_parallel() {
     const SR: u32 = 48_000;
     let mut project = demo_project(SR);
     project.crosstalk = true;
+    let slot = faderframe_project::PluginSlot {
+        id: project.ids.allocate(),
+        plugin: faderframe_project::PluginRef::builtin(
+            faderframe_core::builtin::PREAMPS[1].0,
+            "American 312",
+        ),
+        bypass: false,
+        parameters: vec![],
+        state: None,
+        sidechain: None,
+    };
+    project
+        .tracks
+        .iter_mut()
+        .find(|t| t.name == "Pluck")
+        .unwrap()
+        .preamp = Some(slot);
+
     let sources = render_generated_sources(&project, SR);
     let config = EngineConfig {
         sample_rate: SR,

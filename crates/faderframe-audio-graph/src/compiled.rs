@@ -306,6 +306,7 @@ pub struct CompiledGraph<C> {
     levels: Vec<u32>,
     schedule: Schedule,
     config: PrepareConfig,
+    processing_quantum: usize,
     stats: GraphStats,
     timings: Arc<NodeTimings>,
     cycle_group_ns: Vec<u64>,
@@ -347,6 +348,7 @@ pub(crate) fn compile<C>(
     }
     let mut slots: Vec<Option<NodeDesc<C>>> = nodes.into_iter().map(Some).collect();
     let max_block = config.max_block_size.max(1);
+    let mut processing_quantum = max_block;
     let mut compiled: Vec<Building<C>> = Vec::with_capacity(order.len());
     let mut labels: Vec<String> = Vec::with_capacity(order.len());
     let mut groups_of: Vec<Option<u32>> = Vec::with_capacity(order.len());
@@ -359,6 +361,7 @@ pub(crate) fn compile<C>(
             return Err(GraphError::Limit("node visited twice"));
         };
         processor.prepare(config);
+        processing_quantum = processing_quantum.min(processor.preferred_block_size().max(1));
         let latency = processor.latency();
         compiled.push(Building {
             info: NodeInfo {
@@ -557,6 +560,7 @@ pub(crate) fn compile<C>(
         levels,
         schedule,
         config: *config,
+        processing_quantum,
         stats,
         timings,
         cycle_group_ns: vec![0; group_count],
@@ -773,6 +777,11 @@ impl<C: Sync> PoolJob for Exec<'_, '_, C> {
 impl<C> CompiledGraph<C> {
     pub fn config(&self) -> &PrepareConfig {
         &self.config
+    }
+
+    /// Driver chunk size chosen from the prepared capacity and node preferences.
+    pub fn processing_quantum(&self) -> usize {
+        self.processing_quantum
     }
 
     pub fn stats(&self) -> &GraphStats {

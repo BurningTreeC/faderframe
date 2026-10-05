@@ -67,6 +67,17 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.6.0" date="2026-10-05">
+      <description>
+        <p>Circuit-modelled microphone preamps in dedicated mixer input sections.</p>
+        <ul>
+          <li>Six preamp models with metallic faceplates, Gain and Master controls, automation and project recall.</li>
+          <li>Reusable GainStageFx circuit solver with worker processing, a 128-sample buffer and latency compensation.</li>
+          <li>Process instrument audio after the synth and preserve timing through freezing and bouncing.</li>
+          <li>Correct Tube 610 level control behaviour near zero gain.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.5.0" date="2026-10-05">
       <description>
         <p>Mixer editing, analogue crosstalk and reliable transport shortcuts.</p>

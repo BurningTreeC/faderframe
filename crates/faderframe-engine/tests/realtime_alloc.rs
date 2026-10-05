@@ -1359,3 +1359,87 @@ fn album_playback_does_not_allocate() {
     assert_eq!(allocs, 0, "handing the file back allocates nothing");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn microphone_preamps_do_not_allocate_while_automating_or_resetting() {
+    let _serial = serial();
+    use faderframe_automation::{
+        AutomationCurve, AutomationLane, AutomationMode, AutomationPoint, AutomationTarget,
+        CurveShape,
+    };
+    use faderframe_core::{ChannelLayout, ParameterId, builtin};
+    use faderframe_project::{PluginRef, PluginSlot, TrackKind};
+    use faderframe_timeline::MusicalTime;
+    for (name, label, _) in builtin::PREAMPS {
+        let mut tp = common::TestProject::new(48_000);
+        let t = tp.track(TrackKind::Audio, label, ChannelLayout::Stereo);
+        // Wake the dormant channel after gain automation, then return to
+        // equal input. Copying solver/FIR history must also be allocation-free.
+        let mut right = vec![0.01; 8192];
+        right[2048..2560].fill(-0.01);
+        let src = tp.source(faderframe_audio_files::AudioData::from_channels(
+            48_000,
+            vec![vec![0.01; 8192], right],
+        ));
+        tp.clip(t, src, MusicalTime::ZERO, 8192);
+        let plugin = tp.project.ids.allocate();
+        let lane = tp.project.ids.allocate();
+        let track = tp.project.track_mut(t).unwrap();
+        track.preamp = Some(PluginSlot {
+            id: plugin,
+            plugin: PluginRef::builtin(name, label),
+            bypass: false,
+            parameters: Vec::new(),
+            state: None,
+            sidechain: None,
+        });
+        track.automation.lanes.push(AutomationLane {
+            id: lane,
+            target: AutomationTarget::PluginParameter {
+                plugin,
+                parameter: ParameterId(0),
+            },
+            curve: AutomationCurve::from_points(vec![
+                AutomationPoint {
+                    time: MusicalTime::ZERO,
+                    value: 0.2,
+                    shape: CurveShape::Step,
+                },
+                AutomationPoint {
+                    time: MusicalTime::from_quarters(0.04),
+                    value: 0.8,
+                    shape: CurveShape::Step,
+                },
+                AutomationPoint {
+                    time: MusicalTime::from_quarters(0.08),
+                    value: 0.4,
+                    shape: CurveShape::Step,
+                },
+            ]),
+            mode: AutomationMode::Read,
+            visible: true,
+        });
+        for realtime in [false, true] {
+            let mut r =
+                OfflineRenderer::new(&tp.project, &tp.sources, EngineConfig::default(), 128, 2)
+                    .unwrap();
+            r.controller.plugins().set_realtime(realtime);
+            r.controller.rebuild_graph(&tp.project).unwrap();
+            let mut buffers = OwnedBuffers::new(2, 2, 128);
+            r.play_from(0).unwrap();
+            let (_, count) = armed(|| {
+                for _ in 0..24 {
+                    r.processor.process_device(&mut buffers);
+                }
+            });
+            assert_eq!(count, 0, "{label}: startup and gain automation allocate");
+            r.play_from(0).unwrap();
+            let (_, count) = armed(|| {
+                for _ in 0..24 {
+                    r.processor.process_device(&mut buffers);
+                }
+            });
+            assert_eq!(count, 0, "{label}: transport reset allocates");
+        }
+    }
+}

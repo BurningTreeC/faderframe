@@ -57,3 +57,22 @@ pub fn has_editor(id: &str) -> bool {
             | REVERB
     )
 }
+
+/// Dedicated microphone preamplifiers; never offered as ordinary inserts.
+/// IDs and catalogue order are persistent project data.
+pub const PREAMPS: [(&str, &str, [u8; 3]); 6] = [
+    ("faderframe.preamp.british73", "British 73", [65, 87, 108]),
+    (
+        "faderframe.preamp.american312",
+        "American 312",
+        [47, 55, 64],
+    ),
+    ("faderframe.preamp.console-e", "British 4K E", [84, 88, 89]),
+    ("faderframe.preamp.tube610", "Tube 610", [61, 57, 51]),
+    ("faderframe.preamp.british47", "British 47", [155, 162, 155]),
+    ("faderframe.preamp.german76", "German 76", [132, 137, 130]),
+];
+
+pub fn preamp_index(id: &str) -> Option<usize> {
+    PREAMPS.iter().position(|p| p.0 == id)
+}

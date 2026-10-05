@@ -31,6 +31,9 @@ use std::time::Instant;
 struct Args {
     tracks: usize,
     crosstalk: bool,
+    preamp: Option<usize>,
+    /// Feed a mono tone into the stereo tracks, exercising duplicated input.
+    mono_source: bool,
     block: usize,
     rate: u32,
     seconds: f64,
@@ -56,6 +59,8 @@ fn parse() -> Result<Args, String> {
     let mut a = Args {
         tracks: 64,
         crosstalk: false,
+        preamp: None,
+        mono_source: false,
         block: 128,
         rate: 48_000,
         seconds: 10.0,
@@ -81,7 +86,17 @@ fn parse() -> Result<Args, String> {
             "--seconds" => a.seconds = num("--seconds")?.parse().map_err(|_| "bad --seconds")?,
             "--buses" => a.buses = num("--buses")?.parse().map_err(|_| "bad --buses")?,
             "--crosstalk" => a.crosstalk = true,
+            "--preamp" => {
+                let model: usize = num("--preamp")?
+                    .parse()
+                    .map_err(|_| "invalid preamp index")?;
+                if model >= builtin::PREAMPS.len() {
+                    return Err("preamp index must be 0..5".into());
+                }
+                a.preamp = Some(model);
+            }
             "--no-inserts" => a.inserts = false,
+            "--mono-source" => a.mono_source = true,
             "--no-sends" => a.sends = false,
             "--measure-nodes" => a.measure = true,
             "--threads" => {
@@ -115,7 +130,7 @@ fn parse() -> Result<Args, String> {
             }
             "-h" | "--help" => {
                 println!(
-                    "faderframe-bench [--tracks N] [--block FRAMES] [--rate HZ] [--seconds S] [--buses N] [--no-inserts] [--no-sends] [--measure-nodes] [--threads N] [--fx N] [--plugin clap:<id>|vst3:<id>] [--paced] [--ahead MS] [--crosstalk]"
+                    "faderframe-bench [--tracks N] [--block FRAMES] [--rate HZ] [--seconds S] [--buses N] [--no-inserts] [--no-sends] [--measure-nodes] [--threads N] [--fx N] [--plugin clap:<id>|vst3:<id>] [--paced] [--ahead MS] [--crosstalk] [--preamp 0..5] [--mono-source]"
                 );
                 std::process::exit(0);
             }
@@ -137,10 +152,18 @@ fn build(args: &Args) -> Project {
             id: drum,
             name: "drums".into(),
             spec: SourceSpec::Generated {
-                generator: GeneratorSpec::DrumLoop {
-                    bpm: 120.0,
-                    bars,
-                    seed: 3,
+                generator: if args.mono_source {
+                    GeneratorSpec::Sine {
+                        frequency: 220.0,
+                        seconds: args.seconds,
+                        amplitude: 0.125,
+                    }
+                } else {
+                    GeneratorSpec::DrumLoop {
+                        bpm: 120.0,
+                        bars,
+                        seed: 3,
+                    }
                 },
             },
         },
@@ -190,6 +213,16 @@ fn build(args: &Args) -> Project {
             TrackColor::palette(i),
         )
         .with_layout(ChannelLayout::Stereo);
+        if let Some(model) = args.preamp {
+            t.preamp = Some(PluginSlot {
+                id: p.ids.allocate(),
+                plugin: PluginRef::builtin(builtin::PREAMPS[model].0, builtin::PREAMPS[model].1),
+                bypass: false,
+                parameters: vec![],
+                state: None,
+                sidechain: None,
+            });
+        }
         t.pan = ((i as f32 * 0.37).sin()).clamp(-1.0, 1.0);
         if let Some(bus) = buses.get(i % buses.len().max(1)) {
             t.output = OutputRouting::Track { track: *bus };
@@ -301,6 +334,15 @@ fn main() {
             std::process::exit(1);
         }
     };
+    if args.paced {
+        // A simulated sound card uses the same asynchronous plugin mode as a
+        // live device. Unpaced runs measure the complete synchronous DSP cost.
+        r.controller.plugins().set_realtime(true);
+        if let Err(e) = r.controller.rebuild_graph(&project) {
+            eprintln!("faderframe-bench: {e}");
+            std::process::exit(1);
+        }
+    }
     if args.threads > 1 {
         r.processor.set_worker_pool(Some(std::sync::Arc::new(
             faderframe_realtime::WorkerPool::new(faderframe_realtime::PoolConfig::new(
@@ -387,6 +429,20 @@ fn main() {
         args.rate,
         args.block
     );
+    if let Some(model) = args.preamp {
+        println!(
+            "  preamp      : {} per track (2x oversampling, Gain 50%, Master 0 dB)",
+            builtin::PREAMPS[model].1
+        );
+    }
+    println!(
+        "  source      : {}",
+        if args.mono_source {
+            "mono 220 Hz tone into stereo tracks"
+        } else {
+            "stereo drum loop"
+        }
+    );
     println!(
         "  graph       : {} nodes in {} jobs, {} edges, critical path {} nodes, parallel width {} jobs",
         stats.nodes, stats.jobs, stats.edges, stats.levels, stats.job_width
@@ -425,10 +481,11 @@ fn main() {
     println!("  misses      : {misses} callbacks over the deadline");
     let m = r.controller.metrics();
     println!(
-        "  engine view : {} callbacks, histogram p99 ≤ {:.1} µs, {} deadline misses",
+        "  engine view : {} callbacks, histogram p99 ≤ {:.1} µs, {} deadline misses, {} xruns (including DSP workers)",
         m.callbacks,
         m.p99_ns as f64 / 1000.0,
-        m.deadline_misses
+        m.deadline_misses,
+        m.xruns
     );
     if let Some(ms) = args.ahead {
         println!(

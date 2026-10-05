@@ -85,7 +85,7 @@ pub fn ahead_eligible(
     live: &HashSet<TrackId>,
     fed: &HashSet<TrackId>,
 ) -> bool {
-    let has_plugins = !t.inserts.is_empty() || t.instrument.is_some();
+    let has_plugins = !t.inserts.is_empty() || t.instrument.is_some() || t.preamp.is_some();
     let monitored =
         matches!(t.input, InputRouting::Hardware { .. }) && t.monitor != MonitorMode::Off;
     matches!(t.kind, TrackKind::Audio | TrackKind::Instrument)
@@ -226,6 +226,8 @@ fn node_key(track: TrackId, role: Role, sub: u64, layouts: &[ChannelLayout]) -> 
 #[derive(Default, Clone, Copy)]
 struct TrackNodes {
     input: Option<NodeId>,
+    /// Dedicated input stage output; pre-FX sends include the preamp.
+    preamp: Option<NodeId>,
     /// The signal after the inserts (before fader, mute and solo).
     post_fx: Option<NodeId>,
     strip: Option<NodeId>,
@@ -238,10 +240,37 @@ struct TrackNodes {
 struct PluginCx<'a> {
     plugins: &'a mut PluginHost,
     process: ProcessConfig,
+    realtime: bool,
     warnings: &'a mut Vec<String>,
 }
 
 impl PluginCx<'_> {
+    fn audio_chain<'a>(&mut self, t: &'a Track) -> Vec<&'a PluginSlot> {
+        let mut slots: Vec<_> = t.inserts.iter().collect();
+        if let Some(preamp) = &t.preamp {
+            // Generators can replace their input. In particular, older
+            // projects can have a legacy instrument plus a visible synth
+            // insert. Put the preamp after the last generator so subsequent
+            // instruments cannot discard its output. A MIDI-controlled
+            // effect is not an instrument and keeps its normal placement.
+            let position = if t.kind == TrackKind::Instrument {
+                slots
+                    .iter()
+                    .rposition(|s| {
+                        self.plugins.instance(s).is_ok_and(|i| {
+                            i.descriptor().category
+                                == faderframe_plugin_host::PluginCategory::Instrument
+                        })
+                    })
+                    .map_or(0, |i| i + 1)
+            } else {
+                0
+            };
+            slots.insert(position, preamp);
+        }
+        slots
+    }
+
     /// Does the plugin in `slot` take notes (instruments, MIDI-controlled
     /// effects)?
     fn takes_notes(&mut self, slot: &PluginSlot) -> bool {
@@ -296,13 +325,23 @@ impl PluginCx<'_> {
             sidechain: spec.audio_inputs.len() > 1,
             ..self.process
         };
+        if let Ok(instance) = self.plugins.instance(slot) {
+            instance.configure_realtime(self.realtime && !slot.bypass);
+            instance
+                .configure_channels(spec.audio_outputs.first().map_or(0, |l| l.channel_count()));
+        }
         match self.plugins.activate(slot, &process) {
             Ok(p) => {
                 // Latency and bypass change the node's behaviour, and a
                 // restarted plugin's old processor is dead: all are part of
                 // its identity, so a change yields the fresh processor
                 // instead of adopting the old one.
+                // Only a processor whose execution mode actually changes
+                // needs a different adoption key. External plugins retain
+                // their keys when moving between live and ahead graphs.
+                let buffered = p.processor.preferred_block_size() != usize::MAX;
                 let sub = slot.id.raw()
+                    ^ ((buffered as u64) << 62)
                     ^ ((p.latency as u64) << 40)
                     ^ ((slot.bypass as u64) << 63)
                     ^ p.activation.wrapping_mul(0x9e37_79b9_7f4a_7c15);
@@ -360,6 +399,7 @@ pub fn build_graph(
     let mut warnings = Vec::new();
     let double_precision = plugins.double_precision();
     let mut pcx = PluginCx {
+        realtime: plugins.realtime(),
         plugins,
         process: ProcessConfig {
             sample_rate: config.sample_rate,
@@ -412,7 +452,10 @@ pub fn build_graph(
                     r
                 }
             };
+            let realtime = pcx.realtime;
+            pcx.realtime = false;
             let latency = build_ahead_chain(&mut ab, &mut pcx, project, t, config, &ring)?;
+            pcx.realtime = realtime;
             used_rings.push(Arc::clone(&ring));
             let reader = b.add_node(
                 NodeSpec::new(format!("{} · Ahead", t.name))
@@ -506,12 +549,21 @@ pub fn build_graph(
         match t.kind {
             // Frozen: the rendered audio, straight to the strip.
             TrackKind::Audio | TrackKind::Instrument if frozen => {
+                let latency = t.freeze.as_ref().map_or(0, |f| {
+                    ((f64::from(f.latency) * config.sample_rate / f64::from(project.sample_rate))
+                        .round()) as u32
+                });
                 let player = b.add_node(
                     NodeSpec::new(format!("{} · Frozen", t.name))
-                        .key(node_key(t.id, Role::ClipPlayer, 0xF0_0000, &[layout]))
+                        .key(node_key(
+                            t.id,
+                            Role::ClipPlayer,
+                            0xF0_0000 ^ (u64::from(latency) << 32),
+                            &[layout],
+                        ))
                         .group(gi)
                         .audio_out(layout),
-                    Box::new(AudioClipPlayer::new(t.id)),
+                    Box::new(AudioClipPlayer::new(t.id).with_latency(latency)),
                 );
                 own(&mut owners, player, t.id, None, NodeWork::Clips);
                 b.connect_audio(player, 0, input, 0)?;
@@ -581,7 +633,12 @@ pub fn build_graph(
         }
 
         let mut prev = input;
-        for slot in t.inserts.iter().filter(|_| !frozen) {
+        let chain = if frozen {
+            Vec::new()
+        } else {
+            pcx.audio_chain(t)
+        };
+        for slot in chain {
             // Inserts that take notes (a synth placed as an insert, MIDI-
             // controlled effects) get the track's MIDI too.
             let notes = t.kind == TrackKind::Instrument && pcx.takes_notes(slot);
@@ -609,6 +666,9 @@ pub fn build_graph(
                 sidechains.push((node, src));
             }
             own(&mut owners, node, t.id, Some(slot.id), NodeWork::Insert);
+            if t.preamp.as_ref().is_some_and(|p| p.id == slot.id) {
+                tn.preamp = Some(node);
+            }
             b.connect_audio(prev, 0, node, 0)?;
             if notes {
                 if let Some(midi) = tn.midi {
@@ -702,7 +762,7 @@ pub fn build_graph(
                 continue;
             };
             let (tap_node, tap_port, tap_layout) = match send.tap {
-                SendTap::PreFx => (tn.input.unwrap_or(strip), 0, t.layout),
+                SendTap::PreFx => (tn.preamp.or(tn.input).unwrap_or(strip), 0, t.layout),
                 SendTap::PreFader => (strip, 1, t.layout),
                 SendTap::PostFader => (strip, 0, destination_layout(project, t)),
             };
@@ -889,7 +949,7 @@ fn build_ahead_chain(
         }
     }
     let mut prev = input;
-    for slot in &t.inserts {
+    for slot in pcx.audio_chain(t) {
         let notes = t.kind == TrackKind::Instrument && pcx.takes_notes(slot);
         let mut spec = NodeSpec::new(format!("{} · {}", t.name, slot.plugin.name))
             .audio_in(layout)

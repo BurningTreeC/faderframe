@@ -47,6 +47,8 @@ pub enum PluginFormat {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PluginCategory {
+    /// Channel input stage, selectable only through the dedicated mixer slot.
+    Preamp,
     Effect,
     Instrument,
     Analyzer,
@@ -278,6 +280,12 @@ pub trait PluginEditor {
 /// the thread that owns the engine controller (the UI thread, or a render
 /// thread for its own instances).
 pub trait PluginInstance {
+    /// Actual graph output width, supplied off the audio thread before activation.
+    fn configure_channels(&mut self, _channels: usize) {}
+
+    /// Whether processing has a live deadline. Offline/ahead graphs can run
+    /// buffered built-ins synchronously, with identical reported latency.
+    fn configure_realtime(&mut self, _realtime: bool) {}
     fn descriptor(&self) -> &PluginDescriptor;
     fn parameters(&self) -> &[ParameterInfo];
     fn parameter(&mut self, id: ParameterId) -> Option<f64>;
@@ -383,6 +391,17 @@ pub trait PluginProcessor: Send {
     fn process(&mut self, ctx: &PluginProcessContext<'_>, io: &mut NodeIo<'_>) -> ProcessStatus;
     /// Clear tails, voices and delay lines.
     fn reset(&mut self);
+    /// Newly concealed blocks from an asynchronous processor. The engine
+    /// includes these in its xrun counter even when the callback returned fast.
+    fn take_underruns(&mut self) -> u64 {
+        0
+    }
+    /// Advisory graph quantum for asynchronous processors; not added latency.
+    fn preferred_block_size(&self) -> usize {
+        usize::MAX
+    }
+    /// Whole device callback's bounded work deadline, shared by all chunks.
+    fn set_callback_deadline(&mut self, _deadline: Option<std::time::Instant>) {}
 }
 
 /// Something that can list and instantiate plugins of one format.

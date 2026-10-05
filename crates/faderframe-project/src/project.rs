@@ -291,7 +291,12 @@ impl Project {
     pub fn dependency_edges(&self) -> Vec<(TrackId, TrackId)> {
         let mut edges = self.routing_edges();
         for t in &self.tracks {
-            for s in t.inserts.iter().chain(t.instrument.iter()) {
+            for s in t
+                .inserts
+                .iter()
+                .chain(t.instrument.iter())
+                .chain(t.preamp.iter())
+            {
                 if let Some(src) = s.sidechain {
                     edges.push((src, t.id));
                 }
@@ -431,7 +436,12 @@ impl Project {
             for s in &t.sends {
                 max_id = max_id.max(s.id.raw());
             }
-            for p in t.inserts.iter().chain(t.instrument.iter()) {
+            for p in t
+                .inserts
+                .iter()
+                .chain(t.instrument.iter())
+                .chain(t.preamp.iter())
+            {
                 max_id = max_id.max(p.id.raw());
             }
             for l in &t.automation.lanes {

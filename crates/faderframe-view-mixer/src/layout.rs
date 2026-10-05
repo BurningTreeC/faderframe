@@ -18,6 +18,7 @@ pub struct StripLayout {
     pub color_bar: Rect,
     pub header: Rect,
     pub input: Option<InputRow>,
+    pub preamp: Option<Rect>,
     /// Insert slots shown (as many as wanted and fit).
     pub inserts: Option<Vec<Rect>>,
     pub inserts_label: Option<Rect>,
@@ -86,6 +87,29 @@ impl StripLayout {
         insert_slots: usize,
         tags: bool,
     ) -> Self {
+        Self::with_preamp(
+            strip,
+            theme,
+            has_input,
+            has_sends,
+            send_rows,
+            insert_slots,
+            tags,
+            0.0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_preamp(
+        strip: Rect,
+        theme: &Theme,
+        has_input: bool,
+        has_sends: bool,
+        send_rows: usize,
+        insert_slots: usize,
+        tags: bool,
+        preamp_height: f32,
+    ) -> Self {
         let _ = theme;
         let mut r = strip.inset_xy(MARGIN, 0.0);
         let color_bar = Rect::new(strip.x, strip.y, strip.w, 3.0);
@@ -106,7 +130,15 @@ impl StripLayout {
         r = bottom;
 
         // Decide which optional sections fit, in priority order.
-        let essential = PAN_H + BUTTONS_H + READOUT_H + MIN_FADER_H + 3.0 * SECTION_GAP;
+        let fixed = PAN_H + BUTTONS_H + READOUT_H + 3.0 * SECTION_GAP;
+        // Keep an installed input stage usable in the docked mixer. Shorten
+        // the fader before hiding its Gain and Master controls.
+        let min_fader = if preamp_height >= 80.0 {
+            (r.h - fixed - preamp_height - SECTION_GAP).clamp(36.0, MIN_FADER_H)
+        } else {
+            MIN_FADER_H
+        };
+        let essential = fixed + min_fader;
         let mut budget = r.h - essential;
         let mut take = |h: f32| {
             if budget >= h {
@@ -116,6 +148,7 @@ impl StripLayout {
                 false
             }
         };
+        let show_preamp = preamp_height > 0.0 && take(preamp_height + SECTION_GAP);
         let show_input = has_input && take(INPUT_H + SECTION_GAP);
         // 0: no inserts (VCAs).
         let insert_slots = (1..=insert_slots)
@@ -134,6 +167,11 @@ impl StripLayout {
         let show_sends = send_rows > 0;
 
         let mut dividers = Vec::new();
+        let preamp = show_preamp.then(|| {
+            let area = r.take_top(preamp_height);
+            r.take_top(SECTION_GAP);
+            area
+        });
         let input = show_input.then(|| {
             let row = r.take_top(INPUT_H);
             let third = (row.w - 4.0) / 3.0;
@@ -223,6 +261,7 @@ impl StripLayout {
         Self {
             strip,
             color_bar,
+            preamp,
             header,
             input,
             inserts,

@@ -961,6 +961,7 @@ impl Session {
                         t.sends.clear();
                         t.inserts.clear();
                         t.instrument = None;
+                        t.preamp = None;
                         t.record_arm = false;
                         t.mute = true;
                         let new_track = t.id;

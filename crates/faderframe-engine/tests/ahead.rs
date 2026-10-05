@@ -120,6 +120,24 @@ fn compare(a: &Run, b: &Run) -> (usize, usize) {
 fn rendered_ahead_sounds_the_same() {
     let mut project = project();
     project.crosstalk = true;
+    let slot = faderframe_project::PluginSlot {
+        id: project.ids.allocate(),
+        plugin: faderframe_project::PluginRef::builtin(
+            faderframe_core::builtin::PREAMPS[1].0,
+            "American 312",
+        ),
+        bypass: false,
+        parameters: vec![],
+        state: None,
+        sidechain: None,
+    };
+    project
+        .tracks
+        .iter_mut()
+        .find(|t| t.name == "Pluck")
+        .unwrap()
+        .preamp = Some(slot);
+
     for track in &mut project.tracks {
         if let Some(instrument) = track.instrument.take() {
             track.inserts.insert(0, instrument);

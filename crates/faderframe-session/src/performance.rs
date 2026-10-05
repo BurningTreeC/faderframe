@@ -228,6 +228,7 @@ impl PerformanceMonitor {
                 .instrument
                 .iter()
                 .map(|s| (s, true))
+                .chain(t.preamp.iter().map(|s| (s, false)))
                 .chain(t.inserts.iter().map(|s| (s, false)))
                 .map(|(slot, instrument)| {
                     let (avg, peak) = plugin_loads.get(&slot.id).copied().unwrap_or_default();
@@ -262,6 +263,7 @@ impl PerformanceMonitor {
                 t.inserts
                     .iter()
                     .chain(t.instrument.iter())
+                    .chain(t.preamp.iter())
                     .any(|s| s.id == *id)
             })
         });

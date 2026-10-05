@@ -66,6 +66,13 @@ pub trait Processor<C>: Send {
         0
     }
 
+    /// Preferred processing quantum, queried when compiling. Smaller chunks
+    /// let asynchronous nodes enqueue every track before waiting for output.
+    /// Processors must still accept their full prepared maximum block size.
+    fn preferred_block_size(&self) -> usize {
+        usize::MAX
+    }
+
     /// Process one block (audio thread).
     fn process(&mut self, cx: &ProcessContext<'_, C>, io: &mut NodeIo<'_>);
 

@@ -13,6 +13,7 @@ pub mod drums;
 pub mod gate;
 pub mod limiter;
 pub mod modulation;
+pub mod preamp;
 pub mod reverb;
 #[cfg(test)]
 pub(crate) mod rig;

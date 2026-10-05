@@ -66,6 +66,12 @@ impl AudioBuffer {
         &mut self.channels[ch][..len]
     }
 
+    /// All active channels as disjoint mutable slices, without allocating.
+    pub fn channels_mut(&mut self) -> impl Iterator<Item = &mut [f32]> {
+        let len = self.len;
+        self.channels.iter_mut().map(move |c| &mut c[..len])
+    }
+
     /// Two distinct channels mutably at once (e.g. stereo processing).
     #[inline]
     pub fn channel_pair_mut(&mut self, a: usize, b: usize) -> (&mut [f32], &mut [f32]) {

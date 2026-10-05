@@ -1913,3 +1913,55 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
    dense views.
 10. **Mastering**: multiple CD-Text languages, a DDP player/import;
     surround beds and panning before any object-based format.
+
+
+### Modelled microphone preamplifiers
+
+`faderframe-circuit` contains the reusable GainStageFx circuit engine (MNA
+netlists, nonlinear component models, transient and AC solvers, and FIR
+oversampling). It has no external dependencies or GUI/plugin framework.
+Its upstream revision and local extraction changes are recorded in `UPSTREAM.md`.
+
+`Track::preamp` is a dedicated optional built-in plugin slot, with the same
+parameter, state, automation, undo, and host lifecycle as other plugins.
+It is omitted from ordinary plugin choices and drawn in the mixer's input
+section. Audio, bus, aux, and master inputs feed it before inserts; instrument
+tracks feed it after the last instrument, including projects with both legacy
+instrument slots and visible instrument inserts. This keeps later generators
+from replacing audio that has already passed through the preamp.
+Pre-FX sends include the preamp output. MIDI-only tracks and VCAs have no audio
+input stage. The live and anticipative
+graphs use the same ordering. A frozen track's audio already includes its
+preamp, so the saved slot is unloaded until unfreezing.
+Frozen players report the latency baked into their audio, preserving alignment
+with other tracks and sends; bounced clips skip that leading delay instead.
+
+The six models retain upstream impedances, resting controls, and measured
+calibration curves. British 73 includes its separate line driver. Each channel
+has independent circuit state and uses fixed 2x oversampling with reported
+latency. Live preamps run on a dedicated worker through GainStageFx's generic
+reservoir in `faderframe-realtime`, adding exactly 128 host samples, reported
+alongside the FIR latency for graph compensation. Monitoring stays available:
+the live signal necessarily incurs that delay (2.67 ms at 48 kHz). Offline
+and already anticipated chains use inline DSP plus the same delay, keeping
+renders deterministic without adding nested workers. Parameter values travel
+with each input sample in fixed storage; resets discard the previous epoch.
+Worker underruns join the existing xrun counter. Live graphs honor processors'
+preferred 128-frame quantum so
+large device callbacks enqueue tracks in smaller chunks. Those chunks share
+one bounded device deadline, retaining time for downstream work. Gain moves
+the circuit control with upstream automatic level compensation, except on
+the Tube 610: its physical Level pot uses fixed calibration at 50%, allowing
+it to attenuate without boosting capacitive leakage near zero. Master is a
+smoothed -60 to +12 dB output trim. Calibration is
+applied before decimation, synchronously with circuit gain changes. Constructor
+work runs off the audio thread; processing, automation, and reset use reserved
+storage. Gain switches retain the circuit's discrete positions. Extra hardware
+switches stay at their netlist resting values.
+
+As in GainStageFx, exact duplicated stereo input needs only one circuit solve.
+On the first differing block, the dormant channel receives the active channel's
+solver and FIR history without allocation. Both channels then remain active,
+including during silence, until reset. Tests compare this path bit for bit
+against always processing two independent channels through gain changes,
+stereo transitions, tails, and resets.

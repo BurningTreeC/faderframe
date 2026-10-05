@@ -46,6 +46,7 @@ pub struct PluginHost {
     dirty: HashSet<PluginInstanceId>,
     /// Activate plugins for 64-bit processing where they can.
     double_precision: bool,
+    realtime: bool,
 }
 
 impl Default for PluginHost {
@@ -70,6 +71,7 @@ impl PluginHost {
             instances: HashMap::new(),
             dirty: HashSet::new(),
             double_precision: false,
+            realtime: true,
         }
     }
 
@@ -81,6 +83,15 @@ impl PluginHost {
 
     pub fn double_precision(&self) -> bool {
         self.double_precision
+    }
+
+    /// Set before building a graph; offline renderers have no live deadline.
+    pub fn set_realtime(&mut self, realtime: bool) {
+        self.realtime = realtime;
+    }
+
+    pub fn realtime(&self) -> bool {
+        self.realtime
     }
 
     pub fn registry(&self) -> &PluginRegistry {
@@ -254,7 +265,12 @@ impl PluginHost {
         for slot in project
             .tracks
             .iter()
-            .flat_map(|t| t.inserts.iter().chain(t.instrument.iter()))
+            .flat_map(|t| {
+                t.inserts
+                    .iter()
+                    .chain(t.instrument.iter())
+                    .chain(t.preamp.iter())
+            })
             .chain(project.album.inserts())
         {
             let Some(h) = self.instances.get_mut(&slot.id) else {
@@ -406,7 +422,13 @@ impl PluginHost {
             .tracks
             .iter()
             .filter(|t| t.freeze.is_none())
-            .flat_map(|t| t.inserts.iter().chain(t.instrument.iter()).map(|s| s.id))
+            .flat_map(|t| {
+                t.inserts
+                    .iter()
+                    .chain(t.instrument.iter())
+                    .chain(t.preamp.iter())
+                    .map(|s| s.id)
+            })
             .chain(project.album.inserts().map(|s| s.id))
             .collect();
         self.instances.retain(|id, _| live.contains(id));
