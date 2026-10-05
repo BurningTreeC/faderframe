@@ -330,13 +330,10 @@ impl PluginInstance for BuiltinInstance {
     }
 
     fn programs(&self) -> Vec<String> {
-        match self.kind {
-            Kind::ProgramEq => crate::program_eq::PRESETS
-                .iter()
-                .map(|(name, _)| (*name).to_string())
-                .collect(),
-            _ => Vec::new(),
-        }
+        crate::presets::factory_presets(&self.descriptor.id)
+            .into_iter()
+            .map(|p| p.name.to_string())
+            .collect()
     }
 
     fn current_program(&self) -> Option<usize> {
@@ -344,15 +341,10 @@ impl PluginInstance for BuiltinInstance {
     }
 
     fn select_program(&mut self, index: usize) -> Result<(), PluginError> {
-        let presets = match self.kind {
-            Kind::ProgramEq => crate::program_eq::PRESETS,
-            _ => return Err(PluginError::Failed("no programs".into())),
-        };
-        let (_, values) = presets
-            .get(index)
+        let values = crate::presets::factory_preset_values(&self.descriptor.id, index)
             .ok_or_else(|| PluginError::Failed(format!("no program {index}")))?;
-        for (param, value) in *values {
-            self.params.set_by_id(ParameterId(*param as u32), *value)?;
+        for (param, value) in values {
+            self.params.set_by_id(param, value)?;
         }
         self.program = Some(index);
         Ok(())
@@ -436,7 +428,11 @@ impl PluginInstance for BuiltinInstance {
                 Ok(())
             }
             None => self.params.load(data),
-        }
+        }?;
+        // State files store the sound, not a program index. An undo or
+        // user preset must not keep the checkmark of a later selection.
+        self.program = None;
+        Ok(())
     }
 
     fn create_processor(

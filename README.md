@@ -242,7 +242,10 @@ Contrast:
   Plugin state, parameters and automation are saved too. Moving a knob in a
   plugin's own GUI writes automation like FaderFrame's controls do. Presets:
   save and load your own for any plugin (insert menu or the parameter
-  window's Presets menu), and VST3 factory presets are listed too, as are
+  window's Presets menu). The stock effects, EQs and Synth include 166
+  factory presets, selected from the editor's Presets menu in one undo
+  step. Delay and Reverb presets load fully wet on Aux returns. VST3
+  factory presets are listed too, as are
   VST3 program lists (selecting a program is one undo step; MIDI program
   changes select VST3 programs). Plugins that offer it can process in
   64-bit floating point (Preferences → Audio).

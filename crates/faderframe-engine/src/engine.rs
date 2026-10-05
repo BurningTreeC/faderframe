@@ -976,13 +976,15 @@ impl EngineController {
     }
 
     /// Switch the plugin to one of its programs (it takes effect with the
-    /// processor's next block).
+    /// processor's next block). Apply any contextual parameter overrides
+    /// before the session captures the new state as one undo step.
     pub fn select_plugin_program(
         &mut self,
         plugin: faderframe_core::PluginInstanceId,
         index: usize,
+        overrides: &[(faderframe_core::ParameterId, f64)],
     ) -> Result<(), faderframe_plugin_host::PluginError> {
-        self.plugins.select_program(plugin, index)
+        self.plugins.select_program(plugin, index, overrides)
     }
 
     /// Changes the plugin's processor has not taken yet.

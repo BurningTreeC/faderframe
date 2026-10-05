@@ -25,6 +25,7 @@ pub mod devices;
 pub mod dsp;
 pub mod eq;
 mod params;
+pub mod presets;
 pub mod program_eq;
 pub mod scan;
 pub mod tap;

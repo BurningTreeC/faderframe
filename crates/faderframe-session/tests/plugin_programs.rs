@@ -249,7 +249,9 @@ fn a_built_in_preset_overrides_the_panel_and_undoes() {
     .unwrap();
     let live = |s: &Session| f64::from(s.plugin_tap(plugin).unwrap().params.get(param::LOW_BOOST));
     assert_eq!(live(&s), 2.0);
-    assert_eq!(s.plugin_programs(plugin), vec!["Low End Punch".to_string()]);
+    let programs = s.plugin_programs(plugin);
+    assert_eq!(programs.len(), 15);
+    assert_eq!(programs[0], "Low End Punch");
     s.dispatch(Action::SelectPluginProgram { plugin, index: 0 })
         .unwrap();
     let begun = Instant::now();
@@ -271,4 +273,173 @@ fn a_built_in_preset_overrides_the_panel_and_undoes() {
     s.dispatch(Action::Undo).unwrap();
     run(&mut s, 0.05);
     assert_eq!(live(&s), 2.0, "undo: the panel as it was");
+}
+
+fn stock_device(
+    id: &str,
+    kind: faderframe_project::TrackKind,
+) -> (
+    Session,
+    faderframe_core::TrackId,
+    faderframe_core::PluginInstanceId,
+) {
+    use faderframe_project::{Project, TrackKind};
+    let mut s = Session::new(
+        Project::new("Presets", 48_000),
+        None,
+        EngineConfig::default(),
+    )
+    .unwrap();
+    if kind != TrackKind::Master {
+        s.dispatch(Action::AddTrack(kind)).unwrap();
+    }
+    let track = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.kind == kind)
+        .unwrap()
+        .id;
+    let reference = PluginRef::builtin(id, id);
+    let plugin = if kind == TrackKind::Instrument {
+        s.dispatch(Action::SetInstrumentPlugin {
+            track,
+            plugin: Some(reference),
+        })
+        .unwrap();
+        s.project()
+            .track(track)
+            .unwrap()
+            .instrument
+            .as_ref()
+            .unwrap()
+            .id
+    } else {
+        s.dispatch(Action::InsertPlugin {
+            track,
+            index: 0,
+            plugin: reference,
+        })
+        .unwrap();
+        s.project().track(track).unwrap().inserts[0].id
+    };
+    (s, track, plugin)
+}
+
+fn select_stock_preset(s: &mut Session, plugin: faderframe_core::PluginInstanceId, index: usize) {
+    s.dispatch(Action::SelectPluginProgram { plugin, index })
+        .unwrap();
+    let begun = Instant::now();
+    while s.history().undo_label() != Some("Select Program") && begun.elapsed().as_secs() < 3 {
+        run(s, 0.02);
+    }
+    assert_eq!(s.history().undo_label(), Some("Select Program"));
+}
+
+#[test]
+fn delay_and_reverb_presets_are_wet_only_on_returns_and_undo_as_one_step() {
+    use faderframe_core::builtin;
+    use faderframe_plugin_host::presets::{factory_preset_values, send_return_mix};
+    use faderframe_project::{Command, TrackKind};
+    for id in [builtin::ECHO, builtin::REVERB] {
+        for kind in [
+            TrackKind::Audio,
+            TrackKind::Aux,
+            TrackKind::Bus,
+            TrackKind::Master,
+        ] {
+            let (mut s, track, plugin) = stock_device(id, kind);
+            let mix = send_return_mix(id).unwrap();
+            s.dispatch(Action::Edit(Command::SetPluginParameter {
+                track,
+                plugin,
+                parameter: mix,
+                value: Some(0.23),
+            }))
+            .unwrap();
+            let before = s.plugin_parameter_value(plugin, mix).unwrap();
+            let inserted_mix = factory_preset_values(id, 0)
+                .unwrap()
+                .into_iter()
+                .find(|(p, _)| *p == mix)
+                .unwrap()
+                .1;
+            assert!(inserted_mix < 1.0);
+            let expected = if kind == TrackKind::Aux {
+                1.0
+            } else {
+                inserted_mix
+            };
+            select_stock_preset(&mut s, plugin, 0);
+            assert!((s.plugin_parameter_value(plugin, mix).unwrap() - expected).abs() < 1e-6);
+            s.dispatch(Action::Undo).unwrap();
+            assert_eq!(s.plugin_parameter_value(plugin, mix), Some(before));
+            assert_eq!(s.plugin_current_program(plugin), None);
+            s.dispatch(Action::Redo).unwrap();
+            assert!((s.plugin_parameter_value(plugin, mix).unwrap() - expected).abs() < 1e-6);
+            // A graph rebuild reapplies explicit values after state.
+            s.dispatch(Action::Edit(Command::SetPluginBypass {
+                track,
+                plugin,
+                bypass: true,
+            }))
+            .unwrap();
+            assert!((s.plugin_parameter_value(plugin, mix).unwrap() - expected).abs() < 1e-6);
+        }
+    }
+}
+
+#[test]
+fn stock_instrument_and_return_presets_survive_project_save_and_reopen() {
+    use faderframe_core::builtin;
+    use faderframe_plugin_host::presets::{factory_preset_values, send_return_mix};
+    use faderframe_project::{Command, TrackKind};
+    for (id, kind) in [
+        (builtin::SYNTH, TrackKind::Instrument),
+        (builtin::REVERB, TrackKind::Aux),
+    ] {
+        let (mut s, track, plugin) = stock_device(id, kind);
+        // Pick a later patch so this also checks that program indexes reach
+        // the instrument, and save a user tweak made after selecting it.
+        let index = s.plugin_programs(plugin).len() - 1;
+        select_stock_preset(&mut s, plugin, index);
+        let mut expected = factory_preset_values(id, index).unwrap();
+        if let Some(mix) = send_return_mix(id) {
+            expected.iter_mut().find(|(p, _)| *p == mix).unwrap().1 = 1.0;
+        }
+        let (param, value) = if kind == TrackKind::Instrument {
+            (
+                ParameterId(faderframe_plugin_host::devices::synth::id::VOLUME),
+                -18.0,
+            )
+        } else {
+            (
+                ParameterId(faderframe_plugin_host::devices::reverb::id::MIX),
+                0.75,
+            )
+        };
+        s.dispatch(Action::Edit(Command::SetPluginParameter {
+            track,
+            plugin,
+            parameter: param,
+            value: Some(value),
+        }))
+        .unwrap();
+        expected.iter_mut().find(|(p, _)| *p == param).unwrap().1 = value;
+        let dir =
+            std::env::temp_dir().join(format!("ff-factory-preset-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("presets.ffproj");
+        s.save_as(&path).unwrap();
+        s.open(&path).unwrap();
+        for (param, value) in expected {
+            assert_eq!(
+                s.plugin_parameter_value(plugin, param),
+                Some(f64::from(value as f32)),
+                "{id}, parameter {param:?}"
+            );
+        }
+        drop(s);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

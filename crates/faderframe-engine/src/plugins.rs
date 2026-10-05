@@ -169,12 +169,17 @@ impl PluginHost {
         &mut self,
         plugin: PluginInstanceId,
         index: usize,
+        overrides: &[(ParameterId, f64)],
     ) -> Result<(), PluginError> {
-        self.instances
+        let h = self
+            .instances
             .get_mut(&plugin)
-            .ok_or_else(|| PluginError::NotFound(format!("{plugin}")))?
-            .instance
-            .select_program(index)
+            .ok_or_else(|| PluginError::NotFound(format!("{plugin}")))?;
+        h.instance.select_program(index)?;
+        for &(id, value) in overrides {
+            h.instance.set_parameter(id, value)?;
+        }
+        Ok(())
     }
 
     /// Changes the plugin's processor has not taken yet.

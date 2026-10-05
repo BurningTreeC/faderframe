@@ -11,7 +11,7 @@
 
 use crate::{Result, Session, SessionError};
 use faderframe_core::{PluginInstanceId, TrackId};
-use faderframe_project::{Command, Impact};
+use faderframe_project::{Command, Impact, PluginFormat, TrackKind};
 use std::time::{Duration, Instant};
 
 /// How long a selected program may take to reach the processor before its
@@ -77,8 +77,18 @@ impl Session {
         self.finish_programs(true);
         // The state to go back to.
         self.capture_plugin_state(plugin);
+        // Factory delay/reverb settings are voiced for inserts. On an
+        // effect return, the sending tracks already carry the dry signal.
+        let wet = self.plugin_slot(plugin).and_then(|(track, slot)| {
+            if track.kind == TrackKind::Aux && slot.plugin.format == PluginFormat::Builtin {
+                faderframe_plugin_host::presets::send_return_mix(&slot.plugin.id)
+                    .map(|id| (id, 1.0))
+            } else {
+                None
+            }
+        });
         self.engine
-            .select_plugin_program(plugin, index)
+            .select_plugin_program(plugin, index, wet.as_slice())
             .map_err(|e| SessionError::Other(e.to_string()))?;
         self.pending_programs.push(PendingProgram {
             plugin,

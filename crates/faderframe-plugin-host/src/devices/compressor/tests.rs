@@ -40,6 +40,45 @@ fn the_static_curve_is_threshold_ratio_and_knee() {
 }
 
 #[test]
+fn feedback_styles_do_not_ratchet_reduction_on_repeated_attacks() {
+    for style in [2, 3] {
+        let mut r = rig(&[
+            (id::STYLE, f64::from(style)),
+            (id::THRESHOLD, -24.0),
+            (id::RATIO, 4.0),
+            (id::KNEE, 0.0),
+            (id::ATTACK, 0.01),
+            (id::RELEASE, 300.0),
+        ]);
+        for _ in 0..12 {
+            r.run(0.1, tone(1_000.0, gain(-6.0)), silence);
+            let reduction = r.tap.value(value::REDUCTION_PEAK);
+            // 18 dB over threshold at 4:1 needs 13.5 dB of reduction.
+            assert!(reduction <= 14.5, "style {style}: {reduction:.2} dB");
+            r.run(0.05, tone(1_000.0, gain(-36.0)), silence);
+        }
+    }
+}
+
+#[test]
+fn feedback_styles_keep_the_selected_ratio_with_an_external_key() {
+    for style in [2, 3] {
+        let mut r = rig(&[
+            (id::STYLE, f64::from(style)),
+            (id::EXTERNAL, 1.0),
+            (id::THRESHOLD, -24.0),
+            (id::RATIO, 4.0),
+            (id::KNEE, 0.0),
+            (id::ATTACK, 1.0),
+            (id::RELEASE, 50.0),
+        ]);
+        let (l, _) = r.run(1.0, tone(1_000.0, gain(-30.0)), tone(1_000.0, gain(-6.0)));
+        let got = level(&l, 1_000.0);
+        assert!((got + 43.5).abs() < 0.6, "style {style}: {got:.2} dB");
+    }
+}
+
+#[test]
 fn attack_and_release_take_their_time() {
     // A step from quiet to 20 dB over: after the attack time most of the
     // reduction is there, after many attack times all of it.

@@ -280,8 +280,18 @@ fn presets_button(app: &Rc<AppState>, plugin: PluginInstanceId) -> gtk::MenuButt
         save.append_item(&item);
         menu.append_section(None, &save);
         let list = gtk::gio::Menu::new();
-        let found = app.session.borrow().plugin_presets(plugin);
-        if found.is_empty() {
+        let (found, programs, current, builtin) = {
+            let s = app.session.borrow();
+            (
+                s.plugin_presets(plugin),
+                s.plugin_programs(plugin),
+                s.plugin_current_program(plugin),
+                s.plugin_owner(plugin).is_some_and(|(_, slot)| {
+                    slot.plugin.format == faderframe_project::PluginFormat::Builtin
+                }),
+            )
+        };
+        if found.is_empty() && programs.is_empty() {
             list.append(Some("No presets yet"), None);
         }
         for p in found {
@@ -298,10 +308,6 @@ fn presets_button(app: &Rc<AppState>, plugin: PluginInstanceId) -> gtk::MenuButt
         }
         menu.append_section(None, &list);
         // The plugin's own programs.
-        let (programs, current) = {
-            let s = app.session.borrow();
-            (s.plugin_programs(plugin), s.plugin_current_program(plugin))
-        };
         if !programs.is_empty() {
             let section = gtk::gio::Menu::new();
             for (i, name) in programs.iter().enumerate() {
@@ -315,7 +321,14 @@ fn presets_button(app: &Rc<AppState>, plugin: PluginInstanceId) -> gtk::MenuButt
                 );
                 section.append_item(&item);
             }
-            menu.append_section(Some("Programs"), &section);
+            menu.append_section(
+                Some(if builtin {
+                    "Factory Presets"
+                } else {
+                    "Programs"
+                }),
+                &section,
+            );
         }
         button.set_menu_model(Some(&menu));
     });

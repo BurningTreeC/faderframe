@@ -816,6 +816,20 @@ covered by `the_stock_devices_do_not_allocate`.
   too and loaded into the plugin's state. Loading is
   `Command::SetPluginState` — one undo step; the engine follows a changed
   slot state.
+  Built-in factory presets live in `plugin_host::presets`: 166 across
+  the EQ, Program EQ, compressor, limiter, gate, de-esser, saturator,
+  utility, delay, reverb, modulation and Synth. Samplers, the tuner and
+  the latency probe have none. Each preset expands its overrides over
+  the device's defaults, replacing every parameter when selected.
+  `BuiltinInstance::programs`/`select_program` expose them through the
+  existing program API; the editor labels that section "Factory Presets".
+  The original Program EQ "Low End Punch" remains index 0. On Aux tracks,
+  `session::programs` overrides a built-in delay/reverb's mix to fully wet
+  before the new state is captured, so loading and undo remain one step;
+  inserts on other track kinds keep the preset's mix. User preset files
+  always retain the saved mix. Preset tests validate every parameter and
+  render every program; session tests cover undo, rebuilds and project
+  save/reopen with subsequent user tweaks.
 * **Programs** (`PluginInstance::programs`/`select_program`; VST3 program
   lists) are listed with the presets. Selecting one changes the plugin's
   whole state, so `session::programs` makes it one undo step like a

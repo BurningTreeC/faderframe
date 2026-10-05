@@ -267,8 +267,9 @@ pub struct CompressorProcessor {
     peak: [f64; 2],
     peak_fall: f64,
     gr: [DualRelease; 2],
-    /// The last output (feedback styles' detector).
-    last: [f64; 2],
+    /// The gain computer's slope as a feed-forward compressor has it (a
+    /// feedback style's equilibrium).
+    ff_slope: f64,
     delay: [DelayLine; 2],
     look: usize,
     makeup: Smoothed,
@@ -292,7 +293,7 @@ impl CompressorProcessor {
             peak: [0.0; 2],
             peak_fall: (-1.0 / (0.010 * sr)).exp(),
             gr: [DualRelease::default(); 2],
-            last: [0.0; 2],
+            ff_slope: 0.0,
             delay: [DelayLine::new(look + 1), DelayLine::new(look + 1)],
             look,
             makeup: Smoothed::new(1.0, 20.0, sr),
@@ -357,6 +358,7 @@ impl CompressorProcessor {
         // its effective ratio the one set (s / (1 − s) gives s in the
         // loop), up to what the loop takes stably.
         let s = slope(ratio);
+        self.ff_slope = s;
         let slope = if st.feedback {
             (s / (1.0 - s).max(1e-3)).min(8.0)
         } else {
@@ -436,17 +438,11 @@ impl PluginProcessor for CompressorProcessor {
                     ],
                     _ => x,
                 };
-                // The detector: the key (or, feedback, the last output),
-                // through the sidechain filters.
+                // The detector: the key through the sidechain filters.
                 let mut levels = [0.0f64; 2];
                 let mut heard = [0.0f64; 2];
                 for c in 0..2 {
-                    let src = if st.feedback && !external {
-                        self.last[c]
-                    } else {
-                        key[c]
-                    };
-                    let f = self.sc_high.process(c, self.sc_low.process(c, src));
+                    let f = self.sc_high.process(c, self.sc_low.process(c, key[c]));
                     heard[c] = f;
                     levels[c] = if rms > 0.0 {
                         10.0 * (2.0 * self.rms[c].process(f)).max(1e-24).log10()
@@ -462,9 +458,29 @@ impl PluginProcessor for CompressorProcessor {
                 let makeup = self.makeup.tick();
                 let mix = self.mix.tick();
                 let mut y = [0.0; 2];
+                let feedback = st.feedback && !external;
                 for c in 0..2 {
                     let level = link * loudest + (1.0 - link) * levels[c];
-                    let want = reduction_by(level, threshold, slope, knee).min(range);
+                    let want = if feedback {
+                        // A feedback compressor hears its output: the
+                        // input's level less the reduction it applies now
+                        // (not a held peak from before it applied it, which
+                        // would ratchet the reduction far past the curve),
+                        // and never more than the curve's equilibrium.
+                        let out = level - self.gr[c].fast;
+                        reduction_by(out, threshold, slope, knee).min(reduction_by(
+                            level,
+                            threshold,
+                            self.ff_slope,
+                            knee,
+                        ))
+                    } else {
+                        // An external key never hears the compressed
+                        // output, so feedback slope compensation would
+                        // multiply its reduction instead of its ratio.
+                        reduction_by(level, threshold, self.ff_slope, knee)
+                    }
+                    .min(range);
                     let gr = self.gr[c].process(want, auto);
                     gr_peak = gr_peak.max(gr);
                     self.delay[c].push(x[c]);
@@ -475,7 +491,6 @@ impl PluginProcessor for CompressorProcessor {
                     };
                     let drive = color * (0.2 + st.color) + st.gr_color * gr;
                     let wet = saturate(dry * gain(-gr), drive) * makeup;
-                    self.last[c] = dry * gain(-gr);
                     y[c] = if listen {
                         heard[c]
                     } else {
@@ -495,7 +510,6 @@ impl PluginProcessor for CompressorProcessor {
             self.params.apply_event(e.parameter, e.value);
         }
         for c in 0..2 {
-            self.last[c] = flush(self.last[c]);
             self.peak[c] = flush(self.peak[c]);
             self.rms[c].flush();
         }
@@ -539,7 +553,6 @@ impl PluginProcessor for CompressorProcessor {
             self.gr[c].reset();
             self.rms[c].reset();
             self.delay[c].reset();
-            self.last[c] = 0.0;
             self.peak[c] = 0.0;
         }
         self.sc_low.reset();
