@@ -219,9 +219,11 @@ fn launched_clips_play_and_are_recorded_into_the_arrangement() {
     assert!(s.launch_progress(drums).is_some());
     s.dispatch(Action::Transport(TransportAction::Stop))
         .unwrap();
-    run(&mut s, 100);
     // Written into the arrangement from where the launch started: a copy of
     // the launched clip, cut where playback stopped.
+    wait_for(&mut s, "the run written", |s| {
+        s.project().clips_of(drums).len() > before.len()
+    });
     let now = s.project().clips_of(drums);
     let added: Vec<_> = now.iter().filter(|c| !before.contains(&c.id)).collect();
     assert!(!added.is_empty(), "the run was recorded");

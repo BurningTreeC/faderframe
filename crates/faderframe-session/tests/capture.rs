@@ -140,6 +140,10 @@ fn notes_played_while_playing_land_where_they_were_heard() {
     run(&mut s, 300);
     let xruns = |s: &Session| s.stream_status().map_or(0, |st| st.xruns);
     let xruns_before = xruns(&s);
+    // Whether the device keeps the wall clock's pace from here on (a busy
+    // runner's dummy device falls behind and catches up in bursts).
+    let callbacks = |s: &Session| s.stream_status().map_or(0, |st| st.callbacks);
+    let paced_from = (Instant::now(), callbacks(&s));
     // Where the engine is as the key goes down (extrapolated from its last
     // callback, as captured events are: a busy machine's dummy device
     // falls behind, and the playhead it last reported with it).
@@ -160,10 +164,16 @@ fn notes_played_while_playing_land_where_they_were_heard() {
     let notes = new_notes(&s, midi, &[]);
     assert_eq!(notes.len(), 1);
     let (start, n) = &notes[0];
-    if xruns(&s) != xruns_before {
-        // The device lost time (a frozen runner): the playhead's
-        // extrapolations do not hold across that.
-        eprintln!("dropout while playing: timing not checked");
+    let st = s.stream_status().unwrap();
+    let expected = paced_from.0.elapsed().as_secs_f64() * f64::from(st.sample_rate)
+        / f64::from(st.buffer_size.max(1));
+    let got = (callbacks(&s) - paced_from.1) as f64;
+    if xruns(&s) != xruns_before || (got - expected).abs() > 2.0 + expected * 0.05 {
+        // The device lost time or fell behind the wall clock (a busy
+        // runner): the playhead's extrapolations do not hold across that.
+        eprintln!(
+            "the device did not keep pace ({got} callbacks for {expected:.1}): timing not checked"
+        );
         return;
     }
     let tempo = s.project().timeline.tempo.bpm_at(MusicalTime::ZERO);

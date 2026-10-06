@@ -837,12 +837,20 @@ impl Session {
             });
         }
         self.update_suspended();
-        if !commands.is_empty()
-            && let Err(e) = self.edit(Command::Batch {
-                label: "Write Automation".into(),
-                commands,
-            })
-        {
+        if commands.is_empty() {
+            return;
+        }
+        let batch = Command::Batch {
+            label: "Write Automation".into(),
+            commands,
+        };
+        // Recording to the arrangement: part of the recording's step.
+        let done = if self.launcher_records() && !self.history.in_gesture() {
+            self.record_step(batch)
+        } else {
+            self.edit(batch)
+        };
+        if let Err(e) = done {
             self.notify(NoticeLevel::Error, e.to_string());
         }
     }

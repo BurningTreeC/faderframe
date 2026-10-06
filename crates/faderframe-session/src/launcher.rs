@@ -1388,13 +1388,19 @@ impl Session {
         if commands.is_empty() {
             return Ok(());
         }
-        // One undo step a recording, however often it writes.
+        self.record_step(Command::Batch {
+            label: "Record Launches".into(),
+            commands,
+        })
+    }
+
+    /// `cmd` into the recording's undo step (Record to Arrangement: one a
+    /// transport run, however often it writes — the automation written
+    /// meanwhile too).
+    pub(crate) fn record_step(&mut self, cmd: Command) -> Result<()> {
         let (impact, token) = self.history.apply_amending(
             &mut self.project,
-            Command::Batch {
-                label: "Record Launches".into(),
-                commands,
-            },
+            cmd,
             "Record Launches",
             self.launcher.amend,
         )?;

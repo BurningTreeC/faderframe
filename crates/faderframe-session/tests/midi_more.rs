@@ -358,6 +358,11 @@ fn pads_learned_for_launcher_slots_scenes_and_stops() {
     s.dispatch(Action::Launcher(LauncherOp::SendClips(vec![first])))
         .unwrap();
     let scene = s.project().launcher.scenes[0].id;
+    // Nothing waits for a bar (stops included).
+    s.dispatch(Action::Launcher(LauncherOp::SetQuantize(
+        LaunchQuantize::None,
+    )))
+    .unwrap();
     s.dispatch(Action::Launcher(LauncherOp::SetClipLaunch {
         track: drums,
         scene,
