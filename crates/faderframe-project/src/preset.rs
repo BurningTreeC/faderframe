@@ -1,19 +1,26 @@
 //! Track presets: a track's channel settings — format, input, monitoring,
-//! instrument and inserts (with plugin parameters and state), fader, pan,
-//! polarity, sends, output and colour — saved to a `.fftrack` file and
-//! recalled as a new track or onto an existing one. Clips and automation
-//! are not part of a preset.
+//! instrument and inserts (with plugin parameters and state, containers
+//! with their chains), modulators, fader, pan, polarity, sends, output and
+//! colour — saved to a `.fftrack` file and recalled as a new track or onto
+//! an existing one. Clips and automation are not part of a preset.
+//!
+//! Plugins get new ids when a preset is used: a modulator's route to a
+//! plugin keeps the plugin's place among the track's devices (preamp,
+//! instrument, inserts, each container followed by what its chains hold —
+//! the order of `Track::slots`) and finds it there again.
 //!
 //! Sends and outputs to other tracks are stored by the target's *name*
 //! (ids are project-local) and resolved when the preset is used; targets
 //! that do not exist are reported and left out (an output falls back to
 //! the master).
 
+use crate::container::Chain;
+use crate::modulation::{FollowSource, ModRoute, ModSource, ModTarget, Modulator};
 use crate::{
     AuxSend, Command, EditError, InputRouting, MonitorMode, OutputRouting, PluginRef, PluginSlot,
     Project, SavedParameter, SendTap, Track, TrackColor, TrackKind,
 };
-use faderframe_core::{ChannelLayout, TrackId};
+use faderframe_core::{ChannelLayout, PluginInstanceId, TrackId};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -42,27 +49,132 @@ pub struct PresetPlugin {
     pub parameters: Vec<SavedParameter>,
     #[serde(default)]
     pub state: Option<String>,
+    /// A container's chains.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chains: Vec<PresetChain>,
+}
+
+/// A container's chain in a preset.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PresetChain {
+    pub name: String,
+    #[serde(default)]
+    pub plugins: Vec<PresetPlugin>,
+    #[serde(default)]
+    pub gain_db: f32,
+    #[serde(default)]
+    pub pan: f32,
+    #[serde(default)]
+    pub mute: bool,
+    #[serde(default)]
+    pub solo: bool,
+    #[serde(default)]
+    pub key_low: u8,
+    #[serde(default = "top_key")]
+    pub key_high: u8,
+}
+
+fn top_key() -> u8 {
+    127
+}
+
+/// What a preset's modulator route moves.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum PresetTarget {
+    Volume,
+    Pan,
+    /// The plugin at `index` of the track's devices (`Track::slots`).
+    Plugin {
+        index: usize,
+        parameter: faderframe_core::ParameterId,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PresetModulator {
+    pub name: String,
+    pub source: ModSource,
+    /// A follower's source track, by name (the id in `source` means
+    /// nothing elsewhere).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follows: Option<String>,
+    #[serde(default)]
+    pub routes: Vec<(PresetTarget, f32)>,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+}
+
+/// The plugins built from a preset, with fresh ids.
+struct Built {
+    preamp: Option<PluginSlot>,
+    instrument: Option<PluginSlot>,
+    inserts: Vec<PluginSlot>,
+    containers: Vec<(PluginInstanceId, Vec<Chain>)>,
+    /// Every slot's id, in the order of `Track::slots`.
+    order: Vec<PluginInstanceId>,
 }
 
 impl PresetPlugin {
-    fn capture(slot: &PluginSlot) -> Self {
+    fn capture(track: &Track, slot: &PluginSlot) -> Self {
+        let chains = track
+            .containers
+            .get(&slot.id)
+            .filter(|_| slot.plugin.is_container())
+            .map(|chains| {
+                chains
+                    .iter()
+                    .map(|c| PresetChain {
+                        name: c.name.clone(),
+                        plugins: c.inserts.iter().map(|s| Self::capture(track, s)).collect(),
+                        gain_db: c.gain_db,
+                        pan: c.pan,
+                        mute: c.mute,
+                        solo: c.solo,
+                        key_low: c.key_low,
+                        key_high: c.key_high,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             plugin: slot.plugin.clone(),
             bypass: slot.bypass,
             parameters: slot.parameters.clone(),
             state: slot.state.clone(),
+            chains,
         }
     }
 
-    fn slot(&self, p: &mut Project) -> PluginSlot {
-        PluginSlot {
+    /// The slot with a fresh id (and its chains into `built`).
+    fn build(&self, p: &mut Project, built: &mut Built) -> PluginSlot {
+        let slot = PluginSlot {
             id: p.ids.allocate(),
             plugin: self.plugin.clone(),
             bypass: self.bypass,
             parameters: self.parameters.clone(),
             state: self.state.clone(),
             sidechain: None,
+        };
+        built.order.push(slot.id);
+        if self.plugin.is_container() && !self.chains.is_empty() {
+            let chains = self
+                .chains
+                .iter()
+                .map(|c| Chain {
+                    name: c.name.clone(),
+                    inserts: c.plugins.iter().map(|x| x.build(p, built)).collect(),
+                    gain_db: c.gain_db,
+                    pan: c.pan,
+                    mute: c.mute,
+                    solo: c.solo,
+                    key_low: c.key_low,
+                    key_high: c.key_high,
+                })
+                .collect();
+            built.containers.push((slot.id, chains));
         }
+        slot
     }
 }
 
@@ -116,6 +228,8 @@ pub struct TrackPreset {
     pub inserts: Vec<PresetPlugin>,
     #[serde(default)]
     pub sends: Vec<PresetSend>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modulators: Vec<PresetModulator>,
 }
 
 impl TrackPreset {
@@ -143,9 +257,20 @@ impl TrackPreset {
             pan: track.pan,
             phase_invert: track.phase_invert,
             monitor: track.monitor,
-            instrument: track.instrument.as_ref().map(PresetPlugin::capture),
-            preamp: track.preamp.as_ref().map(PresetPlugin::capture),
-            inserts: track.inserts.iter().map(PresetPlugin::capture).collect(),
+            instrument: track
+                .instrument
+                .as_ref()
+                .map(|s| PresetPlugin::capture(track, s)),
+            preamp: track
+                .preamp
+                .as_ref()
+                .map(|s| PresetPlugin::capture(track, s)),
+            inserts: track
+                .inserts
+                .iter()
+                .map(|s| PresetPlugin::capture(track, s))
+                .collect(),
+            modulators: Self::capture_modulators(project, track),
             sends: track
                 .sends
                 .iter()
@@ -159,6 +284,112 @@ impl TrackPreset {
                 })
                 .collect(),
         }
+    }
+
+    fn capture_modulators(project: &Project, track: &Track) -> Vec<PresetModulator> {
+        let order: Vec<PluginInstanceId> = track.slots().iter().map(|s| s.id).collect();
+        track
+            .modulators
+            .iter()
+            .map(|m| PresetModulator {
+                name: m.name.clone(),
+                source: m.source.clone(),
+                follows: match m.source {
+                    ModSource::Follower {
+                        source: FollowSource::Track { track },
+                        ..
+                    } => project.track(track).map(|t| t.name.clone()),
+                    _ => None,
+                },
+                routes: m
+                    .routes
+                    .iter()
+                    .filter_map(|r| {
+                        let target = match r.target {
+                            ModTarget::Volume => PresetTarget::Volume,
+                            ModTarget::Pan => PresetTarget::Pan,
+                            ModTarget::Plugin { plugin, parameter } => PresetTarget::Plugin {
+                                index: order.iter().position(|id| *id == plugin)?,
+                                parameter,
+                            },
+                        };
+                        Some((target, r.depth))
+                    })
+                    .collect(),
+                enabled: m.enabled,
+            })
+            .collect()
+    }
+
+    /// The preset's plugins with fresh ids, in `Track::slots` order.
+    fn build(&self, p: &mut Project) -> Built {
+        let mut built = Built {
+            preamp: None,
+            instrument: None,
+            inserts: Vec::new(),
+            containers: Vec::new(),
+            order: Vec::new(),
+        };
+        built.preamp = self.preamp.as_ref().map(|i| i.build(p, &mut built));
+        built.instrument = self.instrument.as_ref().map(|i| i.build(p, &mut built));
+        let inserts: Vec<PluginSlot> = self
+            .inserts
+            .iter()
+            .map(|i| i.build(p, &mut built))
+            .collect();
+        built.inserts = inserts;
+        built
+    }
+
+    /// The preset's modulators for a track whose devices are `order`.
+    fn modulators(
+        &self,
+        p: &mut Project,
+        own: Option<TrackId>,
+        order: &[PluginInstanceId],
+        notes: &mut Vec<String>,
+    ) -> Vec<Modulator> {
+        let mut out = Vec::new();
+        for m in &self.modulators {
+            let mut source = m.source.clone();
+            if let (ModSource::Follower { source: follow, .. }, Some(name)) =
+                (&mut source, &m.follows)
+            {
+                *follow = match Self::find(p, name, own) {
+                    Some(track) => FollowSource::Track { track },
+                    None => {
+                        notes.push(format!(
+                            "‘{}’ follows '{name}', which does not exist here: it follows the track's input",
+                            m.name
+                        ));
+                        FollowSource::Input
+                    }
+                };
+            }
+            let mut modulator = Modulator::new(p.ids.allocate(), source);
+            modulator.name = m.name.clone();
+            modulator.enabled = m.enabled;
+            modulator.routes = m
+                .routes
+                .iter()
+                .filter_map(|(target, depth)| {
+                    let target = match *target {
+                        PresetTarget::Volume => ModTarget::Volume,
+                        PresetTarget::Pan => ModTarget::Pan,
+                        PresetTarget::Plugin { index, parameter } => ModTarget::Plugin {
+                            plugin: *order.get(index)?,
+                            parameter,
+                        },
+                    };
+                    Some(ModRoute {
+                        target,
+                        depth: *depth,
+                    })
+                })
+                .collect();
+            out.push(modulator);
+        }
+        out
     }
 
     fn find(project: &Project, name: &str, not: Option<TrackId>) -> Option<TrackId> {
@@ -227,9 +458,12 @@ impl TrackPreset {
         t.pan = self.pan;
         t.phase_invert = self.phase_invert;
         t.monitor = self.monitor;
-        t.instrument = self.instrument.as_ref().map(|i| i.slot(p));
-        t.preamp = self.preamp.as_ref().map(|i| i.slot(p));
-        t.inserts = self.inserts.iter().map(|i| i.slot(p)).collect();
+        let built = self.build(p);
+        t.instrument = built.instrument;
+        t.preamp = built.preamp;
+        t.inserts = built.inserts;
+        t.containers = built.containers.into_iter().collect();
+        t.modulators = self.modulators(p, Some(id), &built.order, &mut notes);
         t.output = self.resolve_output(p, None, &mut notes);
         t.sends = self.resolve_sends(p, None, &mut notes);
         (t, notes)
@@ -293,9 +527,10 @@ impl TrackPreset {
         for s in &t.sends {
             c.push(Command::RemoveSend { track, send: s.id });
         }
+        let built = self.build(p);
         c.push(Command::SetPreamp {
             track,
-            slot: self.preamp.as_ref().map(|i| i.slot(p)),
+            slot: built.preamp,
         });
         for slot in &t.inserts {
             c.push(Command::RemovePlugin {
@@ -303,18 +538,25 @@ impl TrackPreset {
                 plugin: slot.id,
             });
         }
-        for (index, ins) in self.inserts.iter().enumerate() {
-            c.push(Command::InsertPlugin {
-                track,
-                index,
-                slot: ins.slot(p),
-            });
+        for (index, slot) in built.inserts.into_iter().enumerate() {
+            c.push(Command::InsertPlugin { track, index, slot });
         }
         if t.kind == TrackKind::Instrument {
             c.push(Command::SetInstrument {
                 track,
-                slot: self.instrument.as_ref().map(|i| i.slot(p)),
+                slot: built.instrument,
             });
+        }
+        for (container, chains) in built.containers {
+            c.push(Command::SetContainer {
+                track,
+                container,
+                chains: Some(chains),
+            });
+        }
+        let modulators = self.modulators(p, Some(track), &built.order, &mut notes);
+        if !modulators.is_empty() || !t.modulators.is_empty() {
+            c.push(Command::SetModulators { track, modulators });
         }
         if t.kind != TrackKind::Master {
             c.push(Command::SetTrackOutput {
@@ -479,5 +721,114 @@ mod tests {
             preset.apply_commands(&mut p, bus),
             Err(PresetError::Kind { .. })
         ));
+    }
+
+    #[test]
+    fn containers_and_modulators_travel_with_a_preset() {
+        let (mut p, vox, aux) = project();
+        // A container whose chain holds an echo, an LFO on that echo and
+        // on the pan, and a follower of the Reverb aux.
+        let container = PluginSlot {
+            id: p.ids.allocate(),
+            plugin: PluginRef::builtin(builtin::CONTAINER, "Container"),
+            bypass: false,
+            parameters: Vec::new(),
+            state: None,
+            sidechain: None,
+        };
+        let echo = PluginSlot {
+            id: p.ids.allocate(),
+            plugin: PluginRef::builtin(builtin::ECHO, "Echo"),
+            bypass: false,
+            parameters: Vec::new(),
+            state: None,
+            sidechain: None,
+        };
+        let mut wet = Chain::new("Wet");
+        wet.gain_db = -6.0;
+        wet.key_high = 80;
+        wet.inserts.push(echo.clone());
+        let param = faderframe_core::ParameterId(1);
+        let mut lfo = Modulator::new(p.ids.allocate(), ModSource::defaults()[0].clone());
+        lfo.routes = vec![
+            ModRoute {
+                target: ModTarget::Plugin {
+                    plugin: echo.id,
+                    parameter: param,
+                },
+                depth: 0.3,
+            },
+            ModRoute {
+                target: ModTarget::Pan,
+                depth: -0.2,
+            },
+        ];
+        let follower = Modulator::new(
+            p.ids.allocate(),
+            ModSource::Follower {
+                source: FollowSource::Track { track: aux },
+                attack_ms: 5.0,
+                release_ms: 100.0,
+                gain_db: 0.0,
+            },
+        );
+        let t = p.track_mut(vox).unwrap();
+        t.containers
+            .insert(container.id, vec![Chain::new("Dry"), wet.clone()]);
+        t.inserts.push(container);
+        t.modulators = vec![lfo, follower];
+        let preset = TrackPreset::capture(&p, p.track(vox).unwrap());
+
+        // Elsewhere: new ids, the same structure; routes find the echo in
+        // the chain, the follower the other project's Reverb.
+        let (mut other, _, other_aux) = project();
+        let (t, notes) = preset.instantiate(&mut other, None);
+        assert!(notes.is_empty(), "{notes:?}");
+        let c = t.inserts.iter().find(|s| s.plugin.is_container()).unwrap();
+        let chains = &t.containers[&c.id];
+        assert_eq!(chains[1].gain_db, -6.0);
+        assert_eq!(chains[1].key_high, 80);
+        let new_echo = chains[1].inserts[0].id;
+        assert_ne!(new_echo, echo.id);
+        assert_eq!(
+            t.modulators[0].routes[0].target,
+            ModTarget::Plugin {
+                plugin: new_echo,
+                parameter: param
+            }
+        );
+        assert_eq!(t.modulators[0].routes[1].target, ModTarget::Pan);
+        assert!(matches!(
+            t.modulators[1].source,
+            ModSource::Follower {
+                source: FollowSource::Track { track },
+                ..
+            } if track == other_aux
+        ));
+
+        // Onto an existing track, in one undoable step.
+        let plain = other.tracks.iter().find(|t| t.name == "Vocal").unwrap().id;
+        let (commands, _) = preset.apply_commands(&mut other, plain).unwrap();
+        let mut h = History::default();
+        h.apply(
+            &mut other,
+            Command::Batch {
+                label: "Apply Preset".into(),
+                commands,
+            },
+        )
+        .unwrap();
+        let t = other.track(plain).unwrap();
+        let c = t.inserts.iter().find(|s| s.plugin.is_container()).unwrap();
+        let echo_now = t.containers[&c.id][1].inserts[0].id;
+        assert_eq!(
+            t.modulators[0].routes[0].target,
+            ModTarget::Plugin {
+                plugin: echo_now,
+                parameter: param
+            }
+        );
+        h.undo(&mut other).unwrap();
+        assert!(other.track(plain).unwrap().modulators.is_empty());
     }
 }

@@ -1685,7 +1685,11 @@ rendered ahead. Editor:
 `faderframe_project::preset::TrackPreset` captures a track's channel
 settings (kind, mono/stereo format, input, monitoring, instrument and
 inserts with parameters and opaque state, fader, pan, polarity, sends,
-output, colour — not clips or automation) as versioned JSON (`.fftrack`).
+output, colour, containers with their chains and modulators — not clips
+or automation) as versioned JSON (`.fftrack`); a modulator's route to a
+plugin keeps the plugin's place among the track's devices (the order of
+`Track::slots`) and a follower its source track's name, so both find
+their plugin and track again under new ids.
 Other tracks are referenced by name and resolved on use; unknown targets
 are reported and dropped. The session keeps a library folder
 (`$XDG_DATA_HOME/faderframe/track-presets`): save a track into it, add a
