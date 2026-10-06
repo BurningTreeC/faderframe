@@ -43,6 +43,7 @@ mod redraw;
 pub mod samples;
 pub mod sampling;
 mod sandbox;
+pub mod speech;
 pub mod to_midi;
 pub mod vinyl;
 pub use groups::GroupMenuEntry;
@@ -318,6 +319,15 @@ pub enum Action {
     /// Show an audio clip in the pitch editor (finding its notes first if
     /// it has none).
     OpenPitchEditor(ClipId),
+    /// Download the speech model (Whisper) once.
+    DownloadSpeechModel,
+    /// Transcribe an audio clip's words into the lyrics.
+    Transcribe(ClipId),
+    /// Change (`Some`) or remove (`None`) a lyric line's words.
+    EditLyric {
+        index: usize,
+        text: Option<String>,
+    },
     /// Show an audio clip's effects in their editor.
     OpenClipEffects(ClipId),
     /// Edit an audio clip's effects (rendered once the chain rests).
@@ -1051,6 +1061,7 @@ pub struct Session {
     clip_analyses: detect::ClipAnalyses,
     conversions: to_midi::Conversions,
     clip_fx: clip_fx::ClipFxState,
+    speech: speech::SpeechState,
     /// The audio clip the pitch editor shows.
     pitch_clip: Option<ClipId>,
     /// Track renders for freezing and bouncing.
@@ -1268,6 +1279,7 @@ impl Session {
             clip_analyses: detect::ClipAnalyses::default(),
             conversions: to_midi::Conversions::default(),
             clip_fx: clip_fx::ClipFxState::default(),
+            speech: speech::SpeechState::default(),
             pitch_clip: None,
             gesture_base: HashMap::new(),
             bounces: Vec::new(),
@@ -2040,6 +2052,7 @@ impl Session {
         self.poll_clip_analyses();
         self.poll_conversions();
         self.poll_clip_fx();
+        self.poll_speech();
         let mut i = 0;
         while i < self.peak_jobs.len() {
             if self.peak_jobs[i].is_finished() {
@@ -2918,6 +2931,9 @@ impl Session {
             Action::FromClip { clip, what } => self.from_clip(clip, what)?,
             Action::ConvertToMidi { clip, how } => self.convert_to_midi(clip, how)?,
             Action::OpenClipEffects(clip) => self.open_clip_fx(clip)?,
+            Action::DownloadSpeechModel => self.download_speech_model()?,
+            Action::Transcribe(clip) => self.transcribe(clip)?,
+            Action::EditLyric { index, text } => self.edit_lyric(index, text)?,
             Action::ClipEffects { clip, op } => self.edit_clip_fx(clip, op)?,
             Action::OpenPitchEditor(clip) => {
                 let Some(a) = self.project.clip(clip).and_then(|c| c.as_audio()) else {

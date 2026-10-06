@@ -16,6 +16,7 @@ fn lane_height(lane: GlobalLane) -> f32 {
         GlobalLane::Arranger => 22.0,
         GlobalLane::Key => 18.0,
         GlobalLane::Chords => 24.0,
+        GlobalLane::Lyrics => 22.0,
         GlobalLane::Signature => 17.0,
         GlobalLane::Tempo => 46.0,
     }
@@ -60,6 +61,8 @@ pub enum GlobalHit {
     Key(usize),
     /// A chord on the chord track (its index).
     Chord(usize, SectionPart),
+    /// A lyric line (its index).
+    Lyric(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -218,6 +221,14 @@ impl ArrangerView {
             }
             GlobalLane::Key => self.key_hit(pos, at, model),
             GlobalLane::Chords => self.chord_hit(pos, r, at, model),
+            GlobalLane::Lyrics => p
+                .lyrics
+                .iter()
+                .position(|l| {
+                    pos.x >= self.x_of(l.start)
+                        && pos.x < self.x_of(l.end).max(self.x_of(l.start) + 8.0)
+                })
+                .map_or(GlobalHit::Empty(lane, at), GlobalHit::Lyric),
             GlobalLane::Tempo => {
                 let range = Self::tempo_range(model);
                 p.timeline
@@ -256,6 +267,7 @@ impl ArrangerView {
                 GlobalLane::Arranger => self.paint_sections(p, r, model),
                 GlobalLane::Key => self.paint_keys(p, r, model),
                 GlobalLane::Chords => self.paint_chords(p, r, model),
+                GlobalLane::Lyrics => self.paint_lyrics(p, r, model),
                 GlobalLane::Signature => self.paint_signatures(p, r, model),
                 GlobalLane::Tempo => self.paint_tempo(p, r, model),
             }
@@ -292,6 +304,44 @@ impl ArrangerView {
         let bar = meter.bar_at(t);
         let (a, b) = (meter.bar_start(bar), meter.bar_start(bar + 1));
         if t - a <= b - t { a } else { b }
+    }
+
+    /// Each line a block from where it starts to where it ends, its words
+    /// in it (cut where the next begins).
+    fn paint_lyrics(&self, p: &mut dyn Painter, r: Rect, model: &Session) {
+        let th = &self.theme;
+        let lines = &model.project().lyrics;
+        let playhead = model.playhead();
+        for (i, l) in lines.iter().enumerate() {
+            let x0 = self.x_of(l.start);
+            let x1 = self.x_of(l.end).max(x0 + 8.0);
+            if x1 < r.x || x0 > r.right() {
+                continue;
+            }
+            let next = lines
+                .get(i + 1)
+                .map_or(f32::INFINITY, |n| self.x_of(n.start));
+            let block = Rect::new(x0, r.y + 3.0, (x1 - x0).max(2.0), r.h - 6.0);
+            let now = l.start <= playhead && playhead < l.end;
+            p.fill_rounded(
+                block,
+                3.0,
+                &Paint::Solid(if now {
+                    th.ui.accent.with_alpha(0.35)
+                } else {
+                    th.ui.text.with_alpha(0.08)
+                }),
+            );
+            let text_w = (next.min(r.right()) - x0 - 6.0).max(0.0);
+            p.text(
+                &l.text,
+                Rect::new(x0 + 4.0, r.y, text_w, r.h),
+                &TextStyle::new(
+                    th.fonts.small,
+                    if now { th.ui.text } else { th.ui.text_dim },
+                ),
+            );
+        }
     }
 
     fn paint_markers(&self, p: &mut dyn Painter, r: Rect, model: &Session) {
@@ -587,6 +637,28 @@ impl ArrangerView {
             GlobalHit::Empty(GlobalLane::Key | GlobalLane::Chords, _)
             | GlobalHit::Key(_)
             | GlobalHit::Chord(..) => self.harmony_press(hit, pos, clicks, mods, size, model, cx),
+            GlobalHit::Lyric(i) => {
+                let Some(l) = p.lyrics.get(i) else {
+                    return true;
+                };
+                if clicks >= 2 {
+                    let x = self.x_of(l.start);
+                    let rect = Rect::new(x, pos.y - 10.0, (self.x_of(l.end) - x).max(220.0), 20.0);
+                    cx.request(HostRequest::TextInput {
+                        at: rect,
+                        initial: l.text.clone(),
+                        commit: Box::new(move |text| {
+                            let t = text.trim();
+                            Some(Action::EditLyric {
+                                index: i,
+                                text: (!t.is_empty()).then(|| t.to_string()),
+                            })
+                        }),
+                    });
+                } else {
+                    cx.emit(Action::Transport(TransportAction::Locate(l.start)));
+                }
+            }
             GlobalHit::Empty(..) => {}
         }
         cx.redraw();
@@ -966,6 +1038,23 @@ impl ArrangerView {
                 Self::key_menu(model, at, false, pos)
             }
             GlobalHit::Chord(i, _) => Self::chord_menu(model, i, pos),
+            GlobalHit::Lyric(i) => HostRequest::ContextMenu {
+                at: pos,
+                items: vec![
+                    MenuItem::new(
+                        "Delete Line",
+                        Action::EditLyric {
+                            index: i,
+                            text: None,
+                        },
+                    ),
+                    MenuItem::new(
+                        "Delete All Lyrics",
+                        Action::Edit(Command::SetLyrics { lyrics: Vec::new() }),
+                    )
+                    .separated(),
+                ],
+            },
             GlobalHit::Empty(GlobalLane::Chords, _) => Self::chords_lane_menu(pos),
             GlobalHit::Empty(lane, _) => Self::lanes_menu(model, lane, pos),
         }
@@ -1156,6 +1245,17 @@ impl ArrangerView {
             | GlobalHit::Chord(..)
             | GlobalHit::Empty(GlobalLane::Key | GlobalLane::Chords, _) => {
                 return self.harmony_tooltip(hit, model);
+            }
+            GlobalHit::Lyric(i) => {
+                let l = p.lyrics.get(i)?;
+                format!(
+                    "“{}” · {} · Click to go there · Double-click to edit · Right-click to delete",
+                    l.text,
+                    format_bbt(&p.timeline, l.start)
+                )
+            }
+            GlobalHit::Empty(GlobalLane::Lyrics, _) => {
+                "Transcribe an audio clip (its menu) to fill this lane".into()
             }
         })
     }

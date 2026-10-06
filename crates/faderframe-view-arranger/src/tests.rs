@@ -1006,7 +1006,8 @@ fn global_lanes_add_markers_sections_and_change_the_tempo() {
     else {
         panic!("lanes menu")
     };
-    assert_eq!(items.len(), 6);
+    // Every lane, Lyrics too (shown once there are lyrics).
+    assert_eq!(items.len(), 7);
 }
 
 #[test]

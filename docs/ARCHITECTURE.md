@@ -1793,6 +1793,37 @@ come from an instance made for the asking (`EngineController::
 describe_parameters`, cached per plugin). Editor `faderframe-view-clipfx`
 (`ViewKind::ClipFx`, a card per device with parameter bars).
 
+### Speech and lyrics
+
+`faderframe-speech` is OpenAI's Whisper in plain Rust (no runtime, no
+ONNX): safetensors loading (F32/F16), the feature extractor's log-mel
+spectrogram (400-point frames every 160 samples at 16 kHz, the
+checkpoint's mel filters, log10 floored 8 below the loudest, (x+4)/4),
+the encoder (two convolutions as matrix products, pre-norm blocks, exact
+GELU) and the decoder (cached self-attention, cross-attention over the
+encoder, logits by the token embedding), matrix products on all cores.
+`Whisper::transcribe` follows the reference loop: the spectrogram of the
+whole recording plus 30 s of silence, 30 s windows, the language
+detected once (or given), greedy decoding with the timestamp rules (pairs,
+never back, the first within a second, a timestamp when they are likelier
+together than any text token), segments from consecutive timestamps, and
+the next window from the last complete segment. Tokens become text
+through GPT-2's byte-level vocabulary. The JFK test clip comes out word
+for word with whisper-tiny in about a second (opt-in test
+`faderframe-speech/tests/jfk.rs`).
+
+The checkpoint is not shipped: `session::speech` downloads `whisper-base`
+(290 MB, Apache-2.0 on Hugging Face) on request (Audio → Download Speech
+Model; the system's `curl`, `.part` files) into the data folder's
+`models`. `Action::Transcribe(clip)` hears an audio clip's part of its
+source at 16 kHz in a thread and puts its lines into the project's lyrics
+(`faderframe_project::lyrics`, `Project::lyrics`, `Command::SetLyrics`),
+replacing those starting inside the clip, in one step. The arranger's
+Lyrics lane (shown once there are lyrics) draws the lines (lit while
+playing), a click goes there, a double-click edits, right-click deletes;
+`arrange` moves, copies and cuts them with sections; `Session::
+lyrics_text` writes LRC or SRT.
+
 ### Track presets
 
 `faderframe_project::preset::TrackPreset` captures a track's channel
@@ -2234,8 +2265,10 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
 5. **Vocals and audio intelligence**: ~~native pitch editing~~ (done:
    TD-PSOLA rather than the Stretch engine, see *Pitch editing*),
    ~~audio-to-MIDI (basic-pitch, Apache-2.0)~~ (done: *Audio to MIDI*), ~~tempo and key
-   detection~~ (done: *Tempo and key from clips*), ~~per-clip effects rendered offline~~ (done: *Clip effects*), ARA 2 hosting, a speech
-   and lyrics transcription track (Whisper, MIT). Stem separation waits
+   detection~~ (done: *Tempo and key from clips*), ~~per-clip effects rendered offline~~ (done: *Clip effects*), ARA 2 hosting (waits for
+   an ARA plugin to test with: none runs on Linux, yabridge does not
+   bridge ARA), ~~a speech and lyrics transcription track (Whisper,
+   MIT)~~ (done: *Speech and lyrics*). Stem separation waits
    for permissively licensed model weights.
 6. **Performance and control**: a clip launcher with scenes recorded into
    the arrangement, control surfaces (Mackie Control/HUI, OSC).

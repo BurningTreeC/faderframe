@@ -278,6 +278,7 @@ pub fn install(app: &Rc<AppState>) {
         dispatch(app, "loop", A::Transport(T::ToggleLoop)),
         dispatch(app, "record", A::Transport(T::ToggleRecord)),
         dispatch(app, "capture-midi", A::CaptureMidi),
+        dispatch(app, "download-speech-model", A::DownloadSpeechModel),
         dispatch(app, "save-version", A::PromptSaveVersion),
         entry(app, "command-palette", crate::palette::open),
         entry(app, "shortcuts", crate::palette::shortcuts),
@@ -1222,6 +1223,27 @@ pub fn install(app: &Rc<AppState>) {
                         value,
                     },
                 });
+            }
+        }),
+        // Development aids: `transcribe:<track>` (its first clip's words to
+        // the lyrics), `export-lyrics:<path>` (.srt, else LRC).
+        named("transcribe", |a, arg| {
+            let clip = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == arg)
+                .and_then(|t| t.clips.first().copied());
+            if let Some(clip) = clip {
+                a.dispatch(Action::Transcribe(clip));
+            }
+        }),
+        named("export-lyrics", |a, arg| {
+            let text = a.session.borrow().lyrics_text(arg.ends_with(".srt"));
+            if let Err(e) = std::fs::write(arg, text) {
+                tracing::warn!("export-lyrics: {e}");
             }
         }),
         // Development aid: `to-midi:<melody|harmony|drums>=<track>` (its

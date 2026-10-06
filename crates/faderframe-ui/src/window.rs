@@ -506,6 +506,13 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             ("Restart Audio", "app.restart-audio"),
         ]),
     );
+    audio.append_section(
+        None,
+        &section(&[(
+            "Download Speech Model (Whisper)…",
+            "app.download-speech-model",
+        )]),
+    );
     menu.append_submenu(Some("_Audio"), &audio);
 
     let help = gio::Menu::new();

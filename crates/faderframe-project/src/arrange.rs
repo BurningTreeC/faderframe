@@ -33,6 +33,7 @@ pub struct Arrangement {
     pub sections: Vec<Section>,
     pub keys: Vec<KeyChange>,
     pub chords: Vec<ChordEvent>,
+    pub lyrics: Vec<crate::lyrics::LyricLine>,
     pub loop_range: Option<MusicalRange>,
     pub loop_enabled: bool,
     pub punch_range: Option<MusicalRange>,
@@ -53,6 +54,7 @@ impl Arrangement {
             sections: p.sections.clone(),
             keys: p.keys.clone(),
             chords: p.chords.clone(),
+            lyrics: p.lyrics.clone(),
             loop_range: p.loop_range,
             loop_enabled: p.loop_enabled,
             punch_range: p.punch_range,
@@ -80,6 +82,7 @@ impl Arrangement {
             sections: std::mem::replace(&mut p.sections, self.sections),
             keys: std::mem::replace(&mut p.keys, self.keys),
             chords: std::mem::replace(&mut p.chords, self.chords),
+            lyrics: std::mem::replace(&mut p.lyrics, self.lyrics),
             loop_range: std::mem::replace(&mut p.loop_range, self.loop_range),
             loop_enabled: std::mem::replace(&mut p.loop_enabled, self.loop_enabled),
             punch_range: std::mem::replace(&mut p.punch_range, self.punch_range),
@@ -108,6 +111,8 @@ pub struct TimeSlice {
     keys: Vec<KeyChange>,
     /// Chords, cut to the span.
     chords: Vec<ChordEvent>,
+    /// Lyric lines starting in the span.
+    lyrics: Vec<crate::lyrics::LyricLine>,
 }
 
 const TICK: MusicalTime = MusicalTime(1);
@@ -334,6 +339,16 @@ pub fn copy_span(p: &Project, a: MusicalTime, b: MusicalTime) -> TimeSlice {
                 chord: c.chord,
             })
             .collect(),
+        lyrics: p
+            .lyrics
+            .iter()
+            .filter(|l| l.start >= a && l.start < b)
+            .map(|l| crate::lyrics::LyricLine {
+                start: l.start - a,
+                end: l.end.min(b) - a,
+                text: l.text.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -535,6 +550,16 @@ pub fn remove_span(p: &mut Project, a: MusicalTime, b: MusicalTime) {
             None => false,
         });
     crate::harmony::normalize_chords(&mut p.chords);
+    // Lines starting in the cut go with it; later ones move up.
+    p.lyrics.retain(|l| l.start < a || l.start >= b);
+    for l in &mut p.lyrics {
+        if l.start >= b {
+            l.start -= len;
+            l.end -= len;
+        } else if l.end > a {
+            l.end = l.end.min(a).max(l.start);
+        }
+    }
     p.sections
         .retain_mut(|s| match range_after_cut(s.start, s.end, a, b) {
             Some((start, end)) => {
@@ -803,6 +828,20 @@ pub fn insert_span(p: &mut Project, at: MusicalTime, slice: &TimeSlice, keep_ids
     }));
     crate::harmony::normalize_chords(&mut chords);
     p.chords = chords;
+    // Lines from the insertion point on move along; the span's come in.
+    for l in &mut p.lyrics {
+        if l.start >= at {
+            l.start += len;
+            l.end += len;
+        }
+    }
+    p.lyrics
+        .extend(slice.lyrics.iter().map(|l| crate::lyrics::LyricLine {
+            start: at + l.start,
+            end: at + l.end,
+            text: l.text.clone(),
+        }));
+    crate::lyrics::normalize(&mut p.lyrics);
     let shift = |r: MusicalRange| {
         let (start, end) = range_after_insert(r.start, r.end, at, len, true);
         MusicalRange { start, end }
@@ -1222,5 +1261,47 @@ mod harmony_tests {
         insert_span(&mut p, bars(1), &slice, false);
         assert_eq!(chords(&p), ["C", "G", "C", "F", "G"]);
         let _ = ids;
+    }
+
+    #[test]
+    fn lyrics_go_with_their_sections() {
+        let words = |p: &Project| -> Vec<(MusicalTime, String)> {
+            p.lyrics.iter().map(|l| (l.start, l.text.clone())).collect()
+        };
+        let sung = |p: &mut Project| {
+            p.lyrics = ["one", "two", "three", "four"]
+                .iter()
+                .enumerate()
+                .map(|(i, t)| crate::lyrics::LyricLine {
+                    start: bars(i as i64) + MusicalTime::from_quarters(1.0),
+                    end: bars(i as i64 + 1),
+                    text: (*t).into(),
+                })
+                .collect();
+        };
+        let (mut p, ids) = song();
+        sung(&mut p);
+        assert!(move_section(&mut p, ids[0], bars(4)));
+        let q = MusicalTime::from_quarters;
+        assert_eq!(
+            words(&p),
+            vec![
+                (q(1.0), "two".into()),
+                (q(5.0), "three".into()),
+                (q(9.0), "four".into()),
+                (q(13.0), "one".into()),
+            ]
+        );
+        let (mut p, ids) = song();
+        sung(&mut p);
+        assert!(delete_section(&mut p, ids[1]));
+        assert_eq!(
+            words(&p).iter().map(|w| w.1.as_str()).collect::<Vec<_>>(),
+            ["one", "three", "four"]
+        );
+        let (mut p, ids) = song();
+        sung(&mut p);
+        assert!(copy_section(&mut p, ids[2], bars(4)).is_some());
+        assert_eq!(words(&p).last(), Some(&(q(17.0), "three".to_string())));
     }
 }

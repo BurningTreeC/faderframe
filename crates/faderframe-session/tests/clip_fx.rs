@@ -21,7 +21,14 @@ fn session() -> (Session, ClipId, Vec<f32>) {
     let tone: Vec<f32> = (0..SR as usize)
         .map(|i| ((i as f64 * 330.0 * std::f64::consts::TAU / f64::from(SR)).sin() * 0.5) as f32)
         .collect();
-    write_wav(&file, std::slice::from_ref(&tone), SR, WavFormat::Float32, false).unwrap();
+    write_wav(
+        &file,
+        std::slice::from_ref(&tone),
+        SR,
+        WavFormat::Float32,
+        false,
+    )
+    .unwrap();
     let mut s = Session::new(Project::new("Clip FX", SR), None, EngineConfig::default()).unwrap();
     s.dispatch(Action::ImportFiles {
         files: vec![file],

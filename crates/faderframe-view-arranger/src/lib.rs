@@ -337,7 +337,11 @@ impl ArrangerView {
             zone_hover: None,
             zoom_seen: 0,
             view_w: f32::MAX,
-            lanes: Default::default(),
+            // No lyrics yet: their lane shows once there are some.
+            lanes: faderframe_session::lanes::GlobalLanes {
+                lyrics: false,
+                ..Default::default()
+            },
             global_drag: None,
         }
     }
@@ -351,6 +355,10 @@ impl ArrangerView {
     /// Pick up the saved header width (called before painting/events).
     fn update_header_width(&mut self, model: &Session) {
         self.lanes = model.editor.lanes;
+        // The Lyrics lane shows once there are lyrics.
+        if model.project().lyrics.is_empty() {
+            self.lanes.lyrics = false;
+        }
         self.header_width = model
             .header_width()
             .unwrap_or(self.theme.arranger.header_width);
@@ -2376,6 +2384,10 @@ impl ArrangerView {
                 items.push(MenuItem::new(
                     "Clip Effects…",
                     Action::OpenClipEffects(clip.id),
+                ));
+                items.push(MenuItem::new(
+                    "Transcribe Words to the Lyrics Lane",
+                    Action::Transcribe(clip.id),
                 ));
                 items.push(
                     MenuItem::new("Set Project Tempo from Clip", from(FromClip::SetTempo))

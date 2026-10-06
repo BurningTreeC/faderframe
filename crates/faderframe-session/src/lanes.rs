@@ -14,16 +14,19 @@ pub enum GlobalLane {
     Arranger,
     Key,
     Chords,
+    /// The words (shown once there are some).
+    Lyrics,
     Signature,
     Tempo,
 }
 
 impl GlobalLane {
-    pub const ALL: [GlobalLane; 6] = [
+    pub const ALL: [GlobalLane; 7] = [
         GlobalLane::Markers,
         GlobalLane::Arranger,
         GlobalLane::Key,
         GlobalLane::Chords,
+        GlobalLane::Lyrics,
         GlobalLane::Signature,
         GlobalLane::Tempo,
     ];
@@ -34,6 +37,7 @@ impl GlobalLane {
             GlobalLane::Arranger => "Arranger",
             GlobalLane::Key => "Key",
             GlobalLane::Chords => "Chords",
+            GlobalLane::Lyrics => "Lyrics",
             GlobalLane::Signature => "Signature",
             GlobalLane::Tempo => "Tempo",
         }
@@ -47,6 +51,7 @@ pub struct GlobalLanes {
     pub arranger: bool,
     pub key: bool,
     pub chords: bool,
+    pub lyrics: bool,
     pub signature: bool,
     pub tempo: bool,
 }
@@ -58,6 +63,7 @@ impl Default for GlobalLanes {
             arranger: true,
             key: true,
             chords: true,
+            lyrics: true,
             signature: true,
             tempo: true,
         }
@@ -71,6 +77,7 @@ impl GlobalLanes {
             GlobalLane::Arranger => self.arranger,
             GlobalLane::Key => self.key,
             GlobalLane::Chords => self.chords,
+            GlobalLane::Lyrics => self.lyrics,
             GlobalLane::Signature => self.signature,
             GlobalLane::Tempo => self.tempo,
         }
@@ -82,6 +89,7 @@ impl GlobalLanes {
             GlobalLane::Arranger => self.arranger = on,
             GlobalLane::Key => self.key = on,
             GlobalLane::Chords => self.chords = on,
+            GlobalLane::Lyrics => self.lyrics = on,
             GlobalLane::Signature => self.signature = on,
             GlobalLane::Tempo => self.tempo = on,
         }

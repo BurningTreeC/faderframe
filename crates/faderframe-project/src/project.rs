@@ -131,6 +131,9 @@ pub struct Project {
     /// The chord track, by start.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chords: Vec<crate::ChordEvent>,
+    /// The words along the timeline (transcribed or typed), by start.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lyrics: Vec<crate::lyrics::LyricLine>,
     /// Clip aliases: clips with the same link share their content (an edit
     /// of one reaches the others; position, name, colour and mute are each
     /// one's own).
@@ -170,6 +173,7 @@ impl Project {
             album: crate::album::Album::default(),
             keys: Vec::new(),
             chords: Vec::new(),
+            lyrics: Vec::new(),
             clip_links: BTreeMap::new(),
             ids,
         }

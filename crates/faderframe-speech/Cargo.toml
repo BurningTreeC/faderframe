@@ -1,0 +1,16 @@
+[package]
+name = "faderframe-speech"
+description = "Speech and lyrics transcription: OpenAI's Whisper (MIT; weights Apache-2.0) in plain Rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

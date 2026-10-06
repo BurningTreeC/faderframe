@@ -106,7 +106,7 @@ fn harmony(x: &[f32], rate: f64) -> Option<Vec<Found>> {
 }
 
 /// `x` at `to` Hz.
-fn resample(x: &[f32], from: f64, to: f64) -> Option<Vec<f32>> {
+pub(crate) fn resample(x: &[f32], from: f64, to: f64) -> Option<Vec<f32>> {
     if (from - to).abs() < 0.5 {
         return Some(x.to_vec());
     }

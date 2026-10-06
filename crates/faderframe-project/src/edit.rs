@@ -396,6 +396,10 @@ pub enum Command {
     SetChords {
         chords: Vec<crate::ChordEvent>,
     },
+    /// Replace the lyrics (normalised: sorted, no empty lines).
+    SetLyrics {
+        lyrics: Vec<crate::lyrics::LyricLine>,
+    },
     /// Replace everything that lives in time (clips, automation, tempo and
     /// meter, markers, sections, loop and punch) at once: section moves,
     /// copies and deletes (see [`crate::arrange`]).
@@ -671,6 +675,7 @@ impl Command {
             SetTimeline { .. } => "Change Tempo Map".into(),
             SetKeys { .. } => "Change Key".into(),
             SetChords { .. } => "Edit Chords".into(),
+            SetLyrics { .. } => "Edit Lyrics".into(),
             SetArrangement { .. } => "Rearrange".into(),
             SetAlbum { .. } => "Edit Album".into(),
             SetSongInserts { .. } => "Change Song Inserts".into(),
@@ -746,7 +751,8 @@ impl Command {
             | UpdateGroup { .. }
             | SetTrackGroup { .. }
             | SetClipLink { .. }
-            | SetAlbum { .. } => Impact::None,
+            | SetAlbum { .. }
+            | SetLyrics { .. } => Impact::None,
             AddSource { .. }
             | RemoveSource { .. }
             | AddAutomationLane { .. }
@@ -1610,6 +1616,12 @@ impl Command {
                 crate::harmony::normalize_chords(&mut chords);
                 SetChords {
                     chords: std::mem::replace(&mut p.chords, chords),
+                }
+            }
+            SetLyrics { mut lyrics } => {
+                crate::lyrics::normalize(&mut lyrics);
+                SetLyrics {
+                    lyrics: std::mem::replace(&mut p.lyrics, lyrics),
                 }
             }
             SetArrangement { arrangement } => SetArrangement {

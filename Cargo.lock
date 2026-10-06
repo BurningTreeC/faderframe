@@ -765,6 +765,7 @@ dependencies = [
  "faderframe-plugin-vst3",
  "faderframe-project",
  "faderframe-realtime",
+ "faderframe-speech",
  "faderframe-timeline",
  "faderframe-transcribe",
  "faderframe-transport",
@@ -775,6 +776,15 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tracing",
+]
+
+[[package]]
+name = "faderframe-speech"
+version = "0.7.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
