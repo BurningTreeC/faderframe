@@ -866,6 +866,7 @@ dependencies = [
 name = "faderframe-view-arranger"
 version = "0.6.0"
 dependencies = [
+ "faderframe-audio",
  "faderframe-audio-files",
  "faderframe-automation",
  "faderframe-core",

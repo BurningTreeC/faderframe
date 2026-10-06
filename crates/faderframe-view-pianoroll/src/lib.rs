@@ -196,6 +196,8 @@ pub struct PianoRollView {
     /// Pixels per key row.
     row_h: f32,
     scroll_x: f32,
+    /// A scrollbar is held: the view does not follow the playhead.
+    pub(crate) bar_held: bool,
     scroll_y: f32,
     tool: Tool,
     drag: Option<Drag>,
@@ -252,6 +254,7 @@ impl PianoRollView {
             ppq: 90.0,
             row_h,
             scroll_x: 0.0,
+            bar_held: false,
             scroll_y: 0.0,
             tool: Tool::Pointer,
             drag: None,
@@ -591,6 +594,10 @@ impl faderframe_ui_canvas::CanvasView<Session, faderframe_session::Action> for P
             faderframe_ui_canvas::ScrollAxis::Horizontal => self.scroll_x = offset.max(0.0),
             faderframe_ui_canvas::ScrollAxis::Vertical => self.scroll_y = offset.max(0.0),
         }
+    }
+
+    fn scroll_held(&mut self, _axis: faderframe_ui_canvas::ScrollAxis, held: bool) {
+        self.bar_held = held;
     }
 }
 

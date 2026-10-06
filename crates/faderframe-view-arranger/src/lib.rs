@@ -250,6 +250,8 @@ pub struct ArrangerView {
     /// Pixels from the timeline start (f64: sample-level zoom deep into a
     /// project needs the precision).
     scroll_x: f64,
+    /// A scrollbar is held: the view does not follow the playhead.
+    bar_held: bool,
     scroll_y: f32,
     drag: Option<Drag>,
     hover: Option<Hit>,
@@ -321,6 +323,7 @@ impl ArrangerView {
             theme,
             ppq: 34.0,
             scroll_x: 0.0,
+            bar_held: false,
             scroll_y: 0.0,
             drag: None,
             hover: None,
@@ -1748,7 +1751,7 @@ impl ArrangerView {
     }
 
     fn follow(&mut self, model: &Session, size: Size) {
-        if !(model.editor.follow_playhead && model.transport().playing) {
+        if !(model.editor.follow_playhead && model.transport().playing) || self.bar_held {
             return;
         }
         let x = self.x_of(model.playhead());
@@ -3559,6 +3562,10 @@ impl CanvasView<Session, Action> for ArrangerView {
             ScrollAxis::Horizontal => self.scroll_x = offset.max(0.0) as f64,
             ScrollAxis::Vertical => self.scroll_y = offset.max(0.0),
         }
+    }
+
+    fn scroll_held(&mut self, _axis: ScrollAxis, held: bool) {
+        self.bar_held = held;
     }
 }
 

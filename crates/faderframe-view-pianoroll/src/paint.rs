@@ -191,7 +191,11 @@ impl PianoRollView {
 
     /// Page along with the playhead while playing.
     fn follow(&mut self, size: Size, model: &Session, clip: &Clip, m: &MidiClip) {
-        if !model.transport().playing || !model.editor.follow_playhead || self.drag.is_some() {
+        if !model.transport().playing
+            || !model.editor.follow_playhead
+            || self.drag.is_some()
+            || self.bar_held
+        {
             return;
         }
         let ph = model.playhead();

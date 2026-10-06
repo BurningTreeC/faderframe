@@ -634,6 +634,41 @@ impl CanvasWidget {
     pub fn bind_scrollbars(&self, hbar: Option<gtk::Scrollbar>, vbar: Option<gtk::Scrollbar>) {
         let hadj = hbar.as_ref().map(|b| b.adjustment());
         let vadj = vbar.as_ref().map(|b| b.adjustment());
+        // Held bars: the view leaves the scrolling to the hand (it stops
+        // following the playhead). Seen in the capture phase, so the bar's
+        // own dragging is untouched and the release arrives wherever the
+        // pointer has gone.
+        for (bar, axis) in [
+            (hbar.as_ref(), ScrollAxis::Horizontal),
+            (vbar.as_ref(), ScrollAxis::Vertical),
+        ] {
+            let Some(bar) = bar else { continue };
+            let hold = gtk::EventControllerLegacy::new();
+            hold.set_propagation_phase(gtk::PropagationPhase::Capture);
+            hold.connect_event(glib::clone!(
+                #[weak(rename_to = w)]
+                self,
+                #[upgrade_or]
+                glib::Propagation::Proceed,
+                move |_, event| {
+                    let held = match event.event_type() {
+                        gdk::EventType::ButtonPress | gdk::EventType::TouchBegin => true,
+                        gdk::EventType::ButtonRelease
+                        | gdk::EventType::TouchEnd
+                        | gdk::EventType::TouchCancel
+                        | gdk::EventType::GrabBroken => false,
+                        _ => return glib::Propagation::Proceed,
+                    };
+                    if let Ok(mut view) = w.imp().view.try_borrow_mut()
+                        && let Some(v) = view.as_mut()
+                    {
+                        v.scroll_held(axis, held);
+                    }
+                    glib::Propagation::Proceed
+                }
+            ));
+            bar.add_controller(hold);
+        }
         *self.imp().hbar.borrow_mut() = hbar;
         *self.imp().vbar.borrow_mut() = vbar;
         for (adj, axis) in [

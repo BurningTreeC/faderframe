@@ -1370,3 +1370,38 @@ fn the_wheel_over_the_track_headers_never_scrolls() {
     run(&mut view, wheel(Point::new(700.0, row.y + 4.0)), size, &s);
     assert!(view.scroll_y > 0.0);
 }
+
+#[test]
+fn a_held_scrollbar_keeps_the_view_from_following_the_playhead() {
+    let mut s = session();
+    s.start_audio(
+        vec![Box::new(faderframe_audio::dummy::DummyBackend::default())],
+        &faderframe_session::AudioPreferences::default(),
+    )
+    .unwrap();
+    s.dispatch(Action::SetEditFlag(
+        faderframe_session::EditFlag::FollowPlayhead,
+        true,
+    ))
+    .unwrap();
+    s.dispatch(Action::Transport(TransportAction::Play))
+        .unwrap();
+    let start = std::time::Instant::now();
+    while !s.transport().playing && start.elapsed().as_secs() < 5 {
+        s.tick(0.016);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(s.transport().playing);
+    let theme = Theme::default();
+    let mut view = ArrangerView::new(theme.clone());
+    let size = Size::new(1200.0, 400.0);
+    // Dragged far from the playhead while held: it stays there.
+    view.scroll_held(ScrollAxis::Horizontal, true);
+    view.set_scroll(ScrollAxis::Horizontal, 1_500.0);
+    view.paint(&mut RecordingPainter::new(), size, &s, &theme);
+    assert_eq!(view.scroll_x, 1_500.0);
+    // Let go: it follows again.
+    view.scroll_held(ScrollAxis::Horizontal, false);
+    view.paint(&mut RecordingPainter::new(), size, &s, &theme);
+    assert!(view.scroll_x < 1_500.0, "{}", view.scroll_x);
+}

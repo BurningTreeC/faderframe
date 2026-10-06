@@ -21,4 +21,5 @@ faderframe-ui-canvas.workspace = true
 faderframe-audio-files.workspace = true
 
 [dev-dependencies]
+faderframe-audio.workspace = true
 faderframe-engine.workspace = true

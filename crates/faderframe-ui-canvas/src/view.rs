@@ -185,6 +185,11 @@ pub trait CanvasView<M, A> {
 
     fn set_scroll(&mut self, _axis: ScrollAxis, _offset: f32) {}
 
+    /// The pointer holds one of the view's scrollbars (`held`), or let go
+    /// of it: a view that scrolls by itself (following the playhead)
+    /// leaves the scrolling to the hand meanwhile.
+    fn scroll_held(&mut self, _axis: ScrollAxis, _held: bool) {}
+
     /// Files are dragged over the view at `pos` (`None`: the drag left).
     /// Return whether dropping there would be accepted (views typically
     /// remember the position to paint a drop indicator).
