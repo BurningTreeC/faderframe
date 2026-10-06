@@ -230,3 +230,63 @@ fn a_midi_track_plays_every_instrument_of_its_track() {
     let x = render(&tp, 24_000);
     assert_eq!(sounding(&x[4800..], &[60, 69]), [69]);
 }
+
+/// A MIDI track's mute silences it (it has no strip): by itself, by a
+/// folder it is in, or by another track's solo.
+#[test]
+fn muting_a_midi_track_or_its_folder_silences_it() {
+    let build = |setup: &dyn Fn(&mut TestProject, TrackId, TrackId, TrackId)| {
+        let mut tp = TestProject::new(SR);
+        let keys = tp.track(TrackKind::Instrument, "Keys", ChannelLayout::Stereo);
+        let synth = sine(&mut tp);
+        tp.project.track_mut(keys).unwrap().inserts = vec![synth];
+        let m = tp.track(TrackKind::Midi, "Notes", ChannelLayout::Stereo);
+        tp.project.track_mut(m).unwrap().output = OutputRouting::Track { track: keys };
+        clip(&mut tp, m, &[69], 4.0);
+        let folder = tp.track(TrackKind::Folder, "Folder", ChannelLayout::Stereo);
+        tp.project.track_mut(m).unwrap().folder = Some(folder);
+        setup(&mut tp, keys, m, folder);
+        sounding(&render(&tp, 24_000)[4800..], &[69])
+    };
+    assert_eq!(build(&|_, _, _, _| {}), [69], "plays");
+    assert!(build(&|tp, _, m, _| tp.project.track_mut(m).unwrap().mute = true).is_empty());
+    assert!(
+        build(&|tp, _, _, f| tp.project.track_mut(f).unwrap().mute = true).is_empty(),
+        "the folder's mute reaches it"
+    );
+    // Another MIDI track soloed: this one is out.
+    assert!(
+        build(&|tp, keys, _, _| {
+            let other = tp.track(TrackKind::Midi, "Other", ChannelLayout::Stereo);
+            let o = tp.project.track_mut(other).unwrap();
+            o.output = OutputRouting::Track { track: keys };
+            o.solo = true;
+        })
+        .is_empty()
+    );
+    // The folder soloed: what is in it plays.
+    assert_eq!(
+        build(&|tp, _, _, f| tp.project.track_mut(f).unwrap().solo = true),
+        [69]
+    );
+}
+
+/// A folder's mute reaches the audio tracks in it (and folders in it).
+#[test]
+fn a_folders_mute_reaches_the_tracks_in_it() {
+    let build = |mute_outer: bool| {
+        let mut tp = TestProject::new(SR);
+        let keys = tp.track(TrackKind::Instrument, "Keys", ChannelLayout::Stereo);
+        let synth = sine(&mut tp);
+        tp.project.track_mut(keys).unwrap().inserts = vec![synth];
+        clip(&mut tp, keys, &[69], 4.0);
+        let outer = tp.track(TrackKind::Folder, "Outer", ChannelLayout::Stereo);
+        let inner = tp.track(TrackKind::Folder, "Inner", ChannelLayout::Stereo);
+        tp.project.track_mut(inner).unwrap().folder = Some(outer);
+        tp.project.track_mut(keys).unwrap().folder = Some(inner);
+        tp.project.track_mut(outer).unwrap().mute = mute_outer;
+        sounding(&render(&tp, 24_000)[4800..], &[69])
+    };
+    assert_eq!(build(false), [69]);
+    assert!(build(true).is_empty());
+}

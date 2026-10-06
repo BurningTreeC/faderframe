@@ -143,6 +143,12 @@ Contrast:
   the chord track, and drum patterns; previewed in the grid, applied in
   one undo step. The scale follows the key track; the chord track shows
   above the notes and can be stamped.
+* Folder tracks: Track menu (or the "+") → New Folder with the Selected
+  Tracks; folders hold tracks and other folders, show them indented under
+  them, close by their triangle (or a double-click), give an overview of
+  their clips, and their mute and solo reach everything inside. Move tracks
+  into and out of folders from the track menu; removing a folder keeps its
+  tracks; Sum into a New Bus routes the folder's tracks through a bus.
 * Adding tracks: the "+" under the last track in the arranger and right of
   the last strip in the mixer (each kind of track, or one from a saved
   track preset; an instrument track opens the plugin browser).

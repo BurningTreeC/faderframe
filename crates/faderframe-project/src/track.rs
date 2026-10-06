@@ -26,6 +26,9 @@ pub enum TrackKind {
     /// A fader without audio that scales (and mutes, solos) the tracks
     /// assigned to it.
     Vca,
+    /// Holds other tracks (and folders) to organise them: they show under
+    /// it, it opens and closes, and its mute and solo reach them. No audio.
+    Folder,
 }
 
 impl TrackKind {
@@ -38,6 +41,7 @@ impl TrackKind {
             TrackKind::Aux => "Aux",
             TrackKind::Master => "Master",
             TrackKind::Vca => "VCA",
+            TrackKind::Folder => "Folder",
         }
     }
 
@@ -54,9 +58,9 @@ impl TrackKind {
         matches!(self, TrackKind::Bus | TrackKind::Aux | TrackKind::Master)
     }
 
-    /// Produces audio (as opposed to MIDI-only tracks and VCAs).
+    /// Produces audio (as opposed to MIDI-only tracks, VCAs and folders).
     pub fn has_audio(self) -> bool {
-        !matches!(self, TrackKind::Midi | TrackKind::Vca)
+        !matches!(self, TrackKind::Midi | TrackKind::Vca | TrackKind::Folder)
     }
 }
 
@@ -349,6 +353,9 @@ pub struct Track {
     /// The group whose linked controls this track follows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<faderframe_core::GroupId>,
+    /// The folder track this track is in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<TrackId>,
 }
 
 /// Tracks whose controls move together.
@@ -447,6 +454,7 @@ impl Track {
             freeze: None,
             vca: None,
             group: None,
+            folder: None,
         }
     }
 

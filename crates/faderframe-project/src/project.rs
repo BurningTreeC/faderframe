@@ -200,6 +200,52 @@ impl Project {
         chain
     }
 
+    /// The folders `track` is in: its own, then the one that folder is in,
+    /// and so on (loops and missing folders end the chain).
+    pub fn folder_chain(&self, track: &Track) -> Vec<&Track> {
+        let mut chain: Vec<&Track> = Vec::new();
+        let mut next = track.folder;
+        while let Some(id) = next {
+            let Some(f) = self.track(id).filter(|f| f.kind == TrackKind::Folder) else {
+                break;
+            };
+            if f.id == track.id || chain.iter().any(|c| c.id == f.id) {
+                break;
+            }
+            chain.push(f);
+            next = f.folder;
+        }
+        chain
+    }
+
+    /// Is `track` inside `folder` (directly or in a folder inside it)?
+    pub fn in_folder(&self, track: &Track, folder: TrackId) -> bool {
+        self.folder_chain(track).iter().any(|f| f.id == folder)
+    }
+
+    /// The tracks as the editors show them: each folder followed by what it
+    /// holds (in project order), whatever the project order is.
+    pub fn folder_order(&self) -> Vec<&Track> {
+        let parent = |t: &Track| self.folder_chain(t).first().map(|f| f.id);
+        let mut out = Vec::with_capacity(self.tracks.len());
+        let mut stack: Vec<(Option<TrackId>, usize)> = vec![(None, 0)];
+        // Depth first: the children of a folder right after it.
+        while let Some((at, from)) = stack.pop() {
+            let next = self.tracks[from..]
+                .iter()
+                .position(|t| parent(t) == at)
+                .map(|i| from + i);
+            let Some(i) = next else { continue };
+            let t = &self.tracks[i];
+            out.push(t);
+            stack.push((at, i + 1));
+            if t.kind == TrackKind::Folder {
+                stack.push((Some(t.id), 0));
+            }
+        }
+        out
+    }
+
     /// Tracks assigned to a VCA directly.
     pub fn vca_members(&self, vca: TrackId) -> Vec<TrackId> {
         self.tracks
@@ -336,21 +382,27 @@ impl Project {
     /// everything it feeds (its buses, aux returns, master) and everything
     /// feeding it (sources of a soloed bus). Explicit mutes still apply.
     pub fn solo_audible(&self) -> Option<HashSet<TrackId>> {
-        // A soloed VCA solos the tracks it scales.
+        // A soloed VCA solos the tracks it scales, a soloed folder the
+        // tracks in it.
         let soloed: Vec<TrackId> = self
             .tracks
             .iter()
-            .filter(|t| t.solo || self.vca_chain(t).iter().any(|v| v.solo))
-            .filter(|t| t.kind != TrackKind::Vca)
+            .filter(|t| {
+                t.solo
+                    || self.vca_chain(t).iter().any(|v| v.solo)
+                    || self.folder_chain(t).iter().any(|f| f.solo)
+            })
+            .filter(|t| !matches!(t.kind, TrackKind::Vca | TrackKind::Folder))
             .map(|t| t.id)
             .collect();
         if soloed.is_empty()
             && self
                 .tracks
                 .iter()
-                .any(|t| t.kind == TrackKind::Vca && t.solo)
+                .any(|t| matches!(t.kind, TrackKind::Vca | TrackKind::Folder) && t.solo)
         {
-            // A soloed VCA without members silences everything else.
+            // A soloed VCA or folder without members silences everything
+            // else.
             return Some(self.master_id().into_iter().collect());
         }
         if soloed.is_empty() {

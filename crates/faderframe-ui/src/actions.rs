@@ -1020,6 +1020,58 @@ pub fn install(app: &Rc<AppState>) {
                 None => tracing::warn!("make-sample: nothing to sample on '{name}'"),
             }
         }),
+        // Development aids: `new-folder:<track>|<track>…`,
+        // `toggle-folder:<folder>`, `move-to-folder:<track>=<folder|none>`.
+        named("new-folder", |a, arg| {
+            let tracks: Vec<_> = {
+                let s = a.session.borrow();
+                arg.split('|')
+                    .filter_map(|n| {
+                        s.project()
+                            .tracks
+                            .iter()
+                            .find(|t| t.name == n)
+                            .map(|t| t.id)
+                    })
+                    .collect()
+            };
+            a.dispatch(Action::NewFolder { tracks });
+        }),
+        named("toggle-folder", |a, arg| {
+            let id = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == arg)
+                .map(|t| t.id);
+            if let Some(id) = id {
+                a.dispatch(Action::ToggleFolder(id));
+            }
+        }),
+        named("move-to-folder", |a, arg| {
+            let Some((name, folder)) = arg.split_once('=') else {
+                return;
+            };
+            let (track, folder) = {
+                let s = a.session.borrow();
+                let id = |n: &str| {
+                    s.project()
+                        .tracks
+                        .iter()
+                        .find(|t| t.name == n)
+                        .map(|t| t.id)
+                };
+                (id(name), id(folder))
+            };
+            if let Some(track) = track {
+                a.dispatch(Action::MoveToFolder {
+                    tracks: vec![track],
+                    folder,
+                });
+            }
+        }),
         // Development aid: `midi-plays:<MIDI track>=<instrument track|none>`.
         named("midi-plays", |a, arg| {
             let Some((from, to)) = arg.split_once('=') else {

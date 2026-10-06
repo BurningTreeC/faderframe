@@ -2,6 +2,7 @@ use crate::context::EngineContext;
 use faderframe_audio_graph::{NodeIo, ProcessContext, Processor};
 use faderframe_core::TrackId;
 use faderframe_midi::{MidiBuffer, MidiEvent, NoteTracker, TimedMidiEvent};
+use faderframe_realtime::ParamSlot;
 
 /// Controller slots per channel: 128 CCs, pitch bend, channel pressure.
 const SLOTS: usize = 130;
@@ -32,6 +33,10 @@ fn slot(ev: MidiEvent) -> Option<(usize, usize)> {
 /// bend centred) when playback jumps or stops. All state is fixed-size.
 pub struct MidiClipPlayer {
     track: TrackId,
+    /// A MIDI track's mute: while set, it plays nothing (its sounding
+    /// notes are released, controllers chased again when it comes back).
+    mute: Option<ParamSlot>,
+    muted: bool,
     tracker: NoteTracker,
     /// Value last sent per channel and controller slot.
     sent: Box<[[Option<MidiEvent>; SLOTS]; 16]>,
@@ -44,11 +49,19 @@ impl MidiClipPlayer {
     pub fn new(track: TrackId) -> Self {
         Self {
             track,
+            mute: None,
+            muted: false,
             tracker: NoteTracker::default(),
             sent: Box::new([[None; SLOTS]; 16]),
             chase: Box::new([[None; SLOTS]; 16]),
             was_playing: false,
         }
+    }
+
+    /// Silent while the slot is set (MIDI tracks' mute).
+    pub fn with_mute(mut self, mute: ParamSlot) -> Self {
+        self.mute = Some(mute);
+        self
     }
 
     /// Put moved controllers back to rest (pedals up, bend centred).
@@ -145,11 +158,19 @@ impl Processor<EngineContext> for MidiClipPlayer {
             return;
         };
         let t = &cx.data.transport;
-        if cx.data.discontinuity || (self.was_playing && !t.playing) {
+        let muted = self.mute.is_some_and(|m| cx.data.params.get(m) >= 0.5);
+        if cx.data.discontinuity || (self.was_playing && !t.playing) || (muted && !self.muted) {
             self.tracker.release_all(out, 0);
             self.rest(out);
         }
-        let started = t.playing && (!self.was_playing || cx.data.discontinuity);
+        // Unmuted mid-clip: the controllers in effect, as when starting.
+        let unmuted = self.muted && !muted;
+        self.muted = muted;
+        if muted {
+            self.was_playing = t.playing;
+            return;
+        }
+        let started = t.playing && (!self.was_playing || cx.data.discontinuity || unmuted);
         self.was_playing = t.playing;
         if !t.playing {
             return;

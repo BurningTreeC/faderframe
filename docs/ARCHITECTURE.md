@@ -2009,7 +2009,8 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
    chord, scale, note echo), MIDI transformations and generators,
    always-on retrospective MIDI capture~~ — done (see *Harmony*, *MIDI
    effects*, *Piano roll* and `session::capture`).
-3. **Organisation**: folder tracks, clip aliases, project versions
+3. **Organisation**: ~~folder tracks~~ (done: `TrackKind::Folder`,
+   `Track::folder`, `Project::folder_order`, `session::folders`), clip aliases, project versions
    (snapshots to compare and restore), a command palette with a shortcut
    editor, an undo history view.
 4. **Modulation**: modulators (LFO, envelope follower, steps, random,

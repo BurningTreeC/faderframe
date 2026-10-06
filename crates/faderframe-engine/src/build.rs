@@ -445,8 +445,9 @@ pub fn build_graph(
     // Pass 1: per-track chains.
     for (gi, t) in project.tracks.iter().enumerate() {
         let gi = gi as u32;
-        // VCAs have no audio: they scale their members' strips.
-        if t.kind == TrackKind::Vca {
+        // VCAs have no audio: they scale their members' strips. Folders
+        // only hold tracks.
+        if matches!(t.kind, TrackKind::Vca | TrackKind::Folder) {
             continue;
         }
         let mut tn = TrackNodes::default();
@@ -490,12 +491,22 @@ pub fn build_graph(
             continue;
         }
         if matches!(t.kind, TrackKind::Instrument | TrackKind::Midi) && !frozen {
+            // A MIDI track mutes here (it has no strip).
+            let mute = if t.kind == TrackKind::Midi {
+                Some(slots.midi_mute(t.id)?)
+            } else {
+                None
+            };
+            let player = MidiClipPlayer::new(t.id);
             let midi = b.add_node(
                 NodeSpec::new(format!("{} · MIDI", t.name))
                     .key(node_key(t.id, Role::MidiPlayer, 0, &[]))
                     .group(gi)
                     .events_out(1),
-                Box::new(MidiClipPlayer::new(t.id)),
+                Box::new(match mute {
+                    Some(m) => player.with_mute(m),
+                    None => player,
+                }),
             );
             tn.midi = Some(own(&mut owners, midi, t.id, None, NodeWork::Midi));
             // Live input (played through while the session says so) and
@@ -518,12 +529,18 @@ pub fn build_graph(
                     .key(node_key(t.id, Role::MidiInput, sub, &[]))
                     .group(gi)
                     .events_out(1),
-                Box::new(MidiInputNode::new(
-                    t.id,
-                    filter,
-                    live,
-                    std::sync::Arc::clone(&routing.shared),
-                )),
+                Box::new({
+                    let node = MidiInputNode::new(
+                        t.id,
+                        filter,
+                        live,
+                        std::sync::Arc::clone(&routing.shared),
+                    );
+                    match mute {
+                        Some(m) => node.with_mute(m),
+                        None => node,
+                    }
+                }),
             );
             tn.midi_in = Some(own(&mut owners, node, t.id, None, NodeWork::MidiInput));
             // MIDI tracks send their MIDI on through their MIDI effects.

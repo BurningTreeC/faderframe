@@ -203,6 +203,7 @@ fn kind_tag(kind: TrackKind) -> &'static str {
         TrackKind::Aux => "AUX",
         TrackKind::Master => "MAIN",
         TrackKind::Vca => "VCA",
+        TrackKind::Folder => "FOLDER",
     }
 }
 
@@ -310,12 +311,14 @@ impl MixerView {
         self.theme.console.strip_width + self.theme.console.strip_gap
     }
 
+    /// The channel strips: in folder order (a folder's tracks together);
+    /// folders themselves have none.
     fn channel_tracks(model: &Session) -> Vec<&Track> {
         model
             .project()
-            .tracks
-            .iter()
-            .filter(|t| t.kind != TrackKind::Master)
+            .folder_order()
+            .into_iter()
+            .filter(|t| !matches!(t.kind, TrackKind::Master | TrackKind::Folder))
             .collect()
     }
 

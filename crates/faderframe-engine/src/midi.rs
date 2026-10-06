@@ -355,6 +355,8 @@ pub struct MidiInputNode {
     /// `None`: the track has no MIDI input (auditioning only).
     filter: Option<MidiFilter>,
     live: ParamSlot,
+    /// A MIDI track's mute: no live play while set.
+    mute: Option<ParamSlot>,
     held: NoteTracker,
     shared: Arc<MidiShared>,
 }
@@ -370,9 +372,18 @@ impl MidiInputNode {
             track: track.raw(),
             filter,
             live,
+            mute: None,
             held: NoteTracker::default(),
             shared,
         }
+    }
+}
+
+impl MidiInputNode {
+    /// No live play while the slot is set (MIDI tracks' mute).
+    pub fn with_mute(mut self, mute: ParamSlot) -> Self {
+        self.mute = Some(mute);
+        self
     }
 }
 
@@ -381,7 +392,8 @@ impl Processor<EngineContext> for MidiInputNode {
         let Some(out) = io.events_out.first_mut() else {
             return;
         };
-        let live = self.filter.is_some() && cx.data.params.get(self.live) >= 0.5;
+        let muted = self.mute.is_some_and(|m| cx.data.params.get(m) >= 0.5);
+        let live = self.filter.is_some() && cx.data.params.get(self.live) >= 0.5 && !muted;
         if !live && self.held.any_active() {
             // No longer live: nothing may keep sounding.
             self.held.release_all(out, 0);

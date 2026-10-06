@@ -52,6 +52,10 @@ const DISCLOSURE_W: f32 = 15.0;
 const HEADER_MAX_H: f32 = 96.0;
 /// Height of the resize grip at a track's bottom edge (header column).
 const RESIZE_GRIP: f32 = 4.0;
+/// How far a track's header moves right per folder it is in.
+const FOLDER_INDENT: f32 = 12.0;
+/// A folder's row unless it is sized.
+const FOLDER_ROW_H: f32 = 44.0;
 /// Track height presets (View → Track Height, track context menu).
 pub const TRACK_HEIGHTS: [(&str, f32); 4] = [
     ("Small", 44.0),
@@ -76,6 +80,8 @@ pub enum HeaderPart {
     Automation,
     /// The colour stripe: opens the colour chooser.
     Color,
+    /// A folder's triangle: opens or closes it.
+    Fold,
     Body,
 }
 
@@ -270,6 +276,21 @@ pub struct ArrangerView {
     global_drag: Option<global::GlobalDrag>,
 }
 
+/// A folder header's triangle.
+fn fold_rect(l: &HeaderLayout) -> Rect {
+    Rect::new(l.name.x - 2.0, l.name.y, 16.0, l.name.h)
+}
+
+/// A folder's name, right of its triangle.
+fn folder_name_rect(l: &HeaderLayout) -> Rect {
+    Rect::new(
+        l.name.x + 16.0,
+        l.name.y,
+        (l.name.w - 16.0).max(10.0),
+        l.name.h,
+    )
+}
+
 /// The entries making a sample of a track's selection (audio tracks).
 fn sample_items(model: &Session, track: TrackId, clip: Option<ClipId>) -> Vec<MenuItem<Action>> {
     model
@@ -349,13 +370,22 @@ impl ArrangerView {
         MusicalTime::from_quarters(((x - self.header_w()) as f64 + self.scroll_x) / self.ppq as f64)
     }
 
+    /// The tracks with lanes: in folder order (a folder's tracks under
+    /// it), those in closed folders left out.
     fn lane_tracks(model: &Session) -> Vec<&Track> {
         model
             .project()
-            .tracks
-            .iter()
-            .filter(|t| t.kind != TrackKind::Master)
+            .folder_order()
+            .into_iter()
+            .filter(|t| t.kind != TrackKind::Master && model.track_shown(t))
             .collect()
+    }
+
+    /// A track's header at `y`, moved right by the folders it is in.
+    fn header_rect(&self, model: &Session, t: &Track, y: f32) -> Rect {
+        let depth = model.project().folder_chain(t).len() as f32;
+        let x = (depth * FOLDER_INDENT).min(self.header_w() * 0.4);
+        Rect::new(x, y, self.header_w() - x, self.header_h(model, t.id))
     }
 
     /// Take lanes shown under a track (the most takes of its open folders).
@@ -373,7 +403,18 @@ impl ArrangerView {
 
     /// Height of a track's main lane (without take lanes).
     fn base_h(&self, model: &Session, track: TrackId) -> f32 {
-        model.track_height(track).unwrap_or(self.row_h())
+        model.track_height(track).unwrap_or_else(|| {
+            // Folders are compact unless sized.
+            let folder = model
+                .project()
+                .track(track)
+                .is_some_and(|t| t.kind == TrackKind::Folder);
+            if folder {
+                FOLDER_ROW_H.min(self.row_h())
+            } else {
+                self.row_h()
+            }
+        })
     }
 
     /// Height of the header controls area (tall tracks keep their
@@ -590,12 +631,23 @@ impl ArrangerView {
             });
         }
         if pos.x < self.header_w() {
-            let l = HeaderLayout::new(Rect::new(
-                0.0,
-                row.y,
-                self.header_w(),
-                self.header_h(model, t.id),
-            ));
+            let l = HeaderLayout::new(self.header_rect(model, t, row.y));
+            if t.kind == TrackKind::Folder {
+                let part = [
+                    (fold_rect(&l), HeaderPart::Fold),
+                    (l.mute, HeaderPart::Mute),
+                    (l.solo, HeaderPart::Solo),
+                    (folder_name_rect(&l), HeaderPart::Name),
+                    (
+                        Rect::new(l.stripe.x, l.stripe.y, l.stripe.w + 3.0, l.stripe.h),
+                        HeaderPart::Color,
+                    ),
+                ]
+                .into_iter()
+                .find(|(r, _)| r.contains(pos))
+                .map_or(HeaderPart::Body, |(_, p)| p);
+                return Some(Hit::Header(t.id, part));
+            }
             // Pan, fader and meter only where they are painted (not on
             // MIDI tracks).
             let audio = t.kind.has_audio();
@@ -1256,6 +1308,113 @@ impl ArrangerView {
         }
     }
 
+    /// A folder's header: its triangle, name, what it holds, mute and solo.
+    fn paint_folder_header(
+        &self,
+        p: &mut dyn Painter,
+        l: &HeaderLayout,
+        t: &Track,
+        model: &Session,
+    ) {
+        let th = &self.theme;
+        let c = &th.console;
+        let open = model.folder_open(t.id);
+        let fold = fold_rect(l);
+        let hot = self.hover == Some(Hit::Header(t.id, HeaderPart::Fold));
+        let ink = if hot { th.ui.text } else { th.ui.text_dim };
+        // A triangle: right when closed, down when open.
+        let (cx, cy) = (fold.center().x, fold.center().y);
+        let tri = if open {
+            [
+                Point::new(cx - 5.0, cy - 2.5),
+                Point::new(cx + 5.0, cy - 2.5),
+                Point::new(cx, cy + 3.5),
+            ]
+        } else {
+            [
+                Point::new(cx - 2.5, cy - 5.0),
+                Point::new(cx - 2.5, cy + 5.0),
+                Point::new(cx + 3.5, cy),
+            ]
+        };
+        let mut path = faderframe_ui_canvas::Path::new();
+        path.move_to(tri[0]);
+        path.line_to(tri[1]);
+        path.line_to(tri[2]);
+        path.close();
+        p.fill_path(&path, ink);
+        p.text(
+            &t.name,
+            folder_name_rect(l),
+            &TextStyle::new(th.fonts.normal, th.ui.text).bold(),
+        );
+        if let Some(info) = l.info {
+            let project = model.project();
+            let n = model
+                .folder_contents(t.id)
+                .iter()
+                .filter(|id| {
+                    project
+                        .track(**id)
+                        .is_some_and(|t| t.kind != TrackKind::Folder)
+                })
+                .count();
+            let text = format!("Folder · {n} track{}", if n == 1 { "" } else { "s" });
+            p.text(
+                &text,
+                Rect::new(folder_name_rect(l).x, info.y, info.w - 16.0, info.h),
+                &TextStyle::new(th.fonts.tiny + 0.5, th.ui.text_dim).family(FontFamily::Condensed),
+            );
+        }
+        controls::led_button(p, l.mute, "M", model.shown_mute(t), c.led.mute, th);
+        controls::led_button(p, l.solo, "S", t.solo, c.led.solo, th);
+    }
+
+    /// What a folder holds, at a glance: each track's clips as a thin bar.
+    fn paint_folder_lane(
+        &self,
+        p: &mut dyn Painter,
+        row: Rect,
+        lanes: Rect,
+        t: &Track,
+        model: &Session,
+    ) {
+        let project = model.project();
+        let inside: Vec<&Track> = project
+            .folder_order()
+            .into_iter()
+            .filter(|c| c.kind.has_clips() && project.in_folder(c, t.id))
+            .collect();
+        if inside.is_empty() {
+            return;
+        }
+        let area = Rect::new(
+            lanes.x,
+            row.y + 5.0,
+            lanes.w,
+            self.base_h(model, t.id) - 10.0,
+        );
+        let band = (area.h / inside.len() as f32).clamp(2.0, 8.0);
+        for (j, c) in inside.iter().enumerate() {
+            let y = area.y + j as f32 * band;
+            if y + band > area.bottom() + 0.5 {
+                break;
+            }
+            for clip in project.clips_of(c.id) {
+                let r = self.clip_rect(clip, row, model);
+                if r.right() < lanes.x || r.x > lanes.right() {
+                    continue;
+                }
+                let bar = Rect::new(r.x, y, r.w.max(2.0), (band - 1.0).max(1.0));
+                p.fill_rounded(
+                    bar,
+                    1.0,
+                    &Paint::Solid(color_of(clip.color.unwrap_or(c.color)).with_alpha(0.85)),
+                );
+            }
+        }
+    }
+
     fn paint_header(&self, p: &mut dyn Painter, l: &HeaderLayout, t: &Track, model: &Session) {
         let th = &self.theme;
         let a = &th.arranger;
@@ -1284,6 +1443,10 @@ impl ArrangerView {
             self.theme.ui.text.with_alpha(0.05),
         );
 
+        if t.kind == TrackKind::Folder {
+            self.paint_folder_header(p, l, t, model);
+            return;
+        }
         p.text(
             &t.name,
             l.name,
@@ -1765,12 +1928,8 @@ impl ArrangerView {
             .iter()
             .position(|t| t.id == track)?;
         let row = self.row_rect(i, size);
-        Some(HeaderLayout::new(Rect::new(
-            0.0,
-            row.y,
-            self.header_w(),
-            self.header_h(model, track),
-        )))
+        let t = model.project().track(track)?;
+        Some(HeaderLayout::new(self.header_rect(model, t, row.y)))
     }
 
     fn track_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
@@ -1821,6 +1980,34 @@ impl ArrangerView {
         }));
         // A sample of the selection (audio tracks).
         items.extend(sample_items(model, t.id, None));
+        // Folders: what this one holds; into and out of folders.
+        if t.kind == TrackKind::Folder {
+            let open = model.folder_open(t.id);
+            items.push(
+                MenuItem::new(
+                    if open { "Close Folder" } else { "Open Folder" },
+                    Action::ToggleFolder(t.id),
+                )
+                .separated(),
+            );
+            items.push(MenuItem::new(
+                "Select Its Tracks",
+                Action::SelectTracks {
+                    tracks: model.folder_contents(t.id),
+                    mode: SelectMode::Replace,
+                },
+            ));
+            items.push(MenuItem::new("Sum into a New Bus", Action::SumFolder(t.id)));
+        }
+        items.extend(
+            model
+                .folder_choices(t.id)
+                .into_iter()
+                .map(|(label, action, separated)| {
+                    let item = MenuItem::new(label, action);
+                    if separated { item.separated() } else { item }
+                }),
+        );
         // Freezing and bouncing (tracks with clips).
         if matches!(t.kind, TrackKind::Audio | TrackKind::Instrument) {
             let busy = model.bouncing().contains(&t.id);
@@ -2377,9 +2564,18 @@ impl ArrangerView {
                             id,
                         )));
                     }
+                    HeaderPart::Fold => cx.emit(Action::ToggleFolder(id)),
+                    HeaderPart::Body if clicks >= 2 && t.kind == TrackKind::Folder => {
+                        cx.emit(Action::ToggleFolder(id));
+                    }
                     HeaderPart::Name if clicks >= 2 => {
                         if let Some(l) = self.header_layout(model, id, size) {
-                            cx.request(Self::rename_request(t, l.name));
+                            let at = if t.kind == TrackKind::Folder {
+                                folder_name_rect(&l)
+                            } else {
+                                l.name
+                            };
+                            cx.request(Self::rename_request(t, at));
                         }
                     }
                     _ => {
@@ -2730,6 +2926,10 @@ impl CanvasView<Session, Action> for ArrangerView {
         for i in rows.clone() {
             let row = self.row_rect(i, size);
             let t = tracks[i];
+            if t.kind == TrackKind::Folder {
+                self.paint_folder_lane(p, row, lanes, t, model);
+                continue;
+            }
             for clip in model.project().clips_of(t.id) {
                 let rect = self.clip_rect(clip, row, model);
                 if rect.right() < lanes.x || rect.x > lanes.right() {
@@ -2787,12 +2987,20 @@ impl CanvasView<Session, Action> for ArrangerView {
         p.push_clip(headers);
         for i in rows {
             let row = self.row_rect(i, size);
-            let l = HeaderLayout::new(Rect::new(
-                0.0,
-                row.y,
-                self.header_w(),
-                self.header_h(model, tracks[i].id),
-            ));
+            let l = HeaderLayout::new(self.header_rect(model, tracks[i], row.y));
+            // The folders it is in: a stripe in each one's colour.
+            if l.row.x > 0.0 {
+                let indent = Rect::new(0.0, row.y, l.row.x, row.h);
+                p.fill(indent, a.header_bg.darken(0.12));
+                let chain = model.project().folder_chain(tracks[i]);
+                for (k, f) in chain.iter().rev().enumerate() {
+                    let x = (k as f32 * FOLDER_INDENT + 4.0).min(l.row.x - 3.0);
+                    p.fill(
+                        Rect::new(x, row.y, 3.0, row.h),
+                        color_of(f.color).with_alpha(0.75),
+                    );
+                }
+            }
             self.paint_header(p, &l, tracks[i], model);
             self.paint_automation(
                 p,
@@ -3213,6 +3421,12 @@ impl CanvasView<Session, Action> for ArrangerView {
                     HeaderPart::Record => "Record arm".into(),
                     HeaderPart::Monitor => "Input monitoring".into(),
                     HeaderPart::Name => "Double-click to rename".into(),
+                    HeaderPart::Fold => if model.folder_open(id) {
+                        "Close the folder (hide its tracks)"
+                    } else {
+                        "Open the folder (show its tracks)"
+                    }
+                    .into(),
                     HeaderPart::Automation => "Show / hide automation lanes".into(),
                     HeaderPart::Color => {
                         "Track colour · Click to choose (the selected tracks follow)".into()

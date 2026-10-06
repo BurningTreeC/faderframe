@@ -40,6 +40,9 @@ pub struct SlotRegistry {
     track_meters: HashMap<TrackId, MeterRange>,
     /// 1.0 while a track takes live MIDI input.
     midi_live: HashMap<TrackId, ParamSlot>,
+    /// 1.0 while a MIDI track is muted (by itself, a folder it is in, or
+    /// another track's solo).
+    midi_mute: HashMap<TrackId, ParamSlot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -55,7 +58,22 @@ impl SlotRegistry {
             sends: HashMap::new(),
             track_meters: HashMap::new(),
             midi_live: HashMap::new(),
+            midi_mute: HashMap::new(),
         }
+    }
+
+    /// The mute flag of a MIDI track.
+    pub fn midi_mute(&mut self, track: TrackId) -> Result<ParamSlot, SlotsExhausted> {
+        if let Some(s) = self.midi_mute.get(&track) {
+            return Ok(*s);
+        }
+        let slot = ParamSlot(
+            self.params
+                .allocate(1)
+                .ok_or(SlotsExhausted("parameters"))?,
+        );
+        self.midi_mute.insert(track, slot);
+        Ok(slot)
     }
 
     /// The live-MIDI flag of a track.
@@ -163,6 +181,13 @@ impl SlotRegistry {
             }
             keep
         });
+        self.midi_mute.retain(|t, s| {
+            let keep = tracks.contains(t);
+            if !keep {
+                params.release(s.0, 1);
+            }
+            keep
+        });
         let meters = &mut self.meters;
         self.track_meters.retain(|t, m| {
             let keep = tracks.contains(t);
@@ -188,6 +213,13 @@ impl SlotRegistry {
                 let slot = self.midi_live(t.id)?;
                 table.set(slot, if midi_live.contains(&t.id) { 1.0 } else { 0.0 });
             }
+            let folder_muted = project.folder_chain(t).iter().any(|f| f.mute);
+            let solo_out = solo.as_ref().is_some_and(|set| !set.contains(&t.id));
+            if t.kind == faderframe_project::TrackKind::Midi {
+                let slot = self.midi_mute(t.id)?;
+                let muted = t.mute || folder_muted || solo_out;
+                table.set(slot, if muted { 1.0 } else { 0.0 });
+            }
             if !t.kind.has_audio() {
                 continue;
             }
@@ -210,7 +242,7 @@ impl SlotRegistry {
                 vca_muted |= v.mute && !lane(AutomationTarget::TrackMute);
             }
             table.set(s.vca, vca_gain);
-            let solo_muted = vca_muted || solo.as_ref().is_some_and(|set| !set.contains(&t.id));
+            let solo_muted = vca_muted || folder_muted || solo_out;
             table.set(s.mute, if t.mute { 1.0 } else { 0.0 });
             table.set(s.solo_mute, if solo_muted { 1.0 } else { 0.0 });
             table.set(s.phase, if t.phase_invert { 1.0 } else { 0.0 });

@@ -1270,3 +1270,63 @@ fn tracks_are_sized_by_the_edges_of_their_headers() {
         Some(Hit::Header(first, HeaderPart::Resize))
     );
 }
+
+#[test]
+fn folders_indent_their_tracks_and_close_by_their_triangle() {
+    let mut s = session();
+    let ids = |s: &Session| -> Vec<TrackId> {
+        ArrangerView::lane_tracks(s).iter().map(|t| t.id).collect()
+    };
+    let bass = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.name == "Bass")
+        .unwrap()
+        .id;
+    s.dispatch(Action::NewFolder { tracks: vec![bass] })
+        .unwrap();
+    let folder = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.kind == TrackKind::Folder)
+        .unwrap()
+        .id;
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 1400.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    assert!(p.texts().contains(&"Folder 1"));
+    let order = ids(&s);
+    let at = order.iter().position(|t| *t == folder).unwrap();
+    assert_eq!(order[at + 1], bass, "the folder's track right under it");
+    // The track's header is indented.
+    let fl = view.header_layout(&s, folder, size).unwrap();
+    let bl = view.header_layout(&s, bass, size).unwrap();
+    assert!(bl.row.x > fl.row.x);
+    // A folder header has mute and solo, no record or fader.
+    for (r, part) in [
+        (bl.record, HeaderPart::Record),
+        (bl.volume, HeaderPart::Volume),
+    ] {
+        let _ = part;
+        let on_folder = Point::new(r.center().x, fl.row.y + (r.center().y - bl.row.y));
+        assert!(!matches!(
+            view.hit_test(on_folder, size, &s),
+            Some(Hit::Header(_, HeaderPart::Record | HeaderPart::Volume))
+        ));
+    }
+    // Its triangle closes it: the track is gone from the lanes.
+    let fold = fold_rect(&fl);
+    assert_eq!(
+        view.hit_test(fold.center(), size, &s),
+        Some(Hit::Header(folder, HeaderPart::Fold))
+    );
+    let (actions, _) = run(&mut view, down(fold.center()), size, &s);
+    assert!(actions.contains(&Action::ToggleFolder(folder)));
+    for a in actions {
+        s.dispatch(a).unwrap();
+    }
+    assert!(!ids(&s).contains(&bass));
+}

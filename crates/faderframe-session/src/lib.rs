@@ -27,6 +27,7 @@ pub mod analysis;
 pub mod capture;
 pub mod delivery;
 pub mod editing;
+mod folders;
 mod freeze;
 pub mod groove;
 mod groups;
@@ -306,6 +307,19 @@ pub enum Action {
     /// Turn what the live tracks were played last into clips (recording
     /// or not).
     CaptureMidi,
+    /// A new folder track holding these tracks.
+    NewFolder {
+        tracks: Vec<TrackId>,
+    },
+    /// Put tracks into a folder (`None`: out of theirs, a level up).
+    MoveToFolder {
+        tracks: Vec<TrackId>,
+        folder: Option<TrackId>,
+    },
+    /// Open or close a folder (not undoable, kept with the layout).
+    ToggleFolder(TrackId),
+    /// Sum a folder's tracks in a new bus inside it.
+    SumFolder(TrackId),
     /// Ask where to save such a sample, then make it.
     PromptSaveSample {
         track: TrackId,
@@ -2371,6 +2385,8 @@ impl Session {
                 commands: std::iter::once(cmd).chain(linked).collect(),
             }
         };
+        // Removing a folder keeps its tracks.
+        let cmd = self.keep_folder_contents(cmd);
         if removes_plugins(&cmd) {
             // Undo restores removed plugins from their slots: keep the
             // slots' state current.
@@ -2637,6 +2653,14 @@ impl Session {
                 target,
             } => self.make_sample(track, start, end, target)?,
             Action::CaptureMidi => self.capture_midi()?,
+            Action::NewFolder { tracks } => {
+                self.new_folder(&tracks)?;
+            }
+            Action::MoveToFolder { tracks, folder } => self.move_to_folder(&tracks, folder)?,
+            Action::ToggleFolder(folder) => self.toggle_folder(folder),
+            Action::SumFolder(folder) => {
+                self.sum_folder(folder)?;
+            }
             Action::PromptSaveSample { track, start, end } => {
                 self.prompt_save_sample(track, start, end)?;
             }
@@ -3623,7 +3647,22 @@ impl Session {
                 false,
             ),
             ("VCA".into(), Action::AddTrack(TrackKind::Vca), false),
+            ("Folder".into(), Action::AddTrack(TrackKind::Folder), true),
         ];
+        let selected: Vec<TrackId> = self
+            .project
+            .tracks
+            .iter()
+            .filter(|t| self.selection.tracks.contains(&t.id) && t.kind != TrackKind::Master)
+            .map(|t| t.id)
+            .collect();
+        if !selected.is_empty() {
+            out.push((
+                "Folder with the Selected Tracks".into(),
+                Action::NewFolder { tracks: selected },
+                false,
+            ));
+        }
         for (i, preset) in self.track_presets().iter().take(12).enumerate() {
             out.push((
                 format!("From “{}”", preset.name),
@@ -4059,7 +4098,7 @@ impl Session {
             // Like a console channel: input 1 (or 1–2 for stereo) by default.
             track.input = faderframe_project::InputRouting::Hardware { first_channel: 0 };
         }
-        if kind == TrackKind::Vca {
+        if matches!(kind, TrackKind::Vca | TrackKind::Folder) {
             track.output = faderframe_project::OutputRouting::None;
             track.layout = faderframe_core::ChannelLayout::Mono;
         }

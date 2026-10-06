@@ -123,6 +123,9 @@ pub struct WorkspaceSet {
     pub strip_width: Option<f32>,
     #[serde(default)]
     pub strip_widths: std::collections::BTreeMap<faderframe_core::TrackId, f32>,
+    /// Folder tracks shown closed (their tracks hidden).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub closed_folders: std::collections::BTreeSet<faderframe_core::TrackId>,
 }
 
 /// Narrowest and widest mixer channel strips.
@@ -158,6 +161,7 @@ impl Default for WorkspaceSet {
             mixer_insert_slots: None,
             strip_width: None,
             strip_widths: Default::default(),
+            closed_folders: Default::default(),
         }
     }
 }

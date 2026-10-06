@@ -243,6 +243,11 @@ pub enum Command {
         track: TrackId,
         vca: Option<TrackId>,
     },
+    /// Put a track into a folder track (`None`: out of any).
+    SetTrackFolder {
+        track: TrackId,
+        folder: Option<TrackId>,
+    },
     /// Freeze (`Some`) or unfreeze a track.
     SetTrackFreeze {
         track: TrackId,
@@ -599,6 +604,10 @@ impl Command {
             SetTrackGroup { group: Some(_), .. } => "Add to Group".into(),
             SetTrackGroup { group: None, .. } => "Remove from Group".into(),
             SetTrackVca { .. } => "Assign VCA".into(),
+            SetTrackFolder {
+                folder: Some(_), ..
+            } => "Move to Folder".into(),
+            SetTrackFolder { folder: None, .. } => "Move out of Folder".into(),
             SetTrackFreeze {
                 freeze: Some(_), ..
             } => "Freeze Track".into(),
@@ -746,6 +755,8 @@ impl Command {
             | SetPluginSidechain { .. } => Impact::Graph,
             // VCA automation travels with the timeline snapshot.
             SetTrackVca { .. } => Impact::Timeline,
+            // Folder mutes and solos reach the tracks inside.
+            SetTrackFolder { .. } => Impact::Params,
             Batch { commands, .. } => commands
                 .iter()
                 .map(Command::impact)
@@ -1074,6 +1085,34 @@ impl Command {
                 }
                 let old = std::mem::replace(&mut t.vca, vca);
                 SetTrackVca { track, vca: old }
+            }
+            SetTrackFolder { track, folder } => {
+                if let Some(f) = folder {
+                    let ok = p.track(f).is_some_and(|t| t.kind == TrackKind::Folder);
+                    if !ok {
+                        return Err(EditError::Invalid("that track is not a folder".into()));
+                    }
+                    // Not into itself or a folder inside it.
+                    let mut next = Some(f);
+                    let mut steps = 0;
+                    while let Some(id) = next {
+                        if id == track || steps > p.tracks.len() {
+                            return Err(EditError::Invalid(
+                                "a folder cannot go inside itself".into(),
+                            ));
+                        }
+                        next = p.track(id).and_then(|t| t.folder);
+                        steps += 1;
+                    }
+                }
+                let t = track_mut(p, track)?;
+                if t.kind == TrackKind::Master && folder.is_some() {
+                    return Err(EditError::Invalid(
+                        "the master cannot go into a folder".into(),
+                    ));
+                }
+                let old = std::mem::replace(&mut t.folder, folder);
+                SetTrackFolder { track, folder: old }
             }
             SetTrackFreeze { track, freeze } => {
                 let t = track_mut(p, track)?;
