@@ -17,6 +17,7 @@ pub mod album;
 pub mod arrange;
 mod clip;
 pub mod compare;
+pub mod container;
 pub mod demo;
 mod edit;
 mod expression;

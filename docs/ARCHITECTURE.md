@@ -1647,6 +1647,32 @@ the newest note's value with the block's `param_mods`. The sandbox carries
 both. Checked against u-he Diva (62 per-voice parameters; its filter
 frequency moved on one voice) in the opt-in CLAP test.
 
+### Containers
+
+A container (`faderframe.container`, an ordinary insert slot of a built-in
+that does nothing itself) splits its input into parallel chains — each a
+series of devices with its own level, balance, mute and solo — and mixes
+them at its output; a chain without devices is the dry signal. The chains
+live in `Track::containers` by the container's slot
+(`faderframe_project::container`; containers in containers up to
+`MAX_DEPTH` there too), so the slot moves, bypasses (dry) and is removed
+and restored by undo like any other while its chains stay put.
+`Track::slots()`/`slots_mut()`/`plugin()`/`plugin_mut()` reach the devices
+inside, so parameters, bypass, state capture, sampler paths, automation,
+modulation and plugin hosting treat them like the track's own. Edits:
+`Command::SetContainer` (the chains, a graph change) and
+`Command::SetChainMix` (a chain's level, balance, mute and solo: parameter
+slots, `SlotRegistry::chain`, with solo resolved to a zero gain); session
+actions add, rename and remove chains and put devices into and out of them
+(not MIDI effects; inserted containers start with a dry chain and an empty
+one). The engine expands a container in place (`build::add_container`):
+the chains fan out from the previous node, each ends in a `ChainMix` node
+(ramped gain and balance) and all meet at a sum, where the graph's delay
+compensation aligns their latencies. Devices in chains get no notes and no
+sidechains yet; tracks with containers are not rendered ahead. Editor:
+`view-devices` `container::ContainerView` (a column a chain); dev action
+`chain-insert:<n>=<builtin id>`.
+
 ### Track presets
 
 `faderframe_project::preset::TrackPreset` captures a track's channel
@@ -2077,10 +2103,10 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
    `faderframe_project::compare`), ~~a command palette with a shortcut
    editor~~ (done: `faderframe-ui/src/palette.rs`), ~~an undo history
    view~~ (done: `faderframe-view-history`) — wave 3 done.
-4. **Modulation**: ~~modulators (LFO, envelope follower, steps, random,
-   macros) on any parameter, CLAP's non-destructive and polyphonic
-   (per-note) modulation~~ (done: see *Modulators*), FX containers with
-   parallel chains.
+4. ~~**Modulation** (wave 4): modulators (LFO, envelope follower, steps,
+   random, macros) on any parameter, CLAP's non-destructive and
+   polyphonic (per-note) modulation, FX containers with parallel chains~~
+   — done (see *Modulators* and *Containers*).
 5. **Vocals and audio intelligence**: native pitch editing (on the warp
    and transient machinery and the Stretch engine's pitch and formant
    shifting), audio-to-MIDI (basic-pitch, Apache-2.0), tempo and key

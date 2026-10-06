@@ -96,6 +96,8 @@ pub fn ahead_eligible(
         && !live.contains(&t.id)
         && t.midi_output.is_none()
         && t.inserts.iter().all(|s| s.sidechain.is_none())
+        // Containers' chains are built in the realtime graph only.
+        && t.inserts.iter().all(|s| !s.plugin.is_container())
         // Modulators run live (macros move now, followers listen now).
         && t.modulators.is_empty()
         && t.sends
@@ -167,6 +169,8 @@ enum Role {
     Ahead = 10,
     Crosstalk = 11,
     Modulators = 12,
+    ContainerSum = 13,
+    ChainMix = 14,
 }
 
 /// Stretcher voices a track's clip player needs: one per pitch-preserving
@@ -745,6 +749,11 @@ pub fn build_graph(
         let mut events = sources;
         let mut raw = true;
         for slot in chain {
+            // A container: its chains side by side.
+            if slot.plugin.is_container() {
+                prev = add_container(&mut b, &mut pcx, slots, &mut owners, t, slot, prev, gi, 0)?;
+                continue;
+            }
             // A MIDI effect (built above): what follows gets its notes.
             if let Some((_, n)) = fx.iter().find(|(id, _)| *id == slot.id) {
                 events = vec![*n];
@@ -989,6 +998,94 @@ pub fn build_graph(
 }
 
 /// A track's channel strip, fed from `from`.
+/// A container in a track's chain: its chains side by side from `prev`
+/// (each its devices, then its level and balance) into a sum; the graph
+/// aligns the chains' latencies there. A container without chains, or
+/// bypassed, passes `prev` on.
+#[allow(clippy::too_many_arguments)]
+fn add_container(
+    b: &mut GraphBuilder<EngineContext>,
+    pcx: &mut PluginCx<'_>,
+    slots: &mut SlotRegistry,
+    owners: &mut Vec<(NodeId, NodeOwner)>,
+    t: &faderframe_project::Track,
+    container: &PluginSlot,
+    prev: NodeId,
+    gi: u32,
+    depth: usize,
+) -> Result<NodeId, EngineError> {
+    let Some(chains) = t.containers.get(&container.id).filter(|c| !c.is_empty()) else {
+        return Ok(prev);
+    };
+    if container.bypass {
+        return Ok(prev);
+    }
+    let layout = t.layout;
+    let own = |owners: &mut Vec<(NodeId, NodeOwner)>, node, plugin| {
+        owners.push((
+            node,
+            NodeOwner {
+                track: t.id,
+                plugin: Some(plugin),
+                work: NodeWork::Insert,
+            },
+        ));
+    };
+    let sum = b.add_node(
+        NodeSpec::new(format!("{} · {}", t.name, container.plugin.name))
+            .key(node_key(
+                t.id,
+                Role::ContainerSum,
+                container.id.raw(),
+                &[layout],
+            ))
+            .group(gi)
+            .audio_in(layout)
+            .audio_out(layout),
+        Box::new(Passthrough),
+    );
+    own(owners, sum, container.id);
+    for (i, chain) in chains.iter().enumerate() {
+        let mut from = prev;
+        for slot in &chain.inserts {
+            if slot.plugin.is_container() {
+                if depth + 1 < faderframe_project::container::MAX_DEPTH {
+                    from = add_container(b, pcx, slots, owners, t, slot, from, gi, depth + 1)?;
+                }
+                continue;
+            }
+            let spec = NodeSpec::new(format!("{} · {}", t.name, slot.plugin.name))
+                .group(gi)
+                .audio_in(layout)
+                .audio_out(layout);
+            let (node, _) = pcx.node(b, slot, t, spec, Role::Insert);
+            own(owners, node, slot.id);
+            b.connect_audio(from, 0, node, 0)?;
+            from = node;
+        }
+        let mix = b.add_node(
+            NodeSpec::new(format!(
+                "{} · {} · {}",
+                t.name, container.plugin.name, chain.name
+            ))
+            .key(node_key(
+                t.id,
+                Role::ChainMix,
+                container.id.raw().rotate_left(8) ^ i as u64,
+                &[layout],
+            ))
+            .group(gi)
+            .audio_in(layout)
+            .audio_out(layout),
+            Box::new(crate::nodes::ChainMix::new(slots.chain(container.id, i)?)),
+        );
+        own(owners, mix, container.id);
+        b.connect_audio(from, 0, mix, 0)?;
+        b.connect_audio(mix, 0, sum, 0)?;
+    }
+    Ok(sum)
+}
+
 fn add_strip(
     b: &mut GraphBuilder<EngineContext>,
     project: &Project,

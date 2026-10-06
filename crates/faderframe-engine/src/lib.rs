@@ -42,7 +42,7 @@ pub use engine::{
 };
 pub use plugins::{ActivatedPlugin, PluginHost, decode_state, encode_state};
 pub use record::{RecordBlock, RecordStreams, RecordTarget};
-pub use slots::{SlotRegistry, SlotsExhausted, StripSlots};
+pub use slots::{ChainSlots, SlotRegistry, SlotsExhausted, StripSlots};
 pub use snapshot::{
     AudioRegion, Lane, MidiRegion, Source, SourceMap, StreamPlan, StreamRegion, TimelineSnapshot,
     WarpMode, WarpedRegion, render_generated_sources,

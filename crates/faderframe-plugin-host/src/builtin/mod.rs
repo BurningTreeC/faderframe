@@ -36,10 +36,12 @@ enum Kind {
     Chord,
     Scale,
     NoteEcho,
+    /// Parallel chains: the graph builds them; the instance does nothing.
+    Container,
 }
 
 impl Kind {
-    const ALL: [Kind; 26] = [
+    const ALL: [Kind; 27] = [
         Kind::Preamp(0),
         Kind::Preamp(1),
         Kind::Preamp(2),
@@ -65,6 +67,7 @@ impl Kind {
         Kind::Chord,
         Kind::Scale,
         Kind::NoteEcho,
+        Kind::Container,
         Kind::LatencyProbe,
     ];
 
@@ -93,6 +96,7 @@ impl Kind {
             builtin::SATURATOR => Kind::Saturator,
             builtin::DEESSER => Kind::Deesser,
             builtin::GATE => Kind::Gate,
+            builtin::CONTAINER => Kind::Container,
             _ => return None,
         })
     }
@@ -226,6 +230,13 @@ impl Kind {
                 vec![stereo],
                 0,
             ),
+            Kind::Container => (
+                builtin::CONTAINER,
+                "Container",
+                PluginCategory::Utility,
+                vec![stereo],
+                0,
+            ),
             Kind::Sampler => (
                 builtin::SAMPLER,
                 "Sampler",
@@ -316,6 +327,7 @@ impl Kind {
             }],
             Kind::Eq => crate::eq::parameters(),
             Kind::ProgramEq => crate::program_eq::parameters(),
+            Kind::Container => Vec::new(),
         }
     }
 
@@ -519,7 +531,8 @@ impl PluginInstance for BuiltinInstance {
             | Kind::Gate
             | Kind::Deesser
             | Kind::Saturator
-            | Kind::Tuner => TailLength::None,
+            | Kind::Tuner
+            | Kind::Container => TailLength::None,
             // Notes still due: a held arpeggio's last steps, strums, echoes.
             Kind::Arpeggiator | Kind::Chord | Kind::Scale => TailLength::Samples(48_000 * 2),
             Kind::NoteEcho => TailLength::Samples(48_000 * 40),
@@ -665,6 +678,8 @@ impl PluginInstance for BuiltinInstance {
                 config,
             )),
             Kind::LatencyProbe => Box::new(latency::LatencyProcessor::new(self.latency_samples())),
+            // Never in a graph (it is built from the chains): passes audio.
+            Kind::Container => Box::new(latency::LatencyProcessor::new(0)),
             Kind::Eq => {
                 let tap = self
                     .tap

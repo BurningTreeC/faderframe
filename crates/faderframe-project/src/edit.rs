@@ -81,6 +81,7 @@ pub enum CoalesceKey {
     Marker(MarkerId),
     Section(faderframe_core::SectionId),
     Modulators(TrackId),
+    ChainMix(PluginInstanceId, usize),
 }
 
 /// State needed to undo a track removal.
@@ -243,6 +244,23 @@ pub enum Command {
     SetTrackVca {
         track: TrackId,
         vca: Option<TrackId>,
+    },
+    /// A container's chains, all at once (devices added, removed or moved,
+    /// chains added, removed or renamed); `None` takes the entry away.
+    SetContainer {
+        track: TrackId,
+        container: PluginInstanceId,
+        chains: Option<Vec<crate::container::Chain>>,
+    },
+    /// A container chain's level, pan, mute and solo (a drag coalesces).
+    SetChainMix {
+        track: TrackId,
+        container: PluginInstanceId,
+        chain: usize,
+        gain_db: f32,
+        pan: f32,
+        mute: bool,
+        solo: bool,
     },
     /// A track's modulators, all at once (a knob's drag coalesces).
     SetModulators {
@@ -616,6 +634,8 @@ impl Command {
             SetTrackGroup { group: None, .. } => "Remove from Group".into(),
             SetTrackVca { .. } => "Assign VCA".into(),
             SetModulators { .. } => "Change Modulators".into(),
+            SetContainer { .. } => "Change Container".into(),
+            SetChainMix { .. } => "Chain Mix".into(),
             SetTrackFolder {
                 folder: Some(_), ..
             } => "Move to Folder".into(),
@@ -686,6 +706,9 @@ impl Command {
             UpdateSection { section } => CoalesceKey::Section(section.id),
             SetAutomationLane { track, lane } => CoalesceKey::Automation(*track, lane.id),
             SetModulators { track, .. } => CoalesceKey::Modulators(*track),
+            SetChainMix {
+                container, chain, ..
+            } => CoalesceKey::ChainMix(*container, *chain),
             SetPluginParameter {
                 plugin, parameter, ..
             } => CoalesceKey::PluginParameter(*plugin, *parameter),
@@ -776,6 +799,9 @@ impl Command {
             // The engine's modulation table (the graph when a track gains
             // or loses its modulators: escalated by the controller).
             SetModulators { .. } => Impact::Params,
+            // Chains are graph structure; their mix is parameter slots.
+            SetContainer { .. } => Impact::Graph,
+            SetChainMix { .. } => Impact::Params,
             Batch { commands, .. } => commands
                 .iter()
                 .map(Command::impact)
@@ -1104,6 +1130,61 @@ impl Command {
                 }
                 let old = std::mem::replace(&mut t.vca, vca);
                 SetTrackVca { track, vca: old }
+            }
+            SetContainer {
+                track,
+                container,
+                chains,
+            } => {
+                if chains
+                    .as_ref()
+                    .is_some_and(|c| c.len() > crate::container::MAX_CHAINS)
+                {
+                    return Err(EditError::Invalid(format!(
+                        "a container has at most {} chains",
+                        crate::container::MAX_CHAINS
+                    )));
+                }
+                let t = track_mut(p, track)?;
+                let old = match chains {
+                    Some(c) => t.containers.insert(container, c),
+                    None => t.containers.remove(&container),
+                };
+                SetContainer {
+                    track,
+                    container,
+                    chains: old,
+                }
+            }
+            SetChainMix {
+                track,
+                container,
+                chain,
+                gain_db,
+                pan,
+                mute,
+                solo,
+            } => {
+                let t = track_mut(p, track)?;
+                let c = t
+                    .containers
+                    .get_mut(&container)
+                    .and_then(|c| c.get_mut(chain))
+                    .ok_or(EditError::UnknownPlugin(container))?;
+                let old = SetChainMix {
+                    track,
+                    container,
+                    chain,
+                    gain_db: c.gain_db,
+                    pan: c.pan,
+                    mute: c.mute,
+                    solo: c.solo,
+                };
+                c.gain_db = clamp_level(gain_db);
+                c.pan = pan.clamp(-1.0, 1.0);
+                c.mute = mute;
+                c.solo = solo;
+                old
             }
             SetModulators { track, modulators } => {
                 if modulators.len() > crate::modulation::MAX_MODULATORS {

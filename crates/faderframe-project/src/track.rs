@@ -263,6 +263,11 @@ impl PluginRef {
             name: name.into(),
         }
     }
+
+    /// A container of parallel chains (see [`crate::container`]).
+    pub fn is_container(&self) -> bool {
+        self.format == PluginFormat::Builtin && self.id == faderframe_core::builtin::CONTAINER
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -359,6 +364,10 @@ pub struct Track {
     /// Sources that move the track's parameters (LFOs, followers, …).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub modulators: Vec<crate::modulation::Modulator>,
+    /// The chains of the track's containers, by the container's slot
+    /// (containers in containers too; see [`crate::container`]).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub containers: std::collections::BTreeMap<PluginInstanceId, Vec<crate::container::Chain>>,
 }
 
 /// Tracks whose controls move together.
@@ -459,6 +468,7 @@ impl Track {
             group: None,
             folder: None,
             modulators: Vec::new(),
+            containers: Default::default(),
         }
     }
 
@@ -475,13 +485,88 @@ impl Track {
         self.sends.iter_mut().find(|s| s.id == id)
     }
 
-    /// Insert or instrument slot with `id`.
+    /// The slot with `id`: an insert, the instrument, the preamp, or a
+    /// device in a container's chain.
     pub fn plugin_mut(&mut self, id: PluginInstanceId) -> Option<&mut PluginSlot> {
-        self.inserts
+        let top = self
+            .inserts
+            .iter()
+            .chain(self.instrument.iter())
+            .chain(self.preamp.iter())
+            .any(|p| p.id == id);
+        if top {
+            return self
+                .inserts
+                .iter_mut()
+                .chain(self.instrument.iter_mut())
+                .chain(self.preamp.iter_mut())
+                .find(|p| p.id == id);
+        }
+        self.containers
+            .values_mut()
+            .flat_map(|chains| chains.iter_mut().flat_map(|c| c.inserts.iter_mut()))
+            .find(|p| p.id == id)
+    }
+
+    /// The slot with `id` (see [`Self::plugin_mut`]).
+    pub fn plugin(&self, id: PluginInstanceId) -> Option<&PluginSlot> {
+        self.slots().into_iter().find(|p| p.id == id)
+    }
+
+    /// Every device of the track: the preamp, the instrument, the inserts
+    /// and, after each container, what its chains hold (to
+    /// [`crate::container::MAX_DEPTH`]).
+    pub fn slots(&self) -> Vec<&PluginSlot> {
+        fn walk<'a>(t: &'a Track, s: &'a PluginSlot, depth: usize, out: &mut Vec<&'a PluginSlot>) {
+            out.push(s);
+            if depth >= crate::container::MAX_DEPTH {
+                return;
+            }
+            if let Some(chains) = t.containers.get(&s.id) {
+                for c in chains {
+                    for x in &c.inserts {
+                        walk(t, x, depth + 1, out);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for s in self
+            .preamp
+            .iter()
+            .chain(self.instrument.iter())
+            .chain(&self.inserts)
+        {
+            walk(self, s, 0, &mut out);
+        }
+        out
+    }
+
+    /// Every slot of the track to change: the preamp, the instrument, the
+    /// inserts and what every container's chains hold.
+    pub fn slots_mut(&mut self) -> Vec<&mut PluginSlot> {
+        let mut out: Vec<&mut PluginSlot> = self
+            .preamp
             .iter_mut()
             .chain(self.instrument.iter_mut())
-            .chain(self.preamp.iter_mut())
-            .find(|p| p.id == id)
+            .chain(self.inserts.iter_mut())
+            .collect();
+        for chains in self.containers.values_mut() {
+            for c in chains {
+                out.extend(c.inserts.iter_mut());
+            }
+        }
+        out
+    }
+
+    /// The container (and its chain) that holds the slot with `id`.
+    pub fn container_of(&self, id: PluginInstanceId) -> Option<(PluginInstanceId, usize)> {
+        self.containers.iter().find_map(|(c, chains)| {
+            chains
+                .iter()
+                .position(|ch| ch.inserts.iter().any(|s| s.id == id))
+                .map(|i| (*c, i))
+        })
     }
 }
 

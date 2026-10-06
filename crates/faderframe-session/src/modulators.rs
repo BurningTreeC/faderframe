@@ -232,8 +232,7 @@ impl Session {
                 per_note: false,
             },
         ];
-        let slots = t.preamp.iter().chain(t.instrument.iter()).chain(&t.inserts);
-        for slot in slots {
+        for slot in t.slots() {
             let Some(infos) = self.engine.plugin_parameters(slot.id) else {
                 continue;
             };

@@ -7,6 +7,7 @@ mod arpeggiator;
 mod chord;
 mod common;
 mod compressor;
+mod container;
 mod deesser;
 mod delay;
 mod drums;
@@ -125,6 +126,7 @@ pub fn editor_for(
             note_echo::NoteEchoFace::new(theme),
         ))),
         builtin::PROGRAM_EQ => Some(Box::new(program_eq::ProgramEqView::new(plugin, theme))),
+        builtin::CONTAINER => Some(Box::new(container::ContainerView::new(plugin, theme))),
         _ => None,
     }
 }
@@ -136,6 +138,7 @@ const HEADER_BAR: i32 = 46;
 pub fn editor_size(plugin_id: &str) -> Option<(i32, i32)> {
     match plugin_id {
         builtin::EQ => Some((1180, 700)),
+        builtin::CONTAINER => Some((900, 460)),
         builtin::COMPRESSOR => Some((1040, 520 + HEADER_BAR)),
         builtin::LIMITER => Some((900, 480 + HEADER_BAR)),
         builtin::DRUMS => Some((1120, 600 + HEADER_BAR)),

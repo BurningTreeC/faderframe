@@ -1,5 +1,6 @@
 //! Engine-specific graph processors.
 
+mod chain;
 mod clip_player;
 mod crosstalk;
 mod io;
@@ -8,6 +9,7 @@ mod plugin;
 mod send;
 mod strip;
 
+pub use chain::ChainMix;
 pub use clip_player::{AudioClipPlayer, StretchVoices};
 pub use crosstalk::Crosstalk;
 pub use io::{DeviceInputTap, DeviceOutputSink, MonitorGate};

@@ -1090,6 +1090,51 @@ pub fn install(app: &Rc<AppState>) {
                 None => tracing::warn!("mod-route: no modulator {n} or target '{label}'"),
             }
         }),
+        // Development aid: `chain-insert:<n>=<builtin id>` puts a built-in
+        // device into chain n of the first container of the selected (or
+        // first audio) track.
+        named("chain-insert", |a, arg| {
+            let parsed = arg
+                .split_once('=')
+                .and_then(|(n, id)| Some((n.parse::<usize>().ok()?, id)));
+            let Some((chain, id)) = parsed else {
+                tracing::warn!("chain-insert: '{arg}' is not <n>=<builtin id>");
+                return;
+            };
+            let action = {
+                let s = a.session.borrow();
+                let p = s.project();
+                let plugin = s
+                    .available_plugins()
+                    .into_iter()
+                    .find(|x| x.plugin.id == id)
+                    .map(|x| x.plugin);
+                let at = s
+                    .selection
+                    .tracks
+                    .iter()
+                    .filter_map(|t| p.track(*t))
+                    .chain(p.tracks.iter().filter(|t| t.kind == TrackKind::Audio))
+                    .find_map(|t| {
+                        let c = t.inserts.iter().find(|x| x.plugin.is_container())?;
+                        let len = t.containers.get(&c.id)?.get(chain)?.inserts.len();
+                        Some((t.id, c.id, len))
+                    });
+                plugin.zip(at).map(
+                    |(plugin, (track, container, index))| Action::InsertIntoChain {
+                        track,
+                        container,
+                        chain,
+                        index,
+                        plugin,
+                    },
+                )
+            };
+            match action {
+                Some(action) => a.dispatch(action),
+                None => tracing::warn!("chain-insert: no container chain {chain} or no '{id}'"),
+            }
+        }),
         // Development aid: `version:<name>` saves a version.
         named("version", |a, arg| {
             a.dispatch(Action::SaveVersion {

@@ -265,12 +265,7 @@ impl PluginHost {
         for slot in project
             .tracks
             .iter()
-            .flat_map(|t| {
-                t.inserts
-                    .iter()
-                    .chain(t.instrument.iter())
-                    .chain(t.preamp.iter())
-            })
+            .flat_map(|t| t.slots())
             .chain(project.album.inserts())
         {
             let Some(h) = self.instances.get_mut(&slot.id) else {
@@ -445,13 +440,7 @@ impl PluginHost {
             .tracks
             .iter()
             .filter(|t| t.freeze.is_none())
-            .flat_map(|t| {
-                t.inserts
-                    .iter()
-                    .chain(t.instrument.iter())
-                    .chain(t.preamp.iter())
-                    .map(|s| s.id)
-            })
+            .flat_map(|t| t.slots().into_iter().map(|s| s.id))
             .chain(project.album.inserts().map(|s| s.id))
             .collect();
         self.instances.retain(|id, _| live.contains(id));

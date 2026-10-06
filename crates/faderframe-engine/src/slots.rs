@@ -1,7 +1,7 @@
 //! Stable parameter/meter slot assignment (control thread).
 
 use faderframe_automation::AutomationTarget;
-use faderframe_core::{AutomationLaneId, SendId, TrackId};
+use faderframe_core::{AutomationLaneId, PluginInstanceId, SendId, TrackId};
 use faderframe_project::Project;
 use faderframe_realtime::{MeterRange, ParamSlot, ParamTable, SlotAllocator};
 use std::collections::{HashMap, HashSet};
@@ -26,6 +26,15 @@ pub struct StripSlots {
 }
 
 const STRIP_SLOT_COUNT: u32 = 6;
+
+/// Parameter slots of a container's chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainSlots {
+    /// Linear gain; 0 while the chain is muted or another one soloed.
+    pub gain: ParamSlot,
+    /// Balance, −1..1.
+    pub pan: ParamSlot,
+}
 /// Meter channels reserved per track (stereo).
 const METER_CHANNELS: u16 = 2;
 
@@ -43,6 +52,8 @@ pub struct SlotRegistry {
     /// 1.0 while a MIDI track is muted (by itself, a folder it is in, or
     /// another track's solo).
     midi_mute: HashMap<TrackId, ParamSlot>,
+    /// Container chains, by container and chain.
+    chains: HashMap<(PluginInstanceId, usize), ChainSlots>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -59,7 +70,29 @@ impl SlotRegistry {
             track_meters: HashMap::new(),
             midi_live: HashMap::new(),
             midi_mute: HashMap::new(),
+            chains: HashMap::new(),
         }
+    }
+
+    /// The slots of chain `index` of `container`.
+    pub fn chain(
+        &mut self,
+        container: PluginInstanceId,
+        index: usize,
+    ) -> Result<ChainSlots, SlotsExhausted> {
+        if let Some(s) = self.chains.get(&(container, index)) {
+            return Ok(*s);
+        }
+        let base = self
+            .params
+            .allocate(2)
+            .ok_or(SlotsExhausted("parameters"))?;
+        let s = ChainSlots {
+            gain: ParamSlot(base),
+            pan: ParamSlot(base + 1),
+        };
+        self.chains.insert((container, index), s);
+        Ok(s)
     }
 
     /// The mute flag of a MIDI track.
@@ -188,6 +221,22 @@ impl SlotRegistry {
             }
             keep
         });
+        let chains: HashSet<(PluginInstanceId, usize)> = project
+            .tracks
+            .iter()
+            .flat_map(|t| {
+                t.containers
+                    .iter()
+                    .flat_map(|(c, chains)| (0..chains.len()).map(move |i| (*c, i)))
+            })
+            .collect();
+        self.chains.retain(|k, s| {
+            let keep = chains.contains(k);
+            if !keep {
+                params.release(s.gain.0, 2);
+            }
+            keep
+        });
         let meters = &mut self.meters;
         self.track_meters.retain(|t, m| {
             let keep = tracks.contains(t);
@@ -249,6 +298,21 @@ impl SlotRegistry {
             for send in &t.sends {
                 let slot = self.send(send.id)?;
                 table.set(slot, faderframe_core::db_to_gain(send.level_db));
+            }
+            for (container, chains) in &t.containers {
+                for (i, c) in chains.iter().enumerate() {
+                    let s = self.chain(*container, i)?;
+                    let heard = faderframe_project::container::audible(chains, i);
+                    table.set(
+                        s.gain,
+                        if heard {
+                            faderframe_core::db_to_gain(c.gain_db)
+                        } else {
+                            0.0
+                        },
+                    );
+                    table.set(s.pan, c.pan);
+                }
             }
         }
         Ok(())

@@ -27,6 +27,7 @@ mod album_master;
 mod aliases;
 pub mod analysis;
 pub mod capture;
+pub mod containers;
 pub mod delivery;
 pub mod editing;
 mod folders;
@@ -330,6 +331,34 @@ pub enum Action {
     /// Map the next parameter touched on the track's devices to the
     /// modulator (`None`: stop mapping).
     LearnModulation(Option<(TrackId, faderframe_core::ModulatorId)>),
+    /// Containers: a chain more, one renamed or removed, a device into a
+    /// chain or out of one.
+    AddChain {
+        track: TrackId,
+        container: faderframe_core::PluginInstanceId,
+    },
+    RenameChain {
+        track: TrackId,
+        container: faderframe_core::PluginInstanceId,
+        chain: usize,
+        name: String,
+    },
+    RemoveChain {
+        track: TrackId,
+        container: faderframe_core::PluginInstanceId,
+        chain: usize,
+    },
+    InsertIntoChain {
+        track: TrackId,
+        container: faderframe_core::PluginInstanceId,
+        chain: usize,
+        index: usize,
+        plugin: PluginRef,
+    },
+    RemoveFromChain {
+        track: TrackId,
+        plugin: faderframe_core::PluginInstanceId,
+    },
     /// Keep the project as it is now as a named version.
     SaveVersion {
         name: String,
@@ -2539,6 +2568,28 @@ impl Session {
             }
             Action::SetModulator { track, modulator } => self.set_modulator(track, modulator)?,
             Action::LearnModulation(learn) => self.learn_modulation(learn),
+            Action::AddChain { track, container } => self.add_chain(track, container)?,
+            Action::RenameChain {
+                track,
+                container,
+                chain,
+                name,
+            } => self.rename_chain(track, container, chain, name)?,
+            Action::RemoveChain {
+                track,
+                container,
+                chain,
+            } => self.remove_chain(track, container, chain)?,
+            Action::InsertIntoChain {
+                track,
+                container,
+                chain,
+                index,
+                plugin,
+            } => {
+                self.insert_into_chain(track, container, chain, index, plugin)?;
+            }
+            Action::RemoveFromChain { track, plugin } => self.remove_from_chain(track, plugin)?,
             Action::Transport(t) => {
                 self.transport_action(t)?;
                 self.pump_idle();
@@ -2695,7 +2746,23 @@ impl Session {
                     state: None,
                     sidechain: None,
                 };
-                self.edit(Command::InsertPlugin { track, index, slot })?;
+                // A container comes with its first chains.
+                if slot.plugin.is_container() {
+                    let container = slot.id;
+                    self.edit(Command::Batch {
+                        label: "Insert Container".into(),
+                        commands: vec![
+                            Command::InsertPlugin { track, index, slot },
+                            Command::SetContainer {
+                                track,
+                                container,
+                                chains: Some(containers::default_chains()),
+                            },
+                        ],
+                    })?;
+                } else {
+                    self.edit(Command::InsertPlugin { track, index, slot })?;
+                }
             }
             Action::MovePlugin {
                 track,
@@ -2801,12 +2868,7 @@ impl Session {
                     .project
                     .tracks
                     .iter()
-                    .flat_map(|t| {
-                        t.instrument
-                            .iter()
-                            .chain(t.preamp.iter())
-                            .chain(t.inserts.iter())
-                    })
+                    .flat_map(|t| t.slots())
                     .filter(|s| s.plugin.format != faderframe_project::PluginFormat::Builtin)
                     .map(|s| s.id)
                     .collect();
@@ -3629,14 +3691,10 @@ impl Session {
         &self,
         plugin: faderframe_core::PluginInstanceId,
     ) -> Option<(&faderframe_project::Track, &PluginSlot)> {
-        self.project.tracks.iter().find_map(|t| {
-            t.inserts
-                .iter()
-                .chain(t.instrument.iter())
-                .chain(t.preamp.iter())
-                .find(|s| s.id == plugin)
-                .map(|s| (t, s))
-        })
+        self.project
+            .tracks
+            .iter()
+            .find_map(|t| t.plugin(plugin).map(|s| (t, s)))
     }
 
     /// The parameters of a hosted plugin with their current values.
@@ -3893,12 +3951,7 @@ impl Session {
             .project
             .tracks
             .iter()
-            .flat_map(|t| {
-                t.instrument
-                    .iter()
-                    .chain(t.preamp.iter())
-                    .chain(t.inserts.iter())
-            })
+            .flat_map(|t| t.slots())
             .chain(self.project.album.inserts())
             .filter(|s| s.plugin.format != faderframe_project::PluginFormat::Builtin)
             .map(|s| s.id)
@@ -3913,22 +3966,13 @@ impl Session {
     pub(crate) fn capture_plugin_state(&mut self, id: faderframe_core::PluginInstanceId) {
         let state = self.engine.plugin_state(id);
         let project = &mut self.project;
-        let slots = project
-            .tracks
-            .iter_mut()
-            .flat_map(|t| {
-                t.instrument
-                    .iter_mut()
-                    .chain(t.preamp.iter_mut())
-                    .chain(t.inserts.iter_mut())
-            })
-            .chain(
-                project
-                    .album
-                    .songs
-                    .iter_mut()
-                    .flat_map(|s| s.inserts.iter_mut()),
-            );
+        let slots = project.tracks.iter_mut().flat_map(|t| t.slots_mut()).chain(
+            project
+                .album
+                .songs
+                .iter_mut()
+                .flat_map(|s| s.inserts.iter_mut()),
+        );
         for s in slots.filter(|s| s.id == id) {
             if let Some(state) = &state {
                 s.state = Some(state.clone());

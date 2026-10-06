@@ -46,11 +46,15 @@ pub const EQ: &str = "faderframe.eq";
 /// from PultEQFx (effect).
 pub const PROGRAM_EQ: &str = "faderframe.program-eq";
 
+/// Parallel chains of devices, mixed (see `faderframe_project::container`).
+pub const CONTAINER: &str = "faderframe.container";
+
 /// Built-ins with an editor of their own (others get the generic one).
 pub fn has_editor(id: &str) -> bool {
     matches!(
         id,
         EQ | PROGRAM_EQ
+            | CONTAINER
             | DRUMS
             | SAMPLER
             | SYNTH

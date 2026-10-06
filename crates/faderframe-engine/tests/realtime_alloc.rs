@@ -678,6 +678,85 @@ fn note_modulation_does_not_allocate() {
 }
 
 #[test]
+fn containers_do_not_allocate() {
+    let _serial = serial();
+    use faderframe_core::{ChannelLayout, builtin};
+    use faderframe_project::container::Chain;
+    use faderframe_project::{PluginRef, PluginSlot, TrackKind};
+    use faderframe_timeline::MusicalTime;
+
+    const SR: u32 = 48_000;
+    let mut tp = common::TestProject::new(SR);
+    let t = tp.track(TrackKind::Audio, "A", ChannelLayout::Stereo);
+    let src = tp.dc(2, 0.3, 200_000);
+    tp.clip(t, src, MusicalTime::ZERO, 200_000);
+    let mut slot = |id: &str| PluginSlot {
+        id: tp.project.ids.allocate(),
+        plugin: PluginRef::builtin(id, id),
+        bypass: false,
+        parameters: Vec::new(),
+        state: None,
+        sidechain: None,
+    };
+    let (outer, inner) = (slot(builtin::CONTAINER), slot(builtin::CONTAINER));
+    let (utility, reverb, gate) = (
+        slot(builtin::GAIN),
+        slot(builtin::REVERB),
+        slot(builtin::GATE),
+    );
+    let track = tp.project.track_mut(t).unwrap();
+    let mut a = Chain::new("A");
+    a.inserts = vec![utility, inner.clone()];
+    let mut b = Chain::new("B");
+    b.inserts = vec![reverb];
+    track
+        .containers
+        .insert(outer.id, vec![a, b, Chain::new("Dry")]);
+    let mut c = Chain::new("C");
+    c.inserts = vec![gate];
+    track
+        .containers
+        .insert(inner.id, vec![c, Chain::new("Dry")]);
+    track.inserts.push(outer.clone());
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 2).unwrap();
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    let (_, allocs) = armed(|| {
+        for _ in 0..200 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations in containers");
+    // A chain's level, mute and solo move (parameters, no new graph).
+    let chains = tp
+        .project
+        .track_mut(t)
+        .unwrap()
+        .containers
+        .get_mut(&outer.id)
+        .unwrap();
+    chains[0].gain_db = -12.0;
+    chains[1].mute = true;
+    chains[2].solo = true;
+    r.controller
+        .sync(&tp.project, &tp.sources, faderframe_project::Impact::Params)
+        .unwrap();
+    let (_, allocs) = armed(|| {
+        for _ in 0..100 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations mixing chains");
+}
+
+#[test]
 fn live_midi_input_and_midi_recording_do_not_allocate() {
     let _serial = serial();
     use faderframe_engine::midi::{MidiFilter, MidiRecordTarget};

@@ -221,12 +221,7 @@ impl Session {
                 unit: "dB",
             });
         }
-        for slot in t
-            .instrument
-            .iter()
-            .chain(t.preamp.iter())
-            .chain(t.inserts.iter())
-        {
+        for slot in t.slots() {
             let Some(params) = self.engine.plugin_parameters(slot.id) else {
                 continue;
             };
@@ -285,12 +280,7 @@ impl Session {
             AutomationTarget::TrackMute => f64::from(u8::from(t.mute)),
             AutomationTarget::SendLevel(s) => t.send(s)?.level_db as f64,
             AutomationTarget::PluginParameter { plugin, parameter } => {
-                let slot = t
-                    .instrument
-                    .iter()
-                    .chain(t.preamp.iter())
-                    .chain(t.inserts.iter())
-                    .find(|s| s.id == plugin)?;
+                let slot = t.plugin(plugin)?;
                 match slot.parameters.iter().find(|p| p.id == parameter) {
                     Some(p) => p.value,
                     None => {
@@ -303,12 +293,7 @@ impl Session {
                 }
             }
             AutomationTarget::PluginBypass(plugin) => {
-                let slot = t
-                    .instrument
-                    .iter()
-                    .chain(t.preamp.iter())
-                    .chain(t.inserts.iter())
-                    .find(|s| s.id == plugin)?;
+                let slot = t.plugin(plugin)?;
                 f64::from(u8::from(slot.bypass))
             }
         })
