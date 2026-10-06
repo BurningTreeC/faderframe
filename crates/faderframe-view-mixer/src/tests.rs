@@ -900,3 +900,73 @@ fn strips_are_made_wider_or_narrower_by_their_edge() {
         );
     }
 }
+
+#[test]
+fn midi_tracks_have_a_strip_with_their_instrument_and_effects() {
+    let mut s = session();
+    let lead = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.name == "Lead Synth")
+        .unwrap()
+        .id;
+    s.selection.select_tracks(&[lead], SelectMode::Replace);
+    let midi = s.add_track(TrackKind::Midi).unwrap();
+    let mut view = MixerView::new(Theme::default());
+    let size = Size::new(1800.0, 900.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    let texts = p.texts();
+    for t in ["→ Lead Synth", "NOTES", "MIDI OUT —"] {
+        assert!(texts.contains(&t), "{t} in {texts:?}");
+    }
+    let i = MixerView::channel_tracks(&s)
+        .iter()
+        .position(|t| t.id == midi)
+        .unwrap();
+    let l = view.layout_for(view.strip_rect(i, size), s.project().track(midi).unwrap());
+    // No fader, pan or sends on it.
+    for r in [l.fader, l.pan_knob] {
+        assert_eq!(view.hit_test(r.center(), size, &s), Some(Hit::Strip(midi)));
+    }
+    // The instrument it plays: a menu of instrument tracks.
+    let plays = l.preamp.unwrap();
+    assert_eq!(
+        view.hit_test(plays.center(), size, &s),
+        Some(Hit::Plays(midi))
+    );
+    let (_, req) = run(&mut view, down(plays.center(), 1), size, &s);
+    let Some(HostRequest::ContextMenu { items, .. }) = req
+        .into_iter()
+        .find(|r| matches!(r, HostRequest::ContextMenu { .. }))
+    else {
+        panic!("a menu")
+    };
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    assert_eq!(labels, ["None", "Lead Synth (Synth)"]);
+    // The output well: external MIDI devices.
+    let (_, req) = run(&mut view, down(l.output.center(), 1), size, &s);
+    let Some(HostRequest::ContextMenu { items, .. }) = req
+        .into_iter()
+        .find(|r| matches!(r, HostRequest::ContextMenu { .. }))
+    else {
+        panic!("a menu")
+    };
+    assert_eq!(items[0].label, "No External MIDI Output");
+    // An empty insert slot opens the browser for a MIDI effect.
+    let slot = l.inserts.as_ref().unwrap()[0];
+    let (actions, _) = run(&mut view, down(slot.center(), 1), size, &s);
+    assert!(actions.contains(&Action::OpenPluginBrowser {
+        track: midi,
+        target: faderframe_session::PluginTarget::Insert(0),
+    }));
+}
+
+#[test]
+fn sounding_notes_are_named_as_they_fit() {
+    let keys = (1u128 << 60) | (1 << 64) | (1 << 67) | (1 << 72);
+    assert_eq!(note_names(0, 80.0), "—");
+    assert_eq!(note_names(keys, 200.0), "C4 E4 G4 C5");
+    assert_eq!(note_names(keys, 60.0), "C4 E4 +2");
+}

@@ -97,6 +97,11 @@ Contrast:
   scribble strips, pinned master section; click a pan or level readout to
   type a value. The inserts section shows five slots by default; drag the
   grip on the rule below it for more or fewer (saved with the layout).
+  MIDI tracks get a strip of their own: the instrument track they play
+  (PLAYS, where the others have their preamp), their MIDI input and live
+  mode, their MIDI effects in the inserts (add, open, drag to reorder or
+  onto an instrument track), the notes they play now by name and on a key
+  display, mute/solo/arm, and the external MIDI device in the output well.
   Drag a strip's right edge to make it wider or narrower (Shift: every
   strip; double-click: back to normal), or pick Narrow / Normal / Wide /
   Extra Wide in its menu (saved with the layout).

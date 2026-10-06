@@ -25,6 +25,7 @@ use faderframe_project::{
     Command, InputRouting, MappingTarget, MidiControl, MidiMapping, MidiSource, MonitorMode,
     TrackKind, TransportControl,
 };
+use faderframe_timeline::MusicalTime;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -788,6 +789,42 @@ impl Session {
     /// Keys held on the MIDI inputs right now (any channel).
     pub fn held_midi_keys(&self) -> u128 {
         self.midi.held.iter().fold(0, |m, c| m | c)
+    }
+
+    /// The keys a MIDI or instrument track plays right now (a bit per
+    /// key): the notes of its clips under the playhead while the transport
+    /// runs, and the keys held on its MIDI input while it plays live.
+    pub fn sounding_keys(&self, track: TrackId) -> u128 {
+        let Some(t) = self.project.track(track) else {
+            return 0;
+        };
+        let mut keys = 0u128;
+        if self.transport.playing && !t.mute {
+            let now = self.playhead();
+            for c in self.project.clips_of(track) {
+                let Some(m) = c.as_midi().filter(|_| !c.muted) else {
+                    continue;
+                };
+                let rel = now - c.start;
+                if rel < MusicalTime::ZERO || rel >= m.length {
+                    continue;
+                }
+                for n in m.notes.iter().filter(|n| !n.muted) {
+                    if n.start <= rel && rel < n.start + n.length {
+                        keys |= 1u128 << (n.key & 127);
+                    }
+                }
+            }
+        }
+        if self.midi.live.contains(&track) {
+            keys |= match t.input {
+                InputRouting::Midi {
+                    channel: Some(ch), ..
+                } => self.midi.held[usize::from(ch & 15)],
+                _ => self.held_midi_keys(),
+            };
+        }
+        keys
     }
 
     // --- step input ------------------------------------------------------------------

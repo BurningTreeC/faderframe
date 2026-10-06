@@ -81,6 +81,8 @@ pub enum Hit {
     AddTrack,
     /// A strip's right edge: drag to make it wider or narrower.
     Width(TrackId),
+    /// A MIDI track's instrument: the track it plays.
+    Plays(TrackId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -204,6 +206,68 @@ fn kind_tag(kind: TrackKind) -> &'static str {
     }
 }
 
+/// The keys a MIDI strip's key display shows (A0 to C8).
+const KEYS_LO: u8 = 21;
+const KEYS_HI: u8 = 108;
+
+/// A MIDI strip's input well: its input row without the polarity button
+/// (notes have none).
+fn midi_input_rect(row: &layout::InputRow) -> Rect {
+    Rect::new(
+        row.input.x,
+        row.input.y,
+        row.phase.right() - row.input.x,
+        row.input.h,
+    )
+}
+
+/// Where a MIDI strip names the notes it plays (the pan's place).
+fn notes_rect(l: &StripLayout) -> Rect {
+    Rect::new(
+        l.mute.x,
+        l.pan_knob.y,
+        l.record.right() - l.mute.x,
+        l.pan_readout.bottom() - l.pan_knob.y,
+    )
+}
+
+/// A MIDI strip's key display (the level readout's and fader's place).
+fn keys_rect(l: &StripLayout) -> Rect {
+    Rect::new(
+        l.fader.x,
+        l.level_readout.y,
+        l.meter.right() - l.fader.x,
+        l.fader.bottom() - l.level_readout.y,
+    )
+}
+
+/// The sounding keys by name, lowest first, as many as fit `width`
+/// ("C4 E4 +2").
+fn note_names(keys: u128, width: f32) -> String {
+    const NAMES: [&str; 12] = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ];
+    let names: Vec<String> = (0u8..128)
+        .filter(|k| keys & (1u128 << k) != 0)
+        .map(|k| format!("{}{}", NAMES[usize::from(k % 12)], i32::from(k) / 12 - 1))
+        .collect();
+    if names.is_empty() {
+        return "—".into();
+    }
+    // About 6 px a character in the readout's font.
+    let fits = |n: usize| {
+        let shown: usize = names[..n].iter().map(|s| s.len() + 1).sum();
+        let more = if n < names.len() { 3 } else { 0 };
+        (shown + more) as f32 * 6.0 <= width
+    };
+    let n = (1..=names.len()).rev().find(|&n| fits(n)).unwrap_or(1);
+    let mut text = names[..n].join(" ");
+    if n < names.len() {
+        text += &format!(" +{}", names.len() - n);
+    }
+    text
+}
+
 fn parse_db(text: &str) -> Option<f32> {
     let t = text.trim().trim_end_matches("dB").trim();
     if t.eq_ignore_ascii_case("-inf") || t.eq_ignore_ascii_case("inf") || t == "-∞" {
@@ -251,7 +315,7 @@ impl MixerView {
             .project()
             .tracks
             .iter()
-            .filter(|t| t.kind != TrackKind::Master && t.kind != TrackKind::Midi)
+            .filter(|t| t.kind != TrackKind::Master)
             .collect()
     }
 
@@ -361,15 +425,21 @@ impl MixerView {
 
     fn layout_for(&self, rect: Rect, t: &Track) -> StripLayout {
         let vca = t.kind == TrackKind::Vca;
+        // A MIDI strip keeps the rows of the others (its sections line up
+        // with theirs): the preamp's place holds the instrument it plays,
+        // the send rows stay empty.
         StripLayout::with_preamp(
             rect,
             &self.theme,
-            matches!(t.kind, TrackKind::Audio | TrackKind::Instrument),
+            matches!(
+                t.kind,
+                TrackKind::Audio | TrackKind::Instrument | TrackKind::Midi
+            ),
             t.kind != TrackKind::Master && !vca,
             self.send_rows,
             if vca { 0 } else { self.insert_slots.max(1) },
             self.show_tags,
-            if t.kind.has_audio() {
+            if t.kind.has_audio() || t.kind == TrackKind::Midi {
                 if self.expanded_preamps { 84.0 } else { 20.0 }
             } else {
                 0.0
@@ -449,6 +519,9 @@ impl MixerView {
             }
             let l = self.layout_for(rect, t);
             let id = t.id;
+            if t.kind == TrackKind::Midi {
+                return Some(Self::midi_hit(&l, id, pos));
+            }
             if let Some(area) = l.preamp
                 && let Some(hit) = self.preamp_hit(area, t, pos)
             {
@@ -516,6 +589,74 @@ impl MixerView {
         None
     }
 
+    /// What is under `pos` on a MIDI strip.
+    fn midi_hit(l: &StripLayout, id: TrackId, pos: Point) -> Hit {
+        let color = Rect::new(l.color_bar.x, l.color_bar.y, l.color_bar.w, 7.0);
+        let checks: [(Option<Rect>, Hit); 9] = [
+            (Some(color), Hit::Color(id)),
+            (l.preamp, Hit::Plays(id)),
+            (Some(l.mute), Hit::Mute(id)),
+            (Some(l.solo), Hit::Solo(id)),
+            (Some(l.record), Hit::Record(id)),
+            (Some(l.output), Hit::Output(id)),
+            (Some(l.scribble), Hit::Scribble(id)),
+            (l.input.map(|i| i.monitor), Hit::Monitor(id)),
+            (l.input.as_ref().map(midi_input_rect), Hit::Input(id)),
+        ];
+        if let Some((_, hit)) = checks
+            .into_iter()
+            .find(|(r, _)| r.is_some_and(|r| r.contains(pos)))
+        {
+            return hit;
+        }
+        if l.inserts_grip.is_some_and(|g| g.contains(pos)) {
+            return Hit::InsertsGrip(id);
+        }
+        if l.tags.is_some_and(|g| g.contains(pos)) {
+            return Hit::Tags(id);
+        }
+        if let Some(slots) = &l.inserts
+            && let Some(i) = slots.iter().position(|r| r.contains(pos))
+        {
+            return Hit::Insert(id, i);
+        }
+        Hit::Strip(id)
+    }
+
+    /// The instrument tracks a MIDI track can play.
+    fn plays_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
+        let items = model
+            .midi_instrument_choices(t.id)
+            .into_iter()
+            .map(|c| {
+                let item = MenuItem::new(c.label, c.action).checked(c.checked);
+                if c.group_start {
+                    item.separated()
+                } else {
+                    item
+                }
+            })
+            .collect();
+        HostRequest::ContextMenu { at, items }
+    }
+
+    /// The external MIDI device (and channel) a MIDI track plays.
+    fn midi_out_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
+        let items = model
+            .midi_output_choices(t.id)
+            .into_iter()
+            .map(|c| {
+                let item = MenuItem::new(c.label, c.action).checked(c.checked);
+                if c.group_start {
+                    item.separated()
+                } else {
+                    item
+                }
+            })
+            .collect();
+        HostRequest::ContextMenu { at, items }
+    }
+
     // --- painting --------------------------------------------------------------
 
     fn paint_strip(
@@ -566,6 +707,10 @@ impl MixerView {
         if let Some(tags) = l.tags {
             self.paint_tags(p, tags, t, model);
         }
+        if t.kind == TrackKind::Midi {
+            self.paint_midi_strip(p, &l, t, model);
+            return;
+        }
 
         if let Some(row) = l.input {
             let label = match &t.input {
@@ -595,59 +740,7 @@ impl MixerView {
             );
         }
 
-        if let (Some(label), Some(slots)) = (l.inserts_label, &l.inserts) {
-            let title = if t.freeze.is_some() {
-                "INSERTS · FROZEN"
-            } else {
-                "INSERTS"
-            };
-            controls::engraved(p, title, label, th, Align::Center);
-            // More plugins than slots: the last slot says how many more.
-            let overflow = t.inserts.len() > slots.len();
-            for (i, slot) in slots.iter().enumerate() {
-                if overflow && i + 1 == slots.len() {
-                    let more = t.inserts.len() - i;
-                    controls::well_label(p, *slot, &format!("+{more} more"), false, th);
-                    continue;
-                }
-                match t.inserts.get(i) {
-                    Some(s) => {
-                        let name = s.plugin.name.trim_start_matches("FaderFrame ");
-                        // Keyed plugins name their sidechain source.
-                        let key = s
-                            .sidechain
-                            .and_then(|k| model.project().track(k))
-                            .map_or(String::new(), |k| format!(" ⟵ {}", k.name));
-                        let failed = model.plugin_failed(s.id);
-                        let text = if failed {
-                            format!("⚠ {name}")
-                        } else if s.bypass {
-                            format!("({name}{key})")
-                        } else {
-                            format!("{name}{key}")
-                        };
-                        controls::well_label(p, *slot, &text, s.bypass || failed, th);
-                    }
-                    None => controls::well_label(p, *slot, "—", true, th),
-                }
-            }
-        }
-
-        if let Some(g) = l.inserts_grip {
-            // A grip on the rule: drag it to size the inserts section.
-            let hot = matches!(self.hover, Some(Hit::InsertsGrip(_)))
-                || matches!(self.drag, Some(Drag::InsertSlots { .. }));
-            let pill = Rect::new(g.center().x - 12.0, g.center().y - 1.5, 24.0, 3.0);
-            p.fill_rounded(
-                pill,
-                1.5,
-                &faderframe_ui_canvas::Paint::Solid(c.panel_label.with_alpha(if hot {
-                    0.9
-                } else {
-                    0.35
-                })),
-            );
-        }
+        self.paint_inserts(p, &l, t, model);
 
         if let (Some(label), Some(sends)) = (l.sends_label, &l.sends) {
             let per_page = sends.len();
@@ -801,6 +894,237 @@ impl MixerView {
         controls::scribble(p, l.scribble, &t.name, color, th);
     }
 
+    /// A MIDI track's strip. It has no audio, so no pan, fader or meter:
+    /// the instrument it plays where the others have their preamp, its MIDI
+    /// input, its MIDI effects in the inserts, the notes it plays now (by
+    /// name, and lit on a key display where the fader would be) and the
+    /// external MIDI device it plays in the output well.
+    fn paint_midi_strip(&self, p: &mut dyn Painter, l: &StripLayout, t: &Track, model: &Session) {
+        let th = &self.theme;
+        let c = &th.console;
+        if let Some(area) = l.preamp {
+            self.paint_plays(p, area, t, model);
+        }
+        if let Some(row) = l.input {
+            let label = match &t.input {
+                InputRouting::Midi {
+                    channel: Some(ch), ..
+                } => format!("MIDI {}", ch + 1),
+                InputRouting::Midi { .. } => "MIDI".to_string(),
+                _ => "IN —".to_string(),
+            };
+            controls::well_label(p, midi_input_rect(&row), &label, !t.input.is_midi(), th);
+            let live = match t.monitor {
+                MonitorMode::Auto => "A",
+                _ => "I",
+            };
+            controls::led_button(
+                p,
+                row.monitor,
+                live,
+                t.monitor != MonitorMode::Off,
+                c.led.monitor,
+                th,
+            );
+        }
+        self.paint_inserts(p, l, t, model);
+
+        let keys = model.sounding_keys(t.id);
+        let notes = notes_rect(l);
+        controls::engraved(
+            p,
+            "NOTES",
+            Rect::new(notes.x, notes.y, notes.w, 11.0),
+            th,
+            Align::Center,
+        );
+        let readout = Rect::new(notes.x + 2.0, notes.y + 15.0, notes.w - 4.0, 15.0);
+        controls::readout(p, readout, &note_names(keys, readout.w), th);
+
+        controls::led_button(p, l.mute, "M", model.shown_mute(t), c.led.mute, th);
+        controls::led_button(p, l.solo, "S", t.solo, c.led.solo, th);
+        controls::led_button(p, l.record, "R", t.record_arm, c.led.record, th);
+
+        self.paint_keys(p, keys_rect(l), keys, track_color(t.color));
+
+        let out = t.midi_output.as_ref().map_or_else(
+            || "MIDI OUT —".to_string(),
+            |o| {
+                let port = faderframe_project::midi_port_display(&o.port);
+                match o.channel {
+                    Some(ch) => format!("→ {port} {}", ch + 1),
+                    None => format!("→ {port}"),
+                }
+            },
+        );
+        controls::well_label(p, l.output, &out, t.midi_output.is_none(), th);
+        controls::scribble(p, l.scribble, &t.name, track_color(t.color), th);
+    }
+
+    /// The instrument track a MIDI track plays: its colour and name (and,
+    /// with room, its instrument).
+    fn paint_plays(&self, p: &mut dyn Painter, area: Rect, t: &Track, model: &Session) {
+        let th = &self.theme;
+        let c = &th.console;
+        let target = match t.output {
+            OutputRouting::Track { track } => model.project().track(track),
+            _ => None,
+        };
+        let compact = area.h < 40.0;
+        let well = if compact {
+            area
+        } else {
+            controls::engraved(
+                p,
+                "PLAYS",
+                Rect::new(area.x, area.y, area.w, 11.0),
+                th,
+                Align::Center,
+            );
+            Rect::new(area.x, area.y + 14.0, area.w, (area.h - 14.0).min(34.0))
+        };
+        let hot = self.hover == Some(Hit::Plays(t.id));
+        let inner = controls::well(p, well, th);
+        if hot {
+            p.stroke_rounded(well.inset(0.5), 2.5, 1.0, c.panel_label.with_alpha(0.6));
+        }
+        let style = |color: Color| {
+            faderframe_ui_canvas::TextStyle::new(th.fonts.tiny + 0.5, color)
+                .family(faderframe_ui_canvas::FontFamily::Condensed)
+                .center()
+        };
+        let Some(d) = target else {
+            p.text("→ no instrument", inner, &style(c.well_text_empty));
+            return;
+        };
+        p.fill_rounded(
+            Rect::new(well.x + 3.0, well.y + 3.0, 3.0, well.h - 6.0),
+            1.5,
+            &faderframe_ui_canvas::Paint::Solid(track_color(d.color)),
+        );
+        let text = inner.inset_xy(3.0, 0.0);
+        if compact {
+            p.text(&format!("→ {}", d.name), text, &style(c.well_text));
+            return;
+        }
+        let half = text.h / 2.0;
+        p.text(
+            &d.name,
+            Rect::new(text.x, text.y + 1.0, text.w, half),
+            &style(c.well_text).bold(),
+        );
+        let instrument = model.instrument_slot(d).map_or("no instrument yet", |s| {
+            s.plugin.name.trim_start_matches("FaderFrame ")
+        });
+        p.text(
+            instrument,
+            Rect::new(text.x, text.y + half - 1.0, text.w, half),
+            &style(c.well_text_empty),
+        );
+    }
+
+    /// The keys sounding now, lit across a recessed key display (A0 at the
+    /// bottom to C8 at the top, a line at every C).
+    fn paint_keys(&self, p: &mut dyn Painter, area: Rect, keys: u128, color: Color) {
+        let th = &self.theme;
+        let c = &th.console;
+        if area.h < 30.0 {
+            return;
+        }
+        let inner = controls::well(p, area, th).inset_xy(-2.0, 2.0);
+        let count = f32::from(KEYS_HI - KEYS_LO + 1);
+        let row = inner.h / count;
+        let y_of = |k: u8| inner.bottom() - f32::from(k - KEYS_LO + 1) * row;
+        for k in KEYS_LO..=KEYS_HI {
+            let y = y_of(k);
+            if !matches!(k % 12, 1 | 3 | 6 | 8 | 10) {
+                p.fill(
+                    Rect::new(inner.x, y, inner.w, row),
+                    th.ui.text.with_alpha(0.04),
+                );
+            }
+            if k % 12 == 0 {
+                p.hline(inner.x, inner.right(), y + row, th.ui.text.with_alpha(0.16));
+                if row * 12.0 >= 16.0 {
+                    p.text(
+                        &format!("C{}", i32::from(k) / 12 - 1),
+                        Rect::new(inner.x + 1.0, y + row - 10.0, inner.w - 2.0, 10.0),
+                        &faderframe_ui_canvas::TextStyle::new(
+                            th.fonts.tiny - 1.0,
+                            c.well_text_empty,
+                        )
+                        .family(faderframe_ui_canvas::FontFamily::Condensed),
+                    );
+                }
+            }
+        }
+        for k in (0u8..128).filter(|k| keys & (1u128 << k) != 0) {
+            let k = k.clamp(KEYS_LO, KEYS_HI);
+            let bar = Rect::new(inner.x + 1.0, y_of(k), inner.w - 2.0, row.max(2.0));
+            p.shadow(bar, 1.0, color.with_alpha(0.7), 0.0, 0.0, 4.0);
+            p.fill_rounded(bar, 1.0, &faderframe_ui_canvas::Paint::Solid(color));
+        }
+    }
+
+    /// The inserts section and the grip under it.
+    fn paint_inserts(&self, p: &mut dyn Painter, l: &StripLayout, t: &Track, model: &Session) {
+        let th = &self.theme;
+        let c = &th.console;
+        if let (Some(label), Some(slots)) = (l.inserts_label, &l.inserts) {
+            let title = if t.freeze.is_some() {
+                "INSERTS · FROZEN"
+            } else {
+                "INSERTS"
+            };
+            controls::engraved(p, title, label, th, Align::Center);
+            // More plugins than slots: the last slot says how many more.
+            let overflow = t.inserts.len() > slots.len();
+            for (i, slot) in slots.iter().enumerate() {
+                if overflow && i + 1 == slots.len() {
+                    let more = t.inserts.len() - i;
+                    controls::well_label(p, *slot, &format!("+{more} more"), false, th);
+                    continue;
+                }
+                match t.inserts.get(i) {
+                    Some(s) => {
+                        let name = s.plugin.name.trim_start_matches("FaderFrame ");
+                        // Keyed plugins name their sidechain source.
+                        let key = s
+                            .sidechain
+                            .and_then(|k| model.project().track(k))
+                            .map_or(String::new(), |k| format!(" ⟵ {}", k.name));
+                        let failed = model.plugin_failed(s.id);
+                        let text = if failed {
+                            format!("⚠ {name}")
+                        } else if s.bypass {
+                            format!("({name}{key})")
+                        } else {
+                            format!("{name}{key}")
+                        };
+                        controls::well_label(p, *slot, &text, s.bypass || failed, th);
+                    }
+                    None => controls::well_label(p, *slot, "—", true, th),
+                }
+            }
+        }
+
+        if let Some(g) = l.inserts_grip {
+            // A grip on the rule: drag it to size the inserts section.
+            let hot = matches!(self.hover, Some(Hit::InsertsGrip(_)))
+                || matches!(self.drag, Some(Drag::InsertSlots { .. }));
+            let pill = Rect::new(g.center().x - 12.0, g.center().y - 1.5, 24.0, 3.0);
+            p.fill_rounded(
+                pill,
+                1.5,
+                &faderframe_ui_canvas::Paint::Solid(c.panel_label.with_alpha(if hot {
+                    0.9
+                } else {
+                    0.35
+                })),
+            );
+        }
+    }
+
     /// The group (filled, its colour) and VCA (outlined, the VCA's colour)
     /// a track follows.
     fn paint_tags(&self, p: &mut dyn Painter, area: Rect, t: &Track, model: &Session) {
@@ -944,7 +1268,8 @@ impl MixerView {
     }
 
     fn input_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
-        let choices = if t.kind == TrackKind::Instrument {
+        let notes = matches!(t.kind, TrackKind::Instrument | TrackKind::Midi);
+        let choices = if notes {
             model.midi_input_choices(t.id)
         } else {
             model.input_choices(t.id)
@@ -960,7 +1285,7 @@ impl MixerView {
                 }
             })
             .collect();
-        if t.kind == TrackKind::Instrument {
+        if notes {
             // Live play: never, when armed or selected, always.
             for (i, (mode, label)) in [
                 (MonitorMode::Off, "Play Live: Off"),
@@ -1705,7 +2030,16 @@ impl MixerView {
             }
             Hit::Output(id) => {
                 if let Some(t) = Self::track(model, id) {
-                    cx.request(Self::output_menu(model, t, pos));
+                    cx.request(if t.kind == TrackKind::Midi {
+                        Self::midi_out_menu(model, t, pos)
+                    } else {
+                        Self::output_menu(model, t, pos)
+                    });
+                }
+            }
+            Hit::Plays(id) => {
+                if let Some(t) = Self::track(model, id) {
+                    cx.request(Self::plays_menu(model, t, pos));
                 }
             }
             Hit::Color(id) => {
@@ -1850,7 +2184,14 @@ impl MixerView {
             Hit::Insert(id, i) => {
                 Self::track(model, id).map(|t| Self::insert_menu(model, t, i, pos))
             }
-            Hit::Output(id) => Self::track(model, id).map(|t| Self::output_menu(model, t, pos)),
+            Hit::Output(id) => Self::track(model, id).map(|t| {
+                if t.kind == TrackKind::Midi {
+                    Self::midi_out_menu(model, t, pos)
+                } else {
+                    Self::output_menu(model, t, pos)
+                }
+            }),
+            Hit::Plays(id) => Self::track(model, id).map(|t| Self::plays_menu(model, t, pos)),
             Hit::Input(id) | Hit::Monitor(id) => {
                 Self::track(model, id).map(|t| Self::input_menu(model, t, pos))
             }
@@ -1964,9 +2305,32 @@ impl MixerView {
             Hit::Solo(id) => format!("Solo {}", name(id)),
             Hit::Record(id) => format!("Record-arm {}", name(id)),
             Hit::Phase(_) => "Invert polarity".into(),
+            Hit::Monitor(id)
+                if Self::track(model, id)
+                    .is_some_and(|t| matches!(t.kind, TrackKind::Instrument | TrackKind::Midi)) =>
+            {
+                "Play live: A when armed or selected, I always · Right-click for the choices".into()
+            }
             Hit::Monitor(_) => "Input monitoring · Right-click for tape-style auto".into(),
+            Hit::Input(id) if Self::track(model, id).is_some_and(|t| t.kind == TrackKind::Midi) => {
+                "MIDI input: which keyboard and channel this track plays live".into()
+            }
             Hit::Input(_) => "Input routing".into(),
+            Hit::Output(id) if Self::track(model, id).is_some_and(|t| t.kind == TrackKind::Midi) => {
+                "External MIDI device this track also plays · Click to choose".into()
+            }
             Hit::Output(_) => "Output routing".into(),
+            Hit::Plays(id) => {
+                let t = Self::track(model, id)?;
+                let target = match t.output {
+                    OutputRouting::Track { track } => model.project().track(track).map(|d| d.name.clone()),
+                    _ => None,
+                };
+                match target {
+                    Some(name) => format!("{} plays '{name}' · Click to choose another instrument track", t.name),
+                    None => format!("{} plays no instrument · Click to choose an instrument track", t.name),
+                }
+            }
             Hit::Color(_) => "Track colour · Click to choose (the selected tracks follow)".into(),
             Hit::Tags(id) => {
                 let t = Self::track(model, id)?;

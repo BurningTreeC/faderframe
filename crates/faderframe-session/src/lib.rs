@@ -3335,16 +3335,46 @@ impl Session {
             .project
             .track(to)
             .ok_or_else(|| SessionError::Other(format!("no track {to}")))?;
-        if !dest.kind.has_audio() {
-            return Err(SessionError::Other(format!(
-                "'{}' cannot hold plugins",
-                dest.name
-            )));
+        // MIDI effects go on MIDI and instrument tracks (before the
+        // instrument); MIDI tracks take nothing else.
+        let midi_fx = self.is_midi_effect(&slot.plugin);
+        match dest.kind {
+            TrackKind::Midi if !midi_fx => {
+                return Err(SessionError::Other(format!(
+                    "a MIDI track has no audio: {} cannot go on it, only MIDI effects can",
+                    slot.plugin.name
+                )));
+            }
+            TrackKind::Midi | TrackKind::Instrument => {}
+            _ if midi_fx => {
+                return Err(SessionError::Other(format!(
+                    "{} is a MIDI effect: it goes on a MIDI track or an instrument track",
+                    slot.plugin.name
+                )));
+            }
+            _ if !dest.kind.has_audio() => {
+                return Err(SessionError::Other(format!(
+                    "'{}' cannot hold plugins",
+                    dest.name
+                )));
+            }
+            _ => {}
         }
+        // Where the instrument is (with and without the moved plugin), for
+        // MIDI effects, which play before it.
+        let before_instrument = |keep_moved: bool| {
+            dest.inserts
+                .iter()
+                .filter(|s| keep_moved || s.id != plugin)
+                .position(|s| self.engine.plugin_is_instrument(s.id))
+                .filter(|_| midi_fx)
+                .unwrap_or(usize::MAX)
+        };
+        let (first_with, first_without) = (before_instrument(true), before_instrument(false));
         let len = dest.inserts.len();
         if copy {
             slot.id = self.project.ids.allocate();
-            let index = index.min(len);
+            let index = index.min(len).min(first_with);
             return self.batch(
                 "Copy Plugin",
                 vec![Command::InsertPlugin {
@@ -3356,13 +3386,13 @@ impl Session {
         }
         // Within the track the plugin lands in the slot it was dropped on.
         let index = if to == track {
-            let target = index.min(len - 1);
+            let target = index.min(len - 1).min(first_without);
             if target == from {
                 return Ok(());
             }
             target
         } else {
-            index.min(len)
+            index.min(len).min(first_without)
         };
         self.batch(
             "Move Plugin",
