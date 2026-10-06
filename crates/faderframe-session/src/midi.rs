@@ -994,12 +994,15 @@ impl Session {
         self.tick_sync(&system, clock_now);
         self.record_sysex(&system);
         self.tick_sysex(clock_now);
-        let events = self.midi.feed.drain();
+        let events: Vec<MidiInputEvent> = self
+            .midi
+            .feed
+            .drain()
+            .into_iter()
+            .filter(|e| e.port != faderframe_engine::midi::AUDITION_PORT)
+            .collect();
+        self.feed_capture(&events);
         if !events.is_empty() {
-            let events: Vec<MidiInputEvent> = events
-                .into_iter()
-                .filter(|e| e.port != faderframe_engine::midi::AUDITION_PORT)
-                .collect();
             for ev in &events {
                 self.midi.activity.insert(ev.port, now);
                 if let Some(e) = ev.event() {

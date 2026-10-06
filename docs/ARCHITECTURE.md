@@ -1966,7 +1966,7 @@ controllers and plugin editors. Media import (Symphonia, rubato) and
 lock-free disk streaming.
 
 MIDI: devices with hotplug, live play with constant latency, recording,
-MIDI learn, MIDI output and clock, clock/MTC sync, MPE and native note
+always-on capture of what was played (Capture MIDI), MIDI learn, MIDI output and clock, clock/MTC sync, MPE and native note
 expressions for CLAP and VST3 instruments, SysEx to devices and plugins,
 Standard MIDI File import and export, and a full piano roll.
 
@@ -2004,11 +2004,11 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
 2024–2026):
 
 1. ~~**Stock devices** (wave 1)~~ — done (see *Built-in devices*).
-2. **Composition**: ~~project key/scale and a chord track, a scale-aware
-   piano roll, MIDI effects before the instrument (arpeggiator, chord,
-   scale, note echo), MIDI transformations and generators~~ (done, see
-   *Harmony*, *MIDI effects* and *Piano roll*), always-on
-   retrospective MIDI capture.
+2. ~~**Composition** (wave 2): project key/scale and a chord track, a
+   scale-aware piano roll, MIDI effects before the instrument (arpeggiator,
+   chord, scale, note echo), MIDI transformations and generators,
+   always-on retrospective MIDI capture~~ — done (see *Harmony*, *MIDI
+   effects*, *Piano roll* and `session::capture`).
 3. **Organisation**: folder tracks, clip aliases, project versions
    (snapshots to compare and restore), a command palette with a shortcut
    editor, an undo history view.

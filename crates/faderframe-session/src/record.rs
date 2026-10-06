@@ -790,6 +790,8 @@ impl Session {
                 .transport(TransportCommand::SetRecording(false))?;
             self.engine.end_recording()?;
             if let Some(m) = r.midi.as_mut() {
+                // What was played while recording is in the take.
+                self.capture.mark_taken();
                 self.engine.end_midi_recording()?;
                 m.drain();
                 let at = self.engine.transport_snapshot().position - m.shift;

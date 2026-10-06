@@ -24,6 +24,7 @@ pub use performance::{Load, PerformanceReport, PluginPerformance, TrackPerforman
 pub mod album;
 mod album_master;
 pub mod analysis;
+pub mod capture;
 pub mod delivery;
 pub mod editing;
 mod freeze;
@@ -302,6 +303,9 @@ pub enum Action {
         end: MusicalTime,
         target: sampling::SampleTarget,
     },
+    /// Turn what the live tracks were played last into clips (recording
+    /// or not).
+    CaptureMidi,
     /// Ask where to save such a sample, then make it.
     PromptSaveSample {
         track: TrackId,
@@ -923,6 +927,8 @@ pub struct Session {
     /// Track renders for freezing and bouncing.
     bounces: Vec<freeze::PendingBounce>,
     samplings: Vec<sampling::PendingSample>,
+    /// What the live tracks were played, for Capture MIDI.
+    capture: capture::CaptureBuffer,
     /// Album analyses and the running album job.
     album_state: album::AlbumState,
     /// Plugin failures noticed, sandboxed plugins' unsaved state.
@@ -1126,6 +1132,7 @@ impl Session {
             gesture_base: HashMap::new(),
             bounces: Vec::new(),
             samplings: Vec::new(),
+            capture: capture::CaptureBuffer::default(),
             album_state: album::AlbumState::default(),
             plugin_care: sandbox::PluginCare::default(),
             render_ahead: None,
@@ -2629,6 +2636,7 @@ impl Session {
                 end,
                 target,
             } => self.make_sample(track, start, end, target)?,
+            Action::CaptureMidi => self.capture_midi()?,
             Action::PromptSaveSample { track, start, end } => {
                 self.prompt_save_sample(track, start, end)?;
             }

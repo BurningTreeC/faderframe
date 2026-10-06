@@ -16,11 +16,20 @@ const METRONOME: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" h
 </svg>
 "##;
 
+/// Capture MIDI: an arrow circling back around a record dot.
+const CAPTURE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+<path fill="#2e3436" d="M2.28 4.70A6.6 6.6 0 1 1 1.50 9.15L3.08 8.87A5.0 5.0 0 1 0 3.67 5.50z"/>
+<path fill="#2e3436" d="M0.90 3.90L2.20 7.80L5.06 6.30z"/>
+<circle fill="#2e3436" cx="8" cy="8" r="2.4"/>
+</svg>
+"##;
+
 const APP_ICON: &str =
     include_str!("../../../packaging/icons/io.github.BurningTreeC.FaderFrame.svg");
 
 const ICONS: &[(&str, &str)] = &[
     ("faderframe-metronome-symbolic", METRONOME),
+    ("faderframe-capture-symbolic", CAPTURE),
     (crate::APP_ID, APP_ICON),
 ];
 

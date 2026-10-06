@@ -277,6 +277,7 @@ pub fn install(app: &Rc<AppState>) {
         dispatch(app, "to-start", A::Transport(T::ReturnToStart)),
         dispatch(app, "loop", A::Transport(T::ToggleLoop)),
         dispatch(app, "record", A::Transport(T::ToggleRecord)),
+        dispatch(app, "capture-midi", A::CaptureMidi),
         entry(app, "panic", |a| {
             a.with_session(|s| {
                 s.engine_reset_processors()?;
@@ -1558,6 +1559,7 @@ pub fn install(app: &Rc<AppState>) {
         ("app.save-as", &["<Control><Shift>s"]),
         ("app.quit", &["<Control>q"]),
         ("app.render", &["<Control><Shift>r"]),
+        ("app.capture-midi", &["<Control><Shift>c"]),
         ("app.preferences", &["<Control>comma"]),
         ("app.undo", &["<Control>z"]),
         ("app.redo", &["<Control><Shift>z", "<Control>y"]),

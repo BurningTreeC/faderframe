@@ -19,6 +19,7 @@ pub struct Chrome {
     pub record: gtk::Button,
     pub looping: gtk::Button,
     pub metronome: gtk::Button,
+    pub capture: gtk::Button,
     pub edit_button: gtk::Button,
     pub edit_bar: CanvasWidget,
     /// Measures how tall the edit toolbar must be at the window's width.
@@ -126,6 +127,10 @@ impl Chrome {
         set_class(&self.play, "play-active", t.playing);
         set_class(&self.record, "rec-active", t.recording);
         set_class(&self.looping, "loop-active", s.project().loop_enabled);
+        let can = s.can_capture_midi();
+        if self.capture.is_sensitive() != can {
+            self.capture.set_sensitive(can);
+        }
         let click = s.record.metronome;
         if self.metronome.has_css_class("click-active") != (click != MetronomeMode::Off) {
             set_class(&self.metronome, "click-active", click != MetronomeMode::Off);
@@ -411,7 +416,11 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
     );
     transport.append_section(
         None,
-        &section(&[("Loop", "app.loop"), ("Record", "app.record")]),
+        &section(&[
+            ("Loop", "app.loop"),
+            ("Record", "app.record"),
+            ("Capture MIDI", "app.capture-midi"),
+        ]),
     );
     transport.append_section(None, &crate::recording::menu());
     transport.append_section(None, &section(&[("Panic (All Notes Off)", "app.panic")]));
@@ -521,6 +530,17 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
         "app.record",
     );
     transport.append(&record);
+    let capture = gtk::Button::new();
+    capture.set_child(Some(&crate::icons::image(
+        "faderframe-capture-symbolic",
+        "⟲",
+    )));
+    capture.set_action_name(Some("app.capture-midi"));
+    capture.set_tooltip_text(Some(
+        "Capture MIDI: what you just played live becomes a clip, recording or not (Ctrl+Shift+C)",
+    ));
+    capture.set_sensitive(false);
+    transport.append(&capture);
     let looping = icon_button("media-playlist-repeat-symbolic", "Loop (L)", "app.loop");
     transport.append(&looping);
     let metronome = gtk::Button::new();
@@ -680,6 +700,7 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
         record,
         looping,
         metronome,
+        capture,
         edit_button,
         edit_bar,
         edit_bar_layout: faderframe_view_arranger::edit_bar::EditToolbarView::new(

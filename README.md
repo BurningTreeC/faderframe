@@ -290,6 +290,13 @@ Contrast:
   open in FaderFrame's windows; on macOS, where a window cannot show
   another program's views, they open in a window of their own. Audio
   passes through shared memory (7–9 µs per plugin and block).
+* Capture MIDI (the ⟲ button after Record, Ctrl+Shift+C, Transport →
+  Capture MIDI): FaderFrame keeps the last ten minutes of what the tracks
+  that play live were played, recording or not. Capture turns the latest
+  playing into clips on those tracks: played while the song ran, the notes
+  land where you played them (loop passes as the loop-record setting
+  says); played while stopped, the phrase (back to an 8 s pause) starts on
+  the bar at the playhead with its timing kept. One undo step.
 * MIDI files: File → Import MIDI File… (a track per MIDI track or channel,
   with controllers and SysEx; tempo and meter too when the project is
   empty) and File → Export MIDI File… (all MIDI tracks, or the selected
