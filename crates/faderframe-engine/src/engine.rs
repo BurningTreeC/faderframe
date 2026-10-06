@@ -357,11 +357,8 @@ impl EngineProcessor {
             // here.
             std::mem::swap(&mut self.ctx.timeline, &mut *t);
             self.retire(Garbage::Timeline(t));
-            // Launched clips whose slots went stop.
-            let timeline = &self.ctx.timeline;
-            self.ctx
-                .launch
-                .retain_slots(|s| timeline.launch_lane(s).is_some());
+            // Launched clips whose slots went stop; follow actions anew.
+            self.ctx.launch.timeline_changed(&self.ctx.timeline);
         }
         if let Some(mut m) = self.modulation_rx.take() {
             std::mem::swap(&mut self.ctx.modulation, &mut *m);
@@ -450,6 +447,7 @@ impl EngineProcessor {
                         &self.ctx.timeline.timeline,
                         rate,
                     );
+                    self.ctx.launch.follow(&self.ctx.timeline);
                 }
             }
         }
@@ -681,6 +679,7 @@ impl EngineProcessor {
                 );
             }
             self.ctx.launch.played(pos, n);
+            self.ctx.launch.follow(&self.ctx.timeline);
             self.transport.advance(n);
             offset += n;
         }

@@ -326,3 +326,58 @@ fn a_new_launcher_track_is_played_live() {
     let out = take(&mut r, 4096);
     assert!(out[4000] > 0.1, "{}", out[4000]);
 }
+
+#[test]
+fn follow_actions_move_on_exactly_on_time() {
+    use faderframe_project::launcher::{FollowAction, FollowKind};
+    for block in [64, 333] {
+        let mut tp = TestProject::new(SR);
+        let t = tp.track(TrackKind::Audio, "Loop", ChannelLayout::Mono);
+        let ramp: Vec<f32> = (0..BEAT)
+            .map(|i| 0.2 + 0.6 * i as f32 / BEAT as f32)
+            .collect();
+        let a = tp.source(AudioData::from_channels(SR, vec![ramp.clone()]));
+        let b = tp.dc(1, 0.3, BEAT);
+        let first = slot(&mut tp, t, audio(a, BEAT));
+        let _second = slot(&mut tp, t, audio(b, BEAT));
+        let scenes: Vec<SceneId> = tp.project.launcher.scenes.iter().map(|s| s.id).collect();
+        // The first goes to the next after a bar; the second stops after
+        // its length (a beat).
+        for (scene, kind, bars) in [
+            (scenes[0], FollowKind::Next, 1),
+            (scenes[1], FollowKind::Stop, 0),
+        ] {
+            tp.project
+                .launcher
+                .follow
+                .insert(SlotKey { track: t, scene }, FollowAction { kind, bars });
+        }
+        let mut r = renderer(&tp, block);
+        r.play_from(0).unwrap();
+        r.controller
+            .launch(LaunchCommand::Launch {
+                track: t,
+                slot: first,
+                quantize: Quantize::None,
+            })
+            .unwrap();
+        let out = take(&mut r, BAR + 2 * BEAT);
+        let g = out[10] / ramp[10];
+        for (i, v) in out.iter().enumerate().take(BAR + 2 * BEAT) {
+            let want = if i < BAR {
+                ramp[i % BEAT]
+            } else if i < BAR + BEAT {
+                0.3
+            } else {
+                0.0
+            };
+            assert!(
+                (v - g * want).abs() < 1e-4,
+                "block {block}: frame {i}: {v} (want {})",
+                g * want
+            );
+        }
+        // A follow action is not shown as a launch waiting.
+        assert!(r.controller.launch_status()[0].queued.is_none());
+    }
+}

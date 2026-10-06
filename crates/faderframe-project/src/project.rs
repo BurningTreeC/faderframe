@@ -582,6 +582,8 @@ impl Project {
         self.launcher.slots.retain(|k, c| {
             clips.get(c).is_some_and(|clip| clip.track == k.track) && scenes.contains(&k.scene)
         });
+        let slots = &self.launcher.slots;
+        self.launcher.follow.retain(|k, _| slots.contains_key(k));
         let in_slots = self.launcher_clips();
         for t in &mut self.tracks {
             t.clips

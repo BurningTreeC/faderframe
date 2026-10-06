@@ -416,6 +416,12 @@ pub enum Command {
     SetLaunchQuantize {
         quantize: crate::launcher::LaunchQuantize,
     },
+    /// A slot's follow action (`None`: none).
+    SetFollowAction {
+        track: TrackId,
+        scene: faderframe_core::SceneId,
+        follow: Option<crate::launcher::FollowAction>,
+    },
     /// Replace everything that lives in time (clips, automation, tempo and
     /// meter, markers, sections, loop and punch) at once: section moves,
     /// copies and deletes (see [`crate::arrange`]).
@@ -695,6 +701,7 @@ impl Command {
             SetLauncherSlot { .. } => "Launcher Clip".into(),
             SetScenes { .. } => "Scenes".into(),
             SetLaunchQuantize { .. } => "Launch Quantize".into(),
+            SetFollowAction { .. } => "Follow Action".into(),
             SetArrangement { .. } => "Rearrange".into(),
             SetAlbum { .. } => "Edit Album".into(),
             SetSongInserts { .. } => "Change Song Inserts".into(),
@@ -793,6 +800,7 @@ impl Command {
             | SetKeys { .. }
             | SetChords { .. }
             | SetLauncherSlot { .. }
+            | SetFollowAction { .. }
             | SetArrangement { .. }
             | SetTimeSignature { .. }
             | SetLoop { .. } => Impact::Timeline,
@@ -1702,6 +1710,22 @@ impl Command {
             SetLaunchQuantize { quantize } => SetLaunchQuantize {
                 quantize: std::mem::replace(&mut p.launcher.quantize, quantize),
             },
+            SetFollowAction {
+                track,
+                scene,
+                follow,
+            } => {
+                let key = crate::launcher::SlotKey { track, scene };
+                let old = match follow {
+                    Some(f) => p.launcher.follow.insert(key, f),
+                    None => p.launcher.follow.remove(&key),
+                };
+                SetFollowAction {
+                    track,
+                    scene,
+                    follow: old,
+                }
+            }
             SetArrangement { arrangement } => SetArrangement {
                 arrangement: Box::new(arrangement.swap_into(p)),
             },

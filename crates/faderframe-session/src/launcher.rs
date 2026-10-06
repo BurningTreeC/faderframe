@@ -76,6 +76,12 @@ pub enum LauncherOp {
         track: TrackId,
         scene: SceneId,
     },
+    /// A slot's follow action (`None`: none).
+    SetFollow {
+        track: TrackId,
+        scene: SceneId,
+        follow: Option<faderframe_project::launcher::FollowAction>,
+    },
 }
 
 /// A recording into a launcher slot (engine samples).
@@ -248,6 +254,18 @@ impl Session {
                         clip: None,
                     })
                     .collect();
+                commands.extend(
+                    self.project
+                        .launcher
+                        .follow
+                        .keys()
+                        .filter(|k| k.scene == scene)
+                        .map(|k| Command::SetFollowAction {
+                            track: k.track,
+                            scene,
+                            follow: None,
+                        }),
+                );
                 let mut scenes = self.project.launcher.scenes.clone();
                 scenes.retain(|s| s.id != scene);
                 commands.push(Command::SetScenes { scenes });
@@ -297,6 +315,13 @@ impl Session {
                         scene: id,
                         clip: Some(Box::new(copy)),
                     });
+                    if let Some(f) = self.project.launcher.follow.get(&k) {
+                        commands.push(Command::SetFollowAction {
+                            track: k.track,
+                            scene: id,
+                            follow: Some(*f),
+                        });
+                    }
                 }
                 self.edit(Command::Batch {
                     label: "Duplicate Scene".into(),
@@ -390,6 +415,20 @@ impl Session {
                     scene: to.scene,
                     clip: Some(Box::new(moved)),
                 });
+                // The follow action goes (or is copied) with the clip.
+                let follow = self.project.launcher.follow.get(&from).copied();
+                if !copy && follow.is_some() {
+                    commands.push(Command::SetFollowAction {
+                        track: from.track,
+                        scene: from.scene,
+                        follow: None,
+                    });
+                }
+                commands.push(Command::SetFollowAction {
+                    track: to.track,
+                    scene: to.scene,
+                    follow,
+                });
                 self.edit(Command::Batch {
                     label: if copy { "Copy Clip" } else { "Move Clip" }.into(),
                     commands,
@@ -397,12 +436,33 @@ impl Session {
             }
             LauncherOp::ClearSlot { track, scene } => {
                 if self.project.launcher.clip(track, scene).is_some() {
-                    self.edit(Command::SetLauncherSlot {
-                        track,
-                        scene,
-                        clip: None,
+                    self.edit(Command::Batch {
+                        label: "Delete Launcher Clip".into(),
+                        commands: vec![
+                            Command::SetLauncherSlot {
+                                track,
+                                scene,
+                                clip: None,
+                            },
+                            Command::SetFollowAction {
+                                track,
+                                scene,
+                                follow: None,
+                            },
+                        ],
                     })?;
                 }
+            }
+            LauncherOp::SetFollow {
+                track,
+                scene,
+                follow,
+            } => {
+                self.edit(Command::SetFollowAction {
+                    track,
+                    scene,
+                    follow,
+                })?;
             }
             LauncherOp::SetQuantize(quantize) => {
                 self.edit(Command::SetLaunchQuantize { quantize })?;

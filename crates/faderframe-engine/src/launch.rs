@@ -80,6 +80,8 @@ pub struct TrackLaunch {
     pub next: Option<(Option<u64>, i64)>,
     /// The arrangement plays (nothing launched since "back to arrangement").
     pub arrangement: bool,
+    /// `next` is the playing clip's follow action (not launched).
+    pub followed: bool,
 }
 
 /// What a player plays over a piece of a block.
@@ -140,6 +142,8 @@ pub struct LaunchState {
     playing: bool,
     /// Where the next chunk starts if playback runs on.
     expected: i64,
+    /// Follow actions' random choices.
+    rng: u64,
 }
 
 impl Default for LaunchState {
@@ -155,6 +159,7 @@ impl LaunchState {
             tracks: Vec::with_capacity(MAX_TRACKS),
             playing: false,
             expected: 0,
+            rng: 0x9E37_79B9_7F4A_7C15,
         }
     }
 
@@ -178,6 +183,7 @@ impl LaunchState {
             current: None,
             next: None,
             arrangement: true,
+            followed: false,
         });
         self.tracks.last_mut()
     }
@@ -208,6 +214,7 @@ impl LaunchState {
                 let at = at(quantize);
                 if let Some(t) = self.entry(track) {
                     t.next = Some((Some(slot), at));
+                    t.followed = false;
                 }
             }
             LaunchCommand::Stop { track, quantize } => {
@@ -216,6 +223,7 @@ impl LaunchState {
                     && (t.current.is_some() || t.next.is_some())
                 {
                     t.next = Some((None, at));
+                    t.followed = false;
                 }
             }
             LaunchCommand::StopAll { quantize } => {
@@ -223,6 +231,7 @@ impl LaunchState {
                 for t in &mut self.tracks {
                     if t.current.is_some() || t.next.is_some() {
                         t.next = Some((None, at));
+                        t.followed = false;
                     }
                 }
             }
@@ -230,6 +239,7 @@ impl LaunchState {
                 if let Some(t) = self.entry(track) {
                     t.current = Some((slot, start.min(pos)));
                     t.next = None;
+                    t.followed = false;
                     t.arrangement = false;
                 }
             }
@@ -237,6 +247,7 @@ impl LaunchState {
                 for t in &mut self.tracks {
                     t.current = None;
                     t.next = None;
+                    t.followed = false;
                     t.arrangement = true;
                 }
             }
@@ -286,6 +297,7 @@ impl LaunchState {
             {
                 t.current = slot.map(|s| (s, at));
                 t.next = None;
+                t.followed = false;
                 t.arrangement = false;
             }
         }
@@ -300,6 +312,47 @@ impl LaunchState {
                 t.arrangement = false;
             }
         }
+    }
+
+    /// Follow actions: a clip playing with nothing queued gets its follow
+    /// action queued (after every chunk and command).
+    pub fn follow(&mut self, timeline: &crate::snapshot::TimelineSnapshot) {
+        let mut rng = self.rng;
+        for t in &mut self.tracks {
+            let (Some((slot, start)), None) = (t.current, t.next) else {
+                continue;
+            };
+            let Some(f) = timeline.launch_lane(slot).and_then(|l| l.follow.as_ref()) else {
+                continue;
+            };
+            let target = match f.targets.len() {
+                0 => None,
+                n if f.random => {
+                    // xorshift64
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    Some(f.targets[(rng % n as u64) as usize])
+                }
+                _ => Some(f.targets[0]),
+            };
+            t.next = Some((target, start + f.after));
+            t.followed = true;
+        }
+        self.rng = rng;
+    }
+
+    /// A new snapshot: clips of slots it does not know stop, follow actions
+    /// are queued again from it.
+    pub fn timeline_changed(&mut self, timeline: &crate::snapshot::TimelineSnapshot) {
+        self.retain_slots(|s| timeline.launch_lane(s).is_some());
+        for t in &mut self.tracks {
+            if t.followed {
+                t.next = None;
+                t.followed = false;
+            }
+        }
+        self.follow(timeline);
     }
 
     /// Clips of slots no longer known stop (after a snapshot change).
@@ -323,6 +376,8 @@ impl LaunchState {
             e.start
                 .store(t.current.map_or(0, |(_, a)| a), Ordering::Relaxed);
             let (queued, at) = match t.next {
+                // A follow action is not shown as waiting.
+                _ if t.followed => (0, 0),
                 Some((Some(s), at)) => (s | 1 << 63, at),
                 Some((None, at)) => (1, at),
                 None => (0, 0),

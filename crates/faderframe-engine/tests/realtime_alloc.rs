@@ -1025,6 +1025,17 @@ fn the_clip_launcher_does_not_allocate() {
             project.launcher.slots.insert(key, c.id);
             project.clips.insert(c.id, c);
             slots.push((track, k, key.hash()));
+            // Follow actions too (random ones on the first scene).
+            use faderframe_project::launcher::{FollowAction, FollowKind};
+            let kind = if k == 0 {
+                FollowKind::Any
+            } else {
+                FollowKind::Previous
+            };
+            project
+                .launcher
+                .follow
+                .insert(key, FollowAction { kind, bars: 1 });
         }
     }
     let sources = render_generated_sources(&project, SR);

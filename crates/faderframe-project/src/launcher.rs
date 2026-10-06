@@ -49,6 +49,81 @@ impl LaunchQuantize {
     }
 }
 
+/// Where a clip goes after it has played for a while.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FollowKind {
+    /// From its start again.
+    Again,
+    /// The track's clip in the next scene that has one (the first after
+    /// the last).
+    #[default]
+    Next,
+    Previous,
+    First,
+    Last,
+    /// Any of the track's clips (this one too), at random.
+    Any,
+    /// Another of the track's clips, at random.
+    Other,
+    /// The track stops.
+    Stop,
+}
+
+impl FollowKind {
+    pub const ALL: [FollowKind; 8] = [
+        FollowKind::Again,
+        FollowKind::Next,
+        FollowKind::Previous,
+        FollowKind::First,
+        FollowKind::Last,
+        FollowKind::Any,
+        FollowKind::Other,
+        FollowKind::Stop,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FollowKind::Again => "Again",
+            FollowKind::Next => "Next",
+            FollowKind::Previous => "Previous",
+            FollowKind::First => "First",
+            FollowKind::Last => "Last",
+            FollowKind::Any => "Any",
+            FollowKind::Other => "Other",
+            FollowKind::Stop => "Stop",
+        }
+    }
+
+    /// The slots it goes to among the track's clips (in scene order), from
+    /// `at` in them; empty: stop. `random`: one of them at random.
+    pub fn targets(self, at: usize, count: usize) -> (Vec<usize>, bool) {
+        if count == 0 {
+            return (Vec::new(), false);
+        }
+        match self {
+            FollowKind::Again => (vec![at], false),
+            FollowKind::Next => (vec![(at + 1) % count], false),
+            FollowKind::Previous => (vec![(at + count - 1) % count], false),
+            FollowKind::First => (vec![0], false),
+            FollowKind::Last => (vec![count - 1], false),
+            FollowKind::Any => ((0..count).collect(), true),
+            FollowKind::Other if count == 1 => (vec![at], false),
+            FollowKind::Other => ((0..count).filter(|i| *i != at).collect(), true),
+            FollowKind::Stop => (Vec::new(), false),
+        }
+    }
+}
+
+/// A slot's follow action: after `bars` bars (0: the clip's length) the
+/// track goes on as `kind` says.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FollowAction {
+    pub kind: FollowKind,
+    #[serde(default)]
+    pub bars: u16,
+}
+
 /// A row of slots.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scene {
@@ -81,6 +156,13 @@ pub struct Launcher {
     pub slots: BTreeMap<SlotKey, ClipId>,
     #[serde(default)]
     pub quantize: LaunchQuantize,
+    /// Follow actions by slot.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        with = "follow_list"
+    )]
+    pub follow: BTreeMap<SlotKey, FollowAction>,
 }
 
 impl Launcher {
@@ -103,6 +185,51 @@ impl Launcher {
             .iter()
             .find(|(_, c)| **c == clip)
             .map(|(k, _)| *k)
+    }
+}
+
+/// Follow actions as a list in files.
+mod follow_list {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    struct Entry {
+        track: TrackId,
+        scene: SceneId,
+        follow: FollowAction,
+    }
+
+    pub fn serialize<S: Serializer>(
+        m: &BTreeMap<SlotKey, FollowAction>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        let v: Vec<Entry> = m
+            .iter()
+            .map(|(k, f)| Entry {
+                track: k.track,
+                scene: k.scene,
+                follow: *f,
+            })
+            .collect();
+        v.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<BTreeMap<SlotKey, FollowAction>, D::Error> {
+        let v: Vec<Entry> = Vec::deserialize(d)?;
+        Ok(v.into_iter()
+            .map(|e| {
+                (
+                    SlotKey {
+                        track: e.track,
+                        scene: e.scene,
+                    },
+                    e.follow,
+                )
+            })
+            .collect())
     }
 }
 

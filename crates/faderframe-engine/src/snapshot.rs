@@ -269,6 +269,19 @@ pub struct LaunchLane {
     pub track: TrackId,
     pub length: i64,
     pub lane: Lane,
+    /// Where the track goes after it played this long.
+    pub follow: Option<Follow>,
+}
+
+/// A slot's follow action as the engine runs it.
+#[derive(Debug)]
+pub struct Follow {
+    /// Samples after the clip started.
+    pub after: i64,
+    /// The slots it may go to (empty: the track stops).
+    pub targets: Vec<u64>,
+    /// One of the targets at random (else the first).
+    pub random: bool,
 }
 
 #[derive(Debug, Default)]
@@ -855,7 +868,8 @@ impl TimelineSnapshot {
             .iter()
             .filter_map(|c| {
                 let slot = *in_slots.get(&c.id)?;
-                let mut lane = launch_lanes.remove(&slot)?;
+                // An empty (or muted) clip plays silence, but plays.
+                let mut lane = launch_lanes.remove(&slot).unwrap_or_default();
                 lane.audio.sort_by_key(|r| r.start);
                 lane.warped.sort_by_key(|w| w.region.start);
                 lane.midi.sort_by_key(|r| r.start);
@@ -866,10 +880,46 @@ impl TimelineSnapshot {
                     track: c.track,
                     length,
                     lane,
+                    follow: None,
                 })
             })
             .collect();
         launch.sort_by_key(|l| l.slot);
+        // Follow actions: targets among the track's clips in scene order.
+        let mut by_track: HashMap<TrackId, Vec<faderframe_project::launcher::SlotKey>> =
+            HashMap::new();
+        for scene in &project.launcher.scenes {
+            for key in project
+                .launcher
+                .slots
+                .keys()
+                .filter(|k| k.scene == scene.id)
+            {
+                by_track.entry(key.track).or_default().push(*key);
+            }
+        }
+        for l in &mut launch {
+            let Some(list) = by_track.get(&l.track) else {
+                continue;
+            };
+            let Some(at) = list.iter().position(|k| k.hash() == l.slot) else {
+                continue;
+            };
+            let Some(f) = project.launcher.follow.get(&list[at]) else {
+                continue;
+            };
+            let (targets, random) = f.kind.targets(at, list.len());
+            let after = if f.bars == 0 {
+                l.length
+            } else {
+                tl.to_samples(tl.meter.bar_start(i32::from(f.bars)), sr)
+            };
+            l.follow = Some(Follow {
+                after: after.max(1),
+                targets: targets.into_iter().map(|i| list[i].hash()).collect(),
+                random,
+            });
+        }
         lanes.sort_by_key(|(t, _)| *t);
         let mut automation: Vec<(TrackId, TrackAutomation)> = Vec::new();
         for t in &project.tracks {

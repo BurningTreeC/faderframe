@@ -379,3 +379,53 @@ fn notes_recorded_into_a_slot_make_a_midi_clip_of_whole_beats() {
     );
     assert!(m.notes[0].start.quarters() < beats);
 }
+
+#[test]
+fn follow_actions_go_with_their_clips() {
+    use faderframe_project::launcher::{FollowAction, FollowKind};
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let drums = track(&s, "Drums");
+    let first = s.project().clips_of(drums)[0].id;
+    op(&mut s, LauncherOp::SendClips(vec![first]));
+    op(&mut s, LauncherOp::AddScene { after: None });
+    let sc = scenes(&s);
+    let follow = FollowAction {
+        kind: FollowKind::Other,
+        bars: 2,
+    };
+    op(
+        &mut s,
+        LauncherOp::SetFollow {
+            track: drums,
+            scene: sc[0],
+            follow: Some(follow),
+        },
+    );
+    let key = |scene| SlotKey {
+        track: drums,
+        scene,
+    };
+    assert_eq!(s.project().launcher.follow.get(&key(sc[0])), Some(&follow));
+    // Moved with the clip.
+    op(
+        &mut s,
+        LauncherOp::MoveClip {
+            from: key(sc[0]),
+            to: key(sc[1]),
+            copy: false,
+        },
+    );
+    assert_eq!(s.project().launcher.follow.get(&key(sc[1])), Some(&follow));
+    assert!(!s.project().launcher.follow.contains_key(&key(sc[0])));
+    // Gone with it, back with undo.
+    op(
+        &mut s,
+        LauncherOp::ClearSlot {
+            track: drums,
+            scene: sc[1],
+        },
+    );
+    assert!(s.project().launcher.follow.is_empty());
+    s.dispatch(Action::Undo).unwrap();
+    assert_eq!(s.project().launcher.follow.get(&key(sc[1])), Some(&follow));
+}

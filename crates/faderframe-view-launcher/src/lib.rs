@@ -11,7 +11,7 @@
 #![forbid(unsafe_code)]
 
 use faderframe_core::{ClipId, SceneId, TrackId};
-use faderframe_project::launcher::{LaunchQuantize, SlotKey};
+use faderframe_project::launcher::{FollowAction, FollowKind, LaunchQuantize, SlotKey};
 use faderframe_project::{Clip, ClipContent, Track, TrackColor, TrackKind};
 use faderframe_session::launcher::LauncherOp;
 use faderframe_session::{Action, SelectMode, Session};
@@ -364,6 +364,16 @@ impl LauncherView {
         if dragging_over {
             p.stroke_rounded(cell, 3.0, 2.0, th.ui.accent);
         }
+        // A follow action: a chevron at the right.
+        if launcher.follow.contains_key(&key) {
+            let x = cell.right() - 9.0;
+            let y = cell.center().y;
+            let mut path = Path::new();
+            path.move_to(Point::new(x - 3.0, y - 4.0))
+                .line_to(Point::new(x + 1.0, y))
+                .line_to(Point::new(x - 3.0, y + 4.0));
+            p.stroke_path(&path, 1.6, th.arranger.clip_text.with_alpha(0.75));
+        }
     }
 
     fn paint_grid(&self, p: &mut dyn Painter, size: Size, model: &Session) {
@@ -575,6 +585,47 @@ impl LauncherView {
                     "Delete",
                     l(LauncherOp::ClearSlot { track, scene }),
                 ));
+                // Follow actions: what then, and after how long.
+                let now = model
+                    .project()
+                    .launcher
+                    .follow
+                    .get(&SlotKey { track, scene })
+                    .copied();
+                let set = |follow| {
+                    l(LauncherOp::SetFollow {
+                        track,
+                        scene,
+                        follow,
+                    })
+                };
+                items.push(
+                    MenuItem::new("No Follow Action", set(None))
+                        .checked(now.is_none())
+                        .separated(),
+                );
+                for kind in FollowKind::ALL {
+                    let bars = now.map_or(0, |f| f.bars);
+                    items.push(
+                        MenuItem::new(
+                            format!("Then: {}", kind.label()),
+                            set(Some(FollowAction { kind, bars })),
+                        )
+                        .checked(now.is_some_and(|f| f.kind == kind)),
+                    );
+                }
+                if let Some(f) = now {
+                    for (i, bars) in [0u16, 1, 2, 4, 8].into_iter().enumerate() {
+                        let label = match bars {
+                            0 => "After the Clip".to_string(),
+                            1 => "After 1 Bar".to_string(),
+                            n => format!("After {n} Bars"),
+                        };
+                        let item = MenuItem::new(label, set(Some(FollowAction { bars, ..f })))
+                            .checked(f.bars == bars);
+                        items.push(if i == 0 { item.separated() } else { item });
+                    }
+                }
             }
             None => {
                 if matches!(kind, Some(TrackKind::Instrument | TrackKind::Midi)) {

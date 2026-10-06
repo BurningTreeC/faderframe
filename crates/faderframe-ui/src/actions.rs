@@ -1203,7 +1203,7 @@ pub fn install(app: &Rc<AppState>) {
         }),
         // Development aids for the clip launcher: `send-to-launcher:<track>`
         // (its first clip), `launch:<track>@<scene n>` (1-based),
-        // `launch-scene:<n>`, `launcher:<stop-all|back|record|scene|name=<n>=<name>>`.
+        // `launch-scene:<n>`, `launcher:<stop-all|back|record|scene|name=<n>=<name>|follow=<track>@<n>=<kind>[/<bars>]>`.
         named("send-to-launcher", |a, arg| {
             let clip = a
                 .session
@@ -1271,6 +1271,44 @@ pub fn install(app: &Rc<AppState>) {
         }),
         named("launcher", |a, arg| {
             let records = a.session.borrow().launcher_records();
+            // `follow=<track>@<n>=<kind>[/<bars>]`: a slot's follow action
+            // (kind as in its menu, e.g. next; `none` clears it).
+            if let Some(rest) = arg.strip_prefix("follow=") {
+                use faderframe_project::launcher::{FollowAction, FollowKind};
+                let Some((slot, what)) = rest.split_once('=') else {
+                    return;
+                };
+                let Some((name, n)) = slot.split_once('@') else {
+                    return;
+                };
+                let (kind, bars) = what.split_once('/').unwrap_or((what, "0"));
+                let follow = FollowKind::ALL
+                    .into_iter()
+                    .find(|k| k.label().eq_ignore_ascii_case(kind))
+                    .map(|kind| FollowAction {
+                        kind,
+                        bars: bars.parse().unwrap_or(0),
+                    });
+                let found = {
+                    let s = a.session.borrow();
+                    let p = s.project();
+                    let track = p.tracks.iter().find(|t| t.name == name).map(|t| t.id);
+                    let scene = n
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|n| p.launcher.scenes.get(n.saturating_sub(1)))
+                        .map(|s| s.id);
+                    track.zip(scene)
+                };
+                if let Some((track, scene)) = found {
+                    a.dispatch(Action::Launcher(LauncherOp::SetFollow {
+                        track,
+                        scene,
+                        follow,
+                    }));
+                }
+                return;
+            }
             // `name=<n>=<name>`: scene n (1-based) renamed.
             if let Some((n, name)) = arg.strip_prefix("name=").and_then(|r| r.split_once('=')) {
                 let scene = n.parse::<usize>().ok().and_then(|n| {
