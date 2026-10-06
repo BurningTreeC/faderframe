@@ -641,23 +641,31 @@ impl Session {
     /// record window restarts at the playhead and pre-roll applies.
     pub(crate) fn play(&mut self) -> Result<()> {
         if !self.transport.playing && self.recording.is_some() {
-            let punch = self.punch_window();
+            // Slot recordings ignore the punch range and count in by the
+            // launcher's setting.
+            let slot = self.recording.as_ref().is_some_and(|r| r.slot.is_some());
+            let punch = self.punch_window().filter(|_| !slot);
             let from = match punch {
                 Some((a, _)) => a,
                 None => {
                     // Record from wherever the playhead is now.
                     let pos = self.transport.position;
-                    if self.recording.as_ref().is_some_and(|r| r.from != pos) {
+                    if !slot && self.recording.as_ref().is_some_and(|r| r.from != pos) {
                         self.stop_recording()?;
                         self.start_recording(pos)?;
                     }
                     pos
                 }
             };
-            if self.record.preroll_bars > 0 {
+            let preroll = if slot {
+                u32::from(self.project.launcher.count_in)
+            } else {
+                self.record.preroll_bars
+            };
+            if preroll > 0 {
                 let meter = &self.project.timeline.meter;
                 let at = self.engine.samples_to_musical(&self.project, from);
-                let bar = (meter.bar_at(at) - self.record.preroll_bars as i32).max(0);
+                let bar = (meter.bar_at(at) - preroll as i32).max(0);
                 let start = self
                     .engine
                     .musical_to_samples(&self.project, meter.bar_start(bar));
@@ -728,7 +736,11 @@ impl Session {
             );
             return Ok(());
         }
-        let (from, to) = self.punch_window().unwrap_or((from, i64::MAX));
+        // A slot recording (one track) ignores the punch range.
+        let (from, to) = match only {
+            Some(_) => (from, i64::MAX),
+            None => self.punch_window().unwrap_or((from, i64::MAX)),
+        };
         // MIDI: input is placed one buffer late (constant latency) and heard
         // after the output latency; the take moves back by both.
         let midi = if midi_targets.is_empty() {

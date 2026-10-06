@@ -532,3 +532,89 @@ fn launch_modes_answer_presses_and_releases() {
         LaunchMode::Gate
     );
 }
+
+/// A fixed length ends a slot recording by itself (a punch range does not
+/// limit it); recording on a MIDI clip that plays overdubs: the notes
+/// join its loop where they fell, in one undo step.
+#[test]
+fn slot_recordings_have_a_fixed_length_and_midi_clips_take_overdubs() {
+    let (mut s, audio, keys, scene) = recording_session();
+    s.edit(Command::SetTrackRecordArm {
+        track: audio,
+        on: false,
+    })
+    .unwrap();
+    // A punch range somewhere else is not the slot's business.
+    s.edit(Command::SetPunch {
+        range: faderframe_project::MusicalRange::new(
+            faderframe_timeline::MusicalTime::from_quarters(64.0),
+            faderframe_timeline::MusicalTime::from_quarters(68.0),
+        ),
+        enabled: true,
+    })
+    .unwrap();
+    op(
+        &mut s,
+        LauncherOp::SetRecordOptions {
+            bars: 1,
+            count_in: 0,
+        },
+    );
+    s.dispatch(Action::Transport(TransportAction::Play))
+        .unwrap();
+    run(&mut s, 100);
+    op(&mut s, LauncherOp::Record { track: keys, scene });
+    wait_for(&mut s, "the recording to start", |s| {
+        s.engine().transport_snapshot().position >= 24_000 + 2_400
+    });
+    s.midi_keyboard().send(&[0x90, 60, 100]);
+    run(&mut s, 100);
+    s.midi_keyboard().send(&[0x80, 60, 0]);
+    // Nobody ends it: a bar (two seconds) later it is the slot's clip.
+    wait_for(&mut s, "the fixed-length clip", |s| {
+        s.project().launcher.clip(keys, scene).is_some()
+    });
+    let id = s.project().launcher.clip(keys, scene).unwrap();
+    let length = s.project().clips[&id].as_midi().unwrap().length;
+    assert!((length.quarters() - 4.0).abs() < 1e-6, "a bar: {length:?}");
+    assert_eq!(s.project().clips[&id].as_midi().unwrap().notes.len(), 1);
+    // Overdub (until ended): it plays on, and a note played now joins it.
+    op(
+        &mut s,
+        LauncherOp::SetRecordOptions {
+            bars: 0,
+            count_in: 0,
+        },
+    );
+    wait_for(&mut s, "the clip playing", |s| {
+        s.launch_state(keys).is_some_and(|l| l.playing.is_some())
+    });
+    op(&mut s, LauncherOp::Record { track: keys, scene });
+    assert_eq!(s.launcher_recording(), Some((keys, scene, false)));
+    run(&mut s, 700);
+    s.midi_keyboard().send(&[0x90, 67, 100]);
+    run(&mut s, 100);
+    s.midi_keyboard().send(&[0x80, 67, 0]);
+    run(&mut s, 50);
+    op(&mut s, LauncherOp::Record { track: keys, scene });
+    wait_for(&mut s, "the overdub", |s| {
+        s.project().clips[&id].as_midi().unwrap().notes.len() == 2
+    });
+    let notes = &s.project().clips[&id].as_midi().unwrap().notes;
+    let new = notes.iter().find(|n| n.key == 67).unwrap();
+    assert!(
+        new.start.quarters() < 4.0,
+        "inside the loop: {:?}",
+        new.start
+    );
+    assert!(
+        s.launch_state(keys).is_some_and(|l| l.playing.is_some()),
+        "still playing"
+    );
+    assert_eq!(
+        s.history_steps().0.last().map(String::as_str),
+        Some("Overdub")
+    );
+    s.dispatch(Action::Undo).unwrap();
+    assert_eq!(s.project().clips[&id].as_midi().unwrap().notes.len(), 1);
+}

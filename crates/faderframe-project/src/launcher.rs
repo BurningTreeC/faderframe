@@ -268,6 +268,20 @@ pub struct Launcher {
         with = "launch_list"
     )]
     pub launch: BTreeMap<SlotKey, ClipLaunch>,
+    /// Recording into slots: bars a recording lasts (0: until ended) and
+    /// bars counted in when the transport starts for it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub record_bars: u16,
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub count_in: u8,
+}
+
+fn is_zero(v: &u16) -> bool {
+    *v == 0
+}
+
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
 }
 
 impl Launcher {

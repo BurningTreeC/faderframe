@@ -422,6 +422,12 @@ pub enum Command {
         scene: faderframe_core::SceneId,
         follow: Option<crate::launcher::FollowAction>,
     },
+    /// How slot recordings go: their length in bars (0: until ended) and
+    /// bars counted in from stop.
+    SetLaunchRecording {
+        bars: u16,
+        count_in: u8,
+    },
     /// A slot's launch settings (`None`: the defaults).
     SetClipLaunch {
         track: TrackId,
@@ -709,6 +715,7 @@ impl Command {
             SetLaunchQuantize { .. } => "Launch Quantize".into(),
             SetFollowAction { .. } => "Follow Action".into(),
             SetClipLaunch { .. } => "Clip Launch".into(),
+            SetLaunchRecording { .. } => "Slot Recording".into(),
             SetArrangement { .. } => "Rearrange".into(),
             SetAlbum { .. } => "Edit Album".into(),
             SetSongInserts { .. } => "Change Song Inserts".into(),
@@ -788,7 +795,8 @@ impl Command {
             | SetLyrics { .. }
             | SetScenes { .. }
             | SetLaunchQuantize { .. }
-            | SetClipLaunch { .. } => Impact::None,
+            | SetClipLaunch { .. }
+            | SetLaunchRecording { .. } => Impact::None,
             AddSource { .. }
             | RemoveSource { .. }
             | AddAutomationLane { .. }
@@ -1734,6 +1742,10 @@ impl Command {
                     follow: old,
                 }
             }
+            SetLaunchRecording { bars, count_in } => SetLaunchRecording {
+                bars: std::mem::replace(&mut p.launcher.record_bars, bars),
+                count_in: std::mem::replace(&mut p.launcher.count_in, count_in),
+            },
             SetClipLaunch {
                 track,
                 scene,

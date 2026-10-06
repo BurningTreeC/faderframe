@@ -83,8 +83,10 @@ pub enum LauncherOp {
     /// docs).
     SetRecord(bool),
     /// Record into an empty slot of an armed track from the next launch
-    /// position; again (or launching or stopping its track) ends it at the
-    /// next one, and the new clip plays on in time.
+    /// position (for the launcher's fixed length, if it has one); again
+    /// (or launching or stopping its track) ends it at the next one, and
+    /// the new clip plays on in time. On a slot with a MIDI clip it
+    /// overdubs: the clip plays and the notes played join its loop.
     Record {
         track: TrackId,
         scene: SceneId,
@@ -96,6 +98,11 @@ pub enum LauncherOp {
         clips: Vec<ClipId>,
         track: TrackId,
         scene: SceneId,
+    },
+    /// Slot recordings' length (bars, 0: until ended) and count-in.
+    SetRecordOptions {
+        bars: u16,
+        count_in: u8,
     },
     /// A slot's follow action (`None`: none).
     SetFollow {
@@ -125,8 +132,12 @@ pub(crate) struct SlotRecording {
     pub track: TrackId,
     pub scene: SceneId,
     pub from: i64,
-    /// Where it ends, once asked to.
+    /// Where it ends, once asked to (or from the start, with a fixed
+    /// length).
     pub end: Option<i64>,
+    /// Overdubbing the slot's MIDI clip, which started playing here: the
+    /// notes are merged into its loop.
+    pub overdub: Option<i64>,
 }
 
 /// One stretch a launched clip played: its clip, from/to (engine samples).
@@ -590,6 +601,9 @@ impl Session {
                     follow,
                 })?;
             }
+            LauncherOp::SetRecordOptions { bars, count_in } => {
+                self.edit(Command::SetLaunchRecording { bars, count_in })?;
+            }
             LauncherOp::SetQuantize(quantize) => {
                 self.edit(Command::SetLaunchQuantize { quantize })?;
             }
@@ -636,36 +650,73 @@ impl Session {
                 t.name
             )));
         }
-        if self.project.launcher.clip(track, scene).is_some() {
-            return Err(SessionError::Other("the slot has a clip".into()));
-        }
-        let quantize = self.project.launcher.quantize.into();
+        let key = SlotKey { track, scene };
+        let overdub = match self.project.launcher.clip(track, scene) {
+            Some(c) if self.project.clip(c).is_some_and(|c| c.as_midi().is_some()) => true,
+            Some(_) => return Err(SessionError::Other("the slot has a clip".into())),
+            None => false,
+        };
+        let quantize: Quantize = if overdub {
+            self.project.launcher.quantize_of(key).into()
+        } else {
+            self.project.launcher.quantize.into()
+        };
         let pos = self.engine.transport_snapshot().position;
         let playing = self.transport.playing;
-        let from = if playing {
-            faderframe_engine::launch::next_boundary(
-                quantize,
-                pos,
-                &self.project.timeline,
-                self.engine.sample_rate() as f64,
-            )
-        } else {
-            pos
+        let rate = self.engine.sample_rate() as f64;
+        let boundary = |q| {
+            if playing {
+                faderframe_engine::launch::next_boundary(q, pos, &self.project.timeline, rate)
+            } else {
+                pos
+            }
         };
+        let slot_hash = key.hash();
+        // Overdubbing: the clip plays (launched now if it does not), the
+        // recording starts with it or on the next launch position.
+        let playing_start = self
+            .launch_state(track)
+            .and_then(|s| s.playing)
+            .filter(|(s, _)| *s == slot_hash)
+            .map(|(_, start)| start);
+        let from = boundary(quantize);
+        let overdub_start = overdub.then(|| playing_start.unwrap_or(from));
         self.start_recording_only(from, Some(track))?;
         let Some(r) = self.recording.as_mut() else {
             // Nothing could be recorded (a notice says why).
             return Ok(());
         };
+        // A fixed length ends it that many bars on.
+        let bars = self.project.launcher.record_bars;
+        let end = (bars > 0).then(|| {
+            let tl = &self.project.timeline;
+            let at = tl.to_musical(from, rate);
+            let bar = tl.meter.bar_at(at);
+            let length = tl.meter.bar_start(bar + i32::from(bars)) - tl.meter.bar_start(bar);
+            tl.to_samples(at + length, rate)
+        });
         r.slot = Some(SlotRecording {
             track,
             scene,
             from,
-            end: None,
+            end,
+            overdub: overdub_start,
         });
-        // What the track plays stops where the recording starts.
-        self.engine
-            .launch(LaunchCommand::Stop { track, quantize })?;
+        if overdub {
+            if playing_start.is_none() {
+                self.engine.launch(LaunchCommand::Launch {
+                    track,
+                    slot: slot_hash,
+                    quantize,
+                    legato: false,
+                    repeat: 0,
+                })?;
+            }
+        } else {
+            // What the track plays stops where the recording starts.
+            self.engine
+                .launch(LaunchCommand::Stop { track, quantize })?;
+        }
         if !playing {
             self.play()?;
         }
@@ -699,6 +750,9 @@ impl Session {
         latency: i64,
     ) -> Result<()> {
         let end = slot.end.unwrap_or(slot.from + 1);
+        if let Some(play_start) = slot.overdub {
+            return self.finish_overdub(slot, play_start, end, midi);
+        }
         let mut commands = Vec::new();
         let mut clip = None;
         if let Some(m) = midi
@@ -811,6 +865,69 @@ impl Session {
             })?;
         }
         Ok(())
+    }
+
+    /// An overdub's notes into the slot's MIDI clip: each where it falls in
+    /// the loop (from where the clip started playing), as long as it was
+    /// held (a loop at most). One undo step.
+    fn finish_overdub(
+        &mut self,
+        slot: SlotRecording,
+        play_start: i64,
+        end: i64,
+        midi: Option<&crate::midi::MidiTake>,
+    ) -> Result<()> {
+        let key = SlotKey {
+            track: slot.track,
+            scene: slot.scene,
+        };
+        let Some(m) = midi else { return Ok(()) };
+        let Some(i) = m.tracks.iter().position(|t| *t == slot.track) else {
+            return Ok(());
+        };
+        let Some(id) = self.project.launcher.slots.get(&key).copied() else {
+            return Ok(());
+        };
+        let Some(clip) = self.project.clips.get(&id).cloned() else {
+            return Ok(());
+        };
+        let Some(took) = self.midi_take_clip(m, i, Some((slot.from, end))) else {
+            return Ok(());
+        };
+        let (Some(mine), Some(new)) = (clip.as_midi(), took.as_midi()) else {
+            return Ok(());
+        };
+        let loop_len = self.launch_length(&clip).max(1);
+        let from = self.engine.samples_to_musical(&self.project, slot.from);
+        let mut merged = mine.clone();
+        for n in &new.notes {
+            let at = self
+                .engine
+                .musical_to_samples(&self.project, from + n.start);
+            let in_loop = (at - play_start).rem_euclid(loop_len);
+            let start = self.engine.samples_to_musical(&self.project, in_loop);
+            let mut note = *n;
+            note.id = self.project.ids.allocate();
+            note.start = start;
+            note.length = n
+                .length
+                .min(mine.length)
+                .max(faderframe_timeline::MusicalTime(1));
+            merged.notes.push(note);
+        }
+        if new.notes.is_empty() {
+            self.notify(crate::NoticeLevel::Warning, "nothing was overdubbed");
+            return Ok(());
+        }
+        merged.notes.sort_by_key(|n| (n.start, n.key));
+        self.edit(Command::Batch {
+            label: "Overdub".into(),
+            commands: vec![Command::SetClipContent {
+                clip: id,
+                start: clip.start,
+                content: Box::new(ClipContent::Midi(merged)),
+            }],
+        })
     }
 
     /// A slot recording past its end stops (every tick).

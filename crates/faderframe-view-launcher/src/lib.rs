@@ -346,7 +346,15 @@ impl LauncherView {
         } else {
             th.arranger.clip_text.with_alpha(0.75)
         };
-        Self::triangle(p, play.center(), 6.0, tri);
+        let overdubbing = model
+            .launcher_recording()
+            .is_some_and(|(t, s, _)| t == track.id && s == scene);
+        if overdubbing {
+            // Overdubbing: the dot instead of the triangle, a red outline.
+            p.circle(play.center(), 5.0, th.arranger.record);
+        } else {
+            Self::triangle(p, play.center(), 6.0, tri);
+        }
         p.text(
             &clip.name,
             Rect::new(play.right() + 6.0, cell.y, cell.w - PLAY_W - 10.0, cell.h),
@@ -363,7 +371,9 @@ impl LauncherView {
                 &th.arranger.clip_text.with_alpha(0.6).into(),
             );
         }
-        if playing {
+        if overdubbing {
+            p.stroke_rounded(cell, 3.0, 1.5, th.arranger.record);
+        } else if playing {
             p.stroke_rounded(cell, 3.0, 1.5, th.arranger.launch_playing);
         } else if starting {
             p.stroke_rounded(cell, 3.0, 1.5, th.arranger.launch_queued);
@@ -595,6 +605,23 @@ impl LauncherView {
                     items.push(
                         MenuItem::new("Edit in Piano Roll", Action::OpenClipEditor(c)).separated(),
                     );
+                    let armed = model.project().track(track).is_some_and(|t| t.record_arm);
+                    let overdubbing = model
+                        .launcher_recording()
+                        .is_some_and(|(t, s, _)| t == track && s == scene);
+                    if overdubbing {
+                        items.push(MenuItem::new(
+                            "End Overdub",
+                            l(LauncherOp::Record { track, scene }),
+                        ));
+                    } else if armed {
+                        items.push(MenuItem::new(
+                            "Overdub",
+                            l(LauncherOp::Record { track, scene }),
+                        ));
+                    } else {
+                        items.push(MenuItem::disabled("Overdub (arm the track)"));
+                    }
                 }
                 // Copy to the next free slot below.
                 let scenes = &model.project().launcher.scenes;
@@ -899,14 +926,55 @@ impl LauncherView {
     }
 
     fn quantize_menu(model: &Session) -> Vec<MenuItem<Action>> {
-        let now = model.project().launcher.quantize;
-        LaunchQuantize::ALL
+        let launcher = &model.project().launcher;
+        let now = launcher.quantize;
+        let mut items: Vec<MenuItem<Action>> = LaunchQuantize::ALL
             .iter()
             .map(|q| {
                 MenuItem::new(q.label(), Action::Launcher(LauncherOp::SetQuantize(*q)))
                     .checked(*q == now)
             })
-            .collect()
+            .collect();
+        // Recording into slots: a fixed length, a count-in from stop.
+        let (bars, count_in) = (launcher.record_bars, launcher.count_in);
+        let set =
+            |bars, count_in| Action::Launcher(LauncherOp::SetRecordOptions { bars, count_in });
+        let bars_label = |n: u16| match n {
+            0 => "Until Ended".to_string(),
+            1 => "1 Bar".to_string(),
+            n => format!("{n} Bars"),
+        };
+        let lengths = [0u16, 1, 2, 4, 8, 16]
+            .into_iter()
+            .map(|n| MenuItem::new(bars_label(n), set(n, count_in)).checked(bars == n))
+            .collect();
+        let counts = [0u8, 1, 2, 4]
+            .into_iter()
+            .map(|n| {
+                let label = match n {
+                    0 => "None".to_string(),
+                    1 => "1 Bar".to_string(),
+                    n => format!("{n} Bars"),
+                };
+                MenuItem::new(label, set(bars, n)).checked(count_in == n)
+            })
+            .collect();
+        items.push(
+            MenuItem::submenu(
+                format!("Slot Recording Length: {}", bars_label(bars)),
+                lengths,
+            )
+            .separated(),
+        );
+        items.push(MenuItem::submenu(
+            match count_in {
+                0 => "Count-in: None".to_string(),
+                1 => "Count-in: 1 Bar".to_string(),
+                n => format!("Count-in: {n} Bars"),
+            },
+            counts,
+        ));
+        items
     }
 }
 
@@ -1048,7 +1116,12 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for LauncherView {
                         clip: Some(c),
                         play,
                     } => {
-                        if play {
+                        let overdubbing = model
+                            .launcher_recording()
+                            .is_some_and(|(t, s, _)| t == track && s == scene);
+                        if play && overdubbing {
+                            cx.emit(l(LauncherOp::Record { track, scene }));
+                        } else if play {
                             cx.emit(l(LauncherOp::Launch { track, scene }));
                             self.pressed = Some(SlotKey { track, scene });
                         } else if clicks >= 2 {
