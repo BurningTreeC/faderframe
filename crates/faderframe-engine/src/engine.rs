@@ -270,6 +270,8 @@ pub fn create_with_epoch(
         midi_recorder: None,
         midi_out: None,
         clock: crate::midi::ClockGen::default(),
+        clock_due: 0,
+        mtc_due: 0,
         output_latency: 0,
         pool: None,
         ahead: None,
@@ -339,6 +341,10 @@ pub struct EngineProcessor {
     midi_recorder: Option<Box<crate::midi::MidiRecorder>>,
     midi_out: Option<Box<faderframe_midi::MidiOutputQueue>>,
     clock: crate::midi::ClockGen,
+    /// The last MIDI clock and MTC messages' due times: callbacks run late
+    /// now and then, so later messages are kept after earlier ones.
+    clock_due: u64,
+    mtc_due: u64,
     /// Frames from a callback to its audio being heard (buffer + device).
     output_latency: u32,
     /// DSP worker threads for the graph (none: serial on the audio thread).
@@ -613,10 +619,13 @@ impl EngineProcessor {
                 let ns_per_frame = 1e9 / rate.max(1.0);
                 let latency = self.output_latency as usize + offset;
                 let dropped = &self.shared.midi_out_dropped;
+                let last = &mut self.clock_due;
                 self.clock
                     .chunk(&info, self.ctx.discontinuity, n, |o, bytes| {
-                        let due =
-                            callback_ns + ((latency + o as usize) as f64 * ns_per_frame) as u64;
+                        let due = (callback_ns
+                            + ((latency + o as usize) as f64 * ns_per_frame) as u64)
+                            .max(*last + 1);
+                        *last = due;
                         for port in 0..64u16 {
                             if clock_ports & (1u64 << port) != 0
                                 && let Some(m) =
@@ -636,8 +645,11 @@ impl EngineProcessor {
                 let ns_per_frame = 1e9 / rate.max(1.0);
                 let latency = self.output_latency as usize + offset;
                 let dropped = &self.shared.midi_out_dropped;
+                let last = &mut self.mtc_due;
                 crate::midi::MtcGen.chunk(&info, n, &self.shared.midi, |o, bytes| {
-                    let due = callback_ns + ((latency + o as usize) as f64 * ns_per_frame) as u64;
+                    let due = (callback_ns + ((latency + o as usize) as f64 * ns_per_frame) as u64)
+                        .max(*last + 1);
+                    *last = due;
                     for port in 0..64u16 {
                         if mtc_ports & (1u64 << port) != 0
                             && let Some(m) = faderframe_midi::MidiOutputEvent::new(port, due, bytes)

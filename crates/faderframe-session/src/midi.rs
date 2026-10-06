@@ -700,8 +700,7 @@ impl Session {
     /// (playing or stopped), the timecode there goes out at once (the
     /// quarter frames come from the engine).
     pub(crate) fn tick_mtc_out(&mut self) {
-        let mask = self.midi.mtc_mask();
-        if mask == 0 {
+        if self.midi.mtc_mask() == 0 {
             self.midi.mtc_seen = None;
             return;
         }
@@ -720,13 +719,35 @@ impl Session {
             }
         };
         self.midi.mtc_seen = Some((t.playing, t.position, now));
-        if !jumped {
+        if jumped {
+            // Started here (from where playback started, if we know it).
+            let from = if t.playing {
+                self.play_started_at.unwrap_or(t.position)
+            } else {
+                t.position
+            };
+            self.mtc_full_frame(from);
+        }
+    }
+
+    /// Playback starts at `position`: the full frame goes out at once.
+    pub(crate) fn mtc_started(&mut self, position: i64) {
+        if self.midi.mtc_mask() == 0 {
             return;
         }
+        self.midi.mtc_seen = Some((true, position, Instant::now()));
+        self.mtc_full_frame(position);
+    }
+
+    /// The timecode at timeline sample `position` as an MTC full frame to
+    /// every output with MTC on.
+    fn mtc_full_frame(&mut self, position: i64) {
+        let mask = self.midi.mtc_mask();
+        let rate = self.engine.sample_rate() as f64;
         let settings = &self.sync.settings;
         let mtc = settings.mtc_out_rate;
         let start = settings.offset.total_frames(mtc);
-        let frames = start + (t.position.max(0) as f64 / rate * mtc.fps()).floor() as i64;
+        let frames = start + (position.max(0) as f64 / rate * mtc.fps()).floor() as i64;
         let tc = faderframe_midi::timecode::Timecode::from_frames(frames, mtc);
         let full = [
             0xF0,

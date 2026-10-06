@@ -671,6 +671,7 @@ impl Session {
         self.automation_play_requested();
         if !self.transport.playing {
             self.play_started_at = Some(self.transport.position);
+            self.mtc_started(self.transport.position);
             self.automation_play_started();
         }
         Ok(())
