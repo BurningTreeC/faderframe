@@ -418,12 +418,15 @@ pub(crate) enum AheadGarbage {
     // control thread.
     #[allow(clippy::redundant_allocation)]
     Timeline(#[allow(dead_code)] Box<Arc<TimelineSnapshot>>),
+    #[allow(clippy::redundant_allocation)]
+    Modulation(#[allow(dead_code)] Box<Arc<crate::modulation::ModulationSet>>),
 }
 
 /// The control thread's handle on the anticipator.
 pub(crate) struct Anticipator {
     pub graph_tx: MailboxSender<AheadGraph>,
     pub timeline_tx: MailboxSender<Arc<TimelineSnapshot>>,
+    pub modulation_tx: MailboxSender<Arc<crate::modulation::ModulationSet>>,
     pub garbage: Consumer<AheadGarbage>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -445,6 +448,7 @@ impl Drop for Anticipator {
 struct Worker {
     graph_rx: MailboxReceiver<AheadGraph>,
     timeline_rx: MailboxReceiver<Arc<TimelineSnapshot>>,
+    modulation_rx: MailboxReceiver<Arc<crate::modulation::ModulationSet>>,
     sequences: Consumer<Sequence>,
     ready: Arc<AtomicU64>,
     garbage: Producer<AheadGarbage>,
@@ -470,6 +474,7 @@ pub(crate) fn start(
     let lookahead = ((lookahead.as_secs_f64() * rate) as usize).max(block * 2);
     let (graph_tx, graph_rx) = faderframe_realtime::mailbox();
     let (timeline_tx, timeline_rx) = faderframe_realtime::mailbox();
+    let (modulation_tx, modulation_rx) = faderframe_realtime::mailbox();
     let (seq_tx, seq_rx) = RingBuffer::new(64);
     let (garbage_tx, garbage_rx) = RingBuffer::new(64);
     let ready = Arc::new(AtomicU64::new(0));
@@ -477,6 +482,7 @@ pub(crate) fn start(
     let worker = Worker {
         graph_rx,
         timeline_rx,
+        modulation_rx,
         sequences: seq_rx,
         ready: Arc::clone(&ready),
         garbage: garbage_tx,
@@ -496,6 +502,7 @@ pub(crate) fn start(
         Anticipator {
             graph_tx,
             timeline_tx,
+            modulation_tx,
             garbage: garbage_rx,
             stop,
             thread,
@@ -542,6 +549,10 @@ impl Worker {
             if let Some(mut t) = self.timeline_rx.take() {
                 std::mem::swap(&mut self.ctx.timeline, &mut *t);
                 self.retire(AheadGarbage::Timeline(t));
+            }
+            if let Some(mut m) = self.modulation_rx.take() {
+                std::mem::swap(&mut self.ctx.modulation, &mut *m);
+                self.retire(AheadGarbage::Modulation(m));
             }
             while let Ok(s) = self.sequences.pop() {
                 current = Some((s.id, s.transport, 0, true));

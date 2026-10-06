@@ -1299,6 +1299,10 @@ impl EngineController {
             self.modulation_tx
                 .send(Box::new(Arc::clone(&self.modulation))),
         );
+        // The anticipator's modulators too.
+        if let Some(a) = &self.ahead {
+            drop(a.modulation_tx.send(Box::new(Arc::clone(&self.modulation))));
+        }
     }
 
     /// The outputs of a track's modulators now (bipolar ones −1..1,
@@ -1558,8 +1562,7 @@ impl EngineController {
             transport: Default::default(),
             discontinuity: false,
             timeline: Arc::clone(&self.timeline),
-            // Modulated tracks are never rendered ahead.
-            modulation: Arc::default(),
+            modulation: Arc::clone(&self.modulation),
             params: Arc::clone(&self.params),
             readback: Arc::clone(&self.readback),
             meters: Arc::clone(&self.meters),

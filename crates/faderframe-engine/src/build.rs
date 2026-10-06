@@ -95,16 +95,33 @@ pub fn ahead_eligible(
         && !monitored
         && !live.contains(&t.id)
         && t.midi_output.is_none()
-        && t.inserts.iter().all(|s| s.sidechain.is_none())
-        // Containers' chains are built in the realtime graph only.
-        && t.inserts.iter().all(|s| !s.plugin.is_container())
-        // Modulators run live (macros move now, followers listen now).
-        && t.modulators.is_empty()
+        && t.slots().iter().all(|s| s.sidechain.is_none())
+        && modulation_renders_ahead(t)
         && t.sends
             .iter()
             .all(|s| !s.enabled || s.tap != SendTap::PreFx)
         && !fed.contains(&t.id)
         && project.track(t.id).is_some()
+}
+
+/// Can `t`'s modulators run ahead of the playhead? Those that follow the
+/// song position, the track's own input or its notes can; one that
+/// listens to another track cannot (that track may not be rendered ahead),
+/// nor can modulation of the fader or pan (the strip plays live).
+fn modulation_renders_ahead(t: &Track) -> bool {
+    use faderframe_project::modulation::{FollowSource, ModSource, ModTarget};
+    t.modulators.iter().all(|m| {
+        !matches!(
+            m.source,
+            ModSource::Follower {
+                source: FollowSource::Track { .. },
+                ..
+            }
+        ) && m
+            .routes
+            .iter()
+            .all(|r| matches!(r.target, ModTarget::Plugin { .. }))
+    })
 }
 
 /// Tracks that other tracks feed (outputs, sends, MIDI routing).
@@ -482,7 +499,7 @@ pub fn build_graph(
             };
             let realtime = pcx.realtime;
             pcx.realtime = false;
-            let latency = build_ahead_chain(&mut ab, &mut pcx, project, t, config, &ring)?;
+            let latency = build_ahead_chain(&mut ab, &mut pcx, slots, project, t, config, &ring)?;
             pcx.realtime = realtime;
             used_rings.push(Arc::clone(&ring));
             let reader = b.add_node(
@@ -760,7 +777,7 @@ pub fn build_graph(
                     takes_notes: &mut takes_notes,
                     sidechains: &mut sidechains,
                 };
-                prev = add_container(
+                (prev, _) = add_container(
                     &mut b,
                     &mut pcx,
                     slots,
@@ -1038,7 +1055,8 @@ struct ChainLinks<'a> {
 /// (each its devices, then its level and balance) into a sum; the graph
 /// aligns the chains' latencies there. Each chain's devices that take
 /// notes get those in its key range (`ChainNotes`). A container without
-/// chains, or bypassed, passes `prev` on.
+/// chains, or bypassed, passes `prev` on. Returns its output and latency
+/// (its slowest chain's).
 #[allow(clippy::too_many_arguments)]
 fn add_container(
     b: &mut GraphBuilder<EngineContext>,
@@ -1051,13 +1069,14 @@ fn add_container(
     gi: u32,
     depth: usize,
     links: &mut ChainLinks<'_>,
-) -> Result<NodeId, EngineError> {
+) -> Result<(NodeId, u32), EngineError> {
     let Some(chains) = t.containers.get(&container.id).filter(|c| !c.is_empty()) else {
-        return Ok(prev);
+        return Ok((prev, 0));
     };
     if container.bypass {
-        return Ok(prev);
+        return Ok((prev, 0));
     }
+    let mut latency = 0u32;
     let layout = t.layout;
     let own = |owners: &mut Vec<(NodeId, NodeOwner)>, node, plugin| {
         owners.push((
@@ -1085,6 +1104,7 @@ fn add_container(
     own(owners, sum, container.id);
     for (i, chain) in chains.iter().enumerate() {
         let mut from = prev;
+        let mut chain_latency = 0u32;
         // The chain's notes: those of its key range.
         let wants_notes = links.notes
             && chain
@@ -1131,7 +1151,7 @@ fn add_container(
                         takes_notes: links.takes_notes,
                         sidechains: links.sidechains,
                     };
-                    from = add_container(
+                    let (out, l) = add_container(
                         b,
                         pcx,
                         slots,
@@ -1143,6 +1163,8 @@ fn add_container(
                         depth + 1,
                         &mut inner,
                     )?;
+                    from = out;
+                    chain_latency += l;
                 }
                 continue;
             }
@@ -1167,7 +1189,8 @@ fn add_container(
             if let Some((_, l)) = key {
                 spec = spec.audio_in(l);
             }
-            let (node, _) = pcx.node(b, slot, t, spec, Role::Insert);
+            let (node, l) = pcx.node(b, slot, t, spec, Role::Insert);
+            chain_latency += l;
             own(owners, node, slot.id);
             if let Some((src, _)) = key {
                 links.sidechains.push((node, src));
@@ -1197,8 +1220,9 @@ fn add_container(
         own(owners, mix, container.id);
         b.connect_audio(from, 0, mix, 0)?;
         b.connect_audio(mix, 0, sum, 0)?;
+        latency = latency.max(chain_latency);
     }
-    Ok(sum)
+    Ok((sum, latency))
 }
 
 fn add_strip(
@@ -1268,6 +1292,7 @@ fn note_effects(
 fn build_ahead_chain(
     ab: &mut GraphBuilder<EngineContext>,
     pcx: &mut PluginCx<'_>,
+    slots: &mut SlotRegistry,
     project: &Project,
     t: &Track,
     config: &PrepareConfig,
@@ -1327,9 +1352,45 @@ fn build_ahead_chain(
         }
     }
     let mut prev = input;
+    // The modulators (rendered ahead: they follow the song position, the
+    // track's own input and its notes only).
+    if !t.modulators.is_empty() && crate::modulation::modulated_kind(t.kind) {
+        let node = ab.add_node(
+            NodeSpec::new(format!("{} · Modulators", t.name))
+                .key(node_key(t.id, Role::Modulators, 0, &[layout]))
+                .audio_in(layout)
+                .audio_out(layout),
+            Box::new(crate::modulation::ModNode::new(
+                t.id,
+                Vec::new(),
+                config.sample_rate,
+            )),
+        );
+        ab.connect_audio(input, 0, node, 0)?;
+        prev = node;
+    }
+    // Owners are not profiled in the ahead graph; nor are sidechains or
+    // routed MIDI tracks part of it (such tracks stay live).
+    let (mut owners, mut takes_notes, mut sidechains) = (Vec::new(), Vec::new(), Vec::new());
     for slot in chain {
         if let Some((_, n)) = fx.iter().find(|(id, _)| *id == slot.id) {
             midi = Some(*n);
+            continue;
+        }
+        if slot.plugin.is_container() {
+            let events: Vec<NodeId> = midi.into_iter().collect();
+            let mut links = ChainLinks {
+                project,
+                notes: t.kind == TrackKind::Instrument,
+                events: &events,
+                raw: false,
+                takes_notes: &mut takes_notes,
+                sidechains: &mut sidechains,
+            };
+            let (out, l) =
+                add_container(ab, pcx, slots, &mut owners, t, slot, prev, 0, 0, &mut links)?;
+            latency += l;
+            prev = out;
             continue;
         }
         let notes = t.kind == TrackKind::Instrument && pcx.takes_notes(slot);

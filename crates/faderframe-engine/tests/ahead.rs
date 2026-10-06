@@ -277,3 +277,97 @@ fn changing_the_lookahead_keeps_every_track_sounding() {
     assert_eq!(differ, 0, "{differ} of {both} samples differ");
     assert_eq!(ahead.r.controller.ahead_misses(), 0, "never late");
 }
+
+/// Rendered ahead, a container's chains and modulators that follow the
+/// song position sound as they do live. (While stopped an LFO keeps
+/// moving, for as long as each graph happened to run stopped: the first
+/// block after Play glides from there in each. The master's limiter, whose
+/// release would carry that block on, is left out.)
+#[test]
+fn containers_and_synced_modulators_render_ahead_alike() {
+    use faderframe_project::container::Chain;
+    use faderframe_project::modulation::{
+        LfoShape, ModRate, ModRoute, ModSource, ModTarget, Modulator,
+    };
+    let mut project = stateless_project();
+    let pluck = project
+        .tracks
+        .iter()
+        .position(|t| t.name == "Pluck")
+        .unwrap();
+    // A container (a utility beside the dry signal) and synced LFOs on the
+    // utilities in and outside it.
+    let utility = |id: u64| PluginSlot {
+        id: PluginInstanceId(id),
+        plugin: PluginRef::builtin(builtin::GAIN, "Utility"),
+        bypass: false,
+        parameters: Vec::new(),
+        state: None,
+        sidechain: None,
+    };
+    let container = PluginSlot {
+        id: PluginInstanceId(9_100),
+        plugin: PluginRef::builtin(builtin::CONTAINER, "Container"),
+        bypass: false,
+        parameters: Vec::new(),
+        state: None,
+        sidechain: None,
+    };
+    let mut wet = Chain::new("Wet");
+    wet.inserts.push(utility(9_101));
+    wet.gain_db = -6.0;
+    let gain = |plugin: u64| ModTarget::Plugin {
+        plugin: PluginInstanceId(plugin),
+        parameter: faderframe_core::ParameterId(0),
+    };
+    let lfo = |id: u64, shape, beats, target| {
+        let mut m = Modulator::new(
+            faderframe_core::ModulatorId(id),
+            ModSource::Lfo {
+                shape,
+                rate: ModRate::Sync { beats },
+                phase: 0.0,
+            },
+        );
+        m.routes = vec![ModRoute { target, depth: 0.1 }];
+        m
+    };
+    for t in &mut project.tracks {
+        if t.kind == faderframe_project::TrackKind::Master {
+            t.inserts.clear();
+        }
+    }
+    let t = &mut project.tracks[pluck];
+    t.containers
+        .insert(container.id, vec![Chain::new("Dry"), wet]);
+    t.inserts.push(container);
+    t.modulators = vec![
+        lfo(1, LfoShape::Sine, 1.0, gain(9_002)),
+        lfo(2, LfoShape::Triangle, 0.5, gain(9_101)),
+    ];
+    let id = project.tracks[pluck].id;
+    let mut plain = Run::new(&project, false);
+    let mut ahead = Run::new(&project, true);
+    assert!(
+        ahead.r.controller.ahead_tracks().contains(&id),
+        "rendered ahead"
+    );
+    ahead.run(20, true);
+    for run in [&mut plain, &mut ahead] {
+        run.command(TransportCommand::Play);
+    }
+    let blocks = 2 * SR as usize / BLOCK;
+    plain.run(blocks, false);
+    ahead.run(blocks, true);
+    for run in [&mut plain, &mut ahead] {
+        run.heard.retain(|p, _| *p >= 2 * BLOCK as i64);
+    }
+    let (both, differ) = compare(&plain, &ahead);
+    assert!(both > SR as usize, "heard together: {both}");
+    assert_eq!(differ, 0, "{differ} of {both} samples differ");
+    assert_eq!(ahead.r.controller.ahead_misses(), 0, "never late");
+    // Modulating the fader keeps the track live.
+    project.tracks[pluck].modulators[0].routes[0].target = ModTarget::Volume;
+    let live = Run::new(&project, true);
+    assert!(!live.r.controller.ahead_tracks().contains(&id));
+}

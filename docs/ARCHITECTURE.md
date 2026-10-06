@@ -1626,8 +1626,14 @@ automation never see modulation: `ParamValues::get` includes it for
 processors only, the editors' copy (the tap's, `as_set`) reads values as
 set and `live` for the dot that kit knobs draw where modulation has a
 value. The sandbox carries `param_mods` and the modulation flags. A track
-gaining or losing modulators or a follower's source rebuilds the graph;
-modulated tracks are not rendered ahead. The Modulators view
+gaining or losing modulators or a follower's source rebuilds the graph.
+A modulated track is rendered ahead when its modulators depend on the
+song position, its own signal or its notes only and move plugin
+parameters only (`build::modulation_renders_ahead`: no follower of
+another track, no fader or pan routes); the anticipator gets the
+`ModulationSet` through its own mailbox and runs the track's `ModNode`
+in the ahead graph. A macro moved while playing is then heard a
+lookahead later, like a knob on such a track. The Modulators view
 (`faderframe-view-modulators`) shows the selected track's modulators as
 cards.
 
@@ -1675,8 +1681,10 @@ note-off passes; `Action::SetChainKeys`) — layers and key splits; MIDI
 tracks routed to the track reach it, nested containers take their outer
 chain's notes. Devices in chains have sidechain inputs like inserts
 (`SetPluginSidechain` reaches them; the build's `ChainLinks` carries the
-notes and the sidechains to connect). Tracks with containers are not
-rendered ahead. Editor:
+notes and the sidechains to connect). Containers are rendered ahead
+like any device (`build_ahead_chain` builds them with `add_container`;
+the chain's latency is its slowest chain's), unless a device in them has
+a sidechain. Editor:
 `view-devices` `container::ContainerView` (a column a chain); dev action
 `chain-insert:<n>=<builtin id>`.
 
