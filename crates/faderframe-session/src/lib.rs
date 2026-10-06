@@ -48,6 +48,7 @@ mod selection;
 pub mod sync;
 mod sysex;
 mod transients;
+pub mod versions;
 /// A plugin state as projects store it (and back).
 pub use faderframe_engine::{
     decode_state as decode_plugin_state, encode_state as encode_plugin_state,
@@ -308,6 +309,16 @@ pub enum Action {
     /// Turn what the live tracks were played last into clips (recording
     /// or not).
     CaptureMidi,
+    /// Keep the project as it is now as a named version.
+    SaveVersion {
+        name: String,
+    },
+    /// Ask for a name, then save a version.
+    PromptSaveVersion,
+    /// Show the project's versions (compare, restore).
+    ShowVersions,
+    /// Go back to a saved version (the project as it is is kept as one).
+    RestoreVersion(PathBuf),
     /// An alias of each clip (sharing its content) right after it.
     DuplicateAsAlias(Vec<ClipId>),
     /// The clips are their own again (no longer aliases).
@@ -1011,6 +1022,10 @@ pub enum UiRequest {
     RenameGroup(faderframe_core::GroupId),
     /// Pick a colour (track or section).
     PickColor(ColorTarget),
+    /// Ask for a version's name, then save it.
+    SaveVersion,
+    /// The project's versions (compare, restore, save another).
+    Versions,
     /// Ask where to save a sample of `track` from `start` to `end`
     /// (suggesting `name`), then make it there.
     SaveSample {
@@ -2671,6 +2686,19 @@ impl Session {
                 target,
             } => self.make_sample(track, start, end, target)?,
             Action::CaptureMidi => self.capture_midi()?,
+            Action::SaveVersion { name } => {
+                self.save_version(&name)?;
+            }
+            Action::PromptSaveVersion => {
+                if self.project_dir().is_none() {
+                    return Err(SessionError::Other(
+                        "save the project first: its versions are kept next to it".into(),
+                    ));
+                }
+                self.ui_requests.push(UiRequest::SaveVersion);
+            }
+            Action::ShowVersions => self.ui_requests.push(UiRequest::Versions),
+            Action::RestoreVersion(path) => self.restore_version(&path)?,
             Action::DuplicateAsAlias(clips) => {
                 self.duplicate_as_alias(&clips)?;
             }

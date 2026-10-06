@@ -369,6 +369,8 @@ impl AppState {
                 faderframe_session::UiRequest::PickColor(target) => {
                     crate::dialogs::pick_color(self, target);
                 }
+                faderframe_session::UiRequest::SaveVersion => crate::dialogs::save_version(self),
+                faderframe_session::UiRequest::Versions => crate::dialogs::versions(self),
                 faderframe_session::UiRequest::SaveSample {
                     track,
                     start,

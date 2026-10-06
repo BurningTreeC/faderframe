@@ -278,6 +278,8 @@ pub fn install(app: &Rc<AppState>) {
         dispatch(app, "loop", A::Transport(T::ToggleLoop)),
         dispatch(app, "record", A::Transport(T::ToggleRecord)),
         dispatch(app, "capture-midi", A::CaptureMidi),
+        dispatch(app, "save-version", A::PromptSaveVersion),
+        dispatch(app, "show-versions", A::ShowVersions),
         entry(app, "panic", |a| {
             a.with_session(|s| {
                 s.engine_reset_processors()?;
@@ -1020,6 +1022,12 @@ pub fn install(app: &Rc<AppState>) {
                 None => tracing::warn!("make-sample: nothing to sample on '{name}'"),
             }
         }),
+        // Development aid: `version:<name>` saves a version.
+        named("version", |a, arg| {
+            a.dispatch(Action::SaveVersion {
+                name: arg.to_string(),
+            });
+        }),
         // Development aid: `alias-clip:<clip name>` (an alias right after it).
         named("alias-clip", |a, arg| {
             let id = a
@@ -1626,6 +1634,7 @@ pub fn install(app: &Rc<AppState>) {
         ("app.quit", &["<Control>q"]),
         ("app.render", &["<Control><Shift>r"]),
         ("app.capture-midi", &["<Control><Shift>c"]),
+        ("app.save-version", &["<Control><Alt>s"]),
         ("app.preferences", &["<Control>comma"]),
         ("app.undo", &["<Control>z"]),
         ("app.redo", &["<Control><Shift>z", "<Control>y"]),

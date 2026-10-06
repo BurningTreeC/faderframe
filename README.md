@@ -143,6 +143,11 @@ Contrast:
   the chord track, and drum patterns; previewed in the grid, applied in
   one undo step. The scale follows the key track; the chord track shows
   above the notes and can be stamped.
+* Project versions: File → Save Version… (Ctrl+Alt+S) keeps the project
+  as it is now under a name in its Versions folder; File → Versions…
+  lists them, compares one with the project now (tracks, clips, plugins,
+  mixer settings, tempo, key, sections …) and restores one — the project
+  as it is is kept as a version first, so nothing is lost.
 * Clip aliases: right-click a clip → Duplicate as Alias; aliases (marked
   by two overlapping frames before the name) share their content — notes,
   controllers, length, gain, fades, warp — so an edit of one is an edit of

@@ -276,6 +276,13 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
     file.append_section(
         None,
         &section(&[
+            ("Save Version…", "app.save-version"),
+            ("Versions…", "app.show-versions"),
+        ]),
+    );
+    file.append_section(
+        None,
+        &section(&[
             ("Import Audio…", "app.import-audio"),
             ("Import MIDI File…", "app.import-midi"),
             ("Export MIDI File…", "app.export-midi"),

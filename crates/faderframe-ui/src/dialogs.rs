@@ -413,6 +413,196 @@ pub fn rename_group(app: &Rc<AppState>, group: faderframe_core::GroupId) {
     );
 }
 
+/// Ask for a version's name, then keep the project as it is under it.
+pub fn save_version(app: &Rc<AppState>) {
+    let next = app
+        .session
+        .borrow()
+        .versions()
+        .last()
+        .map_or(1, |v| v.number + 1);
+    name_prompt(
+        app,
+        "Save Version",
+        "Keep the project as it is now as a version named:",
+        &format!("Version {next}"),
+        "Save Version",
+        |name| faderframe_session::Action::SaveVersion { name },
+    );
+}
+
+/// How long ago `t` was, in words.
+fn ago(t: Option<std::time::SystemTime>) -> String {
+    let Some(secs) = t.and_then(|t| t.elapsed().ok()).map(|d| d.as_secs()) else {
+        return String::new();
+    };
+    match secs {
+        0..60 => "just now".into(),
+        60..3_600 => format!("{} min ago", secs / 60),
+        3_600..86_400 => format!("{} h ago", secs / 3_600),
+        86_400..172_800 => "yesterday".into(),
+        _ => format!("{} days ago", secs / 86_400),
+    }
+}
+
+/// The project's versions: save another, compare one with the project as
+/// it is now, go back to one (the present is kept as a version first).
+pub fn versions(app: &Rc<AppState>) {
+    let Some(main) = app.window.borrow().clone() else {
+        return;
+    };
+    let win = gtk::Window::builder()
+        .title("Versions")
+        .application(&app.app)
+        .transient_for(&main)
+        .default_width(620)
+        .default_height(520)
+        .build();
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    body.set_margin_top(14);
+    body.set_margin_bottom(14);
+    body.set_margin_start(14);
+    body.set_margin_end(14);
+    let top = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let intro = gtk::Label::new(Some(
+        "Snapshots of this project, kept in its Versions folder. Restoring one keeps the project as it is as a version first.",
+    ));
+    intro.set_wrap(true);
+    intro.set_xalign(0.0);
+    intro.set_hexpand(true);
+    intro.add_css_class("dim-label");
+    let save = gtk::Button::with_label("Save Version…");
+    save.add_css_class("suggested-action");
+    save.set_valign(gtk::Align::Center);
+    top.append(&intro);
+    top.append(&save);
+    body.append(&top);
+    let list = gtk::ListBox::new();
+    list.set_selection_mode(gtk::SelectionMode::None);
+    list.add_css_class("boxed-list");
+    let scroll = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&list)
+        .build();
+    body.append(&scroll);
+    let details = gtk::TextView::builder()
+        .editable(false)
+        .cursor_visible(false)
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .left_margin(8)
+        .top_margin(6)
+        .build();
+    details
+        .buffer()
+        .set_text("Compare a version to see what the project has changed since.");
+    let details_scroll = gtk::ScrolledWindow::builder()
+        .min_content_height(150)
+        .child(&details)
+        .build();
+    body.append(&details_scroll);
+    win.set_child(Some(&body));
+
+    // The rows, rebuilt when the versions change.
+    let shown = Rc::new(std::cell::Cell::new(usize::MAX));
+    let fill: Rc<dyn Fn()> = {
+        let (weak, list, details, shown) = (
+            Rc::downgrade(app),
+            list.clone(),
+            details.clone(),
+            Rc::clone(&shown),
+        );
+        Rc::new(move || {
+            let Some(app) = weak.upgrade() else { return };
+            let versions = app.session.borrow().versions();
+            shown.set(versions.len());
+            while let Some(row) = list.first_child() {
+                list.remove(&row);
+            }
+            if versions.is_empty() {
+                let none = gtk::Label::new(Some(
+                    "No versions yet: Save Version keeps the project as it is now.",
+                ));
+                none.set_margin_top(18);
+                none.set_margin_bottom(18);
+                none.add_css_class("dim-label");
+                list.append(&none);
+            }
+            for v in versions.into_iter().rev() {
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+                row.set_margin_top(6);
+                row.set_margin_bottom(6);
+                row.set_margin_start(10);
+                row.set_margin_end(10);
+                let number = gtk::Label::new(Some(&v.number.to_string()));
+                number.add_css_class("dim-label");
+                number.set_width_chars(3);
+                let name = gtk::Label::new(Some(&v.name));
+                name.set_xalign(0.0);
+                name.set_hexpand(true);
+                name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                name.add_css_class("heading");
+                let when = gtk::Label::new(Some(&ago(v.saved)));
+                when.add_css_class("dim-label");
+                let compare = gtk::Button::with_label("Compare");
+                let restore = gtk::Button::with_label("Restore");
+                for w in [
+                    &number.clone().upcast::<gtk::Widget>(),
+                    &name.upcast(),
+                    &when.upcast(),
+                    &compare.clone().upcast(),
+                    &restore.clone().upcast(),
+                ] {
+                    row.append(w);
+                }
+                let (weak, details, path) = (Rc::downgrade(&app), details.clone(), v.path.clone());
+                let (num, vname) = (v.number, v.name.clone());
+                compare.connect_clicked(move |_| {
+                    let Some(app) = weak.upgrade() else { return };
+                    let text = match app.session.borrow_mut().compare_version(&path) {
+                        Ok(lines) if lines.is_empty() => {
+                            format!("The project is as it was in version {num} ‘{vname}’.")
+                        }
+                        Ok(lines) => {
+                            format!("Since version {num} ‘{vname}’:\n\n• {}", lines.join("\n• "))
+                        }
+                        Err(e) => format!("Cannot read version {num}: {e}"),
+                    };
+                    details.buffer().set_text(&text);
+                });
+                let (weak, path) = (Rc::downgrade(&app), v.path.clone());
+                restore.connect_clicked(move |_| {
+                    if let Some(app) = weak.upgrade() {
+                        app.dispatch(faderframe_session::Action::RestoreVersion(path.clone()));
+                    }
+                });
+                list.append(&row);
+            }
+        })
+    };
+    fill();
+    let weak = Rc::downgrade(app);
+    save.connect_clicked(move |_| {
+        if let Some(app) = weak.upgrade() {
+            app.dispatch(faderframe_session::Action::PromptSaveVersion);
+        }
+    });
+    // New versions (saved here or anywhere) show up.
+    let weak = Rc::downgrade(app);
+    let w = win.downgrade();
+    glib::timeout_add_local(std::time::Duration::from_millis(700), move || {
+        let (Some(app), Some(_)) = (weak.upgrade(), w.upgrade()) else {
+            return glib::ControlFlow::Break;
+        };
+        let n = app.session.borrow().versions().len();
+        if n != shown.get() {
+            fill();
+        }
+        glib::ControlFlow::Continue
+    });
+    win.present();
+}
+
 /// A small modal window asking for a name.
 fn name_prompt(
     app: &Rc<AppState>,

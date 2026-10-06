@@ -2011,8 +2011,9 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
    effects*, *Piano roll* and `session::capture`).
 3. **Organisation**: ~~folder tracks~~ (done: `TrackKind::Folder`,
    `Track::folder`, `Project::folder_order`, `session::folders`), ~~clip
-   aliases~~ (done: `Project::clip_links`, `session::aliases`), project versions
-   (snapshots to compare and restore), a command palette with a shortcut
+   aliases~~ (done: `Project::clip_links`, `session::aliases`), ~~project
+   versions (snapshots to compare and restore)~~ (done: `session::versions`,
+   `faderframe_project::compare`), a command palette with a shortcut
    editor, an undo history view.
 4. **Modulation**: modulators (LFO, envelope follower, steps, random,
    macros) on any parameter, FX containers with parallel chains, CLAP's
