@@ -67,6 +67,21 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.7.0" date="2026-10-06">
+      <description>
+        <p>Composition tools, project organisation and modulation.</p>
+        <ul>
+          <li>A key and a chord track that the piano roll and MIDI effects follow; arpeggiator, chord, scale and note echo before the instrument; MIDI Tools that transform and generate notes.</li>
+          <li>MIDI tracks with mixer strips that play instrument tracks, and Capture MIDI to turn what was played live into clips afterwards.</li>
+          <li>Folder tracks, clip aliases, project versions to compare and restore, a command palette with a shortcut editor and an undo history panel.</li>
+          <li>Modulators on any parameter: LFOs, envelope followers, step sequences, random, macros and per-note sources, with CLAP's non-destructive and polyphonic modulation.</li>
+          <li>Containers with parallel chains of devices, mixed and latency-aligned.</li>
+          <li>Samplers keep a sample's length when they change its pitch, take start and end points, and are made from audio selections.</li>
+          <li>A vinyl premaster for the album, with sides, checks and a cutting sheet.</li>
+          <li>A demo session that shows the new features.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.6.0" date="2026-10-05">
       <description>
         <p>Circuit-modelled microphone preamps in dedicated mixer input sections.</p>
