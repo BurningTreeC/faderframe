@@ -23,7 +23,8 @@ use faderframe_ui_canvas::{
 
 const TOOLBAR_H: f32 = 34.0;
 const RULER_H: f32 = 20.0;
-const KEYS_W: f32 = 52.0;
+/// Black keys' share of the keyboard's width (as in the piano roll).
+const BLACK_KEY_W: f32 = 0.62;
 /// The highest and lowest notes shown (C7, C1).
 const TOP: i32 = 96;
 const BOTTOM: i32 = 24;
@@ -150,12 +151,13 @@ fn is_black(n: i32) -> bool {
 
 impl PitchView {
     pub fn new(theme: Theme) -> Self {
+        let row_h = theme.piano.row_height.clamp(MIN_ROW, MAX_ROW);
         Self {
             theme,
             px_per_sec: 120.0,
             scroll_x: 0.0,
-            row_h: 14.0,
-            scroll_y: (TOP - 72) as f32 * 14.0,
+            row_h,
+            scroll_y: (TOP - 72) as f32 * row_h,
             selected: Vec::new(),
             seen: None,
             drag: None,
@@ -166,11 +168,17 @@ impl PitchView {
         }
     }
 
-    fn grid(size: Size) -> Rect {
+    /// The keyboard's width (the piano roll's).
+    fn keys_w(&self) -> f32 {
+        self.theme.piano.keyboard_width
+    }
+
+    fn grid(&self, size: Size) -> Rect {
+        let k = self.keys_w();
         Rect::new(
-            KEYS_W,
+            k,
             TOOLBAR_H + RULER_H,
-            (size.w - KEYS_W).max(0.0),
+            (size.w - k).max(0.0),
             (size.h - TOOLBAR_H - RULER_H).max(0.0),
         )
     }
@@ -197,7 +205,7 @@ impl PitchView {
     }
 
     fn clamp(&mut self, size: Size, model: &Session) {
-        let g = Self::grid(size);
+        let g = self.grid(size);
         self.scroll_y = self.scroll_y.clamp(0.0, (self.content_h() - g.h).max(0.0));
         let w = shown(model).map_or(0.0, |s| s.seconds() as f32 * self.px_per_sec);
         self.scroll_x = self.scroll_x.clamp(0.0, (w - g.w * 0.5).max(0.0));
@@ -205,7 +213,7 @@ impl PitchView {
 
     /// Fit a newly shown clip: its length across, its notes in the middle.
     fn fit(&mut self, size: Size, s: &Shown<'_>) {
-        let g = Self::grid(size);
+        let g = self.grid(size);
         if g.w > 10.0 {
             self.px_per_sec = ((g.w - 24.0) / s.seconds().max(0.1) as f32).clamp(10.0, 2_000.0);
         }
@@ -229,7 +237,7 @@ impl PitchView {
 
     /// The note under `pos`.
     pub fn note_at(&self, pos: Point, size: Size, model: &Session) -> Option<usize> {
-        let g = Self::grid(size);
+        let g = self.grid(size);
         if !g.contains(pos) {
             return None;
         }
@@ -454,6 +462,31 @@ impl PitchView {
         p.fill(g, pr.background);
         let first = self.note_at_y(g.bottom(), g).floor() as i32;
         let last = self.note_at_y(g.y, g).ceil() as i32;
+        // The key's scale along the clip (as the piano roll shows it).
+        let spans: Vec<(f32, f32, faderframe_project::harmony::Key)> = match s {
+            Some(s) => {
+                let proj = model.project();
+                let tl = &proj.timeline;
+                let x_at = |t: faderframe_timeline::MusicalTime| {
+                    self.x_of((tl.to_samples(t, s.rate) - s.start) as f64 / s.rate, g)
+                };
+                proj.keys
+                    .iter()
+                    .enumerate()
+                    .map(|(i, k)| {
+                        let x0 = x_at(k.at).max(g.x);
+                        let x1 = proj
+                            .keys
+                            .get(i + 1)
+                            .map_or(g.right(), |n| x_at(n.at))
+                            .min(g.right());
+                        (x0, x1, k.key)
+                    })
+                    .filter(|(x0, x1, _)| x1 > x0)
+                    .collect()
+            }
+            None => Vec::new(),
+        };
         for n in first.max(BOTTOM)..=last.min(TOP) {
             let y = self.y_of(n as f32, g) - self.row_h / 2.0;
             let row = Rect::new(g.x, y, g.w, self.row_h);
@@ -465,6 +498,14 @@ impl PitchView {
                     pr.white_row
                 },
             );
+            for (x0, x1, key) in &spans {
+                let part = Rect::new(*x0, y, x1 - x0, self.row_h);
+                if !key.contains(n) {
+                    p.fill(part, pr.off_scale);
+                } else if n.rem_euclid(12) == i32::from(key.root % 12) {
+                    p.fill(part, pr.root_row);
+                }
+            }
             if n.rem_euclid(12) == 0 {
                 p.hline(g.x, g.right(), y + self.row_h - 0.5, pr.octave_line);
             }
@@ -614,35 +655,90 @@ impl PitchView {
         p.pop_clip();
     }
 
-    fn paint_keys(&self, p: &mut dyn Painter, g: Rect) {
+    /// The keyboard, drawn as the piano roll's: white keys reaching
+    /// halfway under the black ones beside them, the keys of the hovered
+    /// and selected notes lit.
+    fn paint_keys(&self, p: &mut dyn Painter, g: Rect, s: Option<&Shown<'_>>) {
         let th = &self.theme;
         let pr = &th.piano;
-        let keys = Rect::new(0.0, g.y, KEYS_W, g.h);
-        p.fill(keys, pr.key_white);
-        p.push_clip(keys);
-        let first = self.note_at_y(g.bottom(), g).floor() as i32;
-        let last = self.note_at_y(g.y, g).ceil() as i32;
-        for n in first.max(BOTTOM)..=last.min(TOP) {
-            let y = self.y_of(n as f32, g) - self.row_h / 2.0;
+        let rect = Rect::new(0.0, g.y, self.keys_w(), g.h);
+        p.fill(rect, pr.key_white_shade);
+        p.push_clip(rect);
+        let notes = s
+            .and_then(Shown::edit)
+            .map(|e| e.notes.as_slice())
+            .unwrap_or(&[]);
+        let heard = |i: usize| notes.get(i).map(|n| n.heard().round() as i32);
+        let hover = self.hover.and_then(heard);
+        let lit: Vec<i32> = self.selected.iter().filter_map(|i| heard(*i)).collect();
+        let half = self.row_h / 2.0;
+        let black_w = rect.w * BLACK_KEY_W;
+        let first = (self.note_at_y(g.bottom(), g).floor() as i32).max(BOTTOM);
+        let last = (self.note_at_y(g.y, g).ceil() as i32).min(TOP);
+        let top_of = |n: i32| self.y_of(n as f32, g) - half;
+        // White keys first: each reaches halfway under the black keys next
+        // to it, where the two white keys meet, as on a real keyboard.
+        for n in (first - 1).max(BOTTOM)..=(last + 1).min(TOP) {
             if is_black(n) {
-                p.fill(Rect::new(0.0, y, KEYS_W * 0.62, self.row_h), pr.key_black);
-            } else {
-                p.hline(0.0, KEYS_W, y + self.row_h - 0.5, pr.key_white_shade);
+                continue;
             }
-            if n.rem_euclid(12) == 0 && self.row_h >= 8.0 {
+            let y = top_of(n);
+            let up = n < TOP && is_black(n + 1);
+            let down = n > BOTTOM && is_black(n - 1);
+            let top_y = if up { y - half } else { y };
+            let bottom_y = y + self.row_h + if down { half } else { 0.0 };
+            let shape = Rect::new(rect.x, top_y, rect.w, bottom_y - top_y);
+            let c = if lit.contains(&n) {
+                th.ui.accent.lighten(0.3)
+            } else if hover == Some(n) {
+                th.ui.selection.lighten(0.5)
+            } else {
+                pr.key_white
+            };
+            p.fill_rect(shape, &Paint::horizontal(shape, c.darken(0.06), c));
+            p.hline(
+                rect.x,
+                rect.right(),
+                bottom_y - 0.5,
+                pr.key_white_shade.darken(0.2),
+            );
+        }
+        for n in first..=last {
+            let y = top_of(n);
+            if is_black(n) {
+                let black = Rect::new(rect.x, y + 1.0, black_w, self.row_h - 2.0);
+                let c = if lit.contains(&n) {
+                    th.ui.accent
+                } else if hover == Some(n) {
+                    th.ui.selection.darken(0.3)
+                } else {
+                    pr.key_black
+                };
+                p.fill_rounded(black, 1.5, &Paint::horizontal(black, c.lighten(0.15), c));
+            }
+            if n.rem_euclid(12) == 0 || self.row_h >= 15.0 {
+                // A black key's name on the key itself.
+                let (area, color) = if is_black(n) {
+                    (
+                        Rect::new(rect.x, y, black_w - 3.0, self.row_h),
+                        pr.key_white.with_alpha(0.75),
+                    )
+                } else {
+                    (Rect::new(rect.x, y, rect.w - 8.0, self.row_h), pr.key_text)
+                };
                 p.text(
                     &note_name(n),
-                    Rect::new(4.0, y, KEYS_W - 8.0, self.row_h),
-                    &TextStyle::new(th.fonts.small, pr.key_text).right(),
+                    area,
+                    &TextStyle::new(th.fonts.tiny, color).right(),
                 );
             }
         }
         p.pop_clip();
-        p.line(
-            Point::new(KEYS_W - 0.5, g.y),
-            Point::new(KEYS_W - 0.5, g.bottom()),
-            1.0,
-            th.ui.border,
+        p.vline(
+            rect.right() - 1.0,
+            rect.y,
+            rect.bottom(),
+            Color::rgba(0.0, 0.0, 0.0, 0.6),
         );
     }
 
@@ -654,7 +750,7 @@ impl PitchView {
         let Some(s) = s else {
             return;
         };
-        let g = Self::grid(size);
+        let g = self.grid(size);
         let tl = &model.project().timeline;
         let first = tl.meter.bar_at(s.clip.start);
         p.push_clip(Rect::new(g.x, r.y, g.w, r.h));
@@ -730,7 +826,7 @@ impl PitchView {
     }
 
     fn select_band(&mut self, from: Point, to: Point, add: bool, size: Size, model: &Session) {
-        let g = Self::grid(size);
+        let g = self.grid(size);
         let band = Rect::from_points(from, to);
         if !add {
             self.selected.clear();
@@ -780,7 +876,7 @@ impl PitchView {
             cx.redraw();
             return true;
         }
-        let g = Self::grid(size);
+        let g = self.grid(size);
         if !g.contains(pos) {
             return false;
         }
@@ -993,12 +1089,12 @@ impl CanvasView<Session, Action> for PitchView {
         self.clamp(size, model);
         let th = self.theme.clone();
         p.fill(Rect::from_size(size), th.ui.background);
-        let g = Self::grid(size);
+        let g = self.grid(size);
         self.paint_grid(p, g, model, s.as_ref());
         if let Some(s) = &s {
             self.paint_notes(p, g, model, s);
         }
-        self.paint_keys(p, g);
+        self.paint_keys(p, g, s.as_ref());
         self.paint_ruler(p, size, model, s.as_ref());
         self.paint_toolbar(p, size, model);
         let hint = match &s {
@@ -1074,7 +1170,7 @@ impl CanvasView<Session, Action> for PitchView {
                 modifiers,
                 precise,
             } => {
-                let g = Self::grid(size);
+                let g = self.grid(size);
                 let step = if precise { 1.0 } else { 40.0 };
                 if modifiers.toggle() {
                     // Zoom in time around the pointer.
@@ -1139,7 +1235,7 @@ impl CanvasView<Session, Action> for PitchView {
     }
 
     fn scroll_info(&self, axis: ScrollAxis, size: Size, model: &Session) -> Option<ScrollInfo> {
-        let g = Self::grid(size);
+        let g = self.grid(size);
         match axis {
             ScrollAxis::Vertical => Some(ScrollInfo {
                 content: self.content_h(),
@@ -1269,7 +1365,7 @@ mod tests {
         }
         // Drag the C4 up two rows: one gesture, two semitones.
         let shown = shown(&s).unwrap();
-        let g = PitchView::grid(size);
+        let g = view.grid(size);
         let e = shown.edit().unwrap().clone();
         let r = view.note_rect(&shown, &e.notes[1], g);
         let steps = s.history_steps().0.len();
@@ -1337,7 +1433,7 @@ mod tests {
         let size = Size::new(1000.0, 600.0);
         let mut view = PitchView::new(Theme::default());
         view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
-        let g = PitchView::grid(size);
+        let g = view.grid(size);
         let r = {
             let sh = shown(&s).unwrap();
             let e = sh.edit().unwrap().clone();
