@@ -1751,6 +1751,29 @@ the key (at the start when the project has none, else from the clip's
 start); MIDI clips give their key from their notes at once. Tempos under
 confidence 0.1 are refused with a notice.
 
+### Audio to MIDI
+
+`session::to_midi` (`Action::ConvertToMidi { clip, how }`, the arranger's
+clip menu "Convert Melody/Harmony/Drums to MIDI") listens to an audio
+clip's part of its source in a thread and puts the notes on a new
+instrument track below it (the built-in synth, or the Drum Sampler for
+drums) as a MIDI clip in the same place, in one "Convert to MIDI" step.
+**Melody** uses the pitch-editing analysis (`melody::notes`, velocity
+from the level). **Harmony** runs Spotify's basic-pitch
+(`faderframe-transcribe`, Apache-2.0, `model/NOTICE`): its ONNX graph
+(CQT, harmonic stacking, six small convolutions; 36k weights) converted
+by `scripts/basic_pitch_model.py` into `model/basic-pitch.ffnn` and run
+by `graph::Graph`, an evaluator for the opset-15 operators it uses
+(tested against onnxruntime's outputs, `tests/reference.json`); 2 s
+windows of 22 050 Hz audio overlapping by 30 frames run on all cores,
+then are unwrapped and turned into notes exactly as basic-pitch's
+`inference.py` and `note_creation.py` do (onset peaks, inferred onsets,
+the energy walk, the melodia trick). The crate builds with opt-level 3
+in dev builds. **Drums** takes the onsets (strength ≥ 0.08; a hit at the
+very start added) and sorts each hit by its first 60 ms's energy under
+150 Hz (kick, C1) or over 5 kHz (closed hat, F#1), else snare (D1),
+velocity from its peak.
+
 ### Track presets
 
 `faderframe_project::preset::TrackPreset` captures a track's channel
@@ -2191,7 +2214,7 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
    — done (see *Modulators* and *Containers*).
 5. **Vocals and audio intelligence**: ~~native pitch editing~~ (done:
    TD-PSOLA rather than the Stretch engine, see *Pitch editing*),
-   audio-to-MIDI (basic-pitch, Apache-2.0), ~~tempo and key
+   ~~audio-to-MIDI (basic-pitch, Apache-2.0)~~ (done: *Audio to MIDI*), ~~tempo and key
    detection~~ (done: *Tempo and key from clips*), per-clip effects rendered offline, ARA 2 hosting, a speech
    and lyrics transcription track (Whisper, MIT). Stem separation waits
    for permissively licensed model weights.

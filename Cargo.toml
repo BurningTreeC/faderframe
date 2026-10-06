@@ -50,6 +50,7 @@ faderframe-view-performance = { path = "crates/faderframe-view-performance" }
 faderframe-view-history = { path = "crates/faderframe-view-history" }
 faderframe-view-modulators = { path = "crates/faderframe-view-modulators" }
 faderframe-view-pitch = { path = "crates/faderframe-view-pitch" }
+faderframe-transcribe = { path = "crates/faderframe-transcribe" }
 faderframe-view-pianoroll = { path = "crates/faderframe-view-pianoroll" }
 faderframe-ui = { path = "crates/faderframe-ui" }
 
@@ -111,6 +112,10 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# The transcription model's convolutions are too slow unoptimised.
+[profile.dev.package.faderframe-transcribe]
+opt-level = 3
 
 [profile.release]
 debug = "line-tables-only"

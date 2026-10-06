@@ -766,6 +766,7 @@ dependencies = [
  "faderframe-project",
  "faderframe-realtime",
  "faderframe-timeline",
+ "faderframe-transcribe",
  "faderframe-transport",
  "faderframe-workspace",
  "midly",
@@ -790,6 +791,15 @@ dependencies = [
  "faderframe-core",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "faderframe-transcribe"
+version = "0.7.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

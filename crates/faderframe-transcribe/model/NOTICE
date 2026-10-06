@@ -1,0 +1,12 @@
+basic-pitch.ffnn is the model of Spotify's basic-pitch
+(https://github.com/spotify/basic-pitch, basic_pitch/saved_models/
+icassp_2022/nmp.onnx), converted by scripts/basic_pitch_model.py.
+
+Copyright 2022 Spotify AB. Licensed under the Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0). The note creation in
+src/lib.rs follows basic_pitch/note_creation.py and inference.py of the
+same project and licence.
+
+Bittner, Bosch, Rubinstein, Meseguer-Brocal, Ewert: "A Lightweight
+Instrument-Agnostic Model for Polyphonic Note Transcription and Multipitch
+Estimation", ICASSP 2022.

@@ -65,6 +65,13 @@ VENDORED = [
         "https://github.com/Signalsmith-Audio/linear",
         "crates/faderframe-stretch/vendor/signalsmith-linear/LICENSE.txt",
     ),
+    (
+        "basic-pitch model and note creation (Spotify)",
+        "icassp_2022 (fa5997a)",
+        "Apache-2.0",
+        "https://github.com/spotify/basic-pitch",
+        "crates/faderframe-transcribe/model/LICENSE",
+    ),
 ]
 
 
@@ -166,7 +173,7 @@ def render(meta: dict) -> str:
         lines.append(f"| {p['name']} | {p['version']} | {lic} | {repo} |")
     lines += [
         "",
-        f"## Vendored C/C++ libraries ({len(VENDORED)}, compiled in)",
+        f"## Vendored libraries and models ({len(VENDORED)}, compiled in)",
         "",
         "| Library | Version | License | Source |",
         "|---|---|---|---|",

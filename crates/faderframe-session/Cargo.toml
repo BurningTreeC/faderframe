@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 faderframe-analysis.workspace = true
+faderframe-transcribe.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 midly.workspace = true

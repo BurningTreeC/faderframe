@@ -42,6 +42,7 @@ mod redraw;
 pub mod samples;
 pub mod sampling;
 mod sandbox;
+pub mod to_midi;
 pub mod vinyl;
 pub use groups::GroupMenuEntry;
 mod midifile;
@@ -316,6 +317,12 @@ pub enum Action {
     /// Show an audio clip in the pitch editor (finding its notes first if
     /// it has none).
     OpenPitchEditor(ClipId),
+    /// An audio clip's notes on a new instrument track (melody, harmony
+    /// or drums; after listening to it).
+    ConvertToMidi {
+        clip: ClipId,
+        how: to_midi::ToMidi,
+    },
     /// Set the project's tempo or key from a clip, or warp it to the
     /// tempo (after analysing it).
     FromClip {
@@ -1034,6 +1041,7 @@ pub struct Session {
     transients: transients::TransientCache,
     pitch: pitch::PitchCache,
     clip_analyses: detect::ClipAnalyses,
+    conversions: to_midi::Conversions,
     /// The audio clip the pitch editor shows.
     pitch_clip: Option<ClipId>,
     /// Track renders for freezing and bouncing.
@@ -1249,6 +1257,7 @@ impl Session {
             transients: transients::TransientCache::default(),
             pitch: pitch::PitchCache::default(),
             clip_analyses: detect::ClipAnalyses::default(),
+            conversions: to_midi::Conversions::default(),
             pitch_clip: None,
             gesture_base: HashMap::new(),
             bounces: Vec::new(),
@@ -2019,6 +2028,7 @@ impl Session {
         self.poll_transients();
         self.poll_pitch();
         self.poll_clip_analyses();
+        self.poll_conversions();
         let mut i = 0;
         while i < self.peak_jobs.len() {
             if self.peak_jobs[i].is_finished() {
@@ -2894,6 +2904,7 @@ impl Session {
             Action::CaptureMidi => self.capture_midi()?,
             Action::DetectPitch { clips } => self.detect_pitch(&clips)?,
             Action::FromClip { clip, what } => self.from_clip(clip, what)?,
+            Action::ConvertToMidi { clip, how } => self.convert_to_midi(clip, how)?,
             Action::OpenPitchEditor(clip) => {
                 let Some(a) = self.project.clip(clip).and_then(|c| c.as_audio()) else {
                     return Ok(());

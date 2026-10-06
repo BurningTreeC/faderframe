@@ -2362,6 +2362,17 @@ impl ArrangerView {
                 what,
             };
             if clip.as_audio().is_some() {
+                use faderframe_session::to_midi::ToMidi;
+                for (i, how) in [ToMidi::Melody, ToMidi::Harmony, ToMidi::Drums]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let item = MenuItem::new(
+                        format!("Convert {} to MIDI", how.label()),
+                        Action::ConvertToMidi { clip: clip.id, how },
+                    );
+                    items.push(if i == 0 { item.separated() } else { item });
+                }
                 items.push(
                     MenuItem::new("Set Project Tempo from Clip", from(FromClip::SetTempo))
                         .separated(),

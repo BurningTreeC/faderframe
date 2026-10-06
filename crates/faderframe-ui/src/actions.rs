@@ -1166,6 +1166,31 @@ pub fn install(app: &Rc<AppState>) {
                 None => tracing::warn!("edit-pitch: no audio clip on {arg}"),
             }
         }),
+        // Development aid: `to-midi:<melody|harmony|drums>=<track>` (its
+        // first clip).
+        named("to-midi", |a, arg| {
+            use faderframe_session::to_midi::ToMidi;
+            let Some((how, name)) = arg.split_once('=') else {
+                return;
+            };
+            let how = match how {
+                "melody" => ToMidi::Melody,
+                "harmony" => ToMidi::Harmony,
+                "drums" => ToMidi::Drums,
+                _ => return,
+            };
+            let clip = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == name)
+                .and_then(|t| t.clips.first().copied());
+            if let Some(clip) = clip {
+                a.dispatch(Action::ConvertToMidi { clip, how });
+            }
+        }),
         // Development aid: `from-clip:<tempo|warp|key>=<track>` (its first
         // clip).
         named("from-clip", |a, arg| {

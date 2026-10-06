@@ -1,0 +1,20 @@
+[package]
+name = "faderframe-transcribe"
+description = "Audio to MIDI: basic-pitch's polyphonic note transcription (Spotify, Apache-2.0) in plain Rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
