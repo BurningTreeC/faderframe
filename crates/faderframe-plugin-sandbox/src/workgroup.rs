@@ -40,7 +40,9 @@ pub(crate) fn note_joined(generation: u32) {
 }
 
 /// FaderFrame's side: the service helpers ask, started on first use
-/// (`None`: no workgroups here, or the service could not be made).
+/// (`None`: no workgroups here, or the service could not be made). Unix
+/// helpers are told it; Windows has no workgroups.
+#[cfg(unix)]
 pub(crate) fn service_name() -> Option<&'static str> {
     #[cfg(target_os = "macos")]
     {
