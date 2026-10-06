@@ -54,7 +54,7 @@ pub use editing::{
     ClipEdge, CounterUnit, EditFlag, EditMode, EditRange, EditTool, GridMode, NudgeTarget,
     NudgeValue, ZoomRequest, parse_position,
 };
-pub use faderframe_workspace::{DEFAULT_INSERT_SLOTS, INSERT_SLOTS_RANGE};
+pub use faderframe_workspace::{DEFAULT_INSERT_SLOTS, INSERT_SLOTS_RANGE, STRIP_WIDTH_RANGE};
 pub use sync::{MtcRate, SyncSettings, SyncSource, SyncStatus, Timecode};
 
 pub use meters::{METER_FLOOR_DB, MeterChannel, MeterDisplay};
@@ -568,6 +568,12 @@ pub enum Action {
     },
     /// Width of the arranger's track header column (saved with the layout).
     SetHeaderWidth(f32),
+    /// Mixer strip width of one track, or of all (`None`); `width: None`
+    /// goes back to the default. Not undoable, saved with the layout.
+    SetStripWidth {
+        track: Option<TrackId>,
+        width: Option<f32>,
+    },
     /// Insert slots per mixer strip (saved with the layout).
     SetMixerInsertSlots(u16),
     /// Remember where a plugin editor window is (saved with the layout).
@@ -1336,6 +1342,11 @@ impl Session {
     /// Arranger height of a track (`None`: the theme default).
     pub fn track_height(&self, track: TrackId) -> Option<f32> {
         self.workspace.track_height(track)
+    }
+
+    /// A mixer strip's width, if not the theme's.
+    pub fn strip_width(&self, track: TrackId) -> Option<f32> {
+        self.workspace.strip_width(track)
     }
 
     /// Are the take lanes of this take folder shown?
@@ -2874,6 +2885,10 @@ impl Session {
             }
             Action::SetTrackHeight { track, height } => {
                 self.workspace.set_track_height(track, height);
+                self.revision += 1;
+            }
+            Action::SetStripWidth { track, width } => {
+                self.workspace.set_strip_width(track, width);
                 self.revision += 1;
             }
             Action::SetPluginWindowPosition { plugin, x, y } => {

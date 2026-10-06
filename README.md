@@ -97,6 +97,9 @@ Contrast:
   scribble strips, pinned master section; click a pan or level readout to
   type a value. The inserts section shows five slots by default; drag the
   grip on the rule below it for more or fewer (saved with the layout).
+  Drag a strip's right edge to make it wider or narrower (Shift: every
+  strip; double-click: back to normal), or pick Narrow / Normal / Wide /
+  Extra Wide in its menu (saved with the layout).
   Drag inserts to reorder them or onto another track to copy them with
   their settings (Ctrl copies within a track, Shift moves to another
   track); Alt-click removes one.

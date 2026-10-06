@@ -995,6 +995,32 @@ pub fn install(app: &Rc<AppState>) {
                 chords,
             }));
         }),
+        // Development aid: `strip-width:<track name|all>=<px|default>`.
+        named("strip-width", |a, arg| {
+            let Some((name, width)) = arg.split_once('=') else {
+                tracing::warn!("strip-width: '{arg}' is not <track>=<px>");
+                return;
+            };
+            let width = width.trim().parse::<f32>().ok();
+            let track = if name == "all" {
+                None
+            } else {
+                let id = a
+                    .session
+                    .borrow()
+                    .project()
+                    .tracks
+                    .iter()
+                    .find(|t| t.name == name)
+                    .map(|t| t.id);
+                let Some(id) = id else {
+                    tracing::warn!("strip-width: no track '{name}'");
+                    return;
+                };
+                Some(id)
+            };
+            a.dispatch(Action::SetStripWidth { track, width });
+        }),
         named("set-key", |a, arg| {
             let Some(key) = faderframe_project::harmony::Key::parse(arg) else {
                 tracing::warn!("set-key: '{arg}' is not a key");

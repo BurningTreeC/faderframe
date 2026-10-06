@@ -31,6 +31,14 @@ use faderframe_ui_canvas::{
     PointerButton, Rect, ScrollAxis, ScrollInfo, Size, Theme, ViewEvent,
 };
 
+/// The widths a strip's menu offers (`None`: the theme's).
+const STRIP_WIDTHS: [(&str, Option<f32>); 4] = [
+    ("Narrow", Some(64.0)),
+    ("Normal", None),
+    ("Wide", Some(130.0)),
+    ("Extra Wide", Some(190.0)),
+];
+
 /// The column right of the last strip with the "+".
 const ADD_W: f32 = 44.0;
 const MASTER_GAP: f32 = 8.0;
@@ -71,6 +79,8 @@ pub enum Hit {
     Color(TrackId),
     /// The "+" right of the last channel strip.
     AddTrack,
+    /// A strip's right edge: drag to make it wider or narrower.
+    Width(TrackId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -108,6 +118,13 @@ enum Drag {
         start_y: f32,
         start: usize,
     },
+    /// Resizing a strip (`all`: every strip).
+    Width {
+        track: TrackId,
+        start_x: f32,
+        start: f32,
+        all: bool,
+    },
     /// An insert pressed: a click on release, or dragged to another slot
     /// (reorder; another track: copy, Shift: move; Ctrl: duplicate).
     Insert {
@@ -138,6 +155,10 @@ pub struct MixerView {
     expanded_preamps: bool,
     /// Only the master strip, filling the view (the side panel).
     master_only: bool,
+    /// Where each channel strip starts (content x) and, last, where they
+    /// end; and each one's width.
+    offsets: Vec<f32>,
+    widths: Vec<f32>,
     /// The side panel shows the master: this mixer leaves it out.
     hide_master: bool,
 }
@@ -207,6 +228,8 @@ impl MixerView {
             expanded_preamps: false,
             master_only: false,
             hide_master: false,
+            offsets: vec![0.0],
+            widths: Vec::new(),
         }
     }
 
@@ -265,8 +288,43 @@ impl MixerView {
         }
     }
 
+    /// Lay the strips out at their widths (before painting and events).
+    fn update_strips(&mut self, model: &Session) {
+        let gap = self.theme.console.strip_gap;
+        let default = self.theme.console.strip_width;
+        self.widths = Self::channel_tracks(model)
+            .iter()
+            .map(|t| model.strip_width(t.id).unwrap_or(default))
+            .collect();
+        self.offsets.clear();
+        let mut x = 0.0;
+        self.offsets.push(x);
+        for w in &self.widths {
+            x += w + gap;
+            self.offsets.push(x);
+        }
+    }
+
+    /// Content x where strip `i` starts (past the end: after the last).
+    fn offset(&self, i: usize) -> f32 {
+        match self.offsets.get(i) {
+            Some(x) => *x,
+            None => {
+                let last = self.offsets.len().saturating_sub(1);
+                self.offsets.last().copied().unwrap_or(0.0) + (i - last) as f32 * self.pitch()
+            }
+        }
+    }
+
+    fn width(&self, i: usize) -> f32 {
+        self.widths
+            .get(i)
+            .copied()
+            .unwrap_or(self.theme.console.strip_width)
+    }
+
     fn content_w(&self, count: usize) -> f32 {
-        count as f32 * self.pitch()
+        self.offset(count)
     }
 
     /// The "+" (add a track) right of the last of `count` strips.
@@ -282,17 +340,21 @@ impl MixerView {
 
     /// Index range of strips intersecting the viewport.
     pub fn visible_range(&self, count: usize, size: Size) -> std::ops::Range<usize> {
-        let pitch = self.pitch();
-        let first = (self.scroll_x / pitch).floor().max(0.0) as usize;
-        let last = ((self.scroll_x + self.viewport_w(size)) / pitch).ceil() as usize;
-        first.min(count)..last.min(count)
+        let (a, b) = (self.scroll_x, self.scroll_x + self.viewport_w(size));
+        let first = (0..count)
+            .find(|&i| self.offset(i + 1) > a)
+            .unwrap_or(count);
+        let last = (first..count)
+            .find(|&i| self.offset(i) >= b)
+            .unwrap_or(count);
+        first..last
     }
 
     fn strip_rect(&self, index: usize, size: Size) -> Rect {
         Rect::new(
-            self.cheek() + index as f32 * self.pitch() - self.scroll_x,
+            self.cheek() + self.offset(index) - self.scroll_x,
             0.0,
-            self.theme.console.strip_width,
+            self.width(index),
             size.h,
         )
     }
@@ -359,9 +421,21 @@ impl MixerView {
 
     pub fn hit_test(&self, pos: Point, size: Size, model: &Session) -> Option<Hit> {
         let master = self.master_rect(size);
-        let add = self.add_track_rect(Self::channel_tracks(model).len());
-        if !self.master_only && add.contains(pos) && pos.x < self.cheek() + self.viewport_w(size) {
+        let channels = Self::channel_tracks(model);
+        let add = self.add_track_rect(channels.len());
+        let inside = pos.x >= self.cheek() && pos.x < self.cheek() + self.viewport_w(size);
+        if !self.master_only && add.contains(pos) && inside {
             return Some(Hit::AddTrack);
+        }
+        // A strip's right edge (below its colour bar).
+        if !self.master_only && inside && pos.y > 4.0 {
+            let gap = self.theme.console.strip_gap;
+            for i in self.visible_range(channels.len(), size) {
+                let edge = self.strip_rect(i, size).right();
+                if pos.x >= edge - 3.0 && pos.x <= edge + gap + 3.0 {
+                    return Some(Hit::Width(channels[i].id));
+                }
+            }
         }
         for (rect, t) in self.visible_strips(model, size) {
             if !rect.contains(pos) {
@@ -1205,6 +1279,27 @@ impl MixerView {
             .separated(),
         );
         items.extend(model.group_menu(t.id).into_iter().map(menu_item));
+        if t.kind != TrackKind::Master {
+            let now = model.strip_width(t.id);
+            for (i, (label, w)) in STRIP_WIDTHS.iter().enumerate() {
+                let item = MenuItem::new(
+                    format!("{label} Strip"),
+                    Action::SetStripWidth {
+                        track: Some(t.id),
+                        width: *w,
+                    },
+                )
+                .checked(now == *w);
+                items.push(if i == 0 { item.separated() } else { item });
+            }
+            items.push(MenuItem::new(
+                "Every Strip This Wide",
+                Action::SetStripWidth {
+                    track: None,
+                    width: now,
+                },
+            ));
+        }
         for (i, c) in TrackColor::PALETTE.iter().enumerate() {
             let mut item = MenuItem::new(
                 format!("Colour {}", i + 1),
@@ -1399,12 +1494,11 @@ impl MixerView {
             return None;
         }
         let tracks = Self::channel_tracks(model);
-        let boundary = ((pos.x - self.cheek() + self.scroll_x + self.theme.console.strip_gap / 2.0)
-            / self.pitch()
-            + 0.5)
-            .floor()
-            .max(0.0) as usize;
-        let boundary = boundary.min(tracks.len());
+        // Before the first strip whose middle is right of the pointer.
+        let x = pos.x - self.cheek() + self.scroll_x;
+        let boundary = (0..tracks.len())
+            .find(|&i| self.offset(i) + self.width(i) / 2.0 > x)
+            .unwrap_or(tracks.len());
         let project = model.project();
         let from = project.track_index(track)?;
         let before = match tracks.get(boundary) {
@@ -1412,10 +1506,7 @@ impl MixerView {
             None => project.track_index(tracks.last()?.id)? + 1,
         };
         let index = before - usize::from(from < before);
-        Some((
-            index,
-            self.cheek() + boundary as f32 * self.pitch() - self.scroll_x,
-        ))
+        Some((index, self.cheek() + self.offset(boundary) - self.scroll_x))
     }
 
     fn press(
@@ -1436,6 +1527,23 @@ impl MixerView {
         };
         let toggle = |cx: &mut EventCx<'_, Action>, cmd: Command| cx.emit(Action::Edit(cmd));
         match hit {
+            Hit::Width(id) => {
+                if clicks >= 2 {
+                    // Back to the default (Shift: every strip).
+                    cx.emit(Action::SetStripWidth {
+                        track: (!mods.shift).then_some(id),
+                        width: None,
+                    });
+                } else {
+                    let i = Self::channel_tracks(model).iter().position(|t| t.id == id);
+                    self.drag = Some(Drag::Width {
+                        track: id,
+                        start_x: pos.x,
+                        start: i.map_or(self.theme.console.strip_width, |i| self.width(i)),
+                        all: mods.shift,
+                    });
+                }
+            }
             Hit::AddTrack => {
                 let r = self.add_track_rect(Self::channel_tracks(model).len());
                 let items = model
@@ -1888,6 +1996,7 @@ impl MixerView {
             ),
             Hit::Strip(_) => return None,
             Hit::AddTrack => "Add a track".into(),
+            Hit::Width(_) => "Drag to make the strip wider or narrower (Shift: every strip) · Double-click: the default width".into(),
         })
     }
 }
@@ -1899,6 +2008,7 @@ impl CanvasView<Session, Action> for MixerView {
 
     fn paint(&mut self, p: &mut dyn Painter, size: Size, model: &Session, theme: &Theme) {
         self.update_sends(model);
+        self.update_strips(model);
         let tracks = Self::channel_tracks(model);
         if let Some(Drag::Track {
             pos, moved: true, ..
@@ -1927,6 +2037,25 @@ impl CanvasView<Session, Action> for MixerView {
             && let Some((_, x)) = self.track_drop(model, size, track, pos)
         {
             p.fill(Rect::new(x - 1.5, 0.0, 3.0, size.h), theme.ui.accent);
+        }
+        // The edge being dragged (or under the pointer).
+        let edge = match (self.drag, self.hover) {
+            (Some(Drag::Width { track, .. }), _) | (_, Some(Hit::Width(track))) => Some(track),
+            _ => None,
+        };
+        if let Some(id) = edge
+            && let Some(i) = tracks.iter().position(|t| t.id == id)
+        {
+            let r = self.strip_rect(i, size);
+            p.fill(
+                Rect::new(
+                    r.right(),
+                    0.0,
+                    self.theme.console.strip_gap.max(2.0),
+                    size.h,
+                ),
+                theme.ui.accent.with_alpha(0.8),
+            );
         }
         // The "+" after the last strip.
         if !self.master_only {
@@ -1987,6 +2116,7 @@ impl CanvasView<Session, Action> for MixerView {
         cx: &mut EventCx<'_, Action>,
     ) -> bool {
         self.update_sends(model);
+        self.update_strips(model);
         match *ev {
             ViewEvent::PointerDown {
                 pos,
@@ -2073,6 +2203,20 @@ impl CanvasView<Session, Action> for MixerView {
                         });
                         cx.redraw();
                     }
+                    Some(Drag::Width {
+                        track,
+                        start_x,
+                        start,
+                        all,
+                    }) => {
+                        let (lo, hi) = faderframe_session::STRIP_WIDTH_RANGE;
+                        let w = (start + pos.x - start_x).round().clamp(lo, hi);
+                        cx.emit(Action::SetStripWidth {
+                            track: (!all).then_some(track),
+                            width: Some(w),
+                        });
+                        cx.set_cursor(Cursor::ResizeHorizontal);
+                    }
                     Some(Drag::InsertSlots { start_y, start }) => {
                         let (lo, hi) = faderframe_session::INSERT_SLOTS_RANGE;
                         let n = (start as f32 + ((pos.y - start_y) / INSERT_SLOT_STEP).round())
@@ -2108,6 +2252,7 @@ impl CanvasView<Session, Action> for MixerView {
                             | Hit::Send(..)
                             | Hit::InsertsGrip(_),
                         ) => Cursor::ResizeVertical,
+                        Some(Hit::Width(_)) => Cursor::ResizeHorizontal,
                         Some(Hit::Strip(_)) | None => Cursor::Default,
                         Some(_) => Cursor::Pointer,
                     });
@@ -2135,7 +2280,7 @@ impl CanvasView<Session, Action> for MixerView {
                         cx.emit(Action::EndGesture);
                         cx.set_cursor(Cursor::Default);
                     }
-                    Some(Drag::InsertSlots { .. }) => {
+                    Some(Drag::InsertSlots { .. } | Drag::Width { .. }) => {
                         cx.set_cursor(Cursor::Default);
                         cx.redraw();
                     }

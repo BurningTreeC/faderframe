@@ -117,7 +117,16 @@ pub struct WorkspaceSet {
     /// Insert slots per mixer strip (`None` = [`DEFAULT_INSERT_SLOTS`]).
     #[serde(default)]
     pub mixer_insert_slots: Option<u16>,
+    /// Mixer strip width for every channel strip (`None` = theme default)
+    /// and per-track overrides.
+    #[serde(default)]
+    pub strip_width: Option<f32>,
+    #[serde(default)]
+    pub strip_widths: std::collections::BTreeMap<faderframe_core::TrackId, f32>,
 }
+
+/// Narrowest and widest mixer channel strips.
+pub const STRIP_WIDTH_RANGE: (f32, f32) = (64.0, 240.0);
 
 /// Insert slots a mixer strip shows by default, and the range the user can
 /// drag the section to.
@@ -147,6 +156,8 @@ impl Default for WorkspaceSet {
             header_width: None,
             plugin_windows: Default::default(),
             mixer_insert_slots: None,
+            strip_width: None,
+            strip_widths: Default::default(),
         }
     }
 }
@@ -170,6 +181,29 @@ impl WorkspaceSet {
             None => {
                 self.track_height = Some(h);
                 self.track_heights.clear();
+            }
+        }
+    }
+
+    /// Width of a track's mixer strip, if not the theme default.
+    pub fn strip_width(&self, track: faderframe_core::TrackId) -> Option<f32> {
+        self.strip_widths.get(&track).copied().or(self.strip_width)
+    }
+
+    /// Set one strip's width, or (with `None`) every strip's; a `None`
+    /// width goes back to the default.
+    pub fn set_strip_width(&mut self, track: Option<faderframe_core::TrackId>, width: Option<f32>) {
+        let w = width.map(|w| w.clamp(STRIP_WIDTH_RANGE.0, STRIP_WIDTH_RANGE.1));
+        match (track, w) {
+            (Some(t), Some(w)) => {
+                self.strip_widths.insert(t, w);
+            }
+            (Some(t), None) => {
+                self.strip_widths.remove(&t);
+            }
+            (None, w) => {
+                self.strip_width = w;
+                self.strip_widths.clear();
             }
         }
     }

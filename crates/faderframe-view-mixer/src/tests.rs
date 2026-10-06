@@ -818,3 +818,85 @@ fn the_plus_after_the_last_strip_offers_new_tracks() {
             .any(|r| matches!(r, faderframe_session::UiRequest::PluginBrowser { .. }))
     );
 }
+
+#[test]
+fn strips_are_made_wider_or_narrower_by_their_edge() {
+    let mut s = session();
+    let mut view = MixerView::new(Theme::default());
+    let size = Size::new(1800.0, 900.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    let normal = Theme::default().console.strip_width;
+    let first = view.strip_rect(0, size);
+    let second = view.strip_rect(1, size);
+    assert_eq!(first.w, normal);
+    let id = MixerView::channel_tracks(&s)[0].id;
+    // Drag the first strip's right edge 40 px right: it widens, the next
+    // one moves along.
+    let edge = Point::new(first.right() + 1.0, 300.0);
+    assert_eq!(view.hit_test(edge, size, &s), Some(Hit::Width(id)));
+    let (actions, _) = run(&mut view, down(edge, 1), size, &s);
+    assert!(actions.is_empty());
+    let (actions, _) = run(
+        &mut view,
+        ViewEvent::PointerMove {
+            pos: Point::new(edge.x + 40.0, 300.0),
+            modifiers: Modifiers::NONE,
+            dragging: true,
+        },
+        size,
+        &s,
+    );
+    for a in actions {
+        s.dispatch(a).unwrap();
+    }
+    assert_eq!(s.strip_width(id), Some(normal + 40.0));
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    assert_eq!(view.strip_rect(0, size).w, normal + 40.0);
+    assert_eq!(view.strip_rect(1, size).x, second.x + 40.0);
+    // Every strip at once from the menu; one back to normal.
+    let (other, menu) = {
+        let t = MixerView::channel_tracks(&s)[1];
+        (t.id, MixerView::track_menu(&s, t, Point::new(0.0, 0.0)))
+    };
+    let HostRequest::ContextMenu { items, .. } = menu else {
+        panic!("a menu")
+    };
+    let narrow = items.iter().find(|i| i.label == "Narrow Strip").unwrap();
+    s.dispatch(narrow.action.clone().unwrap()).unwrap();
+    assert_eq!(s.strip_width(other), Some(64.0));
+    s.dispatch(Action::SetStripWidth {
+        track: None,
+        width: Some(120.0),
+    })
+    .unwrap();
+    assert_eq!(s.strip_width(id), Some(120.0));
+    assert_eq!(s.strip_width(other), Some(120.0));
+    // A double-click on an edge: that strip back to the default (the
+    // others keep the width set for all).
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    let edge = Point::new(view.strip_rect(0, size).right() + 1.0, 300.0);
+    let (actions, _) = run(&mut view, down(edge, 2), size, &s);
+    for a in actions {
+        s.dispatch(a).unwrap();
+    }
+    assert_eq!(s.strip_width(id), Some(120.0), "the width set for all");
+    // Narrow strips still lay their controls out inside them.
+    s.dispatch(Action::SetStripWidth {
+        track: None,
+        width: Some(64.0),
+    })
+    .unwrap();
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    let l = view.layout_of(&s, id, size).unwrap();
+    for r in [l.mute, l.solo, l.record, l.pan_knob, l.fader, l.meter] {
+        assert!(
+            r.x >= l.strip.x && r.right() <= l.strip.right() + 0.01,
+            "{r:?} in {:?}",
+            l.strip
+        );
+    }
+}
