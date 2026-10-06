@@ -47,6 +47,7 @@ pub enum LaunchCommand {
     /// Play a slot's clip on its track.
     Launch {
         track: TrackId,
+        /// The slot's number, below 2^63 (`SlotKey::hash`).
         slot: u64,
         quantize: Quantize,
     },

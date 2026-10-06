@@ -94,6 +94,8 @@ pub struct RemovedTrack {
     pub rerouted: Vec<(TrackId, OutputRouting)>,
     /// Sends that targeted the removed track: (owner, index, send).
     pub removed_sends: Vec<(TrackId, usize, AuxSend)>,
+    /// Its launcher clips, by scene.
+    pub slots: Vec<(faderframe_core::SceneId, Clip)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1343,12 +1345,27 @@ impl Command {
                     }
                 }
                 removed_sends.reverse();
+                let keys: Vec<crate::launcher::SlotKey> = p
+                    .launcher
+                    .slots
+                    .keys()
+                    .filter(|k| k.track == track)
+                    .copied()
+                    .collect();
+                let slots = keys
+                    .into_iter()
+                    .filter_map(|k| {
+                        let id = p.launcher.slots.remove(&k)?;
+                        Some((k.scene, p.clips.remove(&id)?))
+                    })
+                    .collect();
                 RestoreTrack(Box::new(RemovedTrack {
                     track: removed,
                     index,
                     clips,
                     rerouted,
                     removed_sends,
+                    slots,
                 }))
             }
             RestoreTrack(r) => {
@@ -1358,6 +1375,7 @@ impl Command {
                     clips,
                     rerouted,
                     removed_sends,
+                    slots,
                 } = *r;
                 if p.track(track.id).is_some() {
                     return Err(EditError::Invalid(format!(
@@ -1369,6 +1387,12 @@ impl Command {
                 let i = index.min(p.tracks.len());
                 p.tracks.insert(i, track);
                 for c in clips {
+                    p.clips.insert(c.id, c);
+                }
+                for (scene, c) in slots {
+                    p.launcher
+                        .slots
+                        .insert(crate::launcher::SlotKey { track: id, scene }, c.id);
                     p.clips.insert(c.id, c);
                 }
                 for (t, out) in rerouted {

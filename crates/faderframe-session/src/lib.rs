@@ -38,6 +38,7 @@ mod freeze;
 pub mod groove;
 mod groups;
 pub mod lanes;
+pub mod launcher;
 mod programs;
 mod redraw;
 pub mod samples;
@@ -358,6 +359,8 @@ pub enum Action {
         clip: ClipId,
         op: pitch::PitchOp,
     },
+    /// Launch clips and scenes, edit the clip launcher.
+    Launcher(launcher::LauncherOp),
     /// Undo or redo until `n` steps are done (0: as opened); the history
     /// view's click.
     HistoryTo(usize),
@@ -1064,6 +1067,7 @@ pub struct Session {
     conversions: to_midi::Conversions,
     clip_fx: clip_fx::ClipFxState,
     speech: speech::SpeechState,
+    launcher: launcher::LauncherState,
     /// The audio clip the pitch editor shows.
     pitch_clip: Option<ClipId>,
     /// Track renders for freezing and bouncing.
@@ -1282,6 +1286,7 @@ impl Session {
             conversions: to_midi::Conversions::default(),
             clip_fx: clip_fx::ClipFxState::default(),
             speech: speech::SpeechState::default(),
+            launcher: launcher::LauncherState::default(),
             pitch_clip: None,
             gesture_base: HashMap::new(),
             bounces: Vec::new(),
@@ -1857,6 +1862,7 @@ impl Session {
         if !was_playing && self.transport.playing {
             self.automation_play_requested();
         }
+        self.poll_launcher(was_playing);
         if self.album_state.is_playing() {
             // The project started playing: it has the outputs back.
             if !was_playing && self.transport.playing {
@@ -2359,6 +2365,7 @@ impl Session {
         self.editor_clip = self.first_midi_clip();
         self.engine.transport(TransportCommand::Stop)?;
         self.engine.transport(TransportCommand::Locate(0))?;
+        self.reset_launcher()?;
         self.engine
             .sync(&self.project, &self.sources, Impact::Graph)?;
         self.update_loader();
@@ -2953,6 +2960,7 @@ impl Session {
                 self.revision += 1;
             }
             Action::EditPitch { clip, op } => self.edit_pitch(clip, op)?,
+            Action::Launcher(op) => self.launcher_op(op)?,
             Action::SaveVersion { name } => {
                 self.save_version(&name)?;
             }

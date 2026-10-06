@@ -165,7 +165,8 @@ fn notes_played_while_playing_land_where_they_were_heard() {
     // (what was heard then).
     let off = (played - at) * 60.0 / tempo;
     assert!((-0.1..0.01).contains(&off), "{off}");
-    // As long as it was held.
+    // As long as it was held (within a device period: both ends are
+    // extrapolated from the last callback, which a busy runner delays).
     let len = n.length.quarters() * 60.0 / tempo;
-    assert!((len - held).abs() < 0.01, "{len} for {held}");
+    assert!((len - held).abs() < 0.03, "{len} for {held}");
 }

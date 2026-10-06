@@ -315,6 +315,17 @@ pub(crate) fn carve_midi(
     })
 }
 
+/// [`carve`] for every kind of clip (launches written into the
+/// arrangement).
+pub(crate) fn carve_any(
+    p: &mut Project,
+    track: TrackId,
+    a: MusicalTime,
+    b: MusicalTime,
+) -> Vec<Command> {
+    carve_where(p, track, a, b, |_| true)
+}
+
 fn carve_where(
     p: &mut Project,
     track: TrackId,

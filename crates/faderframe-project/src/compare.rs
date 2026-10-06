@@ -116,6 +116,9 @@ pub fn differences(then: &Project, now: &Project) -> Vec<String> {
     if then.album != now.album {
         out.push("Album changed".into());
     }
+    if then.launcher != now.launcher {
+        out.push("Clip launcher changed".into());
+    }
     out
 }
 

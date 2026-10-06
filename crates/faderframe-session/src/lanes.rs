@@ -116,7 +116,13 @@ impl Session {
         let p = &self.project;
         let all: Vec<faderframe_core::ClipId>;
         let ids: &[faderframe_core::ClipId] = if clips.is_empty() {
-            all = p.clips.keys().copied().collect();
+            let launcher = p.launcher_clips();
+            all = p
+                .clips
+                .keys()
+                .filter(|c| !launcher.contains(c))
+                .copied()
+                .collect();
             &all
         } else {
             clips

@@ -64,9 +64,11 @@ pub struct SlotKey {
 }
 
 impl SlotKey {
-    /// A stable number for the engine.
+    /// A stable number for the engine (below 2^63: the engine's status
+    /// flags take the top bit).
     pub fn hash(self) -> u64 {
-        self.track.raw().wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ self.scene.raw().rotate_left(29)
+        (self.track.raw().wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ self.scene.raw().rotate_left(29))
+            >> 1
     }
 }
 
