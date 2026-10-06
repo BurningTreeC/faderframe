@@ -336,7 +336,10 @@ Contrast:
   filter types, two envelopes, LFO, mono/legato with glide), a sampler
   that plays a sample across the keys (between start and end markers
   dragged on its waveform, forwards or reversed, looped or not, every key
-  held lit on its keyboard) or an SFZ instrument, and a
+  held lit on its keyboard) or an SFZ instrument (SFZ 1 and the common
+  SFZ 2 opcodes: keyswitches, release and legato triggers, crossfades,
+  two filters and an EQ, three envelopes and LFOs, controller
+  modulation with curves, `#define`/`#include`), and a
   sixteen-pad drum sampler with choke groups. Both samplers can keep a
   sample's length when they change its pitch (Sampler: Keep Length;
   Drum Sampler: per pad), through the same stretcher as warping, without

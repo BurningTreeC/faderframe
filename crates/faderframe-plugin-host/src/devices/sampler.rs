@@ -2,17 +2,23 @@
 //!
 //! With a single sample its root key, loop (off, forward, while held:
 //! start and end with a crossfade), start and end points, direction and
-//! whether the pitch follows the keys are the device's settings; with an SFZ the
-//! regions' own key and velocity ranges, roots, tuning, levels, pans,
-//! loops, envelopes, release triggers, choke groups (`group`/`off_by`),
-//! round robins (`seq_length`/`seq_position`) and random layers apply, the
-//! device's settings on top. Every voice has an ADSR (a region's `ampeg_*`
-//! where it has them), a filter (12 or 24 dB low pass, band, high pass)
-//! the envelope can open, and reads its sample by cubic interpolation at
-//! the ratio of the pitch and the sample's rate to the host's.
+//! whether the pitch follows the keys are the device's settings; with an
+//! SFZ the regions' opcodes apply (see [`super::sfz`]: conditions,
+//! keyswitches, triggers, crossfades, two filters and an EQ, three
+//! envelopes and three LFOs, controller modulation), the device's settings
+//! on top. Every voice has an amplifier envelope (the device's ADSR, or a
+//! region's `ampeg_*`), the device's filter (12 or 24 dB low pass, band,
+//! high pass) the envelope can open, and reads its sample by cubic
+//! interpolation at the ratio of the pitch and the sample's rate to the
+//! host's. A region's modulation (pitch, level, pan, width, filters, EQ)
+//! is evaluated every 16 samples, gains ramped between.
 
 use super::keep_length::{KeepLength, Render};
 use super::samples::{LoopMode, Sample, Shared, Zone};
+use super::sfz::{
+    CC_BEND, CC_CHANAFT, CC_KEY, CC_POLYAFT, CC_RANDOM_BI, CC_RANDOM_UNI, CC_VELOCITY, CONTROLLERS,
+    CcMod, EgParam, EgSpec, FilterKind, Trigger, Xfade,
+};
 use super::{on_off, param, pick, stepped};
 use crate::tap::{AnalysisTap, MeterTap, Watching};
 use crate::{
@@ -254,34 +260,337 @@ enum Stage {
     Release,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EgStage {
+    Delay,
+    Attack,
+    Hold,
+    Decay,
+    Sustain,
+    Release,
+    Done,
+}
+
+/// An envelope: delay, attack (linear, from `start`), hold, decay and
+/// release (exponential), sustain.
 #[derive(Clone, Copy, Debug)]
-struct Voice {
-    stage: Stage,
-    env: f32,
-    attack_step: f32,
+struct Eg {
+    stage: EgStage,
+    level: f32,
+    /// Samples left in the stage (delay, attack, hold).
+    left: u32,
+    start: f32,
+    attack: u32,
+    hold: u32,
     decay_coef: f32,
     sustain: f32,
     release_coef: f32,
+}
+
+/// A coefficient that falls by 60 dB in `samples`.
+fn fall(samples: f32) -> f32 {
+    (-6.9 / samples.max(1.0)).exp()
+}
+
+impl Eg {
+    const OFF: Eg = Eg {
+        stage: EgStage::Done,
+        level: 0.0,
+        left: 0,
+        start: 0.0,
+        attack: 0,
+        hold: 0,
+        decay_coef: 0.0,
+        sustain: 1.0,
+        release_coef: 0.0,
+    };
+
+    /// Times in samples.
+    fn new(
+        delay: f32,
+        start: f32,
+        attack: f32,
+        hold: f32,
+        decay: f32,
+        sustain: f32,
+        release: f32,
+    ) -> Self {
+        Self {
+            stage: EgStage::Delay,
+            level: 0.0,
+            left: delay.max(0.0) as u32,
+            start: start.clamp(0.0, 1.0),
+            attack: attack.max(0.0) as u32,
+            hold: hold.max(0.0) as u32,
+            decay_coef: if decay <= 0.0 { 0.0 } else { fall(decay) },
+            sustain: sustain.clamp(0.0, 1.0),
+            release_coef: fall(release),
+        }
+    }
+
+    #[inline]
+    fn tick(&mut self) -> f32 {
+        match self.stage {
+            EgStage::Delay => {
+                if self.left == 0 {
+                    self.stage = EgStage::Attack;
+                    self.level = self.start;
+                    self.left = self.attack;
+                } else {
+                    self.left -= 1;
+                }
+            }
+            EgStage::Attack => {
+                if self.left == 0 {
+                    self.level = 1.0;
+                    self.stage = EgStage::Hold;
+                    self.left = self.hold;
+                } else {
+                    self.level += (1.0 - self.level) / self.left as f32;
+                    self.left -= 1;
+                }
+            }
+            EgStage::Hold => {
+                if self.left == 0 {
+                    self.stage = EgStage::Decay;
+                } else {
+                    self.left -= 1;
+                }
+            }
+            EgStage::Decay => {
+                self.level = self.sustain + (self.level - self.sustain) * self.decay_coef;
+                if (self.level - self.sustain).abs() < 1e-4 {
+                    self.level = self.sustain;
+                    self.stage = EgStage::Sustain;
+                }
+            }
+            EgStage::Sustain => self.level = self.sustain,
+            EgStage::Release => {
+                self.level *= self.release_coef;
+                if self.level < 1e-4 {
+                    self.level = 0.0;
+                    self.stage = EgStage::Done;
+                }
+            }
+            EgStage::Done => self.level = 0.0,
+        }
+        self.level
+    }
+
+    /// Into the release (a voice released before it sounded is done).
+    fn release(&mut self) {
+        self.stage = match self.stage {
+            EgStage::Delay => EgStage::Done,
+            EgStage::Done => EgStage::Done,
+            _ => EgStage::Release,
+        };
+    }
+
+    /// Into a quick release (`samples` long).
+    fn cut(&mut self, samples: f32) {
+        self.release_coef = fall(samples);
+        self.release();
+    }
+
+    fn summary(&self) -> Stage {
+        match self.stage {
+            EgStage::Delay | EgStage::Attack => Stage::Attack,
+            EgStage::Hold | EgStage::Decay => Stage::Decay,
+            EgStage::Sustain => Stage::Sustain,
+            EgStage::Release => Stage::Release,
+            EgStage::Done => Stage::Idle,
+        }
+    }
+}
+
+/// A filter's state per channel: up to three SVF stages, or a biquad's
+/// history.
+#[derive(Clone, Copy, Debug, Default)]
+struct FilterState {
+    s: [(f32, f32); 3],
+}
+
+/// A filter's coefficients for a stretch of samples.
+#[derive(Clone, Copy, Debug)]
+enum Coefs {
+    Off,
+    /// One-pole TPT (`g / (1 + g)`).
+    One(f32),
+    /// SVF (`a1`, `a2`, `a3`, `k`).
+    Svf(f32, f32, f32, f32),
+    /// Biquad (b0, b1, b2, a1, a2).
+    Biquad([f32; 5]),
+}
+
+impl Coefs {
+    fn svf(fc: f32, q: f32, sr: f32) -> Self {
+        let g = (PI * fc.clamp(10.0, sr * 0.45) / sr).tan();
+        let k = 1.0 / q.max(0.05);
+        let a1 = 1.0 / (1.0 + g * (g + k));
+        Self::Svf(a1, g * a1, g * g * a1, k)
+    }
+
+    /// RBJ peaking, low and high shelf (`kind` 0, 1, 2).
+    fn rbj(kind: u8, fc: f32, q: f32, gain_db: f32, sr: f32) -> Self {
+        let a = 10f32.powf(gain_db / 40.0);
+        let w0 = 2.0 * PI * fc.clamp(10.0, sr * 0.45) / sr;
+        let (sn, cs) = w0.sin_cos();
+        let alpha = sn / (2.0 * q.max(0.05));
+        let (b0, b1, b2, a0, a1, a2) = match kind {
+            0 => (
+                1.0 + alpha * a,
+                -2.0 * cs,
+                1.0 - alpha * a,
+                1.0 + alpha / a,
+                -2.0 * cs,
+                1.0 - alpha / a,
+            ),
+            1 => {
+                let r = 2.0 * a.sqrt() * alpha;
+                (
+                    a * ((a + 1.0) - (a - 1.0) * cs + r),
+                    2.0 * a * ((a - 1.0) - (a + 1.0) * cs),
+                    a * ((a + 1.0) - (a - 1.0) * cs - r),
+                    (a + 1.0) + (a - 1.0) * cs + r,
+                    -2.0 * ((a - 1.0) + (a + 1.0) * cs),
+                    (a + 1.0) + (a - 1.0) * cs - r,
+                )
+            }
+            _ => {
+                let r = 2.0 * a.sqrt() * alpha;
+                (
+                    a * ((a + 1.0) + (a - 1.0) * cs + r),
+                    -2.0 * a * ((a - 1.0) + (a + 1.0) * cs),
+                    a * ((a + 1.0) + (a - 1.0) * cs - r),
+                    (a + 1.0) - (a - 1.0) * cs + r,
+                    2.0 * ((a - 1.0) - (a + 1.0) * cs),
+                    (a + 1.0) - (a - 1.0) * cs - r,
+                )
+            }
+        };
+        Self::Biquad([b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0])
+    }
+}
+
+/// One SVF stage: (low, band, high).
+#[inline]
+fn svf_stage(st: &mut (f32, f32), x: f32, a1: f32, a2: f32, a3: f32, k: f32) -> (f32, f32, f32) {
+    let (ic1, ic2) = st;
+    let v3 = x - *ic2;
+    let v1 = a1 * *ic1 + a2 * v3;
+    let v2 = *ic2 + a2 * *ic1 + a3 * v3;
+    *ic1 = 2.0 * v1 - *ic1;
+    *ic2 = 2.0 * v2 - *ic2;
+    (v2, v1, x - k * v1 - v2)
+}
+
+/// A region filter on one sample.
+#[inline]
+fn run_filter(kind: FilterKind, c: Coefs, st: &mut FilterState, x: f32) -> f32 {
+    match c {
+        Coefs::Off => x,
+        Coefs::One(gg) => {
+            let s = &mut st.s[0].0;
+            let v = (x - *s) * gg;
+            let lp = v + *s;
+            *s = lp + v;
+            match kind {
+                FilterKind::Hp1 => x - lp,
+                _ => lp,
+            }
+        }
+        Coefs::Svf(a1, a2, a3, k) => {
+            let stages = match kind {
+                FilterKind::Lp4 | FilterKind::Hp4 => 2,
+                FilterKind::Lp6 | FilterKind::Hp6 => 3,
+                _ => 1,
+            };
+            let mut y = x;
+            for st in st.s.iter_mut().take(stages) {
+                let (lp, bp, hp) = svf_stage(st, y, a1, a2, a3, k);
+                y = match kind {
+                    FilterKind::Lp2 | FilterKind::Lp4 | FilterKind::Lp6 => lp,
+                    FilterKind::Hp2 | FilterKind::Hp4 | FilterKind::Hp6 => hp,
+                    FilterKind::Bp2 | FilterKind::Bp1 => bp * k,
+                    FilterKind::Br2 | FilterKind::Br1 => lp + hp,
+                    _ => lp,
+                };
+            }
+            y
+        }
+        Coefs::Biquad([b0, b1, b2, a1, a2]) => {
+            let (x1, x2) = st.s[0];
+            let (y1, y2) = st.s[1];
+            let y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+            st.s[0] = (x, x1);
+            st.s[1] = (y, y1);
+            y
+        }
+    }
+}
+
+/// A region filter's coefficients for a cutoff, resonance (dB) and gain.
+fn filter_coefs(kind: FilterKind, fc: f32, res_db: f32, gain_db: f32, sr: f32) -> Coefs {
+    // Resonance in dB over a Butterworth Q.
+    let q = std::f32::consts::FRAC_1_SQRT_2 * 10f32.powf(res_db / 20.0);
+    match kind {
+        FilterKind::Lp1 | FilterKind::Hp1 => {
+            let g = (PI * fc.clamp(10.0, sr * 0.45) / sr).tan();
+            Coefs::One(g / (1.0 + g))
+        }
+        FilterKind::Bp1 | FilterKind::Br1 => Coefs::svf(fc, 0.5, sr),
+        FilterKind::Peak => Coefs::rbj(0, fc, q, gain_db, sr),
+        FilterKind::LowShelf => Coefs::rbj(1, fc, q, gain_db, sr),
+        FilterKind::HighShelf => Coefs::rbj(2, fc, q, gain_db, sr),
+        _ => Coefs::svf(fc, q, sr),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Voice {
+    stage: Stage,
+    /// The amplifier's envelope (and the filter's and pitch's for zones
+    /// that have them).
+    amp: Eg,
+    fil_eg: Eg,
+    pitch_eg: Eg,
+    /// Samples before the voice starts (a zone's `delay`).
+    delay: u32,
     /// The zone (`usize::MAX`: the single sample) and its sample.
     zone: usize,
     sample: usize,
     pos: f64,
+    /// The step at the voice's own pitch (before bend and modulation).
     step: f64,
     /// Loop range (frames) when looping, and the crossfade before its end.
     looping: Option<(f64, f64)>,
     loop_mode: LoopMode,
     fade: f64,
-    /// Plays to `end` (frames; going backwards: down to it).
+    /// Plays to `end` (frames; going backwards: down to it), from `start`.
     end: f64,
+    start: f64,
     reverse: bool,
+    /// Plays this many more times after this one (`count`).
+    repeats: u32,
     gain: [f32; 2],
+    /// The gain the last block ended with (ramped to the next).
+    last_gain: [f32; 2],
     key: u8,
     channel: u8,
     velocity: f32,
     held: bool,
     pedal_held: bool,
+    group: u32,
     off_by: u32,
     svf: [[(f32, f32); 2]; 2],
+    /// Region filters and EQ per channel.
+    zf: [[FilterState; 2]; 2],
+    eqs: [[FilterState; 3]; 2],
+    /// Random draws (filter cents ×2) and LFO phases (amp, filter, pitch).
+    rnd: [f32; 2],
+    lfo: [f32; 3],
+    /// Seconds since the voice started (LFO delays and fades).
+    age_s: f32,
     age: u64,
     /// Keep Length: the stretcher it plays through and its pitch factor;
     /// its sample has all been fed.
@@ -293,11 +602,10 @@ struct Voice {
 impl Voice {
     const IDLE: Voice = Voice {
         stage: Stage::Idle,
-        env: 0.0,
-        attack_step: 1.0,
-        decay_coef: 0.0,
-        sustain: 1.0,
-        release_coef: 0.0,
+        amp: Eg::OFF,
+        fil_eg: Eg::OFF,
+        pitch_eg: Eg::OFF,
+        delay: 0,
         zone: usize::MAX,
         sample: 0,
         pos: 0.0,
@@ -306,15 +614,24 @@ impl Voice {
         loop_mode: LoopMode::NoLoop,
         fade: 0.0,
         end: 0.0,
+        start: 0.0,
         reverse: false,
+        repeats: 0,
         gain: [1.0; 2],
+        last_gain: [0.0; 2],
         key: 0,
         channel: 0,
         velocity: 0.0,
         held: false,
         pedal_held: false,
+        group: 0,
         off_by: 0,
         svf: [[(0.0, 0.0); 2]; 2],
+        zf: [[FilterState { s: [(0.0, 0.0); 3] }; 2]; 2],
+        eqs: [[FilterState { s: [(0.0, 0.0); 3] }; 3]; 2],
+        rnd: [0.0; 2],
+        lfo: [0.0; 3],
+        age_s: 0.0,
         age: 0,
         slot: None,
         pitch: 1.0,
@@ -324,13 +641,116 @@ impl Voice {
     fn release(&mut self) {
         self.held = false;
         if self.stage != Stage::Idle && self.loop_mode != LoopMode::OneShot {
-            self.stage = Stage::Release;
+            self.amp.release();
+            self.fil_eg.release();
+            self.pitch_eg.release();
+            self.stage = self.amp.summary();
         }
         // Loop while held: play on out of the loop.
         if self.loop_mode == LoopMode::Sustain {
             self.looping = None;
         }
     }
+
+    /// Stop quickly (`samples` long): chokes and polyphony limits.
+    fn cut(&mut self, samples: f32) {
+        self.held = false;
+        self.amp.cut(samples);
+        self.stage = self.amp.summary();
+        self.loop_mode = LoopMode::NoLoop;
+    }
+}
+
+/// What a note-on is: an attack, or a release trigger (with the
+/// attenuation its held time gives).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum NoteKind {
+    Attack,
+    Release {
+        held_s: f32,
+    },
+    ReleaseKey {
+        held_s: f32,
+    },
+    /// A controller entered a zone's `on_cc` range.
+    Controller,
+}
+
+/// MIDI state the zones' conditions and modulation read.
+struct Controls {
+    /// Controller values 0–1 per channel (the extended ones too).
+    cc: Box<[[f32; CONTROLLERS]; 16]>,
+    /// Polyphonic aftertouch per channel and key (0–1).
+    polyaft: Box<[[f32; 128]; 16]>,
+    bend_raw: [i32; 16],
+    keys_down: [[bool; 128]; 16],
+    key_velocity: [[u8; 128]; 16],
+    /// When each key went down (samples since the processor started).
+    key_at: Box<[[u64; 128]; 16]>,
+    /// Release triggers held back by the pedal, per channel and key.
+    pedal_releases: [[bool; 128]; 16],
+    held: u32,
+    last_keyswitch: Option<u8>,
+    previous: Option<(u8, u8)>,
+    tempo: f64,
+}
+
+impl Controls {
+    fn new() -> Self {
+        Self {
+            cc: Box::new([[0.0; CONTROLLERS]; 16]),
+            polyaft: Box::new([[0.0; 128]; 16]),
+            bend_raw: [0; 16],
+            keys_down: [[false; 128]; 16],
+            key_velocity: [[0; 128]; 16],
+            key_at: Box::new([[0; 128]; 16]),
+            pedal_releases: [[false; 128]; 16],
+            held: 0,
+            last_keyswitch: None,
+            previous: None,
+            tempo: 120.0,
+        }
+    }
+
+    /// A controller's value (0–1) through a curve.
+    #[inline]
+    fn value(&self, channel: u8, m: &CcMod, curves: &[[f32; 128]]) -> f32 {
+        let v = self.cc[(channel & 15) as usize][m.cc.min(CONTROLLERS - 1)];
+        match m.curve.and_then(|c| curves.get(c)) {
+            Some(curve) => curve[(v * 127.0).round().clamp(0.0, 127.0) as usize],
+            None => v,
+        }
+    }
+
+    /// The sum of modulations.
+    #[inline]
+    fn sum(&self, channel: u8, mods: &[CcMod], curves: &[[f32; 128]]) -> f32 {
+        mods.iter()
+            .map(|m| m.amount * self.value(channel, m, curves))
+            .sum()
+    }
+}
+
+/// A crossfade's gain at `x` (power or gain curve).
+fn xfade_gain(x: &Xfade, value: f32, power: bool) -> f32 {
+    let t = if x.hi <= x.lo {
+        if value >= x.hi { 1.0 } else { 0.0 }
+    } else {
+        ((value - x.lo) / (x.hi - x.lo)).clamp(0.0, 1.0)
+    };
+    let t = if x.fade_in { t } else { 1.0 - t };
+    if power { t.sqrt() } else { t }
+}
+
+/// An envelope's depth (cents) for a note.
+fn eg_depth(e: &EgSpec, c: &Controls, ch: u8, vel: f32, curves: &[[f32; 128]]) -> f32 {
+    e.depth
+        + e.vel2depth * vel
+        + e.cc
+            .iter()
+            .filter(|(p, _)| *p == EgParam::Depth)
+            .map(|(_, m)| m.amount * c.value(ch, m, curves))
+            .sum::<f32>()
 }
 
 pub struct SamplerProcessor {
@@ -349,9 +769,12 @@ pub struct SamplerProcessor {
     /// Round robin counters per key, and the random draw.
     rounds: [u32; 128],
     random: u32,
-    /// Keys whose release triggers are due (from note-offs).
-    pending_release: [(u8, u8, u8); 16],
+    /// Release triggers due (from note-offs and the pedal).
+    pending_release: [(u8, u8, u8, NoteKind); 32],
     pending: usize,
+    controls: Controls,
+    /// Samples processed (for release triggers' decay).
+    clock: u64,
     /// The block's two sides before they go out.
     mix: [Vec<f32>; 2],
     meters: [MeterTap; 2],
@@ -382,8 +805,10 @@ impl SamplerProcessor {
             rpn: [(127, 127); 16],
             rounds: [0; 128],
             random: 0x2545_f491,
-            pending_release: [(0, 0, 0); 16],
+            pending_release: [(0, 0, 0, NoteKind::Attack); 32],
             pending: 0,
+            controls: Controls::new(),
+            clock: 0,
             mix: [vec![0.0; block], vec![0.0; block]],
             meters: [MeterTap::new(sr as f32); 2],
             keep: (params.get(id::PITCH_MODE as usize) >= 0.5)
@@ -395,6 +820,13 @@ impl SamplerProcessor {
 
     fn get(&self, pid: u32) -> f64 {
         f64::from(self.params.get(pid as usize))
+    }
+
+    fn rand(&mut self) -> f32 {
+        self.random ^= self.random << 13;
+        self.random ^= self.random >> 17;
+        self.random ^= self.random << 5;
+        self.random as f32 / u32::MAX as f32
     }
 
     fn free_voice(&self) -> usize {
@@ -420,6 +852,17 @@ impl SamplerProcessor {
             })
     }
 
+    /// New samples: controllers start where the instrument says, the
+    /// keyswitch at its default.
+    fn adopt(&mut self, set: &super::samples::SampleSet) {
+        if let Some(inst) = &set.instrument {
+            for c in self.controls.cc.iter_mut() {
+                c.copy_from_slice(&inst.initial_cc[..]);
+            }
+        }
+        self.controls.last_keyswitch = set.zones.iter().find_map(|z| z.sw_default);
+    }
+
     /// Start a voice on `zone` (or the single sample) of `set`.
     #[allow(clippy::too_many_arguments)]
     fn start(
@@ -431,24 +874,41 @@ impl SamplerProcessor {
         channel: u8,
         key: u8,
         velocity: u8,
+        kind: NoteKind,
     ) {
         let Some(s) = set.samples.get(sample) else {
             return;
         };
         let sr = self.sr;
+        let srf = sr as f32;
+        let curves: &[[f32; 128]] = set.instrument.as_ref().map_or(&[], |i| &i.curves[..]);
+        let ch = channel;
+        let vel = f64::from(velocity) / 127.0;
+        let velf = vel as f32;
         let ms = |v: f64| (v * 0.001 * sr).max(1.0) as f32;
-        let coef = |samples: f32| (-6.9 / samples).exp();
-        let (a, d, sus, r) = (
-            zone.and_then(|z| z.ampeg[0])
-                .map_or(ms(self.get(id::ATTACK)), |t| ((t * sr) as f32).max(1.0)),
-            zone.and_then(|z| z.ampeg[1])
-                .map_or(ms(self.get(id::DECAY)), |t| ((t * sr) as f32).max(1.0)),
-            zone.and_then(|z| z.ampeg[2])
-                .unwrap_or(self.get(id::SUSTAIN))
-                .clamp(0.0, 1.0) as f32,
-            zone.and_then(|z| z.ampeg[3])
-                .map_or(ms(self.get(id::RELEASE)), |t| ((t * sr) as f32).max(1.0)),
-        );
+        // The amplifier's envelope: the zone's (SFZ's defaults for what it
+        // leaves out) or the device's ADSR.
+        let amp = match zone.filter(|z| z.ampeg.set) {
+            Some(z) => self.eg_of(&z.ampeg, ch, velf, curves, true),
+            None => Eg::new(
+                0.0,
+                0.0,
+                ms(self.get(id::ATTACK)),
+                0.0,
+                ms(self.get(id::DECAY)),
+                self.get(id::SUSTAIN) as f32,
+                ms(self.get(id::RELEASE)),
+            ),
+        };
+        let (fil_eg, fil_depth) = match zone.filter(|z| z.fileg.set) {
+            Some(z) => (self.eg_of(&z.fileg, ch, velf, curves, false), 0.0),
+            None => (Eg::OFF, 0.0f32),
+        };
+        let _ = fil_depth;
+        let pitch_eg = match zone.filter(|z| z.pitcheg.set) {
+            Some(z) => self.eg_of(&z.pitcheg, ch, velf, curves, false),
+            None => Eg::OFF,
+        };
         let frames = s.frames as f64;
         let single = zone.is_none();
         let root = zone.map_or(self.get(id::ROOT).round(), |z| z.root);
@@ -460,12 +920,28 @@ impl SamplerProcessor {
             },
             |z| z.keytrack,
         );
-        let tune = zone.map_or(0.0, |z| z.tune)
+        let pitch_rand = zone.map_or(0.0, |z| f64::from(z.pitch_random));
+        let pitch_rand = if pitch_rand != 0.0 {
+            f64::from(self.rand()) * pitch_rand
+        } else {
+            0.0
+        };
+        let tune = zone.map_or(0.0, |z| z.tune + f64::from(z.pitch_veltrack) * vel)
+            + pitch_rand
             + self.get(id::TUNE)
             + 100.0 * self.get(id::TRANSPOSE).round();
         let semis = (f64::from(key) - root) * keytrack / 100.0 + tune / 100.0;
-        let ratio = 2f64.powf(semis / 12.0) * s.rate / sr;
-        let reverse = single && self.get(id::REVERSE) >= 0.5;
+        // A wavetable's one cycle sounds at the root key's pitch.
+        let rate = match zone {
+            Some(z) if z.oscillator => 440.0 * 2f64.powf((root - 69.0) / 12.0) * frames,
+            _ => s.rate,
+        };
+        let ratio = 2f64.powf(semis / 12.0) * rate / sr;
+        let reverse = if single {
+            self.get(id::REVERSE) >= 0.5
+        } else {
+            zone.is_some_and(|z| z.reverse)
+        };
         let loop_mode = match zone.and_then(|z| z.loop_mode) {
             Some(m) => m,
             None if single => match self.get(id::LOOP).round() as i64 {
@@ -483,7 +959,7 @@ impl SamplerProcessor {
         };
         let mut end = zone
             .and_then(|z| z.end)
-            .map_or(frames, |e| (e as f64).min(frames));
+            .map_or(frames, |e| ((e + 1) as f64).min(frames));
         let start = if single {
             // The region between the start and end markers.
             let a = self.get(id::START).clamp(0.0, 0.99) * frames;
@@ -492,7 +968,15 @@ impl SamplerProcessor {
                 .min(frames);
             a
         } else {
-            zone.map_or(0.0, |z| z.offset as f64).min(end)
+            let z = zone.map_or(0.0, |z| {
+                let random = if z.offset_random > 0 {
+                    f64::from(self.rand()) * z.offset_random as f64
+                } else {
+                    0.0
+                };
+                z.offset as f64 + random + f64::from(self.controls.sum(ch, &z.offset_cc, curves))
+            });
+            z.clamp(0.0, (end - 1.0).max(0.0))
         };
         let looping = match loop_mode {
             LoopMode::Continuous | LoopMode::Sustain => {
@@ -511,27 +995,110 @@ impl SamplerProcessor {
             _ => None,
         };
         let fade = looping.map_or(0.0, |(ls, le)| {
-            (self.get(id::CROSSFADE) * 0.001 * s.rate)
-                .min((le - ls) * 0.5)
-                .min(ls)
+            let seconds = zone
+                .and_then(|z| z.loop_crossfade)
+                .map_or(self.get(id::CROSSFADE) * 0.001, f64::from);
+            (seconds * s.rate).min((le - ls) * 0.5).min(ls)
         });
-        let vel = f64::from(velocity) / 127.0;
-        let vt = self.get(id::VELOCITY) * zone.map_or(1.0, |z| z.veltrack);
-        let level = db_to_gain((self.get(id::VOLUME) + zone.map_or(0.0, |z| z.volume)) as f32)
-            * (1.0 - vt + vt * vel * vel) as f32;
-        let pan = (self.get(id::PAN) + zone.map_or(0.0, |z| z.pan)).clamp(-1.0, 1.0) as f32;
+        // The level: the device's and the zone's volume, velocity, key
+        // tracking, randomness, crossfades by key and velocity, release
+        // triggers' decay.
+        let device_vt = self.get(id::VELOCITY);
+        let vel_gain = match zone.and_then(|z| z.velcurve.as_deref()) {
+            Some(curve) => f64::from(curve[usize::from(velocity.min(127))]),
+            None => {
+                let vt = device_vt * zone.map_or(1.0, |z| f64::from(z.veltrack));
+                if vt >= 0.0 {
+                    1.0 - vt + vt * vel * vel
+                } else {
+                    // Negative tracking: louder when softer.
+                    1.0 + vt * vel * vel
+                }
+            }
+        };
+        let mut db = self.get(id::VOLUME);
+        let mut lin = vel_gain;
+        if let Some(z) = zone {
+            db += f64::from(z.volume)
+                + f64::from(z.amp_keytrack) * (f64::from(key) - f64::from(z.amp_keycenter));
+            if z.amp_random != 0.0 {
+                db += f64::from(self.rand() * z.amp_random);
+            }
+            if let NoteKind::Release { held_s } | NoteKind::ReleaseKey { held_s } = kind {
+                db -= f64::from(z.rt_decay * held_s);
+            }
+            lin *= f64::from(z.amplitude);
+            for x in &z.xfades {
+                let (value, power) = match x.cc {
+                    CC_KEY => (f32::from(key), !z.xf_key_gain),
+                    CC_VELOCITY => (f32::from(velocity), !z.xf_vel_gain),
+                    _ => continue,
+                };
+                lin *= f64::from(xfade_gain(x, value, power));
+            }
+        }
+        let level = db_to_gain(db as f32) * lin as f32;
+        let pan =
+            (self.get(id::PAN) + zone.map_or(0.0, |z| f64::from(z.pan))).clamp(-1.0, 1.0) as f32;
         let gain = [level * (1.0 - pan).min(1.0), level * (1.0 + pan).min(1.0)];
-        let (choke, off_by) = zone.map_or((0, 0), |z| (z.group, z.off_by));
-        // Choke: this group silences voices that it turns off.
-        if choke > 0 {
+        let (group, off_by) = zone.map_or((0, 0), |z| (z.group, z.off_by));
+        // Choke: this group turns off the voices it names.
+        if group > 0 {
             for v in &mut self.voices {
-                if v.stage != Stage::Idle && v.off_by == choke {
-                    v.stage = Stage::Release;
-                    v.release_coef = (-6.9 / (0.005 * sr) as f32).exp();
-                    v.loop_mode = LoopMode::NoLoop;
+                if v.stage != Stage::Idle && v.off_by == group {
+                    let z = set.zones.get(v.zone);
+                    match z {
+                        Some(z) if z.off_normal => v.release(),
+                        _ => {
+                            let t = z.and_then(|z| z.off_time).unwrap_or(0.006);
+                            v.cut(t * srf);
+                        }
+                    }
                 }
             }
         }
+        // Polyphony limits of the zone's group and of the note.
+        if let Some(z) = zone {
+            for (limit, same_key) in [(z.polyphony, false), (z.note_polyphony, true)] {
+                let Some(limit) = limit else { continue };
+                let sounding = |v: &Voice| {
+                    v.stage != Stage::Idle
+                        && v.stage != Stage::Release
+                        && v.group == z.group
+                        && (!same_key || v.key == key)
+                };
+                while self.voices.iter().filter(|v| sounding(v)).count() >= limit.max(1) as usize {
+                    let Some(oldest) = self
+                        .voices
+                        .iter_mut()
+                        .filter(|v| sounding(v))
+                        .min_by_key(|v| v.age)
+                    else {
+                        break;
+                    };
+                    oldest.cut(0.006 * srf);
+                }
+            }
+        }
+        // Random draws for the filters' cutoffs.
+        let mut rnd = [0.0f32; 2];
+        if let Some(z) = zone {
+            for (i, f) in z.filters.iter().enumerate() {
+                if let Some(f) = f
+                    && f.random != 0.0
+                {
+                    rnd[i] = self.rand() * f.random;
+                }
+            }
+        }
+        let delay = zone.map_or(0.0, |z| {
+            let random = if z.delay_random > 0.0 {
+                self.rand() * z.delay_random
+            } else {
+                0.0
+            };
+            (z.delay + random + self.controls.sum(ch, &z.delay_cc, curves)).max(0.0)
+        });
         self.counter += 1;
         let idx = self.free_voice();
         // Keep Length: read at the sample's own speed, pitched by a
@@ -545,17 +1112,16 @@ impl SamplerProcessor {
                     self.voices[e].stage = Stage::Idle;
                     self.voices[e].slot = None;
                 }
-                (s.rate / sr, 2f64.powf(semis / 12.0) as f32, Some(slot))
+                (rate / sr, 2f64.powf(semis / 12.0) as f32, Some(slot))
             }
             None => (ratio, 1.0, None),
         };
         self.voices[idx] = Voice {
             stage: Stage::Attack,
-            env: 0.0,
-            attack_step: 1.0 / a,
-            decay_coef: coef(d),
-            sustain: sus,
-            release_coef: coef(r),
+            amp,
+            fil_eg,
+            pitch_eg,
+            delay: (f64::from(delay) * sr) as u32,
             zone: zone_index,
             sample,
             pos: if reverse { end - 1.0 } else { start },
@@ -564,20 +1130,122 @@ impl SamplerProcessor {
             loop_mode,
             fade,
             end: if reverse { start } else { end },
+            start,
             reverse,
+            repeats: zone.map_or(0, |z| z.count.saturating_sub(1)),
             gain,
+            last_gain: gain,
             key,
             channel,
-            velocity: vel as f32,
-            held: true,
+            velocity: velf,
+            held: kind == NoteKind::Attack,
             pedal_held: false,
+            group,
             off_by,
             svf: [[(0.0, 0.0); 2]; 2],
+            zf: [[FilterState::default(); 2]; 2],
+            eqs: [[FilterState::default(); 3]; 2],
+            rnd,
+            lfo: [0.0; 3],
+            age_s: 0.0,
             age: self.counter,
             slot,
             pitch,
             fed_out: false,
         };
+        let _ = fil_depth;
+    }
+
+    /// A zone's envelope for a note (`amp`: times clamped so it cannot
+    /// click).
+    fn eg_of(&self, e: &EgSpec, ch: u8, vel: f32, curves: &[[f32; 128]], amp: bool) -> Eg {
+        let sr = self.sr as f32;
+        let mut t = [
+            e.delay + e.vel2delay * vel,
+            e.start,
+            e.attack + e.vel2attack * vel,
+            e.hold + e.vel2hold * vel,
+            e.decay + e.vel2decay * vel,
+            e.sustain + e.vel2sustain * vel,
+            e.release + e.vel2release * vel,
+        ];
+        for (p, m) in &e.cc {
+            let v = m.amount * self.controls.value(ch, m, curves);
+            let i = match p {
+                EgParam::Delay => 0,
+                EgParam::Start => 1,
+                EgParam::Attack => 2,
+                EgParam::Hold => 3,
+                EgParam::Decay => 4,
+                EgParam::Sustain => 5,
+                EgParam::Release => 6,
+                EgParam::Depth => continue,
+            };
+            t[i] += v;
+        }
+        let min = if amp { 0.001 } else { 0.0 };
+        Eg::new(
+            t[0].max(0.0) * sr,
+            t[1],
+            t[2].max(0.0) * sr,
+            t[3].max(0.0) * sr,
+            t[4].max(0.0) * sr,
+            t[5],
+            t[6].max(min) * sr,
+        )
+    }
+
+    /// Whether `z` sounds for this note now.
+    fn zone_takes(&self, z: &Zone, channel: u8, key: u8, velocity: u8, rand: f64) -> bool {
+        let c = &self.controls;
+        let ch = (channel & 15) as usize;
+        if !(z.lochan..=z.hichan).contains(&channel) || !z.takes(key, velocity) {
+            return false;
+        }
+        if rand < z.lorand || rand >= z.hirand.max(z.lorand + 1e-9) {
+            return false;
+        }
+        for &(cc, lo, hi) in &z.cc_ranges {
+            let v = (c.cc[ch][cc.min(CONTROLLERS - 1)] * 127.0).round() as u8;
+            if !(lo..=hi).contains(&v) {
+                return false;
+            }
+        }
+        if !(z.lobend..=z.hibend).contains(&c.bend_raw[ch]) {
+            return false;
+        }
+        let chanaft = (c.cc[ch][CC_CHANAFT] * 127.0).round() as u8;
+        let polyaft = (c.polyaft[ch][usize::from(key & 127)] * 127.0).round() as u8;
+        if !(z.lochanaft..=z.hichanaft).contains(&chanaft)
+            || !(z.lopolyaft..=z.hipolyaft).contains(&polyaft)
+        {
+            return false;
+        }
+        let bpm = c.tempo as f32;
+        if bpm < z.lobpm || bpm >= z.hibpm {
+            return false;
+        }
+        if let Some(sw) = z.sw_last
+            && c.last_keyswitch != Some(sw)
+        {
+            return false;
+        }
+        if let Some(k) = z.sw_down
+            && !c.keys_down.iter().any(|keys| keys[usize::from(k & 127)])
+        {
+            return false;
+        }
+        if let Some(k) = z.sw_up
+            && c.keys_down.iter().any(|keys| keys[usize::from(k & 127)])
+        {
+            return false;
+        }
+        if let Some(k) = z.sw_previous
+            && c.previous.map(|(p, _)| p) != Some(k)
+        {
+            return false;
+        }
+        true
     }
 
     fn note_on(
@@ -586,43 +1254,100 @@ impl SamplerProcessor {
         channel: u8,
         key: u8,
         velocity: u8,
-        release: bool,
+        kind: NoteKind,
     ) {
         if set.zones.is_empty() {
-            if !release && let Some(Some(sample)) = set.slots.first() {
-                self.start(set, None, usize::MAX, *sample, channel, key, velocity);
+            if kind == NoteKind::Attack
+                && let Some(Some(sample)) = set.slots.first()
+            {
+                self.start(set, None, usize::MAX, *sample, channel, key, velocity, kind);
             }
             return;
         }
+        let attack = kind == NoteKind::Attack;
+        // A keyswitch: remembered, and it plays nothing itself unless a
+        // zone covers the key.
+        if attack && set.zones.iter().any(|z| z.is_keyswitch(key)) {
+            self.controls.last_keyswitch = Some(key);
+        }
         let k = key as usize & 127;
-        let round = if release {
-            self.rounds[k].saturating_sub(1)
-        } else {
+        let round = if attack {
             self.rounds[k]
+        } else {
+            self.rounds[k].saturating_sub(1)
         };
-        if !release {
+        if attack {
             self.rounds[k] = self.rounds[k].wrapping_add(1);
         }
-        self.random ^= self.random << 13;
-        self.random ^= self.random >> 17;
-        self.random ^= self.random << 5;
-        let rand = f64::from(self.random) / f64::from(u32::MAX);
+        let rand = f64::from(self.rand());
+        // Other keys held (first and legato triggers).
+        let others = self.controls.held.saturating_sub(u32::from(attack));
+        let previous_velocity = self.controls.previous.map_or(velocity, |(_, v)| v);
         for (i, z) in set.zones.iter().enumerate() {
-            if z.on_release != release || !z.takes(key, velocity) {
+            let fits = match (z.trigger, kind) {
+                (Trigger::Attack, NoteKind::Attack) => true,
+                (Trigger::First, NoteKind::Attack) => others == 0,
+                (Trigger::Legato, NoteKind::Attack) => others > 0,
+                (Trigger::Release, NoteKind::Release { .. }) => true,
+                (Trigger::ReleaseKey, NoteKind::ReleaseKey { .. }) => true,
+                _ => false,
+            };
+            if !fits {
+                continue;
+            }
+            let vel = if z.sw_vel_previous {
+                previous_velocity
+            } else {
+                velocity
+            };
+            if !self.zone_takes(z, channel, key, vel, rand) {
                 continue;
             }
             if z.seq_length > 1 && round % z.seq_length + 1 != z.seq_position {
                 continue;
             }
-            if rand < z.lorand || rand >= z.hirand.max(z.lorand + 1e-9) {
-                continue;
-            }
-            self.start(set, Some(z), i, z.sample, channel, key, velocity);
+            self.start(set, Some(z), i, z.sample, channel, key, vel, kind);
         }
     }
 
-    fn note_off(&mut self, channel: u8, key: u8, velocity: u8) {
-        let pedal = self.sustain[(channel & 15) as usize];
+    /// Zones a controller's move into their `on_cc` range triggers.
+    fn controller_triggers(
+        &mut self,
+        set: &super::samples::SampleSet,
+        channel: u8,
+        cc: usize,
+        old: f32,
+        new: f32,
+    ) {
+        let (old, new) = ((old * 127.0).round() as u8, (new * 127.0).round() as u8);
+        for (i, z) in set.zones.iter().enumerate() {
+            let fires = z.on_cc.iter().any(|&(c, lo, hi)| {
+                c == cc && (lo..=hi).contains(&new) && !(lo..=hi).contains(&old)
+            });
+            if fires && (z.lochan..=z.hichan).contains(&channel) {
+                let key = if z.lokey == z.hikey {
+                    z.lokey
+                } else {
+                    z.root.round() as u8
+                };
+                self.start(
+                    set,
+                    Some(z),
+                    i,
+                    z.sample,
+                    channel,
+                    key,
+                    100,
+                    NoteKind::Controller,
+                );
+            }
+        }
+    }
+
+    fn note_off(&mut self, channel: u8, key: u8) {
+        let ch = (channel & 15) as usize;
+        let k = usize::from(key & 127);
+        let pedal = self.sustain[ch];
         for v in &mut self.voices {
             if v.key == key && v.channel == channel && v.held && v.stage != Stage::Idle {
                 if pedal {
@@ -633,8 +1358,25 @@ impl SamplerProcessor {
                 }
             }
         }
+        if self.controls.keys_down[ch][k] {
+            self.controls.keys_down[ch][k] = false;
+            self.controls.held = self.controls.held.saturating_sub(1);
+        }
+        let held_s =
+            (self.clock.saturating_sub(self.controls.key_at[ch][k])) as f32 / self.sr as f32;
+        let velocity = self.controls.key_velocity[ch][k].max(1);
+        // `release_key` at once; `release` once the pedal is up.
+        self.queue_release(channel, key, velocity, NoteKind::ReleaseKey { held_s });
+        if pedal {
+            self.controls.pedal_releases[ch][k] = true;
+        } else {
+            self.queue_release(channel, key, velocity, NoteKind::Release { held_s });
+        }
+    }
+
+    fn queue_release(&mut self, channel: u8, key: u8, velocity: u8, kind: NoteKind) {
         if self.pending < self.pending_release.len() {
-            self.pending_release[self.pending] = (channel, key, velocity.max(64));
+            self.pending_release[self.pending] = (channel, key, velocity, kind);
             self.pending += 1;
         }
     }
@@ -646,63 +1388,109 @@ impl SamplerProcessor {
                 key,
                 velocity,
             } => {
-                if let Some(set) = set {
-                    self.note_on(set, channel, key, velocity, false);
+                let ch = (channel & 15) as usize;
+                let k = usize::from(key & 127);
+                if !self.controls.keys_down[ch][k] {
+                    self.controls.held += 1;
                 }
+                self.controls.keys_down[ch][k] = true;
+                self.controls.key_velocity[ch][k] = velocity;
+                self.controls.key_at[ch][k] = self.clock;
+                self.controls.cc[ch][CC_VELOCITY] = f32::from(velocity) / 127.0;
+                self.controls.cc[ch][CC_KEY] = f32::from(key) / 127.0;
+                let r = self.rand();
+                self.controls.cc[ch][CC_RANDOM_UNI] = r;
+                self.controls.cc[ch][CC_RANDOM_BI] = r;
+                if let Some(set) = set {
+                    self.note_on(set, channel, key, velocity, NoteKind::Attack);
+                }
+                self.controls.previous = Some((key, velocity));
             }
-            MidiEvent::NoteOff {
-                channel,
-                key,
-                velocity,
-            } => self.note_off(channel, key, velocity),
+            MidiEvent::NoteOff { channel, key, .. } => self.note_off(channel, key),
             MidiEvent::ControlChange { controller, .. }
                 if controller == MidiEvent::CC_ALL_NOTES_OFF
                     || controller == MidiEvent::CC_ALL_SOUND_OFF =>
             {
                 self.sustain = [false; 16];
+                self.controls.keys_down = [[false; 128]; 16];
+                self.controls.pedal_releases = [[false; 128]; 16];
+                self.controls.held = 0;
                 for v in &mut self.voices {
                     v.release();
                 }
             }
             MidiEvent::ControlChange {
                 channel,
-                controller: 64,
+                controller,
                 value,
             } => {
-                let c = (channel & 15) as usize;
-                self.sustain[c] = value >= 64;
-                if value < 64 {
-                    for v in &mut self.voices {
-                        if v.channel == channel && v.pedal_held {
-                            v.pedal_held = false;
-                            v.release();
+                let ch = (channel & 15) as usize;
+                let cc = usize::from(controller & 127);
+                let old = self.controls.cc[ch][cc];
+                let new = f32::from(value) / 127.0;
+                self.controls.cc[ch][cc] = new;
+                if let Some(set) = set {
+                    self.controller_triggers(set, channel, cc, old, new);
+                }
+                match controller {
+                    64 => {
+                        self.sustain[ch] = value >= 64;
+                        if value < 64 {
+                            for v in &mut self.voices {
+                                if v.channel == channel && v.pedal_held {
+                                    v.pedal_held = false;
+                                    v.release();
+                                }
+                            }
+                            // Release triggers held back by the pedal.
+                            for k in 0..128u8 {
+                                if std::mem::take(
+                                    &mut self.controls.pedal_releases[ch][usize::from(k)],
+                                ) {
+                                    let held_s = (self
+                                        .clock
+                                        .saturating_sub(self.controls.key_at[ch][usize::from(k)]))
+                                        as f32
+                                        / self.sr as f32;
+                                    let velocity =
+                                        self.controls.key_velocity[ch][usize::from(k)].max(1);
+                                    self.queue_release(
+                                        channel,
+                                        k,
+                                        velocity,
+                                        NoteKind::Release { held_s },
+                                    );
+                                }
+                            }
                         }
                     }
+                    101 => self.rpn[ch].0 = value,
+                    100 => self.rpn[ch].1 = value,
+                    6 if self.rpn[ch] == (0, 0) => {
+                        self.bend_range[ch] = f32::from(value.max(1));
+                    }
+                    _ => {}
                 }
             }
             MidiEvent::PitchBend { channel, value } => {
                 let c = (channel & 15) as usize;
-                self.bend[c] = (value as f32 - 8192.0) / 8192.0 * self.bend_range[c];
+                let raw = i32::from(value) - 8192;
+                self.controls.bend_raw[c] = raw;
+                self.controls.cc[c][CC_BEND] = f32::from(value) / 16383.0;
+                self.bend[c] = raw as f32 / 8192.0 * self.bend_range[c];
             }
-            MidiEvent::ControlChange {
+            MidiEvent::ChannelPressure { channel, pressure } => {
+                self.controls.cc[(channel & 15) as usize][CC_CHANAFT] = f32::from(pressure) / 127.0;
+            }
+            MidiEvent::PolyPressure {
                 channel,
-                controller: 101,
-                value,
-            } => self.rpn[(channel & 15) as usize].0 = value,
-            MidiEvent::ControlChange {
-                channel,
-                controller: 100,
-                value,
-            } => self.rpn[(channel & 15) as usize].1 = value,
-            MidiEvent::ControlChange {
-                channel,
-                controller: 6,
-                value,
+                key,
+                pressure,
             } => {
                 let c = (channel & 15) as usize;
-                if self.rpn[c] == (0, 0) {
-                    self.bend_range[c] = f32::from(value.max(1));
-                }
+                let p = f32::from(pressure) / 127.0;
+                self.controls.polyaft[c][usize::from(key & 127)] = p;
+                self.controls.cc[c][CC_POLYAFT] = p;
             }
             _ => {}
         }
@@ -725,20 +1513,39 @@ impl SamplerProcessor {
         let filtering = cutoff < 19_500.0 || env_amt.abs() > 0.01 || kind != 0;
         let k = 2.0 - 1.9 * self.get(id::RESONANCE).clamp(0.0, 1.0) as f32;
         let bends = self.bend;
-        let Self { voices, keep, .. } = self;
+        let curves: &[[f32; 128]] = set.instrument.as_ref().map_or(&[], |i| &i.curves[..]);
+        let Self {
+            voices,
+            keep,
+            controls,
+            ..
+        } = self;
         for v in voices.iter_mut().filter(|v| v.stage != Stage::Idle) {
             let Some(s) = set.samples.get(v.sample) else {
                 v.stage = Stage::Idle;
                 continue;
             };
-            let bend = 2f64.powf(f64::from(bends[(v.channel & 15) as usize]) / 12.0);
+            let zone = set.zones.get(v.zone);
+            // A zone's delay: silent until it starts.
+            let mut from = start;
+            if v.delay > 0 {
+                let d = (v.delay as usize).min(end - start);
+                v.delay -= d as u32;
+                from += d;
+                if from >= end {
+                    continue;
+                }
+            }
+            let bend_st = bends[(v.channel & 15) as usize];
+            let ch = v.channel;
             // Keep Length: the segment from the voice's stretcher (the bend
             // moves its pitch, not its speed).
             let mut kept: Option<(&[f32], &[f32])> = None;
             if let (Some(slot), Some(pool)) = (v.slot, keep.as_mut()) {
+                let bend = 2f64.powf(f64::from(bend_st) / 12.0);
                 let (step, transpose) = (v.step, v.pitch * bend as f32);
                 let mut feed = |a: &mut [f32], b: &mut [f32]| feed_voice(v, s, step, a, b);
-                match pool.render(slot, transpose, end - start, &mut feed) {
+                match pool.render(slot, transpose, end - from, &mut feed) {
                     Render::Wait => continue,
                     Render::Done => {
                         v.stage = Stage::Idle;
@@ -747,83 +1554,226 @@ impl SamplerProcessor {
                     Render::Out(l, r) => kept = Some((l, r)),
                 }
             }
-            let step = v.step * bend;
-            // The filter's coefficients for this segment.
-            let velocity = v.velocity;
-            let coefs = |env: f32| {
-                let fc = (cutoff * 2f32.powf(env_amt * env * velocity)).clamp(20.0, sr * 0.45);
-                let g = (PI * fc / sr).tan();
-                let a1 = 1.0 / (1.0 + g * (g + k));
-                (a1, g * a1, g * g * a1)
-            };
-            let mut c = coefs(v.env);
-            for i in start..end {
-                match v.stage {
-                    Stage::Attack => {
-                        v.env += v.attack_step;
-                        if v.env >= 1.0 {
-                            v.env = 1.0;
-                            v.stage = Stage::Decay;
-                        }
+            let mut i = from;
+            while i < end && v.stage != Stage::Idle {
+                let n = (end - i).min(16);
+                let dt = n as f32 / sr;
+                // This stretch's modulation.
+                let mut cents = 0.0f32;
+                let mut gain_db = 0.0f32;
+                let mut gain_lin = 1.0f32;
+                let mut pan_add = 0.0f32;
+                let mut width = 1.0f32;
+                let mut position = 0.0f32;
+                let mut zc: [Coefs; 2] = [Coefs::Off; 2];
+                let mut zkind = [FilterKind::Lp2; 2];
+                let mut eqc: [Coefs; 3] = [Coefs::Off; 3];
+                let lfo = |phase: &mut f32,
+                           spec: &crate::devices::sfz::LfoSpec,
+                           age: f32,
+                           c: &Controls|
+                 -> f32 {
+                    if !spec.active() || age < spec.delay {
+                        return 0.0;
                     }
-                    Stage::Decay => {
-                        v.env = v.sustain + (v.env - v.sustain) * v.decay_coef;
-                        if (v.env - v.sustain).abs() < 1e-4 {
-                            v.stage = Stage::Sustain;
-                        }
-                    }
-                    Stage::Sustain => v.env = v.sustain,
-                    Stage::Release => {
-                        v.env *= v.release_coef;
-                        if v.env < 1e-4 {
-                            v.stage = Stage::Idle;
-                        }
-                    }
-                    Stage::Idle => {}
-                }
-                if v.stage == Stage::Idle {
-                    break;
-                }
-                if filtering && i % 16 == 0 {
-                    c = coefs(v.env);
-                }
-                let y = match kept {
-                    Some((l, r)) => [l[i - start], r[i - start]],
-                    None => {
-                        let (y, ended) = next_frame(v, s, step);
-                        if ended {
-                            v.stage = Stage::Idle;
-                        }
-                        y
-                    }
+                    let freq = (spec.freq + c.sum(ch, &spec.freq_cc, curves)).max(0.0);
+                    *phase = (*phase + freq * dt).fract();
+                    let fade = if spec.fade > 0.0 {
+                        ((age - spec.delay) / spec.fade).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                    let depth = spec.depth + c.sum(ch, &spec.depth_cc, curves);
+                    (std::f32::consts::TAU * *phase).sin() * depth * fade
                 };
-                for ch in 0..2 {
-                    let mut x = y[ch];
-                    if filtering {
-                        let (a1, a2, a3) = c;
-                        let (ic1, ic2) = &mut v.svf[ch][0];
-                        let v3 = x - *ic2;
-                        let v1 = a1 * *ic1 + a2 * v3;
-                        let v2 = *ic2 + a2 * *ic1 + a3 * v3;
-                        *ic1 = 2.0 * v1 - *ic1;
-                        *ic2 = 2.0 * v2 - *ic2;
-                        x = match kind {
-                            1 => {
-                                let (jc1, jc2) = &mut v.svf[ch][1];
-                                let w3 = v2 - *jc2;
-                                let w1 = a1 * *jc1 + a2 * w3;
-                                let w2 = *jc2 + a2 * *jc1 + a3 * w3;
-                                *jc1 = 2.0 * w1 - *jc1;
-                                *jc2 = 2.0 * w2 - *jc2;
-                                w2
-                            }
-                            2 => v1 * k,
-                            3 => x - k * v1 - v2,
-                            _ => v2,
+                let c = &*controls;
+                match zone {
+                    Some(z) => {
+                        // Pitch: the zone's bend range, envelope, LFO,
+                        // controllers.
+                        let b = c.bend_raw[(ch & 15) as usize] as f32 / 8192.0;
+                        let mut bend_cents = if b >= 0.0 {
+                            b * z.bend_up
+                        } else {
+                            -b * z.bend_down
                         };
+                        if z.bend_step > 1.0 {
+                            bend_cents = (bend_cents / z.bend_step).round() * z.bend_step;
+                        }
+                        cents += bend_cents + c.sum(ch, &z.pitch_cc, curves);
+                        if z.pitcheg.set {
+                            cents +=
+                                v.pitch_eg.level * eg_depth(&z.pitcheg, c, ch, v.velocity, curves);
+                        }
+                        cents += lfo(&mut v.lfo[2], &z.pitchlfo, v.age_s, c);
+                        // Level and image.
+                        gain_db += c.sum(ch, &z.volume_cc, curves)
+                            + lfo(&mut v.lfo[0], &z.amplfo, v.age_s, c);
+                        gain_lin *= (1.0 + c.sum(ch, &z.amplitude_cc, curves)).max(0.0);
+                        for x in &z.xfades {
+                            if x.cc != CC_KEY && x.cc != CC_VELOCITY {
+                                let value =
+                                    c.cc[(ch & 15) as usize][x.cc.min(CONTROLLERS - 1)] * 127.0;
+                                gain_lin *= xfade_gain(x, value, !z.xf_cc_gain);
+                            }
+                        }
+                        pan_add = c.sum(ch, &z.pan_cc, curves);
+                        width = (z.width + c.sum(ch, &z.width_cc, curves)).clamp(-1.0, 1.0);
+                        position =
+                            (z.position + c.sum(ch, &z.position_cc, curves)).clamp(-1.0, 1.0);
+                        // Filters: key, velocity, random, envelope (the
+                        // first), LFO (the first), controllers.
+                        let fil_lfo = lfo(&mut v.lfo[1], &z.fillfo, v.age_s, c);
+                        let fil_env = if z.fileg.set {
+                            v.fil_eg.level * eg_depth(&z.fileg, c, ch, v.velocity, curves)
+                        } else {
+                            0.0
+                        };
+                        for (fi, f) in z.filters.iter().enumerate() {
+                            let Some(f) = f else { continue };
+                            let mut fc_cents = f.keytrack
+                                * (f32::from(v.key) - f32::from(f.keycenter))
+                                + f.veltrack * v.velocity
+                                + v.rnd[fi]
+                                + c.sum(ch, &f.cutoff_cc, curves);
+                            if fi == 0 {
+                                fc_cents += fil_env + fil_lfo;
+                            }
+                            let fc = f.cutoff * 2f32.powf(fc_cents / 1200.0);
+                            let res = f.resonance + c.sum(ch, &f.resonance_cc, curves);
+                            let gain = f.gain + c.sum(ch, &f.gain_cc, curves);
+                            zc[fi] = filter_coefs(f.kind, fc, res, gain, sr);
+                            zkind[fi] = f.kind;
+                        }
+                        if z.eq_active() {
+                            for (bi, band) in z.eq.iter().enumerate() {
+                                if !band.active() {
+                                    continue;
+                                }
+                                let freq = band.freq
+                                    + band.vel2freq * v.velocity
+                                    + c.sum(ch, &band.freq_cc, curves);
+                                let bw = (band.bw + c.sum(ch, &band.bw_cc, curves)).max(0.01);
+                                let gain = band.gain
+                                    + band.vel2gain * v.velocity
+                                    + c.sum(ch, &band.gain_cc, curves);
+                                // Bandwidth in octaves to Q.
+                                let two = 2f32.powf(bw);
+                                let q = two.sqrt() / (two - 1.0);
+                                eqc[bi] = Coefs::rbj(0, freq, q, gain, sr);
+                            }
+                        }
                     }
-                    out[ch][i] += x * v.env * v.gain[ch];
+                    None => {
+                        cents += bend_st * 100.0;
+                    }
                 }
+                let step = v.step * 2f64.powf(f64::from(cents) / 1200.0);
+                let level = db_to_gain(gain_db) * gain_lin;
+                let pan = pan_add.clamp(-1.0, 1.0);
+                let target = [
+                    v.gain[0] * level * (1.0 - pan).min(1.0),
+                    v.gain[1] * level * (1.0 + pan).min(1.0),
+                ];
+                let from_gain = v.last_gain;
+                v.last_gain = target;
+                // The device's filter for this stretch.
+                let velocity = v.velocity;
+                let coefs = |env: f32| {
+                    let fc = (cutoff * 2f32.powf(env_amt * env * velocity)).clamp(20.0, sr * 0.45);
+                    let g = (PI * fc / sr).tan();
+                    let a1 = 1.0 / (1.0 + g * (g + k));
+                    (a1, g * a1, g * g * a1)
+                };
+                let dc = coefs(v.amp.level);
+                let stereo_sample = s.stereo;
+                for j in 0..n {
+                    let idx = i + j;
+                    let env = v.amp.tick();
+                    v.fil_eg.tick();
+                    v.pitch_eg.tick();
+                    if v.amp.stage == EgStage::Done {
+                        v.stage = Stage::Idle;
+                        break;
+                    }
+                    let mut y = match kept {
+                        Some((l, r)) => [l[idx - from], r[idx - from]],
+                        None => {
+                            let (y, ended) = next_frame(v, s, step);
+                            if ended {
+                                if v.repeats > 0 {
+                                    // `count`: from its start again.
+                                    v.repeats -= 1;
+                                    v.pos = if v.reverse {
+                                        v.start.max(v.end)
+                                    } else {
+                                        v.start
+                                    };
+                                } else {
+                                    v.stage = Stage::Idle;
+                                }
+                            }
+                            y
+                        }
+                    };
+                    // Width and position (stereo samples).
+                    if zone.is_some() && (width != 1.0 || position != 0.0) {
+                        let (l, r) = (y[0], y[1]);
+                        let mid = 0.5 * (l + r);
+                        let side = 0.5 * (l - r) * if stereo_sample { width } else { 0.0 };
+                        let (l, r) = (mid + side, mid - side);
+                        y = [l * (1.0 - position).min(1.0), r * (1.0 + position).min(1.0)];
+                    }
+                    let t = (j as f32 + 1.0) / n as f32;
+                    for side in 0..2 {
+                        let mut x = y[side];
+                        for fi in 0..2 {
+                            if let Coefs::Off = zc[fi] {
+                                continue;
+                            }
+                            x = run_filter(zkind[fi], zc[fi], &mut v.zf[side][fi], x);
+                        }
+                        for bi in 0..3 {
+                            if let Coefs::Off = eqc[bi] {
+                                continue;
+                            }
+                            x = run_filter(FilterKind::Peak, eqc[bi], &mut v.eqs[side][bi], x);
+                        }
+                        if filtering {
+                            let (a1, a2, a3) = dc;
+                            let (ic1, ic2) = &mut v.svf[side][0];
+                            let v3 = x - *ic2;
+                            let v1 = a1 * *ic1 + a2 * v3;
+                            let v2 = *ic2 + a2 * *ic1 + a3 * v3;
+                            *ic1 = 2.0 * v1 - *ic1;
+                            *ic2 = 2.0 * v2 - *ic2;
+                            x = match kind {
+                                1 => {
+                                    let (jc1, jc2) = &mut v.svf[side][1];
+                                    let w3 = v2 - *jc2;
+                                    let w1 = a1 * *jc1 + a2 * w3;
+                                    let w2 = *jc2 + a2 * *jc1 + a3 * w3;
+                                    *jc1 = 2.0 * w1 - *jc1;
+                                    *jc2 = 2.0 * w2 - *jc2;
+                                    w2
+                                }
+                                2 => v1 * k,
+                                3 => x - k * v1 - v2,
+                                _ => v2,
+                            };
+                        }
+                        let g = from_gain[side] + (target[side] - from_gain[side]) * t;
+                        out[side][idx] += x * env * g;
+                    }
+                    if v.stage == Stage::Idle {
+                        break;
+                    }
+                }
+                if v.stage != Stage::Idle {
+                    v.stage = v.amp.summary();
+                }
+                v.age_s += dt;
+                i += n;
             }
             for st in v.svf.iter_mut().flatten() {
                 if st.0.abs() < 1e-20 {
@@ -831,6 +1781,16 @@ impl SamplerProcessor {
                 }
                 if st.1.abs() < 1e-20 {
                     st.1 = 0.0;
+                }
+            }
+            for st in v.zf.iter_mut().flatten().chain(v.eqs.iter_mut().flatten()) {
+                for p in &mut st.s {
+                    if p.0.abs() < 1e-20 {
+                        p.0 = 0.0;
+                    }
+                    if p.1.abs() < 1e-20 {
+                        p.1 = 0.0;
+                    }
                 }
             }
         }
@@ -857,9 +1817,15 @@ impl PluginProcessor for SamplerProcessor {
                 for v in &mut self.voices {
                     v.stage = Stage::Idle;
                 }
+                if let Some(set) = g.set.as_deref() {
+                    self.adopt(set);
+                }
             }
             g.set.as_deref()
         });
+        if ctx.transport.tempo > 0.0 {
+            self.controls.tempo = ctx.transport.tempo;
+        }
         // Stretchers of voices that stopped go back; the block's priming.
         if let Some(pool) = &mut self.keep {
             let voices = &self.voices;
@@ -876,6 +1842,7 @@ impl PluginProcessor for SamplerProcessor {
             r[..frames].fill(0.0);
             let mut sides: [&mut [f32]; 2] = [&mut l[..frames], &mut r[..frames]];
             let mut pos = 0usize;
+            let block_start = self.clock;
             if let Some(events) = io.events_in.first() {
                 for e in events.iter() {
                     let at = (e.sample_offset as usize).min(frames);
@@ -883,13 +1850,14 @@ impl PluginProcessor for SamplerProcessor {
                         self.render(set, &mut sides, pos, at);
                         pos = at;
                     }
+                    self.clock = block_start + at as u64;
                     self.handle(set, e.event);
                     if self.pending > 0 {
                         let due = std::mem::take(&mut self.pending);
                         if let Some(set) = set {
                             for j in 0..due {
-                                let (c, k, v) = self.pending_release[j];
-                                self.note_on(set, c, k, v, true);
+                                let (c, k, v, kind) = self.pending_release[j];
+                                self.note_on(set, c, k, v, kind);
                             }
                         }
                     }
@@ -898,6 +1866,7 @@ impl PluginProcessor for SamplerProcessor {
             if frames > pos {
                 self.render(set, &mut sides, pos, frames);
             }
+            self.clock = block_start + frames as u64;
         }
         let newest = self
             .voices
@@ -986,6 +1955,9 @@ impl PluginProcessor for SamplerProcessor {
         self.voices = [Voice::IDLE; MAX_VOICES];
         self.sustain = [false; 16];
         self.pending = 0;
+        self.controls.keys_down = [[false; 128]; 16];
+        self.controls.pedal_releases = [[false; 128]; 16];
+        self.controls.held = 0;
         if let Some(pool) = &mut self.keep {
             pool.release_all();
         }
@@ -1261,6 +2233,237 @@ pub(crate) mod tests {
         let (l, _, _) = s.run(0.02);
         let peak = l.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         assert!(peak > 0.1, "no latency: {peak}");
+    }
+
+    /// A sampler playing `sfz` (tones written as `name.wav` first).
+    fn sfz(
+        name: &str,
+        tones: &[(&str, f64, f64)],
+        sfz: &str,
+    ) -> (Play<SamplerProcessor>, SampleHost) {
+        let d = fixtures::dir(name);
+        for (file, f, seconds) in tones {
+            fixtures::tone(&d.join(format!("{file}.wav")), *f, 48_000, *seconds);
+        }
+        std::fs::write(d.join("i.sfz"), sfz).unwrap();
+        let mut doc = SampleDoc::default();
+        doc.set(0, Some(d.join("i.sfz").to_string_lossy().into_owned()));
+        sampler(doc, &[(id::VOLUME, 0.0)])
+    }
+
+    fn cc(controller: u8, value: u8) -> MidiEvent {
+        MidiEvent::ControlChange {
+            channel: 0,
+            controller,
+            value,
+        }
+    }
+
+    fn rms_db(x: &[f32]) -> f64 {
+        let e: f64 = x.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / x.len().max(1) as f64;
+        10.0 * e.max(1e-30).log10()
+    }
+
+    /// Zero crossings upwards per second.
+    fn freq(x: &[f32]) -> f64 {
+        let ups = x.windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count();
+        ups as f64 * SR / x.len() as f64
+    }
+
+    #[test]
+    fn sfz_generators_play_at_the_keys_pitch() {
+        let (mut s, _h) = sfz("sfz-gen", &[], "<region>sample=*sine ampeg_release=0.01");
+        s.send(on(69, 127));
+        let (l, _, _) = s.run(0.5);
+        let f = freq(&l[l.len() / 2..]);
+        assert!((f - 440.0).abs() < 3.0, "{f}");
+    }
+
+    #[test]
+    fn sfz_filters_and_their_envelope_shape_the_sound() {
+        let (mut s, _h) = sfz(
+            "sfz-fil",
+            &[],
+            "<region>sample=*saw key=60 ampeg_release=0.01\n<region>sample=*saw key=62 ampeg_release=0.01 fil_type=lpf_2p cutoff=400\n<region>sample=*saw key=64 ampeg_release=0.01 fil_type=lpf_4p cutoff=200 fileg_depth=3600 fileg_decay=1 fileg_sustain=0",
+        );
+        let h8 = 261.6256 * 8.0;
+        let play = |s: &mut Play<SamplerProcessor>, key: u8, secs: f64| {
+            s.send(on(key, 127));
+            let (l, _, _) = s.run(secs);
+            s.send(off(key));
+            s.run(0.2);
+            l
+        };
+        let open = play(&mut s, 60, 0.4);
+        let low = play(&mut s, 62, 0.4);
+        let first = |x: &[f32]| bin_db(x, 261.6256);
+        assert!((first(&open) - first(&low)).abs() < 3.0);
+        assert!(
+            bin_db(&open, h8) > bin_db(&low, h8) + 20.0,
+            "{} vs {}",
+            bin_db(&open, h8),
+            bin_db(&low, h8)
+        );
+        // The filter envelope opens the 4-pole filter, then closes it.
+        let swept = play(&mut s, 64, 1.0);
+        let h4 = 261.6256 * 4.0;
+        let (early, late) = (&swept[..2_400], &swept[38_400..48_000]);
+        assert!(
+            bin_db(early, h4) > bin_db(late, h4) + 30.0,
+            "{} vs {}",
+            bin_db(early, h4),
+            bin_db(late, h4)
+        );
+    }
+
+    #[test]
+    fn sfz_controllers_modulate_and_choose_regions() {
+        let (mut s, _h) = sfz(
+            "sfz-cc",
+            &[("a", 300.0, 1.0), ("b", 500.0, 1.0)],
+            "<control>set_cc1=127\n<global>ampeg_release=0.01\n<region>sample=a.wav key=60 volume_oncc20=-20 hicc30=63\n<region>sample=b.wav key=60 pitch_keycenter=60 locc30=64\n<region>sample=*sine key=69 pitch_oncc1=1200 bend_up=700\n<region>sample=a.wav key=72 pitch_keycenter=72 on_locc31=64 on_hicc31=127",
+        );
+        let play = |s: &mut Play<SamplerProcessor>, key: u8| {
+            s.send(on(key, 127));
+            let (l, _, _) = s.run(0.3);
+            s.send(off(key));
+            s.run(0.1);
+            l
+        };
+        let full = play(&mut s, 60);
+        s.send(cc(20, 127));
+        s.run(0.01);
+        let down = play(&mut s, 60);
+        let drop = bin_db(&full, 300.0) - bin_db(&down, 300.0);
+        assert!((drop - 20.0).abs() < 1.0, "{drop}");
+        // CC 30 high: the other region.
+        s.send(cc(30, 100));
+        s.run(0.01);
+        let other = play(&mut s, 60);
+        assert!(bin_db(&other, 500.0) > bin_db(&other, 300.0) + 30.0);
+        // `key` sets the root too (middle C for a generator); the control
+        // header's CC 1 (127) raises it an octave, a full bend up a fifth.
+        let up = play(&mut s, 69);
+        assert!((freq(&up[up.len() / 2..]) - 523.25).abs() < 6.0);
+        s.send(MidiEvent::PitchBend {
+            channel: 0,
+            value: 16_383,
+        });
+        let bent = play(&mut s, 69);
+        let fifth = 523.25 * 2f64.powf(7.0 / 12.0);
+        assert!((freq(&bent[bent.len() / 2..]) - fifth).abs() < 8.0);
+        // A controller moving into a region's on_cc range plays it.
+        s.send(MidiEvent::PitchBend {
+            channel: 0,
+            value: 8_192,
+        });
+        s.send(cc(31, 100));
+        let (l, _, _) = s.run(0.3);
+        assert!(bin_db(&l, 300.0) > -20.0, "{}", bin_db(&l, 300.0));
+    }
+
+    #[test]
+    fn sfz_keyswitches_pick_the_articulation() {
+        let (mut s, _h) = sfz(
+            "sfz-sw",
+            &[("a", 300.0, 1.0), ("b", 500.0, 1.0)],
+            "<global>sw_lokey=24 sw_hikey=25 sw_default=24 key=60 ampeg_release=0.01\n<region>sample=a.wav sw_last=24\n<region>sample=b.wav sw_last=25",
+        );
+        let play = |s: &mut Play<SamplerProcessor>| {
+            s.send(on(60, 100));
+            let (l, _, _) = s.run(0.3);
+            s.send(off(60));
+            s.run(0.1);
+            l
+        };
+        let a = play(&mut s);
+        assert!(bin_db(&a, 300.0) > bin_db(&a, 500.0) + 30.0);
+        s.send(on(25, 100));
+        s.send(off(25));
+        let (silent, _, _) = s.run(0.1);
+        assert!(rms_db(&silent) < -90.0, "a keyswitch plays nothing");
+        let b = play(&mut s);
+        assert!(bin_db(&b, 500.0) > bin_db(&b, 300.0) + 30.0);
+    }
+
+    #[test]
+    fn sfz_release_triggers_first_and_legato() {
+        let (mut s, _h) = sfz(
+            "sfz-rel",
+            &[("a", 300.0, 1.0), ("b", 500.0, 1.0), ("r", 700.0, 0.3)],
+            "<global>ampeg_release=0.01\n<region>sample=a.wav lokey=60 hikey=62 pitch_keycenter=60 trigger=first\n<region>sample=b.wav lokey=60 hikey=62 pitch_keycenter=60 trigger=legato\n<region>sample=r.wav key=64 trigger=release rt_decay=20",
+        );
+        // Alone: the first region; with a key held: the legato one.
+        s.send(on(60, 100));
+        let (alone, _, _) = s.run(0.2);
+        assert!(bin_db(&alone, 300.0) > bin_db(&alone, 500.0) + 30.0);
+        s.send(on(60 + 2, 100));
+        let (both, _, _) = s.run(0.2);
+        let b = 500.0 * 2f64.powf(2.0 / 12.0);
+        assert!(bin_db(&both, b) > -20.0, "{}", bin_db(&both, b));
+        s.send(off(60));
+        s.send(off(62));
+        s.run(0.2);
+        // A release trigger loses 20 dB per second held.
+        let release = |s: &mut Play<SamplerProcessor>, held: f64| {
+            s.send(on(64, 100));
+            let (pressed, _, _) = s.run(held);
+            assert!(rms_db(&pressed) < -90.0, "nothing until the release");
+            s.send(off(64));
+            let (l, _, _) = s.run(0.4);
+            rms_db(&l[..4_800])
+        };
+        let short = release(&mut s, 0.1);
+        let long = release(&mut s, 1.1);
+        assert!(((short - long) - 20.0).abs() < 2.0, "{short} {long}");
+    }
+
+    #[test]
+    fn sfz_velocity_crossfades_lfos_delays_and_counts() {
+        let (mut s, _h) = sfz(
+            "sfz-misc",
+            &[("a", 300.0, 1.0), ("b", 500.0, 1.0), ("c", 700.0, 0.1)],
+            "<global>ampeg_release=0.01\n<region>sample=a.wav key=60 xfin_lovel=1 xfin_hivel=127\n<region>sample=b.wav key=60 pitch_keycenter=60 xfout_lovel=1 xfout_hivel=127\n<region>sample=*sine key=62 amplfo_freq=4 amplfo_depth=6\n<region>sample=a.wav key=64 pitch_keycenter=64 delay=0.1\n<region>sample=c.wav key=65 pitch_keycenter=65 count=2\n<region>sample=c.wav key=67 pitch_keycenter=67 loop_mode=one_shot\n<region>sample=*sine key=69 note_polyphony=1",
+        );
+        let play = |s: &mut Play<SamplerProcessor>, key: u8, vel: u8, secs: f64| {
+            s.send(on(key, vel));
+            let (l, _, _) = s.run(secs);
+            s.send(off(key));
+            s.run(0.1);
+            l
+        };
+        let hard = play(&mut s, 60, 127, 0.3);
+        assert!(bin_db(&hard, 300.0) > bin_db(&hard, 500.0) + 40.0);
+        let mid = play(&mut s, 60, 64, 0.3);
+        assert!((bin_db(&mid, 300.0) - bin_db(&mid, 500.0)).abs() < 1.0);
+        // ±6 dB of tremolo.
+        let trem = play(&mut s, 62, 127, 1.0);
+        let windows: Vec<f64> = trem[9_600..].chunks(960).map(rms_db).collect();
+        let (lo, hi) = windows
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(a, b), w| (a.min(*w), b.max(*w)));
+        assert!(hi - lo > 9.0 && hi - lo < 13.0, "{lo} {hi}");
+        // Silent for its delay.
+        let delayed = play(&mut s, 64, 127, 0.3);
+        assert!(rms_db(&delayed[..4_000]) < -90.0);
+        assert!(rms_db(&delayed[6_000..]) > -20.0);
+        // Twice through, then done (a one-shot ignores the note-off).
+        let counted = play(&mut s, 65, 127, 0.3);
+        assert!(rms_db(&counted[5_000..9_000]) > -20.0, "the second time");
+        assert!(rms_db(&counted[10_500..]) < -90.0);
+        let once = play(&mut s, 67, 127, 0.3);
+        assert!(rms_db(&once[5_000..9_000]) < -90.0);
+        // One voice per key.
+        s.send(on(69, 127));
+        s.run(0.05);
+        s.send(on(69, 127));
+        s.run(0.05);
+        let sounding =
+            s.p.voices
+                .iter()
+                .filter(|v| matches!(v.stage, Stage::Attack | Stage::Decay | Stage::Sustain))
+                .count();
+        assert_eq!(sounding, 1);
     }
 
     #[test]

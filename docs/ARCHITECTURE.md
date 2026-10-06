@@ -848,10 +848,29 @@ covered by `the_stock_devices_do_not_allocate`.
   plugin state after the parameter block (`samples::pack`: `FFSD`, length,
   parameters, JSON), so it saves, undoes (`Command::SetPluginState`) and
   travels with presets. Loading (`samples::load`: the importer's decoder,
-  any rate — playback steps by the ratio; SFZ files parsed into zones:
-  key/velocity ranges, roots, tune, volume, pan, loops, `ampeg_*`, release
-  triggers, `group`/`off_by`, round robins, random layers) happens on the
-  control thread; the set is swapped into a `TryCell` the processor only
+  any rate — playback steps by the ratio; SFZ files read by
+  `devices::sfz`: `#define`, `#include`, block comments, `<control>`
+  (`default_path`, note/octave offsets, `set_ccN`), `<curve>`s, the
+  generators `*sine`/`*saw`/`*square`/`*triangle`/`*noise`/`*silence`,
+  and the SFZ 1 opcode set with the common SFZ 2 additions inherited
+  through `<global>`/`<master>`/`<group>`/`<region>` into `sfz::Zone`s —
+  conditions (channel, key, velocity, controller, bend, aftertouch,
+  random, tempo, round robins, keyswitches `sw_last`/`sw_down`/`sw_up`/
+  `sw_previous`/`sw_default`, triggers attack/release/first/legato/
+  `release_key`, `on_loccN`), voice control (`group`/`off_by`/`off_mode`,
+  `polyphony`, `note_polyphony`), playback (offset with random and
+  controller, end, count, loops with crossfade, direction, delay),
+  amplifier (volume, amplitude, pan, width, position, key/velocity
+  tracking, velocity curves, random, `rt_decay`, key/velocity/controller
+  crossfades), pitch (key centre, tracking, velocity, random, bend range
+  and step), two filters (1/2/4/6-pole low/high/band pass and reject,
+  peak, shelves) and a three-band EQ, `ampeg`/`fileg`/`pitcheg` (delay,
+  start, attack, hold, decay, sustain, release, depth, `vel2*`) and
+  `amplfo`/`fillfo`/`pitchlfo`; anything of these by controller as
+  `_ccN`/`_onccN` with `_curveccN`, the extended controllers 128–136
+  (bend, aftertouch, velocity, key, random) included. Voices evaluate
+  the modulation every 16 samples; `<effect>` buses are not played)
+  happens on the control thread; the set is swapped into a `TryCell` the processor only
   ever `try_lock`s (voices of an older generation stop; the old set is
   dropped on the control thread) and handed to the editor through
   `AnalysisTap::set_assets`. Sampler: one sample across the keys (root,

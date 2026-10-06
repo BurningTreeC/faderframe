@@ -27,6 +27,7 @@ pub mod sampler;
 pub mod samples;
 pub mod saturator;
 pub mod scale;
+pub mod sfz;
 pub mod synth;
 pub mod tuner;
 pub mod utility;

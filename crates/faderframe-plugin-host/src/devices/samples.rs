@@ -127,25 +127,53 @@ const MAX_FRAMES: usize = 48_000 * 600;
 
 /// Decode an audio file.
 pub fn load_audio(path: &Path) -> Result<Sample, String> {
+    decode(path, |cancel, on_info, sink| {
+        faderframe_audio_files::decode::decode_file(path, cancel, on_info, sink)
+    })
+}
+
+/// Audio held in memory (an SFZ's embedded sample), `name` giving its
+/// format by extension.
+pub fn load_audio_bytes(name: &str, bytes: Vec<u8>) -> Result<Sample, String> {
+    let path = Path::new(name);
+    decode(path, |cancel, on_info, sink| {
+        faderframe_audio_files::decode::decode_bytes(bytes, path, cancel, on_info, sink)
+    })
+}
+
+type InfoFn<'a> = &'a mut dyn FnMut(
+    &faderframe_audio_files::decode::ProbeInfo,
+) -> Result<(), faderframe_audio_files::import::ImportError>;
+type SinkFn<'a> = &'a mut dyn FnMut(
+    &[Vec<f32>],
+    usize,
+) -> Result<(), faderframe_audio_files::import::ImportError>;
+
+fn decode(
+    path: &Path,
+    run: impl FnOnce(
+        &AtomicBool,
+        InfoFn<'_>,
+        SinkFn<'_>,
+    ) -> Result<
+        faderframe_audio_files::decode::ProbeInfo,
+        faderframe_audio_files::import::ImportError,
+    >,
+) -> Result<Sample, String> {
     let cancel = AtomicBool::new(false);
     let mut channels: Vec<Vec<f32>> = Vec::new();
-    let info = faderframe_audio_files::decode::decode_file(
-        path,
-        &cancel,
-        |_| Ok(()),
-        |block, frames| {
-            if channels.is_empty() {
-                channels = vec![Vec::new(); block.len().clamp(1, 2)];
+    let info = run(&cancel, &mut |_| Ok(()), &mut |block, frames| {
+        if channels.is_empty() {
+            channels = vec![Vec::new(); block.len().clamp(1, 2)];
+        }
+        for (c, ch) in channels.iter_mut().enumerate() {
+            if ch.len() < MAX_FRAMES {
+                let src = &block[c.min(block.len() - 1)];
+                ch.extend_from_slice(&src[..frames.min(src.len())]);
             }
-            for (c, ch) in channels.iter_mut().enumerate() {
-                if ch.len() < MAX_FRAMES {
-                    let src = &block[c.min(block.len() - 1)];
-                    ch.extend_from_slice(&src[..frames.min(src.len())]);
-                }
-            }
-            Ok(())
-        },
-    )
+        }
+        Ok(())
+    })
     .map_err(|e| format!("{}: {e}", path.display()))?;
     let name = path
         .file_stem()
@@ -219,74 +247,7 @@ pub enum LoopMode {
     Sustain,
 }
 
-/// One region of an instrument: a sample over a range of keys and
-/// velocities, with its tuning, level, loop and envelope.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Zone {
-    pub sample: usize,
-    pub lokey: u8,
-    pub hikey: u8,
-    pub lovel: u8,
-    pub hivel: u8,
-    pub root: f64,
-    /// Cents.
-    pub tune: f64,
-    pub volume: f64,
-    pub pan: f64,
-    pub loop_mode: Option<LoopMode>,
-    pub loop_start: Option<usize>,
-    pub loop_end: Option<usize>,
-    pub offset: usize,
-    pub end: Option<usize>,
-    /// Attack, decay, sustain (0–1), release in seconds, where the file
-    /// says.
-    pub ampeg: [Option<f64>; 4],
-    pub on_release: bool,
-    pub group: u32,
-    pub off_by: u32,
-    pub seq_length: u32,
-    pub seq_position: u32,
-    pub lorand: f64,
-    pub hirand: f64,
-    /// Velocity tracking (0–1) and key tracking (cents per key).
-    pub veltrack: f64,
-    pub keytrack: f64,
-}
-
-impl Zone {
-    pub fn whole(sample: usize) -> Self {
-        Self {
-            sample,
-            lokey: 0,
-            hikey: 127,
-            lovel: 0,
-            hivel: 127,
-            root: 60.0,
-            tune: 0.0,
-            volume: 0.0,
-            pan: 0.0,
-            loop_mode: None,
-            loop_start: None,
-            loop_end: None,
-            offset: 0,
-            end: None,
-            ampeg: [None; 4],
-            on_release: false,
-            group: 0,
-            off_by: 0,
-            seq_length: 1,
-            seq_position: 1,
-            lorand: 0.0,
-            hirand: 1.0,
-            veltrack: 1.0,
-            keytrack: 100.0,
-        }
-    }
-
-    pub fn takes(&self, key: u8, velocity: u8) -> bool {
-        (self.lokey..=self.hikey).contains(&key) && (self.lovel..=self.hivel).contains(&velocity)
-    }
-}
+pub use super::sfz::{Zone, parse_key};
 
 /// What a device plays: its samples and (for an instrument) the zones
 /// mapping them, with what could not be loaded.
@@ -298,6 +259,8 @@ pub struct SampleSet {
     /// Instrument zones (an SFZ's regions); empty when a slot plays its
     /// sample by the device's own settings.
     pub zones: Vec<Zone>,
+    /// An SFZ's curves and controllers' initial values.
+    pub instrument: Option<Arc<super::sfz::Instrument>>,
     pub errors: Vec<String>,
 }
 
@@ -410,8 +373,7 @@ pub fn load(doc: &SampleDoc) -> SampleSet {
         if is_sfz(&path) {
             match std::fs::read_to_string(&path) {
                 Ok(text) => {
-                    let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
-                    load_sfz(&mut set, &text, &base);
+                    super::sfz::load(&mut set, &text, &path);
                     set.slots.push(None);
                 }
                 Err(e) => {
@@ -433,219 +395,6 @@ pub fn load(doc: &SampleDoc) -> SampleSet {
         }
     }
     set
-}
-
-/// A note name or number (`c4` = 60, `a#3`, `eb2`, `61`).
-pub fn parse_key(v: &str) -> Option<u8> {
-    let v = v.trim();
-    if let Ok(n) = v.parse::<i32>() {
-        return u8::try_from(n.clamp(0, 127)).ok();
-    }
-    let lower = v.to_ascii_lowercase();
-    let mut chars = lower.chars();
-    let base = match chars.next()? {
-        'c' => 0,
-        'd' => 2,
-        'e' => 4,
-        'f' => 5,
-        'g' => 7,
-        'a' => 9,
-        'b' => 11,
-        _ => return None,
-    };
-    let rest: String = chars.collect();
-    let (shift, octave) = if let Some(o) = rest.strip_prefix('#') {
-        (1, o)
-    } else if let Some(o) = rest.strip_prefix('b') {
-        (-1, o)
-    } else {
-        (0, rest.as_str())
-    };
-    let octave: i32 = octave.parse().ok()?;
-    u8::try_from((12 * (octave + 1) + base + shift).clamp(0, 127)).ok()
-}
-
-/// The opcodes of one header, as written.
-type Opcodes = Vec<(String, String)>;
-
-/// Split SFZ text into headers and their opcodes (comments removed).
-fn sfz_headers(text: &str) -> Vec<(String, Opcodes)> {
-    let mut out: Vec<(String, Opcodes)> = Vec::new();
-    for raw in text.lines() {
-        let line = match raw.find("//") {
-            Some(i) => &raw[..i],
-            None => raw,
-        };
-        let mut rest = line.trim();
-        while !rest.is_empty() {
-            if let Some(after) = rest.strip_prefix('<') {
-                let Some(end) = after.find('>') else { break };
-                out.push((after[..end].trim().to_ascii_lowercase(), Vec::new()));
-                rest = after[end + 1..].trim_start();
-                continue;
-            }
-            let Some(eq) = rest.find('=') else { break };
-            let key = rest[..eq].trim().to_ascii_lowercase();
-            let after = &rest[eq + 1..];
-            // The value (spaces and all: sample paths have them) runs to
-            // the next opcode (`name=`) or header.
-            let end = {
-                let mut end = after.len();
-                let bytes = after.as_bytes();
-                let mut i = 0;
-                while i < bytes.len() {
-                    if bytes[i] == b'<' {
-                        end = i;
-                        break;
-                    }
-                    if bytes[i].is_ascii_whitespace() {
-                        let tail = after[i..].trim_start();
-                        let word_end =
-                            tail.find(|c: char| c == '=' || c.is_whitespace() || c == '<');
-                        if let Some(w) = word_end
-                            && tail[w..].starts_with('=')
-                        {
-                            end = i;
-                            break;
-                        }
-                    }
-                    i += 1;
-                }
-                end
-            };
-            let value = after[..end].trim().to_string();
-            if out.is_empty() {
-                out.push(("global".into(), Vec::new()));
-            }
-            if let Some(last) = out.last_mut() {
-                last.1.push((key, value));
-            }
-            rest = after[end..].trim_start();
-        }
-    }
-    out
-}
-
-/// Read an SFZ instrument into `set` (its samples relative to `base`, or
-/// to `default_path`).
-pub fn load_sfz(set: &mut SampleSet, text: &str, base: &Path) {
-    let headers = sfz_headers(text);
-    let mut global: Opcodes = Vec::new();
-    let mut master: Opcodes = Vec::new();
-    let mut group: Opcodes = Vec::new();
-    let mut default_path = String::new();
-    let mut loaded: std::collections::HashMap<PathBuf, Option<usize>> = Default::default();
-    for (header, ops) in headers {
-        match header.as_str() {
-            "control" => {
-                for (k, v) in &ops {
-                    if k == "default_path" {
-                        default_path = v.replace('\\', "/");
-                    }
-                }
-            }
-            "global" => {
-                global = ops;
-                master.clear();
-                group.clear();
-            }
-            "master" => {
-                master = ops;
-                group.clear();
-            }
-            "group" => group = ops,
-            "region" => {
-                let all: Vec<&(String, String)> = global
-                    .iter()
-                    .chain(&master)
-                    .chain(&group)
-                    .chain(&ops)
-                    .collect();
-                let Some(sample) = all
-                    .iter()
-                    .rev()
-                    .find(|(k, _)| k == "sample")
-                    .map(|(_, v)| v.replace('\\', "/"))
-                else {
-                    continue;
-                };
-                let path = base.join(&default_path).join(&sample);
-                let index =
-                    *loaded
-                        .entry(path.clone())
-                        .or_insert_with(|| match load_cached(&path) {
-                            Ok(s) => {
-                                set.samples.push(s);
-                                Some(set.samples.len() - 1)
-                            }
-                            Err(e) => {
-                                set.errors.push(e);
-                                None
-                            }
-                        });
-                let Some(index) = index else { continue };
-                let mut z = Zone::whole(index);
-                let mut key_set = false;
-                for (k, v) in all {
-                    let f = || v.parse::<f64>().ok();
-                    match k.as_str() {
-                        "lokey" => z.lokey = parse_key(v).unwrap_or(z.lokey),
-                        "hikey" => z.hikey = parse_key(v).unwrap_or(z.hikey),
-                        "key" => {
-                            if let Some(n) = parse_key(v) {
-                                (z.lokey, z.hikey, z.root) = (n, n, f64::from(n));
-                                key_set = true;
-                            }
-                        }
-                        "pitch_keycenter" => {
-                            if let Some(n) = parse_key(v) {
-                                z.root = f64::from(n);
-                                key_set = true;
-                            }
-                        }
-                        "lovel" => z.lovel = v.parse().unwrap_or(z.lovel),
-                        "hivel" => z.hivel = v.parse().unwrap_or(z.hivel),
-                        "tune" => z.tune = f().unwrap_or(0.0),
-                        "transpose" => z.tune += 100.0 * f().unwrap_or(0.0),
-                        "volume" => z.volume = f().unwrap_or(0.0),
-                        "pan" => z.pan = (f().unwrap_or(0.0) / 100.0).clamp(-1.0, 1.0),
-                        "loop_mode" | "loopmode" => {
-                            z.loop_mode = match v.as_str() {
-                                "no_loop" => Some(LoopMode::NoLoop),
-                                "one_shot" => Some(LoopMode::OneShot),
-                                "loop_continuous" => Some(LoopMode::Continuous),
-                                "loop_sustain" => Some(LoopMode::Sustain),
-                                _ => z.loop_mode,
-                            }
-                        }
-                        "loop_start" | "loopstart" => z.loop_start = v.parse().ok(),
-                        "loop_end" | "loopend" => z.loop_end = v.parse().ok(),
-                        "offset" => z.offset = v.parse().unwrap_or(0),
-                        "end" => z.end = v.parse().ok(),
-                        "ampeg_attack" => z.ampeg[0] = f(),
-                        "ampeg_decay" => z.ampeg[1] = f(),
-                        "ampeg_sustain" => z.ampeg[2] = f().map(|s| s / 100.0),
-                        "ampeg_release" => z.ampeg[3] = f(),
-                        "trigger" => z.on_release = v == "release",
-                        "group" => z.group = v.parse().unwrap_or(0),
-                        "off_by" => z.off_by = v.parse().unwrap_or(0),
-                        "seq_length" => z.seq_length = v.parse::<u32>().unwrap_or(1).max(1),
-                        "seq_position" => z.seq_position = v.parse::<u32>().unwrap_or(1).max(1),
-                        "lorand" => z.lorand = f().unwrap_or(0.0),
-                        "hirand" => z.hirand = f().unwrap_or(1.0),
-                        "amp_veltrack" => z.veltrack = f().unwrap_or(100.0) / 100.0,
-                        "pitch_keytrack" => z.keytrack = f().unwrap_or(100.0),
-                        _ => {}
-                    }
-                }
-                if !key_set && z.lokey == z.hikey {
-                    z.root = f64::from(z.lokey);
-                }
-                set.zones.push(z);
-            }
-            _ => {}
-        }
-    }
 }
 
 /// Test fixtures: a folder of tones.
@@ -713,7 +462,7 @@ mod tests {
         assert_eq!(parse_key("A#3"), Some(58));
         assert_eq!(parse_key("eb2"), Some(39));
         assert_eq!(parse_key("61"), Some(61));
-        let h = sfz_headers(
+        let h = crate::devices::sfz::headers(
             "// a piano\n<control> default_path=Samples\\\n<group> ampeg_release=0.4 lovel=0\n<region> sample=Piano C4 v1.wav key=c4\n<region>sample=d4.wav lokey=d4 hikey=e4 pitch_keycenter=d4 tune=-5",
         );
         assert_eq!(h.len(), 4);
@@ -756,7 +505,7 @@ mod tests {
         assert_eq!((z.lokey, z.hikey, z.root), (36, 59, 48.0));
         assert_eq!(z.loop_mode, Some(LoopMode::Continuous));
         assert_eq!((z.loop_start, z.loop_end), (Some(100), Some(4000)));
-        assert_eq!(z.ampeg[3], Some(0.3));
+        assert_eq!(z.ampeg.release, 0.3);
         assert_eq!(set.zones[1].seq_length, 2);
         assert_eq!(set.samples[0].rate, 44_100.0);
         let _ = std::fs::remove_dir_all(&dir);

@@ -9,7 +9,7 @@ use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::errors::Error as SymError;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, TrackType};
-use symphonia::core::io::MediaSourceStream;
+use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 
 /// What the container says about the audio track.
@@ -41,11 +41,39 @@ pub fn is_supported(path: &Path) -> bool {
 pub fn decode_file(
     path: &Path,
     cancel: &AtomicBool,
+    on_info: impl FnMut(&ProbeInfo) -> Result<(), ImportError>,
+    sink: impl FnMut(&[Vec<f32>], usize) -> Result<(), ImportError>,
+) -> Result<ProbeInfo, ImportError> {
+    let file = File::open(path)?;
+    decode_source(Box::new(file), path, cancel, on_info, sink)
+}
+
+/// [`decode_file`] for audio in memory (`name`'s extension is the hint,
+/// and it names the audio in errors).
+pub fn decode_bytes(
+    bytes: Vec<u8>,
+    name: &Path,
+    cancel: &AtomicBool,
+    on_info: impl FnMut(&ProbeInfo) -> Result<(), ImportError>,
+    sink: impl FnMut(&[Vec<f32>], usize) -> Result<(), ImportError>,
+) -> Result<ProbeInfo, ImportError> {
+    decode_source(
+        Box::new(std::io::Cursor::new(bytes)),
+        name,
+        cancel,
+        on_info,
+        sink,
+    )
+}
+
+fn decode_source(
+    source: Box<dyn MediaSource>,
+    path: &Path,
+    cancel: &AtomicBool,
     mut on_info: impl FnMut(&ProbeInfo) -> Result<(), ImportError>,
     mut sink: impl FnMut(&[Vec<f32>], usize) -> Result<(), ImportError>,
 ) -> Result<ProbeInfo, ImportError> {
-    let file = File::open(path)?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mss = MediaSourceStream::new(source, Default::default());
     let mut hint = Hint::new();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         hint.with_extension(ext);

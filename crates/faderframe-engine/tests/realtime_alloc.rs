@@ -1753,6 +1753,30 @@ fn the_instruments_do_not_allocate() {
     let mut tp = common::TestProject::new(SR);
     let mut sampler_doc = SampleDoc::default();
     sampler_doc.set(0, Some(files[1].clone()));
+    // An SFZ with every kind of opcode the sampler plays.
+    let sfz = format!(
+        "<control>set_cc1=64 default_path={dir}/\n<curve>curve_index=7 v000=0 v127=1\n\
+         <global>ampeg_attack=0.002 ampeg_hold=0.01 ampeg_decay=0.2 ampeg_sustain=60 ampeg_release=0.05 \
+         amp_velcurve_100=0.8 sw_lokey=24 sw_hikey=25 sw_default=24\n\
+         <group>lokey=40 hikey=70 pitch_keycenter=57 sw_last=24 fil_type=lpf_4p cutoff=800 resonance=6 \
+         cutoff_oncc74=2400 cutoff_curvecc74=7 fil_veltrack=1200 fileg_depth=1200 fileg_decay=0.3 \
+         fil2_type=hsh cutoff2=4000 fil2_gain=-6 eq1_gain=3 eq2_gain=-4 eq3_bw=2 eq3_gain=2 \
+         pitchlfo_freq=5 pitchlfo_depth=20 pitchlfo_depthcc1=30 amplfo_freq=3 amplfo_depth=2 \
+         fillfo_freq=1 fillfo_depth=600 pitcheg_depth=50 pitcheg_decay=0.1 volume_oncc7=-6 pan_oncc10=50 \
+         width=60 position=-20 xfin_locc11=0 xfin_hicc11=127 bend_up=1200 offset_random=200 \
+         note_polyphony=2 polyphony=12 cutoff_chanaft=600 pitch_veltrack=10 amp_random=1 fil_random=50\n\
+         <region>sample=1.wav loop_mode=loop_continuous loop_start=1000 loop_end=20000 loop_crossfade=0.01\n\
+         <region>sample=2.wav sw_last=25 direction=reverse delay=0.01 count=2\n\
+         <region>sample=0.wav lokey=40 hikey=70 trigger=release rt_decay=6\n\
+         <region>sample=*saw key=30 on_locc20=64 on_hicc20=127\n\
+         <region>sample=*sine lokey=40 hikey=70 trigger=legato fil_type=bpf_2p cutoff=1000\n\
+         <region>sample=*noise lokey=71 hikey=80 fil_type=hpf_6p cutoff=3000 group=2 off_by=2 off_mode=normal",
+        dir = dir.display()
+    );
+    let sfz_path = dir.join("all.sfz");
+    std::fs::write(&sfz_path, sfz).unwrap();
+    let mut sfz_doc = SampleDoc::default();
+    sfz_doc.set(0, Some(sfz_path.to_string_lossy().into_owned()));
     let mut drum_doc = SampleDoc::default();
     for (pad, f) in files.iter().enumerate() {
         drum_doc.set(pad, Some(f.clone()));
@@ -1805,6 +1829,11 @@ fn the_instruments_do_not_allocate() {
                 ],
                 &drum_doc,
             )),
+            vec![],
+        ),
+        (
+            builtin::SAMPLER,
+            Some(state(builtin::SAMPLER, &[(9, 1.0), (7, 6_000.0)], &sfz_doc)),
             vec![],
         ),
         // Keep Length: pitch by stretchers, not speed.
@@ -1873,7 +1902,19 @@ fn the_instruments_do_not_allocate() {
         r.processor.process_device(&mut bufs);
     }
     let mut total = 0;
+    let mut sfz_zones = 0.0f32;
     for key in 44..80u8 {
+        // Controllers, bend, aftertouch, the pedal and a keyswitch move
+        // between the notes (the SFZ instrument follows them all).
+        tx.send(0, &[0xB0, 74, key]);
+        tx.send(0, &[0xB0, 20, if key % 4 == 0 { 100 } else { 0 }]);
+        tx.send(0, &[0xB0, 64, if key % 5 == 0 { 127 } else { 0 }]);
+        tx.send(0, &[0xE0, 0, key]);
+        tx.send(0, &[0xD0, key]);
+        tx.send(0, &[0xA0, key, 64]);
+        if key % 7 == 0 {
+            tx.send(0, &[0x90, 24 + key % 2, 100]);
+        }
         tx.send(0, &[0x90, key, 40 + key]);
         let (_, n) = armed(|| {
             for _ in 0..4 {
@@ -1882,10 +1923,13 @@ fn the_instruments_do_not_allocate() {
             }
         });
         total += n;
+        sfz_zones =
+            sfz_zones.max(taps[3].value(faderframe_plugin_host::devices::sampler::value::ZONE));
         if key % 3 != 0 {
             tx.send(0, &[0x80, key, 0]);
         }
     }
+    assert!(sfz_zones >= 1.0, "the SFZ's regions played");
     let (_, n) = armed(|| {
         for _ in 0..40 {
             taps.iter().for_each(|t| t.watch());
