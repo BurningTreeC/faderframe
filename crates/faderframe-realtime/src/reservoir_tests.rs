@@ -38,9 +38,9 @@ struct Stand {
     stall_at: Option<usize>,
     stall: Duration,
     panic_at: Option<usize>,
-    /// Publish the frames the host waits for first, then take this long over
-    /// the rest; and count the segments that asked for that.
-    behind: Duration,
+    /// Hold the first segment's tail until the test releases it, after
+    /// publishing its prefix. Counts the segments that asked for a split.
+    behind: Option<std::sync::mpsc::Receiver<()>>,
     splits: Arc<AtomicUsize>,
 }
 
@@ -53,7 +53,7 @@ impl Stand {
             stall_at: None,
             stall: Duration::ZERO,
             panic_at: None,
-            behind: Duration::ZERO,
+            behind: None,
             splits: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -95,7 +95,9 @@ impl Segments for Stand {
             }
         }
         publish(channels, timing.first);
-        thread::sleep(self.behind);
+        if let Some(release) = self.behind.take() {
+            let _ = release.recv();
+        }
         for channel in channels.iter_mut() {
             for sample in channel[timing.first..].iter_mut() {
                 *sample *= gain;
@@ -172,13 +174,18 @@ fn misaligned(output: &[f32], input: &[f32], delay: usize, from: usize) -> usize
 }
 
 /// The frames a reservoir's own counts say it did not play on time:
-/// concealed, or crossfading back after a concealment. A machine's load
-/// decides how many there are; if the delay ever slipped, every frame after
-/// the slip would be out of place and far more than this.
+/// concealed, re-priming after input overflow, or crossfading back after a
+/// concealment. A machine's load decides how many there are; if the delay ever
+/// slipped, every frame after the slip would be out of place and far more than this.
 fn accounted<P: Segments>(reservoir: &Reservoir<P>) -> usize {
     let c = &reservoir.stats().callback;
+    // Input overflows return before underrun accounting. They conceal that
+    // call and restart the delay; neither interval is a timeline slip. These
+    // tests never exceed max_block, so it bounds each discarded input call.
     (c.underrun_frames.load(Ordering::Relaxed)
-        + RECOVERY as u64 * c.underrun_events.load(Ordering::Relaxed)) as usize
+        + RECOVERY as u64 * c.underrun_events.load(Ordering::Relaxed)
+        + (reservoir.config.max_block + reservoir.config.delay) as u64
+            * c.input_overflows.load(Ordering::Relaxed)) as usize
 }
 
 fn assert_delayed(output: &[f32], input: &[f32], delay: usize, label: &str) {
@@ -420,30 +427,38 @@ fn only_a_block_longer_than_the_reservoir_is_split_and_the_delay_is_exact() {
 #[test]
 fn a_long_block_waits_only_for_the_frames_it_returns() {
     // N = 256 against D = 64: each call returns 192 frames made from its own
-    // input. The worker publishes those and then takes 3 ms over the other
-    // 64, which the next call needs. Waiting for the whole segment would
-    // cost every call 3 ms; waiting for what it returns costs it nearly
-    // nothing.
-    let _timing = timing();
-    let input = signal(48_000 / 2);
+    // input. Hold the remaining 64 frames until the callback returns. This
+    // proves it waits only for its prefix, regardless of timer resolution or
+    // how long the runner takes to schedule the worker.
+    let input = signal(256);
+    let (release, held) = std::sync::mpsc::channel();
+    let (completed, result) = std::sync::mpsc::channel();
     let mut stand = Stand::new();
-    stand.behind = Duration::from_millis(3);
+    stand.behind = Some(held);
+    let splits = Arc::clone(&stand.splits);
     let mut reservoir = Reservoir::new(config(64, 1, 256, false), Box::new(stand));
-    thread::sleep(Duration::from_millis(5));
-    let output = paced(&mut reservoir, &input, 256);
+    thread::scope(|scope| {
+        let callback = scope.spawn(|| {
+            let mut block = input.clone();
+            reservoir.process_with_deadline(
+                &mut [&mut block],
+                1.0,
+                Some(Instant::now() + Duration::from_secs(10)),
+            );
+            completed.send(block).unwrap();
+        });
+        let output = result.recv_timeout(Duration::from_secs(5));
+        // Always release the worker before asserting, including on failure,
+        // so the reservoir's Drop can join it without hanging the test.
+        drop(release);
+        callback.join().unwrap();
+        let output = output.expect("callback waited for the held tail");
+        assert_delayed(&output, &input, 64, "published prefix");
+    });
     let stats = reservoir.stats();
-    let wait = &stats.callback.wait;
-    assert!(stats.callback.structural_waits.load(Ordering::Relaxed) > 0);
-    assert!(
-        wait.quantile(0.5) < 1_500_000,
-        "a call waited {} us at the median: for the whole segment, not its own frames",
-        wait.quantile(0.5) / 1_000
-    );
-    let wrong = misaligned(&output, &input, 64, 0);
-    assert!(
-        wrong <= accounted(&reservoir),
-        "{wrong} frames out of place"
-    );
+    assert_eq!(splits.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.underruns(), 0);
+    assert_eq!(stats.callback.waits_expired.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -482,6 +497,14 @@ fn a_worker_a_whole_ring_behind_is_resynchronised() {
     assert!(stats.input_overflows() > 0);
     assert_eq!(stats.output_overflows(), 0);
     assert!(stats.worker.stale_segments.load(Ordering::Relaxed) > 0);
+    // Also cover the overflow interval itself: unlike an ordinary underrun,
+    // it discards whole input calls and primes the delay again.
+    let total_wrong = misaligned(&output, &input, 64, 0);
+    assert!(
+        total_wrong <= accounted(&reservoir),
+        "{total_wrong} frames out of place, {} accounted for including overflow",
+        accounted(&reservoir)
+    );
     // At the end the output is the input 64 frames late, within the new
     // epoch -- which, the overflowing calls having been outside every
     // timeline, is the same 64 frames of the stream.

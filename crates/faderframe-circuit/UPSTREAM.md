@@ -27,6 +27,10 @@ thread `faderframe-circuit`, and return thread creation errors. The numerical
 solver and generated kernels are unchanged apart from the test configuration
 described above.
 
+Reservoir test adaptations account for input-overflow concealment and delay
+re-priming, and use a gated worker tail to verify partial publication without
+depending on sub-millisecond scheduler timing on hosted runners.
+
 The reservoir also accepts an explicit device callback deadline. Live graphs
 with buffered preamps request at most 128 frames per internal chunk, so every
 track can enqueue work before the next chunk needs its output. All chunks

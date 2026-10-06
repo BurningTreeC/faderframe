@@ -154,9 +154,14 @@ fn synth_preamp_master_changes_playing_audio_live_and_rendered_ahead() {
     use std::time::{Duration, Instant};
     let run = |s: &mut Session, millis| {
         let start = Instant::now();
+        let mut previous = start;
         while start.elapsed() < Duration::from_millis(millis) {
-            std::thread::sleep(Duration::from_millis(5));
-            s.tick(0.005);
+            std::thread::sleep(Duration::from_millis(20));
+            // Hosted runners may sleep much longer than requested. Meter
+            // ballistics must see the elapsed time, just as in the GUI.
+            let now = Instant::now();
+            s.tick(now.duration_since(previous).as_secs_f32());
+            previous = now;
         }
     };
     for ahead in [false, true] {
@@ -218,7 +223,7 @@ fn synth_preamp_master_changes_playing_audio_live_and_rendered_ahead() {
         let quiet = s.meter(track).left.level_db;
         assert!(loud > -50.0, "ahead={ahead}: synth is audible ({loud})");
         assert!(
-            quiet < loud - 40.0,
+            quiet <= (loud - 40.0).max(faderframe_session::METER_FLOOR_DB),
             "ahead={ahead}: Master must attenuate the synth: {loud} -> {quiet}"
         );
         s.stop_audio();
