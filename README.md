@@ -308,8 +308,10 @@ Contrast:
   can toggle switches or run transport functions; soft takeover and
   endless encoders (relative modes); mapped controls don't reach the
   instrument. Mod wheel, pitch bend, sustain and aftertouch are recorded
-  into clips and chased on playback. MIDI tracks play external instruments
-  (track menu → MIDI Out) in time with the audio, and MIDI clock can sync
+  into clips and chased on playback. MIDI tracks play an instrument track
+  (track menu → Plays: …; a MIDI track added while an instrument track is
+  selected plays that one) and external instruments (track menu → MIDI
+  Out) in time with the audio, and MIDI clock can sync
   external gear. Inputs, outputs, clock and mappings in Preferences → MIDI.
 * Performance meter (F8, or click the DSP readout in the status bar): total
   DSP load with a 60 s history and a breakdown into plugins, mixing and

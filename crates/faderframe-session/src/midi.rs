@@ -652,6 +652,49 @@ impl Session {
         }
     }
 
+    /// The instrument a MIDI track plays: none, or one of the instrument
+    /// tracks (its notes and live input go through the MIDI track's MIDI
+    /// effects to that track's instrument).
+    pub fn midi_instrument_choices(&self, track: TrackId) -> Vec<InputChoice> {
+        use faderframe_project::OutputRouting;
+        let Some(t) = self.project.track(track) else {
+            return Vec::new();
+        };
+        if t.kind != TrackKind::Midi {
+            return Vec::new();
+        }
+        let set = |output| Action::Edit(Command::SetTrackOutput { track, output });
+        let current = match t.output {
+            OutputRouting::Track { track } => Some(track),
+            _ => None,
+        };
+        let mut out = vec![InputChoice {
+            label: "None".into(),
+            action: set(OutputRouting::None),
+            checked: current.is_none(),
+            group_start: true,
+        }];
+        for (i, inst) in self
+            .project
+            .tracks
+            .iter()
+            .filter(|d| d.kind == TrackKind::Instrument)
+            .enumerate()
+        {
+            let plays = self
+                .instrument_slot(inst)
+                .map(|s| format!(" ({})", s.plugin.name.trim_start_matches("FaderFrame ")))
+                .unwrap_or_else(|| " (no instrument yet)".into());
+            out.push(InputChoice {
+                label: format!("{}{plays}", inst.name),
+                action: set(OutputRouting::Track { track: inst.id }),
+                checked: current == Some(inst.id),
+                group_start: i == 0,
+            });
+        }
+        out
+    }
+
     /// MIDI output choices of a MIDI track: none, or a device (and channel).
     pub fn midi_output_choices(&self, track: TrackId) -> Vec<InputChoice> {
         use faderframe_project::MidiOutputRouting;

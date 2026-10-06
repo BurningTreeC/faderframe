@@ -1269,6 +1269,12 @@ impl ArrangerView {
         );
         if let Some(info) = l.info {
             let out = match t.output {
+                // A MIDI track plays an instrument track or nothing.
+                OutputRouting::Master | OutputRouting::None | OutputRouting::Hardware { .. }
+                    if t.kind == TrackKind::Midi =>
+                {
+                    " → no instrument".into()
+                }
                 OutputRouting::Master => String::new(),
                 OutputRouting::Track { track } => model
                     .project()
@@ -1316,6 +1322,9 @@ impl ArrangerView {
                     "VCA · {n} track{}{group}{vca}",
                     if n == 1 { "" } else { "s" }
                 )
+            } else if t.kind == TrackKind::Midi {
+                // Notes only: no channel layout.
+                format!("{}{plug}{out}{group}{vca}", t.kind.label())
             } else {
                 format!(
                     "{} · {}{input}{plug}{out}{group}{vca}",
@@ -1913,6 +1922,15 @@ impl ArrangerView {
                 .checked(t.monitor == mode);
                 items.push(if i == 0 { item.separated() } else { item });
             }
+        }
+        // The instrument a MIDI track plays.
+        for (i, c) in model.midi_instrument_choices(t.id).into_iter().enumerate() {
+            let item = MenuItem::new(format!("Plays: {}", c.label), c.action).checked(c.checked);
+            items.push(if i == 0 || c.group_start {
+                item.separated()
+            } else {
+                item
+            });
         }
         // External MIDI device (MIDI tracks).
         if t.kind == TrackKind::Midi {

@@ -3943,6 +3943,16 @@ impl Session {
             track.output = faderframe_project::OutputRouting::None;
             track.layout = faderframe_core::ChannelLayout::Mono;
         }
+        if kind == TrackKind::Midi {
+            // A MIDI track plays the selected instrument track, if one is.
+            track.output = p
+                .tracks
+                .iter()
+                .find(|t| t.kind == TrackKind::Instrument && self.selection.tracks.contains(&t.id))
+                .map_or(faderframe_project::OutputRouting::None, |t| {
+                    faderframe_project::OutputRouting::Track { track: t.id }
+                });
+        }
         // Instrument tracks start without an instrument: one is chosen
         // from the plugins (built-in synth, CLAP, VST3).
         // Content tracks go after the last selected/content track; buses and
