@@ -296,7 +296,11 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
     let edit = gio::Menu::new();
     edit.append_section(
         None,
-        &section(&[("Undo", "app.undo"), ("Redo", "app.redo")]),
+        &section(&[
+            ("Undo", "app.undo"),
+            ("Redo", "app.redo"),
+            ("Undo History", "app.show-history"),
+        ]),
     );
     edit.append_section(
         None,
@@ -443,6 +447,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             ("Tools (Loudness, Level, Phase, Spectrum)", "app.show-tools"),
             ("Album (Songs, Loudness, Delivery)", "app.show-album"),
             ("Performance Meter", "app.show-performance"),
+            ("Undo History", "app.show-history"),
             ("Show / Hide Bottom Dock", "app.toggle-dock"),
             ("Master Strip at the Side", "app.master-panel"),
         ]),

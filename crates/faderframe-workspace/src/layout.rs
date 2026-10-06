@@ -16,10 +16,12 @@ pub enum ViewKind {
     Tools,
     /// Songs in release order, their loudness and delivery.
     Album,
+    /// The undo history.
+    History,
 }
 
 impl ViewKind {
-    pub const ALL: [ViewKind; 7] = [
+    pub const ALL: [ViewKind; 8] = [
         ViewKind::Arranger,
         ViewKind::Mixer,
         ViewKind::PianoRoll,
@@ -27,6 +29,7 @@ impl ViewKind {
         ViewKind::Performance,
         ViewKind::Tools,
         ViewKind::Album,
+        ViewKind::History,
     ];
 
     /// The kind whose default view has this id (views added after a layout
@@ -44,6 +47,7 @@ impl ViewKind {
             ViewKind::Performance => "Performance",
             ViewKind::Tools => "Tools",
             ViewKind::Album => "Album",
+            ViewKind::History => "History",
         }
     }
 
@@ -56,6 +60,7 @@ impl ViewKind {
             ViewKind::Performance => ViewId::performance(),
             ViewKind::Tools => ViewId::tools(),
             ViewKind::Album => ViewId::album(),
+            ViewKind::History => ViewId::history(),
         }
     }
 }

@@ -143,6 +143,10 @@ Contrast:
   the chord track, and drum patterns; previewed in the grid, applied in
   one undo step. The scale follows the key track; the chord track shows
   above the notes and can be stamped.
+* Undo history (Edit or View → Undo History; a dockable panel): every
+  step of the project's history in order, the current one marked and
+  those that can be redone dimmed; a click goes back (or forward) to just
+  after any step.
 * Command palette (Ctrl+Shift+P, View → Command Palette…): find any
   command of the menus by typing and run it with Enter. Keyboard
   Shortcuts… (View) changes any command's shortcut — click it and press

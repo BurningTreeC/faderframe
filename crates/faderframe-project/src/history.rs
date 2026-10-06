@@ -144,6 +144,16 @@ impl History {
         self.redo.last().map(|t| t.label.as_str())
     }
 
+    /// The steps that can be undone, oldest first.
+    pub fn undo_labels(&self) -> Vec<&str> {
+        self.undo.iter().map(|t| t.label.as_str()).collect()
+    }
+
+    /// The steps that can be redone, the next first.
+    pub fn redo_labels(&self) -> Vec<&str> {
+        self.redo.iter().rev().map(|t| t.label.as_str()).collect()
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }

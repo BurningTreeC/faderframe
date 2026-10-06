@@ -65,6 +65,10 @@ impl ViewId {
         Self::new("performance")
     }
 
+    pub fn history() -> Self {
+        Self::new("history")
+    }
+
     pub fn tools() -> Self {
         Self::new("tools")
     }

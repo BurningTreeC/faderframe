@@ -309,6 +309,9 @@ pub enum Action {
     /// Turn what the live tracks were played last into clips (recording
     /// or not).
     CaptureMidi,
+    /// Undo or redo until `n` steps are done (0: as opened); the history
+    /// view's click.
+    HistoryTo(usize),
     /// Keep the project as it is now as a named version.
     SaveVersion {
         name: String,
@@ -1322,6 +1325,45 @@ impl Session {
 
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+
+    /// The undo history: the steps done (oldest first) and those that can
+    /// be redone (the next first).
+    pub fn history_steps(&self) -> (Vec<String>, Vec<String>) {
+        let own = |v: Vec<&str>| v.into_iter().map(String::from).collect();
+        (
+            own(self.history.undo_labels()),
+            own(self.history.redo_labels()),
+        )
+    }
+
+    /// Undo or redo until `steps` are done, syncing the engine once.
+    fn history_to(&mut self, steps: usize) -> Result<()> {
+        let mut impact = faderframe_project::Impact::None;
+        let mut moved = 0usize;
+        loop {
+            let done = self.history.undo_labels().len();
+            let r = if done > steps {
+                self.history.undo(&mut self.project)?
+            } else if done < steps {
+                self.history.redo(&mut self.project)?
+            } else {
+                break;
+            };
+            let Some(r) = r else { break };
+            impact = impact.max(r.impact);
+            moved += 1;
+        }
+        if moved > 0 {
+            self.sync(impact)?;
+            let label = self
+                .history
+                .undo_labels()
+                .last()
+                .map_or_else(|| "the start".to_string(), |l| format!("‘{l}’"));
+            self.notify(NoticeLevel::Info, format!("history: back to {label}"));
+        }
+        Ok(())
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -2457,6 +2499,7 @@ impl Session {
                     self.notify(NoticeLevel::Info, format!("redo: {}", r.label));
                 }
             }
+            Action::HistoryTo(steps) => self.history_to(steps)?,
             Action::Transport(t) => {
                 self.transport_action(t)?;
                 self.pump_idle();

@@ -31,6 +31,7 @@ faderframe-ui-canvas.workspace = true
 faderframe-view-arranger.workspace = true
 faderframe-view-mixer.workspace = true
 faderframe-view-performance.workspace = true
+faderframe-view-history.workspace = true
 faderframe-view-tools.workspace = true
 faderframe-view-devices.workspace = true
 faderframe-view-automation.workspace = true

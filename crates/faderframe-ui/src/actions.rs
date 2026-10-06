@@ -310,6 +310,11 @@ pub fn install(app: &Rc<AppState>) {
         ),
         dispatch(
             app,
+            "show-history",
+            A::Workspace(W::ShowView(ViewId::history())),
+        ),
+        dispatch(
+            app,
             "show-tools",
             A::Workspace(W::ShowView(ViewId::tools())),
         ),

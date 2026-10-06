@@ -826,6 +826,7 @@ dependencies = [
  "faderframe-view-arranger",
  "faderframe-view-automation",
  "faderframe-view-devices",
+ "faderframe-view-history",
  "faderframe-view-mixer",
  "faderframe-view-performance",
  "faderframe-view-pianoroll",
@@ -899,6 +900,17 @@ dependencies = [
  "faderframe-core",
  "faderframe-engine",
  "faderframe-plugin-host",
+ "faderframe-project",
+ "faderframe-session",
+ "faderframe-ui-canvas",
+]
+
+[[package]]
+name = "faderframe-view-history"
+version = "0.6.0"
+dependencies = [
+ "faderframe-core",
+ "faderframe-engine",
  "faderframe-project",
  "faderframe-session",
  "faderframe-ui-canvas",

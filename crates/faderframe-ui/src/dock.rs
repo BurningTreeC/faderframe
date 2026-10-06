@@ -80,6 +80,12 @@ fn create_view(app: &Rc<AppState>, kind: ViewKind) -> ViewHost {
             false,
             false,
         ),
+        ViewKind::History => ViewHost::new(
+            app,
+            Box::new(faderframe_view_history::HistoryView::new(theme)),
+            false,
+            true,
+        ),
     };
     app.register_canvas(&host.canvas);
     host
