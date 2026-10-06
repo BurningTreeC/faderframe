@@ -107,7 +107,10 @@ pub enum KeyFold {
 /// The piano roll's musical settings.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PianoRollSettings {
+    /// The scale where the project has no key, or when not following it.
     pub scale: Scale,
+    /// The scale is the key track's key at each position.
+    pub follow_key: bool,
     /// Drawn and moved notes land on scale keys.
     pub scale_snap: bool,
     pub chord: ChordKind,
@@ -129,6 +132,7 @@ impl Default for PianoRollSettings {
     fn default() -> Self {
         Self {
             scale: Scale::default(),
+            follow_key: true,
             scale_snap: false,
             chord: ChordKind::Single,
             note_length: NoteLength::Grid,
@@ -283,6 +287,73 @@ impl Session {
         Ok(ids)
     }
 
+    /// Does the piano roll's scale come from the key track (following it,
+    /// and the project has keys)?
+    pub fn piano_follows_key(&self) -> bool {
+        self.editor.piano.follow_key && !self.project.keys.is_empty()
+    }
+
+    /// The piano roll's scale at `at` (project time): the key track's key
+    /// there when following it, else the chosen scale.
+    pub fn piano_scale_at(&self, at: MusicalTime) -> Scale {
+        if self.editor.piano.follow_key
+            && let Some(key) = self.project.key_at(at)
+        {
+            return Scale::of_key(key);
+        }
+        self.editor.piano.scale
+    }
+
+    /// The piano roll's scales over `from..to` (project time), as
+    /// `(start, end, scale)` spans.
+    pub fn piano_scales(
+        &self,
+        from: MusicalTime,
+        to: MusicalTime,
+    ) -> Vec<(MusicalTime, MusicalTime, Scale)> {
+        let mut spans = vec![(from, to, self.piano_scale_at(from))];
+        if !self.piano_follows_key() {
+            return spans;
+        }
+        for k in self
+            .project
+            .keys
+            .iter()
+            .filter(|k| k.at > from && k.at < to)
+        {
+            if let Some(last) = spans.last_mut() {
+                last.1 = k.at;
+            }
+            spans.push((k.at, to, Scale::of_key(k.key)));
+        }
+        spans
+    }
+
+    /// The keys a note drawn on `key` at `at` (project time) becomes: the
+    /// editor's chord kind (the chord track's chord, voiced round the key)
+    /// on the key, moved into the scale with scale snap.
+    pub fn piano_chord_keys(&self, key: u8, at: MusicalTime) -> Vec<u8> {
+        let pr = &self.editor.piano;
+        let scale = self.piano_scale_at(at);
+        let root = if pr.scale_snap && !scale.is_chromatic() {
+            scale.nearest(key)
+        } else {
+            key
+        };
+        if pr.chord == ChordKind::ChordTrack
+            && let Some(c) = self.project.chord_at(at)
+        {
+            return c
+                .chord
+                .voicing(i32::from(key))
+                .into_iter()
+                .filter(|k| (0..=127).contains(k))
+                .map(|k| k as u8)
+                .collect();
+        }
+        pr.chord.keys(root, &scale)
+    }
+
     /// A chord of the editor's chord kind and scale on `key`.
     pub fn add_chord(
         &mut self,
@@ -292,15 +363,9 @@ impl Session {
         key: u8,
         velocity: u8,
     ) -> Result<Vec<NoteId>> {
-        let pr = self.editor.piano;
-        let root = if pr.scale_snap {
-            pr.scale.nearest(key)
-        } else {
-            key
-        };
-        let notes: Vec<MidiNote> = pr
-            .chord
-            .keys(root, &pr.scale)
+        let (clip_start, _) = self.midi_clip(clip)?;
+        let notes: Vec<MidiNote> = self
+            .piano_chord_keys(key, clip_start + start)
             .into_iter()
             .map(|k| MidiNote {
                 id: NoteId(0),

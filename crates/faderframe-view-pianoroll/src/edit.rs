@@ -101,14 +101,29 @@ impl PianoRollView {
         (abs - clip_start).max(MusicalTime::ZERO)
     }
 
-    /// `key`, moved into the scale when scale snap is on.
-    fn scale_key(&self, key: u8, model: &Session) -> u8 {
-        let pr = &model.editor.piano;
-        if pr.scale_snap && !pr.scale.is_chromatic() {
-            pr.scale.nearest(key)
+    /// `key`, moved into the scale (the key track's at `at`, project time)
+    /// when scale snap is on.
+    fn scale_key(&self, key: u8, at: MusicalTime, model: &Session) -> u8 {
+        let scale = model.piano_scale_at(at);
+        if model.editor.piano.scale_snap && !scale.is_chromatic() {
+            scale.nearest(key)
         } else {
             key
         }
+    }
+
+    /// Where the earliest of `notes` starts (project time; the clip's
+    /// start without any).
+    fn notes_at(model: &Session, notes: &[NoteId]) -> MusicalTime {
+        Self::clip(model).map_or(MusicalTime::ZERO, |(_, c, m)| {
+            c.start
+                + m.notes
+                    .iter()
+                    .filter(|n| notes.contains(&n.id))
+                    .map(|n| n.start)
+                    .min()
+                    .unwrap_or(MusicalTime::ZERO)
+        })
     }
 
     fn select(cx: &mut EventCx<'_, Action>, notes: Vec<NoteId>, mode: SelectMode) {
@@ -392,7 +407,7 @@ impl PianoRollView {
                 if start >= m.length {
                     return true;
                 }
-                let key = self.scale_key(self.key_at(pos.y), model);
+                let key = self.scale_key(self.key_at(pos.y), clip.start + start, model);
                 let length = self.new_note_length(model, clip.start + start);
                 self.audition(model, clip, key, cx);
                 self.drag = Some(Drag::Draw { start, key, length });
@@ -401,7 +416,7 @@ impl PianoRollView {
                 if clicks >= 2 {
                     let start = self.snap_floor_rel(at, clip.start, model);
                     if start < m.length {
-                        let key = self.scale_key(self.key_at(pos.y), model);
+                        let key = self.scale_key(self.key_at(pos.y), clip.start + start, model);
                         let length = self.new_note_length(model, clip.start + start);
                         cx.emit(Action::AddChord {
                             clip: clip_id,
@@ -551,7 +566,7 @@ impl PianoRollView {
                 *copy |= mods.alt;
                 let raw = grab.start + (self.time_at(pos.x) - self.time_at(origin.x));
                 let start = self.snap_rel(raw.max(MusicalTime::ZERO), clip.start, model, bypass);
-                let key = self.scale_key(self.key_at(pos.y), model);
+                let key = self.scale_key(self.key_at(pos.y), clip.start + start, model);
                 let new_dk = key as i32 - grab.key as i32;
                 if new_dk != *dk {
                     self.audition(model, clip, key, cx);
@@ -1115,7 +1130,6 @@ impl PianoRollView {
         notes: Vec<NoteId>,
         model: &Session,
     ) -> HostRequest<Action> {
-        let pr = model.editor.piano;
         let op = |label: &str, op: NoteOp| {
             MenuItem::new(
                 label,
@@ -1149,10 +1163,11 @@ impl PianoRollView {
             op("Reverse", NoteOp::Reverse),
             op("Invert", NoteOp::Invert),
         ];
-        if !pr.scale.is_chromatic() {
+        let scale = model.piano_scale_at(Self::notes_at(model, &notes));
+        if !scale.is_chromatic() {
             items.push(op(
-                &format!("Fold into {}", pr.scale.label()),
-                NoteOp::FoldToScale(pr.scale),
+                &format!("Fold into {}", scale.label()),
+                NoteOp::FoldToScale(scale),
             ));
         }
         items.push(op("Double Length", NoteOp::ScaleLength(2.0)).separated());
@@ -1392,10 +1407,11 @@ impl PianoRollView {
             },
             Key::Up | Key::Down => {
                 let dir = if key == Key::Up { 1 } else { -1 };
+                let scale = model.piano_scale_at(Self::notes_at(model, &sel));
                 if mods.shift {
                     op(cx, NoteOp::Transpose(12 * dir));
-                } else if pr.scale_snap && !pr.scale.is_chromatic() {
-                    op(cx, NoteOp::TransposeInScale(dir, pr.scale));
+                } else if pr.scale_snap && !scale.is_chromatic() {
+                    op(cx, NoteOp::TransposeInScale(dir, scale));
                 } else {
                     op(cx, NoteOp::Transpose(dir));
                 }

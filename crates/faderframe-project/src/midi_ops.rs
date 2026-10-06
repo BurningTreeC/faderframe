@@ -167,6 +167,28 @@ impl Scale {
     pub fn keys(&self) -> Vec<u8> {
         (0..=127u8).filter(|k| self.contains(*k)).collect()
     }
+
+    /// The scale of a key from the project's key track.
+    pub fn of_key(key: faderframe_midi::theory::Key) -> Self {
+        use faderframe_midi::theory::Scale as S;
+        let kind = match key.scale {
+            S::Major => ScaleKind::Major,
+            S::Minor => ScaleKind::NaturalMinor,
+            S::HarmonicMinor => ScaleKind::HarmonicMinor,
+            S::MelodicMinor => ScaleKind::MelodicMinor,
+            S::Dorian => ScaleKind::Dorian,
+            S::Phrygian => ScaleKind::Phrygian,
+            S::Lydian => ScaleKind::Lydian,
+            S::Mixolydian => ScaleKind::Mixolydian,
+            S::Locrian => ScaleKind::Locrian,
+            S::MajorPentatonic => ScaleKind::MajorPentatonic,
+            S::MinorPentatonic => ScaleKind::MinorPentatonic,
+            S::Blues => ScaleKind::Blues,
+            S::WholeTone => ScaleKind::WholeTone,
+            S::Chromatic => ScaleKind::Chromatic,
+        };
+        Self::new(key.root, kind)
+    }
 }
 
 // --- chords -----------------------------------------------------------------------
@@ -192,11 +214,15 @@ pub enum ChordKind {
     ScaleTriad,
     /// Four notes of the scale, stacked in thirds.
     ScaleSeventh,
+    /// The chord track's chord where the note goes (a scale triad where
+    /// there is none).
+    ChordTrack,
 }
 
 impl ChordKind {
-    pub const ALL: [ChordKind; 14] = [
+    pub const ALL: [ChordKind; 15] = [
         ChordKind::Single,
+        ChordKind::ChordTrack,
         ChordKind::ScaleTriad,
         ChordKind::ScaleSeventh,
         ChordKind::Major,
@@ -228,6 +254,7 @@ impl ChordKind {
             ChordKind::Octave => "Octave",
             ChordKind::ScaleTriad => "Scale Triad",
             ChordKind::ScaleSeventh => "Scale Seventh",
+            ChordKind::ChordTrack => "From the Chord Track",
         }
     }
 
@@ -246,8 +273,12 @@ impl ChordKind {
             ChordKind::Dominant7 => &[0, 4, 7, 10],
             ChordKind::Power => &[0, 7],
             ChordKind::Octave => &[0, 12],
-            ChordKind::ScaleTriad | ChordKind::ScaleSeventh => {
-                let n = if self == ChordKind::ScaleTriad { 3 } else { 4 };
+            ChordKind::ScaleTriad | ChordKind::ScaleSeventh | ChordKind::ChordTrack => {
+                let n = if self == ChordKind::ScaleSeventh {
+                    4
+                } else {
+                    3
+                };
                 let diatonic = if scale.is_chromatic() {
                     Scale::new(root % 12, ScaleKind::Major)
                 } else {

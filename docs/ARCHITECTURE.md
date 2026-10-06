@@ -1321,6 +1321,21 @@ double-click for one a bar, drag to move, edges to resize, right-click for
 the key's diatonic chords with their numerals; colours by root round the
 circle of fifths).
 
+The piano roll follows them (`PianoRollSettings::follow_key`, on by
+default; the chosen scale applies where the project has no key or when it
+is off — choosing a scale in the menu turns it off). `Session::
+piano_scale_at`/`piano_scales` give the scale at a time and the spans over
+a range (`midi_ops::Scale::of_key` maps a key's scale); rows are shaded
+outside the scale and lit on chord tones per key and chord span, notes
+outside the scale at their time get a corner mark, scale snap, Fold to
+Scale (the union of the clip's keys), Transpose in Scale and the scale
+chords use the key where the note is, and the `ChordKind::ChordTrack`
+stamp draws the chord track's chord voiced round the clicked key (a scale
+triad where there is none; `Session::piano_chord_keys`, used by the draw
+preview and `add_chord` alike). Under the ruler a Key row and a Chords row
+(each only when the project has some) show the key spans and the chords.
+Dev action `set-chord:<from>-<to>=<chord>` (quarters).
+
 ### Freezing and bouncing
 
 Both render a track after its inserts and before its fader
@@ -1917,8 +1932,8 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
 2024–2026):
 
 1. ~~**Stock devices** (wave 1)~~ — done (see *Built-in devices*).
-2. **Composition**: ~~project key/scale and a chord track~~ (done, see
-   *Harmony*), a scale-aware piano roll, MIDI effects before the instrument (arpeggiator, chord,
+2. **Composition**: ~~project key/scale and a chord track, a scale-aware
+   piano roll~~ (done, see *Harmony*), MIDI effects before the instrument (arpeggiator, chord,
    scale, note echo), MIDI transformations and generators, always-on
    retrospective MIDI capture.
 3. **Organisation**: folder tracks, clip aliases, project versions

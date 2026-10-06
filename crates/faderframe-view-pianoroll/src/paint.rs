@@ -1,7 +1,10 @@
 //! Painting: ruler, keyboard, grid, ghost notes, notes (with drag
 //! previews), the velocity/controller lane and the toolbar.
 
-use crate::{Drag, LaneKind, Layout, PianoRollView, is_black, note_name, track_color};
+use crate::{
+    CHORD_ROW_H, Drag, KEY_ROW_H, LaneKind, Layout, PianoRollView, is_black, note_name, track_color,
+};
+use faderframe_project::midi_ops::Scale;
 use faderframe_project::{Clip, MidiClip, MidiController, MidiNote};
 use faderframe_session::Session;
 use faderframe_timeline::{GridDivision, GridLineKind, MusicalTime, for_each_grid_line};
@@ -52,6 +55,7 @@ impl PianoRollView {
 
         self.paint_keyboard(p, l.keys, clip, model);
         self.paint_ruler(p, l.ruler, clip, m, model);
+        self.paint_harmony(p, &l, clip, model);
         p.fill(l.corner, theme.arranger.ruler_bg);
         p.text(
             &clip.name,
@@ -65,6 +69,117 @@ impl PianoRollView {
             theme.ui.text_faint,
         );
         self.paint_toolbar(p, l.toolbar, model);
+    }
+
+    /// The key track's keys and the chord track's chords along the clip,
+    /// under the ruler.
+    pub(crate) fn paint_harmony(
+        &self,
+        p: &mut dyn Painter,
+        l: &Layout,
+        clip: &Clip,
+        model: &Session,
+    ) {
+        let (keys, chords) = self.harmony_rows;
+        if !keys && !chords {
+            return;
+        }
+        let th = &self.theme;
+        let r = l.harmony;
+        p.fill(l.harmony_corner, th.arranger.ruler_bg);
+        p.fill(r, th.arranger.ruler_bg.darken(0.05));
+        let project = model.project();
+        let label = TextStyle::new(th.fonts.tiny, th.ui.text_dim);
+        let mut y = r.y;
+        if keys {
+            let row = Rect::new(r.x, y, r.w, KEY_ROW_H);
+            p.text(
+                "Key",
+                Rect::new(
+                    l.harmony_corner.x + 6.0,
+                    y,
+                    l.harmony_corner.w - 8.0,
+                    KEY_ROW_H,
+                ),
+                &label,
+            );
+            p.push_clip(row);
+            for (i, k) in project.keys.iter().enumerate() {
+                let x0 = self.x_of(k.at - clip.start);
+                let x1 = project
+                    .keys
+                    .get(i + 1)
+                    .map_or(row.right(), |n| self.x_of(n.at - clip.start));
+                if x1 <= row.x || x0 >= row.right() {
+                    continue;
+                }
+                let band = Rect::new(
+                    x0.max(row.x),
+                    y + 1.0,
+                    (x1.min(row.right()) - x0.max(row.x)).max(1.0),
+                    KEY_ROW_H - 2.0,
+                );
+                p.fill(
+                    band,
+                    th.ui.accent.with_alpha(if i % 2 == 0 { 0.12 } else { 0.2 }),
+                );
+                p.fill(Rect::new(x0, y, 2.0, KEY_ROW_H), th.ui.accent);
+                p.text(
+                    &k.key.name(),
+                    Rect::new(band.x + 5.0, y, (band.w - 6.0).max(0.0), KEY_ROW_H),
+                    &TextStyle::new(th.fonts.tiny, th.ui.text).bold(),
+                );
+            }
+            p.pop_clip();
+            y += KEY_ROW_H;
+        }
+        if chords {
+            let row = Rect::new(r.x, y, r.w, CHORD_ROW_H);
+            p.text(
+                "Chords",
+                Rect::new(
+                    l.harmony_corner.x + 6.0,
+                    y,
+                    l.harmony_corner.w - 8.0,
+                    CHORD_ROW_H,
+                ),
+                &label,
+            );
+            p.push_clip(row);
+            for c in &project.chords {
+                let x0 = self.x_of(c.start - clip.start);
+                let x1 = self.x_of(c.end - clip.start);
+                if x1 <= row.x || x0 >= row.right() {
+                    continue;
+                }
+                let rr = Rect::new(
+                    x0 + 1.0,
+                    y + 2.0,
+                    (x1 - x0 - 2.0).max(1.0),
+                    CHORD_ROW_H - 4.0,
+                );
+                // A colour per root round the circle of fifths (as in the
+                // arranger's chord lane).
+                let tc =
+                    faderframe_project::TrackColor::palette((usize::from(c.chord.root) * 7) % 12);
+                let base = Color::rgb8(tc.r, tc.g, tc.b);
+                p.fill_rounded(rr, 3.0, &Paint::Solid(base.with_alpha(0.32)));
+                p.stroke_rounded(rr, 3.0, 1.0, base.with_alpha(0.8));
+                let text = Rect::new(
+                    rr.x.max(row.x) + 4.0,
+                    rr.y,
+                    (rr.right() - rr.x.max(row.x) - 6.0).max(0.0),
+                    rr.h,
+                );
+                p.text(
+                    &c.chord.name(project.flats_at(c.start)),
+                    text,
+                    &TextStyle::new(th.fonts.tiny, th.ui.text).bold(),
+                );
+            }
+            p.pop_clip();
+        }
+        p.hline(0.0, r.right(), r.bottom() - 0.5, th.ui.border);
     }
 
     /// Page along with the playhead while playing.
@@ -107,13 +222,40 @@ impl PianoRollView {
 
     fn paint_grid(&self, p: &mut dyn Painter, g: Rect, clip: &Clip, m: &MidiClip, model: &Session) {
         let pr = &self.theme.piano;
-        let scale = model.editor.piano.scale;
         let top = (((g.y - self.grid_top() + self.scroll_y) / self.row_h)
             .floor()
             .max(0.0)) as usize;
         let bottom = (((g.bottom() - self.grid_top() + self.scroll_y) / self.row_h).ceil()
             as usize)
             .min(self.rows.len());
+        // The scales across the view (the key track's keys, or one).
+        let from = clip.start + self.time_at(g.x).max(MusicalTime::ZERO);
+        let to = clip.start + self.time_at(g.right()).max(MusicalTime::ZERO);
+        let spans: Vec<(f32, f32, Scale)> = model
+            .piano_scales(from, to.max(from))
+            .into_iter()
+            .map(|(a, b, s)| {
+                (
+                    self.x_of(a - clip.start).max(g.x),
+                    self.x_of(b - clip.start).min(g.right()),
+                    s,
+                )
+            })
+            .collect();
+        // The chord track's chords across the view: their tones lit.
+        let chords: Vec<(f32, f32, _)> = model
+            .project()
+            .chords
+            .iter()
+            .filter(|c| c.end > from && c.start < to)
+            .map(|c| {
+                (
+                    self.x_of(c.start - clip.start).max(g.x),
+                    self.x_of(c.end - clip.start).min(g.right()),
+                    c.chord,
+                )
+            })
+            .collect();
         for i in top..bottom {
             let key = self.rows[i];
             let y = self.grid_top() + i as f32 * self.row_h - self.scroll_y;
@@ -126,11 +268,23 @@ impl PianoRollView {
                     pr.white_row
                 },
             );
-            if !scale.is_chromatic() {
+            for (x0, x1, scale) in &spans {
+                if scale.is_chromatic() || x1 <= x0 {
+                    continue;
+                }
+                let part = Rect::new(*x0, y, x1 - x0, self.row_h);
                 if !scale.contains(key) {
-                    p.fill(row, pr.off_scale);
+                    p.fill(part, pr.off_scale);
                 } else if scale.is_root(key) {
-                    p.fill(row, pr.root_row);
+                    p.fill(part, pr.root_row);
+                }
+            }
+            for (x0, x1, chord) in &chords {
+                if x1 > x0 && chord.contains(i32::from(key)) {
+                    p.fill(
+                        Rect::new(*x0, y, x1 - x0, self.row_h),
+                        self.theme.ui.accent.with_alpha(0.1),
+                    );
                 }
             }
             if key.is_multiple_of(12) {
@@ -276,6 +430,7 @@ impl PianoRollView {
             Some(Drag::Sweep { hit }) => hit,
             _ => &[],
         };
+        let clip_start = Self::clip(model).map_or(MusicalTime::ZERO, |(_, c, _)| c.start);
         for (n, preview) in self.previewed(m) {
             let Some(r) = self.note_rect(&n) else {
                 continue;
@@ -308,6 +463,18 @@ impl PianoRollView {
             } else if !n.muted {
                 p.stroke_rounded(r, 2.0, 1.0, c.darken(0.45));
             }
+            // Outside the scale (the key track's key where it is): a
+            // corner mark.
+            let scale = model.piano_scale_at(clip_start + n.start);
+            if !scale.is_chromatic() && !scale.contains(n.key) && r.w >= 6.0 {
+                let k = (r.h * 0.6).clamp(4.0, 8.0);
+                let mut tri = Path::new();
+                tri.move_to(Point::new(r.right() - k, r.y));
+                tri.line_to(Point::new(r.right(), r.y));
+                tri.line_to(Point::new(r.right(), r.y + k));
+                tri.close();
+                p.fill_path(&tri, th.tools.level_warn);
+            }
             if r.w > 28.0 && self.row_h >= 11.0 {
                 let text_c = if n.muted || c.luminance() < 0.45 {
                     Color::hex(0xf0eee8)
@@ -324,12 +491,8 @@ impl PianoRollView {
         // A note (or chord) being drawn.
         if let Some(Drag::Draw { start, key, length }) = self.drag {
             let pr = &model.editor.piano;
-            let root = if pr.scale_snap {
-                pr.scale.nearest(key)
-            } else {
-                key
-            };
-            for k in pr.chord.keys(root, &pr.scale) {
+            let at = Self::clip(model).map_or(start, |(_, c, _)| c.start + start);
+            for k in model.piano_chord_keys(key, at) {
                 let n = MidiNote {
                     id: faderframe_core::NoteId(0),
                     start,

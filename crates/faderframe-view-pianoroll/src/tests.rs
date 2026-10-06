@@ -557,3 +557,94 @@ fn volume_and_pan_lanes_draw_in_their_units() {
         .unwrap();
     assert!(tip.starts_with("Pan C"), "{tip}");
 }
+
+#[test]
+fn the_key_and_chord_tracks_show_and_lead_the_scale() {
+    use faderframe_project::harmony::{Chord, Key, Quality, Scale as KeyScale};
+    use faderframe_project::{ChordEvent, Command, KeyChange};
+    let mut s = session();
+    let mut view = PianoRollView::new(Theme::default());
+    paint(&mut view, &s);
+    let plain = view.grid_top();
+    // The melody clip starts at bar 5: C major there, A minor from bar 7;
+    // Am then F under it.
+    let q = MusicalTime::from_quarters;
+    s.dispatch(Action::Edit(Command::SetKeys {
+        keys: vec![
+            KeyChange {
+                at: q(0.0),
+                key: Key::new(0, KeyScale::Major),
+            },
+            KeyChange {
+                at: q(24.0),
+                key: Key::new(9, KeyScale::Minor),
+            },
+        ],
+    }))
+    .unwrap();
+    s.dispatch(Action::Edit(Command::SetChords {
+        chords: vec![
+            ChordEvent {
+                start: q(16.0),
+                end: q(20.0),
+                chord: Chord::new(9, Quality::Minor),
+            },
+            ChordEvent {
+                start: q(20.0),
+                end: q(24.0),
+                chord: Chord::new(5, Quality::Major),
+            },
+        ],
+    }))
+    .unwrap();
+    let p = paint(&mut view, &s);
+    let texts = p.texts();
+    for t in [
+        "Key",
+        "Chords",
+        "C Major",
+        "A Minor",
+        "Am",
+        "F",
+        "Key: C Major",
+    ] {
+        assert!(texts.contains(&t), "{t}: {texts:?}");
+    }
+    assert!(p.balanced_clips());
+    // The strip pushes the grid down.
+    assert_eq!(view.grid_top(), plain + KEY_ROW_H + CHORD_ROW_H);
+    // The scale menu follows the key track (and can stop).
+    let l = view.layout(SIZE);
+    let items = view.toolbar_items(l.toolbar, &s);
+    let at = items
+        .iter()
+        .find(|i| i.0 == crate::toolbar::Item::Scale)
+        .unwrap()
+        .1
+        .center();
+    let (_, req) = run(&mut view, down(at, Modifiers::NONE, 1), &mut s);
+    let Some(HostRequest::ContextMenu { items, .. }) = req
+        .into_iter()
+        .find(|r| matches!(r, HostRequest::ContextMenu { .. }))
+    else {
+        panic!("scale menu")
+    };
+    let follow = items
+        .iter()
+        .find(|i| i.label == "Follow the Key Track")
+        .unwrap();
+    assert_eq!(follow.checked, Some(true));
+    // Fold to the scale: the clip's keys' notes (C major and A minor: the
+    // same seven) and nothing else.
+    let mut pr = s.editor.piano;
+    pr.fold = KeyFold::Scale;
+    s.dispatch(Action::SetPianoRoll(pr)).unwrap();
+    paint(&mut view, &s);
+    let c_major = [0u8, 2, 4, 5, 7, 9, 11];
+    let used: std::collections::HashSet<u8> = notes(&s).iter().map(|n| n.key).collect();
+    assert!(
+        view.rows
+            .iter()
+            .all(|k| c_major.contains(&(k % 12)) || used.contains(k))
+    );
+}

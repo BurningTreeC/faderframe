@@ -122,18 +122,19 @@ impl PianoRollView {
             54.0,
         );
         flow.group();
-        let scale = if pr.scale.is_chromatic() {
-            "Scale".to_string()
-        } else {
-            pr.scale.label()
+        // Following the key track: the key where the clip starts.
+        let shown = match Self::clip(model) {
+            Some((_, c, _)) => model.piano_scale_at(c.start),
+            None => pr.scale,
         };
-        add(
-            &mut flow,
-            Item::Scale,
-            scale,
-            !pr.scale.is_chromatic(),
-            112.0,
-        );
+        let scale = if shown.is_chromatic() {
+            "Scale".to_string()
+        } else if model.piano_follows_key() {
+            format!("Key: {}", shown.label())
+        } else {
+            shown.label()
+        };
+        add(&mut flow, Item::Scale, scale, !shown.is_chromatic(), 112.0);
         add(
             &mut flow,
             Item::Fold,
@@ -144,10 +145,10 @@ impl PianoRollView {
         add(
             &mut flow,
             Item::Chord,
-            if pr.chord == ChordKind::Single {
-                "Chord".into()
-            } else {
-                pr.chord.label().into()
+            match pr.chord {
+                ChordKind::Single => "Chord".into(),
+                ChordKind::ChordTrack => "Chord Track".into(),
+                c => c.label().into(),
             },
             pr.chord != ChordKind::Single,
             92.0,
@@ -372,16 +373,32 @@ impl PianoRollView {
                 cx.request(Self::settings_menu(at, entries));
             }
             Item::Scale => {
-                let mut entries = Vec::new();
+                // The key track's key at every position, or a scale chosen
+                // here (which stops following it).
+                let following = model.piano_follows_key();
+                let mut entries = vec![(
+                    if model.project().keys.is_empty() {
+                        "Follow the Key Track (no keys set yet)".to_string()
+                    } else {
+                        "Follow the Key Track".to_string()
+                    },
+                    PianoRollSettings {
+                        follow_key: !pr.follow_key,
+                        ..pr
+                    },
+                    pr.follow_key,
+                    false,
+                )];
                 for (i, kind) in ScaleKind::ALL.into_iter().enumerate() {
                     entries.push((
                         kind.label().to_string(),
                         PianoRollSettings {
                             scale: Scale::new(pr.scale.root, kind),
+                            follow_key: false,
                             ..pr
                         },
-                        pr.scale.kind == kind,
-                        i == 1,
+                        !following && pr.scale.kind == kind,
+                        i == 0 || i == 1,
                     ));
                 }
                 for (i, name) in PITCH_NAMES.iter().enumerate() {
@@ -389,9 +406,10 @@ impl PianoRollView {
                         format!("Root {name}"),
                         PianoRollSettings {
                             scale: Scale::new(i as u8, pr.scale.kind),
+                            follow_key: false,
                             ..pr
                         },
-                        pr.scale.root == i as u8,
+                        !following && pr.scale.root == i as u8,
                         i == 0,
                     ));
                 }

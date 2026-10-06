@@ -947,6 +947,31 @@ pub fn install(app: &Rc<AppState>) {
         // selected MIDI clips, else all), `set-key:<key>` (from the start).
         named("detect-key", |a, _| a.dispatch(Action::DetectKey)),
         named("detect-chords", |a, _| a.dispatch(Action::DetectChords)),
+        // `set-chord:<from>-<to>=<chord>` (quarters): the chord track.
+        named("set-chord", |a, arg| {
+            let parsed = arg.split_once('=').and_then(|(span, chord)| {
+                let (from, to) = span.split_once('-')?;
+                Some((
+                    from.trim().parse::<f64>().ok()?,
+                    to.trim().parse::<f64>().ok()?,
+                    faderframe_project::harmony::Chord::parse(chord)?,
+                ))
+            });
+            let Some((from, to, chord)) = parsed else {
+                tracing::warn!("set-chord: '{arg}' is not <from>-<to>=<chord>");
+                return;
+            };
+            let q = faderframe_timeline::MusicalTime::from_quarters;
+            let chords = faderframe_project::harmony::set_chord(
+                &a.session.borrow().project().chords,
+                q(from),
+                q(to),
+                Some(chord),
+            );
+            a.dispatch(Action::Edit(faderframe_project::Command::SetChords {
+                chords,
+            }));
+        }),
         named("set-key", |a, arg| {
             let Some(key) = faderframe_project::harmony::Key::parse(arg) else {
                 tracing::warn!("set-key: '{arg}' is not a key");

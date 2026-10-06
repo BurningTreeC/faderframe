@@ -35,6 +35,9 @@ use faderframe_ui_canvas::{Color, Point, Rect, Size, Theme};
 /// Width of the grab zone at a note's edges.
 const EDGE_GRAB: f32 = 6.0;
 const DRAG_THRESHOLD: f32 = 3.0;
+/// The harmony strip's rows.
+const KEY_ROW_H: f32 = 15.0;
+const CHORD_ROW_H: f32 = 18.0;
 /// Height of the grid/lane splitter.
 const SPLITTER: f32 = 5.0;
 const NAMES: [&str; 12] = [
@@ -205,6 +208,9 @@ pub struct PianoRollView {
     rows: Vec<u8>,
     /// Rows the toolbar wraps into at the current width.
     toolbar_rows: usize,
+    /// The harmony strip under the ruler: a key row, a chord row (shown
+    /// when the project has keys / chords).
+    harmony_rows: (bool, bool),
 }
 
 /// The regions of the view.
@@ -213,6 +219,9 @@ struct Layout {
     toolbar: Rect,
     corner: Rect,
     ruler: Rect,
+    /// The key and chord rows under the ruler (and their labels).
+    harmony_corner: Rect,
+    harmony: Rect,
     keys: Rect,
     grid: Rect,
     splitter: Rect,
@@ -242,6 +251,7 @@ impl PianoRollView {
             last_length: MusicalTime::from_quarters(0.25),
             rows: (0..=127u8).rev().collect(),
             toolbar_rows: 1,
+            harmony_rows: (false, false),
         }
     }
 
@@ -262,10 +272,19 @@ impl PianoRollView {
         self.theme.piano.toolbar_height * self.toolbar_rows.max(1) as f32
     }
 
-    /// Re-wrap the toolbar for `width` (before painting and events).
+    /// Re-wrap the toolbar for `width` and size the harmony strip (before
+    /// painting and events).
     fn update_toolbar(&mut self, width: f32, model: &Session) {
         let r = Rect::new(0.0, 0.0, width, self.theme.piano.toolbar_height);
         self.toolbar_rows = self.toolbar_layout(r, model).1;
+        let p = model.project();
+        self.harmony_rows = (!p.keys.is_empty(), !p.chords.is_empty());
+    }
+
+    /// Height of the harmony strip.
+    fn harmony_h(&self) -> f32 {
+        let (keys, chords) = self.harmony_rows;
+        (if keys { KEY_ROW_H } else { 0.0 }) + (if chords { CHORD_ROW_H } else { 0.0 })
     }
 
     fn kb_w(&self) -> f32 {
@@ -277,16 +296,20 @@ impl PianoRollView {
         let mut r = Rect::from_size(size);
         let toolbar = r.take_top(self.toolbar_h());
         let head = r.take_top(pr.ruler_height);
+        let strip = r.take_top(self.harmony_h());
         let lane_h = self.lane_h.clamp(36.0, (r.h * 0.6).max(36.0));
         let lane_row = r.take_bottom(lane_h);
         let splitter = r.take_bottom(SPLITTER);
         let (corner, ruler) = head.split_left(self.kb_w());
+        let (harmony_corner, harmony) = strip.split_left(self.kb_w());
         let (keys, grid) = r.split_left(self.kb_w());
         let (lane_header, lane) = lane_row.split_left(self.kb_w());
         Layout {
             toolbar,
             corner,
             ruler,
+            harmony_corner,
+            harmony,
             keys,
             grid,
             splitter,
@@ -305,7 +328,7 @@ impl PianoRollView {
     }
 
     fn grid_top(&self) -> f32 {
-        self.toolbar_h() + self.theme.piano.ruler_height
+        self.toolbar_h() + self.theme.piano.ruler_height + self.harmony_h()
     }
 
     /// Row index of a key (`None`: folded away).
@@ -333,7 +356,15 @@ impl PianoRollView {
         let mut rows: Vec<u8> = match pr.fold {
             KeyFold::Off => (0..=127u8).collect(),
             KeyFold::Scale => {
-                let mut v = pr.scale.keys();
+                // Every key the clip's scales (key track) use, and its notes.
+                let mut v: Vec<u8> = match Self::clip(model) {
+                    Some((_, c, _)) => model
+                        .piano_scales(c.start, c.start + m.length)
+                        .into_iter()
+                        .flat_map(|(_, _, s)| s.keys())
+                        .collect(),
+                    None => pr.scale.keys(),
+                };
                 v.extend(m.notes.iter().map(|n| n.key));
                 v
             }
