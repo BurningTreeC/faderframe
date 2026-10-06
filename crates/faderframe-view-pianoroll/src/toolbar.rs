@@ -30,6 +30,8 @@ pub(crate) enum Item {
     Audition,
     Step,
     Inspector,
+    /// The MIDI Tools panel.
+    MidiTools,
 }
 
 /// Note lengths offered for new notes.
@@ -178,6 +180,13 @@ impl PianoRollView {
             model.step_input().is_some(),
             56.0,
         );
+        add(
+            &mut flow,
+            Item::MidiTools,
+            "MIDI Tools".into(),
+            pr.tool.is_some(),
+            72.0,
+        );
         flow.fill((Item::Inspector, self.inspector_text(model), false), 180.0);
         let metrics = FlowMetrics {
             row_height: self.theme.piano.toolbar_height,
@@ -281,6 +290,9 @@ impl PianoRollView {
             Item::Audition => "Hear notes while drawing, moving and on the keys".into(),
             Item::Step => "Step input: play notes on your MIDI keyboard to enter them".into(),
             Item::Inspector => "Selection — click to type a velocity".into(),
+            Item::MidiTools => {
+                "Transform the selection (strum, chop, arpeggiate, conform…) or generate notes (rhythms, melodies, chords, basslines, drums)".into()
+            }
         }
     }
 
@@ -512,6 +524,17 @@ impl PianoRollView {
                 }
                 _ => {}
             },
+            Item::MidiTools => {
+                let mut pr = model.editor.piano;
+                match pr.tool {
+                    Some(t) => {
+                        self.last_midi_tool = t;
+                        pr.tool = None;
+                    }
+                    None => pr.tool = Some(self.last_midi_tool),
+                }
+                cx.emit(Action::SetPianoRoll(pr));
+            }
             Item::Inspector => {
                 if let Some((clip, _, m)) = clip {
                     let sel: Vec<&MidiNote> = Self::selected(m, model);

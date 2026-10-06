@@ -130,7 +130,7 @@ impl PianoRollView {
         cx.emit(Action::SelectNotes { notes, mode });
     }
 
-    fn selection_ids(m: &MidiClip, model: &Session) -> Vec<NoteId> {
+    pub(crate) fn selection_ids(m: &MidiClip, model: &Session) -> Vec<NoteId> {
         Self::selected(m, model).iter().map(|n| n.id).collect()
     }
 
@@ -170,6 +170,11 @@ impl PianoRollView {
             ViewEvent::PointerDown { .. } => false,
             ViewEvent::PointerMove {
                 pos,
+                dragging: true,
+                ..
+            } if self.value_drag.is_some() => self.tools_drag(pos, model, cx),
+            ViewEvent::PointerMove {
+                pos,
                 modifiers,
                 dragging: true,
             } => {
@@ -184,6 +189,10 @@ impl PianoRollView {
                 cx.redraw();
                 false
             }
+            ViewEvent::PointerUp { .. } if self.value_drag.take().is_some() => {
+                cx.redraw();
+                true
+            }
             ViewEvent::PointerUp { pos, modifiers, .. } => {
                 self.release(pos, modifiers, size, model, cx);
                 cx.redraw();
@@ -193,6 +202,11 @@ impl PianoRollView {
                 self.hover = None;
                 cx.redraw();
                 false
+            }
+            ViewEvent::Scroll { pos, dy, .. }
+                if self.tools_open && self.layout(size).tools.contains(pos) =>
+            {
+                self.tools_scroll(self.layout(size).tools, pos, dy, model, cx)
             }
             ViewEvent::Scroll {
                 pos,
@@ -261,6 +275,9 @@ impl PianoRollView {
                 self.toolbar_press(item, rect, model, cx);
             }
             return true;
+        }
+        if l.tools.w > 0.0 && l.tools.contains(pos) {
+            return self.tools_press(l.tools, pos, model, cx);
         }
         let Some((clip_id, clip, m)) = Self::clip(model) else {
             return false;
@@ -1334,6 +1351,8 @@ impl PianoRollView {
             }
         };
         match key {
+            // The MIDI Tools panel's Apply.
+            Key::Enter if pr.tool.is_some() => self.apply_tool(model, cx),
             Key::Escape => {
                 if self.drag.take().is_some() {
                     cx.emit(Action::AuditionOff);

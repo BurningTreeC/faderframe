@@ -1676,6 +1676,28 @@ the GDK backend).
 
 ### Piano roll
 
+**MIDI Tools.** `faderframe_project::midi_tools` holds pure, deterministic
+note tools over a `ToolContext` (the clip's start, the meter, the scale
+and key at a time, the chord track): transformations of a selection —
+Strum, Chop, Join, Connect (scale runs through gaps in the top line),
+Arpeggiate, Recombine (shuffle/rotate/reverse pitches, shuffle velocities
+or lengths, by seed), Conform to Chords, Accent, Time Scale, Ornament —
+returning the notes that replace it (kept ones with their ids, new ones
+id 0), and generators filling a range — Euclidean rhythm, Seed melody (a
+walk in the key), Chords (the chord track voice-led round a register),
+Bassline (the chord track's roots, five patterns), Drum Pattern (General
+MIDI keys, five styles). Their settings are `ToolSettings` in
+`PianoRollSettings::tools`; `PianoRollSettings::tool` opens the panel.
+`Session::preview_midi_tool` computes the result (transformations: the
+selection or every note; generators: the bars the selection spans or the
+whole clip, optionally replacing the notes there) and `apply_midi_tool`
+(`Action::ApplyMidiTool`) applies exactly that as one undo step, the
+result selected. The panel (`view-pianoroll/src/tools.rs`) sits right of
+the grid: Transform/Generate tabs, the tools, each one's settings (drag
+or wheel to change, click to cycle a choice or draw a new seed), a
+summary and Apply (Enter); the grid shows the result outlined over the
+notes it replaces. Dev action `midi-tool:<label>|apply|off`.
+
 `faderframe-view-pianoroll` edits the clip in `Session::editor_clip`:
 toolbar (tools, grid and snap, note length, default velocity, scale, fold,
 chord, quantize and its settings, ghost notes, audition, step input,
@@ -1984,7 +2006,8 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
 1. ~~**Stock devices** (wave 1)~~ — done (see *Built-in devices*).
 2. **Composition**: ~~project key/scale and a chord track, a scale-aware
    piano roll, MIDI effects before the instrument (arpeggiator, chord,
-   scale, note echo)~~ (done, see *Harmony* and *MIDI effects*), MIDI transformations and generators, always-on
+   scale, note echo), MIDI transformations and generators~~ (done, see
+   *Harmony*, *MIDI effects* and *Piano roll*), always-on
    retrospective MIDI capture.
 3. **Organisation**: folder tracks, clip aliases, project versions
    (snapshots to compare and restore), a command palette with a shortcut

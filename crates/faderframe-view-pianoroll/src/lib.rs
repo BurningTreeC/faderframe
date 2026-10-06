@@ -22,6 +22,7 @@
 mod edit;
 mod paint;
 mod toolbar;
+mod tools;
 
 #[cfg(test)]
 mod tests;
@@ -211,12 +212,21 @@ pub struct PianoRollView {
     /// The harmony strip under the ruler: a key row, a chord row (shown
     /// when the project has keys / chords).
     harmony_rows: (bool, bool),
+    /// The MIDI Tools panel is open (from the settings), the tool it had
+    /// when closed, the last of each kind, and a value being dragged.
+    tools_open: bool,
+    last_midi_tool: faderframe_project::midi_tools::Tool,
+    last_transform: faderframe_project::midi_tools::Tool,
+    last_generator: faderframe_project::midi_tools::Tool,
+    value_drag: Option<tools::ValueDrag>,
 }
 
 /// The regions of the view.
 #[derive(Clone, Copy, Debug)]
 struct Layout {
     toolbar: Rect,
+    /// The MIDI Tools panel (zero wide when closed).
+    tools: Rect,
     corner: Rect,
     ruler: Rect,
     /// The key and chord rows under the ruler (and their labels).
@@ -252,6 +262,11 @@ impl PianoRollView {
             rows: (0..=127u8).rev().collect(),
             toolbar_rows: 1,
             harmony_rows: (false, false),
+            tools_open: false,
+            last_midi_tool: faderframe_project::midi_tools::Tool::Strum,
+            last_transform: faderframe_project::midi_tools::Tool::Strum,
+            last_generator: faderframe_project::midi_tools::Tool::Euclid,
+            value_drag: None,
         }
     }
 
@@ -279,6 +294,7 @@ impl PianoRollView {
         self.toolbar_rows = self.toolbar_layout(r, model).1;
         let p = model.project();
         self.harmony_rows = (!p.keys.is_empty(), !p.chords.is_empty());
+        self.tools_open = model.editor.piano.tool.is_some();
     }
 
     /// Height of the harmony strip.
@@ -295,6 +311,11 @@ impl PianoRollView {
         let pr = &self.theme.piano;
         let mut r = Rect::from_size(size);
         let toolbar = r.take_top(self.toolbar_h());
+        let tools = if self.tools_open {
+            r.take_right(tools::TOOLS_W.min(r.w * 0.5))
+        } else {
+            Rect::new(r.right(), r.y, 0.0, r.h)
+        };
         let head = r.take_top(pr.ruler_height);
         let strip = r.take_top(self.harmony_h());
         let lane_h = self.lane_h.clamp(36.0, (r.h * 0.6).max(36.0));
@@ -306,6 +327,7 @@ impl PianoRollView {
         let (lane_header, lane) = lane_row.split_left(self.kb_w());
         Layout {
             toolbar,
+            tools,
             corner,
             ruler,
             harmony_corner,

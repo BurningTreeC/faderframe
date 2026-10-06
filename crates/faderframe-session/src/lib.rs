@@ -87,7 +87,7 @@ pub use media::{ImportJob, ImportTarget};
 pub use midi::{
     KEYBOARD_PORT, LiveNote, MidiOutputStatus, MidiPortStatus, MidiPreferences, StepInput,
 };
-pub use notes::{KeyFold, NoteLength, NoteOp, PianoRollSettings};
+pub use notes::{KeyFold, NoteLength, NoteOp, PianoRollSettings, ToolPreview};
 pub use record::{LiveTake, LoopRecordMode, RecordMode, RecordSettings, RecordedTake};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -410,6 +410,12 @@ pub enum Action {
     AddNotes {
         clip: ClipId,
         notes: Vec<MidiNote>,
+    },
+    /// Apply the MIDI Tools panel's tool to these notes (all of the clip's
+    /// without any; generators: the bars they span).
+    ApplyMidiTool {
+        clip: ClipId,
+        notes: Vec<NoteId>,
     },
     /// A chord of the piano roll's chord kind on `key`.
     AddChord {
@@ -2733,6 +2739,7 @@ impl Session {
             } => {
                 self.add_chord(clip, start, length, key, velocity)?;
             }
+            Action::ApplyMidiTool { clip, notes } => self.apply_midi_tool(clip, &notes)?,
             Action::DuplicateNotes {
                 clip,
                 notes,

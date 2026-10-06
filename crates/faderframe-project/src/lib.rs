@@ -23,6 +23,7 @@ pub mod file;
 pub mod harmony;
 mod history;
 pub mod midi_ops;
+pub mod midi_tools;
 mod midimap;
 pub mod preset;
 mod project;

@@ -7,6 +7,7 @@
 use crate::{Result, SelectMode, Session, SessionError};
 use faderframe_core::{ClipId, NoteId};
 use faderframe_project::midi_ops::{self, ChordKind, QuantizeSettings, Scale};
+use faderframe_project::midi_tools::{self, Tool, ToolContext, ToolSettings};
 use faderframe_project::{
     ClipContent, Command, ControllerPoint, ExpressionKind, ExpressionPoint, MidiClip,
     MidiController, MidiNote, NoteExpression,
@@ -126,6 +127,10 @@ pub struct PianoRollSettings {
     pub lane: Option<(MidiController, u8)>,
     /// Per-note expression in the lane instead (overrides `lane`).
     pub expression: Option<ExpressionKind>,
+    /// The MIDI Tools panel's tool (`None`: the panel is closed).
+    pub tool: Option<Tool>,
+    /// Every tool's settings.
+    pub tools: ToolSettings,
 }
 
 impl Default for PianoRollSettings {
@@ -142,8 +147,22 @@ impl Default for PianoRollSettings {
             fold: KeyFold::Off,
             lane: None,
             expression: None,
+            tool: None,
+            tools: ToolSettings::default(),
         }
     }
+}
+
+/// What the MIDI Tools panel's tool would do to the open clip.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolPreview {
+    pub tool: Tool,
+    /// Notes it takes away (by id).
+    pub removed: Vec<NoteId>,
+    /// The notes it leaves or adds (clip time; id 0: a new note).
+    pub notes: Vec<MidiNote>,
+    /// A generator's range (clip time).
+    pub range: Option<(MusicalTime, MusicalTime)>,
 }
 
 impl Session {
@@ -285,6 +304,113 @@ impl Session {
         )?;
         self.selection.select_notes(&ids, SelectMode::Replace);
         Ok(ids)
+    }
+
+    /// What the MIDI Tools panel's tool would do to `clip`: a transformation
+    /// to `notes` (all of the clip's without a selection), a generator in
+    /// the bars the selection spans (the whole clip without one).
+    pub fn preview_midi_tool(&self, clip: ClipId, notes: &[NoteId]) -> Option<ToolPreview> {
+        let tool = self.editor.piano.tool?;
+        let (clip_start, m) = self.midi_clip(clip).ok()?;
+        let s = self.editor.piano.tools;
+        let chosen: Vec<MidiNote> = if notes.is_empty() {
+            m.notes.clone()
+        } else {
+            m.notes
+                .iter()
+                .filter(|n| notes.contains(&n.id))
+                .copied()
+                .collect()
+        };
+        let scale_at = |t: MusicalTime| self.piano_scale_at(t);
+        let key_at = |t: MusicalTime| self.project.key_at(t);
+        let ctx = ToolContext {
+            clip_start,
+            meter: &self.project.timeline.meter,
+            scale_at: &scale_at,
+            key_at: &key_at,
+            chords: &self.project.chords,
+        };
+        if tool.is_generator() {
+            let meter = &self.project.timeline.meter;
+            let range = if notes.is_empty() || chosen.is_empty() {
+                (MusicalTime::ZERO, m.length)
+            } else {
+                // The bars the selection spans.
+                let a = chosen
+                    .iter()
+                    .map(|n| n.start)
+                    .min()
+                    .unwrap_or(MusicalTime::ZERO);
+                let b = chosen.iter().map(|n| n.end()).max().unwrap_or(m.length);
+                let first = meter.bar_start(meter.bar_at(clip_start + a)) - clip_start;
+                let mut last = meter.bar_at(clip_start + b);
+                if meter.bar_start(last) < clip_start + b {
+                    last += 1;
+                }
+                (
+                    first.max(MusicalTime::ZERO),
+                    (meter.bar_start(last) - clip_start).min(m.length),
+                )
+            };
+            let made = midi_tools::generate(tool, &s, range.0, range.1, &ctx);
+            let removed = if s.replace {
+                m.notes
+                    .iter()
+                    .filter(|n| n.start >= range.0 && n.start < range.1)
+                    .map(|n| n.id)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            return Some(ToolPreview {
+                tool,
+                removed,
+                notes: made,
+                range: Some(range),
+            });
+        }
+        if chosen.is_empty() {
+            return None;
+        }
+        let made = midi_tools::transform(tool, &s, &chosen, &ctx);
+        Some(ToolPreview {
+            tool,
+            removed: chosen.iter().map(|n| n.id).collect(),
+            notes: made,
+            range: None,
+        })
+    }
+
+    /// Apply the MIDI Tools panel's tool (one undo step); what it made
+    /// becomes the selection.
+    pub fn apply_midi_tool(&mut self, clip: ClipId, notes: &[NoteId]) -> Result<()> {
+        let Some(p) = self.preview_midi_tool(clip, notes) else {
+            return Ok(());
+        };
+        let (_, mut m) = self.midi_clip(clip)?;
+        let kept: HashSet<NoteId> = p.notes.iter().map(|n| n.id).collect();
+        m.notes
+            .retain(|n| !p.removed.contains(&n.id) || kept.contains(&n.id));
+        let mut selected = Vec::new();
+        for n in p.notes {
+            if n.id.0 != 0
+                && let Some(old) = m.notes.iter_mut().find(|x| x.id == n.id)
+            {
+                *old = n;
+                selected.push(n.id);
+                continue;
+            }
+            let id: NoteId = self.project.ids.allocate();
+            m.notes.push(MidiNote { id, ..n });
+            selected.push(id);
+        }
+        let present: HashSet<NoteId> = m.notes.iter().map(|n| n.id).collect();
+        m.expressions.retain(|e| present.contains(&e.note));
+        m.notes.sort_by_key(|n| (n.start, n.key));
+        self.set_midi_clip(clip, p.tool.label(), m)?;
+        self.selection.select_notes(&selected, SelectMode::Replace);
+        Ok(())
     }
 
     /// Does the piano roll's scale come from the key track (following it,

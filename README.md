@@ -122,7 +122,13 @@ Contrast:
   sustain, any CC: freehand, lines, erase), ghost notes of the track's other
   clips, auditioning, step input from a MIDI keyboard, copy/paste/duplicate,
   clip-length handle, inspector with numeric entry, live keys on the
-  keyboard.
+  keyboard. MIDI Tools (toolbar): transform the selection — strum, chop,
+  join, connect with scale runs, arpeggiate, recombine, conform to the
+  chord track, accent, time scale, ornaments — or generate Euclidean
+  rhythms, seeded melodies in the key, voice-led chords and basslines from
+  the chord track, and drum patterns; previewed in the grid, applied in
+  one undo step. The scale follows the key track; the chord track shows
+  above the notes and can be stamped.
 * Docking: mixer / Tools / album / piano roll / automation / performance
   tabs in a bottom dock, detach any view into its own window and dock it back,
   workspaces (Recording, Editing, Mixing, MIDI, Mastering), layouts saved

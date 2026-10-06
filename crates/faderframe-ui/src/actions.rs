@@ -947,6 +947,29 @@ pub fn install(app: &Rc<AppState>) {
         // selected MIDI clips, else all), `set-key:<key>` (from the start).
         named("detect-key", |a, _| a.dispatch(Action::DetectKey)),
         named("detect-chords", |a, _| a.dispatch(Action::DetectChords)),
+        // `midi-tool:<label>` opens the piano roll's MIDI Tools panel on a
+        // tool (by its label, any case; `off` closes it), `midi-tool:apply`
+        // applies it to the open clip's selection.
+        named("midi-tool", |a, arg| {
+            use faderframe_project::midi_tools::Tool;
+            let arg = arg.trim().to_lowercase();
+            if arg == "apply" {
+                let (clip, notes) = {
+                    let s = a.session.borrow();
+                    let Some(clip) = s.editor_clip() else { return };
+                    (clip, s.selection.notes.iter().copied().collect::<Vec<_>>())
+                };
+                a.dispatch(Action::ApplyMidiTool { clip, notes });
+                return;
+            }
+            let mut pr = a.session.borrow().editor.piano;
+            pr.tool = Tool::TRANSFORMS
+                .iter()
+                .chain(Tool::GENERATORS.iter())
+                .find(|t| t.label().to_lowercase() == arg)
+                .copied();
+            a.dispatch(Action::SetPianoRoll(pr));
+        }),
         // `set-chord:<from>-<to>=<chord>` (quarters): the chord track.
         named("set-chord", |a, arg| {
             let parsed = arg.split_once('=').and_then(|(span, chord)| {

@@ -498,7 +498,7 @@ fn toolbar_wraps_in_narrow_views() {
         view.paint(&mut p, size, &s, &Theme::default());
         let l = view.layout(size);
         let items = view.toolbar_items(l.toolbar, &s);
-        assert_eq!(items.len(), 18, "every control stays reachable at {w}");
+        assert_eq!(items.len(), 19, "every control stays reachable at {w}");
         assert!(
             items
                 .iter()
@@ -647,4 +647,86 @@ fn the_key_and_chord_tracks_show_and_lead_the_scale() {
             .iter()
             .all(|k| c_major.contains(&(k % 12)) || used.contains(k))
     );
+}
+
+#[test]
+fn the_midi_tools_panel_picks_sets_previews_and_applies() {
+    use faderframe_project::midi_tools::Tool as MidiTool;
+    let mut s = session();
+    let mut view = PianoRollView::new(Theme::default());
+    paint(&mut view, &s);
+    let before = notes(&s).len();
+    // Open it from the toolbar.
+    let l = view.layout(SIZE);
+    let items = view.toolbar_items(l.toolbar, &s);
+    let at = items
+        .iter()
+        .find(|i| i.0 == crate::toolbar::Item::MidiTools)
+        .unwrap()
+        .1
+        .center();
+    run(&mut view, down(at, Modifiers::NONE, 1), &mut s);
+    assert_eq!(s.editor.piano.tool, Some(MidiTool::Strum));
+    let p = paint(&mut view, &s);
+    assert!(p.texts().contains(&"MIDI TOOLS"));
+    assert!(
+        p.texts()
+            .iter()
+            .any(|t| t.starts_with("All ") && t.contains("notes →"))
+    );
+    // The grid made room for it.
+    let l = view.layout(SIZE);
+    assert!(l.tools.w > 200.0 && l.grid.right() <= l.tools.x);
+    // Pick Chop, drag its parts up from 4 to 6.
+    let g = view.tools_geometry(l.tools, &s).unwrap();
+    let chop = g
+        .tools
+        .iter()
+        .find(|(t, _)| *t == MidiTool::Chop)
+        .unwrap()
+        .1;
+    run(&mut view, down(chop.center(), Modifiers::NONE, 1), &mut s);
+    assert_eq!(s.editor.piano.tool, Some(MidiTool::Chop));
+    let g = view.tools_geometry(l.tools, &s).unwrap();
+    let parts = g.rows[0];
+    let from = Point::new(parts.right() - 20.0, parts.center().y);
+    run(&mut view, down(from, Modifiers::NONE, 1), &mut s);
+    run(
+        &mut view,
+        drag(Point::new(from.x, from.y - 14.0), Modifiers::NONE),
+        &mut s,
+    );
+    run(
+        &mut view,
+        up(Point::new(from.x, from.y - 14.0), Modifiers::NONE),
+        &mut s,
+    );
+    assert_eq!(s.editor.piano.tools.chop_parts, 6);
+    // Enter applies it to every note (none selected): six parts each.
+    run(
+        &mut view,
+        ViewEvent::Key {
+            key: Key::Enter,
+            modifiers: Modifiers::NONE,
+        },
+        &mut s,
+    );
+    assert_eq!(notes(&s).len(), before * 6);
+    // The Generate tab; the close button.
+    let g = view.tools_geometry(l.tools, &s).unwrap();
+    run(
+        &mut view,
+        down(g.tabs[1].center(), Modifiers::NONE, 1),
+        &mut s,
+    );
+    assert!(s.editor.piano.tool.unwrap().is_generator());
+    let g = view.tools_geometry(l.tools, &s).unwrap();
+    run(
+        &mut view,
+        down(g.close.center(), Modifiers::NONE, 1),
+        &mut s,
+    );
+    assert_eq!(s.editor.piano.tool, None);
+    paint(&mut view, &s);
+    assert_eq!(view.layout(SIZE).tools.w, 0.0);
 }

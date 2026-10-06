@@ -287,3 +287,97 @@ fn expression_travels_with_notes() {
     .unwrap();
     assert!(clip(&s, c).expression(pasted).is_none());
 }
+
+fn notes_of(s: &Session, clip: ClipId) -> Vec<MidiNote> {
+    let mut n = s
+        .project()
+        .clip(clip)
+        .unwrap()
+        .as_midi()
+        .unwrap()
+        .notes
+        .clone();
+    n.sort_by_key(|n| (n.start, n.key));
+    n
+}
+
+/// MIDI Tools: what the panel previews is what applying does, in one
+/// undo step; generators add to the clip or replace what is there.
+#[test]
+fn midi_tools_preview_and_apply_in_one_step() {
+    use faderframe_project::midi_tools::Tool;
+    let (mut s, clip) = setup();
+    assert!(s.preview_midi_tool(clip, &[]).is_none(), "no tool chosen");
+    // Chop every note in four.
+    let mut pr = s.editor.piano;
+    pr.tool = Some(Tool::Chop);
+    s.dispatch(Action::SetPianoRoll(pr)).unwrap();
+    let preview = s.preview_midi_tool(clip, &[]).unwrap();
+    assert_eq!(preview.notes.len(), 12);
+    assert_eq!(preview.removed.len(), 3);
+    s.dispatch(Action::ApplyMidiTool {
+        clip,
+        notes: Vec::new(),
+    })
+    .unwrap();
+    let after = notes_of(&s, clip);
+    assert_eq!(after.len(), 12);
+    let mut expected = preview.notes.clone();
+    expected.sort_by_key(|n| (n.start, n.key));
+    for (a, b) in after.iter().zip(&expected) {
+        assert_eq!(
+            (a.start, a.length, a.key, a.velocity),
+            (b.start, b.length, b.key, b.velocity)
+        );
+    }
+    assert!(after.iter().all(|n| n.id.0 != 0), "ids from the session");
+    assert_eq!(s.selection.notes.len(), 12, "what it made is selected");
+    s.dispatch(Action::Undo).unwrap();
+    assert_eq!(notes_of(&s, clip).len(), 3);
+    // A drum pattern over the whole clip, replacing what is there.
+    pr.tool = Some(Tool::Drums);
+    pr.tools.replace = true;
+    s.dispatch(Action::SetPianoRoll(pr)).unwrap();
+    let p = s.preview_midi_tool(clip, &[]).unwrap();
+    assert_eq!(p.range, Some((MusicalTime::ZERO, q(16.0))));
+    assert_eq!(p.removed.len(), 3);
+    s.dispatch(Action::ApplyMidiTool {
+        clip,
+        notes: Vec::new(),
+    })
+    .unwrap();
+    let after = notes_of(&s, clip);
+    assert_eq!(
+        after.iter().filter(|n| n.key == 36).count(),
+        16,
+        "four bars of four kicks"
+    );
+    assert!(after.iter().all(|n| [36, 39, 42, 46].contains(&n.key)));
+    // Generating from a selection: the bars it spans (bar 2 here).
+    s.dispatch(Action::Undo).unwrap();
+    pr.tools.replace = false;
+    s.dispatch(Action::SetPianoRoll(pr)).unwrap();
+    let second = notes_of(&s, clip)
+        .into_iter()
+        .find(|n| n.key == 67)
+        .unwrap();
+    s.dispatch(Action::NoteOperation {
+        clip,
+        notes: vec![second.id],
+        op: NoteOp::Move {
+            by: q(3.0),
+            keys: 0,
+        },
+    })
+    .unwrap();
+    let moved = notes_of(&s, clip)
+        .into_iter()
+        .find(|n| n.key == 67)
+        .unwrap();
+    assert_eq!(moved.start, q(5.2));
+    let p = s.preview_midi_tool(clip, &[moved.id]).unwrap();
+    let bar = (q(4.0), q(8.0));
+    assert_eq!(p.range, Some(bar));
+    assert!(p.notes.iter().all(|n| n.start >= bar.0 && n.start < bar.1));
+    assert!(p.removed.is_empty(), "added, not replacing");
+}

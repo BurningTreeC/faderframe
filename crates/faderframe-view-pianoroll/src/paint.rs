@@ -49,6 +49,9 @@ impl PianoRollView {
             self.paint_ghosts(p, l.grid, clip, model);
         }
         self.paint_notes(p, l.grid, m, color, model);
+        if model.editor.piano.tool.is_some() {
+            self.paint_tool_preview(p, l.grid, clip, m, model);
+        }
         self.paint_glides(p, l.grid, m);
         self.paint_overlays(p, l.grid, clip, m, model);
         p.pop_clip();
@@ -68,6 +71,9 @@ impl PianoRollView {
             Rect::new(l.splitter.center().x - 12.0, l.splitter.y + 2.0, 24.0, 1.0),
             theme.ui.text_faint,
         );
+        if l.tools.w > 0.0 {
+            self.paint_tools(p, l.tools, model);
+        }
         self.paint_toolbar(p, l.toolbar, model);
     }
 
