@@ -21,7 +21,7 @@ pub(super) fn synth() -> Vec<FactoryPreset> {
         preset(
             "Fat Saw Lead",
             &[
-                (VOLUME, -9.0),
+                (VOLUME, -1.0),
                 (OSC1_WAVE, SAW),
                 (OSC2_WAVE, SAW),
                 (DETUNE, 12.0),
@@ -51,7 +51,7 @@ pub(super) fn synth() -> Vec<FactoryPreset> {
         preset(
             "Supersaw Stack",
             &[
-                (VOLUME, -12.0),
+                (VOLUME, -8.5),
                 (OSC1_WAVE, SAW),
                 (OSC2_WAVE, SAW),
                 (DETUNE, 15.0),
@@ -79,7 +79,7 @@ pub(super) fn synth() -> Vec<FactoryPreset> {
         preset(
             "Chip Lead",
             &[
-                (VOLUME, -12.0),
+                (VOLUME, -5.0),
                 (OSC1_WAVE, SQUARE),
                 (OSC1_PW, 0.5),
                 (OSC2_LEVEL, 0.0),
@@ -103,7 +103,7 @@ pub(super) fn synth() -> Vec<FactoryPreset> {
         preset(
             "Warm Pad",
             &[
-                (VOLUME, -10.0),
+                (VOLUME, -9.0),
                 (OSC1_WAVE, SAW),
                 (OSC2_WAVE, SAW),
                 (DETUNE, 10.0),
@@ -135,7 +135,7 @@ pub(super) fn synth() -> Vec<FactoryPreset> {
         preset(
             "PWM Pad",
             &[
-                (VOLUME, -11.0),
+                (VOLUME, -13.5),
                 (OSC1_WAVE, SQUARE),
                 (OSC2_WAVE, SQUARE),
                 (OSC1_PW, 0.5),
@@ -161,7 +161,7 @@ pub(super) fn synth() -> Vec<FactoryPreset> {
         preset(
             "Soft Strings",
             &[
-                (VOLUME, -12.0),
+                (VOLUME, -7.0),
                 (OSC1_WAVE, SAW),
                 (OSC2_WAVE, SAW),
                 (OSC2_OCTAVE, 1.0),
@@ -191,7 +191,7 @@ pub(super) fn synth() -> Vec<FactoryPreset> {
         preset(
             "Analog Brass",
             &[
-                (VOLUME, -9.0),
+                (VOLUME, -8.0),
                 (OSC1_WAVE, SAW),
                 (OSC2_WAVE, SAW),
                 (DETUNE, 8.0),
@@ -219,7 +219,7 @@ pub(super) fn synth() -> Vec<FactoryPreset> {
         preset(
             "Pluck",
             &[
-                (VOLUME, -9.0),
+                (VOLUME, -0.5),
                 (OSC1_WAVE, SAW),
                 (OSC2_WAVE, SQUARE),
                 (OSC2_LEVEL, 0.6),
@@ -248,7 +248,7 @@ pub(super) fn synth() -> Vec<FactoryPreset> {
         preset(
             "Glass Bells",
             &[
-                (VOLUME, -8.0),
+                (VOLUME, -4.0),
                 (OSC1_WAVE, SINE),
                 (OSC2_WAVE, SINE),
                 (OSC2_OCTAVE, 1.0),
@@ -269,7 +269,7 @@ pub(super) fn synth() -> Vec<FactoryPreset> {
         preset(
             "Tremolo Keys",
             &[
-                (VOLUME, -8.0),
+                (VOLUME, -1.5),
                 (OSC1_WAVE, TRIANGLE),
                 (OSC2_WAVE, SINE),
                 (OSC2_OCTAVE, 1.0),
@@ -299,7 +299,7 @@ pub(super) fn synth() -> Vec<FactoryPreset> {
         preset(
             "Sub Bass",
             &[
-                (VOLUME, -6.0),
+                (VOLUME, -0.5),
                 (OSC1_WAVE, SINE),
                 (OSC2_WAVE, TRIANGLE),
                 (OSC2_LEVEL, 0.25),
@@ -323,7 +323,7 @@ pub(super) fn synth() -> Vec<FactoryPreset> {
         preset(
             "Acid Bass",
             &[
-                (VOLUME, -8.0),
+                (VOLUME, 3.5),
                 (OSC1_WAVE, SAW),
                 (OSC2_LEVEL, 0.0),
                 (DETUNE, 0.0),
@@ -350,7 +350,7 @@ pub(super) fn synth() -> Vec<FactoryPreset> {
         preset(
             "Fat Analog Bass",
             &[
-                (VOLUME, -7.0),
+                (VOLUME, 4.0),
                 (OSC1_WAVE, SAW),
                 (OSC2_WAVE, SQUARE),
                 (OSC2_OCTAVE, -1.0),
@@ -380,7 +380,7 @@ pub(super) fn synth() -> Vec<FactoryPreset> {
         preset(
             "Wobble Bass",
             &[
-                (VOLUME, -9.0),
+                (VOLUME, 2.0),
                 (OSC1_WAVE, SAW),
                 (OSC2_WAVE, SQUARE),
                 (OSC2_OCTAVE, -1.0),
@@ -406,7 +406,7 @@ pub(super) fn synth() -> Vec<FactoryPreset> {
         preset(
             "Noise Riser",
             &[
-                (VOLUME, -6.0),
+                (VOLUME, -2.0),
                 (OSC1_LEVEL, 0.0),
                 (OSC2_LEVEL, 0.0),
                 (NOISE, 1.0),

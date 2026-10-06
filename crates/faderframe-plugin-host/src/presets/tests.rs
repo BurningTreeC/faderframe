@@ -503,3 +503,103 @@ fn centroid(x: &[f32]) -> f64 {
     }
     num / den.max(1e-20)
 }
+
+/// The notes a Synth preset is judged by: a monophonic patch plays one note
+/// (a bass C2, a lead C4), a polyphonic one a four-note chord, each held
+/// until its attack is over and a second more.
+fn synth_notes(preset: &FactoryPreset) -> (Vec<(u8, f64, f64)>, f64) {
+    use crate::devices::synth::id;
+    let values = preset.values(&parameters(builtin::SYNTH));
+    let get = |pid: u32| {
+        values
+            .iter()
+            .find(|(p, _)| p.0 == pid)
+            .map_or(0.0, |(_, v)| *v)
+    };
+    let hold = 1.0 + get(id::ATTACK) * 0.001;
+    let notes = if get(id::VOICE_MODE) >= 0.5 {
+        let key = if preset.name.contains("Bass") { 36 } else { 60 };
+        vec![(key, 0.0, hold)]
+    } else {
+        [48, 52, 55, 60].iter().map(|&k| (k, 0.0, hold)).collect()
+    };
+    (notes, hold + 0.5)
+}
+
+/// The loudest momentary loudness of a render (BS.1770 K-weighting at
+/// 48 kHz, 400 ms windows every 100 ms; LUFS).
+fn momentary_max(out: &[Vec<f32>; 2]) -> f64 {
+    let weighted: Vec<Vec<f64>> = out
+        .iter()
+        .map(|c| {
+            // The head's shelf, then the RLB high pass.
+            let stages = [
+                (
+                    [
+                        1.535_124_859_586_97,
+                        -2.691_696_189_406_38,
+                        1.198_392_810_852_85,
+                    ],
+                    [-1.690_659_293_182_41, 0.732_480_774_215_85],
+                ),
+                (
+                    [1.0, -2.0, 1.0],
+                    [-1.990_047_454_833_98, 0.990_072_250_366_21],
+                ),
+            ];
+            let mut x: Vec<f64> = c.iter().map(|v| f64::from(*v)).collect();
+            for (b, a) in stages {
+                let (mut x1, mut x2, mut y1, mut y2) = (0.0, 0.0, 0.0, 0.0);
+                for v in &mut x {
+                    let y = b[0] * *v + b[1] * x1 + b[2] * x2 - a[0] * y1 - a[1] * y2;
+                    (x2, x1, y2, y1) = (x1, *v, y1, y);
+                    *v = y;
+                }
+            }
+            x
+        })
+        .collect();
+    let (w, hop) = ((0.4 * SR) as usize, (0.1 * SR) as usize);
+    let mut best = f64::NEG_INFINITY;
+    let mut a = 0;
+    while a + w <= weighted[0].len() {
+        let power: f64 = weighted
+            .iter()
+            .map(|c| c[a..a + w].iter().map(|v| v * v).sum::<f64>() / w as f64)
+            .sum();
+        best = best.max(-0.691 + 10.0 * power.max(1e-20).log10());
+        a += hop;
+    }
+    best
+}
+
+/// Patches sit at one loudness (momentary, K-weighted), played as they are
+/// meant to be, so switching from a pad to a bass or a lead does not jump
+/// by 15 dB; and they keep a decibel of headroom.
+#[test]
+fn the_synth_presets_are_balanced() {
+    use crate::devices::synth::id;
+    const TARGET: f64 = -18.0;
+    let (input, key) = material(0.1);
+    let mut wrong = Vec::new();
+    for (i, preset) in factory_presets(builtin::SYNTH).iter().enumerate() {
+        let (notes, seconds) = synth_notes(preset);
+        let r = render(builtin::SYNTH, i, &input, &key, &notes, seconds);
+        let level = momentary_max(&r.out);
+        let peak = peak_db(&r.out[0]).max(peak_db(&r.out[1]));
+        let volume = preset
+            .values(&parameters(builtin::SYNTH))
+            .iter()
+            .find(|(p, _)| p.0 == id::VOLUME)
+            .map_or(0.0, |(_, v)| *v);
+        println!(
+            "{:20} {level:6.1} LUFS  peak {peak:6.1}  volume {volume:+5.1} → {:+5.1}",
+            preset.name,
+            volume + TARGET - level
+        );
+        if (level - TARGET).abs() > 1.5 || peak > -1.0 {
+            wrong.push(preset.name);
+        }
+    }
+    assert!(wrong.is_empty(), "unbalanced: {wrong:?}");
+}

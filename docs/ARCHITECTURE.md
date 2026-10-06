@@ -851,8 +851,11 @@ covered by `the_stock_devices_do_not_allocate`.
   `session::programs` overrides a built-in delay/reverb's mix to fully wet
   before the new state is captured, so loading and undo remain one step;
   inserts on other track kinds keep the preset's mix. User preset files
-  always retain the saved mix. Preset tests validate every parameter and
-  render every program; session tests cover undo, rebuilds and project
+  always retain the saved mix. Synth presets are balanced: played as meant
+  (a mono bass on C2, a mono lead on C4, a poly patch as a four-note
+  chord), each peaks at −18 LUFS momentary with at least 1 dB of headroom
+  (`the_synth_presets_are_balanced` prints the volume each needs). Preset
+  tests validate every parameter and render every program; session tests cover undo, rebuilds and project
   save/reopen with subsequent user tweaks.
 * **Programs** (`PluginInstance::programs`/`select_program`; VST3 program
   lists) are listed with the presets. Selecting one changes the plugin's
@@ -1886,8 +1889,8 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
 2024–2026):
 
 1. ~~**Stock devices** (wave 1)~~ — done (see *Built-in devices*).
-2. **Composition**: project key/scale and a chord track, a scale-aware
-   piano roll, MIDI effects before the instrument (arpeggiator, chord,
+2. **Composition**: ~~project key/scale and a chord track~~ (done, see
+   *Harmony*), a scale-aware piano roll, MIDI effects before the instrument (arpeggiator, chord,
    scale, note echo), MIDI transformations and generators, always-on
    retrospective MIDI capture.
 3. **Organisation**: folder tracks, clip aliases, project versions
