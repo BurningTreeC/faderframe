@@ -15,6 +15,7 @@ repository = "https://github.com/BurningTreeC/faderframe"
 faderframe-circuit = { path = "crates/faderframe-circuit" }
 # --- internal crates -------------------------------------------------------
 faderframe-core = { path = "crates/faderframe-core" }
+faderframe-control = { path = "crates/faderframe-control" }
 faderframe-timeline = { path = "crates/faderframe-timeline" }
 faderframe-midi = { path = "crates/faderframe-midi" }
 faderframe-midi-io = { path = "crates/faderframe-midi-io" }
