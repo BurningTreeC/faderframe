@@ -45,6 +45,9 @@ mod imp {
         /// The bars lie over the canvas: they also keep clear of each other.
         pub overlaid: Cell<bool>,
         pub syncing: Cell<bool>,
+        /// The view a drag that left this one hovers over (it carries a
+        /// payload).
+        pub payload_target: RefCell<Option<glib::WeakRef<super::CanvasWidget>>>,
     }
 
     #[glib::object_subclass]
@@ -259,6 +262,134 @@ impl CanvasWidget {
         handled
     }
 
+    /// What the view's drag carries to other views.
+    fn payload(&self) -> Option<String> {
+        let app = self.app()?;
+        let session = app.session.try_borrow().ok()?;
+        self.imp().view.borrow().as_ref()?.drag_payload(&session)
+    }
+
+    /// Another canvas at `(x, y)` (this one's coordinates) and the point in
+    /// its coordinates.
+    fn canvas_at(&self, x: f64, y: f64) -> Option<(CanvasWidget, Point)> {
+        let root = self.root()?;
+        let at = self.compute_point(&root, &gtk::graphene::Point::new(x as f32, y as f32))?;
+        let hit = root.pick(
+            f64::from(at.x()),
+            f64::from(at.y()),
+            gtk::PickFlags::DEFAULT,
+        )?;
+        let target = hit
+            .ancestor(CanvasWidget::static_type())
+            .and_then(|w| w.downcast::<CanvasWidget>().ok())?;
+        if &target == self {
+            return None;
+        }
+        let local = root.compute_point(&target, &at)?;
+        Some((target, Point::new(local.x(), local.y())))
+    }
+
+    fn hover_payload(&self, payload: Option<(&str, Point)>) {
+        let Some(app) = self.app() else { return };
+        let redraw = {
+            let Ok(session) = app.session.try_borrow() else {
+                return;
+            };
+            match self.imp().view.borrow_mut().as_mut() {
+                Some(v) => v.hover_payload(payload, self.size(), &session),
+                None => false,
+            }
+        };
+        if redraw {
+            self.queue_draw();
+        }
+    }
+
+    /// Follow a drag that left this view with a payload: the view under it
+    /// shows where it would go.
+    fn track_payload(&self, x: f64, y: f64) {
+        let inside = x >= 0.0 && y >= 0.0 && x < self.width() as f64 && y < self.height() as f64;
+        let target = if inside {
+            None
+        } else {
+            self.payload()
+                .and_then(|p| self.canvas_at(x, y).map(|t| (p, t)))
+        };
+        let old = self
+            .imp()
+            .payload_target
+            .borrow_mut()
+            .take()
+            .and_then(|w| w.upgrade());
+        match target {
+            Some((payload, (t, at))) => {
+                if let Some(o) = old.filter(|o| *o != t) {
+                    o.hover_payload(None);
+                }
+                t.hover_payload(Some((&payload, at)));
+                *self.imp().payload_target.borrow_mut() = Some(t.downgrade());
+            }
+            None => {
+                if let Some(o) = old {
+                    o.hover_payload(None);
+                }
+            }
+        }
+    }
+
+    /// The drag ended at `(x, y)`: another view under it takes the
+    /// payload (this view's drag is cancelled). True when one did.
+    fn drop_payload_at(&self, x: f64, y: f64) -> bool {
+        if let Some(o) = self
+            .imp()
+            .payload_target
+            .borrow_mut()
+            .take()
+            .and_then(|w| w.upgrade())
+        {
+            o.hover_payload(None);
+        }
+        let inside = x >= 0.0 && y >= 0.0 && x < self.width() as f64 && y < self.height() as f64;
+        if inside {
+            return false;
+        }
+        let Some(payload) = self.payload() else {
+            return false;
+        };
+        let Some((target, at)) = self.canvas_at(x, y) else {
+            return false;
+        };
+        let Some(app) = self.app() else { return false };
+        let action = {
+            let Ok(session) = app.session.try_borrow() else {
+                return false;
+            };
+            match target.imp().view.borrow_mut().as_mut() {
+                Some(v) => v.drop_payload(&payload, at, target.size(), &session),
+                None => None,
+            }
+        };
+        let Some(action) = action else {
+            return false;
+        };
+        // This view's drag is undone, then the other view's action runs.
+        let mut actions = Vec::new();
+        let mut requests = Vec::new();
+        {
+            let mut cx = EventCx::new(&mut actions, &mut requests);
+            if let Some(v) = self.imp().view.borrow_mut().as_mut() {
+                v.cancel_drag(&mut cx);
+            }
+        }
+        for a in actions {
+            app.dispatch(a);
+        }
+        app.dispatch(action);
+        self.queue_draw();
+        target.queue_draw();
+        true
+    }
+
     fn handle_request(&self, app: &Rc<AppState>, req: HostRequest<Action>) {
         match req {
             HostRequest::GrabFocus => {
@@ -398,6 +529,7 @@ impl CanvasWidget {
                     modifiers: modifiers(g.current_event_state()),
                     dragging: true,
                 });
+                w.track_payload(x + dx, y + dy);
             }
         ));
         drag.connect_drag_end(glib::clone!(
@@ -406,6 +538,8 @@ impl CanvasWidget {
             move |g, dx, dy| {
                 w.imp().dragging.set(false);
                 let (x, y) = w.imp().drag_origin.get();
+                // Dropped on another view that takes what is dragged.
+                w.drop_payload_at(x + dx, y + dy);
                 w.deliver(ViewEvent::PointerUp {
                     pos: Point::new((x + dx) as f32, (y + dy) as f32),
                     button: button(w.imp().drag_button.get()),

@@ -207,4 +207,25 @@ pub trait CanvasView<M, A> {
     ) -> Option<A> {
         None
     }
+
+    /// What the drag in progress carries to other views when it leaves
+    /// this one (an opaque payload, e.g. `clips:1,2`); `None`: nothing.
+    fn drag_payload(&self, _model: &M) -> Option<String> {
+        None
+    }
+
+    /// The drag left this view and another took its payload: undo what the
+    /// drag did here (and forget it).
+    fn cancel_drag(&mut self, _cx: &mut EventCx<'_, A>) {}
+
+    /// Another view's payload hovers at `pos` (`None`: it left); true to
+    /// redraw.
+    fn hover_payload(&mut self, _payload: Option<(&str, Point)>, _size: Size, _model: &M) -> bool {
+        false
+    }
+
+    /// Another view's payload was dropped at `pos`.
+    fn drop_payload(&mut self, _payload: &str, _pos: Point, _size: Size, _model: &M) -> Option<A> {
+        None
+    }
 }

@@ -65,6 +65,8 @@ pub struct LauncherView {
     sy: f32,
     hover: Option<Hit>,
     drag: Option<Drag>,
+    /// Where clips dragged from another view (the arranger) hover.
+    drop_hover: Option<Point>,
 }
 
 fn color_of(c: TrackColor) -> Color {
@@ -79,6 +81,7 @@ impl LauncherView {
             sy: 0.0,
             hover: None,
             drag: None,
+            drop_hover: None,
         }
     }
 
@@ -263,7 +266,8 @@ impl LauncherView {
         let hover = matches!(self.hover, Some(Hit::Slot { track: t, scene: s, .. }) if t == track.id && s == scene);
         let dragging_over = self
             .drag
-            .is_some_and(|d| d.moved && Rect::contains(&cell, d.at));
+            .is_some_and(|d| d.moved && Rect::contains(&cell, d.at))
+            || self.drop_hover.is_some_and(|p| cell.contains(p));
         let Some(clip) = launcher
             .clip(track.id, scene)
             .and_then(|c| model.project().clip(c))
@@ -743,6 +747,39 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for LauncherView {
                 r.inset_xy(8.0, 0.0),
                 &TextStyle::new(theme.fonts.small, theme.arranger.clip_text),
             );
+        }
+    }
+
+    fn hover_payload(
+        &mut self,
+        payload: Option<(&str, Point)>,
+        _size: Size,
+        _model: &Session,
+    ) -> bool {
+        let at = payload
+            .filter(|(p, _)| faderframe_session::launcher::parse_clips_payload(p).is_some())
+            .map(|(_, at)| at);
+        let changed = at != self.drop_hover;
+        self.drop_hover = at;
+        changed
+    }
+
+    fn drop_payload(
+        &mut self,
+        payload: &str,
+        pos: Point,
+        size: Size,
+        model: &Session,
+    ) -> Option<Action> {
+        self.drop_hover = None;
+        let clips = faderframe_session::launcher::parse_clips_payload(payload)?;
+        match self.hit(pos, size, model)? {
+            Hit::Slot { track, scene, .. } => Some(Action::Launcher(LauncherOp::PlaceClips {
+                clips,
+                track,
+                scene,
+            })),
+            _ => None,
         }
     }
 

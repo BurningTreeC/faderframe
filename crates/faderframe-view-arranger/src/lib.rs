@@ -2768,6 +2768,21 @@ impl ArrangerView {
         if self.auto_drag_move(model, pos, mods, size.w, cx) {
             return;
         }
+        // Clips carried over another view (the launcher) go back here
+        // meanwhile.
+        if let Some(clip_edit::EditDrag::Move {
+            clips, moved: true, ..
+        }) = &self.edit_drag
+            && model.editor.edit_mode != faderframe_session::editing::EditMode::Shuffle
+            && !Rect::from_size(size).contains(pos)
+        {
+            cx.emit(Action::MoveClips {
+                clips: clips.clone(),
+                by: 0,
+                tracks: 0,
+            });
+            return;
+        }
         if self.edit_drag_move(pos, mods, model, cx) {
             return;
         }
@@ -3615,6 +3630,23 @@ impl CanvasView<Session, Action> for ArrangerView {
                 end: 0.0,
             },
         })
+    }
+
+    fn drag_payload(&self, model: &Session) -> Option<String> {
+        match &self.edit_drag {
+            Some(clip_edit::EditDrag::Move {
+                clips, moved: true, ..
+            }) if model.editor.edit_mode != faderframe_session::editing::EditMode::Shuffle => {
+                Some(faderframe_session::launcher::clips_payload(clips))
+            }
+            _ => None,
+        }
+    }
+
+    fn cancel_drag(&mut self, cx: &mut EventCx<'_, Action>) {
+        if let Some(clip_edit::EditDrag::Move { moved: true, .. }) = self.edit_drag.take() {
+            cx.emit(Action::CancelGesture);
+        }
     }
 
     fn drag_files(&mut self, pos: Option<Point>, size: Size, model: &Session) -> bool {

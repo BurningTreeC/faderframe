@@ -99,6 +99,20 @@ impl History {
         self.depth > 0
     }
 
+    /// Drop the open gesture, undoing what it did (nothing is recorded).
+    pub fn cancel(&mut self, project: &mut Project) -> Result<Impact, EditError> {
+        if self.depth == 0 {
+            return Ok(Impact::None);
+        }
+        self.depth = 0;
+        let Some(tx) = self.open.take() else {
+            return Ok(Impact::None);
+        };
+        let impact = Self::impact_of(&tx);
+        Self::replay(project, tx)?;
+        Ok(impact)
+    }
+
     fn push(&mut self, tx: Transaction) {
         self.undo.push(tx);
         if self.undo.len() > self.limit {

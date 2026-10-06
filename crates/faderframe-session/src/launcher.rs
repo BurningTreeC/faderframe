@@ -76,12 +76,34 @@ pub enum LauncherOp {
         track: TrackId,
         scene: SceneId,
     },
+    /// Copies of clips (dragged from the arrangement) into a slot and the
+    /// slots below it on its track (new scenes as needed; clips that do not
+    /// fit the track are left out).
+    PlaceClips {
+        clips: Vec<ClipId>,
+        track: TrackId,
+        scene: SceneId,
+    },
     /// A slot's follow action (`None`: none).
     SetFollow {
         track: TrackId,
         scene: SceneId,
         follow: Option<faderframe_project::launcher::FollowAction>,
     },
+}
+
+/// The payload of arrangement clips dragged to other views.
+pub fn clips_payload(clips: &[ClipId]) -> String {
+    let ids: Vec<String> = clips.iter().map(|c| c.raw().to_string()).collect();
+    format!("clips:{}", ids.join(","))
+}
+
+/// The clips in a [`clips_payload`].
+pub fn parse_clips_payload(payload: &str) -> Option<Vec<ClipId>> {
+    let ids = payload.strip_prefix("clips:")?;
+    ids.split(',')
+        .map(|s| s.parse::<u64>().ok().map(ClipId))
+        .collect()
 }
 
 /// A recording into a launcher slot (engine samples).
@@ -453,6 +475,11 @@ impl Session {
                     })?;
                 }
             }
+            LauncherOp::PlaceClips {
+                clips,
+                track,
+                scene,
+            } => self.place_clips(&clips, track, scene)?,
             LauncherOp::SetFollow {
                 track,
                 scene,
@@ -699,6 +726,58 @@ impl Session {
             self.play()?;
         }
         Ok(())
+    }
+
+    /// Copies of `clips` into `track`'s slot in `scene` and the ones below.
+    fn place_clips(&mut self, clips: &[ClipId], track: TrackId, scene: SceneId) -> Result<()> {
+        let Some(kind) = self.project.track(track).map(|t| t.kind) else {
+            return Err(SessionError::Other("no such track".into()));
+        };
+        let fits = |c: &Clip| match c.content {
+            ClipContent::Midi(_) => matches!(kind, TrackKind::Instrument | TrackKind::Midi),
+            _ => kind == TrackKind::Audio,
+        };
+        let mut list: Vec<Clip> = clips
+            .iter()
+            .filter_map(|c| self.project.clips.get(c))
+            .filter(|c| fits(c))
+            .cloned()
+            .collect();
+        if list.is_empty() {
+            return Err(SessionError::Other(
+                "those clips do not fit this track".into(),
+            ));
+        }
+        list.sort_by_key(|c| (c.start, c.id));
+        let mut scenes = self.project.launcher.scenes.clone();
+        let Some(first) = scenes.iter().position(|s| s.id == scene) else {
+            return Err(SessionError::Other("no such scene".into()));
+        };
+        let mut commands = Vec::new();
+        for (k, c) in list.into_iter().enumerate() {
+            let i = first + k;
+            if i >= scenes.len() {
+                let id: SceneId = self.project.ids.allocate();
+                scenes.push(Scene {
+                    id,
+                    name: format!("Scene {}", scenes.len() + 1),
+                });
+            }
+            let mut copy = c;
+            copy.id = self.project.ids.allocate();
+            copy.track = track;
+            copy.start = MusicalTime::ZERO;
+            commands.push(Command::SetLauncherSlot {
+                track,
+                scene: scenes[i].id,
+                clip: Some(Box::new(copy)),
+            });
+        }
+        commands.insert(0, Command::SetScenes { scenes });
+        self.edit(Command::Batch {
+            label: "Clips to Launcher".into(),
+            commands,
+        })
     }
 
     /// Copies of arrangement clips into their tracks' first free slots.

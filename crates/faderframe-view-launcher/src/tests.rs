@@ -191,3 +191,48 @@ fn a_clip_drags_to_another_slot() {
         })]
     );
 }
+
+#[test]
+fn clips_dropped_from_the_arranger_land_in_the_slot() {
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    s.dispatch(Action::Launcher(LauncherOp::AddScene { after: None }))
+        .unwrap();
+    let scene = s.project().launcher.scenes[0].id;
+    let drums = track(&s, "Drums");
+    let clip = s.project().clips_of(drums)[0].id;
+    let mut view = LauncherView::new(Theme::default());
+    let size = Size::new(1200.0, 500.0);
+    let tracks: Vec<TrackId> = s.launcher_tracks().iter().map(|t| t.id).collect();
+    let col = tracks.iter().position(|t| *t == drums).unwrap();
+    let at = Point::new(view.col_x(col) + COL_W / 2.0, view.row_y(0) + ROW_H / 2.0);
+    let payload = faderframe_session::launcher::clips_payload(&[clip]);
+    assert!(view.hover_payload(Some((&payload, at)), size, &s));
+    assert!(view.hover_payload(Some(("something else", at)), size, &s));
+    let action = view.drop_payload(&payload, at, size, &s).unwrap();
+    assert_eq!(
+        action,
+        Action::Launcher(LauncherOp::PlaceClips {
+            clips: vec![clip],
+            track: drums,
+            scene
+        })
+    );
+    s.dispatch(action).unwrap();
+    let placed = s.project().launcher.clip(drums, scene).unwrap();
+    assert_ne!(placed, clip, "a copy");
+    assert_eq!(
+        s.project().clips_of(drums)[0].id,
+        clip,
+        "the arrangement keeps it"
+    );
+    // Audio does not go on a MIDI track.
+    let chords = track(&s, "Chords");
+    assert!(
+        s.dispatch(Action::Launcher(LauncherOp::PlaceClips {
+            clips: vec![clip],
+            track: chords,
+            scene
+        }))
+        .is_err()
+    );
+}

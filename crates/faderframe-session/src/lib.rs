@@ -186,6 +186,8 @@ pub enum Action {
     /// Start grouping subsequent edits into one undo step (e.g. a drag).
     BeginGesture(String),
     EndGesture,
+    /// Drop the open gesture, undoing its edits (a drag taken elsewhere).
+    CancelGesture,
     Undo,
     Redo,
     Transport(TransportAction),
@@ -2641,6 +2643,13 @@ impl Session {
                 }
             }
             Action::BeginGesture(label) => self.history.begin(label),
+            Action::CancelGesture => {
+                let impact = self.history.cancel(&mut self.project)?;
+                self.gesture_base.clear();
+                self.follow_base.clear();
+                self.sync(impact)?;
+                self.revision += 1;
+            }
             Action::EndGesture => {
                 self.mapping_gesture_ended();
                 self.history.end();

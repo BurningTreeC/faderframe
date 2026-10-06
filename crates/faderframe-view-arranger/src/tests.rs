@@ -151,6 +151,52 @@ fn dragging_a_clip_moves_it_with_snap_in_one_gesture() {
 }
 
 #[test]
+fn clips_dragged_out_go_back_and_another_view_can_take_them() {
+    let mut s = session();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 700.0);
+    let tracks = ArrangerView::lane_tracks(&s);
+    let bass_row = tracks.iter().position(|t| t.name == "Bass").unwrap();
+    let bass = tracks[bass_row].id;
+    let clip = s.project().track(bass).unwrap().clips[0];
+    let start = s.project().clip(clip).unwrap().start;
+    let row = view.row_rect(bass_row, size);
+    let grab = Point::new(view.x_of(start) + 30.0, row.y + row.h * 0.8);
+    let steps = s.history_steps().0.len();
+    let mut actions = run(&mut view, down(grab), size, &s).0;
+    assert!(view.drag_payload(&s).is_none(), "not before it moved");
+    actions.extend(run(&mut view, mv(Point::new(grab.x + 40.0, grab.y)), size, &s).0);
+    for a in actions.drain(..) {
+        s.dispatch(a).unwrap();
+    }
+    assert_ne!(s.project().clip(clip).unwrap().start, start, "moving");
+    // Below the arranger (over the launcher): the clip goes back while
+    // it is carried there, and is offered.
+    let below = Point::new(grab.x + 40.0, size.h + 50.0);
+    for a in run(&mut view, mv(below), size, &s).0 {
+        s.dispatch(a).unwrap();
+    }
+    assert_eq!(s.project().clip(clip).unwrap().start, start);
+    let payload = view.drag_payload(&s).unwrap();
+    assert_eq!(
+        faderframe_session::launcher::parse_clips_payload(&payload),
+        Some(vec![clip])
+    );
+    // Taken there: the move is cancelled, not an undo step.
+    let mut actions = Vec::new();
+    let mut requests = Vec::new();
+    let mut cx = EventCx::new(&mut actions, &mut requests);
+    view.cancel_drag(&mut cx);
+    assert_eq!(actions, [Action::CancelGesture]);
+    for a in actions {
+        s.dispatch(a).unwrap();
+    }
+    assert!(run(&mut view, up(below), size, &s).0.is_empty());
+    assert_eq!(s.project().clip(clip).unwrap().start, start);
+    assert_eq!(s.history_steps().0.len(), steps);
+}
+
+#[test]
 fn double_click_on_instrument_lane_creates_a_midi_clip() {
     let s = session();
     let mut view = ArrangerView::new(Theme::default());

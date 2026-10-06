@@ -86,6 +86,39 @@ fn fader_gesture_is_one_undo_step() {
 }
 
 #[test]
+fn a_cancelled_gesture_leaves_nothing_behind() {
+    let mut p = demo_project(48_000);
+    let mut h = History::default();
+    let bass = track_by_name(&p, "Bass");
+    let original = p.track(bass).unwrap().clone();
+    h.begin("Drag");
+    for i in 0..5 {
+        h.apply(
+            &mut p,
+            Command::SetTrackVolume {
+                track: bass,
+                db: -10.0 - i as f32,
+            },
+        )
+        .unwrap();
+        h.apply(
+            &mut p,
+            Command::SetTrackPan {
+                track: bass,
+                pan: 0.1 * i as f32,
+            },
+        )
+        .unwrap();
+    }
+    assert_eq!(h.cancel(&mut p).unwrap(), Impact::Params);
+    let t = p.track(bass).unwrap();
+    assert_eq!((t.volume_db, t.pan), (original.volume_db, original.pan));
+    assert!(!h.can_undo() && !h.can_redo() && !h.in_gesture());
+    // Nothing open: nothing happens.
+    assert_eq!(h.cancel(&mut p).unwrap(), Impact::None);
+}
+
+#[test]
 fn multi_step_undo_redo_preserves_order() {
     let mut p = demo_project(48_000);
     let mut h = History::default();
