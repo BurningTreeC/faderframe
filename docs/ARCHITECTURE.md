@@ -1688,6 +1688,48 @@ a sidechain. Editor:
 `view-devices` `container::ContainerView` (a column a chain); dev action
 `chain-insert:<n>=<builtin id>`.
 
+### Pitch editing
+
+An audio clip's notes are found by `faderframe_analysis::melody`: a pitch
+track every 5 ms (McLeod's method over 40 ms windows of a copy decimated
+to about 11 kHz; octave errors folded to the neighbourhood's median,
+lone frames dropped) and its notes (voiced runs split where a 150 ms
+average of the pitch moves 0.7 semitones and stays, or where the 10 ms
+level dips 8 dB and comes back; a note's pitch is the median of its
+middle 70 %). `session::pitch` runs it per source in a thread (kept for
+the session) and gives the clips a `faderframe_project::pitch::PitchEdit`
+in one "Detect Pitch" step: the notes in source frames at the project
+rate, each with its sung pitch, a cents curve every `hop` frames (values
+further than a fourth from the note are dropped), `shift`, `drift` (how
+much of the wandering around the pitch is straightened) and `formant`,
+plus `keep_formants`. The project holds everything playback needs; the
+analysis is not saved.
+
+Playback: an edited clip becomes a `WarpedRegion` (an identity map when
+unwarped) with a `PitchCurve` (corrections every hop, gliding over 30 ms
+between notes and across gaps up to 200 ms, and the sung pitch for the
+grain spacing) played by `nodes::psola::PsolaVoice` — TD-PSOLA: grains
+two sung periods long (Hann) cut around analysis marks one sung period
+apart, laid down one target period apart, so the pitch is exact and the
+formants stay; `formant` (or, with `keep_formants` off, the shift too)
+squeezes the grains. Unvoiced audio goes in 5 ms grains unchanged, and
+an uncorrected stretch rebuilds the source sample for sample. The marks
+are found through the time map, so warping comes along. Voices are
+counted per track like stretcher voices (`StretchVoices::psola`) and
+primed from 100 ms back on a jump. (Signalsmith's phase vocoder missed
+small transpositions by up to 0.2 semitones: no good for correction; its
+formant control is wrapped all the same.)
+
+Edits are `Action::EditPitch { clip, op }` with a `PitchOp` (move —
+inside a gesture the total from where it began, recomputed from
+`Session::gesture_clip` —, set, correct to the key at the note's
+position (`pitch::snap`, by an amount, with straightening), split, join,
+reset, keep formants, remove). The editor is `faderframe-view-pitch`
+(`ViewKind::Pitch`, `Session::pitch_clip`, `Action::OpenPitchEditor`
+from the arranger's clip menu: notes as blobs at the heard pitch, the
+played and the sung curve, a drag moves by semitones (Alt: freely), a
+double click splits, ↑↓ move, J joins, Delete resets).
+
 ### Track presets
 
 `faderframe_project::preset::TrackPreset` captures a track's channel
@@ -2126,9 +2168,9 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
    random, macros) on any parameter, CLAP's non-destructive and
    polyphonic (per-note) modulation, FX containers with parallel chains~~
    — done (see *Modulators* and *Containers*).
-5. **Vocals and audio intelligence**: native pitch editing (on the warp
-   and transient machinery and the Stretch engine's pitch and formant
-   shifting), audio-to-MIDI (basic-pitch, Apache-2.0), tempo and key
+5. **Vocals and audio intelligence**: ~~native pitch editing~~ (done:
+   TD-PSOLA rather than the Stretch engine, see *Pitch editing*),
+   audio-to-MIDI (basic-pitch, Apache-2.0), tempo and key
    detection, per-clip effects rendered offline, ARA 2 hosting, a speech
    and lyrics transcription track (Whisper, MIT). Stem separation waits
    for permissively licensed model weights.

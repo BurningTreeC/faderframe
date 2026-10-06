@@ -832,6 +832,7 @@ dependencies = [
  "faderframe-view-modulators",
  "faderframe-view-performance",
  "faderframe-view-pianoroll",
+ "faderframe-view-pitch",
  "faderframe-view-tools",
  "faderframe-workspace",
  "glib-unix",
@@ -957,6 +958,18 @@ dependencies = [
 
 [[package]]
 name = "faderframe-view-pianoroll"
+version = "0.7.0"
+dependencies = [
+ "faderframe-core",
+ "faderframe-engine",
+ "faderframe-project",
+ "faderframe-session",
+ "faderframe-timeline",
+ "faderframe-ui-canvas",
+]
+
+[[package]]
+name = "faderframe-view-pitch"
 version = "0.7.0"
 dependencies = [
  "faderframe-core",

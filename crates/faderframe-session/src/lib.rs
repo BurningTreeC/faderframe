@@ -21,6 +21,7 @@ pub mod midi;
 pub mod modulators;
 pub mod notes;
 pub mod performance;
+pub mod pitch;
 pub use performance::{Load, PerformanceReport, PluginPerformance, TrackPerformance};
 pub mod album;
 mod album_master;
@@ -311,6 +312,18 @@ pub enum Action {
     /// Turn what the live tracks were played last into clips (recording
     /// or not).
     CaptureMidi,
+    /// Show an audio clip in the pitch editor (finding its notes first if
+    /// it has none).
+    OpenPitchEditor(ClipId),
+    /// Find the notes of audio clips for pitch editing.
+    DetectPitch {
+        clips: Vec<ClipId>,
+    },
+    /// Edit the notes of a clip's pitch edit.
+    EditPitch {
+        clip: ClipId,
+        op: pitch::PitchOp,
+    },
     /// Undo or redo until `n` steps are done (0: as opened); the history
     /// view's click.
     HistoryTo(usize),
@@ -1012,6 +1025,9 @@ pub struct Session {
     /// Where playback last started (for "insertion follows playback" off).
     play_started_at: Option<i64>,
     transients: transients::TransientCache,
+    pitch: pitch::PitchCache,
+    /// The audio clip the pitch editor shows.
+    pitch_clip: Option<ClipId>,
     /// Track renders for freezing and bouncing.
     bounces: Vec<freeze::PendingBounce>,
     samplings: Vec<sampling::PendingSample>,
@@ -1223,6 +1239,8 @@ impl Session {
             range_clipboard: editing::RangeClipboard::default(),
             play_started_at: None,
             transients: transients::TransientCache::default(),
+            pitch: pitch::PitchCache::default(),
+            pitch_clip: None,
             gesture_base: HashMap::new(),
             bounces: Vec::new(),
             samplings: Vec::new(),
@@ -1369,6 +1387,15 @@ impl Session {
 
     pub fn editor_clip(&self) -> Option<ClipId> {
         self.editor_clip.filter(|c| self.project.clip(*c).is_some())
+    }
+
+    /// The audio clip the pitch editor shows.
+    pub fn pitch_clip(&self) -> Option<ClipId> {
+        self.pitch_clip.filter(|c| {
+            self.project
+                .clip(*c)
+                .is_some_and(|c| c.as_audio().is_some())
+        })
     }
 
     /// Bumped on every model change (views may cache against it).
@@ -1981,6 +2008,7 @@ impl Session {
 
     fn poll_jobs(&mut self) {
         self.poll_transients();
+        self.poll_pitch();
         let mut i = 0;
         while i < self.peak_jobs.len() {
             if self.peak_jobs[i].is_finished() {
@@ -2854,6 +2882,20 @@ impl Session {
                 target,
             } => self.make_sample(track, start, end, target)?,
             Action::CaptureMidi => self.capture_midi()?,
+            Action::DetectPitch { clips } => self.detect_pitch(&clips)?,
+            Action::OpenPitchEditor(clip) => {
+                let Some(a) = self.project.clip(clip).and_then(|c| c.as_audio()) else {
+                    return Ok(());
+                };
+                let analysed = a.pitch.is_some();
+                self.pitch_clip = Some(clip);
+                self.workspace_action(WorkspaceAction::ShowView(ViewId::pitch()))?;
+                if !analysed {
+                    self.detect_pitch(&[clip])?;
+                }
+                self.revision += 1;
+            }
+            Action::EditPitch { clip, op } => self.edit_pitch(clip, op)?,
             Action::SaveVersion { name } => {
                 self.save_version(&name)?;
             }

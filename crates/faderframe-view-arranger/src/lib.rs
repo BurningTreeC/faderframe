@@ -2345,6 +2345,16 @@ impl ArrangerView {
                 Action::OpenClipEditor(clip.id),
             ));
         }
+        if let Some(a) = clip.as_audio() {
+            items.push(MenuItem::new(
+                if a.pitch.is_some() {
+                    "Edit Pitch"
+                } else {
+                    "Edit Pitch (find its notes)"
+                },
+                Action::OpenPitchEditor(clip.id),
+            ));
+        }
         items.push(MenuItem::new(
             match (clip.muted, many) {
                 (true, false) => "Unmute Clip",

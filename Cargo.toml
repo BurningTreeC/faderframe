@@ -49,6 +49,7 @@ faderframe-view-album = { path = "crates/faderframe-view-album" }
 faderframe-view-performance = { path = "crates/faderframe-view-performance" }
 faderframe-view-history = { path = "crates/faderframe-view-history" }
 faderframe-view-modulators = { path = "crates/faderframe-view-modulators" }
+faderframe-view-pitch = { path = "crates/faderframe-view-pitch" }
 faderframe-view-pianoroll = { path = "crates/faderframe-view-pianoroll" }
 faderframe-ui = { path = "crates/faderframe-ui" }
 

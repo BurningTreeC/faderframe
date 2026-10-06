@@ -300,6 +300,11 @@ pub fn install(app: &Rc<AppState>) {
         ),
         dispatch(
             app,
+            "show-pitch",
+            A::Workspace(W::ShowView(ViewId::pitch())),
+        ),
+        dispatch(
+            app,
             "show-automation",
             A::Workspace(W::ShowView(ViewId::automation())),
         ),
@@ -1142,6 +1147,71 @@ pub fn install(app: &Rc<AppState>) {
             });
         }),
         // Development aid: `alias-clip:<clip name>` (an alias right after it).
+        // Development aids: `edit-pitch:<track>` (its first audio clip in
+        // the pitch editor), `pitch:<correct|straighten|reset|move=<n>@<by>|
+        // formant=<n>@<st>|keep|move-formants>` on the clip shown.
+        named("edit-pitch", |a, arg| {
+            let clip = {
+                let s = a.session.borrow();
+                let p = s.project();
+                p.tracks.iter().find(|t| t.name == arg).and_then(|t| {
+                    t.clips
+                        .iter()
+                        .copied()
+                        .find(|c| p.clip(*c).is_some_and(|c| c.as_audio().is_some()))
+                })
+            };
+            match clip {
+                Some(c) => a.dispatch(Action::OpenPitchEditor(c)),
+                None => tracing::warn!("edit-pitch: no audio clip on {arg}"),
+            }
+        }),
+        named("pitch", |a, arg| {
+            use faderframe_session::pitch::PitchOp;
+            let Some(clip) = a.session.borrow().pitch_clip() else {
+                tracing::warn!("pitch: no clip in the pitch editor");
+                return;
+            };
+            let num = |s: &str| s.parse::<f32>().ok();
+            let pair = |v: &str| {
+                let (n, x) = v.split_once('@')?;
+                Some((n.parse::<usize>().ok()?, num(x)?))
+            };
+            let op = match arg.split_once('=') {
+                None if arg == "correct" => PitchOp::Correct {
+                    notes: Vec::new(),
+                    amount: 1.0,
+                    drift: 0.5,
+                },
+                None if arg == "straighten" => PitchOp::Set {
+                    notes: Vec::new(),
+                    shift: None,
+                    drift: Some(1.0),
+                    formant: None,
+                },
+                None if arg == "reset" => PitchOp::Reset { notes: Vec::new() },
+                None if arg == "keep" => PitchOp::KeepFormants(true),
+                None if arg == "move-formants" => PitchOp::KeepFormants(false),
+                Some(("move", v)) => match pair(v) {
+                    Some((n, by)) => PitchOp::Move { notes: vec![n], by },
+                    None => return,
+                },
+                Some(("formant", v)) => match pair(v) {
+                    Some((n, st)) => PitchOp::Set {
+                        notes: vec![n],
+                        shift: None,
+                        drift: None,
+                        formant: Some(st),
+                    },
+                    None => return,
+                },
+                _ => {
+                    tracing::warn!("pitch: unknown {arg}");
+                    return;
+                }
+            };
+            a.dispatch(Action::EditPitch { clip, op });
+        }),
         named("alias-clip", |a, arg| {
             let id = a
                 .session
@@ -1423,6 +1493,15 @@ pub fn install(app: &Rc<AppState>) {
             a.with_session(|s| s.set_plugin_double_precision(on));
         }),
         // Development aids: `import-midi-from:<path>` / `export-midi-to:<path>`.
+        // Development aid: `import-audio-from:<path>` (a new track, at the
+        // start).
+        named("import-audio-from", |a, arg| {
+            a.dispatch(Action::ImportFiles {
+                files: vec![std::path::PathBuf::from(arg)],
+                track: None,
+                at: faderframe_timeline::MusicalTime::ZERO,
+            });
+        }),
         named("import-midi-from", |a, arg| {
             let empty = a.session.borrow().project().clips.is_empty();
             a.dispatch(Action::ImportMidiFile {

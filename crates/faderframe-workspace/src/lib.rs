@@ -73,6 +73,10 @@ impl ViewId {
         Self::new("modulators")
     }
 
+    pub fn pitch() -> Self {
+        Self::new("pitch")
+    }
+
     pub fn tools() -> Self {
         Self::new("tools")
     }

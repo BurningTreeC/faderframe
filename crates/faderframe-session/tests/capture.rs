@@ -143,7 +143,12 @@ fn notes_played_while_playing_land_where_they_were_heard() {
     // falls behind, and the playhead it last reported with it).
     let clock = s.midi_keyboard().clock();
     let at = s.engine().position_at(clock.now_ns()).unwrap();
-    let (_, held) = play(&mut s, 67, 200);
+    s.midi_keyboard().send(&[0x90, 67, 100]);
+    run(&mut s, 200);
+    // The same for the key coming up.
+    let up = s.engine().position_at(clock.now_ns()).unwrap();
+    s.midi_keyboard().send(&[0x80, 67, 0]);
+    let held = (up - at) as f64 / f64::from(s.engine().sample_rate());
     run(&mut s, 100);
     s.dispatch(Action::Transport(TransportAction::Stop))
         .unwrap();
@@ -160,7 +165,7 @@ fn notes_played_while_playing_land_where_they_were_heard() {
     // (what was heard then).
     let off = (played - at) * 60.0 / tempo;
     assert!((-0.1..0.01).contains(&off), "{off}");
-    // As long as it was held (the device's timing moves each end a little).
+    // As long as it was held.
     let len = n.length.quarters() * 60.0 / tempo;
-    assert!((len - held).abs() < 0.08, "{len} for {held}");
+    assert!((len - held).abs() < 0.01, "{len} for {held}");
 }
