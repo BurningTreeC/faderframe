@@ -526,6 +526,9 @@ pub enum Action {
         track: TrackId,
         target: PluginTarget,
     },
+    /// A new instrument track, and the plugin browser to choose its
+    /// instrument.
+    AddInstrumentTrack,
     /// A built-in device editor's own setting (its analyser, its display):
     /// kept for the session, not part of the project or the undo history.
     SetDeviceView {
@@ -2725,6 +2728,14 @@ impl Session {
                     .push(UiRequest::PluginBrowser { track, target });
                 self.revision += 1;
             }
+            Action::AddInstrumentTrack => {
+                let track = self.add_track(TrackKind::Instrument)?;
+                self.ui_requests.push(UiRequest::PluginBrowser {
+                    track,
+                    target: PluginTarget::Instrument,
+                });
+                self.revision += 1;
+            }
             Action::ResetPerformance => self.reset_performance(),
             Action::MidiLearn(target) => self.start_midi_learn(target),
             Action::AddNotes { clip, notes } => {
@@ -3484,6 +3495,53 @@ impl Session {
     ) -> Option<Vec<faderframe_midi::NoteExpressionKind>> {
         let slot = self.instrument_slot(self.project.track(track)?)?;
         self.engine.plugin_note_expressions(slot.id)
+    }
+
+    /// What a "+" (add a track) offers: each kind of track, then a new track
+    /// from each saved track preset — `(label, action, starts a group)`.
+    pub fn add_track_choices(&self) -> Vec<(String, Action, bool)> {
+        let mut out = vec![
+            (
+                "Audio Track (Mono)".to_string(),
+                Action::AddTrack(TrackKind::Audio),
+                false,
+            ),
+            (
+                "Audio Track (Stereo)".into(),
+                Action::AddTrackWithLayout(
+                    TrackKind::Audio,
+                    faderframe_core::ChannelLayout::Stereo,
+                ),
+                false,
+            ),
+            (
+                "Instrument Track…".into(),
+                Action::AddInstrumentTrack,
+                false,
+            ),
+            (
+                "MIDI Track".into(),
+                Action::AddTrack(TrackKind::Midi),
+                false,
+            ),
+            ("Bus".into(), Action::AddTrack(TrackKind::Bus), true),
+            (
+                "Aux (FX Return)".into(),
+                Action::AddTrack(TrackKind::Aux),
+                false,
+            ),
+            ("VCA".into(), Action::AddTrack(TrackKind::Vca), false),
+        ];
+        for (i, preset) in self.track_presets().iter().take(12).enumerate() {
+            out.push((
+                format!("From “{}”", preset.name),
+                Action::AddTrackFromPreset {
+                    path: preset.path.clone(),
+                },
+                i == 0,
+            ));
+        }
+        out
     }
 
     /// Is the plugin of this slot an instrument?

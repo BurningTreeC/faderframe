@@ -31,6 +31,8 @@ use faderframe_ui_canvas::{
     PointerButton, Rect, ScrollAxis, ScrollInfo, Size, Theme, ViewEvent,
 };
 
+/// The column right of the last strip with the "+".
+const ADD_W: f32 = 44.0;
 const MASTER_GAP: f32 = 8.0;
 /// Wooden end cheeks (themes with wood).
 const CHEEK_W: f32 = 22.0;
@@ -67,6 +69,8 @@ pub enum Hit {
     Tags(TrackId),
     /// The colour bar on top: opens the colour chooser.
     Color(TrackId),
+    /// The "+" right of the last channel strip.
+    AddTrack,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -265,8 +269,14 @@ impl MixerView {
         count as f32 * self.pitch()
     }
 
+    /// The "+" (add a track) right of the last of `count` strips.
+    fn add_track_rect(&self, count: usize) -> Rect {
+        let x = self.cheek() + self.content_w(count) - self.scroll_x;
+        Rect::new(x + 6.0, 8.0, ADD_W - 12.0, ADD_W - 12.0)
+    }
+
     fn clamp_scroll(&mut self, count: usize, size: Size) {
-        let max = (self.content_w(count) - self.viewport_w(size)).max(0.0);
+        let max = (self.content_w(count) + ADD_W - self.viewport_w(size)).max(0.0);
         self.scroll_x = self.scroll_x.clamp(0.0, max);
     }
 
@@ -349,6 +359,10 @@ impl MixerView {
 
     pub fn hit_test(&self, pos: Point, size: Size, model: &Session) -> Option<Hit> {
         let master = self.master_rect(size);
+        let add = self.add_track_rect(Self::channel_tracks(model).len());
+        if !self.master_only && add.contains(pos) && pos.x < self.cheek() + self.viewport_w(size) {
+            return Some(Hit::AddTrack);
+        }
         for (rect, t) in self.visible_strips(model, size) {
             if !rect.contains(pos) {
                 continue;
@@ -1422,6 +1436,21 @@ impl MixerView {
         };
         let toggle = |cx: &mut EventCx<'_, Action>, cmd: Command| cx.emit(Action::Edit(cmd));
         match hit {
+            Hit::AddTrack => {
+                let r = self.add_track_rect(Self::channel_tracks(model).len());
+                let items = model
+                    .add_track_choices()
+                    .into_iter()
+                    .map(|(label, action, group)| {
+                        let item = MenuItem::new(label, action);
+                        if group { item.separated() } else { item }
+                    })
+                    .collect();
+                cx.request(HostRequest::ContextMenu {
+                    at: Point::new(r.x, r.bottom()),
+                    items,
+                });
+            }
             Hit::PreampChoose(id) => {
                 if let Some(t) = Self::track(model, id) {
                     cx.request(Self::preamp_menu(t, pos));
@@ -1858,6 +1887,7 @@ impl MixerView {
                 faderframe_session::DEFAULT_INSERT_SLOTS
             ),
             Hit::Strip(_) => return None,
+            Hit::AddTrack => "Add a track".into(),
         })
     }
 }
@@ -1897,6 +1927,27 @@ impl CanvasView<Session, Action> for MixerView {
             && let Some((_, x)) = self.track_drop(model, size, track, pos)
         {
             p.fill(Rect::new(x - 1.5, 0.0, 3.0, size.h), theme.ui.accent);
+        }
+        // The "+" after the last strip.
+        if !self.master_only {
+            let add = self.add_track_rect(tracks.len());
+            let hot = self.hover == Some(Hit::AddTrack);
+            let fill = if hot {
+                theme.ui.accent.with_alpha(0.25)
+            } else {
+                theme.ui.surface
+            };
+            p.fill_rounded(add, add.w / 2.0, &faderframe_ui_canvas::Paint::Solid(fill));
+            p.stroke_rounded(add, add.w / 2.0, 1.0, theme.ui.border);
+            let c = add.center();
+            let arm = add.w * 0.22;
+            let ink = if hot {
+                theme.ui.text
+            } else {
+                theme.ui.text_dim
+            };
+            p.fill(Rect::new(c.x - arm, c.y - 1.0, 2.0 * arm, 2.0), ink);
+            p.fill(Rect::new(c.x - 1.0, c.y - arm, 2.0, 2.0 * arm), ink);
         }
         if tracks.is_empty() {
             let style =

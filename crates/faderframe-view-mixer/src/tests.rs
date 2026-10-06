@@ -786,3 +786,35 @@ fn preamp_chooser_faceplate_controls_and_removal_use_the_dedicated_slot() {
     let (a, _) = run(&mut view, down(remove, 1), size, &s);
     assert_eq!(a, vec![Action::SetPreamp { track, model: None }]);
 }
+
+#[test]
+fn the_plus_after_the_last_strip_offers_new_tracks() {
+    let mut s = session();
+    let mut view = MixerView::new(Theme::default());
+    let size = Size::new(1800.0, 900.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    let count = MixerView::channel_tracks(&s).len();
+    let plus = view.add_track_rect(count);
+    assert!(plus.x >= view.strip_rect(count - 1, size).right());
+    assert_eq!(view.hit_test(plus.center(), size, &s), Some(Hit::AddTrack));
+    let (_, req) = run(&mut view, down(plus.center(), 1), size, &s);
+    let Some(HostRequest::ContextMenu { items, .. }) = req
+        .into_iter()
+        .find(|r| matches!(r, HostRequest::ContextMenu { .. }))
+    else {
+        panic!("a menu")
+    };
+    let instrument = items
+        .iter()
+        .find(|i| i.label == "Instrument Track…")
+        .and_then(|i| i.action.clone())
+        .unwrap();
+    s.dispatch(instrument).unwrap();
+    assert_eq!(MixerView::channel_tracks(&s).len(), count + 1);
+    assert!(
+        s.take_ui_requests()
+            .iter()
+            .any(|r| matches!(r, faderframe_session::UiRequest::PluginBrowser { .. }))
+    );
+}

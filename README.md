@@ -129,6 +129,9 @@ Contrast:
   the chord track, and drum patterns; previewed in the grid, applied in
   one undo step. The scale follows the key track; the chord track shows
   above the notes and can be stamped.
+* Adding tracks: the "+" under the last track in the arranger and right of
+  the last strip in the mixer (each kind of track, or one from a saved
+  track preset; an instrument track opens the plugin browser).
 * Docking: mixer / Tools / album / piano roll / automation / performance
   tabs in a bottom dock, detach any view into its own window and dock it back,
   workspaces (Recording, Editing, Mixing, MIDI, Mastering), layouts saved

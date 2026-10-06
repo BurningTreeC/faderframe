@@ -116,6 +116,8 @@ pub enum Hit {
         pos: i64,
     },
     Empty(MusicalTime),
+    /// The "+" under the last track header.
+    AddTrack,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -439,6 +441,25 @@ impl ArrangerView {
         end.quarters() + 32.0
     }
 
+    /// The "+" (add a track) under the last of `count` track headers.
+    fn add_track_rect(&self, count: usize, size: Size) -> Rect {
+        let top = self.row_rect(count, size).y;
+        Rect::new(8.0, top + 8.0, (self.header_w() - 16.0).max(40.0), 30.0)
+    }
+
+    /// The tracks a "+" offers, as a menu at `at`.
+    fn add_track_menu(model: &Session, at: Point) -> HostRequest<Action> {
+        let items = model
+            .add_track_choices()
+            .into_iter()
+            .map(|(label, action, group)| {
+                let item = MenuItem::new(label, action);
+                if group { item.separated() } else { item }
+            })
+            .collect();
+        HostRequest::ContextMenu { at, items }
+    }
+
     fn clamp_scroll(&mut self, model: &Session, size: Size) {
         let lanes_w = (size.w - self.header_w()).max(1.0);
         let max_x =
@@ -517,6 +538,9 @@ impl ArrangerView {
         }
         let tracks = Self::lane_tracks(model);
         let Some(i) = self.row_at(pos.y).filter(|&i| i < tracks.len()) else {
+            if self.add_track_rect(tracks.len(), size).contains(pos) {
+                return Some(Hit::AddTrack);
+            }
             return (pos.x >= self.header_w()).then_some(Hit::Empty(at));
         };
         let t = tracks[i];
@@ -2175,6 +2199,10 @@ impl ArrangerView {
             Hit::Automation { .. } => {}
             Hit::Global(g) => return self.global_press(g, pos, clicks, mods, size, model, cx),
             Hit::Corner => cx.request(Self::grid_menu(model, pos)),
+            Hit::AddTrack => {
+                let r = self.add_track_rect(Self::lane_tracks(model).len(), size);
+                cx.request(Self::add_track_menu(model, Point::new(r.x, r.bottom())));
+            }
             Hit::Ruler(t) => {
                 cx.emit(Action::Transport(TransportAction::Locate(
                     self.snap(t, model, mods),
@@ -2712,6 +2740,32 @@ impl CanvasView<Session, Action> for ArrangerView {
                 color_of(tracks[i].color),
             );
         }
+        // The "+" under the last track.
+        let add = self.add_track_rect(tracks.len(), size);
+        if add.bottom() > self.ruler_h() && add.y < size.h {
+            let hot = self.hover == Some(Hit::AddTrack);
+            let fill = if hot {
+                theme.ui.accent.with_alpha(0.22)
+            } else {
+                a.header_bg
+            };
+            p.fill_rounded(add, 5.0, &Paint::Solid(fill));
+            p.stroke_rounded(add, 5.0, 1.0, a.header_border);
+            p.text(
+                "+  Add Track",
+                add,
+                &TextStyle::new(
+                    theme.fonts.small,
+                    if hot {
+                        theme.ui.text
+                    } else {
+                        theme.ui.text_dim
+                    },
+                )
+                .bold()
+                .center(),
+            );
+        }
         p.pop_clip();
         p.vline(self.header_w() - 1.0, 0.0, size.h, a.header_border);
         p.shadow(
@@ -3058,6 +3112,7 @@ impl CanvasView<Session, Action> for ArrangerView {
             Hit::LoopBand(_) => Some("Drag to set the loop range · Click to toggle looping".into()),
             Hit::LoopStart | Hit::LoopEnd => Some("Drag to resize the loop range".into()),
             Hit::Corner => Some("Grid, snap and follow settings".into()),
+            Hit::AddTrack => Some("Add a track".into()),
             Hit::HeaderEdge => Some("Drag to resize the track headers · Double-click to reset".into()),
             Hit::Header(id, part) => {
                 let t = model.project().track(id)?;

@@ -1149,3 +1149,30 @@ fn both_loop_edges_resize_without_toggling_and_undo_as_one_gesture() {
     assert_eq!(resized.end, range.end);
     assert!(resized.start < resized.end);
 }
+
+#[test]
+fn the_plus_under_the_last_track_offers_new_tracks() {
+    let mut s = session();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 900.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    assert!(p.texts().contains(&"+  Add Track"));
+    let count = ArrangerView::lane_tracks(&s).len();
+    let plus = view.add_track_rect(count, size);
+    assert!(plus.y >= view.row_rect(count - 1, size).bottom());
+    let (_, req) = run(&mut view, down(plus.center()), size, &s);
+    let Some(HostRequest::ContextMenu { items, .. }) = req
+        .into_iter()
+        .find(|r| matches!(r, HostRequest::ContextMenu { .. }))
+    else {
+        panic!("a menu")
+    };
+    let midi = items
+        .iter()
+        .find(|i| i.label == "MIDI Track")
+        .and_then(|i| i.action.clone())
+        .unwrap();
+    s.dispatch(midi).unwrap();
+    assert_eq!(ArrangerView::lane_tracks(&s).len(), count + 1);
+}
