@@ -730,3 +730,53 @@ fn the_midi_tools_panel_picks_sets_previews_and_applies() {
     paint(&mut view, &s);
     assert_eq!(view.layout(SIZE).tools.w, 0.0);
 }
+
+#[test]
+fn the_keyboard_plays_the_key_under_the_pointer_as_a_real_one_does() {
+    let mut s = session();
+    let mut view = PianoRollView::new(Theme::default());
+    let y = row_y(&mut view, &s, 61); // C#4
+    let keys = view.layout(SIZE).keys;
+    let played = |view: &mut PianoRollView, s: &mut Session, pos: Point| {
+        let (actions, _) = run(view, down(pos, Modifiers::NONE, 1), s);
+        run(view, up(pos, Modifiers::NONE), s);
+        actions.iter().find_map(|a| match a {
+            Action::Audition { key, .. } => Some(*key),
+            _ => None,
+        })
+    };
+    let half = view.row_h / 4.0;
+    // On the black key itself: C#.
+    let on_black = Point::new(keys.x + keys.w * 0.3, y);
+    assert_eq!(view.keyboard_key_at(on_black, keys), 61);
+    assert_eq!(played(&mut view, &mut s, on_black), Some(61));
+    // Beside it: the white keys meeting under it, D above the middle, C
+    // below.
+    let beside = keys.x + keys.w * 0.85;
+    assert_eq!(
+        played(&mut view, &mut s, Point::new(beside, y - half)),
+        Some(62)
+    );
+    assert_eq!(
+        played(&mut view, &mut s, Point::new(beside, y + half)),
+        Some(60)
+    );
+    // A white key's own row is that key across the width.
+    let e = row_y(&mut view, &s, 64);
+    assert_eq!(view.keyboard_key_at(Point::new(keys.x + 4.0, e), keys), 64);
+    assert_eq!(view.keyboard_key_at(Point::new(beside, e), keys), 64);
+    // Folded to the used keys, a black key without its white neighbours
+    // shown is the black key across its row.
+    let mut pr = s.editor.piano;
+    pr.fold = KeyFold::Used;
+    s.dispatch(Action::SetPianoRoll(pr)).unwrap();
+    paint(&mut view, &s);
+    for (i, &k) in view.rows.clone().iter().enumerate() {
+        let y = view.grid_top() + i as f32 * view.row_h - view.scroll_y + view.row_h / 2.0;
+        let got = view.keyboard_key_at(Point::new(beside, y - half), keys);
+        assert!(view.rows.contains(&got));
+        if is_black(k) && !view.rows.contains(&(k + 1)) {
+            assert_eq!(got, k);
+        }
+    }
+}

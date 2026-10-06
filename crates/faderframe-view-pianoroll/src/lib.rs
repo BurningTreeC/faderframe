@@ -49,6 +49,10 @@ pub fn is_black(key: u8) -> bool {
     matches!(key % 12, 1 | 3 | 6 | 8 | 10)
 }
 
+/// How far a black key reaches across the keyboard (of its width); right
+/// of it the white keys meet under it, as on a real keyboard.
+pub const BLACK_KEY_W: f32 = 0.62;
+
 /// "C4" style name (middle C = C4 = MIDI 60).
 pub fn note_name(key: u8) -> String {
     format!("{}{}", NAMES[(key % 12) as usize], key as i32 / 12 - 1)
@@ -370,6 +374,38 @@ impl PianoRollView {
         let i = ((y - self.grid_top() + self.scroll_y) / self.row_h).floor();
         let i = (i.max(0.0) as usize).min(self.rows.len().saturating_sub(1));
         self.rows.get(i).copied().unwrap_or(60)
+    }
+
+    /// The key under `pos` on the keyboard `keys`. A black key is only as
+    /// wide as it looks: right of it the white keys reach under it (its
+    /// upper half belongs to the white key above, its lower half to the one
+    /// below), when they are shown next to it.
+    pub fn keyboard_key_at(&self, pos: Point, keys: Rect) -> u8 {
+        let key = self.key_at(pos.y);
+        if !is_black(key) || pos.x < keys.x + keys.w * BLACK_KEY_W {
+            return key;
+        }
+        let Some(y) = self.y_of(key) else {
+            return key;
+        };
+        let white = if pos.y < y + self.row_h / 2.0 {
+            key.checked_add(1)
+        } else {
+            key.checked_sub(1)
+        };
+        white.filter(|w| self.row_of(*w).is_some()).unwrap_or(key)
+    }
+
+    /// The white key next to the black key in row `i`, `up` or down, when
+    /// it is the neighbouring row (not folded away).
+    fn white_beside(&self, i: usize, up: bool) -> bool {
+        let key = self.rows[i];
+        let (j, white) = if up {
+            (i.checked_sub(1), key.checked_add(1))
+        } else {
+            (Some(i + 1), key.checked_sub(1))
+        };
+        j.and_then(|j| self.rows.get(j)).copied() == white && white.is_some()
     }
 
     /// Recompute the visible rows from the fold setting.

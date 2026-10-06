@@ -303,7 +303,7 @@ impl PianoRollView {
             return true;
         }
         if l.keys.contains(pos) {
-            let key = self.key_at(pos.y);
+            let key = self.keyboard_key_at(pos, l.keys);
             if mods.toggle() || mods.shift {
                 let notes = m
                     .notes
@@ -700,7 +700,7 @@ impl PianoRollView {
                 ));
             }
             Some(Drag::Keys { key }) => {
-                let k = self.key_at(pos.y);
+                let k = self.keyboard_key_at(pos, l.keys);
                 if k != *key {
                     *key = k;
                     self.audition(model, clip, k, cx);

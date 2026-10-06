@@ -2,7 +2,8 @@
 //! previews), the velocity/controller lane and the toolbar.
 
 use crate::{
-    CHORD_ROW_H, Drag, KEY_ROW_H, LaneKind, Layout, PianoRollView, is_black, note_name, track_color,
+    BLACK_KEY_W, CHORD_ROW_H, Drag, KEY_ROW_H, LaneKind, Layout, PianoRollView, is_black,
+    note_name, track_color,
 };
 use faderframe_project::midi_ops::Scale;
 use faderframe_project::{Clip, MidiClip, MidiController, MidiNote};
@@ -564,7 +565,7 @@ impl PianoRollView {
         let hover = self
             .hover
             .filter(|h| rect.contains(*h))
-            .map(|h| self.key_at(h.y));
+            .map(|h| self.keyboard_key_at(h, rect));
         let scale = model.editor.piano.scale;
         let top = (((rect.y - self.grid_top() + self.scroll_y) / self.row_h)
             .floor()
@@ -572,40 +573,65 @@ impl PianoRollView {
         let bottom = (((rect.bottom() - self.grid_top() + self.scroll_y) / self.row_h).ceil()
             as usize)
             .min(self.rows.len());
+        let row_y = |i: usize| self.grid_top() + i as f32 * self.row_h - self.scroll_y;
+        let half = self.row_h / 2.0;
+        let played = |key: u8| (live && held & (1u128 << key) != 0) || pressed == Some(key);
+        let black_w = rect.w * BLACK_KEY_W;
+        // White keys first: each reaches halfway under the black keys next
+        // to it, where the two white keys meet, as on a real keyboard.
+        for i in top.saturating_sub(1)..(bottom + 1).min(self.rows.len()) {
+            let key = self.rows[i];
+            if is_black(key) {
+                continue;
+            }
+            let y = row_y(i);
+            let up = i > 0 && is_black(self.rows[i - 1]) && self.white_beside(i - 1, false);
+            let down = i + 1 < self.rows.len()
+                && is_black(self.rows[i + 1])
+                && self.white_beside(i + 1, true);
+            let top_y = if up { y - half } else { y };
+            let bottom_y = y + self.row_h + if down { half } else { 0.0 };
+            let shape = Rect::new(rect.x, top_y, rect.w, bottom_y - top_y);
+            let c = if played(key) {
+                th.ui.accent.lighten(0.3)
+            } else if hover == Some(key) {
+                th.ui.selection.lighten(0.5)
+            } else {
+                pr.key_white
+            };
+            p.fill_rect(shape, &Paint::horizontal(shape, c.darken(0.06), c));
+            p.hline(
+                rect.x,
+                rect.right(),
+                bottom_y - 0.5,
+                pr.key_white_shade.darken(0.2),
+            );
+        }
         for i in top..bottom {
             let key = self.rows[i];
-            let y = self.grid_top() + i as f32 * self.row_h - self.scroll_y;
-            let row = Rect::new(rect.x, y, rect.w, self.row_h);
-            let played = (live && held & (1u128 << key) != 0) || pressed == Some(key);
-            let lit = played || hover == Some(key);
-            let in_scale = scale.is_chromatic() || scale.contains(key);
+            let y = row_y(i);
             if is_black(key) {
-                p.fill(row, pr.key_white);
-                let black = Rect::new(rect.x, y + 1.0, rect.w * 0.62, self.row_h - 2.0);
-                let c = if played {
+                // Where no white key is shown next to it (folded rows), its
+                // row is plain white beside it.
+                for (up, part) in [
+                    (true, Rect::new(rect.x, y, rect.w, half)),
+                    (false, Rect::new(rect.x, y + half, rect.w, half)),
+                ] {
+                    if !self.white_beside(i, up) {
+                        p.fill(part, pr.key_white);
+                    }
+                }
+                let black = Rect::new(rect.x, y + 1.0, black_w, self.row_h - 2.0);
+                let c = if played(key) {
                     th.ui.accent
-                } else if lit {
+                } else if hover == Some(key) {
                     th.ui.selection.darken(0.3)
                 } else {
                     pr.key_black
                 };
                 p.fill_rounded(black, 1.5, &Paint::horizontal(black, c.lighten(0.15), c));
-            } else {
-                let c = if played {
-                    th.ui.accent.lighten(0.3)
-                } else if lit {
-                    th.ui.selection.lighten(0.5)
-                } else {
-                    pr.key_white
-                };
-                p.fill_rect(row, &Paint::horizontal(row, c.darken(0.06), c));
-                p.hline(
-                    rect.x,
-                    rect.right(),
-                    row.bottom() - 0.5,
-                    pr.key_white_shade.darken(0.2),
-                );
             }
+            let in_scale = scale.is_chromatic() || scale.contains(key);
             if !in_scale {
                 p.fill(
                     Rect::new(rect.right() - 6.0, y, 6.0, self.row_h),
@@ -619,10 +645,19 @@ impl PianoRollView {
             }
             let label = key.is_multiple_of(12) || self.row_h >= 15.0 || self.rows.len() < 60;
             if label {
+                // A black key's name on the key itself.
+                let (area, color) = if is_black(key) {
+                    (
+                        Rect::new(rect.x, y, black_w - 3.0, self.row_h),
+                        pr.key_white.with_alpha(0.75),
+                    )
+                } else {
+                    (Rect::new(rect.x, y, rect.w - 8.0, self.row_h), pr.key_text)
+                };
                 p.text(
                     &note_name(key),
-                    Rect::new(rect.x, y, rect.w - 8.0, self.row_h),
-                    &TextStyle::new(th.fonts.tiny, pr.key_text).right(),
+                    area,
+                    &TextStyle::new(th.fonts.tiny, color).right(),
                 );
             }
         }
