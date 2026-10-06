@@ -282,6 +282,11 @@ impl Session {
         self.engine.modulator_values(track)
     }
 
+    /// How far modulation moves `track`'s fader (in travel) and pan now.
+    pub fn strip_modulation(&self, track: TrackId) -> (f32, f32) {
+        self.engine.strip_modulation(track)
+    }
+
     /// Is `plugin`'s `parameter` moved by a modulator?
     pub fn is_modulated(&self, plugin: PluginInstanceId, parameter: ParameterId) -> bool {
         let target = ModTarget::Plugin { plugin, parameter };

@@ -825,6 +825,25 @@ impl MixerView {
             );
             controls::readout(p, l.pan_readout, &format_pan(model.shown_pan(t)), th);
         }
+        // Modulated: where the pan and the fader are now (a dot).
+        let (travel, pan_mod) = if vca {
+            (0.0, 0.0)
+        } else {
+            model.strip_modulation(t.id)
+        };
+        let dot = |p: &mut dyn Painter, at: Point| {
+            p.circle(at, 3.4, th.ui.background);
+            p.circle(at, 2.3, th.ui.text);
+        };
+        if pan_mod != 0.0 {
+            let now = ((model.shown_pan(t) + pan_mod).clamp(-1.0, 1.0) + 1.0) * 0.5;
+            let a = controls::knob_angle(now);
+            let (o, r) = (
+                l.pan_knob.center(),
+                l.pan_knob.w.min(l.pan_knob.h) * 0.5 - 1.6,
+            );
+            dot(p, Point::new(o.x + r * a.cos(), o.y + r * a.sin()));
+        }
 
         controls::led_button(p, l.mute, "M", model.shown_mute(t), c.led.mute, th);
         controls::led_button(p, l.solo, "S", t.solo, c.led.solo, th);
@@ -862,6 +881,10 @@ impl MixerView {
             &scale,
             th,
         );
+        if travel != 0.0 {
+            let now = self.law.db_to_position(model.shown_volume_db(t)) + travel;
+            dot(p, Point::new(geo.slot.center().x, geo.y_for(now)));
+        }
         if vca {
             // A VCA has no signal: its well says what it controls.
             let n = model.project().vca_members(t.id).len();
