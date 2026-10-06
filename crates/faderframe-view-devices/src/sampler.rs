@@ -307,10 +307,8 @@ impl Face for SamplerFace {
         let strip = Rect::new(keys.x, keys.y, keys.w, 10.0);
         let bed = Rect::new(keys.x, keys.y + 12.0, keys.w, keys.h - 12.0);
         p.fill(bed, th.device.key_white);
-        let playing = if voices > 0.0 {
-            Some(cx.published(value::NOTE) as i32)
-        } else {
-            None
+        let held = |k: i32| {
+            voices > 0.0 && u8::try_from(k).is_ok_and(|k| smp::key_held(|i| cx.published(i), k))
         };
         for k in lo..=hi {
             let x = key_x(k);
@@ -325,7 +323,7 @@ impl Face for SamplerFace {
                     &TextStyle::new(th.fonts.tiny - 1.0, th.device.display),
                 );
             }
-            if playing == Some(k) {
+            if held(k) {
                 p.fill(Rect::new(x, bed.y, w, bed.h), self.accent.with_alpha(0.8));
             }
         }

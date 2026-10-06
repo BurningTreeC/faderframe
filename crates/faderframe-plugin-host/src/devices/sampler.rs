@@ -54,15 +54,27 @@ pub mod id {
 
 /// Published: voices sounding, the newest voice's key and where it plays
 /// (0–1 of its sample) and which zone (−1 the single sample), the output's
-/// peak (linear).
+/// peak (linear), and the keys held (see [`key_held`]).
 pub mod value {
     pub const VOICES: usize = 0;
     pub const NOTE: usize = 1;
     pub const POSITION: usize = 2;
     pub const ZONE: usize = 3;
     pub const OUT_PEAK: usize = 4;
+    /// The first of [`super::KEY_WORDS`] values of 24 key bits each.
+    pub const KEYS: usize = 5;
 }
-pub const TAP_VALUES: usize = 5;
+/// Values that hold the held keys (24 keys each, exact in an `f32`).
+pub const KEY_WORDS: usize = 6;
+pub const TAP_VALUES: usize = value::KEYS + KEY_WORDS;
+
+/// Whether `key` is held, from the published values (`value(i)` reads
+/// value `i`).
+pub fn key_held(value: impl Fn(usize) -> f32, key: u8) -> bool {
+    let k = usize::from(key);
+    let word = value(value::KEYS + k / 24) as u32;
+    (word >> (k % 24)) & 1 == 1
+}
 
 pub const FILTERS: [&str; 4] = ["LP 12", "LP 24", "Band", "High"];
 pub const LOOPS: [&str; 3] = ["Off", "Loop", "While Held"];
@@ -901,6 +913,18 @@ impl PluginProcessor for SamplerProcessor {
                 .filter(|v| v.stage != Stage::Idle)
                 .count();
             tap.set_value(value::VOICES, sounding as f32);
+            let mut held = [0u32; KEY_WORDS];
+            for v in &self.voices {
+                if matches!(v.stage, Stage::Attack | Stage::Decay | Stage::Sustain) {
+                    let k = usize::from(v.key);
+                    if let Some(w) = held.get_mut(k / 24) {
+                        *w |= 1 << (k % 24);
+                    }
+                }
+            }
+            for (i, w) in held.iter().enumerate() {
+                tap.set_value(value::KEYS + i, *w as f32);
+            }
             if let Some(v) = newest {
                 tap.set_value(value::NOTE, f32::from(v.key));
                 tap.set_value(
@@ -1074,6 +1098,40 @@ pub(crate) mod tests {
         s.send(off(69));
         let (_, _, status) = s.run(2.0);
         assert_eq!(status, ProcessStatus::Sleep);
+    }
+
+    #[test]
+    fn every_held_key_is_published() {
+        let d = fixtures::dir("sampler-keys");
+        let mut doc = SampleDoc::default();
+        doc.set(
+            0,
+            Some(fixtures::tone(&d.join("a.wav"), 440.0, 44_100, 2.0)),
+        );
+        let params = ParamValues::new(parameters());
+        params.set_by_id(ParameterId(id::LOOP), 2.0).unwrap();
+        let tap = Arc::new(AnalysisTap::new(params.clone(), TAP_VALUES));
+        let mut host = SampleHost::default();
+        host.set_doc(doc, None);
+        let mut s = Play::new(SamplerProcessor::new(
+            params,
+            Some(Arc::clone(&tap)),
+            &crate::devices::rig::config(),
+            Arc::clone(&host.shared),
+        ));
+        let held = |k: u8| key_held(|i| tap.value(i), k);
+        // A chord, its notes far apart (in different words of bits).
+        for k in [21, 60, 64, 108] {
+            s.send(on(k, 100));
+        }
+        s.run(0.1);
+        assert!([21, 60, 64, 108].into_iter().all(held), "all four lit");
+        assert!(!held(62) && !held(0) && !held(127));
+        // A released key goes dark while it fades out.
+        s.send(off(64));
+        s.run(0.02);
+        assert!(!held(64));
+        assert!(held(60) && held(108));
     }
 
     #[test]
