@@ -11,8 +11,20 @@ use faderframe_transport::TransportInfo;
 const SR: f64 = 48_000.0;
 const BLOCK: usize = 256;
 
+/// The MIDI effects (their presets are played, not heard).
+const MIDI_EFFECTS: [&str; 4] = [
+    builtin::ARPEGGIATOR,
+    builtin::CHORD,
+    builtin::SCALE,
+    builtin::NOTE_ECHO,
+];
+
 /// Every built-in with factory presets.
-const WITH_PRESETS: [&str; 12] = [
+const WITH_PRESETS: [&str; 16] = [
+    builtin::ARPEGGIATOR,
+    builtin::CHORD,
+    builtin::SCALE,
+    builtin::NOTE_ECHO,
     builtin::COMPRESSOR,
     builtin::LIMITER,
     builtin::GATE,
@@ -323,6 +335,7 @@ pub(crate) fn render(
         let ctx = PluginProcessContext {
             transport: &transport,
             param_events: &[],
+            harmony: &crate::NO_HARMONY,
         };
         let mut io = NodeIo {
             frames: BLOCK,
@@ -375,7 +388,10 @@ pub(crate) const CHORD: [(u8, f64, f64); 5] = [
 fn every_preset_sounds_and_stays_in_bounds() {
     let (input, key) = material(4.0);
     let in_db = stereo_rms_db(&input);
-    for id in WITH_PRESETS {
+    for id in WITH_PRESETS
+        .into_iter()
+        .filter(|id| !MIDI_EFFECTS.contains(id))
+    {
         for (i, preset) in factory_presets(id).iter().enumerate() {
             let name = preset.name;
             let instrument = id == builtin::SYNTH;
@@ -449,7 +465,10 @@ fn audition() {
         peak_db(&input[0]),
         centroid(&input[0])
     );
-    for id in WITH_PRESETS {
+    for id in WITH_PRESETS
+        .into_iter()
+        .filter(|id| !MIDI_EFFECTS.contains(id))
+    {
         println!("== {id}");
         for (i, preset) in factory_presets(id).iter().enumerate() {
             let instrument = id == builtin::SYNTH;
@@ -602,4 +621,65 @@ fn the_synth_presets_are_balanced() {
         }
     }
     assert!(wrong.is_empty(), "unbalanced: {wrong:?}");
+}
+
+/// Every MIDI effect preset, played a chord through (held, released,
+/// then a run of single notes over a key change): it plays notes, none of
+/// them stuck, none out of range.
+#[test]
+fn every_midi_effect_preset_plays_and_lets_go() {
+    use crate::Harmony;
+    use crate::devices::midi_fx::rig::{balanced, off, on, ons, run};
+    use faderframe_midi::theory::{Chord, Key, Quality, Scale};
+    let harmony = Harmony {
+        keys: vec![
+            (0, Key::new(0, Scale::Major)),
+            (96_000, Key::new(9, Scale::Minor)),
+        ],
+        chords: vec![
+            (0, 96_000, Chord::new(0, Quality::Major)),
+            (96_000, 192_000, Chord::new(9, Quality::Minor)),
+        ],
+    };
+    let mut input = vec![on(0, 60, 100), on(10, 64, 90), on(20, 67, 80)];
+    input.extend([off(48_000, 60), off(48_000, 64), off(48_000, 67)]);
+    for (k, key) in [62u8, 65, 69, 71].iter().enumerate() {
+        let t = 96_000 + k as u64 * 12_000;
+        input.extend([on(t, *key, 100), off(t + 9_000, *key)]);
+    }
+    for id in MIDI_EFFECTS {
+        for (i, preset) in factory_presets(id).iter().enumerate() {
+            let mut inst = BuiltinFactory.instantiate(id).unwrap();
+            for (pid, v) in factory_preset_values(id, i).unwrap() {
+                inst.set_parameter(pid, v).unwrap();
+            }
+            let config = ProcessConfig {
+                sample_rate: SR,
+                max_block_size: BLOCK as u32,
+                sidechain: false,
+                double_precision: false,
+            };
+            let mut p = inst.create_processor(&config).unwrap();
+            // Long enough for echoes and latched arpeggios to finish
+            // (hold presets keep playing: they are let go by a reset).
+            let mut got = run(p.as_mut(), &input, SR as u64 * 12, 120.0, true, &harmony);
+            let latched = preset.set().iter().any(|(p, v)| {
+                id == builtin::ARPEGGIATOR
+                    && *p == crate::devices::arpeggiator::id::HOLD
+                    && *v > 0.5
+            });
+            if latched {
+                p.reset();
+                got.extend(run(p.as_mut(), &[], 4096, 120.0, true, &harmony));
+            }
+            let notes = ons(&got);
+            assert!(
+                notes.len() >= 3,
+                "{id} '{}': {} notes",
+                preset.name,
+                notes.len()
+            );
+            assert!(balanced(&got), "{id} '{}': a note left on", preset.name);
+        }
+    }
 }

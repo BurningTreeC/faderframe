@@ -54,6 +54,7 @@ impl Rig {
         let ctx = PluginProcessContext {
             transport: &self.transport,
             param_events: params,
+            harmony: &faderframe_plugin_host::NO_HARMONY,
         };
         let mut io = NodeIo {
             frames: BLOCK,

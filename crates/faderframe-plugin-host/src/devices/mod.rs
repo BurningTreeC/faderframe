@@ -1,18 +1,23 @@
 //! The stock devices: dynamics (compressor, limiter, gate, de-esser),
 //! effects (saturator, reverb, delay, modulation), utilities (utility,
-//! tuner) and instruments (synth, sampler, drum sampler). Each module has its parameters (ids stable once released), how
+//! tuner), MIDI effects (arpeggiator, chord, scale, note echo) and
+//! instruments (synth, sampler, drum sampler). Each module has its parameters (ids stable once released), how
 //! it shows their values, what it publishes through the [`AnalysisTap`],
 //! its latency and its processor.
 //!
 //! [`AnalysisTap`]: crate::tap::AnalysisTap
 
+pub mod arpeggiator;
+pub mod chord;
 pub mod compressor;
 pub mod deesser;
 pub mod delay;
 pub mod drums;
 pub mod gate;
 pub mod limiter;
+pub(crate) mod midi_fx;
 pub mod modulation;
+pub mod note_echo;
 pub mod preamp;
 pub mod reverb;
 #[cfg(test)]
@@ -20,6 +25,7 @@ pub(crate) mod rig;
 pub mod sampler;
 pub mod samples;
 pub mod saturator;
+pub mod scale;
 pub mod synth;
 pub mod tuner;
 pub mod utility;

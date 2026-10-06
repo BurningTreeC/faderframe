@@ -362,6 +362,24 @@ of the analysed track (the Tools view) copies its post-fader output into a
   slots and receive the track's MIDI there. The separate instrument field
   remains readable for old projects; replacing it through the chooser moves
   the new instrument into the insert chain as one undoable edit.
+* **MIDI effects.** A plugin with notes in, notes out and no audio
+  (`PluginCategory::MidiEffect`, or any plugin shaped like that) is a MIDI
+  effect: `build::note_effects` chains a track's MIDI effects in insert
+  order (the first fed by the clip player and live input, each by the one
+  before) and gives every later note-taking insert the output of the
+  effects above it; a legacy instrument slot (before every insert) gets
+  what all of them made. MIDI tracks routed to an instrument track enter
+  at its first MIDI effect; a MIDI track's own MIDI effects shape what it
+  sends to an instrument track or a MIDI output. The render-ahead graph
+  builds the same chain. Bypassed (or bypass-automated) MIDI effects pass
+  their notes through (`nodes::plugin::pass_events`). The session places a
+  MIDI effect before the track's first instrument, refuses one on an
+  audio track and anything else on a MIDI track; the plugin browser has a
+  MIDI Effects filter (chosen for MIDI tracks and slots before an
+  instrument), the arranger's track menu "Add MIDI Effect…". Built-in
+  MIDI effects follow the key and chord track: the timeline snapshot
+  carries them in samples (`plugin_host::Harmony`,
+  `PluginProcessContext::harmony`, `NO_HARMONY` outside a project).
 * **Sidechains.** A `PluginSlot::sidechain` names a source track; a plugin
   with a second audio input gets the source's signal *after its inserts and
   before its fader, mute and solo* (a muted "ghost kick" still keys) as
@@ -565,8 +583,9 @@ pair speaking IPC with shared-memory audio (see *Sandboxed plugins* below).
 `PluginHost` (engine) owns one instance per slot. Built-ins: latency probe (used to test PDC
 end to end), the EQ, the Program EQ and the stock devices — compressor,
 limiter, gate, de-esser, saturator, utility (id `faderframe.gain`),
-delay (id `faderframe.echo`), reverb, modulation, tuner, and the
-instruments synth, sampler and drum sampler (see *Built-in devices*).
+delay (id `faderframe.echo`), reverb, modulation, tuner, the MIDI effects
+arpeggiator, chord, scale and note echo, and the instruments synth,
+sampler and drum sampler (see *Built-in devices*).
 Failed plugins
 are bypassed and flagged; missing formats pass audio through with a
 warning.
@@ -682,6 +701,36 @@ bypass, automation, listening).
   `crates/faderframe-view-devices/assets/program-eq`) through
   `Painter::image` — filmstrip frames, never a rotated picture, each tinted
   by its distance from the panel's lamp.
+
+**MIDI effects.** `devices::{arpeggiator, chord, scale, note_echo}` on
+`devices::midi_fx` (a fixed-room `Schedule` of events due later on the
+effect's own sample clock, `Sounding` notes counted per channel and key
+so overlapping copies of a key never leave it stuck, pass-through of
+everything else; a reset sends every sounding note off on the next
+block). The *Arpeggiator* plays the held keys in nine orders (up, down,
+up-down, down-up, converge, diverge, as played, random, chord) over one to
+four octaves, on the song's grid while playing (the rate a division,
+swing delaying every second step) or from the first key when stopped; a
+new chord's first note plays at once unless the grid's next step is
+close; gate (past 100 %: legato), fixed or played velocity, repeats,
+hold. `order_index`/`sequence` are shared with its editor. The *Chord*
+makes each note a chord: up to five intervals, the key's triad or
+seventh (the key track's key where the note is, or its own), or the
+chord track's chord voiced round the note; strummed up or down, added
+notes softer; notes of a strum not started when the key is let go never
+start. The *Scale* keeps notes in a key (the key track's or its own):
+nearest (ties down), up, down or blocked, then by scale degrees and
+octaves; note-offs, poly pressure and note expressions follow each note
+to where it went. The *Note Echo* repeats each note (a division of the
+tempo or milliseconds apart, up to 16, each the feedback's share as loud
+until too soft to play, optionally moving by semitones), each repeat as
+long as the played note, with or without the note itself. Their editors
+(`view-devices::{arpeggiator, chord, scale, note_echo}`, accent
+`Accent::Midi`, `keys::keyboard`) show the pattern as a small piano roll,
+the chord on a keyboard with its name, the key's notes with their
+degrees, and the repeats in time. Engine tests (`midi_effects.rs`) render
+a sine synth and check the pitches it plays; `the_midi_effects_do_not_
+allocate` plays all four chained live over a key change.
 
 **Stock devices.** The other built-ins with editors live in
 `plugin_host::devices` (one module each: parameter ids — stable, never
@@ -840,9 +889,10 @@ covered by `the_stock_devices_do_not_allocate`.
   too and loaded into the plugin's state. Loading is
   `Command::SetPluginState` — one undo step; the engine follows a changed
   slot state.
-  Built-in factory presets live in `plugin_host::presets`: 166 across
+  Built-in factory presets live in `plugin_host::presets`: 216 across
   the EQ, Program EQ, compressor, limiter, gate, de-esser, saturator,
-  utility, delay, reverb, modulation and Synth. Samplers, the tuner and
+  utility, delay, reverb, modulation, the four MIDI effects and Synth
+  (MIDI effect presets are played through by a test: notes, none stuck). Samplers, the tuner and
   the latency probe have none. Each preset expands its overrides over
   the device's defaults, replacing every parameter when selected.
   `BuiltinInstance::programs`/`select_program` expose them through the
@@ -1933,8 +1983,8 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
 
 1. ~~**Stock devices** (wave 1)~~ — done (see *Built-in devices*).
 2. **Composition**: ~~project key/scale and a chord track, a scale-aware
-   piano roll~~ (done, see *Harmony*), MIDI effects before the instrument (arpeggiator, chord,
-   scale, note echo), MIDI transformations and generators, always-on
+   piano roll, MIDI effects before the instrument (arpeggiator, chord,
+   scale, note echo)~~ (done, see *Harmony* and *MIDI effects*), MIDI transformations and generators, always-on
    retrospective MIDI capture.
 3. **Organisation**: folder tracks, clip aliases, project versions
    (snapshots to compare and restore), a command palette with a shortcut

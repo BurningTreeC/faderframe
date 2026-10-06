@@ -231,6 +231,12 @@ Contrast:
   armed and live tracks, tracks with a plugin editor open, faders and
   sends stay immediate. With 64 tracks of six effects at 64-frame buffers
   the audio thread's worst callback went from 1.3 ms to 81 µs.
+* MIDI effects before the instrument: Arpeggiator (nine orders, synced,
+  swing, gate, octaves, hold), Chord (intervals, the key's chords or the
+  chord track's), Scale (keeps notes in the key, transposes by degrees)
+  and Note Echo (fading, optionally rising repeats); the scale-minded ones
+  follow the key and chord track. On instrument tracks before the
+  instrument, and on MIDI tracks (track menu → Add MIDI Effect…).
 * Plugins: built-in synth, EQ, Program EQ and the stock devices, CLAP and VST3 effects and
   instruments on every platform and Audio Units on macOS, found by a
   crash-safe background scan (Audio Units: the system's registry) and
@@ -246,7 +252,7 @@ Contrast:
   Plugin state, parameters and automation are saved too. Moving a knob in a
   plugin's own GUI writes automation like FaderFrame's controls do. Presets:
   save and load your own for any plugin (insert menu or the parameter
-  window's Presets menu). The stock effects, EQs and Synth include 166
+  window's Presets menu). The stock effects, MIDI effects, EQs and Synth include 216
   factory presets, selected from the editor's Presets menu in one undo
   step. Delay and Reverb presets load fully wet on Aux returns. VST3
   factory presets are listed too, as are

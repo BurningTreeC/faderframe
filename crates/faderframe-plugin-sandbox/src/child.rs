@@ -630,6 +630,7 @@ fn audio_loop(
             let ctx = PluginProcessContext {
                 transport,
                 param_events: params,
+                harmony: &faderframe_plugin_host::NO_HARMONY,
             };
             let mut node = NodeIo {
                 frames,

@@ -24,12 +24,14 @@ pub mod builtin;
 pub mod devices;
 pub mod dsp;
 pub mod eq;
+pub mod harmony;
 mod params;
 pub mod presets;
 pub mod program_eq;
 pub mod scan;
 pub mod tap;
 
+pub use harmony::{Harmony, NO_HARMONY};
 pub use params::ParamValues;
 
 use faderframe_audio_graph::NodeIo;
@@ -53,6 +55,9 @@ pub enum PluginCategory {
     Instrument,
     Analyzer,
     Utility,
+    /// Notes in, notes out (no audio): an arpeggiator, a chord or scale
+    /// device; it plays before an instrument.
+    MidiEffect,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,6 +164,9 @@ pub struct PluginProcessContext<'a> {
     pub transport: &'a TransportInfo,
     /// Sample-accurate parameter changes for this block, sorted by offset.
     pub param_events: &'a [ParameterEvent],
+    /// The project's key and chord track (built-in MIDI effects follow
+    /// them; [`NO_HARMONY`] outside a project).
+    pub harmony: &'a Harmony,
 }
 
 /// A parameter moved in the plugin's own editor (plain units), with the

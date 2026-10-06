@@ -197,11 +197,12 @@ pub struct Descriptor {
     pub note_outputs: u16,
 }
 
-const CATEGORIES: [PluginCategory; 4] = [
+const CATEGORIES: [PluginCategory; 5] = [
     PluginCategory::Effect,
     PluginCategory::Instrument,
     PluginCategory::Analyzer,
     PluginCategory::Utility,
+    PluginCategory::MidiEffect,
 ];
 
 impl From<&PluginDescriptor> for Descriptor {

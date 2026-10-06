@@ -113,6 +113,7 @@ scrollbar { background-color: @ff_bg; }
 .badge { font-size: 8pt; font-weight: 700; padding: 1px 7px; border-radius: 10px; margin-left: 4px; }
 .badge-effect { background-color: alpha(@ff_selection, 0.2); color: @ff_fg; }
 .badge-instrument { background-color: alpha(#c77dff, 0.22); color: @ff_fg; }
+.badge-midi { background-color: alpha(#c6e05c, 0.22); color: @ff_fg; }
 .badge-builtin { background-color: @ff_surface_alt; color: @ff_dim; }
 .badge-clap { background-color: alpha(@ff_accent, 0.22); color: @ff_fg; }
 .badge-vst3 { background-color: alpha(@ff_selection, 0.3); color: @ff_fg; }

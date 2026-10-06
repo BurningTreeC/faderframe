@@ -981,6 +981,8 @@ pub struct AvailablePlugin {
     pub vendor: String,
     pub version: String,
     pub instrument: bool,
+    /// Notes in, notes out, no audio: it plays before the instrument.
+    pub midi_effect: bool,
     /// Channels of the main audio ports.
     pub audio_inputs: u16,
     pub audio_outputs: u16,
@@ -2463,6 +2465,40 @@ impl Session {
                         "Choose microphone preamps in the dedicated mixer section".into(),
                     ));
                 }
+                // MIDI effects work on notes: on instrument tracks, before
+                // the instrument (after it they would reach nothing).
+                let mut index = index;
+                let midi_effect = self.is_midi_effect(&plugin);
+                if !midi_effect
+                    && self
+                        .project
+                        .track(track)
+                        .is_some_and(|t| t.kind == TrackKind::Midi)
+                {
+                    return Err(SessionError::Other(format!(
+                        "a MIDI track has no audio: {} cannot go on it, only MIDI effects can",
+                        plugin.name
+                    )));
+                }
+                if midi_effect {
+                    let t = self
+                        .project
+                        .track(track)
+                        .ok_or_else(|| SessionError::Other("no track".into()))?;
+                    if !matches!(t.kind, TrackKind::Instrument | TrackKind::Midi) {
+                        return Err(SessionError::Other(format!(
+                            "{} is a MIDI effect: it goes on an instrument track, before the instrument",
+                            plugin.name
+                        )));
+                    }
+                    if let Some(first) = t
+                        .inserts
+                        .iter()
+                        .position(|s| self.engine.plugin_is_instrument(s.id))
+                    {
+                        index = index.min(first);
+                    }
+                }
                 let slot = PluginSlot {
                     id: self.project.ids.allocate(),
                     plugin,
@@ -3162,6 +3198,11 @@ impl Session {
     ) -> Result<()> {
         let hosted = plugin.format != faderframe_project::PluginFormat::Builtin
             || faderframe_core::builtin::has_editor(&plugin.id);
+        let before: Vec<faderframe_core::PluginInstanceId> = self
+            .project
+            .track(track)
+            .map(|t| t.inserts.iter().map(|s| s.id).collect())
+            .unwrap_or_default();
         match target {
             PluginTarget::Insert(index) => self.dispatch(Action::InsertPlugin {
                 track,
@@ -3182,7 +3223,9 @@ impl Session {
         }
         // Like most DAWs: a newly placed hosted plugin shows its editor.
         let placed = self.project.track(track).and_then(|t| match target {
-            PluginTarget::Insert(i) => t.inserts.get(i.min(t.inserts.len().saturating_sub(1))),
+            // The slot added (a MIDI effect may have gone before the
+            // instrument rather than where it was asked for).
+            PluginTarget::Insert(_) => t.inserts.iter().find(|s| !before.contains(&s.id)),
             PluginTarget::Instrument => self.instrument_slot(t),
             PluginTarget::Song(_) => None,
         });
@@ -3436,6 +3479,18 @@ impl Session {
         self.engine.plugin_note_expressions(slot.id)
     }
 
+    /// Is the plugin of this slot an instrument?
+    pub fn engine_plugin_is_instrument(&self, plugin: faderframe_core::PluginInstanceId) -> bool {
+        self.engine.plugin_is_instrument(plugin)
+    }
+
+    /// Is `plugin` a MIDI effect (notes in, notes out, no audio)?
+    pub fn is_midi_effect(&self, plugin: &PluginRef) -> bool {
+        self.available_plugins()
+            .iter()
+            .any(|p| p.midi_effect && p.plugin.id == plugin.id && p.plugin.format == plugin.format)
+    }
+
     pub fn available_plugins(&self) -> Vec<AvailablePlugin> {
         use faderframe_plugin_host::{PluginCategory, PluginFormat as F};
         self.engine
@@ -3456,6 +3511,8 @@ impl Session {
                 vendor: d.vendor,
                 version: d.version,
                 instrument: d.category == PluginCategory::Instrument,
+                midi_effect: d.category == PluginCategory::MidiEffect
+                    || (d.note_inputs > 0 && d.note_outputs > 0 && d.audio_outputs.is_empty()),
                 audio_inputs: d.audio_inputs.first().map_or(0, |p| p.channels),
                 audio_outputs: d.audio_outputs.first().map_or(0, |p| p.channels),
                 note_inputs: d.note_inputs,

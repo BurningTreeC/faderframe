@@ -224,6 +224,7 @@ fn run(p: &mut ProgramEqProcessor, input: impl Fn(usize) -> f32, blocks: usize) 
         let ctx = PluginProcessContext {
             transport: &transport,
             param_events: &[],
+            harmony: &crate::NO_HARMONY,
         };
         let mut io = NodeIo {
             frames: 256,
@@ -287,6 +288,7 @@ fn mono_lights_both_meters_while_stereo_keeps_independent_channels() {
                 &PluginProcessContext {
                     transport: &transport,
                     param_events: &[],
+                    harmony: &crate::NO_HARMONY,
                 },
                 &mut NodeIo {
                     frames: 256,

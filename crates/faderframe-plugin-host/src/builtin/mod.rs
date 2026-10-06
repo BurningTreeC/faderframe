@@ -31,10 +31,14 @@ enum Kind {
     Saturator,
     Deesser,
     Gate,
+    Arpeggiator,
+    Chord,
+    Scale,
+    NoteEcho,
 }
 
 impl Kind {
-    const ALL: [Kind; 22] = [
+    const ALL: [Kind; 26] = [
         Kind::Preamp(0),
         Kind::Preamp(1),
         Kind::Preamp(2),
@@ -56,6 +60,10 @@ impl Kind {
         Kind::Echo,
         Kind::Compressor,
         Kind::Gain,
+        Kind::Arpeggiator,
+        Kind::Chord,
+        Kind::Scale,
+        Kind::NoteEcho,
         Kind::LatencyProbe,
     ];
 
@@ -75,6 +83,10 @@ impl Kind {
             builtin::DRUMS => Kind::Drums,
             builtin::SAMPLER => Kind::Sampler,
             builtin::TUNER => Kind::Tuner,
+            builtin::ARPEGGIATOR => Kind::Arpeggiator,
+            builtin::CHORD => Kind::Chord,
+            builtin::SCALE => Kind::Scale,
+            builtin::NOTE_ECHO => Kind::NoteEcho,
             builtin::MODULATION => Kind::Modulation,
             builtin::REVERB => Kind::Reverb,
             builtin::SATURATOR => Kind::Saturator,
@@ -178,6 +190,34 @@ impl Kind {
                 vec![stereo],
                 0,
             ),
+            Kind::Arpeggiator => (
+                builtin::ARPEGGIATOR,
+                "Arpeggiator",
+                PluginCategory::MidiEffect,
+                vec![],
+                1,
+            ),
+            Kind::Chord => (
+                builtin::CHORD,
+                "Chord",
+                PluginCategory::MidiEffect,
+                vec![],
+                1,
+            ),
+            Kind::Scale => (
+                builtin::SCALE,
+                "Scale",
+                PluginCategory::MidiEffect,
+                vec![],
+                1,
+            ),
+            Kind::NoteEcho => (
+                builtin::NOTE_ECHO,
+                "Note Echo",
+                PluginCategory::MidiEffect,
+                vec![],
+                1,
+            ),
             Kind::Tuner => (
                 builtin::TUNER,
                 "Tuner",
@@ -222,9 +262,18 @@ impl Kind {
             version: env!("CARGO_PKG_VERSION").into(),
             category,
             audio_inputs: inputs,
-            audio_outputs: vec![stereo],
+            // A MIDI effect: notes in, notes out, no audio.
+            audio_outputs: if category == PluginCategory::MidiEffect {
+                vec![]
+            } else {
+                vec![stereo]
+            },
             note_inputs: notes,
-            note_outputs: 0,
+            note_outputs: if category == PluginCategory::MidiEffect {
+                1
+            } else {
+                0
+            },
         }
     }
 
@@ -248,6 +297,10 @@ impl Kind {
             Kind::Drums => crate::devices::drums::parameters(),
             Kind::Sampler => crate::devices::sampler::parameters(),
             Kind::Tuner => crate::devices::tuner::parameters(),
+            Kind::Arpeggiator => crate::devices::arpeggiator::parameters(),
+            Kind::Chord => crate::devices::chord::parameters(),
+            Kind::Scale => crate::devices::scale::parameters(),
+            Kind::NoteEcho => crate::devices::note_echo::parameters(),
             Kind::Modulation => crate::devices::modulation::parameters(),
             Kind::Reverb => crate::devices::reverb::parameters(),
             Kind::Saturator => crate::devices::saturator::parameters(),
@@ -275,6 +328,10 @@ impl Kind {
             Kind::Sampler => Some(crate::devices::sampler::TAP_VALUES),
             Kind::Synth => Some(crate::devices::synth::TAP_VALUES),
             Kind::Tuner => Some(crate::devices::tuner::TAP_VALUES),
+            Kind::Arpeggiator => Some(crate::devices::arpeggiator::TAP_VALUES),
+            Kind::Chord => Some(crate::devices::chord::TAP_VALUES),
+            Kind::Scale => Some(crate::devices::scale::TAP_VALUES),
+            Kind::NoteEcho => Some(crate::devices::note_echo::TAP_VALUES),
             Kind::Modulation => Some(crate::devices::modulation::TAP_VALUES),
             Kind::Reverb => Some(crate::devices::reverb::TAP_VALUES),
             Kind::Echo => Some(crate::devices::delay::TAP_VALUES),
@@ -340,6 +397,10 @@ impl PluginInstance for BuiltinInstance {
             Kind::Sampler => crate::devices::sampler::format(id, value),
             Kind::Synth => crate::devices::synth::format(id, value),
             Kind::Tuner => crate::devices::tuner::format(id, value),
+            Kind::Arpeggiator => crate::devices::arpeggiator::format(id, value),
+            Kind::Chord => crate::devices::chord::format(id, value),
+            Kind::Scale => crate::devices::scale::format(id, value),
+            Kind::NoteEcho => crate::devices::note_echo::format(id, value),
             Kind::Modulation => crate::devices::modulation::format(id, value),
             Kind::Reverb => crate::devices::reverb::format(id, value),
             Kind::Echo => crate::devices::delay::format(id, value),
@@ -405,6 +466,10 @@ impl PluginInstance for BuiltinInstance {
             Kind::Compressor => crate::devices::compressor::latency(&self.params, self.rate),
             Kind::Limiter => crate::devices::limiter::latency(&self.params, self.rate),
             Kind::Tuner => crate::devices::tuner::latency(&self.params, self.rate),
+            Kind::Arpeggiator => crate::devices::arpeggiator::latency(&self.params, self.rate),
+            Kind::Chord => crate::devices::chord::latency(&self.params, self.rate),
+            Kind::Scale => crate::devices::scale::latency(&self.params, self.rate),
+            Kind::NoteEcho => crate::devices::note_echo::latency(&self.params, self.rate),
             Kind::Modulation => crate::devices::modulation::latency(&self.params, self.rate),
             Kind::Reverb => crate::devices::reverb::latency(&self.params, self.rate),
             Kind::Saturator => crate::devices::saturator::latency(&self.params, self.rate),
@@ -435,6 +500,9 @@ impl PluginInstance for BuiltinInstance {
             | Kind::Deesser
             | Kind::Saturator
             | Kind::Tuner => TailLength::None,
+            // Notes still due: a held arpeggio's last steps, strums, echoes.
+            Kind::Arpeggiator | Kind::Chord | Kind::Scale => TailLength::Samples(48_000 * 2),
+            Kind::NoteEcho => TailLength::Samples(48_000 * 40),
             // The longest ring of a resonant cut near 10 Hz.
             Kind::Eq => TailLength::Samples(48_000),
             Kind::ProgramEq => TailLength::Samples(24_000),
@@ -517,6 +585,26 @@ impl PluginInstance for BuiltinInstance {
                     .map_or_else(crate::devices::samples::empty, |h| Arc::clone(&h.shared)),
             )),
             Kind::Tuner => Box::new(crate::devices::tuner::TunerProcessor::new(
+                params,
+                tap()?,
+                config,
+            )),
+            Kind::Arpeggiator => Box::new(crate::devices::arpeggiator::ArpeggiatorProcessor::new(
+                params,
+                tap()?,
+                config,
+            )),
+            Kind::Chord => Box::new(crate::devices::chord::ChordProcessor::new(
+                params,
+                tap()?,
+                config,
+            )),
+            Kind::Scale => Box::new(crate::devices::scale::ScaleProcessor::new(
+                params,
+                tap()?,
+                config,
+            )),
+            Kind::NoteEcho => Box::new(crate::devices::note_echo::NoteEchoProcessor::new(
                 params,
                 tap()?,
                 config,

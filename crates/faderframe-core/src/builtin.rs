@@ -29,6 +29,15 @@ pub const SAMPLER: &str = "faderframe.sampler";
 pub const DRUMS: &str = "faderframe.drums";
 /// Utility: gain, balance, width, mono bass, polarity, channels (effect).
 pub const GAIN: &str = "faderframe.gain";
+/// Arpeggiator: the held notes one after another (MIDI effect).
+pub const ARPEGGIATOR: &str = "faderframe.arpeggiator";
+/// Chord: each note a chord — intervals, scale chords or the chord track
+/// (MIDI effect).
+pub const CHORD: &str = "faderframe.chord";
+/// Scale: notes kept in a key, transposed by degrees (MIDI effect).
+pub const SCALE: &str = "faderframe.scale";
+/// Note Echo: repeats of each note, fading (MIDI effect).
+pub const NOTE_ECHO: &str = "faderframe.note-echo";
 /// Pure delay that reports its delay as latency (testing PDC).
 pub const LATENCY_PROBE: &str = "faderframe.latency-probe";
 /// 24 band parametric and dynamic equaliser (effect).
@@ -55,6 +64,10 @@ pub fn has_editor(id: &str) -> bool {
             | ECHO
             | MODULATION
             | REVERB
+            | ARPEGGIATOR
+            | CHORD
+            | SCALE
+            | NOTE_ECHO
     )
 }
 

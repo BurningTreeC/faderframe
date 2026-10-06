@@ -326,6 +326,7 @@ fn run_block(
     let ctx = PluginProcessContext {
         transport: &transport,
         param_events: events,
+        harmony: &faderframe_plugin_host::NO_HARMONY,
     };
     let status = proc.process(&ctx, &mut io);
     assert_ne!(status, faderframe_plugin_host::ProcessStatus::Error);
@@ -418,6 +419,7 @@ fn notes_carry_ids_and_note_expressions_reach_their_keys() {
         &PluginProcessContext {
             transport: &transport,
             param_events: &[],
+            harmony: &faderframe_plugin_host::NO_HARMONY,
         },
         &mut io,
     );

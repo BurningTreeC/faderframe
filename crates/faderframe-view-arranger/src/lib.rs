@@ -1813,12 +1813,31 @@ impl ArrangerView {
                 },
             ));
         }
-        if t.kind.has_audio() && t.kind != TrackKind::Master {
+        if t.kind.has_audio() && t.kind != TrackKind::Master && t.kind != TrackKind::Midi {
             items.push(MenuItem::new(
                 "Add Insert Plugin…",
                 Action::OpenPluginBrowser {
                     track: t.id,
                     target: faderframe_session::PluginTarget::Insert(t.inserts.len()),
+                },
+            ));
+        }
+        // MIDI effects: on a MIDI track at the end of its chain, on an
+        // instrument track right before the instrument.
+        if matches!(t.kind, TrackKind::Instrument | TrackKind::Midi) {
+            let at = if t.kind == TrackKind::Midi {
+                t.inserts.len()
+            } else {
+                model
+                    .instrument_slot(t)
+                    .and_then(|i| t.inserts.iter().position(|s| s.id == i.id))
+                    .unwrap_or(0)
+            };
+            items.push(MenuItem::new(
+                "Add MIDI Effect…",
+                Action::OpenPluginBrowser {
+                    track: t.id,
+                    target: faderframe_session::PluginTarget::Insert(at),
                 },
             ));
         }

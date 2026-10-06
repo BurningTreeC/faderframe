@@ -21,6 +21,7 @@ struct Entry {
     vendor: String,
     version: String,
     instrument: bool,
+    midi_effect: bool,
     features: Vec<String>,
     audio: String,
     midi: String,
@@ -28,6 +29,16 @@ struct Entry {
 }
 
 impl Entry {
+    fn kind_label(&self) -> &'static str {
+        if self.instrument {
+            "Instrument"
+        } else if self.midi_effect {
+            "MIDI Effect"
+        } else {
+            "Effect"
+        }
+    }
+
     fn format_label(&self) -> &'static str {
         match self.plugin.format {
             PluginFormat::Builtin => "Built-in",
@@ -60,6 +71,7 @@ enum Kind {
     All,
     Effects,
     Instruments,
+    MidiEffects,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,8 +91,9 @@ impl Filter {
     fn accepts(&self, e: &Entry) -> bool {
         let kind = match self.kind {
             Kind::All => true,
-            Kind::Effects => !e.instrument,
+            Kind::Effects => !e.instrument && !e.midi_effect,
             Kind::Instruments => e.instrument,
+            Kind::MidiEffects => e.midi_effect,
         };
         let scope = match &self.scope {
             Scope::All => true,
@@ -104,7 +117,7 @@ struct Browser {
     count: gtk::Label,
     subtitle: gtk::Label,
     search: gtk::SearchEntry,
-    kind_buttons: [gtk::ToggleButton; 3],
+    kind_buttons: [gtk::ToggleButton; 4],
     generation: std::cell::Cell<u64>,
     /// Scope of each sidebar row (`None` for headings).
     scopes: RefCell<Vec<Option<Scope>>>,
@@ -132,6 +145,7 @@ fn entries(app: &AppState) -> Vec<Entry> {
                 },
                 version: p.version.clone(),
                 instrument: p.instrument,
+                midi_effect: p.midi_effect,
                 features: scanned
                     .as_ref()
                     .map(|c| c.features.clone())
@@ -216,9 +230,11 @@ fn row_widget(e: &Entry) -> gtk::Widget {
     text.append(&sub);
     row.append(&text);
     row.append(&badge(
-        if e.instrument { "Instrument" } else { "Effect" },
+        e.kind_label(),
         if e.instrument {
             "badge-instrument"
+        } else if e.midi_effect {
+            "badge-midi"
         } else {
             "badge-effect"
         },
@@ -404,7 +420,7 @@ impl Browser {
         if !e.version.is_empty() {
             row("Version", &e.version);
         }
-        row("Type", if e.instrument { "Instrument" } else { "Effect" });
+        row("Type", e.kind_label());
         row("Audio", &e.audio);
         row("MIDI", &e.midi);
         if let Some(b) = &e.bundle {
@@ -454,11 +470,12 @@ impl Browser {
 
     fn set_kind(&self, kind: Kind) {
         self.filter.borrow_mut().kind = kind;
-        for (b, k) in self
-            .kind_buttons
-            .iter()
-            .zip([Kind::All, Kind::Effects, Kind::Instruments])
-        {
+        for (b, k) in self.kind_buttons.iter().zip([
+            Kind::All,
+            Kind::Effects,
+            Kind::Instruments,
+            Kind::MidiEffects,
+        ]) {
             b.set_active(k == kind);
         }
         self.refresh_list();
@@ -477,8 +494,26 @@ impl Browser {
             PluginTarget::Insert(i) => format!("Insert slot {} on {name}", i + 1),
             PluginTarget::Song(_) => format!("Add an insert to {name}"),
         });
+        // MIDI effects on a MIDI track, and in a slot before an instrument
+        // (an audio effect there would be replaced by the instrument).
+        let midi = match target {
+            PluginTarget::Insert(i) => self.app.upgrade().is_some_and(|a| {
+                let s = a.session.borrow();
+                s.project().track(track).is_some_and(|t| match t.kind {
+                    faderframe_project::TrackKind::Midi => true,
+                    faderframe_project::TrackKind::Instrument => t
+                        .inserts
+                        .iter()
+                        .position(|x| s.engine_plugin_is_instrument(x.id))
+                        .is_some_and(|first| i <= first),
+                    _ => false,
+                })
+            }),
+            _ => false,
+        };
         self.set_kind(match target {
             PluginTarget::Instrument => Kind::Instruments,
+            PluginTarget::Insert(_) if midi => Kind::MidiEffects,
             PluginTarget::Insert(_) | PluginTarget::Song(_) => Kind::Effects,
         });
     }
@@ -530,7 +565,7 @@ pub fn open(app: &Rc<AppState>, track: TrackId, target: PluginTarget) {
     header.set_title_widget(Some(&search));
     let kinds = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     kinds.add_css_class("linked");
-    let kind_buttons = ["All", "Effects", "Instruments"].map(|l| {
+    let kind_buttons = ["All", "Effects", "Instruments", "MIDI Effects"].map(|l| {
         let b = gtk::ToggleButton::with_label(l);
         kinds.append(&b);
         b
@@ -626,10 +661,12 @@ pub fn open(app: &Rc<AppState>, track: TrackId, target: PluginTarget) {
             b.place(e.plugin);
         }
     });
-    for (button, kind) in kind_buttons
-        .iter()
-        .zip([Kind::All, Kind::Effects, Kind::Instruments])
-    {
+    for (button, kind) in kind_buttons.iter().zip([
+        Kind::All,
+        Kind::Effects,
+        Kind::Instruments,
+        Kind::MidiEffects,
+    ]) {
         let weak = Rc::downgrade(&b);
         button.connect_clicked(move |btn| {
             if let Some(b) = weak.upgrade() {

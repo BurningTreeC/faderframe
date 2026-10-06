@@ -132,6 +132,14 @@ impl PluginNode {
             .and_then(|a| a.bypass(self.plugin))
             .and_then(|l| l.value_at(automation_at(cx, io.frames)))
             .map_or(0.0, |v| if v >= 0.5 { 1.0 } else { 0.0 });
+        // A MIDI effect (no audio): bypassed, its notes pass unchanged.
+        if io.audio_out.is_empty() {
+            if target >= 0.5 {
+                pass_events(io);
+            }
+            self.dry = target;
+            return;
+        }
         let n = io.frames;
         let latency = self.latency as usize;
         let start_pos = self.delay_pos;
@@ -170,6 +178,17 @@ impl PluginNode {
     }
 }
 
+/// Events through unchanged (a bypassed MIDI effect; other bypassed
+/// plugins have no event outputs).
+fn pass_events(io: &mut NodeIo<'_>) {
+    for (i, out) in io.events_out.iter_mut().enumerate() {
+        out.clear();
+        if let Some(input) = io.events_in.get(i) {
+            out.merge_from(input, 0);
+        }
+    }
+}
+
 impl Processor<EngineContext> for PluginNode {
     fn preferred_block_size(&self) -> usize {
         if self.bypass {
@@ -191,6 +210,7 @@ impl Processor<EngineContext> for PluginNode {
                     None => out.clear(),
                 }
             }
+            pass_events(io);
             return;
         }
         self.collect_events(cx, io.frames);
@@ -198,6 +218,7 @@ impl Processor<EngineContext> for PluginNode {
         let ctx = PluginProcessContext {
             transport: &cx.data.transport,
             param_events: &events,
+            harmony: &cx.data.timeline.harmony,
         };
         self.processor
             .set_callback_deadline(cx.data.callback_deadline);

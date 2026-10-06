@@ -3,6 +3,8 @@
 //! ([`program_eq::ProgramEqView`]). The shell opens one in a window of its
 //! own for a plugin whose id [`editor_for`] knows.
 
+mod arpeggiator;
+mod chord;
 mod common;
 mod compressor;
 mod deesser;
@@ -10,13 +12,16 @@ mod delay;
 mod drums;
 pub mod eq;
 mod gate;
+mod keys;
 mod kit;
 mod limiter;
 mod modulation;
+mod note_echo;
 pub mod program_eq;
 mod reverb;
 mod sampler;
 mod saturator;
+mod scale;
 mod synth;
 mod tuner;
 mod utility;
@@ -99,6 +104,26 @@ pub fn editor_for(
             theme,
             gate::GateFace::new(theme),
         ))),
+        builtin::ARPEGGIATOR => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            arpeggiator::ArpeggiatorFace::new(theme),
+        ))),
+        builtin::CHORD => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            chord::ChordFace::new(theme),
+        ))),
+        builtin::SCALE => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            scale::ScaleFace::new(theme),
+        ))),
+        builtin::NOTE_ECHO => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            note_echo::NoteEchoFace::new(theme),
+        ))),
         builtin::PROGRAM_EQ => Some(Box::new(program_eq::ProgramEqView::new(plugin, theme))),
         _ => None,
     }
@@ -124,6 +149,10 @@ pub fn editor_size(plugin_id: &str) -> Option<(i32, i32)> {
         builtin::SATURATOR => Some((960, 520 + HEADER_BAR)),
         builtin::DEESSER => Some((1000, 520 + HEADER_BAR)),
         builtin::GATE => Some((1000, 520 + HEADER_BAR)),
+        builtin::ARPEGGIATOR => Some((920, 480 + HEADER_BAR)),
+        builtin::CHORD => Some((1000, 480 + HEADER_BAR)),
+        builtin::SCALE => Some((880, 470 + HEADER_BAR)),
+        builtin::NOTE_ECHO => Some((900, 470 + HEADER_BAR)),
         // The panel at 1.2 times its size, under the window's header bar.
         builtin::PROGRAM_EQ => Some((
             (program_eq::PANEL_W * 1.2) as i32,

@@ -90,6 +90,7 @@ impl<P: PluginProcessor> Rig<P> {
             let ctx = PluginProcessContext {
                 transport: &self.transport,
                 param_events: &[],
+                harmony: &crate::NO_HARMONY,
             };
             let mut io = NodeIo {
                 frames: BLOCK,

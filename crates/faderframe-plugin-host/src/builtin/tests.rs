@@ -43,6 +43,7 @@ impl Rig {
         let ctx = PluginProcessContext {
             transport: &transport,
             param_events: &[],
+            harmony: &crate::NO_HARMONY,
         };
         let mut io = NodeIo {
             frames: BLOCK,

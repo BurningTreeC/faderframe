@@ -202,6 +202,7 @@ fn run(
         let ctx = PluginProcessContext {
             transport: &transport,
             param_events: if b == 0 { params } else { &[] },
+            harmony: &faderframe_plugin_host::NO_HARMONY,
         };
         let mut io = NodeIo {
             frames: FRAMES,
@@ -266,6 +267,7 @@ fn sysex_crosses_into_the_helper() {
         &PluginProcessContext {
             transport: &transport,
             param_events: &[],
+            harmony: &faderframe_plugin_host::NO_HARMONY,
         },
         &mut io,
     );
@@ -477,6 +479,7 @@ fn round_trip_cost() {
                     &PluginProcessContext {
                         transport: &transport,
                         param_events: &[],
+                        harmony: &faderframe_plugin_host::NO_HARMONY,
                     },
                     &mut io,
                 );

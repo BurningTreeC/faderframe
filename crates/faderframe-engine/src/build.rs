@@ -234,6 +234,8 @@ struct TrackNodes {
     instrument: Option<NodeId>,
     midi: Option<NodeId>,
     midi_in: Option<NodeId>,
+    /// The last of the track's MIDI effects (what MIDI it sends on).
+    midi_fx: Option<NodeId>,
 }
 
 /// Everything needed to turn plugin slots into graph nodes.
@@ -273,6 +275,14 @@ impl PluginCx<'_> {
 
     /// Does the plugin in `slot` take notes (instruments, MIDI-controlled
     /// effects)?
+    /// A MIDI effect: notes in, notes out, no audio.
+    fn note_effect(&mut self, slot: &PluginSlot) -> bool {
+        self.plugins.instance(slot).is_ok_and(|inst| {
+            let d = inst.descriptor();
+            d.note_inputs > 0 && d.note_outputs > 0 && d.audio_outputs.is_empty()
+        })
+    }
+
     fn takes_notes(&mut self, slot: &PluginSlot) -> bool {
         self.plugins.instance(slot).is_ok_and(|inst| {
             let d = inst.descriptor();
@@ -513,6 +523,15 @@ pub fn build_graph(
                 )),
             );
             tn.midi_in = Some(own(&mut owners, node, t.id, None, NodeWork::MidiInput));
+            // MIDI tracks send their MIDI on through their MIDI effects.
+            if t.kind == TrackKind::Midi {
+                let chain: Vec<&PluginSlot> = t.inserts.iter().collect();
+                let fx = note_effects(&mut b, &mut pcx, t, &chain, &[midi, node], Some(gi))?;
+                for (slot, n) in &fx {
+                    own(&mut owners, *n, t.id, Some(*slot), NodeWork::Insert);
+                }
+                tn.midi_fx = fx.last().map(|(_, n)| *n);
+            }
             // An external MIDI device.
             if let Some(out) = &t.midi_output {
                 let port = routing.outputs.get(&out.port).copied().unwrap_or(NO_PORT);
@@ -525,9 +544,13 @@ pub fn build_graph(
                     Box::new(MidiOutputSink::new(out.channel)),
                 );
                 own(&mut owners, sink, t.id, None, NodeWork::MidiOutput);
-                b.connect_events(midi, 0, sink, 0)?;
-                if let Some(live) = tn.midi_in {
-                    b.connect_events(live, 0, sink, 0)?;
+                if let Some(fx) = tn.midi_fx {
+                    b.connect_events(fx, 0, sink, 0)?;
+                } else {
+                    b.connect_events(midi, 0, sink, 0)?;
+                    if let Some(live) = tn.midi_in {
+                        b.connect_events(live, 0, sink, 0)?;
+                    }
                 }
             }
         }
@@ -545,6 +568,32 @@ pub fn build_graph(
             Box::new(Passthrough),
         );
         tn.input = Some(own(&mut owners, input, t.id, None, NodeWork::Input));
+
+        let chain = if frozen {
+            Vec::new()
+        } else {
+            pcx.audio_chain(t)
+        };
+        // MIDI effects first: the track's MIDI through them in order; an
+        // instrument gets what the effects above it made of it (a legacy
+        // instrument, before every insert, what all of them made).
+        let sources: Vec<NodeId> = [tn.midi, tn.midi_in].into_iter().flatten().collect();
+        let fx = if t.kind == TrackKind::Instrument {
+            note_effects(&mut b, &mut pcx, t, &chain, &sources, Some(gi))?
+        } else {
+            Vec::new()
+        };
+        for (slot, n) in &fx {
+            own(&mut owners, *n, t.id, Some(*slot), NodeWork::Insert);
+        }
+        // MIDI tracks routed here start at the first effect.
+        if let Some((_, first)) = fx.first() {
+            tn.instrument = Some(*first);
+        }
+        let all_fx: Vec<NodeId> = match fx.last() {
+            Some((_, last)) => vec![*last],
+            None => sources.clone(),
+        };
 
         match t.kind {
             // Frozen: the rendered audio, straight to the strip.
@@ -619,26 +668,24 @@ pub fn build_graph(
                         .audio_out(layout);
                     let (inst, _) = pcx.node(&mut b, slot, t, spec, Role::Instrument);
                     own(&mut owners, inst, t.id, Some(slot.id), NodeWork::Instrument);
-                    if let Some(midi) = tn.midi {
-                        b.connect_events(midi, 0, inst, 0)?;
-                    }
-                    if let Some(live) = tn.midi_in {
-                        b.connect_events(live, 0, inst, 0)?;
+                    for f in &all_fx {
+                        b.connect_events(*f, 0, inst, 0)?;
                     }
                     b.connect_audio(inst, 0, input, 0)?;
-                    tn.instrument = Some(inst);
+                    tn.instrument.get_or_insert(inst);
                 }
             }
             _ => {}
         }
 
         let mut prev = input;
-        let chain = if frozen {
-            Vec::new()
-        } else {
-            pcx.audio_chain(t)
-        };
+        let mut events = sources;
         for slot in chain {
+            // A MIDI effect (built above): what follows gets its notes.
+            if let Some((_, n)) = fx.iter().find(|(id, _)| *id == slot.id) {
+                events = vec![*n];
+                continue;
+            }
             // Inserts that take notes (a synth placed as an insert, MIDI-
             // controlled effects) get the track's MIDI too.
             let notes = t.kind == TrackKind::Instrument && pcx.takes_notes(slot);
@@ -671,11 +718,8 @@ pub fn build_graph(
             }
             b.connect_audio(prev, 0, node, 0)?;
             if notes {
-                if let Some(midi) = tn.midi {
-                    b.connect_events(midi, 0, node, 0)?;
-                }
-                if let Some(live) = tn.midi_in {
-                    b.connect_events(live, 0, node, 0)?;
+                for e in &events {
+                    b.connect_events(*e, 0, node, 0)?;
                 }
                 // MIDI tracks routed here reach it too.
                 tn.instrument.get_or_insert(node);
@@ -700,9 +744,13 @@ pub fn build_graph(
                 && let (Some(midi), Some(inst)) =
                     (tn.midi, nodes.get(&track).and_then(|n| n.instrument))
             {
-                b.connect_events(midi, 0, inst, 0)?;
-                if let Some(live) = tn.midi_in {
-                    b.connect_events(live, 0, inst, 0)?;
+                if let Some(fx) = tn.midi_fx {
+                    b.connect_events(fx, 0, inst, 0)?;
+                } else {
+                    b.connect_events(midi, 0, inst, 0)?;
+                    if let Some(live) = tn.midi_in {
+                        b.connect_events(live, 0, inst, 0)?;
+                    }
                 }
             }
             continue;
@@ -889,6 +937,38 @@ fn add_strip(
     Ok(strip)
 }
 
+/// A track's MIDI effects in `chain` order, the first fed by `sources`,
+/// each by the one before: the nodes by slot (in order).
+fn note_effects(
+    b: &mut GraphBuilder<EngineContext>,
+    pcx: &mut PluginCx<'_>,
+    t: &Track,
+    chain: &[&PluginSlot],
+    sources: &[NodeId],
+    group: Option<u32>,
+) -> Result<Vec<(faderframe_core::PluginInstanceId, NodeId)>, EngineError> {
+    let mut out = Vec::new();
+    let mut from: Vec<NodeId> = sources.to_vec();
+    for slot in chain {
+        if !pcx.note_effect(slot) {
+            continue;
+        }
+        let mut spec = NodeSpec::new(format!("{} · {}", t.name, slot.plugin.name))
+            .events_in(1)
+            .events_out(1);
+        if let Some(g) = group {
+            spec = spec.group(g);
+        }
+        let (node, _) = pcx.node(b, slot, t, spec, Role::Insert);
+        for f in &from {
+            b.connect_events(*f, 0, node, 0)?;
+        }
+        from = vec![node];
+        out.push((slot.id, node));
+    }
+    Ok(out)
+}
+
 /// An anticipated track's sources, instrument and inserts in the ahead
 /// graph `ab`, ending in the ring's writer; returns the chain's latency.
 fn build_ahead_chain(
@@ -909,6 +989,8 @@ fn build_ahead_chain(
         Box::new(Passthrough),
     );
     let mut midi = None;
+    let chain = pcx.audio_chain(t);
+    let mut fx = Vec::new();
     match t.kind {
         TrackKind::Instrument => {
             let player = ab.add_node(
@@ -918,13 +1000,15 @@ fn build_ahead_chain(
                 Box::new(MidiClipPlayer::new(t.id)),
             );
             midi = Some(player);
+            fx = note_effects(ab, pcx, t, &chain, &[player], None)?;
             if let Some(slot) = &t.instrument {
                 let spec = NodeSpec::new(format!("{} · {}", t.name, slot.plugin.name))
                     .events_in(1)
                     .audio_out(layout);
                 let (inst, l) = pcx.node(ab, slot, t, spec, Role::Instrument);
                 latency += l;
-                ab.connect_events(player, 0, inst, 0)?;
+                let from = fx.last().map_or(player, |(_, n)| *n);
+                ab.connect_events(from, 0, inst, 0)?;
                 ab.connect_audio(inst, 0, input, 0)?;
             }
         }
@@ -949,7 +1033,11 @@ fn build_ahead_chain(
         }
     }
     let mut prev = input;
-    for slot in pcx.audio_chain(t) {
+    for slot in chain {
+        if let Some((_, n)) = fx.iter().find(|(id, _)| *id == slot.id) {
+            midi = Some(*n);
+            continue;
+        }
         let notes = t.kind == TrackKind::Instrument && pcx.takes_notes(slot);
         let mut spec = NodeSpec::new(format!("{} · {}", t.name, slot.plugin.name))
             .audio_in(layout)

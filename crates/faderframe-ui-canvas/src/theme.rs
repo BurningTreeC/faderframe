@@ -306,7 +306,7 @@ pub struct PianoRollTheme {
 
 /// The devices' colours: dynamics, limiting, gating, de-essing,
 /// saturation, space, time, modulation, instruments, samplers.
-pub const DEVICE_ACCENTS: [Color; 10] = [
+pub const DEVICE_ACCENTS: [Color; 11] = [
     Color::hex(0xf0a24a),
     Color::hex(0xf06a5a),
     Color::hex(0x6cc77a),
@@ -317,6 +317,7 @@ pub const DEVICE_ACCENTS: [Color; 10] = [
     Color::hex(0xa98af0),
     Color::hex(0x5fd0e4),
     Color::hex(0xe8925f),
+    Color::hex(0xc6e05c),
 ];
 
 /// Which of [`DeviceTheme::accents`] a device wears.
@@ -332,6 +333,8 @@ pub enum Accent {
     Modulation,
     Instrument,
     Sampler,
+    /// MIDI effects.
+    Midi,
 }
 
 impl DeviceTheme {
@@ -354,7 +357,7 @@ pub struct DeviceTheme {
     pub wave: Color,
     /// Each device's own colour (knob rings, highlights), by
     /// [`DeviceTheme::accent`].
-    pub accents: [Color; 10],
+    pub accents: [Color; 11],
     /// The display behind the curves, and its grid.
     pub display: Color,
     pub grid: Color,

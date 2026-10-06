@@ -97,6 +97,7 @@ impl Rig {
             let ctx = PluginProcessContext {
                 transport: &transport,
                 param_events: if b == 0 { events } else { &[] },
+                harmony: &crate::NO_HARMONY,
             };
             let mut io = NodeIo {
                 frames: BLOCK,
@@ -967,6 +968,7 @@ fn mono_parametric_eq_publishes_both_meter_channels() {
             &PluginProcessContext {
                 transport: &transport,
                 param_events: &[],
+                harmony: &crate::NO_HARMONY,
             },
             &mut NodeIo {
                 frames: BLOCK,

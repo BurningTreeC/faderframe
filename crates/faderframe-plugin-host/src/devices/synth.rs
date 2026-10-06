@@ -1161,6 +1161,7 @@ mod tests {
                 let ctx = PluginProcessContext {
                     transport: &self.transport,
                     param_events: &[],
+                    harmony: &crate::NO_HARMONY,
                 };
                 let mut io = NodeIo {
                     frames: 256,

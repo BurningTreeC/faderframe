@@ -1443,3 +1443,92 @@ fn microphone_preamps_do_not_allocate_while_automating_or_resetting() {
         }
     }
 }
+
+/// The MIDI effects, chained before a synth, played live and from the key
+/// track: arpeggios, strummed chords, scale moves and echoes allocate
+/// nothing.
+#[test]
+fn the_midi_effects_do_not_allocate() {
+    let _serial = serial();
+    use faderframe_core::{ChannelLayout, ParameterId, builtin};
+    use faderframe_project::harmony::{Key, Scale};
+    use faderframe_project::{Impact, KeyChange, PluginRef, PluginSlot, SavedParameter, TrackKind};
+    use faderframe_timeline::MusicalTime;
+    use std::collections::HashSet;
+    const SR: u32 = 48_000;
+    let mut tp = common::TestProject::new(SR);
+    let t = tp.track(TrackKind::Instrument, "Fx", ChannelLayout::Stereo);
+    let mut slot = |id: &str, set: &[(u32, f64)]| PluginSlot {
+        id: tp.project.ids.allocate(),
+        plugin: PluginRef::builtin(id, id),
+        bypass: false,
+        parameters: set
+            .iter()
+            .map(|(k, v)| SavedParameter {
+                id: ParameterId(*k),
+                value: *v,
+            })
+            .collect(),
+        state: None,
+        sidechain: None,
+    };
+    let inserts = vec![
+        slot(
+            builtin::ARPEGGIATOR,
+            &[(0, 2.0), (3, 2.0), (4, 0.5), (6, 1.0)],
+        ),
+        slot(builtin::CHORD, &[(0, 1.0), (9, 20.0)]),
+        slot(builtin::SCALE, &[(4, 2.0)]),
+        slot(builtin::NOTE_ECHO, &[(3, 8.0), (4, 0.9), (5, 7.0)]),
+        slot(builtin::SYNTH, &[]),
+    ];
+    tp.project.track_mut(t).unwrap().inserts = inserts;
+    tp.project.keys = vec![
+        KeyChange {
+            at: MusicalTime::ZERO,
+            key: Key::new(2, Scale::Major),
+        },
+        KeyChange {
+            at: MusicalTime::from_quarters(2.0),
+            key: Key::new(9, Scale::Minor),
+        },
+    ];
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 2).unwrap();
+    let (tx, q, _feed) = faderframe_midi::midi_input_queue(256);
+    r.controller.set_midi_input(q).unwrap();
+    r.controller.set_midi_live(HashSet::from([t]));
+    r.controller
+        .sync(&tp.project, &tp.sources, Impact::Params)
+        .unwrap();
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    let mut total = 0;
+    for key in 48..72u8 {
+        tx.send(0, &[0x90, key, 60 + key]);
+        let (_, n) = armed(|| {
+            for _ in 0..12 {
+                r.processor.process_device(&mut bufs);
+            }
+        });
+        total += n;
+        if key % 4 != 0 {
+            tx.send(0, &[0x80, key, 0]);
+        }
+    }
+    let mut loud = 0.0f32;
+    let (_, n) = armed(|| {
+        for _ in 0..200 {
+            r.processor.process_device(&mut bufs);
+            loud = bufs.output_ref(0).iter().fold(loud, |m, v| m.max(v.abs()));
+        }
+    });
+    assert_eq!(total + n, 0, "allocations in the MIDI effects");
+    assert!(loud > 1e-3, "the synth plays the echoes: {loud}");
+}

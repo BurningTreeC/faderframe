@@ -184,6 +184,7 @@ mod tests {
         let ctx = PluginProcessContext {
             transport: &transport,
             param_events: &[],
+            harmony: &crate::NO_HARMONY,
         };
         let mut input = AudioBuffer::new(ChannelLayout::Stereo, FRAMES);
         let mut output = AudioBuffer::new(ChannelLayout::Stereo, FRAMES);

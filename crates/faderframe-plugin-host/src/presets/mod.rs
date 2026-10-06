@@ -1,4 +1,5 @@
-//! Factory presets of the stock effects and the Synth: starting points that
+//! Factory presets of the stock effects, the MIDI effects and the Synth:
+//! starting points that
 //! show what each device does best, named for what they are for.
 //!
 //! A preset lists only the values it moves; everything else is the
@@ -14,6 +15,7 @@
 mod dynamics;
 mod effects;
 mod equalisers;
+mod midi;
 mod synth;
 #[cfg(test)]
 mod tests;
@@ -76,6 +78,10 @@ pub fn factory_presets(plugin_id: &str) -> Vec<FactoryPreset> {
         builtin::EQ => equalisers::eq(),
         builtin::PROGRAM_EQ => equalisers::program_eq(),
         builtin::SYNTH => synth::synth(),
+        builtin::ARPEGGIATOR => midi::arpeggiator(),
+        builtin::CHORD => midi::chord(),
+        builtin::SCALE => midi::scale(),
+        builtin::NOTE_ECHO => midi::note_echo(),
         _ => Vec::new(),
     }
 }
@@ -96,6 +102,10 @@ pub fn parameters(plugin_id: &str) -> Vec<ParameterInfo> {
         builtin::EQ => crate::eq::parameters(),
         builtin::PROGRAM_EQ => crate::program_eq::parameters(),
         builtin::SYNTH => synth::parameters(),
+        builtin::ARPEGGIATOR => arpeggiator::parameters(),
+        builtin::CHORD => chord::parameters(),
+        builtin::SCALE => scale::parameters(),
+        builtin::NOTE_ECHO => note_echo::parameters(),
         _ => Vec::new(),
     }
 }

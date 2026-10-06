@@ -458,6 +458,8 @@ pub struct TimelineSnapshot {
     pub timeline: Timeline,
     lanes: Vec<(TrackId, Lane)>,
     automation: Vec<(TrackId, TrackAutomation)>,
+    /// The key and chord track in samples (MIDI effects follow them).
+    pub harmony: faderframe_plugin_host::Harmony,
 }
 
 impl TimelineSnapshot {
@@ -467,6 +469,7 @@ impl TimelineSnapshot {
             timeline: Timeline::default(),
             lanes: Vec::new(),
             automation: Vec::new(),
+            harmony: faderframe_plugin_host::Harmony::default(),
         }
     }
 
@@ -765,11 +768,30 @@ impl TimelineSnapshot {
             }
         }
         automation.sort_by_key(|(t, _)| *t);
+        let harmony = faderframe_plugin_host::Harmony {
+            keys: project
+                .keys
+                .iter()
+                .map(|k| (tl.to_samples(k.at, sr), k.key))
+                .collect(),
+            chords: project
+                .chords
+                .iter()
+                .map(|c| {
+                    (
+                        tl.to_samples(c.start, sr),
+                        tl.to_samples(c.end, sr),
+                        c.chord,
+                    )
+                })
+                .collect(),
+        };
         Self {
             sample_rate: sr,
             timeline: project.timeline.clone(),
             lanes,
             automation,
+            harmony,
         }
     }
 }
