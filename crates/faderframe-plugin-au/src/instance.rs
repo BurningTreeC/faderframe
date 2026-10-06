@@ -6,9 +6,10 @@
 #![allow(non_upper_case_globals)]
 
 use crate::ffi::*;
-use crate::processor::{AuProcessor, MAX_CHANNELS, RtState, SharedRt};
+use crate::processor::{AuProcessor, MAX_CHANNELS, Modulation, RtState, SharedRt};
 use crate::view;
 use faderframe_core::ParameterId;
+use faderframe_plugin_host::emulated::{ModBases, append_bases, read_bases};
 use faderframe_plugin_host::scan::ScannedPlugin;
 use faderframe_plugin_host::{
     EditorEdit, EditorRequests, ParameterInfo, ParameterUnit, ParentWindow, PluginDescriptor,
@@ -49,6 +50,11 @@ unsafe extern "C" fn on_property(user: *mut c_void, _unit: AudioUnit, id: u32, _
         _ => {}
     }
 }
+
+/// A state saved while modulating: this, the property list's length, the
+/// list, then the values as set (`emulated::append_bases`). Without
+/// modulation the state is the property list itself.
+const STATE_MAGIC: &[u8; 4] = b"FFAU";
 
 const WATCHED: [u32; 3] = [
     kAudioUnitProperty_Latency,
@@ -111,6 +117,13 @@ pub struct AuInstance {
     edits: *mut Edits,
     listener: AUEventListenerRef,
     editor: Option<Editor>,
+    /// Values set here or in the unit's editor, for the processor's
+    /// modulation (the bases), and the bases it modulates now.
+    bases_tx: Option<rtrb::Producer<(u32, f64)>>,
+    mod_bases: Arc<ModBases>,
+    /// Gestures open in the unit's editor (values outside one, of a
+    /// modulated parameter, are the modulation's echo).
+    gestures: Vec<ParameterId>,
 }
 
 impl AuInstance {
@@ -149,6 +162,9 @@ impl AuInstance {
             edits: Box::into_raw(Box::<Edits>::default()),
             listener: std::ptr::null_mut(),
             editor: None,
+            bases_tx: None,
+            mod_bases: Arc::default(),
+            gestures: Vec::new(),
         };
         s.query_params();
         Ok(s)
@@ -337,13 +353,29 @@ impl AuInstance {
         } else {
             0
         };
+        let (bases_tx, bases_rx) = rtrb::RingBuffer::new((self.params.len() * 2).max(256));
+        let params = self
+            .params
+            .clone()
+            .into_iter()
+            .map(|p| {
+                let v = self.unit_value(p.id.0).unwrap_or(p.default);
+                (p.id.0, v, p.min as f32, p.max as f32)
+            })
+            .collect();
         let state = RtState::new(
             self.unit,
             inputs,
             outputs,
             max as usize,
             self.descriptor.note_inputs > 0,
+            Modulation {
+                params,
+                bases: Arc::clone(&self.mod_bases),
+                bases_rx,
+            },
         );
+        self.bases_tx = Some(bases_tx);
         if inputs > 0 {
             let cb = state.render_callback();
             let s = self.set(
@@ -401,6 +433,7 @@ impl AuInstance {
     pub fn deactivate(&mut self) {
         let Some(cell) = self.rt.take() else { return };
         self.config = None;
+        self.bases_tx = None;
         // The audio thread holds the cell for at most one block.
         let reclaimed = match cell.lock_blocking(10_000) {
             Some(mut g) => {
@@ -427,6 +460,42 @@ impl AuInstance {
         let r = f();
         drop(guard);
         r
+    }
+
+    /// The unit's value of a parameter (modulated, while it is).
+    fn unit_value(&self, id: u32) -> Option<f64> {
+        let mut v = 0.0f32;
+        // SAFETY: plain query.
+        let status =
+            unsafe { AudioUnitGetParameter(self.unit, id, kAudioUnitScope_Global, 0, &mut v) };
+        (status == 0).then_some(f64::from(v))
+    }
+
+    /// A value as set (the processor's base for modulation).
+    fn note_base(&mut self, id: u32, v: f64) {
+        if let Some(tx) = self.bases_tx.as_mut() {
+            let _ = tx.push((id, v));
+        }
+    }
+
+    /// The processor's bases follow the unit (a loaded state); modulated
+    /// parameters keep theirs (the unit holds their modulated values).
+    fn refresh_bases(&mut self) {
+        let modulated: Vec<u32> = self
+            .mod_bases
+            .snapshot()
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        let values: Vec<(u32, f64)> = self
+            .params
+            .iter()
+            .filter(|p| !modulated.contains(&p.id.0))
+            .filter_map(|p| Some((p.id.0, self.unit_value(p.id.0)?)))
+            .collect();
+        for (id, v) in values {
+            self.note_base(id, v);
+        }
     }
 
     /// Tell the unit's own editor that values changed (not our listener).
@@ -560,11 +629,22 @@ impl PluginInstance for AuInstance {
     }
 
     fn parameter(&mut self, id: ParameterId) -> Option<f64> {
-        let mut v = 0.0f32;
-        // SAFETY: plain query.
-        let status =
-            unsafe { AudioUnitGetParameter(self.unit, id.0, kAudioUnitScope_Global, 0, &mut v) };
-        (status == 0).then_some(f64::from(v))
+        // Modulated: the value as set, not the unit's.
+        if let Some((_, base)) = self
+            .mod_bases
+            .snapshot()
+            .into_iter()
+            .find(|(p, _)| *p == id.0)
+        {
+            return Some(base);
+        }
+        self.unit_value(id.0)
+    }
+
+    fn modulatable(&self, id: ParameterId) -> bool {
+        self.params
+            .iter()
+            .any(|p| p.id == id && p.automatable && !p.stepped && p.max > p.min)
     }
 
     fn set_parameter(&mut self, id: ParameterId, value: f64) -> Result<(), PluginError> {
@@ -580,6 +660,7 @@ impl PluginInstance for AuInstance {
         if status != 0 {
             return Err(failed("set parameter", status));
         }
+        self.note_base(id.0, f64::from(v));
         self.notify_ui(id.0);
         Ok(())
     }
@@ -624,10 +705,36 @@ impl PluginInstance for AuInstance {
         if bytes.is_empty() {
             return Err(PluginError::Failed("cannot serialise the state".into()));
         }
-        Ok(bytes)
+        // Saved while modulated: the unit's values are the modulated ones,
+        // the values as set follow the property list.
+        let bases = self.mod_bases.snapshot();
+        if bases.is_empty() {
+            return Ok(bytes);
+        }
+        let mut out = Vec::with_capacity(bytes.len() + 16 + 12 * bases.len());
+        out.extend_from_slice(STATE_MAGIC);
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&bytes);
+        append_bases(&mut out, &bases);
+        Ok(out)
     }
 
     fn load_state(&mut self, data: &[u8]) -> Result<(), PluginError> {
+        let (data, bases) = match data.strip_prefix(STATE_MAGIC) {
+            Some(rest) => {
+                let n = rest
+                    .get(..4)
+                    .and_then(|b| b.try_into().ok())
+                    .map(u32::from_le_bytes)
+                    .ok_or_else(|| PluginError::InvalidState("truncated state".into()))?
+                    as usize;
+                let plist = rest
+                    .get(4..4 + n)
+                    .ok_or_else(|| PluginError::InvalidState("truncated state".into()))?;
+                (plist, read_bases(&rest[4 + n..]))
+            }
+            None => (data, Vec::new()),
+        };
         let plist = plist_from(data);
         if plist.is_null() {
             return Err(PluginError::InvalidState("not a property list".into()));
@@ -648,6 +755,11 @@ impl PluginInstance for AuInstance {
         }
         self.notify_ui(kAUParameterListener_AnyParameter);
         self.query_params();
+        self.refresh_bases();
+        // Parameters saved while modulated: back to their values as set.
+        for (id, v) in bases {
+            let _ = self.set_parameter(ParameterId(id), v);
+        }
         Ok(())
     }
 
@@ -688,12 +800,37 @@ impl PluginInstance for AuInstance {
             Ok(q) => q,
             Err(_) => return Vec::new(),
         };
-        let known = |id: ParameterId| self.params.iter().any(|p| p.id == id);
-        q.drain(..)
-            .filter(|e| match *e {
-                EditorEdit::Begin(id) | EditorEdit::End(id) | EditorEdit::Value(id, _) => known(id),
-            })
-            .collect()
+        let edits: Vec<EditorEdit> = q.drain(..).collect();
+        drop(q);
+        let modulated: Vec<u32> = self
+            .mod_bases
+            .snapshot()
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        let mut out = Vec::with_capacity(edits.len());
+        for e in edits {
+            let id = match e {
+                EditorEdit::Begin(id) | EditorEdit::End(id) | EditorEdit::Value(id, _) => id,
+            };
+            if !self.params.iter().any(|p| p.id == id) {
+                continue;
+            }
+            match e {
+                EditorEdit::Begin(id) => self.gestures.push(id),
+                EditorEdit::End(id) => self.gestures.retain(|g| *g != id),
+                EditorEdit::Value(id, v) => {
+                    // A modulated parameter's value outside a gesture is
+                    // the modulation the unit reports, not an edit.
+                    if modulated.contains(&id.0) && !self.gestures.contains(&id) {
+                        continue;
+                    }
+                    self.note_base(id.0, v);
+                }
+            }
+            out.push(e);
+        }
+        out
     }
 
     fn poll(&mut self) -> PluginPoll {

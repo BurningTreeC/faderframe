@@ -23,6 +23,7 @@
 pub mod builtin;
 pub mod devices;
 pub mod dsp;
+pub mod emulated;
 pub mod eq;
 pub mod harmony;
 mod params;

@@ -12,7 +12,7 @@ use faderframe_automation::ParameterEvent;
 use faderframe_core::{ChannelLayout, ParameterId};
 use faderframe_midi::{ExpressionValue, MidiBuffer, MidiEvent, NoteExpressionKind, TimedMidiEvent};
 use faderframe_plugin_host::{
-    PluginFactory, PluginInstance, PluginProcessContext, PluginProcessor, ProcessConfig,
+    ParamMod, PluginFactory, PluginInstance, PluginProcessContext, PluginProcessor, ProcessConfig,
 };
 use faderframe_plugin_vst3::{Vst3Factory, module, scan, util};
 use faderframe_transport::TransportInfo;
@@ -837,11 +837,20 @@ impl Rig {
     }
 
     fn run(&mut self, p: &mut dyn PluginProcessor, params: &[ParameterEvent]) -> Vec<f32> {
+        self.run_with(p, params, &[])
+    }
+
+    fn run_with(
+        &mut self,
+        p: &mut dyn PluginProcessor,
+        params: &[ParameterEvent],
+        mods: &[ParamMod],
+    ) -> Vec<f32> {
         let ctx = PluginProcessContext {
             transport: &self.transport,
             param_events: params,
             harmony: &faderframe_plugin_host::NO_HARMONY,
-            param_mods: &[],
+            param_mods: mods,
             note_mods: &[],
         };
         let mut io = NodeIo {
@@ -881,6 +890,60 @@ fn scanning_describes_buses_and_categories() {
     assert_eq!(p.audio_outputs, vec![2]);
     assert_eq!(p.note_inputs, 1);
     assert_eq!(p.id, util::tuid_hex(&TestProcessor::CID));
+}
+
+/// Modulators move VST3 parameters by sending the modulated value as a
+/// change, leaving the value as set (the controller's, the saved one)
+/// alone; changes under modulation move the base, and the end of the
+/// modulation puts the base back.
+#[test]
+fn modulation_rides_on_the_value_as_set() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut inst = instantiate();
+    assert!(inst.modulatable(ParameterId(GAIN)));
+    assert!(!inst.modulatable(ParameterId(MODE)), "stepped");
+    assert!(!inst.modulatable(ParameterId(METER)), "read-only");
+    let mut proc = inst.create_processor(&CONFIG).unwrap();
+    let mut rig = Rig::new();
+    let up = [ParamMod {
+        parameter: ParameterId(GAIN),
+        share: 0.25,
+        amount: 0.25,
+    }];
+    ALLOCS.store(0, Ordering::Relaxed);
+    // The modulated value arrives by the block's end (0.5 + 0.25 → ×1.5).
+    let out = rig.run_with(proc.as_mut(), &[], &up);
+    assert_eq!(out[0], 1.0);
+    assert_eq!(out[BLOCK - 1], 1.5);
+    assert_eq!(rig.run_with(proc.as_mut(), &[], &up)[0], 1.5);
+    assert_eq!(inst.parameter(ParameterId(GAIN)), Some(0.5), "as set");
+    // A change from the UI moves the base under the modulation.
+    inst.set_parameter(ParameterId(GAIN), 0.25).unwrap();
+    assert_eq!(rig.run_with(proc.as_mut(), &[], &up)[0], 1.0);
+    // So does automation (clamped at the top of the range).
+    let ev = [ParameterEvent {
+        sample_offset: 32,
+        parameter: ParameterId(GAIN),
+        value: 0.9,
+    }];
+    let out = rig.run_with(proc.as_mut(), &ev, &up);
+    assert_eq!((out[31], out[32]), (1.0, 2.0));
+    // Saved while modulated: the value as set comes back with the state.
+    let state = inst.save_state().unwrap();
+    // Modulation ends: the base again.
+    let out = rig.run_with(proc.as_mut(), &[], &[]);
+    assert_eq!(out[BLOCK - 1], 1.8);
+    assert_eq!(rig.run(proc.as_mut(), &[])[0], 1.8);
+    assert_eq!(ALLOCS.load(Ordering::Relaxed), 0, "allocations in process");
+    drop(proc);
+    drop(inst);
+    let mut again = instantiate();
+    again.load_state(&state).unwrap();
+    let mut proc = again.create_processor(&CONFIG).unwrap();
+    let out = rig.run(proc.as_mut(), &[]);
+    assert!((out[0] - 1.8).abs() < 1e-6, "{}", out[0]);
+    let shown = again.parameter(ParameterId(GAIN)).unwrap();
+    assert!((shown - 0.9).abs() < 1e-6, "{shown}");
 }
 
 /// One test at a time: they share the test plugin's statics.
@@ -1204,6 +1267,78 @@ fn hosts_an_installed_plugin() {
             let out = rig.run(proc.as_mut(), &[]);
             assert!(out.iter().all(|v| v.is_finite()));
             inst.poll();
+        }
+        // Modulation (emulated): each of the first modulatable parameters
+        // moved half its range for a while, then left; the value as set
+        // stays, and the parameter is back at it afterwards (the levels
+        // are printed: dynamic plugins drift on their own).
+        let mut x = 0x1234_5678u32;
+        for c in 0..2 {
+            for v in rig.input[0].channel_mut(c).iter_mut() {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                *v = (x as f32 / u32::MAX as f32 - 0.5) * 0.5;
+            }
+        }
+        let rms = |v: &[f32]| (v.iter().map(|s| s * s).sum::<f32>() / v.len() as f32).sqrt();
+        let settle = |rig: &mut Rig, proc: &mut dyn PluginProcessor, mods: &[ParamMod]| {
+            let mut level = 0.0;
+            for _ in 0..100 {
+                level = rms(&rig.run_with(proc, &[], mods));
+            }
+            level
+        };
+        let ids: Vec<ParameterId> = inst
+            .parameters()
+            .iter()
+            .filter(|q| inst.modulatable(q.id))
+            .map(|q| q.id)
+            .take(6)
+            .collect();
+        eprintln!(
+            "  {} modulatable",
+            inst.parameters()
+                .iter()
+                .filter(|q| inst.modulatable(q.id))
+                .count()
+        );
+        for id in ids {
+            let base = inst.parameter(id).unwrap();
+            let before = settle(&mut rig, proc.as_mut(), &[]);
+            let share = if base > 0.5 { -0.5 } else { 0.5 };
+            let m = [ParamMod {
+                parameter: id,
+                share,
+                amount: share,
+            }];
+            let moved = settle(&mut rig, proc.as_mut(), &m);
+            inst.poll();
+            let shown = inst.parameter(id).unwrap();
+            let after = settle(&mut rig, proc.as_mut(), &[]);
+            let name = inst
+                .parameters()
+                .iter()
+                .find(|q| q.id == id)
+                .unwrap()
+                .name
+                .clone();
+            eprintln!(
+                "  {name}: base {base:.3} (shown {shown:.3} while modulated), level {before:.4} → {moved:.4} → {after:.4}"
+            );
+            assert!(after.is_finite() && moved.is_finite());
+            assert!(
+                (shown - base).abs() < 1e-6,
+                "{name}: the value as set is shown"
+            );
+            // Back at its base (plugins that report their processor's
+            // values show it in the controller again).
+            inst.poll();
+            let now = inst.parameter(id).unwrap();
+            assert!(
+                (now - base).abs() < 1e-4,
+                "{name}: {now} after, {base} before"
+            );
         }
         let state = inst.save_state().unwrap();
         eprintln!("  state {} bytes", state.len());

@@ -21,6 +21,7 @@ use crate::processor::{
 use crate::util::{parse_tuid, wstr};
 use faderframe_core::ParameterId;
 use faderframe_midi::NoteExpressionKind;
+use faderframe_plugin_host::emulated::{ModBases, append_bases, read_bases};
 use faderframe_plugin_host::scan::ScannedPlugin;
 use faderframe_plugin_host::{
     EditorRequests, ParameterInfo, ParameterUnit, ParentWindow, PluginDescriptor, PluginEditor,
@@ -104,6 +105,12 @@ pub struct Vst3Instance {
     config: Option<ProcessConfig>,
     to_rt: Option<rtrb::Producer<(ParamID, ParamValue)>>,
     from_rt: Option<rtrb::Consumer<(ParamID, ParamValue)>>,
+    /// The controller's values after a state load (bases for modulation).
+    bases_tx: Option<rtrb::Producer<(ParamID, ParamValue)>>,
+    /// The bases of the parameters the processor modulates now.
+    mod_bases: Arc<ModBases>,
+    /// Parameters modulation may move (continuous, automatable).
+    modulatable: Vec<ParamID>,
     /// Changes made while inactive, sent to the processor on activation.
     pending: Vec<(ParamID, ParamValue)>,
     latency: u32,
@@ -179,6 +186,9 @@ impl Vst3Instance {
             config: None,
             to_rt: None,
             from_rt: None,
+            bases_tx: None,
+            mod_bases: Arc::default(),
+            modulatable: Vec::new(),
             pending: Vec::new(),
             latency: 0,
             tail: TailLength::None,
@@ -269,6 +279,7 @@ impl Vst3Instance {
             .unwrap_or_default();
         let mut out = Vec::new();
         let mut steps = Vec::new();
+        let mut modulatable = Vec::new();
         // The program-change parameter (often hidden): (id, unit, steps).
         let mut program = None;
         // SAFETY: plain queries with valid out pointers.
@@ -295,6 +306,14 @@ impl Vst3Instance {
                 if s > 0 {
                     steps.push((info.id, s));
                 }
+                // Modulation (sent as changes) for continuous automatable
+                // parameters; never bypass or program switches.
+                if s == 0
+                    && info.flags & kCanAutomate != 0
+                    && info.flags & (kIsReadOnly | kIsBypass | kIsProgramChange) == 0
+                {
+                    modulatable.push(info.id);
+                }
                 let def = info.defaultNormalizedValue.clamp(0.0, 1.0);
                 out.push(ParameterInfo {
                     id: ParameterId(info.id),
@@ -309,6 +328,8 @@ impl Vst3Instance {
             }
         }
         self.params = out;
+        modulatable.sort_unstable();
+        self.modulatable = modulatable;
         self.map = Arc::new(ParamMap::new(steps));
         self.programs = program.map_or_else(Vec::new, |(id, unit, steps)| {
             self.program_names(id, unit, steps)
@@ -515,6 +536,7 @@ impl Vst3Instance {
         let Some(cell) = self.rt.take() else { return };
         self.to_rt = None;
         self.from_rt = None;
+        self.bases_tx = None;
         self.config = None;
         let Some(mut guard) = cell.lock_blocking(10_000) else {
             tracing::error!(
@@ -532,6 +554,38 @@ impl Vst3Instance {
                 self.component.setActive(0);
             }
             drop(active);
+        }
+    }
+
+    /// Every listed parameter's normalised value in the controller.
+    fn controller_values(&self) -> Vec<(ParamID, ParamValue)> {
+        let Some(ctrl) = &self.controller else {
+            return Vec::new();
+        };
+        self.params
+            .iter()
+            // SAFETY: plain query.
+            .map(|p| (p.id.0, unsafe { ctrl.getParamNormalized(p.id.0) }))
+            .collect()
+    }
+
+    /// The processor's bases follow the controller (a loaded state, the
+    /// plugin's own preset); modulated parameters keep theirs (the
+    /// controller may show their modulated values).
+    fn refresh_bases(&mut self) {
+        let modulated: Vec<u32> = self
+            .mod_bases
+            .snapshot()
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        let values = self.controller_values();
+        if let Some(tx) = self.bases_tx.as_mut() {
+            for (id, n) in values {
+                if !modulated.contains(&id) {
+                    let _ = tx.push((id, n));
+                }
+            }
         }
     }
 
@@ -588,10 +642,24 @@ impl FfInstance for Vst3Instance {
         &self.params
     }
 
+    fn modulatable(&self, id: ParameterId) -> bool {
+        self.modulatable.binary_search(&id.0).is_ok()
+    }
+
     fn parameter(&mut self, id: ParameterId) -> Option<f64> {
         let ctrl = self.controller.as_ref()?;
-        // SAFETY: plain query.
-        let n = unsafe { ctrl.getParamNormalized(id.0) };
+        // Modulated: the value as set (the controller may show the
+        // modulated one the processor reported).
+        let n = match self
+            .mod_bases
+            .snapshot()
+            .into_iter()
+            .find(|(p, _)| *p == id.0)
+        {
+            Some((_, base)) => base,
+            // SAFETY: plain query.
+            None => unsafe { ctrl.getParamNormalized(id.0) },
+        };
         Some(self.map.plain(id.0, n))
     }
 
@@ -697,23 +765,25 @@ impl FfInstance for Vst3Instance {
         out.extend_from_slice(&comp);
         out.extend_from_slice(&(ctrl.len() as u32).to_le_bytes());
         out.extend_from_slice(&ctrl);
+        // The component saved modulated values: the values as set follow.
+        append_bases(&mut out, &self.mod_bases.snapshot());
         Ok(out)
     }
 
     fn load_state(&mut self, data: &[u8]) -> Result<(), PluginError> {
         let bad = || PluginError::InvalidState("truncated VST3 state".into());
         // Foreign blobs (no magic) are taken as component state.
-        let (comp, ctrl) = match data.strip_prefix(STATE_MAGIC) {
+        let (comp, ctrl, bases) = match data.strip_prefix(STATE_MAGIC) {
             Some(rest) => {
                 let take = |b: &[u8]| -> Option<(Vec<u8>, usize)> {
                     let n = u32::from_le_bytes(b.get(..4)?.try_into().ok()?) as usize;
                     Some((b.get(4..4 + n)?.to_vec(), 4 + n))
                 };
                 let (comp, used) = take(rest).ok_or_else(bad)?;
-                let ctrl = take(&rest[used..]).map(|(c, _)| c).unwrap_or_default();
-                (comp, ctrl)
+                let (ctrl, more) = take(&rest[used..]).unwrap_or_default();
+                (comp, ctrl, read_bases(&rest[used + more..]))
             }
-            None => (data.to_vec(), Vec::new()),
+            None => (data.to_vec(), Vec::new(), Vec::new()),
         };
         let stream = MemoryStream::with_data(comp);
         // SAFETY: streams alive for the calls.
@@ -733,6 +803,15 @@ impl FfInstance for Vst3Instance {
             }
         }
         self.query_params();
+        // Parameters saved while modulated: back to their values as set.
+        for (id, n) in bases {
+            if let Some(c) = &self.controller {
+                // SAFETY: plain call.
+                unsafe { c.setParamNormalized(id, n) };
+            }
+            self.send(id, n);
+        }
+        self.refresh_bases();
         Ok(())
     }
 
@@ -742,6 +821,7 @@ impl FfInstance for Vst3Instance {
         let flags = self.state.take_restart();
         if flags & (kParamTitlesChanged | kParamValuesChanged) != 0 {
             self.query_params();
+            self.refresh_bases();
             poll.params_changed = true;
         }
         if flags & (kReloadComponent | kIoChanged | kMidiCCAssignmentChanged) != 0 {
@@ -877,6 +957,8 @@ impl FfInstance for Vst3Instance {
             }
             let (mut tx, rx) = rtrb::RingBuffer::new(4096);
             let (out_tx, out_rx) = rtrb::RingBuffer::new(4096);
+            let (bases_tx, bases_rx) = rtrb::RingBuffer::new((self.params.len() * 2).max(256));
+            let values = self.controller_values();
             for (id, n) in self.pending.drain(..) {
                 let _ = tx.push((id, n));
             }
@@ -899,14 +981,18 @@ impl FfInstance for Vst3Instance {
                         };
                         (id, last)
                     }),
+                    values,
+                    bases: Arc::clone(&self.mod_bases),
                 },
                 rx,
                 out_tx,
+                bases_rx,
             );
             self.rt = Some(Arc::new(TryCell::new(Some(active))));
             self.activations += 1;
             self.to_rt = Some(tx);
             self.from_rt = Some(out_rx);
+            self.bases_tx = Some(bases_tx);
             self.config = Some(*config);
         }
         let cell = self

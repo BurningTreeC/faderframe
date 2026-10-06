@@ -18,6 +18,7 @@ faderframe-plugin-host.workspace = true
 faderframe-realtime.workspace = true
 faderframe-transport.workspace = true
 objc2 = { workspace = true, features = ["relax-void-encoding"] }
+rtrb.workspace = true
 tracing.workspace = true
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]

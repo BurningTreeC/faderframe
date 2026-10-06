@@ -12,7 +12,8 @@
 
 use crate::ffi::*;
 use faderframe_audio_graph::NodeIo;
-use faderframe_plugin_host::{PluginProcessContext, PluginProcessor, ProcessStatus};
+use faderframe_plugin_host::emulated::{EmulatedMods, ModBases, delta_of};
+use faderframe_plugin_host::{ParamMod, PluginProcessContext, PluginProcessor, ProcessStatus};
 use faderframe_realtime::TryCell;
 use faderframe_transport::TransportInfo;
 use std::ffi::c_void;
@@ -56,6 +57,33 @@ pub(crate) struct RtState {
     sample_time: f64,
     max_frames: usize,
     midi: bool,
+    /// Modulation set on the unit (Audio Units have none of their own),
+    /// with the parameters' ranges, and the values set elsewhere (the
+    /// UI, the unit's editor, a loaded state) as bases.
+    emu: EmulatedMods,
+    ranges: Box<[(u32, f32, f32)]>,
+    bases_rx: rtrb::Consumer<(u32, f64)>,
+}
+
+/// What the processor needs to modulate (see [`RtState`]'s `emu`).
+pub(crate) struct Modulation {
+    /// Every parameter: id, value now, range.
+    pub params: Vec<(u32, f64, f32, f32)>,
+    pub bases: Arc<ModBases>,
+    pub bases_rx: rtrb::Consumer<(u32, f64)>,
+}
+
+/// A modulation in the parameter's own units.
+fn amount(m: &ParamMod) -> f64 {
+    f64::from(m.amount)
+}
+
+/// `v` within the parameter's range.
+fn clamp_in(ranges: &[(u32, f32, f32)], id: u32, v: f64) -> f64 {
+    match ranges.binary_search_by_key(&id, |r| r.0) {
+        Ok(i) => v.clamp(f64::from(ranges[i].1), f64::from(ranges[i].2)),
+        Err(_) => v,
+    }
 }
 
 // SAFETY: the raw pointers are owned allocations of this state (freed in
@@ -70,6 +98,7 @@ impl RtState {
         outputs: usize,
         max_frames: usize,
         midi: bool,
+        modulation: Modulation,
     ) -> Self {
         let feed = Box::into_raw(Box::new(InputFeed {
             bufs: (0..inputs).map(|_| vec![0.0; max_frames]).collect(),
@@ -92,6 +121,17 @@ impl RtState {
             sample_time: 0.0,
             max_frames,
             midi,
+            emu: EmulatedMods::new(
+                modulation.params.iter().map(|p| (p.0, p.1)).collect(),
+                modulation.bases,
+            ),
+            ranges: {
+                let mut r: Vec<(u32, f32, f32)> =
+                    modulation.params.iter().map(|p| (p.0, p.2, p.3)).collect();
+                r.sort_unstable_by_key(|p| p.0);
+                r.into_boxed_slice()
+            },
+            bases_rx: modulation.bases_rx,
         }
     }
 
@@ -324,19 +364,51 @@ impl PluginProcessor for AuProcessor {
             t.was_playing = t.info.playing;
         }
 
-        // Automation, sample-accurate.
+        // Automation, sample-accurate, with any modulation on top; then
+        // the block's modulation from its start.
         st.events.clear();
         let last = n.saturating_sub(1) as u32;
+        let mods = ctx.param_mods;
+        while let Ok((id, v)) = st.bases_rx.pop() {
+            st.emu.set(id, v);
+        }
+        let event = |parameter: u32, offset: u32, value: f64| AudioUnitParameterEvent {
+            scope: kAudioUnitScope_Global,
+            element: 0,
+            parameter,
+            eventType: kParameterEvent_Immediate,
+            bufferOffset: offset,
+            value: value as f32,
+            _ramp_rest: [0; 2],
+        };
         for e in ctx.param_events.iter().take(EVENT_CAPACITY) {
-            st.events.push(AudioUnitParameterEvent {
-                scope: kAudioUnitScope_Global,
-                element: 0,
-                parameter: e.parameter.0,
-                eventType: kParameterEvent_Immediate,
-                bufferOffset: e.sample_offset.min(last),
-                value: e.value,
-                _ramp_rest: [0; 2],
-            });
+            let id = e.parameter.0;
+            st.emu.set(id, f64::from(e.value));
+            let v = match delta_of(mods, id, amount) {
+                Some(d) => clamp_in(&st.ranges, id, f64::from(e.value) + d),
+                None => f64::from(e.value),
+            };
+            st.events.push(event(id, e.sample_offset.min(last), v));
+        }
+        {
+            let RtState {
+                emu,
+                events,
+                ranges,
+                ..
+            } = st;
+            // Automated parameters had their modulation with each point.
+            let automated = |id: u32| ctx.param_events.iter().any(|e| e.parameter.0 == id);
+            emu.block(
+                mods,
+                amount,
+                |id, v| clamp_in(ranges, id, v),
+                |id, v| {
+                    if !automated(id) && events.len() < events.capacity() {
+                        events.push(event(id, 0, v));
+                    }
+                },
+            );
         }
         // SAFETY: an initialised unit (see `UnitPtr`); the event slice and
         // MIDI bytes are valid for the calls.

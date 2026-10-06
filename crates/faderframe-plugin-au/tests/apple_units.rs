@@ -10,7 +10,8 @@ use faderframe_core::{ChannelLayout, ParameterId};
 use faderframe_midi::{MidiBuffer, MidiEvent, TimedMidiEvent};
 use faderframe_plugin_au::{AuFactory, catalog, scan};
 use faderframe_plugin_host::{
-    PluginFactory, PluginInstance, PluginProcessContext, PluginProcessor, ProcessConfig, TailLength,
+    ParamMod, PluginFactory, PluginInstance, PluginProcessContext, PluginProcessor, ProcessConfig,
+    TailLength,
 };
 use faderframe_transport::TransportInfo;
 
@@ -51,11 +52,20 @@ impl Rig {
     }
 
     fn run(&mut self, p: &mut dyn PluginProcessor, params: &[ParameterEvent]) -> Vec<f32> {
+        self.run_with(p, params, &[])
+    }
+
+    fn run_with(
+        &mut self,
+        p: &mut dyn PluginProcessor,
+        params: &[ParameterEvent],
+        mods: &[ParamMod],
+    ) -> Vec<f32> {
         let ctx = PluginProcessContext {
             transport: &self.transport,
             param_events: params,
             harmony: &faderframe_plugin_host::NO_HARMONY,
-            param_mods: &[],
+            param_mods: mods,
             note_mods: &[],
         };
         let mut io = NodeIo {
@@ -189,6 +199,58 @@ fn automation_reaches_the_unit() {
         quiet < loud * 0.5,
         "cutoff automation had no effect: {loud} → {quiet} (range {range:?})"
     );
+}
+
+/// Modulators move an Audio Unit's parameter by setting the modulated
+/// value on the unit; the value as set stays what the host shows and
+/// saves, and comes back when the modulation ends.
+#[test]
+fn modulation_moves_the_unit_and_keeps_the_value_as_set() {
+    let mut inst = instantiate(LOWPASS);
+    let cutoff = param(&*inst, "cutoff");
+    assert!(inst.modulatable(cutoff));
+    inst.set_parameter(cutoff, 40.0).unwrap();
+    let info = inst
+        .parameters()
+        .iter()
+        .find(|p| p.id == cutoff)
+        .cloned()
+        .unwrap();
+    let mut p = inst.create_processor(&CONFIG).unwrap();
+    let mut rig = Rig::new();
+    rig.input(|i| (i as f32 * std::f32::consts::TAU / 8.0).sin());
+    let energy = |v: &[f32]| v.iter().map(|s| s * s).sum::<f32>();
+    let mut quiet = 0.0;
+    for _ in 0..8 {
+        quiet = energy(&rig.run(&mut *p, &[]));
+    }
+    let open = [ParamMod {
+        parameter: cutoff,
+        share: 1.0,
+        amount: (info.max - info.min) as f32,
+    }];
+    let mut loud = 0.0;
+    for _ in 0..8 {
+        loud = energy(&rig.run_with(&mut *p, &[], &open));
+    }
+    assert!(
+        quiet < loud * 0.5,
+        "modulation had no effect: {quiet} → {loud}"
+    );
+    assert!(
+        (inst.parameter(cutoff).unwrap() - 40.0).abs() < 1e-3,
+        "the value as set"
+    );
+    let state = inst.save_state().unwrap();
+    assert!(state.starts_with(b"FFAU"), "saved with the values as set");
+    let mut again = 0.0;
+    for _ in 0..8 {
+        again = energy(&rig.run(&mut *p, &[]));
+    }
+    assert!(again < loud * 0.5, "back to the value as set: {again}");
+    let mut b = instantiate(LOWPASS);
+    b.load_state(&state).unwrap();
+    assert!((b.parameter(cutoff).unwrap() - 40.0).abs() < 1e-3);
 }
 
 #[test]

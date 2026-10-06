@@ -1616,9 +1616,24 @@ glide), a random source (a new value a step, smoothed) and a macro knob.
 Each routes to any number of targets with a depth (−1..1 of the target's
 range): the track's fader (in fader travel, as a hand would move it), its
 pan, and every device parameter that takes modulation — continuous
-built-in parameters (stepped ones are left out) and CLAP parameters
-flagged `IS_MODULATABLE`. VST3 and AU parameters are not modulated (they
-have no non-destructive modulation). Edits are `Command::SetModulators`
+built-in parameters (stepped ones are left out), CLAP parameters
+flagged `IS_MODULATABLE`, and continuous automatable VST3 and AU
+parameters (not bypass or program switches). VST3 and AU have no
+modulation of their own, so it is emulated
+(`faderframe_plugin_host::emulated`): the processor follows each
+parameter's value as set — the *base*: the UI, automation, mapped MIDI,
+the plugin's own changes that are not a modulated parameter's echo,
+values the controller or unit has after a loaded state (sent through a
+bases ring) — and sends `base + modulation` as an ordinary change (VST3:
+a point at the block's end, so ramping plugins glide; AU: a parameter
+event at the block's start, or with each automation point), the base
+again once the modulation ends. The host keeps showing and recording the
+base (`parameter()` reads it while modulated; an AU editor's values
+outside a gesture are taken as the modulation's echo, not edits), and as
+a plugin's own state holds the modulated values, the bases of modulated
+parameters are saved after it (`FFMB` trailer: after the VST3 state's
+controller part, or around the AU property list in an `FFAU` wrapper) and
+set again on load. Edits are `Command::SetModulators`
 (one undo step a gesture); the session's actions add, change and remove
 modulators and *map* one: while mapping, the next parameter touched on the
 track's devices becomes a target (a FaderFrame control's move is taken for

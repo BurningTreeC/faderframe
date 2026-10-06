@@ -10,7 +10,8 @@
 
 use faderframe_audio_graph::NodeIo;
 use faderframe_midi::{MidiEvent, NoteExpressionKind, NoteIds, TimedMidiEvent};
-use faderframe_plugin_host::{PluginProcessContext, PluginProcessor, ProcessStatus};
+use faderframe_plugin_host::emulated::{EmulatedMods, ModBases, delta_of};
+use faderframe_plugin_host::{ParamMod, PluginProcessContext, PluginProcessor, ProcessStatus};
 use faderframe_realtime::TryCell;
 use std::cell::Cell;
 use std::sync::Arc;
@@ -448,6 +449,10 @@ pub(crate) struct Active {
     context: ProcessContext,
     params_rx: rtrb::Consumer<(ParamID, ParamValue)>,
     out_tx: rtrb::Producer<(ParamID, ParamValue)>,
+    /// Values the controller has now (a loaded state): bases only.
+    bases_rx: rtrb::Consumer<(ParamID, ParamValue)>,
+    /// Modulation sent as parameter changes (VST3 has none of its own).
+    emu: EmulatedMods,
     map: Arc<ParamMap>,
     midi: Option<Box<MidiMap>>,
     /// Ids of the sounding notes (note expressions address them).
@@ -480,6 +485,15 @@ pub(crate) struct ActiveConfig {
     /// The program-change parameter and its last program's index (MIDI
     /// program changes select programs).
     pub program: Option<(ParamID, u32)>,
+    /// Every parameter's value now (normalised), and where the bases of
+    /// modulated ones are published.
+    pub values: Vec<(ParamID, ParamValue)>,
+    pub bases: Arc<ModBases>,
+}
+
+/// A modulation's share of the range: VST3's normalised offset.
+fn share(m: &ParamMod) -> f64 {
+    f64::from(m.share)
 }
 
 impl Active {
@@ -488,8 +502,11 @@ impl Active {
         c: ActiveConfig,
         params_rx: rtrb::Consumer<(ParamID, ParamValue)>,
         out_tx: rtrb::Producer<(ParamID, ParamValue)>,
+        bases_rx: rtrb::Consumer<(ParamID, ParamValue)>,
     ) -> Self {
         Self {
+            emu: EmulatedMods::new(c.values, c.bases),
+            bases_rx,
             processor,
             inputs: Buses::new(&c.inputs, c.max_frames, c.double),
             outputs: Buses::new(&c.outputs, c.max_frames, c.double),
@@ -593,7 +610,15 @@ fn note_event(offset: i32, kind: u16, set: impl FnOnce(&mut Event)) -> Event {
 impl Active {
     /// Notes become events; controllers become parameter changes through the
     /// plugin's MIDI mapping (VST3 has no CC events).
-    fn midi_in(&mut self, io: &NodeIo<'_>, last: i32) {
+    /// A value set this block (`id` at `t`): the new base, and what the
+    /// plugin gets with the parameter's modulation on top.
+    fn set_param(&mut self, mods: &[ParamMod], id: ParamID, t: int32, v: ParamValue) -> bool {
+        self.emu.set(id, v);
+        let v = delta_of(mods, id, share).map_or(v, |d| (v + d).clamp(0.0, 1.0));
+        self.in_params.add(id, t, v)
+    }
+
+    fn midi_in(&mut self, io: &NodeIo<'_>, last: i32, mods: &[ParamMod]) {
         use vst3::Steinberg::Vst::Event_::EventTypes_::*;
         let Some(midi) = io.events_in.first() else {
             return;
@@ -696,17 +721,17 @@ impl Active {
                     value,
                 } => {
                     if let Some(id) = mapped(channel, controller as usize & 127) {
-                        self.in_params.add(id, t, value as f64 / 127.0);
+                        self.set_param(mods, id, t, value as f64 / 127.0);
                     }
                 }
                 MidiEvent::ChannelPressure { channel, pressure } => {
                     if let Some(id) = mapped(channel, AFTERTOUCH) {
-                        self.in_params.add(id, t, pressure as f64 / 127.0);
+                        self.set_param(mods, id, t, pressure as f64 / 127.0);
                     }
                 }
                 MidiEvent::PitchBend { channel, value } => {
                     if let Some(id) = mapped(channel, PITCH_BEND) {
-                        self.in_params.add(id, t, value.min(16383) as f64 / 16383.0);
+                        self.set_param(mods, id, t, value.min(16383) as f64 / 16383.0);
                     }
                 }
                 // SysEx: a data event pointing at the bytes in the graph's
@@ -732,7 +757,7 @@ impl Active {
                         && u32::from(program) <= last
                     {
                         let n = f64::from(program) / f64::from(last);
-                        self.in_params.add(id, t, n);
+                        self.set_param(mods, id, t, n);
                         let _ = self.out_tx.push((id, n));
                     }
                 }
@@ -752,21 +777,36 @@ impl Active {
 
         // Parameter changes: from the UI and the plugin's editor first (they
         // wait in the queue when no slot is free), then automation, then
-        // mapped MIDI controllers.
+        // mapped MIDI controllers; modulation rides on all of them, and
+        // reaches its block's value at the end of the block.
+        let mods = ctx.param_mods;
+        while let Ok((id, v)) = self.bases_rx.pop() {
+            self.emu.set(id, v);
+        }
         while let Ok(&(id, v)) = self.params_rx.peek() {
             if !self.in_params.has_room_for(id) {
                 break;
             }
-            self.in_params.add(id, 0, v);
+            self.set_param(mods, id, 0, v);
             let _ = self.params_rx.pop();
         }
         for e in ctx.param_events {
             let v = self.map.normalized(e.parameter.0, e.value as f64);
-            self.in_params
-                .add(e.parameter.0, (e.sample_offset as i32).min(last), v);
+            self.set_param(mods, e.parameter.0, (e.sample_offset as i32).min(last), v);
         }
         if self.has_event_input {
-            self.midi_in(io, last);
+            self.midi_in(io, last, mods);
+        }
+        {
+            let inp = &self.in_params;
+            self.emu.block(
+                mods,
+                share,
+                |_, v| v.clamp(0.0, 1.0),
+                |id, v| {
+                    inp.add(id, last, v);
+                },
+            );
         }
 
         // Audio: graph input `b` into bus `b` (the main input, then the
@@ -821,10 +861,15 @@ impl Active {
         let result = unsafe { self.processor.process(&mut data) };
         self.continuous += n as i64;
 
-        // Values the processor changed itself go to the controller.
+        // Values the processor changed itself go to the controller (and are
+        // new bases, unless they are a modulated parameter's echo).
         for q in self.out_params.changed() {
             if let Some(v) = q.last() {
-                let _ = self.out_tx.push((q.id.get(), v));
+                let id = q.id.get();
+                if !self.emu.modulated(id) {
+                    self.emu.set(id, v);
+                }
+                let _ = self.out_tx.push((id, v));
             }
         }
 

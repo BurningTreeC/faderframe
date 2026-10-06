@@ -641,6 +641,7 @@ dependencies = [
  "faderframe-realtime",
  "faderframe-transport",
  "objc2",
+ "rtrb",
  "tracing",
 ]
 
