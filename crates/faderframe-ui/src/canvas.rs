@@ -930,38 +930,7 @@ pub fn show_menu(
     popover.set_has_arrow(false);
     popover.add_css_class("ff-menu");
     let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    for item in items {
-        if item.separator_before && list.first_child().is_some() {
-            list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        }
-        let mark = match item.checked {
-            Some(true) => "✓  ",
-            Some(false) => "    ",
-            None => "",
-        };
-        let label = gtk::Label::new(Some(&format!("{mark}{}", item.label)));
-        label.set_xalign(0.0);
-        let button = gtk::Button::new();
-        button.set_child(Some(&label));
-        button.add_css_class("flat");
-        match item.action {
-            Some(action) => {
-                let weak = Rc::downgrade(app);
-                button.connect_clicked(glib::clone!(
-                    #[weak]
-                    popover,
-                    move |_| {
-                        popover.popdown();
-                        if let Some(app) = weak.upgrade() {
-                            app.dispatch(action.clone());
-                        }
-                    }
-                ));
-            }
-            None => button.set_sensitive(false),
-        }
-        list.append(&button);
-    }
+    fill_menu(&list, &popover, Rc::new(items), Vec::new(), app);
     let scroller = gtk::ScrolledWindow::new();
     scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
     scroller.set_propagate_natural_height(true);
@@ -975,6 +944,109 @@ pub fn show_menu(
         glib::idle_add_local_once(move || p.unparent());
     });
     popover.popup();
+}
+
+/// The entries of the menu level `path` (indices into submenus) in `list`;
+/// a submenu entry shows its level in place, with a way back.
+fn fill_menu(
+    list: &gtk::Box,
+    popover: &gtk::Popover,
+    root: Rc<Vec<MenuItem<Action>>>,
+    path: Vec<usize>,
+    app: &Rc<AppState>,
+) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+    let mut level: &[MenuItem<Action>] = &root;
+    let mut title = None;
+    for &i in &path {
+        let Some(item) = level.get(i) else { break };
+        title = Some(item.label.clone());
+        level = &item.children;
+    }
+    let row = |text: &str| {
+        let label = gtk::Label::new(Some(text));
+        label.set_xalign(0.0);
+        let button = gtk::Button::new();
+        button.set_child(Some(&label));
+        button.add_css_class("flat");
+        button
+    };
+    if let Some(title) = title {
+        let back = row(&format!("‹  {title}"));
+        let weak = Rc::downgrade(app);
+        back.connect_clicked(glib::clone!(
+            #[weak]
+            list,
+            #[weak]
+            popover,
+            #[strong]
+            root,
+            #[strong]
+            path,
+            move |_| {
+                if let Some(app) = weak.upgrade() {
+                    let up = path[..path.len() - 1].to_vec();
+                    fill_menu(&list, &popover, root.clone(), up, &app);
+                }
+            }
+        ));
+        list.append(&back);
+        list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    }
+    for (i, item) in level.iter().enumerate() {
+        if item.separator_before && list.first_child().is_some() {
+            list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        }
+        let mark = match item.checked {
+            Some(true) => "✓  ",
+            Some(false) => "    ",
+            None => "",
+        };
+        let more = if item.children.is_empty() {
+            ""
+        } else {
+            "  ›"
+        };
+        let button = row(&format!("{mark}{}{more}", item.label));
+        if !item.children.is_empty() {
+            let weak = Rc::downgrade(app);
+            let mut deeper = path.clone();
+            deeper.push(i);
+            button.connect_clicked(glib::clone!(
+                #[weak]
+                list,
+                #[weak]
+                popover,
+                #[strong]
+                root,
+                move |_| {
+                    if let Some(app) = weak.upgrade() {
+                        fill_menu(&list, &popover, root.clone(), deeper.clone(), &app);
+                    }
+                }
+            ));
+        } else {
+            match item.action.clone() {
+                Some(action) => {
+                    let weak = Rc::downgrade(app);
+                    button.connect_clicked(glib::clone!(
+                        #[weak]
+                        popover,
+                        move |_| {
+                            popover.popdown();
+                            if let Some(app) = weak.upgrade() {
+                                app.dispatch(action.clone());
+                            }
+                        }
+                    ));
+                }
+                None => button.set_sensitive(false),
+            }
+        }
+        list.append(&button);
+    }
 }
 
 /// A canvas plus optional native scrollbars, the unit the dock places.

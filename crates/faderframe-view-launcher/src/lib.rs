@@ -11,7 +11,9 @@
 #![forbid(unsafe_code)]
 
 use faderframe_core::{ClipId, SceneId, TrackId};
-use faderframe_project::launcher::{FollowAction, FollowKind, LaunchQuantize, SlotKey};
+use faderframe_project::launcher::{
+    ClipLaunch, FollowAction, FollowKind, LaunchMode, LaunchQuantize, SlotKey,
+};
 use faderframe_project::{Clip, ClipContent, Track, TrackColor, TrackKind};
 use faderframe_session::launcher::LauncherOp;
 use faderframe_session::{Action, SelectMode, Session};
@@ -67,6 +69,8 @@ pub struct LauncherView {
     drag: Option<Drag>,
     /// Where clips dragged from another view (the arranger) hover.
     drop_hover: Option<Point>,
+    /// The slot whose launch button is held (let go: a release).
+    pressed: Option<SlotKey>,
 }
 
 fn color_of(c: TrackColor) -> Color {
@@ -81,6 +85,7 @@ impl LauncherView {
             sy: 0.0,
             hover: None,
             drag: None,
+            pressed: None,
             drop_hover: None,
         }
     }
@@ -368,6 +373,30 @@ impl LauncherView {
         if dragging_over {
             p.stroke_rounded(cell, 3.0, 2.0, th.ui.accent);
         }
+        // A launch mode other than trigger, and legato: letters at the
+        // right (before the follow chevron).
+        let settings = launcher.launch_of(key);
+        let mark = match settings.mode {
+            LaunchMode::Trigger => "",
+            LaunchMode::Gate => "G",
+            LaunchMode::Toggle => "T",
+            LaunchMode::Repeat => "R",
+        };
+        let mark = format!("{mark}{}", if settings.legato { "L" } else { "" });
+        if !mark.is_empty() {
+            let right = if launcher.follow.contains_key(&key) {
+                16.0
+            } else {
+                5.0
+            };
+            p.text(
+                &mark,
+                Rect::new(cell.right() - right - 24.0, cell.y, 24.0, cell.h),
+                &TextStyle::new(th.fonts.small, th.arranger.clip_text.with_alpha(0.7))
+                    .align(faderframe_ui_canvas::Align::End)
+                    .bold(),
+            );
+        }
         // A follow action: a chevron at the right.
         if launcher.follow.contains_key(&key) {
             let x = cell.right() - 9.0;
@@ -589,47 +618,9 @@ impl LauncherView {
                     "Delete",
                     l(LauncherOp::ClearSlot { track, scene }),
                 ));
-                // Follow actions: what then, and after how long.
-                let now = model
-                    .project()
-                    .launcher
-                    .follow
-                    .get(&SlotKey { track, scene })
-                    .copied();
-                let set = |follow| {
-                    l(LauncherOp::SetFollow {
-                        track,
-                        scene,
-                        follow,
-                    })
-                };
-                items.push(
-                    MenuItem::new("No Follow Action", set(None))
-                        .checked(now.is_none())
-                        .separated(),
-                );
-                for kind in FollowKind::ALL {
-                    let bars = now.map_or(0, |f| f.bars);
-                    items.push(
-                        MenuItem::new(
-                            format!("Then: {}", kind.label()),
-                            set(Some(FollowAction { kind, bars })),
-                        )
-                        .checked(now.is_some_and(|f| f.kind == kind)),
-                    );
-                }
-                if let Some(f) = now {
-                    for (i, bars) in [0u16, 1, 2, 4, 8].into_iter().enumerate() {
-                        let label = match bars {
-                            0 => "After the Clip".to_string(),
-                            1 => "After 1 Bar".to_string(),
-                            n => format!("After {n} Bars"),
-                        };
-                        let item = MenuItem::new(label, set(Some(FollowAction { bars, ..f })))
-                            .checked(f.bars == bars);
-                        items.push(if i == 0 { item.separated() } else { item });
-                    }
-                }
+                let key = SlotKey { track, scene };
+                items.extend(Self::launch_items(model, key));
+                items.push(Self::follow_menu(model, key));
             }
             None => {
                 if matches!(kind, Some(TrackKind::Instrument | TrackKind::Midi)) {
@@ -642,6 +633,218 @@ impl LauncherView {
             }
         }
         items
+    }
+
+    /// A slot's launch settings: mode, quantisation, legato.
+    fn launch_items(model: &Session, key: SlotKey) -> Vec<MenuItem<Action>> {
+        let launcher = &model.project().launcher;
+        let now = launcher.launch_of(key);
+        let set = |launch: ClipLaunch| {
+            Action::Launcher(LauncherOp::SetClipLaunch {
+                track: key.track,
+                scene: key.scene,
+                launch: Some(launch),
+            })
+        };
+        let modes = LaunchMode::ALL
+            .iter()
+            .map(|m| {
+                MenuItem::new(m.label(), set(ClipLaunch { mode: *m, ..now }))
+                    .checked(now.mode == *m)
+            })
+            .collect();
+        let mut quantize = vec![
+            MenuItem::new(
+                format!("The Launcher's ({})", launcher.quantize.label()),
+                set(ClipLaunch {
+                    quantize: None,
+                    ..now
+                }),
+            )
+            .checked(now.quantize.is_none()),
+        ];
+        for (i, q) in LaunchQuantize::ALL.iter().enumerate() {
+            let item = MenuItem::new(
+                q.label(),
+                set(ClipLaunch {
+                    quantize: Some(*q),
+                    ..now
+                }),
+            )
+            .checked(now.quantize == Some(*q));
+            quantize.push(if i == 0 { item.separated() } else { item });
+        }
+        vec![
+            MenuItem::submenu(format!("Launch Mode: {}", now.mode.label()), modes).separated(),
+            MenuItem::submenu(
+                format!("Launch Quantize: {}", launcher.quantize_of(key).label()),
+                quantize,
+            ),
+            MenuItem::new(
+                "Legato",
+                set(ClipLaunch {
+                    legato: !now.legato,
+                    ..now
+                }),
+            )
+            .checked(now.legato),
+        ]
+        .into_iter()
+        .chain(Self::tempo_item(model, key, now, set))
+        .collect()
+    }
+
+    /// Audio: follow the project's tempo (the audio as it sounds now is
+    /// in time).
+    fn tempo_item(
+        model: &Session,
+        key: SlotKey,
+        now: ClipLaunch,
+        set: impl Fn(ClipLaunch) -> Action,
+    ) -> Option<MenuItem<Action>> {
+        let p = model.project();
+        let clip = p.clip(*p.launcher.slots.get(&key)?)?;
+        if !matches!(clip.content, ClipContent::Audio(_)) {
+            return None;
+        }
+        let item = match now.tempo {
+            Some(bpm) => MenuItem::new(
+                format!("Follow Tempo (in time at {bpm:.1} BPM)"),
+                set(ClipLaunch { tempo: None, ..now }),
+            )
+            .checked(true),
+            None => {
+                let here = model.playhead();
+                MenuItem::new(
+                    "Follow Tempo",
+                    set(ClipLaunch {
+                        tempo: Some(p.timeline.tempo.bpm_at(here)),
+                        ..now
+                    }),
+                )
+                .checked(false)
+            }
+        };
+        Some(item)
+    }
+
+    /// A slot's follow action: what then (and otherwise, with a chance),
+    /// after how long.
+    fn follow_menu(model: &Session, key: SlotKey) -> MenuItem<Action> {
+        let launcher = &model.project().launcher;
+        let now = launcher.follow.get(&key).copied();
+        let set = |follow| {
+            Action::Launcher(LauncherOp::SetFollow {
+                track: key.track,
+                scene: key.scene,
+                follow,
+            })
+        };
+        let base = now.unwrap_or_default();
+        let kinds = |pick: &dyn Fn(FollowKind) -> Option<FollowAction>,
+                     current: Option<FollowKind>| {
+            let mut out: Vec<MenuItem<Action>> = FollowKind::ALL
+                .iter()
+                .map(|k| MenuItem::new(k.label(), set(pick(*k))).checked(current == Some(*k)))
+                .collect();
+            let jumps: Vec<MenuItem<Action>> = (0..launcher.scenes.len().min(64))
+                .map(|i| {
+                    let k = FollowKind::Jump(i as u16);
+                    MenuItem::new(
+                        format!("{} ({})", k.label(), launcher.scenes[i].name),
+                        set(pick(k)),
+                    )
+                    .checked(current == Some(k))
+                })
+                .collect();
+            if !jumps.is_empty() {
+                out.push(MenuItem::submenu("Jump to Scene", jumps).separated());
+            }
+            out
+        };
+        let mut items = vec![MenuItem::new("None", set(None)).checked(now.is_none())];
+        let then = kinds(
+            &|k| Some(FollowAction { kind: k, ..base }),
+            now.map(|f| f.kind),
+        );
+        items.push(MenuItem::submenu(
+            format!(
+                "Then: {}",
+                now.map_or_else(|| "—".to_string(), |f| f.kind.label())
+            ),
+            then,
+        ));
+        if let Some(f) = now {
+            let mut otherwise = vec![
+                MenuItem::new("Nothing Else", set(Some(FollowAction { other: None, ..f })))
+                    .checked(f.other.is_none()),
+            ];
+            let more = kinds(
+                &|k| {
+                    Some(FollowAction {
+                        other: Some(k),
+                        chance: if f.other.is_none() { 50 } else { f.chance },
+                        ..f
+                    })
+                },
+                f.other,
+            );
+            otherwise.extend(
+                more.into_iter()
+                    .enumerate()
+                    .map(|(i, m)| if i == 0 { m.separated() } else { m }),
+            );
+            items.push(MenuItem::submenu(
+                format!(
+                    "Otherwise: {}",
+                    f.other.map_or_else(|| "—".to_string(), |k| k.label())
+                ),
+                otherwise,
+            ));
+            if f.other.is_some() {
+                let chances = [100u8, 90, 75, 50, 25, 10, 0]
+                    .into_iter()
+                    .map(|c| {
+                        MenuItem::new(
+                            format!("{c} % Then, {} % Otherwise", 100 - c),
+                            set(Some(FollowAction { chance: c, ..f })),
+                        )
+                        .checked(f.chance == c)
+                    })
+                    .collect();
+                items.push(MenuItem::submenu(
+                    format!("Chance: {} %", f.chance),
+                    chances,
+                ));
+            }
+            let after = [0u16, 1, 2, 4, 8, 16]
+                .into_iter()
+                .map(|bars| {
+                    let label = match bars {
+                        0 => "After the Clip".to_string(),
+                        1 => "After 1 Bar".to_string(),
+                        n => format!("After {n} Bars"),
+                    };
+                    MenuItem::new(label, set(Some(FollowAction { bars, ..f })))
+                        .checked(f.bars == bars)
+                })
+                .collect();
+            items.push(MenuItem::submenu(
+                match f.bars {
+                    0 => "When: After the Clip".to_string(),
+                    1 => "When: After 1 Bar".to_string(),
+                    n => format!("When: After {n} Bars"),
+                },
+                after,
+            ));
+        }
+        MenuItem::submenu(
+            format!(
+                "Follow Action: {}",
+                now.map_or_else(|| "None".to_string(), |f| f.kind.label())
+            ),
+            items,
+        )
     }
 
     fn scene_menu(scene: SceneId) -> Vec<MenuItem<Action>> {
@@ -847,6 +1050,7 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for LauncherView {
                     } => {
                         if play {
                             cx.emit(l(LauncherOp::Launch { track, scene }));
+                            self.pressed = Some(SlotKey { track, scene });
                         } else if clicks >= 2 {
                             if model.project().clip(c).is_some_and(is_midi) {
                                 cx.emit(Action::OpenClipEditor(c));
@@ -947,6 +1151,14 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for LauncherView {
                 button: PointerButton::Primary,
                 modifiers,
             } => {
+                // A held launch let go (gate and repeat clips stop).
+                if let Some(k) = self.pressed.take() {
+                    cx.emit(l(LauncherOp::Release {
+                        track: k.track,
+                        scene: k.scene,
+                    }));
+                    return true;
+                }
                 let Some(d) = self.drag.take() else {
                     return false;
                 };

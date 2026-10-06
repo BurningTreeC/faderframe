@@ -278,6 +278,16 @@ pub struct LaunchLane {
 pub struct Follow {
     /// Samples after the clip started.
     pub after: i64,
+    pub first: FollowChoice,
+    /// The second action, taken when the draw misses `chance`.
+    pub second: Option<FollowChoice>,
+    /// Percent for `first` (with a second action).
+    pub chance: u8,
+}
+
+/// Where one follow action goes.
+#[derive(Debug)]
+pub struct FollowChoice {
     /// The slots it may go to (empty: the track stops).
     pub targets: Vec<u64>,
     /// One of the targets at random (else the first).
@@ -693,12 +703,15 @@ impl TimelineSnapshot {
             .iter()
             .map(|(k, c)| (*c, k.hash()))
             .collect();
-        let slot_clips: Vec<faderframe_project::Clip> = in_slots
+        // As they play: from the song's start, following the tempo.
+        let slot_clips: Vec<faderframe_project::Clip> = project
+            .launcher
+            .slots
             .keys()
-            .filter_map(|id| project.clips.get(id))
+            .filter_map(|k| project.launcher_clip_as_played(*k))
             .map(|c| faderframe_project::Clip {
                 start: faderframe_timeline::MusicalTime::ZERO,
-                ..c.clone()
+                ..c
             })
             .collect();
         let mut launch_lanes: HashMap<u64, Lane> = HashMap::new();
@@ -885,30 +898,28 @@ impl TimelineSnapshot {
             })
             .collect();
         launch.sort_by_key(|l| l.slot);
-        // Follow actions: targets among the track's clips in scene order.
-        let mut by_track: HashMap<TrackId, Vec<faderframe_project::launcher::SlotKey>> =
-            HashMap::new();
-        for scene in &project.launcher.scenes {
-            for key in project
-                .launcher
-                .slots
-                .keys()
-                .filter(|k| k.scene == scene.id)
-            {
-                by_track.entry(key.track).or_default().push(*key);
-            }
-        }
+        // Follow actions: targets among the track's clips in scene order
+        // (or a scene's, for a jump).
+        let keys: HashMap<u64, faderframe_project::launcher::SlotKey> = project
+            .launcher
+            .slots
+            .keys()
+            .map(|k| (k.hash(), *k))
+            .collect();
         for l in &mut launch {
-            let Some(list) = by_track.get(&l.track) else {
+            let Some(key) = keys.get(&l.slot) else {
                 continue;
             };
-            let Some(at) = list.iter().position(|k| k.hash() == l.slot) else {
+            let Some(f) = project.launcher.follow.get(key) else {
                 continue;
             };
-            let Some(f) = project.launcher.follow.get(&list[at]) else {
-                continue;
+            let choice = |kind| {
+                let (targets, random) = project.launcher.follow_targets(*key, kind);
+                FollowChoice {
+                    targets: targets.into_iter().map(|k| k.hash()).collect(),
+                    random,
+                }
             };
-            let (targets, random) = f.kind.targets(at, list.len());
             let after = if f.bars == 0 {
                 l.length
             } else {
@@ -916,8 +927,9 @@ impl TimelineSnapshot {
             };
             l.follow = Some(Follow {
                 after: after.max(1),
-                targets: targets.into_iter().map(|i| list[i].hash()).collect(),
-                random,
+                first: choice(f.kind),
+                second: f.other.map(choice),
+                chance: f.chance.min(100),
             });
         }
         lanes.sort_by_key(|(t, _)| *t);

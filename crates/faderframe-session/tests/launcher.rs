@@ -392,6 +392,8 @@ fn follow_actions_go_with_their_clips() {
     let follow = FollowAction {
         kind: FollowKind::Other,
         bars: 2,
+        other: Some(FollowKind::Jump(0)),
+        chance: 70,
     };
     op(
         &mut s,
@@ -428,4 +430,105 @@ fn follow_actions_go_with_their_clips() {
     assert!(s.project().launcher.follow.is_empty());
     s.dispatch(Action::Undo).unwrap();
     assert_eq!(s.project().launcher.follow.get(&key(sc[1])), Some(&follow));
+}
+
+/// Launch modes: a toggle stops on its second press, a gate stops when
+/// let go; the settings are saved, go with their clips and undo.
+#[test]
+fn launch_modes_answer_presses_and_releases() {
+    use faderframe_project::launcher::{ClipLaunch, LaunchMode};
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    s.start_audio(
+        vec![Box::new(DummyBackend::default())],
+        &AudioPreferences::default(),
+    )
+    .unwrap();
+    let drums = track(&s, "Drums");
+    let first = s.project().clips_of(drums)[0].id;
+    op(&mut s, LauncherOp::SendClips(vec![first]));
+    op(&mut s, LauncherOp::AddScene { after: None });
+    let sc = scenes(&s);
+    let key = |scene| SlotKey {
+        track: drums,
+        scene,
+    };
+    let set = |s: &mut Session, mode, scene| {
+        op(
+            s,
+            LauncherOp::SetClipLaunch {
+                track: drums,
+                scene,
+                launch: Some(ClipLaunch {
+                    mode,
+                    quantize: Some(LaunchQuantize::None),
+                    legato: false,
+                    tempo: None,
+                }),
+            },
+        );
+    };
+    set(&mut s, LaunchMode::Toggle, sc[0]);
+    assert_eq!(
+        s.project().launcher.quantize_of(key(sc[0])),
+        LaunchQuantize::None
+    );
+    let slot = key(sc[0]).hash();
+    let playing = |s: &Session| s.launch_state(drums).and_then(|t| t.playing).map(|p| p.0);
+    let press = |s: &mut Session| {
+        op(
+            s,
+            LauncherOp::Launch {
+                track: drums,
+                scene: sc[0],
+            },
+        )
+    };
+    press(&mut s);
+    wait_for(&mut s, "the toggle to play", |s| playing(s) == Some(slot));
+    press(&mut s);
+    wait_for(&mut s, "the toggle to stop", |s| playing(s).is_none());
+    // A gate plays while held.
+    set(&mut s, LaunchMode::Gate, sc[0]);
+    press(&mut s);
+    wait_for(&mut s, "the gate to play", |s| playing(s) == Some(slot));
+    run(&mut s, 50);
+    assert_eq!(playing(&s), Some(slot), "still held");
+    op(
+        &mut s,
+        LauncherOp::Release {
+            track: drums,
+            scene: sc[0],
+        },
+    );
+    wait_for(&mut s, "the gate to stop", |s| playing(s).is_none());
+    // Moved with the clip, gone with it, back with undo; saved.
+    op(
+        &mut s,
+        LauncherOp::MoveClip {
+            from: key(sc[0]),
+            to: key(sc[1]),
+            copy: false,
+        },
+    );
+    assert_eq!(
+        s.project().launcher.launch_of(key(sc[1])).mode,
+        LaunchMode::Gate
+    );
+    assert!(!s.project().launcher.launch.contains_key(&key(sc[0])));
+    let json = serde_json::to_string(&s.project().launcher).unwrap();
+    let back: faderframe_project::launcher::Launcher = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, s.project().launcher);
+    op(
+        &mut s,
+        LauncherOp::ClearSlot {
+            track: drums,
+            scene: sc[1],
+        },
+    );
+    assert!(s.project().launcher.launch.is_empty());
+    s.dispatch(Action::Undo).unwrap();
+    assert_eq!(
+        s.project().launcher.launch_of(key(sc[1])).mode,
+        LaunchMode::Gate
+    );
 }

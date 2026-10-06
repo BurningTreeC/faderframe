@@ -1,13 +1,16 @@
 use crate::{Cursor, Painter, Point, Rect, Size, Theme, ViewEvent};
 
 /// An entry of a context menu requested by a view.
+#[derive(Clone)]
 pub struct MenuItem<A> {
     pub label: String,
-    /// `None` renders a disabled entry.
+    /// `None` renders a disabled entry (unless it opens `children`).
     pub action: Option<A>,
     pub checked: Option<bool>,
     /// Draw a separator before this entry.
     pub separator_before: bool,
+    /// A submenu (the entry opens it instead of acting).
+    pub children: Vec<MenuItem<A>>,
 }
 
 impl<A> MenuItem<A> {
@@ -17,6 +20,7 @@ impl<A> MenuItem<A> {
             action: Some(action),
             checked: None,
             separator_before: false,
+            children: Vec::new(),
         }
     }
 
@@ -26,6 +30,18 @@ impl<A> MenuItem<A> {
             action: None,
             checked: None,
             separator_before: false,
+            children: Vec::new(),
+        }
+    }
+
+    /// An entry that opens `children`.
+    pub fn submenu(label: impl Into<String>, children: Vec<MenuItem<A>>) -> Self {
+        Self {
+            label: label.into(),
+            action: None,
+            checked: None,
+            separator_before: false,
+            children,
         }
     }
 

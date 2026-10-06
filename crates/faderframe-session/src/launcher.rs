@@ -14,8 +14,9 @@
 
 use crate::{Result, Session, SessionError};
 use faderframe_core::{ClipId, SceneId, TrackId};
+use faderframe_engine::launch::Quantize;
 use faderframe_engine::launch::{LaunchCommand, TrackStatus};
-use faderframe_project::launcher::{LaunchQuantize, Scene, SlotKey};
+use faderframe_project::launcher::{LaunchMode, LaunchQuantize, Scene, SlotKey};
 use faderframe_project::{Clip, ClipContent, Command, MidiClip, Project, TrackKind};
 use faderframe_timeline::MusicalTime;
 use std::collections::HashMap;
@@ -23,10 +24,22 @@ use std::collections::HashMap;
 /// A launcher edit or action.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LauncherOp {
-    /// Launch a slot's clip (an empty slot stops its track).
+    /// A slot's launch button pressed: its clip launches as its launch
+    /// mode says (a toggle playing stops); an empty slot stops its track.
     Launch {
         track: TrackId,
         scene: SceneId,
+    },
+    /// The launch button let go (gate and repeat clips stop).
+    Release {
+        track: TrackId,
+        scene: SceneId,
+    },
+    /// A slot's launch settings (`None`: the defaults).
+    SetClipLaunch {
+        track: TrackId,
+        scene: SceneId,
+        launch: Option<faderframe_project::launcher::ClipLaunch>,
     },
     /// Launch a scene's row.
     LaunchScene(SceneId),
@@ -182,8 +195,8 @@ impl Session {
             .slots
             .keys()
             .find(|k| k.hash() == slot)?;
-        let clip = self.project.clips.get(&self.project.launcher.slots[key])?;
-        let length = self.launch_length(clip).max(1);
+        let clip = self.project.launcher_clip_as_played(*key)?;
+        let length = self.launch_length(&clip).max(1);
         let pos = self.transport.position;
         Some(((pos - start).rem_euclid(length)) as f32 / length as f32)
     }
@@ -206,6 +219,7 @@ impl Session {
             LauncherOp::Launch { track, .. } | LauncherOp::StopTrack(track) => {
                 self.end_slot_recording(Some(*track));
             }
+            LauncherOp::Release { .. } | LauncherOp::SetClipLaunch { .. } => {}
             LauncherOp::LaunchScene(_) | LauncherOp::StopAll => self.end_slot_recording(None),
             _ => {}
         }
@@ -213,26 +227,74 @@ impl Session {
             LauncherOp::Record { track, scene } => self.record_slot(track, scene)?,
             LauncherOp::Launch { track, scene } => match self.project.launcher.clip(track, scene) {
                 Some(_) => {
-                    let slot = SlotKey { track, scene }.hash();
-                    self.engine.launch(LaunchCommand::Launch {
-                        track,
-                        slot,
-                        quantize,
-                    })?;
-                    self.start_for_launch()?;
+                    let key = SlotKey { track, scene };
+                    let settings = self.project.launcher.launch_of(key);
+                    let q: Quantize = self.project.launcher.quantize_of(key).into();
+                    let slot = key.hash();
+                    let state = self.launch_state(track);
+                    let busy = state.is_some_and(|s| {
+                        s.playing.is_some_and(|(p, _)| p == slot)
+                            || s.queued.is_some_and(|(n, _)| n == Some(slot))
+                    });
+                    if settings.mode == LaunchMode::Toggle && busy {
+                        self.engine
+                            .launch(LaunchCommand::Stop { track, quantize: q })?;
+                    } else {
+                        let repeat = match settings.mode {
+                            LaunchMode::Repeat => self.repeat_every(q),
+                            _ => 0,
+                        };
+                        self.engine.launch(LaunchCommand::Launch {
+                            track,
+                            slot,
+                            quantize: q,
+                            legato: settings.legato,
+                            repeat,
+                        })?;
+                        self.start_for_launch()?;
+                    }
                 }
                 None => self
                     .engine
                     .launch(LaunchCommand::Stop { track, quantize })?,
             },
+            LauncherOp::Release { track, scene } => {
+                let key = SlotKey { track, scene };
+                if self.project.launcher.slots.contains_key(&key)
+                    && matches!(
+                        self.project.launcher.launch_of(key).mode,
+                        LaunchMode::Gate | LaunchMode::Repeat
+                    )
+                {
+                    self.engine.launch(LaunchCommand::Release {
+                        track,
+                        slot: key.hash(),
+                        quantize: self.project.launcher.quantize_of(key).into(),
+                    })?;
+                }
+            }
+            LauncherOp::SetClipLaunch {
+                track,
+                scene,
+                launch,
+            } => {
+                self.edit(Command::SetClipLaunch {
+                    track,
+                    scene,
+                    launch,
+                })?;
+            }
             LauncherOp::LaunchScene(scene) => {
                 let tracks: Vec<TrackId> = self.launcher_tracks().iter().map(|t| t.id).collect();
                 for track in tracks {
+                    let key = SlotKey { track, scene };
                     let cmd = match self.project.launcher.clip(track, scene) {
                         Some(_) => LaunchCommand::Launch {
                             track,
-                            slot: SlotKey { track, scene }.hash(),
-                            quantize,
+                            slot: key.hash(),
+                            quantize: self.project.launcher.quantize_of(key).into(),
+                            legato: self.project.launcher.launch_of(key).legato,
+                            repeat: 0,
                         },
                         None => LaunchCommand::Stop { track, quantize },
                     };
@@ -286,6 +348,18 @@ impl Session {
                             track: k.track,
                             scene,
                             follow: None,
+                        }),
+                );
+                commands.extend(
+                    self.project
+                        .launcher
+                        .launch
+                        .keys()
+                        .filter(|k| k.scene == scene)
+                        .map(|k| Command::SetClipLaunch {
+                            track: k.track,
+                            scene,
+                            launch: None,
                         }),
                 );
                 let mut scenes = self.project.launcher.scenes.clone();
@@ -342,6 +416,13 @@ impl Session {
                             track: k.track,
                             scene: id,
                             follow: Some(*f),
+                        });
+                    }
+                    if let Some(l) = self.project.launcher.launch.get(&k) {
+                        commands.push(Command::SetClipLaunch {
+                            track: k.track,
+                            scene: id,
+                            launch: Some(*l),
                         });
                     }
                 }
@@ -451,6 +532,19 @@ impl Session {
                     scene: to.scene,
                     follow,
                 });
+                let launch = self.project.launcher.launch.get(&from).copied();
+                if !copy && launch.is_some() {
+                    commands.push(Command::SetClipLaunch {
+                        track: from.track,
+                        scene: from.scene,
+                        launch: None,
+                    });
+                }
+                commands.push(Command::SetClipLaunch {
+                    track: to.track,
+                    scene: to.scene,
+                    launch,
+                });
                 self.edit(Command::Batch {
                     label: if copy { "Copy Clip" } else { "Move Clip" }.into(),
                     commands,
@@ -470,6 +564,11 @@ impl Session {
                                 track,
                                 scene,
                                 follow: None,
+                            },
+                            Command::SetClipLaunch {
+                                track,
+                                scene,
+                                launch: None,
                             },
                         ],
                     })?;
@@ -680,11 +779,21 @@ impl Session {
             }
             self.peaks.insert(id, std::sync::Arc::new(peaks));
         }
+        let at = self.engine.samples_to_musical(&self.project, slot.from);
+        let follow = self.follow_tempo_command(
+            &clip,
+            SlotKey {
+                track: slot.track,
+                scene: slot.scene,
+            },
+            at,
+        );
         commands.push(Command::SetLauncherSlot {
             track: slot.track,
             scene: slot.scene,
             clip: Some(Box::new(clip)),
         });
+        commands.extend(follow);
         self.edit(Command::Batch {
             label: "Record Clip".into(),
             commands,
@@ -718,6 +827,40 @@ impl Session {
         {
             self.notify(crate::NoticeLevel::Error, e.to_string());
         }
+    }
+
+    /// An audio clip entering a slot follows the tempo from the one it was
+    /// in time with (at `at`).
+    fn follow_tempo_command(&self, clip: &Clip, key: SlotKey, at: MusicalTime) -> Option<Command> {
+        clip.is_audio().then(|| Command::SetClipLaunch {
+            track: key.track,
+            scene: key.scene,
+            launch: Some(faderframe_project::launcher::ClipLaunch {
+                tempo: Some(self.project.timeline.tempo.bpm_at(at)),
+                ..self.project.launcher.launch_of(key)
+            }),
+        })
+    }
+
+    /// How often a repeating clip starts again: its launch quantum where
+    /// the playhead is (a sixteenth without quantisation).
+    fn repeat_every(&self, q: Quantize) -> i64 {
+        let tl = &self.project.timeline;
+        let rate = self.engine.sample_rate() as f64;
+        let pos = self.engine.transport_snapshot().position.max(0);
+        let here = tl.to_musical(pos, rate);
+        let length = match q {
+            Quantize::None => MusicalTime::from_quarters(0.25),
+            Quantize::Beat => {
+                let sig = tl.meter.signature_of_bar(tl.meter.bar_at(here));
+                MusicalTime::from_quarters(4.0 / f64::from(sig.denominator.max(1)))
+            }
+            Quantize::Bars(n) => {
+                let bar = tl.meter.bar_at(here);
+                tl.meter.bar_start(bar + n as i32) - tl.meter.bar_start(bar)
+            }
+        };
+        (tl.to_samples(here + length, rate) - tl.to_samples(here, rate)).max(1)
     }
 
     /// Launching while stopped starts playback.
@@ -763,15 +906,22 @@ impl Session {
                     name: format!("Scene {}", scenes.len() + 1),
                 });
             }
+            let at = c.start;
             let mut copy = c;
             copy.id = self.project.ids.allocate();
             copy.track = track;
             copy.start = MusicalTime::ZERO;
+            let key = SlotKey {
+                track,
+                scene: scenes[i].id,
+            };
+            let follow = self.follow_tempo_command(&copy, key, at);
             commands.push(Command::SetLauncherSlot {
                 track,
                 scene: scenes[i].id,
                 clip: Some(Box::new(copy)),
             });
+            commands.extend(follow);
         }
         commands.insert(0, Command::SetScenes { scenes });
         self.edit(Command::Batch {
@@ -817,11 +967,20 @@ impl Session {
             let mut copy = c.clone();
             copy.id = self.project.ids.allocate();
             copy.start = MusicalTime::ZERO;
+            let follow = self.follow_tempo_command(
+                &copy,
+                SlotKey {
+                    track: c.track,
+                    scene,
+                },
+                c.start,
+            );
             commands.push(Command::SetLauncherSlot {
                 track: c.track,
                 scene,
                 clip: Some(Box::new(copy)),
             });
+            commands.extend(follow);
         }
         if commands.is_empty() {
             return Ok(());
@@ -917,11 +1076,18 @@ impl Session {
         let mut scratch = self.project.clone();
         let mut commands = Vec::new();
         for run in runs.iter().filter(|r| r.end > r.start) {
-            let Some(clip) = self.project.clips.get(&run.clip) else {
+            // As it played (following the tempo).
+            let Some(clip) = self
+                .project
+                .launcher
+                .slot_of(run.clip)
+                .and_then(|k| self.project.launcher_clip_as_played(k))
+                .or_else(|| self.project.clips.get(&run.clip).cloned())
+            else {
                 continue;
             };
-            let length = self.launch_length(clip);
-            for cmd in run_commands(&mut scratch, run, clip, length, |p, s| {
+            let length = self.launch_length(&clip);
+            for cmd in run_commands(&mut scratch, run, &clip, length, |p, s| {
                 self.engine.samples_to_musical(p, s)
             }) {
                 let applied = cmd.clone().apply(&mut scratch);

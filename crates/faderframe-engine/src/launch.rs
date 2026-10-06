@@ -50,10 +50,22 @@ pub enum LaunchCommand {
         /// The slot's number, below 2^63 (`SlotKey::hash`).
         slot: u64,
         quantize: Quantize,
+        /// Take over the playing clip's position (in time).
+        legato: bool,
+        /// Start again every this many samples until stopped (0: no).
+        repeat: i64,
     },
     /// Stop the track's clip (the track is then silent).
     Stop {
         track: TrackId,
+        quantize: Quantize,
+    },
+    /// A held launch (gate, repeat) let go: the slot's clip stops at the
+    /// next launch position, or a quantum after it started if it has not
+    /// yet.
+    Release {
+        track: TrackId,
+        slot: u64,
         quantize: Quantize,
     },
     StopAll {
@@ -82,6 +94,12 @@ pub struct TrackLaunch {
     pub arrangement: bool,
     /// `next` is the playing clip's follow action (not launched).
     pub followed: bool,
+    /// `next` takes over the playing clip's position.
+    pub legato: bool,
+    /// The slot launched to repeat, and every how many samples.
+    pub repeat: Option<(u64, i64)>,
+    /// Released before its launch took effect: it stops here then.
+    pub stop_after: Option<i64>,
 }
 
 /// What a player plays over a piece of a block.
@@ -104,6 +122,15 @@ impl TrackLaunch {
             None => Play::Silence,
         }
     }
+
+    /// Where a clip launched to take effect at `at` starts (a legato one
+    /// where the playing clip did).
+    fn start_of_next(&self, at: i64) -> i64 {
+        match self.current {
+            Some((_, start)) if self.legato => start,
+            _ => at,
+        }
+    }
 }
 
 /// What to play over the block `[pos, pos + n)`: up to two pieces
@@ -122,7 +149,10 @@ pub fn pieces(
         Some((slot, at)) if at < pos + n as i64 => {
             let split = (at - pos).clamp(0, n as i64) as usize;
             let after = match slot {
-                Some(slot) => Play::Clip { slot, start: at },
+                Some(slot) => Play::Clip {
+                    slot,
+                    start: t.start_of_next(at),
+                },
                 None => Play::Silence,
             };
             if split == 0 {
@@ -184,6 +214,9 @@ impl LaunchState {
             next: None,
             arrangement: true,
             followed: false,
+            legato: false,
+            repeat: None,
+            stop_after: None,
         });
         self.tracks.last_mut()
     }
@@ -210,28 +243,68 @@ impl LaunchState {
                 track,
                 slot,
                 quantize,
+                legato,
+                repeat,
             } => {
                 let at = at(quantize);
                 if let Some(t) = self.entry(track) {
                     t.next = Some((Some(slot), at));
                     t.followed = false;
+                    t.legato = legato;
+                    t.repeat = (repeat > 0).then_some((slot, repeat));
+                    t.stop_after = None;
                 }
             }
             LaunchCommand::Stop { track, quantize } => {
                 let at = at(quantize);
-                if let Some(t) = self.entry(track)
-                    && (t.current.is_some() || t.next.is_some())
-                {
-                    t.next = Some((None, at));
-                    t.followed = false;
+                if let Some(t) = self.entry(track) {
+                    t.repeat = None;
+                    t.stop_after = None;
+                    if t.current.is_some() || t.next.is_some() {
+                        t.next = Some((None, at));
+                        t.followed = false;
+                        t.legato = false;
+                    }
+                }
+            }
+            LaunchCommand::Release {
+                track,
+                slot,
+                quantize,
+            } => {
+                let at = at(quantize);
+                if let Some(t) = self.entry(track) {
+                    if t.repeat.is_some_and(|(s, _)| s == slot) {
+                        t.repeat = None;
+                    }
+                    match t.next {
+                        // Not started yet: it plays one quantum.
+                        Some((Some(s), when)) if s == slot && !t.followed => {
+                            t.stop_after = Some(if playing {
+                                next_boundary(quantize, when + 1, timeline, rate)
+                            } else {
+                                when + 1
+                            });
+                        }
+                        _ if t.current.is_some_and(|(s, _)| s == slot) => {
+                            t.next = Some((None, at));
+                            t.followed = false;
+                            t.legato = false;
+                            t.stop_after = None;
+                        }
+                        _ => {}
+                    }
                 }
             }
             LaunchCommand::StopAll { quantize } => {
                 let at = at(quantize);
                 for t in &mut self.tracks {
+                    t.repeat = None;
+                    t.stop_after = None;
                     if t.current.is_some() || t.next.is_some() {
                         t.next = Some((None, at));
                         t.followed = false;
+                        t.legato = false;
                     }
                 }
             }
@@ -240,6 +313,9 @@ impl LaunchState {
                     t.current = Some((slot, start.min(pos)));
                     t.next = None;
                     t.followed = false;
+                    t.legato = false;
+                    t.repeat = None;
+                    t.stop_after = None;
                     t.arrangement = false;
                 }
             }
@@ -248,6 +324,9 @@ impl LaunchState {
                     t.current = None;
                     t.next = None;
                     t.followed = false;
+                    t.legato = false;
+                    t.repeat = None;
+                    t.stop_after = None;
                     t.arrangement = true;
                 }
             }
@@ -295,9 +374,11 @@ impl LaunchState {
             if let Some((slot, at)) = t.next
                 && at < end
             {
-                t.current = slot.map(|s| (s, at));
-                t.next = None;
+                let start = t.start_of_next(at);
+                t.current = slot.map(|s| (s, start));
+                t.next = t.stop_after.take().map(|stop| (None, stop.max(at + 1)));
                 t.followed = false;
+                t.legato = false;
                 t.arrangement = false;
             }
         }
@@ -308,6 +389,9 @@ impl LaunchState {
     pub fn stopped(&mut self) {
         for t in &mut self.tracks {
             t.next = None;
+            t.legato = false;
+            t.repeat = None;
+            t.stop_after = None;
             if t.current.take().is_some() {
                 t.arrangement = false;
             }
@@ -315,26 +399,39 @@ impl LaunchState {
     }
 
     /// Follow actions: a clip playing with nothing queued gets its follow
-    /// action queued (after every chunk and command).
+    /// action queued, or starts again when it repeats (after every chunk
+    /// and command).
     pub fn follow(&mut self, timeline: &crate::snapshot::TimelineSnapshot) {
         let mut rng = self.rng;
+        let mut draw = || {
+            // xorshift64
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
         for t in &mut self.tracks {
             let (Some((slot, start)), None) = (t.current, t.next) else {
                 continue;
             };
+            if let Some((repeat, every)) = t.repeat
+                && repeat == slot
+            {
+                t.next = Some((Some(slot), start + every.max(1)));
+                t.followed = true;
+                continue;
+            }
             let Some(f) = timeline.launch_lane(slot).and_then(|l| l.follow.as_ref()) else {
                 continue;
             };
-            let target = match f.targets.len() {
+            let choice = match &f.second {
+                Some(second) if draw() % 100 >= u64::from(f.chance) => second,
+                _ => &f.first,
+            };
+            let target = match choice.targets.len() {
                 0 => None,
-                n if f.random => {
-                    // xorshift64
-                    rng ^= rng << 13;
-                    rng ^= rng >> 7;
-                    rng ^= rng << 17;
-                    Some(f.targets[(rng % n as u64) as usize])
-                }
-                _ => Some(f.targets[0]),
+                n if choice.random => Some(choice.targets[(draw() % n as u64) as usize]),
+                _ => Some(choice.targets[0]),
             };
             t.next = Some((target, start + f.after));
             t.followed = true;
@@ -503,6 +600,8 @@ mod tests {
                 track: t,
                 slot: 42,
                 quantize: Quantize::Bars(1),
+                legato: false,
+                repeat: 0,
             },
             90_000,
             true,

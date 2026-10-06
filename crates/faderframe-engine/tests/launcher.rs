@@ -114,6 +114,8 @@ fn a_launched_clip_starts_on_the_bar_loops_and_stops() {
                 track: t,
                 slot: s,
                 quantize: Quantize::Bars(1),
+                legato: false,
+                repeat: 0,
             })
             .unwrap();
         let more = take(&mut r, BAR + 3 * BEAT - out.len());
@@ -164,6 +166,8 @@ fn launching_while_stopped_plays_from_the_start_of_playback() {
             track: t,
             slot: s,
             quantize: Quantize::Bars(1),
+            legato: false,
+            repeat: 0,
         })
         .unwrap();
     take(&mut r, 256);
@@ -214,6 +218,8 @@ fn launcher_clips_play_from_disk() {
             track: t,
             slot: s,
             quantize: Quantize::None,
+            legato: false,
+            repeat: 0,
         })
         .unwrap();
     take(&mut r, 512);
@@ -283,6 +289,8 @@ fn a_launched_midi_clip_plays_and_releases_the_arrangements_notes() {
             track: t,
             slot: s,
             quantize: Quantize::Bars(1),
+            legato: false,
+            repeat: 0,
         })
         .unwrap();
     let out = take(&mut r, BAR / 2 + 2 * BAR);
@@ -321,6 +329,8 @@ fn a_new_launcher_track_is_played_live() {
             track: t,
             slot: s,
             quantize: Quantize::None,
+            legato: false,
+            repeat: 0,
         })
         .unwrap();
     let out = take(&mut r, 4096);
@@ -347,10 +357,14 @@ fn follow_actions_move_on_exactly_on_time() {
             (scenes[0], FollowKind::Next, 1),
             (scenes[1], FollowKind::Stop, 0),
         ] {
-            tp.project
-                .launcher
-                .follow
-                .insert(SlotKey { track: t, scene }, FollowAction { kind, bars });
+            tp.project.launcher.follow.insert(
+                SlotKey { track: t, scene },
+                FollowAction {
+                    kind,
+                    bars,
+                    ..FollowAction::default()
+                },
+            );
         }
         let mut r = renderer(&tp, block);
         r.play_from(0).unwrap();
@@ -359,6 +373,8 @@ fn follow_actions_move_on_exactly_on_time() {
                 track: t,
                 slot: first,
                 quantize: Quantize::None,
+                legato: false,
+                repeat: 0,
             })
             .unwrap();
         let out = take(&mut r, BAR + 2 * BEAT);
@@ -380,4 +396,156 @@ fn follow_actions_move_on_exactly_on_time() {
         // A follow action is not shown as a launch waiting.
         assert!(r.controller.launch_status()[0].queued.is_none());
     }
+}
+
+/// Two bar-long ramps on one track (different levels): the slots.
+fn two_ramps() -> (TestProject, TrackId, [u64; 2], [Vec<f32>; 2]) {
+    let mut tp = TestProject::new(SR);
+    let t = tp.track(TrackKind::Audio, "Loop", ChannelLayout::Mono);
+    let ramp =
+        |lo: f32| -> Vec<f32> { (0..BAR).map(|i| lo + 0.3 * i as f32 / BAR as f32).collect() };
+    let (a, b) = (ramp(0.2), ramp(0.6));
+    let sa = tp.source(AudioData::from_channels(SR, vec![a.clone()]));
+    let sb = tp.source(AudioData::from_channels(SR, vec![b.clone()]));
+    let first = slot(&mut tp, t, audio(sa, BAR));
+    let second = slot(&mut tp, t, audio(sb, BAR));
+    (tp, t, [first, second], [a, b])
+}
+
+fn launch(
+    r: &mut OfflineRenderer,
+    track: TrackId,
+    slot: u64,
+    q: Quantize,
+    legato: bool,
+    repeat: i64,
+) {
+    r.controller
+        .launch(LaunchCommand::Launch {
+            track,
+            slot,
+            quantize: q,
+            legato,
+            repeat,
+        })
+        .unwrap();
+}
+
+#[test]
+fn legato_keeps_the_position_and_repeat_restarts_until_let_go() {
+    for block in [64, 333] {
+        let (tp, t, [a, b], [ra, rb]) = two_ramps();
+        let mut r = renderer(&tp, block);
+        r.play_from(0).unwrap();
+        launch(&mut r, t, a, Quantize::None, false, 0);
+        let mut out = take(&mut r, BEAT + BEAT / 2);
+        let g = out[100] / ra[100];
+        // Legato on the beat: the second clip from where the first was.
+        launch(&mut r, t, b, Quantize::Beat, true, 0);
+        out.extend(take(&mut r, 3 * BEAT - out.len()));
+        for i in (BEAT..3 * BEAT).step_by(97) {
+            let want = if i < 2 * BEAT { ra[i] } else { rb[i] };
+            assert!(
+                (out[i] - g * want).abs() < 1e-4,
+                "block {block}: frame {i}: {} (want {})",
+                out[i],
+                g * want
+            );
+        }
+        // Repeat every beat (from its start each time), then let go: it
+        // stops on the next beat.
+        let at = out.len();
+        launch(&mut r, t, a, Quantize::Beat, false, BEAT as i64);
+        let from = at.div_ceil(BEAT) * BEAT;
+        out.extend(take(&mut r, from + 2 * BEAT + BEAT / 3 - out.len()));
+        r.controller
+            .launch(LaunchCommand::Release {
+                track: t,
+                slot: a,
+                quantize: Quantize::Beat,
+            })
+            .unwrap();
+        let released = out.len();
+        out.extend(take(&mut r, from + 5 * BEAT - out.len()));
+        let stop = released.div_ceil(BEAT) * BEAT;
+        for i in (from..from + 5 * BEAT).step_by(89) {
+            let want = if i < stop { ra[(i - from) % BEAT] } else { 0.0 };
+            assert!(
+                (out[i] - g * want).abs() < 1e-4,
+                "block {block}: frame {i}: {} (want {})",
+                out[i],
+                g * want
+            );
+        }
+        // Let go before its launch: it still plays one quantum (a bar).
+        let at = out.len();
+        launch(&mut r, t, b, Quantize::Bars(1), false, 0);
+        r.controller
+            .launch(LaunchCommand::Release {
+                track: t,
+                slot: b,
+                quantize: Quantize::Bars(1),
+            })
+            .unwrap();
+        let bar = at.div_ceil(BAR) * BAR;
+        out.extend(take(&mut r, bar + BAR + BEAT - out.len()));
+        assert!((out[bar + 10] - g * rb[10]).abs() < 1e-4, "it started");
+        assert!(
+            (out[bar + BAR - 10] - g * rb[BAR - 10]).abs() < 1e-4,
+            "for a bar"
+        );
+        assert!(out[bar + BAR + 10].abs() < 1e-6, "then stopped");
+    }
+}
+
+#[test]
+fn follow_actions_draw_between_two_and_jump_to_scenes() {
+    use faderframe_project::launcher::{FollowAction, FollowKind};
+    let (mut tp, t, [a, b], [ra, rb]) = two_ramps();
+    let scenes: Vec<SceneId> = tp.project.launcher.scenes.iter().map(|s| s.id).collect();
+    // The first: Next with no chance, so always the second action (jump
+    // to scene 2); the second: back to scene 1 by a jump after a beat.
+    tp.project.launcher.follow.insert(
+        SlotKey {
+            track: t,
+            scene: scenes[0],
+        },
+        FollowAction {
+            kind: FollowKind::Next,
+            bars: 0,
+            other: Some(FollowKind::Jump(1)),
+            chance: 0,
+        },
+    );
+    tp.project.launcher.follow.insert(
+        SlotKey {
+            track: t,
+            scene: scenes[1],
+        },
+        FollowAction {
+            kind: FollowKind::Jump(0),
+            bars: 1,
+            other: Some(FollowKind::Stop),
+            chance: 100,
+        },
+    );
+    let mut r = renderer(&tp, 256);
+    r.play_from(0).unwrap();
+    launch(&mut r, t, a, Quantize::None, false, 0);
+    let out = take(&mut r, 3 * BAR + 10);
+    let g = out[100] / ra[100];
+    for (i, want) in [
+        (100, ra[100]),
+        (BAR + 100, rb[100]),
+        (2 * BAR + 100, ra[100]),
+        (3 * BAR + 5, rb[5]),
+    ] {
+        assert!(
+            (out[i] - g * want).abs() < 1e-4,
+            "frame {i}: {} (want {})",
+            out[i],
+            g * want
+        );
+    }
+    let _ = b;
 }

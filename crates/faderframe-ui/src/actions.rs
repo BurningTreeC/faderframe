@@ -1281,8 +1281,41 @@ pub fn install(app: &Rc<AppState>) {
         }),
         named("launcher", |a, arg| {
             let records = a.session.borrow().launcher_records();
-            // `follow=<track>@<n>=<kind>[/<bars>]`: a slot's follow action
-            // (kind as in its menu, e.g. next; `none` clears it).
+            // `follow=<track>@<n>=<kind>[/<bars>][:<other>@<chance>]`: a
+            // slot's follow action (kind as in its menu, e.g. next, or
+            // `jump<scene>`; `none` clears it). `mode=<track>@<n>=<mode>
+            // [/<quantize index>][/legato]`: its launch settings.
+            if let Some(rest) = arg.strip_prefix("mode=") {
+                use faderframe_project::launcher::{ClipLaunch, LaunchMode, LaunchQuantize};
+                let Some((slot, what)) = rest.split_once('=') else {
+                    return;
+                };
+                let mut parts = what.split('/');
+                let mode = parts.next().and_then(|m| {
+                    LaunchMode::ALL
+                        .into_iter()
+                        .find(|k| k.label().eq_ignore_ascii_case(m))
+                });
+                let quantize = parts
+                    .next()
+                    .and_then(|q| q.parse::<usize>().ok())
+                    .and_then(|i| LaunchQuantize::ALL.get(i).copied());
+                let legato = parts.next() == Some("legato");
+                let found = slot_by_name(a, slot);
+                if let (Some(mode), Some((track, scene))) = (mode, found) {
+                    a.dispatch(Action::Launcher(LauncherOp::SetClipLaunch {
+                        track,
+                        scene,
+                        launch: Some(ClipLaunch {
+                            mode,
+                            quantize,
+                            legato,
+                            tempo: None,
+                        }),
+                    }));
+                }
+                return;
+            }
             if let Some(rest) = arg.strip_prefix("follow=") {
                 use faderframe_project::launcher::{FollowAction, FollowKind};
                 let Some((slot, what)) = rest.split_once('=') else {
@@ -1291,14 +1324,31 @@ pub fn install(app: &Rc<AppState>) {
                 let Some((name, n)) = slot.split_once('@') else {
                     return;
                 };
+                let (what, second) = what
+                    .split_once(':')
+                    .map_or((what, None), |(a, b)| (a, Some(b)));
                 let (kind, bars) = what.split_once('/').unwrap_or((what, "0"));
-                let follow = FollowKind::ALL
-                    .into_iter()
-                    .find(|k| k.label().eq_ignore_ascii_case(kind))
-                    .map(|kind| FollowAction {
-                        kind,
-                        bars: bars.parse().unwrap_or(0),
-                    });
+                let parse_kind = |k: &str| {
+                    if let Some(n) = k.strip_prefix("jump") {
+                        return n
+                            .parse::<u16>()
+                            .ok()
+                            .map(|n| FollowKind::Jump(n.saturating_sub(1)));
+                    }
+                    FollowKind::ALL
+                        .into_iter()
+                        .find(|f| f.label().eq_ignore_ascii_case(k))
+                };
+                let (other, chance) = match second.and_then(|b| b.split_once('@')) {
+                    Some((k, c)) => (parse_kind(k), c.parse().unwrap_or(50)),
+                    None => (None, 100),
+                };
+                let follow = parse_kind(kind).map(|kind| FollowAction {
+                    kind,
+                    bars: bars.parse().unwrap_or(0),
+                    other,
+                    chance,
+                });
                 let found = {
                     let s = a.session.borrow();
                     let p = s.project();
@@ -2280,4 +2330,21 @@ fn section_op(app: &Rc<AppState>, arg: &str, copy: bool) {
             copy,
         });
     }
+}
+
+/// `<track name>@<scene number>` as a slot.
+fn slot_by_name(
+    a: &AppState,
+    slot: &str,
+) -> Option<(faderframe_core::TrackId, faderframe_core::SceneId)> {
+    let (name, n) = slot.split_once('@')?;
+    let s = a.session.borrow();
+    let p = s.project();
+    let track = p.tracks.iter().find(|t| t.name == name)?.id;
+    let scene = n
+        .parse::<usize>()
+        .ok()
+        .and_then(|n| p.launcher.scenes.get(n.saturating_sub(1)))?
+        .id;
+    Some((track, scene))
 }

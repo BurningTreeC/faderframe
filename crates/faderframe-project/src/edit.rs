@@ -422,6 +422,12 @@ pub enum Command {
         scene: faderframe_core::SceneId,
         follow: Option<crate::launcher::FollowAction>,
     },
+    /// A slot's launch settings (`None`: the defaults).
+    SetClipLaunch {
+        track: TrackId,
+        scene: faderframe_core::SceneId,
+        launch: Option<crate::launcher::ClipLaunch>,
+    },
     /// Replace everything that lives in time (clips, automation, tempo and
     /// meter, markers, sections, loop and punch) at once: section moves,
     /// copies and deletes (see [`crate::arrange`]).
@@ -702,6 +708,7 @@ impl Command {
             SetScenes { .. } => "Scenes".into(),
             SetLaunchQuantize { .. } => "Launch Quantize".into(),
             SetFollowAction { .. } => "Follow Action".into(),
+            SetClipLaunch { .. } => "Clip Launch".into(),
             SetArrangement { .. } => "Rearrange".into(),
             SetAlbum { .. } => "Edit Album".into(),
             SetSongInserts { .. } => "Change Song Inserts".into(),
@@ -780,7 +787,8 @@ impl Command {
             | SetAlbum { .. }
             | SetLyrics { .. }
             | SetScenes { .. }
-            | SetLaunchQuantize { .. } => Impact::None,
+            | SetLaunchQuantize { .. }
+            | SetClipLaunch { .. } => Impact::None,
             AddSource { .. }
             | RemoveSource { .. }
             | AddAutomationLane { .. }
@@ -1724,6 +1732,22 @@ impl Command {
                     track,
                     scene,
                     follow: old,
+                }
+            }
+            SetClipLaunch {
+                track,
+                scene,
+                launch,
+            } => {
+                let key = crate::launcher::SlotKey { track, scene };
+                let old = match launch.filter(|l| !l.is_default()) {
+                    Some(l) => p.launcher.launch.insert(key, l),
+                    None => p.launcher.launch.remove(&key),
+                };
+                SetClipLaunch {
+                    track,
+                    scene,
+                    launch: old,
                 }
             }
             SetArrangement { arrangement } => SetArrangement {

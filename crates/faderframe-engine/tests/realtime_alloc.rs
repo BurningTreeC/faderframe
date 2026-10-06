@@ -1032,10 +1032,14 @@ fn the_clip_launcher_does_not_allocate() {
             } else {
                 FollowKind::Previous
             };
-            project
-                .launcher
-                .follow
-                .insert(key, FollowAction { kind, bars: 1 });
+            project.launcher.follow.insert(
+                key,
+                FollowAction {
+                    kind,
+                    bars: 1,
+                    ..FollowAction::default()
+                },
+            );
         }
     }
     let sources = render_generated_sources(&project, SR);
@@ -1049,16 +1053,22 @@ fn the_clip_launcher_does_not_allocate() {
     for _ in 0..4 {
         r.processor.process_device(&mut bufs);
     }
-    let launch = |r: &mut OfflineRenderer, scene: usize, quantize: Quantize| {
-        for &(track, k, slot) in &slots {
-            if k == scene {
-                let _ = r.controller.launch(LaunchCommand::Launch {
-                    track,
-                    slot,
-                    quantize,
-                });
+    let launch_as =
+        |r: &mut OfflineRenderer, scene: usize, quantize: Quantize, legato: bool, repeat: i64| {
+            for &(track, k, slot) in &slots {
+                if k == scene {
+                    let _ = r.controller.launch(LaunchCommand::Launch {
+                        track,
+                        slot,
+                        quantize,
+                        legato,
+                        repeat,
+                    });
+                }
             }
-        }
+        };
+    let launch = |r: &mut OfflineRenderer, scene: usize, quantize: Quantize| {
+        launch_as(r, scene, quantize, false, 0);
     };
     // Launching scenes (at once and on the beat), looping, stopping a
     // track and all, locating, stopping the transport, back to the
@@ -1089,6 +1099,19 @@ fn the_clip_launcher_does_not_allocate() {
                     let _ = r.controller.transport(TransportCommand::Stop);
                     let _ = r.controller.transport(TransportCommand::Play);
                     launch(&mut r, 1, Quantize::None);
+                }
+                // Legato into the other scene, repeating, then let go.
+                950 => launch_as(&mut r, 0, Quantize::Beat, true, SR as i64 / 4),
+                980 => {
+                    for &(track, k, slot) in &slots {
+                        if k == 0 {
+                            let _ = r.controller.launch(LaunchCommand::Release {
+                                track,
+                                slot,
+                                quantize: Quantize::Beat,
+                            });
+                        }
+                    }
                 }
                 1_000 => {
                     let _ = r.controller.launch(LaunchCommand::BackToArrangement);
