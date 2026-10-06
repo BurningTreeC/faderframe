@@ -33,6 +33,7 @@ pub mod preview;
 pub mod record;
 mod slots;
 mod snapshot;
+pub mod varispeed;
 
 pub use build::{AheadPlan, BuiltGraph, MidiRouting, NodeOwner, NodeWork, build_graph};
 pub use click::{MetronomeMode, MetronomeShared};

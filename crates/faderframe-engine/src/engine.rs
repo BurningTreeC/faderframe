@@ -87,6 +87,8 @@ enum Message {
         play: bool,
     },
     Launch(crate::launch::LaunchCommand),
+    /// Play at a speed (see [`crate::varispeed`]), or no more.
+    Varispeed(Option<Box<crate::varispeed::Varispeed>>),
 }
 
 /// Objects retired by the audio thread, dropped on the control thread.
@@ -103,6 +105,7 @@ enum Garbage {
     MidiOutQueue(#[allow(dead_code)] Box<faderframe_midi::MidiOutputQueue>),
     MidiRecorder(#[allow(dead_code)] Box<crate::midi::MidiRecorder>),
     Preview(#[allow(dead_code)] Box<crate::preview::Preview>),
+    Varispeed(#[allow(dead_code)] Box<crate::varispeed::Varispeed>),
 }
 
 /// When a callback started (MIDI clock) and the transport position then,
@@ -152,6 +155,10 @@ pub struct EngineShared {
     pub metrics: CallbackMetrics,
     stream_sample_rate: AtomicU32,
     stream_buffer_size: AtomicU32,
+    stream_inputs: AtomicU32,
+    stream_outputs: AtomicU32,
+    /// Varispeed: the playback speed (f64 bits; 0 = 1).
+    speed: AtomicU64,
     /// The running graph was prepared for a different sample rate.
     rate_mismatch: AtomicBool,
     /// Objects that could not be returned (garbage queue full) and were leaked.
@@ -188,6 +195,16 @@ pub struct EngineShared {
 }
 
 /// Create a connected controller/processor pair.
+impl EngineShared {
+    /// The varispeed speed (1: none).
+    pub fn speed(&self) -> f64 {
+        match f64::from_bits(self.speed.load(Ordering::Relaxed)) {
+            s if s > 0.0 && s.is_finite() => s,
+            _ => 1.0,
+        }
+    }
+}
+
 pub fn create(config: EngineConfig) -> (EngineController, EngineProcessor) {
     create_with_epoch(config, Epoch::new())
 }
@@ -257,6 +274,7 @@ pub fn create_with_epoch(
         pool: None,
         ahead: None,
         preview: None,
+        varispeed: None,
     };
     let controller = EngineController {
         config,
@@ -297,6 +315,7 @@ pub fn create_with_epoch(
         ahead_rings: Default::default(),
         ahead_tracks: Default::default(),
         ahead_misses: Arc::new(AtomicU64::new(0)),
+        varispeed: false,
     };
     (controller, processor)
 }
@@ -329,6 +348,7 @@ pub struct EngineProcessor {
     ahead: Option<Box<crate::ahead::AheadLink>>,
     /// Album playback's file.
     preview: Option<Box<crate::preview::Preview>>,
+    varispeed: Option<Box<crate::varispeed::Varispeed>>,
 }
 
 impl EngineProcessor {
@@ -438,6 +458,11 @@ impl EngineProcessor {
                         TransportCommand::Stop
                     });
                 }
+                Message::Varispeed(v) => {
+                    if let Some(old) = std::mem::replace(&mut self.varispeed, v) {
+                        self.retire(Garbage::Varispeed(old));
+                    }
+                }
                 Message::Launch(cmd) => {
                     let rate = self.stream_rate as f64;
                     self.ctx.launch.command(
@@ -484,6 +509,22 @@ impl EngineProcessor {
             self.shared.epoch.advance();
             return;
         }
+        // Varispeed: the engine renders the frames the device's need at
+        // the speed (resampled both ways).
+        match self.varispeed.take() {
+            Some(mut v) => {
+                let speed = self.shared.speed();
+                v.process(io, speed, |e| self.render(e, started));
+                self.varispeed = Some(v);
+            }
+            None => self.render(io, started),
+        }
+    }
+
+    /// One callback's processing (the device's frames, or the engine's
+    /// under varispeed).
+    fn render(&mut self, io: &mut dyn DeviceBuffers, started: Instant) {
+        let frames = io.frames();
         for c in 0..io.output_channels() {
             io.output(c).fill(0.0);
         }
@@ -749,6 +790,12 @@ impl AudioCallback for EngineProcessor {
         self.shared
             .stream_buffer_size
             .store(info.buffer_size, Ordering::Relaxed);
+        self.shared
+            .stream_inputs
+            .store(u32::from(info.input_channels), Ordering::Relaxed);
+        self.shared
+            .stream_outputs
+            .store(u32::from(info.output_channels), Ordering::Relaxed);
     }
 
     fn process(&mut self, io: &mut dyn DeviceBuffers) {
@@ -826,6 +873,8 @@ pub struct EngineController {
     ahead_rings: std::collections::HashMap<faderframe_core::TrackId, Arc<crate::ahead::AheadRing>>,
     ahead_tracks: std::collections::HashSet<faderframe_core::TrackId>,
     ahead_misses: Arc<AtomicU64>,
+    /// Varispeed is on.
+    varispeed: bool,
 }
 
 /// The tracks with launcher clips (sorted).
@@ -1005,7 +1054,8 @@ impl EngineController {
         if !self.shared.transport.snapshot().playing {
             return Some(pos);
         }
-        let rate = self.stream_sample_rate() as f64;
+        // At the varispeed's speed.
+        let rate = self.stream_sample_rate() as f64 * self.speed();
         Some(pos + ((t_ns as f64 - cb as f64) * rate / 1e9) as i64)
     }
 
@@ -1511,6 +1561,39 @@ impl EngineController {
 
     pub fn transport(&mut self, cmd: TransportCommand) -> Result<(), EngineError> {
         self.send(Message::Transport(cmd))
+    }
+
+    /// Varispeed on (for the stream as it runs) or off; see
+    /// [`crate::varispeed`].
+    pub fn set_varispeed(&mut self, on: bool) -> Result<(), EngineError> {
+        self.set_speed(1.0);
+        let v = on.then(|| {
+            let ins = self.shared.stream_inputs.load(Ordering::Relaxed) as usize;
+            let outs = self.shared.stream_outputs.load(Ordering::Relaxed) as usize;
+            let buffer = self.shared.stream_buffer_size.load(Ordering::Relaxed) as usize;
+            Box::new(crate::varispeed::Varispeed::new(
+                ins,
+                outs.max(1),
+                (buffer * 4).max(8192),
+            ))
+        });
+        self.varispeed = on;
+        self.send(Message::Varispeed(v))
+    }
+
+    pub fn varispeed(&self) -> bool {
+        self.varispeed
+    }
+
+    /// The varispeed's speed (clamped to ±2 %).
+    pub fn set_speed(&self, speed: f64) {
+        let d = crate::varispeed::MAX_DEVIATION;
+        let s = speed.clamp(1.0 - d, 1.0 + d);
+        self.shared.speed.store(s.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn speed(&self) -> f64 {
+        self.shared.speed()
     }
 
     /// Launch or stop launcher clips (see [`crate::launch`]).

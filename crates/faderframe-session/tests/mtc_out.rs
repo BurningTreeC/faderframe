@@ -44,11 +44,7 @@ fn mtc_goes_out_from_the_project_start_timecode() {
     assert_eq!(&full[..9], &[0xF0, 0x7F, 0x7F, 0x01, 0x01, 0x21, 0, 0, 0]);
     // Quarter frames: whole sequences spell 01:00:00:ff with ff even and
     // rising.
-    let qf: Vec<u8> = got
-        .iter()
-        .filter(|m| m[0] == 0xF1)
-        .map(|m| m[1])
-        .collect();
+    let qf: Vec<u8> = got.iter().filter(|m| m[0] == 0xF1).map(|m| m[1]).collect();
     assert!(qf.len() >= 24, "{} quarter frames", qf.len());
     let first = qf.iter().position(|b| b >> 4 == 0).unwrap();
     let mut last_frame = None;

@@ -280,8 +280,13 @@ pub fn sync_status_text(st: &faderframe_session::SyncStatus) -> String {
             } else {
                 ""
             };
+            let speed = if (st.speed - 1.0).abs() > 1e-6 {
+                format!(" · speed {:+.3} %", (st.speed - 1.0) * 100.0)
+            } else {
+                String::new()
+            };
             format!(
-                "{what} · {} · off by {:.1} ms · {} re-lock{}{tempo}",
+                "{what} · {} · off by {:.1} ms{speed} · {} re-lock{}{tempo}",
                 if st.running { "following" } else { "stopped" },
                 st.error_ms,
                 st.relocks,
@@ -367,15 +372,22 @@ fn sync_section(app: &Rc<AppState>) -> SyncWidgets {
     ));
     grid.attach(&label("MTC sent at"), 0, 3, 1, 1);
     grid.attach(&out_rate, 1, 3, 1, 1);
-    grid.attach(&status, 1, 4, 1, 1);
+    let varispeed = gtk::CheckButton::with_label("Follow by varispeed (no jumps)");
+    varispeed.set_active(current.varispeed);
+    varispeed.set_tooltip_text(Some(
+        "Play a little faster or slower to stay with the master (within 1 %), instead of jumping back into step when the clocks drift apart",
+    ));
+    grid.attach(&varispeed, 1, 4, 1, 1);
+    grid.attach(&status, 1, 5, 1, 1);
 
     let apply = {
         let weak = Rc::downgrade(app);
-        let (source, port, offset, out_rate) = (
+        let (source, port, offset, out_rate, vs) = (
             source.clone(),
             port.clone(),
             offset.clone(),
             out_rate.clone(),
+            varispeed.clone(),
         );
         let ports = ports.clone();
         let absent = current.port.clone();
@@ -385,6 +397,7 @@ fn sync_section(app: &Rc<AppState>) -> SyncWidgets {
             s.source = SyncSource::ALL[source.selected() as usize % SyncSource::ALL.len()];
             let rates = faderframe_session::MtcRate::ALL;
             s.mtc_out_rate = rates[out_rate.selected() as usize % rates.len()];
+            s.varispeed = vs.is_active();
             s.port = match port.selected() as usize {
                 0 => None,
                 i => ports.get(i - 1).map(|(k, _)| k.clone()).or(absent.clone()),
@@ -405,6 +418,10 @@ fn sync_section(app: &Rc<AppState>) -> SyncWidgets {
         }
     };
     let apply = Rc::new(apply);
+    {
+        let apply = Rc::clone(&apply);
+        varispeed.connect_toggled(move |_| apply());
+    }
     for d in [&source, &port, &out_rate] {
         let apply = Rc::clone(&apply);
         d.connect_selected_notify(move |_| apply());

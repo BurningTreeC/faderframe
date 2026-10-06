@@ -1824,6 +1824,30 @@ playing), a click goes there, a double-click edits, right-click deletes;
 `arrange` moves, copies and cuts them with sections; `Session::
 lyrics_text` writes LRC or SRT.
 
+### MIDI time code out and varispeed
+
+MTC output: outputs with MTC on (`MidiShared::mtc_ports`, rate and the
+project start's timecode packed in `mtc_format`) get quarter frames from
+the audio thread while playing (`engine::midi::MtcGen`: four a frame,
+sequences of eight starting on even frames, timed like MIDI clock), and a
+full frame from the session when playback starts or the playhead jumps
+(`Session::tick_mtc_out`, sent at once with `MidiOutputs::send_now`).
+`faderframe_midi::timecode` holds `MtcRate`/`Timecode` for both sides.
+
+Varispeed (`engine::varispeed`): with it on (`EngineController::
+set_varispeed`, built on the control thread for the stream's channels and
+buffer size) each device callback renders as many engine frames as its
+frames need at the speed (`EngineShared::speed`, ±2 %), the transport
+advancing by those, the outputs resampled to the device and the inputs
+from it (FIFOs read with an 8-tap Lanczos kernel; four frames of latency
+each way); `process_device` wraps `render` in it. `position_at`
+extrapolates at the speed. `session::sync` follows a master with it by
+default: a PI loop on the smoothed distance per tick sets the speed within
+±1 %, a distance beyond four times the tolerance for three ticks still
+chases. Tests: `engine/tests/varispeed.rs`, `varispeed_does_not_allocate`,
+`follows_a_drifting_clock_by_varispeed_without_jumps`,
+`session/tests/mtc_out.rs`.
+
 ### Clip launcher
 
 Scenes (`faderframe_project::launcher::Scene`, rows) and slots
@@ -2371,7 +2395,8 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
 7. **Ports**: signed and notarised packages, a Flathub submission
    (vendored crates), sandboxed plugins' audio threads in the device's
    workgroup (macOS: needs the workgroup's Mach port in the helper).
-8. **MIDI**: MTC output, varispeed chase without a shared word clock.
+8. ~~**MIDI**: MTC output, varispeed chase without a shared word clock~~ —
+   done (see *MIDI time code out and varispeed*).
 9. **Performance**: render-ahead for buses whose inputs are all rendered
    ahead, job affinity for cache locality, an optional wgpu painter for
    dense views.

@@ -47,6 +47,8 @@ pub struct Preferences {
     /// MIDI outputs that get MIDI time code, and its rate.
     pub midi_mtc_outputs: Vec<String>,
     pub mtc_out_rate: String,
+    /// Follow an external master by varispeed.
+    pub sync_varispeed: bool,
     /// Mackie Control, HUI and OSC surfaces.
     pub control_surfaces: Vec<faderframe_session::control::SurfaceSettings>,
     /// "internal", "midi-clock" or "mtc".
@@ -91,6 +93,7 @@ impl Default for Preferences {
             midi_clock_outputs: Vec::new(),
             midi_mtc_outputs: Vec::new(),
             mtc_out_rate: "25".into(),
+            sync_varispeed: true,
             control_surfaces: Vec::new(),
             sync_source: "internal".into(),
             sync_port: None,
@@ -111,6 +114,7 @@ impl Preferences {
             port: self.sync_port.clone(),
             offset: faderframe_session::Timecode::parse(&self.mtc_offset).unwrap_or_default(),
             mtc_out_rate: faderframe_session::MtcRate::from_id(&self.mtc_out_rate),
+            varispeed: self.sync_varispeed,
             ..Default::default()
         }
     }
@@ -120,6 +124,7 @@ impl Preferences {
         self.sync_port = s.port.clone();
         self.mtc_offset = s.offset.to_string();
         self.mtc_out_rate = s.mtc_out_rate.id().into();
+        self.sync_varispeed = s.varispeed;
     }
 
     pub fn path() -> PathBuf {

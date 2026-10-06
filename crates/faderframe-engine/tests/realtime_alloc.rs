@@ -1102,6 +1102,44 @@ fn the_clip_launcher_does_not_allocate() {
 }
 
 #[test]
+fn varispeed_does_not_allocate() {
+    let _serial = serial();
+    const SR: u32 = 48_000;
+    const BLOCK: usize = 256;
+    let project = demo_project(SR);
+    let sources = render_generated_sources(&project, SR);
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&project, &sources, config, BLOCK, 2).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, BLOCK);
+    r.controller.set_varispeed(true).unwrap();
+    r.play_from(0).unwrap();
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    // Speeds up and down, a locate, stop and start.
+    let (_, n) = armed(|| {
+        for i in 0..800 {
+            let speed = 1.0 + 0.015 * ((i as f64) * 0.05).sin();
+            r.controller.set_speed(speed);
+            if i == 300 {
+                let _ = r
+                    .controller
+                    .transport(TransportCommand::Locate(SR as i64 * 3));
+            }
+            if i == 500 {
+                let _ = r.controller.transport(TransportCommand::Stop);
+                let _ = r.controller.transport(TransportCommand::Play);
+            }
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(n, 0, "allocations/frees under varispeed");
+}
+
+#[test]
 fn rendering_ahead_does_not_allocate_on_the_audio_thread() {
     let _serial = serial();
     const SR: u32 = 48_000;

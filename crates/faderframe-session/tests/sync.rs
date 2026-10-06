@@ -204,3 +204,45 @@ fn takes_the_masters_tempo_when_it_starts() {
     // One undo step restores the old tempo.
     assert_eq!(s.history().undo_label(), Some("Change Tempo"));
 }
+
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "millisecond MIDI timing; the macOS/Windows CI machines oversleep"
+)]
+fn follows_a_drifting_clock_by_varispeed_without_jumps() {
+    let mut s = session();
+    s.set_sync_settings(SyncSettings {
+        source: SyncSource::MidiClock,
+        follow_tempo: false,
+        ..SyncSettings::default()
+    });
+    // A master whose clock runs 0.5 % fast against ours (no shared word
+    // clock): 120 BPM by its crystal.
+    let tick = Duration::from_secs_f64(0.5 / 24.0 / 1.005);
+    let mut at = Instant::now();
+    at = stream_from(
+        &mut s,
+        at,
+        |i| {
+            if i == 24 {
+                vec![vec![0xFA], vec![0xF8]]
+            } else {
+                vec![vec![0xF8]]
+            }
+        },
+        tick,
+        24 + 48 * 6,
+    );
+    let st = s.sync_status();
+    assert!(st.running);
+    // It keeps up by speed, not by jumping.
+    assert_eq!(st.relocks, 0, "no relocks");
+    assert!(
+        (st.speed - 1.005).abs() < 0.002,
+        "playing at the master's speed: {:.4}",
+        st.speed
+    );
+    assert!(st.error_ms.abs() < 10.0, "{:.2} ms", st.error_ms);
+    let _ = at;
+}

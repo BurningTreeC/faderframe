@@ -11,9 +11,13 @@
 //!   master's position *plus the output latency* when the master sent it —
 //!   our audio is heard that much after it is processed — and plays;
 //! * while running, every tick compares the master's position with the
-//!   engine's ([`EngineController::position_at`]); beyond the tolerance for
-//!   a few ticks in a row, the engine is chased again (counted as a
-//!   re-lock: two clocks without a shared word clock drift apart slowly);
+//!   engine's ([`EngineController::position_at`]). Two clocks without a
+//!   shared word clock drift apart slowly: with varispeed (the default) a
+//!   PI loop on the (smoothed) distance sets the engine's speed within
+//!   ±1 % (`faderframe_engine::varispeed`), so it follows without jumps,
+//!   and only a distance far beyond the tolerance for a few ticks chases
+//!   again; without it, beyond the tolerance for a few ticks in a row the
+//!   engine is chased again (each counted as a re-lock);
 //! * stop and song-position / full-frame messages stop or move the
 //!   transport.
 //!
@@ -86,6 +90,8 @@ pub struct SyncSettings {
     /// The rate MTC is sent at (from the project start's timecode,
     /// `offset`).
     pub mtc_out_rate: MtcRate,
+    /// Follow by varispeed (no jumps) rather than by chasing.
+    pub varispeed: bool,
 }
 
 impl Default for SyncSettings {
@@ -97,6 +103,7 @@ impl Default for SyncSettings {
             tolerance_ms: 15.0,
             follow_tempo: true,
             mtc_out_rate: MtcRate::default(),
+            varispeed: true,
         }
     }
 }
@@ -119,6 +126,8 @@ pub struct SyncStatus {
     pub relocks: u32,
     /// Last measured distance to the master, in milliseconds.
     pub error_ms: f64,
+    /// The engine's speed (varispeed; 1 without).
+    pub speed: f64,
 }
 
 /// A follower's verdict, in the master's units (quarters or seconds).
@@ -390,7 +399,21 @@ pub(crate) struct SyncState {
     /// Consecutive ticks beyond the tolerance.
     off: u32,
     now_ns: u64,
+    /// Varispeed's loop: the smoothed distance (s), its integral, the last
+    /// tick's time.
+    filtered: Option<f64>,
+    integral: f64,
+    last_tick_ns: u64,
 }
+
+/// Varispeed's loop: proportional and integral gains (per second), the
+/// distance's smoothing per tick, the speed's range and the distance (a
+/// multiple of the tolerance) beyond which the engine is chased instead.
+const KP: f64 = 1.0;
+const KI: f64 = 0.5;
+const SMOOTHING: f64 = 0.15;
+const MAX_SPEED_DEVIATION: f64 = 0.01;
+const CHASE_BEYOND: f64 = 4.0;
 
 impl Session {
     pub fn sync_settings(&self) -> &SyncSettings {
@@ -399,6 +422,11 @@ impl Session {
 
     /// Change the timing source; followers start from scratch.
     pub fn set_sync_settings(&mut self, settings: SyncSettings) {
+        // Varispeed only follows a master.
+        let wants = settings.varispeed && settings.source != SyncSource::Internal;
+        if !wants && self.engine.varispeed() {
+            let _ = self.engine.set_varispeed(false);
+        }
         let rate = settings.mtc_out_rate;
         self.engine
             .midi_shared()
@@ -435,6 +463,7 @@ impl Session {
                 .then(|| s.mtc.timecode().zip(s.mtc.rate()))
                 .flatten(),
             relocks: s.relocks,
+            speed: self.engine.speed(),
             error_ms: s.error_ms,
         }
     }
@@ -504,6 +533,7 @@ impl Session {
         match f {
             Follow::Start { at, at_ns } => {
                 self.follow_external_tempo();
+                self.start_varispeed()?;
                 let target = self.sync_samples(at) + latency;
                 self.sync_start(target, at_ns)?;
                 self.sync.running = true;
@@ -515,6 +545,24 @@ impl Session {
                 let target = self.sync_samples(at) + latency;
                 let rate = self.engine.sample_rate().max(1) as f64;
                 match self.engine.position_at(at_ns) {
+                    Some(pos) if self.transport.playing && self.engine.varispeed() => {
+                        let err = (target - pos) as f64 / rate;
+                        self.sync.error_ms = err * 1000.0;
+                        let far = self.sync.settings.tolerance_ms * CHASE_BEYOND / 1000.0;
+                        if err.abs() > far {
+                            self.sync.off += 1;
+                        } else {
+                            self.sync.off = 0;
+                        }
+                        if self.sync.off >= 3 {
+                            self.sync.off = 0;
+                            self.sync.relocks += 1;
+                            self.start_varispeed()?;
+                            self.engine.chase(target, at_ns, true)?;
+                        } else {
+                            self.steer(err, at_ns);
+                        }
+                    }
                     Some(pos) if self.transport.playing => {
                         let err = (target - pos) as f64 / rate * 1000.0;
                         self.sync.error_ms = err;
@@ -532,6 +580,7 @@ impl Session {
                     }
                     _ => {
                         // Running master, stopped engine: join in.
+                        self.start_varispeed()?;
                         self.sync_start(target, at_ns)?;
                     }
                 }
@@ -539,6 +588,9 @@ impl Session {
             }
             Follow::Stop => {
                 self.sync.running = false;
+                self.engine.set_speed(1.0);
+                self.sync.filtered = None;
+                self.sync.integral = 0.0;
                 self.follow_external_tempo();
                 let what = self.sync.settings.source.label();
                 self.notify(crate::NoticeLevel::Info, format!("{what} stopped"));
@@ -594,6 +646,42 @@ impl Session {
 
     /// Play from `target` as of `at_ns` (like the play button: recording
     /// and automation writing start as usual).
+    /// Varispeed on (when set) at speed 1, its loop from scratch.
+    fn start_varispeed(&mut self) -> Result<()> {
+        self.sync.filtered = None;
+        self.sync.integral = 0.0;
+        self.sync.last_tick_ns = 0;
+        if self.sync.settings.varispeed {
+            if !self.engine.varispeed() {
+                self.engine.set_varispeed(true)?;
+            }
+            self.engine.set_speed(1.0);
+        }
+        Ok(())
+    }
+
+    /// One step of varispeed's loop on the distance `err` (s, positive:
+    /// the master is ahead).
+    fn steer(&mut self, err: f64, at_ns: u64) {
+        let s = &mut self.sync;
+        let dt = if s.last_tick_ns == 0 {
+            0.0
+        } else {
+            (at_ns.saturating_sub(s.last_tick_ns) as f64 / 1e9).min(0.5)
+        };
+        s.last_tick_ns = at_ns;
+        let e = match s.filtered {
+            Some(f) => f + SMOOTHING * (err - f),
+            None => err,
+        };
+        s.filtered = Some(e);
+        let limit = MAX_SPEED_DEVIATION / KI;
+        s.integral = (s.integral + e * dt).clamp(-limit, limit);
+        let speed =
+            1.0 + (KP * e + KI * s.integral).clamp(-MAX_SPEED_DEVIATION, MAX_SPEED_DEVIATION);
+        self.engine.set_speed(speed);
+    }
+
     fn sync_start(&mut self, target: i64, at_ns: u64) -> Result<()> {
         if !self.transport.playing
             && self.recording.as_ref().is_some_and(|r| r.from != target)

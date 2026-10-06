@@ -314,6 +314,9 @@ Contrast:
   clips; they drag between slots, and follow actions (next, previous,
   first, last, any, other, again, stop — after the clip or some bars) move
   a track on by itself.
+* MIDI sync: follows MIDI clock or MIDI time code (by varispeed, so the
+  clocks drifting apart never makes it jump), and sends MIDI clock and MIDI
+  time code (24, 25, 29.97 drop or 30 fps from the project's start time).
 * Control surfaces (Preferences → MIDI → Control Surfaces): Mackie Control
   and its extenders, HUI, and OSC (e.g. TouchOSC) — motorised faders,
   pan and send pots, Flip, mute/solo/arm/select, automation modes, names,
