@@ -136,6 +136,9 @@ pub(crate) struct WriteState {
     mode: AutomationMode,
     start: MusicalTime,
     points: Vec<AutomationPoint>,
+    /// A lane made for it when written (Record to Arrangement moved a
+    /// control that had none).
+    create: Option<AutomationTarget>,
 }
 
 #[derive(Debug, Default)]
@@ -553,17 +556,42 @@ impl Session {
         if !self.transport.playing || self.automation_writer.stop_sent {
             return None;
         }
-        let lane = self
+        let existing = self
             .project
             .track(track)
             .and_then(|t| t.automation.lane(target))
-            .filter(|l| {
-                matches!(
-                    l.mode,
-                    AutomationMode::Touch | AutomationMode::Latch | AutomationMode::Write
-                )
-            })
-            .map(|l| (l.id, l.mode))?;
+            .map(|l| (l.id, l.mode));
+        let mut create = None;
+        let lane = match existing {
+            Some((
+                id,
+                mode @ (AutomationMode::Touch | AutomationMode::Latch | AutomationMode::Write),
+            )) => (id, mode),
+            // Record to Arrangement: every move is written (latched), into
+            // a lane made for it if there is none.
+            _ if self.launcher_records()
+                && self
+                    .project
+                    .track(track)
+                    .is_some_and(|t| has_automation(t.kind)) =>
+            {
+                match existing {
+                    Some((id, _)) => (id, AutomationMode::Latch),
+                    None => {
+                        let made = self
+                            .automation_writer
+                            .writing
+                            .iter()
+                            .find(|(_, w)| w.track == track && w.create == Some(target))
+                            .map(|(id, _)| *id);
+                        let id = made.unwrap_or_else(|| self.project.ids.allocate());
+                        create = Some(target);
+                        (id, AutomationMode::Latch)
+                    }
+                }
+            }
+            _ => return None,
+        };
         let now = self.playhead();
         let started = !self.automation_writer.writing.contains_key(&lane.0);
         let shape = if target == AutomationTarget::TrackMute {
@@ -580,6 +608,7 @@ impl Session {
                 mode: lane.1,
                 start: now,
                 points: Vec::new(),
+                create,
             });
         state.points.push(AutomationPoint {
             time: now,
@@ -690,6 +719,7 @@ impl Session {
                         value: v,
                         shape: CurveShape::Linear,
                     }],
+                    create: None,
                 },
             );
         }
@@ -749,23 +779,31 @@ impl Session {
             let Some(state) = self.automation_writer.writing.remove(&id) else {
                 continue;
             };
-            let Some(param) = self
+            let found = self
                 .project
                 .track(state.track)
                 .and_then(|t| t.automation.lanes.iter().find(|l| l.id == id))
-                .map(|l| l.target)
-                .and_then(|target| self.automation_param(state.track, target))
-            else {
+                .cloned();
+            // A lane written into being (Record to Arrangement).
+            let made = found.is_none();
+            let Some(mut lane) = found.or_else(|| {
+                state.create.map(|target| AutomationLane {
+                    id,
+                    target,
+                    curve: AutomationCurve::new(),
+                    mode: AutomationMode::Read,
+                    visible: true,
+                })
+            }) else {
                 continue;
             };
-            let Some(mut lane) = self
-                .project
-                .track(state.track)
-                .and_then(|t| t.automation.lanes.iter().find(|l| l.id == id))
-                .cloned()
-            else {
+            let Some(param) = self.automation_param(state.track, lane.target) else {
                 continue;
             };
+            // What was written plays back.
+            if lane.mode == AutomationMode::Off {
+                lane.mode = AutomationMode::Read;
+            }
             let mut points = state.points;
             // Latch/Write hold the last value until the end of the run.
             if state.mode != AutomationMode::Touch
@@ -786,9 +824,16 @@ impl Session {
             };
             let to = points.last().map_or(end, |p| p.time.max(state.start));
             lane.curve.replace_range(state.start, to, &points);
-            commands.push(Command::SetAutomationLane {
-                track: state.track,
-                lane: Box::new(lane),
+            commands.push(if made {
+                Command::AddAutomationLane {
+                    track: state.track,
+                    lane: Box::new(lane),
+                }
+            } else {
+                Command::SetAutomationLane {
+                    track: state.track,
+                    lane: Box::new(lane),
+                }
             });
         }
         self.update_suspended();

@@ -1284,7 +1284,7 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for LauncherView {
             Hit::Quantize => "When launches start: at once, on the next beat or bar(s)".into(),
             Hit::Back => "Every track plays the arrangement again".into(),
             Hit::Record => {
-                "Write what the launcher plays into the arrangement (when playback stops)".into()
+                "Write what the launcher plays into the arrangement as it plays, with the mixer's and devices' moves as automation".into()
             }
             Hit::AddScene => "A new scene (row) at the end".into(),
             Hit::StopAll => "Stop every launched clip".into(),

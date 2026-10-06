@@ -8,9 +8,12 @@
 //! The clips live in `Project::clips` keyed by slot in
 //! `Project::launcher` (`Command::SetLauncherSlot`), in no track's clip
 //! list. With "Record to Arrangement" on, what the launcher plays is
-//! written into the arrangement when the transport stops (one undo step,
-//! "Record Launches"): each run of a clip as copies over its span (the
-//! last one cut where it stopped), clearing what the track had there.
+//! written into the arrangement as it plays — each loop once it has
+//! played, the rest where the clip stopped or another took over — as
+//! copies in time with the clip's loop, clearing what the track had there
+//! (one undo step a transport run, "Record Launches"); moves of the
+//! mixer and of device parameters are written as automation meanwhile
+//! (latched, into new lanes where there are none).
 
 use crate::{Result, Session, SessionError};
 use faderframe_core::{ClipId, SceneId, TrackId};
@@ -140,13 +143,24 @@ pub(crate) struct SlotRecording {
     pub overdub: Option<i64>,
 }
 
-/// One stretch a launched clip played: its clip, from/to (engine samples).
+/// One stretch a launched clip played: its clip, where its loop starts
+/// (its phase), from/to (engine samples).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Run {
     track: TrackId,
     clip: ClipId,
+    phase: i64,
     start: i64,
     end: i64,
+}
+
+/// A clip playing while recorded: its phase, where it began and how far
+/// it is written into the arrangement.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OpenRun {
+    clip: ClipId,
+    phase: i64,
+    written: i64,
 }
 
 /// The launcher's session state (not saved).
@@ -155,10 +169,13 @@ pub struct LauncherState {
     record: bool,
     /// The engine's state at the last tick.
     status: Vec<TrackStatus>,
-    /// Runs that ended, waiting for the transport to stop.
+    /// Runs played, waiting to be written (when no gesture is open).
     runs: Vec<Run>,
-    /// Clips playing (for recording): slot's clip and start, by track.
-    open: HashMap<TrackId, (ClipId, i64)>,
+    /// Clips playing (for recording), by track.
+    open: HashMap<TrackId, OpenRun>,
+    /// The undo step the recording writes into (see
+    /// `History::apply_amending`).
+    amend: Option<u64>,
     /// The playhead at the last tick while playing.
     last_pos: i64,
 }
@@ -1126,59 +1143,108 @@ impl Session {
             }
             self.launcher.last_pos = self.transport.position;
         }
+        if self.transport.playing && !was_playing {
+            // A new transport run: a new undo step.
+            self.launcher.amend = None;
+        }
         if self.launcher.record {
+            let pos = self.transport.position;
             for s in &status {
-                let now = s.playing.and_then(|(slot, start)| {
+                let now = s.playing.and_then(|(slot, phase)| {
                     let key = self
                         .project
                         .launcher
                         .slots
                         .keys()
                         .find(|k| k.hash() == slot)?;
-                    Some((self.project.launcher.slots[key], start))
+                    Some((self.project.launcher.slots[key], phase))
                 });
                 let was = self.launcher.open.get(&s.track).copied();
-                if was == now {
+                if was.map(|w| (w.clip, w.phase)) == now {
                     continue;
                 }
-                if let Some((clip, start)) = was {
-                    // It ended where the next started, or where it was told
-                    // to stop, or about now.
-                    let end = match (now, self.launch_state(s.track).and_then(|o| o.queued)) {
-                        (Some((_, next)), _) => next,
-                        (None, Some((None, at))) if at <= self.launcher.last_pos => at,
-                        _ => self.launcher.last_pos,
-                    };
+                // When it changed: at the launch (or stop) the last tick
+                // saw waiting, else where the new clip's loop starts, else
+                // about now.
+                let waited = self
+                    .launch_state(s.track)
+                    .and_then(|o| o.queued)
+                    .map(|(_, at)| at)
+                    .filter(|at| *at <= pos);
+                let switch = waited
+                    .or(now.map(|(_, phase)| phase))
+                    .unwrap_or(self.launcher.last_pos);
+                if let Some(w) = was {
                     self.launcher.runs.push(Run {
                         track: s.track,
-                        clip,
-                        start,
-                        end,
+                        clip: w.clip,
+                        phase: w.phase,
+                        start: w.written,
+                        end: switch.max(w.written),
                     });
                 }
                 match now {
-                    Some(n) => self.launcher.open.insert(s.track, n),
+                    Some((clip, phase)) => self.launcher.open.insert(
+                        s.track,
+                        OpenRun {
+                            clip,
+                            phase,
+                            written: switch.max(phase),
+                        },
+                    ),
                     None => self.launcher.open.remove(&s.track),
                 };
+            }
+            // Clips playing on: every loop played goes in now.
+            let open: Vec<(TrackId, OpenRun)> =
+                self.launcher.open.iter().map(|(t, o)| (*t, *o)).collect();
+            for (track, o) in open {
+                let Some(clip) = self
+                    .project
+                    .launcher
+                    .slot_of(o.clip)
+                    .and_then(|k| self.project.launcher_clip_as_played(k))
+                else {
+                    continue;
+                };
+                let length = self.launch_length(&clip);
+                let looped = o.phase + (pos - o.phase).div_euclid(length) * length;
+                if looped > o.written {
+                    self.launcher.runs.push(Run {
+                        track,
+                        clip: o.clip,
+                        phase: o.phase,
+                        start: o.written,
+                        end: looped,
+                    });
+                    if let Some(w) = self.launcher.open.get_mut(&track) {
+                        w.written = looped;
+                    }
+                }
             }
         }
         self.launcher.status = status;
         if was_playing && !self.transport.playing {
             self.close_launch_runs(self.launcher.last_pos);
-            if let Err(e) = self.write_launch_runs() {
-                self.notify(crate::NoticeLevel::Error, e.to_string());
-            }
+        }
+        // Written when no gesture is open (they would join it).
+        if !self.launcher.runs.is_empty()
+            && !self.history.in_gesture()
+            && let Err(e) = self.write_launch_runs()
+        {
+            self.notify(crate::NoticeLevel::Error, e.to_string());
         }
     }
 
     /// Clips still playing end at `at`.
     fn close_launch_runs(&mut self, at: i64) {
-        for (track, (clip, start)) in self.launcher.open.drain() {
+        for (track, o) in self.launcher.open.drain() {
             self.launcher.runs.push(Run {
                 track,
-                clip,
-                start,
-                end: at,
+                clip: o.clip,
+                phase: o.phase,
+                start: o.written,
+                end: at.max(o.written),
             });
         }
     }
@@ -1218,10 +1284,18 @@ impl Session {
         if commands.is_empty() {
             return Ok(());
         }
-        self.edit(Command::Batch {
-            label: "Record Launches".into(),
-            commands,
-        })
+        // One undo step a recording, however often it writes.
+        let (impact, token) = self.history.apply_amending(
+            &mut self.project,
+            Command::Batch {
+                label: "Record Launches".into(),
+                commands,
+            },
+            "Record Launches",
+            self.launcher.amend,
+        )?;
+        self.launcher.amend = Some(token);
+        self.sync(impact)
     }
 
     /// The transport stops on the project being replaced: launches end.
@@ -1234,7 +1308,8 @@ impl Session {
 }
 
 /// The commands writing one run into the arrangement: its span cleared on
-/// the track, then copies of the clip over it, the last cut at its end.
+/// the track, then copies of the clip in time with its loop over it, cut
+/// at the span's ends.
 fn run_commands(
     p: &mut Project,
     run: &Run,
@@ -1245,12 +1320,23 @@ fn run_commands(
     let a = to_musical(p, run.start);
     let b = to_musical(p, run.end);
     let mut out = crate::record::carve_any(p, run.track, a, b);
-    let mut at = run.start;
+    let length = length.max(1);
+    let mut at = run.phase + (run.start - run.phase).div_euclid(length) * length;
     while at < run.end {
         let mut copy = clip.clone();
         copy.id = p.ids.allocate();
         copy.track = run.track;
         copy.start = to_musical(p, at);
+        if at < run.start {
+            let right = p.ids.allocate();
+            match copy.split_at(a, right, &p.timeline, p.sample_rate) {
+                Ok((_, r)) => copy = r,
+                Err(_) => {
+                    at += length;
+                    continue;
+                }
+            }
+        }
         let end = copy.end(&p.timeline, p.sample_rate);
         if end > b {
             let right = p.ids.allocate();

@@ -618,3 +618,72 @@ fn slot_recordings_have_a_fixed_length_and_midi_clips_take_overdubs() {
     s.dispatch(Action::Undo).unwrap();
     assert_eq!(s.project().clips[&id].as_midi().unwrap().notes.len(), 1);
 }
+
+/// Record to Arrangement writes each loop once it has played (while still
+/// playing), all of it one undo step, and writes the mixer's moves as
+/// automation (a lane made for the fader).
+#[test]
+fn recording_to_the_arrangement_writes_as_it_plays_with_the_mixer() {
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    s.start_audio(
+        vec![Box::new(DummyBackend::default())],
+        &AudioPreferences::default(),
+    )
+    .unwrap();
+    // A bar is a second.
+    s.edit(Command::SetTempo { bpm: 240.0 }).unwrap();
+    let lead = track(&s, "Lead Synth");
+    op(&mut s, LauncherOp::AddScene { after: None });
+    let scene = scenes(&s)[0];
+    op(&mut s, LauncherOp::CreateClip { track: lead, scene });
+    op(&mut s, LauncherOp::SetQuantize(LaunchQuantize::None));
+    op(&mut s, LauncherOp::SetRecord(true));
+    assert!(
+        s.project()
+            .track(lead)
+            .unwrap()
+            .automation
+            .lane(faderframe_automation::AutomationTarget::TrackVolume)
+            .is_none()
+    );
+    let before = s.project().clips_of(lead).len();
+    op(&mut s, LauncherOp::Launch { track: lead, scene });
+    // The fader moves while it plays.
+    run(&mut s, 300);
+    s.dispatch(Action::BeginGesture("Fader".into())).unwrap();
+    for db in [-3.0f32, -6.0, -9.0] {
+        s.dispatch(Action::Edit(Command::SetTrackVolume { track: lead, db }))
+            .unwrap();
+        run(&mut s, 80);
+    }
+    s.dispatch(Action::EndGesture).unwrap();
+    // Two loops played: in the arrangement already.
+    wait_for(&mut s, "loops written while playing", |s| {
+        s.project().clips_of(lead).len() >= before + 2
+    });
+    assert!(s.transport().playing);
+    s.dispatch(Action::Transport(TransportAction::Stop))
+        .unwrap();
+    run(&mut s, 100);
+    let labels = s.history_steps().0;
+    assert_eq!(
+        labels.iter().filter(|l| *l == "Record Launches").count(),
+        1,
+        "{labels:?}"
+    );
+    let lane = s
+        .project()
+        .track(lead)
+        .unwrap()
+        .automation
+        .lane(faderframe_automation::AutomationTarget::TrackVolume)
+        .cloned()
+        .expect("a lane for the fader's moves");
+    assert!(lane.curve.points().len() >= 2, "{:?}", lane.curve.points());
+    // Undoing the recording takes every loop back.
+    while s.history_steps().0.last().map(String::as_str) != Some("Record Launches") {
+        s.dispatch(Action::Undo).unwrap();
+    }
+    s.dispatch(Action::Undo).unwrap();
+    assert_eq!(s.project().clips_of(lead).len(), before);
+}

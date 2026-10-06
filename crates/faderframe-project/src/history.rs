@@ -142,6 +142,39 @@ impl History {
         Ok(impact)
     }
 
+    /// Apply `cmd` as part of the last undo step while that is still the
+    /// one `token` names (returned by the call before: nothing was done,
+    /// undone or redone since, no gesture is open); else as a step of its
+    /// own named `label`. Returns the impact and the token for next time
+    /// (work written as it goes — a recording — stays one step).
+    pub fn apply_amending(
+        &mut self,
+        project: &mut Project,
+        cmd: Command,
+        label: &str,
+        token: Option<u64>,
+    ) -> Result<(Impact, u64), EditError> {
+        let ours = token == Some(self.revision)
+            && self.open.is_none()
+            && self.undo.last().is_some_and(|t| t.label == label);
+        if !ours {
+            let cmd = Command::Batch {
+                label: label.to_string(),
+                commands: vec![cmd],
+            };
+            let impact = self.apply(project, cmd)?;
+            return Ok((impact, self.revision));
+        }
+        let impact = cmd.impact();
+        let inverse = cmd.apply(project)?;
+        if let Some(tx) = self.undo.last_mut() {
+            tx.inverses.push(inverse);
+        }
+        self.redo.clear();
+        self.revision += 1;
+        Ok((impact, self.revision))
+    }
+
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty() || self.open.as_ref().is_some_and(|t| !t.inverses.is_empty())
     }
@@ -226,5 +259,40 @@ impl History {
         self.redo.clear();
         self.open = None;
         self.depth = 0;
+    }
+}
+
+#[cfg(test)]
+mod amend_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use crate::Project;
+
+    #[test]
+    fn amending_stays_one_step_until_something_else_happens() {
+        let mut p = Project::new("A", 48_000);
+        let mut h = History::default();
+        let tempo = |bpm| Command::SetTempo { bpm };
+        let (_, t) = h.apply_amending(&mut p, tempo(100.0), "Rec", None).unwrap();
+        let (_, t) = h
+            .apply_amending(&mut p, tempo(110.0), "Rec", Some(t))
+            .unwrap();
+        assert_eq!(h.undo_labels(), vec!["Rec"]);
+        // Another edit in between: a new step.
+        h.apply(&mut p, tempo(90.0)).unwrap();
+        h.apply_amending(&mut p, tempo(120.0), "Rec", Some(t))
+            .unwrap();
+        assert_eq!(h.undo_labels().len(), 3);
+        // One undo takes back everything the first step amended.
+        h.undo(&mut p).unwrap();
+        h.undo(&mut p).unwrap();
+        h.undo(&mut p).unwrap();
+        assert_eq!(
+            p.timeline
+                .tempo
+                .bpm_at(faderframe_timeline::MusicalTime::ZERO),
+            120.0
+        );
     }
 }
