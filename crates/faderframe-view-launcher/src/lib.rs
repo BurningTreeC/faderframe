@@ -1021,6 +1021,19 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for LauncherView {
         }
     }
 
+    fn drag_payload(&self, model: &Session) -> Option<String> {
+        let d = self.drag.filter(|d| d.moved)?;
+        let clip = model.project().launcher.slots.get(&d.from)?;
+        Some(faderframe_session::launcher::clips_payload(&[*clip]))
+    }
+
+    fn cancel_drag(&mut self, cx: &mut EventCx<'_, Action>) {
+        if self.drag.take().is_some() {
+            cx.set_cursor(Cursor::Default);
+            cx.redraw();
+        }
+    }
+
     fn hover_payload(
         &mut self,
         payload: Option<(&str, Point)>,

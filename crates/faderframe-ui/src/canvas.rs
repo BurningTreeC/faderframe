@@ -48,6 +48,9 @@ mod imp {
         /// The view a drag that left this one hovers over (it carries a
         /// payload).
         pub payload_target: RefCell<Option<glib::WeakRef<super::CanvasWidget>>>,
+        /// The payload left the window: a native drag carries it to other
+        /// windows (this view's own drag is over).
+        pub native_drag: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -305,6 +308,85 @@ impl CanvasWidget {
         }
     }
 
+    /// Is `(x, y)` (this view's coordinates) outside its window?
+    fn outside_window(&self, x: f64, y: f64) -> bool {
+        let Some(root) = self.root() else {
+            return false;
+        };
+        let Some(at) = self.compute_point(&root, &gtk::graphene::Point::new(x as f32, y as f32))
+        else {
+            return false;
+        };
+        let (w, h) = (f64::from(root.width()), f64::from(root.height()));
+        let (ax, ay) = (f64::from(at.x()), f64::from(at.y()));
+        ax < 0.0 || ay < 0.0 || ax >= w || ay >= h
+    }
+
+    /// The payload drag left the window: it goes on as a native drag that
+    /// other windows' canvases take (their views' `drop_payload`); this
+    /// view's own drag is undone.
+    fn start_native_drag(&self, g: &gtk::GestureDrag, x: f64, y: f64) {
+        let Some(payload) = self.payload() else {
+            return;
+        };
+        let (Some(native), Some(device)) = (self.native(), g.device()) else {
+            return;
+        };
+        let Some(surface) = native.surface() else {
+            return;
+        };
+        let Some(at) = self.compute_point(&native, &gtk::graphene::Point::new(x as f32, y as f32))
+        else {
+            return;
+        };
+        let (sx, sy) = native.surface_transform();
+        let content = gdk::ContentProvider::for_value(&payload.to_value());
+        let Some(drag) = gdk::Drag::begin(
+            &surface,
+            &device,
+            &content,
+            gdk::DragAction::COPY,
+            f64::from(at.x()) + sx,
+            f64::from(at.y()) + sy,
+        ) else {
+            return;
+        };
+        self.imp().native_drag.set(true);
+        let done = glib::clone!(
+            #[weak(rename_to = w)]
+            self,
+            move || w.imp().native_drag.set(false)
+        );
+        let done = Rc::new(done);
+        drag.connect_dnd_finished({
+            let done = done.clone();
+            move |_| done()
+        });
+        drag.connect_cancel(move |_, _| done());
+        if let Some(o) = self
+            .imp()
+            .payload_target
+            .borrow_mut()
+            .take()
+            .and_then(|w| w.upgrade())
+        {
+            o.hover_payload(None);
+        }
+        let Some(app) = self.app() else { return };
+        let mut actions = Vec::new();
+        let mut requests = Vec::new();
+        {
+            let mut cx = EventCx::new(&mut actions, &mut requests);
+            if let Some(v) = self.imp().view.borrow_mut().as_mut() {
+                v.cancel_drag(&mut cx);
+            }
+        }
+        for a in actions {
+            app.dispatch(a);
+        }
+        self.queue_draw();
+    }
+
     /// Follow a drag that left this view with a payload: the view under it
     /// shows where it would go.
     fn track_payload(&self, x: f64, y: f64) {
@@ -529,7 +611,13 @@ impl CanvasWidget {
                     modifiers: modifiers(g.current_event_state()),
                     dragging: true,
                 });
+                if w.imp().native_drag.get() {
+                    return;
+                }
                 w.track_payload(x + dx, y + dy);
+                if w.outside_window(x + dx, y + dy) {
+                    w.start_native_drag(g, x + dx, y + dy);
+                }
             }
         ));
         drag.connect_drag_end(glib::clone!(
@@ -538,8 +626,11 @@ impl CanvasWidget {
             move |g, dx, dy| {
                 w.imp().dragging.set(false);
                 let (x, y) = w.imp().drag_origin.get();
-                // Dropped on another view that takes what is dragged.
-                w.drop_payload_at(x + dx, y + dy);
+                // Dropped on another view that takes what is dragged (a
+                // native drag carries it elsewhere instead).
+                if !w.imp().native_drag.get() {
+                    w.drop_payload_at(x + dx, y + dy);
+                }
                 w.deliver(ViewEvent::PointerUp {
                     pos: Point::new((x + dx) as f32, (y + dy) as f32),
                     button: button(w.imp().drag_button.get()),
@@ -705,6 +796,67 @@ impl CanvasWidget {
             }
         ));
         self.add_controller(drop);
+
+        // Payloads (clips) dragged from another window's views.
+        let payload = gtk::DropTarget::new(glib::Type::STRING, gdk::DragAction::COPY);
+        payload.set_preload(true);
+        let over = |w: &CanvasWidget, t: &gtk::DropTarget, pos: Option<Point>| -> gdk::DragAction {
+            let text = t.value().and_then(|v| v.get::<String>().ok());
+            let Some(text) = text.filter(|s| s.starts_with("clips:")) else {
+                return gdk::DragAction::empty();
+            };
+            w.hover_payload(pos.map(|p| (text.as_str(), p)));
+            gdk::DragAction::COPY
+        };
+        payload.connect_enter(glib::clone!(
+            #[weak(rename_to = w)]
+            self,
+            #[upgrade_or]
+            gdk::DragAction::empty(),
+            move |t, x, y| over(&w, t, Some(Point::new(x as f32, y as f32)))
+        ));
+        payload.connect_motion(glib::clone!(
+            #[weak(rename_to = w)]
+            self,
+            #[upgrade_or]
+            gdk::DragAction::empty(),
+            move |t, x, y| over(&w, t, Some(Point::new(x as f32, y as f32)))
+        ));
+        payload.connect_leave(glib::clone!(
+            #[weak(rename_to = w)]
+            self,
+            move |_| w.hover_payload(None)
+        ));
+        payload.connect_drop(glib::clone!(
+            #[weak(rename_to = w)]
+            self,
+            #[upgrade_or]
+            false,
+            move |_, value, x, y| {
+                w.hover_payload(None);
+                let Ok(text) = value.get::<String>() else {
+                    return false;
+                };
+                let Some(app) = w.app() else { return false };
+                let action = {
+                    let Ok(session) = app.session.try_borrow() else {
+                        return false;
+                    };
+                    w.imp().view.borrow_mut().as_mut().and_then(|v| {
+                        v.drop_payload(&text, Point::new(x as f32, y as f32), w.size(), &session)
+                    })
+                };
+                w.queue_draw();
+                match action {
+                    Some(a) => {
+                        app.dispatch(a);
+                        true
+                    }
+                    None => false,
+                }
+            }
+        ));
+        self.add_controller(payload);
 
         self.connect_query_tooltip(|w, x, y, keyboard, tooltip| {
             if keyboard {

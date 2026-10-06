@@ -687,3 +687,70 @@ fn recording_to_the_arrangement_writes_as_it_plays_with_the_mixer() {
     s.dispatch(Action::Undo).unwrap();
     assert_eq!(s.project().clips_of(lead).len(), before);
 }
+
+/// Launcher clips dragged to the arranger are copied there (where they
+/// were dropped); arrangement clips of several tracks dropped on a slot go
+/// to their own columns, each track's down the scenes.
+#[test]
+fn clips_go_back_to_the_arrangement_and_tracks_keep_their_columns() {
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let columns: Vec<TrackId> = s.launcher_tracks().iter().map(|t| t.id).collect();
+    let i = (0..columns.len() - 1)
+        .find(|&i| {
+            !s.project().clips_of(columns[i]).is_empty()
+                && !s.project().clips_of(columns[i + 1]).is_empty()
+        })
+        .expect("two tracks with clips");
+    let (drums, next) = (columns[i], columns[i + 1]);
+    let first = s.project().clips_of(drums)[0].id;
+    op(&mut s, LauncherOp::SendClips(vec![first]));
+    let scene = scenes(&s)[0];
+    // Back into the arrangement, where it was dropped (a copy).
+    let slot_clip = s.project().launcher.clip(drums, scene).unwrap();
+    let before = s.project().clips_of(drums).len();
+    let at = faderframe_timeline::MusicalTime::from_quarters(200.0);
+    op(
+        &mut s,
+        LauncherOp::ToArrangement {
+            clips: vec![slot_clip],
+            track: drums,
+            at,
+        },
+    );
+    let now = s.project().clips_of(drums);
+    assert_eq!(now.len(), before + 1);
+    assert!(now.iter().any(|c| c.start == at));
+    assert!(s.project().launcher.clip(drums, scene).is_some());
+    assert_eq!(
+        s.history_steps().0.last().map(String::as_str),
+        Some("Clips to Arrangement")
+    );
+    // Two clips of one track and one of the next onto an empty row: each
+    // track in its own column.
+    let dragged: Vec<_> = s
+        .project()
+        .clips_of(drums)
+        .iter()
+        .take(2)
+        .map(|c| c.id)
+        .chain(s.project().clips_of(next).first().map(|c| c.id))
+        .collect();
+    op(&mut s, LauncherOp::AddScene { after: None });
+    let row = scenes(&s)[1];
+    op(
+        &mut s,
+        LauncherOp::PlaceClips {
+            clips: dragged,
+            track: drums,
+            scene: row,
+        },
+    );
+    let sc = scenes(&s);
+    let l = &s.project().launcher;
+    assert!(l.clip(drums, sc[1]).is_some() && l.clip(drums, sc[2]).is_some());
+    assert!(
+        l.clip(next, sc[1]).is_some(),
+        "the other track's clip in its own column"
+    );
+    assert!(l.clip(next, sc[2]).is_none());
+}

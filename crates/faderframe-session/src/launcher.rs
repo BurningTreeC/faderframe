@@ -94,9 +94,19 @@ pub enum LauncherOp {
         track: TrackId,
         scene: SceneId,
     },
+    /// Copies of launcher clips (dragged to the arranger) into the
+    /// arrangement at `at` on `track` (as they play: following the tempo);
+    /// clips of other tracks go to the tracks after it, in their order,
+    /// one after another on each.
+    ToArrangement {
+        clips: Vec<ClipId>,
+        track: TrackId,
+        at: MusicalTime,
+    },
     /// Copies of clips (dragged from the arrangement) into a slot and the
     /// slots below it on its track (new scenes as needed; clips that do not
-    /// fit the track are left out).
+    /// fit the track are left out); clips of other tracks go to the
+    /// columns after it, in the tracks' order.
     PlaceClips {
         clips: Vec<ClipId>,
         track: TrackId,
@@ -607,6 +617,9 @@ impl Session {
                 track,
                 scene,
             } => self.place_clips(&clips, track, scene)?,
+            LauncherOp::ToArrangement { clips, track, at } => {
+                self.copy_to_arrangement(&clips, track, at)?;
+            }
             LauncherOp::SetFollow {
                 track,
                 scene,
@@ -1005,61 +1018,152 @@ impl Session {
         Ok(())
     }
 
-    /// Copies of `clips` into `track`'s slot in `scene` and the ones below.
+    /// Copies of `clips` into `track`'s slot in `scene` and the ones below;
+    /// clips of other tracks into the columns after it.
     fn place_clips(&mut self, clips: &[ClipId], track: TrackId, scene: SceneId) -> Result<()> {
-        let Some(kind) = self.project.track(track).map(|t| t.kind) else {
+        let columns: Vec<TrackId> = self.launcher_tracks().iter().map(|t| t.id).collect();
+        let Some(first_col) = columns.iter().position(|t| *t == track) else {
             return Err(SessionError::Other("no such track".into()));
         };
-        let fits = |c: &Clip| match c.content {
-            ClipContent::Midi(_) => matches!(kind, TrackKind::Instrument | TrackKind::Midi),
-            _ => kind == TrackKind::Audio,
-        };
+        // The clips by their own track, in the editors' order.
+        let order = self.project.folder_order();
+        let rank = |t: TrackId| order.iter().position(|x| x.id == t).unwrap_or(usize::MAX);
         let mut list: Vec<Clip> = clips
             .iter()
             .filter_map(|c| self.project.clips.get(c))
-            .filter(|c| fits(c))
             .cloned()
             .collect();
-        if list.is_empty() {
-            return Err(SessionError::Other(
-                "those clips do not fit this track".into(),
-            ));
+        list.sort_by_key(|c| (rank(c.track), c.start, c.id));
+        let mut groups: Vec<Vec<Clip>> = Vec::new();
+        for c in list {
+            match groups.last_mut() {
+                Some(g) if g[0].track == c.track => g.push(c),
+                _ => groups.push(vec![c]),
+            }
         }
-        list.sort_by_key(|c| (c.start, c.id));
         let mut scenes = self.project.launcher.scenes.clone();
         let Some(first) = scenes.iter().position(|s| s.id == scene) else {
             return Err(SessionError::Other("no such scene".into()));
         };
         let mut commands = Vec::new();
-        for (k, c) in list.into_iter().enumerate() {
-            let i = first + k;
-            if i >= scenes.len() {
-                let id: SceneId = self.project.ids.allocate();
-                scenes.push(Scene {
-                    id,
-                    name: format!("Scene {}", scenes.len() + 1),
-                });
-            }
-            let at = c.start;
-            let mut copy = c;
-            copy.id = self.project.ids.allocate();
-            copy.track = track;
-            copy.start = MusicalTime::ZERO;
-            let key = SlotKey {
-                track,
-                scene: scenes[i].id,
+        let mut placed = 0;
+        for (g, group) in groups.into_iter().enumerate() {
+            let Some(&column) = columns.get(first_col + g) else {
+                break;
             };
-            let follow = self.follow_tempo_command(&copy, key, at);
-            commands.push(Command::SetLauncherSlot {
-                track,
-                scene: scenes[i].id,
-                clip: Some(Box::new(copy)),
-            });
-            commands.extend(follow);
+            let Some(kind) = self.project.track(column).map(|t| t.kind) else {
+                continue;
+            };
+            let fits = |c: &Clip| match c.content {
+                ClipContent::Midi(_) => matches!(kind, TrackKind::Instrument | TrackKind::Midi),
+                _ => kind == TrackKind::Audio,
+            };
+            for (k, c) in group.into_iter().filter(|c| fits(c)).enumerate() {
+                let i = first + k;
+                while i >= scenes.len() {
+                    let id: SceneId = self.project.ids.allocate();
+                    scenes.push(Scene {
+                        id,
+                        name: format!("Scene {}", scenes.len() + 1),
+                    });
+                }
+                let at = c.start;
+                let mut copy = c;
+                copy.id = self.project.ids.allocate();
+                copy.track = column;
+                copy.start = MusicalTime::ZERO;
+                let key = SlotKey {
+                    track: column,
+                    scene: scenes[i].id,
+                };
+                let follow = self.follow_tempo_command(&copy, key, at);
+                commands.push(Command::SetLauncherSlot {
+                    track: column,
+                    scene: scenes[i].id,
+                    clip: Some(Box::new(copy)),
+                });
+                commands.extend(follow);
+                placed += 1;
+            }
+        }
+        if placed == 0 {
+            return Err(SessionError::Other(
+                "those clips do not fit this track".into(),
+            ));
         }
         commands.insert(0, Command::SetScenes { scenes });
         self.edit(Command::Batch {
             label: "Clips to Launcher".into(),
+            commands,
+        })
+    }
+
+    /// Copies of launcher clips into the arrangement (see
+    /// [`LauncherOp::ToArrangement`]).
+    fn copy_to_arrangement(
+        &mut self,
+        clips: &[ClipId],
+        track: TrackId,
+        at: MusicalTime,
+    ) -> Result<()> {
+        let rows: Vec<TrackId> = self.project.folder_order().iter().map(|t| t.id).collect();
+        let Some(first_row) = rows.iter().position(|t| *t == track) else {
+            return Err(SessionError::Other("no such track".into()));
+        };
+        // The clips as they play, by their track (in order), then scene.
+        let launcher = &self.project.launcher;
+        let mut list: Vec<(usize, usize, Clip)> = clips
+            .iter()
+            .filter_map(|c| {
+                let key = launcher.slot_of(*c)?;
+                let row = rows.iter().position(|t| *t == key.track)?;
+                let scene = launcher.scene_index(key.scene)?;
+                Some((row, scene, self.project.launcher_clip_as_played(key)?))
+            })
+            .collect();
+        if list.is_empty() {
+            return Err(SessionError::Other("no launcher clips".into()));
+        }
+        list.sort_by_key(|(row, scene, _)| (*row, *scene));
+        let base_row = list[0].0;
+        let mut commands = Vec::new();
+        let mut placed = 0;
+        let mut next_at: HashMap<TrackId, MusicalTime> = HashMap::new();
+        for (row, _, clip) in list {
+            let Some(&target) = rows.get(first_row + (row - base_row)) else {
+                continue;
+            };
+            let Some(kind) = self.project.track(target).map(|t| t.kind) else {
+                continue;
+            };
+            let fits = match clip.content {
+                ClipContent::Midi(_) => matches!(kind, TrackKind::Instrument | TrackKind::Midi),
+                _ => kind == TrackKind::Audio,
+            };
+            if !fits {
+                continue;
+            }
+            let start = *next_at.get(&target).unwrap_or(&at);
+            let mut copy = clip;
+            copy.id = self.project.ids.allocate();
+            copy.track = target;
+            copy.start = start;
+            next_at.insert(
+                target,
+                copy.end(&self.project.timeline, self.project.sample_rate),
+            );
+            commands.push(Command::AddClip {
+                clip: Box::new(copy),
+            });
+            placed += 1;
+        }
+        if placed == 0 {
+            return Err(SessionError::Other(
+                "those clips do not fit this track".into(),
+            ));
+        }
+        self.edit(Command::Batch {
+            label: "Clips to Arrangement".into(),
             commands,
         })
     }

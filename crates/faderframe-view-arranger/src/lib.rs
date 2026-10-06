@@ -1929,6 +1929,20 @@ impl ArrangerView {
         Some((target, at))
     }
 
+    /// Where clips dropped at `pos` go: the track under it, the snapped
+    /// time.
+    fn clip_drop_target(
+        &self,
+        pos: Point,
+        size: Size,
+        model: &Session,
+    ) -> Option<(TrackId, MusicalTime)> {
+        let (_, at) = self.drop_target(pos, size, model)?;
+        let tracks = Self::lane_tracks(model);
+        let track = self.row_at(pos.y).and_then(|i| tracks.get(i))?.id;
+        Some((track, at))
+    }
+
     // --- interaction ----------------------------------------------------------------
 
     fn snap(&self, t: MusicalTime, model: &Session, mods: Modifiers) -> MusicalTime {
@@ -3649,6 +3663,38 @@ impl CanvasView<Session, Action> for ArrangerView {
         }
     }
 
+    fn hover_payload(
+        &mut self,
+        payload: Option<(&str, Point)>,
+        size: Size,
+        model: &Session,
+    ) -> bool {
+        self.update_header_width(model);
+        self.update_rows(model);
+        let next = payload
+            .filter(|(p, _)| launcher_payload(p, model).is_some())
+            .and_then(|(_, at)| self.clip_drop_target(at, size, model))
+            .map(|(t, at)| (Some(t), at));
+        let changed = next != self.drop_at;
+        self.drop_at = next;
+        changed
+    }
+
+    fn drop_payload(
+        &mut self,
+        payload: &str,
+        pos: Point,
+        size: Size,
+        model: &Session,
+    ) -> Option<Action> {
+        self.drop_at = None;
+        let clips = launcher_payload(payload, model)?;
+        let (track, at) = self.clip_drop_target(pos, size, model)?;
+        Some(Action::Launcher(
+            faderframe_session::launcher::LauncherOp::ToArrangement { clips, track, at },
+        ))
+    }
+
     fn drag_files(&mut self, pos: Option<Point>, size: Size, model: &Session) -> bool {
         self.update_header_width(model);
         self.update_rows(model);
@@ -3687,3 +3733,11 @@ impl CanvasView<Session, Action> for ArrangerView {
 
 #[cfg(test)]
 mod tests;
+
+/// The launcher clips a payload carries (arrangement clips move inside the
+/// arranger's own drag).
+fn launcher_payload(payload: &str, model: &Session) -> Option<Vec<ClipId>> {
+    let clips = faderframe_session::launcher::parse_clips_payload(payload)?;
+    (!clips.is_empty() && clips.iter().all(|c| model.project().is_launcher_clip(*c)))
+        .then_some(clips)
+}

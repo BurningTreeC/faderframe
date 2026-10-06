@@ -1469,3 +1469,54 @@ fn a_held_scrollbar_keeps_the_view_from_following_the_playhead() {
     view.paint(&mut RecordingPainter::new(), size, &s, &theme);
     assert!(view.scroll_x < 1_500.0, "{}", view.scroll_x);
 }
+
+/// A launcher clip dragged over the arranger shows where it goes and is
+/// dropped as a copy at the track and (snapped) time under the pointer;
+/// arrangement clips are not taken this way (they move in the arranger's
+/// own drag).
+#[test]
+fn launcher_clips_drop_into_the_arrangement() {
+    let mut s = session();
+    let drums = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.name == "Drums")
+        .unwrap()
+        .id;
+    let first = s.project().clips_of(drums)[0].id;
+    s.dispatch(Action::Launcher(
+        faderframe_session::launcher::LauncherOp::SendClips(vec![first]),
+    ))
+    .unwrap();
+    let scene = s.project().launcher.scenes[0].id;
+    let slot = s.project().launcher.clip(drums, scene).unwrap();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 700.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    let row = ArrangerView::lane_tracks(&s)
+        .iter()
+        .position(|t| t.id == drums)
+        .unwrap();
+    let y = view.row_rect(row, size).center().y;
+    let at = MusicalTime::from_quarters(32.0);
+    let pos = Point::new(view.x_of(at) + 2.0, y);
+    let payload = faderframe_session::launcher::clips_payload(&[slot]);
+    assert!(view.hover_payload(Some((&payload, pos)), size, &s));
+    assert!(view.drop_at.is_some());
+    let action = view.drop_payload(&payload, pos, size, &s).unwrap();
+    let Action::Launcher(faderframe_session::launcher::LauncherOp::ToArrangement {
+        clips,
+        track,
+        at: dropped,
+    }) = action
+    else {
+        panic!("{action:?}")
+    };
+    assert_eq!((clips, track), (vec![slot], drums));
+    assert!((dropped.quarters() - 32.0).abs() < 1.0, "{dropped:?}");
+    // The arrangement's own clips: not this way.
+    let own = faderframe_session::launcher::clips_payload(&[first]);
+    assert!(view.drop_payload(&own, pos, size, &s).is_none());
+}
