@@ -574,15 +574,22 @@ impl ArrangerView {
                 self.header_w(),
                 self.header_h(model, t.id),
             ));
+            // Pan, fader and meter only where they are painted (not on
+            // MIDI tracks).
+            let audio = t.kind.has_audio();
+            let fader = audio || t.kind == TrackKind::Vca;
             let part = [
                 (Some(l.mute), HeaderPart::Mute),
                 (Some(l.solo), HeaderPart::Solo),
                 (Some(l.record), HeaderPart::Record),
                 (Some(l.monitor), HeaderPart::Monitor),
                 (Some(l.automation), HeaderPart::Automation),
-                (l.pan, HeaderPart::Pan),
-                (Some(l.volume.inset_xy(-2.0, -3.0)), HeaderPart::Volume),
-                (Some(l.meter), HeaderPart::Meter),
+                (l.pan.filter(|_| audio), HeaderPart::Pan),
+                (
+                    fader.then(|| l.volume.inset_xy(-2.0, -3.0)),
+                    HeaderPart::Volume,
+                ),
+                (fader.then_some(l.meter), HeaderPart::Meter),
                 (Some(l.name), HeaderPart::Name),
                 (
                     Some(Rect::new(

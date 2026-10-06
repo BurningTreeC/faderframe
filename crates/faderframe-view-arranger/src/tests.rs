@@ -1176,3 +1176,45 @@ fn the_plus_under_the_last_track_offers_new_tracks() {
     s.dispatch(midi).unwrap();
     assert_eq!(ArrangerView::lane_tracks(&s).len(), count + 1);
 }
+
+#[test]
+fn midi_tracks_have_no_hidden_fader() {
+    let mut s = session();
+    let midi = s.add_track(TrackKind::Midi).unwrap();
+    let audio = ArrangerView::lane_tracks(&s)[0].id;
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 1400.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    for (track, fader) in [(audio, true), (midi, false)] {
+        let l = view.header_layout(&s, track, size).unwrap();
+        let hit = view.hit_test(l.volume.center(), size, &s);
+        assert_eq!(
+            hit == Some(Hit::Header(track, HeaderPart::Volume)),
+            fader,
+            "{hit:?}"
+        );
+        let meter = view.hit_test(l.meter.center(), size, &s);
+        assert_eq!(meter == Some(Hit::Header(track, HeaderPart::Meter)), fader);
+    }
+    // The wheel over where a fader would be changes nothing.
+    let l = view.header_layout(&s, midi, size).unwrap();
+    let (actions, _) = run(
+        &mut view,
+        ViewEvent::Scroll {
+            pos: l.volume.center(),
+            dx: 0.0,
+            dy: 3.0,
+            precise: false,
+            modifiers: Modifiers::NONE,
+        },
+        size,
+        &s,
+    );
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, Action::Edit(Command::SetTrackVolume { .. }))),
+        "{actions:?}"
+    );
+}
