@@ -5,7 +5,8 @@
 
 use faderframe_audio::dummy::DummyBackend;
 use faderframe_engine::EngineConfig;
-use faderframe_project::Command;
+use faderframe_project::demo::demo_project;
+use faderframe_project::{Command, Project, TrackKind};
 use faderframe_session::{Action, AudioPreferences, Session, TransportAction};
 use std::time::{Duration, Instant};
 
@@ -17,9 +18,23 @@ fn run(s: &mut Session, d: Duration) {
     }
 }
 
+/// The demo's Lead Synth and master alone: what is rendered ahead stays
+/// light enough for a slow CI machine's debug build to keep ahead.
+fn lead_alone() -> Project {
+    let mut p = demo_project(EngineConfig::default().sample_rate);
+    p.tracks
+        .retain(|t| t.name == "Lead Synth" || t.kind == TrackKind::Master);
+    let kept: Vec<_> = p.tracks.iter().map(|t| t.id).collect();
+    p.clips.retain(|_, c| kept.contains(&c.track));
+    for t in &mut p.tracks {
+        t.sends.clear();
+    }
+    p
+}
+
 #[test]
 fn tracks_render_ahead_until_armed() {
-    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let mut s = Session::new(lead_alone(), None, EngineConfig::default()).unwrap();
     s.set_render_ahead(Some(Duration::from_millis(150)))
         .unwrap();
     let synth = s
@@ -29,12 +44,6 @@ fn tracks_render_ahead_until_armed() {
         .find(|t| t.name == "Lead Synth")
         .unwrap()
         .id;
-    // Modulators keep a track live: without them, it renders ahead.
-    s.dispatch(Action::Edit(Command::SetModulators {
-        track: synth,
-        modulators: Vec::new(),
-    }))
-    .unwrap();
     let ahead = |s: &Session| s.engine().ahead_tracks().contains(&synth);
     // Nothing selected: the instrument is not live.
     s.dispatch(Action::SelectTracks {

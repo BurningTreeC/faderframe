@@ -217,10 +217,10 @@ fn plugin_editor_moves_write_touch_and_latch_automation() {
     edit(&mut s, EditorEdit::Value(DRIVE, 0.25), 1.2);
     let pts = lane_points(&s, bass, target);
     assert!(pts.iter().any(|p| (p - 0.25).abs() < 1e-9), "{pts:?}");
-    // Nothing is written while stopped.
+    // Nothing is written once stopped, even while the audio thread has
+    // not taken the stop yet (moves right after it are not written).
     s.dispatch(Action::Transport(TransportAction::Stop))
         .unwrap();
-    run(&mut s, 0.1);
     let before = lane_points(&s, bass, target).len();
     edit(&mut s, EditorEdit::Value(DRIVE, 0.9), 0.1);
     assert_eq!(lane_points(&s, bass, target).len(), before);

@@ -1785,6 +1785,9 @@ impl Session {
         self.engine.collect_garbage();
         let was_playing = self.transport.playing;
         self.transport = self.engine.transport_snapshot();
+        if !was_playing && self.transport.playing {
+            self.automation_play_requested();
+        }
         if self.album_state.is_playing() {
             // The project started playing: it has the outputs back.
             if !was_playing && self.transport.playing {
@@ -3377,7 +3380,7 @@ impl Session {
                 if self.transport.playing {
                     self.engine.transport(TransportCommand::Stop)?;
                     self.stop_recording()?;
-                    self.automation_play_stopped();
+                    self.automation_stop_sent();
                     self.return_to_play_start()?;
                 } else if self.recording.is_some() {
                     self.stop_recording()?;
@@ -3389,7 +3392,7 @@ impl Session {
                 if self.transport.playing {
                     self.engine.transport(TransportCommand::Stop)?;
                     self.stop_recording()?;
-                    self.automation_play_stopped();
+                    self.automation_stop_sent();
                     self.return_to_play_start()?;
                 } else {
                     self.play()?;

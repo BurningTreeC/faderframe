@@ -145,6 +145,9 @@ pub(crate) struct AutomationWriter {
     /// them (Touch ends at the gesture's end, or after a pause for plugins
     /// that report no gestures).
     plugin_touch: HashMap<AutomationLaneId, std::time::Instant>,
+    /// Stop was sent: the engine reports playing until its next callbacks
+    /// have run, and nothing is written meanwhile.
+    stop_sent: bool,
 }
 
 /// A plugin editor's Touch ends this long after its last move when the
@@ -547,7 +550,7 @@ impl Session {
         target: AutomationTarget,
         value: f64,
     ) -> Option<(AutomationLaneId, AutomationMode)> {
-        if !self.transport.playing {
+        if !self.transport.playing || self.automation_writer.stop_sent {
             return None;
         }
         let lane = self
@@ -701,6 +704,19 @@ impl Session {
     /// Playback stopped: everything stops writing.
     pub(crate) fn automation_play_stopped(&mut self) {
         self.commit_writes(|_| true);
+    }
+
+    /// The session sent Stop: write nothing more, though the engine may
+    /// report playing for a few more callbacks.
+    pub(crate) fn automation_stop_sent(&mut self) {
+        self.automation_play_stopped();
+        self.automation_writer.stop_sent = true;
+    }
+
+    /// Playback starts (sent from here or seen starting): writing may
+    /// resume.
+    pub(crate) fn automation_play_requested(&mut self) {
+        self.automation_writer.stop_sent = false;
     }
 
     fn update_suspended(&mut self) {

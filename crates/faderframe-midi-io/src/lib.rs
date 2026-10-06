@@ -75,6 +75,11 @@ impl VirtualMidiInput {
     pub fn send(&self, msg: &[u8]) -> bool {
         self.tx.send(self.port, msg)
     }
+
+    /// The clock its messages are stamped with.
+    pub fn clock(&self) -> faderframe_midi::MidiClock {
+        self.tx.clock()
+    }
 }
 
 struct Known {

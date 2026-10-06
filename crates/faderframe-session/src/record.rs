@@ -655,6 +655,7 @@ impl Session {
         }
         self.engine.transport(TransportCommand::Play)?;
         self.loader.wake();
+        self.automation_play_requested();
         if !self.transport.playing {
             self.play_started_at = Some(self.transport.position);
             self.automation_play_started();

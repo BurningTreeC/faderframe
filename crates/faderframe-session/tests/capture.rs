@@ -28,12 +28,17 @@ fn run(s: &mut Session, millis: u64) {
     }
 }
 
-/// Play `key` for `millis` on the virtual keyboard.
-fn play(s: &mut Session, key: u8, millis: u64) {
+/// Play `key` for `millis` on the virtual keyboard; returns when it went
+/// down and how long it was held in seconds (the keyboard stamps events
+/// as they are sent, and a busy machine oversleeps).
+fn play(s: &mut Session, key: u8, millis: u64) -> (Instant, f64) {
+    let down = Instant::now();
     s.midi_keyboard().send(&[0x90, key, 100]);
     run(s, millis);
+    let held = down.elapsed().as_secs_f64();
     s.midi_keyboard().send(&[0x80, key, 0]);
     run(s, 30);
+    (down, held)
 }
 
 /// The clips on `track` now.
@@ -75,9 +80,10 @@ fn a_phrase_played_while_stopped_starts_on_the_bar() {
     )))
     .unwrap();
     run(&mut s, 30);
-    play(&mut s, 60, 150);
+    let (first_down, held) = play(&mut s, 60, 150);
     run(&mut s, 150);
-    play(&mut s, 64, 150);
+    let (second_down, _) = play(&mut s, 64, 150);
+    let apart = (second_down - first_down).as_secs_f64();
     assert!(s.can_capture_midi());
     let before = clip_ids(&s, lead);
     s.dispatch(Action::CaptureMidi).unwrap();
@@ -94,12 +100,13 @@ fn a_phrase_played_while_stopped_starts_on_the_bar() {
     let on = quarters(*start + first.start) - 8.0;
     assert!((0.0..0.001).contains(&on), "{on}");
     assert_eq!(quarters(*start), 8.0, "the clip starts on bar 3");
-    // About 0.33 s apart (150 + 30 + 150 ms) and 0.15 s long, as played.
+    // As far apart (about 150 + 30 + 150 ms) and as long (about 0.15 s)
+    // as played.
     let seconds = |q: f64| q * 60.0 / tempo;
     let gap = seconds(quarters(notes[1].1.start - first.start));
-    assert!((gap - 0.33).abs() < 0.06, "{gap}");
+    assert!((gap - apart).abs() < 0.02, "{gap} for {apart}");
     let len = seconds(quarters(first.length));
-    assert!((len - 0.15).abs() < 0.06, "{len}");
+    assert!((len - held).abs() < 0.02, "{len} for {held}");
     // One undo step; captured, it is not offered again.
     assert!(!s.can_capture_midi());
     s.dispatch(Action::CaptureMidi).unwrap();
@@ -131,8 +138,12 @@ fn notes_played_while_playing_land_where_they_were_heard() {
     s.dispatch(Action::Transport(TransportAction::Play))
         .unwrap();
     run(&mut s, 300);
-    let at = s.playhead();
-    play(&mut s, 67, 200);
+    // Where the engine is as the key goes down (extrapolated from its last
+    // callback, as captured events are: a busy machine's dummy device
+    // falls behind, and the playhead it last reported with it).
+    let clock = s.midi_keyboard().clock();
+    let at = s.engine().position_at(clock.now_ns()).unwrap();
+    let (_, held) = play(&mut s, 67, 200);
     run(&mut s, 100);
     s.dispatch(Action::Transport(TransportAction::Stop))
         .unwrap();
@@ -144,10 +155,12 @@ fn notes_played_while_playing_land_where_they_were_heard() {
     let (start, n) = &notes[0];
     let tempo = s.project().timeline.tempo.bpm_at(MusicalTime::ZERO);
     let played = (*start + n.start).quarters();
-    // Where the playhead was when the key went down (within the latency
-    // and the tick).
-    let off = (played - at.quarters()) * 60.0 / tempo;
-    assert!((-0.1..0.15).contains(&off), "{off}");
+    let at = s.engine().samples_to_musical(s.project(), at).quarters();
+    // Where the playhead was when the key went down, less the latency
+    // (what was heard then).
+    let off = (played - at) * 60.0 / tempo;
+    assert!((-0.1..0.01).contains(&off), "{off}");
+    // As long as it was held (the device's timing moves each end a little).
     let len = n.length.quarters() * 60.0 / tempo;
-    assert!((len - 0.2).abs() < 0.08, "{len}");
+    assert!((len - held).abs() < 0.08, "{len} for {held}");
 }
