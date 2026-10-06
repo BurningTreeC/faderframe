@@ -11,6 +11,14 @@ use faderframe_session::{Action, Session};
 use faderframe_timeline::MusicalTime;
 use std::path::PathBuf;
 
+/// The demo without its sections (each test makes the ones it needs).
+fn demo() -> Session {
+    let config = EngineConfig::default();
+    let mut p = faderframe_project::demo::demo_project(config.sample_rate);
+    p.sections.clear();
+    Session::new(p, None, config).unwrap()
+}
+
 fn tmp(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("ff-album-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -25,7 +33,7 @@ fn album(s: &mut Session, a: AlbumAction) {
 #[test]
 fn songs_are_analysed_and_exported_as_an_album() {
     let dir = tmp("export");
-    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let mut s = demo();
     // Two sections of the demo (bars 1–4 and 5–8) and a quiet tone file.
     for (a, b) in [(0.0, 16.0), (16.0, 32.0)] {
         s.dispatch(Action::AddSection {
@@ -153,7 +161,7 @@ fn songs_are_analysed_and_exported_as_an_album() {
 
 #[test]
 fn a_missing_section_is_reported_not_rendered() {
-    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let mut s = demo();
     s.dispatch(Action::AddSection {
         start: MusicalTime::ZERO,
         end: MusicalTime::from_quarters(8.0),
@@ -172,7 +180,7 @@ fn a_missing_section_is_reported_not_rendered() {
 
 #[test]
 fn the_album_plays_as_it_will_be_delivered() {
-    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let mut s = demo();
     for (a, b) in [(0.0, 16.0), (16.0, 32.0)] {
         s.dispatch(Action::AddSection {
             start: MusicalTime::from_quarters(a),
@@ -234,7 +242,7 @@ fn the_album_plays_as_it_will_be_delivered() {
 fn the_album_is_premastered_for_vinyl_with_a_cutting_sheet() {
     use faderframe_project::album::VinylFormat;
     let dir = tmp("vinyl");
-    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let mut s = demo();
     for (a, b) in [(0.0, 16.0), (16.0, 32.0), (0.0, 32.0)] {
         s.dispatch(Action::AddSection {
             start: MusicalTime::from_quarters(a),

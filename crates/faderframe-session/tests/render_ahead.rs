@@ -29,6 +29,13 @@ fn tracks_render_ahead_until_armed() {
         .find(|t| t.name == "Lead Synth")
         .unwrap()
         .id;
+    // Modulators keep a track live: without them, it renders ahead.
+    s.dispatch(Action::Edit(Command::SetModulators {
+        track: synth,
+        modulators: Vec::new(),
+    }))
+    .unwrap();
+    let ahead = |s: &Session| s.engine().ahead_tracks().contains(&synth);
     // Nothing selected: the instrument is not live.
     s.dispatch(Action::SelectTracks {
         tracks: Vec::new(),
@@ -41,7 +48,8 @@ fn tracks_render_ahead_until_armed() {
     )
     .unwrap();
     run(&mut s, Duration::from_millis(200));
-    assert_eq!(s.render_ahead_status().0, 1, "the instrument track");
+    assert!(ahead(&s), "the instrument track");
+    let others = s.render_ahead_status().0 - 1;
     // Into the melody (bar 5), playing.
     s.dispatch(Action::Transport(TransportAction::Locate(
         faderframe_timeline::MusicalTime::from_quarters_i(16),
@@ -59,7 +67,8 @@ fn tracks_render_ahead_until_armed() {
     }))
     .unwrap();
     run(&mut s, Duration::from_millis(300));
-    assert_eq!(s.render_ahead_status().0, 0);
+    assert!(!ahead(&s));
+    assert_eq!(s.render_ahead_status().0, others);
     assert!(level(&s) > -50.0, "still heard: {}", level(&s));
     // Disarmed while playing: stays there until playback stops.
     s.dispatch(Action::Edit(Command::SetTrackRecordArm {
@@ -68,11 +77,12 @@ fn tracks_render_ahead_until_armed() {
     }))
     .unwrap();
     run(&mut s, Duration::from_millis(200));
-    assert_eq!(s.render_ahead_status().0, 0);
+    assert!(!ahead(&s));
     s.dispatch(Action::Transport(TransportAction::Stop))
         .unwrap();
     run(&mut s, Duration::from_millis(300));
-    assert_eq!(s.render_ahead_status().0, 1, "back after the stop");
+    assert!(ahead(&s), "back after the stop");
+    assert_eq!(s.render_ahead_status().0, others + 1);
     // A stale or mis-keyed ring misses every block (~60 here); a busy
     // machine's dummy device, catching up after oversleeping, consumes
     // blocks faster than real time and may outrun the anticipator by one

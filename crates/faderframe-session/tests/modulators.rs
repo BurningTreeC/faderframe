@@ -19,6 +19,18 @@ fn track(s: &Session, name: &str) -> TrackId {
         .id
 }
 
+/// The demo, its lead synth without the modulators it comes with.
+fn demo() -> Session {
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let lead = track(&s, "Lead Synth");
+    s.dispatch(Action::Edit(Command::SetModulators {
+        track: lead,
+        modulators: Vec::new(),
+    }))
+    .unwrap();
+    s
+}
+
 fn lfo() -> ModSource {
     ModSource::Lfo {
         shape: LfoShape::Sine,
@@ -39,7 +51,7 @@ fn names(s: &Session, t: TrackId) -> Vec<String> {
 
 #[test]
 fn modulators_are_added_named_changed_in_one_step_and_undone() {
-    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let mut s = demo();
     let lead = track(&s, "Lead Synth");
     for source in [lfo(), lfo(), ModSource::Macro { value: 0.0 }] {
         s.dispatch(Action::AddModulator {
@@ -53,7 +65,7 @@ fn modulators_are_added_named_changed_in_one_step_and_undone() {
     let bass = track(&s, "Bass");
     s.dispatch(Action::NewFolder { tracks: vec![bass] })
         .unwrap();
-    let folder = track(&s, "Folder 1");
+    let folder = s.project().track(bass).unwrap().folder.unwrap();
     assert!(
         s.dispatch(Action::AddModulator {
             track: folder,
@@ -102,7 +114,7 @@ fn modulators_are_added_named_changed_in_one_step_and_undone() {
 
 #[test]
 fn touching_a_parameter_maps_it_and_leaves_its_value() {
-    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let mut s = demo();
     let lead = track(&s, "Lead Synth");
     let plugin = s.project().track(lead).unwrap().inserts[0].id;
     let cutoff = ParameterId(synth::CUTOFF);
@@ -171,7 +183,7 @@ fn touching_a_parameter_maps_it_and_leaves_its_value() {
 
 #[test]
 fn modulator_values_follow_the_list() {
-    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let mut s = demo();
     let lead = track(&s, "Lead Synth");
     assert!(s.modulator_values(lead).is_empty());
     for value in [0.7, 0.2] {
@@ -197,7 +209,7 @@ fn modulator_values_follow_the_list() {
 
 #[test]
 fn note_modulators_map_only_to_devices_that_get_the_notes() {
-    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let mut s = demo();
     let lead = track(&s, "Lead Synth");
     let synth_slot = s.project().track(lead).unwrap().inserts[0].id;
     s.dispatch(Action::InsertPlugin {

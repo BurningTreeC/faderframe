@@ -17,9 +17,32 @@ use std::time::Duration;
 const SR: u32 = 48_000;
 const BLOCK: usize = 256;
 
-/// The demo with `plugin` on its audio tracks (something to render).
+/// The demo with `plugin` on its audio tracks (something to render)
+/// instead of their own devices, and without modulators (they keep their
+/// tracks live). Free-running LFOs (the chorus's, the reverb's
+/// modulation) are left out: playing with render-ahead starts once the
+/// rings are primed, a few blocks later, so at the same song position
+/// they would be a phase apart.
 fn project_with(plugin: &str) -> Project {
     let mut p = demo_project(SR);
+    for t in &mut p.tracks {
+        t.modulators.clear();
+        if ["Drums", "Bass", "Pluck", "Pad"].contains(&t.name.as_str()) {
+            t.inserts.clear();
+            t.preamp = None;
+        }
+        for slot in t
+            .inserts
+            .iter_mut()
+            .filter(|s| s.plugin.id == builtin::REVERB)
+        {
+            // Its modulation.
+            slot.parameters.push(faderframe_project::SavedParameter {
+                id: faderframe_core::ParameterId(7),
+                value: 0.0,
+            });
+        }
+    }
     for (i, name) in ["Drums", "Bass", "Pluck", "Pad"].iter().enumerate() {
         let t = p.tracks.iter_mut().find(|t| t.name == *name).unwrap();
         t.inserts.push(PluginSlot {

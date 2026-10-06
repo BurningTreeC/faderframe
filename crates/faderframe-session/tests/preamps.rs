@@ -180,6 +180,8 @@ fn synth_preamp_master_changes_playing_audio_live_and_rendered_ahead() {
         synth.id = synth_id;
         t.inserts.push(synth);
         t.sends.clear();
+        // Modulators would keep it live; this is about rendering ahead.
+        t.modulators.clear();
         let mut s = Session::new(project, None, EngineConfig::default()).unwrap();
         s.set_render_ahead(ahead.then(|| Duration::from_millis(150)))
             .unwrap();
@@ -202,7 +204,7 @@ fn synth_preamp_master_changes_playing_audio_live_and_rendered_ahead() {
         })
         .unwrap();
         run(&mut s, 800);
-        assert_eq!(s.render_ahead_status().0, usize::from(ahead));
+        assert_eq!(s.engine().ahead_tracks().contains(&track), ahead);
         let loud = s.meter(track).left.level_db;
         let plugin = s
             .project()

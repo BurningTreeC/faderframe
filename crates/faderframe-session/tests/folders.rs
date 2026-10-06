@@ -16,6 +16,15 @@ fn track(s: &Session, name: &str) -> TrackId {
         .id
 }
 
+/// The demo without the folder it comes with (its tracks stay).
+fn demo() -> Session {
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let folder = track(&s, "Arpeggios");
+    s.dispatch(Action::Edit(Command::RemoveTrack { track: folder }))
+        .unwrap();
+    s
+}
+
 fn order(s: &Session) -> Vec<String> {
     s.project()
         .folder_order()
@@ -26,7 +35,7 @@ fn order(s: &Session) -> Vec<String> {
 
 #[test]
 fn a_folder_holds_the_selected_tracks_and_keeps_them_when_removed() {
-    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let mut s = demo();
     let (bass, pad) = (track(&s, "Bass"), track(&s, "Pad"));
     s.dispatch(Action::NewFolder {
         tracks: vec![pad, bass],
@@ -84,7 +93,7 @@ fn a_folder_holds_the_selected_tracks_and_keeps_them_when_removed() {
 
 #[test]
 fn a_folder_sums_into_a_bus_on_request() {
-    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let mut s = demo();
     let (pluck, pad, lead) = (
         track(&s, "Pluck"),
         track(&s, "Pad"),
@@ -119,7 +128,7 @@ fn a_folder_sums_into_a_bus_on_request() {
 
 #[test]
 fn the_track_menu_offers_folders() {
-    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let mut s = demo();
     let (bass, pad) = (track(&s, "Bass"), track(&s, "Pad"));
     s.dispatch(Action::NewFolder { tracks: vec![bass] })
         .unwrap();

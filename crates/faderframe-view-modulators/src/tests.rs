@@ -56,6 +56,12 @@ fn setup() -> (Session, TrackId, ModulatorsView) {
         mode: SelectMode::Replace,
     })
     .unwrap();
+    // Without the modulators the demo gives it.
+    s.dispatch(Action::Edit(faderframe_project::Command::SetModulators {
+        track: lead,
+        modulators: Vec::new(),
+    }))
+    .unwrap();
     (s, lead, ModulatorsView::new(Theme::default()))
 }
 

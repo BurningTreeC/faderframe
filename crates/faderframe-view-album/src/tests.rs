@@ -3,10 +3,18 @@ use faderframe_engine::EngineConfig;
 use faderframe_timeline::MusicalTime;
 use faderframe_ui_canvas::{Modifiers, RecordingPainter};
 
+/// The demo without its sections (each test makes the ones it needs).
+fn demo() -> Session {
+    let config = EngineConfig::default();
+    let mut p = faderframe_project::demo::demo_project(config.sample_rate);
+    p.sections.clear();
+    Session::new(p, None, config).unwrap()
+}
+
 const SIZE: Size = Size::new(1400.0, 320.0);
 
 fn session() -> Session {
-    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let mut s = demo();
     for (a, b) in [(0.0, 16.0), (16.0, 32.0)] {
         s.dispatch(Action::AddSection {
             start: MusicalTime::from_quarters(a),

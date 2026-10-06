@@ -433,7 +433,8 @@ fn file_format_errors_and_migration() {
     assert_eq!(loaded.project.tracks.len(), 1);
     assert!(loaded.notes.iter().any(|n| n.contains("version 0")));
 
-    // Version 1: instrument tracks had no MIDI input; they get one.
+    // Version 1: instrument (and MIDI) tracks had no MIDI input; they get
+    // one.
     let demo = demo_project(48_000);
     let mut value: serde_json::Value =
         serde_json::from_str(&file::to_string(&demo, None).unwrap()).unwrap();
@@ -444,7 +445,7 @@ fn file_format_errors_and_migration() {
     }
     let loaded = file::from_str(&value.to_string()).unwrap();
     for t in &loaded.project.tracks {
-        if t.kind == TrackKind::Instrument {
+        if matches!(t.kind, TrackKind::Instrument | TrackKind::Midi) {
             assert_eq!(t.input, InputRouting::all_midi());
             assert_eq!(t.monitor, MonitorMode::Auto);
         } else {

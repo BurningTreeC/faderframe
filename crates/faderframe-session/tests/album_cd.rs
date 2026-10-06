@@ -12,6 +12,14 @@ use faderframe_session::{Action, Session};
 use faderframe_timeline::MusicalTime;
 use std::path::PathBuf;
 
+/// The demo without its sections (each test makes the ones it needs).
+fn demo() -> Session {
+    let config = EngineConfig::default();
+    let mut p = faderframe_project::demo::demo_project(config.sample_rate);
+    p.sections.clear();
+    Session::new(p, None, config).unwrap()
+}
+
 fn tmp(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("ff-album-cd-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -26,7 +34,7 @@ fn album(s: &mut Session, a: AlbumAction) {
 #[test]
 fn a_release_with_a_crossfade_inserts_and_a_cd_master() {
     let dir = tmp("release");
-    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let mut s = demo();
     for (a, b) in [(0.0, 16.0), (16.0, 32.0)] {
         s.dispatch(Action::AddSection {
             start: MusicalTime::from_quarters(a),
@@ -209,7 +217,7 @@ fn a_release_with_a_crossfade_inserts_and_a_cd_master() {
 #[test]
 fn a_cd_track_lasts_four_seconds() {
     let dir = tmp("short");
-    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let mut s = demo();
     let short: Vec<f32> = vec![0.1; 48_000 * 2];
     let file = dir.join("short.wav");
     write_wav(&file, &[short], 48_000, WavFormat::Pcm24, false).unwrap();

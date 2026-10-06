@@ -25,7 +25,7 @@ fn export_then_import_keeps_notes_and_tempo() {
     let demo = Session::demo(EngineConfig::default()).unwrap();
     let path = dir().join("demo.mid");
     let tracks = demo.export_midi_file(&path, None).unwrap();
-    assert_eq!(tracks, 1, "the demo's one instrument track");
+    assert_eq!(tracks, 2, "the demo's instrument track and MIDI track");
     let original = demo
         .project()
         .clips
@@ -36,7 +36,7 @@ fn export_then_import_keeps_notes_and_tempo() {
 
     let mut s = empty();
     let created = s.import_midi_file(&path, MusicalTime::ZERO, true).unwrap();
-    assert_eq!(created.len(), 1);
+    assert_eq!(created.len(), 2);
     let t = s.project().track(created[0]).unwrap();
     assert_eq!(
         (t.kind, t.name.as_str()),

@@ -82,6 +82,9 @@ fn legacy_demo() -> (faderframe_project::Project, faderframe_core::TrackId) {
         .find(|t| t.kind == faderframe_project::TrackKind::Instrument)
         .unwrap();
     t.instrument = Some(t.inserts.remove(0));
+    // Kept apart, the instrument runs before the modulators (opening a
+    // project makes it an insert again): without them here.
+    t.modulators.clear();
     let id = t.id;
     (project, id)
 }

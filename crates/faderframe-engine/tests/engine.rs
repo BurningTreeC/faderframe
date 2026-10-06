@@ -224,7 +224,7 @@ fn demo_project_renders_audio_and_meters() {
     let peak = out[0].iter().fold(0.0f32, |m, s| m.max(s.abs()));
     assert!(peak > 0.05 && peak < 4.0, "peak {peak}");
     assert!(out.iter().flatten().all(|s| s.is_finite()));
-    for t in &project.tracks {
+    for t in project.tracks.iter().filter(|t| t.kind.has_audio()) {
         let m = r.controller.take_meter(t.id).unwrap();
         assert!(m.left.peak > 0.0, "track '{}' meter is silent", t.name);
     }

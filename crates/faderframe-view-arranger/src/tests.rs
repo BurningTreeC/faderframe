@@ -7,6 +7,22 @@ fn session() -> Session {
     Session::demo(EngineConfig::default()).unwrap()
 }
 
+/// The demo without its sections, marker, key, chords and folder (for
+/// making them).
+fn bare_session() -> Session {
+    let config = EngineConfig::default();
+    let mut p = faderframe_project::demo::demo_project(config.sample_rate);
+    p.sections.clear();
+    p.markers.clear();
+    p.keys.clear();
+    p.chords.clear();
+    p.tracks.retain(|t| t.kind != TrackKind::Folder);
+    for t in &mut p.tracks {
+        t.folder = None;
+    }
+    Session::new(p, None, config).unwrap()
+}
+
 fn run(
     view: &mut ArrangerView,
     ev: ViewEvent,
@@ -884,7 +900,7 @@ fn the_pencil_redraws_samples_when_zoomed_in_to_sample_level() {
 #[test]
 fn global_lanes_add_markers_sections_and_change_the_tempo() {
     use faderframe_session::lanes::GlobalLane;
-    let mut s = session();
+    let mut s = bare_session();
     let theme = Theme::default();
     let mut view = ArrangerView::new(theme.clone());
     let size = Size::new(1400.0, 700.0);
@@ -997,7 +1013,7 @@ fn global_lanes_add_markers_sections_and_change_the_tempo() {
 fn the_chord_and_key_lanes_take_typed_chords_moves_and_keys() {
     use faderframe_project::harmony::{Chord, Key, Scale};
     use faderframe_session::lanes::GlobalLane;
-    let mut s = session();
+    let mut s = bare_session();
     let theme = Theme::default();
     let mut view = ArrangerView::new(theme.clone());
     let size = Size::new(1400.0, 700.0);
@@ -1154,7 +1170,8 @@ fn both_loop_edges_resize_without_toggling_and_undo_as_one_gesture() {
 fn the_plus_under_the_last_track_offers_new_tracks() {
     let mut s = session();
     let mut view = ArrangerView::new(Theme::default());
-    let size = Size::new(1400.0, 900.0);
+    // Tall enough for every track and the button.
+    let size = Size::new(1400.0, 1600.0);
     let mut p = RecordingPainter::new();
     view.paint(&mut p, size, &s, &Theme::default());
     assert!(p.texts().contains(&"+  Add Track"));
@@ -1273,7 +1290,7 @@ fn tracks_are_sized_by_the_edges_of_their_headers() {
 
 #[test]
 fn folders_indent_their_tracks_and_close_by_their_triangle() {
-    let mut s = session();
+    let mut s = bare_session();
     let ids = |s: &Session| -> Vec<TrackId> {
         ArrangerView::lane_tracks(s).iter().map(|t| t.id).collect()
     };

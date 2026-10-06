@@ -563,6 +563,11 @@ fn the_key_and_chord_tracks_show_and_lead_the_scale() {
     use faderframe_project::harmony::{Chord, Key, Quality, Scale as KeyScale};
     use faderframe_project::{ChordEvent, Command, KeyChange};
     let mut s = session();
+    // Without the demo's key and chords first.
+    s.dispatch(Action::Edit(Command::SetKeys { keys: Vec::new() }))
+        .unwrap();
+    s.dispatch(Action::Edit(Command::SetChords { chords: Vec::new() }))
+        .unwrap();
     let mut view = PianoRollView::new(Theme::default());
     paint(&mut view, &s);
     let plain = view.grid_top();

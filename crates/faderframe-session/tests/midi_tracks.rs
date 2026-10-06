@@ -37,7 +37,7 @@ fn a_midi_track_is_routed_to_an_instrument_track() {
 
     let choices = s.midi_instrument_choices(other);
     let labels: Vec<&str> = choices.iter().map(|c| c.label.as_str()).collect();
-    assert_eq!(labels, ["None", "Lead Synth (Synth)"]);
+    assert_eq!(labels, ["None", "Lead Synth (Synth)", "Arp Synth (Synth)"]);
     assert!(choices[0].checked);
     s.dispatch(choices[1].action.clone()).unwrap();
     assert_eq!(

@@ -61,6 +61,8 @@ fn mute_button_toggles_via_command() {
     let theme = Theme::default();
     let mut view = MixerView::new(theme.clone());
     let size = Size::new(1400.0, 760.0);
+    // Laid out by a paint, as before any click in the app.
+    view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
     let first = MixerView::channel_tracks(&s)[0];
     let l = view.layout_for(view.strip_rect(0, size), first);
     let (actions, _) = run(&mut view, down(l.mute.center(), 1), size, &s);
@@ -79,6 +81,8 @@ fn fader_drag_is_one_gesture_and_double_click_resets() {
     let theme = Theme::default();
     let mut view = MixerView::new(theme.clone());
     let size = Size::new(1400.0, 760.0);
+    // Laid out by a paint, as before any click in the app.
+    view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
     let bass = MixerView::channel_tracks(&s)[1].id;
     let l = view.layout_of(&s, bass, size).unwrap();
     let geo = FaderGeometry::new(l.fader, &theme);
@@ -141,6 +145,8 @@ fn routing_and_insert_clicks_open_menus() {
     let theme = Theme::default();
     let mut view = MixerView::new(theme);
     let size = Size::new(1400.0, 760.0);
+    // Laid out by a paint, as before any click in the app.
+    view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
     let first = MixerView::channel_tracks(&s)[0];
     let l = view.layout_of(&s, first.id, size).unwrap();
     let (_, req) = run(&mut view, down(l.output.center(), 1), size, &s);
@@ -296,6 +302,8 @@ fn faders_knobs_and_buttons_offer_midi_learn() {
     let s = session();
     let mut view = MixerView::new(Theme::default());
     let size = Size::new(1400.0, 760.0);
+    // Laid out by a paint, as before any click in the app.
+    view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
     let first = MixerView::channel_tracks(&s)[0];
     let l = view.layout_of(&s, first.id, size).unwrap();
     for at in [l.fader.center(), l.mute.center()] {
@@ -325,6 +333,8 @@ fn instrument_strips_choose_a_midi_input() {
     let s = session();
     let mut view = MixerView::new(Theme::default());
     let size = Size::new(1400.0, 760.0);
+    // Laid out by a paint, as before any click in the app.
+    view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
     let synth = MixerView::channel_tracks(&s)
         .into_iter()
         .find(|t| t.kind == TrackKind::Instrument)
@@ -450,11 +460,15 @@ fn the_inserts_grip_sizes_the_section_and_more_slots_show() {
     }
     let mut p = RecordingPainter::new();
     view.paint(&mut p, size, &s, &theme);
-    assert!(p.texts().contains(&"+3 more"), "{:?}", p.texts());
+    // Two slots: the first plugin, and how many more there are.
+    let count = s.project().track(bass).unwrap().inserts.len();
+    let more = format!("+{} more", count - 1);
+    assert!(p.texts().contains(&more.as_str()), "{:?}", p.texts());
     let l = view.layout_of(&s, bass, size).unwrap();
     let last = l.inserts.as_ref().unwrap()[1].center();
     let (a, _) = run(&mut view, down(last, 1), size, &s);
-    assert_eq!(a, vec![Action::SetMixerInsertSlots(5)]);
+    // Every plugin and an empty slot.
+    assert_eq!(a, vec![Action::SetMixerInsertSlots(count as u16 + 1)]);
 }
 
 fn press_drag_release(
@@ -514,7 +528,15 @@ fn press_drag_release(
 fn inserts_drag_to_reorder_copy_and_alt_click_removes() {
     use faderframe_core::builtin;
     use faderframe_project::PluginRef;
-    let mut s = session();
+    // The demo, its bass and plucks without the devices they come with.
+    let config = EngineConfig::default();
+    let mut project = faderframe_project::demo::demo_project(config.sample_rate);
+    for t in &mut project.tracks {
+        if t.name == "Bass" || t.name == "Pluck" {
+            t.inserts.clear();
+        }
+    }
+    let mut s = Session::new(project, None, config).unwrap();
     let theme = Theme::default();
     let mut view = MixerView::new(theme.clone());
     let size = Size::new(1400.0, 900.0);
@@ -917,14 +939,30 @@ fn midi_tracks_have_a_strip_with_their_instrument_and_effects() {
     let size = Size::new(1800.0, 900.0);
     let mut p = RecordingPainter::new();
     view.paint(&mut p, size, &s, &Theme::default());
-    let texts = p.texts();
-    for t in ["→ Lead Synth", "NOTES", "MIDI OUT —"] {
-        assert!(texts.contains(&t), "{t} in {texts:?}");
-    }
     let i = MixerView::channel_tracks(&s)
         .iter()
         .position(|t| t.id == midi)
         .unwrap();
+    // On its strip: the instrument track it plays ("→ Lead Synth" when its
+    // well is compact, the name and its instrument when there is room).
+    let strip = view.strip_rect(i, size);
+    let texts: Vec<&str> = p
+        .ops
+        .iter()
+        .filter_map(|o| match o {
+            faderframe_ui_canvas::DrawOp::Text(t, r) if strip.contains(r.center()) => {
+                Some(t.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        texts.contains(&"→ Lead Synth") || texts.contains(&"Lead Synth"),
+        "{texts:?}"
+    );
+    for t in ["NOTES", "MIDI OUT —"] {
+        assert!(texts.contains(&t), "{t} in {texts:?}");
+    }
     let l = view.layout_for(view.strip_rect(i, size), s.project().track(midi).unwrap());
     // No fader, pan or sends on it.
     for r in [l.fader, l.pan_knob] {
@@ -944,7 +982,7 @@ fn midi_tracks_have_a_strip_with_their_instrument_and_effects() {
         panic!("a menu")
     };
     let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
-    assert_eq!(labels, ["None", "Lead Synth (Synth)"]);
+    assert_eq!(labels, ["None", "Lead Synth (Synth)", "Arp Synth (Synth)"]);
     // The output well: external MIDI devices.
     let (_, req) = run(&mut view, down(l.output.center(), 1), size, &s);
     let Some(HostRequest::ContextMenu { items, .. }) = req
