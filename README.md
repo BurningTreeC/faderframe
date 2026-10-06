@@ -262,6 +262,28 @@ Contrast:
   devices is the dry signal, containers nest, and the chains' latencies
   are aligned automatically. Its editor shows a column a chain: add
   devices and chains, drag levels, open the devices' editors.
+* Pitch editing (an audio clip's menu → Edit Pitch, or View → Pitch
+  Editor): the notes of a voice or solo instrument are found and shown as
+  blobs at the pitch they are heard at, the pitch curve drawn through
+  them. Drag notes to move them by semitones (Alt: freely), straighten
+  their drift and vibrato, correct them to the key of the song, move their
+  formants, split and join them. Notes play back through pitch-synchronous
+  grains: the pitch is exact and a voice keeps its character, warping
+  included.
+* Audio to MIDI (an audio clip's menu): a melody, the notes of any
+  instrument, chords too (Spotify's basic-pitch model, built in), or a
+  drum pattern (kick, snare and hat on the Drum Sampler's pads) on a new
+  instrument track.
+* Tempo and key from clips: set the project's tempo or key from a loop or
+  a recording, or warp a clip to the project's tempo.
+* Clip effects (an audio clip's menu → Clip Effects…): a chain of devices
+  on one clip, rendered into the audio it plays as you change it; the
+  original stays with the clip, so the effects can change again or go.
+* Speech and lyrics (an audio clip's menu → Transcribe Words): a clip's
+  words, sung or spoken, as lines on the arranger's Lyrics lane (OpenAI's
+  Whisper running in FaderFrame; the model, 290 MB, is downloaded once
+  from Audio → Download Speech Model). Lines are edited in place and
+  exported as LRC or SRT subtitles.
 * Stock dynamics with editors of their own: a compressor (five styles,
   soft knee, lookahead, auto release and makeup, colour, mix, a filtered
   sidechain), a true-peak lookahead limiter that never passes its ceiling,
