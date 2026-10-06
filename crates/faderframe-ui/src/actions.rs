@@ -1463,6 +1463,34 @@ pub fn install(app: &Rc<AppState>) {
             };
             a.dispatch(Action::SetStripWidth { track, width });
         }),
+        // Development aid: `track-height:<track|all>=<px>` (arranger rows).
+        named("track-height", |a, arg| {
+            let Some((name, height)) = arg.split_once('=') else {
+                tracing::warn!("track-height: '{arg}' is not <track>=<px>");
+                return;
+            };
+            let Ok(height) = height.trim().parse::<f32>() else {
+                return;
+            };
+            let track = if name == "all" {
+                None
+            } else {
+                let id = a
+                    .session
+                    .borrow()
+                    .project()
+                    .tracks
+                    .iter()
+                    .find(|t| t.name == name)
+                    .map(|t| t.id);
+                let Some(id) = id else {
+                    tracing::warn!("track-height: no track '{name}'");
+                    return;
+                };
+                Some(id)
+            };
+            a.dispatch(Action::SetTrackHeight { track, height });
+        }),
         named("set-key", |a, arg| {
             let Some(key) = faderframe_project::harmony::Key::parse(arg) else {
                 tracing::warn!("set-key: '{arg}' is not a key");

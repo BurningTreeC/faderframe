@@ -67,6 +67,19 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.8.0" date="2026-10-06">
+      <description>
+        <p>Vocals and audio intelligence.</p>
+        <ul>
+          <li>Pitch editing: the notes of a voice or solo instrument, moved, straightened, corrected to the key and given other formants, played back at exact pitch with the voice's character kept.</li>
+          <li>Audio to MIDI: melodies, harmony with chords (Spotify's basic-pitch, built in) and drum patterns on new instrument tracks.</li>
+          <li>Tempo and key from clips: the project's tempo or key set from a recording, or a clip warped to the project's tempo.</li>
+          <li>Clip effects: a chain of devices on one clip, rendered into the audio it plays, the original kept.</li>
+          <li>Speech and lyrics: a clip's words transcribed into a Lyrics lane (OpenAI's Whisper, the model downloaded once), exported as LRC and SRT.</li>
+          <li>Track presets keep containers and modulators; containers and modulated tracks render ahead.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.7.0" date="2026-10-06">
       <description>
         <p>Composition tools, project organisation and modulation.</p>

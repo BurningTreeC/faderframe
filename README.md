@@ -21,7 +21,7 @@ detachable editors.
 
 All of them show the demo session (`--demo`, or Preferences → General →
 On start-up): eight bars in A minor whose audio is generated, so it needs
-no files.
+no files (the vocals shot adds two imported recordings).
 
 The Editing workspace: markers, the Intro and Verse sections, the key and
 the chord track above the tracks, the arpeggios in a folder, and in the
@@ -52,6 +52,19 @@ make of them (levelling, limiting) and the CD and vinyl masters a click
 away:
 
 ![The album view with two songs analysed](docs/screenshots/album.png)
+
+Vocals: a sung phrase in the pitch editor, its notes corrected to the key
+(their sung positions faintly behind them, the vibrato halved), and a
+speech clip transcribed into the Lyrics lane above the tracks (both
+imported into the demo):
+
+![The pitch editor and the Lyrics lane](docs/screenshots/vocals.png)
+
+Clips: the plucks' harmony and the drum loop's hits converted to MIDI on
+new tracks under them, and the pad's clip effects (a compressor, a
+saturator and a reverb rendered into the audio it plays):
+
+![Audio converted to MIDI and the Clip Effects editor](docs/screenshots/clips.png)
 
 Device editors: the EQ (dynamic and spectral bands, analyser), the synth
 (the dots on Cutoff and Resonance show where its modulators have them
