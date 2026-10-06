@@ -90,6 +90,10 @@ define_id!(
     /// A note inside a MIDI clip.
     NoteId, "note#"
 );
+define_id!(
+    /// Clips sharing their content (aliases).
+    ClipLinkId, "link#"
+);
 
 /// Identifier of a parameter *within* a processor or plugin.
 ///

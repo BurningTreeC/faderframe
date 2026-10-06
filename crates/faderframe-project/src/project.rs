@@ -131,6 +131,11 @@ pub struct Project {
     /// The chord track, by start.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chords: Vec<crate::ChordEvent>,
+    /// Clip aliases: clips with the same link share their content (an edit
+    /// of one reaches the others; position, name, colour and mute are each
+    /// one's own).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub clip_links: BTreeMap<ClipId, faderframe_core::ClipLinkId>,
     #[serde(default)]
     pub ids: IdAllocator,
 }
@@ -165,8 +170,21 @@ impl Project {
             album: crate::album::Album::default(),
             keys: Vec::new(),
             chords: Vec::new(),
+            clip_links: BTreeMap::new(),
             ids,
         }
+    }
+
+    /// The other clips sharing `clip`'s content (its aliases).
+    pub fn linked_clips(&self, clip: ClipId) -> Vec<ClipId> {
+        let Some(link) = self.clip_links.get(&clip) else {
+            return Vec::new();
+        };
+        self.clip_links
+            .iter()
+            .filter(|(c, l)| *l == link && **c != clip && self.clips.contains_key(c))
+            .map(|(c, _)| *c)
+            .collect()
     }
 
     pub fn group(&self, id: faderframe_core::GroupId) -> Option<&crate::TrackGroup> {
@@ -514,6 +532,16 @@ impl Project {
                 max_id = max_id.max(p.id.raw());
             }
         }
+        // Links of clips that are gone (and of a clip alone) go.
+        let clips = &self.clips;
+        self.clip_links.retain(|c, _| clips.contains_key(c));
+        let mut counts: BTreeMap<faderframe_core::ClipLinkId, usize> = BTreeMap::new();
+        for l in self.clip_links.values() {
+            *counts.entry(*l).or_default() += 1;
+        }
+        self.clip_links
+            .retain(|_, l| counts.get(l).is_some_and(|n| *n > 1));
+        max_id = max_id.max(self.clip_links.values().map(|l| l.raw()).max().unwrap_or(0));
         max_id = max_id
             .max(self.sources.keys().map(|k| k.raw()).max().unwrap_or(0))
             .max(self.markers.iter().map(|m| m.id.raw()).max().unwrap_or(0));

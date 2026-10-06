@@ -1230,6 +1230,21 @@ impl ArrangerView {
                 );
             }
         } else if name_rect.w > 12.0 {
+            let mut name_rect = name_rect;
+            if model.is_alias(clip.id) && name_rect.w > 30.0 {
+                // An alias: two overlapping frames before its name.
+                let y = name_rect.center().y;
+                let x = name_rect.x;
+                for (dx, dy) in [(0.0, -1.5), (3.0, 1.5)] {
+                    p.stroke_rounded(
+                        Rect::new(x + dx, y - 3.0 + dy, 7.0, 5.0),
+                        1.0,
+                        1.0,
+                        text_color.with_alpha(0.9),
+                    );
+                }
+                name_rect = Rect::new(x + 14.0, name_rect.y, name_rect.w - 14.0, name_rect.h);
+            }
             p.text(
                 &clip.name,
                 name_rect,
@@ -2343,6 +2358,24 @@ impl ArrangerView {
             "Split at Playhead",
             Action::SplitSelectedAtPlayhead,
         ));
+        // Aliases: copies that share their content.
+        items.push(
+            MenuItem::new(
+                if many {
+                    "Duplicate as Aliases"
+                } else {
+                    "Duplicate as Alias"
+                },
+                Action::DuplicateAsAlias(targets.clone()),
+            )
+            .separated(),
+        );
+        if targets.iter().any(|c| model.is_alias(*c)) {
+            items.push(MenuItem::new(
+                "Make Unique (no longer an alias)",
+                Action::MakeClipsUnique(targets.clone()),
+            ));
+        }
         Self::clip_edit_menu(model, clip, at, &mut items);
         items.extend(sample_items(model, clip.track, Some(clip.id)));
         items.push(

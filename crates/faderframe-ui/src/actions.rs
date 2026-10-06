@@ -1020,6 +1020,20 @@ pub fn install(app: &Rc<AppState>) {
                 None => tracing::warn!("make-sample: nothing to sample on '{name}'"),
             }
         }),
+        // Development aid: `alias-clip:<clip name>` (an alias right after it).
+        named("alias-clip", |a, arg| {
+            let id = a
+                .session
+                .borrow()
+                .project()
+                .clips
+                .values()
+                .find(|c| c.name == arg)
+                .map(|c| c.id);
+            if let Some(id) = id {
+                a.dispatch(Action::DuplicateAsAlias(vec![id]));
+            }
+        }),
         // Development aids: `new-folder:<track>|<track>…`,
         // `toggle-folder:<folder>`, `move-to-folder:<track>=<folder|none>`.
         named("new-folder", |a, arg| {

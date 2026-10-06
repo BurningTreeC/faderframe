@@ -337,6 +337,11 @@ pub enum Command {
         at: MusicalTime,
         new_clip: ClipId,
     },
+    /// Link a clip to others sharing its content (`None`: its own again).
+    SetClipLink {
+        clip: ClipId,
+        link: Option<faderframe_core::ClipLinkId>,
+    },
 
     // --- MIDI notes ----------------------------------------------------------
     AddNote {
@@ -624,6 +629,8 @@ impl Command {
             AddSource { .. } => "Add Audio".into(),
             RemoveSource { .. } => "Remove Audio".into(),
             AddClip { .. } => "Add Clip".into(),
+            SetClipLink { link: Some(_), .. } => "Link Clips".into(),
+            SetClipLink { link: None, .. } => "Make Clip Unique".into(),
             RemoveClip { .. } => "Delete Clip".into(),
             MoveClip { .. } => "Move Clip".into(),
             SetClipContent { .. } => "Edit Clip".into(),
@@ -707,6 +714,7 @@ impl Command {
             | RemoveGroup { .. }
             | UpdateGroup { .. }
             | SetTrackGroup { .. }
+            | SetClipLink { .. }
             | SetAlbum { .. } => Impact::None,
             AddSource { .. }
             | RemoveSource { .. }
@@ -1350,6 +1358,16 @@ impl Command {
                     t.clips.retain(|x| *x != clip);
                 }
                 AddClip { clip: Box::new(c) }
+            }
+            SetClipLink { clip, link } => {
+                if !p.clips.contains_key(&clip) {
+                    return Err(EditError::Invalid(format!("no clip {clip}")));
+                }
+                let old = match link {
+                    Some(l) => p.clip_links.insert(clip, l),
+                    None => p.clip_links.remove(&clip),
+                };
+                SetClipLink { clip, link: old }
             }
             MoveClip { clip, track, start } => {
                 let content = p

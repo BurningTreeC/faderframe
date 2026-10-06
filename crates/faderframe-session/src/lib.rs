@@ -23,6 +23,7 @@ pub mod performance;
 pub use performance::{Load, PerformanceReport, PluginPerformance, TrackPerformance};
 pub mod album;
 mod album_master;
+mod aliases;
 pub mod analysis;
 pub mod capture;
 pub mod delivery;
@@ -307,6 +308,10 @@ pub enum Action {
     /// Turn what the live tracks were played last into clips (recording
     /// or not).
     CaptureMidi,
+    /// An alias of each clip (sharing its content) right after it.
+    DuplicateAsAlias(Vec<ClipId>),
+    /// The clips are their own again (no longer aliases).
+    MakeClipsUnique(Vec<ClipId>),
     /// A new folder track holding these tracks.
     NewFolder {
         tracks: Vec<TrackId>,
@@ -2387,13 +2392,26 @@ impl Session {
         };
         // Removing a folder keeps its tracks.
         let cmd = self.keep_folder_contents(cmd);
+        // Splitting an alias makes it its own; content edits reach the
+        // others (one undo step).
+        let cmd = self.unlink_split_aliases(cmd);
+        let aliases = self.aliases_before(&cmd);
         if removes_plugins(&cmd) {
             // Undo restores removed plugins from their slots: keep the
             // slots' state current.
             self.capture_plugin_states();
         }
-        let impact = self.history.apply(&mut self.project, cmd)?;
-        self.sync(impact)
+        if aliases.is_empty() {
+            let impact = self.history.apply(&mut self.project, cmd)?;
+            return self.sync(impact);
+        }
+        self.history.begin(cmd.label());
+        let impact = match self.history.apply(&mut self.project, cmd) {
+            Ok(i) => self.mirror_aliases(aliases).map(|m| m.max(i)),
+            Err(e) => Err(e.into()),
+        };
+        self.history.end();
+        self.sync(impact?)
     }
 
     pub fn dispatch(&mut self, action: Action) -> Result<()> {
@@ -2653,6 +2671,10 @@ impl Session {
                 target,
             } => self.make_sample(track, start, end, target)?,
             Action::CaptureMidi => self.capture_midi()?,
+            Action::DuplicateAsAlias(clips) => {
+                self.duplicate_as_alias(&clips)?;
+            }
+            Action::MakeClipsUnique(clips) => self.make_unique(&clips)?,
             Action::NewFolder { tracks } => {
                 self.new_folder(&tracks)?;
             }

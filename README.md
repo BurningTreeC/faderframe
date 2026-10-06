@@ -143,6 +143,12 @@ Contrast:
   the chord track, and drum patterns; previewed in the grid, applied in
   one undo step. The scale follows the key track; the chord track shows
   above the notes and can be stamped.
+* Clip aliases: right-click a clip → Duplicate as Alias; aliases (marked
+  by two overlapping frames before the name) share their content — notes,
+  controllers, length, gain, fades, warp — so an edit of one is an edit of
+  all (one undo step), while each keeps its own position, name, colour and
+  mute. Make Unique ends it; splitting an alias makes the split one its
+  own. Copies and pastes are never aliases.
 * Folder tracks: Track menu (or the "+") → New Folder with the Selected
   Tracks; folders hold tracks and other folders, show them indented under
   them, close by their triangle (or a double-click), give an overview of
