@@ -268,6 +268,18 @@ pub struct ArrangerView {
     global_drag: Option<global::GlobalDrag>,
 }
 
+/// The entries making a sample of a track's selection (audio tracks).
+fn sample_items(model: &Session, track: TrackId, clip: Option<ClipId>) -> Vec<MenuItem<Action>> {
+    model
+        .sample_choices(track, clip)
+        .into_iter()
+        .map(|(label, action, separated)| {
+            let item = MenuItem::new(label, action);
+            if separated { item.separated() } else { item }
+        })
+        .collect()
+}
+
 fn color_of(c: TrackColor) -> Color {
     Color::rgb8(c.r, c.g, c.b)
 }
@@ -1769,6 +1781,8 @@ impl ArrangerView {
             }
             m
         }));
+        // A sample of the selection (audio tracks).
+        items.extend(sample_items(model, t.id, None));
         // Freezing and bouncing (tracks with clips).
         if matches!(t.kind, TrackKind::Audio | TrackKind::Instrument) {
             let busy = model.bouncing().contains(&t.id);
@@ -2096,6 +2110,7 @@ impl ArrangerView {
             Action::SplitSelectedAtPlayhead,
         ));
         Self::clip_edit_menu(model, clip, at, &mut items);
+        items.extend(sample_items(model, clip.track, Some(clip.id)));
         items.push(
             MenuItem::new(
                 if many { "Delete Clips" } else { "Delete" },

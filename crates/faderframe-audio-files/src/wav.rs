@@ -68,8 +68,10 @@ pub fn write_wav_with(
     }
     let mut w = BufWriter::new(File::create(path)?);
     let tag: u16 = if format.is_integer() { 1 } else { 3 };
+    // An odd-sized chunk is followed by a pad byte (RIFF).
+    let pad = (data_len & 1) as u32;
     w.write_all(b"RIFF")?;
-    w.write_all(&(36 + data_len as u32).to_le_bytes())?;
+    w.write_all(&(36 + data_len as u32 + pad).to_le_bytes())?;
     w.write_all(b"WAVEfmt ")?;
     w.write_all(&16u32.to_le_bytes())?;
     w.write_all(&tag.to_le_bytes())?;
@@ -94,6 +96,9 @@ pub fn write_wav_with(
                 }
             }
         }
+    }
+    if pad == 1 {
+        w.write_all(&[0])?;
     }
     w.flush()
 }

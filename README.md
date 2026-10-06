@@ -117,6 +117,12 @@ Contrast:
 * Freeze and bounce: Freeze Track renders a track after its inserts and
   plays the file instead (its plugins are unloaded until you unfreeze);
   Bounce to New Track puts the rendered audio on a new track.
+* Samples from audio: right-click an audio clip (or an audio track's
+  header) to turn the edit selection, or the selected clips, into a sample:
+  rendered as the clips play (clip gain, fades, warp; without the track's
+  plugins), it goes to a new Sampler track (the root key and tuning found
+  in the audio), a new Drum Sampler track, the next free pad of a Drum
+  Sampler in the project, or a 24-bit WAV file.
 * Piano roll: select/draw/erase/split/mute tools, rubber-band selection,
   moving and Alt-copying with snap (Shift: free), resizing from either edge,
   chords (fixed or scale-aware), scales with highlighting, snap and folding,

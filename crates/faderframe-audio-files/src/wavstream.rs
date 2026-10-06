@@ -80,8 +80,11 @@ impl WavWriter {
         let data_len = frames * channels as u64 * bps as u64;
         let data_len = u32::try_from(data_len).unwrap_or(u32::MAX - 64);
         let tag: u16 = if format.is_integer() { 1 } else { 3 };
+        // An odd-sized chunk is followed by a pad byte (RIFF).
         out.write_all(b"RIFF")?;
-        out.write_all(&(36u32.saturating_add(data_len)).to_le_bytes())?;
+        out.write_all(
+            &(36u32.saturating_add(data_len).saturating_add(data_len & 1)).to_le_bytes(),
+        )?;
         out.write_all(b"WAVEfmt ")?;
         out.write_all(&16u32.to_le_bytes())?;
         out.write_all(&tag.to_le_bytes())?;
@@ -147,6 +150,10 @@ impl WavWriter {
 
     /// Flush, patch the header sizes and close.
     pub fn finish(mut self) -> io::Result<PathBuf> {
+        let bytes = self.frames * u64::from(self.channels) * u64::from(self.format.bits() / 8);
+        if bytes & 1 == 1 {
+            self.out.write_all(&[0])?;
+        }
         self.out.flush()?;
         let mut file = self.out.into_inner().map_err(|e| e.into_error())?;
         file.seek(SeekFrom::Start(0))?;
@@ -366,6 +373,38 @@ mod tests {
         assert_eq!(l[9], ramp[9_999]);
         assert!(l[10..].iter().all(|v| *v == 0.0));
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn odd_sized_data_is_padded() {
+        // 24-bit mono, an odd number of frames: 9 data bytes and a pad.
+        let data: Vec<f32> = vec![0.25, -0.5, 0.75];
+        for streamed in [false, true] {
+            let path = tmp(&format!("odd-{streamed}.wav"));
+            if streamed {
+                let mut w = WavWriter::create(&path, 1, 48_000, WavFormat::Pcm24, false).unwrap();
+                w.write_planar(&[&data], 3).unwrap();
+                w.finish().unwrap();
+            } else {
+                crate::write_wav(
+                    &path,
+                    std::slice::from_ref(&data),
+                    48_000,
+                    WavFormat::Pcm24,
+                    false,
+                )
+                .unwrap();
+            }
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(bytes.len(), 44 + 9 + 1);
+            let riff = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+            assert_eq!(riff as usize, bytes.len() - 8);
+            let back = crate::read_wav(&path).unwrap();
+            assert_eq!(back.channels[0].len(), 3);
+            assert!((back.channels[0][2] - 0.75).abs() < 1e-6);
+            assert_eq!(WavFile::open(&path).unwrap().frames(), 3);
+            std::fs::remove_file(&path).unwrap();
+        }
     }
 
     #[test]

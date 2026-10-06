@@ -369,6 +369,12 @@ impl AppState {
                 faderframe_session::UiRequest::PickColor(target) => {
                     crate::dialogs::pick_color(self, target);
                 }
+                faderframe_session::UiRequest::SaveSample {
+                    track,
+                    start,
+                    end,
+                    name,
+                } => crate::dialogs::save_sample(self, track, start, end, &name),
             }
         }
         let report = self

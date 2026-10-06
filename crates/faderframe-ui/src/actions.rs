@@ -995,6 +995,30 @@ pub fn install(app: &Rc<AppState>) {
                 chords,
             }));
         }),
+        // Development aid: `make-sample:<track>=<sampler|drums>` samples the
+        // track's selection (or its first clip).
+        named("make-sample", |a, arg| {
+            let Some((name, to)) = arg.split_once('=') else {
+                tracing::warn!("make-sample: '{arg}' is not <track>=<sampler|drums>");
+                return;
+            };
+            let action = {
+                let s = a.session.borrow();
+                let track = s.project().tracks.iter().find(|t| t.name == name);
+                track.and_then(|t| {
+                    let clip = s.project().clips_of(t.id).first().map(|c| c.id);
+                    let index = usize::from(to == "drums");
+                    s.sample_choices(t.id, clip)
+                        .into_iter()
+                        .nth(index)
+                        .map(|c| c.1)
+                })
+            };
+            match action {
+                Some(action) => a.dispatch(action),
+                None => tracing::warn!("make-sample: nothing to sample on '{name}'"),
+            }
+        }),
         // Development aid: `strip-width:<track name|all>=<px|default>`.
         named("strip-width", |a, arg| {
             let Some((name, width)) = arg.split_once('=') else {

@@ -12,6 +12,7 @@
 pub mod delivery;
 mod dynamics;
 mod loudness;
+pub mod pitch;
 mod spectrum;
 pub mod vinyl;
 

@@ -56,17 +56,7 @@ impl Session {
         }
         let name = t.name.clone();
         let mono = t.layout == ChannelLayout::Mono;
-        // The project copy carries the plugins' current settings.
-        self.capture_plugin_states();
-        let mut project = self.project.clone();
-        for s in project.sources.values_mut() {
-            if let SourceSpec::File { path, .. } = &mut s.spec
-                && path.is_relative()
-                && let Some(dir) = self.project_dir()
-            {
-                *path = dir.join(&*path);
-            }
-        }
+        let project = self.absolute_copy();
         let (copy, start, end) = render::track_render_project(&project, track)
             .ok_or_else(|| SessionError::Other(format!("'{name}' has no clips to render")))?;
         std::fs::create_dir_all(&self.media_dir)
@@ -102,6 +92,22 @@ impl Session {
         );
         self.revision += 1;
         Ok(())
+    }
+
+    /// A copy of the project to render: the plugins' current settings
+    /// captured, every media path absolute.
+    pub(crate) fn absolute_copy(&mut self) -> faderframe_project::Project {
+        self.capture_plugin_states();
+        let mut project = self.project.clone();
+        for s in project.sources.values_mut() {
+            if let SourceSpec::File { path, .. } = &mut s.spec
+                && path.is_relative()
+                && let Some(dir) = self.project_dir()
+            {
+                *path = dir.join(&*path);
+            }
+        }
+        project
     }
 
     /// Unfreeze: the clips, instrument and inserts play again.

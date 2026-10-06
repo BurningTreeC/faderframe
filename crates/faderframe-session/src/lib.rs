@@ -33,6 +33,7 @@ pub mod lanes;
 mod programs;
 mod redraw;
 pub mod samples;
+pub mod sampling;
 mod sandbox;
 pub mod vinyl;
 pub use groups::GroupMenuEntry;
@@ -293,6 +294,20 @@ pub enum Action {
     },
     /// Every plugin of the project.
     ReloadAllPlugins,
+    /// Render an audio track from `start` to `end` (its clips as they
+    /// play, without its plugins) and give it to a sampler or a file.
+    MakeSample {
+        track: TrackId,
+        start: MusicalTime,
+        end: MusicalTime,
+        target: sampling::SampleTarget,
+    },
+    /// Ask where to save such a sample, then make it.
+    PromptSaveSample {
+        track: TrackId,
+        start: MusicalTime,
+        end: MusicalTime,
+    },
     /// Switch a plugin to one of its own programs (one undo step).
     SelectPluginProgram {
         plugin: faderframe_core::PluginInstanceId,
@@ -907,6 +922,7 @@ pub struct Session {
     transients: transients::TransientCache,
     /// Track renders for freezing and bouncing.
     bounces: Vec<freeze::PendingBounce>,
+    samplings: Vec<sampling::PendingSample>,
     /// Album analyses and the running album job.
     album_state: album::AlbumState,
     /// Plugin failures noticed, sandboxed plugins' unsaved state.
@@ -970,6 +986,14 @@ pub enum UiRequest {
     RenameGroup(faderframe_core::GroupId),
     /// Pick a colour (track or section).
     PickColor(ColorTarget),
+    /// Ask where to save a sample of `track` from `start` to `end`
+    /// (suggesting `name`), then make it there.
+    SaveSample {
+        track: TrackId,
+        start: MusicalTime,
+        end: MusicalTime,
+        name: String,
+    },
 }
 
 /// What a picked colour is for.
@@ -1101,6 +1125,7 @@ impl Session {
             transients: transients::TransientCache::default(),
             gesture_base: HashMap::new(),
             bounces: Vec::new(),
+            samplings: Vec::new(),
             album_state: album::AlbumState::default(),
             plugin_care: sandbox::PluginCare::default(),
             render_ahead: None,
@@ -1611,6 +1636,7 @@ impl Session {
     pub fn tick(&mut self, dt: f32) {
         self.poll_jobs();
         self.poll_bounces();
+        self.poll_samples();
         self.poll_album();
         self.poll_analysis(dt);
         self.pump_idle();
@@ -2592,6 +2618,15 @@ impl Session {
             } => self.load_device_samples(plugin, slot, files)?,
             Action::SelectPluginProgram { plugin, index } => {
                 self.select_plugin_program(plugin, index)?;
+            }
+            Action::MakeSample {
+                track,
+                start,
+                end,
+                target,
+            } => self.make_sample(track, start, end, target)?,
+            Action::PromptSaveSample { track, start, end } => {
+                self.prompt_save_sample(track, start, end)?;
             }
             Action::ReloadAllPlugins => {
                 let all: Vec<_> = self

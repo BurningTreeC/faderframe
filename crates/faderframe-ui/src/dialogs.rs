@@ -735,6 +735,47 @@ pub fn install_close_guard(app: &Rc<AppState>, window: &gtk::ApplicationWindow) 
     });
 }
 
+/// Ask where to save a sample of `track` (24-bit WAV), then make it.
+pub fn save_sample(
+    app: &Rc<AppState>,
+    track: faderframe_core::TrackId,
+    start: faderframe_timeline::MusicalTime,
+    end: faderframe_timeline::MusicalTime,
+    name: &str,
+) {
+    let Some(win) = app.window.borrow().clone() else {
+        return;
+    };
+    let wav = gtk::FileFilter::new();
+    wav.set_name(Some("WAV files (.wav)"));
+    wav.add_suffix("wav");
+    let filters = gio::ListStore::new::<gtk::FileFilter>();
+    filters.append(&wav);
+    let dialog = gtk::FileDialog::builder()
+        .title("Save Sample")
+        .accept_label("Save")
+        .modal(true)
+        .initial_name(name)
+        .filters(&filters)
+        .build();
+    let weak = Rc::downgrade(app);
+    dialog.save(Some(&win), gio::Cancellable::NONE, move |res| {
+        if let (Ok(file), Some(app)) = (res, weak.upgrade())
+            && let Some(mut path) = file.path()
+        {
+            if path.extension().is_none() {
+                path.set_extension("wav");
+            }
+            app.dispatch(faderframe_session::Action::MakeSample {
+                track,
+                start,
+                end,
+                target: faderframe_session::sampling::SampleTarget::File(path),
+            });
+        }
+    });
+}
+
 fn sysex_filters() -> gio::ListStore {
     let syx = gtk::FileFilter::new();
     syx.set_name(Some("SysEx files (.syx)"));

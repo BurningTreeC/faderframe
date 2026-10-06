@@ -1,133 +1,18 @@
-//! The Tuner's face and its pitch detector.
-//!
-//! The detector is McLeod's (the normalised square difference function of
-//! "A Smarter Way to Find Pitch"): over the last 4096 input frames, the
-//! autocorrelation (by FFT) normalised by the energy of the overlapping
-//! parts; the first peak within 90 % of the highest, refined by a parabola,
-//! is the period. Its height is the clarity: below 0.8, or a signal under
+//! The Tuner's face. The pitch is McLeod's (`faderframe_analysis::pitch`)
+//! over the last 4096 input frames; a clarity below 0.8, or a signal under
 //! −60 dBFS, shows no note. Estimates are taken as a median of five and
 //! smoothed, so the needle moves calmly and a strobe drifts at the rate the
 //! string is out.
 
 use crate::kit::{self, Ctl, Ctx, Face, KNOB, Meter, MeterKind, Panel, SWITCH_H};
 use crate::values::note_name;
-use faderframe_analysis::fft;
+use faderframe_analysis::pitch::{Detector, FRAMES, note_at};
 use faderframe_core::ParameterId;
 use faderframe_plugin_host::devices::tuner::{self as tun, id};
 use faderframe_ui_canvas::{Color, Paint, Painter, Path, Point, Rect, Size, TextStyle};
 
 fn pid(i: u32) -> ParameterId {
     ParameterId(i)
-}
-
-/// Frames analysed.
-const FRAMES: usize = 4096;
-
-/// A pitch and how clear it is.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Pitch {
-    pub freq: f64,
-    pub clarity: f64,
-}
-
-/// Work buffers for [`detect`].
-pub(crate) struct Detector {
-    re: Vec<f64>,
-    im: Vec<f64>,
-    nsdf: Vec<f64>,
-}
-
-impl Detector {
-    pub fn new() -> Self {
-        Self {
-            re: vec![0.0; 2 * FRAMES],
-            im: vec![0.0; 2 * FRAMES],
-            nsdf: vec![0.0; FRAMES],
-        }
-    }
-
-    /// The pitch of `x` (at most `FRAMES` long) at `rate`, from 25 Hz to
-    /// 4.2 kHz.
-    pub fn detect(&mut self, x: &[f32], rate: f64) -> Option<Pitch> {
-        let n = x.len().min(FRAMES);
-        let x = &x[x.len() - n..];
-        let mean = x.iter().map(|v| f64::from(*v)).sum::<f64>() / n as f64;
-        let energy: f64 = x.iter().map(|v| (f64::from(*v) - mean).powi(2)).sum();
-        if energy / (n as f64) < 1e-6 {
-            return None;
-        }
-        // The autocorrelation: the power spectrum's transform.
-        let size = (2 * n).next_power_of_two();
-        self.re.resize(size, 0.0);
-        self.im.resize(size, 0.0);
-        self.re.fill(0.0);
-        self.im.fill(0.0);
-        for (r, v) in self.re.iter_mut().zip(x) {
-            *r = f64::from(*v) - mean;
-        }
-        fft(&mut self.re, &mut self.im);
-        for i in 0..size {
-            self.re[i] = self.re[i].powi(2) + self.im[i].powi(2);
-            self.im[i] = 0.0;
-        }
-        fft(&mut self.re, &mut self.im);
-        let r0 = self.re[0] / size as f64;
-        // The overlap's energy, shrinking with the lag.
-        let min_lag = (rate / 4_200.0).floor() as usize;
-        let max_lag = ((rate / 25.0).ceil() as usize).min(n - 2);
-        let mut m = 2.0 * r0;
-        self.nsdf.resize(n, 0.0);
-        self.nsdf[0] = 1.0;
-        for t in 1..=max_lag {
-            let a = f64::from(x[t - 1]) - mean;
-            let b = f64::from(x[n - t]) - mean;
-            m -= a * a + b * b;
-            let r = self.re[t] / size as f64;
-            self.nsdf[t] = if m > 1e-12 { 2.0 * r / m } else { 0.0 };
-        }
-        // The peaks between the positive zero crossings.
-        let mut peaks: Vec<(usize, f64)> = Vec::new();
-        let mut t = 1;
-        while t < max_lag && self.nsdf[t] > 0.0 {
-            t += 1;
-        }
-        while t < max_lag {
-            while t < max_lag && self.nsdf[t] <= 0.0 {
-                t += 1;
-            }
-            let mut best = (t, f64::MIN);
-            while t < max_lag && self.nsdf[t] > 0.0 {
-                if self.nsdf[t] > best.1 {
-                    best = (t, self.nsdf[t]);
-                }
-                t += 1;
-            }
-            if best.1 > 0.0 && best.0 >= min_lag {
-                peaks.push(best);
-            }
-        }
-        let highest = peaks.iter().map(|p| p.1).fold(0.0, f64::max);
-        let &(k, v) = peaks.iter().find(|p| p.1 >= 0.9 * highest)?;
-        // A parabola through the peak and its neighbours.
-        let (a, b, c) = (self.nsdf[k - 1], v, self.nsdf[(k + 1).min(max_lag)]);
-        let d = a - 2.0 * b + c;
-        let shift = if d.abs() > 1e-12 {
-            0.5 * (a - c) / d
-        } else {
-            0.0
-        };
-        let lag = k as f64 + shift.clamp(-0.5, 0.5);
-        let clarity = b - 0.25 * (a - c) * shift;
-        Some(Pitch {
-            freq: rate / lag,
-            clarity,
-        })
-    }
-}
-
-/// A note (MIDI number, may be fractional) for a frequency at a reference.
-pub(crate) fn note_at(freq: f64, reference: f64) -> f64 {
-    69.0 + 12.0 * (freq / reference).log2()
 }
 
 pub(crate) struct TunerFace {
