@@ -323,6 +323,8 @@ pub enum Action {
     DownloadSpeechModel,
     /// Transcribe an audio clip's words into the lyrics.
     Transcribe(ClipId),
+    /// Write the lyrics as LRC and SRT next to the project.
+    ExportLyrics,
     /// Change (`Some`) or remove (`None`) a lyric line's words.
     EditLyric {
         index: usize,
@@ -2933,6 +2935,9 @@ impl Session {
             Action::OpenClipEffects(clip) => self.open_clip_fx(clip)?,
             Action::DownloadSpeechModel => self.download_speech_model()?,
             Action::Transcribe(clip) => self.transcribe(clip)?,
+            Action::ExportLyrics => {
+                self.export_lyrics()?;
+            }
             Action::EditLyric { index, text } => self.edit_lyric(index, text)?,
             Action::ClipEffects { clip, op } => self.edit_clip_fx(clip, op)?,
             Action::OpenPitchEditor(clip) => {

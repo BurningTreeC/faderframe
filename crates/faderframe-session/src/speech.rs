@@ -278,6 +278,34 @@ impl Session {
         self.edit(Command::SetLyrics { lyrics })
     }
 
+    /// Write the lyrics as `<project>.lrc` and `.srt` next to the project
+    /// (in the media folder while it is unsaved); returns the LRC's path.
+    pub fn export_lyrics(&mut self) -> Result<PathBuf> {
+        if self.project.lyrics.is_empty() {
+            return Err(SessionError::Other("there are no lyrics to export".into()));
+        }
+        let dir = self
+            .project_dir()
+            .unwrap_or_else(|| self.media_dir().to_path_buf());
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| SessionError::Other(format!("{}: {e}", dir.display())))?;
+        let stem = self.project.name.clone();
+        let lrc = dir.join(format!("{stem}.lrc"));
+        let srt = dir.join(format!("{stem}.srt"));
+        for (path, text) in [
+            (&lrc, self.lyrics_text(false)),
+            (&srt, self.lyrics_text(true)),
+        ] {
+            std::fs::write(path, text)
+                .map_err(|e| SessionError::Other(format!("{}: {e}", path.display())))?;
+        }
+        self.notify(
+            NoticeLevel::Info,
+            format!("Lyrics written to {} and .srt", lrc.display()),
+        );
+        Ok(lrc)
+    }
+
     /// The lyrics as LRC (`[mm:ss.xx]line`) or SRT text.
     pub fn lyrics_text(&self, srt: bool) -> String {
         let p = &self.project;

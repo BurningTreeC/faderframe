@@ -282,8 +282,8 @@ Contrast:
 * Speech and lyrics (an audio clip's menu → Transcribe Words): a clip's
   words, sung or spoken, as lines on the arranger's Lyrics lane (OpenAI's
   Whisper running in FaderFrame; the model, 290 MB, is downloaded once
-  from Audio → Download Speech Model). Lines are edited in place and
-  exported as LRC or SRT subtitles.
+  from Audio → Download Speech Model). Lines are edited in place; the
+  lane's menu writes them next to the project as LRC and SRT.
 * Stock dynamics with editors of their own: a compressor (five styles,
   soft knee, lookahead, auto release and makeup, colour, mix, a filtered
   sidechain), a true-peak lookahead limiter that never passes its ceiling,

@@ -58,6 +58,13 @@ fn lines_are_edited_and_written_out() {
     s.dispatch(Action::Undo).unwrap();
     s.dispatch(Action::Undo).unwrap();
     assert_eq!(texts(&s), ["First", "Hello there"]);
+    // Written next to the project (here, unsaved: its media folder).
+    let lrc = s.export_lyrics().unwrap();
+    assert_eq!(std::fs::read_to_string(&lrc).unwrap(), s.lyrics_text(false));
+    assert_eq!(
+        std::fs::read_to_string(lrc.with_extension("srt")).unwrap(),
+        s.lyrics_text(true)
+    );
 }
 
 #[test]

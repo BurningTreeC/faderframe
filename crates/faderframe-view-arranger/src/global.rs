@@ -1048,6 +1048,7 @@ impl ArrangerView {
                             text: None,
                         },
                     ),
+                    MenuItem::new("Export Lyrics (LRC and SRT)", Action::ExportLyrics).separated(),
                     MenuItem::new(
                         "Delete All Lyrics",
                         Action::Edit(Command::SetLyrics { lyrics: Vec::new() }),
