@@ -170,12 +170,13 @@ fn synth_preamp_master_changes_playing_audio_live_and_rendered_ahead() {
         let t = project
             .tracks
             .iter_mut()
-            .find(|t| t.instrument.is_some())
+            .find(|t| t.kind == faderframe_project::TrackKind::Instrument)
             .unwrap();
         let track = t.id;
         // Older projects may retain an invisible instrument beneath the
         // visible synth insert. The preamp must process the latter's audio.
-        let mut synth = t.instrument.clone().unwrap();
+        let mut synth = t.inserts.remove(0);
+        t.instrument = Some(synth.clone());
         synth.id = synth_id;
         t.inserts.push(synth);
         t.sends.clear();

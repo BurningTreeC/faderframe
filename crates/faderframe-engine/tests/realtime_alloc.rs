@@ -425,7 +425,7 @@ fn live_midi_input_and_midi_recording_do_not_allocate() {
     let synth = project
         .tracks
         .iter()
-        .find(|t| t.instrument.is_some())
+        .find(|t| t.kind == faderframe_project::TrackKind::Instrument)
         .unwrap()
         .id;
     let (tx, q, _feed) = faderframe_midi::midi_input_queue(256);

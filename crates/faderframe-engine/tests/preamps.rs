@@ -72,18 +72,25 @@ fn audio_preamp_is_before_inserts_and_all_channels_are_processed_independently()
     );
 }
 
+/// The demo with its Lead Synth's synth kept apart from the inserts, as
+/// older projects had it, and that track.
+fn legacy_demo() -> (faderframe_project::Project, faderframe_core::TrackId) {
+    let mut project = faderframe_project::demo::demo_project(48_000);
+    let t = project
+        .tracks
+        .iter_mut()
+        .find(|t| t.kind == faderframe_project::TrackKind::Instrument)
+        .unwrap();
+    t.instrument = Some(t.inserts.remove(0));
+    let id = t.id;
+    (project, id)
+}
+
 #[test]
 fn instrument_preamp_follows_audio_generation_for_legacy_and_insert_instruments() {
-    let project = faderframe_project::demo::demo_project(48_000);
+    let (project, track) = legacy_demo();
     let sources = faderframe_engine::render_generated_sources(&project, 48_000);
     let mut tp = TestProject { project, sources };
-    let track = tp
-        .project
-        .tracks
-        .iter()
-        .find(|t| t.instrument.is_some())
-        .unwrap()
-        .id;
     for t in &mut tp.project.tracks {
         t.solo = t.id == track;
     }
@@ -110,13 +117,7 @@ fn preamp_attenuates_the_last_synth_even_with_a_legacy_instrument() {
     use faderframe_project::SavedParameter;
     for legacy in [false, true] {
         for count in [1, 2] {
-            let mut project = faderframe_project::demo::demo_project(48_000);
-            let track = project
-                .tracks
-                .iter()
-                .find(|t| t.instrument.is_some())
-                .unwrap()
-                .id;
+            let (mut project, track) = legacy_demo();
             let instrument = project.track(track).unwrap().instrument.clone().unwrap();
             if !legacy {
                 project.track_mut(track).unwrap().instrument = None;

@@ -109,7 +109,7 @@ pub fn demo_project(sample_rate: u32) -> Project {
     );
     keys.volume_db = -7.0;
     keys.pan = 0.25;
-    keys.instrument = Some(PluginSlot {
+    keys.inserts.push(PluginSlot {
         id: p.ids.allocate(),
         plugin: PluginRef::builtin(builtin::SYNTH, "FaderFrame Synth"),
         bypass: false,

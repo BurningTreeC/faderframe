@@ -2191,16 +2191,20 @@ impl Session {
             }
         }
         samples::map_states(&mut project, |p| media::resolve(p, dir.as_deref()));
+        let mut adopted = Vec::new();
+        for t in &mut project.tracks {
+            adopted.extend(self.adopt_instrument(t));
+        }
         self.discard_unsaved_media();
         self.path = Some(path.clone());
         self.media_dir = dir.unwrap_or_default().join(MEDIA_FOLDER);
         self.unsaved_media = false;
         self.replace_project(project, loaded.workspace)?;
-        for n in &notes {
+        for n in notes.iter().chain(&adopted) {
             self.notify(NoticeLevel::Warning, n.clone());
         }
         self.notify(NoticeLevel::Info, format!("opened {}", path.display()));
-        Ok(notes)
+        Ok(notes.into_iter().chain(adopted).collect())
     }
 
     pub fn save_as(&mut self, path: &Path) -> Result<()> {
@@ -3629,6 +3633,43 @@ impl Session {
         self.engine.plugin_is_instrument(plugin)
     }
 
+    /// Is `plugin` an instrument (by what the plugin says it is, without
+    /// an instance)?
+    pub fn is_instrument_plugin(&self, plugin: &PluginRef) -> bool {
+        self.available_plugins()
+            .iter()
+            .any(|p| p.instrument && p.plugin.id == plugin.id && p.plugin.format == plugin.format)
+    }
+
+    /// An instrument track's instrument kept apart from its inserts (older
+    /// projects and track presets) becomes an insert like any other, after
+    /// the MIDI effects, where it played. A track whose inserts already
+    /// hold an instrument never heard it (an instrument replaces what
+    /// comes in): it goes, and the note returned says so.
+    pub(crate) fn adopt_instrument(&self, t: &mut Track) -> Option<String> {
+        if t.kind != TrackKind::Instrument {
+            return None;
+        }
+        let slot = t.instrument.take()?;
+        if t.inserts
+            .iter()
+            .any(|s| self.is_instrument_plugin(&s.plugin))
+        {
+            return Some(format!(
+                "'{}' had a second instrument from an older version that was never heard ({}): removed",
+                t.name,
+                slot.plugin.name.trim_start_matches("FaderFrame ")
+            ));
+        }
+        let at = t
+            .inserts
+            .iter()
+            .rposition(|s| self.is_midi_effect(&s.plugin))
+            .map_or(0, |i| i + 1);
+        t.inserts.insert(at, slot);
+        None
+    }
+
     /// Is `plugin` a MIDI effect (notes in, notes out, no audio)?
     pub fn is_midi_effect(&self, plugin: &PluginRef) -> bool {
         self.available_plugins()
@@ -3888,7 +3929,8 @@ impl Session {
             .into());
         }
         let index = self.insertion_index(preset.kind);
-        let (track, notes) = preset.instantiate(&mut self.project, None);
+        let (mut track, mut notes) = preset.instantiate(&mut self.project, None);
+        notes.extend(self.adopt_instrument(&mut track));
         let id = track.id;
         self.edit(Command::AddTrack {
             track: Box::new(track),
@@ -3906,9 +3948,49 @@ impl Session {
 
     fn apply_track_preset(&mut self, track: TrackId, path: &Path) -> Result<()> {
         let preset = self.load_preset(path)?;
-        let (commands, notes) = preset
+        let (commands, mut notes) = preset
             .apply_commands(&mut self.project, track)
             .map_err(|e| SessionError::Other(e.to_string()))?;
+        // A preset's instrument kept apart: an insert after its MIDI
+        // effects (unless its inserts bring an instrument).
+        let mut out = Vec::with_capacity(commands.len() + 1);
+        let mut inserted: Vec<&PluginSlot> = Vec::new();
+        for c in &commands {
+            if let Command::InsertPlugin { slot, .. } = c {
+                inserted.push(slot);
+            }
+        }
+        let has_instrument = inserted
+            .iter()
+            .any(|s| self.is_instrument_plugin(&s.plugin));
+        let after_fx = inserted
+            .iter()
+            .rposition(|s| self.is_midi_effect(&s.plugin))
+            .map_or(0, |i| i + 1);
+        for c in commands {
+            match c {
+                Command::SetInstrument {
+                    track,
+                    slot: Some(slot),
+                } => {
+                    out.push(Command::SetInstrument { track, slot: None });
+                    if has_instrument {
+                        notes.push(format!(
+                            "its second instrument ({}) was never heard: left out",
+                            slot.plugin.name
+                        ));
+                    } else {
+                        out.push(Command::InsertPlugin {
+                            track,
+                            index: after_fx,
+                            slot,
+                        });
+                    }
+                }
+                c => out.push(c),
+            }
+        }
+        let commands = out;
         self.edit(Command::Batch {
             label: format!("Apply Track Preset '{}'", preset.name),
             commands,
