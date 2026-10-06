@@ -759,6 +759,7 @@ dependencies = [
  "faderframe-audio-files",
  "faderframe-audio-graph",
  "faderframe-automation",
+ "faderframe-control",
  "faderframe-core",
  "faderframe-disc",
  "faderframe-engine",

@@ -15,8 +15,10 @@
 #![forbid(unsafe_code)]
 
 mod output;
+mod surface;
 
 pub use output::{Captured, MidiOutputPort, MidiOutputs, OUTPUT_CAPACITY};
+pub use surface::{SurfacePorts, VirtualSurface};
 
 use faderframe_midi::MidiInputSender;
 use std::collections::{HashMap, HashSet};

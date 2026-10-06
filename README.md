@@ -303,6 +303,11 @@ Contrast:
   Arrangement", and "Record to Arrangement" writes what was launched into
   the arrangement. Clips come from the arrangement (a clip's menu → Send
   to Clip Launcher) or are new MIDI clips; they drag between slots.
+* Control surfaces (Preferences → MIDI → Control Surfaces): Mackie Control
+  and its extenders, HUI, and OSC (e.g. TouchOSC) — motorised faders,
+  pan pots, mute/solo/arm/select, names, levels and meters on the
+  displays, the transport and the song position, banks of eight; over OSC
+  also the clip launcher.
 * Stock dynamics with editors of their own: a compressor (five styles,
   soft knee, lookahead, auto release and makeup, colour, mix, a filtered
   sidechain), a true-peak lookahead limiter that never passes its ceiling,

@@ -44,6 +44,8 @@ pub struct Preferences {
     pub midi_disabled_outputs: Vec<String>,
     /// MIDI outputs that get MIDI clock.
     pub midi_clock_outputs: Vec<String>,
+    /// Mackie Control, HUI and OSC surfaces.
+    pub control_surfaces: Vec<faderframe_session::control::SurfaceSettings>,
     /// "internal", "midi-clock" or "mtc".
     pub sync_source: String,
     /// Input port key to follow (none: any).
@@ -84,6 +86,7 @@ impl Default for Preferences {
             midi_disabled_inputs: Vec::new(),
             midi_disabled_outputs: Vec::new(),
             midi_clock_outputs: Vec::new(),
+            control_surfaces: Vec::new(),
             sync_source: "internal".into(),
             sync_port: None,
             mtc_offset: "00:00:00:00".into(),

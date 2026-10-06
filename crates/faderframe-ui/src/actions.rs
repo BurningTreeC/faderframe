@@ -1178,6 +1178,29 @@ pub fn install(app: &Rc<AppState>) {
                 None => tracing::warn!("edit-pitch: no audio clip on {arg}"),
             }
         }),
+        // `add-surface:<mackie|xt|hui|osc[@<listen port>]>`: a control
+        // surface without ports (MIDI) or listening on that UDP port.
+        named("add-surface", |a, arg| {
+            use faderframe_session::control::{SurfaceKind, SurfaceSettings};
+            let (kind, port) = arg.split_once('@').unwrap_or((arg, ""));
+            let kind = match kind {
+                "mackie" => SurfaceKind::Mackie,
+                "xt" => SurfaceKind::MackieExtender,
+                "hui" => SurfaceKind::Hui,
+                "osc" => SurfaceKind::Osc,
+                _ => return,
+            };
+            let mut all = a.session.borrow().control_surfaces().to_vec();
+            let mut s = SurfaceSettings {
+                kind,
+                ..SurfaceSettings::default()
+            };
+            if let Ok(p) = port.parse() {
+                s.listen = p;
+            }
+            all.push(s);
+            a.session.borrow_mut().set_control_surfaces(all);
+        }),
         // Development aids for the clip launcher: `send-to-launcher:<track>`
         // (its first clip), `launch:<track>@<scene n>` (1-based),
         // `launch-scene:<n>`, `launcher:<stop-all|back|record|scene>`.

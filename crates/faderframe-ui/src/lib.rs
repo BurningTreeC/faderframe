@@ -31,6 +31,7 @@ mod render;
 mod screenshot;
 pub mod state;
 mod style;
+mod surface_prefs;
 mod transport_display;
 mod transport_keys;
 mod window;
@@ -184,6 +185,8 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
             disabled_outputs: prefs.midi_disabled_outputs.clone(),
             clock_outputs: prefs.midi_clock_outputs.clone(),
         });
+        // Control surfaces (OSC too: scripted runs keep them all closed).
+        session.set_control_surfaces(prefs.control_surfaces.clone());
     }
     let state = AppState::new(app, session, options);
     transport_keys::install(&state);

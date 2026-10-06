@@ -30,6 +30,7 @@ pub mod analysis;
 pub mod capture;
 pub mod clip_fx;
 pub mod containers;
+pub mod control;
 pub mod delivery;
 pub mod detect;
 pub mod editing;
@@ -1068,6 +1069,7 @@ pub struct Session {
     clip_fx: clip_fx::ClipFxState,
     speech: speech::SpeechState,
     launcher: launcher::LauncherState,
+    control: control::ControlState,
     /// The audio clip the pitch editor shows.
     pitch_clip: Option<ClipId>,
     /// Track renders for freezing and bouncing.
@@ -1287,6 +1289,7 @@ impl Session {
             clip_fx: clip_fx::ClipFxState::default(),
             speech: speech::SpeechState::default(),
             launcher: launcher::LauncherState::default(),
+            control: control::ControlState::default(),
             pitch_clip: None,
             gesture_base: HashMap::new(),
             bounces: Vec::new(),
@@ -1909,6 +1912,7 @@ impl Session {
         }
         self.tick_performance();
         self.tick_midi();
+        self.tick_control();
         let status = self.stream_status();
         if let Some(status) = status {
             if status.shut_down {

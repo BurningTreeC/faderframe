@@ -422,6 +422,9 @@ pub fn page(app: &Rc<AppState>) -> gtk::Widget {
     let sync = sync_section(app);
     body.append(&sync.grid);
 
+    body.append(&heading("CONTROL SURFACES"));
+    body.append(&crate::surface_prefs::section(app));
+
     body.append(&heading("CONTROLLER MAPPINGS"));
     let maps = gtk::ListBox::new();
     maps.set_selection_mode(gtk::SelectionMode::None);

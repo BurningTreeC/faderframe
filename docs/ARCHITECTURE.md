@@ -1864,6 +1864,36 @@ track's material there carved away) in one "Record Launches" step when
 the transport stops. The grid is `faderframe-view-launcher`
 (`ViewKind::Launcher`); the arranger dims tracks that play the launcher.
 
+### Control surfaces
+
+`faderframe-control` holds the protocols without I/O: the session builds
+a `SurfaceState` (a bank of strips — fader travel by the console law,
+level text, pan, mute/solo/arm/select, name, peak — the master fader,
+transport flags, bars/beats/sixteenths/ticks, the bank's first track)
+every tick and a `Protocol` sends only what changed; what arrives becomes
+`SurfaceInput`s. `mackie` (notes for buttons/LEDs, pitch-bend faders, the
+2×56 LCD by SysEx, pot rings, the ten-digit display, channel-pressure
+meters refreshed every 100 ms), `hui` (zone/port switches and LEDs,
+14-bit faders over two CCs, scribble strips, the 2×40 display, timecode
+digits, meters, a ping every second) and `osc` (an OSC 1.0 codec and
+FaderFrame's address space, documented in the module; toggles compare
+with the state shown so TouchOSC's toggle and push buttons both work).
+Faders a user holds are never moved.
+
+`session::control` opens the surfaces from `SurfaceSettings` (saved as
+`Preferences::control_surfaces`): MIDI ones through
+`faderframe_midi_io::SurfacePorts` — their own input connection and an
+immediate output, the ports taken from the hub and the track outputs
+(`MidiState::surface_inputs/outputs`, kept out of the preferences'
+disabled lists) so a surface never plays tracks — and OSC on a
+non-blocking `UdpSocket`, answering the last sender on the reply port.
+Surfaces sit side by side from the shared bank start over
+`Session::surface_tracks` (mixer strips in editor order). Faders and pots
+are gestures (touch to release, or 400 ms of rest), buttons toggle, select
+or run the transport, banks move by a surface's width; OSC also launches
+the clip launcher. Tests: `faderframe-control`'s, `session/tests/control.rs`
+(a virtual Mackie on the demo, OSC over UDP on localhost).
+
 ### Track presets
 
 `faderframe_project::preset::TrackPreset` captures a track's channel
@@ -2310,9 +2340,9 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
    bridge ARA), ~~a speech and lyrics transcription track (Whisper,
    MIT)~~ (done: *Speech and lyrics*). Stem separation waits
    for permissively licensed model weights.
-6. **Performance and control**: ~~a clip launcher with scenes recorded
-   into the arrangement~~ (done: *Clip launcher*), control surfaces
-   (Mackie Control/HUI, OSC).
+6. ~~**Performance and control**: a clip launcher with scenes recorded
+   into the arrangement, control surfaces (Mackie Control/HUI, OSC)~~ —
+   done (see *Clip launcher* and *Control surfaces*).
 7. **Ports**: signed and notarised packages, a Flathub submission
    (vendored crates), sandboxed plugins' audio threads in the device's
    workgroup (macOS: needs the workgroup's Mach port in the helper).

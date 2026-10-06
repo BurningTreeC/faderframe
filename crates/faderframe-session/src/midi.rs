@@ -365,6 +365,10 @@ pub(crate) struct MidiState {
     /// Keys of the chord being entered by step input (and how many are down).
     step_chord: Vec<(u8, u8, u8)>,
     step_down: usize,
+    /// Input and output ports control surfaces have (kept from the hub and
+    /// the track outputs, and out of the preferences' disabled lists).
+    surface_inputs: Vec<String>,
+    surface_outputs: Vec<String>,
 }
 
 impl MidiState {
@@ -395,6 +399,8 @@ impl MidiState {
                 sysex: crate::sysex::SysexPlayback::default(),
                 step_chord: Vec::new(),
                 step_down: 0,
+                surface_inputs: Vec::new(),
+                surface_outputs: Vec::new(),
             },
             queue,
         )
@@ -479,17 +485,29 @@ impl Session {
 
     /// Connect the system's MIDI devices (the shell calls this at start-up).
     pub fn start_midi(&mut self, prefs: &MidiPreferences) {
-        self.midi
-            .hub
-            .set_disabled(prefs.disabled_inputs.iter().cloned());
+        let surfaces = &self.midi.surface_inputs;
+        self.midi.hub.set_disabled(
+            prefs
+                .disabled_inputs
+                .iter()
+                .chain(surfaces.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
         self.midi.hub.start_system();
         if let Some(e) = self.midi.hub.error() {
             let e = e.to_string();
             self.notify(NoticeLevel::Warning, e);
         }
-        self.midi
-            .outputs
-            .set_disabled(prefs.disabled_outputs.iter().cloned());
+        let surfaces = &self.midi.surface_outputs;
+        self.midi.outputs.set_disabled(
+            prefs
+                .disabled_outputs
+                .iter()
+                .chain(surfaces.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
         self.midi.outputs.start_system();
         self.midi.clock_outputs = prefs.clock_outputs.iter().cloned().collect();
         self.midi.last_scan = Some(Instant::now());
@@ -540,6 +558,28 @@ impl Session {
             .collect()
     }
 
+    /// Keep the ports control surfaces use from the hub and the track
+    /// outputs (and give back the ones they no longer use).
+    pub(crate) fn apply_surface_ports(&mut self) {
+        let prefs = self.midi_preferences();
+        let (ins, outs) = self.surface_ports();
+        self.midi.surface_inputs = ins;
+        self.midi.surface_outputs = outs;
+        let mut inputs = prefs.disabled_inputs;
+        inputs.extend(self.midi.surface_inputs.iter().cloned());
+        self.midi.hub.set_disabled(inputs);
+        let mut outputs = prefs.disabled_outputs;
+        outputs.extend(self.midi.surface_outputs.iter().cloned());
+        self.midi.outputs.set_disabled(outputs);
+        self.midi_ports_changed();
+    }
+
+    /// Is this MIDI port a control surface's?
+    pub fn is_surface_port(&self, key: &str) -> bool {
+        self.midi.surface_inputs.iter().any(|k| k == key)
+            || self.midi.surface_outputs.iter().any(|k| k == key)
+    }
+
     /// Any input received something just now.
     pub fn midi_active(&self) -> bool {
         let now = Instant::now();
@@ -556,7 +596,7 @@ impl Session {
                 .hub
                 .ports()
                 .into_iter()
-                .filter(|p| !p.enabled)
+                .filter(|p| !p.enabled && !self.midi.surface_inputs.contains(&p.key))
                 .map(|p| p.key)
                 .collect(),
             disabled_outputs: self
@@ -564,7 +604,7 @@ impl Session {
                 .outputs
                 .ports()
                 .into_iter()
-                .filter(|p| !p.enabled)
+                .filter(|p| !p.enabled && !self.midi.surface_outputs.contains(&p.key))
                 .map(|p| p.key)
                 .collect(),
             clock_outputs: {
@@ -582,6 +622,7 @@ impl Session {
         if !enabled {
             disabled.push(key.to_string());
         }
+        disabled.extend(self.midi.surface_inputs.iter().cloned());
         self.midi.hub.set_disabled(disabled);
         self.midi_ports_changed();
         self.revision += 1;
@@ -594,6 +635,7 @@ impl Session {
         if !enabled {
             disabled.push(key.to_string());
         }
+        disabled.extend(self.midi.surface_outputs.iter().cloned());
         self.midi.outputs.set_disabled(disabled);
         self.midi_ports_changed();
         self.revision += 1;
