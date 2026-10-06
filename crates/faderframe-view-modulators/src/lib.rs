@@ -428,7 +428,7 @@ impl ModulatorsView {
             .map(|r| {
                 let line = Rect::new(x + PAD, top + r as f32 * ROUTE_H, w - 2.0 * PAD, ROUTE_H);
                 let rm = Rect::new(line.right() - 14.0, line.y + 3.0, 14.0, 14.0);
-                let depth = Rect::new(rm.x - 88.0, line.y + 4.0, 82.0, 12.0);
+                let depth = Rect::new(rm.x - 72.0, line.y + 5.0, 66.0, 10.0);
                 (r, line, depth, rm)
             })
             .collect();
@@ -806,7 +806,7 @@ impl ModulatorsView {
                 .unwrap_or_else(|| "(gone)".into());
             p.text(
                 &name,
-                Rect::new(line.x, line.y, depth.x - line.x - 4.0, line.h),
+                Rect::new(line.x, line.y, depth.x - line.x - 50.0, line.h),
                 &TextStyle::new(th.fonts.small, text),
             );
             p.fill_rounded(*depth, 2.0, &Paint::Solid(th.ui.background));
@@ -821,12 +821,13 @@ impl ModulatorsView {
                 },
             );
             p.vline(mid, depth.y, depth.bottom(), th.ui.border);
+            // The depth before its bar.
             p.text(
                 &format!("{:+.0} %", route.depth * 100.0),
-                *depth,
-                &TextStyle::new(th.fonts.tiny, th.ui.text)
+                Rect::new(depth.x - 46.0, line.y, 42.0, line.h),
+                &TextStyle::new(th.fonts.tiny, th.ui.text_dim)
                     .family(FontFamily::Mono)
-                    .center(),
+                    .right(),
             );
             p.text(
                 "×",
