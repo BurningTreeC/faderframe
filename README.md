@@ -6,9 +6,12 @@ come from the same code.
 
 FaderFrame aims to be a professional DAW: graph-based routing with buses,
 aux sends and sidechains, hard-realtime multicore audio processing with
-automatic plugin delay compensation, MIDI and virtual instruments,
-automation, CLAP/VST3 hosting, an analogue-console-style mixer, mastering
-meters and dockable, detachable editors.
+automatic plugin delay compensation, MIDI and virtual instruments with a
+key, a chord track and MIDI effects, modulators and parallel effect
+containers, automation, CLAP/VST3 (and Audio Unit) hosting, an
+analogue-console-style mixer, a full set of stock devices, mastering
+meters, album delivery down to CD and vinyl masters, and dockable,
+detachable editors.
 
 > **Status: in active development.** Most of a working DAW is there; see
 > [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#status-and-roadmap) for what
@@ -16,18 +19,46 @@ meters and dockable, detachable editors.
 
 ## Screenshots
 
-The demo session playing — Mixing workspace:
+All of them show the demo session (`--demo`, or Preferences → General →
+On start-up): eight bars in A minor whose audio is generated, so it needs
+no files.
+
+The Editing workspace: markers, the Intro and Verse sections, the key and
+the chord track above the tracks, the arpeggios in a folder, and in the
+bottom dock the pad's modulators — an envelope follower that ducks it under
+the drums and a synced LFO that moves it across the stereo field:
+
+![Editing workspace with the global lanes, a folder and the Modulators panel](docs/screenshots/editing.png)
+
+The Mixing workspace: a preamp on the bass, inserts, sends to an echo and
+a reverb aux, a MIDI track's strip (it plays the arpeggiating synth), the
+drum bus's parallel-compression container and a true-peak limiter on the
+master:
 
 ![Mixing workspace with the analogue-console mixer](docs/screenshots/mixing.png)
 
-The MIDI workspace with the piano roll editing the lead synth's melody:
+The MIDI workspace with the piano roll editing the lead synth's melody,
+the key and the chords above the notes and the scale highlighted:
 
-![Piano roll showing a MIDI clip](docs/screenshots/piano-roll.png)
+![Piano roll showing a MIDI clip under the key and chord tracks](docs/screenshots/piano-roll.png)
 
 The Mastering workspace with the Tools view (EBU R128 loudness, levels,
 phase and spectrum):
 
 ![Mastering workspace with loudness, level, phase and spectrum meters](docs/screenshots/mastering.png)
+
+The album: the demo's sections as songs, analysed, with what delivery will
+make of them (levelling, limiting) and the CD and vinyl masters a click
+away:
+
+![The album view with two songs analysed](docs/screenshots/album.png)
+
+Device editors: the EQ (dynamic and spectral bands, analyser), the synth
+(the dots on Cutoff and Resonance show where its modulators have them
+now), the compressor, the reverb, the Parallel Squash container on the
+drum bus and the program EQ:
+
+![EQ, synth, compressor, reverb, container and program EQ editors](docs/screenshots/devices.png)
 
 Seven skins, switched live (View → Theme or Preferences → General → Theme):
 Studio, Vintage Console (walnut cheeks, enamel panels, skirted knobs,
@@ -42,7 +73,9 @@ Contrast:
 * Arranger (virtualised): tracks, audio clips with waveforms, MIDI clips,
   move/split/delete, snapping, zoom down to single samples, loop range,
   playhead, console-style track headers with mute/solo/arm/monitor, volume,
-  pan and meters. Clicking a clip selects it and moves the playhead to the
+  pan and meters (the wheel over the headers turns their faders and knobs
+  and never scrolls; a held scrollbar stops the view following the
+  playhead). Clicking a clip selects it and moves the playhead to the
   (snapped) click; Shift- or Ctrl-click selects more clips, and moves,
   trims, fades and gain changes apply to every selected clip.
 * Global lanes under the ruler (click a lane's title to show or hide
@@ -172,8 +205,8 @@ Contrast:
 * Adding tracks: the "+" under the last track in the arranger and right of
   the last strip in the mixer (each kind of track, or one from a saved
   track preset; an instrument track opens the plugin browser).
-* Docking: mixer / Tools / album / piano roll / automation / performance
-  tabs in a bottom dock, detach any view into its own window and dock it back,
+* Docking: mixer / Tools / album / piano roll / automation / performance /
+  undo history / modulators tabs in a bottom dock, detach any view into its own window and dock it back,
   workspaces (Recording, Editing, Mixing, MIDI, Mastering), layouts saved
   with the project. View → Master Strip at the Side keeps the master fader
   at the window's right edge, full height, whatever view is shown (per
@@ -203,8 +236,32 @@ Contrast:
   each song's file and a cutting sheet.
 * Engine: routing graph with cycle detection and plugin delay compensation,
   buses, auxes, sends, sidechains, solo-in-place, sample-accurate loops,
-  built-in synth, echo, gain and latency-probe plugins,
-  realtime-safe (verified by an allocation-counting test).
+  realtime-safe (verified by allocation-counting tests over every device,
+  modulator and container).
+* Modulators (View → Modulators, a tab in the bottom dock, for the
+  selected track): LFOs (five shapes, synced to the beat or free, start
+  phase), envelope followers (the track's own input or another track),
+  step sequences (up to 32 steps, drawn with the mouse, with glide),
+  smoothed random and macro knobs — and per note: velocity, key, a note
+  envelope, a note LFO and a note random, a value for every sounding
+  note. Each moves any number of targets with a depth: the track's fader
+  (in fader travel) and pan and every device parameter that takes
+  modulation; Map, then move a control, routes it. Modulation never
+  changes a value — automation, presets and saved state keep what you set,
+  and the device knobs show a dot where modulation has the value now.
+  Synced modulators follow the song position, so every playback and every
+  render of a passage sounds alike.
+* CLAP modulation: CLAP parameters take FaderFrame's modulation without
+  their values changing (CLAP's parameter modulation events), and
+  per-note modulators reach single voices of CLAP instruments that offer
+  polyphonic modulation (by key or note id — with u-he Diva, for example,
+  each note's filter moves on its own), also through the plugin sandbox.
+* Containers (insert a Container): parallel chains of devices, each with
+  its own level, balance, mute and solo, mixed at the container's output —
+  parallel compression, dry/wet blends, split effects; a chain without
+  devices is the dry signal, containers nest, and the chains' latencies
+  are aligned automatically. Its editor shows a column a chain: add
+  devices and chains, drag levels, open the devices' editors.
 * Stock dynamics with editors of their own: a compressor (five styles,
   soft knee, lookahead, auto release and makeup, colour, mix, a filtered
   sidechain), a true-peak lookahead limiter that never passes its ceiling,
@@ -217,7 +274,9 @@ Contrast:
   decay), chorus/ensemble/flanger/phaser/vibrato, and a tuner.
 * Stock instruments: a virtual analogue synth (unison, sub, noise, four
   filter types, two envelopes, LFO, mono/legato with glide), a sampler
-  that plays a sample across the keys or an SFZ instrument, and a
+  that plays a sample across the keys (between start and end markers
+  dragged on its waveform, forwards or reversed, looped or not, every key
+  held lit on its keyboard) or an SFZ instrument, and a
   sixteen-pad drum sampler with choke groups. Both samplers can keep a
   sample's length when they change its pitch (Sampler: Keep Length;
   Drum Sampler: per pad), through the same stretcher as warping, without
@@ -465,8 +524,12 @@ shows where the data goes.
 | F8 | Performance meter |
 | F12 | Tools (loudness, level, phase, spectrum) |
 | Ctrl+1 … Ctrl+5 | Workspaces |
+| Ctrl+T / Ctrl+Shift+T | New audio track / new instrument track |
 | Ctrl+I | Import audio files |
 | Ctrl+Shift+R | Render / export |
+| Ctrl+Shift+C | Capture MIDI (what was played last becomes clips) |
+| Ctrl+Alt+S | Save a version of the project |
+| Ctrl+Shift+P | Command palette |
 | Ctrl+, | Preferences |
 | Ctrl+wheel / Shift+wheel | Zoom / scroll horizontally |
 | Shift or Ctrl while dragging | Fine adjustment |
@@ -483,6 +546,8 @@ shows where the data goes.
 | Tab / Shift+Tab | Next / previous clip boundary or transient (Ctrl: extend the selection) |
 | Ctrl+Shift+↑ / ↓ | Clip gain ±0.5 dB |
 | Ctrl+] / Ctrl+[ | Zoom in / out |
+
+View → Keyboard Shortcuts… changes any command's shortcut.
 
 ## Development
 
