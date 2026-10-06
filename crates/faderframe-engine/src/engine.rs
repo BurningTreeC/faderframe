@@ -587,6 +587,26 @@ impl EngineProcessor {
                         }
                     });
             }
+            let mtc_ports = self.shared.midi.mtc_ports.load(Ordering::Relaxed);
+            if mtc_ports != 0
+                && !scrubbing
+                && let Some(q) = self.midi_out.as_deref_mut()
+            {
+                let ns_per_frame = 1e9 / rate.max(1.0);
+                let latency = self.output_latency as usize + offset;
+                let dropped = &self.shared.midi_out_dropped;
+                crate::midi::MtcGen.chunk(&info, n, &self.shared.midi, |o, bytes| {
+                    let due = callback_ns + ((latency + o as usize) as f64 * ns_per_frame) as u64;
+                    for port in 0..64u16 {
+                        if mtc_ports & (1u64 << port) != 0
+                            && let Some(m) = faderframe_midi::MidiOutputEvent::new(port, due, bytes)
+                            && q.producer.push(m).is_err()
+                        {
+                            dropped.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
             if graph_ok && let Some(graph) = self.graph.as_deref_mut() {
                 let ins = io.input_channels();
                 graph.fill_device_inputs(n, |first, buf| {

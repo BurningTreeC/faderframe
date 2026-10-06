@@ -1632,6 +1632,17 @@ impl Session {
             .clock_ports
             .store(self.midi.clock_mask(), std::sync::atomic::Ordering::Relaxed);
         self.engine
+            .midi_shared()
+            .mtc_ports
+            .store(self.midi.mtc_mask(), std::sync::atomic::Ordering::Relaxed);
+        {
+            let s = &self.sync.settings;
+            let rate = s.mtc_out_rate;
+            self.engine
+                .midi_shared()
+                .set_mtc(rate, s.offset.total_frames(rate));
+        }
+        self.engine
             .sync(&self.project, &self.sources, Impact::Graph)?;
         self.engine.transport(TransportCommand::Locate(position))?;
         self.pending = Some(processor);
@@ -1918,6 +1929,7 @@ impl Session {
         }
         self.tick_performance();
         self.tick_midi();
+        self.tick_mtc_out();
         self.tick_control();
         let status = self.stream_status();
         if let Some(status) = status {

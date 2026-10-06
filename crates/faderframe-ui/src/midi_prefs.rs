@@ -18,6 +18,7 @@ fn save_disabled(app: &AppState) {
     p.midi_disabled_inputs = m.disabled_inputs;
     p.midi_disabled_outputs = m.disabled_outputs;
     p.midi_clock_outputs = m.clock_outputs;
+    p.midi_mtc_outputs = m.mtc_outputs;
     if let Err(e) = p.save() {
         tracing::warn!("cannot save preferences: {e}");
     }
@@ -151,6 +152,25 @@ fn output_rows(
             });
         }
         row.append(&clock);
+        let mtc = gtk::CheckButton::with_label("MTC");
+        mtc.set_active(o.mtc);
+        mtc.set_tooltip_text(Some(
+            "Send MIDI time code (quarter frames while playing, full frames on start and locate; rate and start time under Sync)",
+        ));
+        mtc.set_sensitive(o.enabled);
+        {
+            let weak = Rc::downgrade(app);
+            let key = o.key.clone();
+            mtc.connect_toggled(move |b| {
+                if let Some(a) = weak.upgrade() {
+                    a.session
+                        .borrow_mut()
+                        .set_midi_mtc_output(&key, b.is_active());
+                    save_disabled(&a);
+                }
+            });
+        }
+        row.append(&mtc);
         let syx = gtk::Button::with_label("Send .syx…");
         syx.add_css_class("flat");
         syx.set_sensitive(o.enabled && o.connected);
@@ -331,17 +351,40 @@ fn sync_section(app: &Rc<AppState>) -> SyncWidgets {
     grid.attach(&port, 1, 1, 1, 1);
     grid.attach(&label("MTC at project start"), 0, 2, 1, 1);
     grid.attach(&offset, 1, 2, 1, 1);
-    grid.attach(&status, 1, 3, 1, 1);
+    let rates: Vec<&str> = faderframe_session::MtcRate::ALL
+        .iter()
+        .map(|r| r.label())
+        .collect();
+    let out_rate = gtk::DropDown::from_strings(&rates);
+    out_rate.set_selected(
+        faderframe_session::MtcRate::ALL
+            .iter()
+            .position(|r| *r == current.mtc_out_rate)
+            .unwrap_or(1) as u32,
+    );
+    out_rate.set_tooltip_text(Some(
+        "The frame rate of the MIDI time code FaderFrame sends",
+    ));
+    grid.attach(&label("MTC sent at"), 0, 3, 1, 1);
+    grid.attach(&out_rate, 1, 3, 1, 1);
+    grid.attach(&status, 1, 4, 1, 1);
 
     let apply = {
         let weak = Rc::downgrade(app);
-        let (source, port, offset) = (source.clone(), port.clone(), offset.clone());
+        let (source, port, offset, out_rate) = (
+            source.clone(),
+            port.clone(),
+            offset.clone(),
+            out_rate.clone(),
+        );
         let ports = ports.clone();
         let absent = current.port.clone();
         move || {
             let Some(app) = weak.upgrade() else { return };
             let mut s = app.session.borrow().sync_settings().clone();
             s.source = SyncSource::ALL[source.selected() as usize % SyncSource::ALL.len()];
+            let rates = faderframe_session::MtcRate::ALL;
+            s.mtc_out_rate = rates[out_rate.selected() as usize % rates.len()];
             s.port = match port.selected() as usize {
                 0 => None,
                 i => ports.get(i - 1).map(|(k, _)| k.clone()).or(absent.clone()),
@@ -362,7 +405,7 @@ fn sync_section(app: &Rc<AppState>) -> SyncWidgets {
         }
     };
     let apply = Rc::new(apply);
-    for d in [&source, &port] {
+    for d in [&source, &port, &out_rate] {
         let apply = Rc::clone(&apply);
         d.connect_selected_notify(move |_| apply());
     }

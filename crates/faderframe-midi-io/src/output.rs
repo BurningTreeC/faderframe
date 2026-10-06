@@ -198,6 +198,16 @@ impl MidiOutputs {
         let _ = self.sysex.send((due_ns, self.sysex_seq, port, g, data));
     }
 
+    /// Send a message to output `port` now, past the timed queue (full-
+    /// frame timecode, control surfaces' displays).
+    pub fn send_now(&self, port: u16, bytes: &[u8]) {
+        if let Ok(mut sinks) = self.sinks.lock()
+            && let Some(s) = sinks.get_mut(&port)
+        {
+            s.send(self.clock.now_ns(), bytes);
+        }
+    }
+
     /// How many SysEx messages were handed to the sender so far.
     pub fn sysex_scheduled(&self) -> u64 {
         self.sysex_seq

@@ -120,6 +120,26 @@ pub struct MidiShared {
     pub consumed: ConsumedControls,
     /// Output ports (bit per index < 64) that get MIDI clock.
     pub clock_ports: AtomicU64,
+    /// Output ports that get MIDI time code, and what they get: the
+    /// timecode frame at the project start (<< 2) and the rate's two bits.
+    pub mtc_ports: AtomicU64,
+    pub mtc_format: AtomicU64,
+}
+
+impl MidiShared {
+    /// MTC output: its rate and the timecode at the project's start.
+    pub fn set_mtc(&self, rate: faderframe_midi::timecode::MtcRate, start_frames: i64) {
+        let v = (start_frames.max(0) as u64) << 2 | u64::from(rate.bits());
+        self.mtc_format.store(v, Ordering::Relaxed);
+    }
+
+    fn mtc(&self) -> (faderframe_midi::timecode::MtcRate, i64) {
+        let v = self.mtc_format.load(Ordering::Relaxed);
+        (
+            faderframe_midi::timecode::MtcRate::from_bits((v & 3) as u8),
+            (v >> 2) as i64,
+        )
+    }
 }
 
 /// Input events of the current chunk: (port, event at a chunk offset).
@@ -796,6 +816,106 @@ impl ClockGen {
             emit(offset.max(0.0) as u32, &[0xF8]);
             k += 1.0;
         }
+    }
+}
+
+/// MIDI time code: quarter-frame messages (four a frame, eight make a
+/// whole timecode, starting on even frames) while the transport plays,
+/// generated on the audio thread for every port with MTC enabled; the
+/// session sends the full-frame messages on start and locate.
+#[derive(Debug, Default)]
+pub(crate) struct MtcGen;
+
+impl MtcGen {
+    /// The quarter frames due in a chunk of `frames` from `info` (offsets
+    /// in the chunk).
+    pub(crate) fn chunk(
+        &mut self,
+        info: &faderframe_transport::TransportInfo,
+        frames: usize,
+        shared: &MidiShared,
+        mut emit: impl FnMut(u32, &[u8]),
+    ) {
+        use faderframe_midi::timecode::Timecode;
+        if !info.playing {
+            return;
+        }
+        let (rate, start) = shared.mtc();
+        let sr = info.sample_rate.max(1.0);
+        let per_second = 4.0 * rate.fps();
+        // Quarter frames since 00:00:00:00 at the chunk's start.
+        let t0 = info.sample_position as f64 / sr;
+        let base = start as f64 * 4.0;
+        let mut q = (base + t0 * per_second - 1e-9).ceil();
+        loop {
+            let t = (q - base) / per_second;
+            let offset = ((t - t0) * sr).round();
+            if offset >= frames as f64 {
+                break;
+            }
+            if q >= 0.0 {
+                let qi = q as i64;
+                let piece = (qi % 8) as u8;
+                let tc = Timecode::from_frames((qi - i64::from(piece)) / 4, rate);
+                let nibble = match piece {
+                    0 => tc.frames & 0x0F,
+                    1 => tc.frames >> 4 & 1,
+                    2 => tc.seconds & 0x0F,
+                    3 => tc.seconds >> 4 & 3,
+                    4 => tc.minutes & 0x0F,
+                    5 => tc.minutes >> 4 & 3,
+                    6 => tc.hours & 0x0F,
+                    _ => rate.bits() << 1 | (tc.hours >> 4 & 1),
+                };
+                emit(offset.max(0.0) as u32, &[0xF1, piece << 4 | nibble]);
+            }
+            q += 1.0;
+        }
+    }
+}
+
+#[cfg(test)]
+mod mtc_tests {
+    use super::*;
+    use faderframe_midi::timecode::MtcRate;
+    use faderframe_transport::TransportInfo;
+
+    #[test]
+    fn quarter_frames_spell_the_timecode() {
+        let shared = MidiShared::default();
+        // 25 fps, the project starting at 01:00:00:00: a quarter frame
+        // every 480 frames at 48 kHz.
+        shared.set_mtc(MtcRate::Fps25, 25 * 3600);
+        let info = TransportInfo {
+            playing: true,
+            sample_rate: 48_000.0,
+            sample_position: 0,
+            ..TransportInfo::default()
+        };
+        let mut got = Vec::new();
+        MtcGen.chunk(&info, 8 * 480, &shared, |o, b| got.push((o, b.to_vec())));
+        assert_eq!(got.len(), 8);
+        let offsets: Vec<u32> = got.iter().map(|(o, _)| *o).collect();
+        assert_eq!(offsets, (0..8).map(|k| k * 480).collect::<Vec<_>>());
+        // 01:00:00:00, 25 fps (rate bits 01).
+        let pieces: Vec<u8> = got.iter().map(|(_, b)| b[1]).collect();
+        assert_eq!(pieces, [0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x61, 0x72]);
+        // At frame 12 (0.48 s): a sequence starts on 12.
+        let info = TransportInfo {
+            sample_position: 23_040,
+            ..info
+        };
+        got.clear();
+        MtcGen.chunk(&info, 480, &shared, |o, b| got.push((o, b.to_vec())));
+        assert_eq!(got, vec![(0, vec![0xF1, 0x0C])]);
+        // Stopped: nothing.
+        got.clear();
+        let stopped = TransportInfo {
+            playing: false,
+            ..info
+        };
+        MtcGen.chunk(&stopped, 4800, &shared, |o, b| got.push((o, b.to_vec())));
+        assert!(got.is_empty());
     }
 }
 

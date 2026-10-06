@@ -17,6 +17,7 @@ mod input;
 mod note_ids;
 mod output;
 pub mod theory;
+pub mod timecode;
 mod tracker;
 
 pub use buffer::{MidiBuffer, MidiBufferFull};

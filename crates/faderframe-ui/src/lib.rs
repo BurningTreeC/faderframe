@@ -184,6 +184,7 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
             disabled_inputs: prefs.midi_disabled_inputs.clone(),
             disabled_outputs: prefs.midi_disabled_outputs.clone(),
             clock_outputs: prefs.midi_clock_outputs.clone(),
+            mtc_outputs: prefs.midi_mtc_outputs.clone(),
         });
         // Control surfaces (OSC too: scripted runs keep them all closed).
         session.set_control_surfaces(prefs.control_surfaces.clone());

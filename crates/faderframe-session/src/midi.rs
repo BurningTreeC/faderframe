@@ -49,6 +49,8 @@ pub struct MidiPreferences {
     pub disabled_outputs: Vec<String>,
     /// Output port keys that get MIDI clock.
     pub clock_outputs: Vec<String>,
+    /// Output port keys that get MIDI time code.
+    pub mtc_outputs: Vec<String>,
 }
 
 /// A MIDI output as shown in preferences and menus.
@@ -61,6 +63,8 @@ pub struct MidiOutputStatus {
     pub is_virtual: bool,
     /// Sends MIDI clock (24 ppqn, start/stop/song position).
     pub clock: bool,
+    /// Sends MIDI time code.
+    pub mtc: bool,
 }
 
 /// Step input: notes played on a MIDI keyboard are entered at the cursor
@@ -338,6 +342,10 @@ pub(crate) struct MidiState {
     pub(crate) hub: MidiHub,
     pub(crate) outputs: faderframe_midi_io::MidiOutputs,
     clock_outputs: HashSet<String>,
+    mtc_outputs: HashSet<String>,
+    /// MTC full frames: the transport as last seen (playing, position) and
+    /// when.
+    mtc_seen: Option<(bool, i64, Instant)>,
     sender: MidiInputSender,
     feed: MidiControlFeed,
     keyboard: VirtualMidiInput,
@@ -382,6 +390,8 @@ impl MidiState {
                 hub,
                 outputs,
                 clock_outputs: HashSet::new(),
+                mtc_outputs: HashSet::new(),
+                mtc_seen: None,
                 sender,
                 feed,
                 keyboard,
@@ -430,6 +440,15 @@ impl MidiState {
             .ports()
             .iter()
             .filter(|p| p.index < 64 && self.clock_outputs.contains(&p.key))
+            .fold(0, |m, p| m | (1u64 << p.index))
+    }
+
+    /// Bit mask of output indices that send MIDI time code.
+    pub(crate) fn mtc_mask(&self) -> u64 {
+        self.outputs
+            .ports()
+            .iter()
+            .filter(|p| p.index < 64 && self.mtc_outputs.contains(&p.key))
             .fold(0, |m, p| m | (1u64 << p.index))
     }
 
@@ -510,6 +529,7 @@ impl Session {
         );
         self.midi.outputs.start_system();
         self.midi.clock_outputs = prefs.clock_outputs.iter().cloned().collect();
+        self.midi.mtc_outputs = prefs.mtc_outputs.iter().cloned().collect();
         self.midi.last_scan = Some(Instant::now());
         self.midi_ports_changed();
     }
@@ -549,6 +569,7 @@ impl Session {
             .into_iter()
             .map(|p| MidiOutputStatus {
                 clock: self.midi.clock_outputs.contains(&p.key),
+                mtc: self.midi.mtc_outputs.contains(&p.key),
                 key: p.key,
                 name: p.name,
                 enabled: p.enabled,
@@ -612,6 +633,11 @@ impl Session {
                 v.sort();
                 v
             },
+            mtc_outputs: {
+                let mut v: Vec<String> = self.midi.mtc_outputs.iter().cloned().collect();
+                v.sort();
+                v
+            },
         }
     }
 
@@ -655,6 +681,70 @@ impl Session {
         self.revision += 1;
     }
 
+    /// Send MIDI time code to an output (or stop).
+    pub fn set_midi_mtc_output(&mut self, key: &str, on: bool) {
+        if on {
+            self.midi.mtc_outputs.insert(key.to_string());
+        } else {
+            self.midi.mtc_outputs.remove(key);
+        }
+        self.midi.mtc_seen = None;
+        self.engine
+            .midi_shared()
+            .mtc_ports
+            .store(self.midi.mtc_mask(), std::sync::atomic::Ordering::Relaxed);
+        self.revision += 1;
+    }
+
+    /// MTC full-frame messages: when playback starts or the playhead jumps
+    /// (playing or stopped), the timecode there goes out at once (the
+    /// quarter frames come from the engine).
+    pub(crate) fn tick_mtc_out(&mut self) {
+        let mask = self.midi.mtc_mask();
+        if mask == 0 {
+            self.midi.mtc_seen = None;
+            return;
+        }
+        let t = self.engine.transport_snapshot();
+        let rate = self.engine.sample_rate() as f64;
+        let now = Instant::now();
+        let jumped = match self.midi.mtc_seen {
+            None => true,
+            Some((playing, pos, at)) => {
+                let expected = if playing {
+                    pos + (now.duration_since(at).as_secs_f64() * rate) as i64
+                } else {
+                    pos
+                };
+                (t.playing && !playing) || (t.position - expected).abs() as f64 > rate * 0.25
+            }
+        };
+        self.midi.mtc_seen = Some((t.playing, t.position, now));
+        if !jumped {
+            return;
+        }
+        let settings = &self.sync.settings;
+        let mtc = settings.mtc_out_rate;
+        let start = settings.offset.total_frames(mtc);
+        let frames = start + (t.position.max(0) as f64 / rate * mtc.fps()).floor() as i64;
+        let tc = faderframe_midi::timecode::Timecode::from_frames(frames, mtc);
+        let full = [
+            0xF0,
+            0x7F,
+            0x7F,
+            0x01,
+            0x01,
+            mtc.bits() << 5 | tc.hours,
+            tc.minutes,
+            tc.seconds,
+            tc.frames,
+            0xF7,
+        ];
+        for port in (0..64u16).filter(|p| mask & (1 << p) != 0) {
+            self.midi.outputs.send_now(port, &full);
+        }
+    }
+
     /// The virtual keyboard input (computer keyboard, on-screen keys, tests).
     pub fn midi_keyboard(&self) -> &VirtualMidiInput {
         &self.midi.keyboard
@@ -674,6 +764,10 @@ impl Session {
             .midi_shared()
             .clock_ports
             .store(self.midi.clock_mask(), std::sync::atomic::Ordering::Relaxed);
+        self.engine
+            .midi_shared()
+            .mtc_ports
+            .store(self.midi.mtc_mask(), std::sync::atomic::Ordering::Relaxed);
         let inputs = self.midi.port_map();
         let outputs = self.midi.output_port_map();
         if inputs == *self.engine.midi_ports() && outputs == *self.engine.midi_output_ports() {

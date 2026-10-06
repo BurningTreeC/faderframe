@@ -44,6 +44,9 @@ pub struct Preferences {
     pub midi_disabled_outputs: Vec<String>,
     /// MIDI outputs that get MIDI clock.
     pub midi_clock_outputs: Vec<String>,
+    /// MIDI outputs that get MIDI time code, and its rate.
+    pub midi_mtc_outputs: Vec<String>,
+    pub mtc_out_rate: String,
     /// Mackie Control, HUI and OSC surfaces.
     pub control_surfaces: Vec<faderframe_session::control::SurfaceSettings>,
     /// "internal", "midi-clock" or "mtc".
@@ -86,6 +89,8 @@ impl Default for Preferences {
             midi_disabled_inputs: Vec::new(),
             midi_disabled_outputs: Vec::new(),
             midi_clock_outputs: Vec::new(),
+            midi_mtc_outputs: Vec::new(),
+            mtc_out_rate: "25".into(),
             control_surfaces: Vec::new(),
             sync_source: "internal".into(),
             sync_port: None,
@@ -105,6 +110,7 @@ impl Preferences {
             source: faderframe_session::SyncSource::from_id(&self.sync_source),
             port: self.sync_port.clone(),
             offset: faderframe_session::Timecode::parse(&self.mtc_offset).unwrap_or_default(),
+            mtc_out_rate: faderframe_session::MtcRate::from_id(&self.mtc_out_rate),
             ..Default::default()
         }
     }
@@ -113,6 +119,7 @@ impl Preferences {
         self.sync_source = s.source.id().into();
         self.sync_port = s.port.clone();
         self.mtc_offset = s.offset.to_string();
+        self.mtc_out_rate = s.mtc_out_rate.id().into();
     }
 
     pub fn path() -> PathBuf {
