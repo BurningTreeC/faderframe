@@ -391,6 +391,15 @@ impl PluginHost {
             .is_some_and(|h| h.instance.modulatable(id))
     }
 
+    /// Does the instantiated plugin take notes (an instrument, a
+    /// MIDI-controlled effect)?
+    pub fn takes_notes(&self, plugin: PluginInstanceId) -> bool {
+        self.instances.get(&plugin).is_some_and(|h| {
+            let d = h.instance.descriptor();
+            d.note_inputs > 0 || d.category == faderframe_plugin_host::PluginCategory::Instrument
+        })
+    }
+
     /// Does the parameter take modulation per note?
     pub fn modulatable_per_note(&self, plugin: PluginInstanceId, id: ParameterId) -> bool {
         self.instances

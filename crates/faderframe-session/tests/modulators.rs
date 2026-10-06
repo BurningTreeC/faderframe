@@ -194,3 +194,64 @@ fn modulator_values_follow_the_list() {
     let values = s.modulator_values(lead);
     assert_eq!(values.iter().map(|v| v.0).collect::<Vec<_>>(), ids);
 }
+
+#[test]
+fn note_modulators_map_only_to_devices_that_get_the_notes() {
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let lead = track(&s, "Lead Synth");
+    let synth_slot = s.project().track(lead).unwrap().inserts[0].id;
+    s.dispatch(Action::InsertPlugin {
+        track: lead,
+        index: 1,
+        plugin: faderframe_project::PluginRef::builtin(faderframe_core::builtin::GAIN, "Utility"),
+    })
+    .unwrap();
+    let utility = s.project().track(lead).unwrap().inserts[1].id;
+    s.dispatch(Action::AddModulator {
+        track: lead,
+        source: ModSource::Velocity,
+    })
+    .unwrap();
+    let id = s.project().track(lead).unwrap().modulators[0].id;
+    // The synth gets the notes (its parameters move as the newest note
+    // has it: built-ins take no per-voice modulation); the utility not.
+    let targets = s.modulation_targets(lead);
+    let of = |plugin| {
+        targets
+            .iter()
+            .find(|c| matches!(c.target, ModTarget::Plugin { plugin: p, .. } if p == plugin))
+            .unwrap()
+            .clone()
+    };
+    assert!(of(synth_slot).takes_notes && !of(synth_slot).per_note);
+    assert!(!of(utility).takes_notes);
+    s.dispatch(Action::LearnModulation(Some((lead, id))))
+        .unwrap();
+    s.dispatch(Action::Edit(Command::SetPluginParameter {
+        track: lead,
+        plugin: utility,
+        parameter: ParameterId(0),
+        value: Some(-3.0),
+    }))
+    .unwrap();
+    assert!(
+        s.project().track(lead).unwrap().modulators[0]
+            .routes
+            .is_empty()
+    );
+    assert_eq!(
+        s.plugin_parameter_value(utility, ParameterId(0)),
+        Some(-3.0)
+    );
+    s.dispatch(Action::Edit(Command::SetPluginParameter {
+        track: lead,
+        plugin: synth_slot,
+        parameter: ParameterId(synth::CUTOFF),
+        value: Some(3_000.0),
+    }))
+    .unwrap();
+    assert_eq!(
+        s.project().track(lead).unwrap().modulators[0].routes.len(),
+        1
+    );
+}

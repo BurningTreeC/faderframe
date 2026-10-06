@@ -3,7 +3,9 @@ use crate::context::EngineContext;
 use faderframe_audio_graph::{NodeIo, ProcessContext, Processor};
 use faderframe_automation::ParameterEvent;
 use faderframe_core::{ParameterId, PluginInstanceId, TrackId};
-use faderframe_plugin_host::{ParamMod, PluginProcessContext, PluginProcessor, ProcessStatus};
+use faderframe_plugin_host::{
+    NoteParamMod, ParamMod, PluginProcessContext, PluginProcessor, ProcessStatus,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -34,8 +36,11 @@ pub struct PluginNode {
     events: Vec<ParameterEvent>,
     /// Last value sent per automated parameter (to skip repeats).
     sent: Vec<(ParameterId, f32)>,
-    /// This block's modulation of the plugin's parameters.
+    /// This block's modulation of the plugin's parameters, and of its
+    /// single voices (from the notes it gets).
     mods: Vec<ParamMod>,
+    note_mods: Vec<NoteParamMod>,
+    voices: Box<crate::modulation::NoteVoices>,
     /// Soft-bypass mix: 0 = plugin output, 1 = (delayed) input.
     dry: f32,
     /// Latency-matching delay of the dry signal, per channel.
@@ -65,6 +70,8 @@ impl PluginNode {
             events: Vec::with_capacity(EVENT_CAPACITY),
             sent: Vec::with_capacity(MAX_AUTOMATED),
             mods: Vec::with_capacity(crate::modulation::MAX_PARAM_MODS),
+            note_mods: Vec::with_capacity(crate::modulation::MAX_NOTE_MODS),
+            voices: Box::default(),
             dry: 0.0,
             delay: (0..channels)
                 .map(|_| vec![0.0; latency as usize].into_boxed_slice())
@@ -217,17 +224,34 @@ impl Processor<EngineContext> for PluginNode {
             return;
         }
         self.collect_events(cx, io.frames);
+        self.note_mods.clear();
         match cx.data.modulation.track(self.track) {
-            Some(m) => m.plugin_mods(self.plugin, &mut self.mods),
+            Some(m) => {
+                m.plugin_mods(self.plugin, &mut self.mods);
+                if m.moves_notes_of(self.plugin) {
+                    self.voices.process(
+                        m,
+                        self.plugin,
+                        io.events_in.first(),
+                        io.frames,
+                        &cx.data.transport,
+                        cx.data.discontinuity,
+                        &mut self.mods,
+                        &mut self.note_mods,
+                    );
+                }
+            }
             None => self.mods.clear(),
         }
         let events = std::mem::take(&mut self.events);
         let mods = std::mem::take(&mut self.mods);
+        let note_mods = std::mem::take(&mut self.note_mods);
         let ctx = PluginProcessContext {
             transport: &cx.data.transport,
             param_events: &events,
             harmony: &cx.data.timeline.harmony,
             param_mods: &mods,
+            note_mods: &note_mods,
         };
         self.processor
             .set_callback_deadline(cx.data.callback_deadline);
@@ -240,6 +264,7 @@ impl Processor<EngineContext> for PluginNode {
         }
         self.events = events;
         self.mods = mods;
+        self.note_mods = note_mods;
         if status == ProcessStatus::Error {
             // Reported to the control side through the shared flag.
             self.failed.store(true, Ordering::Relaxed);
@@ -261,6 +286,7 @@ impl Processor<EngineContext> for PluginNode {
     fn reset(&mut self) {
         self.processor.reset();
         self.sent.clear();
+        self.voices.reset();
         for d in &mut self.delay {
             d.fill(0.0);
         }

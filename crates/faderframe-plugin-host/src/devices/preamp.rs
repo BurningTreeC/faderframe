@@ -186,6 +186,7 @@ mod tests {
             param_events: &[],
             harmony: &crate::NO_HARMONY,
             param_mods: &[],
+            note_mods: &[],
         };
         let mut input = AudioBuffer::new(ChannelLayout::Stereo, FRAMES);
         let mut output = AudioBuffer::new(ChannelLayout::Stereo, FRAMES);

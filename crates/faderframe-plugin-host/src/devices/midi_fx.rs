@@ -314,6 +314,7 @@ pub(crate) mod rig {
                 param_events: &[],
                 harmony,
                 param_mods: &[],
+                note_mods: &[],
             };
             let mut io = NodeIo {
                 frames: BLOCK,

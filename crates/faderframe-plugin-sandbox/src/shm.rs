@@ -17,7 +17,7 @@ use faderframe_audio_graph::AudioBuffer;
 use faderframe_automation::ParameterEvent;
 use faderframe_core::{ChannelLayout, ParameterId};
 use faderframe_midi::{ExpressionValue, MidiBuffer, MidiEvent, TimedMidiEvent};
-use faderframe_plugin_host::{ParamMod, ProcessStatus};
+use faderframe_plugin_host::{NoteParamMod, ParamMod, ProcessStatus};
 use faderframe_timeline::TimeSignature;
 use faderframe_transport::{LoopRange, TransportInfo};
 use std::io;
@@ -30,6 +30,8 @@ pub const MAX_EVENTS: usize = 1024;
 pub const MAX_PARAMS: usize = 1024;
 /// Most parameters modulated in a block.
 pub const MAX_MODS: usize = 64;
+/// Most single voices' modulations in a block.
+pub const MAX_NOTE_MODS: usize = 256;
 /// Bytes of SysEx per block (to the plugin).
 pub const MAX_SYSEX: usize = 16 * 1024;
 const MAGIC: u32 = 0x4646_5348;
@@ -147,6 +149,17 @@ pub struct WireMod {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WireNoteMod {
+    pub parameter: u32,
+    pub channel: u8,
+    pub key: u8,
+    pub pad: [u8; 2],
+    pub amount: f32,
+    pub offset: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct WireTransport {
     pub playing: u8,
     pub recording: u8,
@@ -245,9 +258,11 @@ pub struct Header {
     pub n_events_out: u32,
     pub n_params: u32,
     pub n_mods: u32,
+    pub n_note_mods: u32,
     pub transport: WireTransport,
     pub params: [WireParam; MAX_PARAMS],
     pub mods: [WireMod; MAX_MODS],
+    pub note_mods: [WireNoteMod; MAX_NOTE_MODS],
     pub events_in: [WireEvent; MAX_EVENTS],
     pub events_out: [WireEvent; MAX_EVENTS],
     /// Bytes used in `sysex_in`.
@@ -272,6 +287,8 @@ pub struct BlockIn<'a> {
     pub params: &'a [ParameterEvent],
     /// Modulation offsets (plain units).
     pub mods: &'a [ParamMod],
+    /// Single voices' modulation.
+    pub note_mods: &'a [NoteParamMod],
     pub audio_in: &'a [AudioBuffer],
     pub events_in: Option<&'a MidiBuffer>,
     /// Channels of each output buffer.
@@ -378,6 +395,7 @@ impl Block {
             transport,
             params,
             mods,
+            note_mods,
             audio_in,
             events_in,
             out_channels,
@@ -425,6 +443,18 @@ impl Block {
                 });
             }
             addr_of_mut!((*h).n_mods).write_volatile(nm as u32);
+            let nn = note_mods.len().min(MAX_NOTE_MODS);
+            for (i, m) in note_mods.iter().take(nn).enumerate() {
+                addr_of_mut!((*h).note_mods[i]).write_volatile(WireNoteMod {
+                    parameter: m.parameter.0,
+                    channel: m.channel,
+                    key: m.key,
+                    pad: [0; 2],
+                    amount: m.amount,
+                    offset: m.sample_offset,
+                });
+            }
+            addr_of_mut!((*h).n_note_mods).write_volatile(nn as u32);
             let (mut ne, mut sysex) = (0, 0usize);
             if let Some(ev) = events_in {
                 for e in ev.iter().take(MAX_EVENTS) {
@@ -560,6 +590,18 @@ impl Block {
                     amount: m.amount,
                 });
             }
+            io.note_mods.clear();
+            let nn = (addr_of!((*h).n_note_mods).read_volatile() as usize).min(MAX_NOTE_MODS);
+            for i in 0..nn {
+                let m = addr_of!((*h).note_mods[i]).read_volatile();
+                io.note_mods.push(NoteParamMod {
+                    parameter: ParameterId(m.parameter),
+                    channel: m.channel,
+                    key: m.key,
+                    amount: m.amount,
+                    sample_offset: m.offset.min(frames.saturating_sub(1) as u32),
+                });
+            }
             io.events_in.clear();
             if addr_of!((*h).has_events_in).read_volatile() != 0 {
                 let mut buf = io
@@ -648,6 +690,7 @@ pub struct HelperIo {
     pub events_out: Vec<MidiBuffer>,
     pub params: Vec<ParameterEvent>,
     pub mods: Vec<ParamMod>,
+    pub note_mods: Vec<NoteParamMod>,
     pub transport: TransportInfo,
     spare_events: Option<MidiBuffer>,
     spare_out_events: Option<MidiBuffer>,
@@ -664,6 +707,7 @@ impl Default for HelperIo {
             events_out: Vec::with_capacity(1),
             params: Vec::with_capacity(MAX_PARAMS),
             mods: Vec::with_capacity(MAX_MODS),
+            note_mods: Vec::with_capacity(MAX_NOTE_MODS),
             transport: TransportInfo::default(),
             spare_events: None,
             spare_out_events: None,
@@ -791,6 +835,13 @@ mod tests {
                 share: 0.5,
                 amount: 0.25,
             }],
+            note_mods: &[NoteParamMod {
+                parameter: ParameterId(4),
+                channel: 1,
+                key: 61,
+                amount: -2.0,
+                sample_offset: 7,
+            }],
             audio_in: std::slice::from_ref(&input),
             events_in: Some(&midi),
             out_channels: &[2],
@@ -809,6 +860,16 @@ mod tests {
                 amount: 0.25
             }],
             "modulation crosses too"
+        );
+        assert_eq!(
+            io.note_mods,
+            [NoteParamMod {
+                parameter: ParameterId(4),
+                channel: 1,
+                key: 61,
+                amount: -2.0,
+                sample_offset: 7
+            }]
         );
         assert_eq!(io.events_in[0].iter().count(), 1);
         // The "plugin": output = input × 2, a NaN, an event back.

@@ -22,8 +22,9 @@ pub struct ClapInstance {
     descriptor: PluginDescriptor,
     scanned: ScannedPlugin,
     params: Vec<ParameterInfo>,
-    /// Parameters that take modulation: (id, per note too).
-    modulation: Vec<(ParameterId, bool)>,
+    /// Parameters that take modulation, and how single voices are
+    /// addressed (if they can be).
+    modulation: Vec<(ParameterId, PerNote)>,
     rt: Option<SharedRt>,
     config: Option<ProcessConfig>,
     params_tx: Option<rtrb::Producer<(u32, f64)>>,
@@ -37,6 +38,16 @@ pub struct ClapInstance {
     gui_open: bool,
     // Declared last: dropped after the processor has been deactivated.
     instance: PluginInstance<FfHost>,
+}
+
+/// How a parameter's voices are addressed for modulation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PerNote {
+    No,
+    /// By key and channel (`IS_MODULATABLE_PER_KEY`).
+    ByKey,
+    /// By note id only (`IS_MODULATABLE_PER_NOTE_ID`).
+    ByNoteId,
 }
 
 pub(crate) fn descriptor_of(p: &ScannedPlugin) -> PluginDescriptor {
@@ -125,11 +136,17 @@ impl ClapInstance {
                 continue;
             }
             if info.flags.contains(ParamInfoFlags::IS_MODULATABLE) {
-                modulation.push((
-                    ParameterId(info.id.get()),
-                    info.flags
-                        .contains(ParamInfoFlags::IS_MODULATABLE_PER_NOTE_ID),
-                ));
+                let per_note = if info.flags.contains(ParamInfoFlags::IS_MODULATABLE_PER_KEY) {
+                    PerNote::ByKey
+                } else if info
+                    .flags
+                    .contains(ParamInfoFlags::IS_MODULATABLE_PER_NOTE_ID)
+                {
+                    PerNote::ByNoteId
+                } else {
+                    PerNote::No
+                };
+                modulation.push((ParameterId(info.id.get()), per_note));
             }
             let module = text(info.module);
             let name = text(info.name);
@@ -266,7 +283,9 @@ impl FfInstance for ClapInstance {
     }
 
     fn modulatable_per_note(&self, id: ParameterId) -> bool {
-        self.modulation.iter().any(|(p, n)| *p == id && *n)
+        self.modulation
+            .iter()
+            .any(|(p, n)| *p == id && *n != PerNote::No)
     }
 
     fn parameter(&mut self, id: ParameterId) -> Option<f64> {
@@ -444,6 +463,16 @@ impl FfInstance for ClapInstance {
                 double,
                 rx,
                 edits_tx,
+                {
+                    let mut ids: Vec<u32> = self
+                        .modulation
+                        .iter()
+                        .filter(|(_, n)| *n == PerNote::ByNoteId)
+                        .map(|(p, _)| p.0)
+                        .collect();
+                    ids.sort_unstable();
+                    ids.into()
+                },
             );
             self.edits_rx = Some(edits_rx);
             self.rt = Some(Arc::new(TryCell::new(state)));

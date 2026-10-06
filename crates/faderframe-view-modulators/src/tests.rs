@@ -246,3 +246,23 @@ fn steps_are_drawn_and_a_macro_dragged() {
     let texts = p.texts();
     assert!(texts.contains(&"Steps") && texts.contains(&"Macro"));
 }
+
+#[test]
+fn per_note_modulators_offer_the_instrument() {
+    let (mut s, lead, mut view) = setup();
+    add(&mut s, &mut view, "Note Envelope (per note)");
+    let m = s.project().track(lead).unwrap().modulators[0].clone();
+    let card = view.card(0, &m, SIZE);
+    let knobs: Vec<Ctl> = card.knobs.iter().map(|k| k.0).collect();
+    assert_eq!(knobs, [Ctl::Attack, Ctl::Decay, Ctl::Sustain, Ctl::Release]);
+    let (_, req) = run(&mut view, down(card.add_route.center(), 1), &s);
+    let Some(HostRequest::ContextMenu { items, .. }) = req.into_iter().next() else {
+        panic!("no menu");
+    };
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    assert!(!labels.contains(&"Volume") && !labels.contains(&"Pan"));
+    assert!(labels.contains(&"FaderFrame Synth · Cutoff"), "{labels:?}");
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, SIZE, &s, &Theme::default());
+    assert!(p.texts().contains(&"PER NOTE"));
+}

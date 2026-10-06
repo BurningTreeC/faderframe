@@ -57,6 +57,9 @@ pub(crate) struct RtState {
     /// Modulation sent and still in effect: (parameter, amount).
     mods: Box<[(u32, f32); MAX_MODS]>,
     mod_count: usize,
+    /// Parameters whose voices are addressed by note id, not by key
+    /// (sorted).
+    by_note_id: Box<[u32]>,
 }
 
 /// Most parameters modulated at once.
@@ -88,6 +91,7 @@ fn note_match(id: i32) -> Match<u32> {
 }
 
 impl RtState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         proc: StoppedPluginAudioProcessor<FfHost>,
         inputs: &[u16],
@@ -96,6 +100,7 @@ impl RtState {
         double: bool,
         params_rx: rtrb::Consumer<(u32, f64)>,
         edits_tx: rtrb::Producer<(u8, u32, f64)>,
+        by_note_id: Box<[u32]>,
     ) -> Self {
         let (n32, n64) = if double {
             (0, max_frames)
@@ -133,6 +138,7 @@ impl RtState {
             note_ids: Box::new(NoteIds::new()),
             mods: Box::new([(0, 0.0); MAX_MODS]),
             mod_count: 0,
+            by_note_id,
         }
     }
 }
@@ -346,6 +352,24 @@ impl PluginProcessor for ClapProcessor {
                     }
                 }
             }
+        }
+        // Single voices' modulation, after their notes (the sort keeps the
+        // order at one time), addressed by key and channel like note
+        // expressions, or by note id where the plugin takes only that.
+        let room = EVENT_CAPACITY.saturating_sub(st.events_in.len() as usize);
+        for m in ctx.note_mods.iter().take(room) {
+            let id = if st.by_note_id.binary_search(&m.parameter.0).is_ok() {
+                note_match(st.note_ids.get(m.channel, m.key))
+            } else {
+                Match::All
+            };
+            let pckn = Pckn::new(0u16, u16::from(m.channel), u16::from(m.key), id);
+            st.events_in.push(&ParamModEvent::new(
+                m.sample_offset.min(last),
+                ClapId::new(m.parameter.0),
+                pckn,
+                f64::from(m.amount),
+            ));
         }
         st.events_in.sort();
 

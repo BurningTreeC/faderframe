@@ -71,6 +71,7 @@ impl Channel {
             transport: ctx.transport,
             params: ctx.param_events,
             mods: ctx.param_mods,
+            note_mods: ctx.note_mods,
             audio_in: io.audio_in,
             events_in: io.events_in.first(),
             out_channels: &out_channels[..n_out],

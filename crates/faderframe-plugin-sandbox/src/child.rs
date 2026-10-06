@@ -632,6 +632,7 @@ fn audio_loop(
                 events_out,
                 params,
                 mods,
+                note_mods,
                 transport,
                 ..
             } = &mut io;
@@ -640,6 +641,7 @@ fn audio_loop(
                 param_events: params,
                 harmony: &faderframe_plugin_host::NO_HARMONY,
                 param_mods: mods,
+                note_mods,
             };
             let mut node = NodeIo {
                 frames,

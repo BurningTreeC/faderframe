@@ -1631,6 +1631,22 @@ modulated tracks are not rendered ahead. The Modulators view
 (`faderframe-view-modulators`) shows the selected track's modulators as
 cards.
 
+Per-note modulators (velocity, key, a note envelope, a note LFO that
+starts with the note, a note random) have a value for every sounding note.
+They move the devices that get the track's notes (the session's targets
+say which: `ModTargetChoice::{takes_notes, per_note}`; mapping one onto
+another device is refused). Their state lives in each plugin node
+(`modulation::NoteVoices`, 32 voices, closed-form envelopes, released
+notes followed through their release): parameters that take modulation
+per voice (CLAP `IS_MODULATABLE_PER_KEY`, addressed by key and channel, or
+`IS_MODULATABLE_PER_NOTE_ID`, addressed by the voice's note id) get one
+`NoteParamMod` per voice and block in `PluginProcessContext::note_mods`
+(a new note's right after its note-on, at its offset), sent as per-voice
+`CLAP_EVENT_PARAM_MOD`s; the device's other parameters (and built-ins) get
+the newest note's value with the block's `param_mods`. The sandbox carries
+both. Checked against u-he Diva (62 per-voice parameters; its filter
+frequency moved on one voice) in the opt-in CLAP test.
+
 ### Track presets
 
 `faderframe_project::preset::TrackPreset` captures a track's channel
@@ -2062,9 +2078,9 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
    editor~~ (done: `faderframe-ui/src/palette.rs`), ~~an undo history
    view~~ (done: `faderframe-view-history`) — wave 3 done.
 4. **Modulation**: ~~modulators (LFO, envelope follower, steps, random,
-   macros) on any parameter, with CLAP's non-destructive modulation~~
-   (done: see *Modulators*), FX containers with parallel chains, CLAP's
-   polyphonic (per-note) modulation.
+   macros) on any parameter, CLAP's non-destructive and polyphonic
+   (per-note) modulation~~ (done: see *Modulators*), FX containers with
+   parallel chains.
 5. **Vocals and audio intelligence**: native pitch editing (on the warp
    and transient machinery and the Stretch engine's pitch and formant
    shifting), audio-to-MIDI (basic-pitch, Apache-2.0), tempo and key

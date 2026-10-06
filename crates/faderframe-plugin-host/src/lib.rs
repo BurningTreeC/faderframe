@@ -171,6 +171,20 @@ pub struct PluginProcessContext<'a> {
     /// leave the values themselves as they are. A parameter not listed has
     /// none.
     pub param_mods: &'a [ParamMod],
+    /// Modulation of single voices (CLAP's polyphonic modulation), for
+    /// parameters that take it per note: addressed by the note's channel
+    /// and key, in time order (a new note's after its note-on).
+    pub note_mods: &'a [NoteParamMod],
+}
+
+/// One voice's modulation of a parameter (plain units).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NoteParamMod {
+    pub parameter: ParameterId,
+    pub channel: u8,
+    pub key: u8,
+    pub amount: f32,
+    pub sample_offset: u32,
 }
 
 /// A parameter's modulation for a block.

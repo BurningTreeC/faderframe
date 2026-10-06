@@ -1165,6 +1165,21 @@ impl EngineController {
         self.plugins.parameters(plugin)
     }
 
+    /// Does the plugin take notes (per-note modulators move it)?
+    pub fn plugin_takes_notes(&self, plugin: faderframe_core::PluginInstanceId) -> bool {
+        self.plugins.takes_notes(plugin)
+    }
+
+    /// Does the plugin's parameter take modulation per note (each voice
+    /// its own)?
+    pub fn plugin_modulatable_per_note(
+        &self,
+        plugin: faderframe_core::PluginInstanceId,
+        parameter: faderframe_core::ParameterId,
+    ) -> bool {
+        self.plugins.modulatable_per_note(plugin, parameter)
+    }
+
     /// Does the plugin's parameter take modulation (that leaves its value)?
     pub fn plugin_modulatable(
         &self,

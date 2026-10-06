@@ -45,6 +45,7 @@ impl Rig {
             param_events: &[],
             harmony: &crate::NO_HARMONY,
             param_mods: &[],
+            note_mods: &[],
         };
         let mut io = NodeIo {
             frames: BLOCK,

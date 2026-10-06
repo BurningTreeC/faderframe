@@ -531,6 +531,153 @@ fn modulation_does_not_allocate() {
 }
 
 #[test]
+fn note_modulation_does_not_allocate() {
+    let _serial = serial();
+    use faderframe_core::{ModulatorId, ParameterId, PluginInstanceId, TrackId};
+    use faderframe_engine::modulation::{
+        MAX_NOTE_MODS, MAX_PARAM_MODS, ModSpec, NoteVoices, RouteSpec, TrackModulation,
+    };
+    use faderframe_midi::{MidiBuffer, MidiEvent, TimedMidiEvent};
+    use faderframe_project::modulation::{
+        LfoShape, ModRate, ModRoute, ModSource, ModTarget, Modulator,
+    };
+
+    // The voices of a plugin that takes per-note modulation: every source,
+    // more notes than voices.
+    let sources = [
+        ModSource::Velocity,
+        ModSource::Key,
+        ModSource::NoteEnvelope {
+            attack_ms: 5.0,
+            decay_ms: 50.0,
+            sustain: 0.5,
+            release_ms: 100.0,
+        },
+        ModSource::NoteLfo {
+            shape: LfoShape::Triangle,
+            rate: ModRate::Hz { hz: 6.0 },
+            phase: 0.0,
+        },
+        ModSource::NoteRandom,
+    ];
+    let plugin = PluginInstanceId(5);
+    let tm = TrackModulation {
+        track: TrackId(1),
+        modulators: sources
+            .iter()
+            .enumerate()
+            .map(|(i, source)| ModSpec {
+                id: ModulatorId(i as u64),
+                source: source.clone(),
+                enabled: true,
+            })
+            .collect(),
+        routes: (0..sources.len())
+            .flat_map(|i| {
+                [true, false].map(|per_note| RouteSpec {
+                    modulator: i,
+                    target: ModTarget::Plugin {
+                        plugin,
+                        parameter: ParameterId(i as u32 + if per_note { 0 } else { 10 }),
+                    },
+                    depth: 0.3,
+                    range: 10.0,
+                    per_note,
+                })
+            })
+            .collect(),
+        bus: Default::default(),
+    };
+    let mut voices = Box::<NoteVoices>::default();
+    let mut midi = MidiBuffer::with_capacity(64);
+    let mut mods = Vec::with_capacity(MAX_PARAM_MODS);
+    let mut out = Vec::with_capacity(MAX_NOTE_MODS);
+    let transport = faderframe_transport::TransportInfo {
+        sample_rate: 48_000.0,
+        tempo: 120.0,
+        ..Default::default()
+    };
+    let (_, allocs) = armed(|| {
+        for b in 0..400u32 {
+            midi.clear();
+            for k in 0..3u32 {
+                let key = (36 + (b * 3 + k) % 60) as u8;
+                let event = if b % 2 == 0 {
+                    MidiEvent::NoteOn {
+                        channel: 0,
+                        key,
+                        velocity: 90,
+                    }
+                } else {
+                    MidiEvent::NoteOff {
+                        channel: 0,
+                        key: (36 + ((b - 1) * 3 + k) % 60) as u8,
+                        velocity: 0,
+                    }
+                };
+                let _ = midi.push(TimedMidiEvent::new(k * 40, event));
+            }
+            voices.process(
+                &tm,
+                plugin,
+                Some(&midi),
+                256,
+                &transport,
+                b % 97 == 0,
+                &mut mods,
+                &mut out,
+            );
+        }
+    });
+    assert_eq!(allocs, 0, "allocations following notes");
+    assert!(!out.is_empty());
+
+    // The demo's Lead Synth with note modulators (built-in: the newest
+    // note's), playing its melody.
+    const SR: u32 = 48_000;
+    let mut project = demo_project(SR);
+    let lead = project
+        .tracks
+        .iter()
+        .position(|t| t.name == "Lead Synth")
+        .unwrap();
+    let synth = project.tracks[lead].inserts[0].id;
+    let modulators: Vec<Modulator> = sources
+        .iter()
+        .enumerate()
+        .map(|(i, source)| {
+            let mut m = Modulator::new(project.ids.allocate(), source.clone());
+            m.routes = vec![ModRoute {
+                target: ModTarget::Plugin {
+                    plugin: synth,
+                    parameter: ParameterId(i as u32 + 1),
+                },
+                depth: 0.2,
+            }];
+            m
+        })
+        .collect();
+    project.tracks[lead].modulators = modulators;
+    let sources = render_generated_sources(&project, SR);
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&project, &sources, config, 256, 2).unwrap();
+    r.play_from(i64::from(SR) * 8).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    for _ in 0..8 {
+        r.processor.process_device(&mut bufs);
+    }
+    let (_, allocs) = armed(|| {
+        for _ in 0..400 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations playing note modulation");
+}
+
+#[test]
 fn live_midi_input_and_midi_recording_do_not_allocate() {
     let _serial = serial();
     use faderframe_engine::midi::{MidiFilter, MidiRecordTarget};

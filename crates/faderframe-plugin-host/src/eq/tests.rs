@@ -99,6 +99,7 @@ impl Rig {
                 param_events: if b == 0 { events } else { &[] },
                 harmony: &crate::NO_HARMONY,
                 param_mods: &[],
+                note_mods: &[],
             };
             let mut io = NodeIo {
                 frames: BLOCK,
@@ -971,6 +972,7 @@ fn mono_parametric_eq_publishes_both_meter_channels() {
                 param_events: &[],
                 harmony: &crate::NO_HARMONY,
                 param_mods: &[],
+                note_mods: &[],
             },
             &mut NodeIo {
                 frames: BLOCK,

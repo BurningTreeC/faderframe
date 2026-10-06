@@ -173,3 +173,102 @@ fn tracks_following_each_other_still_build_and_renders_repeat() {
     assert!(first[0].iter().any(|x| x.abs() > 0.1));
     assert_eq!(first, render(&tp, 48_000), "the same on every render");
 }
+
+/// An instrument track whose synth (a sine at −6 dB) plays A4 at
+/// `velocity` for two quarters.
+fn synth_track(tp: &mut TestProject, velocity: u8) -> (faderframe_core::TrackId, PluginSlot) {
+    use faderframe_plugin_host::devices::synth::id::*;
+    use faderframe_project::{Clip, ClipContent, MidiClip, MidiNote, SavedParameter};
+    let t = tp.track(TrackKind::Instrument, "Keys", ChannelLayout::Stereo);
+    let set = [
+        (OSC1_WAVE, 3.0),
+        (OSC2_LEVEL, 0.0),
+        (DETUNE, 0.0),
+        (CUTOFF, 20_000.0),
+        (RESONANCE, 0.0),
+        (ENV_AMOUNT, 0.0),
+        (ATTACK, 1.0),
+        (SUSTAIN, 1.0),
+        (RELEASE, 5.0),
+        (WIDTH, 0.0),
+        (VELOCITY_AMP, 0.0),
+        (VELOCITY_CUTOFF, 0.0),
+    ];
+    let slot = PluginSlot {
+        id: tp.project.ids.allocate(),
+        plugin: PluginRef::builtin(builtin::SYNTH, "Synth"),
+        bypass: false,
+        parameters: set
+            .iter()
+            .map(|(id, value)| SavedParameter {
+                id: ParameterId(*id),
+                value: *value,
+            })
+            .collect(),
+        state: None,
+        sidechain: None,
+    };
+    tp.project.track_mut(t).unwrap().inserts.push(slot.clone());
+    let note = MidiNote {
+        id: tp.project.ids.allocate(),
+        start: MusicalTime::ZERO,
+        length: MusicalTime::from_quarters(2.0),
+        key: 69,
+        velocity,
+        channel: 0,
+        muted: false,
+    };
+    let id = tp.project.ids.allocate();
+    tp.project.clips.insert(
+        id,
+        Clip {
+            id,
+            track: t,
+            name: "Note".into(),
+            color: None,
+            start: MusicalTime::ZERO,
+            muted: false,
+            content: ClipContent::Midi(MidiClip {
+                length: MusicalTime::from_quarters_i(4),
+                notes: vec![note],
+                controllers: Vec::new(),
+                expressions: Vec::new(),
+                sysex: Vec::new(),
+            }),
+        },
+    );
+    tp.project.track_mut(t).unwrap().clips.push(id);
+    (t, slot)
+}
+
+fn rms(x: &[f32]) -> f32 {
+    (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
+}
+
+#[test]
+fn a_note_source_moves_the_instrument_by_the_note() {
+    let level = |velocity: u8, depth: Option<f32>| {
+        let mut tp = TestProject::new(48_000);
+        let (t, slot) = synth_track(&mut tp, velocity);
+        if let Some(depth) = depth {
+            let volume = ModTarget::Plugin {
+                plugin: slot.id,
+                parameter: ParameterId(faderframe_plugin_host::devices::synth::id::VOLUME),
+            };
+            let m = modulator(&mut tp, ModSource::Velocity, &[(volume, depth)]);
+            tp.project.track_mut(t).unwrap().modulators.push(m);
+        }
+        let out = render(&tp, 24_000);
+        rms(&out[0][8_000..20_000])
+    };
+    let plain = level(127, None);
+    assert!(plain > 0.01, "{plain}");
+    // −0.2 of the volume's 54 dB at full velocity: −10.8 dB.
+    let hard = level(127, Some(-0.2));
+    let db = 20.0 * (hard / plain).log10();
+    assert!((db + 10.8).abs() < 0.5, "{db}");
+    // Played half as hard: half of that.
+    let soft = level(64, Some(-0.2));
+    let db = 20.0 * (soft / plain).log10();
+    assert!((db + 10.8 * 64.0 / 127.0).abs() < 0.5, "{db}");
+}

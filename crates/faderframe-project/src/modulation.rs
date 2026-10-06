@@ -9,6 +9,12 @@
 //! user set. Bipolar sources (LFO, steps, random) swing around it,
 //! unipolar ones (follower, macro) move it one way.
 //!
+//! Per-note sources (velocity, key, a note envelope, a note LFO, a note
+//! random) have a value for every sounding note: they move the parameters
+//! of the devices that play the notes, each voice its own where the plugin
+//! takes modulation per note (CLAP's polyphonic modulation), else as the
+//! newest note has it.
+//!
 //! The shape functions here are the ones the engine plays and the editor
 //! draws.
 
@@ -170,6 +176,27 @@ pub enum ModSource {
     },
     /// A knob (0..1) that moves many parameters at once.
     Macro { value: f32 },
+    /// Per note: how hard it was played (0..1).
+    Velocity,
+    /// Per note: where it is on the keyboard (−1 at C−1, 0 at C4, +1 at
+    /// C9).
+    Key,
+    /// Per note: an envelope from the note's start (0..1).
+    NoteEnvelope {
+        attack_ms: f32,
+        decay_ms: f32,
+        sustain: f32,
+        release_ms: f32,
+    },
+    /// Per note: an LFO that starts with the note (−1..1).
+    NoteLfo {
+        shape: LfoShape,
+        rate: ModRate,
+        #[serde(default)]
+        phase: f32,
+    },
+    /// Per note: a random value of its own (−1..1).
+    NoteRandom,
 }
 
 impl ModSource {
@@ -180,6 +207,11 @@ impl ModSource {
             ModSource::Steps { .. } => "Steps",
             ModSource::Random { .. } => "Random",
             ModSource::Macro { .. } => "Macro",
+            ModSource::Velocity => "Velocity",
+            ModSource::Key => "Key",
+            ModSource::NoteEnvelope { .. } => "Note Envelope",
+            ModSource::NoteLfo { .. } => "Note LFO",
+            ModSource::NoteRandom => "Note Random",
         }
     }
 
@@ -187,13 +219,31 @@ impl ModSource {
     pub fn bipolar(&self) -> bool {
         matches!(
             self,
-            ModSource::Lfo { .. } | ModSource::Steps { .. } | ModSource::Random { .. }
+            ModSource::Lfo { .. }
+                | ModSource::Steps { .. }
+                | ModSource::Random { .. }
+                | ModSource::Key
+                | ModSource::NoteLfo { .. }
+                | ModSource::NoteRandom
         )
     }
 
-    /// New modulators of each kind, as they start.
-    pub fn defaults() -> [ModSource; 5] {
-        [
+    /// Has a value per sounding note.
+    pub fn per_note(&self) -> bool {
+        matches!(
+            self,
+            ModSource::Velocity
+                | ModSource::Key
+                | ModSource::NoteEnvelope { .. }
+                | ModSource::NoteLfo { .. }
+                | ModSource::NoteRandom
+        )
+    }
+
+    /// New modulators of each kind, as they start (the per-note ones
+    /// last).
+    pub fn defaults() -> Vec<ModSource> {
+        vec![
             ModSource::Lfo {
                 shape: LfoShape::Sine,
                 rate: ModRate::Sync { beats: 1.0 },
@@ -215,8 +265,50 @@ impl ModSource {
                 smooth: 0.3,
             },
             ModSource::Macro { value: 0.0 },
+            ModSource::Velocity,
+            ModSource::Key,
+            ModSource::NoteEnvelope {
+                attack_ms: 5.0,
+                decay_ms: 300.0,
+                sustain: 0.4,
+                release_ms: 300.0,
+            },
+            ModSource::NoteLfo {
+                shape: LfoShape::Sine,
+                rate: ModRate::Hz { hz: 5.0 },
+                phase: 0.0,
+            },
+            ModSource::NoteRandom,
         ]
     }
+}
+
+/// A note envelope's level `t_ms` after the note started, released (if it
+/// was) `held_ms` after its start and `released_ms` ago.
+pub fn note_envelope(
+    (attack_ms, decay_ms, sustain, release_ms): (f32, f32, f32, f32),
+    t_ms: f32,
+    released: Option<(f32, f32)>,
+) -> f32 {
+    let s = sustain.clamp(0.0, 1.0);
+    let held = |t: f32| {
+        if t < attack_ms {
+            t / attack_ms.max(1e-3)
+        } else if t < attack_ms + decay_ms {
+            1.0 - (1.0 - s) * (t - attack_ms) / decay_ms.max(1e-3)
+        } else {
+            s
+        }
+    };
+    match released {
+        None => held(t_ms),
+        Some((held_ms, since)) => held(held_ms) * (1.0 - since / release_ms.max(1e-3)).max(0.0),
+    }
+}
+
+/// The key source's value for `key`.
+pub fn key_value(key: u8) -> f32 {
+    ((f32::from(key) - 60.0) / 60.0).clamp(-1.0, 1.0)
 }
 
 /// The step sequence at `position` (in steps, wrapping), with glide.
@@ -318,6 +410,23 @@ mod tests {
         assert_eq!(ModRate::Sync { beats: 1.0 }.hz(120.0), 2.0);
         assert_eq!(ModRate::Hz { hz: 3.0 }.hz(90.0), 3.0);
         assert_eq!(ModRate::Sync { beats: 0.5 }.label(), "1/8");
+    }
+
+    #[test]
+    fn note_envelopes_attack_decay_hold_and_release() {
+        let adsr = (10.0, 100.0, 0.5, 200.0);
+        assert_eq!(note_envelope(adsr, 5.0, None), 0.5);
+        assert_eq!(note_envelope(adsr, 10.0, None), 1.0);
+        assert!((note_envelope(adsr, 60.0, None) - 0.75).abs() < 1e-6);
+        assert_eq!(note_envelope(adsr, 1_000.0, None), 0.5);
+        // Released at the sustain: down to nothing over the release.
+        assert_eq!(note_envelope(adsr, 1_100.0, Some((1_000.0, 100.0))), 0.25);
+        assert_eq!(note_envelope(adsr, 1_300.0, Some((1_000.0, 300.0))), 0.0);
+        // Released in the attack: from where it was.
+        assert_eq!(note_envelope(adsr, 5.0, Some((5.0, 0.0))), 0.5);
+        assert_eq!(key_value(60), 0.0);
+        assert_eq!(key_value(0), -1.0);
+        assert!(ModSource::Velocity.per_note() && !ModSource::Macro { value: 0.0 }.per_note());
     }
 
     #[test]

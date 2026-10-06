@@ -39,11 +39,16 @@ struct TestGain;
 
 pub struct GainShared {
     gain_db: AtomicU64,
+    /// Modulation of every voice (dB on top of the gain).
+    gain_mod: AtomicU64,
 }
 
 impl GainShared {
     fn get(&self) -> f64 {
         f64::from_bits(self.gain_db.load(Ordering::Relaxed))
+    }
+    fn modulation(&self) -> f64 {
+        f64::from_bits(self.gain_mod.load(Ordering::Relaxed))
     }
     fn set(&self, v: f64) {
         self.gain_db
@@ -59,6 +64,14 @@ impl GainShared {
         for e in events {
             match e.as_core_event() {
                 Some(CoreEventSpace::ParamValue(p)) => self.set(p.value()),
+                // Modulation: ("mod", note id, key, amount); a global one
+                // moves the gain.
+                Some(CoreEventSpace::ParamMod(m)) => {
+                    note("mod".into(), m.pckn(), m.amount());
+                    if m.pckn().raw_key() < 0 {
+                        self.gain_mod.store(m.amount().to_bits(), Ordering::Relaxed);
+                    }
+                }
                 Some(CoreEventSpace::NoteOn(n)) => note("on".into(), n.pckn(), n.velocity()),
                 Some(CoreEventSpace::NoteOff(n)) => note("off".into(), n.pckn(), 0.0),
                 Some(CoreEventSpace::NoteExpression(x)) => {
@@ -99,7 +112,10 @@ impl PluginMainThreadParams for GainMain<'_> {
         if index == 0 {
             info.set(&ParamInfo {
                 id: ClapId::new(0),
-                flags: ParamInfoFlags::IS_AUTOMATABLE,
+                flags: ParamInfoFlags::IS_AUTOMATABLE
+                    | ParamInfoFlags::IS_MODULATABLE
+                    | ParamInfoFlags::IS_MODULATABLE_PER_NOTE_ID
+                    | ParamInfoFlags::IS_MODULATABLE_PER_KEY,
                 cookie: Default::default(),
                 name: b"Gain",
                 module: b"",
@@ -187,7 +203,7 @@ impl<'a> PluginAudioProcessor<'a, GainShared, GainMain<'a>> for GainProcessor<'a
         events: Events,
     ) -> Result<ProcessStatus, PluginError> {
         self.shared.apply(events.input);
-        let gain = db_to_gain(self.shared.get() as f32);
+        let gain = db_to_gain((self.shared.get() + self.shared.modulation()) as f32);
         let mut port = audio.port_pair(0).ok_or(PluginError::Message("no port"))?;
         let channels = port.channels()?;
         let mut channels = match channels.into_f64() {
@@ -267,6 +283,7 @@ impl DefaultPluginFactory for TestGain {
     fn new_shared(_host: HostSharedHandle<'_>) -> Result<GainShared, PluginError> {
         Ok(GainShared {
             gain_db: AtomicU64::new(0f64.to_bits()),
+            gain_mod: AtomicU64::new(0f64.to_bits()),
         })
     }
 
@@ -337,6 +354,7 @@ fn run_block_modulated(
         param_events: events,
         harmony: &faderframe_plugin_host::NO_HARMONY,
         param_mods: mods,
+        note_mods: &[],
     };
     let status = proc.process(&ctx, &mut io);
     assert_ne!(status, faderframe_plugin_host::ProcessStatus::Error);
@@ -431,6 +449,7 @@ fn notes_carry_ids_and_note_expressions_reach_their_keys() {
             param_events: &[],
             harmony: &faderframe_plugin_host::NO_HARMONY,
             param_mods: &[],
+            note_mods: &[],
         },
         &mut io,
     );
@@ -460,6 +479,102 @@ fn notes_carry_ids_and_note_expressions_reach_their_keys() {
         (sysex.1, sysex.3),
         (6, f64::from(0xF0u32 + 0x7E + 0x7F + 0x06 + 0x01 + 0xF7))
     );
+}
+
+#[test]
+fn modulation_moves_the_plugin_not_its_value_and_reaches_single_voices() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    use faderframe_midi::{MidiBuffer, MidiEvent, TimedMidiEvent};
+    use faderframe_plugin_host::{NoteParamMod, ParamMod};
+    let f = factory();
+    let mut inst = f.instantiate("org.faderframe.test-gain").unwrap();
+    let gain = ParameterId(0);
+    assert!(inst.modulatable(gain) && inst.modulatable_per_note(gain));
+    let mut proc = inst
+        .create_processor(&ProcessConfig {
+            sample_rate: 48_000.0,
+            max_block_size: 64,
+            sidechain: false,
+            double_precision: false,
+        })
+        .unwrap();
+    NOTES.lock().unwrap().clear();
+    // Every voice: −6 dB on top of the gain, which stays where it was.
+    let m = ParamMod {
+        parameter: gain,
+        share: -6.0 / 72.0,
+        amount: -6.0,
+    };
+    let out = run_block_modulated(proc.as_mut(), &[], &[m], 64);
+    assert!(
+        (out[10] - 0.5 * db_to_gain(-6.0)).abs() < 1e-4,
+        "{}",
+        out[10]
+    );
+    assert_eq!(inst.parameter(gain), Some(0.0));
+    // The same again is not sent again; gone, it is reset to nothing.
+    run_block_modulated(proc.as_mut(), &[], &[m], 64);
+    let out = run_block(proc.as_mut(), &[], 64);
+    assert!((out[10] - 0.5).abs() < 1e-4);
+    let mods: Vec<f64> = NOTES
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|n| n.0 == "mod")
+        .map(|n| n.3)
+        .collect();
+    assert_eq!(mods, [-6.0, 0.0]);
+    // One voice: its modulation follows its note-on, by key.
+    NOTES.lock().unwrap().clear();
+    let mut midi = MidiBuffer::with_capacity(4);
+    midi.push(TimedMidiEvent::new(
+        10,
+        MidiEvent::NoteOn {
+            channel: 0,
+            key: 64,
+            velocity: 100,
+        },
+    ))
+    .unwrap();
+    let input = {
+        let mut b = AudioBuffer::new(ChannelLayout::Stereo, 64);
+        b.set_len(64);
+        b
+    };
+    let mut outputs = [{
+        let mut b = AudioBuffer::new(ChannelLayout::Stereo, 64);
+        b.set_len(64);
+        b
+    }];
+    let (inputs, events) = ([input], [midi]);
+    let mut io = NodeIo {
+        frames: 64,
+        audio_in: &inputs,
+        audio_out: &mut outputs,
+        events_in: &events,
+        events_out: &mut [],
+    };
+    let transport = faderframe_transport::TransportInfo::default();
+    proc.process(
+        &PluginProcessContext {
+            transport: &transport,
+            param_events: &[],
+            harmony: &faderframe_plugin_host::NO_HARMONY,
+            param_mods: &[],
+            note_mods: &[NoteParamMod {
+                parameter: gain,
+                channel: 0,
+                key: 64,
+                amount: 3.0,
+                sample_offset: 10,
+            }],
+        },
+        &mut io,
+    );
+    let seen = NOTES.lock().unwrap().clone();
+    let at = |what: &str| seen.iter().position(|n| n.0 == what).unwrap();
+    assert!(at("on") < at("mod"), "{seen:?}");
+    assert_eq!(seen[at("mod")], ("mod".into(), -1, 64, 3.0));
 }
 
 #[test]
@@ -581,6 +696,9 @@ fn hosts_an_installed_plugin() {
     assert!(!plugins.is_empty());
     faderframe_plugin_clap::set_catalog(plugins.clone());
     let f = ClapFactory::new();
+    for p in plugins.iter().filter(|p| p.is_instrument()) {
+        play_an_installed_instrument(&f, p);
+    }
     for p in plugins.iter().filter(|p| !p.is_instrument()) {
         let mut inst = f.instantiate(&p.id).unwrap();
         eprintln!(
@@ -645,4 +763,113 @@ fn hosts_an_installed_plugin() {
             eprintln!("{}: '{}' modulated, output peak {peak}", p.name, info.name);
         }
     }
+}
+
+/// An installed instrument: its modulation flags, and a note played with
+/// and without a per-voice offset on a parameter (a filter cutoff if it
+/// has one).
+fn play_an_installed_instrument(f: &ClapFactory, p: &ScannedPlugin) {
+    let inst = f.instantiate(&p.id).unwrap();
+    let infos = inst.parameters().to_vec();
+    let per_note: Vec<_> = infos
+        .iter()
+        .filter(|i| inst.modulatable_per_note(i.id))
+        .collect();
+    eprintln!(
+        "{}: {} parameters, {} take modulation, {} per note",
+        p.name,
+        infos.len(),
+        infos.iter().filter(|i| inst.modulatable(i.id)).count(),
+        per_note.len()
+    );
+    if std::env::var_os("FADERFRAME_TEST_LIST").is_some() {
+        for i in &per_note {
+            eprintln!("  per note: {} ({}..{})", i.name, i.min, i.max);
+        }
+    }
+    drop(inst);
+    let target = per_note
+        .iter()
+        .find(|i| i.name.contains("Cutoff") || i.name == "VCF1/Frequency")
+        .or(per_note.first())
+        .map(|i| (i.id, (i.max - i.min) as f32, i.name.clone()));
+    let plain = play_a_note(f, p, None);
+    eprintln!("{}: a note, rms {plain}", p.name);
+    if let Some((id, range, name)) = target {
+        let moved = play_a_note(f, p, Some((id, -0.4 * range)));
+        eprintln!("{}: '{name}' −40 % on its voice, rms {moved}", p.name);
+    }
+}
+
+/// The rms of a second of A3 (with a per-voice offset on a parameter).
+fn play_a_note(f: &ClapFactory, p: &ScannedPlugin, offset: Option<(ParameterId, f32)>) -> f32 {
+    use faderframe_midi::{MidiBuffer, MidiEvent, TimedMidiEvent};
+    use faderframe_plugin_host::NoteParamMod;
+    let mut inst = f.instantiate(&p.id).unwrap();
+    let mut proc = inst
+        .create_processor(&ProcessConfig {
+            sample_rate: 48_000.0,
+            max_block_size: 512,
+            sidechain: false,
+            double_precision: false,
+        })
+        .unwrap();
+    let (mut sum, mut n) = (0.0f64, 0usize);
+    for b in 0..94u32 {
+        let mut midi = MidiBuffer::with_capacity(4);
+        if b == 0 {
+            midi.push(TimedMidiEvent::new(
+                0,
+                MidiEvent::NoteOn {
+                    channel: 0,
+                    key: 57,
+                    velocity: 110,
+                },
+            ))
+            .unwrap();
+        }
+        let note_mods: Vec<NoteParamMod> = offset
+            .iter()
+            .map(|(id, amount)| NoteParamMod {
+                parameter: *id,
+                channel: 0,
+                key: 57,
+                amount: *amount,
+                sample_offset: 0,
+            })
+            .collect();
+        let mut outputs = [{
+            let mut o = AudioBuffer::new(ChannelLayout::Stereo, 512);
+            o.set_len(512);
+            o
+        }];
+        let events = [midi];
+        let mut io = NodeIo {
+            frames: 512,
+            audio_in: &[],
+            audio_out: &mut outputs,
+            events_in: &events,
+            events_out: &mut [],
+        };
+        let transport = faderframe_transport::TransportInfo::default();
+        let status = proc.process(
+            &PluginProcessContext {
+                transport: &transport,
+                param_events: &[],
+                harmony: &faderframe_plugin_host::NO_HARMONY,
+                param_mods: &[],
+                note_mods: &note_mods,
+            },
+            &mut io,
+        );
+        assert_ne!(status, faderframe_plugin_host::ProcessStatus::Error);
+        for v in outputs[0].channel(0) {
+            assert!(v.is_finite());
+            if b >= 20 {
+                sum += f64::from(*v) * f64::from(*v);
+                n += 1;
+            }
+        }
+    }
+    (sum / n.max(1) as f64).sqrt() as f32
 }

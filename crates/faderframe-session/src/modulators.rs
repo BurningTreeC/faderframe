@@ -3,6 +3,11 @@
 //! their gesture), mapping one by touching a parameter, what they can
 //! move, and what they put out now.
 //!
+//! Per-note modulators (velocity, key, note envelope, note LFO, note
+//! random) move the devices that get the notes: each voice its own where
+//! the parameter takes it ([`ModTargetChoice::per_note`]), else as the
+//! newest note has it.
+//!
 //! Mapping: while a modulator maps, the next parameter touched on its
 //! track's devices becomes one of its targets. A FaderFrame control's move
 //! is taken for that (the value stays as it was) until the gesture ends; a
@@ -23,6 +28,10 @@ pub struct ModTargetChoice {
     /// "Track", or the device's name.
     pub group: String,
     pub name: String,
+    /// The device gets the track's notes (per-note modulators move it).
+    pub takes_notes: bool,
+    /// The parameter takes modulation per note (each voice its own).
+    pub per_note: bool,
 }
 
 /// A modulator mapping (see the module docs).
@@ -160,6 +169,16 @@ impl Session {
             self.mod_learn = None;
             return Ok(false);
         };
+        if m.source.per_note() && !self.engine.plugin_takes_notes(plugin) {
+            self.notify(
+                NoticeLevel::Warning,
+                format!(
+                    "‘{}’ follows notes: it moves the devices that get them, not {name}",
+                    m.name
+                ),
+            );
+            return Ok(false);
+        }
         let modulator = m.name.clone();
         if m.routes.iter().any(|r| r.target == target) {
             self.notify(
@@ -202,11 +221,15 @@ impl Session {
                 target: ModTarget::Volume,
                 group: "Track".into(),
                 name: "Volume".into(),
+                takes_notes: false,
+                per_note: false,
             },
             ModTargetChoice {
                 target: ModTarget::Pan,
                 group: "Track".into(),
                 name: "Pan".into(),
+                takes_notes: false,
+                per_note: false,
             },
         ];
         let slots = t.preamp.iter().chain(t.instrument.iter()).chain(&t.inserts);
@@ -214,6 +237,7 @@ impl Session {
             let Some(infos) = self.engine.plugin_parameters(slot.id) else {
                 continue;
             };
+            let takes_notes = self.engine.plugin_takes_notes(slot.id);
             for p in infos {
                 if self.engine.plugin_modulatable(slot.id, p.id) {
                     out.push(ModTargetChoice {
@@ -223,6 +247,9 @@ impl Session {
                         },
                         group: slot.plugin.name.clone(),
                         name: p.name.clone(),
+                        takes_notes,
+                        per_note: takes_notes
+                            && self.engine.plugin_modulatable_per_note(slot.id, p.id),
                     });
                 }
             }

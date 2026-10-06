@@ -44,6 +44,8 @@ pub enum Ctl {
     Glide,
     Smooth,
     Attack,
+    Decay,
+    Sustain,
     Release,
     Gain,
     Value,
@@ -57,6 +59,8 @@ impl Ctl {
             Ctl::Glide => "GLIDE",
             Ctl::Smooth => "SMOOTH",
             Ctl::Attack => "ATTACK",
+            Ctl::Decay => "DECAY",
+            Ctl::Sustain => "SUSTAIN",
             Ctl::Release => "RELEASE",
             Ctl::Gain => "GAIN",
             Ctl::Value => "VALUE",
@@ -85,6 +89,9 @@ fn knobs(src: &ModSource) -> &'static [Ctl] {
         ModSource::Random { .. } => &[Ctl::Rate, Ctl::Smooth],
         ModSource::Follower { .. } => &[Ctl::Attack, Ctl::Release, Ctl::Gain],
         ModSource::Macro { .. } => &[Ctl::Value],
+        ModSource::NoteEnvelope { .. } => &[Ctl::Attack, Ctl::Decay, Ctl::Sustain, Ctl::Release],
+        ModSource::NoteLfo { .. } => &[Ctl::Rate, Ctl::Phase],
+        ModSource::Velocity | ModSource::Key | ModSource::NoteRandom => &[],
     }
 }
 
@@ -94,7 +101,8 @@ fn buttons(src: &ModSource) -> &'static [Btn] {
         ModSource::Steps { .. } => &[Btn::Sync, Btn::Fewer, Btn::More],
         ModSource::Random { .. } => &[Btn::Sync],
         ModSource::Follower { .. } => &[Btn::Source],
-        ModSource::Macro { .. } => &[],
+        ModSource::NoteLfo { .. } => &[Btn::Shape, Btn::Sync],
+        _ => &[],
     }
 }
 
@@ -102,7 +110,8 @@ fn rate_of(src: &ModSource) -> Option<ModRate> {
     match src {
         ModSource::Lfo { rate, .. }
         | ModSource::Steps { rate, .. }
-        | ModSource::Random { rate, .. } => Some(*rate),
+        | ModSource::Random { rate, .. }
+        | ModSource::NoteLfo { rate, .. } => Some(*rate),
         _ => None,
     }
 }
@@ -110,7 +119,8 @@ fn rate_of(src: &ModSource) -> Option<ModRate> {
 fn set_rate(src: &mut ModSource, r: ModRate) {
     if let ModSource::Lfo { rate, .. }
     | ModSource::Steps { rate, .. }
-    | ModSource::Random { rate, .. } = src
+    | ModSource::Random { rate, .. }
+    | ModSource::NoteLfo { rate, .. } = src
     {
         *rate = r;
     }
@@ -140,6 +150,7 @@ fn log_from(n: f32, (lo, hi): (f32, f32)) -> f32 {
 
 const ATTACK: (f32, f32) = (0.1, 500.0);
 const RELEASE: (f32, f32) = (5.0, 5_000.0);
+const DECAY: (f32, f32) = (5.0, 5_000.0);
 
 /// A knob's position (0..1).
 pub fn ctl_get(src: &ModSource, ctl: Ctl) -> f32 {
@@ -151,7 +162,13 @@ pub fn ctl_get(src: &ModSource, ctl: Ctl) -> f32 {
             Some(ModRate::Hz { hz }) => log_norm(hz, HZ),
             None => 0.0,
         },
-        (Ctl::Phase, ModSource::Lfo { phase, .. }) => *phase,
+        (Ctl::Phase, ModSource::Lfo { phase, .. } | ModSource::NoteLfo { phase, .. }) => *phase,
+        (Ctl::Attack, ModSource::NoteEnvelope { attack_ms, .. }) => log_norm(*attack_ms, ATTACK),
+        (Ctl::Decay, ModSource::NoteEnvelope { decay_ms, .. }) => log_norm(*decay_ms, DECAY),
+        (Ctl::Sustain, ModSource::NoteEnvelope { sustain, .. }) => *sustain,
+        (Ctl::Release, ModSource::NoteEnvelope { release_ms, .. }) => {
+            log_norm(*release_ms, RELEASE)
+        }
         (Ctl::Glide, ModSource::Steps { glide, .. }) => *glide,
         (Ctl::Smooth, ModSource::Random { smooth, .. }) => *smooth,
         (Ctl::Attack, ModSource::Follower { attack_ms, .. }) => log_norm(*attack_ms, ATTACK),
@@ -181,7 +198,19 @@ pub fn ctl_set(src: &mut ModSource, ctl: Ctl, n: f32) {
             ),
             None => {}
         },
-        (Ctl::Phase, ModSource::Lfo { phase, .. }) => *phase = n,
+        (Ctl::Phase, ModSource::Lfo { phase, .. } | ModSource::NoteLfo { phase, .. }) => *phase = n,
+        (Ctl::Attack, ModSource::NoteEnvelope { attack_ms, .. }) => {
+            *attack_ms = (log_from(n, ATTACK) * 10.0).round() / 10.0;
+        }
+        (Ctl::Decay, ModSource::NoteEnvelope { decay_ms, .. }) => {
+            *decay_ms = log_from(n, DECAY).round();
+        }
+        (Ctl::Sustain, ModSource::NoteEnvelope { sustain, .. }) => {
+            *sustain = (n * 100.0).round() / 100.0;
+        }
+        (Ctl::Release, ModSource::NoteEnvelope { release_ms, .. }) => {
+            *release_ms = log_from(n, RELEASE).round();
+        }
         (Ctl::Glide, ModSource::Steps { glide, .. }) => *glide = n,
         (Ctl::Smooth, ModSource::Random { smooth, .. }) => *smooth = n,
         (Ctl::Attack, ModSource::Follower { attack_ms, .. }) => {
@@ -202,7 +231,15 @@ pub fn ctl_set(src: &mut ModSource, ctl: Ctl, n: f32) {
 pub fn ctl_text(src: &ModSource, ctl: Ctl) -> String {
     match (ctl, src) {
         (Ctl::Rate, s) => rate_of(s).map_or_else(String::new, ModRate::label),
-        (Ctl::Phase, ModSource::Lfo { phase, .. }) => format!("{:.0}°", phase * 360.0),
+        (Ctl::Phase, ModSource::Lfo { phase, .. } | ModSource::NoteLfo { phase, .. }) => {
+            format!("{:.0}°", phase * 360.0)
+        }
+        (Ctl::Attack, ModSource::NoteEnvelope { attack_ms: v, .. })
+        | (Ctl::Decay, ModSource::NoteEnvelope { decay_ms: v, .. })
+        | (Ctl::Release, ModSource::NoteEnvelope { release_ms: v, .. }) => ms(*v),
+        (Ctl::Sustain, ModSource::NoteEnvelope { sustain, .. }) => {
+            format!("{:.0} %", sustain * 100.0)
+        }
         (Ctl::Glide, ModSource::Steps { glide: v, .. })
         | (Ctl::Smooth, ModSource::Random { smooth: v, .. })
         | (Ctl::Value, ModSource::Macro { value: v }) => format!("{:.0} %", v * 100.0),
@@ -495,10 +532,21 @@ impl ModulatorsView {
     }
 
     fn add_menu(track: TrackId) -> Vec<MenuItem<Action>> {
+        let mut first_note = true;
         ModSource::defaults()
             .into_iter()
             .map(|source| {
-                MenuItem::new(source.kind_label(), Action::AddModulator { track, source })
+                let notes = source.per_note();
+                let mut item = MenuItem::new(
+                    if notes {
+                        format!("{} (per note)", source.kind_label())
+                    } else {
+                        source.kind_label().to_string()
+                    },
+                    Action::AddModulator { track, source },
+                );
+                item.separator_before = notes && std::mem::take(&mut first_note);
+                item
             })
             .collect()
     }
@@ -506,12 +554,20 @@ impl ModulatorsView {
     fn route_menu(model: &Session, track: TrackId, m: &Modulator) -> Vec<MenuItem<Action>> {
         let mut items = Vec::new();
         let mut group = String::new();
+        let notes = m.source.per_note();
         for c in model.modulation_targets(track) {
-            let label = if c.group == "Track" {
+            // Per-note modulators move what gets the notes.
+            if notes && !c.takes_notes {
+                continue;
+            }
+            let mut label = if c.group == "Track" {
                 c.name.clone()
             } else {
                 format!("{} · {}", c.group, c.name)
             };
+            if notes && c.per_note {
+                label.push_str(" (per voice)");
+            }
             let routed = m.routes.iter().any(|r| r.target == c.target);
             let mut item = if routed {
                 MenuItem::disabled(label).checked(true)
@@ -535,7 +591,11 @@ impl ModulatorsView {
             }
             items.push(item);
         }
-        if items.len() <= 2 {
+        if notes && items.is_empty() {
+            items.push(MenuItem::disabled(
+                "(no device on this track gets the notes)",
+            ));
+        } else if !notes && items.len() <= 2 {
             items.push(MenuItem::disabled("(no device parameters take modulation)"));
         }
         items
@@ -581,14 +641,17 @@ impl ModulatorsView {
     }
 
     fn shape_menu(track: TrackId, m: &Modulator) -> Vec<MenuItem<Action>> {
-        let ModSource::Lfo { shape: now, .. } = m.source else {
+        let (ModSource::Lfo { shape: now, .. } | ModSource::NoteLfo { shape: now, .. }) = m.source
+        else {
             return Vec::new();
         };
         LfoShape::ALL
             .into_iter()
             .map(|shape| {
                 let mut x = m.clone();
-                if let ModSource::Lfo { shape: s, .. } = &mut x.source {
+                if let ModSource::Lfo { shape: s, .. } | ModSource::NoteLfo { shape: s, .. } =
+                    &mut x.source
+                {
                     *s = shape;
                 }
                 MenuItem::new(
@@ -605,7 +668,9 @@ impl ModulatorsView {
 
     fn button_text(model: &Session, m: &Modulator, b: Btn) -> String {
         match (b, &m.source) {
-            (Btn::Shape, ModSource::Lfo { shape, .. }) => format!("{} ▾", shape.label()),
+            (Btn::Shape, ModSource::Lfo { shape, .. } | ModSource::NoteLfo { shape, .. }) => {
+                format!("{} ▾", shape.label())
+            }
             (Btn::Sync, s) => match rate_of(s) {
                 Some(ModRate::Sync { .. }) => "Synced".into(),
                 _ => "Free".into(),
@@ -856,6 +921,38 @@ impl ModulatorsView {
                 let pts = [0.6f32, -0.4, 0.9, -0.8, 0.1, 0.5, -0.2, -0.7];
                 curve(p, &move |t| steps_at(&pts, t * pts.len() as f64, s));
             }
+            ModSource::NoteLfo { shape, phase, .. } => {
+                let (shape, phase) = (*shape, f64::from(*phase));
+                curve(p, &|t| shape.at(t * 2.0 + phase));
+            }
+            ModSource::NoteEnvelope {
+                attack_ms,
+                decay_ms,
+                sustain,
+                release_ms,
+            } => {
+                // Held for as long as attack and decay take, and as long
+                // again at the sustain, then released.
+                let adsr = (*attack_ms, *decay_ms, *sustain, *release_ms);
+                let held = 2.0 * (attack_ms + decay_ms).max(1.0);
+                let total = held + release_ms.max(1.0);
+                curve(p, &move |t| {
+                    let ms = t as f32 * total;
+                    let released = (ms > held).then_some((held, ms - held));
+                    faderframe_project::modulation::note_envelope(adsr, ms, released)
+                });
+            }
+            ModSource::Velocity => curve(p, &|t| t as f32),
+            ModSource::Key => curve(p, &|t| t as f32 * 2.0 - 1.0),
+            ModSource::NoteRandom => {
+                for (i, v) in [0.6f32, -0.4, 0.9, -0.8, 0.1, 0.5, -0.2, -0.7]
+                    .iter()
+                    .enumerate()
+                {
+                    let x = plot.x + plot.w * (i as f32 + 0.5) / 8.0;
+                    p.circle(Point::new(x, y_of(*v)), 2.5, accent.with_alpha(0.8));
+                }
+            }
             ModSource::Follower { .. } | ModSource::Macro { .. } => {
                 p.fill(
                     Rect::new(
@@ -878,6 +975,13 @@ impl ModulatorsView {
             Rect::new(meter.x, base.min(y), meter.w, (base - y).abs().max(1.0)),
             accent,
         );
+        if m.source.per_note() {
+            p.text(
+                "PER NOTE",
+                Rect::new(r.x + 6.0, r.y + 3.0, 80.0, 11.0),
+                &TextStyle::new(th.fonts.tiny, th.ui.text_dim).bold(),
+            );
+        }
         if learning {
             p.text(
                 "Move a control on this track's devices",

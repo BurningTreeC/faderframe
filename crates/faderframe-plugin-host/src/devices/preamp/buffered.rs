@@ -330,6 +330,7 @@ mod tests {
                             param_events: &events,
                             harmony: &crate::NO_HARMONY,
                             param_mods: &[],
+                            note_mods: &[],
                         };
                         for (p, out) in [(&mut worker, &mut a), (&mut inline, &mut b)] {
                             assert_eq!(
