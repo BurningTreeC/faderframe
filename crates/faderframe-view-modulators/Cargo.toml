@@ -1,0 +1,21 @@
+[package]
+name = "faderframe-view-modulators"
+description = "Modulators: a track's LFOs, envelope followers, step sequences, random sources and macros, and what they move"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-core.workspace = true
+faderframe-project.workspace = true
+faderframe-session.workspace = true
+faderframe-ui-canvas.workspace = true
+
+[dev-dependencies]
+faderframe-engine.workspace = true
+faderframe-plugin-host.workspace = true

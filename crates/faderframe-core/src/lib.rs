@@ -17,6 +17,7 @@ pub use channel::ChannelLayout;
 pub use gain::{Decibels, FaderLaw, db_to_gain, gain_to_db};
 pub use id::{
     AudioSourceId, AutomationLaneId, ClipId, ClipLinkId, GroupId, IdAllocator, MarkerId,
-    MidiMappingId, NoteId, ParameterId, PluginInstanceId, SectionId, SendId, SongId, TrackId,
+    MidiMappingId, ModulatorId, NoteId, ParameterId, PluginInstanceId, SectionId, SendId, SongId,
+    TrackId,
 };
 pub use pan::PanLaw;

@@ -6,9 +6,10 @@ mod latency;
 use crate::tap::AnalysisTap;
 use crate::{
     AudioPortInfo, ParamValues, ParameterInfo, ParameterUnit, PluginCategory, PluginDescriptor,
-    PluginError, PluginFactory, PluginFormat, PluginInstance, PluginProcessor, ProcessConfig,
-    TailLength,
+    PluginError, PluginFactory, PluginFormat, PluginInstance, PluginProcessContext,
+    PluginProcessor, ProcessConfig, ProcessStatus, TailLength,
 };
+use faderframe_audio_graph::NodeIo;
 use faderframe_core::{ParameterId, builtin};
 use std::sync::Arc;
 
@@ -384,6 +385,14 @@ impl PluginInstance for BuiltinInstance {
         self.params.get_by_id(id)
     }
 
+    fn modulatable(&self, id: ParameterId) -> bool {
+        // Continuous parameters (a mode or a switch does not glide).
+        self.params
+            .infos()
+            .iter()
+            .any(|p| p.id == id && p.automatable && !p.stepped)
+    }
+
     fn set_parameter(&mut self, id: ParameterId, value: f64) -> Result<(), PluginError> {
         self.params.set_by_id(id, value)
     }
@@ -556,7 +565,7 @@ impl PluginInstance for BuiltinInstance {
                 .clone()
                 .ok_or_else(|| PluginError::Failed("no tap".into()))
         };
-        Ok(match self.kind {
+        let inner: Box<dyn PluginProcessor> = match self.kind {
             Kind::Preamp(i) => Box::new(crate::devices::preamp::BufferedPreampProcessor::new(
                 i,
                 params,
@@ -672,7 +681,65 @@ impl PluginInstance for BuiltinInstance {
                     params, tap, config,
                 ))
             }
-        })
+        };
+        Ok(Box::new(Modulated {
+            params: self.params.clone(),
+            inner,
+            set: [usize::MAX; MAX_MODULATED],
+            count: 0,
+        }))
+    }
+}
+
+/// Most parameters of a built-in modulated at once.
+const MAX_MODULATED: usize = 64;
+
+/// A built-in processor with modulation: the block's offsets go into the
+/// shared values' modulation (cleared when a parameter's goes away), so
+/// the processor reads them as it reads any value.
+struct Modulated {
+    params: ParamValues,
+    inner: Box<dyn PluginProcessor>,
+    /// Indices given an offset last block.
+    set: [usize; MAX_MODULATED],
+    count: usize,
+}
+
+impl PluginProcessor for Modulated {
+    fn process(&mut self, ctx: &PluginProcessContext<'_>, io: &mut NodeIo<'_>) -> ProcessStatus {
+        if self.count > 0 || !ctx.param_mods.is_empty() {
+            for &i in &self.set[..self.count] {
+                self.params.set_mod(i, 0.0);
+            }
+            self.count = 0;
+            for m in ctx.param_mods {
+                if self.count == MAX_MODULATED {
+                    break;
+                }
+                if let Some(i) = self.params.index(m.parameter) {
+                    self.params.set_mod(i, m.share);
+                    self.set[self.count] = i;
+                    self.count += 1;
+                }
+            }
+        }
+        self.inner.process(ctx, io)
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+
+    fn take_underruns(&mut self) -> u64 {
+        self.inner.take_underruns()
+    }
+
+    fn preferred_block_size(&self) -> usize {
+        self.inner.preferred_block_size()
+    }
+
+    fn set_callback_deadline(&mut self, deadline: Option<std::time::Instant>) {
+        self.inner.set_callback_deadline(deadline);
     }
 }
 

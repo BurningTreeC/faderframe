@@ -448,6 +448,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             ("Album (Songs, Loudness, Delivery)", "app.show-album"),
             ("Performance Meter", "app.show-performance"),
             ("Undo History", "app.show-history"),
+            ("Modulators", "app.show-modulators"),
             ("Show / Hide Bottom Dock", "app.toggle-dock"),
             ("Master Strip at the Side", "app.master-panel"),
         ]),

@@ -203,6 +203,7 @@ fn run(
             transport: &transport,
             param_events: if b == 0 { params } else { &[] },
             harmony: &faderframe_plugin_host::NO_HARMONY,
+            param_mods: &[],
         };
         let mut io = NodeIo {
             frames: FRAMES,
@@ -268,6 +269,7 @@ fn sysex_crosses_into_the_helper() {
             transport: &transport,
             param_events: &[],
             harmony: &faderframe_plugin_host::NO_HARMONY,
+            param_mods: &[],
         },
         &mut io,
     );
@@ -480,6 +482,7 @@ fn round_trip_cost() {
                         transport: &transport,
                         param_events: &[],
                         harmony: &faderframe_plugin_host::NO_HARMONY,
+                        param_mods: &[],
                     },
                     &mut io,
                 );

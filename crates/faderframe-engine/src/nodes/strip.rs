@@ -5,7 +5,7 @@ use faderframe_audio_graph::{
     AudioBuffer, NodeIo, ProcessContext, Processor, for_each_channel_route,
 };
 use faderframe_automation::SampleLane;
-use faderframe_core::{PanLaw, TrackId, db_to_gain, pan::stereo_balance};
+use faderframe_core::{FaderLaw, PanLaw, TrackId, db_to_gain, gain_to_db, pan::stereo_balance};
 use faderframe_realtime::MeterRange;
 
 /// Channel strip: polarity, mute, fader, pan/balance and post-fader metering.
@@ -21,11 +21,15 @@ use faderframe_realtime::MeterRange;
 /// that step; steps in the curve become short declicked ramps). Pan law:
 /// mono sources use `pan_law` (default constant-power, -3 dB centre); stereo
 /// sources use a 0 dB balance control (see `faderframe_core::pan`).
+///
+/// Modulators move the fader in travel (as a hand on the console's fader
+/// would) and the pan, on top of their values (see [`crate::modulation`]).
 pub struct ChannelStrip {
     track: TrackId,
     slots: StripSlots,
     meter: MeterRange,
     pan_law: PanLaw,
+    law: FaderLaw,
     post: [f32; MAX_CHANNELS],
     pre: f32,
 }
@@ -37,6 +41,7 @@ impl ChannelStrip {
             slots,
             meter,
             pan_law,
+            law: FaderLaw::console(),
             post: [f32::NAN; MAX_CHANNELS],
             pre: f32::NAN,
         }
@@ -148,6 +153,11 @@ impl Processor<EngineContext> for ChannelStrip {
             post.clear();
         }
         let step = if automated { AUTOMATION_STEP } else { n.max(1) };
+        let (travel, pan_mod) = cx
+            .data
+            .modulation
+            .track(self.track)
+            .map_or((0.0, 0.0), |m| m.strip());
         let mut values = (static_fader, static_pan, static_mute);
         let mut off = 0;
         while off < n {
@@ -173,7 +183,16 @@ impl Processor<EngineContext> for ChannelStrip {
             } else {
                 polarity
             };
-            self.render(input, io.audio_out, off, m, fader * vca, pan, audible);
+            let (fader_m, pan_m) = if travel == 0.0 && pan_mod == 0.0 {
+                (fader, pan)
+            } else {
+                let at = self.law.db_to_position(gain_to_db(fader)) + travel;
+                (
+                    db_to_gain(self.law.position_to_db(at.clamp(0.0, 1.0))),
+                    (pan + pan_mod).clamp(-1.0, 1.0),
+                )
+            };
+            self.render(input, io.audio_out, off, m, fader_m * vca, pan_m, audible);
             values = (fader, pan, mute);
             off += m;
         }

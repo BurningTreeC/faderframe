@@ -336,6 +336,7 @@ pub(crate) fn render(
             transport: &transport,
             param_events: &[],
             harmony: &crate::NO_HARMONY,
+            param_mods: &[],
         };
         let mut io = NodeIo {
             frames: BLOCK,

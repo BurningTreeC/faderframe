@@ -828,6 +828,7 @@ dependencies = [
  "faderframe-view-devices",
  "faderframe-view-history",
  "faderframe-view-mixer",
+ "faderframe-view-modulators",
  "faderframe-view-performance",
  "faderframe-view-pianoroll",
  "faderframe-view-tools",
@@ -924,6 +925,18 @@ dependencies = [
  "faderframe-automation",
  "faderframe-core",
  "faderframe-engine",
+ "faderframe-project",
+ "faderframe-session",
+ "faderframe-ui-canvas",
+]
+
+[[package]]
+name = "faderframe-view-modulators"
+version = "0.6.0"
+dependencies = [
+ "faderframe-core",
+ "faderframe-engine",
+ "faderframe-plugin-host",
  "faderframe-project",
  "faderframe-session",
  "faderframe-ui-canvas",

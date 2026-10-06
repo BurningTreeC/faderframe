@@ -315,6 +315,11 @@ pub fn install(app: &Rc<AppState>) {
         ),
         dispatch(
             app,
+            "show-modulators",
+            A::Workspace(W::ShowView(ViewId::modulators())),
+        ),
+        dispatch(
+            app,
             "show-tools",
             A::Workspace(W::ShowView(ViewId::tools())),
         ),
@@ -1027,6 +1032,62 @@ pub fn install(app: &Rc<AppState>) {
             match action {
                 Some(action) => a.dispatch(action),
                 None => tracing::warn!("make-sample: nothing to sample on '{name}'"),
+            }
+        }),
+        // Development aids: `add-modulator:<lfo|follower|steps|random|macro>`
+        // (on the first selected track) and `mod-route:<n>:<target>@<depth>`
+        // (modulator n of that track moves the target named as in its
+        // "+ Target" menu, e.g. `Volume` or `FaderFrame Synth · Cutoff`).
+        named("add-modulator", |a, arg| {
+            let track = a.session.borrow().selection.tracks.iter().next().copied();
+            let source = faderframe_project::modulation::ModSource::defaults()
+                .into_iter()
+                .find(|s| {
+                    s.kind_label()
+                        .to_lowercase()
+                        .starts_with(&arg.to_lowercase())
+                        || (arg == "follower" && s.kind_label() == "Envelope Follower")
+                });
+            match (track, source) {
+                (Some(track), Some(source)) => a.dispatch(Action::AddModulator { track, source }),
+                _ => tracing::warn!("add-modulator: no selected track or no kind '{arg}'"),
+            }
+        }),
+        named("mod-route", |a, arg| {
+            let parsed = arg.split_once(':').and_then(|(n, rest)| {
+                let (target, depth) = rest.rsplit_once('@')?;
+                Some((n.parse::<usize>().ok()?, target, depth.parse::<f32>().ok()?))
+            });
+            let Some((n, label, depth)) = parsed else {
+                tracing::warn!("mod-route: '{arg}' is not <n>:<target>@<depth>");
+                return;
+            };
+            let action = {
+                let s = a.session.borrow();
+                let track = s
+                    .selection
+                    .tracks
+                    .iter()
+                    .next()
+                    .and_then(|t| s.project().track(*t));
+                track.and_then(|t| {
+                    let mut m = t.modulators.get(n)?.clone();
+                    let target = s.modulation_targets(t.id).into_iter().find(|c| {
+                        c.name == label || format!("{} · {}", c.group, c.name) == label
+                    })?;
+                    m.routes.push(faderframe_project::modulation::ModRoute {
+                        target: target.target,
+                        depth,
+                    });
+                    Some(Action::SetModulator {
+                        track: t.id,
+                        modulator: m,
+                    })
+                })
+            };
+            match action {
+                Some(action) => a.dispatch(action),
+                None => tracing::warn!("mod-route: no modulator {n} or target '{label}'"),
             }
         }),
         // Development aid: `version:<name>` saves a version.

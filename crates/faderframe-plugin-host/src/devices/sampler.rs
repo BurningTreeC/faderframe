@@ -1035,6 +1035,7 @@ pub(crate) mod tests {
                     transport: &self.transport,
                     param_events: &[],
                     harmony: &crate::NO_HARMONY,
+                    param_mods: &[],
                 };
                 let mut io = NodeIo {
                     frames: 256,

@@ -313,6 +313,7 @@ pub(crate) mod rig {
                 transport: &transport,
                 param_events: &[],
                 harmony,
+                param_mods: &[],
             };
             let mut io = NodeIo {
                 frames: BLOCK,

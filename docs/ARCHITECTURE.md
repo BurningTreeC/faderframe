@@ -1586,6 +1586,51 @@ gestures like the arranger's lanes; Write Value puts the control's value
 at the playhead or over the edit selection (with jumps at its edges),
 Thin drops points within half a percent of the lane's height.
 
+### Modulators
+
+A track's modulators (`Track::modulators`, `faderframe_project::modulation`;
+at most 16) move its parameters without changing them: an LFO (five
+shapes, synced to the beat or free in Hz, start phase), an envelope
+follower (the track's input before its devices, or another track before
+its fader; attack, release, gain), a step sequence (up to 32 steps with
+glide), a random source (a new value a step, smoothed) and a macro knob.
+Each routes to any number of targets with a depth (−1..1 of the target's
+range): the track's fader (in fader travel, as a hand would move it), its
+pan, and every device parameter that takes modulation — continuous
+built-in parameters (stepped ones are left out) and CLAP parameters
+flagged `IS_MODULATABLE`. VST3 and AU parameters are not modulated (they
+have no non-destructive modulation). Edits are `Command::SetModulators`
+(one undo step a gesture); the session's actions add, change and remove
+modulators and *map* one: while mapping, the next parameter touched on the
+track's devices becomes a target (a FaderFrame control's move is taken for
+it, a plugin editor's stays).
+
+The engine (`faderframe_engine::modulation`): the control side turns the
+project into a `ModulationSet` (modulators and their routes in the
+targets' units, per track a `ModBus` of atomics kept across sets) sent
+through a latest-value mailbox and swapped into `EngineContext::modulation`
+like the timeline, published on every Params impact when it changed.
+A `ModNode` between a track's input and its devices evaluates the
+modulators once a block into the bus — while playing from the song
+position (synced rates by the beat, free rates by the second; random
+values hashed from the step index), so every playback and render of a
+passage sounds alike; stopped, they run on. Followers listen on extra
+inputs connected from their source tracks' post-insert taps (a connection
+that would close a loop is left out). Plugin nodes turn the routes to
+their plugin into `PluginProcessContext::param_mods` (`ParamMod`: a share
+of the range for built-ins, which apply it in their own scale — octaves
+for Hz parameters — through `ParamValues`' modulation offsets; the plain
+amount for CLAP, sent as `CLAP_EVENT_PARAM_MOD` and reset to 0 when a
+route goes); the strip adds the fader and pan offsets. Values, state and
+automation never see modulation: `ParamValues::get` includes it for
+processors only, the editors' copy (the tap's, `as_set`) reads values as
+set and `live` for the dot that kit knobs draw where modulation has a
+value. The sandbox carries `param_mods` and the modulation flags. A track
+gaining or losing modulators or a follower's source rebuilds the graph;
+modulated tracks are not rendered ahead. The Modulators view
+(`faderframe-view-modulators`) shows the selected track's modulators as
+cards.
+
 ### Track presets
 
 `faderframe_project::preset::TrackPreset` captures a track's channel
@@ -2016,9 +2061,10 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
    `faderframe_project::compare`), ~~a command palette with a shortcut
    editor~~ (done: `faderframe-ui/src/palette.rs`), ~~an undo history
    view~~ (done: `faderframe-view-history`) — wave 3 done.
-4. **Modulation**: modulators (LFO, envelope follower, steps, random,
-   macros) on any parameter, FX containers with parallel chains, CLAP's
-   non-destructive and polyphonic parameter modulation.
+4. **Modulation**: ~~modulators (LFO, envelope follower, steps, random,
+   macros) on any parameter, with CLAP's non-destructive modulation~~
+   (done: see *Modulators*), FX containers with parallel chains, CLAP's
+   polyphonic (per-note) modulation.
 5. **Vocals and audio intelligence**: native pitch editing (on the warp
    and transient machinery and the Stretch engine's pitch and formant
    shifting), audio-to-MIDI (basic-pitch, Apache-2.0), tempo and key

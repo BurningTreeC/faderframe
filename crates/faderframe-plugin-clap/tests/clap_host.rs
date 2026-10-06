@@ -306,6 +306,15 @@ fn run_block(
     events: &[ParameterEvent],
     frames: usize,
 ) -> Vec<f32> {
+    run_block_modulated(proc, events, &[], frames)
+}
+
+fn run_block_modulated(
+    proc: &mut dyn faderframe_plugin_host::PluginProcessor,
+    events: &[ParameterEvent],
+    mods: &[faderframe_plugin_host::ParamMod],
+    frames: usize,
+) -> Vec<f32> {
     let mut input = AudioBuffer::new(ChannelLayout::Stereo, frames);
     input.set_len(frames);
     for c in 0..2 {
@@ -327,6 +336,7 @@ fn run_block(
         transport: &transport,
         param_events: events,
         harmony: &faderframe_plugin_host::NO_HARMONY,
+        param_mods: mods,
     };
     let status = proc.process(&ctx, &mut io);
     assert_ne!(status, faderframe_plugin_host::ProcessStatus::Error);
@@ -420,6 +430,7 @@ fn notes_carry_ids_and_note_expressions_reach_their_keys() {
             transport: &transport,
             param_events: &[],
             harmony: &faderframe_plugin_host::NO_HARMONY,
+            param_mods: &[],
         },
         &mut io,
     );
@@ -595,5 +606,43 @@ fn hosts_an_installed_plugin() {
             assert!(out.iter().all(|v| v.is_finite()));
         }
         eprintln!("{}: output peak {peak} for a 0.5 DC input", p.name);
+        // Modulation: the parameters that take it, moved without changing
+        // their values.
+        let infos = inst.parameters().to_vec();
+        let modulated: Vec<_> = infos.iter().filter(|i| inst.modulatable(i.id)).collect();
+        eprintln!(
+            "{}: {} of {} parameters take modulation ({} per note)",
+            p.name,
+            modulated.len(),
+            infos.len(),
+            infos
+                .iter()
+                .filter(|i| inst.modulatable_per_note(i.id))
+                .count()
+        );
+        if let Some(info) = modulated.first() {
+            let before = inst.parameter(info.id);
+            let range = (info.max - info.min) as f32;
+            let mut peak = 0.0f32;
+            for i in 0..50 {
+                let share = (i as f32 / 10.0).sin() * 0.5;
+                let m = faderframe_plugin_host::ParamMod {
+                    parameter: info.id,
+                    share,
+                    amount: share * range,
+                };
+                let out = run_block_modulated(proc.as_mut(), &[], &[m], 512);
+                peak = out.iter().fold(peak, |m, v| m.max(v.abs()));
+                assert!(out.iter().all(|v| v.is_finite()));
+            }
+            run_block(proc.as_mut(), &[], 512);
+            assert_eq!(
+                inst.parameter(info.id),
+                before,
+                "modulation left {}",
+                info.name
+            );
+            eprintln!("{}: '{}' modulated, output peak {peak}", p.name, info.name);
+        }
     }
 }

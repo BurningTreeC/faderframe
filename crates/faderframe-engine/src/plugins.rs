@@ -384,6 +384,20 @@ impl PluginHost {
         self.instances.get(&plugin).map(|h| h.instance.parameters())
     }
 
+    /// Does the parameter take modulation that leaves its value alone?
+    pub fn modulatable(&self, plugin: PluginInstanceId, id: ParameterId) -> bool {
+        self.instances
+            .get(&plugin)
+            .is_some_and(|h| h.instance.modulatable(id))
+    }
+
+    /// Does the parameter take modulation per note?
+    pub fn modulatable_per_note(&self, plugin: PluginInstanceId, id: ParameterId) -> bool {
+        self.instances
+            .get(&plugin)
+            .is_some_and(|h| h.instance.modulatable_per_note(id))
+    }
+
     /// Does the instantiated plugin have a sidechain (second audio) input?
     pub fn has_sidechain(&self, plugin: PluginInstanceId) -> bool {
         self.instances.get(&plugin).is_some_and(|h| {

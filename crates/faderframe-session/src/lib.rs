@@ -18,6 +18,7 @@ pub mod automation;
 pub mod media;
 mod meters;
 pub mod midi;
+pub mod modulators;
 pub mod notes;
 pub mod performance;
 pub use performance::{Load, PerformanceReport, PluginPerformance, TrackPerformance};
@@ -312,6 +313,23 @@ pub enum Action {
     /// Undo or redo until `n` steps are done (0: as opened); the history
     /// view's click.
     HistoryTo(usize),
+    /// A new modulator on a track (its id allocated here).
+    AddModulator {
+        track: TrackId,
+        source: faderframe_project::modulation::ModSource,
+    },
+    RemoveModulator {
+        track: TrackId,
+        modulator: faderframe_core::ModulatorId,
+    },
+    /// Replace a modulator (its settings, routes, depths), found by id.
+    SetModulator {
+        track: TrackId,
+        modulator: faderframe_project::modulation::Modulator,
+    },
+    /// Map the next parameter touched on the track's devices to the
+    /// modulator (`None`: stop mapping).
+    LearnModulation(Option<(TrackId, faderframe_core::ModulatorId)>),
     /// Keep the project as it is now as a named version.
     SaveVersion {
         name: String,
@@ -981,6 +999,8 @@ pub struct Session {
     /// selected tracks follow it (mapped controllers and automation don't
     /// move the selection).
     user_edit: bool,
+    /// A modulator mapping (see [`modulators`]).
+    mod_learn: Option<modulators::ModLearn>,
     /// Clips as the running gesture first saw them (drags recompute from
     /// these).
     gesture_base: HashMap<ClipId, faderframe_project::Clip>,
@@ -1178,6 +1198,7 @@ impl Session {
             analysis: analysis::AnalysisState::new(config.sample_rate),
             follow_base: HashMap::new(),
             user_edit: false,
+            mod_learn: None,
             note_clipboard_expressions: Vec::new(),
             perf: Default::default(),
             midi,
@@ -2474,13 +2495,23 @@ impl Session {
     pub fn dispatch(&mut self, action: Action) -> Result<()> {
         match action {
             Action::Edit(cmd) => {
-                self.user_edit = true;
-                let r = self.edit(cmd);
-                self.user_edit = false;
-                r?;
+                // Mapping a modulator: the touched parameter is taken.
+                let mapped = match &cmd {
+                    Command::SetPluginParameter {
+                        plugin, parameter, ..
+                    } if self.mod_learn.is_some() => self.map_touched(*plugin, *parameter)?,
+                    _ => false,
+                };
+                if !mapped {
+                    self.user_edit = true;
+                    let r = self.edit(cmd);
+                    self.user_edit = false;
+                    r?;
+                }
             }
             Action::BeginGesture(label) => self.history.begin(label),
             Action::EndGesture => {
+                self.mapping_gesture_ended();
                 self.history.end();
                 self.gesture_base.clear();
                 self.follow_base.clear();
@@ -2500,6 +2531,14 @@ impl Session {
                 }
             }
             Action::HistoryTo(steps) => self.history_to(steps)?,
+            Action::AddModulator { track, source } => {
+                self.add_modulator(track, source)?;
+            }
+            Action::RemoveModulator { track, modulator } => {
+                self.remove_modulator(track, modulator)?;
+            }
+            Action::SetModulator { track, modulator } => self.set_modulator(track, modulator)?,
+            Action::LearnModulation(learn) => self.learn_modulation(learn),
             Action::Transport(t) => {
                 self.transport_action(t)?;
                 self.pump_idle();

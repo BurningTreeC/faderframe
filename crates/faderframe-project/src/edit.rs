@@ -80,6 +80,7 @@ pub enum CoalesceKey {
     PluginParameter(PluginInstanceId, ParameterId),
     Marker(MarkerId),
     Section(faderframe_core::SectionId),
+    Modulators(TrackId),
 }
 
 /// State needed to undo a track removal.
@@ -242,6 +243,11 @@ pub enum Command {
     SetTrackVca {
         track: TrackId,
         vca: Option<TrackId>,
+    },
+    /// A track's modulators, all at once (a knob's drag coalesces).
+    SetModulators {
+        track: TrackId,
+        modulators: Vec<crate::modulation::Modulator>,
     },
     /// Put a track into a folder track (`None`: out of any).
     SetTrackFolder {
@@ -609,6 +615,7 @@ impl Command {
             SetTrackGroup { group: Some(_), .. } => "Add to Group".into(),
             SetTrackGroup { group: None, .. } => "Remove from Group".into(),
             SetTrackVca { .. } => "Assign VCA".into(),
+            SetModulators { .. } => "Change Modulators".into(),
             SetTrackFolder {
                 folder: Some(_), ..
             } => "Move to Folder".into(),
@@ -678,6 +685,7 @@ impl Command {
             UpdateMarker { marker } => CoalesceKey::Marker(marker.id),
             UpdateSection { section } => CoalesceKey::Section(section.id),
             SetAutomationLane { track, lane } => CoalesceKey::Automation(*track, lane.id),
+            SetModulators { track, .. } => CoalesceKey::Modulators(*track),
             SetPluginParameter {
                 plugin, parameter, ..
             } => CoalesceKey::PluginParameter(*plugin, *parameter),
@@ -765,6 +773,9 @@ impl Command {
             SetTrackVca { .. } => Impact::Timeline,
             // Folder mutes and solos reach the tracks inside.
             SetTrackFolder { .. } => Impact::Params,
+            // The engine's modulation table (the graph when a track gains
+            // or loses its modulators: escalated by the controller).
+            SetModulators { .. } => Impact::Params,
             Batch { commands, .. } => commands
                 .iter()
                 .map(Command::impact)
@@ -1093,6 +1104,20 @@ impl Command {
                 }
                 let old = std::mem::replace(&mut t.vca, vca);
                 SetTrackVca { track, vca: old }
+            }
+            SetModulators { track, modulators } => {
+                if modulators.len() > crate::modulation::MAX_MODULATORS {
+                    return Err(EditError::Invalid(format!(
+                        "a track has at most {} modulators",
+                        crate::modulation::MAX_MODULATORS
+                    )));
+                }
+                let t = track_mut(p, track)?;
+                let old = std::mem::replace(&mut t.modulators, modulators);
+                SetModulators {
+                    track,
+                    modulators: old,
+                }
             }
             SetTrackFolder { track, folder } => {
                 if let Some(f) = folder {

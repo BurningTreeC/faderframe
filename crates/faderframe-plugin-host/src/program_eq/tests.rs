@@ -225,6 +225,7 @@ fn run(p: &mut ProgramEqProcessor, input: impl Fn(usize) -> f32, blocks: usize) 
             transport: &transport,
             param_events: &[],
             harmony: &crate::NO_HARMONY,
+            param_mods: &[],
         };
         let mut io = NodeIo {
             frames: 256,
@@ -289,6 +290,7 @@ fn mono_lights_both_meters_while_stereo_keeps_independent_channels() {
                     transport: &transport,
                     param_events: &[],
                     harmony: &crate::NO_HARMONY,
+                    param_mods: &[],
                 },
                 &mut NodeIo {
                     frames: 256,

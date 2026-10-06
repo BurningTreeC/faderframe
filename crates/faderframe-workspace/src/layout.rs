@@ -18,10 +18,12 @@ pub enum ViewKind {
     Album,
     /// The undo history.
     History,
+    /// The selected track's modulators.
+    Modulators,
 }
 
 impl ViewKind {
-    pub const ALL: [ViewKind; 8] = [
+    pub const ALL: [ViewKind; 9] = [
         ViewKind::Arranger,
         ViewKind::Mixer,
         ViewKind::PianoRoll,
@@ -30,6 +32,7 @@ impl ViewKind {
         ViewKind::Tools,
         ViewKind::Album,
         ViewKind::History,
+        ViewKind::Modulators,
     ];
 
     /// The kind whose default view has this id (views added after a layout
@@ -48,6 +51,7 @@ impl ViewKind {
             ViewKind::Tools => "Tools",
             ViewKind::Album => "Album",
             ViewKind::History => "History",
+            ViewKind::Modulators => "Modulators",
         }
     }
 
@@ -61,6 +65,7 @@ impl ViewKind {
             ViewKind::Tools => ViewId::tools(),
             ViewKind::Album => ViewId::album(),
             ViewKind::History => ViewId::history(),
+            ViewKind::Modulators => ViewId::modulators(),
         }
     }
 }

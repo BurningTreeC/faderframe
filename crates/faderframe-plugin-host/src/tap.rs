@@ -253,9 +253,11 @@ pub struct AnalysisTap {
 }
 
 impl AnalysisTap {
+    /// `params` as the editors read them: as set (see
+    /// [`ParamValues::as_set`]).
     pub fn new(params: ParamValues, values: usize) -> Self {
         Self {
-            params,
+            params: params.as_set(),
             input: AudioRing::default(),
             output: AudioRing::default(),
             sidechain: AudioRing::default(),

@@ -167,6 +167,22 @@ pub struct PluginProcessContext<'a> {
     /// The project's key and chord track (built-in MIDI effects follow
     /// them; [`NO_HARMONY`] outside a project).
     pub harmony: &'a Harmony,
+    /// Modulation for this block: offsets on parameters' values that
+    /// leave the values themselves as they are. A parameter not listed has
+    /// none.
+    pub param_mods: &'a [ParamMod],
+}
+
+/// A parameter's modulation for a block.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ParamMod {
+    pub parameter: ParameterId,
+    /// Share of the parameter's whole range (−1..1). Built-ins apply it in
+    /// their own scale (a frequency's is logarithmic).
+    pub share: f32,
+    /// The same in plain units (`share × (max − min)`), for plugins that
+    /// add it to the value (CLAP).
+    pub amount: f32,
 }
 
 /// A parameter moved in the plugin's own editor (plain units), with the
@@ -297,6 +313,16 @@ pub trait PluginInstance {
     fn descriptor(&self) -> &PluginDescriptor;
     fn parameters(&self) -> &[ParameterInfo];
     fn parameter(&mut self, id: ParameterId) -> Option<f64>;
+    /// Whether the parameter takes modulation that leaves its value as it
+    /// is ([`PluginProcessContext::param_mods`]).
+    fn modulatable(&self, _id: ParameterId) -> bool {
+        false
+    }
+    /// Whether the parameter takes modulation per note (a voice's own;
+    /// CLAP's polyphonic modulation).
+    fn modulatable_per_note(&self, _id: ParameterId) -> bool {
+        false
+    }
     /// Set a parameter from the UI; reaches the processor without blocking.
     fn set_parameter(&mut self, id: ParameterId, value: f64) -> Result<(), PluginError>;
     fn latency_samples(&self) -> u32;

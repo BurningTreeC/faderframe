@@ -2,6 +2,7 @@ use crate::EngineError;
 use crate::build::build_graph;
 use crate::click::{Click, MetronomeMode, MetronomeShared};
 use crate::context::EngineContext;
+use crate::modulation::ModulationSet;
 use crate::plugins::PluginHost;
 use crate::record::{RecordStreams, RecordTarget, Recorder};
 use crate::slots::SlotRegistry;
@@ -93,6 +94,8 @@ enum Garbage {
     // The mailbox's box, handed back whole: the audio thread frees nothing.
     #[allow(clippy::redundant_allocation)]
     Timeline(#[allow(dead_code)] Box<Arc<TimelineSnapshot>>),
+    #[allow(clippy::redundant_allocation)]
+    Modulation(#[allow(dead_code)] Box<Arc<ModulationSet>>),
     AheadLink(#[allow(dead_code)] Box<crate::ahead::AheadLink>),
     Recorder(#[allow(dead_code)] Box<Recorder>),
     MidiQueue(#[allow(dead_code)] Box<faderframe_midi::MidiInputQueue>),
@@ -197,6 +200,7 @@ pub fn create_with_epoch(
     let (gtx, grx) = RingBuffer::new(config.queue_capacity.max(64));
     let (graph_tx, graph_rx) = mailbox();
     let (timeline_tx, timeline_rx) = mailbox();
+    let (modulation_tx, modulation_rx) = mailbox();
     let shared_midi = Arc::new(crate::midi::MidiShared::default());
     let shared = Arc::new(EngineShared {
         epoch,
@@ -216,6 +220,7 @@ pub fn create_with_epoch(
         rx,
         graph_rx,
         timeline_rx,
+        modulation_rx,
         garbage: gtx,
         graph: None,
         ctx: EngineContext {
@@ -224,6 +229,7 @@ pub fn create_with_epoch(
             transport: Default::default(),
             discontinuity: false,
             timeline: Arc::new(TimelineSnapshot::empty(config.sample_rate as f64)),
+            modulation: Arc::default(),
             params: Arc::clone(&params),
             readback: Arc::clone(&readback),
             meters: Arc::clone(&meters),
@@ -255,6 +261,7 @@ pub fn create_with_epoch(
         tx,
         graph_tx,
         timeline_tx,
+        modulation_tx,
         garbage: grx,
         shared,
         params,
@@ -277,6 +284,9 @@ pub fn create_with_epoch(
         edited: Default::default(),
         album_monitor: None,
         timeline: Arc::new(TimelineSnapshot::empty(config.sample_rate as f64)),
+        modulation: Arc::default(),
+        mod_buses: Default::default(),
+        mod_shape: Vec::new(),
         ahead: None,
         ahead_setting: None,
         ahead_rings: Default::default(),
@@ -292,6 +302,7 @@ pub struct EngineProcessor {
     rx: Consumer<Message>,
     graph_rx: MailboxReceiver<CompiledGraph<EngineContext>>,
     timeline_rx: MailboxReceiver<Arc<TimelineSnapshot>>,
+    modulation_rx: MailboxReceiver<Arc<ModulationSet>>,
     garbage: Producer<Garbage>,
     graph: Option<Box<CompiledGraph<EngineContext>>>,
     ctx: EngineContext,
@@ -341,6 +352,10 @@ impl EngineProcessor {
             // here.
             std::mem::swap(&mut self.ctx.timeline, &mut *t);
             self.retire(Garbage::Timeline(t));
+        }
+        if let Some(mut m) = self.modulation_rx.take() {
+            std::mem::swap(&mut self.ctx.modulation, &mut *m);
+            self.retire(Garbage::Modulation(m));
         }
         for _ in 0..Self::MAX_MESSAGES_PER_CALLBACK {
             let Ok(msg) = self.rx.pop() else { break };
@@ -723,6 +738,7 @@ pub struct EngineController {
     tx: Producer<Message>,
     graph_tx: MailboxSender<CompiledGraph<EngineContext>>,
     timeline_tx: MailboxSender<Arc<TimelineSnapshot>>,
+    modulation_tx: MailboxSender<Arc<ModulationSet>>,
     garbage: Consumer<Garbage>,
     shared: Arc<EngineShared>,
     params: Arc<ParamTable>,
@@ -752,6 +768,11 @@ pub struct EngineController {
     voices: Vec<(faderframe_core::TrackId, crate::nodes::StretchVoices)>,
     /// The latest timeline snapshot (handed to an anticipator that starts).
     timeline: Arc<TimelineSnapshot>,
+    /// The modulation published last, the tracks' buses, and the
+    /// modulation the installed graph was built for.
+    modulation: Arc<ModulationSet>,
+    mod_buses: std::collections::HashMap<faderframe_core::TrackId, Arc<crate::modulation::ModBus>>,
+    mod_shape: Vec<(faderframe_core::TrackId, Vec<faderframe_core::TrackId>)>,
     /// Render-ahead: the anticipator, its lookahead, the rings by track,
     /// the tracks rendered ahead in the installed graph, reader misses.
     ahead: Option<crate::ahead::Anticipator>,
@@ -1144,6 +1165,15 @@ impl EngineController {
         self.plugins.parameters(plugin)
     }
 
+    /// Does the plugin's parameter take modulation (that leaves its value)?
+    pub fn plugin_modulatable(
+        &self,
+        plugin: faderframe_core::PluginInstanceId,
+        parameter: faderframe_core::ParameterId,
+    ) -> bool {
+        self.plugins.modulatable(plugin, parameter)
+    }
+
     /// Automated fader gain (linear), pan and mute of a track, as the audio
     /// thread last applied them (only meaningful while a lane drives them).
     pub fn automated_strip(&self, track: TrackId) -> Option<(f32, f32, bool)> {
@@ -1225,10 +1255,14 @@ impl EngineController {
     }
 
     pub fn update_params(&mut self, project: &Project) -> Result<(), EngineError> {
-        // A track became live or armed: out of the render-ahead graph.
-        if self.ahead.is_some() && self.ahead_plan(project) != self.ahead_tracks {
+        // A track became live or armed: out of the render-ahead graph. A
+        // track gained (or lost) modulators or a follower's source.
+        if (self.ahead.is_some() && self.ahead_plan(project) != self.ahead_tracks)
+            || crate::modulation::shape(project) != self.mod_shape
+        {
             self.rebuild_graph(project)?;
         }
+        self.publish_modulation(project);
         self.slots.write_params(
             project,
             &self.params,
@@ -1237,6 +1271,41 @@ impl EngineController {
         )?;
         self.plugins.sync_parameters(project);
         Ok(())
+    }
+
+    /// Send the tracks' modulation to the audio thread when it changed.
+    fn publish_modulation(&mut self, project: &Project) {
+        let set = crate::modulation::build_set(project, &self.plugins, &mut self.mod_buses);
+        if *self.modulation == set {
+            return;
+        }
+        self.modulation = Arc::new(set);
+        drop(
+            self.modulation_tx
+                .send(Box::new(Arc::clone(&self.modulation))),
+        );
+    }
+
+    /// The outputs of a track's modulators now (bipolar ones −1..1,
+    /// unipolar ones 0..1).
+    pub fn modulator_values(
+        &self,
+        track: faderframe_core::TrackId,
+    ) -> Vec<(faderframe_core::ModulatorId, f32)> {
+        self.modulation.track(track).map_or_else(Vec::new, |t| {
+            t.modulators
+                .iter()
+                .enumerate()
+                .map(|(i, m)| (m.id, t.bus.get(i)))
+                .collect()
+        })
+    }
+
+    /// What modulation moves a track's fader (in travel) and pan by now.
+    pub fn strip_modulation(&self, track: faderframe_core::TrackId) -> (f32, f32) {
+        self.modulation
+            .track(track)
+            .map_or((0.0, 0.0), crate::modulation::TrackModulation::strip)
     }
 
     pub fn rebuild_graph(&mut self, project: &Project) -> Result<(), EngineError> {
@@ -1289,6 +1358,7 @@ impl EngineController {
         self.ahead_rings.retain(|t, _| ahead_tracks.contains(t));
         self.ahead_tracks = ahead_tracks;
         self.voices = voice_needs(project);
+        self.mod_shape = crate::modulation::shape(project);
         // Parameters must be valid before the new graph's processors read them.
         self.slots.write_params(
             project,
@@ -1473,6 +1543,8 @@ impl EngineController {
             transport: Default::default(),
             discontinuity: false,
             timeline: Arc::clone(&self.timeline),
+            // Modulated tracks are never rendered ahead.
+            modulation: Arc::default(),
             params: Arc::clone(&self.params),
             readback: Arc::clone(&self.readback),
             meters: Arc::clone(&self.meters),

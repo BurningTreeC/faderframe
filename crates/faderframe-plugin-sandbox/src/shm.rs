@@ -17,7 +17,7 @@ use faderframe_audio_graph::AudioBuffer;
 use faderframe_automation::ParameterEvent;
 use faderframe_core::{ChannelLayout, ParameterId};
 use faderframe_midi::{ExpressionValue, MidiBuffer, MidiEvent, TimedMidiEvent};
-use faderframe_plugin_host::ProcessStatus;
+use faderframe_plugin_host::{ParamMod, ProcessStatus};
 use faderframe_timeline::TimeSignature;
 use faderframe_transport::{LoopRange, TransportInfo};
 use std::io;
@@ -28,6 +28,8 @@ pub const MAX_BUFFERS: usize = 4;
 pub const MAX_CHANNELS: usize = 16;
 pub const MAX_EVENTS: usize = 1024;
 pub const MAX_PARAMS: usize = 1024;
+/// Most parameters modulated in a block.
+pub const MAX_MODS: usize = 64;
 /// Bytes of SysEx per block (to the plugin).
 pub const MAX_SYSEX: usize = 16 * 1024;
 const MAGIC: u32 = 0x4646_5348;
@@ -137,6 +139,14 @@ pub struct WireParam {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WireMod {
+    pub parameter: u32,
+    pub share: f32,
+    pub amount: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct WireTransport {
     pub playing: u8,
     pub recording: u8,
@@ -234,8 +244,10 @@ pub struct Header {
     pub n_events_in: u32,
     pub n_events_out: u32,
     pub n_params: u32,
+    pub n_mods: u32,
     pub transport: WireTransport,
     pub params: [WireParam; MAX_PARAMS],
+    pub mods: [WireMod; MAX_MODS],
     pub events_in: [WireEvent; MAX_EVENTS],
     pub events_out: [WireEvent; MAX_EVENTS],
     /// Bytes used in `sysex_in`.
@@ -258,6 +270,8 @@ pub struct BlockIn<'a> {
     pub frames: usize,
     pub transport: &'a TransportInfo,
     pub params: &'a [ParameterEvent],
+    /// Modulation offsets (plain units).
+    pub mods: &'a [ParamMod],
     pub audio_in: &'a [AudioBuffer],
     pub events_in: Option<&'a MidiBuffer>,
     /// Channels of each output buffer.
@@ -363,6 +377,7 @@ impl Block {
             frames,
             transport,
             params,
+            mods,
             audio_in,
             events_in,
             out_channels,
@@ -401,6 +416,15 @@ impl Block {
                 });
             }
             addr_of_mut!((*h).n_params).write_volatile(np as u32);
+            let nm = mods.len().min(MAX_MODS);
+            for (i, m) in mods.iter().take(nm).enumerate() {
+                addr_of_mut!((*h).mods[i]).write_volatile(WireMod {
+                    parameter: m.parameter.0,
+                    share: m.share,
+                    amount: m.amount,
+                });
+            }
+            addr_of_mut!((*h).n_mods).write_volatile(nm as u32);
             let (mut ne, mut sysex) = (0, 0usize);
             if let Some(ev) = events_in {
                 for e in ev.iter().take(MAX_EVENTS) {
@@ -526,6 +550,16 @@ impl Block {
                     sample_offset: p.offset.min(frames.saturating_sub(1) as u32),
                 });
             }
+            io.mods.clear();
+            let nm = (addr_of!((*h).n_mods).read_volatile() as usize).min(MAX_MODS);
+            for i in 0..nm {
+                let m = addr_of!((*h).mods[i]).read_volatile();
+                io.mods.push(ParamMod {
+                    parameter: ParameterId(m.parameter),
+                    share: m.share,
+                    amount: m.amount,
+                });
+            }
             io.events_in.clear();
             if addr_of!((*h).has_events_in).read_volatile() != 0 {
                 let mut buf = io
@@ -613,6 +647,7 @@ pub struct HelperIo {
     pub events_in: Vec<MidiBuffer>,
     pub events_out: Vec<MidiBuffer>,
     pub params: Vec<ParameterEvent>,
+    pub mods: Vec<ParamMod>,
     pub transport: TransportInfo,
     spare_events: Option<MidiBuffer>,
     spare_out_events: Option<MidiBuffer>,
@@ -628,6 +663,7 @@ impl Default for HelperIo {
             events_in: Vec::with_capacity(1),
             events_out: Vec::with_capacity(1),
             params: Vec::with_capacity(MAX_PARAMS),
+            mods: Vec::with_capacity(MAX_MODS),
             transport: TransportInfo::default(),
             spare_events: None,
             spare_out_events: None,
@@ -750,6 +786,11 @@ mod tests {
             frames,
             transport: &TransportInfo::default(),
             params: &params,
+            mods: &[ParamMod {
+                parameter: ParameterId(4),
+                share: 0.5,
+                amount: 0.25,
+            }],
             audio_in: std::slice::from_ref(&input),
             events_in: Some(&midi),
             out_channels: &[2],
@@ -760,6 +801,15 @@ mod tests {
         assert_eq!(io.ins[0].channel(1)[3], 0.25);
         assert_eq!(io.outs[0].num_channels(), 2);
         assert_eq!(io.params, params);
+        assert_eq!(
+            io.mods,
+            [ParamMod {
+                parameter: ParameterId(4),
+                share: 0.5,
+                amount: 0.25
+            }],
+            "modulation crosses too"
+        );
         assert_eq!(io.events_in[0].iter().count(), 1);
         // The "plugin": output = input × 2, a NaN, an event back.
         for c in 0..2 {

@@ -96,6 +96,8 @@ pub fn ahead_eligible(
         && !live.contains(&t.id)
         && t.midi_output.is_none()
         && t.inserts.iter().all(|s| s.sidechain.is_none())
+        // Modulators run live (macros move now, followers listen now).
+        && t.modulators.is_empty()
         && t.sends
             .iter()
             .all(|s| !s.enabled || s.tap != SendTap::PreFx)
@@ -139,6 +141,8 @@ pub enum NodeWork {
     HardwareOut,
     /// Rendered ahead (the reader in the realtime graph).
     Ahead,
+    /// The track's modulators.
+    Modulators,
 }
 
 /// The track (and plugin instance) a graph node works for.
@@ -162,6 +166,7 @@ enum Role {
     MidiInput = 9,
     Ahead = 10,
     Crosstalk = 11,
+    Modulators = 12,
 }
 
 /// Stretcher voices a track's clip player needs: one per pitch-preserving
@@ -425,6 +430,10 @@ pub fn build_graph(
     let mut note_inputs: HashMap<TrackId, Vec<NodeId>> = HashMap::new();
     // (plugin node, source track) of connected sidechain inputs.
     let mut sidechains: Vec<(NodeId, TrackId)> = Vec::new();
+    // Modulated tracks and their followers' sources; (modulator node,
+    // input, source track) of those inputs.
+    let mod_shape = crate::modulation::shape(project);
+    let mut followers: Vec<(NodeId, u16, TrackId)> = Vec::new();
     let mut owners: Vec<(NodeId, NodeOwner)> = Vec::new();
     let own = |owners: &mut Vec<(NodeId, NodeOwner)>,
                node: NodeId,
@@ -588,6 +597,38 @@ pub fn build_graph(
             Box::new(Passthrough),
         );
         tn.input = Some(own(&mut owners, input, t.id, None, NodeWork::Input));
+        // The modulators, between the input and the devices (a follower of
+        // the input hears the track before its devices).
+        let mut chain_start = input;
+        if let Some((_, keys)) = mod_shape.iter().find(|(id, _)| *id == t.id) {
+            let sub = keys
+                .iter()
+                .fold(keys.len() as u64, |h, k| h.rotate_left(13) ^ k.raw());
+            let mut spec = NodeSpec::new(format!("{} · Modulators", t.name))
+                .key(node_key(t.id, Role::Modulators, sub, &[layout]))
+                .group(gi)
+                .audio_in(layout)
+                .audio_out(layout);
+            for k in keys {
+                spec = spec.audio_in(project.track(*k).map_or(layout, |s| s.layout));
+            }
+            let node = b.add_node(
+                spec,
+                Box::new(crate::modulation::ModNode::new(
+                    t.id,
+                    keys.clone(),
+                    config.sample_rate,
+                )),
+            );
+            followers.extend(
+                keys.iter()
+                    .enumerate()
+                    .map(|(i, k)| (node, i as u16 + 1, *k)),
+            );
+            own(&mut owners, node, t.id, None, NodeWork::Modulators);
+            b.connect_audio(input, 0, node, 0)?;
+            chain_start = node;
+        }
 
         let chain = if frozen {
             Vec::new()
@@ -700,7 +741,7 @@ pub fn build_graph(
             _ => {}
         }
 
-        let mut prev = input;
+        let mut prev = chain_start;
         let mut events = sources;
         let mut raw = true;
         for slot in chain {
@@ -869,6 +910,16 @@ pub fn build_graph(
     for (node, src) in sidechains {
         if let Some(tap) = nodes.get(&src).and_then(|n| n.post_fx) {
             b.connect_audio(tap, 0, node, 1)?;
+        }
+    }
+    // Followers hear their source tracks the same way, unless that would
+    // close a loop (two tracks following each other: the second hears
+    // nothing).
+    for (node, port, src) in followers {
+        if let Some(tap) = nodes.get(&src).and_then(|n| n.post_fx)
+            && !b.would_cycle_with(&[(tap, node)])?
+        {
+            b.connect_audio(tap, 0, node, port)?;
         }
     }
     // Each direction taps the clean post-insert signal, never another leak.

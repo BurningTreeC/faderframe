@@ -407,6 +407,130 @@ fn automation_does_not_allocate() {
 }
 
 #[test]
+fn modulation_does_not_allocate() {
+    let _serial = serial();
+    use faderframe_core::{ChannelLayout, ParameterId, builtin};
+    use faderframe_project::modulation::{
+        FollowSource, LfoShape, ModRate, ModRoute, ModSource, ModTarget, Modulator,
+    };
+    use faderframe_project::{PluginRef, PluginSlot, TrackKind};
+    use faderframe_timeline::MusicalTime;
+
+    const SR: u32 = 48_000;
+    let mut tp = common::TestProject::new(SR);
+    let key = tp.track(TrackKind::Audio, "Key", ChannelLayout::Stereo);
+    let src = tp.dc(2, 0.3, 200_000);
+    tp.clip(key, src, MusicalTime::ZERO, 200_000);
+    let t = tp.track(TrackKind::Audio, "A", ChannelLayout::Stereo);
+    tp.clip(t, src, MusicalTime::ZERO, 200_000);
+    let plugin = tp.project.ids.allocate();
+    tp.project.track_mut(t).unwrap().inserts.push(PluginSlot {
+        id: plugin,
+        plugin: PluginRef::builtin(builtin::GAIN, "Utility"),
+        bypass: false,
+        parameters: Vec::new(),
+        state: None,
+        sidechain: None,
+    });
+    let param = |p: u32| ModTarget::Plugin {
+        plugin,
+        parameter: ParameterId(p),
+    };
+    let targets = [ModTarget::Volume, ModTarget::Pan, param(0), param(2)];
+    let sources = [
+        ModSource::Lfo {
+            shape: LfoShape::Triangle,
+            rate: ModRate::Sync { beats: 0.5 },
+            phase: 0.25,
+        },
+        ModSource::Lfo {
+            shape: LfoShape::Sine,
+            rate: ModRate::Hz { hz: 3.0 },
+            phase: 0.0,
+        },
+        ModSource::Follower {
+            source: FollowSource::Track { track: key },
+            attack_ms: 5.0,
+            release_ms: 80.0,
+            gain_db: 3.0,
+        },
+        ModSource::Follower {
+            source: FollowSource::Input,
+            attack_ms: 1.0,
+            release_ms: 20.0,
+            gain_db: 0.0,
+        },
+        ModSource::Steps {
+            steps: vec![1.0, -1.0, 0.5, 0.0],
+            rate: ModRate::Sync { beats: 0.25 },
+            glide: 0.3,
+        },
+        ModSource::Random {
+            rate: ModRate::Sync { beats: 0.25 },
+            smooth: 0.5,
+        },
+        ModSource::Macro { value: 0.7 },
+    ];
+    let modulators: Vec<Modulator> = sources
+        .into_iter()
+        .enumerate()
+        .map(|(i, source)| {
+            let mut m = Modulator::new(tp.project.ids.allocate(), source);
+            m.routes = targets
+                .iter()
+                .map(|&target| ModRoute {
+                    target,
+                    depth: 0.1 * (i as f32 - 3.0),
+                })
+                .collect();
+            m
+        })
+        .collect();
+    tp.project.track_mut(t).unwrap().modulators = modulators;
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 2).unwrap();
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    let (_, allocs) = armed(|| {
+        for _ in 0..200 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations while modulating");
+    // A new set (a macro turned, a modulator switched off) mid-play, then
+    // stopped (the modulators run on).
+    let tm = tp.project.track_mut(t).unwrap();
+    tm.modulators[6].source = ModSource::Macro { value: 0.2 };
+    tm.modulators[0].enabled = false;
+    tm.modulators.swap(1, 2);
+    r.controller
+        .sync(&tp.project, &tp.sources, faderframe_project::Impact::Params)
+        .unwrap();
+    let (_, allocs) = armed(|| {
+        for _ in 0..100 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations taking a new modulation set");
+    r.controller.transport(TransportCommand::Stop).unwrap();
+    for _ in 0..2 {
+        r.processor.process_device(&mut bufs);
+    }
+    let (_, allocs) = armed(|| {
+        for _ in 0..100 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations while stopped");
+}
+
+#[test]
 fn live_midi_input_and_midi_recording_do_not_allocate() {
     let _serial = serial();
     use faderframe_engine::midi::{MidiFilter, MidiRecordTarget};

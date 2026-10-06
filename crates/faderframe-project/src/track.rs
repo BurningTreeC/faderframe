@@ -356,6 +356,9 @@ pub struct Track {
     /// The folder track this track is in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder: Option<TrackId>,
+    /// Sources that move the track's parameters (LFOs, followers, …).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modulators: Vec<crate::modulation::Modulator>,
 }
 
 /// Tracks whose controls move together.
@@ -455,6 +458,7 @@ impl Track {
             vca: None,
             group: None,
             folder: None,
+            modulators: Vec::new(),
         }
     }
 

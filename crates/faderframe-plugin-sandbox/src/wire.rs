@@ -137,6 +137,11 @@ pub struct Param {
     pub unit: u8,
     pub automatable: bool,
     pub stepped: bool,
+    /// Takes modulation (that leaves its value), and per note.
+    #[serde(default)]
+    pub modulatable: bool,
+    #[serde(default)]
+    pub per_note: bool,
 }
 
 const UNITS: [ParameterUnit; 6] = [
@@ -159,6 +164,19 @@ impl From<&ParameterInfo> for Param {
             unit: UNITS.iter().position(|u| *u == p.unit).unwrap_or(0) as u8,
             automatable: p.automatable,
             stepped: p.stepped,
+            modulatable: false,
+            per_note: false,
+        }
+    }
+}
+
+impl Param {
+    /// The parameter with what the instance says of its modulation.
+    pub fn of(p: &ParameterInfo, inst: &dyn faderframe_plugin_host::PluginInstance) -> Self {
+        Self {
+            modulatable: inst.modulatable(p.id),
+            per_note: inst.modulatable_per_note(p.id),
+            ..Self::from(p)
         }
     }
 }

@@ -70,6 +70,7 @@ impl Channel {
             frames,
             transport: ctx.transport,
             params: ctx.param_events,
+            mods: ctx.param_mods,
             audio_in: io.audio_in,
             events_in: io.events_in.first(),
             out_channels: &out_channels[..n_out],
@@ -142,6 +143,8 @@ pub struct RemoteInstance {
     dead: Arc<AtomicBool>,
     descriptor: PluginDescriptor,
     params: Vec<ParameterInfo>,
+    /// Parameters that take modulation: (id, per note too).
+    modulation: Vec<(u32, bool)>,
     values: HashMap<u32, f64>,
     latency: u32,
     tail: TailLength,
@@ -195,6 +198,7 @@ impl RemoteInstance {
                 note_outputs: 0,
             },
             params: Vec::new(),
+            modulation: Vec::new(),
             values: HashMap::new(),
             latency: 0,
             tail: TailLength::None,
@@ -221,6 +225,12 @@ impl RemoteInstance {
             (Response::Instantiated(i), _) => {
                 inst.descriptor = (&i.descriptor).into();
                 inst.params = i.params.iter().map(ParameterInfo::from).collect();
+                inst.modulation = i
+                    .params
+                    .iter()
+                    .filter(|p| p.modulatable)
+                    .map(|p| (p.id, p.per_note))
+                    .collect();
                 inst.values = i.values.into_iter().collect();
                 inst.latency = i.latency;
                 inst.tail = i.tail.into();
@@ -353,6 +363,14 @@ impl PluginInstance for RemoteInstance {
         &self.params
     }
 
+    fn modulatable(&self, id: ParameterId) -> bool {
+        self.modulation.iter().any(|(p, _)| *p == id.0)
+    }
+
+    fn modulatable_per_note(&self, id: ParameterId) -> bool {
+        self.modulation.iter().any(|(p, n)| *p == id.0 && *n)
+    }
+
     fn parameter(&mut self, id: ParameterId) -> Option<f64> {
         self.values.get(&id.0).copied()
     }
@@ -470,6 +488,11 @@ impl PluginInstance for RemoteInstance {
         }
         if let Some(params) = &p.params {
             self.params = params.iter().map(ParameterInfo::from).collect();
+            self.modulation = params
+                .iter()
+                .filter(|p| p.modulatable)
+                .map(|p| (p.id, p.per_note))
+                .collect();
         }
         if let Some(t) = p.tail {
             self.tail = t.into();

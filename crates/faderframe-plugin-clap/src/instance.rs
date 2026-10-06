@@ -22,6 +22,8 @@ pub struct ClapInstance {
     descriptor: PluginDescriptor,
     scanned: ScannedPlugin,
     params: Vec<ParameterInfo>,
+    /// Parameters that take modulation: (id, per note too).
+    modulation: Vec<(ParameterId, bool)>,
     rt: Option<SharedRt>,
     config: Option<ProcessConfig>,
     params_tx: Option<rtrb::Producer<(u32, f64)>>,
@@ -64,6 +66,7 @@ impl ClapInstance {
             descriptor: descriptor_of(scanned),
             scanned: scanned.clone(),
             params: Vec::new(),
+            modulation: Vec::new(),
             rt: None,
             config: None,
             params_tx: None,
@@ -107,8 +110,10 @@ impl ClapInstance {
     fn query_params(&mut self) {
         let Some(params) = self.ext().params else {
             self.params.clear();
+            self.modulation.clear();
             return;
         };
+        let mut modulation = Vec::new();
         let handle = self.instance.plugin_handle();
         let mut buffer = ParamInfoBuffer::new();
         let mut out = Vec::new();
@@ -118,6 +123,13 @@ impl ClapInstance {
             };
             if info.flags.contains(ParamInfoFlags::IS_HIDDEN) {
                 continue;
+            }
+            if info.flags.contains(ParamInfoFlags::IS_MODULATABLE) {
+                modulation.push((
+                    ParameterId(info.id.get()),
+                    info.flags
+                        .contains(ParamInfoFlags::IS_MODULATABLE_PER_NOTE_ID),
+                ));
             }
             let module = text(info.module);
             let name = text(info.name);
@@ -138,6 +150,7 @@ impl ClapInstance {
             });
         }
         self.params = out;
+        self.modulation = modulation;
     }
 
     /// Handle what the plugin asked for (main-thread callbacks run here).
@@ -246,6 +259,14 @@ impl FfInstance for ClapInstance {
 
     fn parameters(&self) -> &[ParameterInfo] {
         &self.params
+    }
+
+    fn modulatable(&self, id: ParameterId) -> bool {
+        self.modulation.iter().any(|(p, _)| *p == id)
+    }
+
+    fn modulatable_per_note(&self, id: ParameterId) -> bool {
+        self.modulation.iter().any(|(p, n)| *p == id && *n)
     }
 
     fn parameter(&mut self, id: ParameterId) -> Option<f64> {

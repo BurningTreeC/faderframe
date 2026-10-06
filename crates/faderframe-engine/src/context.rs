@@ -18,6 +18,9 @@ pub struct EngineContext {
     /// Shared with the anticipator (see [`crate::ahead`]); dropped only on
     /// the control thread.
     pub timeline: Arc<TimelineSnapshot>,
+    /// The tracks' modulators (see [`crate::modulation`]); swapped like
+    /// the timeline.
+    pub modulation: Arc<crate::modulation::ModulationSet>,
     pub params: Arc<ParamTable>,
     /// Automated values of strip/send parameters (same slots as `params`),
     /// written by the processors for the UI.

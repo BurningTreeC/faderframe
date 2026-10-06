@@ -24,6 +24,7 @@ mod click;
 mod context;
 mod engine;
 pub mod midi;
+pub mod modulation;
 pub mod nodes;
 pub mod offline;
 mod plugins;

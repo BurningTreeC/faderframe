@@ -12,8 +12,8 @@
 use crate::host::FfHost;
 use clack_host::events::event_types::{
     MidiEvent as ClapMidi, MidiSysExEvent, NoteExpressionEvent, NoteExpressionType, NoteOffEvent,
-    NoteOnEvent, ParamGestureBeginEvent, ParamGestureEndEvent, ParamValueEvent, TransportEvent,
-    TransportFlags,
+    NoteOnEvent, ParamGestureBeginEvent, ParamGestureEndEvent, ParamModEvent, ParamValueEvent,
+    TransportEvent, TransportFlags,
 };
 use clack_host::events::{EventFlags, EventHeader, Match, Pckn};
 use clack_host::prelude::*;
@@ -54,7 +54,13 @@ pub(crate) struct RtState {
     max_frames: usize,
     /// Ids of the sounding notes (note expressions address them).
     note_ids: Box<NoteIds>,
+    /// Modulation sent and still in effect: (parameter, amount).
+    mods: Box<[(u32, f32); MAX_MODS]>,
+    mod_count: usize,
 }
+
+/// Most parameters modulated at once.
+const MAX_MODS: usize = 64;
 
 /// A note expression as CLAP has it (volume: linear gain up to 4 = +12 dB;
 /// pan: 0 left … 0.5 centre … 1 right; tuning in semitones).
@@ -125,6 +131,8 @@ impl RtState {
             steady: 0,
             max_frames,
             note_ids: Box::new(NoteIds::new()),
+            mods: Box::new([(0, 0.0); MAX_MODS]),
+            mod_count: 0,
         }
     }
 }
@@ -200,7 +208,11 @@ impl PluginProcessor for ClapProcessor {
             Some(RtProc::Started(s)) => s,
             // CLAP: start_processing happens on the audio thread.
             Some(RtProc::Stopped(s)) => match s.start_processing() {
-                Ok(s) => s,
+                Ok(s) => {
+                    // Started again: send all the modulation anew.
+                    st.mod_count = 0;
+                    s
+                }
                 Err(e) => {
                     st.proc = Some(RtProc::Stopped(e.into_stopped_processor()));
                     silence(io);
@@ -232,6 +244,51 @@ impl PluginProcessor for ClapProcessor {
                 ClapId::new(e.parameter.0),
                 Pckn::match_all(),
                 e.value as f64,
+            ));
+            room -= 1;
+        }
+        // Modulation (leaves the values as they are): what changed, and 0
+        // for what went away.
+        let mut i = 0;
+        while i < st.mod_count {
+            let (id, _) = st.mods[i];
+            if room > 0 && !ctx.param_mods.iter().any(|m| m.parameter.0 == id) {
+                st.events_in.push(&ParamModEvent::new(
+                    0,
+                    ClapId::new(id),
+                    Pckn::match_all(),
+                    0.0,
+                ));
+                room -= 1;
+                st.mod_count -= 1;
+                st.mods[i] = st.mods[st.mod_count];
+            } else {
+                i += 1;
+            }
+        }
+        for m in ctx.param_mods {
+            if room == 0 {
+                break;
+            }
+            let known = st.mods[..st.mod_count]
+                .iter()
+                .position(|(id, _)| *id == m.parameter.0);
+            if known.is_some_and(|k| st.mods[k].1 == m.amount) {
+                continue;
+            }
+            match known {
+                Some(k) => st.mods[k].1 = m.amount,
+                None if st.mod_count < MAX_MODS => {
+                    st.mods[st.mod_count] = (m.parameter.0, m.amount);
+                    st.mod_count += 1;
+                }
+                None => continue,
+            }
+            st.events_in.push(&ParamModEvent::new(
+                0,
+                ClapId::new(m.parameter.0),
+                Pckn::match_all(),
+                f64::from(m.amount),
             ));
             room -= 1;
         }

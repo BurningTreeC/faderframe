@@ -621,6 +621,16 @@ impl Session {
             let parameter = match edit {
                 E::Begin(p) | E::End(p) | E::Value(p, _) => p,
             };
+            // Mapping a modulator: the plugin has moved its value already
+            // (it stays); the parameter becomes a target.
+            if self.mod_learn.is_some() {
+                match edit {
+                    E::Begin(_) | E::Value(..) => {
+                        let _ = self.map_touched(plugin, parameter);
+                    }
+                    E::End(_) => self.mapping_gesture_ended(),
+                }
+            }
             let target = AutomationTarget::PluginParameter { plugin, parameter };
             match edit {
                 E::Value(_, v) => {

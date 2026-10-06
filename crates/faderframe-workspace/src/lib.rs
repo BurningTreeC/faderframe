@@ -69,6 +69,10 @@ impl ViewId {
         Self::new("history")
     }
 
+    pub fn modulators() -> Self {
+        Self::new("modulators")
+    }
+
     pub fn tools() -> Self {
         Self::new("tools")
     }

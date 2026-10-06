@@ -26,6 +26,7 @@ mod history;
 pub mod midi_ops;
 pub mod midi_tools;
 mod midimap;
+pub mod modulation;
 pub mod preset;
 mod project;
 mod takes;

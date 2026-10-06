@@ -331,7 +331,11 @@ impl Helper {
             Ok(i) => i,
             Err(e) => return failed(e),
         };
-        let params: Vec<Param> = inst.parameters().iter().map(Param::from).collect();
+        let params: Vec<Param> = inst
+            .parameters()
+            .iter()
+            .map(|p| Param::of(p, inst.as_ref()))
+            .collect();
         let mut values = Vec::with_capacity(params.len());
         for p in &params {
             if let Some(v) = inst.parameter(faderframe_core::ParameterId(p.id)) {
@@ -380,9 +384,12 @@ impl Helper {
             }
             _ => (false, Default::default()),
         };
-        let params: Option<Vec<Param>> = p
-            .params_changed
-            .then(|| inst.parameters().iter().map(Param::from).collect());
+        let params: Option<Vec<Param>> = p.params_changed.then(|| {
+            inst.parameters()
+                .iter()
+                .map(|p| Param::of(p, inst.as_ref()))
+                .collect()
+        });
         let ids: Vec<u32> = inst.parameters().iter().map(|p| p.id.0).collect();
         let mut values = Vec::new();
         for id in ids {
@@ -624,6 +631,7 @@ fn audio_loop(
                 events_in,
                 events_out,
                 params,
+                mods,
                 transport,
                 ..
             } = &mut io;
@@ -631,6 +639,7 @@ fn audio_loop(
                 transport,
                 param_events: params,
                 harmony: &faderframe_plugin_host::NO_HARMONY,
+                param_mods: mods,
             };
             let mut node = NodeIo {
                 frames,

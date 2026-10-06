@@ -487,6 +487,17 @@ impl<F: Face> DeviceView<F> {
                     },
                     th,
                 );
+                // Modulated: a dot on the ring where the value is now.
+                if let Some(i) = cx.index(c.id) {
+                    let live = f64::from(cx.tap.params.live(i));
+                    if (live - v).abs() > (info.max - info.min).abs() * 1e-4 {
+                        let a = controls::knob_angle(scale.to_norm(info, live) as f32);
+                        let (o, rad) = (k.center(), size * 0.5 - 1.6);
+                        let at = Point::new(o.x + rad * a.cos(), o.y + rad * a.sin());
+                        p.circle(at, 3.2, th.ui.background);
+                        p.circle(at, 2.2, th.ui.text);
+                    }
+                }
                 p.text(
                     c.label,
                     Rect::new(r.x - 8.0, r.y, r.w + 16.0, 13.0),
