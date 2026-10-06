@@ -495,6 +495,10 @@ fn control_of(ev: MidiEvent) -> Option<(u8, MidiControl, f64)> {
             key,
             velocity,
         } if velocity > 0 => Some((channel, MidiControl::Note { key }, 1.0)),
+        // Let go (launcher buttons release on it).
+        MidiEvent::NoteOn { channel, key, .. } | MidiEvent::NoteOff { channel, key, .. } => {
+            Some((channel, MidiControl::Note { key }, 0.0))
+        }
         _ => None,
     }
 }
@@ -1240,7 +1244,33 @@ impl Session {
                 format!("{track_name} · {param}")
             }
             MappingTarget::Transport { control } => format!("Transport · {}", control.label()),
+            MappingTarget::LauncherSlot { track, scene } => format!(
+                "Launcher · {} · {}",
+                self.project
+                    .track(*track)
+                    .map_or("(removed track)", |t| t.name.as_str()),
+                self.scene_name(*scene)
+            ),
+            MappingTarget::LauncherScene { scene } => {
+                format!("Launcher · {}", self.scene_name(*scene))
+            }
+            MappingTarget::LauncherStop { track: Some(track) } => format!(
+                "Launcher · Stop {}",
+                self.project
+                    .track(*track)
+                    .map_or("(removed track)", |t| t.name.as_str())
+            ),
+            MappingTarget::LauncherStop { track: None } => "Launcher · Stop All".into(),
         }
+    }
+
+    fn scene_name(&self, scene: faderframe_core::SceneId) -> String {
+        self.project
+            .launcher
+            .scenes
+            .iter()
+            .find(|s| s.id == scene)
+            .map_or_else(|| "(removed scene)".to_string(), |s| s.name.clone())
     }
 
     /// Menu entries for mapping `target`: learn, and remove existing ones.
@@ -1257,10 +1287,10 @@ impl Session {
 
     fn is_toggle_target(&self, target: &MappingTarget) -> bool {
         match target {
-            MappingTarget::Transport { .. } => true,
             MappingTarget::Parameter { track, target } => self
                 .automation_param(*track, *target)
                 .is_some_and(|p| p.kind == crate::ParamKind::Toggle),
+            _ => true,
         }
     }
 
@@ -1270,15 +1300,16 @@ impl Session {
         let mut values: Vec<(TrackId, AutomationTarget, f64)> = Vec::new();
         let mut toggles: Vec<(TrackId, AutomationTarget)> = Vec::new();
         let mut transport: Vec<TransportControl> = Vec::new();
+        let mut launcher: Vec<crate::launcher::LauncherOp> = Vec::new();
         for raw in events {
             let Some(ev) = raw.event() else { continue };
             let Some((channel, control, value)) = control_of(ev) else {
                 continue;
             };
             let port_key = self.midi.hub.port_key(raw.port).map(str::to_string);
-            // Button edge for CCs (pads/switches sending 127/0).
-            let pressed = match control {
-                MidiControl::Note { .. } => true,
+            // Button edges (pads and switches: notes, CCs sending 127/0).
+            let (pressed, released) = match control {
+                MidiControl::Note { .. } => (value > 0.0, value <= 0.0),
                 MidiControl::Cc { number } => {
                     let v = (value * 127.0).round() as u8;
                     let prev = self
@@ -1286,10 +1317,15 @@ impl Session {
                         .cc_last
                         .insert((raw.port, channel, number), v)
                         .unwrap_or(0);
-                    prev < 64 && v >= 64
+                    (prev < 64 && v >= 64, prev >= 64 && v < 64)
                 }
-                _ => false,
+                _ => (false, false),
             };
+            // A key let go is no value for anything but launcher buttons.
+            let note_off = matches!(control, MidiControl::Note { .. }) && released;
+            if note_off && self.midi.learn.is_some() {
+                continue;
+            }
             if let Some((target, _)) = self.midi.learn {
                 let toggle = self.is_toggle_target(&target);
                 let fits = match control {
@@ -1317,12 +1353,34 @@ impl Session {
                 .cloned()
                 .collect();
             for m in mapped {
+                use crate::launcher::LauncherOp;
                 match m.target {
                     MappingTarget::Transport { control: tc } => {
                         if pressed {
                             transport.push(tc);
                         }
                     }
+                    MappingTarget::LauncherSlot { track, scene } => {
+                        if pressed {
+                            launcher.push(LauncherOp::Launch { track, scene });
+                        } else if released {
+                            launcher.push(LauncherOp::Release { track, scene });
+                        }
+                    }
+                    MappingTarget::LauncherScene { scene } => {
+                        if pressed {
+                            launcher.push(LauncherOp::LaunchScene(scene));
+                        }
+                    }
+                    MappingTarget::LauncherStop { track } => {
+                        if pressed {
+                            launcher.push(match track {
+                                Some(t) => LauncherOp::StopTrack(t),
+                                None => LauncherOp::StopAll,
+                            });
+                        }
+                    }
+                    _ if note_off => {}
                     MappingTarget::Parameter { track, target } => {
                         let toggle =
                             self.is_toggle_target(&MappingTarget::Parameter { track, target });
@@ -1388,6 +1446,11 @@ impl Session {
                 TransportControl::ToStart => TransportAction::ReturnToStart,
             };
             if let Err(e) = self.dispatch(Action::Transport(action)) {
+                self.notify(NoticeLevel::Error, e.to_string());
+            }
+        }
+        for op in launcher {
+            if let Err(e) = self.dispatch(Action::Launcher(op)) {
                 self.notify(NoticeLevel::Error, e.to_string());
             }
         }

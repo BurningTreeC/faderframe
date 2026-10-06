@@ -338,3 +338,77 @@ fn midi_tracks_play_external_devices_and_send_clock() {
     );
     s.stop_audio();
 }
+
+/// Launcher buttons take MIDI learn: a pad launches a slot (a gate clip
+/// plays while it is held), another a scene, another stops everything.
+#[test]
+fn pads_learned_for_launcher_slots_scenes_and_stops() {
+    use faderframe_project::launcher::{ClipLaunch, LaunchMode, LaunchQuantize};
+    use faderframe_session::launcher::LauncherOp;
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    audio(&mut s);
+    let drums = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.name == "Drums")
+        .unwrap()
+        .id;
+    let first = s.project().clips_of(drums)[0].id;
+    s.dispatch(Action::Launcher(LauncherOp::SendClips(vec![first])))
+        .unwrap();
+    let scene = s.project().launcher.scenes[0].id;
+    s.dispatch(Action::Launcher(LauncherOp::SetClipLaunch {
+        track: drums,
+        scene,
+        launch: Some(ClipLaunch {
+            mode: LaunchMode::Gate,
+            quantize: Some(LaunchQuantize::None),
+            legato: false,
+            tempo: None,
+        }),
+    }))
+    .unwrap();
+    let slot = MappingTarget::LauncherSlot {
+        track: drums,
+        scene,
+    };
+    learn(&mut s, slot, &[0x90, 36, 100]);
+    learn(
+        &mut s,
+        MappingTarget::LauncherStop { track: None },
+        &[0x90, 38, 100],
+    );
+    learn(
+        &mut s,
+        MappingTarget::LauncherScene { scene },
+        &[0xB0, 50, 127],
+    );
+    // The button let go after learning.
+    s.midi_keyboard().send(&[0xB0, 50, 0]);
+    s.tick(0.0);
+    assert_eq!(s.midi_mappings_for(slot).len(), 1);
+    assert!(
+        s.mapping_target_label(&slot)
+            .starts_with("Launcher · Drums")
+    );
+    let playing = |s: &Session| s.launch_state(drums).and_then(|l| l.playing).is_some();
+    let wait = |s: &mut Session, what: &str, want: bool| {
+        let start = Instant::now();
+        while playing(s) != want {
+            assert!(start.elapsed() < Duration::from_secs(5), "{what}");
+            run(s, Duration::from_millis(5));
+        }
+    };
+    // Held: plays; let go: stops (a gate).
+    s.midi_keyboard().send(&[0x90, 36, 100]);
+    wait(&mut s, "the pad launches", true);
+    s.midi_keyboard().send(&[0x80, 36, 0]);
+    wait(&mut s, "letting go stops it", false);
+    // The scene by a CC button (127, then 0), stop all by its pad.
+    s.midi_keyboard().send(&[0xB0, 50, 127]);
+    s.midi_keyboard().send(&[0xB0, 50, 0]);
+    wait(&mut s, "the scene launches", true);
+    s.midi_keyboard().send(&[0x90, 38, 100]);
+    wait(&mut s, "stop all", false);
+}

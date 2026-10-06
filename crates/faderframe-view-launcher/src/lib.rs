@@ -590,7 +590,32 @@ impl LauncherView {
         p.pop_clip();
     }
 
+    /// MIDI learn entries for a launcher button.
+    fn learn_items(
+        model: &Session,
+        target: faderframe_project::MappingTarget,
+    ) -> Vec<MenuItem<Action>> {
+        model
+            .midi_learn_menu(target)
+            .into_iter()
+            .enumerate()
+            .map(|(i, (label, action))| {
+                let item = MenuItem::new(label, action);
+                if i == 0 { item.separated() } else { item }
+            })
+            .collect()
+    }
+
     fn slot_menu(&self, model: &Session, track: TrackId, scene: SceneId) -> Vec<MenuItem<Action>> {
+        let mut items = self.slot_items(model, track, scene);
+        items.extend(Self::learn_items(
+            model,
+            faderframe_project::MappingTarget::LauncherSlot { track, scene },
+        ));
+        items
+    }
+
+    fn slot_items(&self, model: &Session, track: TrackId, scene: SceneId) -> Vec<MenuItem<Action>> {
         let l = |op| Action::Launcher(op);
         let mut items = Vec::new();
         let kind = model.project().track(track).map(|t| t.kind);
@@ -874,7 +899,16 @@ impl LauncherView {
         )
     }
 
-    fn scene_menu(scene: SceneId) -> Vec<MenuItem<Action>> {
+    fn scene_menu(model: &Session, scene: SceneId) -> Vec<MenuItem<Action>> {
+        let mut items = Self::scene_items(scene);
+        items.extend(Self::learn_items(
+            model,
+            faderframe_project::MappingTarget::LauncherScene { scene },
+        ));
+        items
+    }
+
+    fn scene_items(scene: SceneId) -> Vec<MenuItem<Action>> {
         let l = |op| Action::Launcher(op);
         vec![
             MenuItem::new("Launch Scene", l(LauncherOp::LaunchScene(scene))),
@@ -1193,8 +1227,30 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for LauncherView {
             } => {
                 let items = match self.hit(pos, size, model) {
                     Some(Hit::Slot { track, scene, .. }) => self.slot_menu(model, track, scene),
-                    Some(Hit::SceneLaunch(s) | Hit::SceneName(s)) => Self::scene_menu(s),
+                    Some(Hit::SceneLaunch(s) | Hit::SceneName(s)) => Self::scene_menu(model, s),
                     Some(Hit::Quantize) => Self::quantize_menu(model),
+                    Some(Hit::TrackStop(t)) => {
+                        let mut items = vec![MenuItem::new(
+                            "Stop Track",
+                            Action::Launcher(LauncherOp::StopTrack(t)),
+                        )];
+                        items.extend(Self::learn_items(
+                            model,
+                            faderframe_project::MappingTarget::LauncherStop { track: Some(t) },
+                        ));
+                        items
+                    }
+                    Some(Hit::StopAll) => {
+                        let mut items = vec![MenuItem::new(
+                            "Stop All Clips",
+                            Action::Launcher(LauncherOp::StopAll),
+                        )];
+                        items.extend(Self::learn_items(
+                            model,
+                            faderframe_project::MappingTarget::LauncherStop { track: None },
+                        ));
+                        items
+                    }
                     _ => return false,
                 };
                 cx.request(HostRequest::ContextMenu { at: pos, items });

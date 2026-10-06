@@ -2,7 +2,7 @@
 //! controller drives a parameter or a transport function.
 
 use faderframe_automation::AutomationTarget;
-use faderframe_core::{MidiMappingId, TrackId};
+use faderframe_core::{MidiMappingId, SceneId, TrackId};
 use serde::{Deserialize, Serialize};
 
 /// Which control of a MIDI device.
@@ -107,6 +107,28 @@ pub enum MappingTarget {
     Transport {
         control: TransportControl,
     },
+    /// A launcher slot's button: a press launches it (as its launch mode
+    /// says), letting go releases it.
+    LauncherSlot {
+        track: TrackId,
+        scene: SceneId,
+    },
+    /// A scene's launch button.
+    LauncherScene {
+        scene: SceneId,
+    },
+    /// Stop a track's launched clip (`None`: every track's).
+    LauncherStop {
+        #[serde(default)]
+        track: Option<TrackId>,
+    },
+}
+
+impl MappingTarget {
+    /// A button (pads and keys fit it), not a value.
+    pub fn is_button(&self) -> bool {
+        !matches!(self, MappingTarget::Parameter { .. })
+    }
 }
 
 /// How a control's values drive the target.
