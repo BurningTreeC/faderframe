@@ -1218,3 +1218,55 @@ fn midi_tracks_have_no_hidden_fader() {
         "{actions:?}"
     );
 }
+
+#[test]
+fn tracks_are_sized_by_the_edges_of_their_headers() {
+    let mut s = session();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 1400.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    let tracks: Vec<TrackId> = ArrangerView::lane_tracks(&s).iter().map(|t| t.id).collect();
+    let (first, second) = (tracks[0], tracks[1]);
+    let h = view.base_h(&s, first);
+    let edge = view.row_rect(0, size).y + h;
+    // Both sides of the boundary size the upper track, in the headers only.
+    for dy in [-3.0, 0.0, 3.0] {
+        assert_eq!(
+            view.hit_test(Point::new(40.0, edge + dy), size, &s),
+            Some(Hit::Header(first, HeaderPart::Resize)),
+            "{dy}"
+        );
+    }
+    assert_ne!(
+        view.hit_test(Point::new(40.0, edge + 10.0), size, &s),
+        Some(Hit::Header(first, HeaderPart::Resize))
+    );
+    assert_ne!(
+        view.hit_test(Point::new(view.header_w() + 40.0, edge), size, &s),
+        Some(Hit::Header(first, HeaderPart::Resize))
+    );
+    // Dragging the top edge of the second header down makes the first
+    // taller; it lights while hovered.
+    let at = Point::new(40.0, edge + 2.0);
+    run(&mut view, mv(at), size, &s);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    run(&mut view, down(at), size, &s);
+    let (actions, _) = run(&mut view, mv(Point::new(40.0, edge + 32.0)), size, &s);
+    for a in actions {
+        s.dispatch(a).unwrap();
+    }
+    run(&mut view, up(Point::new(40.0, edge + 32.0)), size, &s);
+    assert_eq!(s.track_height(first), Some(h + 30.0));
+    assert_eq!(s.track_height(second), None, "only the dragged one");
+    // With automation lanes shown, the edge is still the track's own.
+    s.dispatch(Action::ToggleTrackAutomation(first)).unwrap();
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    let edge = view.row_rect(0, size).y + view.base_h(&s, first);
+    assert_eq!(
+        view.hit_test(Point::new(40.0, edge), size, &s),
+        Some(Hit::Header(first, HeaderPart::Resize))
+    );
+}

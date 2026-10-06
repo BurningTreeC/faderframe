@@ -159,6 +159,8 @@ enum Drag {
         track: TrackId,
         start_y: f32,
         start_h: f32,
+        /// Alt: every track at once.
+        all: bool,
     },
 }
 
@@ -380,6 +382,26 @@ impl ArrangerView {
         self.base_h(model, track).min(HEADER_MAX_H)
     }
 
+    /// Where track `i`'s own part ends (its take and automation lanes, or
+    /// the next track, follow): the edge that sizes it.
+    fn resize_edge(&self, model: &Session, i: usize, track: TrackId, size: Size) -> f32 {
+        self.row_rect(i, size).y + self.base_h(model, track)
+    }
+
+    /// The track whose resize edge is under `pos` in the header column
+    /// (a few pixels either side of it).
+    fn resize_hit(&self, model: &Session, pos: Point, size: Size) -> Option<TrackId> {
+        if pos.x >= self.header_w() || pos.y < self.ruler_h() {
+            return None;
+        }
+        let tracks = Self::lane_tracks(model);
+        self.visible_rows(tracks.len(), size)
+            .find(|&i| {
+                (pos.y - self.resize_edge(model, i, tracks[i].id, size)).abs() <= RESIZE_GRIP
+            })
+            .map(|i| tracks[i].id)
+    }
+
     fn update_rows(&mut self, model: &Session) {
         self.rows.clear();
         let mut y = 0.0;
@@ -548,6 +570,9 @@ impl ArrangerView {
                 Hit::Ruler(at)
             });
         }
+        if let Some(track) = self.resize_hit(model, pos, size) {
+            return Some(Hit::Header(track, HeaderPart::Resize));
+        }
         let tracks = Self::lane_tracks(model);
         let Some(i) = self.row_at(pos.y).filter(|&i| i < tracks.len()) else {
             if self.add_track_rect(tracks.len(), size).contains(pos) {
@@ -565,9 +590,6 @@ impl ArrangerView {
             });
         }
         if pos.x < self.header_w() {
-            if pos.y >= row.bottom() - RESIZE_GRIP {
-                return Some(Hit::Header(t.id, HeaderPart::Resize));
-            }
             let l = HeaderLayout::new(Rect::new(
                 0.0,
                 row.y,
@@ -2275,7 +2297,7 @@ impl ArrangerView {
                 match part {
                     HeaderPart::Automation => cx.emit(Action::ToggleTrackAutomation(id)),
                     HeaderPart::Resize if clicks >= 2 => cx.emit(Action::SetTrackHeight {
-                        track: Some(id),
+                        track: (!mods.alt).then_some(id),
                         height: self.row_h(),
                     }),
                     HeaderPart::Resize => {
@@ -2283,6 +2305,7 @@ impl ArrangerView {
                             track: id,
                             start_y: pos.y,
                             start_h: self.base_h(model, id),
+                            all: mods.alt,
                         });
                         cx.set_cursor(Cursor::ResizeVertical);
                     }
@@ -2547,11 +2570,12 @@ impl ArrangerView {
                 track,
                 start_y,
                 start_h,
+                all,
             }) => {
                 let h = (start_h + pos.y - start_y).round();
                 if (h - self.base_h(model, track)).abs() >= 1.0 {
                     cx.emit(Action::SetTrackHeight {
-                        track: Some(track),
+                        track: (!all).then_some(track),
                         height: h,
                     });
                 }
@@ -2780,6 +2804,19 @@ impl CanvasView<Session, Action> for ArrangerView {
                 color_of(tracks[i].color),
             );
         }
+        // The edge being dragged, or under the pointer, to size a track.
+        let sizing = match (self.drag, self.hover) {
+            (Some(Drag::Height { track, .. }), _)
+            | (_, Some(Hit::Header(track, HeaderPart::Resize))) => Some(track),
+            _ => None,
+        };
+        if let Some(i) = sizing.and_then(|id| tracks.iter().position(|t| t.id == id)) {
+            let y = self.resize_edge(model, i, tracks[i].id, size);
+            p.fill(
+                Rect::new(0.0, y - 1.0, self.header_w(), 2.0),
+                theme.ui.accent.with_alpha(0.85),
+            );
+        }
         // The "+" under the last track.
         let add = self.add_track_rect(tracks.len(), size);
         if add.bottom() > self.ruler_h() && add.y < size.h {
@@ -2952,6 +2989,13 @@ impl CanvasView<Session, Action> for ArrangerView {
                     return false;
                 }
                 if hit != self.hover {
+                    // Hover highlights: the "+" and a track's resize edge.
+                    let lit = |h: Option<Hit>| {
+                        matches!(h, Some(Hit::AddTrack | Hit::Header(_, HeaderPart::Resize)))
+                    };
+                    if lit(hit) || lit(self.hover) {
+                        cx.redraw();
+                    }
                     self.hover = hit;
                     cx.set_cursor(match hit {
                         Some(Hit::Clip { .. }) => Cursor::Grab,
@@ -3174,7 +3218,7 @@ impl CanvasView<Session, Action> for ArrangerView {
                         "Track colour · Click to choose (the selected tracks follow)".into()
                     }
                     HeaderPart::Resize => {
-                        "Drag to change the track height · Double-click to reset · Alt+wheel: all tracks"
+                        "Drag to change the track height (Alt: every track) · Double-click to reset · Alt+wheel: all tracks"
                             .into()
                     }
                     _ => return None,
