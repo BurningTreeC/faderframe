@@ -2,6 +2,7 @@
 
 use crate::state::AppState;
 use faderframe_project::TrackKind;
+use faderframe_session::launcher::LauncherOp;
 use faderframe_session::{Action, TransportAction, WorkspaceAction};
 use faderframe_workspace::{DockAreaId, ViewId};
 use gtk::prelude::*;
@@ -308,6 +309,11 @@ pub fn install(app: &Rc<AppState>) {
             app,
             "show-clip-fx",
             A::Workspace(W::ShowView(ViewId::clip_fx())),
+        ),
+        dispatch(
+            app,
+            "show-launcher",
+            A::Workspace(W::ShowView(ViewId::launcher())),
         ),
         dispatch(
             app,
@@ -1171,6 +1177,64 @@ pub fn install(app: &Rc<AppState>) {
                 Some(c) => a.dispatch(Action::OpenPitchEditor(c)),
                 None => tracing::warn!("edit-pitch: no audio clip on {arg}"),
             }
+        }),
+        // Development aids for the clip launcher: `send-to-launcher:<track>`
+        // (its first clip), `launch:<track>@<scene n>` (1-based),
+        // `launch-scene:<n>`, `launcher:<stop-all|back|record|scene>`.
+        named("send-to-launcher", |a, arg| {
+            let clip = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == arg)
+                .and_then(|t| t.clips.first().copied());
+            if let Some(clip) = clip {
+                a.dispatch(Action::Launcher(LauncherOp::SendClips(vec![clip])));
+            }
+        }),
+        named("launch", |a, arg| {
+            let Some((name, n)) = arg.split_once('@') else {
+                return;
+            };
+            let found = {
+                let s = a.session.borrow();
+                let p = s.project();
+                let track = p.tracks.iter().find(|t| t.name == name).map(|t| t.id);
+                let scene = n
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|n| p.launcher.scenes.get(n.saturating_sub(1)))
+                    .map(|s| s.id);
+                track.zip(scene)
+            };
+            if let Some((track, scene)) = found {
+                a.dispatch(Action::Launcher(LauncherOp::Launch { track, scene }));
+            }
+        }),
+        named("launch-scene", |a, arg| {
+            let scene = {
+                let s = a.session.borrow();
+                arg.parse::<usize>()
+                    .ok()
+                    .and_then(|n| s.project().launcher.scenes.get(n.saturating_sub(1)))
+                    .map(|s| s.id)
+            };
+            if let Some(scene) = scene {
+                a.dispatch(Action::Launcher(LauncherOp::LaunchScene(scene)));
+            }
+        }),
+        named("launcher", |a, arg| {
+            let records = a.session.borrow().launcher_records();
+            let op = match arg {
+                "stop-all" => LauncherOp::StopAll,
+                "back" => LauncherOp::BackToArrangement,
+                "record" => LauncherOp::SetRecord(!records),
+                "scene" => LauncherOp::AddScene { after: None },
+                _ => return,
+            };
+            a.dispatch(Action::Launcher(op));
         }),
         // Development aids: `clip-fx:<track>` (its first clip in the clip
         // effects editor), `clip-fx-add:<plugin id>`,

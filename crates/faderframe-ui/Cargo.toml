@@ -35,6 +35,7 @@ faderframe-view-history.workspace = true
 faderframe-view-modulators.workspace = true
 faderframe-view-pitch.workspace = true
 faderframe-view-clipfx.workspace = true
+faderframe-view-launcher.workspace = true
 faderframe-view-tools.workspace = true
 faderframe-view-devices.workspace = true
 faderframe-view-automation.workspace = true

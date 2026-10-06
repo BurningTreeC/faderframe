@@ -1824,6 +1824,46 @@ playing), a click goes there, a double-click edits, right-click deletes;
 `arrange` moves, copies and cuts them with sections; `Session::
 lyrics_text` writes LRC or SRT.
 
+### Clip launcher
+
+Scenes (`faderframe_project::launcher::Scene`, rows) and slots
+(`SlotKey { track, scene }` → `ClipId`) live in `Project::launcher`;
+launcher clips are ordinary `Project::clips` entries (start 0) listed in
+no `Track::clips`, so the arrangement, its edits (`arrange`, carving,
+`repair`) and `clips_of` never see them; `RemoveTrack` takes a track's
+launcher clips and restores them on undo. Commands: `SetLauncherSlot`
+(Timeline), `SetScenes`, `SetLaunchQuantize`.
+
+The snapshot gives every slot's clip a `LaunchLane` of its own from
+sample 0 (looping over `length`), its streamed pages pinned in the
+`StreamPlan` (a launch can come any moment). `engine::launch` keeps the
+launch state on the audio thread (in `EngineContext`, preallocated for
+`MAX_TRACKS`): `Message::Launch` commands (launch a slot, stop a track or
+all, back to the arrangement) wait for the next quantised position
+(`next_boundary`: beat, bars from the meter), take effect at once while
+stopped, and `transport()` follows play/stop/jumps (stopping stops the
+launched clips; the tracks stay silent until launched again or back to
+the arrangement). Clip players ask `launch::pieces` what to play over a
+block — the arrangement, a launched clip or silence, split where a launch
+lands — so switches are sample-accurate in any block size; the MIDI
+player ends sounding notes where the played source changes or the clip
+wraps. The state is published through `LaunchStatus` atomics (slot
+numbers below 2^63: the top bit is the status flag). Tracks with launcher
+clips play live (not rendered ahead; `sync` escalates to a graph rebuild
+when that set changes) and get one more stretcher voice per algorithm
+their launcher clips use. Tests: `engine/tests/launcher.rs`,
+`the_clip_launcher_does_not_allocate`.
+
+`session::launcher` (`Action::Launcher(LauncherOp)`) launches slots and
+scenes (a scene stops the tracks without a clip in it; launching while
+stopped plays), edits scenes and slots (send arrangement clips to their
+tracks' first free slots, new MIDI clips, move/copy), and with Record to
+Arrangement on follows the published state on every tick: each run of a
+clip becomes copies over its span (the last cut where it ended, the
+track's material there carved away) in one "Record Launches" step when
+the transport stops. The grid is `faderframe-view-launcher`
+(`ViewKind::Launcher`); the arranger dims tracks that play the launcher.
+
 ### Track presets
 
 `faderframe_project::preset::TrackPreset` captures a track's channel
@@ -2270,8 +2310,9 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
    bridge ARA), ~~a speech and lyrics transcription track (Whisper,
    MIT)~~ (done: *Speech and lyrics*). Stem separation waits
    for permissively licensed model weights.
-6. **Performance and control**: a clip launcher with scenes recorded into
-   the arrangement, control surfaces (Mackie Control/HUI, OSC).
+6. **Performance and control**: ~~a clip launcher with scenes recorded
+   into the arrangement~~ (done: *Clip launcher*), control surfaces
+   (Mackie Control/HUI, OSC).
 7. **Ports**: signed and notarised packages, a Flathub submission
    (vendored crates), sandboxed plugins' audio threads in the device's
    workgroup (macOS: needs the workgroup's Mach port in the helper).

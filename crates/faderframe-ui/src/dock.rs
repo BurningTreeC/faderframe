@@ -104,6 +104,12 @@ fn create_view(app: &Rc<AppState>, kind: ViewKind) -> ViewHost {
             true,
             true,
         ),
+        ViewKind::Launcher => ViewHost::new(
+            app,
+            Box::new(faderframe_view_launcher::LauncherView::new(theme)),
+            true,
+            true,
+        ),
     };
     app.register_canvas(&host.canvas);
     host

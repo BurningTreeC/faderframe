@@ -181,6 +181,8 @@ fn build(s: Spec) -> Theme {
             playhead: accent,
             record: c(s.leds[2]),
             automation: c(s.leds[1]),
+            launch_playing: c(m[1]),
+            launch_queued: c(m[2]),
             clip_radius: 4.0,
             clip_header: 22.0,
             clip_text: c(s.clip_text),

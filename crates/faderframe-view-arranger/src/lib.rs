@@ -2364,6 +2364,20 @@ impl ArrangerView {
             ));
         }
         {
+            // The selected clips when this is one of them.
+            let clips = if model.selection.clips.contains(&clip.id) {
+                let mut v: Vec<_> = model.selection.clips.iter().copied().collect();
+                v.sort();
+                v
+            } else {
+                vec![clip.id]
+            };
+            items.push(MenuItem::new(
+                "Send to Clip Launcher",
+                Action::Launcher(faderframe_session::launcher::LauncherOp::SendClips(clips)),
+            ));
+        }
+        {
             use faderframe_session::detect::FromClip;
             let from = |what| Action::FromClip {
                 clip: clip.id,
@@ -3041,6 +3055,14 @@ impl CanvasView<Session, Action> for ArrangerView {
                     let top = row.y + self.base_h(model, t.id);
                     self.paint_take_lanes(p, rect, top, lanes, clip, f, model, color);
                 }
+            }
+            // The track plays the clip launcher, not the arrangement.
+            if model.launch_state(t.id).is_some_and(|s| !s.arrangement) {
+                let x = lanes.x.max(row.x);
+                p.fill(
+                    Rect::new(x, row.y, lanes.right() - x, row.h),
+                    a.background.with_alpha(0.6),
+                );
             }
         }
         for i in rows.clone() {

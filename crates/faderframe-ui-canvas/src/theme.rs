@@ -197,6 +197,9 @@ pub struct ArrangerTheme {
     pub record: Color,
     /// Automation button and lanes.
     pub automation: Color,
+    /// The clip launcher: a clip playing, one waiting to start or stop.
+    pub launch_playing: Color,
+    pub launch_queued: Color,
     pub clip_radius: f32,
     pub clip_header: f32,
     pub clip_text: Color,
@@ -532,6 +535,8 @@ impl Theme {
                 playhead: accent,
                 record: Color::hex(0xff4b4b),
                 automation: Color::hex(0x5fc27a),
+                launch_playing: Color::hex(0x4fc36b),
+                launch_queued: Color::hex(0xe1c14b),
                 clip_radius: 4.0,
                 // Tall enough for the clip gain knob.
                 clip_header: 22.0,

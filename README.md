@@ -297,6 +297,12 @@ Contrast:
   Whisper running in FaderFrame; the model, 290 MB, is downloaded once
   from Audio → Download Speech Model). Lines are edited in place; the
   lane's menu writes them next to the project as LRC and SRT.
+* Clip launcher (View → Clip Launcher): scenes of clips per track,
+  launched while the song plays on the next bar, beat or bars, looping
+  until the next one; whole scenes at once, per-track stops, "Back to
+  Arrangement", and "Record to Arrangement" writes what was launched into
+  the arrangement. Clips come from the arrangement (a clip's menu → Send
+  to Clip Launcher) or are new MIDI clips; they drag between slots.
 * Stock dynamics with editors of their own: a compressor (five styles,
   soft knee, lookahead, auto release and makeup, colour, mix, a filtered
   sidechain), a true-peak lookahead limiter that never passes its ceiling,

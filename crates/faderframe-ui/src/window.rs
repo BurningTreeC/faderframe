@@ -451,6 +451,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             ("Modulators", "app.show-modulators"),
             ("Pitch Editor", "app.show-pitch"),
             ("Clip Effects", "app.show-clip-fx"),
+            ("Clip Launcher", "app.show-launcher"),
             ("Show / Hide Bottom Dock", "app.toggle-dock"),
             ("Master Strip at the Side", "app.master-panel"),
         ]),

@@ -81,6 +81,10 @@ impl ViewId {
         Self::new("clip-fx")
     }
 
+    pub fn launcher() -> Self {
+        Self::new("launcher")
+    }
+
     pub fn tools() -> Self {
         Self::new("tools")
     }

@@ -333,7 +333,7 @@ pub fn next_boundary(q: Quantize, pos: i64, timeline: &Timeline, rate: f64) -> i
             let beat = MusicalTime::from_quarters(4.0 / f64::from(sig.denominator.max(1)));
             let mut t = start;
             while t < here {
-                t = t + beat;
+                t += beat;
             }
             t
         }

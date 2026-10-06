@@ -24,10 +24,12 @@ pub enum ViewKind {
     Pitch,
     /// An audio clip's effects, rendered offline.
     ClipFx,
+    /// Scenes of clips launched while the song plays.
+    Launcher,
 }
 
 impl ViewKind {
-    pub const ALL: [ViewKind; 11] = [
+    pub const ALL: [ViewKind; 12] = [
         ViewKind::Arranger,
         ViewKind::Mixer,
         ViewKind::PianoRoll,
@@ -39,6 +41,7 @@ impl ViewKind {
         ViewKind::Modulators,
         ViewKind::Pitch,
         ViewKind::ClipFx,
+        ViewKind::Launcher,
     ];
 
     /// The kind whose default view has this id (views added after a layout
@@ -60,6 +63,7 @@ impl ViewKind {
             ViewKind::Modulators => "Modulators",
             ViewKind::Pitch => "Pitch",
             ViewKind::ClipFx => "Clip Effects",
+            ViewKind::Launcher => "Clip Launcher",
         }
     }
 
@@ -76,6 +80,7 @@ impl ViewKind {
             ViewKind::Modulators => ViewId::modulators(),
             ViewKind::Pitch => ViewId::pitch(),
             ViewKind::ClipFx => ViewId::clip_fx(),
+            ViewKind::Launcher => ViewId::launcher(),
         }
     }
 }
