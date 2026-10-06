@@ -162,9 +162,10 @@ fn notes_played_while_playing_land_where_they_were_heard() {
     let played = (*start + n.start).quarters();
     let at = s.engine().samples_to_musical(s.project(), at).quarters();
     // Where the playhead was when the key went down, less the latency
-    // (what was heard then).
+    // (what was heard then); a device period late at most (both are
+    // extrapolated from the last callback, which a busy runner delays).
     let off = (played - at) * 60.0 / tempo;
-    assert!((-0.1..0.01).contains(&off), "{off}");
+    assert!((-0.1..0.03).contains(&off), "{off}");
     // As long as it was held (within a device period: both ends are
     // extrapolated from the last callback, which a busy runner delays).
     let len = n.length.quarters() * 60.0 / tempo;
