@@ -67,6 +67,15 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.9.0" date="2026-10-06">
+      <description>
+        <p>Performance and control.</p>
+        <ul>
+          <li>A clip launcher: scenes of clips per track, launched while the song plays on the next bar, beat or bars, looping until the next; per-track stops, Back to Arrangement, and Record to Arrangement to write what was launched into the arrangement.</li>
+          <li>Control surfaces: Mackie Control and its extenders, HUI and OSC, with motorised faders, pan pots, mute, solo, arm and select, names, levels and meters, the transport and the song position, in banks of eight.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.8.0" date="2026-10-06">
       <description>
         <p>Vocals and audio intelligence.</p>

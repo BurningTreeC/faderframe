@@ -1203,7 +1203,7 @@ pub fn install(app: &Rc<AppState>) {
         }),
         // Development aids for the clip launcher: `send-to-launcher:<track>`
         // (its first clip), `launch:<track>@<scene n>` (1-based),
-        // `launch-scene:<n>`, `launcher:<stop-all|back|record|scene>`.
+        // `launch-scene:<n>`, `launcher:<stop-all|back|record|scene|name=<n>=<name>>`.
         named("send-to-launcher", |a, arg| {
             let clip = a
                 .session
@@ -1250,6 +1250,24 @@ pub fn install(app: &Rc<AppState>) {
         }),
         named("launcher", |a, arg| {
             let records = a.session.borrow().launcher_records();
+            // `name=<n>=<name>`: scene n (1-based) renamed.
+            if let Some((n, name)) = arg.strip_prefix("name=").and_then(|r| r.split_once('=')) {
+                let scene = n.parse::<usize>().ok().and_then(|n| {
+                    let s = a.session.borrow();
+                    s.project()
+                        .launcher
+                        .scenes
+                        .get(n.saturating_sub(1))
+                        .map(|s| s.id)
+                });
+                if let Some(scene) = scene {
+                    a.dispatch(Action::Launcher(LauncherOp::RenameScene {
+                        scene,
+                        name: name.to_string(),
+                    }));
+                }
+                return;
+            }
             let op = match arg {
                 "stop-all" => LauncherOp::StopAll,
                 "back" => LauncherOp::BackToArrangement,
