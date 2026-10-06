@@ -1847,11 +1847,22 @@ fn the_midi_effects_do_not_allocate() {
             &[(0, 2.0), (3, 2.0), (4, 0.5), (6, 1.0)],
         ),
         slot(builtin::CHORD, &[(0, 1.0), (9, 20.0)]),
+        // The chord track's chords (a slash chord's bass too).
+        slot(builtin::CHORD, &[(0, 3.0)]),
         slot(builtin::SCALE, &[(4, 2.0)]),
         slot(builtin::NOTE_ECHO, &[(3, 8.0), (4, 0.9), (5, 7.0)]),
         slot(builtin::SYNTH, &[]),
     ];
     tp.project.track_mut(t).unwrap().inserts = inserts;
+    tp.project.chords = ["Am7/G", "F", "Cmaj9", "G"]
+        .iter()
+        .enumerate()
+        .map(|(i, c)| faderframe_project::ChordEvent {
+            start: MusicalTime::from_quarters(i as f64),
+            end: MusicalTime::from_quarters(i as f64 + 1.0),
+            chord: faderframe_project::harmony::Chord::parse(c).unwrap(),
+        })
+        .collect();
     tp.project.keys = vec![
         KeyChange {
             at: MusicalTime::ZERO,

@@ -166,7 +166,8 @@ pub fn chord_of(
         }
         3 => match harmony.chord_at(sample) {
             Some(c) => {
-                for v in c.voicing(k) {
+                let (notes, count) = c.voicing_into(k);
+                for &v in &notes[..count] {
                     add(v);
                 }
             }

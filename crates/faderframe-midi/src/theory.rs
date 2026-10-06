@@ -458,6 +458,13 @@ impl Chord {
     /// Its notes in close position from the root nearest `around` (the
     /// bass, if any, an octave below the root).
     pub fn voicing(self, around: i32) -> Vec<i32> {
+        let (notes, n) = self.voicing_into(around);
+        notes[..n].to_vec()
+    }
+
+    /// [`Self::voicing`] without allocating (realtime code): the notes and
+    /// how many there are.
+    pub fn voicing_into(self, around: i32) -> ([i32; Self::MAX_NOTES], usize) {
         let r = i32::from(self.root);
         let root = around - (around - r).rem_euclid(12)
             + if (around - r).rem_euclid(12) > 6 {
@@ -465,19 +472,25 @@ impl Chord {
             } else {
                 0
             };
-        let mut notes: Vec<i32> = self
-            .quality
-            .intervals()
-            .iter()
-            .map(|i| root + i32::from(*i))
-            .collect();
+        let mut notes = [0i32; Self::MAX_NOTES];
+        let mut n = 0;
         if let Some(b) = self.bass {
             let b = i32::from(b);
             let below = root - 12 + (b - root + 12).rem_euclid(12);
-            notes.insert(0, if below >= root { below - 12 } else { below });
+            notes[0] = if below >= root { below - 12 } else { below };
+            n = 1;
         }
-        notes
+        for i in self.quality.intervals() {
+            if n < Self::MAX_NOTES {
+                notes[n] = root + i32::from(*i);
+                n += 1;
+            }
+        }
+        (notes, n)
     }
+
+    /// Most notes of a voicing (the longest quality and a bass).
+    pub const MAX_NOTES: usize = 8;
 
     /// The chord these notes make, if they make one (the lowest note is
     /// the bass; inversions are named over it, "C/E").
