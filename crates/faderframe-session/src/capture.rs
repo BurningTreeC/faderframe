@@ -164,10 +164,20 @@ impl Session {
                 None
             };
             let cap = &mut self.capture;
+            // A new pass when the loop wrapped (back by half the loop or
+            // more); a smaller step back is the clock's (a dropout: the
+            // engine's playhead lost time), kept in order instead.
+            let position = position.map(|p| match cap.last_position {
+                Some(last) if p < last => match looped {
+                    Some((a, b)) if last - p >= (b - a) / 2 => {
+                        cap.pass += 1;
+                        p
+                    }
+                    _ => last,
+                },
+                _ => p,
+            });
             if let Some(p) = position {
-                if cap.last_position.is_some_and(|last| p < last) {
-                    cap.pass += 1;
-                }
                 cap.last_position = Some(p);
             }
             cap.played.push_back(Played {

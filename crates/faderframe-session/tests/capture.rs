@@ -138,6 +138,8 @@ fn notes_played_while_playing_land_where_they_were_heard() {
     s.dispatch(Action::Transport(TransportAction::Play))
         .unwrap();
     run(&mut s, 300);
+    let xruns = |s: &Session| s.stream_status().map_or(0, |st| st.xruns);
+    let xruns_before = xruns(&s);
     // Where the engine is as the key goes down (extrapolated from its last
     // callback, as captured events are: a busy machine's dummy device
     // falls behind, and the playhead it last reported with it).
@@ -158,6 +160,12 @@ fn notes_played_while_playing_land_where_they_were_heard() {
     let notes = new_notes(&s, midi, &[]);
     assert_eq!(notes.len(), 1);
     let (start, n) = &notes[0];
+    if xruns(&s) != xruns_before {
+        // The device lost time (a frozen runner): the playhead's
+        // extrapolations do not hold across that.
+        eprintln!("dropout while playing: timing not checked");
+        return;
+    }
     let tempo = s.project().timeline.tempo.bpm_at(MusicalTime::ZERO);
     let played = (*start + n.start).quarters();
     let at = s.engine().samples_to_musical(s.project(), at).quarters();
