@@ -211,3 +211,22 @@ fn the_scale_device_follows_the_key_track_and_a_midi_track_sends_through_its_eff
     let x = render(&tp, 24_000);
     assert_eq!(sounding(&x[4800..], &[60, 64, 67]), [60, 67]);
 }
+
+/// A MIDI track reaches every instrument of the track it plays, as that
+/// track's own notes do: with an old-style instrument slot followed by a
+/// synth insert (which replaces what comes in), only the insert is heard.
+#[test]
+fn a_midi_track_plays_every_instrument_of_its_track() {
+    let mut tp = TestProject::new(SR);
+    let keys = tp.track(TrackKind::Instrument, "Keys", ChannelLayout::Stereo);
+    let legacy = sine(&mut tp);
+    let insert = sine(&mut tp);
+    let kt = tp.project.track_mut(keys).unwrap();
+    kt.instrument = Some(legacy);
+    kt.inserts = vec![insert];
+    let m = tp.track(TrackKind::Midi, "Notes", ChannelLayout::Stereo);
+    tp.project.track_mut(m).unwrap().output = OutputRouting::Track { track: keys };
+    clip(&mut tp, m, &[69], 4.0);
+    let x = render(&tp, 24_000);
+    assert_eq!(sounding(&x[4800..], &[60, 69]), [69]);
+}

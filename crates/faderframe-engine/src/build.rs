@@ -231,7 +231,6 @@ struct TrackNodes {
     /// The signal after the inserts (before fader, mute and solo).
     post_fx: Option<NodeId>,
     strip: Option<NodeId>,
-    instrument: Option<NodeId>,
     midi: Option<NodeId>,
     midi_in: Option<NodeId>,
     /// The last of the track's MIDI effects (what MIDI it sends on).
@@ -420,6 +419,10 @@ pub fn build_graph(
         warnings: &mut warnings,
     };
     let mut nodes: HashMap<TrackId, TrackNodes> = HashMap::new();
+    // Per instrument track: the nodes taking its own MIDI as it comes (the
+    // first MIDI effect, else the instrument and every insert that takes
+    // notes); MIDI tracks routed there feed the same ones.
+    let mut note_inputs: HashMap<TrackId, Vec<NodeId>> = HashMap::new();
     // (plugin node, source track) of connected sidechain inputs.
     let mut sidechains: Vec<(NodeId, TrackId)> = Vec::new();
     let mut owners: Vec<(NodeId, NodeOwner)> = Vec::new();
@@ -586,9 +589,9 @@ pub fn build_graph(
         for (slot, n) in &fx {
             own(&mut owners, *n, t.id, Some(*slot), NodeWork::Insert);
         }
-        // MIDI tracks routed here start at the first effect.
+        let mut takes_notes = Vec::new();
         if let Some((_, first)) = fx.first() {
-            tn.instrument = Some(*first);
+            takes_notes.push(*first);
         }
         let all_fx: Vec<NodeId> = match fx.last() {
             Some((_, last)) => vec![*last],
@@ -672,7 +675,9 @@ pub fn build_graph(
                         b.connect_events(*f, 0, inst, 0)?;
                     }
                     b.connect_audio(inst, 0, input, 0)?;
-                    tn.instrument.get_or_insert(inst);
+                    if fx.is_empty() {
+                        takes_notes.push(inst);
+                    }
                 }
             }
             _ => {}
@@ -680,10 +685,12 @@ pub fn build_graph(
 
         let mut prev = input;
         let mut events = sources;
+        let mut raw = true;
         for slot in chain {
             // A MIDI effect (built above): what follows gets its notes.
             if let Some((_, n)) = fx.iter().find(|(id, _)| *id == slot.id) {
                 events = vec![*n];
+                raw = false;
                 continue;
             }
             // Inserts that take notes (a synth placed as an insert, MIDI-
@@ -721,8 +728,11 @@ pub fn build_graph(
                 for e in &events {
                     b.connect_events(*e, 0, node, 0)?;
                 }
-                // MIDI tracks routed here reach it too.
-                tn.instrument.get_or_insert(node);
+                // Before any MIDI effect: MIDI tracks routed here reach it
+                // too.
+                if raw {
+                    takes_notes.push(node);
+                }
             }
             prev = node;
         }
@@ -731,6 +741,9 @@ pub fn build_graph(
         tn.post_fx = Some(prev);
         tn.strip = Some(own(&mut owners, strip, t.id, None, NodeWork::Strip));
         nodes.insert(t.id, tn);
+        if !takes_notes.is_empty() {
+            note_inputs.insert(t.id, takes_notes);
+        }
     }
 
     // Pass 2: outputs and sends.
@@ -741,15 +754,16 @@ pub fn build_graph(
         };
         if t.kind == TrackKind::Midi {
             if let OutputRouting::Track { track } = t.output
-                && let (Some(midi), Some(inst)) =
-                    (tn.midi, nodes.get(&track).and_then(|n| n.instrument))
+                && let (Some(midi), Some(targets)) = (tn.midi, note_inputs.get(&track))
             {
-                if let Some(fx) = tn.midi_fx {
-                    b.connect_events(fx, 0, inst, 0)?;
-                } else {
-                    b.connect_events(midi, 0, inst, 0)?;
-                    if let Some(live) = tn.midi_in {
-                        b.connect_events(live, 0, inst, 0)?;
+                for &inst in targets {
+                    if let Some(fx) = tn.midi_fx {
+                        b.connect_events(fx, 0, inst, 0)?;
+                    } else {
+                        b.connect_events(midi, 0, inst, 0)?;
+                        if let Some(live) = tn.midi_in {
+                            b.connect_events(live, 0, inst, 0)?;
+                        }
                     }
                 }
             }
