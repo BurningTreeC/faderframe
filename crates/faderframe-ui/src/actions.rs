@@ -685,6 +685,38 @@ pub fn install(app: &Rc<AppState>) {
                     settings.ddp = true;
                     AA::Settings(settings)
                 }
+                // The vinyl premaster: on (with a format index), and a
+                // side break before song n (1-based).
+                "vinyl" | "vinyl=0" | "vinyl=1" | "vinyl=2" | "vinyl=3" => {
+                    let mut settings = a.session.borrow().project().album.settings.clone();
+                    settings.vinyl.enabled = true;
+                    if let Some(k) = arg
+                        .trim()
+                        .strip_prefix("vinyl=")
+                        .and_then(|k| k.parse::<usize>().ok())
+                    {
+                        settings.vinyl.format = faderframe_project::album::VinylFormat::ALL[k];
+                    }
+                    AA::Settings(settings)
+                }
+                other if other.starts_with("side-break=") => {
+                    let n = other
+                        .strip_prefix("side-break=")
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let song = a
+                        .session
+                        .borrow()
+                        .project()
+                        .album
+                        .songs
+                        .get(n.saturating_sub(1))
+                        .map(|s| s.id);
+                    match song {
+                        Some(song) => AA::SideBreak { song, on: true },
+                        None => return,
+                    }
+                }
                 other => {
                     if let Some(path) = other.strip_prefix("file=") {
                         AA::AddFiles(vec![std::path::PathBuf::from(path)])

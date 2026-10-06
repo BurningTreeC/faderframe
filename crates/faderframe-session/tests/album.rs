@@ -229,3 +229,103 @@ fn the_album_plays_as_it_will_be_delivered() {
     album(&mut s, AlbumAction::StopPlaying);
     assert!(s.album_playback().is_none());
 }
+
+#[test]
+fn the_album_is_premastered_for_vinyl_with_a_cutting_sheet() {
+    use faderframe_project::album::VinylFormat;
+    let dir = tmp("vinyl");
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    for (a, b) in [(0.0, 16.0), (16.0, 32.0), (0.0, 32.0)] {
+        s.dispatch(Action::AddSection {
+            start: MusicalTime::from_quarters(a),
+            end: MusicalTime::from_quarters(b),
+        })
+        .unwrap();
+    }
+    album(&mut s, AlbumAction::AddSections);
+    let songs = s.project().album.songs.clone();
+    assert_eq!(songs.len(), 3);
+    assert!(s.vinyl_sides().is_none(), "no vinyl until asked for");
+    let mut settings = s.project().album.settings.clone();
+    settings.output = Some(dir.join("out"));
+    settings.tail = 0.5;
+    settings.vinyl.enabled = true;
+    settings.vinyl.format = VinylFormat::Single7At45;
+    album(&mut s, AlbumAction::Settings(settings));
+    // Before the analysis: sides from the sections' lengths, and a note.
+    let sides = s.vinyl_sides().unwrap();
+    assert_eq!(sides.len(), 2, "{sides:?}");
+    assert!(
+        s.vinyl_notes()
+            .iter()
+            .any(|n| n.text.contains("not measured yet"))
+    );
+    album(&mut s, AlbumAction::Export);
+    s.wait_album();
+    let done = s.album_export().unwrap().clone();
+    let vinyl = done.vinyl.clone().expect("a vinyl premaster");
+    let sides = s.vinyl_sides().unwrap();
+    assert_eq!(vinyl.sides.len(), sides.len());
+    assert!(
+        !s.vinyl_notes()
+            .iter()
+            .any(|n| n.text.contains("not measured"))
+    );
+    // One 24-bit file per side, as long as the side; peaks at −3 dBTP at
+    // most, the loudest song there (gain only, no limiting).
+    let mut loudest = f64::NEG_INFINITY;
+    for (k, (path, side)) in vinyl.sides.iter().zip(&sides).enumerate() {
+        let wav = read_wav(path).unwrap();
+        assert_eq!(wav.format, WavFormat::Pcm24, "{}", path.display());
+        let seconds = wav.channels[0].len() as f64 / f64::from(wav.sample_rate);
+        assert!(
+            (seconds - side.seconds).abs() < 0.05,
+            "side {k}: {seconds} vs {}",
+            side.seconds
+        );
+        let r = measure(&wav.channels, wav.sample_rate);
+        assert!(r.true_peak <= -2.95, "side {k}: {r:?}");
+        loudest = loudest.max(r.true_peak);
+    }
+    assert!(loudest > -3.3, "{loudest}");
+    // Each song's file, named for its place on the record.
+    let a1 = vinyl.folder.join(format!("A1 {}.wav", songs[0].title));
+    assert!(a1.exists(), "{}", a1.display());
+    // The cutting sheet: format, sides, songs.
+    let sheet = std::fs::read_to_string(&vinyl.sheet).unwrap();
+    for needle in [
+        "VINYL CUTTING SHEET",
+        "7″ single at 45 rpm",
+        "SIDE A",
+        "SIDE B",
+        "Side A.wav",
+        &songs[2].title,
+    ] {
+        assert!(sheet.contains(needle), "{needle}:\n{sheet}");
+    }
+    // A side split by hand: the sides stay, then song 2 starts side B.
+    let before = s.vinyl_sides().unwrap();
+    album(
+        &mut s,
+        AlbumAction::SideBreak {
+            song: songs[1].id,
+            on: true,
+        },
+    );
+    let v = &s.project().album.settings.vinyl;
+    assert!(!v.auto_sides);
+    let after = s.vinyl_sides().unwrap();
+    assert_eq!(after[0].songs, 0..1);
+    assert_eq!(after.last().unwrap().songs.end, 3);
+    assert!(
+        before
+            .iter()
+            .skip(1)
+            .all(|side| s.project().album.songs[side.songs.start].side_break)
+    );
+    // One undo step back to automatic sides.
+    s.dispatch(Action::Undo).unwrap();
+    assert!(s.project().album.settings.vinyl.auto_sides);
+    assert_eq!(s.vinyl_sides().unwrap(), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}

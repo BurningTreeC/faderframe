@@ -27,12 +27,14 @@
 use faderframe_audio::{STANDARD_SAMPLE_RATES, format_sample_rate};
 use faderframe_audio_files::{Dither, WavFormat};
 use faderframe_core::SongId;
-use faderframe_project::album::{AlbumLevel, AlbumSettings, Song, SongSource};
+use faderframe_project::album::{
+    AlbumLevel, AlbumSettings, Song, SongSource, VinylFormat, VinylSettings,
+};
 use faderframe_session::album::{AlbumAction, AlbumTask};
 use faderframe_session::analysis::LOUDNESS_TARGETS;
 use faderframe_session::delivery::DELIVERY_PRESETS;
+use faderframe_session::vinyl::{self, Severity};
 use faderframe_session::{Action, PluginTarget, Session};
-use faderframe_timeline::MusicalTime;
 use faderframe_ui_canvas::{
     CanvasView, Color, Cursor, EventCx, FileChoice, HostRequest, Key, MenuItem, Paint, Painter,
     Point, PointerButton, Rect, Size, TextStyle, Theme, ViewEvent,
@@ -45,6 +47,8 @@ const TOOLBAR_H: f32 = 32.0;
 const HEADER_H: f32 = 22.0;
 const ROW_H: f32 = 28.0;
 const FOOTER_H: f32 = 28.0;
+/// With a vinyl premaster the footer has a second line: the sides.
+const FOOTER_VINYL_H: f32 = 42.0;
 /// Album playback's strip under the toolbar.
 const PLAYER_H: f32 = 34.0;
 const PAD: f32 = 8.0;
@@ -67,6 +71,7 @@ pub enum Button {
     Format,
     AlbumFile,
     Cd,
+    Vinyl,
     Release,
     Analyse,
     Export,
@@ -272,6 +277,8 @@ impl AlbumView {
             }
             Button::AlbumFile => "Album file + CUE".into(),
             Button::Cd => "CD master (DDP) ▾".into(),
+            Button::Vinyl if s.vinyl.enabled => format!("Vinyl · {} ▾", s.vinyl.format.short()),
+            Button::Vinyl => "Vinyl ▾".into(),
             Button::Release => "Release…".into(),
             Button::Analyse => "Analyse".into(),
             Button::Export => "Export".into(),
@@ -294,12 +301,13 @@ impl AlbumView {
             Button::Format,
             Button::AlbumFile,
             Button::Cd,
+            Button::Vinyl,
             Button::Release,
         ]
         .into_iter()
         .enumerate()
         {
-            if i == 3 || i == 9 {
+            if i == 3 || i == 10 {
                 x += 10.0;
             }
             let w = width(&Self::button_label(b, model));
@@ -335,17 +343,22 @@ impl AlbumView {
         let seek_x = px + 300.0;
         let seek = Rect::new(seek_x, py + 7.0, (size.w - seek_x - PAD).max(0.0), 10.0);
         let header = Rect::new(0.0, player.bottom(), size.w, HEADER_H);
+        let footer_h = if model.project().album.settings.vinyl.enabled {
+            FOOTER_VINYL_H
+        } else {
+            FOOTER_H
+        };
         let list = Rect::new(
             0.0,
             header.bottom(),
             size.w,
-            (size.h - header.bottom() - FOOTER_H).max(0.0),
+            (size.h - header.bottom() - footer_h).max(0.0),
         );
-        let footer = Rect::new(0.0, size.h - FOOTER_H, size.w, FOOTER_H);
+        let footer = Rect::new(0.0, size.h - footer_h, size.w, footer_h);
         let folder_w = (size.w * 0.42).min(520.0);
         let folder = Rect::new(
             size.w - folder_w - PAD,
-            footer.y + 3.0,
+            footer.y + (footer_h - (FOOTER_H - 6.0)) / 2.0,
             folder_w,
             FOOTER_H - 6.0,
         );
@@ -437,20 +450,7 @@ impl AlbumView {
 
     /// Seconds a song lasts: measured, or from its section.
     fn seconds(model: &Session, song: &Song) -> Option<f64> {
-        if let Some(a) = model.album_analysis(song) {
-            return Some(a.seconds);
-        }
-        let tempo = &model.project().timeline.tempo;
-        let p = model.project();
-        let (a, b) = match &song.source {
-            SongSource::Section(id) => {
-                let s = p.sections.iter().find(|s| s.id == *id)?;
-                (s.start, s.end)
-            }
-            SongSource::ThisProject => (MusicalTime::ZERO, p.content_end()),
-            _ => return None,
-        };
-        Some(tempo.musical_to_seconds(b) - tempo.musical_to_seconds(a))
+        model.album_song_seconds(song)
     }
 
     // --- menus ---------------------------------------------------------------------
@@ -632,6 +632,75 @@ impl AlbumView {
         HostRequest::ContextMenu { at, items }
     }
 
+    fn vinyl_menu(s: &AlbumSettings, at: Point) -> HostRequest<Action> {
+        let v = &s.vinyl;
+        let set = |vinyl: VinylSettings| settings_action(AlbumSettings { vinyl, ..s.clone() });
+        let mut items = vec![
+            MenuItem::new(
+                "Write a Vinyl Premaster",
+                set(VinylSettings {
+                    enabled: !v.enabled,
+                    ..v.clone()
+                }),
+            )
+            .checked(v.enabled),
+        ];
+        for (k, format) in VinylFormat::ALL.into_iter().enumerate() {
+            let (recommended, _) = format.side_seconds();
+            let item = MenuItem::new(
+                format!("{} (sides up to {})", format.name(), duration(recommended)),
+                set(VinylSettings {
+                    enabled: true,
+                    format,
+                    ..v.clone()
+                }),
+            )
+            .checked(v.enabled && v.format == format);
+            items.push(if k == 0 { item.separated() } else { item });
+        }
+        items.push(
+            MenuItem::new(
+                "Split Sides Automatically",
+                set(VinylSettings {
+                    auto_sides: !v.auto_sides,
+                    ..v.clone()
+                }),
+            )
+            .checked(v.auto_sides)
+            .separated(),
+        );
+        for (k, peak) in [-1.0f32, -2.0, -3.0, -4.0, -6.0].into_iter().enumerate() {
+            let item = MenuItem::new(
+                minus(format!("Peaks at {peak:.0} dBTP")),
+                set(VinylSettings { peak, ..v.clone() }),
+            )
+            .checked((v.peak - peak).abs() < 0.05);
+            items.push(if k == 0 { item.separated() } else { item });
+        }
+        items.push(
+            MenuItem::new(
+                "Limit to the Peak (else gain only)",
+                set(VinylSettings {
+                    limit: !v.limit,
+                    ..v.clone()
+                }),
+            )
+            .checked(v.limit),
+        );
+        items.push(
+            MenuItem::new(
+                "Also Each Song as a File",
+                set(VinylSettings {
+                    track_files: !v.track_files,
+                    ..v.clone()
+                }),
+            )
+            .checked(v.track_files)
+            .separated(),
+        );
+        HostRequest::ContextMenu { at, items }
+    }
+
     /// A song's inserts: each one's editor, bypass and removal, adding one
     /// (the plugin browser) and hearing them on the master.
     fn inserts_menu(model: &Session, song: &Song, at: Point) -> HostRequest<Action> {
@@ -786,10 +855,29 @@ impl AlbumView {
             )
             .checked(monitored),
         );
-        items.push(MenuItem::new(
-            "Remove from Album",
-            Action::Album(AlbumAction::Remove(song.id)),
-        ));
+        if model.project().album.settings.vinyl.enabled && i > 0 {
+            let starts = model
+                .vinyl_sides()
+                .is_some_and(|sides| sides.iter().any(|x| x.songs.start == i));
+            items.push(
+                MenuItem::new(
+                    "Start a New Side Here",
+                    Action::Album(AlbumAction::SideBreak {
+                        song: song.id,
+                        on: !starts,
+                    }),
+                )
+                .checked(starts)
+                .separated(),
+            );
+        }
+        items.push(
+            MenuItem::new(
+                "Remove from Album",
+                Action::Album(AlbumAction::Remove(song.id)),
+            )
+            .separated(),
+        );
         Some(HostRequest::ContextMenu { at, items })
     }
 
@@ -921,6 +1009,7 @@ impl AlbumView {
                 ..s.clone()
             })),
             Button::Cd => cx.request(Self::cd_menu(s, at)),
+            Button::Vinyl => cx.request(Self::vinyl_menu(s, at)),
             Button::Release => cx.emit(Action::Album(AlbumAction::Details(None))),
             Button::Analyse => cx.emit(Action::Album(AlbumAction::Analyse)),
             Button::Export => cx.emit(Action::Album(AlbumAction::Export)),
@@ -1100,6 +1189,12 @@ impl AlbumView {
         let playback = model.album_playback();
         let marks = model.album_marks();
         let settings = &model.project().album.settings;
+        let sides = model.vinyl_sides();
+        let notes = if sides.is_some() {
+            model.vinyl_notes()
+        } else {
+            Vec::new()
+        };
         for (i, song) in songs.iter().enumerate() {
             let r = self.row_rect(l, i);
             if r.bottom() < l.list.y || r.y > l.list.bottom() {
@@ -1148,14 +1243,50 @@ impl AlbumView {
                 }
                 p.text(s, inner, &style);
             };
-            text(
-                p,
-                Column::Number,
-                &format!("{}", i + 1),
-                th.ui.text_dim,
-                false,
-            );
+            let number = match sides.as_deref().and_then(|s| vinyl::placement(s, i)) {
+                Some((side, k)) => vinyl::track_label(side, k),
+                None => format!("{}", i + 1),
+            };
+            text(p, Column::Number, &number, th.ui.text_dim, false);
+            // A new side starts: a line across.
+            if let Some((_, 0)) = sides.as_deref().and_then(|s| vinyl::placement(s, i))
+                && i > 0
+            {
+                p.fill(
+                    Rect::new(0.0, r.y - 1.0, r.w, 2.0),
+                    th.ui.accent.with_alpha(0.8),
+                );
+            }
             text(p, Column::Title, &song.title, th.ui.text, true);
+            // Vinyl findings about the song: a mark at the title's end.
+            if let Some(worst) = notes
+                .iter()
+                .filter(|n| n.song == Some(song.id))
+                .map(|n| n.severity)
+                .max()
+            {
+                let cell = self.cell(l, i, Column::Title);
+                let color = match worst {
+                    Severity::Problem => th.tools.level_over,
+                    Severity::Warning => th.tools.level_warn,
+                    Severity::Note => th.ui.text_dim,
+                };
+                // A badge: "!" on the severity's colour.
+                let badge = Rect::new(
+                    cell.right() - 22.0,
+                    cell.y + (cell.h - 15.0) / 2.0,
+                    15.0,
+                    15.0,
+                );
+                p.fill_rounded(badge, 7.5, &Paint::Solid(color));
+                p.text(
+                    "!",
+                    badge,
+                    &TextStyle::new(th.fonts.small, th.ui.background)
+                        .bold()
+                        .center(),
+                );
+            }
             let (source, ok) = Self::source_text(model, song);
             text(
                 p,
@@ -1311,6 +1442,33 @@ impl AlbumView {
                 minus(format!("{:.1} dBTP", r.true_peak))
             );
         }
+        let mut side_text = None;
+        if let Some(sides) = model.vinyl_sides() {
+            let v = &model.project().album.settings.vinyl;
+            let (recommended, maximum) = v.format.side_seconds();
+            let worst = sides.iter().map(|s| s.seconds).fold(0.0, f64::max);
+            let list: Vec<String> = sides
+                .iter()
+                .enumerate()
+                .map(|(k, x)| format!("{} {}", vinyl::side_name(k), duration(x.seconds)))
+                .collect();
+            let color = if worst > maximum {
+                th.tools.level_over
+            } else if worst > recommended {
+                th.tools.level_warn
+            } else {
+                th.ui.text_dim
+            };
+            side_text = Some((
+                format!(
+                    "Vinyl {}: {} (≤ {})",
+                    v.format.short(),
+                    list.join(" · "),
+                    duration(recommended)
+                ),
+                color,
+            ));
+        }
         let left = Rect::new(PAD, l.footer.y, l.folder.x - 2.0 * PAD, l.footer.h);
         if let Some(pr) = model.album_progress() {
             let bar = Rect::new(
@@ -1331,6 +1489,19 @@ impl AlbumView {
                 &format!("{verb} song {} of {}…", pr.song + 1, pr.songs),
                 bar,
                 &TextStyle::new(th.fonts.small, th.ui.text).center(),
+            );
+        } else if let Some((sides, color)) = side_text {
+            // Two lines: the album, then its sides.
+            let half = (left.h - 6.0) / 2.0;
+            p.text(
+                &summary,
+                Rect::new(left.x, left.y + 3.0, left.w, half),
+                &TextStyle::new(th.fonts.small, th.ui.text_dim),
+            );
+            p.text(
+                &sides,
+                Rect::new(left.x, left.y + 3.0 + half, left.w, half),
+                &TextStyle::new(th.fonts.small, color),
             );
         } else {
             p.text(
@@ -1612,6 +1783,20 @@ impl CanvasView<Session, Action> for AlbumView {
     }
 
     fn tooltip(&self, pos: Point, size: Size, model: &Session) -> Option<String> {
+        // A song's vinyl findings over its number and title.
+        if let Hit::Cell(i, Column::Number | Column::Title) = self.hit(pos, size, model)
+            && let Some(song) = model.project().album.songs.get(i)
+        {
+            let found: Vec<String> = model
+                .vinyl_notes()
+                .into_iter()
+                .filter(|n| n.song == Some(song.id))
+                .map(|n| n.text)
+                .collect();
+            if !found.is_empty() {
+                return Some(found.join("\n\n"));
+            }
+        }
         Some(
             match self.hit(pos, size, model) {
                 Hit::Button(b) => match b {
@@ -1624,6 +1809,7 @@ impl CanvasView<Session, Action> for AlbumView {
                     Button::Format => "File format, sample rate and dither (or a delivery preset)",
                     Button::AlbumFile => "Also write the whole album as one file with a cue sheet (pauses become pregaps; codes, titles and credits included)",
                     Button::Cd => "Also write a CD master for replication: a DDP 2.00 fileset at 44.1 kHz/16-bit with PQ codes (ISRC, UPC/EAN), CD-Text and checksums, verified after writing",
+                    Button::Vinyl => "Also write a vinyl premaster: one continuous 24-bit file per side (the songs at the digital release's balance, peaks brought to the vinyl level without limiting), each song's file and a cutting sheet. Sides follow the album's order; the checks look at side lengths, out-of-phase bass, esses and the inner grooves",
                     Button::Release => "The album's title, performer and other credits, and its UPC/EAN",
                     Button::Analyse => "Render and measure every song",
                     Button::Export => "Write every song (and the album file) to the export folder",

@@ -1,5 +1,6 @@
 use super::*;
 use faderframe_engine::EngineConfig;
+use faderframe_timeline::MusicalTime;
 use faderframe_ui_canvas::{Modifiers, RecordingPainter};
 
 const SIZE: Size = Size::new(1400.0, 320.0);
@@ -256,4 +257,53 @@ fn codes_crossfades_inserts_and_the_cd_master() {
         s.take_ui_requests()
             .contains(&faderframe_session::UiRequest::AlbumDetails(None))
     );
+}
+
+#[test]
+fn the_vinyl_menu_sides_and_side_breaks() {
+    let mut s = session();
+    let mut view = AlbumView::new(Theme::default());
+    press(&mut view, &mut s, Button::AddProject);
+    // Off: the songs are numbered.
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, SIZE, &s, &Theme::default());
+    assert!(p.texts().contains(&"1") && !p.texts().contains(&"A1"));
+    // The menu turns the premaster on with a format.
+    let items = menu(press(&mut view, &mut s, Button::Vinyl));
+    s.dispatch(pick(&items, "7″ single at 45 rpm")).unwrap();
+    let v = &s.project().album.settings.vinyl;
+    assert!(v.enabled && v.format == VinylFormat::Single7At45);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, SIZE, &s, &Theme::default());
+    let texts = p.texts();
+    assert!(texts.contains(&"A1"), "{texts:?}");
+    assert!(
+        texts.iter().any(|t| t.starts_with("Vinyl 7″ 45: A ")),
+        "{texts:?}"
+    );
+    assert!(texts.contains(&"Vinyl · 7″ 45 ▾"), "{texts:?}");
+    // A side break from a row's menu: song 2 starts side B.
+    let l = view.layout(SIZE, &s);
+    let at = view.cell(&l, 1, Column::Title).center();
+    let req = run(
+        &mut view,
+        &mut s,
+        ViewEvent::PointerDown {
+            pos: at,
+            button: PointerButton::Secondary,
+            modifiers: Modifiers::NONE,
+            clicks: 1,
+        },
+    );
+    let items = menu(req);
+    s.dispatch(pick(&items, "Start a New Side Here")).unwrap();
+    let sides = s.vinyl_sides().unwrap();
+    assert_eq!(sides[1].songs.start, 1, "{sides:?}");
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, SIZE, &s, &Theme::default());
+    assert!(p.texts().contains(&"B1"));
+    // Peaks and limiting from the menu.
+    let items = menu(press(&mut view, &mut s, Button::Vinyl));
+    s.dispatch(pick(&items, "Peaks at −1 dBTP")).unwrap();
+    assert_eq!(s.project().album.settings.vinyl.peak, -1.0);
 }

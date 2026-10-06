@@ -147,7 +147,11 @@ Contrast:
   dither, one file per song (cut gaplessly when songs crossfade), the whole
   album with a cue sheet and a CD master for replication: a DDP 2.00
   fileset (44.1 kHz/16-bit, PQ codes, CD-Text, checksums) verified after
-  writing.
+  writing; and a vinyl premaster (12″ 33⅓ or 45, 10″, 7″): sides split
+  automatically or by hand with their times against the format's limits,
+  checks for out-of-phase bass, esses, hard limiting and the inner
+  grooves, one continuous 24-bit file per side (gain only, no limiting),
+  each song's file and a cutting sheet.
 * Engine: routing graph with cycle detection and plugin delay compensation,
   buses, auxes, sends, sidechains, solo-in-place, sample-accurate loops,
   built-in synth, echo, gain and latency-probe plugins,

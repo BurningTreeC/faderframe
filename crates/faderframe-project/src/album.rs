@@ -54,6 +54,10 @@ fn is_true(v: &bool) -> bool {
     *v
 }
 
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 fn yes() -> bool {
     true
 }
@@ -131,6 +135,9 @@ pub struct Song {
     /// the album's level processing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inserts: Vec<PluginSlot>,
+    /// On vinyl, with sides split by hand: the song starts a new side.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub side_break: bool,
 }
 
 impl Song {
@@ -147,6 +154,7 @@ impl Song {
             isrc: String::new(),
             credits: Credits::default(),
             inserts: Vec::new(),
+            side_break: false,
         }
     }
 
@@ -198,6 +206,102 @@ pub struct AlbumSettings {
     pub cd_text: bool,
     /// The CD's tracks may be copied digitally (the DCP flag).
     pub copy_permitted: bool,
+    /// The vinyl premaster.
+    #[serde(skip_serializing_if = "VinylSettings::is_default")]
+    pub vinyl: VinylSettings,
+}
+
+/// A record: its size and speed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VinylFormat {
+    /// 12″ LP at 33⅓ rpm.
+    #[default]
+    Lp12At33,
+    /// 12″ at 45 rpm: shorter sides, more level and detail.
+    Lp12At45,
+    /// 10″ at 33⅓ rpm.
+    Ten33,
+    /// 7″ single at 45 rpm.
+    Single7At45,
+}
+
+impl VinylFormat {
+    pub const ALL: [VinylFormat; 4] = [
+        VinylFormat::Lp12At33,
+        VinylFormat::Lp12At45,
+        VinylFormat::Ten33,
+        VinylFormat::Single7At45,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            VinylFormat::Lp12At33 => "12″ LP at 33⅓ rpm",
+            VinylFormat::Lp12At45 => "12″ at 45 rpm",
+            VinylFormat::Ten33 => "10″ at 33⅓ rpm",
+            VinylFormat::Single7At45 => "7″ single at 45 rpm",
+        }
+    }
+
+    pub fn short(self) -> &'static str {
+        match self {
+            VinylFormat::Lp12At33 => "12″ 33⅓",
+            VinylFormat::Lp12At45 => "12″ 45",
+            VinylFormat::Ten33 => "10″ 33⅓",
+            VinylFormat::Single7At45 => "7″ 45",
+        }
+    }
+
+    /// The longest a side should be for full level and bass, and the
+    /// longest it can be cut at all (seconds; pressing plants' guidance —
+    /// past the first the level has to come down).
+    pub fn side_seconds(self) -> (f64, f64) {
+        match self {
+            VinylFormat::Lp12At33 => (18.0 * 60.0, 22.0 * 60.0),
+            VinylFormat::Lp12At45 => (12.0 * 60.0, 15.0 * 60.0),
+            VinylFormat::Ten33 => (12.0 * 60.0, 15.0 * 60.0),
+            VinylFormat::Single7At45 => (4.5 * 60.0, 6.0 * 60.0),
+        }
+    }
+}
+
+/// The vinyl premaster: one continuous file per side for the cutting
+/// engineer, levelled like the digital release but brought to its peak
+/// with gain only (a lathe needs no brickwall limiting), and a cutting
+/// sheet.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VinylSettings {
+    /// Write it with the export.
+    pub enabled: bool,
+    pub format: VinylFormat,
+    /// Sides split automatically (in album order, as few as fit, as even
+    /// as can be); else before the songs marked [`Song::side_break`].
+    pub auto_sides: bool,
+    /// The premaster's highest true peak (dBTP).
+    pub peak: f32,
+    /// Limit to the peak instead of using gain only.
+    pub limit: bool,
+    /// Each song as its own file too.
+    pub track_files: bool,
+}
+
+impl Default for VinylSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            format: VinylFormat::Lp12At33,
+            auto_sides: true,
+            peak: -3.0,
+            limit: false,
+            track_files: true,
+        }
+    }
+}
+
+impl VinylSettings {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl Default for AlbumSettings {
@@ -216,6 +320,7 @@ impl Default for AlbumSettings {
             ddp: false,
             cd_text: true,
             copy_permitted: false,
+            vinyl: VinylSettings::default(),
         }
     }
 }
@@ -318,6 +423,21 @@ mod tests {
         album.songs[0].crossfade = 1.5;
         let json = serde_json::to_string(&album).unwrap();
         assert!(!json.contains("songwriter"), "{json}");
+        assert!(
+            !json.contains("vinyl") && !json.contains("side_break"),
+            "{json}"
+        );
+        let back: Album = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, album);
+        // The vinyl premaster and hand-made side breaks round-trip.
+        album.settings.vinyl = VinylSettings {
+            enabled: true,
+            format: VinylFormat::Lp12At45,
+            auto_sides: false,
+            ..VinylSettings::default()
+        };
+        album.songs[1].side_break = true;
+        let json = serde_json::to_string(&album).unwrap();
         let back: Album = serde_json::from_str(&json).unwrap();
         assert_eq!(back, album);
     }

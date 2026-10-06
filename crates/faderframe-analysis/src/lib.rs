@@ -13,6 +13,7 @@ pub mod delivery;
 mod dynamics;
 mod loudness;
 mod spectrum;
+pub mod vinyl;
 
 pub use dynamics::{Dynamics, DynamicsMeter};
 pub use loudness::{Loudness, LoudnessMeter};

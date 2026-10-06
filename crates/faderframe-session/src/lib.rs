@@ -34,6 +34,7 @@ mod programs;
 mod redraw;
 pub mod samples;
 mod sandbox;
+pub mod vinyl;
 pub use groups::GroupMenuEntry;
 mod midifile;
 pub mod presets;

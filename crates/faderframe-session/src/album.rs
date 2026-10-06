@@ -21,10 +21,11 @@
 use crate::album_master::{Assembler, CdMaster, Gapless, Mark, check_codes, disc};
 use crate::delivery::{Finished, LoudnessReport, PeakHandling};
 use crate::render::{RenderProgress, process_through, render_span, sanitize};
-use crate::{NoticeLevel, Result, Session, SessionError};
+use crate::{NoticeLevel, Result, Session, SessionError, vinyl};
 use faderframe_analysis::delivery::{
     Measurement, apply_gain, gain_and_limit, measure, normalize_loudness,
 };
+use faderframe_analysis::vinyl::VinylReport;
 use faderframe_audio_files::decode::decode_at_rate;
 use faderframe_audio_files::wavstream::WavWriter;
 use faderframe_audio_files::{Dither, WavFormat, read_wav, write_wav_with};
@@ -97,6 +98,13 @@ pub enum AlbumAction {
     StopPlaying,
     /// The previous (−1) or next (+1) song.
     Skip(i32),
+    /// On vinyl: start a new side at the song (or join it to the side
+    /// before). Sides split automatically keep where they are and are
+    /// split by hand from then on.
+    SideBreak {
+        song: SongId,
+        on: bool,
+    },
     /// To a point of the album (seconds).
     Seek(f64),
 }
@@ -122,6 +130,8 @@ pub struct SongAnalysis {
     pub song: Song,
     pub report: LoudnessReport,
     pub seconds: f64,
+    /// What a record's groove makes of it.
+    pub vinyl: VinylReport,
 }
 
 /// How a song will come out, from its analysis and the album settings.
@@ -179,6 +189,19 @@ pub struct AlbumExport {
     /// The CD master's folder (DDP fileset, read back and verified) and
     /// its length in CD frames (1/75 s).
     pub ddp: Option<(PathBuf, u32)>,
+    pub vinyl: Option<VinylExport>,
+}
+
+/// The vinyl premaster as written.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VinylExport {
+    pub folder: PathBuf,
+    /// One file per side.
+    pub sides: Vec<PathBuf>,
+    pub sheet: PathBuf,
+    /// Findings: problems (it cannot be cut as it is) and warnings.
+    pub problems: usize,
+    pub warnings: usize,
 }
 
 #[derive(Default)]
@@ -404,6 +427,7 @@ fn analyse(plan: &Plan, shared: &Shared) -> Outcome {
             song: item.song.clone(),
             report: measure(&audio, plan.rate),
             seconds: audio[0].len() as f64 / plan.rate as f64,
+            vinyl: faderframe_analysis::vinyl::measure(&audio, plan.rate),
         });
         if cancelled(shared) {
             out.cancelled = true;
@@ -432,13 +456,24 @@ fn export_files(
 ) -> std::result::Result<AlbumExport, String> {
     let io = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
     std::fs::create_dir_all(&plan.folder).map_err(|e| io(&plan.folder, e))?;
-    let (temps, gains) = render_songs(plan, shared, out, &plan.folder)?;
-    let result = check_cd_tracks(plan, out).and_then(|()| deliver(plan, shared, &temps, &gains));
+    let (temps, gains, reports) = render_songs(plan, shared, out, &plan.folder)?;
+    let result = check_cd_tracks(plan, out)
+        .and_then(|()| deliver(plan, shared, &temps, &gains))
+        .and_then(|mut done| {
+            if plan.settings.vinyl.enabled {
+                done.vinyl = Some(deliver_vinyl(plan, shared, out, &temps, &gains, &reports)?);
+            }
+            Ok(done)
+        });
     for t in &temps {
         let _ = std::fs::remove_file(t);
     }
     result
 }
+
+/// Pass 1's songs: their temporary files, the gains the settings give
+/// them and their measurements.
+type Rendered = (Vec<PathBuf>, Vec<f64>, Vec<LoudnessReport>);
 
 /// Pass 1: every song once, to a temporary file in `dir`, measured on its
 /// own and as part of the album; the gains the settings give them.
@@ -447,7 +482,7 @@ fn render_songs(
     shared: &Shared,
     out: &mut Outcome,
     dir: &Path,
-) -> std::result::Result<(Vec<PathBuf>, Vec<f64>), String> {
+) -> std::result::Result<Rendered, String> {
     let io = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
     let rate = plan.rate;
     let mut temps: Vec<PathBuf> = Vec::new();
@@ -479,6 +514,7 @@ fn render_songs(
                 song: item.song.clone(),
                 report,
                 seconds: audio[0].len() as f64 / rate as f64,
+                vinyl: faderframe_analysis::vinyl::measure(&audio, rate),
             }),
         ));
         reports.push(report);
@@ -490,7 +526,7 @@ fn render_songs(
         temps.push(temp);
     }
     let gains = gains(&plan.settings, &reports, album.report().integrated);
-    Ok((temps, gains))
+    Ok((temps, gains, reports))
 }
 
 /// A song at its gain, its true peak limited as the settings ask; the
@@ -518,7 +554,7 @@ fn prepare(plan: &Plan, shared: &Shared, dir: &Path, revision: u64) -> Outcome {
     let result = (|| {
         let io = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
         std::fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
-        let (temps, gains) = render_songs(plan, shared, &mut out, dir)?;
+        let (temps, gains, _) = render_songs(plan, shared, &mut out, dir)?;
         let path = dir.join("album.wav");
         let rate = plan.rate;
         let mut writer = WavWriter::create_with(&path, 2, rate, WavFormat::Float32, Dither::Off)
@@ -731,6 +767,139 @@ fn deliver(
         album_file,
         cue,
         ddp,
+        vinyl: None,
+    })
+}
+
+/// The vinyl premaster (after the digital release, from the same rendered
+/// songs): the songs at their premaster gain (see
+/// [`vinyl::premaster_gains`]), one continuous 24-bit file per side with
+/// the pauses and crossfades inside a side, each song's own file if asked
+/// for, and the cutting sheet with the checks' findings.
+fn deliver_vinyl(
+    plan: &Plan,
+    shared: &Shared,
+    out: &Outcome,
+    temps: &[PathBuf],
+    digital: &[f64],
+    reports: &[LoudnessReport],
+) -> std::result::Result<VinylExport, String> {
+    let io = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
+    let (s, rate, n) = (&plan.settings, plan.rate, plan.items.len());
+    let v = &s.vinyl;
+    let folder = plan
+        .folder
+        .join(format!("{} (Vinyl)", sanitize(&plan.name)));
+    std::fs::create_dir_all(&folder).map_err(|e| io(&folder, e))?;
+    let peaks: Vec<f64> = reports.iter().map(|r| r.true_peak).collect();
+    let gains = vinyl::premaster_gains(v, &peaks, digital);
+    let songs: Vec<Song> = plan.items.iter().map(|i| i.song.clone()).collect();
+    let analyses: Vec<Option<&SongAnalysis>> = plan
+        .items
+        .iter()
+        .map(|item| {
+            out.analyses
+                .iter()
+                .rev()
+                .find(|(id, _)| *id == item.song.id)
+                .and_then(|(_, a)| a.as_ref().ok())
+        })
+        .collect();
+    let lengths: Vec<f64> = analyses
+        .iter()
+        .map(|a| a.map_or(0.0, |a| a.seconds))
+        .collect();
+    let sides = vinyl::plan_sides(&songs, &lengths, v);
+    let album = Album {
+        songs: songs.clone(),
+        ..plan.album.clone()
+    };
+    let facts: Vec<Option<vinyl::SongFacts<'_>>> = analyses
+        .iter()
+        .zip(&gains)
+        .map(|(a, g)| a.map(|a| vinyl::facts(a, *g)))
+        .collect();
+    let notes = vinyl::check(&album, v.format, &sides, &facts);
+    let format = WavFormat::Pcm24;
+    let mut sheet_sides = Vec::new();
+    let mut side_files = Vec::new();
+    for (k, side) in sides.iter().enumerate() {
+        let name = format!("Side {}.wav", vinyl::side_name(k));
+        let path = folder.join(&name);
+        let mut writer =
+            WavWriter::create_with(&path, 2, rate, format, s.dither).map_err(|e| io(&path, e))?;
+        let mut sheet = Vec::new();
+        let (marks, length) = {
+            let mut sink = |_: &[Mark], _: u64, planes: &[&[f32]]| {
+                writer
+                    .write_planar(planes, planes[0].len())
+                    .map_err(|e| e.to_string())
+            };
+            let mut assembler = Assembler::new(rate);
+            for i in side.songs.clone() {
+                shared.song.store(2 * n + i, Ordering::Relaxed);
+                if cancelled(shared) {
+                    return Err("cancelled".into());
+                }
+                let mut audio = read_wav(&temps[i]).map_err(|e| io(&temps[i], e))?.channels;
+                if v.limit {
+                    gain_and_limit(&mut audio, rate, gains[i], f64::from(v.peak));
+                } else {
+                    apply_gain(&mut audio, gains[i]);
+                }
+                let report = measure(&audio, rate);
+                let first = i == side.songs.start;
+                let last = i + 1 == side.songs.end;
+                let file = if v.track_files {
+                    let label = vinyl::track_label(k, i - side.songs.start);
+                    let f = format!("{label} {}.wav", sanitize(&songs[i].title));
+                    let p = folder.join(&f);
+                    write_wav_with(&p, &audio, rate, format, s.dither).map_err(|e| io(&p, e))?;
+                    Some(f)
+                } else {
+                    None
+                };
+                sheet.push(vinyl::SheetSong {
+                    title: songs[i].title.clone(),
+                    isrc: songs[i].isrc.clone(),
+                    start: 0.0,
+                    length: audio[0].len() as f64 / f64::from(rate),
+                    true_peak: report.true_peak,
+                    loudness: report.integrated,
+                    file,
+                });
+                let pause = if first { 0.0 } else { songs[i].pause };
+                let crossfade = if first { 0.0 } else { songs[i].crossfade };
+                let keep = if last {
+                    0.0
+                } else {
+                    songs.get(i + 1).map_or(0.0, |x| x.crossfade)
+                };
+                assembler.add(&audio, pause, crossfade, keep, &mut sink)?;
+            }
+            assembler.finish(&mut sink)?
+        };
+        writer.finish().map_err(|e| io(&path, e))?;
+        for (song, mark) in sheet.iter_mut().zip(&marks) {
+            song.start = mark.start as f64 / f64::from(rate);
+        }
+        sheet_sides.push(vinyl::SheetSide {
+            seconds: length as f64 / f64::from(rate),
+            file: name,
+            songs: sheet,
+        });
+        side_files.push(path);
+    }
+    let text = vinyl::cutting_sheet(&album, &plan.name, rate, &sheet_sides, &notes);
+    let sheet = folder.join("Cutting Sheet.txt");
+    std::fs::write(&sheet, text).map_err(|e| io(&sheet, e))?;
+    let count = |sev| notes.iter().filter(|n| n.severity == sev).count();
+    Ok(VinylExport {
+        folder,
+        sides: side_files,
+        sheet,
+        problems: count(vinyl::Severity::Problem),
+        warnings: count(vinyl::Severity::Warning),
     })
 }
 
@@ -797,7 +966,23 @@ impl Session {
                     None => return Ok(()),
                 }
             }
-            AlbumAction::Settings(settings) => album.settings = settings,
+            AlbumAction::Settings(settings) => {
+                // Splitting sides by hand starts from the sides as they are.
+                if album.settings.vinyl.auto_sides && !settings.vinyl.auto_sides {
+                    self.seed_side_breaks(&mut album);
+                }
+                album.settings = settings;
+            }
+            AlbumAction::SideBreak { song, on } => {
+                if album.settings.vinyl.auto_sides {
+                    self.seed_side_breaks(&mut album);
+                    album.settings.vinyl.auto_sides = false;
+                }
+                match album.index(song) {
+                    Some(i) if i > 0 => album.songs[i].side_break = on,
+                    _ => return Ok(()),
+                }
+            }
             AlbumAction::Info(mut info) => {
                 info.upc = match info.upc.trim() {
                     "" => String::new(),
@@ -1011,6 +1196,7 @@ impl Session {
         let song = j.shared.song.load(Ordering::Relaxed);
         let steps = match j.task {
             AlbumTask::Analyse => j.songs,
+            AlbumTask::Export if self.project.album.settings.vinyl.enabled => j.songs * 3,
             AlbumTask::Export | AlbumTask::Prepare => j.songs * 2,
         }
         .max(1);
@@ -1184,6 +1370,13 @@ impl Session {
                         faderframe_disc::msf_colon(*sectors)
                     ));
                 }
+                if let Some(v) = &done.vinyl {
+                    extras.push(format!(
+                        "a vinyl premaster ({} side{} and a cutting sheet)",
+                        v.sides.len(),
+                        if v.sides.len() == 1 { "" } else { "s" }
+                    ));
+                }
                 self.notify(
                     NoticeLevel::Info,
                     format!(
@@ -1203,6 +1396,19 @@ impl Session {
                     self.notify(
                         NoticeLevel::Warning,
                         "the CD master is longer than 79:57 — check with the plant",
+                    );
+                }
+                if let Some(v) = done.vinyl.as_ref().filter(|v| v.problems + v.warnings > 0) {
+                    self.notify(
+                        if v.problems > 0 {
+                            NoticeLevel::Warning
+                        } else {
+                            NoticeLevel::Info
+                        },
+                        format!(
+                            "vinyl: {} problem(s) and {} warning(s) — see the cutting sheet",
+                            v.problems, v.warnings
+                        ),
                     );
                 }
                 self.album_state.last_export = Some(done);
@@ -1318,6 +1524,98 @@ impl Session {
                 .collect(),
             p.frames as f64 / rate,
         ))
+    }
+
+    /// Mark where the automatic sides start now (on `album`, a copy of
+    /// the project's).
+    fn seed_side_breaks(&self, album: &mut Album) {
+        let starts: Vec<usize> = self
+            .vinyl_sides()
+            .unwrap_or_default()
+            .iter()
+            .map(|s| s.songs.start)
+            .collect();
+        for (i, song) in album.songs.iter_mut().enumerate() {
+            song.side_break = i > 0 && starts.contains(&i);
+        }
+    }
+
+    /// A song's length: as analysed, else (a section, this project) from
+    /// the tempo map; files are known once analysed.
+    pub fn album_song_seconds(&self, song: &Song) -> Option<f64> {
+        if let Some(a) = self.album_analysis(song) {
+            return Some(a.seconds);
+        }
+        let p = &self.project;
+        let (a, b) = match &song.source {
+            SongSource::Section(id) => {
+                let s = p.sections.iter().find(|s| s.id == *id)?;
+                (s.start, s.end)
+            }
+            SongSource::ThisProject => (MusicalTime::ZERO, p.content_end()),
+            _ => return None,
+        };
+        let tempo = &p.timeline.tempo;
+        Some(tempo.musical_to_seconds(b) - tempo.musical_to_seconds(a))
+    }
+
+    /// The album's sides on vinyl (`None`: no vinyl premaster). Songs not
+    /// measured yet count with their estimate, files as nothing.
+    pub fn vinyl_sides(&self) -> Option<Vec<vinyl::Side>> {
+        let album = &self.project.album;
+        if !album.settings.vinyl.enabled {
+            return None;
+        }
+        let lengths: Vec<f64> = album
+            .songs
+            .iter()
+            .map(|s| self.album_song_seconds(s).unwrap_or(0.0))
+            .collect();
+        Some(vinyl::plan_sides(
+            &album.songs,
+            &lengths,
+            &album.settings.vinyl,
+        ))
+    }
+
+    /// What a lathe will make of the album (worst first; empty without a
+    /// vinyl premaster).
+    pub fn vinyl_notes(&self) -> Vec<vinyl::VinylNote> {
+        let Some(sides) = self.vinyl_sides() else {
+            return Vec::new();
+        };
+        let album = &self.project.album;
+        let analyses: Vec<Option<&SongAnalysis>> =
+            album.songs.iter().map(|s| self.album_analysis(s)).collect();
+        let digital: Vec<f64> = album
+            .songs
+            .iter()
+            .map(|s| self.album_delivered(s.id).map_or(0.0, |d| d.gain_db))
+            .collect();
+        let peaks: Vec<f64> = analyses
+            .iter()
+            .map(|a| a.map_or(f64::NEG_INFINITY, |a| a.report.true_peak))
+            .collect();
+        let gains = vinyl::premaster_gains(&album.settings.vinyl, &peaks, &digital);
+        let facts: Vec<Option<vinyl::SongFacts<'_>>> = analyses
+            .iter()
+            .zip(&gains)
+            .map(|(a, g)| a.map(|a| vinyl::facts(a, *g)))
+            .collect();
+        let mut notes = vinyl::check(album, album.settings.vinyl.format, &sides, &facts);
+        let missing = analyses.iter().filter(|a| a.is_none()).count();
+        if missing > 0 {
+            notes.push(vinyl::VinylNote {
+                severity: vinyl::Severity::Note,
+                song: None,
+                side: None,
+                text: format!(
+                    "{missing} song{} not measured yet: analyse the album for the vinyl checks and exact side times.",
+                    if missing == 1 { "" } else { "s" }
+                ),
+            });
+        }
+        notes
     }
 
     /// Album playback now (`None`: neither playing nor being prepared).

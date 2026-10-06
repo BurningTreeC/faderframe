@@ -1252,6 +1252,34 @@ its progress; playing the project hands the outputs back. Tested in
 `engine/tests/preview.rs` (sample-exact, pause, locate, end) and
 `album_playback_does_not_allocate`.
 
+**Vinyl.** `AlbumSettings::vinyl` (`VinylSettings`: format — 12″ 33⅓,
+12″ 45, 10″ 33⅓, 7″ 45, each with a recommended and a maximum side length
+—, automatic or hand-made sides, the premaster's peak, optional limiting,
+per-song files) adds a vinyl premaster to the export. `session::vinyl`
+plans the sides in album order (`plan_sides`: as few as fit the
+recommended length — an odd count takes the record's other side too —
+with the longest side as short as can be, by a small DP; by hand, a side
+starts at each `Song::side_break`; pauses count within a side, a crossfade
+into a side's first song is dropped). The analysis measures what a groove
+makes of each song (`faderframe_analysis::vinyl`: side energy and the
+lowest left/right correlation below 150 Hz, the loudest 10 ms of the
+4.5–10 kHz band, the share above 8 kHz), and `vinyl::check` turns that
+into findings, worst first: sides over the recommended or maximum length,
+out-of-phase or wide bass, esses that will distort at the premaster's
+level, hard limiting (PLR under 8 LU), and a side's brightest or loudest
+song sitting at its inner groove. The premaster keeps the digital
+release's balance between the songs and brings the highest peak to the
+vinyl peak with gain only (`premaster_gains`); `deliver_vinyl` writes
+`<name> (Vinyl)/Side A.wav …` (24-bit, continuous, pauses and crossfades
+inside each side), `A1 <title>.wav …` and `Cutting Sheet.txt` (format,
+side times against the limits, per song start, length, ISRC, peak and
+loudness, and the findings). The Album view's Vinyl menu sets it up; rows
+are numbered A1, A2, B1 … with a line where a side starts, songs with
+findings carry a badge (the findings in the tooltip), the footer lists the
+side times, and a row's menu starts a new side there (sides split
+automatically are kept as hand-made breaks from then on, one undo step).
+Dev actions `album:vinyl[=<format index>]`, `album:side-break=<n>`.
+
 A song's inserts are ordinary `PluginSlot`s (`Command::SetSongInserts`,
 `Session::song_insert`/`plugin_owner`); the plugin commands
 (`SetPluginBypass`, `SetPluginParameter`, `SetPluginState`) find them when
