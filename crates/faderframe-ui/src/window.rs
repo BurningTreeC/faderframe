@@ -450,6 +450,13 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
     view.append_section(
         None,
         &section(&[
+            ("Command Palette…", "app.command-palette"),
+            ("Keyboard Shortcuts…", "app.shortcuts"),
+        ]),
+    );
+    view.append_section(
+        None,
+        &section(&[
             ("Detach Mixer", "app.detach-mixer"),
             ("Detach Piano Roll", "app.detach-piano-roll"),
             ("Detach Tools", "app.detach-tools"),

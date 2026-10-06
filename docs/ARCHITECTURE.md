@@ -2013,8 +2013,8 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
    `Track::folder`, `Project::folder_order`, `session::folders`), ~~clip
    aliases~~ (done: `Project::clip_links`, `session::aliases`), ~~project
    versions (snapshots to compare and restore)~~ (done: `session::versions`,
-   `faderframe_project::compare`), a command palette with a shortcut
-   editor, an undo history view.
+   `faderframe_project::compare`), ~~a command palette with a shortcut
+   editor~~ (done: `faderframe-ui/src/palette.rs`), an undo history view.
 4. **Modulation**: modulators (LFO, envelope follower, steps, random,
    macros) on any parameter, FX containers with parallel chains, CLAP's
    non-destructive and polyphonic parameter modulation.

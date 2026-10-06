@@ -57,6 +57,9 @@ pub struct Preferences {
     /// Render tracks nobody plays live this many milliseconds ahead (0:
     /// off).
     pub render_ahead_ms: u32,
+    /// Keyboard shortcuts changed in the shortcut editor (detailed action
+    /// → accelerators; empty: none), over the defaults.
+    pub shortcuts: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 impl Default for Preferences {
@@ -87,6 +90,7 @@ impl Default for Preferences {
             sandbox_plugins: true,
             plugin_double_precision: false,
             render_ahead_ms: 200,
+            shortcuts: Default::default(),
         }
     }
 }

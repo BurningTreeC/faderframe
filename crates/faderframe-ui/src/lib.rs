@@ -18,6 +18,7 @@ pub mod dock;
 mod icons;
 mod midi_prefs;
 pub mod painter;
+mod palette;
 mod paths;
 mod plugin_browser;
 mod plugin_window;

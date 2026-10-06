@@ -279,6 +279,8 @@ pub fn install(app: &Rc<AppState>) {
         dispatch(app, "record", A::Transport(T::ToggleRecord)),
         dispatch(app, "capture-midi", A::CaptureMidi),
         dispatch(app, "save-version", A::PromptSaveVersion),
+        entry(app, "command-palette", crate::palette::open),
+        entry(app, "shortcuts", crate::palette::shortcuts),
         dispatch(app, "show-versions", A::ShowVersions),
         entry(app, "panic", |a| {
             a.with_session(|s| {
@@ -1624,36 +1626,8 @@ pub fn install(app: &Rc<AppState>) {
         show_instrument,
     ]);
 
-    let accels: &[(&str, &[&str])] = &[
-        ("app.new", &["<Control>n"]),
-        ("app.open", &["<Control>o"]),
-        ("app.save", &["<Control>s"]),
-        ("app.toggle-edit-toolbar", &["<Control>e"]),
-        ("app.import-audio", &["<Control>i"]),
-        ("app.save-as", &["<Control><Shift>s"]),
-        ("app.quit", &["<Control>q"]),
-        ("app.render", &["<Control><Shift>r"]),
-        ("app.capture-midi", &["<Control><Shift>c"]),
-        ("app.save-version", &["<Control><Alt>s"]),
-        ("app.preferences", &["<Control>comma"]),
-        ("app.undo", &["<Control>z"]),
-        ("app.redo", &["<Control><Shift>z", "<Control>y"]),
-        ("app.add-audio", &["<Control>t"]),
-        ("app.add-instrument", &["<Control><Shift>t"]),
-        ("app.toggle-dock", &["F2"]),
-        ("app.show-mixer", &["F3"]),
-        ("app.show-piano-roll", &["F4"]),
-        ("app.show-performance", &["F8"]),
-        ("app.show-tools", &["F12"]),
-        ("app.workspace-1", &["<Control>1"]),
-        ("app.workspace-2", &["<Control>2"]),
-        ("app.workspace-3", &["<Control>3"]),
-        ("app.workspace-4", &["<Control>4"]),
-        ("app.workspace-5", &["<Control>5"]),
-    ];
-    for (action, keys) in accels {
-        app.app.set_accels_for_action(action, keys);
-    }
+    // The default shortcuts, then the user's (the shortcut editor's).
+    crate::palette::apply_shortcuts(&app.app, &crate::prefs::Preferences::load().shortcuts);
 }
 
 /// Remaining single-key shortcuts run after focused widgets. Space is

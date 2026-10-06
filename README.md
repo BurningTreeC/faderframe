@@ -143,6 +143,11 @@ Contrast:
   the chord track, and drum patterns; previewed in the grid, applied in
   one undo step. The scale follows the key track; the chord track shows
   above the notes and can be stamped.
+* Command palette (Ctrl+Shift+P, View → Command Palette…): find any
+  command of the menus by typing and run it with Enter. Keyboard
+  Shortcuts… (View) changes any command's shortcut — click it and press
+  the keys (Backspace: none); a shortcut taken from another command
+  leaves it; Reset per command or for all. Kept in the preferences.
 * Project versions: File → Save Version… (Ctrl+Alt+S) keeps the project
   as it is now under a name in its Versions folder; File → Versions…
   lists them, compares one with the project now (tracks, clips, plugins,
