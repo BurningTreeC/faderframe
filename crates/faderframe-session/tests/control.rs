@@ -308,3 +308,145 @@ fn a_launchpad_plays_the_launcher_from_its_own_bank() {
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+
+/// The Mackie's other buttons: the plug-in page puts the selected
+/// track's device on the pots and the LCD (a pot moves its parameter),
+/// the track types filter the strips, SMPTE/Beats switches the time
+/// display, Shift + Undo redoes, F2 switches the workspace, the arrows
+/// zoom in zoom mode, Option + Solo solos every track and the global
+/// Solo clears them.
+#[test]
+fn the_mackies_other_buttons() {
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let m = s.add_virtual_surface(SurfaceKind::Mackie);
+    let press = |m: &faderframe_midi_io::VirtualSurface, note: u8| {
+        m.send(&[0x90, note, 0x7F]);
+        m.send(&[0x90, note, 0x00]);
+    };
+    // A track with a device.
+    let t = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.kind == faderframe_project::TrackKind::Audio && !t.slots().is_empty())
+        .map(|t| t.id)
+        .expect("a track with a device");
+    s.dispatch(Action::SelectTracks {
+        tracks: vec![t],
+        mode: faderframe_session::SelectMode::Replace,
+    })
+    .unwrap();
+    s.tick(0.01);
+    let before = lcd_names(&m.take()).unwrap();
+    press(&m, 0x2B);
+    s.tick(0.01);
+    let sent = m.take();
+    let names = lcd_names(&sent).unwrap();
+    assert_ne!(names, before, "the device's parameters: {names}");
+    assert!(sent.contains(&vec![0x90, 0x2B, 0x7F]), "the plug-in LED");
+    // The first pot moves the device's first parameter.
+    let plugin = s.project().track(t).unwrap().slots()[0].id;
+    let first = s
+        .automatable_parameters(t)
+        .into_iter()
+        .find(|p| {
+            matches!(p.target, faderframe_automation::AutomationTarget::PluginParameter { plugin: q, .. } if q == plugin)
+        })
+        .unwrap();
+    let was = s.display_value(t, first.target).unwrap();
+    m.send(&[0xB0, 0x10, 0x10]);
+    s.tick(0.01);
+    let now = s.display_value(t, first.target).unwrap();
+    assert_ne!(was, now, "{} moved", first.name);
+    // Shift + Undo: undone and redone.
+    s.dispatch(Action::Undo).unwrap();
+    assert_eq!(s.display_value(t, first.target).unwrap(), was);
+    m.send(&[0x90, 0x46, 0x7F]);
+    press(&m, 0x51);
+    m.send(&[0x90, 0x46, 0x00]);
+    s.tick(0.01);
+    assert_eq!(s.display_value(t, first.target).unwrap(), now, "redone");
+    // Back to pan; only the audio tracks on the strips.
+    press(&m, 0x2A);
+    press(&m, 0x40);
+    s.tick(0.01);
+    assert!(
+        s.surface_tracks()
+            .iter()
+            .all(|t| t.kind == faderframe_project::TrackKind::Audio)
+    );
+    press(&m, 0x33);
+    s.tick(0.01);
+    assert!(s.surface_tracks().len() > 3, "every track again");
+    // SMPTE: its LED, BEATS off.
+    press(&m, 0x35);
+    s.tick(0.01);
+    let sent = m.take();
+    assert!(sent.contains(&vec![0x90, 0x71, 0x7F]) && sent.contains(&vec![0x90, 0x72, 0x00]));
+    // F2: the second workspace.
+    press(&m, 0x37);
+    s.tick(0.01);
+    assert_eq!(s.workspace().active, 1);
+    // Zoom mode: the right arrow zooms in.
+    let zoom = s.editor.zoom_request.0;
+    press(&m, 0x64);
+    press(&m, 0x63);
+    s.tick(0.01);
+    assert_ne!(s.editor.zoom_request.0, zoom);
+    // Option + Solo: every strip soloed; the global Solo clears it.
+    m.send(&[0x90, 0x47, 0x7F]);
+    press(&m, 0x08);
+    m.send(&[0x90, 0x47, 0x00]);
+    s.tick(0.01);
+    assert!(s.surface_tracks().iter().all(|t| t.solo));
+    press(&m, 0x5A);
+    s.tick(0.01);
+    assert!(s.project().tracks.iter().all(|t| !t.solo));
+}
+
+/// HUI: the keypad locates to a bar and recalls markers, edit keys edit,
+/// the window keys show views; a surface that never answers the pings
+/// shows as off line.
+#[test]
+fn a_hui_keypad_and_its_other_zones() {
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let h = s.add_virtual_surface(SurfaceKind::Hui);
+    let press = |h: &faderframe_midi_io::VirtualSurface, zone: u8, port: u8| {
+        h.send(&[0xB0, 0x0F, zone]);
+        h.send(&[0xB0, 0x2F, 0x40 | port]);
+        h.send(&[0xB0, 0x2F, port]);
+    };
+    // "5", enter: bar 5.
+    press(&h, 0x13, 4);
+    press(&h, 0x14, 0);
+    s.tick(0.01);
+    let bar5 = s.project().timeline.meter.bar_start(4);
+    assert!((s.playhead().quarters() - bar5.quarters()).abs() < 0.01);
+    // Enter alone: a marker here.
+    let markers = s.project().markers.len();
+    press(&h, 0x14, 0);
+    s.tick(0.01);
+    assert_eq!(s.project().markers.len(), markers + 1);
+    // ".1.": the first marker.
+    s.dispatch(Action::Transport(
+        faderframe_session::TransportAction::Locate(
+            faderframe_timeline::MusicalTime::from_quarters(1.0),
+        ),
+    ))
+    .unwrap();
+    press(&h, 0x13, 5);
+    press(&h, 0x13, 1);
+    press(&h, 0x13, 5);
+    s.tick(0.01);
+    let mut at: Vec<_> = s.project().markers.iter().map(|m| m.position).collect();
+    at.sort();
+    assert!((s.playhead().quarters() - at[0].quarters()).abs() < 0.01);
+    // The transport window key shows the launcher (a tab behind the
+    // mixer).
+    let layout = s.layout_revision();
+    press(&h, 0x09, 2);
+    s.tick(0.01);
+    assert_ne!(s.layout_revision(), layout);
+    // Nobody answers the pings: off line after a few seconds.
+    assert_eq!(s.control_surface_online(), vec![None]);
+}

@@ -105,6 +105,93 @@ pub struct SurfaceState {
     /// The launcher's slots of the shown strips (for surfaces that show
     /// it).
     pub launcher: LauncherView,
+    /// The song position as timecode (hours, minutes, seconds, frames)
+    /// when the time display shows it instead of bars and beats.
+    pub timecode: Option<[i32; 4]>,
+    /// The surface's modes and what its mode lights show.
+    pub modes: Modes,
+}
+
+/// Modes the surface switches (and their lights).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Modes {
+    /// The arrows zoom.
+    pub zoom: bool,
+    /// The jog wheel scrubs (or shuttles).
+    pub scrub: bool,
+    pub shuttle: bool,
+    /// The left/right arrows nudge the selection.
+    pub nudge: bool,
+    /// Recording keeps to the punch range.
+    pub punch: bool,
+    /// Recording replaces what was there.
+    pub replace: bool,
+    /// A track is soloed.
+    pub any_solo: bool,
+    /// The lower display line shows the pots' values instead of the
+    /// levels.
+    pub values: bool,
+    /// The strips show only these tracks.
+    pub filter: Option<TrackFilter>,
+    pub modifiers: [bool; 4],
+}
+
+/// Modifier keys (Shift, Option, Control, Alt in this order in
+/// [`Modes::modifiers`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Modifier {
+    Shift,
+    Option,
+    Control,
+    Alt,
+}
+
+impl Modifier {
+    pub fn index(self) -> usize {
+        match self {
+            Modifier::Shift => 0,
+            Modifier::Option => 1,
+            Modifier::Control => 2,
+            Modifier::Alt => 3,
+        }
+    }
+}
+
+/// Which tracks the strips show (the track-type buttons).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TrackFilter {
+    /// Tracks that play MIDI (instrument and MIDI tracks).
+    Midi,
+    /// Tracks armed to record.
+    Inputs,
+    Audio,
+    Instruments,
+    Aux,
+    Buses,
+    /// VCAs.
+    Outputs,
+    /// The selected tracks.
+    User,
+}
+
+/// Views a surface brings up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Window {
+    Mixer,
+    Editor,
+    Launcher,
+}
+
+/// Edit commands from a surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EditButton {
+    Cut,
+    Copy,
+    Paste,
+    Delete,
+    Separate,
+    /// Capture the MIDI just played.
+    Capture,
 }
 
 /// What a launcher slot shows.
@@ -176,6 +263,15 @@ pub enum Page {
     Pan,
     /// A send (0-based).
     Send(usize),
+    /// The selected track's own parameters (volume, pan, sends) on the
+    /// pots: a channel strip.
+    Track,
+    /// The selected track's devices' parameters (a device at a time).
+    Plugin,
+    /// Its EQ's parameters.
+    Eq,
+    /// Its instrument's parameters.
+    Instrument,
 }
 
 impl Page {
@@ -184,7 +280,19 @@ impl Page {
         match self {
             Page::Pan => "PN".into(),
             Page::Send(n) => format!("S{}", (n + 1).min(9)),
+            Page::Track => "TR".into(),
+            Page::Plugin => "PI".into(),
+            Page::Eq => "EQ".into(),
+            Page::Instrument => "IN".into(),
         }
+    }
+
+    /// The pots show one track's parameters (not a strip each).
+    pub fn is_channel_strip(self) -> bool {
+        matches!(
+            self,
+            Page::Track | Page::Plugin | Page::Eq | Page::Instrument
+        )
     }
 }
 
@@ -235,6 +343,61 @@ pub enum Button {
     /// The launcher's scene bank (a surface showing it).
     SceneUp,
     SceneDown,
+    Modifier(Modifier),
+    /// Channel-strip pages (see [`Page`]).
+    TrackPage,
+    PluginPage,
+    EqPage,
+    InstrumentPage,
+    /// F1–F8 (0–7).
+    Function(u8),
+    /// Every track on the strips again.
+    GlobalView,
+    TrackType(TrackFilter),
+    /// The lower display line: levels or the pots' values.
+    NameValue,
+    /// The time display: bars and beats or timecode.
+    TimeDisplay,
+    /// A group of the selected tracks.
+    Group,
+    Cancel,
+    Enter,
+    /// Modes of the arrows and the jog wheel.
+    Nudge,
+    Zoom,
+    Scrub,
+    Shuttle,
+    /// The arrow keys.
+    Up,
+    Down,
+    Left,
+    Right,
+    /// Punch (drop) and replace recording.
+    Drop,
+    Replace,
+    PunchIn,
+    PunchOut,
+    PreRoll,
+    /// Every solo off.
+    ClearSolo,
+    /// Arm (or disarm) every track.
+    ArmAll,
+    /// The master's mute (the monitor section).
+    MonitorMute,
+    /// The selected track's input monitoring.
+    InputMonitor,
+    /// The shown device bypassed (channel-strip pages).
+    Bypass,
+    Window(Window),
+    /// The next edit mode and tool.
+    EditMode,
+    EditTool,
+    Edit(EditButton),
+    /// A footswitch (0, 1).
+    Footswitch(u8),
+    /// A numeric keypad key: '0'–'9', '.', '+', '-', 'E' (enter), 'C'
+    /// (clear).
+    Numpad(char),
 }
 
 /// What a surface sends.
@@ -309,6 +472,10 @@ pub trait Protocol {
     /// What it sends when it is closed (back to its own mode).
     fn goodbye(&self) -> Vec<Vec<u8>> {
         Vec::new()
+    }
+    /// Whether it answers (surfaces that say so: HUI's pings).
+    fn online(&self) -> Option<bool> {
+        None
     }
 }
 

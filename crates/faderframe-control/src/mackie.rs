@@ -2,22 +2,35 @@
 //!
 //! Buttons and LEDs are notes (velocity 127 pressed/on, 0 released/off):
 //! record arm 0–7, solo 8–15, mute 16–23, select 24–31, pot press 32–39,
-//! bank ←/→ 46/47, channel ←/→ 48/49, save 80, undo 81, marker 84,
-//! cycle 86, click 89, rewind 91, forward 92, stop 93, play 94, record
-//! 95, fader touch 104–112 (112 the master), the BEATS LED 114. Faders
+//! the assignment pages 40–45 (track, send, pan, plug-in, EQ,
+//! instrument), bank ←/→ 46/47, channel ←/→ 48/49, flip 50, global view
+//! 51, name/value 52, SMPTE/beats 53, F1–F8 54–61, the track types 62–69
+//! (MIDI, inputs, audio, instruments, aux, buses, outputs, user), Shift,
+//! Option, Control, Alt 70–73, automation read/off, write, trim, touch,
+//! latch 74–78, group 79, save 80, undo 81 (Shift: redo), cancel 82,
+//! enter 83, marker 84, nudge 85, cycle 86, drop 87 (punch), replace 88,
+//! click 89, solo 90 (every solo off; lit while one is on), rewind 91,
+//! forward 92 (Shift: the start and end), stop 93, play 94, record 95,
+//! the arrows 96–99 (zoom: zooming, nudge: moving the selection, else
+//! the selected track up and down and the channel), zoom 100, scrub 101
+//! (the jog wheel scrubs), the footswitches 102/103 (play, record),
+//! fader touch 104–112 (112 the master), the SMPTE and BEATS LEDs 113 and
+//! 114, rude solo 115. Faders
 //! are pitch bend (channels 0–7, 8 the master, 14 bits); pots CC 16–23
 //! (bit 6 the direction, the rest ticks), the jog wheel CC 60, pot rings
 //! CC 48–55 (mode in bits 4–5, position 1–11). The 2×56 LCD is SysEx
 //! `F0 00 00 66 <device> 12 <offset> <text> F7`, 7 characters a strip:
-//! the names above, the levels below. The ten-digit display shows bars,
-//! beats, sixteenths and ticks (CC 64–73 right to left, 0x40 adds the
-//! dot), the two-digit one the bank's first track (CC 74–75). Meters are
+//! the names above, the levels below (or the pots' values: name/value;
+//! on the channel-strip pages the parameters' names and values). The
+//! ten-digit display shows bars, beats, sixteenths and ticks or hours,
+//! minutes, seconds and frames (CC 64–73 right to left, 0x40 adds the
+//! dot), the two-digit one the page (CC 74–75). Meters are
 //! channel pressure (strip in the high nibble, segment 0–12 in the low),
 //! sent again every 100 ms (the surface lets them fall).
 
 use crate::{
-    AutomationButton, Button, MASTER, Protocol, SurfaceInput, SurfaceState, abbreviate, fit,
-    meter_level,
+    AutomationButton, Button, MASTER, Modifier, Page, Protocol, SurfaceInput, SurfaceState,
+    TrackFilter, abbreviate, fit, meter_level,
 };
 
 /// Device ids: the Mackie Control and its extender.
@@ -35,9 +48,34 @@ mod note {
     pub const MUTE: u8 = 0x10;
     pub const SELECT: u8 = 0x18;
     pub const POT: u8 = 0x20;
+    pub const TRACK: u8 = 0x28;
     pub const SEND: u8 = 0x29;
     pub const PAN: u8 = 0x2A;
+    pub const PLUGIN: u8 = 0x2B;
+    pub const EQ: u8 = 0x2C;
+    pub const INSTRUMENT: u8 = 0x2D;
     pub const FLIP: u8 = 0x32;
+    pub const GLOBAL: u8 = 0x33;
+    pub const NAME_VALUE: u8 = 0x34;
+    pub const SMPTE_BEATS: u8 = 0x35;
+    pub const F1: u8 = 0x36;
+    pub const TYPES: u8 = 0x3E;
+    pub const SHIFT: u8 = 0x46;
+    pub const TRIM: u8 = 0x4C;
+    pub const GROUP: u8 = 0x4F;
+    pub const CANCEL: u8 = 0x52;
+    pub const ENTER: u8 = 0x53;
+    pub const NUDGE: u8 = 0x55;
+    pub const DROP: u8 = 0x57;
+    pub const REPLACE: u8 = 0x58;
+    pub const SOLO_ALL: u8 = 0x5A;
+    pub const UP: u8 = 0x60;
+    pub const DOWN: u8 = 0x61;
+    pub const ZOOM: u8 = 0x64;
+    pub const SCRUB: u8 = 0x65;
+    pub const FOOT: u8 = 0x66;
+    pub const SMPTE: u8 = 0x71;
+    pub const RUDE_SOLO: u8 = 0x73;
     pub const READ: u8 = 0x4A;
     pub const WRITE: u8 = 0x4B;
     pub const AUTO_TOUCH: u8 = 0x4D;
@@ -143,6 +181,18 @@ fn segment(c: u8, dot: bool) -> u8 {
     v | if dot { 0x40 } else { 0 }
 }
 
+/// The track-type buttons in order.
+const FILTERS: [TrackFilter; 8] = [
+    TrackFilter::Midi,
+    TrackFilter::Inputs,
+    TrackFilter::Audio,
+    TrackFilter::Instruments,
+    TrackFilter::Aux,
+    TrackFilter::Buses,
+    TrackFilter::Outputs,
+    TrackFilter::User,
+];
+
 /// Signed ticks of a relative encoder (bit 6 counter-clockwise).
 fn ticks(v: u8) -> i32 {
     let n = i32::from(v & 0x3F);
@@ -168,17 +218,49 @@ impl Protocol for Mackie {
                     0x10..=0x17 => Button::Mute(strip(note::MUTE)),
                     0x18..=0x1F => Button::Select(strip(note::SELECT)),
                     0x20..=0x27 => Button::PotPress(strip(note::POT)),
+                    note::TRACK => Button::TrackPage,
                     note::SEND => Button::SendPage(None),
                     note::PAN => Button::PanPage,
+                    note::PLUGIN => Button::PluginPage,
+                    note::EQ => Button::EqPage,
+                    note::INSTRUMENT => Button::InstrumentPage,
                     note::FLIP => Button::Flip,
+                    note::GLOBAL => Button::GlobalView,
+                    note::NAME_VALUE => Button::NameValue,
+                    note::SMPTE_BEATS => Button::TimeDisplay,
+                    0x36..=0x3D => Button::Function(a - note::F1),
+                    0x3E..=0x45 => Button::TrackType(FILTERS[(a - note::TYPES) as usize]),
+                    0x46..=0x49 => Button::Modifier(
+                        [
+                            Modifier::Shift,
+                            Modifier::Option,
+                            Modifier::Control,
+                            Modifier::Alt,
+                        ][(a - note::SHIFT) as usize],
+                    ),
+                    note::TRIM => Button::Automation(AutomationButton::Off),
+                    note::GROUP => Button::Group,
+                    note::CANCEL => Button::Cancel,
+                    note::ENTER => Button::Enter,
+                    note::NUDGE => Button::Nudge,
+                    note::DROP => Button::Drop,
+                    note::REPLACE => Button::Replace,
+                    note::SOLO_ALL => Button::ClearSolo,
+                    note::UP => Button::Up,
+                    note::DOWN => Button::Down,
+                    note::ZOOM => Button::Zoom,
+                    note::SCRUB => Button::Scrub,
+                    0x66 | 0x67 => Button::Footswitch(a - note::FOOT),
                     note::READ => Button::Automation(AutomationButton::Read),
                     note::WRITE => Button::Automation(AutomationButton::Write),
                     note::AUTO_TOUCH => Button::Automation(AutomationButton::Touch),
                     note::LATCH => Button::Automation(AutomationButton::Latch),
                     note::BANK_LEFT => Button::BankLeft,
                     note::BANK_RIGHT => Button::BankRight,
-                    note::CHANNEL_LEFT | note::LEFT => Button::ChannelLeft,
-                    note::CHANNEL_RIGHT | note::RIGHT => Button::ChannelRight,
+                    note::CHANNEL_LEFT => Button::ChannelLeft,
+                    note::CHANNEL_RIGHT => Button::ChannelRight,
+                    note::LEFT => Button::Left,
+                    note::RIGHT => Button::Right,
                     note::SAVE => Button::Save,
                     note::UNDO => Button::Undo,
                     note::MARKER => Button::Marker,
@@ -287,10 +369,31 @@ impl Protocol for Mackie {
         self.led(note::RECORD, state.recording, out);
         self.led(note::CYCLE, state.looping, out);
         self.led(note::CLICK, state.click, out);
-        self.led(note::BEATS, true, out);
-        self.led(note::PAN, state.page == crate::Page::Pan, out);
-        self.led(note::SEND, matches!(state.page, crate::Page::Send(_)), out);
+        self.led(note::BEATS, state.timecode.is_none(), out);
+        self.led(note::PAN, state.page == Page::Pan, out);
+        self.led(note::SEND, matches!(state.page, Page::Send(_)), out);
+        self.led(note::TRACK, state.page == Page::Track, out);
+        self.led(note::PLUGIN, state.page == Page::Plugin, out);
+        self.led(note::EQ, state.page == Page::Eq, out);
+        self.led(note::INSTRUMENT, state.page == Page::Instrument, out);
         self.led(note::FLIP, state.flip, out);
+        let m = state.modes;
+        self.led(note::GLOBAL, m.filter.is_none(), out);
+        for (k, f) in FILTERS.iter().enumerate() {
+            self.led(note::TYPES + k as u8, m.filter == Some(*f), out);
+        }
+        self.led(note::NAME_VALUE, m.values, out);
+        self.led(note::NUDGE, m.nudge, out);
+        self.led(note::DROP, m.punch, out);
+        self.led(note::REPLACE, m.replace, out);
+        self.led(note::SOLO_ALL, m.any_solo, out);
+        self.led(note::RUDE_SOLO, m.any_solo, out);
+        self.led(note::ZOOM, m.zoom, out);
+        self.led(note::SCRUB, m.scrub, out);
+        for (k, on) in m.modifiers.iter().enumerate() {
+            self.led(note::SHIFT + k as u8, *on, out);
+        }
+        self.led(note::SMPTE, state.timecode.is_some(), out);
         for (n, b) in [
             (note::READ, AutomationButton::Read),
             (note::WRITE, AutomationButton::Write),
@@ -299,15 +402,25 @@ impl Protocol for Mackie {
         ] {
             self.led(n, state.automation == Some(b), out);
         }
-        // Bars, beats, sixteenths, ticks; the bank's first track.
+        // Bars, beats, sixteenths, ticks (or hours, minutes, seconds,
+        // frames); the page.
         let p = state.position;
-        let text = format!(
-            "{:>3}{:>2}{:>2}{:>3}",
-            p.bar.clamp(-99, 999),
-            p.beat.clamp(0, 99),
-            p.sixteenth.clamp(0, 99),
-            p.tick.clamp(0, 999)
-        );
+        let text = match state.timecode {
+            Some([h, mi, se, f]) => format!(
+                "{:>3}{:02}{:02}{:>3}",
+                h.clamp(0, 999),
+                mi.clamp(0, 59),
+                se.clamp(0, 59),
+                f.clamp(0, 999)
+            ),
+            None => format!(
+                "{:>3}{:>2}{:>2}{:>3}",
+                p.bar.clamp(-99, 999),
+                p.beat.clamp(0, 99),
+                p.sixteenth.clamp(0, 99),
+                p.tick.clamp(0, 999)
+            ),
+        };
         let assign = state.page.short();
         let digits: Vec<u8> = text.bytes().chain(assign.bytes()).collect();
         for (k, c) in digits.iter().enumerate() {

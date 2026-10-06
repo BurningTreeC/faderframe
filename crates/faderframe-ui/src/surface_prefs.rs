@@ -246,6 +246,7 @@ fn update_status(section: &Section, app: &AppState) {
     let s = app.session.borrow();
     let errors = s.control_surface_errors();
     let settings = s.control_surfaces();
+    let online = s.control_surface_online();
     for (i, label) in section.status.borrow().iter().enumerate() {
         let (text, tip) = match (errors.get(i), settings.get(i)) {
             (Some(Some(e)), _) => ("Not running".to_string(), e.clone()),
@@ -258,7 +259,9 @@ fn update_status(section: &Section, app: &AppState) {
                 )
             }
             (Some(None), Some(c)) => (
-                if c.kind.is_midi() {
+                if online.get(i).copied().flatten() == Some(false) {
+                    "Not answering (off line)".to_string()
+                } else if c.kind.is_midi() {
                     "Running".to_string()
                 } else {
                     "Listening".to_string()

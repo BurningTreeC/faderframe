@@ -311,17 +311,29 @@ Contrast:
   the arrangement. Clips are dragged in from the arrangement (or sent from
   a clip's menu), recorded into an empty slot of an armed track (audio or
   MIDI, playing on in time when the recording ends), or are new MIDI
-  clips; they drag between slots, and follow actions (next, previous,
-  first, last, any, other, again, stop — after the clip or some bars) move
-  a track on by itself.
+  clips; they drag between slots (and back into the arrangement, across
+  windows too), and follow actions (next, previous, first, last, any,
+  other, again, stop, jump to a scene — after the clip or some bars, two
+  of them with a chance each) move a track on by itself. Clips launch as
+  triggers, gates, toggles or repeats, with their own quantisation,
+  legato, and audio that follows the tempo; slots record with a fixed
+  length and a count-in, MIDI clips take overdubs, and Record to
+  Arrangement writes what plays (and the mixer's moves) as it plays.
+  Pads, keys and buttons learn slots, scenes and stops.
 * MIDI sync: follows MIDI clock or MIDI time code (by varispeed, so the
   clocks drifting apart never makes it jump), and sends MIDI clock and MIDI
   time code (24, 25, 29.97 drop or 30 fps from the project's start time).
 * Control surfaces (Preferences → MIDI → Control Surfaces): Mackie Control
   and its extenders, HUI, and OSC (e.g. TouchOSC) — motorised faders,
   pan and send pots, Flip, mute/solo/arm/select, automation modes, names,
-  levels and meters on the displays, the transport and the song position,
-  banks of eight; over OSC also the clip launcher.
+  levels and meters on the displays, the transport and the song position
+  (bars and beats or timecode), banks of eight (shared or a surface's own),
+  channel-strip pages for the selected track's parameters, devices, EQ
+  and instrument, track-type filters, F-keys for workspaces, modifiers,
+  zoom/nudge/scrub/shuttle, punch, edit keys and HUI's numeric keypad;
+  over OSC also the clip launcher, shown and played. Grid controllers
+  play the clip launcher in the clips' colours: Launchpad Mini MK3, X and
+  Pro MK3, APC mini and mk2, Push 2.
 * Stock dynamics with editors of their own: a compressor (five styles,
   soft knee, lookahead, auto release and makeup, colour, mix, a filtered
   sidechain), a true-peak lookahead limiter that never passes its ceiling,

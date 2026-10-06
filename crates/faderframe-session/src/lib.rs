@@ -31,6 +31,7 @@ pub mod capture;
 pub mod clip_fx;
 pub mod containers;
 pub mod control;
+mod control_extra;
 pub mod delivery;
 pub mod detect;
 pub mod editing;

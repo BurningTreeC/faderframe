@@ -1939,7 +1939,42 @@ snapshot queues them again). Clips dragged from the arranger reach the
 grid through the canvas host's payloads (`CanvasView::drag_payload`/
 `hover_payload`/`drop_payload`/`cancel_drag`; the move is cancelled with
 `Action::CancelGesture` = `History::cancel`) and land by
-`LauncherOp::PlaceClips`.
+`LauncherOp::PlaceClips` — clips of several tracks into their own
+columns; launcher clips dragged to the arranger go back as copies
+(`LauncherOp::ToArrangement`, as they play). A payload drag that leaves
+its window goes on as a native GTK drag (`gdk::Drag::begin`, the source
+view's drag undone) that every canvas's string drop target hands to its
+view, so clips drag between windows.
+
+Slots have launch settings (`ClipLaunch`, `Command::SetClipLaunch`,
+moved and copied with their clips): the launch mode — trigger, gate
+(plays while held), toggle (the next press stops it), repeat (starts
+again every launch quantum while held) — presses are `LauncherOp::Launch`
+and releases `LauncherOp::Release` (mouse-up, key-off, a falling CC
+edge); their own quantisation; legato (`LaunchCommand::Launch { legato }`
+keeps the playing clip's loop start, so it takes over its position) and
+Follow Tempo (`ClipLaunch::tempo`: audio in time at that BPM is played
+as `launcher::as_played` makes it — its warp map, or a uniform one,
+scaled to its musical length under the tempo map — by the snapshot,
+the loop length and Record to Arrangement; set when audio is sent,
+placed or recorded into a slot). The engine's `TrackLaunch` keeps
+`legato`, `repeat` (slot and samples: requeued like a follow action) and
+`stop_after` (released before the launch landed: one quantum).
+`LaunchCommand::Release` stops at the next launch position. Follow
+actions have a second action (`FollowAction::{other, chance}`: drawn per
+cycle on the audio thread) and `FollowKind::Jump(scene)`
+(`Launcher::follow_targets`). Slot recording has a fixed length and a
+count-in from stop (`Launcher::{record_bars, count_in}`,
+`Command::SetLaunchRecording`; the recording ignores the punch range),
+and recording on a MIDI clip that plays overdubs (`SlotRecording::
+overdub`: the notes join its loop where they fell, one "Overdub" step).
+Record to Arrangement writes as it plays — each loop once played, the
+rest where a clip stopped or another took over (the switch time from
+the launch the previous tick saw waiting) — in one undo step per
+transport run (`History::apply_amending`), and writes the mixer's and
+devices' moves as latched automation (lanes made for controls without
+one). Slots, scenes and stops take MIDI learn
+(`MappingTarget::{LauncherSlot, LauncherScene, LauncherStop}`).
 
 ### Control surfaces
 
@@ -1976,6 +2011,47 @@ the clip launcher. Automation buttons put the selected track's lanes in
 that mode (a volume lane is made when it has none); Save saves a project
 that has a file. Tests: `faderframe-control`'s, `session/tests/control.rs`
 (a virtual Mackie on the demo, OSC over UDP on localhost).
+
+The rest of the surfaces' buttons (`Button`, `session::control_extra`):
+the channel-strip pages (`Page::{Track, Plugin, Eq, Instrument}`: the
+selected track's own parameters, a device's — the plug-in page again or
+the channel buttons: the next device —, its EQ's or its instrument's on
+the pots and the display; the bank buttons page through them; pot press
+resets one, Flip puts them on the faders), F1–F8 (workspaces; Shift: the
+markers in time), the track types (filters of `surface_tracks`: MIDI and
+instrument tracks, armed ones, audio, aux, buses, VCAs, the selected;
+Global View: all), Name/Value (the lower line: levels or the pots'
+values), SMPTE/Beats (`SurfaceState::timecode` at the MIDI time code
+rate), Shift/Option/Control/Alt (Shift + Undo redoes, + Rewind/Forward
+goes to the start/end, + Select adds to the selection; Option + Mute/
+Solo/Arm sets every track), Read again = Off (Trim too: there is no trim
+mode), Group, Cancel (clears the selection), Enter, Nudge/Zoom/Scrub/
+Shuttle (the arrows nudge or zoom, the jog wheel scrubs a 64th or
+shuttles a beat a tick, heard while stopped), the arrows (Up/Down select
+the strip above/below), Drop (punch) and Replace (record mode), punch
+in/out and pre-roll, the global Solo (clears them; lit with the rude
+solo LED while one is on), arm all, the monitor section's mute (the
+master), input monitoring, bypass of the shown device, windows (the
+mixer, the editor, the launcher), the edit mode and tool, cut/copy/
+paste/delete/separate/capture, footswitches, and HUI's numeric keypad
+(a bar to locate to, `.n.` a marker, enter alone a marker; ± a bar). The
+mode lights come from `SurfaceState::modes`. HUI answers its pings, so
+`Session::control_surface_online` (and the preferences) say when it is
+off line. A surface may have a bank of its own (`SurfaceSettings::
+own_bank`; grids always).
+
+Grid controllers (`faderframe_control::grid::Grid`, `SurfaceKind::
+{LaunchpadMiniMk3, LaunchpadX, LaunchpadProMk3, ApcMini, ApcMiniMk2,
+Push2}`) play the launcher: `Protocol::launcher_columns` makes their
+strips the launcher's tracks, `Protocol::scenes` gives them a
+`LauncherView` (slot and scene states from their scene bank) to light —
+the clips' colours by Launchpad RGB SysEx, by the nearest entry of the
+shared 128-colour palette (APC mini mk2), by Push 2 palette entries set
+to the clips' colours; green pulsing playing, flashing waiting, red
+pulsing recording — and pads launch and release slots; scene, stop,
+arrow and mode buttons and the APCs' faders as their module docs say;
+`Protocol::goodbye` puts them back in their own mode. OSC shows the
+launcher too (`/launcher/clip/N/S` and friends, see `osc`).
 
 ### Track presets
 

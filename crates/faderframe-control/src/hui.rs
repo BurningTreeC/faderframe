@@ -7,17 +7,31 @@
 //! 3 solo, 5 v-sel, 7 record ready); zone 0x0A banks and channels (0 ←
 //! channel, 1 ← bank, 2 channel →, 3 bank →); zone 0x0E the transport
 //! (1 rewind, 2 forward, 3 stop, 4 play, 5 record); zone 0x0F (0 return
-//! to zero, 1 end, 3 loop); zone 0x08 (3 undo, 7 save). Faders are
+//! to zero, 1 end, 3 loop, 4 quick punch); zone 0x08 (0 control, 1
+//! shift, 2 edit mode, 3 undo, 4 alt, 5 option, 6 edit tool, 7 save);
+//! 0x09 the windows (0 mix, 1 edit, 2 transport: the launcher); 0x0C (6
+//! record ready all); 0x0D the cursor keys (0 down, 1 left, 2 mode: zoom,
+//! 3 right, 4 up, 5 scrub, 6 shuttle); 0x10 (1 pre-roll, 2 punch in, 3
+//! punch out); 0x11/0x12 the monitor section (3 mute: the master's);
+//! 0x13–0x15 the numeric keypad (digits and '.': locate to a bar, or
+//! `.n.` to marker n; enter: a marker, or locate; clr; + and − a bar);
+//! 0x19 (1 the selected track's input monitoring, 4 create a group); 0x1A
+//! edit (0 paste, 1 cut, 2 capture, 3 delete, 4 copy, 5 separate); 0x1B
+//! F1–F8; 0x1C parameter edit (0 ins/para: the plug-in page, 6 bypass).
+//! The timecode LEDs (0x16: timecode, beats, rude solo) follow the
+//! display and the solos. Faders are
 //! `B0 0z <hi>` `B0 2z <lo>` (14 bits) both ways; pots `B0 4p <v>` (v >
 //! 0x40: v − 0x40 clockwise ticks, else −v), the jog wheel `B0 0D <v>`;
 //! pot rings `B0 1y <1…11>`. SysEx `F0 00 00 66 05 00 …`: 0x10 the
 //! 4-character strip displays, 0x11 the timecode digits (rightmost first,
 //! 0x10 adds the dot), 0x12 the 2×40 display in ten-character zones.
 //! Meters are `A0 0y <side << 4 | segment>`. The host pings (`90 00 00`)
-//! every second, or the surface goes off line and its faders stop.
+//! every second, or the surface goes off line and its faders stop; it
+//! answers (`90 00 7F`), so a silent surface shows as off line.
 
 use crate::{
-    AutomationButton, Button, Protocol, SurfaceInput, SurfaceState, abbreviate, fit, meter_level,
+    AutomationButton, Button, EditButton, Modifier, Protocol, SurfaceInput, SurfaceState, Window,
+    abbreviate, fit, meter_level,
 };
 
 const STRIPS: usize = 8;
@@ -34,7 +48,23 @@ mod zone {
     pub const TIMECODE_LEDS: u8 = 0x16;
     pub const ASSIGN: u8 = 0x0B;
     pub const AUTO_MODE: u8 = 0x18;
+    pub const WINDOW: u8 = 0x09;
+    pub const ASSIGN2: u8 = 0x0C;
+    pub const CURSOR: u8 = 0x0D;
+    pub const PUNCH: u8 = 0x10;
+    pub const MONITOR: u8 = 0x11;
+    pub const MONITOR2: u8 = 0x12;
+    pub const PAD1: u8 = 0x13;
+    pub const PAD2: u8 = 0x14;
+    pub const PAD3: u8 = 0x15;
+    pub const STATUS: u8 = 0x19;
+    pub const EDIT: u8 = 0x1A;
+    pub const FUNCTION: u8 = 0x1B;
+    pub const PARAM: u8 = 0x1C;
 }
+
+/// No answer to the pings this long: off line.
+const ONLINE_FOR: f64 = 3.0;
 
 mod port {
     pub const TOUCH: u8 = 0;
@@ -66,6 +96,11 @@ pub struct Hui {
     touched: [bool; STRIPS],
     ping_at: f64,
     meters_at: f64,
+    /// When the surface last answered a ping, and when we last looked.
+    answered: f64,
+    now: f64,
+    /// The first ping.
+    since: Option<f64>,
 }
 
 impl Default for Hui {
@@ -83,6 +118,9 @@ impl Hui {
             touched: [false; STRIPS],
             ping_at: f64::NEG_INFINITY,
             meters_at: f64::NEG_INFINITY,
+            answered: f64::NEG_INFINITY,
+            now: 0.0,
+            since: None,
         }
     }
 
@@ -148,8 +186,51 @@ impl Hui {
             (zone::AUTO_MODE, 3) => Button::Automation(AutomationButton::Off),
             (zone::AUTO_MODE, 4) => Button::Automation(AutomationButton::Write),
             (zone::AUTO_MODE, 5) => Button::Automation(AutomationButton::Touch),
+            (zone::LOCATE, 4) => Button::Drop,
+            (zone::KEYS, 0) => Button::Modifier(Modifier::Control),
+            (zone::KEYS, 1) => Button::Modifier(Modifier::Shift),
+            (zone::KEYS, 2) => Button::EditMode,
             (zone::KEYS, 3) => Button::Undo,
+            (zone::KEYS, 4) => Button::Modifier(Modifier::Alt),
+            (zone::KEYS, 5) => Button::Modifier(Modifier::Option),
+            (zone::KEYS, 6) => Button::EditTool,
             (zone::KEYS, 7) => Button::Save,
+            (zone::WINDOW, 0) => Button::Window(Window::Mixer),
+            (zone::WINDOW, 1) => Button::Window(Window::Editor),
+            (zone::WINDOW, 2) => Button::Window(Window::Launcher),
+            (zone::ASSIGN2, 6) => Button::ArmAll,
+            (zone::CURSOR, 0) => Button::Down,
+            (zone::CURSOR, 1) => Button::Left,
+            (zone::CURSOR, 2) => Button::Zoom,
+            (zone::CURSOR, 3) => Button::Right,
+            (zone::CURSOR, 4) => Button::Up,
+            (zone::CURSOR, 5) => Button::Scrub,
+            (zone::CURSOR, 6) => Button::Shuttle,
+            (zone::PUNCH, 1) => Button::PreRoll,
+            (zone::PUNCH, 2) => Button::PunchIn,
+            (zone::PUNCH, 3) => Button::PunchOut,
+            (zone::MONITOR | zone::MONITOR2, 3) => Button::MonitorMute,
+            (zone::PAD1, p) => {
+                Button::Numpad(['0', '1', '4', '2', '5', '.', '3', '6'][p as usize & 7])
+            }
+            (zone::PAD2, 0) => Button::Numpad('E'),
+            (zone::PAD2, 1) => Button::Numpad('+'),
+            (zone::PAD3, 0) => Button::Numpad('7'),
+            (zone::PAD3, 1) => Button::Numpad('8'),
+            (zone::PAD3, 2) => Button::Numpad('9'),
+            (zone::PAD3, 3) => Button::Numpad('-'),
+            (zone::PAD3, 4) => Button::Numpad('C'),
+            (zone::STATUS, 1) => Button::InputMonitor,
+            (zone::STATUS, 4) => Button::Group,
+            (zone::EDIT, 0) => Button::Edit(EditButton::Paste),
+            (zone::EDIT, 1) => Button::Edit(EditButton::Cut),
+            (zone::EDIT, 2) => Button::Edit(EditButton::Capture),
+            (zone::EDIT, 3) => Button::Edit(EditButton::Delete),
+            (zone::EDIT, 4) => Button::Edit(EditButton::Copy),
+            (zone::EDIT, 5) => Button::Edit(EditButton::Separate),
+            (zone::FUNCTION, f) => Button::Function(f),
+            (zone::PARAM, 0) => Button::PluginPage,
+            (zone::PARAM, 6) => Button::Bypass,
             _ => return,
         };
         out.push(SurfaceInput::Button { button, pressed });
@@ -174,6 +255,11 @@ impl Protocol for Hui {
         let [status, a, b, ..] = *msg else {
             return;
         };
+        // The answer to a ping: on line.
+        if status == 0x90 && a == 0 && b == 0x7F {
+            self.answered = self.now;
+            return;
+        }
         if status != 0xB0 {
             return;
         }
@@ -206,6 +292,8 @@ impl Protocol for Hui {
     }
 
     fn update(&mut self, state: &SurfaceState, now: f64, out: &mut Vec<Vec<u8>>) {
+        self.now = now;
+        self.since.get_or_insert(now);
         if now - self.ping_at >= PING_EVERY {
             self.ping_at = now;
             out.push(vec![0x90, 0x00, 0x00]);
@@ -280,7 +368,14 @@ impl Protocol for Hui {
         self.led(zone::TRANSPORT, 3, !state.playing, out);
         self.led(zone::TRANSPORT, 5, state.recording, out);
         self.led(zone::LOCATE, 3, state.looping, out);
-        self.led(zone::TIMECODE_LEDS, 2, true, out);
+        self.led(zone::TIMECODE_LEDS, 0, state.timecode.is_some(), out);
+        self.led(zone::TIMECODE_LEDS, 2, state.timecode.is_none(), out);
+        self.led(zone::TIMECODE_LEDS, 3, state.modes.any_solo, out);
+        self.led(zone::LOCATE, 4, state.modes.punch, out);
+        self.led(zone::CURSOR, 2, state.modes.zoom, out);
+        self.led(zone::CURSOR, 5, state.modes.scrub, out);
+        self.led(zone::CURSOR, 6, state.modes.shuttle, out);
+        self.led(zone::PARAM, 0, state.page.is_channel_strip(), out);
         self.led(zone::ASSIGN, 2, state.page == crate::Page::Pan, out);
         for k in 0..5u8 {
             let on = state.page == crate::Page::Send(k as usize);
@@ -295,20 +390,35 @@ impl Protocol for Hui {
         ] {
             self.led(zone::AUTO_MODE, port, state.automation == Some(b), out);
         }
-        // Bars (3), beats (2), sixteenths (1), ticks (2): rightmost first.
+        // Bars (3), beats (2), sixteenths (1), ticks (2) — or hours (2),
+        // minutes, seconds, frames — rightmost first.
         let p = state.position;
-        let text = format!(
-            "{:03}{:02}{:01}{:02}",
-            p.bar.clamp(0, 999),
-            p.beat.clamp(0, 99),
-            p.sixteenth.clamp(0, 9),
-            (p.tick / 10).clamp(0, 99)
-        );
+        let text = match state.timecode {
+            Some([h, m, s, f]) => format!(
+                "{:02}{:02}{:02}{:02}",
+                h.clamp(0, 99),
+                m.clamp(0, 59),
+                s.clamp(0, 59),
+                f.clamp(0, 99)
+            ),
+            None => format!(
+                "{:03}{:02}{:01}{:02}",
+                p.bar.clamp(0, 999),
+                p.beat.clamp(0, 99),
+                p.sixteenth.clamp(0, 9),
+                (p.tick / 10).clamp(0, 99)
+            ),
+        };
+        let dots: &[usize] = if state.timecode.is_some() {
+            &[2, 4, 6]
+        } else {
+            &[2, 3, 5]
+        };
         let digits: Vec<u8> = text
             .bytes()
             .rev()
             .enumerate()
-            .map(|(k, c)| (c - b'0') | if matches!(k, 2 | 3 | 5) { 0x10 } else { 0 })
+            .map(|(k, c)| (c - b'0') | if dots.contains(&k) { 0x10 } else { 0 })
             .collect();
         if self.sent.digits.as_ref() != Some(&digits) {
             let mut body = vec![0x11];
@@ -330,8 +440,15 @@ impl Protocol for Hui {
         }
     }
 
+    fn online(&self) -> Option<bool> {
+        // Not judged before the pings had time to be answered.
+        let judged = self.since.is_some_and(|t| self.now - t >= ONLINE_FOR);
+        judged.then_some(self.now - self.answered < ONLINE_FOR)
+    }
+
     fn reset(&mut self) {
         self.sent = Sent::default();
+        self.since = None;
         self.ping_at = f64::NEG_INFINITY;
         self.meters_at = f64::NEG_INFINITY;
     }
@@ -443,5 +560,51 @@ mod tests {
         assert!(out.is_empty(), "nothing changed: {out:x?}");
         h.update(&state, 1.2, &mut out);
         assert_eq!(out, vec![vec![0x90, 0x00, 0x00]]);
+    }
+
+    #[test]
+    fn the_other_zones_and_the_answer_to_pings() {
+        let mut h = Hui::new();
+        let mut out = Vec::new();
+        let press = |h: &mut Hui, zone: u8, port: u8, out: &mut Vec<SurfaceInput>| {
+            h.receive(&[0xB0, 0x0F, zone], out);
+            h.receive(&[0xB0, 0x2F, 0x40 | port], out);
+            h.receive(&[0xB0, 0x2F, port], out);
+        };
+        press(&mut h, 0x1B, 2, &mut out);
+        press(&mut h, 0x1A, 5, &mut out);
+        press(&mut h, 0x13, 4, &mut out);
+        press(&mut h, 0x0D, 5, &mut out);
+        press(&mut h, 0x09, 0, &mut out);
+        let pressed: Vec<Button> = out
+            .iter()
+            .filter_map(|i| match i {
+                SurfaceInput::Button {
+                    button,
+                    pressed: true,
+                } => Some(*button),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            pressed,
+            vec![
+                Button::Function(2),
+                Button::Edit(EditButton::Separate),
+                Button::Numpad('5'),
+                Button::Scrub,
+                Button::Window(Window::Mixer),
+            ]
+        );
+        // Silent: off line after a few seconds; answering: on line.
+        let state = SurfaceState::default();
+        let mut sent = Vec::new();
+        h.update(&state, 0.0, &mut sent);
+        assert_eq!(h.online(), None);
+        h.update(&state, 4.0, &mut sent);
+        assert_eq!(h.online(), Some(false));
+        h.receive(&[0x90, 0x00, 0x7F], &mut out);
+        h.update(&state, 4.5, &mut sent);
+        assert_eq!(h.online(), Some(true));
     }
 }

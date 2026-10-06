@@ -23,7 +23,7 @@ use faderframe_control::{
     SlotState, StripState, SurfaceInput, SurfaceState,
 };
 use faderframe_core::{FaderLaw, TrackId};
-use faderframe_project::{Command, Track, TrackKind};
+use faderframe_project::{Command, Track};
 use serde::{Deserialize, Serialize};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
@@ -188,15 +188,16 @@ pub struct ControlState {
     /// What went wrong opening each (by index in `settings`).
     errors: Vec<Option<String>>,
     /// The first strip's index in the mixer's tracks.
-    bank: usize,
+    pub(crate) bank: usize,
     started: Instant,
     /// A gesture opened from a surface, and when it last moved.
     gesture: Option<Instant>,
     /// Faders held on a surface (gesture ends on release).
     held: usize,
     /// What the pots control, and whether faders and pots are swapped.
-    page: Page,
+    pub(crate) page: Page,
     flip: bool,
+    pub(crate) extra: crate::control_extra::ExtraState,
 }
 
 impl Default for ControlState {
@@ -211,6 +212,7 @@ impl Default for ControlState {
             held: 0,
             page: Page::Pan,
             flip: false,
+            extra: Default::default(),
         }
     }
 }
@@ -237,16 +239,13 @@ fn level_text(db: f32) -> String {
 
 impl Session {
     /// The tracks with mixer strips, in the editors' order (not the master).
+    /// (The track-type buttons may show only some.)
     pub fn surface_tracks(&self) -> Vec<&Track> {
+        let filter = self.control.extra.filter;
         self.project
             .folder_order()
             .into_iter()
-            .filter(|t| {
-                matches!(
-                    t.kind,
-                    TrackKind::Audio | TrackKind::Instrument | TrackKind::Bus | TrackKind::Aux
-                )
-            })
+            .filter(|t| crate::control_extra::passes(self, t, filter))
             .collect()
     }
 
@@ -257,6 +256,20 @@ impl Session {
     /// Why each surface did not open (`None`: running).
     pub fn control_surface_errors(&self) -> &[Option<String>] {
         &self.control.errors
+    }
+
+    /// Whether each surface (by index in its settings) answers, for those
+    /// that say (HUI): `None` when unknown or not running.
+    pub fn control_surface_online(&self) -> Vec<Option<bool>> {
+        let mut running = self.control.surfaces.iter();
+        self.control
+            .errors
+            .iter()
+            .map(|e| match e {
+                None => running.next().and_then(|s| s.protocol.online()),
+                Some(_) => None,
+            })
+            .collect()
     }
 
     /// The first strip's track number (1-based).
@@ -395,15 +408,29 @@ impl Session {
             let start = own.unwrap_or(first);
             let shown: Vec<Option<TrackId>> =
                 (start..start + n).map(|i| list.get(i).copied()).collect();
+            // Channel-strip pages: the parameters from this surface's first
+            // pot on.
+            let params_at = if own.is_some() {
+                0
+            } else {
+                start - self.control.bank
+            };
             let rows = self.control.surfaces[k].protocol.scenes();
             let launcher = if rows > 0 {
                 self.surface_launcher(&shown, self.control.surfaces[k].scene_bank, rows)
             } else {
                 LauncherView::default()
             };
+            let page_params = if self.control.page.is_channel_strip() {
+                self.page_params(self.control.page)
+            } else {
+                None
+            };
+            let values = self.control.extra.values;
             let strips = shown
                 .iter()
-                .map(|t| {
+                .enumerate()
+                .map(|(i, t)| {
                     let Some(t) = t.and_then(|t| self.project.track(t)) else {
                         return StripState::default();
                     };
@@ -420,12 +447,32 @@ impl Session {
                         (volume, pot, bipolar)
                     };
                     let level = match self.control.page {
-                        Page::Pan if !self.control.flip => level_text(db),
+                        Page::Pan if !self.control.flip && !values => level_text(db),
+                        _ if values => level_text(db),
                         _ => pot_text,
                     };
+                    let (mut name, mut fader, mut level, mut pot, mut pot_bipolar) =
+                        (t.name.clone(), fader, level, pot, pot_bipolar);
+                    // A channel strip: the selected track's parameters on
+                    // the pots and the display.
+                    if let Some((pt, params, _)) = &page_params {
+                        let p = params.get(self.control.extra.param_offset + params_at + i);
+                        let (v, bipolar, text) =
+                            p.map_or((0.0, false, String::new()), |p| self.param_pot(*pt, p));
+                        name = p.map_or(String::new(), Self::param_label);
+                        level = text;
+                        if self.control.flip {
+                            fader = v;
+                            pot = volume;
+                            pot_bipolar = false;
+                        } else {
+                            pot = v;
+                            pot_bipolar = bipolar;
+                        }
+                    }
                     StripState {
                         present: true,
-                        name: t.name.clone(),
+                        name,
                         fader,
                         level,
                         pan: self.shown_pan(t),
@@ -452,6 +499,8 @@ impl Session {
                 flip: self.control.flip,
                 automation: self.surface_automation(),
                 launcher,
+                timecode: self.control.extra.timecode.then(|| self.surface_timecode()),
+                modes: self.surface_modes(),
             };
             let s = &mut self.control.surfaces[k];
             let mut out = Vec::new();
@@ -609,6 +658,20 @@ impl Session {
         self.surface_tracks().get(start + strip).map(|t| t.id)
     }
 
+    /// The channel-strip page's parameter index of surface `k`'s strip.
+    fn param_index(&self, k: usize, strip: usize) -> usize {
+        let before: usize = if self.control.surfaces[k].own_bank.is_some() {
+            0
+        } else {
+            self.control.surfaces[..k]
+                .iter()
+                .filter(|s| s.own_bank.is_none())
+                .map(|s| s.protocol.strips())
+                .sum()
+        };
+        before + strip
+    }
+
     fn begin_surface_gesture(&mut self) -> crate::Result<()> {
         if self.control.gesture.is_none() {
             self.dispatch(Action::BeginGesture("Control Surface".into()))?;
@@ -631,7 +694,10 @@ impl Session {
                     return Ok(());
                 };
                 self.begin_surface_gesture()?;
-                if self.control.flip && strip != MASTER {
+                if self.control.flip && strip != MASTER && self.control.page.is_channel_strip() {
+                    let i = self.param_index(k, strip);
+                    self.move_param(i, travel)?;
+                } else if self.control.flip && strip != MASTER {
                     self.set_pot(track, travel)?;
                 } else {
                     self.dispatch(Action::Edit(Command::SetTrackVolume {
@@ -650,6 +716,13 @@ impl Session {
                         self.end_surface_gesture();
                     }
                 }
+            }
+            SurfaceInput::Pot { strip, delta }
+                if self.control.page.is_channel_strip() && !self.control.flip =>
+            {
+                self.begin_surface_gesture()?;
+                let i = self.param_index(k, strip);
+                self.turn_param(i, delta)?;
             }
             SurfaceInput::Pot { strip, delta } => {
                 let Some(t) = self
@@ -671,7 +744,7 @@ impl Session {
                 } else if let Some(v) = pot {
                     let step = match self.control.page {
                         Page::Pan => PAN_STEP / 2.0,
-                        Page::Send(_) => LEVEL_STEP,
+                        _ => LEVEL_STEP,
                     };
                     self.set_pot(track, (v + delta as f32 * step).clamp(0.0, 1.0))?;
                 }
@@ -686,16 +759,15 @@ impl Session {
                     pan: pan.clamp(-1.0, 1.0),
                 }))?;
             }
-            SurfaceInput::Jog(ticks) => {
-                // A sixteenth a tick.
-                let q = faderframe_timeline::MusicalTime::QUARTER.ticks() / 4;
-                let at = self.playhead()
-                    + faderframe_timeline::MusicalTime::from_ticks(i64::from(ticks) * q);
-                let at = at.max(faderframe_timeline::MusicalTime::ZERO);
-                self.dispatch(Action::Transport(TransportAction::Locate(at)))?;
+            SurfaceInput::Jog(ticks) => self.surface_jog(ticks)?,
+            SurfaceInput::Button {
+                button: Button::Modifier(m),
+                pressed,
+            } => {
+                self.control.extra.modifiers[m.index()] = pressed;
             }
             SurfaceInput::Button { button, pressed } => {
-                if pressed {
+                if pressed && !self.surface_extra_button(button)? {
                     self.surface_button(k, button)?;
                 }
             }
@@ -751,7 +823,21 @@ impl Session {
         let edit = |cmd| Action::Edit(cmd);
         let width = self.control.surfaces[k].protocol.strips();
         let count = self.surface_tracks().len();
+        use faderframe_control::Modifier as Mod;
+        let (shift, option) = (
+            self.control.extra.held(Mod::Shift),
+            self.control.extra.held(Mod::Option),
+        );
         match button {
+            // Option + mute/solo/arm: every track like this one.
+            Button::Mute(i) | Button::Solo(i) if option => {
+                if let Some(t) = track(self, i) {
+                    let solo = matches!(button, Button::Solo(_));
+                    let on = if solo { !t.solo } else { !self.shown_mute(&t) };
+                    self.set_all(solo, on)?;
+                }
+            }
+            Button::Arm(_) if option => self.arm_all()?,
             Button::Mute(i) => {
                 if let Some(t) = track(self, i) {
                     let on = !self.shown_mute(&t);
@@ -776,11 +862,20 @@ impl Session {
             }
             Button::Select(i) => {
                 if let Some(t) = track(self, i) {
+                    // Shift: added to (or taken from) the selection.
                     self.dispatch(Action::SelectTracks {
                         tracks: vec![t.id],
-                        mode: crate::SelectMode::Replace,
+                        mode: if shift {
+                            crate::SelectMode::Toggle
+                        } else {
+                            crate::SelectMode::Replace
+                        },
                     })?;
                 }
+            }
+            Button::PotPress(i) if self.control.page.is_channel_strip() && !self.control.flip => {
+                let i = self.param_index(k, i);
+                self.reset_param(i)?;
             }
             Button::PotPress(i) => {
                 // Pan to the centre, a send (or, flipped, the volume) to 0 dB.
@@ -794,7 +889,7 @@ impl Session {
                     } else {
                         match self.control.page {
                             Page::Pan => self.set_pot(t.id, 0.5)?,
-                            Page::Send(_) => self.set_pot(t.id, unity)?,
+                            _ => self.set_pot(t.id, unity)?,
                         }
                     }
                 }
@@ -816,13 +911,27 @@ impl Session {
                     .max(1);
                 self.control.page = match self.control.page {
                     Page::Send(n) => Page::Send((n + 1) % most),
-                    Page::Pan => Page::Send(0),
+                    _ => Page::Send(0),
                 };
+            }
+            // Read again: off (the MCU's Read/Off).
+            Button::Automation(AutomationButton::Read)
+                if self.surface_automation() == Some(AutomationButton::Read) =>
+            {
+                self.surface_automation_mode(AutomationButton::Off)?;
             }
             Button::Automation(b) => self.surface_automation_mode(b)?,
             Button::Play => self.dispatch(Action::Transport(TransportAction::Play))?,
             Button::Stop => self.dispatch(Action::Transport(TransportAction::Stop))?,
             Button::Record => self.dispatch(Action::Transport(TransportAction::ToggleRecord))?,
+            // Shift: to the start and the end.
+            Button::Rewind if shift => {
+                self.dispatch(Action::Transport(TransportAction::ReturnToStart))?;
+            }
+            Button::Forward if shift => {
+                let end = self.project.content_end();
+                self.dispatch(Action::Transport(TransportAction::Locate(end)))?;
+            }
             Button::Rewind => self.dispatch(Action::Transport(TransportAction::NudgeBars(-1)))?,
             Button::Forward => self.dispatch(Action::Transport(TransportAction::NudgeBars(1)))?,
             Button::Loop => self.dispatch(Action::Transport(TransportAction::ToggleLoop))?,
@@ -841,7 +950,59 @@ impl Session {
                 };
                 self.dispatch(Action::SetRecordSettings(r))?;
             }
+            Button::Undo if shift => self.dispatch(Action::Redo)?,
             Button::Undo => self.dispatch(Action::Undo)?,
+            // The arrows: zooming, nudging, else the channel.
+            Button::Left | Button::Right => {
+                let right = button == Button::Right;
+                if self.control.extra.zoom {
+                    let z = if right {
+                        crate::ZoomRequest::In
+                    } else {
+                        crate::ZoomRequest::Out
+                    };
+                    self.dispatch(Action::Zoom(z))?;
+                } else if self.control.extra.nudge {
+                    self.dispatch(Action::Nudge {
+                        forward: right,
+                        target: crate::NudgeTarget::Move,
+                    })?;
+                } else {
+                    let b = if right {
+                        Button::ChannelRight
+                    } else {
+                        Button::ChannelLeft
+                    };
+                    return self.surface_button(k, b);
+                }
+            }
+            // Channel-strip pages: the bank moves through the parameters,
+            // the channel buttons through the devices (or a parameter).
+            Button::BankLeft | Button::BankRight | Button::ChannelLeft | Button::ChannelRight
+                if self.control.page.is_channel_strip() =>
+            {
+                let n = self
+                    .page_params(self.control.page)
+                    .map_or(0, |(_, p, _)| p.len());
+                let e = &mut self.control.extra;
+                match button {
+                    Button::BankLeft => e.param_offset = e.param_offset.saturating_sub(width),
+                    Button::BankRight if e.param_offset + width < n => e.param_offset += width,
+                    Button::ChannelLeft | Button::ChannelRight
+                        if self.control.page == Page::Plugin =>
+                    {
+                        e.device = if button == Button::ChannelRight {
+                            e.device + 1
+                        } else {
+                            e.device.saturating_sub(1)
+                        };
+                        e.param_offset = 0;
+                    }
+                    Button::ChannelLeft => e.param_offset = e.param_offset.saturating_sub(1),
+                    Button::ChannelRight if e.param_offset + 1 < n => e.param_offset += 1,
+                    _ => {}
+                }
+            }
             Button::Marker => {
                 let at = self.playhead();
                 self.dispatch(Action::AddMarker(at))?;
@@ -892,6 +1053,8 @@ impl Session {
                     s.scene_bank += 1;
                 }
             }
+            // The rest is `surface_extra_button`'s.
+            _ => {}
         }
         Ok(())
     }
@@ -914,6 +1077,8 @@ impl Session {
                     level_text(db),
                 )
             }),
+            // The channel-strip pages show parameters instead.
+            _ => None,
         }
     }
 
@@ -939,6 +1104,7 @@ impl Session {
                     db: FaderLaw::console().position_to_db(travel),
                 }))
             }
+            _ => Ok(()),
         }
     }
 
