@@ -836,6 +836,7 @@ dependencies = [
  "faderframe-view-album",
  "faderframe-view-arranger",
  "faderframe-view-automation",
+ "faderframe-view-clipfx",
  "faderframe-view-devices",
  "faderframe-view-history",
  "faderframe-view-mixer",
@@ -898,6 +899,19 @@ dependencies = [
  "faderframe-automation",
  "faderframe-core",
  "faderframe-engine",
+ "faderframe-project",
+ "faderframe-session",
+ "faderframe-timeline",
+ "faderframe-ui-canvas",
+]
+
+[[package]]
+name = "faderframe-view-clipfx"
+version = "0.7.0"
+dependencies = [
+ "faderframe-core",
+ "faderframe-engine",
+ "faderframe-plugin-host",
  "faderframe-project",
  "faderframe-session",
  "faderframe-timeline",

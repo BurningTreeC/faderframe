@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-fn host_format(f: ProjectFormat) -> PluginFormat {
+pub(crate) fn host_format(f: ProjectFormat) -> PluginFormat {
     match f {
         ProjectFormat::Builtin => PluginFormat::Builtin,
         ProjectFormat::Clap => PluginFormat::Clap,

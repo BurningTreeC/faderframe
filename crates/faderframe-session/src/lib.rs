@@ -28,6 +28,7 @@ mod album_master;
 mod aliases;
 pub mod analysis;
 pub mod capture;
+pub mod clip_fx;
 pub mod containers;
 pub mod delivery;
 pub mod detect;
@@ -317,6 +318,13 @@ pub enum Action {
     /// Show an audio clip in the pitch editor (finding its notes first if
     /// it has none).
     OpenPitchEditor(ClipId),
+    /// Show an audio clip's effects in their editor.
+    OpenClipEffects(ClipId),
+    /// Edit an audio clip's effects (rendered once the chain rests).
+    ClipEffects {
+        clip: ClipId,
+        op: clip_fx::ClipFxOp,
+    },
     /// An audio clip's notes on a new instrument track (melody, harmony
     /// or drums; after listening to it).
     ConvertToMidi {
@@ -1042,6 +1050,7 @@ pub struct Session {
     pitch: pitch::PitchCache,
     clip_analyses: detect::ClipAnalyses,
     conversions: to_midi::Conversions,
+    clip_fx: clip_fx::ClipFxState,
     /// The audio clip the pitch editor shows.
     pitch_clip: Option<ClipId>,
     /// Track renders for freezing and bouncing.
@@ -1258,6 +1267,7 @@ impl Session {
             pitch: pitch::PitchCache::default(),
             clip_analyses: detect::ClipAnalyses::default(),
             conversions: to_midi::Conversions::default(),
+            clip_fx: clip_fx::ClipFxState::default(),
             pitch_clip: None,
             gesture_base: HashMap::new(),
             bounces: Vec::new(),
@@ -2029,6 +2039,7 @@ impl Session {
         self.poll_pitch();
         self.poll_clip_analyses();
         self.poll_conversions();
+        self.poll_clip_fx();
         let mut i = 0;
         while i < self.peak_jobs.len() {
             if self.peak_jobs[i].is_finished() {
@@ -2263,6 +2274,7 @@ impl Session {
                     reversed: false,
                     warp: None,
                     pitch: None,
+                    effects: None,
                 }),
             };
             clips.push(clip.id);
@@ -2905,6 +2917,8 @@ impl Session {
             Action::DetectPitch { clips } => self.detect_pitch(&clips)?,
             Action::FromClip { clip, what } => self.from_clip(clip, what)?,
             Action::ConvertToMidi { clip, how } => self.convert_to_midi(clip, how)?,
+            Action::OpenClipEffects(clip) => self.open_clip_fx(clip)?,
+            Action::ClipEffects { clip, op } => self.edit_clip_fx(clip, op)?,
             Action::OpenPitchEditor(clip) => {
                 let Some(a) = self.project.clip(clip).and_then(|c| c.as_audio()) else {
                     return Ok(());

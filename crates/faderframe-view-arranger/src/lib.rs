@@ -2373,6 +2373,10 @@ impl ArrangerView {
                     );
                     items.push(if i == 0 { item.separated() } else { item });
                 }
+                items.push(MenuItem::new(
+                    "Clip Effects…",
+                    Action::OpenClipEffects(clip.id),
+                ));
                 items.push(
                     MenuItem::new("Set Project Tempo from Clip", from(FromClip::SetTempo))
                         .separated(),

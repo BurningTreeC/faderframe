@@ -229,6 +229,7 @@ impl Session {
                         reversed: false,
                         warp: None,
                         pitch: None,
+                        effects: None,
                     }),
                 }),
             });

@@ -77,6 +77,10 @@ impl ViewId {
         Self::new("pitch")
     }
 
+    pub fn clip_fx() -> Self {
+        Self::new("clip-fx")
+    }
+
     pub fn tools() -> Self {
         Self::new("tools")
     }

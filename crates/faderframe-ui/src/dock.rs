@@ -98,6 +98,12 @@ fn create_view(app: &Rc<AppState>, kind: ViewKind) -> ViewHost {
             true,
             true,
         ),
+        ViewKind::ClipFx => ViewHost::new(
+            app,
+            Box::new(faderframe_view_clipfx::ClipFxView::new(theme)),
+            true,
+            true,
+        ),
     };
     app.register_canvas(&host.canvas);
     host

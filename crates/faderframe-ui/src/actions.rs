@@ -305,6 +305,11 @@ pub fn install(app: &Rc<AppState>) {
         ),
         dispatch(
             app,
+            "show-clip-fx",
+            A::Workspace(W::ShowView(ViewId::clip_fx())),
+        ),
+        dispatch(
+            app,
             "show-automation",
             A::Workspace(W::ShowView(ViewId::automation())),
         ),
@@ -1164,6 +1169,59 @@ pub fn install(app: &Rc<AppState>) {
             match clip {
                 Some(c) => a.dispatch(Action::OpenPitchEditor(c)),
                 None => tracing::warn!("edit-pitch: no audio clip on {arg}"),
+            }
+        }),
+        // Development aids: `clip-fx:<track>` (its first clip in the clip
+        // effects editor), `clip-fx-add:<plugin id>`,
+        // `clip-fx-set:<n>:<parameter>=<value>` (on that clip).
+        named("clip-fx", |a, arg| {
+            let clip = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == arg)
+                .and_then(|t| t.clips.first().copied());
+            if let Some(clip) = clip {
+                a.dispatch(Action::OpenClipEffects(clip));
+            }
+        }),
+        named("clip-fx-add", |a, arg| {
+            let found = {
+                let s = a.session.borrow();
+                s.clip_fx_clip().and_then(|clip| {
+                    s.available_plugins()
+                        .into_iter()
+                        .find(|p| p.plugin.id == arg)
+                        .map(|p| (clip, p.plugin))
+                })
+            };
+            if let Some((clip, plugin)) = found {
+                a.dispatch(Action::ClipEffects {
+                    clip,
+                    op: faderframe_session::clip_fx::ClipFxOp::Add(plugin),
+                });
+            }
+        }),
+        named("clip-fx-set", |a, arg| {
+            let Some(clip) = a.session.borrow().clip_fx_clip() else {
+                return;
+            };
+            let parsed = (|| {
+                let (n, rest) = arg.split_once(':')?;
+                let (p, v) = rest.split_once('=')?;
+                Some((n.parse().ok()?, p.parse().ok()?, v.parse().ok()?))
+            })();
+            if let Some((index, parameter, value)) = parsed {
+                a.dispatch(Action::ClipEffects {
+                    clip,
+                    op: faderframe_session::clip_fx::ClipFxOp::SetParameter {
+                        index,
+                        parameter: faderframe_core::ParameterId(parameter),
+                        value,
+                    },
+                });
             }
         }),
         // Development aid: `to-midi:<melody|harmony|drums>=<track>` (its

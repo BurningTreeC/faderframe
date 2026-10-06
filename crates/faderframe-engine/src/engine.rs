@@ -981,6 +981,19 @@ impl EngineController {
         self.plugins.registry().scan()
     }
 
+    /// A plugin's parameters, from an instance made for the asking (not
+    /// hosted; control thread).
+    pub fn describe_parameters(
+        &self,
+        plugin: &faderframe_project::PluginRef,
+    ) -> Option<Vec<faderframe_plugin_host::ParameterInfo>> {
+        self.plugins
+            .registry()
+            .instantiate(crate::plugins::host_format(plugin.format), &plugin.id)
+            .ok()
+            .map(|i| i.parameters().to_vec())
+    }
+
     /// Let plugins handle their requests (call from the UI timer); returns
     /// what they asked for (a restart needs a graph rebuild).
     pub fn poll_plugins(&mut self) -> faderframe_plugin_host::PluginPoll {

@@ -16,6 +16,7 @@
 pub mod album;
 pub mod arrange;
 mod clip;
+pub mod clip_fx;
 pub mod compare;
 pub mod container;
 pub mod demo;

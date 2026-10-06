@@ -59,6 +59,7 @@ fn session() -> (Session, TrackId, ClipId) {
                 reversed: false,
                 warp: None,
                 pitch: None,
+                effects: None,
             }),
         }),
     })

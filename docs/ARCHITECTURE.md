@@ -1774,6 +1774,25 @@ very start added) and sorts each hit by its first 60 ms's energy under
 150 Hz (kick, C1) or over 5 kHz (closed hat, F#1), else snare (D1),
 velocity from its peak.
 
+### Clip effects
+
+An audio clip can carry a chain of devices rendered offline into the
+audio it plays (`faderframe_project::clip_fx`: `AudioClip::effects`, a
+`ClipEffects` with the chain, the `OriginalAudio` it processes — source,
+region, warp, pitch edit, reversal — and `rendered_offset`, the frame in
+the render where the original region starts, so trims carry over).
+`session::clip_fx` (`Action::OpenClipEffects`, `Action::ClipEffects {
+clip, op: ClipFxOp }`): an edit changes a pending chain at once (what the
+editor shows); after 300 ms of rest the chain renders in a worker on a
+one-track copy of the project (the original audio, the chain as inserts,
+`render::track_render_project`, 2 s of tail), and the result becomes a
+source the clip plays, chain and all, in one "Clip Effects" step; a
+render overtaken by a newer edit is dropped. Removing every effect
+restores the original (`OriginalAudio::restore`). Devices' parameters
+come from an instance made for the asking (`EngineController::
+describe_parameters`, cached per plugin). Editor `faderframe-view-clipfx`
+(`ViewKind::ClipFx`, a card per device with parameter bars).
+
 ### Track presets
 
 `faderframe_project::preset::TrackPreset` captures a track's channel
@@ -2215,7 +2234,7 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
 5. **Vocals and audio intelligence**: ~~native pitch editing~~ (done:
    TD-PSOLA rather than the Stretch engine, see *Pitch editing*),
    ~~audio-to-MIDI (basic-pitch, Apache-2.0)~~ (done: *Audio to MIDI*), ~~tempo and key
-   detection~~ (done: *Tempo and key from clips*), per-clip effects rendered offline, ARA 2 hosting, a speech
+   detection~~ (done: *Tempo and key from clips*), ~~per-clip effects rendered offline~~ (done: *Clip effects*), ARA 2 hosting, a speech
    and lyrics transcription track (Whisper, MIT). Stem separation waits
    for permissively licensed model weights.
 6. **Performance and control**: a clip launcher with scenes recorded into

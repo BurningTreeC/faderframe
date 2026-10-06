@@ -346,6 +346,7 @@ pub(crate) fn process_through(
                 reversed: false,
                 warp: None,
                 pitch: None,
+                effects: None,
             }),
         },
     );

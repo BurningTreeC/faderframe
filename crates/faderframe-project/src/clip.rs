@@ -72,6 +72,9 @@ pub struct AudioClip {
     /// recorded).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pitch: Option<crate::pitch::PitchEdit>,
+    /// Effects rendered onto the clip (the original audio kept).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effects: Option<Box<crate::clip_fx::ClipEffects>>,
 }
 
 impl AudioClip {
@@ -626,6 +629,7 @@ mod tests {
                 reversed: false,
                 warp: None,
                 pitch: None,
+                effects: None,
             }),
         };
         assert_eq!(clip.end(&timeline, 48_000), MusicalTime::from_quarters_i(6));

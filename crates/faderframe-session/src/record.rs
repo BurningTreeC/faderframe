@@ -494,6 +494,7 @@ pub(crate) fn place_takes(
             reversed: false,
             warp: None,
             pitch: None,
+            effects: None,
         }),
     };
     // Existing material in the way.
@@ -1096,6 +1097,7 @@ impl Session {
                         reversed: false,
                         warp: None,
                         pitch: None,
+                        effects: None,
                     }),
                 }),
             });

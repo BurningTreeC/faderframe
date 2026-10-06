@@ -283,6 +283,7 @@ fn build(args: &Args) -> Project {
                 reversed: false,
                 warp: None,
                 pitch: None,
+                effects: None,
             }),
         };
         t.clips.push(clip.id);

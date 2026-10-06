@@ -397,6 +397,7 @@ pub fn demo_project(sample_rate: u32) -> Project {
                 reversed: false,
                 warp: None,
                 pitch: None,
+                effects: None,
             }),
         };
         track.clips.push(clip.id);

@@ -524,6 +524,7 @@ fn sources_are_undoable_and_protected_while_in_use() {
             reversed: false,
             warp: None,
             pitch: None,
+            effects: None,
         }),
     };
     let mut h = History::default();
