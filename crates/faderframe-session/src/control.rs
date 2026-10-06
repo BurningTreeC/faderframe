@@ -2,7 +2,8 @@
 //! OSC over UDP (`faderframe_control` has the protocols).
 //!
 //! Each surface shows a bank of the mixer's strips — the surfaces side by
-//! side in the order they are set up, from the shared bank start — with
+//! side in the order they are set up, from the shared bank start, unless
+//! one has a bank of its own — with
 //! the master fader, the transport and the song position; every tick the
 //! session builds what they should show and the protocol sends what
 //! changed. What is done on a surface becomes session actions: faders and
@@ -10,12 +11,16 @@
 //! they rest for 400 ms), buttons toggle, select, run the transport or
 //! move the bank. A MIDI surface's ports are its own: the MIDI hub and the
 //! track outputs leave them alone. OSC listens on a UDP port and answers
-//! whoever spoke last, on the reply port.
+//! whoever spoke last, on the reply port. Grid controllers (Launchpad,
+//! APC mini, Push 2) play the clip launcher: their columns are the tracks
+//! that hold clips, from a bank of their own, by eight scenes from their
+//! scene bank.
 
 use crate::{Action, Session, TransportAction};
+use faderframe_control::grid::{Grid, GridModel};
 use faderframe_control::{
-    AutomationButton, Button, MASTER, Page, Position, Protocol, StripState, SurfaceInput,
-    SurfaceState,
+    AutomationButton, Button, LauncherView, MASTER, Page, Position, Protocol, SceneLight, SlotKind,
+    SlotState, StripState, SurfaceInput, SurfaceState,
 };
 use faderframe_core::{FaderLaw, TrackId};
 use faderframe_project::{Command, Track, TrackKind};
@@ -38,14 +43,26 @@ pub enum SurfaceKind {
     MackieExtender,
     Hui,
     Osc,
+    LaunchpadMiniMk3,
+    LaunchpadX,
+    LaunchpadProMk3,
+    ApcMini,
+    ApcMiniMk2,
+    Push2,
 }
 
 impl SurfaceKind {
-    pub const ALL: [SurfaceKind; 4] = [
+    pub const ALL: [SurfaceKind; 10] = [
         SurfaceKind::Mackie,
         SurfaceKind::MackieExtender,
         SurfaceKind::Hui,
         SurfaceKind::Osc,
+        SurfaceKind::LaunchpadMiniMk3,
+        SurfaceKind::LaunchpadX,
+        SurfaceKind::LaunchpadProMk3,
+        SurfaceKind::ApcMini,
+        SurfaceKind::ApcMiniMk2,
+        SurfaceKind::Push2,
     ];
 
     pub fn label(self) -> &'static str {
@@ -54,11 +71,30 @@ impl SurfaceKind {
             SurfaceKind::MackieExtender => "Mackie Control Extender",
             SurfaceKind::Hui => "HUI",
             SurfaceKind::Osc => "OSC",
+            SurfaceKind::LaunchpadMiniMk3 => "Launchpad Mini MK3",
+            SurfaceKind::LaunchpadX => "Launchpad X",
+            SurfaceKind::LaunchpadProMk3 => "Launchpad Pro MK3",
+            SurfaceKind::ApcMini => "APC mini",
+            SurfaceKind::ApcMiniMk2 => "APC mini mk2",
+            SurfaceKind::Push2 => "Push 2 (User Mode)",
         }
     }
 
     pub fn is_midi(self) -> bool {
         self != SurfaceKind::Osc
+    }
+
+    /// A grid controller playing the launcher.
+    pub fn grid(self) -> Option<GridModel> {
+        Some(match self {
+            SurfaceKind::LaunchpadMiniMk3 => GridModel::LaunchpadMiniMk3,
+            SurfaceKind::LaunchpadX => GridModel::LaunchpadX,
+            SurfaceKind::LaunchpadProMk3 => GridModel::LaunchpadProMk3,
+            SurfaceKind::ApcMini => GridModel::ApcMini,
+            SurfaceKind::ApcMiniMk2 => GridModel::ApcMiniMk2,
+            SurfaceKind::Push2 => GridModel::Push2,
+            _ => return None,
+        })
     }
 }
 
@@ -75,6 +111,9 @@ pub struct SurfaceSettings {
     pub reply: u16,
     /// Strips an OSC surface shows.
     pub strips: u8,
+    /// A bank of its own (not the next strips after the surfaces before
+    /// it); grids always have one.
+    pub own_bank: bool,
 }
 
 impl Default for SurfaceSettings {
@@ -86,6 +125,7 @@ impl Default for SurfaceSettings {
             listen: 8000,
             reply: 9000,
             strips: 8,
+            own_bank: false,
         }
     }
 }
@@ -102,6 +142,43 @@ enum Link {
 struct Surface {
     protocol: Box<dyn Protocol>,
     link: Link,
+    /// Its own bank's first strip (when it has one), and the first scene
+    /// it shows of the launcher.
+    own_bank: Option<usize>,
+    scene_bank: usize,
+}
+
+impl Surface {
+    fn new(protocol: Box<dyn Protocol>, link: Link, settings: &SurfaceSettings) -> Self {
+        let own = settings.own_bank || protocol.launcher_columns();
+        Self {
+            protocol,
+            link,
+            own_bank: own.then_some(0),
+            scene_bank: 0,
+        }
+    }
+
+    fn send(&mut self, messages: Vec<Vec<u8>>) {
+        match &mut self.link {
+            Link::Midi(ports) => {
+                for m in messages {
+                    ports.send(&m);
+                }
+            }
+            Link::Osc {
+                socket,
+                peer: Some(peer),
+                reply,
+            } => {
+                let to = SocketAddr::new(peer.ip(), *reply);
+                for m in messages {
+                    let _ = socket.send_to(&m, to);
+                }
+            }
+            Link::Osc { peer: None, .. } => {}
+        }
+    }
 }
 
 /// The surfaces' session state.
@@ -190,6 +267,11 @@ impl Session {
     /// Set up the surfaces (opens their ports; MIDI ports they use are
     /// taken from the hub and the track outputs).
     pub fn set_control_surfaces(&mut self, settings: Vec<SurfaceSettings>) {
+        // Controllers that were put in a mode of ours go back to theirs.
+        for s in &mut self.control.surfaces {
+            let bye = s.protocol.goodbye();
+            s.send(bye);
+        }
         self.control.surfaces.clear();
         self.control.errors.clear();
         self.control.settings = settings.clone();
@@ -216,10 +298,11 @@ impl Session {
             kind,
             ..SurfaceSettings::default()
         };
-        self.control.surfaces.push(Surface {
-            protocol: protocol_for(&settings),
-            link: Link::Midi(ports),
-        });
+        self.control.surfaces.push(Surface::new(
+            protocol_for(&settings),
+            Link::Midi(ports),
+            &settings,
+        ));
         self.control.settings.push(settings);
         self.control.errors.push(None);
         other
@@ -298,12 +381,26 @@ impl Session {
             .project
             .master()
             .map(|m| law.db_to_position(self.shown_volume_db(m)));
+        let columns: Vec<TrackId> = self.launcher_tracks().iter().map(|t| t.id).collect();
         let mut first = self.control.bank;
         let mut sends: Vec<(usize, Vec<Vec<u8>>)> = Vec::new();
         for k in 0..self.control.surfaces.len() {
             let n = self.control.surfaces[k].protocol.strips();
+            let list = if self.control.surfaces[k].protocol.launcher_columns() {
+                &columns
+            } else {
+                &tracks
+            };
+            let own = self.control.surfaces[k].own_bank;
+            let start = own.unwrap_or(first);
             let shown: Vec<Option<TrackId>> =
-                (first..first + n).map(|i| tracks.get(i).copied()).collect();
+                (start..start + n).map(|i| list.get(i).copied()).collect();
+            let rows = self.control.surfaces[k].protocol.scenes();
+            let launcher = if rows > 0 {
+                self.surface_launcher(&shown, self.control.surfaces[k].scene_bank, rows)
+            } else {
+                LauncherView::default()
+            };
             let strips = shown
                 .iter()
                 .map(|t| {
@@ -354,6 +451,7 @@ impl Session {
                 page: self.control.page,
                 flip: self.control.flip,
                 automation: self.surface_automation(),
+                launcher,
             };
             let s = &mut self.control.surfaces[k];
             let mut out = Vec::new();
@@ -361,29 +459,127 @@ impl Session {
             if !out.is_empty() {
                 sends.push((k, out));
             }
-            first += n;
+            if own.is_none() {
+                first += n;
+            }
         }
         for (k, out) in sends {
             let s = &mut self.control.surfaces[k];
-            match &mut s.link {
-                Link::Midi(ports) => {
-                    for m in out {
-                        ports.send(&m);
-                    }
-                }
-                Link::Osc {
-                    socket,
-                    peer: Some(peer),
-                    reply,
-                } => {
-                    let to = SocketAddr::new(peer.ip(), *reply);
-                    for m in out {
-                        let _ = socket.send_to(&m, to);
-                    }
-                }
-                // Nobody to answer yet: send everything once someone speaks.
-                Link::Osc { peer: None, .. } => s.protocol.reset(),
+            // Nobody to answer yet: send everything once someone speaks.
+            if let Link::Osc { peer: None, .. } = s.link {
+                s.protocol.reset();
+                continue;
             }
+            s.send(out);
+        }
+    }
+
+    /// The launcher's slots of `tracks` by `rows` scenes from `first`.
+    fn surface_launcher(
+        &self,
+        tracks: &[Option<TrackId>],
+        first: usize,
+        rows: usize,
+    ) -> LauncherView {
+        use faderframe_project::launcher::SlotKey;
+        let l = &self.project.launcher;
+        let recording = self.launcher_recording();
+        let slot = |track: TrackId, scene: faderframe_core::SceneId| -> SlotState {
+            let key = SlotKey { track, scene };
+            let t = self.project.track(track);
+            let state = self.launch_state(track);
+            let hash = key.hash();
+            let clip = l.slots.get(&key).and_then(|c| self.project.clip(*c));
+            let recorded = recording.is_some_and(|(rt, rs, _)| rt == track && rs == scene);
+            let kind = match clip {
+                _ if recorded => SlotKind::Recording,
+                Some(_) => {
+                    let playing = state
+                        .and_then(|s| s.playing)
+                        .is_some_and(|(s, _)| s == hash);
+                    let queued = state.and_then(|s| s.queued);
+                    match queued {
+                        Some((None, _)) if playing => SlotKind::Stopping,
+                        Some((Some(q), _)) if q == hash => SlotKind::Queued,
+                        _ if playing => SlotKind::Playing,
+                        _ => SlotKind::Clip,
+                    }
+                }
+                None if t.is_some_and(|t| t.record_arm) => SlotKind::Armed,
+                None => SlotKind::Empty,
+            };
+            let color = clip
+                .and_then(|c| c.color)
+                .or(t.map(|t| t.color))
+                .map_or([0; 3], |c| [c.r, c.g, c.b]);
+            SlotState {
+                kind,
+                color,
+                name: clip.map_or(String::new(), |c| c.name.clone()),
+            }
+        };
+        let scenes: Vec<Option<&faderframe_project::launcher::Scene>> =
+            (first..first + rows).map(|i| l.scenes.get(i)).collect();
+        let slots = tracks
+            .iter()
+            .map(|t| {
+                scenes
+                    .iter()
+                    .map(|s| match (t, s) {
+                        (Some(t), Some(s)) => slot(*t, s.id),
+                        _ => SlotState::default(),
+                    })
+                    .collect()
+            })
+            .collect();
+        let lights = scenes
+            .iter()
+            .map(|s| {
+                let Some(s) = s else {
+                    return SceneLight::Off;
+                };
+                let keys: Vec<SlotKey> = l
+                    .slots
+                    .keys()
+                    .filter(|k| k.scene == s.id)
+                    .copied()
+                    .collect();
+                let any = |f: &dyn Fn(&SlotKey) -> bool| keys.iter().any(f);
+                if any(&|k| {
+                    self.launch_state(k.track)
+                        .and_then(|st| st.queued)
+                        .is_some_and(|(q, _)| q == Some(k.hash()))
+                }) {
+                    SceneLight::Queued
+                } else if any(&|k| {
+                    self.launch_state(k.track)
+                        .and_then(|st| st.playing)
+                        .is_some_and(|(p, _)| p == k.hash())
+                }) {
+                    SceneLight::Playing
+                } else if keys.is_empty() {
+                    SceneLight::Off
+                } else {
+                    SceneLight::Clips
+                }
+            })
+            .collect();
+        LauncherView {
+            first_scene: first,
+            scene_count: l.scenes.len(),
+            scene_names: scenes
+                .iter()
+                .map(|s| s.map_or(String::new(), |s| s.name.clone()))
+                .collect(),
+            scenes: lights,
+            slots,
+            playing: tracks
+                .iter()
+                .map(|t| {
+                    t.and_then(|t| self.launch_state(t))
+                        .is_some_and(|s| s.playing.is_some())
+                })
+                .collect(),
         }
     }
 
@@ -392,13 +588,25 @@ impl Session {
         if strip == MASTER {
             return self.project.master().map(|m| m.id);
         }
-        let before: usize = self.control.surfaces[..k]
-            .iter()
-            .map(|s| s.protocol.strips())
-            .sum();
-        self.surface_tracks()
-            .get(self.control.bank + before + strip)
-            .map(|t| t.id)
+        let s = &self.control.surfaces[k];
+        if s.protocol.launcher_columns() {
+            return self
+                .launcher_tracks()
+                .get(s.own_bank.unwrap_or(0) + strip)
+                .map(|t| t.id);
+        }
+        let start = match s.own_bank {
+            Some(b) => b,
+            None => {
+                let before: usize = self.control.surfaces[..k]
+                    .iter()
+                    .filter(|s| s.own_bank.is_none())
+                    .map(|s| s.protocol.strips())
+                    .sum();
+                self.control.bank + before
+            }
+        };
+        self.surface_tracks().get(start + strip).map(|t| t.id)
     }
 
     fn begin_surface_gesture(&mut self) -> crate::Result<()> {
@@ -491,17 +699,30 @@ impl Session {
                     self.surface_button(k, button)?;
                 }
             }
-            SurfaceInput::LaunchClip { strip, scene } => {
+            SurfaceInput::LaunchClip { strip, scene }
+            | SurfaceInput::ReleaseClip { strip, scene } => {
                 let track = self.strip_track(k, strip);
-                let scene = self.project.launcher.scenes.get(scene).map(|s| s.id);
+                let at = self.control.surfaces[k].scene_bank + scene;
+                let scene = self.project.launcher.scenes.get(at).map(|s| s.id);
                 if let (Some(track), Some(scene)) = (track, scene) {
-                    self.dispatch(Action::Launcher(crate::launcher::LauncherOp::Launch {
+                    let op = match input {
+                        SurfaceInput::LaunchClip { .. } => {
+                            crate::launcher::LauncherOp::Launch { track, scene }
+                        }
+                        _ => crate::launcher::LauncherOp::Release { track, scene },
+                    };
+                    self.dispatch(Action::Launcher(op))?;
+                }
+            }
+            SurfaceInput::StopTrack(strip) => {
+                if let Some(track) = self.strip_track(k, strip) {
+                    self.dispatch(Action::Launcher(crate::launcher::LauncherOp::StopTrack(
                         track,
-                        scene,
-                    }))?;
+                    )))?;
                 }
             }
             SurfaceInput::LaunchScene(n) => {
+                let n = self.control.surfaces[k].scene_bank + n;
                 if let Some(scene) = self.project.launcher.scenes.get(n).map(|s| s.id) {
                     self.dispatch(Action::Launcher(crate::launcher::LauncherOp::LaunchScene(
                         scene,
@@ -631,16 +852,44 @@ impl Session {
                 Ok(()) => self.notify(crate::NoticeLevel::Info, "saved"),
                 Err(e) => self.notify(crate::NoticeLevel::Warning, e.to_string()),
             },
-            Button::BankLeft => self.control.bank = self.control.bank.saturating_sub(width),
-            Button::BankRight => {
-                if self.control.bank + width < count {
-                    self.control.bank += width;
+            Button::BankLeft | Button::BankRight | Button::ChannelLeft | Button::ChannelRight => {
+                let step = match button {
+                    Button::BankLeft | Button::BankRight => width,
+                    _ => 1,
+                };
+                let right = matches!(button, Button::BankRight | Button::ChannelRight);
+                let count = if self.control.surfaces[k].protocol.launcher_columns() {
+                    self.launcher_tracks().len()
+                } else {
+                    count
+                };
+                let bank = match self.control.surfaces[k].own_bank {
+                    Some(b) => b,
+                    None => self.control.bank,
+                };
+                let bank = if right {
+                    if bank + step < count {
+                        bank + step
+                    } else {
+                        bank
+                    }
+                } else {
+                    bank.saturating_sub(step)
+                };
+                match &mut self.control.surfaces[k].own_bank {
+                    Some(b) => *b = bank,
+                    None => self.control.bank = bank,
                 }
             }
-            Button::ChannelLeft => self.control.bank = self.control.bank.saturating_sub(1),
-            Button::ChannelRight => {
-                if self.control.bank + 1 < count {
-                    self.control.bank += 1;
+            Button::SceneUp => {
+                let s = &mut self.control.surfaces[k];
+                s.scene_bank = s.scene_bank.saturating_sub(1);
+            }
+            Button::SceneDown => {
+                let scenes = self.project.launcher.scenes.len();
+                let s = &mut self.control.surfaces[k];
+                if s.scene_bank + 1 < scenes {
+                    s.scene_bank += 1;
                 }
             }
         }
@@ -755,6 +1004,10 @@ fn protocol_for(s: &SurfaceSettings) -> Box<dyn Protocol> {
         SurfaceKind::Osc => Box::new(faderframe_control::osc::OscSurface::new(usize::from(
             s.strips.max(1),
         ))),
+        kind => match kind.grid() {
+            Some(model) => Box::new(Grid::new(model)),
+            None => Box::new(faderframe_control::hui::Hui::new()),
+        },
     }
 }
 
@@ -771,8 +1024,5 @@ fn open(s: &SurfaceSettings) -> Result<Surface, String> {
             reply: s.reply,
         }
     };
-    Ok(Surface {
-        protocol: protocol_for(s),
-        link,
-    })
+    Ok(Surface::new(protocol_for(s), link, s))
 }

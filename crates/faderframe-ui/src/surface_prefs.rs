@@ -198,6 +198,20 @@ fn rebuild(section: &Rc<Section>, app: &Rc<AppState>) {
                 row.append(w);
             }
         }
+        // Mixer surfaces may have a bank of their own (grids always do).
+        if s.kind.grid().is_none() {
+            let own = gtk::CheckButton::with_label("Own bank");
+            own.set_active(s.own_bank);
+            own.set_tooltip_text(Some(
+                "Its strips move on their own instead of following the surfaces before it",
+            ));
+            let change = Rc::clone(&change);
+            own.connect_toggled(move |b| {
+                let on = b.is_active();
+                change(i, &|s| s.own_bank = on, false);
+            });
+            row.append(&own);
+        }
         let status = gtk::Label::new(None);
         status.set_hexpand(true);
         status.set_xalign(0.0);
@@ -249,7 +263,11 @@ fn update_status(section: &Section, app: &AppState) {
                 } else {
                     "Listening".to_string()
                 },
-                format!("Its strips start at track {}", s.surface_bank()),
+                if c.kind.grid().is_some() {
+                    "Its pads play the clip launcher".to_string()
+                } else {
+                    format!("Its strips start at track {}", s.surface_bank())
+                },
             ),
             _ => (String::new(), String::new()),
         };
@@ -289,7 +307,7 @@ pub fn section(app: &Rc<AppState>) -> gtk::Box {
     }
     root.append(&add);
     let hint = gtk::Label::new(Some(
-        "Mackie Control (an extender shows the next strips) and HUI: choose the surface's MIDI ports — they then serve only the surface. OSC: FaderFrame listens on one UDP port and answers on the reply port (e.g. TouchOSC sending to 8000, listening on 9000).",
+        "Mackie Control (an extender shows the next strips) and HUI: choose the surface's MIDI ports — they then serve only the surface. OSC: FaderFrame listens on one UDP port and answers on the reply port (e.g. TouchOSC sending to 8000, listening on 9000). Launchpad, APC mini and Push 2: their pads play the clip launcher (Launchpads in programmer mode on their MIDI port, Push 2 in user mode on its user port).",
     ));
     hint.set_wrap(true);
     hint.set_natural_wrap_mode(gtk::NaturalWrapMode::Word);

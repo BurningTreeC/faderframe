@@ -210,3 +210,101 @@ fn send_pages_flip_and_automation_from_a_mackie_control() {
     s.tick(0.01);
     assert!(surface.take().contains(&vec![0x90, 0x4D, 0x7F]));
 }
+
+/// A Launchpad plays the launcher: it is put in programmer mode, its pads
+/// light in the clips' colours (green pulsing once one plays), a pad
+/// launches its slot, the arrows move its own bank (the Mackie's stays),
+/// a scene button launches its scene.
+#[test]
+fn a_launchpad_plays_the_launcher_from_its_own_bank() {
+    use faderframe_audio::dummy::DummyBackend;
+    use faderframe_session::AudioPreferences;
+    use faderframe_session::launcher::LauncherOp;
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    s.start_audio(
+        vec![Box::new(DummyBackend::default())],
+        &AudioPreferences::default(),
+    )
+    .unwrap();
+    let mackie = s.add_virtual_surface(SurfaceKind::Mackie);
+    let pad = s.add_virtual_surface(SurfaceKind::LaunchpadMiniMk3);
+    let columns: Vec<TrackId> = s.launcher_tracks().iter().map(|t| t.id).collect();
+    let first = s.project().clips_of(columns[0])[0].id;
+    s.dispatch(Action::Launcher(LauncherOp::SendClips(vec![first])))
+        .unwrap();
+    s.dispatch(Action::Launcher(LauncherOp::SetQuantize(
+        faderframe_project::launcher::LaunchQuantize::None,
+    )))
+    .unwrap();
+    s.tick(0.01);
+    let sent = pad.take();
+    assert_eq!(
+        sent[0],
+        vec![0xF0, 0x00, 0x20, 0x29, 0x02, 0x0D, 0x0E, 0x01, 0xF7]
+    );
+    let lights: Vec<u8> = sent[1..].concat();
+    let c = s.project().clips[&s
+        .project()
+        .launcher
+        .clip(columns[0], s.project().launcher.scenes[0].id)
+        .unwrap()]
+        .color
+        .unwrap_or(s.project().track(columns[0]).unwrap().color);
+    assert!(
+        lights
+            .windows(5)
+            .any(|w| w == [3, 81, c.r >> 1, c.g >> 1, c.b >> 1]),
+        "the top-left pad in the clip's colour: {lights:?}"
+    );
+    // The pad launches it; it pulses green.
+    pad.send(&[0x90, 81, 127]);
+    pad.send(&[0x90, 81, 0]);
+    let start = std::time::Instant::now();
+    loop {
+        s.tick(0.005);
+        if s.launch_state(columns[0])
+            .is_some_and(|l| l.playing.is_some())
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "launched by the pad"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    s.tick(0.005);
+    let lights: Vec<u8> = pad.take().concat();
+    assert!(lights.windows(3).any(|w| w == [2, 81, 21]), "{lights:?}");
+    // Its bank moves; the Mackie's does not.
+    let _ = mackie.take();
+    pad.send(&[0xB0, 94, 127]);
+    pad.send(&[0xB0, 94, 0]);
+    s.tick(0.01);
+    assert_eq!(s.surface_bank(), 1);
+    let lights: Vec<u8> = pad.take().concat();
+    assert!(
+        lights.windows(3).any(|w| w == [0, 81, 0]),
+        "a new first column: {lights:?}"
+    );
+    // The scene button: its scene.
+    s.dispatch(Action::Launcher(LauncherOp::StopAll)).unwrap();
+    pad.send(&[0xB0, 89, 127]);
+    let start = std::time::Instant::now();
+    loop {
+        s.tick(0.005);
+        if s.launch_state(columns[0])
+            .and_then(|l| l.queued)
+            .is_some_and(|q| q.0.is_some())
+            || s.launch_state(columns[0])
+                .is_some_and(|l| l.playing.is_some())
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the scene launched"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}

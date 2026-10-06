@@ -13,7 +13,8 @@
 //! | `/strip/N/{mute,solo,arm,select} i` | |
 //! | `/master/fader f` | |
 //! | `/bank/{left,right}`, `/channel/{left,right}` | move the bank |
-//! | `/launcher/clip/N/S`, `/launcher/scene/S`, `/launcher/stop`, `/launcher/back` | the clip launcher (scene S 1-based) |
+//! | `/launcher/clip/N/S` (0: let go), `/launcher/scene/S`, `/launcher/track/N/stop`, `/launcher/stop`, `/launcher/back` | the clip launcher (scene S 1-based from the scene bank's start) |
+//! | `/launcher/scenes/{up,down}` | move the scene bank |
 //! | `/jog i`, `/undo`, `/save`, `/marker`, `/refresh` | |
 //! | `/flip`, `/page/pan`, `/page/send/K` | what faders and pots move |
 //! | `/automation/{off,read,touch,latch,write}` | the selected track's mode |
@@ -22,10 +23,21 @@
 //! mute i, solo i, arm i, select i, meter f}` (the meter 0…1),
 //! `/master/fader f`, `/transport/{play,record,loop,click} i`,
 //! `/transport/position s` ("bar.beat.sixteenth.tick"), `/bank/first i`,
-//! `/page s` ("PN", "S1" …) and `/flip i`.
+//! `/page s` ("PN", "S1" …) and `/flip i`; the launcher's eight scenes
+//! from the scene bank: `/launcher/clip/N/S i` (0 empty, 1 armed, 2 a
+//! clip, 3 waiting to start, 4 playing, 5 stopping, 6 recording) with
+//! `…/name s` and `…/color i` (0xRRGGBB), `/launcher/scene/S i` (0 none,
+//! 1 clips, 2 starting, 3 playing) and `…/name s`,
+//! `/launcher/track/N/playing i`, `/launcher/first i` (the first scene
+//! shown, 1-based) and `/launcher/scenes i` (how many).
 
-use crate::{Button, MASTER, Protocol, SurfaceInput, SurfaceState, meter_level};
+use crate::{
+    Button, MASTER, Protocol, SceneLight, SlotKind, SurfaceInput, SurfaceState, meter_level,
+};
 use std::collections::HashMap;
+
+/// Scenes an OSC surface shows.
+const LAUNCHER_ROWS: usize = 8;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Arg {
@@ -300,11 +312,22 @@ impl OscSurface {
                 };
                 press(button, out);
             }
-            ["launcher", "clip", n, s] if on => {
+            ["launcher", "clip", n, s] => {
                 if let (Some(strip), Some(scene)) = (index(n), index(s)) {
-                    out.push(SurfaceInput::LaunchClip { strip, scene });
+                    out.push(if on {
+                        SurfaceInput::LaunchClip { strip, scene }
+                    } else {
+                        SurfaceInput::ReleaseClip { strip, scene }
+                    });
                 }
             }
+            ["launcher", "track", n, "stop"] if on => {
+                if let Some(strip) = index(n) {
+                    out.push(SurfaceInput::StopTrack(strip));
+                }
+            }
+            ["launcher", "scenes", "up"] if on => press(Button::SceneUp, out),
+            ["launcher", "scenes", "down"] if on => press(Button::SceneDown, out),
             ["launcher", "scene", s] if on => {
                 if let Some(scene) = index(s) {
                     out.push(SurfaceInput::LaunchScene(scene));
@@ -419,6 +442,69 @@ impl Protocol for OscSurface {
         );
         self.put("/page".into(), Arg::Str(state.page.short()), out);
         self.put("/flip".into(), Arg::Int(i32::from(state.flip)), out);
+        // The launcher's part of the bank.
+        let l = &state.launcher;
+        for strip in 0..self.strips {
+            for row in 0..LAUNCHER_ROWS {
+                let slot = l.slot(strip, row);
+                let base = format!("/launcher/clip/{}/{}", strip + 1, row + 1);
+                let kind = match slot.map_or(SlotKind::Empty, |s| s.kind) {
+                    SlotKind::Empty => 0,
+                    SlotKind::Armed => 1,
+                    SlotKind::Clip => 2,
+                    SlotKind::Queued => 3,
+                    SlotKind::Playing => 4,
+                    SlotKind::Stopping => 5,
+                    SlotKind::Recording => 6,
+                };
+                self.put(base.clone(), Arg::Int(kind), out);
+                self.put(
+                    format!("{base}/name"),
+                    Arg::Str(slot.map_or(String::new(), |s| s.name.clone())),
+                    out,
+                );
+                let [r, g, b] = slot.map_or([0; 3], |s| s.color);
+                self.put(
+                    format!("{base}/color"),
+                    Arg::Int(i32::from(r) << 16 | i32::from(g) << 8 | i32::from(b)),
+                    out,
+                );
+            }
+            let playing = l.playing.get(strip).copied().unwrap_or(false);
+            self.put(
+                format!("/launcher/track/{}/playing", strip + 1),
+                Arg::Int(i32::from(playing)),
+                out,
+            );
+        }
+        for row in 0..LAUNCHER_ROWS {
+            let light = match l.scenes.get(row).copied().unwrap_or_default() {
+                SceneLight::Off => 0,
+                SceneLight::Clips => 1,
+                SceneLight::Queued => 2,
+                SceneLight::Playing => 3,
+            };
+            self.put(format!("/launcher/scene/{}", row + 1), Arg::Int(light), out);
+            self.put(
+                format!("/launcher/scene/{}/name", row + 1),
+                Arg::Str(l.scene_names.get(row).cloned().unwrap_or_default()),
+                out,
+            );
+        }
+        self.put(
+            "/launcher/first".into(),
+            Arg::Int(l.first_scene as i32 + 1),
+            out,
+        );
+        self.put(
+            "/launcher/scenes".into(),
+            Arg::Int(l.scene_count as i32),
+            out,
+        );
+    }
+
+    fn scenes(&self) -> usize {
+        LAUNCHER_ROWS
     }
 
     fn reset(&mut self) {
@@ -538,5 +624,66 @@ mod tests {
             &mut out,
         );
         assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn the_launcher_is_shown_and_played() {
+        use crate::{LauncherView, SlotState};
+        let mut s = OscSurface::new(2);
+        let mut slots = vec![vec![SlotState::default(); 8]; 2];
+        slots[1][0] = SlotState {
+            kind: SlotKind::Playing,
+            color: [255, 128, 0],
+            name: "Beat".into(),
+        };
+        let state = SurfaceState {
+            launcher: LauncherView {
+                first_scene: 2,
+                scene_count: 5,
+                scene_names: vec!["Verse".into()],
+                scenes: vec![SceneLight::Playing],
+                slots,
+                playing: vec![false, true],
+            },
+            ..SurfaceState::default()
+        };
+        let mut sent = Vec::new();
+        s.update(&state, 0.0, &mut sent);
+        let msgs: Vec<Message> = sent.iter().flat_map(|p| decode(p)).collect();
+        for (addr, arg) in [
+            ("/launcher/clip/2/1", Arg::Int(4)),
+            ("/launcher/clip/2/1/name", Arg::Str("Beat".into())),
+            ("/launcher/clip/2/1/color", Arg::Int(0xFF8000)),
+            ("/launcher/clip/1/1", Arg::Int(0)),
+            ("/launcher/scene/1", Arg::Int(3)),
+            ("/launcher/scene/1/name", Arg::Str("Verse".into())),
+            ("/launcher/track/2/playing", Arg::Int(1)),
+            ("/launcher/first", Arg::Int(3)),
+            ("/launcher/scenes", Arg::Int(5)),
+        ] {
+            assert!(
+                msgs.contains(&Message::new(addr, vec![arg.clone()])),
+                "{addr} {arg:?}"
+            );
+        }
+        let mut out = Vec::new();
+        for m in [
+            Message::new("/launcher/clip/2/1", vec![Arg::Int(1)]),
+            Message::new("/launcher/clip/2/1", vec![Arg::Int(0)]),
+            Message::new("/launcher/track/2/stop", vec![]),
+            Message::new("/launcher/scenes/down", vec![]),
+        ] {
+            s.receive(&encode(&m), &mut out);
+        }
+        assert_eq!(out[0], SurfaceInput::LaunchClip { strip: 1, scene: 0 });
+        assert_eq!(out[1], SurfaceInput::ReleaseClip { strip: 1, scene: 0 });
+        assert_eq!(out[2], SurfaceInput::StopTrack(1));
+        assert_eq!(
+            out[3],
+            SurfaceInput::Button {
+                button: Button::SceneDown,
+                pressed: true
+            }
+        );
     }
 }

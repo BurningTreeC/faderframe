@@ -11,10 +11,15 @@
 //! clones: notes for buttons and LEDs, pitch bend for faders, SysEx for the
 //! LCD), [`hui::Hui`] (zone/port switches, 14-bit faders over two CCs, a
 //! ping each second) — both MIDI — and [`osc::OscSurface`] (FaderFrame's
-//! own OSC address space over UDP, see [`osc`]).
+//! own OSC address space over UDP, see [`osc`]). Grid controllers
+//! ([`grid::Grid`]: Launchpad Mini MK3 / X / Pro MK3, APC mini and mk2,
+//! Push 2) play the clip launcher: their pads are its slots, their
+//! columns the tracks that hold clips (a bank of their own), lit in the
+//! clips' colours as the [`LauncherView`] says.
 
 #![forbid(unsafe_code)]
 
+pub mod grid;
 pub mod hui;
 pub mod mackie;
 pub mod osc;
@@ -97,6 +102,71 @@ pub struct SurfaceState {
     pub flip: bool,
     /// The selected track's automation mode.
     pub automation: Option<AutomationButton>,
+    /// The launcher's slots of the shown strips (for surfaces that show
+    /// it).
+    pub launcher: LauncherView,
+}
+
+/// What a launcher slot shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SlotKind {
+    #[default]
+    Empty,
+    /// Empty, on a track armed to record into it.
+    Armed,
+    /// A clip, not playing.
+    Clip,
+    /// Launched, waiting for its launch position.
+    Queued,
+    Playing,
+    /// Playing, stopping at the next launch position.
+    Stopping,
+    /// Being recorded into.
+    Recording,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SlotState {
+    pub kind: SlotKind,
+    /// The clip's colour.
+    pub color: [u8; 3],
+    pub name: String,
+}
+
+/// What a scene's launch button shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SceneLight {
+    /// No scene (or no clips in it).
+    #[default]
+    Off,
+    /// It has clips.
+    Clips,
+    /// One of its clips is waiting to start.
+    Queued,
+    /// Its clips play.
+    Playing,
+}
+
+/// The launcher as a surface shows it: the strips' tracks by `rows` scenes
+/// from `first_scene`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LauncherView {
+    pub first_scene: usize,
+    /// Scenes in all.
+    pub scene_count: usize,
+    /// The shown scenes' names (empty: no scene there).
+    pub scene_names: Vec<String>,
+    pub scenes: Vec<SceneLight>,
+    /// Per strip, a slot per shown scene.
+    pub slots: Vec<Vec<SlotState>>,
+    /// Per strip: a clip plays on its track (its stop button lights).
+    pub playing: Vec<bool>,
+}
+
+impl LauncherView {
+    pub fn slot(&self, strip: usize, row: usize) -> Option<&SlotState> {
+        self.slots.get(strip)?.get(row)
+    }
 }
 
 /// What the pots control.
@@ -162,6 +232,9 @@ pub enum Button {
     SendPage(Option<usize>),
     /// The selected track's automation mode.
     Automation(AutomationButton),
+    /// The launcher's scene bank (a surface showing it).
+    SceneUp,
+    SceneDown,
 }
 
 /// What a surface sends.
@@ -194,11 +267,18 @@ pub enum SurfaceInput {
         pan: f32,
     },
     /// Launch a clip-launcher slot (track and scene, 0-based from the
-    /// bank's start for tracks; OSC).
+    /// bank's and the scene bank's start).
     LaunchClip {
         strip: usize,
         scene: usize,
     },
+    /// The slot's button let go (gate and repeat clips stop).
+    ReleaseClip {
+        strip: usize,
+        scene: usize,
+    },
+    /// Stop the strip's track's clip.
+    StopTrack(usize),
     LaunchScene(usize),
     StopClips,
     BackToArrangement,
@@ -217,6 +297,19 @@ pub trait Protocol {
     fn update(&mut self, state: &SurfaceState, now: f64, out: &mut Vec<Vec<u8>>);
     /// Forget what was sent: the next update sends everything.
     fn reset(&mut self);
+    /// Rows of launcher slots it shows (0: none).
+    fn scenes(&self) -> usize {
+        0
+    }
+    /// Its strips are the launcher's columns (the tracks that hold clips)
+    /// with a bank of their own, not the mixer's.
+    fn launcher_columns(&self) -> bool {
+        false
+    }
+    /// What it sends when it is closed (back to its own mode).
+    fn goodbye(&self) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
 }
 
 /// The meter segment (0…12) of the Mackie/HUI meters for a peak level.
