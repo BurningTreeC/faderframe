@@ -2355,6 +2355,31 @@ impl ArrangerView {
                 Action::OpenPitchEditor(clip.id),
             ));
         }
+        {
+            use faderframe_session::detect::FromClip;
+            let from = |what| Action::FromClip {
+                clip: clip.id,
+                what,
+            };
+            if clip.as_audio().is_some() {
+                items.push(
+                    MenuItem::new("Set Project Tempo from Clip", from(FromClip::SetTempo))
+                        .separated(),
+                );
+                items.push(MenuItem::new(
+                    "Warp Clip to Project Tempo",
+                    from(FromClip::WarpToTempo),
+                ));
+            }
+            if clip.as_audio().is_some() || clip.as_midi().is_some() {
+                let item = MenuItem::new("Set Key from Clip", from(FromClip::SetKey));
+                items.push(if clip.as_audio().is_some() {
+                    item
+                } else {
+                    item.separated()
+                });
+            }
+        }
         items.push(MenuItem::new(
             match (clip.muted, many) {
                 (true, false) => "Unmute Clip",

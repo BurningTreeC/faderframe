@@ -114,7 +114,7 @@ pub fn track(x: &[f32], rate: f64) -> PitchTrack {
 
 /// Every `d`-th sample of `x` after a windowed-sinc low-pass at 0.45 of
 /// the new Nyquist rate (centred taps: no delay).
-fn decimate(x: &[f32], d: usize) -> Vec<f32> {
+pub(crate) fn decimate(x: &[f32], d: usize) -> Vec<f32> {
     if d == 1 {
         return x.to_vec();
     }

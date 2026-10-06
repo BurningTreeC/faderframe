@@ -30,6 +30,7 @@ pub mod analysis;
 pub mod capture;
 pub mod containers;
 pub mod delivery;
+pub mod detect;
 pub mod editing;
 mod folders;
 mod freeze;
@@ -315,6 +316,12 @@ pub enum Action {
     /// Show an audio clip in the pitch editor (finding its notes first if
     /// it has none).
     OpenPitchEditor(ClipId),
+    /// Set the project's tempo or key from a clip, or warp it to the
+    /// tempo (after analysing it).
+    FromClip {
+        clip: ClipId,
+        what: detect::FromClip,
+    },
     /// Find the notes of audio clips for pitch editing.
     DetectPitch {
         clips: Vec<ClipId>,
@@ -1026,6 +1033,7 @@ pub struct Session {
     play_started_at: Option<i64>,
     transients: transients::TransientCache,
     pitch: pitch::PitchCache,
+    clip_analyses: detect::ClipAnalyses,
     /// The audio clip the pitch editor shows.
     pitch_clip: Option<ClipId>,
     /// Track renders for freezing and bouncing.
@@ -1240,6 +1248,7 @@ impl Session {
             play_started_at: None,
             transients: transients::TransientCache::default(),
             pitch: pitch::PitchCache::default(),
+            clip_analyses: detect::ClipAnalyses::default(),
             pitch_clip: None,
             gesture_base: HashMap::new(),
             bounces: Vec::new(),
@@ -2009,6 +2018,7 @@ impl Session {
     fn poll_jobs(&mut self) {
         self.poll_transients();
         self.poll_pitch();
+        self.poll_clip_analyses();
         let mut i = 0;
         while i < self.peak_jobs.len() {
             if self.peak_jobs[i].is_finished() {
@@ -2883,6 +2893,7 @@ impl Session {
             } => self.make_sample(track, start, end, target)?,
             Action::CaptureMidi => self.capture_midi()?,
             Action::DetectPitch { clips } => self.detect_pitch(&clips)?,
+            Action::FromClip { clip, what } => self.from_clip(clip, what)?,
             Action::OpenPitchEditor(clip) => {
                 let Some(a) = self.project.clip(clip).and_then(|c| c.as_audio()) else {
                     return Ok(());

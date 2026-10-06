@@ -1730,6 +1730,27 @@ from the arranger's clip menu: notes as blobs at the heard pitch, the
 played and the sung curve, a drag moves by semitones (Alt: freely), a
 double click splits, ↑↓ move, J joins, Delete resets).
 
+### Tempo and key from clips
+
+`faderframe_analysis::tempo::detect` finds a recording's tempo and first
+beat: an onset envelope (spectral flux of 512-point frames every 64
+samples at about 11 kHz, less its local mean), then the beat period
+whose comb (the envelope a period apart at the best phase; half and
+double periods counting a quarter) stands out most under a log-normal
+prior around 120 BPM, refined to 0.01 BPM over the whole recording and
+snapped to whole BPM within 0.05; confidence is how far the comb peak
+stands over the envelope's mean (noise ≈ 0, a clear beat 1).
+`faderframe_analysis::chroma::profile` sums the pitch classes of spectral
+peaks (C2–C7, a quarter-tone tolerance, each frame normalised) and
+`faderframe_midi::theory::detect_key` correlates the profile with the
+Krumhansl–Kessler keys. `session::detect` (`Action::FromClip { clip,
+what }`, the arranger's clip menu) analyses an audio clip's part of its
+source in a thread and then sets the project's tempo, warps the clip to
+the project's tempo (`length = span × clip BPM / project BPM`), or sets
+the key (at the start when the project has none, else from the clip's
+start); MIDI clips give their key from their notes at once. Tempos under
+confidence 0.1 are refused with a notice.
+
 ### Track presets
 
 `faderframe_project::preset::TrackPreset` captures a track's channel
@@ -2170,8 +2191,8 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
    — done (see *Modulators* and *Containers*).
 5. **Vocals and audio intelligence**: ~~native pitch editing~~ (done:
    TD-PSOLA rather than the Stretch engine, see *Pitch editing*),
-   audio-to-MIDI (basic-pitch, Apache-2.0), tempo and key
-   detection, per-clip effects rendered offline, ARA 2 hosting, a speech
+   audio-to-MIDI (basic-pitch, Apache-2.0), ~~tempo and key
+   detection~~ (done: *Tempo and key from clips*), per-clip effects rendered offline, ARA 2 hosting, a speech
    and lyrics transcription track (Whisper, MIT). Stem separation waits
    for permissively licensed model weights.
 6. **Performance and control**: a clip launcher with scenes recorded into

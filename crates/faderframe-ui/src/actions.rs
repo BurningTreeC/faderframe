@@ -1166,6 +1166,31 @@ pub fn install(app: &Rc<AppState>) {
                 None => tracing::warn!("edit-pitch: no audio clip on {arg}"),
             }
         }),
+        // Development aid: `from-clip:<tempo|warp|key>=<track>` (its first
+        // clip).
+        named("from-clip", |a, arg| {
+            use faderframe_session::detect::FromClip;
+            let Some((what, name)) = arg.split_once('=') else {
+                return;
+            };
+            let what = match what {
+                "tempo" => FromClip::SetTempo,
+                "warp" => FromClip::WarpToTempo,
+                "key" => FromClip::SetKey,
+                _ => return,
+            };
+            let clip = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == name)
+                .and_then(|t| t.clips.first().copied());
+            if let Some(clip) = clip {
+                a.dispatch(Action::FromClip { clip, what });
+            }
+        }),
         named("pitch", |a, arg| {
             use faderframe_session::pitch::PitchOp;
             let Some(clip) = a.session.borrow().pitch_clip() else {

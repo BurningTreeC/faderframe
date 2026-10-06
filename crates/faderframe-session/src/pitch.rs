@@ -88,15 +88,21 @@ fn read_mono(media: &Path) -> std::io::Result<(Vec<f32>, f64)> {
     Ok((mono, f64::from(f.sample_rate())))
 }
 
-/// The analysis of a source (helper thread).
-fn analyse(source: Source) -> Analysis {
-    let (mono, rate) = match source {
+/// A source's mono mix and rate (helper threads: reads the media file
+/// of a streamed source).
+pub(crate) fn mono_of(source: &Source) -> Option<(Vec<f32>, f64)> {
+    match source {
         Source::Memory(d) => {
             let views: Vec<&[f32]> = (0..d.num_channels()).map(|c| d.channel(c)).collect();
-            (onsets::mixdown(&views), f64::from(d.sample_rate()))
+            Some((onsets::mixdown(&views), f64::from(d.sample_rate())))
         }
-        Source::Stream(st) => read_mono(st.path()).ok()?,
-    };
+        Source::Stream(st) => read_mono(st.path()).ok(),
+    }
+}
+
+/// The analysis of a source (helper thread).
+fn analyse(source: Source) -> Analysis {
+    let (mono, rate) = mono_of(&source)?;
     Some((melody::track(&mono, rate), rate))
 }
 

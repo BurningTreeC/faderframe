@@ -9,12 +9,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod chroma;
 pub mod delivery;
 mod dynamics;
 mod loudness;
 pub mod melody;
 pub mod pitch;
 mod spectrum;
+pub mod tempo;
 pub mod vinyl;
 
 pub use dynamics::{Dynamics, DynamicsMeter};
