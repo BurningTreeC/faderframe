@@ -1019,6 +1019,36 @@ pub fn install(app: &Rc<AppState>) {
                 None => tracing::warn!("make-sample: nothing to sample on '{name}'"),
             }
         }),
+        // Development aid: `midi-plays:<MIDI track>=<instrument track|none>`.
+        named("midi-plays", |a, arg| {
+            let Some((from, to)) = arg.split_once('=') else {
+                tracing::warn!("midi-plays: '{arg}' is not <MIDI track>=<instrument track>");
+                return;
+            };
+            let action = {
+                let s = a.session.borrow();
+                let id = |name: &str| {
+                    s.project()
+                        .tracks
+                        .iter()
+                        .find(|t| t.name == name)
+                        .map(|t| t.id)
+                };
+                id(from).and_then(|track| {
+                    s.midi_instrument_choices(track)
+                        .into_iter()
+                        .find(|c| {
+                            c.label == "None" && to == "none"
+                                || id(to).is_some_and(|_| c.label.starts_with(to))
+                        })
+                        .map(|c| c.action)
+                })
+            };
+            match action {
+                Some(action) => a.dispatch(action),
+                None => tracing::warn!("midi-plays: no choice '{arg}'"),
+            }
+        }),
         // Development aid: `strip-width:<track name|all>=<px|default>`.
         named("strip-width", |a, arg| {
             let Some((name, width)) = arg.split_once('=') else {
