@@ -268,6 +268,27 @@ impl LauncherView {
             .clip(track.id, scene)
             .and_then(|c| model.project().clip(c))
         else {
+            let rec = th.arranger.record;
+            let recording = model
+                .launcher_recording()
+                .filter(|(t, s, _)| *t == track.id && *s == scene);
+            if let Some((_, _, ending)) = recording {
+                // Recording here: red, the dot on, the bar running.
+                p.fill_rounded(cell, 3.0, &rec.with_alpha(0.35).into());
+                p.stroke_rounded(cell, 3.0, 1.5, rec);
+                let play = Rect::new(cell.x, cell.y, PLAY_W, cell.h);
+                p.circle(play.center(), 5.0, rec);
+                p.text(
+                    if ending {
+                        "Recording · ending"
+                    } else {
+                        "Recording"
+                    },
+                    Rect::new(play.right() + 6.0, cell.y, cell.w - PLAY_W - 10.0, cell.h),
+                    &TextStyle::new(th.fonts.small, th.ui.text),
+                );
+                return;
+            }
             let bg = if hover || dragging_over {
                 th.ui.text.with_alpha(0.07)
             } else {
@@ -277,8 +298,17 @@ impl LauncherView {
             if dragging_over {
                 p.stroke_rounded(cell, 3.0, 1.5, th.ui.accent);
             }
-            // An empty slot stops a track that plays a clip.
-            if state.is_some_and(|s| s.playing.is_some()) {
+            if track.record_arm {
+                // Armed: the slot records.
+                let play = Rect::new(cell.x, cell.y, PLAY_W, cell.h);
+                let on = matches!(self.hover, Some(Hit::Slot { track: t, scene: s, play: true, .. }) if t == track.id && s == scene);
+                p.circle(
+                    play.center(),
+                    4.5,
+                    if on { rec } else { rec.with_alpha(0.55) },
+                );
+            } else if state.is_some_and(|s| s.playing.is_some()) {
+                // An empty slot stops a track that plays a clip.
                 Self::square(p, cell.center(), 3.5, th.ui.text_faint);
             }
             return;
@@ -754,10 +784,16 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for LauncherView {
                         track,
                         scene,
                         clip: None,
-                        ..
+                        play,
                     } => {
                         let kind = model.project().track(track).map(|t| t.kind);
-                        if clicks >= 2
+                        let armed = model.project().track(track).is_some_and(|t| t.record_arm);
+                        let recording = model
+                            .launcher_recording()
+                            .is_some_and(|(t, s, _)| t == track && s == scene);
+                        if recording || (play && armed) {
+                            cx.emit(l(LauncherOp::Record { track, scene }));
+                        } else if clicks >= 2
                             && matches!(kind, Some(TrackKind::Instrument | TrackKind::Midi))
                         {
                             cx.emit(l(LauncherOp::CreateClip { track, scene }));
@@ -892,6 +928,19 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for LauncherView {
             } => "Launch".into(),
             Hit::Slot { clip: Some(_), .. } => {
                 "Drag to another slot (Ctrl copies); double-click a MIDI clip to edit it".into()
+            }
+            Hit::Slot {
+                track, scene, play, ..
+            } if model
+                .launcher_recording()
+                .is_some_and(|(t, s, _)| t == track && s == scene)
+                || (play && model.project().track(track).is_some_and(|t| t.record_arm)) =>
+            {
+                if model.launcher_recording().is_some() {
+                    "Click to end the recording on the next launch position".into()
+                } else {
+                    "Record a clip here from the next launch position".into()
+                }
             }
             Hit::Slot { track, .. } => {
                 let midi = model

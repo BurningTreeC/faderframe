@@ -686,11 +686,12 @@ impl Session {
         })
     }
 
-    fn record_targets(&self) -> Vec<RecordTarget> {
+    fn record_targets(&self, only: Option<TrackId>) -> Vec<RecordTarget> {
         self.project
             .tracks
             .iter()
             .filter(|t| t.record_arm && t.kind == TrackKind::Audio)
+            .filter(|t| only.is_none_or(|o| o == t.id))
             .filter_map(|t| match t.input {
                 faderframe_project::InputRouting::Hardware { first_channel } => {
                     Some(RecordTarget {
@@ -708,11 +709,17 @@ impl Session {
     /// Enter record mode with the window starting at `from` (or the punch
     /// range).
     pub(crate) fn start_recording(&mut self, from: i64) -> Result<()> {
+        self.start_recording_only(from, None)
+    }
+
+    /// [`Self::start_recording`] for one armed track (`None`: all).
+    pub(crate) fn start_recording_only(&mut self, from: i64, only: Option<TrackId>) -> Result<()> {
         let Some(info) = self.stream_info() else {
             return Err(SessionError::Other("start audio before recording".into()));
         };
-        let targets = self.record_targets();
-        let midi_targets = self.midi_record_targets();
+        let targets = self.record_targets(only);
+        let mut midi_targets = self.midi_record_targets();
+        midi_targets.retain(|t| only.is_none_or(|o| o == t.track));
         if targets.is_empty() && midi_targets.is_empty() {
             self.notify(
                 NoticeLevel::Warning,
@@ -747,6 +754,7 @@ impl Session {
                     + info.output_latency as i64
                     + self.record.latency_offset,
                 seen: false,
+                slot: None,
             });
             self.pump_idle();
             return Ok(());
@@ -792,6 +800,7 @@ impl Session {
             tracks,
             latency,
             seen: false,
+            slot: None,
         });
         self.pump_idle();
         Ok(())
@@ -800,6 +809,12 @@ impl Session {
     /// Leave record mode; the takes become clips once the writer is done.
     pub(crate) fn stop_recording(&mut self) -> Result<()> {
         if let Some(mut r) = self.recording.take() {
+            if let Some(slot) = r.slot.as_mut()
+                && slot.end.is_none()
+            {
+                // Stopped before the slot's end was set: it ends here.
+                slot.end = Some(self.engine.transport_snapshot().position.max(slot.from + 1));
+            }
             self.engine
                 .transport(TransportCommand::SetRecording(false))?;
             self.engine.end_recording()?;
@@ -878,6 +893,9 @@ impl Session {
         let outcome = r.writer.map(RecordWriter::join).unwrap_or_default();
         if let Some(e) = &outcome.error {
             self.notify(NoticeLevel::Error, format!("recording: {e}"));
+        }
+        if let Some(slot) = r.slot {
+            return self.finish_slot_recording(slot, outcome, r.midi.as_ref(), r.latency);
         }
         let (overruns, _) = self.engine.record_counters();
         let mut commands = Vec::new();

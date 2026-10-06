@@ -69,6 +69,23 @@ pub enum LauncherOp {
     /// Write what the launcher plays into the arrangement (see the module
     /// docs).
     SetRecord(bool),
+    /// Record into an empty slot of an armed track from the next launch
+    /// position; again (or launching or stopping its track) ends it at the
+    /// next one, and the new clip plays on in time.
+    Record {
+        track: TrackId,
+        scene: SceneId,
+    },
+}
+
+/// A recording into a launcher slot (engine samples).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SlotRecording {
+    pub track: TrackId,
+    pub scene: SceneId,
+    pub from: i64,
+    /// Where it ends, once asked to.
+    pub end: Option<i64>,
 }
 
 /// One stretch a launched clip played: its clip, from/to (engine samples).
@@ -156,7 +173,16 @@ impl Session {
 
     pub(crate) fn launcher_op(&mut self, op: LauncherOp) -> Result<()> {
         let quantize = self.project.launcher.quantize.into();
+        // Launching or stopping a recording track ends its recording.
+        match &op {
+            LauncherOp::Launch { track, .. } | LauncherOp::StopTrack(track) => {
+                self.end_slot_recording(Some(*track));
+            }
+            LauncherOp::LaunchScene(_) | LauncherOp::StopAll => self.end_slot_recording(None),
+            _ => {}
+        }
         match op {
+            LauncherOp::Record { track, scene } => self.record_slot(track, scene)?,
             LauncherOp::Launch { track, scene } => match self.project.launcher.clip(track, scene) {
                 Some(_) => {
                     let slot = SlotKey { track, scene }.hash();
@@ -392,6 +418,219 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    /// The slot being recorded into: track, scene, and whether it is
+    /// ending.
+    pub fn launcher_recording(&self) -> Option<(TrackId, SceneId, bool)> {
+        let s = self.recording.as_ref()?.slot?;
+        Some((s.track, s.scene, s.end.is_some()))
+    }
+
+    /// Start recording into a slot, or end the recording there.
+    fn record_slot(&mut self, track: TrackId, scene: SceneId) -> Result<()> {
+        if let Some(s) = self.recording.as_ref().and_then(|r| r.slot) {
+            if s.track == track && s.scene == scene {
+                self.end_slot_recording(Some(track));
+                return Ok(());
+            }
+            return Err(SessionError::Other("already recording into a slot".into()));
+        }
+        if self.recording.is_some() {
+            return Err(SessionError::Other(
+                "stop recording the arrangement first".into(),
+            ));
+        }
+        let Some(t) = self.project.track(track) else {
+            return Err(SessionError::Other("no such track".into()));
+        };
+        if !t.record_arm {
+            return Err(SessionError::Other(format!(
+                "arm '{}' to record into the launcher",
+                t.name
+            )));
+        }
+        if self.project.launcher.clip(track, scene).is_some() {
+            return Err(SessionError::Other("the slot has a clip".into()));
+        }
+        let quantize = self.project.launcher.quantize.into();
+        let pos = self.engine.transport_snapshot().position;
+        let playing = self.transport.playing;
+        let from = if playing {
+            faderframe_engine::launch::next_boundary(
+                quantize,
+                pos,
+                &self.project.timeline,
+                self.engine.sample_rate() as f64,
+            )
+        } else {
+            pos
+        };
+        self.start_recording_only(from, Some(track))?;
+        let Some(r) = self.recording.as_mut() else {
+            // Nothing could be recorded (a notice says why).
+            return Ok(());
+        };
+        r.slot = Some(SlotRecording {
+            track,
+            scene,
+            from,
+            end: None,
+        });
+        // What the track plays stops where the recording starts.
+        self.engine
+            .launch(LaunchCommand::Stop { track, quantize })?;
+        if !playing {
+            self.play()?;
+        }
+        self.revision += 1;
+        Ok(())
+    }
+
+    /// The slot recording (on `track`, or any) ends at the next launch
+    /// position.
+    fn end_slot_recording(&mut self, track: Option<TrackId>) {
+        let quantize = self.project.launcher.quantize.into();
+        let pos = self.engine.transport_snapshot().position;
+        let rate = self.engine.sample_rate() as f64;
+        let tl = &self.project.timeline;
+        if let Some(s) = self.recording.as_mut().and_then(|r| r.slot.as_mut())
+            && s.end.is_none()
+            && track.is_none_or(|t| t == s.track)
+        {
+            let end = faderframe_engine::launch::next_boundary(quantize, pos, tl, rate);
+            s.end = Some(end.max(s.from + 1));
+            self.revision += 1;
+        }
+    }
+
+    /// A slot recording's take becomes the slot's clip, playing on in time.
+    pub(crate) fn finish_slot_recording(
+        &mut self,
+        slot: SlotRecording,
+        outcome: crate::record::RecordOutcome,
+        midi: Option<&crate::midi::MidiTake>,
+        latency: i64,
+    ) -> Result<()> {
+        let end = slot.end.unwrap_or(slot.from + 1);
+        let mut commands = Vec::new();
+        let mut clip = None;
+        if let Some(m) = midi
+            && let Some(i) = m.tracks.iter().position(|t| *t == slot.track)
+        {
+            // Notes are where they were heard already.
+            clip = self.midi_take_clip(m, i, Some((slot.from, end)));
+        }
+        let mut opened = None;
+        if let Some(take) = outcome.takes.into_iter().find(|t| t.track == slot.track) {
+            let p = &mut self.project;
+            let take_rate = take.sample_rate.max(1) as f64;
+            let to_project = |f: i64| (f as f64 * p.sample_rate as f64 / take_rate).round() as i64;
+            let name = take.path.file_stem().map_or_else(
+                || "Launcher Take".to_string(),
+                |s| s.to_string_lossy().to_string(),
+            );
+            if let Some(seg) = take.segments.first() {
+                let offset =
+                    seg.file_offset as i64 + latency + (slot.from - seg.timeline_start).max(0);
+                let length = (end - slot.from).min(take.frames as i64 - offset);
+                if length > 0 {
+                    let source = faderframe_project::AudioSource {
+                        id: p.ids.allocate(),
+                        name: name.clone(),
+                        spec: faderframe_project::SourceSpec::File {
+                            path: take.path.clone(),
+                            channels: take.channels as u16,
+                            frames: take.frames as i64,
+                            sample_rate: take.sample_rate,
+                        },
+                    };
+                    clip = Some(Clip {
+                        id: p.ids.allocate(),
+                        track: slot.track,
+                        name,
+                        color: None,
+                        start: MusicalTime::ZERO,
+                        muted: false,
+                        content: ClipContent::Audio(faderframe_project::AudioClip {
+                            source: source.id,
+                            source_offset: to_project(offset),
+                            length: to_project(length),
+                            gain_db: 0.0,
+                            fades: faderframe_project::ClipFades::default(),
+                            stretch: faderframe_project::StretchSettings::Off,
+                            reversed: false,
+                            warp: None,
+                            pitch: None,
+                            effects: None,
+                        }),
+                    });
+                    opened = Some((source.id, take.path.clone(), take.peaks));
+                    commands.push(Command::AddSource {
+                        source: Box::new(source),
+                    });
+                }
+            }
+        }
+        let Some(mut clip) = clip else {
+            self.notify(
+                crate::NoticeLevel::Warning,
+                "nothing was recorded into the slot",
+            );
+            return Ok(());
+        };
+        clip.start = MusicalTime::ZERO;
+        if let Some((id, path, peaks)) = opened {
+            match crate::media::open_stream(&path) {
+                Ok(s) => {
+                    self.sources
+                        .insert(id, faderframe_engine::Source::Stream(s));
+                }
+                Err(e) => self.notify(
+                    crate::NoticeLevel::Error,
+                    format!("{}: {e}", path.display()),
+                ),
+            }
+            self.peaks.insert(id, std::sync::Arc::new(peaks));
+        }
+        commands.push(Command::SetLauncherSlot {
+            track: slot.track,
+            scene: slot.scene,
+            clip: Some(Box::new(clip)),
+        });
+        self.edit(Command::Batch {
+            label: "Record Clip".into(),
+            commands,
+        })?;
+        // It plays on from where the recording started, in time.
+        if self.transport.playing {
+            self.engine.launch(LaunchCommand::Resume {
+                track: slot.track,
+                slot: SlotKey {
+                    track: slot.track,
+                    scene: slot.scene,
+                }
+                .hash(),
+                start: slot.from,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// A slot recording past its end stops (every tick).
+    pub(crate) fn poll_slot_recording(&mut self) {
+        let due = self.recording.as_ref().and_then(|r| {
+            let end = r.slot?.end?;
+            // Captured that much after it was heard.
+            let late = r.latency.max(r.midi.as_ref().map_or(0, |m| m.shift));
+            Some(end + late)
+        });
+        if let Some(due) = due
+            && self.engine.transport_snapshot().position >= due
+            && let Err(e) = self.stop_recording()
+        {
+            self.notify(crate::NoticeLevel::Error, e.to_string());
+        }
     }
 
     /// Launching while stopped starts playback.

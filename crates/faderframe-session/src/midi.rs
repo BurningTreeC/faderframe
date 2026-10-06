@@ -1477,147 +1477,174 @@ impl Session {
 }
 
 impl Session {
+    /// The clip a finished MIDI take makes on its `i`th track: bar-rounded
+    /// around what was played, or exactly `span` (timeline samples; a
+    /// launcher slot's recording), with the clip's start as its position.
+    pub(crate) fn midi_take_clip(
+        &mut self,
+        take: &MidiTake,
+        i: usize,
+        span: Option<(i64, i64)>,
+    ) -> Option<faderframe_project::Clip> {
+        use faderframe_project::{Clip, ClipContent, MidiClip, MidiNote};
+        let track = &take.tracks[i];
+        let name = self.project.track(*track).map(|t| t.name.clone())?;
+        let mut notes = take.notes[i].clone();
+        let mut ccs = take.controllers[i].clone();
+        let sysex_rec = take.sysex[i].clone();
+        let last_pass = notes
+            .iter()
+            .map(|n| n.pass)
+            .chain(ccs.iter().map(|c| c.4))
+            .max();
+        if self.record.loop_mode == crate::LoopRecordMode::LastPass
+            && let Some(last) = last_pass
+        {
+            notes.retain(|n| n.pass == last);
+            ccs.retain(|c| c.4 == last);
+        }
+        if let Some((from, to)) = span {
+            notes.retain(|n| n.start < to && n.end > from);
+            for n in &mut notes {
+                n.start = n.start.max(from);
+                n.end = n.end.min(to).max(n.start + 1);
+            }
+            ccs.retain(|c| c.0 < to);
+        }
+        if span.is_none() && notes.is_empty() && ccs.is_empty() && sysex_rec.is_empty() {
+            return None;
+        }
+        notes.sort_by_key(|n| (n.start, n.key));
+        let ids: Vec<faderframe_core::NoteId> =
+            notes.iter().map(|_| self.project.ids.allocate()).collect();
+        let to_musical = |s: i64| self.engine.samples_to_musical(&self.project, s.max(0));
+        // MPE: member-channel expression goes with the notes.
+        let expressions = match self.project.track(*track).and_then(|t| t.mpe) {
+            Some(cfg) => mpe_expressions(
+                &notes,
+                &ids,
+                &mut ccs,
+                cfg.bend_range,
+                self.engine.sample_rate() as f64,
+                |pos, start| to_musical(pos) - to_musical(start),
+            ),
+            None => Vec::new(),
+        };
+        let meter = &self.project.timeline.meter;
+        let first = notes
+            .iter()
+            .map(|n| n.start)
+            .chain(ccs.iter().map(|c| c.0))
+            .chain(sysex_rec.iter().map(|x| x.0))
+            .min()
+            .unwrap_or(0);
+        let last = notes
+            .iter()
+            .map(|n| n.end)
+            .chain(ccs.iter().map(|c| c.0))
+            .chain(sysex_rec.iter().map(|x| x.0))
+            .max()
+            .unwrap_or(first);
+        let (start, end) = match span {
+            Some((from, to)) => (to_musical(from), to_musical(to)),
+            None => (
+                meter.bar_start(meter.bar_at(to_musical(first))),
+                meter.bar_start(meter.bar_at(to_musical(last)) + 1),
+            ),
+        };
+        let sysex_events: Vec<faderframe_project::SysexEvent> = sysex_rec
+            .iter()
+            .map(|(pos, data)| faderframe_project::SysexEvent {
+                time: (to_musical(*pos) - start).max(faderframe_timeline::MusicalTime::ZERO),
+                data: data.clone(),
+            })
+            .collect();
+        let midi_notes: Vec<MidiNote> = notes
+            .iter()
+            .zip(ids)
+            .map(|(n, id)| {
+                let s = to_musical(n.start);
+                MidiNote {
+                    id,
+                    start: s - start,
+                    length: (to_musical(n.end) - s).max(faderframe_timeline::MusicalTime(1)),
+                    key: n.key,
+                    velocity: n.velocity.max(1),
+                    channel: n.channel,
+                    muted: false,
+                }
+            })
+            .collect();
+        // Controller moves become lanes (one per controller and channel).
+        let mut lanes: Vec<faderframe_project::ControllerLane> = Vec::new();
+        for &(pos, c, ch, v, _) in &ccs {
+            let time = (to_musical(pos) - start).max(faderframe_timeline::MusicalTime::ZERO);
+            let i = match lanes
+                .iter()
+                .position(|l| l.controller == c && l.channel == ch)
+            {
+                Some(i) => i,
+                None => {
+                    lanes.push(faderframe_project::ControllerLane::new(c, ch));
+                    lanes.len() - 1
+                }
+            };
+            lanes[i]
+                .points
+                .push(faderframe_project::ControllerPoint { time, value: v });
+        }
+        for l in &mut lanes {
+            l.normalize();
+        }
+        lanes.sort_by_key(|l| (l.controller, l.channel));
+        let takes = self
+            .project
+            .clips_of(*track)
+            .iter()
+            .filter(|c| c.name.starts_with(&format!("{name} Take")))
+            .count();
+        Some(Clip {
+            id: self.project.ids.allocate(),
+            track: *track,
+            name: format!("{name} Take {}", takes + 1),
+            color: None,
+            start,
+            muted: false,
+            content: ClipContent::Midi(MidiClip {
+                length: end - start,
+                notes: midi_notes,
+                controllers: lanes,
+                expressions,
+                sysex: sysex_events,
+            }),
+        })
+    }
+
     /// Clips for a finished MIDI take (one per track with notes), and the
     /// carving Replace mode does first.
     pub(crate) fn midi_take_commands(
         &mut self,
         take: &MidiTake,
     ) -> (Vec<Command>, Vec<faderframe_core::ClipId>) {
-        use faderframe_project::{Clip, ClipContent, MidiClip, MidiNote};
         let mut commands = Vec::new();
         let mut placed = Vec::new();
-        for (i, track) in take.tracks.iter().enumerate() {
-            let Some(name) = self.project.track(*track).map(|t| t.name.clone()) else {
+        for i in 0..take.tracks.len() {
+            let Some(clip) = self.midi_take_clip(take, i, None) else {
                 continue;
             };
-            let mut notes = take.notes[i].clone();
-            let mut ccs = take.controllers[i].clone();
-            let sysex_rec = take.sysex[i].clone();
-            let last_pass = notes
-                .iter()
-                .map(|n| n.pass)
-                .chain(ccs.iter().map(|c| c.4))
-                .max();
-            if self.record.loop_mode == crate::LoopRecordMode::LastPass
-                && let Some(last) = last_pass
-            {
-                notes.retain(|n| n.pass == last);
-                ccs.retain(|c| c.4 == last);
-            }
-            if notes.is_empty() && ccs.is_empty() && sysex_rec.is_empty() {
-                continue;
-            }
-            notes.sort_by_key(|n| (n.start, n.key));
-            let ids: Vec<faderframe_core::NoteId> =
-                notes.iter().map(|_| self.project.ids.allocate()).collect();
-            let to_musical = |s: i64| self.engine.samples_to_musical(&self.project, s.max(0));
-            // MPE: member-channel expression goes with the notes.
-            let expressions = match self.project.track(*track).and_then(|t| t.mpe) {
-                Some(cfg) => mpe_expressions(
-                    &notes,
-                    &ids,
-                    &mut ccs,
-                    cfg.bend_range,
-                    self.engine.sample_rate() as f64,
-                    |pos, start| to_musical(pos) - to_musical(start),
-                ),
-                None => Vec::new(),
-            };
-            let meter = &self.project.timeline.meter;
-            let first = notes
-                .iter()
-                .map(|n| n.start)
-                .chain(ccs.iter().map(|c| c.0))
-                .chain(sysex_rec.iter().map(|x| x.0))
-                .min()
-                .unwrap_or(0);
-            let last = notes
-                .iter()
-                .map(|n| n.end)
-                .chain(ccs.iter().map(|c| c.0))
-                .chain(sysex_rec.iter().map(|x| x.0))
-                .max()
-                .unwrap_or(first);
-            let start = meter.bar_start(meter.bar_at(to_musical(first)));
-            let end = meter.bar_start(meter.bar_at(to_musical(last)) + 1);
-            let sysex_events: Vec<faderframe_project::SysexEvent> = sysex_rec
-                .iter()
-                .map(|(pos, data)| faderframe_project::SysexEvent {
-                    time: (to_musical(*pos) - start).max(faderframe_timeline::MusicalTime::ZERO),
-                    data: data.clone(),
-                })
-                .collect();
-            let midi_notes: Vec<MidiNote> = notes
-                .iter()
-                .zip(ids)
-                .map(|(n, id)| {
-                    let s = to_musical(n.start);
-                    MidiNote {
-                        id,
-                        start: s - start,
-                        length: (to_musical(n.end) - s).max(faderframe_timeline::MusicalTime(1)),
-                        key: n.key,
-                        velocity: n.velocity.max(1),
-                        channel: n.channel,
-                        muted: false,
-                    }
-                })
-                .collect();
-            // Controller moves become lanes (one per controller and channel).
-            let mut lanes: Vec<faderframe_project::ControllerLane> = Vec::new();
-            for &(pos, c, ch, v, _) in &ccs {
-                let time = (to_musical(pos) - start).max(faderframe_timeline::MusicalTime::ZERO);
-                let i = match lanes
-                    .iter()
-                    .position(|l| l.controller == c && l.channel == ch)
-                {
-                    Some(i) => i,
-                    None => {
-                        lanes.push(faderframe_project::ControllerLane::new(c, ch));
-                        lanes.len() - 1
-                    }
-                };
-                lanes[i]
-                    .points
-                    .push(faderframe_project::ControllerPoint { time, value: v });
-            }
-            for l in &mut lanes {
-                l.normalize();
-            }
-            lanes.sort_by_key(|l| (l.controller, l.channel));
             if self.record.mode == crate::RecordMode::Replace {
+                let end = clip.end(&self.project.timeline, self.project.sample_rate);
                 commands.extend(crate::record::carve_midi(
                     &mut self.project,
-                    *track,
-                    start,
+                    clip.track,
+                    clip.start,
                     end,
                 ));
             }
-            let takes = self
-                .project
-                .clips_of(*track)
-                .iter()
-                .filter(|c| c.name.starts_with(&format!("{name} Take")))
-                .count();
-            let id = self.project.ids.allocate();
+            placed.push(clip.id);
             commands.push(Command::AddClip {
-                clip: Box::new(Clip {
-                    id,
-                    track: *track,
-                    name: format!("{name} Take {}", takes + 1),
-                    color: None,
-                    start,
-                    muted: false,
-                    content: ClipContent::Midi(MidiClip {
-                        length: end - start,
-                        notes: midi_notes,
-                        controllers: lanes,
-                        expressions,
-                        sysex: sysex_events,
-                    }),
-                }),
+                clip: Box::new(clip),
             });
-            placed.push(id);
         }
         (commands, placed)
     }

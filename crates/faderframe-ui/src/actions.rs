@@ -1236,6 +1236,27 @@ pub fn install(app: &Rc<AppState>) {
                 a.dispatch(Action::Launcher(LauncherOp::Launch { track, scene }));
             }
         }),
+        // `launch-record:<track>@<scene n>`: record into (or end recording
+        // into) that slot.
+        named("launch-record", |a, arg| {
+            let Some((name, n)) = arg.split_once('@') else {
+                return;
+            };
+            let found = {
+                let s = a.session.borrow();
+                let p = s.project();
+                let track = p.tracks.iter().find(|t| t.name == name).map(|t| t.id);
+                let scene = n
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|n| p.launcher.scenes.get(n.saturating_sub(1)))
+                    .map(|s| s.id);
+                track.zip(scene)
+            };
+            if let Some((track, scene)) = found {
+                a.dispatch(Action::Launcher(LauncherOp::Record { track, scene }));
+            }
+        }),
         named("launch-scene", |a, arg| {
             let scene = {
                 let s = a.session.borrow();

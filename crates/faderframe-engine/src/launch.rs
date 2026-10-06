@@ -61,6 +61,13 @@ pub enum LaunchCommand {
     },
     /// Every track plays the arrangement again (at once).
     BackToArrangement,
+    /// Play a slot's clip at once as if it had started at `start` (a clip
+    /// just recorded goes on looping in time).
+    Resume {
+        track: TrackId,
+        slot: u64,
+        start: i64,
+    },
 }
 
 /// One track's launcher state.
@@ -217,6 +224,13 @@ impl LaunchState {
                     if t.current.is_some() || t.next.is_some() {
                         t.next = Some((None, at));
                     }
+                }
+            }
+            LaunchCommand::Resume { track, slot, start } => {
+                if let Some(t) = self.entry(track) {
+                    t.current = Some((slot, start.min(pos)));
+                    t.next = None;
+                    t.arrangement = false;
                 }
             }
             LaunchCommand::BackToArrangement => {

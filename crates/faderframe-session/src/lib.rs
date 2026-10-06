@@ -985,6 +985,9 @@ struct ActiveRecording {
     latency: i64,
     /// The transport has reported recording at least once.
     seen: bool,
+    /// Recording into a clip-launcher slot (one track) instead of the
+    /// arrangement.
+    slot: Option<launcher::SlotRecording>,
 }
 
 /// What the arranger draws while recording.
@@ -1866,6 +1869,7 @@ impl Session {
             self.automation_play_requested();
         }
         self.poll_launcher(was_playing);
+        self.poll_slot_recording();
         if self.album_state.is_playing() {
             // The project started playing: it has the outputs back.
             if !was_playing && self.transport.playing {
