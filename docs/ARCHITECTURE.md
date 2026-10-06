@@ -1864,6 +1864,25 @@ track's material there carved away) in one "Record Launches" step when
 the transport stops. The grid is `faderframe-view-launcher`
 (`ViewKind::Launcher`); the arranger dims tracks that play the launcher.
 
+Recording into a slot (`LauncherOp::Record`, an armed track's empty
+slot) runs the arrangement recorder for that track only
+(`start_recording_only`) from the next launch position, with a
+`SlotRecording` on the `ActiveRecording`; asked again (or the track
+launched or stopped) it ends on the next one, is stopped once the
+transport is past that plus the capture latency, and `finish_slot_recording`
+turns the take into the slot's clip (audio from the take file, MIDI via
+`midi_take_clip` over the span) that plays on in time
+(`LaunchCommand::Resume` with the recording's start). Follow actions
+(`Launcher::follow`, `FollowKind`, `Command::SetFollowAction`) become
+`snapshot::Follow`s on the launch lanes (targets among the track's clips
+in scene order); `LaunchState::follow` queues them on the audio thread
+as soon as a clip plays (`followed` ones are not shown as waiting, a new
+snapshot queues them again). Clips dragged from the arranger reach the
+grid through the canvas host's payloads (`CanvasView::drag_payload`/
+`hover_payload`/`drop_payload`/`cancel_drag`; the move is cancelled with
+`Action::CancelGesture` = `History::cancel`) and land by
+`LauncherOp::PlaceClips`.
+
 ### Control surfaces
 
 `faderframe-control` holds the protocols without I/O: the session builds
