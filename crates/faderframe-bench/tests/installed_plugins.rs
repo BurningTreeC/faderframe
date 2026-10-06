@@ -102,6 +102,7 @@ fn tone_track(p: &mut Project, sources: &mut SourceMap, layout: ChannelLayout) -
                 stretch: StretchSettings::Off,
                 reversed: false,
                 warp: None,
+                pitch: None,
             }),
         },
     );

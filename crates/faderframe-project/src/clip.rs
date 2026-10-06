@@ -68,6 +68,10 @@ pub struct AudioClip {
     /// Elastic audio: the clip's time map (`None`: plays 1:1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warp: Option<crate::Warp>,
+    /// Pitch editing: its notes, moved or straightened (`None`: as
+    /// recorded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pitch: Option<crate::pitch::PitchEdit>,
 }
 
 impl AudioClip {
@@ -621,6 +625,7 @@ mod tests {
                 stretch: StretchSettings::Off,
                 reversed: false,
                 warp: None,
+                pitch: None,
             }),
         };
         assert_eq!(clip.end(&timeline, 48_000), MusicalTime::from_quarters_i(6));

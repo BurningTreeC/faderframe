@@ -27,3 +27,6 @@ faderframe-automation.workspace = true
 rtrb.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+faderframe-analysis.workspace = true

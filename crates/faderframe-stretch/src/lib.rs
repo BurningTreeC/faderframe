@@ -36,6 +36,8 @@ unsafe extern "C" {
         output_length: i32,
     );
     fn ff_stretch_set_transpose(s: *mut c_void, factor: f32);
+    fn ff_stretch_set_formant(s: *mut c_void, factor: f32, compensate: i32);
+    fn ff_stretch_set_formant_base(s: *mut c_void, hz: f32);
 }
 
 /// Analysis settings.
@@ -199,6 +201,20 @@ impl Stretcher {
     pub fn set_transpose(&mut self, factor: f32) {
         // SAFETY: `raw` is a live stretcher owned by `self`.
         unsafe { ff_stretch_set_transpose(self.raw.as_ptr(), factor) }
+    }
+
+    /// Formants: moved by `factor` (1 = where they are), and with
+    /// `keep` kept in place when the pitch is transposed (a voice keeps
+    /// its character instead of sounding smaller or larger).
+    pub fn set_formant(&mut self, factor: f32, keep: bool) {
+        // SAFETY: `raw` is a live stretcher owned by `self`.
+        unsafe { ff_stretch_set_formant(self.raw.as_ptr(), factor, i32::from(keep)) }
+    }
+
+    /// A rough fundamental for the formant analysis (0: estimated).
+    pub fn set_formant_base(&mut self, hz: f32) {
+        // SAFETY: `raw` is a live stretcher owned by `self`.
+        unsafe { ff_stretch_set_formant_base(self.raw.as_ptr(), hz) }
     }
 }
 

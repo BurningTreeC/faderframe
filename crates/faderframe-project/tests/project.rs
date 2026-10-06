@@ -523,6 +523,7 @@ fn sources_are_undoable_and_protected_while_in_use() {
             stretch: Default::default(),
             reversed: false,
             warp: None,
+            pitch: None,
         }),
     };
     let mut h = History::default();

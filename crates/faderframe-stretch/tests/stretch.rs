@@ -24,6 +24,14 @@ fn cpp_allocations() -> u64 {
     }
 }
 
+/// The allocation counter counts the whole process: tests that configure
+/// stretchers run one at a time, so none counts another's.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 const SR: f64 = 48_000.0;
 
 fn sine(freq: f64, frames: usize) -> Vec<f32> {
@@ -72,6 +80,7 @@ fn stretch(s: &mut Stretcher, input: &[f32], factor: f64) -> Vec<f32> {
 
 #[test]
 fn stretching_keeps_the_pitch() {
+    let _serial = serial();
     let mut s = Stretcher::new(1, SR, Preset::Polyphonic).unwrap();
     let input = sine(440.0, 96_000);
     for factor in [1.5, 0.75] {
@@ -88,6 +97,7 @@ fn stretching_keeps_the_pitch() {
 
 #[test]
 fn latency_contract_aligns_input_and_output() {
+    let _serial = serial();
     // A click at input frame 20 000, played at the original speed, comes
     // out at output frame 20 000 once the output latency is removed.
     let mut s = Stretcher::new(1, SR, Preset::Rhythmic).unwrap();
@@ -110,6 +120,7 @@ fn latency_contract_aligns_input_and_output() {
 
 #[test]
 fn processing_never_allocates() {
+    let _serial = serial();
     let mut stretchers = vec![
         Stretcher::new(2, SR, Preset::Polyphonic).unwrap(),
         Stretcher::new(2, SR, Preset::Rhythmic).unwrap(),
@@ -136,8 +147,11 @@ fn processing_never_allocates() {
             .enumerate()
         {
             let n = 64 + (i * 37) % 512;
-            // Transposing as it goes (the samplers' Keep Length, bends).
+            // Transposing as it goes (the samplers' Keep Length, bends,
+            // pitch editing with its formants kept or moved).
             s.set_transpose([0.5, 1.0, 1.26, 2.0][i % 4]);
+            s.set_formant([1.0, 1.0, 0.84, 1.19, 1.0][i % 5], i % 3 != 0);
+            s.set_formant_base([0.0, 220.0][i % 2]);
             let take = ((n as f64 * ratio) as usize).min(4096);
             if pos + take > input.len() {
                 pos = 0;
@@ -172,4 +186,60 @@ fn processing_never_allocates() {
         drop(Stretcher::new(2, SR, Preset::Polyphonic));
         assert!(cpp_allocations() > before);
     }
+}
+
+/// The spectral centroid of `x` (Hz), by a plain DFT over 2048 frames.
+fn centroid(x: &[f32]) -> f64 {
+    let n = 2048;
+    let x = &x[x.len() / 2..x.len() / 2 + n];
+    let (mut num, mut den) = (0.0, 0.0);
+    for k in 1..n / 2 {
+        let (mut re, mut im) = (0.0, 0.0);
+        for (i, v) in x.iter().enumerate() {
+            let w = 0.5 - 0.5 * (std::f64::consts::TAU * i as f64 / n as f64).cos();
+            let a = std::f64::consts::TAU * (k * i) as f64 / n as f64;
+            re += f64::from(*v) * w * a.cos();
+            im -= f64::from(*v) * w * a.sin();
+        }
+        let m = (re * re + im * im).sqrt();
+        num += m * k as f64 * SR / n as f64;
+        den += m;
+    }
+    num / den
+}
+
+#[test]
+fn transposing_can_keep_the_formants() {
+    let _serial = serial();
+    // A buzz (all harmonics of 150 Hz) through a resonance near 1 kHz:
+    // a vowel-like spectrum.
+    let mut lp = 0.0f64;
+    let mut bp = 0.0f64;
+    let (f, q) = (2.0 * (std::f64::consts::PI * 1_000.0 / SR).sin(), 0.2);
+    let input: Vec<f32> = (0..96_000)
+        .map(|i| {
+            let phase = (i as f64 * 150.0 / SR).fract();
+            let saw = 2.0 * phase - 1.0;
+            let hp = saw - lp - q * bp;
+            bp += f * hp;
+            lp += f * bp;
+            (bp * 0.3) as f32
+        })
+        .collect();
+    let shifted = |keep: bool| {
+        let mut s = Stretcher::new(1, SR, Preset::Polyphonic).unwrap();
+        s.set_transpose(2f32.powf(5.0 / 12.0));
+        s.set_formant(1.0, keep);
+        stretch(&mut s, &input, 1.0)
+    };
+    let moved = centroid(&shifted(false));
+    let kept = centroid(&shifted(true));
+    let original = centroid(&input);
+    // Up a fourth: without keeping them the formants rise with the pitch,
+    // kept they stay near the original's.
+    assert!(moved > original * 1.15, "{moved} vs {original}");
+    assert!(
+        (kept / original - 1.0).abs() < (moved / original - 1.0).abs() / 2.0,
+        "kept {kept}, moved {moved}, original {original}"
+    );
 }

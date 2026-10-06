@@ -493,6 +493,7 @@ pub(crate) fn place_takes(
             stretch: Default::default(),
             reversed: false,
             warp: None,
+            pitch: None,
         }),
     };
     // Existing material in the way.
@@ -1094,6 +1095,7 @@ impl Session {
                         stretch: Default::default(),
                         reversed: false,
                         warp: None,
+                        pitch: None,
                     }),
                 }),
             });

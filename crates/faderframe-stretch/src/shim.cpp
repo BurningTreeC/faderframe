@@ -49,4 +49,12 @@ void ff_stretch_set_transpose(void *s, float factor) {
     static_cast<Stretch *>(s)->setTransposeFactor(factor);
 }
 
+void ff_stretch_set_formant(void *s, float factor, int32_t compensate) {
+    static_cast<Stretch *>(s)->setFormantFactor(factor, compensate != 0);
+}
+
+void ff_stretch_set_formant_base(void *s, float hz) {
+    static_cast<Stretch *>(s)->setFormantBase(hz);
+}
+
 }

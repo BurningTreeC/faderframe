@@ -58,6 +58,7 @@ fn session() -> (Session, TrackId, ClipId) {
                 stretch: StretchSettings::Off,
                 reversed: false,
                 warp: None,
+                pitch: None,
             }),
         }),
     })

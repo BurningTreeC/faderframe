@@ -589,6 +589,7 @@ name = "faderframe-engine"
 version = "0.7.0"
 dependencies = [
  "base64",
+ "faderframe-analysis",
  "faderframe-audio",
  "faderframe-audio-files",
  "faderframe-audio-graph",

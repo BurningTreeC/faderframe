@@ -396,6 +396,7 @@ pub fn demo_project(sample_rate: u32) -> Project {
                 stretch: StretchSettings::Off,
                 reversed: false,
                 warp: None,
+                pitch: None,
             }),
         };
         track.clips.push(clip.id);

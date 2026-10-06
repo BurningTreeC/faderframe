@@ -2214,6 +2214,7 @@ impl Session {
                     stretch: Default::default(),
                     reversed: false,
                     warp: None,
+                    pitch: None,
                 }),
             };
             clips.push(clip.id);

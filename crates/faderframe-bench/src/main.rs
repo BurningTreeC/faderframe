@@ -282,6 +282,7 @@ fn build(args: &Args) -> Project {
                 stretch: StretchSettings::Off,
                 reversed: false,
                 warp: None,
+                pitch: None,
             }),
         };
         t.clips.push(clip.id);

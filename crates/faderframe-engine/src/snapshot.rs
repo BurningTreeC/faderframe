@@ -147,6 +147,9 @@ pub enum WarpMode {
     Varispeed,
     /// Pitch-preserving time stretching.
     Stretch(faderframe_stretch::Preset),
+    /// Pitch-synchronous grains (pitch-edited clips): exact pitch, kept
+    /// formants, through the time map.
+    Psola,
 }
 
 /// An audio clip played through a warp time map.
@@ -168,6 +171,45 @@ pub struct WarpedRegion {
     /// Pitch correction when the source rate differs from the engine rate
     /// (stretching plays source frames at the engine rate).
     pub transpose: f32,
+    /// A pitch edit's corrections.
+    pub pitch: Option<PitchCurve>,
+}
+
+/// A pitch edit as played: its corrections at regular source frames.
+#[derive(Debug)]
+pub struct PitchCurve {
+    /// Source frame (the source's own rate) of the first value, and
+    /// source frames between values.
+    pub start: f64,
+    pub step: f64,
+    /// (semitones, formant semitones, the sung pitch in Hz or 0).
+    pub values: Vec<(f32, f32, f32)>,
+    pub keep_formants: bool,
+}
+
+impl PitchCurve {
+    /// The correction at source frame `source` (interpolated; none
+    /// outside the curve). Realtime-safe.
+    #[inline]
+    pub fn at(&self, source: f64) -> (f32, f32, f32) {
+        let x = (source - self.start) / self.step.max(1e-9);
+        if x < 0.0 || self.values.is_empty() {
+            return (0.0, 0.0, 0.0);
+        }
+        let i = x.floor() as usize;
+        let Some(a) = self.values.get(i) else {
+            return (0.0, 0.0, 0.0);
+        };
+        let b = self.values.get(i + 1).unwrap_or(a);
+        let f = (x - i as f64) as f32;
+        // The sung pitch only between voiced values.
+        let hz = if a.2 > 0.0 && b.2 > 0.0 {
+            a.2 + (b.2 - a.2) * f
+        } else {
+            a.2.max(b.2)
+        };
+        (a.0 + (b.0 - a.0) * f, a.1 + (b.1 - a.1) * f, hz)
+    }
 }
 
 impl WarpedRegion {
@@ -616,6 +658,7 @@ impl TimelineSnapshot {
                     .region(start, sources, sr, project_rate);
                     let Some(r) = region else { continue };
                     let lane = lanes.entry(clip.track).or_default();
+                    let pitched = a.pitch.as_ref().is_some_and(|e| e.edited());
                     match a.warp.as_ref() {
                         Some(w) if !a.reversed && !w.is_identity(a.source_offset, a.length) => {
                             lane.warped.push(warped_region(
@@ -623,6 +666,18 @@ impl TimelineSnapshot {
                                 r,
                                 a,
                                 w,
+                                sr,
+                                project_rate,
+                            ));
+                        }
+                        // Pitch edited: through a stretcher, 1:1 in time.
+                        _ if pitched && !a.reversed => {
+                            let w = faderframe_project::Warp::uniform(a.length);
+                            lane.warped.push(warped_region(
+                                clip.id.raw(),
+                                r,
+                                a,
+                                &w,
                                 sr,
                                 project_rate,
                             ));
@@ -824,9 +879,15 @@ fn warped_region(
     }
     points.dedup_by(|b, a| b.0 <= a.0);
     let channels = region.source.channels();
+    let pitch = a
+        .pitch
+        .as_ref()
+        .filter(|e| e.edited())
+        .map(|e| pitch_curve(e, a, src, project_rate));
     let mode = match w.algorithm {
-        WarpAlgorithm::Varispeed => WarpMode::Varispeed,
+        _ if pitch.is_some() => WarpMode::Psola,
         _ if channels > faderframe_stretch::MAX_CHANNELS => WarpMode::Varispeed,
+        WarpAlgorithm::Varispeed => WarpMode::Varispeed,
         WarpAlgorithm::Polyphonic => WarpMode::Stretch(faderframe_stretch::Preset::Polyphonic),
         WarpAlgorithm::Rhythmic => WarpMode::Stretch(faderframe_stretch::Preset::Rhythmic),
     };
@@ -837,7 +898,37 @@ fn warped_region(
         points,
         mode,
         transpose: (source_rate / sr) as f32,
+        pitch,
         region,
+    }
+}
+
+/// A clip's pitch corrections over its source range, every curve hop.
+fn pitch_curve(
+    e: &faderframe_project::pitch::PitchEdit,
+    a: &faderframe_project::AudioClip,
+    src: f64,
+    project_rate: f64,
+) -> PitchCurve {
+    let hop = i64::from(e.hop.max(1));
+    let from = a.source_offset - hop;
+    let count = (a.source_span() / hop + 3) as usize;
+    let values = (0..count)
+        .map(|k| {
+            let at = from + k as i64 * hop;
+            let (st, fm) = e.correction_at(at, project_rate);
+            let hz = e
+                .note_at(at)
+                .and_then(|n| e.notes[n].sung_at(at, e.hop))
+                .map_or(0.0, |m| 440.0 * 2f32.powf((m - 69.0) / 12.0));
+            (st, fm, hz)
+        })
+        .collect();
+    PitchCurve {
+        start: from as f64 * src,
+        step: hop as f64 * src,
+        values,
+        keep_formants: e.keep_formants,
     }
 }
 

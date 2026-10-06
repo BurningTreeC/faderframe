@@ -6,6 +6,7 @@ mod crosstalk;
 mod io;
 mod midi_player;
 mod plugin;
+mod psola;
 mod send;
 mod strip;
 

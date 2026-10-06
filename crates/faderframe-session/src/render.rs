@@ -345,6 +345,7 @@ pub(crate) fn process_through(
                 stretch: StretchSettings::Off,
                 reversed: false,
                 warp: None,
+                pitch: None,
             }),
         },
     );

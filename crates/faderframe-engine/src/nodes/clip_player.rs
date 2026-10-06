@@ -1,3 +1,4 @@
+use super::psola::PsolaVoice;
 use crate::context::EngineContext;
 use crate::snapshot::{AudioRegion, Source, WarpMode, WarpedRegion};
 use faderframe_audio_graph::{
@@ -23,6 +24,8 @@ pub struct AudioClipPlayer {
     track: TrackId,
     latency: u32,
     voices: Vec<StretchVoice>,
+    /// For pitch-edited clips.
+    psola: Vec<PsolaVoice>,
     /// Blocks processed (voices free up when their clip stopped playing).
     cycle: u64,
 }
@@ -32,18 +35,23 @@ pub struct AudioClipPlayer {
 pub struct StretchVoices {
     pub polyphonic: usize,
     pub rhythmic: usize,
+    /// PSOLA voices (pitch-edited clips).
+    pub psola: usize,
     /// Channels per voice.
     pub channels: usize,
 }
 
 impl StretchVoices {
     pub fn is_empty(&self) -> bool {
-        self.polyphonic + self.rhythmic == 0
+        self.polyphonic + self.rhythmic + self.psola == 0
     }
 
     /// For the node key.
     pub fn key(&self) -> u64 {
-        (self.polyphonic as u64) | (self.rhythmic as u64) << 8 | (self.channels as u64) << 16
+        (self.polyphonic as u64)
+            | (self.rhythmic as u64) << 8
+            | (self.channels as u64) << 16
+            | (self.psola as u64) << 24
     }
 }
 
@@ -78,37 +86,9 @@ impl StretchVoice {
         })
     }
 
-    /// Fill the input buffers with source frames `[from, from + n)` (zero
-    /// outside the clip's source range or a missing page).
+    /// Fill the input buffers with source frames `[from, from + n)`.
     fn read(&mut self, w: &WarpedRegion, from: i64, n: usize) {
-        let lo = w.source_lo.floor() as i64;
-        let hi = (w.source_hi.ceil() as i64).min(w.region.source.frames());
-        let src_ch = w.region.source.channels();
-        for (c, buf) in self.input.iter_mut().enumerate() {
-            let buf = &mut buf[..n];
-            buf.fill(0.0);
-            if c >= src_ch {
-                continue;
-            }
-            let a = from.max(lo).max(0);
-            let b = (from + n as i64).min(hi);
-            if b <= a {
-                continue;
-            }
-            let off = (a - from) as usize;
-            let len = (b - a) as usize;
-            match &w.region.source {
-                Source::Memory(d) => {
-                    let ch = d.channel(c);
-                    buf[off..off + len].copy_from_slice(&ch[a as usize..a as usize + len]);
-                }
-                Source::Stream(s) => s.read_segments(c, a, len, |o, k, seg| {
-                    if let Some(seg) = seg {
-                        buf[off + o..off + o + k].copy_from_slice(&seg[..k]);
-                    }
-                }),
-            }
-        }
+        read_source(w, from, n, &mut self.input);
     }
 
     /// Run the stretcher for `outputs` frames, feeding the source up to
@@ -163,11 +143,46 @@ impl StretchVoice {
     }
 }
 
+/// Fill `bufs` with source frames `[from, from + n)` of `w` (zero outside
+/// the clip's source range or a missing page). Realtime-safe.
+pub(crate) fn read_source(w: &WarpedRegion, from: i64, n: usize, bufs: &mut [Vec<f32>]) {
+    let lo = w.source_lo.floor() as i64;
+    let hi = (w.source_hi.ceil() as i64).min(w.region.source.frames());
+    let src_ch = w.region.source.channels();
+    for (c, buf) in bufs.iter_mut().enumerate() {
+        let n = n.min(buf.len());
+        let buf = &mut buf[..n];
+        buf.fill(0.0);
+        if c >= src_ch {
+            continue;
+        }
+        let a = from.max(lo).max(0);
+        let b = (from + n as i64).min(hi);
+        if b <= a {
+            continue;
+        }
+        let off = (a - from) as usize;
+        let len = (b - a) as usize;
+        match &w.region.source {
+            Source::Memory(d) => {
+                let ch = d.channel(c);
+                buf[off..off + len].copy_from_slice(&ch[a as usize..a as usize + len]);
+            }
+            Source::Stream(s) => s.read_segments(c, a, len, |o, k, seg| {
+                if let Some(seg) = seg {
+                    buf[off + o..off + o + k].copy_from_slice(&seg[..k]);
+                }
+            }),
+        }
+    }
+}
+
 impl AudioClipPlayer {
     pub fn new(track: TrackId) -> Self {
         Self {
             track,
             voices: Vec::new(),
+            psola: Vec::new(),
             cycle: 0,
             latency: 0,
         }
@@ -198,12 +213,35 @@ impl AudioClipPlayer {
                 }
             }
         }
+        let psola = (0..v.psola)
+            .map(|_| PsolaVoice::new(channels, sample_rate, max_block))
+            .collect();
         Self {
             track,
             voices,
+            psola,
             cycle: 0,
             latency: 0,
         }
+    }
+
+    /// The PSOLA voice playing `w` (or a free one).
+    fn psola_for(&mut self, w: &WarpedRegion) -> Option<usize> {
+        let fits = |v: &PsolaVoice| v.channels() >= w.region.source.channels();
+        if let Some(i) = self
+            .psola
+            .iter()
+            .position(|v| v.bound.is_some_and(|(k, _)| k == w.key) && fits(v))
+        {
+            return Some(i);
+        }
+        let cycle = self.cycle;
+        let i = self
+            .psola
+            .iter()
+            .position(|v| fits(v) && (v.bound.is_none() || v.last_cycle + 1 < cycle))?;
+        self.psola[i].bound = None;
+        Some(i)
     }
 
     /// The voice playing `w` (or a free one of its preset).
@@ -366,9 +404,30 @@ impl Processor<EngineContext> for AudioClipPlayer {
         for w in lane.warped[..upto].iter().filter(|w| w.region.end > pos) {
             let a = pos.max(w.region.start);
             let b = end.min(w.region.end);
+            if let (WarpMode::Psola, Some(curve)) = (w.mode, &w.pitch) {
+                let Some(vi) = self.psola_for(w) else {
+                    play_varispeed(w, out, pos, a, b);
+                    continue;
+                };
+                let cycle = self.cycle;
+                let v = &mut self.psola[vi];
+                let n = (b - a) as usize;
+                v.process(w, curve, a - w.region.start, n);
+                v.last_cycle = cycle;
+                let src_ch = w.region.source.channels().min(v.channels());
+                let output = &v.output;
+                for_each_channel_route(src_ch, out.num_channels(), |s, d, g| {
+                    let dst = out.channel_mut(d);
+                    for (k, x) in output[s][..n].iter().enumerate() {
+                        let t = a + k as i64;
+                        dst[(t - pos) as usize] += x * w.region.gain_at(t) * g;
+                    }
+                });
+                continue;
+            }
             let voice = match w.mode {
                 WarpMode::Stretch(preset) => self.voice_for(w, preset),
-                WarpMode::Varispeed => None,
+                WarpMode::Varispeed | WarpMode::Psola => None,
             };
             let Some(vi) = voice else {
                 play_varispeed(w, out, pos, a, b);

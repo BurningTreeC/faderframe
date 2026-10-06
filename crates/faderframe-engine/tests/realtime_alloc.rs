@@ -920,6 +920,34 @@ fn warped_playback_does_not_allocate() {
             algorithm,
         });
     }
+    // Pitch edits (PSOLA voices): the pad's notes moved, and the warped
+    // plucks' too, their formants as well.
+    for name in ["Pad", "Pluck"] {
+        use faderframe_project::pitch::{PitchEdit, PitchNote};
+        let t = project.tracks.iter().find(|t| t.name == name).unwrap();
+        let id = t.clips[0];
+        let Some(ClipContent::Audio(a)) = project.clips.get_mut(&id).map(|c| &mut c.content) else {
+            panic!("audio clip");
+        };
+        let (from, span) = (a.source_offset, a.source_span());
+        let note = |start: i64, end: i64, pitch: f32, shift: f32, formant: f32| PitchNote {
+            start,
+            end,
+            pitch,
+            shift,
+            drift: 0.5,
+            formant,
+            curve: vec![12; ((end - start) / 240) as usize],
+        };
+        a.pitch = Some(PitchEdit {
+            hop: 240,
+            notes: vec![
+                note(from, from + span / 2, 57.0, 3.0, 2.0),
+                note(from + span / 2, from + span, 45.0, -2.0, -12.0),
+            ],
+            keep_formants: name == "Pad",
+        });
+    }
     let sources = render_generated_sources(&project, SR);
     let config = EngineConfig {
         sample_rate: SR,
@@ -947,7 +975,10 @@ fn warped_playback_does_not_allocate() {
             r.processor.process_device(&mut bufs);
         }
     });
-    assert_eq!(n, 0, "allocations/frees while playing warped audio");
+    assert_eq!(
+        n, 0,
+        "allocations/frees while playing warped or pitch-edited audio"
+    );
 }
 
 #[test]

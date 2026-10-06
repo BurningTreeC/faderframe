@@ -68,6 +68,7 @@ fn add_clip(s: &mut Session, t: TrackId, source: AudioSourceId, start: f64, bars
                 stretch: StretchSettings::Off,
                 reversed: false,
                 warp: None,
+                pitch: None,
             }),
         }),
     }))

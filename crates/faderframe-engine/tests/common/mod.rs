@@ -137,6 +137,7 @@ impl TestProject {
                     stretch: StretchSettings::Off,
                     reversed: false,
                     warp: None,
+                    pitch: None,
                 }),
             },
         );

@@ -195,23 +195,25 @@ enum Role {
 /// warp preset its clips use, two when such clips overlap.
 pub fn stretch_voices(project: &Project, track: &faderframe_project::Track) -> StretchVoices {
     use faderframe_project::{ClipContent, WarpAlgorithm};
-    let mut spans: [Vec<(i64, i64)>; 2] = [Vec::new(), Vec::new()];
+    let mut spans: [Vec<(i64, i64)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     for c in project.clips_of(track.id) {
         let ClipContent::Audio(a) = &c.content else {
             continue;
         };
-        let Some(w) = a.warp.as_ref() else { continue };
-        if c.muted
-            || a.reversed
-            || track.freeze.is_some()
-            || w.is_identity(a.source_offset, a.length)
-        {
+        let pitched = a.pitch.as_ref().is_some_and(|e| e.edited());
+        let warped = a
+            .warp
+            .as_ref()
+            .filter(|w| !w.is_identity(a.source_offset, a.length));
+        if c.muted || a.reversed || track.freeze.is_some() || (warped.is_none() && !pitched) {
             continue;
         }
-        let i = match w.algorithm {
-            WarpAlgorithm::Polyphonic => 0,
-            WarpAlgorithm::Rhythmic => 1,
-            WarpAlgorithm::Varispeed => continue,
+        // Pitch edits play through PSOLA voices, warped or not.
+        let i = match warped.map(|w| w.algorithm) {
+            _ if pitched => 2,
+            Some(WarpAlgorithm::Polyphonic) => 0,
+            Some(WarpAlgorithm::Rhythmic) => 1,
+            _ => continue,
         };
         let start = c.start.ticks();
         spans[i].push((start, c.end(&project.timeline, project.sample_rate).ticks()));
@@ -224,10 +226,11 @@ pub fn stretch_voices(project: &Project, track: &faderframe_project::Track) -> S
         let overlap = v.windows(2).any(|w| w[1].0 < w[0].1);
         if overlap { 2 } else { 1 }
     };
-    let [mut poly, mut rhythmic] = spans;
+    let [mut poly, mut rhythmic, mut psola] = spans;
     StretchVoices {
         polyphonic: need(&mut poly),
         rhythmic: need(&mut rhythmic),
+        psola: need(&mut psola),
         channels: track.layout.channel_count().max(2),
     }
 }
