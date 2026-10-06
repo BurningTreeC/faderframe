@@ -16,7 +16,9 @@
 //! Meters are `A0 0y <side << 4 | segment>`. The host pings (`90 00 00`)
 //! every second, or the surface goes off line and its faders stop.
 
-use crate::{Button, Protocol, SurfaceInput, SurfaceState, abbreviate, fit, meter_level};
+use crate::{
+    AutomationButton, Button, Protocol, SurfaceInput, SurfaceState, abbreviate, fit, meter_level,
+};
 
 const STRIPS: usize = 8;
 const HEADER: [u8; 6] = [0xF0, 0x00, 0x00, 0x66, 0x05, 0x00];
@@ -30,6 +32,8 @@ mod zone {
     pub const LOCATE: u8 = 0x0F;
     pub const KEYS: u8 = 0x08;
     pub const TIMECODE_LEDS: u8 = 0x16;
+    pub const ASSIGN: u8 = 0x0B;
+    pub const AUTO_MODE: u8 = 0x18;
 }
 
 mod port {
@@ -136,6 +140,14 @@ impl Hui {
             (zone::LOCATE, 0) => Button::Start,
             (zone::LOCATE, 1) => Button::End,
             (zone::LOCATE, 3) => Button::Loop,
+            (zone::ASSIGN, 2) => Button::PanPage,
+            // send a … e
+            (zone::ASSIGN, 3..=7) => Button::SendPage(Some((7 - port) as usize)),
+            (zone::AUTO_MODE, 1) => Button::Automation(AutomationButton::Latch),
+            (zone::AUTO_MODE, 2) => Button::Automation(AutomationButton::Read),
+            (zone::AUTO_MODE, 3) => Button::Automation(AutomationButton::Off),
+            (zone::AUTO_MODE, 4) => Button::Automation(AutomationButton::Write),
+            (zone::AUTO_MODE, 5) => Button::Automation(AutomationButton::Touch),
             (zone::KEYS, 3) => Button::Undo,
             (zone::KEYS, 7) => Button::Save,
             _ => return,
@@ -219,8 +231,15 @@ impl Protocol for Hui {
                     (v & 0x7F) as u8,
                 ]);
             }
+            // A dot (1…11) for pan, a bar from the left (0x21…0x2B) for
+            // levels.
             let ring = s.map_or(0, |s| {
-                1 + ((s.pan.clamp(-1.0, 1.0) + 1.0) * 5.0).round() as u8
+                let v = s.pot.clamp(0.0, 1.0);
+                if s.pot_bipolar {
+                    1 + (v * 10.0).round() as u8
+                } else {
+                    0x21 + (v * 10.0).round() as u8
+                }
             });
             if self.sent.rings[i] != Some(ring) {
                 self.sent.rings[i] = Some(ring);
@@ -262,6 +281,20 @@ impl Protocol for Hui {
         self.led(zone::TRANSPORT, 5, state.recording, out);
         self.led(zone::LOCATE, 3, state.looping, out);
         self.led(zone::TIMECODE_LEDS, 2, true, out);
+        self.led(zone::ASSIGN, 2, state.page == crate::Page::Pan, out);
+        for k in 0..5u8 {
+            let on = state.page == crate::Page::Send(k as usize);
+            self.led(zone::ASSIGN, 7 - k, on, out);
+        }
+        for (port, b) in [
+            (1, AutomationButton::Latch),
+            (2, AutomationButton::Read),
+            (3, AutomationButton::Off),
+            (4, AutomationButton::Write),
+            (5, AutomationButton::Touch),
+        ] {
+            self.led(zone::AUTO_MODE, port, state.automation == Some(b), out);
+        }
         // Bars (3), beats (2), sixteenths (1), ticks (2): rightmost first.
         let p = state.position;
         let text = format!(

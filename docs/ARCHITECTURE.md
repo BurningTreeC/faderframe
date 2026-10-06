@@ -1878,7 +1878,11 @@ meters refreshed every 100 ms), `hui` (zone/port switches and LEDs,
 digits, meters, a ping every second) and `osc` (an OSC 1.0 codec and
 FaderFrame's address space, documented in the module; toggles compare
 with the state shown so TouchOSC's toggle and push buttons both work).
-Faders a user holds are never moved.
+Faders a user holds are never moved. The pots' page (`Page::Pan` or a
+send), Flip (faders and pots swapped) and the selected track's automation
+mode are part of the state (Mackie: Pan/Send/Flip/Read/Write/Touch/Latch
+buttons and LEDs, the assignment display; HUI: the assignment and
+auto-mode zones; OSC: `/page`, `/flip`, `/automation`).
 
 `session::control` opens the surfaces from `SurfaceSettings` (saved as
 `Preferences::control_surfaces`): MIDI ones through
@@ -1891,7 +1895,9 @@ Surfaces sit side by side from the shared bank start over
 `Session::surface_tracks` (mixer strips in editor order). Faders and pots
 are gestures (touch to release, or 400 ms of rest), buttons toggle, select
 or run the transport, banks move by a surface's width; OSC also launches
-the clip launcher. Tests: `faderframe-control`'s, `session/tests/control.rs`
+the clip launcher. Automation buttons put the selected track's lanes in
+that mode (a volume lane is made when it has none); Save saves a project
+that has a file. Tests: `faderframe-control`'s, `session/tests/control.rs`
 (a virtual Mackie on the demo, OSC over UDP on localhost).
 
 ### Track presets

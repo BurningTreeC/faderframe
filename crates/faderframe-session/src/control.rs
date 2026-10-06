@@ -14,7 +14,8 @@
 
 use crate::{Action, Session, TransportAction};
 use faderframe_control::{
-    Button, MASTER, Position, Protocol, StripState, SurfaceInput, SurfaceState,
+    AutomationButton, Button, MASTER, Page, Position, Protocol, StripState, SurfaceInput,
+    SurfaceState,
 };
 use faderframe_core::{FaderLaw, TrackId};
 use faderframe_project::{Command, Track, TrackKind};
@@ -116,6 +117,9 @@ pub struct ControlState {
     gesture: Option<Instant>,
     /// Faders held on a surface (gesture ends on release).
     held: usize,
+    /// What the pots control, and whether faders and pots are swapped.
+    page: Page,
+    flip: bool,
 }
 
 impl Default for ControlState {
@@ -128,7 +132,21 @@ impl Default for ControlState {
             started: Instant::now(),
             gesture: None,
             held: 0,
+            page: Page::Pan,
+            flip: false,
         }
+    }
+}
+
+/// Pot ticks per full travel (levels).
+const LEVEL_STEP: f32 = 0.01;
+
+fn pan_text(pan: f32) -> String {
+    let p = (pan * 100.0).round() as i32;
+    match p {
+        0 => "<C>".into(),
+        p if p < 0 => format!("L{}", -p),
+        p => format!("R{p}"),
     }
 }
 
@@ -294,12 +312,28 @@ impl Session {
                     };
                     let db = self.shown_volume_db(t);
                     let m = self.meter(t.id);
+                    let volume = law.db_to_position(db);
+                    let (pot, bipolar, pot_text) =
+                        self.pot_value(t).unwrap_or((0.0, false, String::new()));
+                    // Flipped: the fader moves what the pot did, the pot
+                    // the volume.
+                    let (fader, pot, pot_bipolar) = if self.control.flip {
+                        (pot, volume, false)
+                    } else {
+                        (volume, pot, bipolar)
+                    };
+                    let level = match self.control.page {
+                        Page::Pan if !self.control.flip => level_text(db),
+                        _ => pot_text,
+                    };
                     StripState {
                         present: true,
                         name: t.name.clone(),
-                        fader: law.db_to_position(db),
-                        level: level_text(db),
+                        fader,
+                        level,
                         pan: self.shown_pan(t),
+                        pot,
+                        pot_bipolar,
                         mute: self.shown_mute(t),
                         solo: t.solo,
                         arm: t.record_arm,
@@ -317,6 +351,9 @@ impl Session {
                 click: self.record.metronome != faderframe_engine::MetronomeMode::Off,
                 position,
                 first_track: first + 1,
+                page: self.control.page,
+                flip: self.control.flip,
+                automation: self.surface_automation(),
             };
             let s = &mut self.control.surfaces[k];
             let mut out = Vec::new();
@@ -386,10 +423,14 @@ impl Session {
                     return Ok(());
                 };
                 self.begin_surface_gesture()?;
-                self.dispatch(Action::Edit(Command::SetTrackVolume {
-                    track,
-                    db: law.position_to_db(travel),
-                }))?;
+                if self.control.flip && strip != MASTER {
+                    self.set_pot(track, travel)?;
+                } else {
+                    self.dispatch(Action::Edit(Command::SetTrackVolume {
+                        track,
+                        db: law.position_to_db(travel),
+                    }))?;
+                }
             }
             SurfaceInput::Touch { touched, .. } => {
                 if touched {
@@ -409,12 +450,23 @@ impl Session {
                 else {
                     return Ok(());
                 };
-                let (track, pan) = (t.id, self.shown_pan(t));
+                let track = t.id;
+                let volume = law.db_to_position(self.shown_volume_db(t));
+                let pot = self.pot_value(t).map(|(v, _, _)| v);
                 self.begin_surface_gesture()?;
-                self.dispatch(Action::Edit(Command::SetTrackPan {
-                    track,
-                    pan: (pan + delta as f32 * PAN_STEP).clamp(-1.0, 1.0),
-                }))?;
+                if self.control.flip {
+                    let travel = (volume + delta as f32 * LEVEL_STEP).clamp(0.0, 1.0);
+                    self.dispatch(Action::Edit(Command::SetTrackVolume {
+                        track,
+                        db: law.position_to_db(travel),
+                    }))?;
+                } else if let Some(v) = pot {
+                    let step = match self.control.page {
+                        Page::Pan => PAN_STEP / 2.0,
+                        Page::Send(_) => LEVEL_STEP,
+                    };
+                    self.set_pot(track, (v + delta as f32 * step).clamp(0.0, 1.0))?;
+                }
             }
             SurfaceInput::Pan { strip, pan } => {
                 let Some(track) = self.strip_track(k, strip) else {
@@ -510,13 +562,43 @@ impl Session {
                 }
             }
             Button::PotPress(i) => {
+                // Pan to the centre, a send (or, flipped, the volume) to 0 dB.
                 if let Some(t) = track(self, i) {
-                    self.dispatch(edit(Command::SetTrackPan {
-                        track: t.id,
-                        pan: 0.0,
-                    }))?;
+                    let unity = FaderLaw::console().unity_position();
+                    if self.control.flip {
+                        self.dispatch(edit(Command::SetTrackVolume {
+                            track: t.id,
+                            db: 0.0,
+                        }))?;
+                    } else {
+                        match self.control.page {
+                            Page::Pan => self.set_pot(t.id, 0.5)?,
+                            Page::Send(_) => self.set_pot(t.id, unity)?,
+                        }
+                    }
                 }
             }
+            Button::Flip => {
+                self.control.flip = !self.control.flip;
+                self.revision += 1;
+            }
+            Button::PanPage => self.control.page = Page::Pan,
+            Button::SendPage(Some(n)) => self.control.page = Page::Send(n),
+            Button::SendPage(None) => {
+                // Cycles through the sends the shown tracks have.
+                let most = self
+                    .surface_tracks()
+                    .iter()
+                    .map(|t| t.sends.len())
+                    .max()
+                    .unwrap_or(0)
+                    .max(1);
+                self.control.page = match self.control.page {
+                    Page::Send(n) => Page::Send((n + 1) % most),
+                    Page::Pan => Page::Send(0),
+                };
+            }
+            Button::Automation(b) => self.surface_automation_mode(b)?,
             Button::Play => self.dispatch(Action::Transport(TransportAction::Play))?,
             Button::Stop => self.dispatch(Action::Transport(TransportAction::Stop))?,
             Button::Record => self.dispatch(Action::Transport(TransportAction::ToggleRecord))?,
@@ -543,8 +625,12 @@ impl Session {
                 let at = self.playhead();
                 self.dispatch(Action::AddMarker(at))?;
             }
-            // Saving may need a file chooser: the window's job.
-            Button::Save => {}
+            // A project without a file name is saved from the window (it
+            // needs a file chooser).
+            Button::Save => match self.save() {
+                Ok(()) => self.notify(crate::NoticeLevel::Info, "saved"),
+                Err(e) => self.notify(crate::NoticeLevel::Warning, e.to_string()),
+            },
             Button::BankLeft => self.control.bank = self.control.bank.saturating_sub(width),
             Button::BankRight => {
                 if self.control.bank + width < count {
@@ -559,6 +645,101 @@ impl Session {
             }
         }
         Ok(())
+    }
+}
+
+impl Session {
+    /// What a track's pot controls on the current page: travel (0…1),
+    /// whether it is bipolar, its value as text.
+    fn pot_value(&self, t: &Track) -> Option<(f32, bool, String)> {
+        match self.control.page {
+            Page::Pan => {
+                let pan = self.shown_pan(t);
+                Some(((pan + 1.0) / 2.0, true, pan_text(pan)))
+            }
+            Page::Send(n) => t.sends.get(n).map(|s| {
+                let db = self.shown_send_db(t, s);
+                (
+                    FaderLaw::console().db_to_position(db),
+                    false,
+                    level_text(db),
+                )
+            }),
+        }
+    }
+
+    /// Set what the pot controls on the current page from travel (0…1).
+    fn set_pot(&mut self, track: TrackId, travel: f32) -> crate::Result<()> {
+        match self.control.page {
+            Page::Pan => self.dispatch(Action::Edit(Command::SetTrackPan {
+                track,
+                pan: (travel * 2.0 - 1.0).clamp(-1.0, 1.0),
+            })),
+            Page::Send(n) => {
+                let Some(send) = self
+                    .project
+                    .track(track)
+                    .and_then(|t| t.sends.get(n))
+                    .map(|s| s.id)
+                else {
+                    return Ok(());
+                };
+                self.dispatch(Action::Edit(Command::SetSendLevel {
+                    track,
+                    send,
+                    db: FaderLaw::console().position_to_db(travel),
+                }))
+            }
+        }
+    }
+
+    /// The selected track's automation mode (its first lane's).
+    fn surface_automation(&self) -> Option<AutomationButton> {
+        use faderframe_automation::AutomationMode as M;
+        let t = self.project.track(self.selection.primary_track()?)?;
+        Some(match t.automation.lanes.first()?.mode {
+            M::Off => AutomationButton::Off,
+            M::Read => AutomationButton::Read,
+            M::Touch => AutomationButton::Touch,
+            M::Latch => AutomationButton::Latch,
+            M::Write => AutomationButton::Write,
+        })
+    }
+
+    /// The selected track's lanes in a mode (a volume lane made if it has
+    /// none).
+    fn surface_automation_mode(&mut self, b: AutomationButton) -> crate::Result<()> {
+        use faderframe_automation::AutomationMode as M;
+        let Some(track) = self.selection.primary_track() else {
+            self.notify(
+                crate::NoticeLevel::Info,
+                "select a track for its automation mode",
+            );
+            return Ok(());
+        };
+        let none = self
+            .project
+            .track(track)
+            .is_some_and(|t| t.automation.lanes.is_empty());
+        if none {
+            self.dispatch(Action::ShowAutomation {
+                track,
+                target: faderframe_automation::AutomationTarget::TrackVolume,
+            })?;
+        }
+        let lanes: Vec<_> = self
+            .project
+            .track(track)
+            .map(|t| t.automation.lanes.iter().map(|l| (track, l.id)).collect())
+            .unwrap_or_default();
+        let mode = match b {
+            AutomationButton::Off => M::Off,
+            AutomationButton::Read => M::Read,
+            AutomationButton::Touch => M::Touch,
+            AutomationButton::Latch => M::Latch,
+            AutomationButton::Write => M::Write,
+        };
+        self.dispatch(Action::SetAutomationModes { lanes, mode })
     }
 }
 

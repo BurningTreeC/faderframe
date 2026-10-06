@@ -15,11 +15,14 @@
 //! | `/bank/{left,right}`, `/channel/{left,right}` | move the bank |
 //! | `/launcher/clip/N/S`, `/launcher/scene/S`, `/launcher/stop`, `/launcher/back` | the clip launcher (scene S 1-based) |
 //! | `/jog i`, `/undo`, `/save`, `/marker`, `/refresh` | |
+//! | `/flip`, `/page/pan`, `/page/send/K` | what faders and pots move |
+//! | `/automation/{off,read,touch,latch,write}` | the selected track's mode |
 //!
 //! Out (only what changed): `/strip/N/{name s, fader f, level s, pan f,
 //! mute i, solo i, arm i, select i, meter f}` (the meter 0…1),
 //! `/master/fader f`, `/transport/{play,record,loop,click} i`,
-//! `/transport/position s` ("bar.beat.sixteenth.tick") and `/bank/first i`.
+//! `/transport/position s` ("bar.beat.sixteenth.tick"), `/bank/first i`,
+//! `/page s` ("PN", "S1" …) and `/flip i`.
 
 use crate::{Button, MASTER, Protocol, SurfaceInput, SurfaceState, meter_level};
 use std::collections::HashMap;
@@ -314,6 +317,25 @@ impl OscSurface {
                     out.push(SurfaceInput::Jog(v as i32));
                 }
             }
+            ["flip"] if on => press(Button::Flip, out),
+            ["page", "pan"] if on => press(Button::PanPage, out),
+            ["page", "send", k] if on => {
+                if let Some(k) = index(k) {
+                    press(Button::SendPage(Some(k)), out);
+                }
+            }
+            ["automation", mode] if on => {
+                use crate::AutomationButton as A;
+                let b = match *mode {
+                    "off" => A::Off,
+                    "read" => A::Read,
+                    "touch" => A::Touch,
+                    "latch" => A::Latch,
+                    "write" => A::Write,
+                    _ => return,
+                };
+                press(Button::Automation(b), out);
+            }
             ["undo"] if on => press(Button::Undo, out),
             ["save"] if on => press(Button::Save, out),
             ["marker"] if on => press(Button::Marker, out),
@@ -395,6 +417,8 @@ impl Protocol for OscSurface {
             Arg::Int(state.first_track as i32),
             out,
         );
+        self.put("/page".into(), Arg::Str(state.page.short()), out);
+        self.put("/flip".into(), Arg::Int(i32::from(state.flip)), out);
     }
 
     fn reset(&mut self) {

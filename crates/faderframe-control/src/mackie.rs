@@ -15,7 +15,10 @@
 //! channel pressure (strip in the high nibble, segment 0–12 in the low),
 //! sent again every 100 ms (the surface lets them fall).
 
-use crate::{Button, MASTER, Protocol, SurfaceInput, SurfaceState, abbreviate, fit, meter_level};
+use crate::{
+    AutomationButton, Button, MASTER, Protocol, SurfaceInput, SurfaceState, abbreviate, fit,
+    meter_level,
+};
 
 /// Device ids: the Mackie Control and its extender.
 pub const MCU: u8 = 0x14;
@@ -32,6 +35,13 @@ mod note {
     pub const MUTE: u8 = 0x10;
     pub const SELECT: u8 = 0x18;
     pub const POT: u8 = 0x20;
+    pub const SEND: u8 = 0x29;
+    pub const PAN: u8 = 0x2A;
+    pub const FLIP: u8 = 0x32;
+    pub const READ: u8 = 0x4A;
+    pub const WRITE: u8 = 0x4B;
+    pub const AUTO_TOUCH: u8 = 0x4D;
+    pub const LATCH: u8 = 0x4E;
     pub const BANK_LEFT: u8 = 0x2E;
     pub const BANK_RIGHT: u8 = 0x2F;
     pub const CHANNEL_LEFT: u8 = 0x30;
@@ -158,6 +168,13 @@ impl Protocol for Mackie {
                     0x10..=0x17 => Button::Mute(strip(note::MUTE)),
                     0x18..=0x1F => Button::Select(strip(note::SELECT)),
                     0x20..=0x27 => Button::PotPress(strip(note::POT)),
+                    note::SEND => Button::SendPage(None),
+                    note::PAN => Button::PanPage,
+                    note::FLIP => Button::Flip,
+                    note::READ => Button::Automation(AutomationButton::Read),
+                    note::WRITE => Button::Automation(AutomationButton::Write),
+                    note::AUTO_TOUCH => Button::Automation(AutomationButton::Touch),
+                    note::LATCH => Button::Automation(AutomationButton::Latch),
                     note::BANK_LEFT => Button::BankLeft,
                     note::BANK_RIGHT => Button::BankRight,
                     note::CHANNEL_LEFT | note::LEFT => Button::ChannelLeft,
@@ -245,9 +262,15 @@ impl Protocol for Mackie {
         }
         for i in 0..STRIPS {
             let s = strip(i);
-            // Mode 0 (a dot), 1…11 left to right.
+            // Mode 0 (a dot, 1…11 left to right) for pan, mode 2 (a bar
+            // from the left) for levels.
             let ring = s.map_or(0, |s| {
-                1 + ((s.pan.clamp(-1.0, 1.0) + 1.0) * 5.0).round() as u8
+                let v = s.pot.clamp(0.0, 1.0);
+                if s.pot_bipolar {
+                    1 + (v * 10.0).round() as u8
+                } else {
+                    0x20 | (v * 11.0).round() as u8
+                }
             });
             if self.sent.rings[i] != Some(ring) {
                 self.sent.rings[i] = Some(ring);
@@ -265,6 +288,17 @@ impl Protocol for Mackie {
         self.led(note::CYCLE, state.looping, out);
         self.led(note::CLICK, state.click, out);
         self.led(note::BEATS, true, out);
+        self.led(note::PAN, state.page == crate::Page::Pan, out);
+        self.led(note::SEND, matches!(state.page, crate::Page::Send(_)), out);
+        self.led(note::FLIP, state.flip, out);
+        for (n, b) in [
+            (note::READ, AutomationButton::Read),
+            (note::WRITE, AutomationButton::Write),
+            (note::AUTO_TOUCH, AutomationButton::Touch),
+            (note::LATCH, AutomationButton::Latch),
+        ] {
+            self.led(n, state.automation == Some(b), out);
+        }
         // Bars, beats, sixteenths, ticks; the bank's first track.
         let p = state.position;
         let text = format!(
@@ -274,7 +308,7 @@ impl Protocol for Mackie {
             p.sixteenth.clamp(0, 99),
             p.tick.clamp(0, 999)
         );
-        let assign = format!("{:>2}", state.first_track.min(99));
+        let assign = state.page.short();
         let digits: Vec<u8> = text.bytes().chain(assign.bytes()).collect();
         for (k, c) in digits.iter().enumerate() {
             // Digit k from the left; CC 0x40 is the rightmost of the ten,
@@ -323,6 +357,7 @@ mod tests {
             fader: 0.75,
             level: "0.0".into(),
             pan: -1.0,
+            pot: 0.0,
             mute: true,
             meter_db: -5.0,
             ..StripState::default()
@@ -421,5 +456,46 @@ mod tests {
         sent.clear();
         m.update(&s, 0.0, &mut sent);
         assert!(sent.iter().any(|m| m[0] == 0xE1));
+    }
+
+    #[test]
+    fn pages_flip_and_automation() {
+        let mut m = Mackie::new(MCU);
+        let mut out = Vec::new();
+        for n in [0x29, 0x2A, 0x32, 0x4D] {
+            m.receive(&[0x90, n, 0x7F], &mut out);
+        }
+        let buttons: Vec<Button> = out
+            .iter()
+            .filter_map(|i| match i {
+                SurfaceInput::Button { button, .. } => Some(*button),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            buttons,
+            [
+                Button::SendPage(None),
+                Button::PanPage,
+                Button::Flip,
+                Button::Automation(AutomationButton::Touch)
+            ]
+        );
+        // A send page: a level bar on the ring, "S2" on the display, the
+        // send and flip LEDs, Touch lit.
+        let mut s = state();
+        s.strips[0].pot = 1.0;
+        s.strips[0].pot_bipolar = false;
+        s.page = crate::Page::Send(1);
+        s.flip = true;
+        s.automation = Some(AutomationButton::Touch);
+        let mut sent = Vec::new();
+        m.update(&s, 0.0, &mut sent);
+        let has = |msg: &[u8]| sent.iter().any(|m| m == msg);
+        assert!(has(&[0xB0, 0x30, 0x20 | 11]));
+        assert!(has(&[0xB0, 0x4B, b'S' - 0x40]));
+        assert!(has(&[0xB0, 0x4A, b'2']));
+        assert!(has(&[0x90, 0x29, 0x7F]) && has(&[0x90, 0x2A, 0x00]));
+        assert!(has(&[0x90, 0x32, 0x7F]) && has(&[0x90, 0x4D, 0x7F]));
     }
 }

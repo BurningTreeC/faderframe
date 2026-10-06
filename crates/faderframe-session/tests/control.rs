@@ -150,3 +150,63 @@ fn osc_moves_the_mixer_and_answers() {
     let db_after = s.project().track(bass).unwrap().volume_db;
     assert!((db_after - db).abs() > 0.01, "the move was its own step");
 }
+
+#[test]
+fn send_pages_flip_and_automation_from_a_mackie_control() {
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let surface = s.add_virtual_surface(SurfaceKind::Mackie);
+    s.tick(0.01);
+    // A shown track with a send.
+    let tracks: Vec<TrackId> = s.surface_tracks().iter().map(|t| t.id).collect();
+    let (i, t) = tracks
+        .iter()
+        .take(8)
+        .enumerate()
+        .find(|(_, t)| !s.project().track(**t).unwrap().sends.is_empty())
+        .map(|(i, t)| (i, *t))
+        .unwrap();
+    let send_db = |s: &Session| s.project().track(t).unwrap().sends[0].level_db;
+    let before = send_db(&s);
+    // Send: the pots move the first send.
+    surface.send(&[0x90, 0x29, 0x7F]);
+    s.tick(0.01);
+    surface.send(&[0xB0, 0x10 + i as u8, 0x05]);
+    s.tick(0.01);
+    assert!(send_db(&s) > before, "{} → {}", before, send_db(&s));
+    // Flip: the fader moves the send, to the top.
+    surface.send(&[0x90, 0x32, 0x7F]);
+    s.tick(0.01);
+    let vol = s.project().track(t).unwrap().volume_db;
+    surface.send(&[0x90, 0x68 + i as u8, 0x7F]);
+    surface.send(&[0xE0 | i as u8, 0x7F, 0x7F]);
+    surface.send(&[0x90, 0x68 + i as u8, 0x00]);
+    s.tick(0.01);
+    assert!((send_db(&s) - FaderLaw::console().max_db()).abs() < 0.01);
+    assert_eq!(
+        s.project().track(t).unwrap().volume_db,
+        vol,
+        "not the volume"
+    );
+    // The LEDs: Send and Flip lit, Pan dark; "S1" on the display.
+    let sent = surface.take();
+    assert!(sent.contains(&vec![0x90, 0x29, 0x7F]));
+    assert!(sent.contains(&vec![0x90, 0x32, 0x7F]));
+    assert!(sent.contains(&vec![0xB0, 0x4B, b'S' - 0x40]));
+    // Touch on the selected track: its lanes (a volume lane made) in Touch.
+    s.dispatch(Action::SelectTracks {
+        tracks: vec![t],
+        mode: faderframe_session::SelectMode::Replace,
+    })
+    .unwrap();
+    surface.send(&[0x90, 0x4D, 0x7F]);
+    s.tick(0.01);
+    let lanes = &s.project().track(t).unwrap().automation.lanes;
+    assert!(!lanes.is_empty());
+    assert!(
+        lanes
+            .iter()
+            .all(|l| l.mode == faderframe_session::AutomationMode::Touch)
+    );
+    s.tick(0.01);
+    assert!(surface.take().contains(&vec![0x90, 0x4D, 0x7F]));
+}

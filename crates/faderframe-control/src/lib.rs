@@ -34,6 +34,12 @@ pub struct StripState {
     pub level: String,
     /// -1 (left) … 1 (right).
     pub pan: f32,
+    /// What the pot's ring shows (0…1): the pan, a send level, or (flipped)
+    /// the volume.
+    pub pot: f32,
+    /// The ring is a dot from the middle (pan) rather than a bar from the
+    /// left (levels).
+    pub pot_bipolar: bool,
     pub mute: bool,
     pub solo: bool,
     pub arm: bool,
@@ -50,6 +56,8 @@ impl Default for StripState {
             fader: 0.0,
             level: String::new(),
             pan: 0.0,
+            pot: 0.5,
+            pot_bipolar: true,
             mute: false,
             solo: false,
             arm: false,
@@ -81,8 +89,43 @@ pub struct SurfaceState {
     pub looping: bool,
     pub click: bool,
     pub position: Position,
-    /// The first strip's track number (1-based; the assignment display).
+    /// The first strip's track number (1-based).
     pub first_track: usize,
+    /// What the pots do (and the faders, flipped).
+    pub page: Page,
+    /// Faders and pots swapped.
+    pub flip: bool,
+    /// The selected track's automation mode.
+    pub automation: Option<AutomationButton>,
+}
+
+/// What the pots control.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Page {
+    #[default]
+    Pan,
+    /// A send (0-based).
+    Send(usize),
+}
+
+impl Page {
+    /// Two characters for the assignment display.
+    pub fn short(self) -> String {
+        match self {
+            Page::Pan => "PN".into(),
+            Page::Send(n) => format!("S{}", (n + 1).min(9)),
+        }
+    }
+}
+
+/// Automation mode buttons.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AutomationButton {
+    Off,
+    Read,
+    Touch,
+    Latch,
+    Write,
 }
 
 /// Buttons a surface has.
@@ -111,6 +154,14 @@ pub enum Button {
     Undo,
     Save,
     Marker,
+    /// Faders and pots swap.
+    Flip,
+    /// The pots control pan.
+    PanPage,
+    /// The pots control a send (`None`: the next one).
+    SendPage(Option<usize>),
+    /// The selected track's automation mode.
+    Automation(AutomationButton),
 }
 
 /// What a surface sends.
