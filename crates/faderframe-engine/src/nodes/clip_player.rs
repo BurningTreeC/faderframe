@@ -1,6 +1,7 @@
 use super::psola::PsolaVoice;
 use crate::context::EngineContext;
-use crate::snapshot::{AudioRegion, Source, WarpMode, WarpedRegion};
+use crate::launch::{self, Play};
+use crate::snapshot::{AudioRegion, Lane, Source, WarpMode, WarpedRegion};
 use faderframe_audio_graph::{
     AudioBuffer, NodeIo, ProcessContext, Processor, for_each_channel_route,
 };
@@ -373,32 +374,17 @@ fn play_varispeed(w: &WarpedRegion, out: &mut AudioBuffer, pos: i64, a: i64, b: 
     });
 }
 
-impl Processor<EngineContext> for AudioClipPlayer {
-    fn latency(&self) -> u32 {
-        self.latency
-    }
-    fn process(&mut self, cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
-        let Some(out) = io.audio_out.first_mut() else {
-            return;
-        };
-        out.clear();
-        self.cycle += 1;
-        let t = &cx.data.transport;
-        if !t.playing {
-            return;
-        }
-        let Some(lane) = cx.data.timeline.lane(self.track) else {
-            return;
-        };
-        let pos = t.sample_position;
-        let end = pos + io.frames as i64;
+impl AudioClipPlayer {
+    /// Mix `lane`'s audio over lane time `[pos, end)` into `out`, lane time
+    /// `t` at block index `t - shift`.
+    fn play_span(&mut self, lane: &Lane, out: &mut AudioBuffer, pos: i64, end: i64, shift: i64) {
         // Regions are sorted by start; everything starting at/after `end` is
         // irrelevant for this block.
         let upto = lane.audio.partition_point(|r| r.start < end);
         for region in lane.audio[..upto].iter().filter(|r| r.end > pos) {
             let a = pos.max(region.start);
             let b = end.min(region.end);
-            play_region(region, out, pos, a, b);
+            play_region(region, out, shift, a, b);
         }
         let upto = lane.warped.partition_point(|w| w.region.start < end);
         for w in lane.warped[..upto].iter().filter(|w| w.region.end > pos) {
@@ -406,7 +392,7 @@ impl Processor<EngineContext> for AudioClipPlayer {
             let b = end.min(w.region.end);
             if let (WarpMode::Psola, Some(curve)) = (w.mode, &w.pitch) {
                 let Some(vi) = self.psola_for(w) else {
-                    play_varispeed(w, out, pos, a, b);
+                    play_varispeed(w, out, shift, a, b);
                     continue;
                 };
                 let cycle = self.cycle;
@@ -420,7 +406,7 @@ impl Processor<EngineContext> for AudioClipPlayer {
                     let dst = out.channel_mut(d);
                     for (k, x) in output[s][..n].iter().enumerate() {
                         let t = a + k as i64;
-                        dst[(t - pos) as usize] += x * w.region.gain_at(t) * g;
+                        dst[(t - shift) as usize] += x * w.region.gain_at(t) * g;
                     }
                 });
                 continue;
@@ -430,7 +416,7 @@ impl Processor<EngineContext> for AudioClipPlayer {
                 WarpMode::Varispeed | WarpMode::Psola => None,
             };
             let Some(vi) = voice else {
-                play_varispeed(w, out, pos, a, b);
+                play_varispeed(w, out, shift, a, b);
                 continue;
             };
             let cycle = self.cycle;
@@ -452,9 +438,54 @@ impl Processor<EngineContext> for AudioClipPlayer {
                 let dst = out.channel_mut(d);
                 for (k, x) in output[s][..n].iter().enumerate() {
                     let t = a + k as i64;
-                    dst[(t - pos) as usize] += x * w.region.gain_at(t) * g;
+                    dst[(t - shift) as usize] += x * w.region.gain_at(t) * g;
                 }
             });
+        }
+    }
+}
+
+impl Processor<EngineContext> for AudioClipPlayer {
+    fn latency(&self) -> u32 {
+        self.latency
+    }
+    fn process(&mut self, cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
+        let Some(out) = io.audio_out.first_mut() else {
+            return;
+        };
+        out.clear();
+        self.cycle += 1;
+        let t = &cx.data.transport;
+        if !t.playing {
+            return;
+        }
+        let pos = t.sample_position;
+        let timeline = &cx.data.timeline;
+        // The arrangement, or a launched clip looping from its start.
+        let (pieces, count) = launch::pieces(cx.data.launch.track(self.track), pos, io.frames);
+        for &(o, n, play) in &pieces[..count] {
+            let from = pos + o as i64;
+            let to = from + n as i64;
+            match play {
+                Play::Arrangement => {
+                    if let Some(lane) = timeline.lane(self.track) {
+                        self.play_span(lane, out, from, to, pos);
+                    }
+                }
+                Play::Clip { slot, start } => {
+                    let Some(l) = timeline.launch_lane(slot) else {
+                        continue;
+                    };
+                    let mut t = from;
+                    while t < to {
+                        let local = (t - start).rem_euclid(l.length);
+                        let k = (l.length - local).min(to - t);
+                        self.play_span(&l.lane, out, local, local + k, local - (t - pos));
+                        t += k;
+                    }
+                }
+                Play::Silence => {}
+            }
         }
     }
 }

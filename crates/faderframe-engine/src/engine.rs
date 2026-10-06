@@ -86,6 +86,7 @@ enum Message {
         at_ns: u64,
         play: bool,
     },
+    Launch(crate::launch::LaunchCommand),
 }
 
 /// Objects retired by the audio thread, dropped on the control thread.
@@ -146,6 +147,8 @@ impl CallbackStamp {
 #[derive(Debug, Default)]
 pub struct EngineShared {
     pub transport: TransportShared,
+    /// The clip launcher's state, published after every callback.
+    pub launch: crate::launch::LaunchStatus,
     pub metrics: CallbackMetrics,
     stream_sample_rate: AtomicU32,
     stream_buffer_size: AtomicU32,
@@ -239,6 +242,7 @@ pub fn create_with_epoch(
             ),
             ahead_seq: 0,
             preview_active: false,
+            launch: crate::launch::LaunchState::new(),
         },
         transport: TransportState::default(),
         shared: Arc::clone(&shared),
@@ -274,6 +278,7 @@ pub fn create_with_epoch(
         stats: GraphStats::default(),
         warnings: Vec::new(),
         voices: Vec::new(),
+        launch_tracks: Vec::new(),
         plan: Arc::new(StreamPlan::default()),
         suspended_lanes: Default::default(),
         midi_routing: crate::build::MidiRouting {
@@ -352,6 +357,11 @@ impl EngineProcessor {
             // here.
             std::mem::swap(&mut self.ctx.timeline, &mut *t);
             self.retire(Garbage::Timeline(t));
+            // Launched clips whose slots went stop.
+            let timeline = &self.ctx.timeline;
+            self.ctx
+                .launch
+                .retain_slots(|s| timeline.launch_lane(s).is_some());
         }
         if let Some(mut m) = self.modulation_rx.take() {
             std::mem::swap(&mut self.ctx.modulation, &mut *m);
@@ -430,6 +440,16 @@ impl EngineProcessor {
                     } else {
                         TransportCommand::Stop
                     });
+                }
+                Message::Launch(cmd) => {
+                    let rate = self.stream_rate as f64;
+                    self.ctx.launch.command(
+                        cmd,
+                        self.transport.position(),
+                        self.transport.playing(),
+                        &self.ctx.timeline.timeline,
+                        rate,
+                    );
                 }
             }
         }
@@ -516,6 +536,9 @@ impl EngineProcessor {
             let info = self.transport.info(&self.ctx.timeline.timeline, rate);
             self.ctx.transport = info;
             self.ctx.discontinuity = self.transport.take_discontinuity();
+            self.ctx
+                .launch
+                .transport(info.playing, self.transport.position());
             if self.ctx.discontinuity {
                 self.click.reset();
             }
@@ -657,9 +680,11 @@ impl EngineProcessor {
                     self.shared.metronome.gain(),
                 );
             }
+            self.ctx.launch.played(pos, n);
             self.transport.advance(n);
             offset += n;
         }
+        self.ctx.launch.publish(&self.shared.launch);
         if self.ctx.preview_active
             && let Some(p) = self.preview.as_deref_mut()
         {
@@ -766,6 +791,8 @@ pub struct EngineController {
     /// Stretcher voices per track in the installed graph (a timeline edit
     /// that changes them rebuilds the graph).
     voices: Vec<(faderframe_core::TrackId, crate::nodes::StretchVoices)>,
+    /// The tracks with launcher clips in the installed graph.
+    launch_tracks: Vec<faderframe_core::TrackId>,
     /// The latest timeline snapshot (handed to an anticipator that starts).
     timeline: Arc<TimelineSnapshot>,
     /// The modulation published last, the tracks' buses, and the
@@ -780,6 +807,13 @@ pub struct EngineController {
     ahead_rings: std::collections::HashMap<faderframe_core::TrackId, Arc<crate::ahead::AheadRing>>,
     ahead_tracks: std::collections::HashSet<faderframe_core::TrackId>,
     ahead_misses: Arc<AtomicU64>,
+}
+
+/// The tracks with launcher clips (sorted).
+fn launch_tracks(project: &Project) -> Vec<faderframe_core::TrackId> {
+    let mut v: Vec<_> = project.launcher.slots.keys().map(|k| k.track).collect();
+    v.dedup();
+    v
 }
 
 /// Voices every audio track needs.
@@ -1266,8 +1300,12 @@ impl EngineController {
         match impact {
             Impact::None => Ok(()),
             Impact::Params => self.update_params(project),
-            Impact::Timeline if voice_needs(project) != self.voices => {
-                // A track gained (or no longer needs) stretcher voices.
+            Impact::Timeline
+                if voice_needs(project) != self.voices
+                    || launch_tracks(project) != self.launch_tracks =>
+            {
+                // A track gained (or no longer needs) stretcher voices, or
+                // launcher clips (those tracks play live).
                 self.sync(project, sources, Impact::Graph)
             }
             Impact::Timeline => {
@@ -1390,6 +1428,7 @@ impl EngineController {
         self.ahead_rings.retain(|t, _| ahead_tracks.contains(t));
         self.ahead_tracks = ahead_tracks;
         self.voices = voice_needs(project);
+        self.launch_tracks = launch_tracks(project);
         self.mod_shape = crate::modulation::shape(project);
         // Parameters must be valid before the new graph's processors read them.
         self.slots.write_params(
@@ -1453,6 +1492,16 @@ impl EngineController {
 
     pub fn transport(&mut self, cmd: TransportCommand) -> Result<(), EngineError> {
         self.send(Message::Transport(cmd))
+    }
+
+    /// Launch or stop launcher clips (see [`crate::launch`]).
+    pub fn launch(&mut self, cmd: crate::launch::LaunchCommand) -> Result<(), EngineError> {
+        self.send(Message::Launch(cmd))
+    }
+
+    /// The launcher's state as last published.
+    pub fn launch_status(&self) -> Vec<crate::launch::TrackStatus> {
+        self.shared.launch.read()
     }
 
     /// Start capturing `targets` (only while the transport records, and only
@@ -1583,6 +1632,7 @@ impl EngineController {
             midi_input: crate::midi::MidiInputBlock::with_capacity(0),
             ahead_seq: 0,
             preview_active: false,
+            launch: crate::launch::LaunchState::new(),
         };
         let (anticipator, link) = crate::ahead::start(
             ctx,

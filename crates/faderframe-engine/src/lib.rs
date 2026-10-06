@@ -23,6 +23,7 @@ mod build;
 mod click;
 mod context;
 mod engine;
+pub mod launch;
 pub mod midi;
 pub mod modulation;
 pub mod nodes;

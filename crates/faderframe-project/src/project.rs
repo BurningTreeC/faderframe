@@ -134,6 +134,9 @@ pub struct Project {
     /// The words along the timeline (transcribed or typed), by start.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lyrics: Vec<crate::lyrics::LyricLine>,
+    /// The clip launcher's scenes and slots.
+    #[serde(default, skip_serializing_if = "crate::launcher::Launcher::is_empty")]
+    pub launcher: crate::launcher::Launcher,
     /// Clip aliases: clips with the same link share their content (an edit
     /// of one reaches the others; position, name, colour and mute are each
     /// one's own).
@@ -174,6 +177,7 @@ impl Project {
             keys: Vec::new(),
             chords: Vec::new(),
             lyrics: Vec::new(),
+            launcher: crate::launcher::Launcher::default(),
             clip_links: BTreeMap::new(),
             ids,
         }
@@ -548,7 +552,15 @@ impl Project {
         max_id = max_id.max(self.clip_links.values().map(|l| l.raw()).max().unwrap_or(0));
         max_id = max_id
             .max(self.sources.keys().map(|k| k.raw()).max().unwrap_or(0))
-            .max(self.markers.iter().map(|m| m.id.raw()).max().unwrap_or(0));
+            .max(self.markers.iter().map(|m| m.id.raw()).max().unwrap_or(0))
+            .max(
+                self.launcher
+                    .scenes
+                    .iter()
+                    .map(|s| s.id.raw())
+                    .max()
+                    .unwrap_or(0),
+            );
         self.ids.reserve_through(max_id);
 
         // Clip ↔ track membership consistency.
@@ -563,6 +575,14 @@ impl Project {
             self.clips.remove(&id);
             notes.push(format!("removed clip {id} on a missing track"));
         }
+        // Launcher slots of clips, tracks or scenes that are gone.
+        let scenes: BTreeSet<faderframe_core::SceneId> =
+            self.launcher.scenes.iter().map(|s| s.id).collect();
+        let clips = &self.clips;
+        self.launcher.slots.retain(|k, c| {
+            clips.get(c).is_some_and(|clip| clip.track == k.track) && scenes.contains(&k.scene)
+        });
+        let in_slots = self.launcher_clips();
         for t in &mut self.tracks {
             t.clips
                 .retain(|c| self.clips.get(c).is_some_and(|clip| clip.track == t.id));
@@ -575,7 +595,7 @@ impl Project {
         let unlisted: Vec<(ClipId, TrackId)> = self
             .clips
             .values()
-            .filter(|c| !listed.contains(&c.id))
+            .filter(|c| !listed.contains(&c.id) && !in_slots.contains(&c.id))
             .map(|c| (c.id, c.track))
             .collect();
         for (clip, track) in unlisted {

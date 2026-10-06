@@ -102,6 +102,8 @@ pub fn ahead_eligible(
             .all(|s| !s.enabled || s.tap != SendTap::PreFx)
         && !fed.contains(&t.id)
         && project.track(t.id).is_some()
+        // Launched clips are played as they are launched.
+        && !project.launcher.slots.keys().any(|k| k.track == t.id)
 }
 
 /// Can `t`'s modulators run ahead of the playhead? Those that follow the
@@ -196,7 +198,21 @@ enum Role {
 pub fn stretch_voices(project: &Project, track: &faderframe_project::Track) -> StretchVoices {
     use faderframe_project::{ClipContent, WarpAlgorithm};
     let mut spans: [Vec<(i64, i64)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-    for c in project.clips_of(track.id) {
+    // A launched clip plays alone (but may start while the arrangement's
+    // clip still has its voice): one more of its kind.
+    let mut launched = [0usize; 3];
+    let slot_clips = project
+        .launcher
+        .slots
+        .iter()
+        .filter(|(k, _)| k.track == track.id)
+        .filter_map(|(_, c)| project.clips.get(c));
+    for (c, in_slot) in project
+        .clips_of(track.id)
+        .into_iter()
+        .map(|c| (c, false))
+        .chain(slot_clips.map(|c| (c, true)))
+    {
         let ClipContent::Audio(a) = &c.content else {
             continue;
         };
@@ -215,6 +231,10 @@ pub fn stretch_voices(project: &Project, track: &faderframe_project::Track) -> S
             Some(WarpAlgorithm::Rhythmic) => 1,
             _ => continue,
         };
+        if in_slot {
+            launched[i] = 1;
+            continue;
+        }
         let start = c.start.ticks();
         spans[i].push((start, c.end(&project.timeline, project.sample_rate).ticks()));
     }
@@ -228,9 +248,9 @@ pub fn stretch_voices(project: &Project, track: &faderframe_project::Track) -> S
     };
     let [mut poly, mut rhythmic, mut psola] = spans;
     StretchVoices {
-        polyphonic: need(&mut poly),
-        rhythmic: need(&mut rhythmic),
-        psola: need(&mut psola),
+        polyphonic: need(&mut poly) + launched[0],
+        rhythmic: need(&mut rhythmic) + launched[1],
+        psola: need(&mut psola) + launched[2],
         channels: track.layout.channel_count().max(2),
     }
 }

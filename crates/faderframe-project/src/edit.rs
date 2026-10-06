@@ -400,6 +400,20 @@ pub enum Command {
     SetLyrics {
         lyrics: Vec<crate::lyrics::LyricLine>,
     },
+    /// Put a clip in a launcher slot (`None`: empty it); the clip it held
+    /// goes.
+    SetLauncherSlot {
+        track: TrackId,
+        scene: faderframe_core::SceneId,
+        clip: Option<Box<Clip>>,
+    },
+    /// The launcher's scenes (their slots stay keyed by id).
+    SetScenes {
+        scenes: Vec<crate::launcher::Scene>,
+    },
+    SetLaunchQuantize {
+        quantize: crate::launcher::LaunchQuantize,
+    },
     /// Replace everything that lives in time (clips, automation, tempo and
     /// meter, markers, sections, loop and punch) at once: section moves,
     /// copies and deletes (see [`crate::arrange`]).
@@ -676,6 +690,9 @@ impl Command {
             SetKeys { .. } => "Change Key".into(),
             SetChords { .. } => "Edit Chords".into(),
             SetLyrics { .. } => "Edit Lyrics".into(),
+            SetLauncherSlot { .. } => "Launcher Clip".into(),
+            SetScenes { .. } => "Scenes".into(),
+            SetLaunchQuantize { .. } => "Launch Quantize".into(),
             SetArrangement { .. } => "Rearrange".into(),
             SetAlbum { .. } => "Edit Album".into(),
             SetSongInserts { .. } => "Change Song Inserts".into(),
@@ -752,7 +769,9 @@ impl Command {
             | SetTrackGroup { .. }
             | SetClipLink { .. }
             | SetAlbum { .. }
-            | SetLyrics { .. } => Impact::None,
+            | SetLyrics { .. }
+            | SetScenes { .. }
+            | SetLaunchQuantize { .. } => Impact::None,
             AddSource { .. }
             | RemoveSource { .. }
             | AddAutomationLane { .. }
@@ -771,6 +790,7 @@ impl Command {
             | SetTimeline { .. }
             | SetKeys { .. }
             | SetChords { .. }
+            | SetLauncherSlot { .. }
             | SetArrangement { .. }
             | SetTimeSignature { .. }
             | SetLoop { .. } => Impact::Timeline,
@@ -1624,6 +1644,40 @@ impl Command {
                     lyrics: std::mem::replace(&mut p.lyrics, lyrics),
                 }
             }
+            SetLauncherSlot { track, scene, clip } => {
+                track_mut(p, track)?;
+                let key = crate::launcher::SlotKey { track, scene };
+                if let Some(c) = &clip {
+                    if c.track != track {
+                        return Err(EditError::Invalid("a slot's clip is on its track".into()));
+                    }
+                    if p.clips.contains_key(&c.id) && p.launcher.slots.get(&key) != Some(&c.id) {
+                        return Err(EditError::Invalid(format!("clip {} exists", c.id)));
+                    }
+                    check_clip_fits(p, track, &c.content)?;
+                }
+                let old = p
+                    .launcher
+                    .slots
+                    .remove(&key)
+                    .and_then(|id| p.clips.remove(&id))
+                    .map(Box::new);
+                if let Some(c) = clip {
+                    p.launcher.slots.insert(key, c.id);
+                    p.clips.insert(c.id, *c);
+                }
+                SetLauncherSlot {
+                    track,
+                    scene,
+                    clip: old,
+                }
+            }
+            SetScenes { scenes } => SetScenes {
+                scenes: std::mem::replace(&mut p.launcher.scenes, scenes),
+            },
+            SetLaunchQuantize { quantize } => SetLaunchQuantize {
+                quantize: std::mem::replace(&mut p.launcher.quantize, quantize),
+            },
             SetArrangement { arrangement } => SetArrangement {
                 arrangement: Box::new(arrangement.swap_into(p)),
             },

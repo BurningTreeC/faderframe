@@ -1,4 +1,6 @@
 use crate::context::EngineContext;
+use crate::launch::{self, Play};
+use crate::snapshot::Lane;
 use faderframe_audio_graph::{NodeIo, ProcessContext, Processor};
 use faderframe_core::TrackId;
 use faderframe_midi::{MidiBuffer, MidiEvent, NoteTracker, TimedMidiEvent};
@@ -43,6 +45,8 @@ pub struct MidiClipPlayer {
     /// Scratch for chasing.
     chase: Box<[[Option<MidiEvent>; SLOTS]; 16]>,
     was_playing: bool,
+    /// What played last (the arrangement or a launched clip).
+    playing: Play,
 }
 
 impl MidiClipPlayer {
@@ -55,6 +59,7 @@ impl MidiClipPlayer {
             sent: Box::new([[None; SLOTS]; 16]),
             chase: Box::new([[None; SLOTS]; 16]),
             was_playing: false,
+            playing: Play::Arrangement,
         }
     }
 
@@ -152,6 +157,39 @@ impl MidiClipPlayer {
     }
 }
 
+impl MidiClipPlayer {
+    /// Emit `lane`'s events in lane time `[pos, end)`, lane time `t` at
+    /// block offset `t - shift`.
+    fn play_span(&mut self, lane: &Lane, out: &mut MidiBuffer, pos: i64, end: i64, shift: i64) {
+        let upto = lane.midi.partition_point(|r| r.start < end);
+        for region in lane.midi[..upto].iter().filter(|r| r.end >= pos) {
+            // SysEx for the track's plugins (bytes copied into the buffer).
+            let first = region.sysex.partition_point(|(time, _)| *time < pos);
+            for (time, bytes) in &region.sysex[first..] {
+                if *time >= end {
+                    break;
+                }
+                let _ = out.push_sysex((*time - shift) as u32, bytes);
+            }
+            let first = region.events.partition_point(|(time, _)| *time < pos);
+            for &(time, event) in &region.events[first..] {
+                if time >= end {
+                    break;
+                }
+                if out
+                    .push(TimedMidiEvent::new((time - shift) as u32, event))
+                    .is_ok()
+                {
+                    self.tracker.observe(event);
+                    if let Some((ch, i)) = slot(event) {
+                        self.sent[ch][i] = Some(event);
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl Processor<EngineContext> for MidiClipPlayer {
     fn process(&mut self, cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
         let Some(out) = io.events_out.first_mut() else {
@@ -176,40 +214,49 @@ impl Processor<EngineContext> for MidiClipPlayer {
             return;
         }
         let pos = t.sample_position;
+        let timeline = &cx.data.timeline;
+        let (pieces, count) = launch::pieces(cx.data.launch.track(self.track), pos, io.frames);
         if started {
-            if let Some(cfg) = cx.data.timeline.lane(self.track).and_then(|l| l.mpe) {
+            if let Some(cfg) = timeline.lane(self.track).and_then(|l| l.mpe) {
                 Self::announce_mpe(cfg, out);
             }
-            self.chase_to(cx.data, pos, out);
-        }
-        let Some(lane) = cx.data.timeline.lane(self.track) else {
-            return;
-        };
-        let end = pos + io.frames as i64;
-        let upto = lane.midi.partition_point(|r| r.start < end);
-        for region in lane.midi[..upto].iter().filter(|r| r.end >= pos) {
-            // SysEx for the track's plugins (bytes copied into the buffer).
-            let first = region.sysex.partition_point(|(time, _)| *time < pos);
-            for (time, bytes) in &region.sysex[first..] {
-                if *time >= end {
-                    break;
-                }
-                let _ = out.push_sysex((*time - pos) as u32, bytes);
+            if pieces[0].2 == Play::Arrangement {
+                self.chase_to(cx.data, pos, out);
             }
-            let first = region.events.partition_point(|(time, _)| *time < pos);
-            for &(time, event) in &region.events[first..] {
-                if time >= end {
-                    break;
-                }
-                if out
-                    .push(TimedMidiEvent::new((time - pos) as u32, event))
-                    .is_ok()
-                {
-                    self.tracker.observe(event);
-                    if let Some((ch, i)) = slot(event) {
-                        self.sent[ch][i] = Some(event);
+            self.playing = pieces[0].2;
+        }
+        // The arrangement, or a launched clip looping from its start; notes
+        // sounding where one gives way to another (or the clip wraps) end
+        // there.
+        for &(o, n, play) in &pieces[..count] {
+            if play != self.playing {
+                self.tracker.release_all(out, o as u32);
+                self.playing = play;
+            }
+            let from = pos + o as i64;
+            let to = from + n as i64;
+            match play {
+                Play::Arrangement => {
+                    if let Some(lane) = timeline.lane(self.track) {
+                        self.play_span(lane, out, from, to, pos);
                     }
                 }
+                Play::Clip { slot, start } => {
+                    let Some(l) = timeline.launch_lane(slot) else {
+                        continue;
+                    };
+                    let mut t = from;
+                    while t < to {
+                        let local = (t - start).rem_euclid(l.length);
+                        if local == 0 && t != start {
+                            self.tracker.release_all(out, (t - pos) as u32);
+                        }
+                        let m = (l.length - local).min(to - t);
+                        self.play_span(&l.lane, out, local, local + m, local - (t - pos));
+                        t += m;
+                    }
+                }
+                Play::Silence => {}
             }
         }
     }

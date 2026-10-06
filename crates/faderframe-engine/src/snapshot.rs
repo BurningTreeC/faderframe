@@ -261,6 +261,16 @@ pub struct MidiRegion {
     pub sysex: Vec<(i64, Box<[u8]>)>,
 }
 
+/// A launcher slot's clip as played: its lane from sample 0, looping over
+/// `length` samples.
+#[derive(Debug)]
+pub struct LaunchLane {
+    pub slot: u64,
+    pub track: TrackId,
+    pub length: i64,
+    pub lane: Lane,
+}
+
 #[derive(Debug, Default)]
 pub struct Lane {
     /// Sorted by start.
@@ -499,6 +509,9 @@ pub struct TimelineSnapshot {
     pub sample_rate: f64,
     pub timeline: Timeline,
     lanes: Vec<(TrackId, Lane)>,
+    /// The launcher's clips, each in a lane of its own from sample 0, by
+    /// slot (see [`crate::launch`]).
+    launch: Vec<LaunchLane>,
     automation: Vec<(TrackId, TrackAutomation)>,
     /// The key and chord track in samples (MIDI effects follow them).
     pub harmony: faderframe_plugin_host::Harmony,
@@ -510,9 +523,23 @@ impl TimelineSnapshot {
             sample_rate,
             timeline: Timeline::default(),
             lanes: Vec::new(),
+            launch: Vec::new(),
             automation: Vec::new(),
             harmony: faderframe_plugin_host::Harmony::default(),
         }
+    }
+
+    /// A launcher slot's clip.
+    pub fn launch_lane(&self, slot: u64) -> Option<&LaunchLane> {
+        self.launch
+            .binary_search_by_key(&slot, |l| l.slot)
+            .ok()
+            .map(|i| &self.launch[i])
+    }
+
+    /// The slots that have clips.
+    pub fn launch_slots(&self) -> impl Iterator<Item = u64> + '_ {
+        self.launch.iter().map(|l| l.slot)
     }
 
     /// Automation of a track (binary search; realtime-safe).
@@ -544,46 +571,57 @@ impl TimelineSnapshot {
     pub fn stream_plan(&self) -> StreamPlan {
         let mut regions = Vec::new();
         for (_, lane) in &self.lanes {
-            for r in &lane.audio {
-                if let Source::Stream(s) = &r.source {
-                    regions.push(StreamRegion {
-                        source: Arc::clone(s),
-                        start: r.start,
-                        end: r.end,
-                        source_start: r.source_start,
-                        step: r.step,
-                        reversed: r.reversed,
-                    });
-                }
-            }
-            // Warped clips: one linear piece per warp segment, widened by
-            // the stretcher's look-ahead and pre-roll (~0.25 s).
-            for w in &lane.warped {
-                let Source::Stream(s) = &w.region.source else {
-                    continue;
-                };
-                let margin = (self.sample_rate as i64 / 4).max(1);
-                for (k, seg) in w.points.windows(2).enumerate() {
-                    let (a, b) = (seg[0], seg[1]);
-                    let step = (b.1 - a.1) / (b.0 - a.0).max(1) as f64;
-                    let first = k == 0;
-                    let last = k + 2 == w.points.len();
-                    let start = w.region.start + a.0 - if first { margin } else { 0 };
-                    let end = w.region.start + b.0 + if last { margin } else { 0 };
-                    let source_start =
-                        (a.1 - if first { margin as f64 * step } else { 0.0 }).floor() as i64;
-                    regions.push(StreamRegion {
-                        source: Arc::clone(s),
-                        start,
-                        end,
-                        source_start: source_start.max(0),
-                        step: step.max(1e-3),
-                        reversed: false,
-                    });
-                }
-            }
+            Self::plan_lane(lane, self.sample_rate, false, &mut regions);
+        }
+        // The launcher's clips can start any moment: always loaded.
+        for l in &self.launch {
+            Self::plan_lane(&l.lane, self.sample_rate, true, &mut regions);
         }
         StreamPlan { regions }
+    }
+
+    /// A lane's streamed regions (`pinned`: needed wherever the playhead).
+    fn plan_lane(lane: &Lane, sample_rate: f64, pinned: bool, regions: &mut Vec<StreamRegion>) {
+        for r in &lane.audio {
+            if let Source::Stream(s) = &r.source {
+                regions.push(StreamRegion {
+                    source: Arc::clone(s),
+                    start: r.start,
+                    end: r.end,
+                    source_start: r.source_start,
+                    step: r.step,
+                    reversed: r.reversed,
+                    pinned,
+                });
+            }
+        }
+        // Warped clips: one linear piece per warp segment, widened by the
+        // stretcher's look-ahead and pre-roll (~0.25 s).
+        for w in &lane.warped {
+            let Source::Stream(s) = &w.region.source else {
+                continue;
+            };
+            let margin = (sample_rate as i64 / 4).max(1);
+            for (k, seg) in w.points.windows(2).enumerate() {
+                let (a, b) = (seg[0], seg[1]);
+                let step = (b.1 - a.1) / (b.0 - a.0).max(1) as f64;
+                let first = k == 0;
+                let last = k + 2 == w.points.len();
+                let start = w.region.start + a.0 - if first { margin } else { 0 };
+                let end = w.region.start + b.0 + if last { margin } else { 0 };
+                let source_start =
+                    (a.1 - if first { margin as f64 * step } else { 0.0 }).floor() as i64;
+                regions.push(StreamRegion {
+                    source: Arc::clone(s),
+                    start,
+                    end,
+                    source_start: source_start.max(0),
+                    step: step.max(1e-3),
+                    reversed: false,
+                    pinned,
+                });
+            }
+        }
     }
 
     /// Build from the project (control thread; allocates).
@@ -634,10 +672,33 @@ impl TimelineSnapshot {
                 lanes.entry(t.id).or_default().audio.push(r);
             }
         }
-        for clip in project.clips.values() {
+        // The arrangement's clips, then the launcher's: from the song's
+        // start, each in a lane of its own.
+        let in_slots: HashMap<faderframe_core::ClipId, u64> = project
+            .launcher
+            .slots
+            .iter()
+            .map(|(k, c)| (*c, k.hash()))
+            .collect();
+        let slot_clips: Vec<faderframe_project::Clip> = in_slots
+            .keys()
+            .filter_map(|id| project.clips.get(id))
+            .map(|c| faderframe_project::Clip {
+                start: faderframe_timeline::MusicalTime::ZERO,
+                ..c.clone()
+            })
+            .collect();
+        let mut launch_lanes: HashMap<u64, Lane> = HashMap::new();
+        let all = project
+            .clips
+            .values()
+            .filter(|c| !in_slots.contains_key(&c.id))
+            .chain(slot_clips.iter());
+        for clip in all {
             if clip.muted || frozen.contains(&clip.track) {
                 continue;
             }
+            let slot = in_slots.get(&clip.id).copied();
             let start = tl.to_samples(clip.start, sr);
             match &clip.content {
                 ClipContent::Audio(a) => {
@@ -657,7 +718,7 @@ impl TimelineSnapshot {
                     }
                     .region(start, sources, sr, project_rate);
                     let Some(r) = region else { continue };
-                    let lane = lanes.entry(clip.track).or_default();
+                    let lane = lane_for(&mut lanes, &mut launch_lanes, clip.track, slot);
                     let pitched = a.pitch.as_ref().is_some_and(|e| e.edited());
                     match a.warp.as_ref() {
                         Some(w) if !a.reversed && !w.is_identity(a.source_offset, a.length) => {
@@ -688,7 +749,9 @@ impl TimelineSnapshot {
                 ClipContent::Takes(f) => {
                     for piece in comp_pieces(f) {
                         if let Some(r) = piece.region(start, sources, sr, project_rate) {
-                            lanes.entry(clip.track).or_default().audio.push(r);
+                            lane_for(&mut lanes, &mut launch_lanes, clip.track, slot)
+                                .audio
+                                .push(r);
                         }
                     }
                 }
@@ -771,12 +834,14 @@ impl TimelineSnapshot {
                         })
                         .collect();
                     sysex.sort_by_key(|(t, _)| *t);
-                    lanes.entry(clip.track).or_default().midi.push(MidiRegion {
-                        start,
-                        end,
-                        events,
-                        sysex,
-                    });
+                    lane_for(&mut lanes, &mut launch_lanes, clip.track, slot)
+                        .midi
+                        .push(MidiRegion {
+                            start,
+                            end,
+                            events,
+                            sysex,
+                        });
                 }
             }
         }
@@ -786,6 +851,25 @@ impl TimelineSnapshot {
             lane.warped.sort_by_key(|w| w.region.start);
             lane.midi.sort_by_key(|r| r.start);
         }
+        let mut launch: Vec<LaunchLane> = slot_clips
+            .iter()
+            .filter_map(|c| {
+                let slot = *in_slots.get(&c.id)?;
+                let mut lane = launch_lanes.remove(&slot)?;
+                lane.audio.sort_by_key(|r| r.start);
+                lane.warped.sort_by_key(|w| w.region.start);
+                lane.midi.sort_by_key(|r| r.start);
+                lane.mpe = mpe_of.get(&c.track).copied();
+                let length = tl.to_samples(c.end(tl, project.sample_rate), sr).max(1);
+                Some(LaunchLane {
+                    slot,
+                    track: c.track,
+                    length,
+                    lane,
+                })
+            })
+            .collect();
+        launch.sort_by_key(|l| l.slot);
         lanes.sort_by_key(|(t, _)| *t);
         let mut automation: Vec<(TrackId, TrackAutomation)> = Vec::new();
         for t in &project.tracks {
@@ -845,9 +929,23 @@ impl TimelineSnapshot {
             sample_rate: sr,
             timeline: project.timeline.clone(),
             lanes,
+            launch,
             automation,
             harmony,
         }
+    }
+}
+
+/// The lane a clip's regions go to: its track's, or its launcher slot's.
+fn lane_for<'a>(
+    lanes: &'a mut HashMap<TrackId, Lane>,
+    launch: &'a mut HashMap<u64, Lane>,
+    track: TrackId,
+    slot: Option<u64>,
+) -> &'a mut Lane {
+    match slot {
+        Some(s) => launch.entry(s).or_default(),
+        None => lanes.entry(track).or_default(),
     }
 }
 
@@ -1054,6 +1152,8 @@ pub struct StreamRegion {
     pub source_start: i64,
     pub step: f64,
     pub reversed: bool,
+    /// Needed wherever the playhead is (launcher clips).
+    pub pinned: bool,
 }
 
 impl StreamRegion {
@@ -1106,6 +1206,8 @@ impl StreamPlan {
     pub fn needed(&self, windows: &[(i64, i64)]) -> Vec<(Arc<StreamSource>, Vec<Range<usize>>)> {
         let mut out: Vec<(Arc<StreamSource>, Vec<Range<usize>>)> = Vec::new();
         for r in &self.regions {
+            let whole = [(r.start, r.end)];
+            let windows = if r.pinned { &whole[..] } else { windows };
             for &(a, b) in windows {
                 if let Some(range) = r.pages(a, b) {
                     match out.iter_mut().find(|(s, _)| Arc::ptr_eq(s, &r.source)) {

@@ -193,11 +193,12 @@ fn simplify_meter(changes: Vec<(i32, TimeSignature)>) -> Vec<(i32, TimeSignature
 /// Make every track's clip list match the clips that name it (clips were
 /// added, split and removed by id).
 fn sync_track_clips(p: &mut Project) {
+    let in_slots = p.launcher_clips();
     for t in &mut p.tracks {
         t.clips
             .retain(|id| p.clips.get(id).is_some_and(|c| c.track == t.id));
         for c in p.clips.values() {
-            if c.track == t.id && !t.clips.contains(&c.id) {
+            if c.track == t.id && !t.clips.contains(&c.id) && !in_slots.contains(&c.id) {
                 t.clips.push(c.id);
             }
         }
@@ -399,8 +400,14 @@ pub fn remove_span(p: &mut Project, a: MusicalTime, b: MusicalTime) {
     }
     let len = b - a;
     let rate = p.sample_rate;
-    // Clips (cut with the old timeline).
-    let old: Vec<Clip> = p.clips.values().cloned().collect();
+    // Clips (cut with the old timeline; not the launcher's).
+    let in_slots = p.launcher_clips();
+    let old: Vec<Clip> = p
+        .clips
+        .values()
+        .filter(|c| !in_slots.contains(&c.id))
+        .cloned()
+        .collect();
     for c in old {
         let end = c.end(&p.timeline, rate);
         if end <= a + SLACK {
@@ -592,8 +599,14 @@ pub fn insert_span(p: &mut Project, at: MusicalTime, slice: &TimeSlice, keep_ids
         return;
     }
     let rate = p.sample_rate;
-    // Clips: split across `at`, move what follows.
-    let old: Vec<Clip> = p.clips.values().cloned().collect();
+    // Clips: split across `at`, move what follows (not the launcher's).
+    let in_slots = p.launcher_clips();
+    let old: Vec<Clip> = p
+        .clips
+        .values()
+        .filter(|c| !in_slots.contains(&c.id))
+        .cloned()
+        .collect();
     for c in old {
         let end = c.end(&p.timeline, rate);
         if c.start + SLACK >= at {

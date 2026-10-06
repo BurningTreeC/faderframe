@@ -98,6 +98,10 @@ define_id!(
     /// A modulator of a track (LFO, follower, steps, random, macro).
     ModulatorId, "mod#"
 );
+define_id!(
+    /// A scene (row) of the clip launcher.
+    SceneId, "scene#"
+);
 
 /// Identifier of a parameter *within* a processor or plugin.
 ///

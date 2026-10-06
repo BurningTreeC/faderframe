@@ -36,4 +36,6 @@ pub struct EngineContext {
     /// The album plays instead of the project: the strips do not feed the
     /// scope.
     pub preview_active: bool,
+    /// The clip launcher (see [`crate::launch`]).
+    pub launch: crate::launch::LaunchState,
 }

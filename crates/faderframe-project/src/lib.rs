@@ -25,6 +25,7 @@ mod expression;
 pub mod file;
 pub mod harmony;
 mod history;
+pub mod launcher;
 pub mod lyrics;
 pub mod midi_ops;
 pub mod midi_tools;

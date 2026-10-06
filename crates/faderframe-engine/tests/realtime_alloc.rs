@@ -982,6 +982,115 @@ fn warped_playback_does_not_allocate() {
 }
 
 #[test]
+fn the_clip_launcher_does_not_allocate() {
+    let _serial = serial();
+    use faderframe_engine::launch::{LaunchCommand, Quantize};
+    use faderframe_project::launcher::{Scene, SlotKey};
+    use faderframe_project::{ClipContent, Warp, WarpAlgorithm};
+    const SR: u32 = 48_000;
+    const BLOCK: usize = 256;
+    // Two scenes of copies of the demo's clips: audio (the second scene's
+    // warped) and MIDI.
+    let mut project = demo_project(SR);
+    let scenes: Vec<faderframe_core::SceneId> = (0..2).map(|_| project.ids.allocate()).collect();
+    for (i, id) in scenes.iter().enumerate() {
+        project.launcher.scenes.push(Scene {
+            id: *id,
+            name: format!("Scene {i}"),
+        });
+    }
+    let mut slots = Vec::new();
+    let picks: Vec<(faderframe_core::TrackId, faderframe_core::ClipId)> = project
+        .tracks
+        .iter()
+        .filter_map(|t| t.clips.first().map(|c| (t.id, *c)))
+        .take(6)
+        .collect();
+    for (track, clip) in picks {
+        for (k, scene) in scenes.iter().enumerate() {
+            let mut c = project.clips[&clip].clone();
+            c.id = project.ids.allocate();
+            if let (1, ClipContent::Audio(a)) = (k, &mut c.content) {
+                a.warp = Some(Warp {
+                    source_length: a.length,
+                    markers: Vec::new(),
+                    algorithm: WarpAlgorithm::Polyphonic,
+                });
+                a.length = a.length * 3 / 2;
+            }
+            let key = SlotKey {
+                track,
+                scene: *scene,
+            };
+            project.launcher.slots.insert(key, c.id);
+            project.clips.insert(c.id, c);
+            slots.push((track, k, key.hash()));
+        }
+    }
+    let sources = render_generated_sources(&project, SR);
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&project, &sources, config, BLOCK, 2).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, BLOCK);
+    r.play_from(0).unwrap();
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    let launch = |r: &mut OfflineRenderer, scene: usize, quantize: Quantize| {
+        for &(track, k, slot) in &slots {
+            if k == scene {
+                let _ = r.controller.launch(LaunchCommand::Launch {
+                    track,
+                    slot,
+                    quantize,
+                });
+            }
+        }
+    };
+    // Launching scenes (at once and on the beat), looping, stopping a
+    // track and all, locating, stopping the transport, back to the
+    // arrangement.
+    let (_, n) = armed(|| {
+        for i in 0..1_200 {
+            match i {
+                10 => launch(&mut r, 0, Quantize::None),
+                200 => launch(&mut r, 1, Quantize::Beat),
+                400 => {
+                    let _ = r.controller.launch(LaunchCommand::Stop {
+                        track: slots[0].0,
+                        quantize: Quantize::Bars(1),
+                    });
+                }
+                600 => {
+                    let _ = r
+                        .controller
+                        .transport(TransportCommand::Locate(SR as i64 * 3));
+                }
+                700 => {
+                    let _ = r.controller.launch(LaunchCommand::StopAll {
+                        quantize: Quantize::Beat,
+                    });
+                }
+                800 => launch(&mut r, 0, Quantize::Bars(1)),
+                900 => {
+                    let _ = r.controller.transport(TransportCommand::Stop);
+                    let _ = r.controller.transport(TransportCommand::Play);
+                    launch(&mut r, 1, Quantize::None);
+                }
+                1_000 => {
+                    let _ = r.controller.launch(LaunchCommand::BackToArrangement);
+                }
+                _ => {}
+            }
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(n, 0, "allocations/frees while launching clips");
+}
+
+#[test]
 fn rendering_ahead_does_not_allocate_on_the_audio_thread() {
     let _serial = serial();
     const SR: u32 = 48_000;
