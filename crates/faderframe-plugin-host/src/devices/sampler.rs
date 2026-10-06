@@ -1,8 +1,8 @@
 //! Sampler: plays one sample across the keyboard, or an SFZ instrument.
 //!
 //! With a single sample its root key, loop (off, forward, while held:
-//! start and end with a crossfade), start point, direction and whether the
-//! pitch follows the keys are the device's settings; with an SFZ the
+//! start and end with a crossfade), start and end points, direction and
+//! whether the pitch follows the keys are the device's settings; with an SFZ the
 //! regions' own key and velocity ranges, roots, tuning, levels, pans,
 //! loops, envelopes, release triggers, choke groups (`group`/`off_by`),
 //! round robins (`seq_length`/`seq_position`) and random layers apply, the
@@ -50,6 +50,9 @@ pub mod id {
     pub const KEY_TRACK: u32 = 21;
     /// 0: the pitch moves with the speed (repitch); 1: the length stays.
     pub const PITCH_MODE: u32 = 22;
+    /// Where playing stops (0–1 of the sample; the start to here plays,
+    /// backwards when reversed).
+    pub const END: u32 = 23;
 }
 
 /// Published: voices sounding, the newest voice's key and where it plays
@@ -122,6 +125,7 @@ pub fn parameters() -> Vec<ParameterInfo> {
         stepped(id::REVERSE, "Reverse", 1.0, 0.0),
         stepped(id::KEY_TRACK, "Key Tracking", 1.0, 1.0),
         stepped(id::PITCH_MODE, "Pitch", 1.0, 0.0),
+        param(id::END, "End", 0.0, 1.0, 1.0, Percent),
     ]
 }
 
@@ -187,6 +191,21 @@ fn next_frame(v: &mut Voice, s: &Sample, step: f64) -> ([f32; 2], bool) {
         y[0] = y[0] * (1.0 - t) + read(s, 0, back) * t;
         if stereo {
             y[1] = y[1] * (1.0 - t) + read(s, 1, back) * t;
+        }
+    }
+    if v.looping.is_none() {
+        // Fade the last 3 ms before the end (an end point mid-waveform
+        // would click).
+        let left = if v.reverse {
+            v.pos - v.end
+        } else {
+            v.end - v.pos
+        };
+        let fade = s.rate * 0.003;
+        if left < fade {
+            let g = (left / fade).max(0.0) as f32;
+            y[0] *= g;
+            y[1] *= g;
         }
     }
     if !stereo {
@@ -462,11 +481,16 @@ impl SamplerProcessor {
                 }
             }
         };
-        let end = zone
+        let mut end = zone
             .and_then(|z| z.end)
             .map_or(frames, |e| (e as f64).min(frames));
         let start = if single {
-            self.get(id::START).clamp(0.0, 0.99) * frames
+            // The region between the start and end markers.
+            let a = self.get(id::START).clamp(0.0, 0.99) * frames;
+            end = (self.get(id::END).clamp(0.0, 1.0) * frames)
+                .max(a + 1.0)
+                .min(frames);
+            a
         } else {
             zone.map_or(0.0, |z| z.offset as f64).min(end)
         };
@@ -479,7 +503,7 @@ impl SamplerProcessor {
                     ),
                     None => (
                         self.get(id::LOOP_START).clamp(0.0, 1.0) * frames,
-                        self.get(id::LOOP_END).clamp(0.0, 1.0) * frames,
+                        (self.get(id::LOOP_END).clamp(0.0, 1.0) * frames).min(end),
                     ),
                 };
                 (le - ls > 16.0).then_some((ls, le))
@@ -534,12 +558,12 @@ impl SamplerProcessor {
             release_coef: coef(r),
             zone: zone_index,
             sample,
-            pos: if reverse { end - 1.0 - start } else { start },
+            pos: if reverse { end - 1.0 } else { start },
             step,
             looping,
             loop_mode,
             fade,
-            end: if reverse { 0.0 } else { end },
+            end: if reverse { start } else { end },
             reverse,
             gain,
             key,
@@ -1098,6 +1122,66 @@ pub(crate) mod tests {
         s.send(off(69));
         let (_, _, status) = s.run(2.0);
         assert_eq!(status, ProcessStatus::Sleep);
+    }
+
+    #[test]
+    fn the_start_and_end_points_bound_what_plays() {
+        // One second: 440 Hz, then 880 Hz.
+        let d = fixtures::dir("sampler-region");
+        let path = d.join("two.wav");
+        let x: Vec<f32> = (0..48_000)
+            .map(|i| {
+                let f = if i < 24_000 { 440.0 } else { 880.0 };
+                (0.5 * (std::f64::consts::TAU * f * i as f64 / 48_000.0).sin()) as f32
+            })
+            .collect();
+        faderframe_audio_files::write_wav(
+            &path,
+            &[x],
+            48_000,
+            faderframe_audio_files::WavFormat::Float32,
+            false,
+        )
+        .unwrap();
+        let mut doc = SampleDoc::default();
+        doc.set(0, Some(path.to_string_lossy().into_owned()));
+        let play = |set: &[(u32, f64)]| {
+            let mut all = vec![(id::ROOT, 69.0), (id::RELEASE, 5.0), (id::VOLUME, 0.0)];
+            all.extend_from_slice(set);
+            let (mut s, _host) = sampler(doc.clone(), &all);
+            s.send(on(69, 127));
+            let (l, _, _) = s.run(1.2);
+            let last = l.iter().rposition(|v| v.abs() > 1e-4).unwrap_or(0);
+            (l, last as f64 / SR)
+        };
+        // The first half only.
+        let (l, length) = play(&[(id::END, 0.5)]);
+        assert!((length - 0.5).abs() < 0.01, "{length}");
+        assert!(
+            bin_db(&l[..20_000], 440.0) > -12.0,
+            "{}",
+            bin_db(&l[..20_000], 440.0)
+        );
+        assert!(bin_db(&l, 880.0) < -40.0, "{}", bin_db(&l, 880.0));
+        // The middle.
+        let (_, length) = play(&[(id::START, 0.25), (id::END, 0.75)]);
+        assert!((length - 0.5).abs() < 0.01, "{length}");
+        // Reversed: the region backwards (the 440 half, not the 880 one).
+        let (l, length) = play(&[(id::END, 0.5), (id::REVERSE, 1.0)]);
+        assert!((length - 0.5).abs() < 0.01, "{length}");
+        assert!(
+            bin_db(&l[..20_000], 440.0) > -12.0,
+            "{}",
+            bin_db(&l[..20_000], 440.0)
+        );
+        assert!(bin_db(&l, 880.0) < -40.0, "{}", bin_db(&l, 880.0));
+        // The end does not click: the last milliseconds fade out.
+        let (l, length) = play(&[(id::END, 0.3)]);
+        let end = (length * SR) as usize;
+        let peak =
+            |r: std::ops::RangeInclusive<usize>| l[r].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let (before, last) = (peak(end - 400..=end - 300), peak(end - 20..=end));
+        assert!(before > 0.4 && last < 0.1, "{before} → {last}");
     }
 
     #[test]

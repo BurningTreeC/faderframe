@@ -1,6 +1,6 @@
 //! The Sampler's face: what is loaded (a sample or an SFZ instrument, with
-//! a button to load another), the waveform with the start and the loop
-//! (drag their markers) and where the newest voice plays, a keyboard with
+//! a button to load another), the waveform with the start and end points
+//! and the loop (drag their markers) and where the newest voice plays, a keyboard with
 //! the zones over it, and the controls.
 
 use crate::kit::{
@@ -20,8 +20,20 @@ fn pid(i: u32) -> ParameterId {
 #[derive(Clone, Copy, PartialEq)]
 enum Marker {
     Start,
+    End,
     LoopStart,
     LoopEnd,
+}
+
+impl Marker {
+    fn parameter(self) -> u32 {
+        match self {
+            Marker::Start => id::START,
+            Marker::End => id::END,
+            Marker::LoopStart => id::LOOP_START,
+            Marker::LoopEnd => id::LOOP_END,
+        }
+    }
 }
 
 pub(crate) struct SamplerFace {
@@ -62,7 +74,7 @@ impl Face for SamplerFace {
     }
 
     fn min_size(&self) -> Size {
-        Size::new(1180.0, 560.0)
+        Size::new(1240.0, 560.0)
     }
 
     fn panel(&self, size: Size) -> Panel {
@@ -70,11 +82,11 @@ impl Face for SamplerFace {
         let s = kit::sections(
             deck,
             &[
-                ("SAMPLE", 5.6),
+                ("SAMPLE", 6.4),
                 ("LOOP", 4.6),
                 ("AMP", 6.6),
                 ("FILTER", 5.2),
-                ("OUT", 4.2),
+                ("OUT", 4.6),
             ],
         );
         let mut c = Vec::new();
@@ -82,11 +94,12 @@ impl Face for SamplerFace {
             c.push(Ctl::small(pid(i), label, r))
         };
         let r = kit::inside(&s[0]);
-        let k = kit::row(Rect::new(r.x, r.y, r.w, SMALL.1), &[SMALL.0; 4]);
+        let k = kit::row(Rect::new(r.x, r.y, r.w, SMALL.1), &[SMALL.0; 5]);
         small(&mut c, id::ROOT, "ROOT", k[0]);
         c.push(Ctl::small(pid(id::TRANSPOSE), "TRANSPOSE", k[1]).bipolar());
         c.push(Ctl::small(pid(id::TUNE), "TUNE", k[2]).bipolar());
         small(&mut c, id::START, "START", k[3]);
+        small(&mut c, id::END, "END", k[4]);
         let b = kit::row(
             Rect::new(r.x, r.bottom() - SWITCH_H, r.w, SWITCH_H),
             &[110.0, 110.0],
@@ -277,12 +290,29 @@ impl Face for SamplerFace {
                         }
                     }
                 }
-                let s = x(frac(id::START));
-                p.vline(s, wave.y, wave.bottom(), th.ui.text);
+                // What does not play is dimmed; the start and end markers.
+                let (s, e) = (x(frac(id::START)), x(frac(id::END)));
+                let shade = th.device.display.darken(0.12).with_alpha(0.7);
                 p.fill(
-                    Rect::new(s - 4.0, wave.bottom() - 8.0, 8.0, 8.0),
-                    th.ui.text,
+                    Rect::new(wave.x, wave.y, (s - wave.x).max(0.0), wave.h),
+                    shade,
                 );
+                p.fill(
+                    Rect::new(e, wave.y, (wave.right() - e).max(0.0), wave.h),
+                    shade,
+                );
+                for (xx, left) in [(s, true), (e, false)] {
+                    p.vline(xx, wave.y, wave.bottom(), th.ui.text);
+                    p.fill(
+                        Rect::new(
+                            if left { xx } else { xx - 8.0 },
+                            wave.bottom() - 8.0,
+                            8.0,
+                            8.0,
+                        ),
+                        th.ui.text,
+                    );
+                }
             }
             if voices > 0.0 {
                 let pos = cx.published(value::POSITION).clamp(0.0, 1.0);
@@ -370,7 +400,13 @@ impl Face for SamplerFace {
                 let f = f64::from((pos.x - wave.x) / wave.w);
                 let near = |i: u32| (cx.value(pid(i)) - f).abs() * f64::from(wave.w);
                 let looping = cx.value(pid(id::LOOP)) >= 0.5;
+                // The nearest marker (start or end on its own side when
+                // they meet).
                 let mut best = (Marker::Start, near(id::START));
+                let end = (Marker::End, near(id::END));
+                if end.1 < best.1 || (end.1 == best.1 && f > cx.value(pid(id::START))) {
+                    best = end;
+                }
                 if looping {
                     for (m, i) in [
                         (Marker::LoopStart, id::LOOP_START),
@@ -383,12 +419,7 @@ impl Face for SamplerFace {
                 }
                 self.drag = Some(best.0);
                 edit.begin("Sample Marker");
-                let target = match best.0 {
-                    Marker::Start => id::START,
-                    Marker::LoopStart => id::LOOP_START,
-                    Marker::LoopEnd => id::LOOP_END,
-                };
-                edit.set(pid(target), f.clamp(0.0, 1.0));
+                edit.set(pid(best.0.parameter()), f.clamp(0.0, 1.0));
                 true
             }
             ViewEvent::PointerMove {
@@ -398,12 +429,7 @@ impl Face for SamplerFace {
             } => {
                 let Some(m) = self.drag else { return false };
                 let f = f64::from((pos.x - wave.x) / wave.w).clamp(0.0, 1.0);
-                let target = match m {
-                    Marker::Start => id::START,
-                    Marker::LoopStart => id::LOOP_START,
-                    Marker::LoopEnd => id::LOOP_END,
-                };
-                edit.set(pid(target), f);
+                edit.set(pid(m.parameter()), f);
                 true
             }
             ViewEvent::PointerUp { .. } => {
@@ -431,7 +457,10 @@ impl Face for SamplerFace {
             id::PITCH_MODE => {
                 "Keep Length: other keys change the pitch, not the length (16 voices; off: higher plays shorter, as a tape would)"
             }
-            id::START => "Where playing starts (drag the white marker)",
+            id::START => "Where playing starts (drag the left white marker)",
+            id::END => {
+                "Where playing stops (drag the right white marker); reversed, it plays from here back to the start"
+            }
             id::LOOP => "Loop for ever, or while the key is held (drag the markers)",
             id::CROSSFADE => "Blend across the loop's seam",
             id::FILTER_ENV => "The amp envelope opens (or closes) the filter",

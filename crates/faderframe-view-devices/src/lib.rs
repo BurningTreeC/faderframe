@@ -139,7 +139,7 @@ pub fn editor_size(plugin_id: &str) -> Option<(i32, i32)> {
         builtin::COMPRESSOR => Some((1040, 520 + HEADER_BAR)),
         builtin::LIMITER => Some((900, 480 + HEADER_BAR)),
         builtin::DRUMS => Some((1120, 600 + HEADER_BAR)),
-        builtin::SAMPLER => Some((1240, 560 + HEADER_BAR)),
+        builtin::SAMPLER => Some((1300, 560 + HEADER_BAR)),
         builtin::SYNTH => Some((1300, 640 + HEADER_BAR)),
         builtin::TUNER => Some((620, 440 + HEADER_BAR)),
         builtin::MODULATION => Some((1060, 520 + HEADER_BAR)),
