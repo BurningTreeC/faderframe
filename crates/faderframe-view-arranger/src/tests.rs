@@ -1330,3 +1330,43 @@ fn folders_indent_their_tracks_and_close_by_their_triangle() {
     }
     assert!(!ids(&s).contains(&bass));
 }
+
+#[test]
+fn the_wheel_over_the_track_headers_never_scrolls() {
+    let s = session();
+    let theme = Theme::default();
+    let mut view = ArrangerView::new(theme.clone());
+    // Short: the tracks can scroll.
+    let size = Size::new(1200.0, 260.0);
+    view.paint(&mut RecordingPainter::new(), size, &s, &theme);
+    let bass = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.name == "Bass")
+        .unwrap()
+        .id;
+    let wheel = |pos: Point| ViewEvent::Scroll {
+        pos,
+        dx: 0.0,
+        dy: 3.0,
+        modifiers: Modifiers::NONE,
+        precise: false,
+    };
+    let l = view.header_layout(&s, bass, size).unwrap();
+    // Over a header, not on a control: nothing moves.
+    let row = view.row_rect(0, size);
+    let (a, _) = run(&mut view, wheel(Point::new(8.0, row.y + 4.0)), size, &s);
+    assert!(a.is_empty());
+    assert_eq!(view.scroll_y, 0.0);
+    // On its fader: the fader moves, the tracks stay.
+    let (a, _) = run(&mut view, wheel(l.volume.center()), size, &s);
+    assert!(
+        matches!(a.as_slice(), [Action::Edit(Command::SetTrackVolume { .. })]),
+        "{a:?}"
+    );
+    assert_eq!(view.scroll_y, 0.0);
+    // Over the lanes it scrolls.
+    run(&mut view, wheel(Point::new(700.0, row.y + 4.0)), size, &s);
+    assert!(view.scroll_y > 0.0);
+}

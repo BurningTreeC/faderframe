@@ -3350,6 +3350,10 @@ impl CanvasView<Session, Action> for ArrangerView {
                             pan: (t.pan - steps * step).clamp(-1.0, 1.0),
                         }));
                     }
+                } else if pos.x < self.header_w() {
+                    // Over the track headers the wheel turns their controls
+                    // and never scrolls (a wheel meant for a knob or a
+                    // fader would move the tracks under the pointer).
                 } else {
                     let (mut hx, mut vy) = (dx, dy);
                     if modifiers.shift && dx == 0.0 {
