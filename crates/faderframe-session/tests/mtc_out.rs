@@ -22,7 +22,7 @@ fn mtc_goes_out_from_the_project_start_timecode() {
     let out = s.add_virtual_midi_output("MTC Out");
     s.set_midi_mtc_output("virtual:MTC Out", true);
     s.set_sync_settings(SyncSettings {
-        offset: Timecode::parse("01:00:00:00").unwrap(),
+        mtc_out_offset: Timecode::parse("01:00:00:00").unwrap(),
         mtc_out_rate: MtcRate::Fps25,
         ..SyncSettings::default()
     });

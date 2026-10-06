@@ -746,7 +746,7 @@ impl Session {
         let rate = self.engine.sample_rate() as f64;
         let settings = &self.sync.settings;
         let mtc = settings.mtc_out_rate;
-        let start = settings.offset.total_frames(mtc);
+        let start = settings.mtc_out_offset.total_frames(mtc);
         let frames = start + (position.max(0) as f64 / rate * mtc.fps()).floor() as i64;
         let tc = faderframe_midi::timecode::Timecode::from_frames(frames, mtc);
         let full = [

@@ -1071,9 +1071,19 @@ impl EngineController {
         Some(pos + ((t_ns as f64 - cb as f64) * rate / 1e9) as i64)
     }
 
-    /// Frames from processing to hearing (device buffer + output latency).
+    /// Frames from processing to hearing (device buffer + output latency,
+    /// and varispeed's resampler when it runs).
     pub fn output_latency(&self) -> u32 {
-        self.shared.output_latency.load(Ordering::Relaxed)
+        self.shared.output_latency.load(Ordering::Relaxed) + self.varispeed_delay()
+    }
+
+    /// Varispeed's resampler delay each way (0 when it does not run).
+    pub fn varispeed_delay(&self) -> u32 {
+        if self.varispeed {
+            crate::varispeed::DELAY as u32
+        } else {
+            0
+        }
     }
 
     pub fn reset_metrics(&self) {
@@ -1597,7 +1607,7 @@ impl EngineController {
         self.varispeed
     }
 
-    /// The varispeed's speed (clamped to ±2 %).
+    /// The varispeed's speed (clamped to ±12 %).
     pub fn set_speed(&self, speed: f64) {
         let d = crate::varispeed::MAX_DEVIATION;
         let s = speed.clamp(1.0 - d, 1.0 + d);

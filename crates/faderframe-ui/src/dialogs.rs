@@ -885,6 +885,90 @@ pub fn pick_color(app: &Rc<AppState>, target: faderframe_session::ColorTarget) {
     );
 }
 
+/// Transport → Varispeed: the song faster or slower (and higher or lower)
+/// by up to ±10 %, like a tape machine.
+pub fn varispeed(app: &Rc<AppState>) {
+    let range = faderframe_session::MANUAL_SPEED_RANGE;
+    let win = gtk::Window::builder()
+        .application(&app.app)
+        .title("Varispeed")
+        .resizable(false)
+        .default_width(380)
+        .build();
+    if let Some(main) = app.window.borrow().as_ref() {
+        win.set_transient_for(Some(main));
+    }
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    body.set_margin_top(14);
+    body.set_margin_bottom(14);
+    body.set_margin_start(14);
+    body.set_margin_end(14);
+    let on = gtk::CheckButton::with_label("Varispeed");
+    let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, -range, range, 0.1);
+    scale.set_draw_value(false);
+    scale.set_hexpand(true);
+    for (v, label) in [(-range, "-10 %"), (0.0, "0"), (range, "+10 %")] {
+        scale.add_mark(v, gtk::PositionType::Bottom, Some(label));
+    }
+    let readout = gtk::Label::new(None);
+    readout.add_css_class("dim-label");
+    let current = app.session.borrow().manual_speed();
+    on.set_active(current.is_some());
+    scale.set_value(current.unwrap_or(0.0));
+    scale.set_sensitive(current.is_some());
+    let show = {
+        let readout = readout.clone();
+        move |p: f64| {
+            let semitones = 12.0 * (1.0 + p / 100.0).log2();
+            readout.set_text(&format!("{p:+.1} % · {semitones:+.2} semitones"));
+        }
+    };
+    show(current.unwrap_or(0.0));
+    let apply = {
+        let weak = Rc::downgrade(app);
+        let (on, scale) = (on.clone(), scale.clone());
+        let show = show.clone();
+        move || {
+            let Some(a) = weak.upgrade() else { return };
+            let p = scale.value();
+            scale.set_sensitive(on.is_active());
+            show(if on.is_active() { p } else { 0.0 });
+            a.session
+                .borrow_mut()
+                .set_manual_speed(on.is_active().then_some(p));
+        }
+    };
+    let apply = Rc::new(apply);
+    {
+        let apply = Rc::clone(&apply);
+        on.connect_toggled(move |_| apply());
+    }
+    {
+        let apply = Rc::clone(&apply);
+        scale.connect_value_changed(move |_| apply());
+    }
+    let reset = gtk::Button::with_label("Normal Speed");
+    {
+        let scale = scale.clone();
+        reset.connect_clicked(move |_| scale.set_value(0.0));
+    }
+    let hint = gtk::Label::new(Some(
+        "Following MIDI clock or MTC, the master sets the speed instead.",
+    ));
+    hint.add_css_class("dim-label");
+    hint.set_wrap(true);
+    hint.set_xalign(0.0);
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    row.append(&on);
+    row.append(&readout);
+    body.append(&row);
+    body.append(&scale);
+    body.append(&reset);
+    body.append(&hint);
+    win.set_child(Some(&body));
+    win.present();
+}
+
 pub fn about(app: &Rc<AppState>) {
     let dialog = gtk::AboutDialog::builder()
         .program_name("FaderFrame")

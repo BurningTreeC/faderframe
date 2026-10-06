@@ -69,7 +69,7 @@ pub use editing::{
     NudgeValue, ZoomRequest, parse_position,
 };
 pub use faderframe_workspace::{DEFAULT_INSERT_SLOTS, INSERT_SLOTS_RANGE, STRIP_WIDTH_RANGE};
-pub use sync::{MtcRate, SyncSettings, SyncSource, SyncStatus, Timecode};
+pub use sync::{MANUAL_SPEED_RANGE, MtcRate, SyncSettings, SyncSource, SyncStatus, Timecode};
 
 pub use meters::{METER_FLOOR_DB, MeterChannel, MeterDisplay};
 pub use selection::{SelectMode, Selection};
@@ -1640,7 +1640,7 @@ impl Session {
             let rate = s.mtc_out_rate;
             self.engine
                 .midi_shared()
-                .set_mtc(rate, s.offset.total_frames(rate));
+                .set_mtc(rate, s.mtc_out_offset.total_frames(rate));
         }
         self.engine
             .sync(&self.project, &self.sources, Impact::Graph)?;
@@ -1930,6 +1930,10 @@ impl Session {
         self.tick_performance();
         self.tick_midi();
         self.tick_mtc_out();
+        // A manual varispeed waits for the stream.
+        if self.manual_speed().is_some() && !self.engine.varispeed() {
+            self.apply_manual_speed();
+        }
         self.tick_control();
         let status = self.stream_status();
         if let Some(status) = status {

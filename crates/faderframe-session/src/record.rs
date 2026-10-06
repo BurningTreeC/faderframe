@@ -734,8 +734,10 @@ impl Session {
         let midi = if midi_targets.is_empty() {
             None
         } else {
-            let shift =
-                info.buffer_size as i64 + info.output_latency as i64 + self.record.latency_offset;
+            let shift = info.buffer_size as i64
+                + info.output_latency as i64
+                + self.record.latency_offset
+                + i64::from(self.engine.varispeed_delay());
             let tracks: Vec<TrackId> = midi_targets.iter().map(|t| t.track).collect();
             let rx = self.engine.begin_midi_recording(midi_targets, from, to)?;
             Some(crate::midi::MidiTake::new(rx, tracks, shift))
@@ -753,6 +755,7 @@ impl Session {
                 tracks: midi_tracks,
                 latency: info.input_latency as i64
                     + info.output_latency as i64
+                    + 2 * i64::from(self.engine.varispeed_delay())
                     + self.record.latency_offset,
                 seen: false,
                 slot: None,
@@ -783,8 +786,11 @@ impl Session {
             paths.push(path);
         }
         let tracks = targets.iter().map(|t| t.track).chain(midi_tracks).collect();
-        let latency =
-            info.input_latency as i64 + info.output_latency as i64 + self.record.latency_offset;
+        let latency = info.input_latency as i64
+                + info.output_latency as i64
+                + self.record.latency_offset
+                // Varispeed's resampler, in and out.
+                + 2 * i64::from(self.engine.varispeed_delay());
         let streams = self
             .engine
             .begin_recording(targets, from, to, self.record.buffer_seconds)?;

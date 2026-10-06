@@ -76,6 +76,7 @@ pub fn install(app: &Rc<AppState>) {
         }),
         entry(app, "restart-audio", |a| a.start_audio()),
         entry(app, "about", crate::dialogs::about),
+        entry(app, "varispeed", crate::dialogs::varispeed),
         // Development aid: render the main window into the PNG named by
         // $FADERFRAME_SCREENSHOT (the app's own pixels only).
         entry(app, "screenshot", |a| {
@@ -1180,6 +1181,15 @@ pub fn install(app: &Rc<AppState>) {
         }),
         // `add-surface:<mackie|xt|hui|osc[@<listen port>]>`: a control
         // surface without ports (MIDI) or listening on that UDP port.
+        // `set-varispeed:<percent|off>`: the manual varispeed.
+        named("set-varispeed", |a, arg| {
+            let p = if arg == "off" {
+                None
+            } else {
+                arg.parse::<f64>().ok()
+            };
+            a.session.borrow_mut().set_manual_speed(p);
+        }),
         named("add-surface", |a, arg| {
             use faderframe_session::control::{SurfaceKind, SurfaceSettings};
             let (kind, port) = arg.split_once('@').unwrap_or((arg, ""));

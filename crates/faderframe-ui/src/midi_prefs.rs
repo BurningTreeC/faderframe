@@ -347,6 +347,12 @@ fn sync_section(app: &Rc<AppState>) -> SyncWidgets {
     offset.set_tooltip_text(Some(
         "Timecode at the project start (hh:mm:ss:ff), e.g. 01:00:00:00",
     ));
+    let out_offset = gtk::Entry::new();
+    out_offset.set_text(&current.mtc_out_offset.to_string());
+    out_offset.set_max_width_chars(12);
+    out_offset.set_tooltip_text(Some(
+        "The timecode FaderFrame sends at the project start (hh:mm:ss:ff)",
+    ));
     let status = gtk::Label::new(None);
     status.set_xalign(0.0);
     status.add_css_class("dim-label");
@@ -371,7 +377,11 @@ fn sync_section(app: &Rc<AppState>) -> SyncWidgets {
         "The frame rate of the MIDI time code FaderFrame sends",
     ));
     grid.attach(&label("MTC sent at"), 0, 3, 1, 1);
-    grid.attach(&out_rate, 1, 3, 1, 1);
+    let out_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    out_row.append(&out_rate);
+    out_row.append(&label("from"));
+    out_row.append(&out_offset);
+    grid.attach(&out_row, 1, 3, 1, 1);
     let varispeed = gtk::CheckButton::with_label("Follow by varispeed (no jumps)");
     varispeed.set_active(current.varispeed);
     varispeed.set_tooltip_text(Some(
@@ -382,12 +392,13 @@ fn sync_section(app: &Rc<AppState>) -> SyncWidgets {
 
     let apply = {
         let weak = Rc::downgrade(app);
-        let (source, port, offset, out_rate, vs) = (
+        let (source, port, offset, out_rate, vs, out_offset) = (
             source.clone(),
             port.clone(),
             offset.clone(),
             out_rate.clone(),
             varispeed.clone(),
+            out_offset.clone(),
         );
         let ports = ports.clone();
         let absent = current.port.clone();
@@ -409,6 +420,13 @@ fn sync_section(app: &Rc<AppState>) -> SyncWidgets {
                 }
                 None => offset.add_css_class("error"),
             }
+            match Timecode::parse(&out_offset.text()) {
+                Some(tc) => {
+                    s.mtc_out_offset = tc;
+                    out_offset.remove_css_class("error");
+                }
+                None => out_offset.add_css_class("error"),
+            }
             app.session.borrow_mut().set_sync_settings(s.clone());
             let mut p = Preferences::load();
             p.set_sync_settings(&s);
@@ -426,15 +444,15 @@ fn sync_section(app: &Rc<AppState>) -> SyncWidgets {
         let apply = Rc::clone(&apply);
         d.connect_selected_notify(move |_| apply());
     }
-    {
-        let apply = Rc::clone(&apply);
-        offset.connect_activate(move |_| apply());
-    }
-    {
+    for e in [&offset, &out_offset] {
+        {
+            let apply = Rc::clone(&apply);
+            e.connect_activate(move |_| apply());
+        }
         let apply = Rc::clone(&apply);
         let focus = gtk::EventControllerFocus::new();
         focus.connect_leave(move |_| apply());
-        offset.add_controller(focus);
+        e.add_controller(focus);
     }
     SyncWidgets { grid, status }
 }

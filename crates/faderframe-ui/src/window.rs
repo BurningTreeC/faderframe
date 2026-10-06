@@ -431,6 +431,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             ("Loop", "app.loop"),
             ("Record", "app.record"),
             ("Capture MIDI", "app.capture-midi"),
+            ("Varispeed…", "app.varispeed"),
         ]),
     );
     transport.append_section(None, &crate::recording::menu());

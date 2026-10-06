@@ -246,3 +246,27 @@ fn follows_a_drifting_clock_by_varispeed_without_jumps() {
     assert!(st.error_ms.abs() < 10.0, "{:.2} ms", st.error_ms);
     let _ = at;
 }
+
+#[test]
+fn a_manual_varispeed_plays_faster_and_gives_way_to_a_master() {
+    let mut s = session();
+    s.set_manual_speed(Some(5.0));
+    s.tick(0.005);
+    assert!(s.engine().varispeed());
+    assert!((s.engine().speed() - 1.05).abs() < 1e-9);
+    // Clamped to ±10 %.
+    s.set_manual_speed(Some(40.0));
+    assert!((s.engine().speed() - 1.10).abs() < 1e-9);
+    // Following a master: it sets the speed (from 1); back to internal,
+    // the manual speed returns.
+    s.set_sync_settings(SyncSettings {
+        source: SyncSource::MidiClock,
+        ..SyncSettings::default()
+    });
+    assert_eq!(s.engine().speed(), 1.0, "the master's");
+    s.set_sync_settings(SyncSettings::default());
+    assert!((s.engine().speed() - 1.10).abs() < 1e-9);
+    s.set_manual_speed(None);
+    assert!(!s.engine().varispeed());
+    assert_eq!(s.engine().speed(), 1.0);
+}

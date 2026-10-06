@@ -192,11 +192,21 @@ impl CanvasView<Session, Action> for TransportDisplay {
             z.tempo,
             &mono(theme.fonts.large, lcd_text).align(Align::End),
         );
-        p.text(
-            "BPM",
-            z.bpm,
-            &small(lcd_text.with_alpha(0.7)).align(Align::End),
-        );
+        // Varispeed: the speed in place of "BPM".
+        let speed = s.engine().speed();
+        if (speed - 1.0).abs() > 1e-6 {
+            p.text(
+                &format!("VARI {:+.1}%", (speed - 1.0) * 100.0),
+                z.bpm,
+                &small(Color::hex(0xffc24b)).align(Align::End),
+            );
+        } else {
+            p.text(
+                "BPM",
+                z.bpm,
+                &small(lcd_text.with_alpha(0.7)).align(Align::End),
+            );
+        }
         // The tap pad.
         let lit = self.flashing();
         p.fill_rounded(

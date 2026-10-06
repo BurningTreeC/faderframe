@@ -237,8 +237,12 @@ impl Varispeed {
     }
 }
 
-/// How far from 1 the speed may go.
-pub const MAX_DEVIATION: f64 = 0.02;
+/// How far from 1 the speed may go (a manual varispeed reaches ±10 %).
+pub const MAX_DEVIATION: f64 = 0.12;
+
+/// Frames of delay each way (device to engine, engine to device) at speed
+/// 1; recordings and the chase compensate it.
+pub const DELAY: usize = TAPS - BEFORE;
 
 #[cfg(test)]
 mod tests {
@@ -291,5 +295,42 @@ mod tests {
             .fold(0.0f32, f32::max);
         let max_step = (std::f64::consts::TAU * f * speed / rate) as f32;
         assert!(jumps <= max_step * 1.05, "{jumps} > {max_step}");
+    }
+
+    /// The delay each way: an impulse into the device's input comes out of
+    /// the engine's [`DELAY`] frames later, and an impulse the engine
+    /// renders reaches the device [`DELAY`] frames later (at speed 1).
+    #[test]
+    fn the_delay_each_way_is_delay_frames() {
+        let mut v = Varispeed::new(1, 1, 64);
+        let mut io = OwnedBuffers::new(1, 1, 64);
+        let mut engine_in = Vec::new();
+        let mut rendered = 0usize;
+        let mut heard = Vec::new();
+        for k in 0..4 {
+            io.set_frames(64);
+            io.input_mut(0).fill(0.0);
+            if k == 1 {
+                io.input_mut(0)[10] = 1.0;
+            }
+            v.process(&mut io, 1.0, |e| {
+                let m = e.frames();
+                engine_in.extend_from_slice(&e.input(0)[..m]);
+                for (j, o) in e.output(0).iter_mut().enumerate().take(m) {
+                    *o = if rendered + j == 64 + 10 { 1.0 } else { 0.0 };
+                }
+                rendered += m;
+            });
+            heard.extend_from_slice(io.output_ref(0));
+        }
+        let peak = |x: &[f32]| {
+            x.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i)
+                .unwrap()
+        };
+        assert_eq!(peak(&engine_in), 64 + 10 + DELAY, "input");
+        assert_eq!(peak(&heard), 64 + 10 + DELAY, "output");
     }
 }

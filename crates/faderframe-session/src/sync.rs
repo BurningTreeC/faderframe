@@ -90,6 +90,8 @@ pub struct SyncSettings {
     /// The rate MTC is sent at (from the project start's timecode,
     /// `offset`).
     pub mtc_out_rate: MtcRate,
+    /// The timecode MTC output starts from at the project start.
+    pub mtc_out_offset: Timecode,
     /// Follow by varispeed (no jumps) rather than by chasing.
     pub varispeed: bool,
 }
@@ -103,6 +105,7 @@ impl Default for SyncSettings {
             tolerance_ms: 15.0,
             follow_tempo: true,
             mtc_out_rate: MtcRate::default(),
+            mtc_out_offset: Timecode::default(),
             varispeed: true,
         }
     }
@@ -404,7 +407,12 @@ pub(crate) struct SyncState {
     filtered: Option<f64>,
     integral: f64,
     last_tick_ns: u64,
+    /// A manual varispeed (percent), used while FaderFrame is the master.
+    manual: Option<f64>,
 }
+
+/// How far a manual varispeed goes (percent).
+pub const MANUAL_SPEED_RANGE: f64 = 10.0;
 
 /// Varispeed's loop: proportional and integral gains (per second), the
 /// distance's smoothing per tick, the speed's range and the distance (a
@@ -422,20 +430,29 @@ impl Session {
 
     /// Change the timing source; followers start from scratch.
     pub fn set_sync_settings(&mut self, settings: SyncSettings) {
-        // Varispeed only follows a master.
-        let wants = settings.varispeed && settings.source != SyncSource::Internal;
-        if !wants && self.engine.varispeed() {
+        // Following a master by varispeed, or a manual speed while
+        // FaderFrame is the master.
+        let follows = settings.varispeed && settings.source != SyncSource::Internal;
+        let manual = settings.source == SyncSource::Internal && self.sync.manual.is_some();
+        if !follows && !manual && self.engine.varispeed() {
             let _ = self.engine.set_varispeed(false);
+        }
+        if settings.source != SyncSource::Internal {
+            // The master sets the speed from now on.
+            self.engine.set_speed(1.0);
         }
         let rate = settings.mtc_out_rate;
         self.engine
             .midi_shared()
-            .set_mtc(rate, settings.offset.total_frames(rate));
+            .set_mtc(rate, settings.mtc_out_offset.total_frames(rate));
         if settings != self.sync.settings {
+            let manual = self.sync.manual;
             self.sync = SyncState {
                 settings,
+                manual,
                 ..SyncState::default()
             };
+            self.apply_manual_speed();
             self.revision += 1;
         }
     }
@@ -542,6 +559,13 @@ impl Session {
                 self.notify(crate::NoticeLevel::Info, format!("following {what}"));
             }
             Follow::Tick { at, at_ns } => {
+                // A new stream (or engine) came without varispeed.
+                if self.sync.settings.varispeed
+                    && !self.engine.varispeed()
+                    && self.engine.stream_sample_rate() > 0
+                {
+                    self.start_varispeed()?;
+                }
                 let target = self.sync_samples(at) + latency;
                 let rate = self.engine.sample_rate().max(1) as f64;
                 match self.engine.position_at(at_ns) {
@@ -646,6 +670,50 @@ impl Session {
 
     /// Play from `target` as of `at_ns` (like the play button: recording
     /// and automation writing start as usual).
+    /// A manual varispeed in percent (±[`MANUAL_SPEED_RANGE`]; `None`:
+    /// off): the song plays that much faster or slower, higher or lower.
+    /// While a master is followed it sets the speed; the manual one comes
+    /// back when FaderFrame is the master again.
+    pub fn set_manual_speed(&mut self, percent: Option<f64>) {
+        self.sync.manual = percent
+            .filter(|p| p.is_finite())
+            .map(|p| p.clamp(-MANUAL_SPEED_RANGE, MANUAL_SPEED_RANGE));
+        self.apply_manual_speed();
+        self.revision += 1;
+    }
+
+    pub fn manual_speed(&self) -> Option<f64> {
+        self.sync.manual
+    }
+
+    /// The manual varispeed onto the engine (when FaderFrame is the master
+    /// and the stream runs: the resampler is made for its channels).
+    pub(crate) fn apply_manual_speed(&mut self) {
+        if self.sync.settings.source != SyncSource::Internal {
+            return;
+        }
+        match self.sync.manual {
+            Some(p) => {
+                if !self.engine.varispeed() {
+                    if self.engine.stream_sample_rate() == 0 {
+                        // Not prepared yet: the next tick tries again.
+                        return;
+                    }
+                    if let Err(e) = self.engine.set_varispeed(true) {
+                        self.notify(crate::NoticeLevel::Warning, format!("varispeed: {e}"));
+                        return;
+                    }
+                }
+                self.engine.set_speed(1.0 + p / 100.0);
+            }
+            None => {
+                if self.engine.varispeed() {
+                    let _ = self.engine.set_varispeed(false);
+                }
+            }
+        }
+    }
+
     /// Varispeed on (when set) at speed 1, its loop from scratch.
     fn start_varispeed(&mut self) -> Result<()> {
         self.sync.filtered = None;
