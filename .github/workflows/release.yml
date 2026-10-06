@@ -134,7 +134,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           ls -l artifacts
-          gh release create "$GITHUB_REF_NAME" artifacts/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "FaderFrame ${GITHUB_REF_NAME#v}" \
-            --generate-notes
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            # The tag was moved: the release gets the new builds.
+            gh release upload "$GITHUB_REF_NAME" artifacts/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" artifacts/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "FaderFrame ${GITHUB_REF_NAME#v}" \
+              --generate-notes
+          fi
