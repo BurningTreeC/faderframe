@@ -754,6 +754,48 @@ fn containers_do_not_allocate() {
         }
     });
     assert_eq!(allocs, 0, "allocations mixing chains");
+
+    // Instruments in key ranges: the demo's lead split between two synths.
+    let mut project = demo_project(SR);
+    let lead = project
+        .tracks
+        .iter()
+        .position(|t| t.name == "Lead Synth")
+        .unwrap();
+    let slot = |p: &mut faderframe_project::Project, id: &str| PluginSlot {
+        id: p.ids.allocate(),
+        plugin: PluginRef::builtin(id, id),
+        bypass: false,
+        parameters: Vec::new(),
+        state: None,
+        sidechain: None,
+    };
+    let split = slot(&mut project, builtin::CONTAINER);
+    let (a, b) = (
+        slot(&mut project, builtin::SYNTH),
+        slot(&mut project, builtin::SYNTH),
+    );
+    let mut low = Chain::new("Low");
+    low.key_high = 71;
+    low.inserts.push(a);
+    let mut high = Chain::new("High");
+    high.key_low = 72;
+    high.inserts.push(b);
+    let t = &mut project.tracks[lead];
+    t.containers.insert(split.id, vec![low, high]);
+    t.inserts = vec![split];
+    let sources = render_generated_sources(&project, SR);
+    let mut r = OfflineRenderer::new(&project, &sources, config, 256, 2).unwrap();
+    r.play_from(i64::from(SR) * 8).unwrap();
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    let (_, allocs) = armed(|| {
+        for _ in 0..300 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations playing instruments in chains");
 }
 
 #[test]

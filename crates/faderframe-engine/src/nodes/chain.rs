@@ -59,3 +59,42 @@ impl Processor<EngineContext> for ChainMix {
         self.last = [f32::NAN; MAX_CHANNELS];
     }
 }
+
+/// The notes a container's chain gets: those in its key range (and every
+/// note-off, so a range changed while notes sound never strands one).
+pub struct ChainNotes {
+    low: u8,
+    high: u8,
+}
+
+impl ChainNotes {
+    pub fn new(low: u8, high: u8) -> Self {
+        Self { low, high }
+    }
+
+    fn takes(&self, key: u8) -> bool {
+        (self.low..=self.high).contains(&key)
+    }
+}
+
+impl Processor<EngineContext> for ChainNotes {
+    fn process(&mut self, _cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
+        let (Some(input), Some(out)) = (io.events_in.first(), io.events_out.first_mut()) else {
+            return;
+        };
+        out.clear();
+        for e in input.iter() {
+            let pass = match e.event {
+                faderframe_midi::MidiEvent::NoteOn { key, velocity, .. } => {
+                    velocity == 0 || self.takes(key)
+                }
+                faderframe_midi::MidiEvent::PolyPressure { key, .. }
+                | faderframe_midi::MidiEvent::NoteExpression { key, .. } => self.takes(key),
+                _ => true,
+            };
+            if pass {
+                let _ = out.push_from(input, *e);
+            }
+        }
+    }
+}

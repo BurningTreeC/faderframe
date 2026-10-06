@@ -75,6 +75,24 @@ impl Session {
         Ok(())
     }
 
+    /// The keys chain `chain`'s devices get.
+    pub(crate) fn set_chain_keys(
+        &mut self,
+        track: TrackId,
+        container: PluginInstanceId,
+        chain: usize,
+        low: u8,
+        high: u8,
+    ) -> Result<()> {
+        let mut chains = self.chains_of(track, container)?;
+        let (low, high) = (low.min(127), high.min(127));
+        if let Some(c) = chains.get_mut(chain) {
+            (c.key_low, c.key_high) = (low.min(high), low.max(high));
+            self.set_chains(track, container, chains)?;
+        }
+        Ok(())
+    }
+
     /// How deep the container sits in other containers (0: in the track's
     /// inserts).
     fn depth_of(&self, track: TrackId, container: PluginInstanceId) -> usize {

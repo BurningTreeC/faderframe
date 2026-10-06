@@ -1,10 +1,13 @@
 //! The Container's face: its chains side by side, each a column — its name
 //! (double-click renames), mute, solo and remove; its level and balance
-//! (drag; double-click resets); its devices in order (the light bypasses,
-//! a click opens the editor, the right button offers Remove); and a row to
-//! add a device. "+ Chain" adds a chain. The chains run in parallel and are
-//! mixed at the container's output.
+//! (drag; double-click resets); on an instrument track the keys it plays
+//! (click to type "C2-B3", double-click: all); its devices in order (the
+//! light bypasses, a click opens the editor, the right button offers the
+//! sidechain, bypass and Remove); and a row to add a device (instruments
+//! too on an instrument track). "+ Chain" adds a chain. The chains run in
+//! parallel and are mixed at the container's output.
 
+use crate::values::{note_name, parse_key_range};
 use faderframe_core::{PluginInstanceId, TrackId, builtin};
 use faderframe_project::container::{Chain, audible};
 use faderframe_project::{Command, PluginRef, PluginSlot};
@@ -33,6 +36,7 @@ pub enum Hit {
     RemoveChain(usize),
     Level(usize),
     Pan(usize),
+    Keys(usize),
     /// A device: its light (bypass) or its name.
     Bypass(usize, usize),
     Device(usize, usize),
@@ -49,6 +53,8 @@ pub struct Column {
     pub remove: Rect,
     pub level: Rect,
     pub pan: Rect,
+    /// The keys it plays (instrument tracks).
+    pub keys: Option<Rect>,
     /// (light, row) of each device.
     pub devices: Vec<(Rect, Rect)>,
     pub add: Rect,
@@ -65,6 +71,8 @@ pub struct ContainerView {
     theme: Theme,
     scroll: f32,
     drag: Option<Drag>,
+    /// The track plays notes: chains show their keys.
+    keys: bool,
 }
 
 fn level_norm(db: f32) -> f32 {
@@ -83,6 +91,7 @@ impl ContainerView {
             theme: theme.clone(),
             scroll: 0.0,
             drag: None,
+            keys: false,
         }
     }
 
@@ -99,7 +108,7 @@ impl ContainerView {
     }
 
     /// Chain `i`'s column for `chain`.
-    pub fn column(&self, i: usize, chain: &Chain, size: Size) -> Column {
+    pub fn column(&self, i: usize, chain: &Chain, size: Size, keys: bool) -> Column {
         let rect = Rect::new(
             GAP + i as f32 * (COL_W + GAP) - self.scroll,
             TOP + 4.0,
@@ -113,7 +122,8 @@ impl ContainerView {
         let name = Rect::new(x + 8.0, y, mute.x - x - 12.0, HEAD_H);
         let level = Rect::new(x + 8.0, y + HEAD_H + 6.0, w - 16.0, 14.0);
         let pan = Rect::new(x + 8.0, level.bottom() + 8.0, w - 16.0, 10.0);
-        let top = y + HEAD_H + MIX_H + 6.0;
+        let keys_row = keys.then(|| Rect::new(x + 8.0, pan.bottom() + 14.0, w - 16.0, 16.0));
+        let top = y + HEAD_H + MIX_H + 6.0 + if keys { 22.0 } else { 0.0 };
         let devices = (0..chain.inserts.len())
             .map(|d| {
                 let row = Rect::new(x + 6.0, top + d as f32 * ROW_H, w - 12.0, ROW_H - 3.0);
@@ -134,6 +144,7 @@ impl ContainerView {
             remove,
             level,
             pan,
+            keys: keys_row,
             devices,
             add,
         }
@@ -145,7 +156,7 @@ impl ContainerView {
         }
         let (_, chains) = self.chains(model)?;
         for (i, chain) in chains.iter().enumerate() {
-            let c = self.column(i, chain, size);
+            let c = self.column(i, chain, size, self.keys);
             if !c.rect.contains(pos) {
                 continue;
             }
@@ -156,6 +167,7 @@ impl ContainerView {
                 (c.name, Hit::Name(i)),
                 (c.level.inset_xy(0.0, -4.0), Hit::Level(i)),
                 (c.pan.inset_xy(0.0, -4.0), Hit::Pan(i)),
+                (c.keys.unwrap_or_default(), Hit::Keys(i)),
                 (c.add, Hit::AddDevice(i)),
             ]
             .into_iter()
@@ -189,7 +201,8 @@ impl ContainerView {
         }
     }
 
-    /// The devices to add: every effect, built-ins first, and a container.
+    /// The devices to add: every effect (and instrument, on an instrument
+    /// track), built-ins first, and a container.
     fn add_menu(
         model: &Session,
         track: TrackId,
@@ -197,10 +210,14 @@ impl ContainerView {
         chain: usize,
         index: usize,
     ) -> Vec<MenuItem<Action>> {
+        let instruments = model
+            .project()
+            .track(track)
+            .is_some_and(|t| t.kind == faderframe_project::TrackKind::Instrument);
         let mut effects: Vec<_> = model
             .available_plugins()
             .into_iter()
-            .filter(|p| !p.instrument && !model.is_midi_effect(&p.plugin))
+            .filter(|p| (instruments || !p.instrument) && !model.is_midi_effect(&p.plugin))
             .collect();
         effects.sort_by(|a, b| {
             let hosted = |p: &faderframe_session::AvailablePlugin| {
@@ -257,8 +274,8 @@ impl ContainerView {
         items
     }
 
-    fn device_menu(track: TrackId, slot: &PluginSlot) -> Vec<MenuItem<Action>> {
-        vec![
+    fn device_menu(model: &Session, track: TrackId, slot: &PluginSlot) -> Vec<MenuItem<Action>> {
+        let mut items = vec![
             MenuItem::disabled(slot.plugin.name.clone()),
             MenuItem::new(
                 "Show Editor",
@@ -283,7 +300,29 @@ impl ContainerView {
                     plugin: slot.id,
                 },
             ),
-        ]
+        ];
+        // Which track's pre-fader signal keys it.
+        if model.plugin_has_sidechain(slot.id) {
+            let set = |source| {
+                Action::Edit(Command::SetPluginSidechain {
+                    track,
+                    plugin: slot.id,
+                    source,
+                })
+            };
+            items.push(
+                MenuItem::new("Sidechain: None", set(None))
+                    .checked(slot.sidechain.is_none())
+                    .separated(),
+            );
+            for (id, name) in model.sidechain_sources(slot.id) {
+                items.push(
+                    MenuItem::new(format!("Sidechain from {name}"), set(Some(id)))
+                        .checked(slot.sidechain == Some(id)),
+                );
+            }
+        }
+        items
     }
 
     fn content_w(count: usize) -> f32 {
@@ -372,6 +411,28 @@ impl ContainerView {
             Rect::new(c.pan.x, c.pan.bottom(), c.pan.w, 10.0),
             &TextStyle::new(th.fonts.tiny, th.ui.text_dim).center(),
         );
+        if let Some(k) = c.keys {
+            p.fill_rounded(k, 3.0, &Paint::Solid(th.ui.background));
+            let text = if chain.all_keys() {
+                "All keys".to_string()
+            } else {
+                format!(
+                    "{} – {}",
+                    note_name(i32::from(chain.key_low)),
+                    note_name(i32::from(chain.key_high))
+                )
+            };
+            p.text(
+                "KEYS",
+                k.inset_xy(6.0, 0.0),
+                &TextStyle::new(th.fonts.tiny, th.ui.text_dim).bold(),
+            );
+            p.text(
+                &text,
+                k.inset_xy(6.0, 0.0),
+                &TextStyle::new(th.fonts.small, th.ui.text).right(),
+            );
+        }
         // Devices.
         for (d, (light, row)) in c.devices.iter().enumerate() {
             let slot = &chain.inserts[d];
@@ -431,6 +492,9 @@ impl CanvasView<Session, Action> for ContainerView {
         p.fill(Rect::from_size(size), th.ui.background);
         p.fill(Rect::new(0.0, 0.0, size.w, TOP), th.ui.surface);
         p.hline(0.0, size.w, TOP - 0.5, th.ui.border);
+        self.keys = model
+            .plugin_slot(self.plugin)
+            .is_some_and(|(t, _)| t.kind == faderframe_project::TrackKind::Instrument);
         let Some((_, chains)) = self.chains(model) else {
             p.text(
                 "This container is gone",
@@ -461,7 +525,7 @@ impl CanvasView<Session, Action> for ContainerView {
         self.clamp(chains.len(), size);
         p.push_clip(Rect::new(0.0, TOP, size.w, size.h - TOP));
         for (i, chain) in chains.iter().enumerate() {
-            let c = self.column(i, chain, size);
+            let c = self.column(i, chain, size, self.keys);
             if c.rect.right() >= 0.0 && c.rect.x <= size.w {
                 self.paint_column(p, &c, chains, i, model);
             }
@@ -506,7 +570,7 @@ impl CanvasView<Session, Action> for ContainerView {
                         chain: i,
                     }),
                     Hit::Name(i) if clicks >= 2 => {
-                        let c = self.column(i, &chains[i], size);
+                        let c = self.column(i, &chains[i], size, self.keys);
                         cx.request(HostRequest::TextInput {
                             at: c.name,
                             initial: chains[i].name.clone(),
@@ -529,6 +593,35 @@ impl CanvasView<Session, Action> for ContainerView {
                             c.solo = !c.solo;
                         }
                         cx.emit(Action::Edit(Self::mix(track, container, i, &c)));
+                    }
+                    Hit::Keys(i) if clicks >= 2 => cx.emit(Action::SetChainKeys {
+                        track,
+                        container,
+                        chain: i,
+                        low: 0,
+                        high: 127,
+                    }),
+                    Hit::Keys(i) => {
+                        let c = &chains[i];
+                        let at = self.column(i, c, size, self.keys).keys.unwrap_or_default();
+                        cx.request(HostRequest::TextInput {
+                            at,
+                            initial: format!(
+                                "{}-{}",
+                                note_name(i32::from(c.key_low)),
+                                note_name(i32::from(c.key_high))
+                            ),
+                            commit: Box::new(move |text| {
+                                let (low, high) = parse_key_range(text)?;
+                                Some(Action::SetChainKeys {
+                                    track,
+                                    container,
+                                    chain: i,
+                                    low,
+                                    high,
+                                })
+                            }),
+                        });
                     }
                     Hit::Level(i) | Hit::Pan(i) if clicks >= 2 => {
                         let mut c = chains[i].clone();
@@ -565,7 +658,7 @@ impl CanvasView<Session, Action> for ContainerView {
                     }
                     Hit::Device(i, d) if secondary => cx.request(HostRequest::ContextMenu {
                         at: pos,
-                        items: Self::device_menu(track, &chains[i].inserts[d]),
+                        items: Self::device_menu(model, track, &chains[i].inserts[d]),
                     }),
                     Hit::Device(i, d) => cx.emit(Action::OpenPluginEditor {
                         track,
@@ -593,7 +686,7 @@ impl CanvasView<Session, Action> for ContainerView {
                         let Some(c) = chains.get(chain) else {
                             return true;
                         };
-                        let width = self.column(chain, c, size).level.w.max(1.0);
+                        let width = self.column(chain, c, size, self.keys).level.w.max(1.0);
                         let mut c = c.clone();
                         c.gain_db = level_db(start + (pos.x - from) / width * fine);
                         cx.emit(Action::Edit(Self::mix(track, container, chain, &c)));
@@ -602,7 +695,7 @@ impl CanvasView<Session, Action> for ContainerView {
                         let Some(c) = chains.get(chain) else {
                             return true;
                         };
-                        let width = self.column(chain, c, size).pan.w.max(1.0);
+                        let width = self.column(chain, c, size, self.keys).pan.w.max(1.0);
                         let mut c = c.clone();
                         let v = start + (pos.x - from) / (width / 2.0) * fine;
                         c.pan = (v.clamp(-1.0, 1.0) * 100.0).round() / 100.0;
@@ -669,6 +762,9 @@ impl CanvasView<Session, Action> for ContainerView {
                 "Balance {} · drag, double-click: centre",
                 faderframe_core::pan::format_pan(chains[i].pan)
             ),
+            Hit::Keys(_) => {
+                "The keys this chain plays: click to type (\"C2-B3\"), double-click for all".into()
+            }
             Hit::Bypass(..) => "On / bypassed".into(),
             Hit::Device(..) => "Click to open its editor · right-click for more".into(),
             Hit::AddDevice(_) => "Add a device at the end of the chain".into(),
@@ -754,7 +850,7 @@ mod tests {
         assert!(texts.contains(&"Dry") && texts.contains(&"Chain 2"));
         // + Device on the second chain: built-in effects, no MIDI effects.
         let chains = s.container_chains(bass, container).unwrap().to_vec();
-        let col = view.column(1, &chains[1], SIZE);
+        let col = view.column(1, &chains[1], SIZE, false);
         let (_, req) = run(&mut view, down(col.add.center(), 1), &s);
         let Some(HostRequest::ContextMenu { items, .. }) = req.into_iter().next() else {
             panic!("no menu")
@@ -773,7 +869,7 @@ mod tests {
             1
         );
         // The level: dragged a quarter of the bar to the left, one step.
-        let col = view.column(0, &chains[0], SIZE);
+        let col = view.column(0, &chains[0], SIZE, false);
         let at = col.level.center();
         let mut actions = run(&mut view, down(at, 1), &s).0;
         actions.extend(
@@ -828,5 +924,66 @@ mod tests {
                 container
             }]
         );
+    }
+
+    #[test]
+    fn chains_on_an_instrument_track_play_key_ranges() {
+        let mut s = Session::demo(EngineConfig::default()).unwrap();
+        let lead = s
+            .project()
+            .tracks
+            .iter()
+            .find(|t| t.name == "Lead Synth")
+            .unwrap()
+            .id;
+        s.dispatch(Action::InsertPlugin {
+            track: lead,
+            index: 1,
+            plugin: PluginRef::builtin(builtin::CONTAINER, "Container"),
+        })
+        .unwrap();
+        let container = s.project().track(lead).unwrap().inserts[1].id;
+        // A synth in its second chain is an instrument of the track.
+        s.dispatch(Action::InsertIntoChain {
+            track: lead,
+            container,
+            chain: 1,
+            index: 0,
+            plugin: PluginRef::builtin(builtin::SYNTH, "Synth"),
+        })
+        .unwrap();
+        let mut view = ContainerView::new(container, &Theme::default());
+        view.paint(&mut RecordingPainter::new(), SIZE, &s, &Theme::default());
+        let chains = s.container_chains(lead, container).unwrap().to_vec();
+        let col = view.column(1, &chains[1], SIZE, true);
+        let keys = col.keys.expect("instrument tracks show the keys");
+        let (_, req) = run(&mut view, down(keys.center(), 1), &s);
+        let Some(HostRequest::TextInput { commit, .. }) = req.into_iter().next() else {
+            panic!("a text field")
+        };
+        let action = commit("C4-C6").unwrap();
+        assert_eq!(
+            action,
+            Action::SetChainKeys {
+                track: lead,
+                container,
+                chain: 1,
+                low: 60,
+                high: 84
+            }
+        );
+        s.dispatch(action).unwrap();
+        let c = &s.container_chains(lead, container).unwrap()[1];
+        assert_eq!((c.key_low, c.key_high), (60, 84));
+        // Double-click: all keys again.
+        let (a, _) = run(&mut view, down(keys.center(), 2), &s);
+        assert!(matches!(
+            a.as_slice(),
+            [Action::SetChainKeys {
+                low: 0,
+                high: 127,
+                ..
+            }]
+        ));
     }
 }

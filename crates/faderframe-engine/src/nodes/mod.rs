@@ -9,7 +9,7 @@ mod plugin;
 mod send;
 mod strip;
 
-pub use chain::ChainMix;
+pub use chain::{ChainMix, ChainNotes};
 pub use clip_player::{AudioClipPlayer, StretchVoices};
 pub use crosstalk::Crosstalk;
 pub use io::{DeviceInputTap, DeviceOutputSink, MonitorGate};

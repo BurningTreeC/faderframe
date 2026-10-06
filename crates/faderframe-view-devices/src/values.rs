@@ -58,6 +58,32 @@ pub(crate) fn parse_freq(text: &str) -> Option<f64> {
     (v > 0.0).then_some(v * k)
 }
 
+/// A typed key range: "C2-B3", "C2 B3", "C2–B3" (a minus before an
+/// octave stays one: "C-1-G9"); one key alone is a range of one.
+pub(crate) fn parse_key_range(text: &str) -> Option<(u8, u8)> {
+    let t = text.trim().replace('–', " ").replace("..", " ");
+    let key = |s: &str| {
+        let n = parse_note(s.trim())?.round();
+        (0.0..=127.0).contains(&n).then_some(n as u8)
+    };
+    let chars: Vec<char> = t.chars().collect();
+    // A dash that a note name follows splits the two keys.
+    let dash = (1..chars.len())
+        .find(|&i| chars[i] == '-' && chars.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic()));
+    let (a, b) = match dash {
+        Some(i) => (
+            chars[..i].iter().collect::<String>(),
+            chars[i + 1..].iter().collect::<String>(),
+        ),
+        None => match t.split_once(' ') {
+            Some((a, b)) => (a.to_string(), b.to_string()),
+            None => (t.clone(), t.clone()),
+        },
+    };
+    let (a, b) = (key(&a)?, key(&b)?);
+    Some((a.min(b), a.max(b)))
+}
+
 /// "C#3+13" → MIDI note (fractional).
 fn parse_note(t: &str) -> Option<f64> {
     let mut chars = t.chars().peekable();
@@ -164,6 +190,17 @@ pub(crate) fn ms_text(ms: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn key_ranges_are_typed_as_people_write_them() {
+        assert_eq!(parse_key_range("C2-B3"), Some((36, 59)));
+        assert_eq!(parse_key_range("C2 – B3"), Some((36, 59)));
+        assert_eq!(parse_key_range("C-1-G9"), Some((0, 127)));
+        assert_eq!(parse_key_range("B3 C2"), Some((36, 59)));
+        assert_eq!(parse_key_range("A4"), Some((69, 69)));
+        assert_eq!(parse_key_range("H2"), None);
+    }
+
     use super::*;
 
     #[test]

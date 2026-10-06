@@ -1,7 +1,9 @@
 //! Containers: a device (`faderframe.container`, an ordinary insert slot)
 //! that splits its input into parallel chains — each a series of devices
 //! with its own level, pan, mute and solo — and mixes them back together.
-//! A chain without devices is the dry signal. The chains live in
+//! A chain without devices is the dry signal. On an instrument track the
+//! chains' instruments get the track's notes, each chain those in its key
+//! range (layers and key splits). The chains live in
 //! `Track::containers` by the container's slot (containers in containers
 //! there too), so a container slot is like any other: moved, bypassed,
 //! removed (and restored by undo) with its chains.
@@ -29,6 +31,15 @@ pub struct Chain {
     pub mute: bool,
     #[serde(default)]
     pub solo: bool,
+    /// The notes the chain's devices get: keys `key_low..=key_high`.
+    #[serde(default)]
+    pub key_low: u8,
+    #[serde(default = "top_key")]
+    pub key_high: u8,
+}
+
+fn top_key() -> u8 {
+    127
 }
 
 impl Chain {
@@ -40,7 +51,14 @@ impl Chain {
             pan: 0.0,
             mute: false,
             solo: false,
+            key_low: 0,
+            key_high: 127,
         }
+    }
+
+    /// Does the chain take every key?
+    pub fn all_keys(&self) -> bool {
+        self.key_low == 0 && self.key_high >= 127
     }
 }
 

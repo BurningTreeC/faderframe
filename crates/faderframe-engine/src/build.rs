@@ -171,6 +171,7 @@ enum Role {
     Modulators = 12,
     ContainerSum = 13,
     ChainMix = 14,
+    ChainNotes = 15,
 }
 
 /// Stretcher voices a track's clip player needs: one per pitch-preserving
@@ -751,7 +752,26 @@ pub fn build_graph(
         for slot in chain {
             // A container: its chains side by side.
             if slot.plugin.is_container() {
-                prev = add_container(&mut b, &mut pcx, slots, &mut owners, t, slot, prev, gi, 0)?;
+                let mut links = ChainLinks {
+                    project,
+                    notes: t.kind == TrackKind::Instrument,
+                    events: &events,
+                    raw,
+                    takes_notes: &mut takes_notes,
+                    sidechains: &mut sidechains,
+                };
+                prev = add_container(
+                    &mut b,
+                    &mut pcx,
+                    slots,
+                    &mut owners,
+                    t,
+                    slot,
+                    prev,
+                    gi,
+                    0,
+                    &mut links,
+                )?;
                 continue;
             }
             // A MIDI effect (built above): what follows gets its notes.
@@ -998,10 +1018,27 @@ pub fn build_graph(
 }
 
 /// A track's channel strip, fed from `from`.
+/// What a container's devices connect to besides the audio.
+struct ChainLinks<'a> {
+    project: &'a Project,
+    /// The track plays notes (an instrument track): devices that take
+    /// notes get them.
+    notes: bool,
+    /// Where the notes come from at the container's place.
+    events: &'a [NodeId],
+    /// They are the track's own (no MIDI effect before): MIDI tracks
+    /// routed to the track reach the chains too.
+    raw: bool,
+    takes_notes: &'a mut Vec<NodeId>,
+    /// (node, source track) of sidechain inputs to connect.
+    sidechains: &'a mut Vec<(NodeId, TrackId)>,
+}
+
 /// A container in a track's chain: its chains side by side from `prev`
 /// (each its devices, then its level and balance) into a sum; the graph
-/// aligns the chains' latencies there. A container without chains, or
-/// bypassed, passes `prev` on.
+/// aligns the chains' latencies there. Each chain's devices that take
+/// notes get those in its key range (`ChainNotes`). A container without
+/// chains, or bypassed, passes `prev` on.
 #[allow(clippy::too_many_arguments)]
 fn add_container(
     b: &mut GraphBuilder<EngineContext>,
@@ -1013,6 +1050,7 @@ fn add_container(
     prev: NodeId,
     gi: u32,
     depth: usize,
+    links: &mut ChainLinks<'_>,
 ) -> Result<NodeId, EngineError> {
     let Some(chains) = t.containers.get(&container.id).filter(|c| !c.is_empty()) else {
         return Ok(prev);
@@ -1047,20 +1085,97 @@ fn add_container(
     own(owners, sum, container.id);
     for (i, chain) in chains.iter().enumerate() {
         let mut from = prev;
+        // The chain's notes: those of its key range.
+        let wants_notes = links.notes
+            && chain
+                .inserts
+                .iter()
+                .any(|s| s.plugin.is_container() || pcx.takes_notes(s));
+        let notes = if wants_notes {
+            let sub = container.id.raw().rotate_left(8)
+                ^ i as u64
+                ^ (u64::from(chain.key_low) << 40)
+                ^ (u64::from(chain.key_high) << 48);
+            let f = b.add_node(
+                NodeSpec::new(format!(
+                    "{} · {} · {} · Notes",
+                    t.name, container.plugin.name, chain.name
+                ))
+                .key(node_key(t.id, Role::ChainNotes, sub, &[]))
+                .group(gi)
+                .events_in(1)
+                .events_out(1),
+                Box::new(crate::nodes::ChainNotes::new(chain.key_low, chain.key_high)),
+            );
+            own(owners, f, container.id);
+            for e in links.events {
+                b.connect_events(*e, 0, f, 0)?;
+            }
+            if links.raw {
+                links.takes_notes.push(f);
+            }
+            Some(f)
+        } else {
+            None
+        };
         for slot in &chain.inserts {
             if slot.plugin.is_container() {
                 if depth + 1 < faderframe_project::container::MAX_DEPTH {
-                    from = add_container(b, pcx, slots, owners, t, slot, from, gi, depth + 1)?;
+                    // Inside: the notes of this chain.
+                    let inner_events: Vec<NodeId> = notes.into_iter().collect();
+                    let mut inner = ChainLinks {
+                        project: links.project,
+                        notes: links.notes,
+                        events: &inner_events,
+                        raw: false,
+                        takes_notes: links.takes_notes,
+                        sidechains: links.sidechains,
+                    };
+                    from = add_container(
+                        b,
+                        pcx,
+                        slots,
+                        owners,
+                        t,
+                        slot,
+                        from,
+                        gi,
+                        depth + 1,
+                        &mut inner,
+                    )?;
                 }
                 continue;
             }
-            let spec = NodeSpec::new(format!("{} · {}", t.name, slot.plugin.name))
+            let mut spec = NodeSpec::new(format!("{} · {}", t.name, slot.plugin.name))
                 .group(gi)
                 .audio_in(layout)
                 .audio_out(layout);
+            let takes = notes.is_some() && pcx.takes_notes(slot);
+            if takes {
+                spec = spec.events_in(1);
+            }
+            // A sidechain from another track (one that does not depend on
+            // this one).
+            let key = slot.sidechain.filter(|&src| {
+                links
+                    .project
+                    .track(src)
+                    .is_some_and(|s| s.kind.has_audio() && s.kind != TrackKind::Midi)
+                    && !links.project.reaches(t.id, src, None)
+            });
+            let key = key.and_then(|src| Some((src, pcx.sidechain_layout(slot)?)));
+            if let Some((_, l)) = key {
+                spec = spec.audio_in(l);
+            }
             let (node, _) = pcx.node(b, slot, t, spec, Role::Insert);
             own(owners, node, slot.id);
+            if let Some((src, _)) = key {
+                links.sidechains.push((node, src));
+            }
             b.connect_audio(from, 0, node, 0)?;
+            if let (true, Some(f)) = (takes, notes) {
+                b.connect_events(f, 0, node, 0)?;
+            }
             from = node;
         }
         let mix = b.add_node(

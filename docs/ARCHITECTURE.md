@@ -1668,8 +1668,15 @@ actions add, rename and remove chains and put devices into and out of them
 one). The engine expands a container in place (`build::add_container`):
 the chains fan out from the previous node, each ends in a `ChainMix` node
 (ramped gain and balance) and all meet at a sum, where the graph's delay
-compensation aligns their latencies. Devices in chains get no notes and no
-sidechains yet; tracks with containers are not rendered ahead. Editor:
+compensation aligns their latencies. On instrument tracks each chain's
+note-taking devices get the track's notes through a `ChainNotes` node
+that passes the chain's key range (`Chain::{key_low, key_high}`, every
+note-off passes; `Action::SetChainKeys`) — layers and key splits; MIDI
+tracks routed to the track reach it, nested containers take their outer
+chain's notes. Devices in chains have sidechain inputs like inserts
+(`SetPluginSidechain` reaches them; the build's `ChainLinks` carries the
+notes and the sidechains to connect). Tracks with containers are not
+rendered ahead. Editor:
 `view-devices` `container::ContainerView` (a column a chain); dev action
 `chain-insert:<n>=<builtin id>`.
 

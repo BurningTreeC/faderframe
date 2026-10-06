@@ -143,3 +143,157 @@ fn containers_nest() {
     assert_eq!(ids.len(), 3);
     assert!(ids.contains(&inner_id));
 }
+
+/// A plain sine synth (no filter movement, quick envelope).
+fn sine(tp: &mut TestProject) -> PluginSlot {
+    use faderframe_plugin_host::devices::synth::id::*;
+    slot(
+        tp,
+        builtin::SYNTH,
+        &[
+            (OSC1_WAVE, 3.0),
+            (OSC2_LEVEL, 0.0),
+            (DETUNE, 0.0),
+            (CUTOFF, 20_000.0),
+            (RESONANCE, 0.0),
+            (ENV_AMOUNT, 0.0),
+            (ATTACK, 1.0),
+            (SUSTAIN, 1.0),
+            (RELEASE, 5.0),
+            (WIDTH, 0.0),
+        ],
+    )
+}
+
+/// A MIDI clip on `track` holding `key` for a bar.
+fn note(tp: &mut TestProject, track: TrackId, key: u8) {
+    use faderframe_project::{Clip, ClipContent, MidiClip, MidiNote};
+    let n = MidiNote {
+        id: tp.project.ids.allocate(),
+        start: MusicalTime::ZERO,
+        length: MusicalTime::from_quarters(4.0),
+        key,
+        velocity: 100,
+        channel: 0,
+        muted: false,
+    };
+    let id = tp.project.ids.allocate();
+    tp.project.clips.insert(
+        id,
+        Clip {
+            id,
+            track,
+            name: "Note".into(),
+            color: None,
+            start: MusicalTime::ZERO,
+            muted: false,
+            content: ClipContent::Midi(MidiClip {
+                length: MusicalTime::from_quarters(4.0),
+                notes: vec![n],
+                controllers: Vec::new(),
+                expressions: Vec::new(),
+                sysex: Vec::new(),
+            }),
+        },
+    );
+    tp.project.track_mut(track).unwrap().clips.push(id);
+}
+
+fn peak(x: &[f32]) -> f32 {
+    x.iter().fold(0.0f32, |m, v| m.max(v.abs()))
+}
+
+/// An instrument track whose container splits the keyboard: a synth in
+/// "Low" (up to B3) and one in "High" (C4 up).
+fn split(tp: &mut TestProject) -> (TrackId, PluginInstanceId) {
+    let t = tp.track(TrackKind::Instrument, "Keys", ChannelLayout::Stereo);
+    let container = slot(tp, builtin::CONTAINER, &[]);
+    let (lo_synth, hi_synth) = (sine(tp), sine(tp));
+    let id = container.id;
+    let track = tp.project.track_mut(t).unwrap();
+    track.inserts.push(container);
+    let mut low = Chain::new("Low");
+    low.key_high = 59;
+    low.inserts.push(lo_synth);
+    let mut high = Chain::new("High");
+    high.key_low = 60;
+    high.inserts.push(hi_synth);
+    track.containers.insert(id, vec![low, high]);
+    (t, id)
+}
+
+#[test]
+fn chains_play_the_notes_of_their_key_range() {
+    for (key, low_heard) in [(48u8, true), (72u8, false)] {
+        let mut tp = TestProject::new(48_000);
+        let (t, c) = split(&mut tp);
+        note(&mut tp, t, key);
+        let both = peak(&render(&tp, 12_000)[2_000..]);
+        assert!(both > 0.01, "{key}: {both}");
+        // The low chain muted: only a high note still sounds.
+        tp.project
+            .track_mut(t)
+            .unwrap()
+            .containers
+            .get_mut(&c)
+            .unwrap()[0]
+            .mute = true;
+        let without_low = peak(&render(&tp, 12_000)[2_000..]);
+        if low_heard {
+            assert!(
+                without_low < 1e-4,
+                "{key}: the high chain kept out: {without_low}"
+            );
+        } else {
+            assert!(
+                (without_low - both).abs() < 1e-4,
+                "{key}: {without_low} vs {both}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_midi_track_reaches_the_instruments_in_containers() {
+    let mut tp = TestProject::new(48_000);
+    let (t, _) = split(&mut tp);
+    let midi = tp.track(TrackKind::Midi, "Notes", ChannelLayout::Stereo);
+    tp.project.track_mut(midi).unwrap().output =
+        faderframe_project::OutputRouting::Track { track: t };
+    note(&mut tp, midi, 72);
+    let out = render(&tp, 12_000);
+    assert!(
+        peak(&out[2_000..]) > 0.01,
+        "the high chain plays the MIDI track's note"
+    );
+}
+
+#[test]
+fn a_device_in_a_chain_is_keyed_from_another_track() {
+    use faderframe_plugin_host::devices::gate::id as gate;
+    let mut tp = TestProject::new(48_000);
+    // The key: loud for a quarter of a second, then silent; not heard.
+    let key = tp.track(TrackKind::Audio, "Key", ChannelLayout::Stereo);
+    let src = tp.dc(2, 0.5, 12_000);
+    tp.clip(key, src, MusicalTime::ZERO, 12_000);
+    tp.project.track_mut(key).unwrap().output = faderframe_project::OutputRouting::None;
+    let t = tp.track(TrackKind::Audio, "Tone", ChannelLayout::Stereo);
+    let src = tp.dc(2, 0.25, 48_000);
+    tp.clip(t, src, MusicalTime::ZERO, 48_000);
+    let container = slot(&mut tp, builtin::CONTAINER, &[]);
+    let mut gate_slot = slot(&mut tp, builtin::GATE, &[(gate::RELEASE, 20.0)]);
+    gate_slot.sidechain = Some(key);
+    let id = container.id;
+    let track = tp.project.track_mut(t).unwrap();
+    track.inserts.push(container);
+    let mut gated = Chain::new("Gated");
+    gated.inserts.push(gate_slot);
+    track.containers.insert(id, vec![gated]);
+    let out = render(&tp, 36_000);
+    assert!(peak(&out[4_000..10_000]) > 0.2, "open while the key plays");
+    assert!(
+        peak(&out[24_000..]) < 1e-3,
+        "closed after: {}",
+        peak(&out[24_000..])
+    );
+}

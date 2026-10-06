@@ -359,6 +359,14 @@ pub enum Action {
         track: TrackId,
         plugin: faderframe_core::PluginInstanceId,
     },
+    /// The keys a chain's devices get (`low..=high`).
+    SetChainKeys {
+        track: TrackId,
+        container: faderframe_core::PluginInstanceId,
+        chain: usize,
+        low: u8,
+        high: u8,
+    },
     /// Keep the project as it is now as a named version.
     SaveVersion {
         name: String,
@@ -2590,6 +2598,13 @@ impl Session {
                 self.insert_into_chain(track, container, chain, index, plugin)?;
             }
             Action::RemoveFromChain { track, plugin } => self.remove_from_chain(track, plugin)?,
+            Action::SetChainKeys {
+                track,
+                container,
+                chain,
+                low,
+                high,
+            } => self.set_chain_keys(track, container, chain, low, high)?,
             Action::Transport(t) => {
                 self.transport_action(t)?;
                 self.pump_idle();
@@ -3678,11 +3693,18 @@ impl Session {
         &self,
         track: &'a faderframe_project::Track,
     ) -> Option<&'a PluginSlot> {
+        // The inserts first, then what containers hold.
         track.instrument.as_ref().or_else(|| {
             track
                 .inserts
                 .iter()
                 .find(|s| self.engine.plugin_is_instrument(s.id))
+                .or_else(|| {
+                    track
+                        .slots()
+                        .into_iter()
+                        .find(|s| self.engine.plugin_is_instrument(s.id))
+                })
         })
     }
 
