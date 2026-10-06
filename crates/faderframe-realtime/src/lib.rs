@@ -70,4 +70,7 @@ pub use pool::{
 pub use scope::ScopeRing;
 pub use slots::SlotAllocator;
 pub use trycell::{TryCell, TryCellGuard};
-pub use workgroup::{Membership, Workgroup};
+pub use workgroup::{
+    Membership, Workgroup, process as process_workgroup,
+    process_generation as process_workgroup_generation, set_process as set_process_workgroup,
+};

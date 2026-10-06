@@ -1695,9 +1695,12 @@ impl Session {
             match backend.open_stream(config, Box::new(processor)) {
                 Ok(stream) => {
                     let info = stream.info();
-                    // macOS: the workers join the device's audio workgroup.
+                    // macOS: the workers join the device's audio workgroup,
+                    // and so do sandboxed plugins' audio threads.
+                    let workgroup = stream.io_workgroup();
+                    faderframe_realtime::set_process_workgroup(workgroup.clone());
                     if let Some(pool) = &self.pool {
-                        pool.set_workgroup(stream.io_workgroup());
+                        pool.set_workgroup(workgroup);
                     }
                     self.audio = Some(ActiveAudio {
                         stream,
@@ -1852,6 +1855,7 @@ impl Session {
     /// Close the stream (the engine processor goes with it).
     pub fn stop_audio(&mut self) {
         self.audio = None;
+        faderframe_realtime::set_process_workgroup(None);
         if let Some(pool) = &self.pool {
             pool.set_workgroup(None);
         }

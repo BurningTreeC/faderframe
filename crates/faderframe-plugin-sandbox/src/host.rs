@@ -61,6 +61,15 @@ impl Channel {
             h.sched.store(packed, Ordering::Release);
             self.sched_sent = true;
         }
+        // macOS: the helper's audio thread follows the device's workgroup.
+        h.wg_gen.store(
+            faderframe_realtime::process_workgroup_generation(),
+            Ordering::Release,
+        );
+        let joined = h.wg_joined.load(Ordering::Acquire);
+        if joined != 0 {
+            crate::workgroup::note_joined(joined);
+        }
         let mut out_channels = [0usize; MAX_BUFFERS];
         let n_out = io.audio_out.len().min(MAX_BUFFERS);
         for (c, b) in out_channels.iter_mut().zip(io.audio_out.iter()) {

@@ -37,6 +37,8 @@ struct Helper {
     audio: Option<Audio>,
     go: Arc<Waiter>,
     done: Arc<Signal>,
+    /// The device's audio workgroup for the audio thread (macOS).
+    workgroup: Arc<crate::workgroup::Fetcher>,
     /// Parameter values as FaderFrame last heard them.
     sent: HashMap<u32, f64>,
     /// The window of our own the editor sits in (macOS: views do not
@@ -57,6 +59,7 @@ pub fn run(registry: PluginRegistry) -> i32 {
         audio: None,
         go: Arc::new(go),
         done: Arc::new(done),
+        workgroup: crate::workgroup::Fetcher::start(),
         sent: HashMap::new(),
         #[cfg(target_os = "macos")]
         window: None,
@@ -432,14 +435,15 @@ impl Helper {
             Err(e) => return failed(e),
         };
         let latency = inst.latency_samples();
-        let (b, go, done) = (
+        let (b, go, done, wg) = (
             Arc::clone(&block),
             Arc::clone(&self.go),
             Arc::clone(&self.done),
+            Arc::clone(&self.workgroup),
         );
         let thread = std::thread::Builder::new()
             .name("faderframe-plugin-audio".into())
-            .spawn(move || audio_loop(processor, b, go, done));
+            .spawn(move || audio_loop(processor, b, go, done, wg));
         match thread {
             Ok(thread) => {
                 self.audio = Some(Audio { block, thread });
@@ -590,8 +594,10 @@ fn audio_loop(
     block: Arc<Block>,
     go: Arc<Waiter>,
     done: Arc<Signal>,
+    workgroup: Arc<crate::workgroup::Fetcher>,
 ) {
     faderframe_realtime::flush_denormals_on_this_thread();
+    let mut membership = crate::workgroup::AudioMembership::default();
     let h = block.header();
     let mut io = HelperIo::default();
     // A fresh block: FaderFrame's first request is 1.
@@ -619,6 +625,10 @@ fn audio_loop(
         if s != 0 && s != sched {
             faderframe_realtime::apply_thread_scheduling(s, h.sched_extra.load(Ordering::Relaxed));
             sched = s;
+        }
+        // macOS: the device's workgroup, as FaderFrame's has it now.
+        if let Some(joined) = membership.update(h.wg_gen.load(Ordering::Acquire), &workgroup) {
+            h.wg_joined.store(joined, Ordering::Release);
         }
         if h.reset.swap(0, Ordering::AcqRel) != 0 {
             processor.reset();

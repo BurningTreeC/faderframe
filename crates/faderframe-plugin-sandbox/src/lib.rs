@@ -43,6 +43,7 @@ mod host;
 mod mac;
 mod shm;
 mod sys;
+pub mod workgroup;
 
 use faderframe_plugin_host::{PluginDescriptor, PluginError, PluginFactory, PluginFormat};
 use std::path::PathBuf;

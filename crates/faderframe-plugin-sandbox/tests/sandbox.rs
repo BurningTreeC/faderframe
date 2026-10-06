@@ -500,3 +500,27 @@ fn round_trip_cost() {
         );
     }
 }
+
+/// macOS: a sandboxed plugin's audio thread joins the audio workgroup
+/// FaderFrame's process has (handed over as a Mach port).
+#[test]
+#[cfg(target_os = "macos")]
+fn a_helpers_audio_thread_joins_the_audio_workgroup() {
+    let wg = faderframe_realtime::Workgroup::new_interval(c"FaderFrame sandbox test")
+        .expect("a work interval");
+    assert!(wg.copy_port().is_some(), "the workgroup crosses processes");
+    faderframe_realtime::set_process_workgroup(Some(wg));
+    let target = u64::from(faderframe_realtime::process_workgroup_generation());
+    let mut inst = remote(PluginFormat::Builtin, builtin::GAIN);
+    let mut p = inst.create_processor(&CONFIG).unwrap();
+    let start = Instant::now();
+    while faderframe_plugin_sandbox::workgroup::helpers_joined() < target {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the helper's audio thread joined"
+        );
+        run(&mut *p, 4, &[], &[]);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    faderframe_realtime::set_process_workgroup(None);
+}

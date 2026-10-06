@@ -35,7 +35,7 @@ pub const MAX_NOTE_MODS: usize = 256;
 /// Bytes of SysEx per block (to the plugin).
 pub const MAX_SYSEX: usize = 16 * 1024;
 const MAGIC: u32 = 0x4646_5348;
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 /// A SysEx event: `value` holds the start of its bytes in `sysex_in`
 /// (low 16 bits) and their count (high 16 bits).
 const SYSEX_KIND: u8 = 9;
@@ -244,6 +244,10 @@ pub struct Header {
     /// The host audio thread's scheduling (`thread_scheduling`, 0 unknown).
     pub sched: AtomicU64,
     pub sched_extra: AtomicU64,
+    /// The host's audio workgroup generation, and the one the helper's
+    /// audio thread joined (see `workgroup`).
+    pub wg_gen: AtomicU32,
+    pub wg_joined: AtomicU32,
     pub max_frames: u32,
     pub frames: u32,
     /// 0 continue, 1 sleep, 2 error.

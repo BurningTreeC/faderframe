@@ -58,6 +58,10 @@ pub fn spawn(launcher: &Launcher) -> io::Result<Link> {
         .envs(launcher.env.iter().map(|(k, v)| (k, v)))
         .env(ENV_HELPER, "1")
         .stdin(Stdio::null());
+    // macOS: where the helper asks for the audio workgroup.
+    if let Some(service) = crate::workgroup::service_name() {
+        cmd.env(crate::workgroup::SERVICE_ENV, service);
+    }
     place_fds(
         &mut cmd,
         vec![

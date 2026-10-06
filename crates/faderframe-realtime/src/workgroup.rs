@@ -4,6 +4,36 @@
 //! workload with the IO thread's deadline (on Apple silicon: performance
 //! cores, no throttling mid-cycle). Elsewhere there are no workgroups and
 //! [`Workgroup`] cannot be made.
+//!
+//! The process keeps the current device's workgroup ([`set_process`]) with
+//! a generation that changes with it; plugin helper processes get it as a
+//! Mach port ([`Workgroup::copy_port`], [`Workgroup::from_port`]) and their
+//! audio threads join it too.
+
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+static PROCESS: Mutex<Option<Workgroup>> = Mutex::new(None);
+static GENERATION: AtomicU32 = AtomicU32::new(0);
+
+/// The audio device's workgroup for the whole process (`None`: none); every
+/// call starts a new generation.
+pub fn set_process(workgroup: Option<Workgroup>) {
+    if let Ok(mut g) = PROCESS.lock() {
+        *g = workgroup;
+    }
+    GENERATION.fetch_add(1, Ordering::AcqRel);
+}
+
+/// The process's current workgroup.
+pub fn process() -> Option<Workgroup> {
+    PROCESS.lock().ok().and_then(|g| g.clone())
+}
+
+/// Changes with every [`set_process`] (0: never set); realtime-safe.
+pub fn process_generation() -> u32 {
+    GENERATION.load(Ordering::Acquire)
+}
 
 /// A retained `os_workgroup_t` (`Send`/`Sync`: workgroups are thread-safe).
 pub struct Workgroup {
@@ -112,6 +142,8 @@ mod mac {
         pub fn os_release(object: *mut c_void);
         pub fn os_workgroup_join(wg: *mut c_void, token: *mut JoinToken) -> i32;
         pub fn os_workgroup_leave(wg: *mut c_void, token: *mut JoinToken);
+        pub fn os_workgroup_copy_port(wg: *mut c_void, port: *mut u32) -> i32;
+        pub fn os_workgroup_create_with_port(name: *const c_char, port: u32) -> *mut c_void;
     }
 
     /// A CoreAudio device's IO-thread workgroup (+1 retained), if it has one.
@@ -254,6 +286,39 @@ impl Workgroup {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = name;
+            None
+        }
+    }
+
+    /// A send right to a Mach port standing for this workgroup, for another
+    /// process ([`Workgroup::from_port`] there); the caller owns the right.
+    pub fn copy_port(&self) -> Option<u32> {
+        #[cfg(target_os = "macos")]
+        {
+            let mut port = 0u32;
+            // SAFETY: a live workgroup; the port is written on success.
+            let r = unsafe { mac::os_workgroup_copy_port(self.raw, &mut port) };
+            (r == 0 && port != 0).then_some(port)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            match self._none {}
+        }
+    }
+
+    /// The workgroup another process sent as a Mach port (its send right
+    /// stays the caller's).
+    pub fn from_port(name: &std::ffi::CStr, port: u32) -> Option<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: a valid C string and a send right we hold; the result
+            // is +1.
+            let raw = unsafe { mac::os_workgroup_create_with_port(name.as_ptr(), port) };
+            (!raw.is_null()).then_some(Self { raw })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (name, port);
             None
         }
     }
