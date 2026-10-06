@@ -1226,6 +1226,25 @@ fn the_instruments_do_not_allocate() {
             )),
             vec![],
         ),
+        // Keep Length: pitch by stretchers, not speed.
+        (
+            builtin::SAMPLER,
+            Some(state(
+                builtin::SAMPLER,
+                &[(22, 1.0), (13, 1.0), (14, 0.2), (15, 0.8)],
+                &sampler_doc,
+            )),
+            vec![],
+        ),
+        (
+            builtin::DRUMS,
+            Some(state(
+                builtin::DRUMS,
+                &[(1, 48.0), (102, 7.0), (112, 1.0), (118, -5.0), (128, 1.0)],
+                &drum_doc,
+            )),
+            vec![],
+        ),
     ];
     let mut tracks = HashSet::new();
     let mut ids = Vec::new();

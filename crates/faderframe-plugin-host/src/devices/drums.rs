@@ -5,8 +5,9 @@
 //! oldest stolen); a pad in a choke group silences the others in it (the
 //! open hi-hat stops when the closed one plays).
 
+use super::keep_length::{KeepLength, Render};
 use super::sampler::read;
-use super::samples::Shared;
+use super::samples::{Sample, Shared};
 use super::{on_off, param, pick, stepped};
 use crate::tap::{AnalysisTap, MeterTap, Watching};
 use crate::{
@@ -21,7 +22,7 @@ use std::sync::Arc;
 
 pub const PADS: usize = 16;
 /// Parameters per pad.
-const FIELDS: usize = 12;
+const FIELDS: usize = 13;
 const LAYERS: usize = 4;
 
 pub mod id {
@@ -43,6 +44,8 @@ pub mod id {
     pub const CUTOFF: u32 = 9;
     pub const RESONANCE: u32 = 10;
     pub const VELOCITY: u32 = 11;
+    /// The pad's tune moves its pitch, not its length.
+    pub const KEEP: u32 = 12;
 }
 
 /// Published: per pad how hard it sounds now (0–1), then voices sounding.
@@ -96,6 +99,7 @@ pub fn parameters() -> Vec<ParameterInfo> {
             ),
             param(b + id::RESONANCE, &n("Resonance"), 0.0, 1.0, 0.1, Percent),
             param(b + id::VELOCITY, &n("Velocity"), 0.0, 1.0, 0.8, Percent),
+            stepped(b + id::KEEP, &n("Keep Length"), 1.0, 0.0),
         ]);
     }
     v
@@ -110,7 +114,7 @@ pub fn format(pid: ParameterId, v: f64) -> Option<String> {
     }
     Some(match (pid.0 - id::pad(0)) % 16 {
         id::MODE => pick(&MODES, v),
-        id::REVERSE => on_off(v),
+        id::REVERSE | id::KEEP => on_off(v),
         id::CHOKE if v < 0.5 => "None".into(),
         id::CHOKE => format!("{:.0}", v.round()),
         id::TUNE => format!("{v:+.2} st").replace("+0.00 st", "0 st"),
@@ -142,6 +146,11 @@ struct Voice {
     coefs: (f32, f32, f32),
     filtering: bool,
     age: u64,
+    /// Keep Length: the stretcher it plays through and its pitch factor;
+    /// its sample has all been fed.
+    slot: Option<u8>,
+    pitch: f32,
+    fed_out: bool,
 }
 
 impl Voice {
@@ -162,6 +171,9 @@ impl Voice {
         coefs: (0.0, 0.0, 0.0),
         filtering: false,
         age: 0,
+        slot: None,
+        pitch: 1.0,
+        fed_out: false,
     };
 }
 
@@ -178,6 +190,45 @@ pub struct DrumsProcessor {
     hits: [f32; PADS],
     mix: [Vec<f32>; 2],
     meters: [MeterTap; 2],
+    /// Stretchers for pads that keep their length (made when one does).
+    keep: Option<KeepLength>,
+}
+
+/// Does any pad keep its length (its processor needs stretchers)?
+pub fn keeps_length(params: &ParamValues) -> bool {
+    (0..PADS).any(|p| params.get(2 + p * FIELDS + id::KEEP as usize) >= 0.5)
+}
+
+/// A voice's sample at its position, and on by its step: the frame and
+/// whether that was the sample's end.
+fn next_frame(v: &mut Voice, s: &Sample) -> ([f32; 2], bool) {
+    let y = [read(s, 0, v.pos), read(s, usize::from(s.stereo), v.pos)];
+    let ended = if v.reverse {
+        v.pos -= v.step;
+        v.pos < 0.0
+    } else {
+        v.pos += v.step;
+        v.pos >= s.frames as f64
+    };
+    (y, ended)
+}
+
+/// A Keep Length voice's sample at its own speed into `a`/`b`: the frames
+/// it had (fewer once it ended).
+fn feed_voice(v: &mut Voice, s: &Sample, a: &mut [f32], b: &mut [f32]) -> usize {
+    if v.fed_out {
+        return 0;
+    }
+    for k in 0..a.len().min(b.len()) {
+        let (y, ended) = next_frame(v, s);
+        a[k] = y[0];
+        b[k] = y[1];
+        if ended {
+            v.fed_out = true;
+            return k + 1;
+        }
+    }
+    a.len().min(b.len())
 }
 
 impl DrumsProcessor {
@@ -190,6 +241,9 @@ impl DrumsProcessor {
         let sr = config.sample_rate.max(1.0);
         let block = config.max_block_size.max(1) as usize;
         Self {
+            keep: keeps_length(&params)
+                .then(|| KeepLength::new(sr, block))
+                .flatten(),
             params,
             tap,
             watching: Watching::new(sr as f32),
@@ -253,13 +307,29 @@ impl DrumsProcessor {
         let k = 2.0 - 1.9 * self.pad(pad, id::RESONANCE).clamp(0.0, 1.0) as f32;
         let g = (PI * cutoff.min(sr as f32 * 0.45) / sr as f32).tan();
         let a1 = 1.0 / (1.0 + g * (g + k));
+        let tune = 2f64.powf(self.pad(pad, id::TUNE) / 12.0);
+        // Keep Length: read at the sample's own speed, pitched by a
+        // stretcher.
+        let keep = self.pad(pad, id::KEEP) >= 0.5;
+        let (step, pitch, slot) = match self.keep.as_mut().filter(|_| keep) {
+            Some(pool) => {
+                let ages: [u64; PADS * LAYERS] = std::array::from_fn(|i| self.voices[i].age);
+                let (slot, evicted) = pool.claim(idx, |i| ages[i]);
+                if let Some(e) = evicted {
+                    self.voices[e].on = false;
+                    self.voices[e].slot = None;
+                }
+                (s.rate / sr, tune as f32, Some(slot))
+            }
+            None => (tune * s.rate / sr, 1.0, None),
+        };
         self.counter += 1;
         self.voices[idx] = Voice {
             on: true,
             pad,
             sample,
             pos: if reverse { frames - 1.0 - start } else { start },
-            step: 2f64.powf(self.pad(pad, id::TUNE) / 12.0) * s.rate / sr,
+            step,
             reverse,
             env: if attack < 0.05 { 1.0 } else { 0.0 },
             attack_step: if attack < 0.05 {
@@ -279,6 +349,9 @@ impl DrumsProcessor {
             coefs: (a1, g * a1, g * g * a1),
             filtering: cutoff < 19_500.0,
             age: self.counter,
+            slot,
+            pitch,
+            fed_out: false,
         };
     }
 
@@ -299,26 +372,40 @@ impl DrumsProcessor {
     ) {
         let Some(set) = set else { return };
         let fade = self.fade;
-        for v in self.voices.iter_mut().filter(|v| v.on) {
+        let Self {
+            voices, keep, hits, ..
+        } = self;
+        for v in voices.iter_mut().filter(|v| v.on) {
             let Some(s) = set.samples.get(v.sample) else {
                 v.on = false;
                 continue;
             };
-            let frames = s.frames as f64;
+            // Keep Length: the segment from the voice's stretcher.
+            let mut kept: Option<(&[f32], &[f32])> = None;
+            if let (Some(slot), Some(pool)) = (v.slot, keep.as_mut()) {
+                let pitch = v.pitch;
+                let mut feed = |a: &mut [f32], b: &mut [f32]| feed_voice(v, s, a, b);
+                match pool.render(slot, pitch, end - start, &mut feed) {
+                    Render::Wait => continue,
+                    Render::Done => {
+                        v.on = false;
+                        continue;
+                    }
+                    Render::Out(l, r) => kept = Some((l, r)),
+                }
+            }
             let mut loudest = 0.0f32;
             for i in start..end {
-                let y = [read(s, 0, v.pos), read(s, usize::from(s.stereo), v.pos)];
-                if v.reverse {
-                    v.pos -= v.step;
-                    if v.pos < 0.0 {
-                        v.on = false;
+                let y = match kept {
+                    Some((l, r)) => [l[i - start], r[i - start]],
+                    None => {
+                        let (y, ended) = next_frame(v, s);
+                        if ended {
+                            v.on = false;
+                        }
+                        y
                     }
-                } else {
-                    v.pos += v.step;
-                    if v.pos >= frames {
-                        v.on = false;
-                    }
-                }
+                };
                 let amp = v.env;
                 // Attack, then the decay (a fast fade when let go or
                 // choked).
@@ -356,7 +443,7 @@ impl DrumsProcessor {
                     break;
                 }
             }
-            self.hits[v.pad] = self.hits[v.pad].max(loudest);
+            hits[v.pad] = hits[v.pad].max(loudest);
         }
     }
 }
@@ -383,6 +470,13 @@ impl PluginProcessor for DrumsProcessor {
             g.set.as_deref()
         });
         self.hits = [0.0; PADS];
+        // Stretchers of voices that stopped go back; the block's priming.
+        if let Some(pool) = &mut self.keep {
+            let voices = &self.voices;
+            pool.begin_block(frames, self.sr, |o, slot| {
+                voices[o].on && voices[o].slot == Some(slot)
+            });
+        }
         let mut mix = std::mem::take(&mut self.mix);
         {
             let [l, r] = &mut mix;
@@ -480,6 +574,9 @@ impl PluginProcessor for DrumsProcessor {
 
     fn reset(&mut self) {
         self.voices = [Voice::IDLE; PADS * LAYERS];
+        if let Some(pool) = &mut self.keep {
+            pool.release_all();
+        }
     }
 }
 
@@ -547,6 +644,43 @@ mod tests {
         let (l, _, status) = s.run(0.2);
         assert!(l.iter().all(|v| *v == 0.0));
         assert_eq!(status, ProcessStatus::Sleep);
+    }
+
+    #[test]
+    fn a_pad_can_keep_its_length_when_tuned() {
+        let d = fixtures::dir("drums-keep");
+        let mut doc = SampleDoc::default();
+        doc.set(
+            0,
+            Some(fixtures::tone(&d.join("tom.wav"), 220.0, 48_000, 0.4)),
+        );
+        let play = |keep: f64| {
+            let params = ParamValues::new(parameters());
+            let pad = |f: u32, v: f64| params.set_by_id(ParameterId(id::pad(0) + f), v).unwrap();
+            pad(id::TUNE, 12.0);
+            pad(id::KEEP, keep);
+            let mut host = SampleHost::default();
+            host.set_doc(doc.clone(), None);
+            let mut s = Play::new(DrumsProcessor::new(
+                params,
+                None,
+                &crate::devices::rig::config(),
+                Arc::clone(&host.shared),
+            ));
+            s.send(on(36, 127));
+            let (l, _, _) = s.run(1.0);
+            let sr = crate::devices::rig::SR;
+            let sounding = l.iter().rposition(|v| v.abs() > 0.01).unwrap_or(0) as f64 / sr;
+            let head = &l[..(0.15 * sr) as usize];
+            (sounding, bin_db(head, 440.0))
+        };
+        // Repitched: half as long; kept: as long, both an octave up.
+        let (short, hi) = play(0.0);
+        assert!((short - 0.2).abs() < 0.03, "{short}");
+        assert!(hi > -14.0, "{hi}");
+        let (long, hi) = play(1.0);
+        assert!((long - 0.4).abs() < 0.05, "{long}");
+        assert!(hi > -14.0, "{hi}");
     }
 
     #[test]

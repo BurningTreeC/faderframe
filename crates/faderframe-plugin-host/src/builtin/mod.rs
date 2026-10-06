@@ -353,8 +353,9 @@ pub struct BuiltinInstance {
     descriptor: PluginDescriptor,
     params: ParamValues,
     tap: Option<Arc<AnalysisTap>>,
-    /// The latency last reported (a change asks for a restart).
-    reported: Option<u32>,
+    /// The latency and processor shape last reported (a change asks for a
+    /// restart).
+    reported: Option<(u32, u64)>,
     /// The program last selected.
     program: Option<usize>,
     /// The sample rate of the last processor (latencies in samples depend
@@ -445,7 +446,17 @@ impl PluginInstance for BuiltinInstance {
             // Samples the processor kept us from swapping in.
             h.flush();
         }
-        let now = self.latency_samples();
+        // The samplers' Keep Length needs a processor with stretchers.
+        let shape = match self.kind {
+            Kind::Sampler => u64::from(
+                self.params
+                    .get(crate::devices::sampler::id::PITCH_MODE as usize)
+                    >= 0.5,
+            ),
+            Kind::Drums => u64::from(crate::devices::drums::keeps_length(&self.params)),
+            _ => 0,
+        };
+        let now = (self.latency_samples(), shape);
         let restart = self.reported.is_some_and(|r| r != now);
         self.reported = Some(now);
         crate::PluginPoll {

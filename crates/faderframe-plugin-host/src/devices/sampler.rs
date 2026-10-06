@@ -11,6 +11,7 @@
 //! the envelope can open, and reads its sample by cubic interpolation at
 //! the ratio of the pitch and the sample's rate to the host's.
 
+use super::keep_length::{KeepLength, Render};
 use super::samples::{LoopMode, Sample, Shared, Zone};
 use super::{on_off, param, pick, stepped};
 use crate::tap::{AnalysisTap, MeterTap, Watching};
@@ -47,6 +48,8 @@ pub mod id {
     pub const PAN: u32 = 19;
     pub const REVERSE: u32 = 20;
     pub const KEY_TRACK: u32 = 21;
+    /// 0: the pitch moves with the speed (repitch); 1: the length stays.
+    pub const PITCH_MODE: u32 = 22;
 }
 
 /// Published: voices sounding, the newest voice's key and where it plays
@@ -63,6 +66,7 @@ pub const TAP_VALUES: usize = 5;
 
 pub const FILTERS: [&str; 4] = ["LP 12", "LP 24", "Band", "High"];
 pub const LOOPS: [&str; 3] = ["Off", "Loop", "While Held"];
+pub const PITCH_MODES: [&str; 2] = ["Repitch", "Keep Length"];
 
 const MAX_VOICES: usize = 64;
 
@@ -105,6 +109,7 @@ pub fn parameters() -> Vec<ParameterInfo> {
         param(id::PAN, "Pan", -1.0, 1.0, 0.0, None),
         stepped(id::REVERSE, "Reverse", 1.0, 0.0),
         stepped(id::KEY_TRACK, "Key Tracking", 1.0, 1.0),
+        stepped(id::PITCH_MODE, "Pitch", 1.0, 0.0),
     ]
 }
 
@@ -112,6 +117,7 @@ pub fn format(pid: ParameterId, v: f64) -> Option<String> {
     Some(match pid.0 {
         id::FILTER_TYPE => pick(&FILTERS, v),
         id::LOOP => pick(&LOOPS, v),
+        id::PITCH_MODE => pick(&PITCH_MODES, v),
         id::REVERSE | id::KEY_TRACK => on_off(v),
         id::ROOT => crate::devices::note_name(v.round() as i32),
         id::TRANSPOSE => format!("{:+.0} st", v.round()).replace("+0 st", "0 st"),
@@ -148,6 +154,64 @@ pub(crate) fn read(s: &Sample, c: usize, pos: f64) -> f32 {
     let c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
     let c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
     ((c3 * t + c2) * t + c1) * t + y1
+}
+
+/// The voice's sample at its position (crossfaded into the loop start near
+/// the loop's end), and on by `step`: the frame and whether that was the
+/// end of the sample.
+fn next_frame(v: &mut Voice, s: &Sample, step: f64) -> ([f32; 2], bool) {
+    let stereo = s.stereo;
+    let mut y = [
+        read(s, 0, v.pos),
+        if stereo { read(s, 1, v.pos) } else { 0.0 },
+    ];
+    if let Some((ls, le)) = v.looping
+        && v.fade > 0.0
+        && !v.reverse
+        && v.pos > le - v.fade
+    {
+        let t = ((v.pos - (le - v.fade)) / v.fade) as f32;
+        let back = v.pos - (le - ls);
+        y[0] = y[0] * (1.0 - t) + read(s, 0, back) * t;
+        if stereo {
+            y[1] = y[1] * (1.0 - t) + read(s, 1, back) * t;
+        }
+    }
+    if !stereo {
+        y[1] = y[0];
+    }
+    let ended = if v.reverse {
+        v.pos -= step;
+        v.pos < v.end
+    } else {
+        v.pos += step;
+        match v.looping {
+            Some((ls, le)) if v.pos >= le => {
+                v.pos -= le - ls;
+                false
+            }
+            _ => v.pos >= v.end,
+        }
+    };
+    (y, ended)
+}
+
+/// A Keep Length voice's sample at its own speed into `a`/`b`: the frames
+/// it had (fewer once it ended).
+fn feed_voice(v: &mut Voice, s: &Sample, step: f64, a: &mut [f32], b: &mut [f32]) -> usize {
+    if v.fed_out {
+        return 0;
+    }
+    for k in 0..a.len().min(b.len()) {
+        let (y, ended) = next_frame(v, s, step);
+        a[k] = y[0];
+        b[k] = y[1];
+        if ended {
+            v.fed_out = true;
+            return k + 1;
+        }
+    }
+    a.len().min(b.len())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -188,6 +252,11 @@ struct Voice {
     off_by: u32,
     svf: [[(f32, f32); 2]; 2],
     age: u64,
+    /// Keep Length: the stretcher it plays through and its pitch factor;
+    /// its sample has all been fed.
+    slot: Option<u8>,
+    pitch: f32,
+    fed_out: bool,
 }
 
 impl Voice {
@@ -216,6 +285,9 @@ impl Voice {
         off_by: 0,
         svf: [[(0.0, 0.0); 2]; 2],
         age: 0,
+        slot: None,
+        pitch: 1.0,
+        fed_out: false,
     };
 
     fn release(&mut self) {
@@ -252,6 +324,8 @@ pub struct SamplerProcessor {
     /// The block's two sides before they go out.
     mix: [Vec<f32>; 2],
     meters: [MeterTap; 2],
+    /// Stretchers for Keep Length (made when the mode is on).
+    keep: Option<KeepLength>,
 }
 
 impl SamplerProcessor {
@@ -264,7 +338,6 @@ impl SamplerProcessor {
         let sr = config.sample_rate.max(1.0);
         let block = config.max_block_size.max(1) as usize;
         Self {
-            params,
             tap,
             watching: Watching::new(sr as f32),
             shared,
@@ -282,6 +355,10 @@ impl SamplerProcessor {
             pending: 0,
             mix: [vec![0.0; block], vec![0.0; block]],
             meters: [MeterTap::new(sr as f32); 2],
+            keep: (params.get(id::PITCH_MODE as usize) >= 0.5)
+                .then(|| KeepLength::new(sr, block))
+                .flatten(),
+            params,
         }
     }
 
@@ -421,6 +498,21 @@ impl SamplerProcessor {
         }
         self.counter += 1;
         let idx = self.free_voice();
+        // Keep Length: read at the sample's own speed, pitched by a
+        // stretcher.
+        let keep = self.get(id::PITCH_MODE) >= 0.5;
+        let (step, pitch, slot) = match self.keep.as_mut().filter(|_| keep) {
+            Some(pool) => {
+                let ages: [u64; MAX_VOICES] = std::array::from_fn(|i| self.voices[i].age);
+                let (slot, evicted) = pool.claim(idx, |i| ages[i]);
+                if let Some(e) = evicted {
+                    self.voices[e].stage = Stage::Idle;
+                    self.voices[e].slot = None;
+                }
+                (s.rate / sr, 2f64.powf(semis / 12.0) as f32, Some(slot))
+            }
+            None => (ratio, 1.0, None),
+        };
         self.voices[idx] = Voice {
             stage: Stage::Attack,
             env: 0.0,
@@ -431,7 +523,7 @@ impl SamplerProcessor {
             zone: zone_index,
             sample,
             pos: if reverse { end - 1.0 - start } else { start },
-            step: ratio,
+            step,
             looping,
             loop_mode,
             fade,
@@ -446,6 +538,9 @@ impl SamplerProcessor {
             off_by,
             svf: [[(0.0, 0.0); 2]; 2],
             age: self.counter,
+            slot,
+            pitch,
+            fed_out: false,
         };
     }
 
@@ -594,14 +689,29 @@ impl SamplerProcessor {
         let filtering = cutoff < 19_500.0 || env_amt.abs() > 0.01 || kind != 0;
         let k = 2.0 - 1.9 * self.get(id::RESONANCE).clamp(0.0, 1.0) as f32;
         let bends = self.bend;
-        for v in self.voices.iter_mut().filter(|v| v.stage != Stage::Idle) {
+        let Self { voices, keep, .. } = self;
+        for v in voices.iter_mut().filter(|v| v.stage != Stage::Idle) {
             let Some(s) = set.samples.get(v.sample) else {
                 v.stage = Stage::Idle;
                 continue;
             };
             let bend = 2f64.powf(f64::from(bends[(v.channel & 15) as usize]) / 12.0);
+            // Keep Length: the segment from the voice's stretcher (the bend
+            // moves its pitch, not its speed).
+            let mut kept: Option<(&[f32], &[f32])> = None;
+            if let (Some(slot), Some(pool)) = (v.slot, keep.as_mut()) {
+                let (step, transpose) = (v.step, v.pitch * bend as f32);
+                let mut feed = |a: &mut [f32], b: &mut [f32]| feed_voice(v, s, step, a, b);
+                match pool.render(slot, transpose, end - start, &mut feed) {
+                    Render::Wait => continue,
+                    Render::Done => {
+                        v.stage = Stage::Idle;
+                        continue;
+                    }
+                    Render::Out(l, r) => kept = Some((l, r)),
+                }
+            }
             let step = v.step * bend;
-            let stereo = s.stereo;
             // The filter's coefficients for this segment.
             let velocity = v.velocity;
             let coefs = |env: f32| {
@@ -641,40 +751,16 @@ impl SamplerProcessor {
                 if filtering && i % 16 == 0 {
                     c = coefs(v.env);
                 }
-                // The sample, crossfaded into the loop start near its end.
-                let mut y = [
-                    read(s, 0, v.pos),
-                    if stereo { read(s, 1, v.pos) } else { 0.0 },
-                ];
-                if let Some((ls, le)) = v.looping
-                    && v.fade > 0.0
-                    && !v.reverse
-                    && v.pos > le - v.fade
-                {
-                    let t = ((v.pos - (le - v.fade)) / v.fade) as f32;
-                    let back = v.pos - (le - ls);
-                    y[0] = y[0] * (1.0 - t) + read(s, 0, back) * t;
-                    if stereo {
-                        y[1] = y[1] * (1.0 - t) + read(s, 1, back) * t;
+                let y = match kept {
+                    Some((l, r)) => [l[i - start], r[i - start]],
+                    None => {
+                        let (y, ended) = next_frame(v, s, step);
+                        if ended {
+                            v.stage = Stage::Idle;
+                        }
+                        y
                     }
-                }
-                if !stereo {
-                    y[1] = y[0];
-                }
-                // Move on.
-                if v.reverse {
-                    v.pos -= step;
-                    if v.pos < v.end {
-                        v.stage = Stage::Idle;
-                    }
-                } else {
-                    v.pos += step;
-                    match v.looping {
-                        Some((ls, le)) if v.pos >= le => v.pos -= le - ls,
-                        _ if v.pos >= v.end => v.stage = Stage::Idle,
-                        _ => {}
-                    }
-                }
+                };
                 for ch in 0..2 {
                     let mut x = y[ch];
                     if filtering {
@@ -738,6 +824,13 @@ impl PluginProcessor for SamplerProcessor {
             }
             g.set.as_deref()
         });
+        // Stretchers of voices that stopped go back; the block's priming.
+        if let Some(pool) = &mut self.keep {
+            let voices = &self.voices;
+            pool.begin_block(frames, self.sr, |o, slot| {
+                voices[o].stage != Stage::Idle && voices[o].slot == Some(slot)
+            });
+        }
         // Render both sides into the preallocated mix (taken out and put
         // back: no allocation), split at the events.
         let mut mix = std::mem::take(&mut self.mix);
@@ -845,6 +938,9 @@ impl PluginProcessor for SamplerProcessor {
         self.voices = [Voice::IDLE; MAX_VOICES];
         self.sustain = [false; 16];
         self.pending = 0;
+        if let Some(pool) = &mut self.keep {
+            pool.release_all();
+        }
     }
 }
 
@@ -978,6 +1074,49 @@ pub(crate) mod tests {
         s.send(off(69));
         let (_, _, status) = s.run(2.0);
         assert_eq!(status, ProcessStatus::Sleep);
+    }
+
+    #[test]
+    fn keep_length_moves_the_pitch_not_the_length() {
+        let d = fixtures::dir("sampler-keep");
+        let mut doc = SampleDoc::default();
+        // Half a second of A4 at 44.1 kHz, played an octave up.
+        doc.set(
+            0,
+            Some(fixtures::tone(&d.join("a.wav"), 440.0, 44_100, 0.5)),
+        );
+        // How long it sounds (above -40 dBFS), and its pitch.
+        let play = |mode: f64| {
+            let (mut s, _host) = sampler(
+                doc.clone(),
+                &[(id::ROOT, 69.0), (id::VOLUME, 0.0), (id::PITCH_MODE, mode)],
+            );
+            s.send(on(81, 127));
+            let (l, _, _) = s.run(1.0);
+            let sounding = l.iter().rposition(|v| v.abs() > 0.01).unwrap_or(0);
+            let head = &l[..(0.2 * SR) as usize];
+            (
+                sounding as f64 / SR,
+                bin_db(head, 880.0),
+                bin_db(head, 440.0),
+            )
+        };
+        let (repitch, hi, lo) = play(0.0);
+        assert!((repitch - 0.25).abs() < 0.03, "{repitch}");
+        assert!(hi > -12.0 && lo < -40.0, "{hi} {lo}");
+        let (kept, hi, lo) = play(1.0);
+        assert!((kept - 0.5).abs() < 0.05, "the length stays: {kept}");
+        assert!(hi > -14.0, "an octave up: {hi}");
+        assert!(lo < hi - 20.0, "not the original pitch: {lo} {hi}");
+        // It starts on time: the first 20 ms already sound.
+        let (mut s, _host) = sampler(
+            doc,
+            &[(id::ROOT, 69.0), (id::VOLUME, 0.0), (id::PITCH_MODE, 1.0)],
+        );
+        s.send(on(81, 127));
+        let (l, _, _) = s.run(0.02);
+        let peak = l.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(peak > 0.1, "no latency: {peak}");
     }
 
     #[test]

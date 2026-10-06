@@ -93,6 +93,11 @@ impl Face for SamplerFace {
         );
         c.push(Ctl::toggle(pid(id::KEY_TRACK), "Follow Keys", b[0]));
         c.push(Ctl::toggle(pid(id::REVERSE), "Reverse", b[1]));
+        c.push(Ctl::toggle(
+            pid(id::PITCH_MODE),
+            "Keep Length",
+            Rect::new(b[0].x, b[0].y - SWITCH_H - 6.0, b[0].w, SWITCH_H),
+        ));
         let r = kit::inside(&s[1]);
         c.push(Ctl::segments(
             pid(id::LOOP),
@@ -425,6 +430,9 @@ impl Face for SamplerFace {
         Some(match pid.0 {
             id::ROOT => "The key that plays the sample as recorded",
             id::KEY_TRACK => "The pitch follows the keys (off: every key plays it as recorded)",
+            id::PITCH_MODE => {
+                "Keep Length: other keys change the pitch, not the length (16 voices; off: higher plays shorter, as a tape would)"
+            }
             id::START => "Where playing starts (drag the white marker)",
             id::LOOP => "Loop for ever, or while the key is held (drag the markers)",
             id::CROSSFADE => "Blend across the loop's seam",

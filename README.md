@@ -204,7 +204,10 @@ Contrast:
 * Stock instruments: a virtual analogue synth (unison, sub, noise, four
   filter types, two envelopes, LFO, mono/legato with glide), a sampler
   that plays a sample across the keys or an SFZ instrument, and a
-  sixteen-pad drum sampler with choke groups.
+  sixteen-pad drum sampler with choke groups. Both samplers can keep a
+  sample's length when they change its pitch (Sampler: Keep Length;
+  Drum Sampler: per pad), through the same stretcher as warping, without
+  added latency.
 * EQ in the spirit of FabFilter Pro-Q 4: 24 bands (bell, shelves, cuts of
   any slope from 0 to 96 dB/oct and brickwall, notch, band pass, tilt, flat
   tilt, all pass) whose curves keep their analog shape up to Nyquist; zero

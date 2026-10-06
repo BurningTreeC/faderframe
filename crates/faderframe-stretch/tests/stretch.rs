@@ -136,6 +136,8 @@ fn processing_never_allocates() {
             .enumerate()
         {
             let n = 64 + (i * 37) % 512;
+            // Transposing as it goes (the samplers' Keep Length, bends).
+            s.set_transpose([0.5, 1.0, 1.26, 2.0][i % 4]);
             let take = ((n as f64 * ratio) as usize).min(4096);
             if pos + take > input.len() {
                 pos = 0;

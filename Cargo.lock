@@ -671,6 +671,7 @@ dependencies = [
  "faderframe-core",
  "faderframe-midi",
  "faderframe-realtime",
+ "faderframe-stretch",
  "faderframe-transport",
  "realfft",
  "rtrb",

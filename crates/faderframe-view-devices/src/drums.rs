@@ -113,6 +113,11 @@ impl Face for DrumsFace {
             "START",
             kit::at(k[3], 0.0, 6.0, SMALL.0, SMALL.1),
         ));
+        c.push(Ctl::toggle(
+            self.pid(id::KEEP),
+            "Keep Length",
+            Rect::new(k[2].x - 22.0, r.bottom() - SWITCH_H, 112.0, SWITCH_H),
+        ));
         let r = kit::inside(&s[1]);
         let k = kit::row(
             Rect::new(r.x, r.y + 20.0, r.w, SMALL.1),
@@ -336,6 +341,7 @@ impl Face for DrumsFace {
             id::MODE => "One-shot plays to the end; Gate stops when the key is let go",
             id::DECAY => "How fast the pad dies away (Full: the whole sample)",
             id::START => "Where in the sample it starts",
+            id::KEEP => "The tune changes the pad's pitch, not its length",
             _ => return None,
         })
     }
