@@ -12,6 +12,8 @@ pub struct SendNode {
     send: SendId,
     level: ParamSlot,
     current: f32,
+    /// Rendered ahead: shows nothing (a [`super::StripEcho`] does).
+    quiet: bool,
 }
 
 impl SendNode {
@@ -21,6 +23,15 @@ impl SendNode {
             send,
             level,
             current: f32::NAN,
+            quiet: false,
+        }
+    }
+
+    /// Rendered ahead of the playhead: the level it plays is not shown.
+    pub fn quiet(self) -> Self {
+        Self {
+            quiet: true,
+            ..self
         }
     }
 }
@@ -65,7 +76,7 @@ impl Processor<EngineContext> for SendNode {
             self.current = target;
             off += m;
         }
-        if lane.is_some() {
+        if lane.is_some() && !self.quiet {
             cx.data.readback.set(self.level, self.current);
         }
     }

@@ -152,7 +152,32 @@ fn audio_page(app: &Rc<AppState>, alive: &Rc<std::cell::Cell<bool>>) -> gtk::Wid
             }
         });
     }
-    row(&g, 5, "Render ahead", &ahead);
+    let buses = gtk::CheckButton::with_label("Buses too");
+    buses.set_active(app.session.borrow().render_ahead_buses());
+    buses.set_tooltip_text(Some(
+        "Also render buses, auxes and the master's devices ahead when everything reaching \
+         them is: their plugins leave the audio thread too. The faders, pan, mute and send \
+         levels of the tracks reaching them are then heard after the render-ahead time \
+         (their automation stays exact, their meters in time).",
+    ));
+    {
+        let weak = Rc::downgrade(app);
+        buses.connect_toggled(move |b| {
+            let on = b.is_active();
+            let mut p = Preferences::load();
+            p.render_ahead_buses = on;
+            if let Err(e) = p.save() {
+                tracing::warn!("cannot save preferences: {e}");
+            }
+            if let Some(app) = weak.upgrade() {
+                app.with_session(|s| s.set_render_ahead_buses(on));
+            }
+        });
+    }
+    let ahead_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    ahead_row.append(&ahead);
+    ahead_row.append(&buses);
+    row(&g, 5, "Render ahead", &ahead_row);
 
     let status = gtk::Label::new(None);
     status.set_xalign(0.0);

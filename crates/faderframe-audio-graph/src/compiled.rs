@@ -401,15 +401,26 @@ pub(crate) fn compile<C>(
         groups_of.push(spec.group);
     }
 
-    // Audio summing follows builder node order, not topological position.
-    // Replacing a plugin chain with a render-ahead reader changes schedule
-    // depth; it must not change floating-point addition order at its strip.
-    // Keep event tie ordering in topological order as before.
+    // Audio summing follows the sources' keys (then builder order), not
+    // topological position or the order nodes were added in: moving a
+    // chain into a render-ahead graph (a reader in its place, its strip and
+    // buses built in another order) must not change floating-point
+    // addition order where it is summed. Keep event tie ordering in
+    // topological order as before.
+    let key_of: Vec<(bool, u64)> = compiled
+        .iter()
+        .map(|b| b.info.key.map_or((true, 0), |k| (false, k.0)))
+        .collect();
     let mut sorted_edges = edges.clone();
     sorted_edges.sort_by_key(|e| {
+        let from = position[e.from.0 as usize] as usize;
         (
             position[e.to.0 as usize],
             e.to_port,
+            match e.kind {
+                EdgeKind::Audio => key_of[from],
+                EdgeKind::Events => (false, 0),
+            },
             match e.kind {
                 EdgeKind::Audio => e.from.0,
                 EdgeKind::Events => position[e.from.0 as usize],

@@ -124,7 +124,10 @@ fn build_session(options: &RunOptions, prefs: &prefs::Preferences) -> (Session, 
     }
     let ahead = (prefs.render_ahead_ms > 0)
         .then(|| std::time::Duration::from_millis(u64::from(prefs.render_ahead_ms)));
-    if let Err(e) = session.set_render_ahead(ahead) {
+    if let Err(e) = session
+        .set_render_ahead_buses(prefs.render_ahead_buses)
+        .and_then(|()| session.set_render_ahead(ahead))
+    {
         tracing::warn!("render ahead: {e}");
     }
     if let Some(p) = gone {

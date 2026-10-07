@@ -316,6 +316,8 @@ pub fn create_with_epoch(
         ahead_setting: None,
         ahead_rings: Default::default(),
         ahead_tracks: Default::default(),
+        ahead_strips: Default::default(),
+        ahead_buses: false,
         ahead_misses: Arc::new(AtomicU64::new(0)),
         varispeed: false,
     };
@@ -884,6 +886,10 @@ pub struct EngineController {
     ahead_setting: Option<std::time::Duration>,
     ahead_rings: std::collections::HashMap<faderframe_core::TrackId, Arc<crate::ahead::AheadRing>>,
     ahead_tracks: std::collections::HashSet<faderframe_core::TrackId>,
+    /// Those whose strips are rendered ahead too.
+    ahead_strips: std::collections::HashSet<faderframe_core::TrackId>,
+    /// Render buses ahead (and the strips that reach them).
+    ahead_buses: bool,
     ahead_misses: Arc<AtomicU64>,
     /// Varispeed is on.
     varispeed: bool,
@@ -1414,7 +1420,7 @@ impl EngineController {
     pub fn update_params(&mut self, project: &Project) -> Result<(), EngineError> {
         // A track became live or armed: out of the render-ahead graph. A
         // track gained (or lost) modulators or a follower's source.
-        if (self.ahead.is_some() && self.ahead_plan(project) != self.ahead_tracks)
+        if (self.ahead.is_some() && !self.ahead_plan_installed(project))
             || crate::modulation::shape(project) != self.mod_shape
         {
             self.rebuild_graph(project)?;
@@ -1476,10 +1482,11 @@ impl EngineController {
             PrepareConfig::new(self.config.sample_rate as f64, self.config.max_block_size);
         prepare.measure_nodes = self.config.measure_nodes;
         prepare.parallel_min_ns = self.config.parallel_min_ns;
-        let ahead_tracks = self.ahead_plan(project);
+        let sets = self.ahead_plan(project);
         let lookahead = self.ahead.as_ref().map(|a| a.lookahead);
         let plan = lookahead.map(|lookahead| crate::build::AheadPlan {
-            tracks: &ahead_tracks,
+            tracks: &sets.tracks,
+            strips: &sets.strips,
             rings: &mut self.ahead_rings,
             ring_frames: crate::ahead::ring_frames(lookahead, self.config.max_block_size),
             misses: Arc::clone(&self.ahead_misses),
@@ -1516,8 +1523,9 @@ impl EngineController {
                 rings,
             })));
         }
-        self.ahead_rings.retain(|t, _| ahead_tracks.contains(t));
-        self.ahead_tracks = ahead_tracks;
+        self.ahead_rings.retain(|t, _| sets.tracks.contains(t));
+        self.ahead_tracks = sets.tracks;
+        self.ahead_strips = sets.strips;
         self.voices = voice_needs(project);
         self.launch_tracks = launch_tracks(project);
         self.mod_shape = crate::modulation::shape(project);
@@ -1741,6 +1749,7 @@ impl EngineController {
         }
         self.ahead_rings.clear();
         self.ahead_tracks.clear();
+        self.ahead_strips.clear();
         let Some(lookahead) = lookahead else { return };
         let ctx = EngineContext {
             worker_underruns: AtomicU64::new(0),
@@ -1784,23 +1793,49 @@ impl EngineController {
         self.ahead_misses.load(Ordering::Relaxed)
     }
 
-    /// The tracks to render ahead: those that can, but while playing none
-    /// that plays on the audio thread now (moving it there would leave a
-    /// gap); a stop brings them back ([`Self::ahead_wants_rebuild`]).
-    fn ahead_plan(&self, project: &Project) -> std::collections::HashSet<faderframe_core::TrackId> {
+    /// Tracks whose channel strips (and sends) are rendered ahead too:
+    /// they reach buses rendered ahead ([`Self::set_render_ahead_buses`]).
+    pub fn ahead_strips(&self) -> &std::collections::HashSet<faderframe_core::TrackId> {
+        &self.ahead_strips
+    }
+
+    /// Render buses ahead too, when everything reaching them can be: their
+    /// inputs' faders, pan, mute and send levels are then heard after the
+    /// lookahead. The caller rebuilds the graph ([`Self::sync`] with
+    /// [`Impact::Graph`]).
+    pub fn set_render_ahead_buses(&mut self, on: bool) {
+        self.ahead_buses = on;
+    }
+
+    pub fn render_ahead_buses(&self) -> bool {
+        self.ahead_buses
+    }
+
+    /// What to render ahead: what can be, but while playing nothing that
+    /// plays on the audio thread now (moving it there would leave a gap); a
+    /// stop brings it back ([`Self::ahead_wants_rebuild`]).
+    fn ahead_plan(&self, project: &Project) -> crate::build::AheadSets {
         if self.ahead.is_none() {
             return Default::default();
         }
         let playing = self.shared.transport.snapshot().playing;
-        let fed = crate::build::fed_tracks(project);
-        project
-            .tracks
-            .iter()
-            .filter(|t| !self.edited.contains(&t.id))
-            .filter(|t| crate::build::ahead_eligible(project, t, &self.midi_live, &fed))
-            .filter(|t| !playing || self.ahead_tracks.contains(&t.id))
-            .map(|t| t.id)
-            .collect()
+        let now = crate::build::AheadSets {
+            tracks: self.ahead_tracks.clone(),
+            strips: self.ahead_strips.clone(),
+        };
+        crate::build::ahead_sets(
+            project,
+            &self.midi_live,
+            &self.edited,
+            self.ahead_buses,
+            playing.then_some(&now),
+        )
+    }
+
+    /// Is what is rendered ahead what should be?
+    fn ahead_plan_installed(&self, project: &Project) -> bool {
+        let plan = self.ahead_plan(project);
+        plan.tracks == self.ahead_tracks && plan.strips == self.ahead_strips
     }
 
     /// Stopped with tracks that could be rendered ahead but are not: a
@@ -1808,7 +1843,7 @@ impl EngineController {
     pub fn ahead_wants_rebuild(&self, project: &Project) -> bool {
         self.ahead.is_some()
             && !self.shared.transport.snapshot().playing
-            && self.ahead_plan(project) != self.ahead_tracks
+            && !self.ahead_plan_installed(project)
     }
 
     pub fn midi_live(&self) -> &std::collections::HashSet<faderframe_core::TrackId> {

@@ -5,8 +5,10 @@ use faderframe_audio_graph::{
     AudioBuffer, NodeIo, ProcessContext, Processor, for_each_channel_route,
 };
 use faderframe_automation::SampleLane;
-use faderframe_core::{FaderLaw, PanLaw, TrackId, db_to_gain, gain_to_db, pan::stereo_balance};
-use faderframe_realtime::MeterRange;
+use faderframe_core::{
+    FaderLaw, PanLaw, SendId, TrackId, db_to_gain, gain_to_db, pan::stereo_balance,
+};
+use faderframe_realtime::{MeterRange, ParamSlot};
 
 /// Channel strip: polarity, mute, fader, pan/balance and post-fader metering.
 ///
@@ -32,6 +34,9 @@ pub struct ChannelStrip {
     law: FaderLaw,
     post: [f32; MAX_CHANNELS],
     pre: f32,
+    /// Rendered ahead: no meters, scope or shown values (a [`StripEcho`]
+    /// publishes them when the audio is heard).
+    quiet: bool,
 }
 
 impl ChannelStrip {
@@ -44,6 +49,15 @@ impl ChannelStrip {
             law: FaderLaw::console(),
             post: [f32::NAN; MAX_CHANNELS],
             pre: f32::NAN,
+            quiet: false,
+        }
+    }
+
+    /// Rendered ahead of the playhead (see [`StripEcho`]).
+    pub fn quiet(self) -> Self {
+        Self {
+            quiet: true,
+            ..self
         }
     }
 
@@ -196,6 +210,9 @@ impl Processor<EngineContext> for ChannelStrip {
             values = (fader, pan, mute);
             off += m;
         }
+        if self.quiet {
+            return;
+        }
         if automated {
             // What the faders show while automation plays.
             let rb = &cx.data.readback;
@@ -204,29 +221,116 @@ impl Processor<EngineContext> for ChannelStrip {
             rb.set(self.slots.mute, if values.2 { 1.0 } else { 0.0 });
         }
 
-        let Some(post) = io.audio_out.first() else {
-            return;
-        };
-        // The analysed track feeds the scope (mono: both sides alike).
-        if !cx.data.preview_active
-            && cx.data.scope.source() == Some(self.track.raw())
-            && post.num_channels() > 0
-        {
-            let l = &post.channel(0)[..n];
-            let r = &post.channel(post.num_channels().min(2) - 1)[..n];
-            cx.data.scope.push(self.track.raw(), l, r);
+        if let Some(post) = io.audio_out.first() {
+            publish(cx, self.track, self.meter, post, n);
         }
-        let out_ch = post.num_channels().min(MAX_CHANNELS);
-        for c in 0..out_ch {
-            if let Some(idx) = self.meter.channel(c) {
-                cx.data.meters.measure(idx, post.channel(c));
+    }
+}
+
+/// A strip's post-fader output to its meters and (when it is the analysed
+/// track) the scope.
+fn publish(
+    cx: &ProcessContext<'_, EngineContext>,
+    track: TrackId,
+    meter: MeterRange,
+    post: &AudioBuffer,
+    n: usize,
+) {
+    // The analysed track feeds the scope (mono: both sides alike).
+    if !cx.data.preview_active
+        && cx.data.scope.source() == Some(track.raw())
+        && post.num_channels() > 0
+    {
+        let l = &post.channel(0)[..n];
+        let r = &post.channel(post.num_channels().min(2) - 1)[..n];
+        cx.data.scope.push(track.raw(), l, r);
+    }
+    let out_ch = post.num_channels().min(MAX_CHANNELS);
+    for c in 0..out_ch {
+        if let Some(idx) = meter.channel(c) {
+            cx.data.meters.measure(idx, post.channel(c));
+        }
+    }
+    // Mono strips light both meter channels.
+    if out_ch == 1
+        && let Some(idx) = meter.channel(1)
+    {
+        cx.data.meters.measure(idx, post.channel(0));
+    }
+}
+
+/// A channel strip rendered ahead ([`crate::ahead`]) as it is heard: its
+/// post-fader audio, back from the ring, goes to the meters and the scope,
+/// and its automated fader, pan, mute and send levels are shown — what the
+/// strip and its sends do on the audio thread (rendered ahead they would
+/// be early, so they are quiet there).
+pub struct StripEcho {
+    track: TrackId,
+    slots: StripSlots,
+    meter: MeterRange,
+    sends: Vec<(SendId, ParamSlot)>,
+}
+
+impl StripEcho {
+    pub fn new(
+        track: TrackId,
+        slots: StripSlots,
+        meter: MeterRange,
+        sends: Vec<(SendId, ParamSlot)>,
+    ) -> Self {
+        Self {
+            track,
+            slots,
+            meter,
+            sends,
+        }
+    }
+}
+
+impl Processor<EngineContext> for StripEcho {
+    fn process(&mut self, cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
+        let n = io.frames;
+        if let Some(auto) = cx.data.timeline.automation(self.track) {
+            // The values at the block's end, as the strip shows them.
+            let at = automation_at(cx, n);
+            let rb = &cx.data.readback;
+            let params = &cx.data.params;
+            if auto.volume.is_some()
+                || auto.pan.is_some()
+                || auto.mute.is_some()
+                || !auto.vca_volume.is_empty()
+                || !auto.vca_mute.is_empty()
+            {
+                let fader = auto
+                    .volume
+                    .as_ref()
+                    .and_then(|l| l.value_at(at))
+                    .map_or(params.get(self.slots.volume), |db| db_to_gain(db as f32));
+                let pan = auto
+                    .pan
+                    .as_ref()
+                    .and_then(|l| l.value_at(at))
+                    .map_or(params.get(self.slots.pan), |v| v.clamp(-1.0, 1.0) as f32);
+                let mute = auto
+                    .mute
+                    .as_ref()
+                    .and_then(|l| l.value_at(at))
+                    .map_or(params.get(self.slots.mute) >= 0.5, |v| v >= 0.5);
+                rb.set(self.slots.volume, fader);
+                rb.set(self.slots.pan, pan);
+                rb.set(self.slots.mute, if mute { 1.0 } else { 0.0 });
+            }
+            for (send, level) in &self.sends {
+                if let Some(l) = auto.send(*send) {
+                    let v = l
+                        .value_at(at)
+                        .map_or(params.get(*level), |db| db_to_gain(db as f32));
+                    rb.set(*level, v);
+                }
             }
         }
-        // Mono strips light both meter channels.
-        if out_ch == 1
-            && let Some(idx) = self.meter.channel(1)
-        {
-            cx.data.meters.measure(idx, post.channel(0));
+        if let Some(post) = io.audio_in.first() {
+            publish(cx, self.track, self.meter, post, n);
         }
     }
 }

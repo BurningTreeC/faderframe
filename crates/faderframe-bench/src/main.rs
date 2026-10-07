@@ -53,6 +53,8 @@ struct Args {
     paced: bool,
     /// Render tracks ahead by this many milliseconds (implies `paced`).
     ahead: Option<u64>,
+    /// Render buses ahead too.
+    ahead_buses: bool,
 }
 
 fn parse() -> Result<Args, String> {
@@ -73,6 +75,7 @@ fn parse() -> Result<Args, String> {
         plugin: None,
         paced: false,
         ahead: None,
+        ahead_buses: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -108,6 +111,7 @@ fn parse() -> Result<Args, String> {
             }
             "--fx" => a.fx = num("--fx")?.parse().map_err(|_| "bad --fx")?,
             "--paced" => a.paced = true,
+            "--ahead-buses" => a.ahead_buses = true,
             "--ahead" => {
                 a.ahead = Some(num("--ahead")?.parse().map_err(|_| "bad --ahead")?);
                 a.paced = true;
@@ -130,7 +134,7 @@ fn parse() -> Result<Args, String> {
             }
             "-h" | "--help" => {
                 println!(
-                    "faderframe-bench [--tracks N] [--block FRAMES] [--rate HZ] [--seconds S] [--buses N] [--no-inserts] [--no-sends] [--measure-nodes] [--threads N] [--fx N] [--plugin clap:<id>|vst3:<id>] [--paced] [--ahead MS] [--crosstalk] [--preamp 0..5] [--mono-source]"
+                    "faderframe-bench [--tracks N] [--block FRAMES] [--rate HZ] [--seconds S] [--buses N] [--no-inserts] [--no-sends] [--measure-nodes] [--threads N] [--fx N] [--plugin clap:<id>|vst3:<id>] [--paced] [--ahead MS] [--ahead-buses] [--crosstalk] [--preamp 0..5] [--mono-source]"
                 );
                 std::process::exit(0);
             }
@@ -363,6 +367,7 @@ fn main() {
         let helpers = faderframe_realtime::physical_cores()
             .saturating_sub(args.threads)
             .max(1);
+        r.controller.set_render_ahead_buses(args.ahead_buses);
         r.controller
             .set_render_ahead(Some(std::time::Duration::from_millis(ms)), helpers);
         if let Err(e) = r
@@ -491,10 +496,11 @@ fn main() {
     );
     if let Some(ms) = args.ahead {
         println!(
-            "  render ahead: {} ms, {} of {} tracks, {} late blocks",
+            "  render ahead: {} ms, {} of {} tracks ({} strips), {} late blocks",
             ms,
             r.controller.ahead_tracks().len(),
             project.tracks.len(),
+            r.controller.ahead_strips().len(),
             r.controller.ahead_misses()
         );
     }

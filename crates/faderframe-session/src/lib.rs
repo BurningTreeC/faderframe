@@ -1089,6 +1089,8 @@ pub struct Session {
     plugin_care: sandbox::PluginCare,
     /// Render tracks nobody plays live this far ahead (`None`: off).
     render_ahead: Option<std::time::Duration>,
+    /// Render buses ahead too (see [`Session::set_render_ahead_buses`]).
+    render_ahead_buses: bool,
     /// Tracks with a plugin editor open.
     edited_tracks: std::collections::HashSet<TrackId>,
     /// Selected programs whose new state is not recorded yet.
@@ -1304,6 +1306,7 @@ impl Session {
             album_state: album::AlbumState::default(),
             plugin_care: sandbox::PluginCare::default(),
             render_ahead: None,
+            render_ahead_buses: false,
             edited_tracks: Default::default(),
             pending_programs: Vec::new(),
             analysis: analysis::AnalysisState::new(config.sample_rate),
@@ -1624,6 +1627,7 @@ impl Session {
         self.engine
             .set_midi_output_ports(self.midi.output_port_map());
         self.engine.set_midi_live(self.midi.live().clone());
+        self.engine.set_render_ahead_buses(self.render_ahead_buses);
         self.engine
             .set_render_ahead(self.render_ahead, render_ahead_threads());
         self.engine.set_edited_tracks(self.edited_tracks.clone());
@@ -1762,6 +1766,24 @@ impl Session {
         self.render_ahead
     }
 
+    /// Render buses (auxes, the master's devices) ahead too, when
+    /// everything that reaches them can be rendered ahead: their devices
+    /// leave the audio thread, and the faders, pan, mute and send levels of
+    /// the strips reaching them are heard after the lookahead (their
+    /// automation stays exact, their meters in time).
+    pub fn set_render_ahead_buses(&mut self, on: bool) -> Result<()> {
+        if on == self.render_ahead_buses {
+            return Ok(());
+        }
+        self.render_ahead_buses = on;
+        self.engine.set_render_ahead_buses(on);
+        self.sync(Impact::Graph)
+    }
+
+    pub fn render_ahead_buses(&self) -> bool {
+        self.render_ahead_buses
+    }
+
     /// The plugins whose editors are open (the UI says so every tick): their
     /// tracks play on the audio thread while rendering ahead, so what is
     /// turned is heard at once.
@@ -1798,6 +1820,12 @@ impl Session {
     /// Tracks rendered ahead now, and blocks in which their audio was late.
     pub fn render_ahead_status(&self) -> (usize, u64) {
         (self.engine.ahead_tracks().len(), self.engine.ahead_misses())
+    }
+
+    /// Tracks whose strips are rendered ahead now (they reach buses
+    /// rendered ahead).
+    pub fn render_ahead_strips(&self) -> usize {
+        self.engine.ahead_strips().len()
     }
 
     /// Threads processing the graph (the audio thread plus workers).

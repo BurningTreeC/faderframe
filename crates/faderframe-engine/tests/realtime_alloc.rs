@@ -1165,6 +1165,18 @@ fn varispeed_does_not_allocate() {
 #[test]
 fn rendering_ahead_does_not_allocate_on_the_audio_thread() {
     let _serial = serial();
+    render_ahead_without_allocating(false);
+    // Buses too: strips rendered ahead, their meters, scope and automated
+    // values echoed on the audio thread.
+    render_ahead_without_allocating(true);
+}
+
+#[allow(clippy::unwrap_used)]
+fn render_ahead_without_allocating(buses: bool) {
+    use faderframe_automation::{
+        AutomationCurve, AutomationLane, AutomationMode, AutomationPoint, AutomationTarget,
+        CurveShape,
+    };
     const SR: u32 = 48_000;
     const BLOCK: usize = 256;
     let mut project = demo_project(SR);
@@ -1180,6 +1192,34 @@ fn rendering_ahead_does_not_allocate_on_the_audio_thread() {
             sidechain: None,
         });
     }
+    if buses {
+        // The pad ducks under the drums: that would keep the drums live.
+        let pad = project.tracks.iter_mut().find(|t| t.name == "Pad").unwrap();
+        pad.modulators.clear();
+    }
+    // The drums' fader automated (what it shows comes from the echo).
+    let lane = project.ids.allocate();
+    let drums = project
+        .tracks
+        .iter_mut()
+        .find(|t| t.name == "Drums")
+        .unwrap();
+    drums.automation.lanes.push(AutomationLane {
+        id: lane,
+        target: AutomationTarget::TrackVolume,
+        curve: AutomationCurve::from_points(
+            (0..16)
+                .map(|i| AutomationPoint {
+                    time: faderframe_timeline::MusicalTime::from_quarters(i as f64),
+                    value: -(i % 4) as f64 * 2.0,
+                    shape: CurveShape::Smooth,
+                })
+                .collect(),
+        ),
+        mode: AutomationMode::Read,
+        visible: true,
+    });
+    let drums = drums.id;
     let sources = render_generated_sources(&project, SR);
     let config = EngineConfig {
         sample_rate: SR,
@@ -1187,12 +1227,15 @@ fn rendering_ahead_does_not_allocate_on_the_audio_thread() {
         ..EngineConfig::default()
     };
     let mut r = OfflineRenderer::new(&project, &sources, config, BLOCK, 2).unwrap();
+    r.controller.set_render_ahead_buses(buses);
     r.controller
         .set_render_ahead(Some(std::time::Duration::from_millis(100)), 1);
     r.controller
         .sync(&project, &sources, faderframe_project::Impact::Graph)
         .unwrap();
     assert!(!r.controller.ahead_tracks().is_empty());
+    assert_eq!(r.controller.ahead_strips().contains(&drums), buses);
+    r.controller.scope().set_source(Some(drums.raw()));
     let mut bufs = OwnedBuffers::new(2, 2, BLOCK);
     let pace = std::time::Duration::from_secs_f64(BLOCK as f64 / SR as f64);
     // Warm up (the link arrives, the first sequence starts).
@@ -1215,8 +1258,15 @@ fn rendering_ahead_does_not_allocate_on_the_audio_thread() {
         }
         r.controller.collect_garbage();
     }
-    assert_eq!(total, 0, "allocations/frees on the audio thread");
+    assert_eq!(
+        total, 0,
+        "allocations/frees on the audio thread (buses: {buses})"
+    );
     assert_eq!(r.controller.ahead_misses(), 0);
+    assert!(
+        r.controller.scope().written() > 0,
+        "the drums reached the scope"
+    );
 }
 
 #[test]

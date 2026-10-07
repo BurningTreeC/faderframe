@@ -1865,9 +1865,16 @@ pub fn install(app: &Rc<AppState>) {
             let s = a.session.borrow();
             let (tracks, late) = s.render_ahead_status();
             tracing::info!(
-                "render ahead {:?}: {tracks} tracks, {late} late blocks",
-                s.render_ahead()
+                "render ahead {:?} (buses: {}): {tracks} tracks, {} strips, {late} late blocks",
+                s.render_ahead(),
+                s.render_ahead_buses(),
+                s.render_ahead_strips(),
             );
+        }),
+        // Development aid: `render-ahead-buses:<0|1>`.
+        named("render-ahead-buses", |a, arg| {
+            let on = arg.trim() == "1";
+            a.with_session(|s| s.set_render_ahead_buses(on));
         }),
         // Development aid: `plugin-precision:<0|1>` (64-bit processing).
         named("plugin-precision", |a, arg| {

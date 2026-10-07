@@ -25,7 +25,7 @@ use crate::context::EngineContext;
 use crate::midi::{MidiFilter, MidiInputNode, MidiOutputSink, MidiShared, NO_PORT};
 use crate::nodes::{
     AudioClipPlayer, ChannelStrip, Crosstalk, DeviceInputTap, DeviceOutputSink, MidiClipPlayer,
-    MonitorGate, PluginNode, SendNode, StretchVoices,
+    MonitorGate, PluginNode, SendNode, StretchVoices, StripEcho,
 };
 use crate::plugins::PluginHost;
 use crate::slots::SlotRegistry;
@@ -66,12 +66,23 @@ pub struct BuiltGraph {
 /// Which tracks are rendered ahead, and where their audio goes.
 pub struct AheadPlan<'a> {
     pub tracks: &'a HashSet<TrackId>,
+    /// Those of `tracks` whose strips and sends are rendered ahead too
+    /// (they feed buses rendered ahead only).
+    pub strips: &'a HashSet<TrackId>,
     /// Rings by track, kept across builds (replaced when their shape
     /// changes).
     pub rings: &'a mut HashMap<TrackId, Arc<AheadRing>>,
     /// Frames per ring.
     pub ring_frames: usize,
     pub misses: Arc<AtomicU64>,
+}
+
+/// What is rendered ahead: the chains of `tracks`, and of those the
+/// `strips` whose channel strips and sends are too.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AheadSets {
+    pub tracks: HashSet<TrackId>,
+    pub strips: HashSet<TrackId>,
 }
 
 /// Can `t` be rendered ahead? Only what plays from the timeline alone and
@@ -86,12 +97,21 @@ pub fn ahead_eligible(
     fed: &HashSet<TrackId>,
 ) -> bool {
     let has_plugins = !t.inserts.is_empty() || t.instrument.is_some() || t.preamp.is_some();
-    let monitored =
-        matches!(t.input, InputRouting::Hardware { .. }) && t.monitor != MonitorMode::Off;
     matches!(t.kind, TrackKind::Audio | TrackKind::Instrument)
         && has_plugins
         && t.freeze.is_none()
-        && !t.record_arm
+        && !fed.contains(&t.id)
+        && plays_from_timeline(project, t, live)
+}
+
+/// Does `t` play from the timeline alone (whatever its kind)? Not armed,
+/// no input monitoring, live MIDI or external MIDI output, no sidechain
+/// inputs, no pre-FX sends, modulators that can run ahead, no launcher
+/// clips.
+fn plays_from_timeline(project: &Project, t: &Track, live: &HashSet<TrackId>) -> bool {
+    let monitored =
+        matches!(t.input, InputRouting::Hardware { .. }) && t.monitor != MonitorMode::Off;
+    !t.record_arm
         && !monitored
         && !live.contains(&t.id)
         && t.midi_output.is_none()
@@ -100,10 +120,135 @@ pub fn ahead_eligible(
         && t.sends
             .iter()
             .all(|s| !s.enabled || s.tap != SendTap::PreFx)
-        && !fed.contains(&t.id)
         && project.track(t.id).is_some()
         // Launched clips are played as they are launched.
         && !project.launcher.slots.keys().any(|k| k.track == t.id)
+}
+
+fn is_bus(kind: TrackKind) -> bool {
+    matches!(kind, TrackKind::Bus | TrackKind::Aux | TrackKind::Master)
+}
+
+/// The tracks to render ahead ([`ahead_eligible`], not `edited`). With
+/// `buses`, buses (auxes, the master) too, when everything that reaches
+/// them is a strip rendered ahead: a track (or bus) whose output and sends
+/// all go to buses rendered ahead, that keys no sidechain or follower
+/// (those tap it on the audio thread), without crosstalk. Such strips'
+/// faders, pan, mute and send levels are heard after the lookahead;
+/// automation stays exact. A bus without devices is only worth it as a
+/// stage of a larger tree (its own strip rendered ahead).
+///
+/// `keep` (while playing) is what is rendered ahead now: nothing joins,
+/// and a track whose strip has to come back to the audio thread comes
+/// back whole (its strip alone would start with a gap).
+pub fn ahead_sets(
+    project: &Project,
+    live: &HashSet<TrackId>,
+    edited: &HashSet<TrackId>,
+    buses: bool,
+    keep: Option<&AheadSets>,
+) -> AheadSets {
+    use faderframe_project::modulation::{FollowSource, ModSource};
+    let fed = fed_tracks(project);
+    let mut tracks: HashSet<TrackId> = project
+        .tracks
+        .iter()
+        .filter(|t| !edited.contains(&t.id) && ahead_eligible(project, t, live, &fed))
+        .filter(|t| keep.is_none_or(|k| k.tracks.contains(&t.id)))
+        .map(|t| t.id)
+        .collect();
+    let mut strips = HashSet::new();
+    if !buses {
+        if let Some(k) = keep {
+            tracks.retain(|t| !k.strips.contains(t));
+        }
+        return AheadSets { tracks, strips };
+    }
+    let ok = |t: &Track| !edited.contains(&t.id) && plays_from_timeline(project, t, live);
+    // Where each track's audio goes.
+    let dests: Vec<(TrackId, Vec<TrackId>)> = project
+        .tracks
+        .iter()
+        .filter(|t| matches!(t.kind, TrackKind::Audio | TrackKind::Instrument) || is_bus(t.kind))
+        .map(|t| {
+            let mut d: Vec<TrackId> = project.output_target(t).into_iter().collect();
+            d.extend(t.sends.iter().filter(|s| s.enabled).map(|s| s.target));
+            (t.id, d)
+        })
+        .collect();
+    let mut keyed = HashSet::new();
+    for t in &project.tracks {
+        keyed.extend(t.slots().iter().filter_map(|s| s.sidechain));
+        for m in &t.modulators {
+            if let ModSource::Follower {
+                source: FollowSource::Track { track },
+                ..
+            } = m.source
+            {
+                keyed.insert(track);
+            }
+        }
+    }
+    let has_devices = |id: &TrackId| {
+        project
+            .track(*id)
+            .is_some_and(|t| !t.inserts.is_empty() || t.preamp.is_some())
+    };
+    let mut bus_set: HashSet<TrackId> = project
+        .tracks
+        .iter()
+        .filter(|t| is_bus(t.kind) && t.freeze.is_none() && ok(t))
+        .filter(|t| keep.is_none_or(|k| k.tracks.contains(&t.id)))
+        .map(|t| t.id)
+        .collect();
+    let mut candidates: HashSet<TrackId> = project
+        .tracks
+        .iter()
+        .filter(|t| {
+            ok(t)
+                && !project.crosstalk
+                && !keyed.contains(&t.id)
+                // Reaches a bus (not a device output).
+                && project.output_target(t).is_some()
+                && (is_bus(t.kind)
+                    || (matches!(t.kind, TrackKind::Audio | TrackKind::Instrument)
+                        && !fed.contains(&t.id)))
+        })
+        .filter(|t| keep.is_none_or(|k| k.strips.contains(&t.id)))
+        .map(|t| t.id)
+        .collect();
+    loop {
+        strips = dests
+            .iter()
+            .filter(|(t, d)| {
+                candidates.contains(t)
+                    && (!project.track(*t).is_some_and(|t| is_bus(t.kind)) || bus_set.contains(t))
+                    && d.iter().all(|d| bus_set.contains(d))
+            })
+            .map(|(t, _)| *t)
+            .collect();
+        // While playing, a strip that has to come back brings its chain.
+        let mut changed = false;
+        if let Some(k) = keep {
+            for f in k.strips.iter().filter(|f| !strips.contains(f)) {
+                changed |= bus_set.remove(f) | candidates.remove(f) | tracks.remove(f);
+            }
+        }
+        let before = bus_set.len();
+        bus_set.retain(|b| {
+            (has_devices(b) || strips.contains(b))
+                && dests
+                    .iter()
+                    .filter(|(_, d)| d.contains(b))
+                    .all(|(f, _)| strips.contains(f))
+        });
+        if !changed && bus_set.len() == before {
+            break;
+        }
+    }
+    tracks.extend(&bus_set);
+    tracks.extend(&strips);
+    AheadSets { tracks, strips }
 }
 
 /// Can `t`'s modulators run ahead of the playhead? Those that follow the
@@ -191,6 +336,7 @@ enum Role {
     ContainerSum = 13,
     ChainMix = 14,
     ChainNotes = 15,
+    StripEcho = 16,
 }
 
 /// Stretcher voices a track's clip player needs: one per pitch-preserving
@@ -285,6 +431,10 @@ struct TrackNodes {
     midi_in: Option<NodeId>,
     /// The last of the track's MIDI effects (what MIDI it sends on).
     midi_fx: Option<NodeId>,
+    /// `input` is in the render-ahead graph.
+    input_ahead: bool,
+    /// So are `strip` and `post_fx` (the strip is rendered ahead).
+    strip_ahead: bool,
 }
 
 /// Everything needed to turn plugin slots into graph nodes.
@@ -496,8 +646,17 @@ pub fn build_graph(
         node
     };
 
+    // Strips rendered ahead: the latency of their signal (buses rendered
+    // ahead are built after everything that reaches them, to know it).
+    let mut strip_latency: HashMap<TrackId, u32> = HashMap::new();
+    let order = match &ahead {
+        Some(plan) if !plan.strips.is_empty() => ahead_order(project, plan.tracks),
+        _ => (0..project.tracks.len()).collect(),
+    };
+
     // Pass 1: per-track chains.
-    for (gi, t) in project.tracks.iter().enumerate() {
+    for gi in order {
+        let t = &project.tracks[gi];
         let gi = gi as u32;
         // VCAs have no audio: they scale their members' strips. Folders
         // only hold tracks.
@@ -507,9 +666,14 @@ pub fn build_graph(
         let mut tn = TrackNodes::default();
         let layout = t.layout;
         let frozen = t.freeze.is_some();
-        // Rendered ahead: the chain into the ahead graph, a reader here.
+        // Rendered ahead: the chain into the ahead graph and a reader here
+        // for the strip, or (a strip rendered ahead) the strip and its
+        // sends there too and its audio back here for the meters.
         if let Some(plan) = ahead.as_mut().filter(|p| p.tracks.contains(&t.id)) {
-            let channels = layout.channel_count().max(1);
+            let strip_ahead = plan.strips.contains(&t.id);
+            let dest = destination_layout(project, t);
+            let ring_layout = if strip_ahead { dest } else { layout };
+            let channels = ring_layout.channel_count().max(1);
             let ring = match plan.rings.get(&t.id) {
                 Some(r) if r.channels() == channels && r.capacity() == plan.ring_frames => {
                     Arc::clone(r)
@@ -522,25 +686,94 @@ pub fn build_graph(
             };
             let realtime = pcx.realtime;
             pcx.realtime = false;
-            let latency = build_ahead_chain(&mut ab, &mut pcx, slots, project, t, config, &ring)?;
+            let (input, end, chain_latency) =
+                build_ahead_chain(&mut ab, &mut pcx, slots, project, t, config)?;
             pcx.realtime = realtime;
+            // What reaches a bus is aligned at its input (in the ahead
+            // graph) to the slowest of it.
+            let fed_latency = project
+                .tracks
+                .iter()
+                .filter(|f| {
+                    project.output_target(f) == Some(t.id)
+                        || f.sends.iter().any(|s| s.enabled && s.target == t.id)
+                })
+                .filter_map(|f| strip_latency.get(&f.id).copied())
+                .max()
+                .unwrap_or(0);
+            let latency = fed_latency + chain_latency;
             used_rings.push(Arc::clone(&ring));
-            let reader = b.add_node(
-                NodeSpec::new(format!("{} · Ahead", t.name))
-                    .key(node_key(
+            tn.input = Some(input);
+            tn.input_ahead = true;
+            let reader_key = |sub: u64| {
+                node_key(
+                    t.id,
+                    Role::Ahead,
+                    u64::from(latency) ^ ring.identity().rotate_left(17) ^ sub,
+                    &[ring_layout],
+                )
+            };
+            if strip_ahead {
+                let strip = add_strip(&mut ab, project, slots, t, None, end, true)?;
+                let writer = ab.add_node(
+                    NodeSpec::new(format!("{} · To Ring", t.name))
+                        .key(node_key(t.id, Role::Ahead, 2 ^ ring.identity(), &[dest]))
+                        .audio_in(dest),
+                    Box::new(AheadWriter::new(Arc::clone(&ring))),
+                );
+                ab.connect_audio(strip, 0, writer, 0)?;
+                let reader = b.add_node(
+                    NodeSpec::new(format!("{} · Ahead", t.name))
+                        .key(reader_key(0x5157))
+                        .group(gi)
+                        .audio_out(dest),
+                    Box::new(AheadReader::new(ring, latency, Arc::clone(&plan.misses))),
+                );
+                own(&mut owners, reader, t.id, None, NodeWork::Ahead);
+                let sends = t
+                    .sends
+                    .iter()
+                    .filter(|s| s.enabled)
+                    .map(|s| Ok((s.id, slots.send(s.id)?)))
+                    .collect::<Result<Vec<_>, crate::slots::SlotsExhausted>>()?;
+                let echo = b.add_node(
+                    NodeSpec::new(format!("{} · Meters", t.name))
+                        .key(node_key(t.id, Role::StripEcho, 0, &[dest]))
+                        .group(gi)
+                        .audio_in(dest),
+                    Box::new(StripEcho::new(
                         t.id,
-                        Role::Ahead,
-                        u64::from(latency) ^ ring.identity().rotate_left(17),
-                        &[layout],
-                    ))
-                    .group(gi)
-                    .audio_out(layout),
-                Box::new(AheadReader::new(ring, latency, Arc::clone(&plan.misses))),
-            );
-            own(&mut owners, reader, t.id, None, NodeWork::Ahead);
-            let strip = add_strip(&mut b, project, slots, t, gi, reader)?;
-            tn.post_fx = Some(reader);
-            tn.strip = Some(own(&mut owners, strip, t.id, None, NodeWork::Strip));
+                        slots.strip(t.id)?,
+                        slots.meter(t.id)?,
+                        sends,
+                    )),
+                );
+                own(&mut owners, echo, t.id, None, NodeWork::Strip);
+                b.connect_audio(reader, 0, echo, 0)?;
+                tn.post_fx = Some(end);
+                tn.strip = Some(strip);
+                tn.strip_ahead = true;
+                strip_latency.insert(t.id, latency);
+            } else {
+                let writer = ab.add_node(
+                    NodeSpec::new(format!("{} · To Ring", t.name))
+                        .key(node_key(t.id, Role::Ahead, 1 ^ ring.identity(), &[layout]))
+                        .audio_in(layout),
+                    Box::new(AheadWriter::new(Arc::clone(&ring))),
+                );
+                ab.connect_audio(end, 0, writer, 0)?;
+                let reader = b.add_node(
+                    NodeSpec::new(format!("{} · Ahead", t.name))
+                        .key(reader_key(0))
+                        .group(gi)
+                        .audio_out(layout),
+                    Box::new(AheadReader::new(ring, latency, Arc::clone(&plan.misses))),
+                );
+                own(&mut owners, reader, t.id, None, NodeWork::Ahead);
+                let strip = add_strip(&mut b, project, slots, t, Some(gi), reader, false)?;
+                tn.post_fx = Some(reader);
+                tn.strip = Some(own(&mut owners, strip, t.id, None, NodeWork::Strip));
+            }
             nodes.insert(t.id, tn);
             continue;
         }
@@ -864,7 +1097,7 @@ pub fn build_graph(
             prev = node;
         }
 
-        let strip = add_strip(&mut b, project, slots, t, gi, prev)?;
+        let strip = add_strip(&mut b, project, slots, t, Some(gi), prev, false)?;
         tn.post_fx = Some(prev);
         tn.strip = Some(own(&mut owners, strip, t.id, None, NodeWork::Strip));
         nodes.insert(t.id, tn);
@@ -897,6 +1130,14 @@ pub fn build_graph(
             continue;
         }
         let Some(strip) = tn.strip else { continue };
+        // A strip rendered ahead connects there (to buses rendered ahead).
+        let ahead_strip = tn.strip_ahead;
+        let g = if ahead_strip { &mut ab } else { &mut b };
+        let mut owned = |node: NodeId, work: NodeWork, plugin: Option<PluginInstanceId>| {
+            if !ahead_strip {
+                own(&mut owners, node, t.id, plugin, work);
+            }
+        };
         // A monitored album song's inserts after the master strip (post
         // fader, as the album renders the song).
         let mut out = strip;
@@ -907,25 +1148,27 @@ pub fn build_graph(
                     .group(gi)
                     .audio_in(layout)
                     .audio_out(layout);
-                let (node, _) = pcx.node(&mut b, slot, t, spec, Role::Insert);
-                own(&mut owners, node, t.id, Some(slot.id), NodeWork::Insert);
-                b.connect_audio(out, 0, node, 0)?;
+                let (node, _) = pcx.node(g, slot, t, spec, Role::Insert);
+                owned(node, NodeWork::Insert, Some(slot.id));
+                g.connect_audio(out, 0, node, 0)?;
                 out = node;
             }
         }
+        // The node's graph is `g`'s.
+        let reachable = |n: &TrackNodes| n.input.filter(|_| n.input_ahead == ahead_strip);
         match t.output {
             OutputRouting::Master | OutputRouting::Track { .. } => {
                 if let Some(dst) = project
                     .output_target(t)
                     .and_then(|d| nodes.get(&d))
-                    .and_then(|n| n.input)
+                    .and_then(reachable)
                 {
-                    b.connect_audio(out, 0, dst, 0)?;
+                    g.connect_audio(out, 0, dst, 0)?;
                 }
             }
-            OutputRouting::Hardware { first_channel } => {
+            OutputRouting::Hardware { first_channel } if !ahead_strip => {
                 let dest = destination_layout(project, t);
-                let hw = b.add_node(
+                let hw = g.add_node(
                     NodeSpec::new(format!("{} · Hardware Out", t.name))
                         .key(node_key(
                             t.id,
@@ -938,16 +1181,16 @@ pub fn build_graph(
                         .audio_in(dest),
                     Box::new(DeviceOutputSink),
                 );
-                own(&mut owners, hw, t.id, None, NodeWork::HardwareOut);
-                b.connect_audio(out, 0, hw, 0)?;
+                owned(hw, NodeWork::HardwareOut, None);
+                g.connect_audio(out, 0, hw, 0)?;
             }
-            OutputRouting::None => {}
+            OutputRouting::Hardware { .. } | OutputRouting::None => {}
         }
         for send in t.sends.iter().filter(|s| s.enabled) {
             let Some(target) = project.track(send.target) else {
                 continue;
             };
-            let Some(dst) = nodes.get(&send.target).and_then(|n| n.input) else {
+            let Some(dst) = nodes.get(&send.target).and_then(reachable) else {
                 continue;
             };
             let (tap_node, tap_port, tap_layout) = match send.tap {
@@ -956,7 +1199,8 @@ pub fn build_graph(
                 SendTap::PostFader => (strip, 0, destination_layout(project, t)),
             };
             let level = slots.send(send.id)?;
-            let node = b.add_node(
+            let node = SendNode::new(t.id, send.id, level);
+            let node = g.add_node(
                 NodeSpec::new(format!("{} → {}", t.name, target.name))
                     .key(node_key(
                         t.id,
@@ -967,11 +1211,11 @@ pub fn build_graph(
                     .group(gi)
                     .audio_in(tap_layout)
                     .audio_out(target.layout),
-                Box::new(SendNode::new(t.id, send.id, level)),
+                Box::new(if ahead_strip { node.quiet() } else { node }),
             );
-            own(&mut owners, node, t.id, None, NodeWork::Send);
-            b.connect_audio(tap_node, tap_port, node, 0)?;
-            b.connect_audio(node, 0, dst, 0)?;
+            owned(node, NodeWork::Send, None);
+            g.connect_audio(tap_node, tap_port, node, 0)?;
+            g.connect_audio(node, 0, dst, 0)?;
         }
     }
     // Sidechains tap their source after its inserts: before its fader,
@@ -1057,7 +1301,6 @@ pub fn build_graph(
     })
 }
 
-/// A track's channel strip, fed from `from`.
 /// What a container's devices connect to besides the audio.
 struct ChainLinks<'a> {
     project: &'a Project,
@@ -1248,32 +1491,30 @@ fn add_container(
     Ok((sum, latency))
 }
 
+/// A track's channel strip, fed from `from` (`quiet`: rendered ahead).
 fn add_strip(
     b: &mut GraphBuilder<EngineContext>,
     project: &Project,
     slots: &mut SlotRegistry,
     t: &Track,
-    gi: u32,
+    group: Option<u32>,
     from: NodeId,
+    quiet: bool,
 ) -> Result<NodeId, EngineError> {
     let layout = t.layout;
     let dest = destination_layout(project, t);
     let strip_slots = slots.strip(t.id)?;
     let meter = slots.meter(t.id)?;
-    let strip = b.add_node(
-        NodeSpec::new(format!("{} · Strip", t.name))
-            .key(node_key(t.id, Role::Strip, 0, &[layout, dest]))
-            .group(gi)
-            .audio_in(layout)
-            .audio_out(dest)
-            .audio_out(layout),
-        Box::new(ChannelStrip::new(
-            t.id,
-            strip_slots,
-            meter,
-            PanLaw::default(),
-        )),
-    );
+    let mut spec = NodeSpec::new(format!("{} · Strip", t.name))
+        .key(node_key(t.id, Role::Strip, 0, &[layout, dest]))
+        .audio_in(layout)
+        .audio_out(dest)
+        .audio_out(layout);
+    if let Some(g) = group {
+        spec = spec.group(g);
+    }
+    let strip = ChannelStrip::new(t.id, strip_slots, meter, PanLaw::default());
+    let strip = b.add_node(spec, Box::new(if quiet { strip.quiet() } else { strip }));
     b.connect_audio(from, 0, strip, 0)?;
     Ok(strip)
 }
@@ -1310,8 +1551,46 @@ fn note_effects(
     Ok(out)
 }
 
+/// Track indices for building with buses rendered ahead: every other
+/// track first (in project order), then those buses, each after the buses
+/// that reach it.
+fn ahead_order(project: &Project, tracks: &HashSet<TrackId>) -> Vec<usize> {
+    let ahead_bus = |t: &Track| is_bus(t.kind) && tracks.contains(&t.id);
+    let mut order: Vec<usize> = (0..project.tracks.len())
+        .filter(|&i| !ahead_bus(&project.tracks[i]))
+        .collect();
+    let mut left: Vec<usize> = (0..project.tracks.len())
+        .filter(|&i| ahead_bus(&project.tracks[i]))
+        .collect();
+    let mut placed: HashSet<TrackId> = HashSet::new();
+    while !left.is_empty() {
+        let before = left.len();
+        left.retain(|&i| {
+            let b = project.tracks[i].id;
+            let ready = project.tracks.iter().all(|f| {
+                !ahead_bus(f)
+                    || placed.contains(&f.id)
+                    || f.id == b
+                    || (project.output_target(f) != Some(b)
+                        && !f.sends.iter().any(|s| s.enabled && s.target == b))
+            });
+            if ready {
+                order.push(i);
+                placed.insert(b);
+            }
+            !ready
+        });
+        if left.len() == before {
+            // A loop (the compiler rejects it): any order.
+            order.append(&mut left);
+        }
+    }
+    order
+}
+
 /// An anticipated track's sources, instrument and inserts in the ahead
-/// graph `ab`, ending in the ring's writer; returns the chain's latency.
+/// graph `ab` (a bus: its input and inserts); returns the chain's input
+/// (where buses sum what reaches them), its end and its latency.
 fn build_ahead_chain(
     ab: &mut GraphBuilder<EngineContext>,
     pcx: &mut PluginCx<'_>,
@@ -1319,8 +1598,7 @@ fn build_ahead_chain(
     project: &Project,
     t: &Track,
     config: &PrepareConfig,
-    ring: &Arc<AheadRing>,
-) -> Result<u32, EngineError> {
+) -> Result<(NodeId, NodeId, u32), EngineError> {
     let layout = t.layout;
     let mut latency = 0u32;
     let input = ab.add_node(
@@ -1331,9 +1609,34 @@ fn build_ahead_chain(
         Box::new(Passthrough),
     );
     let mut midi = None;
-    let chain = pcx.audio_chain(t);
+    let frozen = t.freeze.as_ref();
+    let chain = if frozen.is_some() {
+        Vec::new()
+    } else {
+        pcx.audio_chain(t)
+    };
     let mut fx = Vec::new();
     match t.kind {
+        // Frozen: the rendered audio.
+        TrackKind::Audio | TrackKind::Instrument if frozen.is_some() => {
+            let frozen_latency = frozen.map_or(0, |f| {
+                ((f64::from(f.latency) * config.sample_rate / f64::from(project.sample_rate))
+                    .round()) as u32
+            });
+            let player = ab.add_node(
+                NodeSpec::new(format!("{} · Frozen", t.name))
+                    .key(node_key(
+                        t.id,
+                        Role::ClipPlayer,
+                        0xF0_0000 ^ (u64::from(frozen_latency) << 32),
+                        &[layout],
+                    ))
+                    .audio_out(layout),
+                Box::new(AudioClipPlayer::new(t.id).with_latency(frozen_latency)),
+            );
+            latency += frozen_latency;
+            ab.connect_audio(player, 0, input, 0)?;
+        }
         TrackKind::Instrument => {
             let player = ab.add_node(
                 NodeSpec::new(format!("{} · MIDI", t.name))
@@ -1354,7 +1657,7 @@ fn build_ahead_chain(
                 ab.connect_audio(inst, 0, input, 0)?;
             }
         }
-        _ => {
+        TrackKind::Audio => {
             let voices = stretch_voices(project, t);
             let player = ab.add_node(
                 NodeSpec::new(format!("{} · Clips", t.name))
@@ -1373,6 +1676,8 @@ fn build_ahead_chain(
             );
             ab.connect_audio(player, 0, input, 0)?;
         }
+        // Buses: what reaches them.
+        _ => {}
     }
     let mut prev = input;
     // The modulators (rendered ahead: they follow the song position, the
@@ -1431,12 +1736,5 @@ fn build_ahead_chain(
         }
         prev = node;
     }
-    let writer = ab.add_node(
-        NodeSpec::new(format!("{} · To Ring", t.name))
-            .key(node_key(t.id, Role::Ahead, 1 ^ ring.identity(), &[layout]))
-            .audio_in(layout),
-        Box::new(AheadWriter::new(Arc::clone(ring))),
-    );
-    ab.connect_audio(prev, 0, writer, 0)?;
-    Ok(latency)
+    Ok((input, prev, latency))
 }

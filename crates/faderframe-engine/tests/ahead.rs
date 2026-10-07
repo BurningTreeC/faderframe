@@ -81,6 +81,11 @@ struct Run {
 
 impl Run {
     fn new(project: &Project, ahead: bool) -> Self {
+        Self::with(project, ahead, false)
+    }
+
+    /// With render-ahead and `buses` rendered ahead too.
+    fn with(project: &Project, ahead: bool, buses: bool) -> Self {
         let sources = render_generated_sources(project, SR);
         let config = EngineConfig {
             sample_rate: SR,
@@ -89,6 +94,7 @@ impl Run {
         };
         let mut r = OfflineRenderer::new(project, &sources, config, BLOCK, 2).unwrap();
         if ahead {
+            r.controller.set_render_ahead_buses(buses);
             r.controller
                 .set_render_ahead(Some(Duration::from_millis(150)), 2);
             r.controller.sync(project, &sources, Impact::Graph).unwrap();
@@ -370,4 +376,144 @@ fn containers_and_synced_modulators_render_ahead_alike() {
     project.tracks[pluck].modulators[0].routes[0].target = ModTarget::Volume;
     let live = Run::new(&project, true);
     assert!(!live.r.controller.ahead_tracks().contains(&id));
+}
+
+/// Buses rendered ahead sound as they do live: the drum bus, the auxes and
+/// the master's chain, with every strip and send that reaches them
+/// rendered ahead too. Their meters still move, as the audio is heard.
+#[test]
+fn buses_rendered_ahead_sound_the_same() {
+    let mut project = project();
+    // The arpeggios' synth plays a MIDI track's notes (on the audio
+    // thread): without them, everything reaches the master from ahead.
+    project
+        .tracks
+        .retain(|t| !["Chords", "Arp Synth", "Arpeggios"].contains(&t.name.as_str()));
+    let id = |name: &str| project.tracks.iter().find(|t| t.name == name).unwrap().id;
+    let mut plain = Run::new(&project, false);
+    let mut ahead = Run::with(&project, true, true);
+    let c = &ahead.r.controller;
+    for name in ["Drum Bus", "Echo", "Space", "Master"] {
+        assert!(
+            c.ahead_tracks().contains(&id(name)),
+            "{name} rendered ahead"
+        );
+    }
+    for name in [
+        "Drums",
+        "Bass",
+        "Pluck",
+        "Pad",
+        "Lead Synth",
+        "Drum Bus",
+        "Echo",
+        "Space",
+    ] {
+        assert!(c.ahead_strips().contains(&id(name)), "{name}'s strip ahead");
+    }
+    // The master's strip plays live (to the device).
+    assert!(!c.ahead_strips().contains(&id("Master")));
+    ahead.run(20, true);
+    for run in [&mut plain, &mut ahead] {
+        run.command(TransportCommand::Play);
+    }
+    let blocks = 2 * SR as usize / BLOCK;
+    plain.run(blocks, false);
+    ahead.run(blocks, true);
+    let (both, differ) = compare(&plain, &ahead);
+    assert!(both > SR as usize, "heard together: {both}");
+    assert_eq!(differ, 0, "{differ} of {both} samples differ");
+    assert_eq!(ahead.r.controller.ahead_misses(), 0, "never late");
+    assert!(ahead.heard.values().any(|s| s.abs() > 0.01));
+    // The drums' meter, from its echo on the audio thread.
+    let meter = ahead.r.controller.take_meter(id("Drums")).unwrap();
+    assert!(meter.left.peak > 0.01, "metered: {:?}", meter.left);
+}
+
+/// A bus is rendered ahead only when everything that reaches it is; a
+/// track that plays live keeps its buses live, and while playing a strip
+/// that has to come back brings its chain (no gap), and its buses theirs.
+#[test]
+fn a_live_input_keeps_its_buses_live() {
+    let project = project();
+    let id = |name: &str| project.tracks.iter().find(|t| t.name == name).unwrap().id;
+    let mut ahead = Run::with(&project, true, true);
+    let c = &ahead.r.controller;
+    // The drum bus: only the drums reach it.
+    assert!(c.ahead_tracks().contains(&id("Drum Bus")));
+    assert!(c.ahead_strips().contains(&id("Drums")));
+    // The arpeggios' synth plays on the audio thread and reaches the
+    // master: the master stays live, so do the strips reaching it (the lead
+    // synth's), and the auxes they send to.
+    assert!(!c.ahead_tracks().contains(&id("Master")));
+    assert!(!c.ahead_strips().contains(&id("Lead Synth")));
+    assert!(
+        c.ahead_tracks().contains(&id("Lead Synth")),
+        "its chain still is"
+    );
+    assert!(!c.ahead_tracks().contains(&id("Echo")));
+    // Playing: the drums go live; the drum bus comes back, and with it its
+    // strip's chain (the drums are back whole).
+    ahead.run(20, true);
+    ahead.command(TransportCommand::Play);
+    ahead.run(10, true);
+    let drums = id("Drums");
+    ahead.r.controller.set_midi_live(HashSet::from([drums]));
+    ahead.r.controller.update_params(&project).unwrap();
+    let c = &ahead.r.controller;
+    assert!(!c.ahead_tracks().contains(&drums));
+    assert!(!c.ahead_tracks().contains(&id("Drum Bus")));
+    // Nothing joins while playing.
+    ahead.r.controller.set_midi_live(HashSet::new());
+    ahead.r.controller.update_params(&project).unwrap();
+    assert!(!ahead.r.controller.ahead_tracks().contains(&id("Drum Bus")));
+    ahead.run(10, true);
+    ahead.command(TransportCommand::Stop);
+    ahead.run(4, true);
+    assert!(ahead.r.controller.ahead_wants_rebuild(&project));
+    ahead.r.controller.update_params(&project).unwrap();
+    assert!(ahead.r.controller.ahead_tracks().contains(&id("Drum Bus")));
+}
+
+/// Latency rendered ahead (a limiter's lookahead on the drums, before the
+/// drum bus) is compensated where it meets live tracks at the master.
+#[test]
+fn latency_reaching_a_bus_rendered_ahead_is_compensated() {
+    let mut project = project();
+    let drums = project
+        .tracks
+        .iter_mut()
+        .find(|t| t.name == "Drums")
+        .unwrap();
+    drums.inserts.push(PluginSlot {
+        id: PluginInstanceId(9_200),
+        plugin: PluginRef::builtin(builtin::LIMITER, "Limiter"),
+        bypass: false,
+        parameters: Vec::new(),
+        state: None,
+        sidechain: None,
+    });
+    let drums = drums.id;
+    let bus = project
+        .tracks
+        .iter()
+        .find(|t| t.name == "Drum Bus")
+        .unwrap()
+        .id;
+    let mut plain = Run::new(&project, false);
+    let mut ahead = Run::with(&project, true, true);
+    assert!(ahead.r.controller.ahead_strips().contains(&drums));
+    assert!(ahead.r.controller.ahead_tracks().contains(&bus));
+    assert!(!ahead.r.controller.ahead_strips().contains(&bus));
+    ahead.run(20, true);
+    for run in [&mut plain, &mut ahead] {
+        run.command(TransportCommand::Play);
+    }
+    let blocks = 2 * SR as usize / BLOCK;
+    plain.run(blocks, false);
+    ahead.run(blocks, true);
+    let (both, differ) = compare(&plain, &ahead);
+    assert!(both > SR as usize, "heard together: {both}");
+    assert_eq!(differ, 0, "{differ} of {both} samples differ");
+    assert_eq!(ahead.r.controller.ahead_misses(), 0, "never late");
 }
