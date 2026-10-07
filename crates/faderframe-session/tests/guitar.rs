@@ -54,6 +54,20 @@ fn set(s: &mut Session, t: TrackId, plugin: PluginInstanceId, id: u32, v: f64) {
     .unwrap();
 }
 
+/// The meter of `track` once it is over `floor` dB (or after 20 s): a busy
+/// runner's debug build may take a while to bring a (re)started line up;
+/// a line that never sounds still fails its assertion.
+fn level_once_over(s: &mut Session, track: TrackId, floor: f32) -> f32 {
+    let end = Instant::now() + Duration::from_secs(20);
+    loop {
+        let level = s.meter(track).left.level_db;
+        if level > floor || Instant::now() > end {
+            return level;
+        }
+        run(s, 0.05);
+    }
+}
+
 #[test]
 fn it_plays_live_and_a_pedal_added_while_playing_restarts_the_line() {
     let (mut s, t, plugin) = rig();
@@ -65,7 +79,7 @@ fn it_plays_live_and_a_pedal_added_while_playing_restarts_the_line() {
     s.dispatch(Action::Transport(TransportAction::Play))
         .unwrap();
     run(&mut s, 1.5);
-    let level = s.meter(t).left.level_db;
+    let level = level_once_over(&mut s, t, -50.0);
     assert!(level > -50.0, "the amplifier sounds: {level:.1} dB");
     let latency = s.engine().plugin_latency(plugin).unwrap();
     assert_eq!(s.plugin_output_buses(plugin).len(), 2, "main and DI");
@@ -80,7 +94,7 @@ fn it_plays_live_and_a_pedal_added_while_playing_restarts_the_line() {
     run(&mut s, 1.5);
     let more = s.engine().plugin_latency(plugin).unwrap();
     assert!(more > latency, "{more} after {latency}");
-    let level = s.meter(t).left.level_db;
+    let level = level_once_over(&mut s, t, -50.0);
     assert!(level > -50.0, "still sounding: {level:.1} dB");
     // Its footswitch does not restart anything.
     set(&mut s, t, plugin, id::slot(0, id::ON), 0.0);
@@ -94,7 +108,7 @@ fn it_plays_live_and_a_pedal_added_while_playing_restarts_the_line() {
     .unwrap();
     let di = s.project().plugin_output_tracks(plugin)[0].id;
     run(&mut s, 1.0);
-    let level = s.meter(di).left.level_db;
+    let level = level_once_over(&mut s, di, -60.0);
     assert!(
         level > -60.0,
         "the DI track takes the guitar: {level:.1} dB"
@@ -226,16 +240,9 @@ fn a_mono_track_is_stereo_from_the_guitar_station_on() {
         if !ahead {
             s.set_render_ahead(None).unwrap();
         }
-        // Until it sounds: a busy runner's debug build may take a while to
-        // bring the restarted line up (it passed after 2 s here, failed at
-        // CI); a line that never sounds still fails.
         run(&mut s, 2.0);
-        let end = Instant::now() + Duration::from_secs(20);
-        let mut m = s.meter(t);
-        while m.left.level_db <= -50.0 && Instant::now() < end {
-            run(&mut s, 0.05);
-            m = s.meter(t);
-        }
+        level_once_over(&mut s, t, -50.0);
+        let m = s.meter(t);
         assert!(
             m.left.level_db > -50.0,
             "left {:.1} dB (ahead {ahead})",
