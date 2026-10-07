@@ -255,11 +255,6 @@ impl Session {
                 .pending
                 .get(&j.clip)
                 .is_none_or(|p| p.generation == j.generation);
-            let latency = j
-                .job
-                .progress
-                .latency
-                .load(std::sync::atomic::Ordering::Relaxed);
             let result = j.job.join();
             if !latest {
                 // Overtaken by a newer edit.
@@ -269,7 +264,7 @@ impl Session {
             self.clip_fx.pending.remove(&j.clip);
             let placed = result
                 .map_err(|e| SessionError::Other(e.to_string()))
-                .and_then(|_| self.place_clip_fx(j.clip, j.chain, j.original, &j.path, latency));
+                .and_then(|_| self.place_clip_fx(j.clip, j.chain, j.original, &j.path));
             if let Err(e) = placed {
                 self.notify(NoticeLevel::Error, format!("clip effects: {e}"));
             }
@@ -383,7 +378,6 @@ impl Session {
         chain: Vec<PluginSlot>,
         original: OriginalAudio,
         path: &std::path::Path,
-        latency: u32,
     ) -> Result<()> {
         let wav = faderframe_audio_files::wavstream::WavFile::open(path)
             .map_err(|e| SessionError::Other(format!("{}: {e}", path.display())))?;
@@ -407,7 +401,8 @@ impl Session {
                 sample_rate: rate,
             },
         };
-        let offset = i64::from(latency);
+        // Renders start where the range does (their latency is taken off).
+        let offset = 0;
         a.source = source.id;
         a.source_offset = (offset + trim.max(0)).min(frames - 1).max(0);
         a.length = a.length.min(frames - a.source_offset).max(1);

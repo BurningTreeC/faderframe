@@ -76,6 +76,9 @@ impl Session {
             format: WavFormat::Float32,
             dither: faderframe_audio_files::Dither::Off,
             report: false,
+            // A freeze plays its file with the latency it was made with
+            // (exactly as the track did); a bounce starts on time.
+            keep_latency: freeze,
             ..RenderSettings::defaults_for(&copy, path.clone())
         };
         let job = render::start(copy, settings).map_err(|e| SessionError::Other(e.to_string()))?;
@@ -130,19 +133,15 @@ impl Session {
                 continue;
             }
             let b = self.bounces.remove(i);
-            let progress = std::sync::Arc::clone(&b.job.progress);
+            let latency = b
+                .job
+                .progress
+                .latency
+                .load(std::sync::atomic::Ordering::Relaxed);
             let result = b.job.join();
             if let Err(e) = result
                 .map_err(|e| SessionError::Other(e.to_string()))
-                .and_then(|_| {
-                    self.finish_bounce(
-                        b.track,
-                        b.freeze,
-                        b.start,
-                        b.path,
-                        progress.latency.load(std::sync::atomic::Ordering::Relaxed),
-                    )
-                })
+                .and_then(|_| self.finish_bounce(b.track, b.freeze, b.start, b.path, latency))
             {
                 self.notify(NoticeLevel::Error, format!("bounce: {e}"));
             }
@@ -221,8 +220,8 @@ impl Session {
                     muted: false,
                     content: ClipContent::Audio(AudioClip {
                         source: source_id,
-                        source_offset: i64::from(latency).min(frames),
-                        length: frames.saturating_sub(i64::from(latency)),
+                        source_offset: 0,
+                        length: frames,
                         gain_db: 0.0,
                         fades: ClipFades::default(),
                         stretch: StretchSettings::Off,

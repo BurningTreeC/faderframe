@@ -77,6 +77,10 @@ pub struct RenderSettings {
     pub dither: Dither,
     /// Measure every written file (loudness, true peak).
     pub report: bool,
+    /// Leave the graph's latency at the front of the file (a freeze: the
+    /// frozen track claims it, so it plays exactly as before). Otherwise
+    /// it is taken off and the file starts where the range does.
+    pub keep_latency: bool,
     /// File for a master render, directory for stems.
     pub output: PathBuf,
 }
@@ -98,6 +102,7 @@ impl RenderSettings {
             finish: Finish::default(),
             dither: Dither::Tpdf,
             report: true,
+            keep_latency: false,
             output,
         }
     }
@@ -130,7 +135,8 @@ pub struct RenderProgress {
     pub done: AtomicU64,
     pub total: AtomicU64,
     pub cancel: AtomicBool,
-    /// Delay already present in the rendered audio, at the render rate.
+    /// Delay left at the front of the rendered audio (`keep_latency`), at
+    /// the render rate.
     pub latency: AtomicU32,
 }
 
@@ -291,6 +297,7 @@ pub(crate) fn render_span(
         progress,
         2,
         None,
+        false,
     )
 }
 
@@ -306,6 +313,7 @@ fn render_one(
     progress: &RenderProgress,
     outputs: usize,
     binaural: Option<faderframe_binaural::Room>,
+    keep_latency: bool,
 ) -> Result<Vec<Vec<f32>>, RenderError> {
     let config = EngineConfig {
         sample_rate,
@@ -319,9 +327,15 @@ fn render_one(
         r.controller
             .sync(project, sources, faderframe_project::Impact::Graph)?;
     }
-    progress
-        .latency
-        .store(r.controller.graph_stats().output_latency, Ordering::Relaxed);
+    // The graph's delay (plugins, listening) comes off the front: the file
+    // starts where the range does (unless it is kept).
+    let latency = r.controller.graph_stats().output_latency;
+    let mut skip = if keep_latency {
+        progress.latency.store(latency, Ordering::Relaxed);
+        0
+    } else {
+        latency as usize
+    };
     // Faster than realtime on every core.
     let workers = faderframe_realtime::default_worker_count();
     if workers > 0 {
@@ -335,12 +349,16 @@ fn render_one(
         if progress.cancel.load(Ordering::Relaxed) {
             return Err(RenderError::Cancelled);
         }
-        let n = (frames - out[0].len()).min(16_384);
+        let n = (frames - out[0].len() + skip).min(16_384);
         let chunk = r.render(n);
+        let from = skip.min(n);
+        skip -= from;
         for (o, c) in out.iter_mut().zip(chunk) {
-            o.extend_from_slice(&c);
+            o.extend_from_slice(&c[from..]);
         }
-        progress.done.fetch_add(n as u64, Ordering::Relaxed);
+        progress
+            .done
+            .fetch_add((n - from) as u64, Ordering::Relaxed);
     }
     Ok(out)
 }
@@ -635,6 +653,7 @@ pub fn start(project: Project, settings: RenderSettings) -> Result<RenderJob, Re
                     &p,
                     outputs,
                     binaural,
+                    settings.keep_latency,
                 )?;
                 written.push(finish(audio, &settings, &settings.output, mask)?);
             } else {
@@ -656,6 +675,7 @@ pub fn start(project: Project, settings: RenderSettings) -> Result<RenderJob, Re
                         &p,
                         outputs,
                         binaural,
+                        settings.keep_latency,
                     )?;
                     let path = settings.output.join(format!(
                         "{} - {}.wav",

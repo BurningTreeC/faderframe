@@ -98,6 +98,7 @@ impl Form {
             finish: self.finish(),
             dither: Dither::ALL[self.dither.selected() as usize % Dither::ALL.len()],
             report: true,
+            keep_latency: false,
             output: PathBuf::from(self.output.text().as_str()),
         }
     }

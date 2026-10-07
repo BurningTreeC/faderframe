@@ -125,3 +125,88 @@ fn bouncing_an_instrument_makes_an_audio_track_and_mutes_the_original() {
     s.dispatch(Action::Undo).unwrap();
     assert!(!s.project().track(lead).unwrap().mute);
 }
+
+/// Renders start where their range does, whatever the graph's latency: a
+/// click on frame 1000 through a limiter with lookahead (on the master,
+/// then on the track) lands on frame 1000 of the export, of a frozen
+/// track's playback and of a bounce.
+#[test]
+fn renders_take_the_latency_off_the_front() {
+    let dir = std::env::temp_dir().join(format!("ff-latency-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut s = Session::new(
+        Project::new("Latency", 48_000),
+        None,
+        EngineConfig::default(),
+    )
+    .unwrap();
+    let file = dir.join("click.wav");
+    let mut x = vec![0.0f32; 192_000];
+    x[1000] = 0.25;
+    faderframe_audio_files::write_wav(&file, &[x], 48_000, WavFormat::Float32, false).unwrap();
+    let t = s.add_track(TrackKind::Audio).unwrap();
+    s.dispatch(Action::Edit(Command::SetTrackLayout {
+        track: t,
+        layout: faderframe_core::ChannelLayout::Mono,
+    }))
+    .unwrap();
+    s.import_audio(
+        vec![file],
+        faderframe_session::ImportTarget {
+            track: Some(t),
+            at: MusicalTime::ZERO,
+        },
+    );
+    s.wait_for_imports();
+    let limiter = s
+        .available_plugins()
+        .into_iter()
+        .find(|p| p.plugin.id == "faderframe.limiter")
+        .unwrap()
+        .plugin;
+    let onset = |x: &[f32]| x.iter().position(|v| v.abs() > 1e-4);
+    let master_id = s.project().master_id().unwrap();
+    s.dispatch(Action::InsertPlugin {
+        track: master_id,
+        index: 0,
+        plugin: limiter.clone(),
+    })
+    .unwrap();
+    assert!(s.engine().graph_stats().output_latency > 100);
+    assert_eq!(onset(&master(s.project(), "master-limited")), Some(1000));
+    s.dispatch(Action::Edit(Command::RemovePlugin {
+        track: master_id,
+        plugin: s.project().master().unwrap().inserts[0].id,
+    }))
+    .unwrap();
+    s.dispatch(Action::InsertPlugin {
+        track: t,
+        index: 0,
+        plugin: limiter,
+    })
+    .unwrap();
+    s.dispatch(Action::BounceTrack(t)).unwrap();
+    wait(&mut s);
+    s.dispatch(Action::FreezeTrack(t)).unwrap();
+    wait(&mut s);
+    assert!(s.project().track(t).unwrap().freeze.is_some());
+    // The frozen track and the bounce play together: the click twice at
+    // once, so the onset stays where it was.
+    let both = master(s.project(), "frozen-and-bounced");
+    assert_eq!(onset(&both), Some(1000));
+    assert!(
+        s.project()
+            .tracks
+            .iter()
+            .any(|x| x.name.ends_with("Bounce"))
+    );
+    s.dispatch(Action::Edit(Command::SetTrackMute { track: t, on: true }))
+        .unwrap();
+    assert_eq!(
+        onset(&master(s.project(), "bounce-only")),
+        Some(1000),
+        "the bounce"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}

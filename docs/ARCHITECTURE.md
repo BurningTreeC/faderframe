@@ -1658,6 +1658,16 @@ instrument and inserts, the plugins are unloaded, and edits of the frozen
 track's clips and plugins are refused until it is unfrozen. *Bounce to New
 Track* puts the file on a new audio track below and mutes the original.
 
+Renders start where their range does: `render_one` renders the graph's
+output latency (plugins, listening) more and drops it from the front, so
+an export with a lookahead limiter on the master lines up with the
+timeline, and bounces, clip effects and samples need no offsets. A freeze
+alone keeps the latency in its file (`RenderSettings::keep_latency`,
+`Freeze::latency`) and the frozen player claims it: everything after the
+track (time-varying devices on buses, automation) sees the audio exactly
+as before, so freezing is bit-exact (`renders_take_the_latency_off_the_front`,
+`freezing_keeps_the_sound_and_blocks_edits_until_unfrozen`).
+
 ### Groups and multi-track edits
 
 `Session::edit` expands an edit of one track to the tracks that follow it

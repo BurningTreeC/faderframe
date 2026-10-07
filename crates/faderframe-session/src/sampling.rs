@@ -21,7 +21,6 @@ use faderframe_project::{Command, PluginRef, PluginSlot, Track, TrackColor, Trac
 use faderframe_timeline::MusicalTime;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
 
 /// Where a sample goes.
@@ -255,7 +254,6 @@ impl Session {
         let handle = std::thread::Builder::new()
             .name("faderframe-sample".into())
             .spawn(move || {
-                let progress = Arc::clone(&job.progress);
                 let rendered = job.join();
                 let wav = rendered
                     .map_err(|e| e.to_string())
@@ -263,8 +261,7 @@ impl Session {
                 let _ = std::fs::remove_file(&scratch);
                 let wav = wav?;
                 let mut channels = wav.channels;
-                let latency = progress.latency.load(Ordering::Relaxed) as usize;
-                trim(&mut channels, latency, frames, wav.sample_rate);
+                trim(&mut channels, frames, wav.sample_rate);
                 let root = if want_root {
                     let n = channels.first().map_or(0, Vec::len);
                     let mix: Vec<f32> = (0..n)
@@ -459,11 +456,9 @@ impl Session {
     }
 }
 
-/// Drop the first `latency` frames, keep `frames`, and fade an end that
-/// cuts through sound.
-fn trim(channels: &mut [Vec<f32>], latency: usize, frames: usize, rate: u32) {
+/// Keep `frames`, and fade an end that cuts through sound.
+fn trim(channels: &mut [Vec<f32>], frames: usize, rate: u32) {
     for c in channels.iter_mut() {
-        c.drain(..latency.min(c.len()));
         c.truncate(frames);
     }
     let len = channels.first().map_or(0, Vec::len);
@@ -495,7 +490,7 @@ mod tests {
         let mut ch = vec![vec![0.5f32; 1000], vec![0.0f32; 1000]];
         ch[0][999] = 0.0;
         ch[0][998] = 0.0;
-        trim(&mut ch, 10, 900, 48_000);
+        trim(&mut ch, 900, 48_000);
         assert_eq!(ch[0].len(), 900);
         assert_eq!(ch[0][0], 0.0, "faded in");
         assert!((ch[0][47] - 0.5 * 47.0 / 48.0).abs() < 1e-6);
@@ -503,7 +498,7 @@ mod tests {
         // Quiet ends stay as they are.
         let mut quiet = vec![vec![0.0f32; 400]];
         quiet[0][200] = 1.0;
-        trim(&mut quiet, 0, 400, 48_000);
+        trim(&mut quiet, 400, 48_000);
         assert_eq!(quiet[0][200], 1.0);
     }
 }
