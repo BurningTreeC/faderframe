@@ -11,8 +11,8 @@ key, a chord track and MIDI effects, modulators and parallel effect
 containers, automation, CLAP/VST3 hosting (LV2 on Linux, Audio Units on
 macOS), an analogue-console-style mixer, a full set of stock devices,
 mastering meters, surround, object-based (ADM BWF) and IAMF masters with
-binaural monitoring, album delivery down to CD and vinyl masters, and
-dockable, detachable editors.
+binaural monitoring, album delivery down to CD and vinyl masters, video for
+working to picture, project templates, and dockable, detachable editors.
 
 > **Status: in active development.** Most of a working DAW is there; see
 > [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#status-and-roadmap) for what
@@ -81,6 +81,13 @@ new tracks under them, and the pad's clip effects (a compressor, a
 saturator and a reverb rendered into the audio it plays):
 
 ![Audio converted to MIDI and the Clip Effects editor](docs/screenshots/clips.png)
+
+Picture: a movie in the arranger's Video lane above the demo (a filmstrip
+of the clip) and the video window in the bottom dock, frame-exact against
+the sound — the clock burnt into the picture and the overlay's project
+timecode agree:
+
+![The Video lane and the video window](docs/screenshots/video.png)
 
 The clip launcher: the demo's clips sent to it in four scenes, the Verse
 playing (green, each clip's loop progress under its name) and the Chorus
@@ -258,6 +265,15 @@ long sessions), Neon and High Contrast:
   lists them, compares one with the project now (tracks, clips, plugins,
   mixer settings, tempo, key, sections …) and restores one — the project
   as it is is kept as a version first, so nothing is lost.
+* Project templates: File → Save as Template… keeps a project's set-up —
+  tracks and routing, devices with their settings, sends, groups, VCAs,
+  folders, modulators and containers, MIDI mappings, automation, tempo,
+  meter, key and chords, markers and sections, loop and punch, the album's
+  delivery settings, the launcher's scenes, video tracks and the window
+  layout — without its clips and media (the samplers' samples go with it,
+  so a template stands on its own). File → New from Template… starts an
+  unsaved project from one (or from any project file's set-up); the one
+  marked Default is where New Project (Ctrl+N) and a new start begin.
 * Clip aliases: right-click a clip → Duplicate as Alias; aliases (marked
   by two overlapping frames before the name) share their content — notes,
   controllers, length, gain, fades, warp — so an edit of one is an edit of
@@ -274,7 +290,8 @@ long sessions), Neon and High Contrast:
   the last strip in the mixer (each kind of track, or one from a saved
   track preset; an instrument track opens the plugin browser).
 * Docking: mixer / Tools / album / piano roll / automation / performance /
-  undo history / modulators tabs in a bottom dock, detach any view into its own window and dock it back,
+  undo history / modulators / video tabs in a bottom dock, detach any view
+  into its own window and dock it back,
   workspaces (Recording, Editing, Mixing, MIDI, Mastering), layouts saved
   with the project. View → Master Strip at the Side keeps the master fader
   at the window's right edge, full height, whatever view is shown (per
@@ -356,6 +373,32 @@ long sessions), Neon and High Contrast:
   Whisper running in FaderFrame; the model, 290 MB, is downloaded once
   from Audio → Download Speech Model). Lines are edited in place; the
   lane's menu writes them next to the project as LRC and SRT.
+* Video (File → Import Video…, or drop a movie on the video window): the
+  picture on a Video lane above the tracks, a filmstrip of each clip, in
+  absolute time (tempo changes never move it) and placed at its own
+  timecode; its sound on an audio track of its own in step with it; the
+  project takes the movie's frame rate and start timecode (every SMPTE
+  rate, 23.976 to 120, drop-frame 29.97 and 59.94) and warns when another
+  movie's rate differs. The video window (View → Video; dockable,
+  detachable, full screen with a double-click — Escape leaves) shows the
+  frame for the sample you hear when that frame reaches the screen: the
+  audio engine is the clock, the picture follows locates, loops and
+  varispeed, and output latency is taken into account; a timecode overlay
+  shows the project's timecode and the frame. Scrubbing and locating are
+  exact to the frame: every file is indexed on import (variable frame
+  rates and B-frames included) and gets an all-intra proxy in the
+  background where it needs one, so once it is made a 4K long-GOP original
+  scrubs like an intra-frame file (until then a keyframe shows at once and
+  the exact frame follows); stopped, the picture is decoded sharp from the
+  original. Drag a clip along the lane (snapped to whole frames), spot it
+  to its timecode, move the picture against the sound by frames or
+  milliseconds (the window's menu), and check the whole chain with the
+  built-in flash-and-beep sync test. Export Movie (File menu) writes the
+  movie with the mix next to the picture copied as it is coded — no
+  re-encoding: QuickTime or Matroska with PCM, MPEG-4 with Opus. Decoding
+  and muxing are GStreamer's (hardware decoders where the system has
+  them: VA-API, Direct3D, VideoToolbox); proxies and indexes go to the
+  computer's cache folder (`faderframe/video`), deletable any time.
 * Clip launcher (View → Clip Launcher): scenes of clips per track,
   launched while the song plays on the next bar, beat or bars, looping
   until the next one; whole scenes at once, per-track stops, "Back to
@@ -372,9 +415,10 @@ long sessions), Neon and High Contrast:
   length and a count-in, MIDI clips take overdubs, and Record to
   Arrangement writes what plays (and the mixer's moves) as it plays.
   Pads, keys and buttons learn slots, scenes and stops.
-* MIDI sync: follows MIDI clock or MIDI time code (by varispeed, so the
-  clocks drifting apart never makes it jump), and sends MIDI clock and MIDI
-  time code (24, 25, 29.97 drop or 30 fps from the project's start time).
+* MIDI sync (Preferences → MIDI → Sync): follows MIDI clock (its tempo
+  too) or MIDI time code (by varispeed, so the clocks drifting apart never
+  makes it jump), and sends MIDI clock and MIDI time code (24, 25, 29.97
+  drop or 30 fps from the project's start time).
 * Control surfaces (Preferences → MIDI → Control Surfaces): Mackie Control
   and its extenders, HUI, and OSC (e.g. TouchOSC) — motorised faders,
   pan and send pots, Flip, mute/solo/arm/select, automation modes, names,
@@ -410,8 +454,10 @@ long sessions), Neon and High Contrast:
   SFZ 2 opcodes: keyswitches, release and legato triggers, crossfades,
   two filters and an EQ, three envelopes and LFOs, controller
   modulation with curves, `#define`/`#include`), and a
-  sixteen-pad drum sampler with choke groups and eight extra stereo
-  outputs (each pad's Output; Create Output Tracks gives them tracks).
+  sixteen-pad drum sampler with choke groups, each pad's start and end
+  dragged on its waveform, a click on a pad to hear it, and eight extra
+  stereo outputs (each pad's Output; Create Output Tracks gives them
+  tracks).
   Both samplers can keep a
   sample's length when they change its pitch (Sampler: Keep Length;
   Drum Sampler: per pad), through the same stretcher as warping, without
@@ -443,6 +489,12 @@ long sessions), Neon and High Contrast:
   drawn like the hardware: the pedalboard, the amplifier's head, the cabinet
   with its microphones. Every pedal is a stage of its own on its own thread
   (a stereo signal on two), which reports its buffer as latency.
+  GainStageFx's noise gate sits after the input (switch and threshold in
+  the output strip). 61 factory presets: the rigs, every amplifier on its
+  own (Amplifiers) and guitar sounds researched from well-known records,
+  named for the record (Sounds). A mono
+  track turns stereo from the Guitar Station on, so the microphones' pans
+  are heard, and the IN and OUT meters always show left and right.
 * Audio: native PipeWire (one node with a port per channel, linked to your
   default devices), JACK (JACK2 or PipeWire-JACK), ALSA, WASAPI and ASIO
   (Windows; ASIO in builds with the `asio` feature, see below), CoreAudio
@@ -451,7 +503,8 @@ long sessions), Neon and High Contrast:
   common sample rates (44.1 – 192 kHz) and buffer sizes (16 – 8192
   frames).
 * Audio import: WAV, AIFF, CAF, FLAC, MP3, Ogg Vorbis, AAC/M4A, ALAC — via
-  File → Import Audio (Ctrl+I) or drag & drop onto the arranger. Files are
+  File → Import Audio (Ctrl+I) or drag & drop from any file manager onto
+  the arranger (samples onto the samplers' slots and pads). Files are
   converted to the project rate once and streamed from disk during playback
   (bounded memory, lock-free read-ahead); media is kept in the project's
   `Audio/` folder; missing files show as offline clips.
@@ -526,9 +579,9 @@ long sessions), Neon and High Contrast:
   save and load your own for any plugin (insert menu or the parameter
   window's Presets menu); saving under an existing name asks before it
   replaces that preset, and Delete Preset removes your own (factory
-  presets stay). The stock effects, MIDI effects, EQs and Synth include 216
-  factory presets, selected from the editor's Presets menu in one undo
-  step. Delay and Reverb presets load fully wet on Aux returns. VST3
+  presets stay). The stock effects, MIDI effects, EQs, the Synth and the
+  Guitar Station include 277 factory presets, selected from the editor's
+  Presets menu (in submenus where there are many) in one undo step. Delay and Reverb presets load fully wet on Aux returns. VST3
   factory presets and LV2 presets (the plugin's and preset bundles') are listed too, as are
   VST3 program lists (selecting a program is one undo step; MIDI program
   changes select VST3 programs). Plugins that offer it can process in
@@ -552,8 +605,7 @@ long sessions), Neon and High Contrast:
   with controllers and SysEx; tempo and meter too when the project is
   empty) and File → Export MIDI File… (all MIDI tracks, or the selected
   clips).
-* MIDI sync: follow an external MIDI clock (tempo too) or MIDI time code
-  (Preferences → MIDI → Sync). Per-note expression: pitch, pressure,
+* Per-note expression and SysEx: pitch, pressure,
   timbre, volume, pan, vibrato and expression per note — drawn in the piano
   roll's expression lanes, recorded from MPE controllers, played natively
   to plugin instruments (CLAP note expressions, VST3 note expression values
@@ -567,10 +619,14 @@ long sessions), Neon and High Contrast:
   selected, with constant low latency; choose the input and channel per
   track (track menu → MIDI In). Record MIDI into clips (takes or replace,
   loop recording). MIDI learn: right-click a fader, pan, mute, send,
-  automation lane or plugin parameter → MIDI Learn and move a knob; pads
-  can toggle switches or run transport functions; soft takeover and
-  endless encoders (relative modes); mapped controls don't reach the
-  instrument. Mod wheel, pitch bend, sustain and aftertouch are recorded
+  automation lane, plugin parameter or bypass — in FaderFrame's own device
+  editors too (the Guitar Station, the EQs, every stock device), a surround
+  pan's parameters, the transport buttons and an editor window's Bypass —
+  → MIDI Learn… and move a knob; Remove MIDI Mapping (named after its
+  controller) takes it away where it was learned, and Preferences → MIDI
+  removes learned transport controls. Pads can toggle switches or run
+  transport functions; soft takeover and endless encoders (relative
+  modes); mapped controls don't reach the instrument. Mod wheel, pitch bend, sustain and aftertouch are recorded
   into clips and chased on playback. MIDI tracks play an instrument track
   (track menu → Plays: …; a MIDI track added while an instrument track is
   selected plays that one) and external instruments (track menu → MIDI
@@ -590,13 +646,15 @@ long sessions), Neon and High Contrast:
   ATSC A/85, and each written file's loudness, range and true peak.
 * Preferences (start-up project, audio system, sample rate, buffer size,
   live DSP statistics, editing defaults), undo/redo, versioned project
-  files (`.ffproj`). A new start opens the last project, a new one or the
-  demo session (Preferences → General; `--empty` / `--demo` / a project
+  files (`.ffproj`). A new start opens the last project, a new one (from
+  the default template, if one is set) or the demo session (Preferences → General; `--empty` / `--demo` / a project
   path override it once); File → Open Recent lists the last ten projects.
 
 ## Building
 
-Requirements: Rust 1.92 or newer (`rustup`) and GTK 4.14+ with `pkg-config`.
+Requirements: Rust 1.92 or newer (`rustup`), GTK 4.14+ and GStreamer 1.22+
+(with its base and good plugins; the bad ones add the H.264/H.265 parsers
+and hardware decoders video uses) with `pkg-config`.
 
 **Linux** additionally needs the development files of JACK (`jack.pc`;
 libjack itself is loaded at run time, so FaderFrame starts without it),
@@ -605,15 +663,17 @@ build time):
 
 | Distribution | Packages |
 |---|---|
-| Arch / Manjaro | `gtk4 pkgconf pipewire-jack` (or `jack2`) `alsa-lib pipewire clang cmake` |
-| Debian / Ubuntu (24.04+) | `libgtk-4-dev pkg-config libjack-jackd2-dev libasound2-dev libpipewire-0.3-dev libclang-dev cmake` |
-| Fedora | `gtk4-devel pkgconf-pkg-config pipewire-jack-audio-connection-kit-devel alsa-lib-devel pipewire-devel clang-devel cmake` |
+| Arch / Manjaro | `gtk4 pkgconf pipewire-jack` (or `jack2`) `alsa-lib pipewire clang cmake gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad` |
+| Debian / Ubuntu (24.04+) | `libgtk-4-dev pkg-config libjack-jackd2-dev libasound2-dev libpipewire-0.3-dev libclang-dev cmake libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad` |
+| Fedora | `gtk4-devel pkgconf-pkg-config pipewire-jack-audio-connection-kit-devel alsa-lib-devel pipewire-devel clang-devel cmake gstreamer1-devel gstreamer1-plugins-base-devel gstreamer1-plugins-good gstreamer1-plugins-bad-free` |
 
-**macOS** (Apple Silicon or Intel): `brew install gtk4 pkgconf cmake`.
+**macOS** (Apple Silicon or Intel): `brew install gtk4 pkgconf cmake gstreamer`.
 
 **Windows**: in an [MSYS2](https://www.msys2.org) UCRT64 shell,
 `pacman -S mingw-w64-ucrt-x86_64-gtk4 mingw-w64-ucrt-x86_64-pkgconf
-mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-rust mingw-w64-ucrt-x86_64-cmake`.
+mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-rust mingw-w64-ucrt-x86_64-cmake
+mingw-w64-ucrt-x86_64-gstreamer mingw-w64-ucrt-x86_64-gst-plugins-base
+mingw-w64-ucrt-x86_64-gst-plugins-good mingw-w64-ucrt-x86_64-gst-plugins-bad`.
 
 Plugin GUIs embed natively everywhere: X11 windows on Linux (through
 XWayland), Win32 windows on Windows, Cocoa views on macOS. CI builds and
@@ -652,11 +712,16 @@ of them for a `v*` tag and attaches them to the GitHub release.
 
 | Platform | Package | How |
 |---|---|---|
-| Linux | portable tarball (GTK bundled; runs in place, `install.sh` installs it) | `cargo build --release && packaging/linux/tarball.sh` |
+| Linux | portable tarball (GTK bundled, GStreamer too for systems without one; runs in place, `install.sh` installs it) | `cargo build --release && packaging/linux/tarball.sh` |
 | Linux | Flatpak (GNOME 51 runtime) | `flatpak-builder --user --install build-dir packaging/flatpak/io.github.BurningTreeC.FaderFrame.yml` |
 | Linux | system install from source (binary, desktop entry, AppStream, MIME type, icon) | `cargo build --release && sudo packaging/linux/install.sh /usr/local` |
-| macOS | `FaderFrame.app` in a DMG (GTK bundled, ad-hoc signed) | `brew install gtk4 adwaita-icon-theme librsvg pkgconf && packaging/macos/bundle.sh` |
-| Windows | installer (Inno Setup) and portable zip | in MSYS2 UCRT64: `packaging/windows/bundle.sh` |
+| macOS | `FaderFrame.app` in a DMG (GTK and GStreamer bundled, ad-hoc signed) | `brew install gtk4 adwaita-icon-theme librsvg pkgconf gstreamer && packaging/macos/bundle.sh` |
+| Windows | installer (Inno Setup) and portable zip (GTK and GStreamer bundled) | in MSYS2 UCRT64: `packaging/windows/bundle.sh` |
+
+Video needs nothing installed with a package: the macOS and Windows
+packages carry GStreamer with the plugins video uses; the Linux tarball
+uses the system's GStreamer (with its codecs) and its own where there is
+none; the Flatpak takes it from the GNOME runtime. No FFmpeg is bundled.
 
 The macOS app is signed ad hoc, not notarised, so Gatekeeper stops it the
 first time. On macOS 15 and later, try to open it once, then allow it in
@@ -674,12 +739,16 @@ and also loads CLAP and VST3 plugins from its `Plug-Ins/CLAP` and
 folder, so they run from a USB stick as they are; on macOS put the folder
 next to `FaderFrame.app` (after moving the app out of the download
 folder, which macOS runs from a read-only copy). Preferences → General
-shows where the data goes.
+shows where the data goes. Video proxies and frame indexes are the
+exception: they take gigabytes per hour of picture, so they go to the
+computer's cache folder even then.
 
 ### Shortcuts
 
 | Key | Action |
 |---|---|
+| Ctrl+N | New project (from the default template, if one is set) |
+| Ctrl+O / Ctrl+S / Ctrl+Shift+S | Open / save / save as |
 | Space | Play / pause |
 | Home | Return to start |
 | L | Toggle loop |
@@ -715,6 +784,7 @@ shows where the data goes.
 | Tab / Shift+Tab | Next / previous clip boundary or transient (Ctrl: extend the selection) |
 | Ctrl+Shift+↑ / ↓ | Clip gain ±0.5 dB |
 | Ctrl+] / Ctrl+[ | Zoom in / out |
+| Double-click, F11 / Escape (video window) | Full screen / leave full screen |
 
 View → Keyboard Shortcuts… changes any command's shortcut.
 
