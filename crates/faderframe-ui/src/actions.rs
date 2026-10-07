@@ -137,6 +137,18 @@ pub fn install(app: &Rc<AppState>) {
                     }
                 }
                 crate::plugin_window::screenshot(std::path::Path::new(&path));
+                // An open context menu.
+                if let Some((menu, level)) = crate::canvas::open_menu() {
+                    let p = std::path::Path::new(&path);
+                    let stem = p
+                        .file_stem()
+                        .map_or_else(String::new, |s| s.to_string_lossy().to_string());
+                    let file = p.with_file_name(format!("{stem}-menu.png"));
+                    match crate::screenshot::popover_to_png(&menu, &file) {
+                        Ok(()) => tracing::info!("menu ({level}) saved to {}", file.display()),
+                        Err(e) => tracing::warn!("screenshot of the menu failed: {e}"),
+                    }
+                }
             }
         }),
         dispatch(app, "undo", A::Undo),
@@ -1674,6 +1686,67 @@ pub fn install(app: &Rc<AppState>) {
                 Some(action) => a.dispatch(action),
                 None => tracing::warn!("midi-plays: no choice '{arg}'"),
             }
+        }),
+        // Development aid: `right-click:<view id>@<x>/<y>` (a secondary
+        // click in a docked view; negative coordinates count from its right
+        // and bottom edges), then `menu:<label>` clicks an entry of the
+        // context menu it opened and `menu-state:x` logs whether it is open.
+        named("right-click", |a, arg| {
+            use faderframe_ui_canvas::{Modifiers, Point, PointerButton, ViewEvent};
+            let Some((view, at)) = arg.split_once('@') else {
+                tracing::warn!("right-click: '{arg}' is not <view id>@<x>/<y>");
+                return;
+            };
+            let canvas = a
+                .dock
+                .borrow()
+                .hosts
+                .get(&faderframe_workspace::ViewId::new(view))
+                .map(|(_, h)| h.canvas.clone());
+            let Some(canvas) = canvas else {
+                tracing::warn!("right-click: no view '{view}'");
+                return;
+            };
+            let mut xy = at.split('/').filter_map(|v| v.trim().parse::<f32>().ok());
+            let (Some(x), Some(y)) = (xy.next(), xy.next()) else {
+                return;
+            };
+            let x = if x < 0.0 {
+                canvas.width() as f32 + x
+            } else {
+                x
+            };
+            let y = if y < 0.0 {
+                canvas.height() as f32 + y
+            } else {
+                y
+            };
+            let pos = Point::new(x, y);
+            canvas.deliver(ViewEvent::PointerDown {
+                pos,
+                button: PointerButton::Secondary,
+                modifiers: Modifiers::NONE,
+                clicks: 1,
+            });
+            canvas.deliver(ViewEvent::PointerUp {
+                pos,
+                button: PointerButton::Secondary,
+                modifiers: Modifiers::NONE,
+            });
+        }),
+        named("menu", |_, arg| {
+            if !crate::canvas::activate_menu_entry(arg) {
+                tracing::warn!("menu: no entry '{arg}' shown");
+            }
+        }),
+        named("menu-state", |_, _| match crate::canvas::open_menu() {
+            Some((menu, level)) => tracing::info!(
+                "menu: open ({}) showing {level}, {}×{}",
+                menu.is_visible(),
+                menu.width(),
+                menu.height()
+            ),
+            None => tracing::info!("menu: closed"),
         }),
         // Development aid: `track-format:<track>=<mono|stereo|5.1|7.1.4|…>`
         // (a track's channel format, as its Channel Format menu sets it).

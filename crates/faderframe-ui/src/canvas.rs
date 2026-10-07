@@ -1108,7 +1108,12 @@ impl CanvasWidget {
     }
 }
 
-/// Native popover menu for a view's context menu request.
+/// Native popover menu for a view's context menu request. Every submenu
+/// level is a page of one stack, built up front: the stack is as large as
+/// its largest level, so the popover is placed once with room for all of
+/// them and moving between levels never resizes or moves it (a popover
+/// that grows by the edge of the screen may otherwise be closed by the
+/// compositor).
 pub fn show_menu(
     parent: &gtk::Widget,
     at: Point,
@@ -1118,42 +1123,93 @@ pub fn show_menu(
     let popover = gtk::Popover::new();
     popover.set_has_arrow(false);
     popover.add_css_class("ff-menu");
-    let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    fill_menu(&list, &popover, Rc::new(items), Vec::new(), app);
+    let stack = gtk::Stack::new();
+    stack.set_hhomogeneous(true);
+    stack.set_vhomogeneous(true);
+    stack.set_transition_type(gtk::StackTransitionType::SlideLeftRight);
+    stack.set_transition_duration(150);
+    add_menu_pages(&stack, &popover, &items, &[], None, app);
+    stack.set_visible_child_name(&page_name(&[]));
     let scroller = gtk::ScrolledWindow::new();
     scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
     scroller.set_propagate_natural_height(true);
     scroller.set_max_content_height(520);
-    scroller.set_child(Some(&list));
+    scroller.set_child(Some(&stack));
     popover.set_child(Some(&scroller));
     popover.set_parent(parent);
     popover.set_pointing_to(Some(&gdk::Rectangle::new(at.x as i32, at.y as i32, 1, 1)));
     popover.connect_closed(|p| {
+        OPEN_MENU.with(|m| m.borrow_mut().take());
         let p = p.clone();
         glib::idle_add_local_once(move || p.unparent());
     });
+    OPEN_MENU.with(|m| *m.borrow_mut() = Some((popover.clone(), stack)));
     popover.popup();
 }
 
-/// The entries of the menu level `path` (indices into submenus) in `list`;
-/// a submenu entry shows its level in place, with a way back.
-fn fill_menu(
-    list: &gtk::Box,
+thread_local! {
+    /// The context menu open now (for scripted checks).
+    static OPEN_MENU: RefCell<Option<(gtk::Popover, gtk::Stack)>> = const { RefCell::new(None) };
+}
+
+/// The open context menu and the name of the level it shows.
+pub fn open_menu() -> Option<(gtk::Popover, String)> {
+    OPEN_MENU.with(|m| {
+        m.borrow().as_ref().map(|(p, s)| {
+            (
+                p.clone(),
+                s.visible_child_name()
+                    .map_or_else(String::new, |n| n.to_string()),
+            )
+        })
+    })
+}
+
+/// Click the entry of the open context menu's shown level whose label
+/// contains `label` (as a pointer click would; scripted checks).
+pub fn activate_menu_entry(label: &str) -> bool {
+    let Some(page) = OPEN_MENU.with(|m| m.borrow().as_ref().and_then(|(_, s)| s.visible_child()))
+    else {
+        return false;
+    };
+    let mut child = page.first_child();
+    while let Some(c) = child {
+        if let Ok(button) = c.clone().downcast::<gtk::Button>()
+            && let Some(text) = button
+                .child()
+                .and_then(|l| l.downcast::<gtk::Label>().ok())
+                .map(|l| l.text())
+            && text.contains(label)
+        {
+            button.emit_clicked();
+            return true;
+        }
+        child = c.next_sibling();
+    }
+    false
+}
+
+/// The stack page of the menu level at `path` (indices into submenus).
+fn page_name(path: &[usize]) -> String {
+    let mut name = String::from("menu");
+    for i in path {
+        name.push('-');
+        name.push_str(&i.to_string());
+    }
+    name
+}
+
+/// A page for the level `items` at `path` (with a way back to its parent
+/// when it has a `title`), then pages for its submenus.
+fn add_menu_pages(
+    stack: &gtk::Stack,
     popover: &gtk::Popover,
-    root: Rc<Vec<MenuItem<Action>>>,
-    path: Vec<usize>,
+    items: &[MenuItem<Action>],
+    path: &[usize],
+    title: Option<&str>,
     app: &Rc<AppState>,
 ) {
-    while let Some(child) = list.first_child() {
-        list.remove(&child);
-    }
-    let mut level: &[MenuItem<Action>] = &root;
-    let mut title = None;
-    for &i in &path {
-        let Some(item) = level.get(i) else { break };
-        title = Some(item.label.clone());
-        level = &item.children;
-    }
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let row = |text: &str| {
         let label = gtk::Label::new(Some(text));
         label.set_xalign(0.0);
@@ -1164,27 +1220,16 @@ fn fill_menu(
     };
     if let Some(title) = title {
         let back = row(&format!("‹  {title}"));
-        let weak = Rc::downgrade(app);
+        let up = page_name(&path[..path.len() - 1]);
         back.connect_clicked(glib::clone!(
             #[weak]
-            list,
-            #[weak]
-            popover,
-            #[strong]
-            root,
-            #[strong]
-            path,
-            move |_| {
-                if let Some(app) = weak.upgrade() {
-                    let up = path[..path.len() - 1].to_vec();
-                    fill_menu(&list, &popover, root.clone(), up, &app);
-                }
-            }
+            stack,
+            move |_| stack.set_visible_child_name(&up)
         ));
         list.append(&back);
         list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     }
-    for (i, item) in level.iter().enumerate() {
+    for (i, item) in items.iter().enumerate() {
         if item.separator_before && list.first_child().is_some() {
             list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         }
@@ -1200,21 +1245,21 @@ fn fill_menu(
         };
         let button = row(&format!("{mark}{}{more}", item.label));
         if !item.children.is_empty() {
-            let weak = Rc::downgrade(app);
-            let mut deeper = path.clone();
+            let mut deeper = path.to_vec();
             deeper.push(i);
+            let name = page_name(&deeper);
+            add_menu_pages(
+                stack,
+                popover,
+                &item.children,
+                &deeper,
+                Some(&item.label),
+                app,
+            );
             button.connect_clicked(glib::clone!(
                 #[weak]
-                list,
-                #[weak]
-                popover,
-                #[strong]
-                root,
-                move |_| {
-                    if let Some(app) = weak.upgrade() {
-                        fill_menu(&list, &popover, root.clone(), deeper.clone(), &app);
-                    }
-                }
+                stack,
+                move |_| stack.set_visible_child_name(&name)
             ));
         } else {
             match item.action.clone() {
@@ -1236,6 +1281,7 @@ fn fill_menu(
         }
         list.append(&button);
     }
+    stack.add_named(&list, Some(&page_name(path)));
 }
 
 /// A canvas plus optional native scrollbars, the unit the dock places.

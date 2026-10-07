@@ -24,6 +24,28 @@ pub fn window_to_png(window: &impl IsA<gtk::Window>, path: &Path) -> Result<(), 
     texture.save_to_png(path).map_err(|e| e.to_string())
 }
 
+/// Render an open popover (a context menu) as it is shown.
+pub fn popover_to_png(popover: &gtk::Popover, path: &Path) -> Result<(), String> {
+    let (w, h) = (popover.width(), popover.height());
+    if w <= 0 || h <= 0 {
+        return Err("the menu has no size".into());
+    }
+    let paintable = gtk::WidgetPaintable::new(Some(popover));
+    let snapshot = gtk::Snapshot::new();
+    paintable.snapshot(&snapshot, w as f64, h as f64);
+    let node = snapshot
+        .to_node()
+        .ok_or_else(|| "nothing to render".to_string())?;
+    let renderer = popover
+        .native()
+        .and_then(|n| n.renderer())
+        .ok_or_else(|| "the menu is not realized".to_string())?;
+    renderer
+        .render_texture(node, None)
+        .save_to_png(path)
+        .map_err(|e| e.to_string())
+}
+
 /// Render the given canvases stacked top to bottom (fallback when GTK has
 /// no current frame of the window, e.g. while it is on a hidden workspace).
 pub fn canvases_to_png(
