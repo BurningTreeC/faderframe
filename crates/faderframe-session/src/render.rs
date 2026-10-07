@@ -574,7 +574,7 @@ pub fn track_render_project(
         .max()?;
     let mono = project
         .track(track)
-        .is_some_and(|t| t.layout == faderframe_core::ChannelLayout::Mono);
+        .is_some_and(|t| t.chain_layout() == faderframe_core::ChannelLayout::Mono);
     let mut p = project.clone();
     for t in &mut p.tracks {
         t.solo = t.id == track;

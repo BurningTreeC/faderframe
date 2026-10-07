@@ -328,8 +328,10 @@ impl PluginProcessor for GuitarProcessor {
         }
         if let Some(tap) = &self.tap {
             for c in 0..count.min(METERED) {
-                self.meters[0][c].publish(&tap.meter_in, c, frames);
-                self.meters[1][c].publish(&tap.meter_out, c, frames);
+                // A mono line lights both bars of the panel's meters.
+                let shown = if count == 1 { 0..METERED } else { c..c + 1 };
+                self.meters[0][c].publish_on(&tap.meter_in, shown.clone(), frames);
+                self.meters[1][c].publish_on(&tap.meter_out, shown, frames);
             }
             let underruns =
                 self.pedals.iter().map(StageRun::underruns).sum::<u64>() + self.amp.underruns();

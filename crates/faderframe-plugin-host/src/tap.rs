@@ -207,15 +207,25 @@ impl MeterTap {
 
     /// Hand the last `samples` to the editor.
     pub fn publish(&mut self, meter: &Meter, channel: usize, samples: usize) {
+        self.publish_on(meter, channel..channel + 1, samples);
+    }
+
+    /// [`Self::publish`] on each of `channels` (a mono signal shown on both
+    /// bars of a stereo meter).
+    pub fn publish_on(&mut self, meter: &Meter, channels: std::ops::Range<usize>, samples: usize) {
         if self.mean_square < 1e-20 {
             self.mean_square = 0.0;
         }
-        meter.publish(channel, self.peak, self.mean_square as f32);
+        for c in channels.clone() {
+            meter.publish(c, self.peak, self.mean_square as f32);
+        }
         self.peak = 0.0;
         self.since_figure += samples;
         if self.since_figure >= self.figure_every {
             self.since_figure = 0;
-            meter.publish_figure(channel, self.mean_square as f32);
+            for c in channels {
+                meter.publish_figure(c, self.mean_square as f32);
+            }
         }
     }
 

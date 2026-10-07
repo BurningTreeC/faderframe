@@ -1,12 +1,12 @@
 #![allow(clippy::unwrap_used)]
 //! The Guitar Station in a live session: it plays, a pedal added while
 //! playing restarts the line with its stage's latency and keeps playing, the
-//! DI is an output a track can take, and an offline render does not depend
-//! on how fast its pedals were built.
+//! DI is an output a track can take, an offline render does not depend
+//! on how fast its pedals were built, and a mono track is stereo after it.
 
 use faderframe_audio::dummy::DummyBackend;
 use faderframe_audio_files::{WavFormat, read_wav};
-use faderframe_core::{ParameterId, PluginInstanceId, TrackId, builtin};
+use faderframe_core::{ChannelLayout, ParameterId, PluginInstanceId, TrackId, builtin};
 use faderframe_engine::EngineConfig;
 use faderframe_guitar::pedal::Stomp;
 use faderframe_guitar::voice::Pedal;
@@ -146,6 +146,141 @@ fn renders_are_the_same_every_time() {
     assert_eq!(a.len(), b.len());
     assert!(a == b, "two renders differ");
     assert!(a.iter().any(|x| x.abs() > 1e-4));
+}
+
+/// Two bars of the master in stereo, rendered offline.
+fn master_stereo(project: &Project, name: &str) -> [Vec<f32>; 2] {
+    let path = std::env::temp_dir().join(format!(
+        "ff-guitar-{}-{name}-stereo.wav",
+        std::process::id()
+    ));
+    let settings = RenderSettings {
+        range: RenderRange::Bars { start: 0, end: 2 },
+        channels: RenderChannels::Stereo,
+        tail_seconds: 0.0,
+        normalize_db: None,
+        format: WavFormat::Float32,
+        ..RenderSettings::defaults_for(project, path.clone())
+    };
+    render::start(project.clone(), settings)
+        .unwrap()
+        .join()
+        .unwrap();
+    let wav = read_wav(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let mut c = wav.channels.into_iter();
+    [c.next().unwrap(), c.next().unwrap()]
+}
+
+fn rms_db(x: &[f32]) -> f64 {
+    let ms = x.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / x.len().max(1) as f64;
+    10.0 * ms.max(1e-30).log10()
+}
+
+/// On a mono track the Guitar Station makes the signal stereo from its
+/// slot on: its microphones pan, live and in renders, and a freeze keeps
+/// both sides.
+#[test]
+fn a_mono_track_is_stereo_from_the_guitar_station_on() {
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let t = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.name == "Pluck")
+        .unwrap()
+        .id;
+    s.dispatch(Action::Edit(Command::SetTrackLayout {
+        track: t,
+        layout: ChannelLayout::Mono,
+    }))
+    .unwrap();
+    assert_eq!(
+        s.project().track(t).unwrap().chain_layout(),
+        ChannelLayout::Mono
+    );
+    // After the instrument, so it plays the guitar's part.
+    let index = s.project().track(t).unwrap().inserts.len();
+    s.dispatch(Action::InsertPlugin {
+        track: t,
+        index,
+        plugin: PluginRef::builtin(builtin::GUITAR_STATION, "Guitar Station"),
+    })
+    .unwrap();
+    let plugin = s.project().track(t).unwrap().inserts[index].id;
+    assert_eq!(
+        s.project().track(t).unwrap().chain_layout(),
+        ChannelLayout::Stereo
+    );
+    // One microphone, hard left.
+    set(&mut s, t, plugin, id::A_PAN, -1.0);
+    s.start_audio(
+        vec![Box::new(DummyBackend::default())],
+        &AudioPreferences::default(),
+    )
+    .unwrap();
+    s.dispatch(Action::Transport(TransportAction::Play))
+        .unwrap();
+    // Rendered ahead (the default), then on the audio thread.
+    for ahead in [true, false] {
+        if !ahead {
+            s.set_render_ahead(None).unwrap();
+        }
+        run(&mut s, 2.0);
+        let m = s.meter(t);
+        assert!(m.left.level_db > -50.0, "left {:.1} dB", m.left.level_db);
+        assert!(
+            m.right.level_db < m.left.level_db - 30.0,
+            "panned left, live (ahead {ahead}): {:.1} / {:.1} dB",
+            m.left.level_db,
+            m.right.level_db
+        );
+    }
+    s.dispatch(Action::Transport(TransportAction::Stop))
+        .unwrap();
+    // Only the Pluck: the master's left and right are the microphone's.
+    for other in s
+        .project()
+        .tracks
+        .iter()
+        .filter(|o| o.id != t && o.kind != faderframe_project::TrackKind::Master)
+        .map(|o| o.id)
+        .collect::<Vec<_>>()
+    {
+        s.dispatch(Action::Edit(Command::SetTrackMute {
+            track: other,
+            on: true,
+        }))
+        .unwrap();
+    }
+    let [l, r] = master_stereo(s.project(), "panned");
+    let (l, r) = (rms_db(&l), rms_db(&r));
+    assert!(
+        l > -60.0 && r < l - 30.0,
+        "panned left, rendered: {l:.1} / {r:.1} dB"
+    );
+    // Frozen: the rendered audio is stereo, and sounds the same.
+    s.dispatch(Action::FreezeTrack(t)).unwrap();
+    let end = Instant::now() + Duration::from_secs(120);
+    while !s.bouncing().is_empty() {
+        assert!(Instant::now() < end, "freeze timed out");
+        s.tick(0.016);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let f = s
+        .project()
+        .track(t)
+        .unwrap()
+        .freeze
+        .clone()
+        .expect("frozen");
+    assert_eq!(s.project().sources[&f.source].channels(), 2);
+    let [fl, fr] = master_stereo(s.project(), "frozen");
+    let (fl, fr) = (rms_db(&fl), rms_db(&fr));
+    assert!(
+        (fl - l).abs() < 0.5 && fr < fl - 30.0,
+        "frozen: {fl:.1} / {fr:.1} dB, playing {l:.1} / {r:.1}"
+    );
 }
 
 /// Every factory rig on the demo's Pluck, played: what render-ahead misses,

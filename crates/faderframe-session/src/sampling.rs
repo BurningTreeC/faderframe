@@ -215,6 +215,11 @@ impl Session {
                 )
             });
         }
+        // Without its devices a mono track is mono to the end (the render
+        // project kept a stereo master for one a device widened).
+        if mono && let Some(m) = copy.master_id().and_then(|m| copy.track_mut(m)) {
+            m.layout = ChannelLayout::Mono;
+        }
         let rate = project.sample_rate;
         let frames = (project.timeline.to_samples(end, f64::from(rate))
             - project.timeline.to_samples(start, f64::from(rate)))

@@ -786,8 +786,12 @@ pub fn build_graph(
             continue;
         }
         let mut tn = TrackNodes::default();
-        let layout = t.layout;
         let frozen = t.freeze.is_some();
+        // Frozen: the rendered audio is the chain's (stereo, if a device
+        // widened a mono track).
+        let layout = if frozen { t.chain_layout() } else { t.layout };
+        // What the chain ends in: the strip's input.
+        let end_layout = t.chain_layout();
         // Rendered ahead: the chain into the deep tier's graph and a
         // reader here for the strip. A bus's chain is in the shallow tier's
         // (what reaches it sums there). A strip rendered ahead is there too,
@@ -822,7 +826,7 @@ pub fn build_graph(
                 tn.input = Some(input);
                 tn.input_ahead = true;
             }
-            let channels = layout.channel_count();
+            let channels = end_layout.channel_count();
             // A reader of `ring` in graph `g` reporting `latency`.
             let reader = |g: &mut GraphBuilder<EngineContext>,
                           ring: &Arc<AheadRing>,
@@ -871,8 +875,15 @@ pub fn build_graph(
                 } else {
                     let ring = ring_of(plan.rings, t.id, channels, plan.ring_frames);
                     used_rings.push(Arc::clone(&ring));
-                    writer(&mut ab, &ring, layout, end)?;
-                    reader(&mut bb, &ring, chain_latency, layout, None, &plan.misses)
+                    writer(&mut ab, &ring, end_layout, end)?;
+                    reader(
+                        &mut bb,
+                        &ring,
+                        chain_latency,
+                        end_layout,
+                        None,
+                        &plan.misses,
+                    )
                 };
                 let strip = add_strip(&mut bb, project, slots, t, None, end, true)?;
                 let echo = ring_of(
@@ -914,16 +925,16 @@ pub fn build_graph(
                 // shallow tier, a track's from the deep one.
                 let ring = if bus {
                     let r = ring_of(plan.bus_rings, t.id, channels, plan.bus_ring_frames);
-                    writer(&mut bb, &r, layout, end)?;
+                    writer(&mut bb, &r, end_layout, end)?;
                     bus_used_rings.push(Arc::clone(&r));
                     r
                 } else {
                     let r = ring_of(plan.rings, t.id, channels, plan.ring_frames);
-                    writer(&mut ab, &r, layout, end)?;
+                    writer(&mut ab, &r, end_layout, end)?;
                     used_rings.push(Arc::clone(&r));
                     r
                 };
-                let back = reader(&mut b, &ring, latency, layout, Some(gi), &plan.misses);
+                let back = reader(&mut b, &ring, latency, end_layout, Some(gi), &plan.misses);
                 own(&mut owners, back, t.id, None, NodeWork::Ahead);
                 let strip = add_strip(&mut b, project, slots, t, Some(gi), back, false)?;
                 tn.post_fx = Some(back);
@@ -1180,6 +1191,7 @@ pub fn build_graph(
         let mut prev = chain_start;
         let mut events = sources;
         let mut raw = true;
+        let mut layout = layout;
         for slot in chain {
             // A container: its chains side by side.
             if slot.plugin.is_container() {
@@ -1198,7 +1210,7 @@ pub fn build_graph(
                     &mut owners,
                     t,
                     slot,
-                    prev,
+                    (prev, layout),
                     gi,
                     0,
                     &mut links,
@@ -1214,6 +1226,9 @@ pub fn build_graph(
             // Inserts that take notes (a synth placed as an insert, MIDI-
             // controlled effects) get the track's MIDI too.
             let notes = t.kind == TrackKind::Instrument && pcx.takes_notes(slot);
+            // A device that widens a mono track takes it as stereo (the
+            // graph duplicates it) and everything after it is stereo.
+            layout = slot.plugin.output_layout(layout);
             let mut spec = NodeSpec::new(format!("{} · {}", t.name, slot.plugin.name))
                 .group(gi)
                 .audio_in(layout)
@@ -1444,7 +1459,7 @@ pub fn build_graph(
             };
             let (tap_node, tap_port, tap_layout) = match send.tap {
                 SendTap::PreFx => (tn.preamp.or(tn.input).unwrap_or(strip), 0, t.layout),
-                SendTap::PreFader => (strip, 1, t.layout),
+                SendTap::PreFader => (strip, 1, t.chain_layout()),
                 SendTap::PostFader => (strip, 0, destination_layout(project, t)),
             };
             let level = slots.send(send.id)?;
@@ -1595,7 +1610,7 @@ fn add_container(
     owners: &mut Vec<(NodeId, NodeOwner)>,
     t: &faderframe_project::Track,
     container: &PluginSlot,
-    prev: NodeId,
+    (prev, layout): (NodeId, ChannelLayout),
     gi: u32,
     depth: usize,
     links: &mut ChainLinks<'_>,
@@ -1607,7 +1622,6 @@ fn add_container(
         return Ok((prev, 0));
     }
     let mut latency = 0u32;
-    let layout = t.layout;
     let own = |owners: &mut Vec<(NodeId, NodeOwner)>, node, plugin| {
         owners.push((
             node,
@@ -1688,7 +1702,7 @@ fn add_container(
                         owners,
                         t,
                         slot,
-                        from,
+                        (from, layout),
                         gi,
                         depth + 1,
                         &mut inner,
@@ -1765,7 +1779,7 @@ fn add_strip(
     from: NodeId,
     quiet: bool,
 ) -> Result<NodeId, EngineError> {
-    let layout = t.layout;
+    let layout = t.chain_layout();
     let dest = destination_layout(project, t);
     let strip_slots = slots.strip(t.id)?;
     let meter = slots.meter(t.id, dest.channel_count())?;
@@ -1880,7 +1894,13 @@ fn build_ahead_chain(
     t: &Track,
     config: &PrepareConfig,
 ) -> Result<(NodeId, NodeId, u32), EngineError> {
-    let layout = t.layout;
+    // Frozen: the rendered audio is the chain's (stereo, if a device
+    // widened a mono track).
+    let layout = if t.freeze.is_some() {
+        t.chain_layout()
+    } else {
+        t.layout
+    };
     let mut latency = 0u32;
     let input = ab.add_node(
         NodeSpec::new(format!("{} · Input", t.name))
@@ -1981,6 +2001,7 @@ fn build_ahead_chain(
     // Owners are not profiled in the ahead graph; nor are sidechains or
     // routed MIDI tracks part of it (such tracks stay live).
     let (mut owners, mut takes_notes, mut sidechains) = (Vec::new(), Vec::new(), Vec::new());
+    let mut layout = layout;
     for slot in chain {
         if let Some((_, n)) = fx.iter().find(|(id, _)| *id == slot.id) {
             midi = Some(*n);
@@ -1996,13 +2017,26 @@ fn build_ahead_chain(
                 takes_notes: &mut takes_notes,
                 sidechains: &mut sidechains,
             };
-            let (out, l) =
-                add_container(ab, pcx, slots, &mut owners, t, slot, prev, 0, 0, &mut links)?;
+            let (out, l) = add_container(
+                ab,
+                pcx,
+                slots,
+                &mut owners,
+                t,
+                slot,
+                (prev, layout),
+                0,
+                0,
+                &mut links,
+            )?;
             latency += l;
             prev = out;
             continue;
         }
         let notes = t.kind == TrackKind::Instrument && pcx.takes_notes(slot);
+        // A device that widens a mono track takes it as stereo (the graph
+        // duplicates it) and everything after it is stereo.
+        layout = slot.plugin.output_layout(layout);
         let mut spec = NodeSpec::new(format!("{} · {}", t.name, slot.plugin.name))
             .audio_in(layout)
             .audio_out(layout);

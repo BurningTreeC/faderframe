@@ -54,6 +54,13 @@ pub const PROGRAM_EQ: &str = "faderframe.program-eq";
 /// GainStageFx (effect).
 pub const GUITAR_STATION: &str = "faderframe.guitar-station";
 
+/// Built-ins that make a stereo sound of a mono source (the Guitar
+/// Station's panned microphones): on a mono track the signal is stereo
+/// from their slot on (`faderframe_project::Track::chain_layout`).
+pub fn widens_mono(id: &str) -> bool {
+    id == GUITAR_STATION
+}
+
 /// Parallel chains of devices, mixed (see `faderframe_project::container`).
 pub const CONTAINER: &str = "faderframe.container";
 

@@ -310,6 +310,21 @@ impl PluginRef {
     pub fn is_container(&self) -> bool {
         self.format == PluginFormat::Builtin && self.id == faderframe_core::builtin::CONTAINER
     }
+
+    /// A device that turns a mono track stereo from its slot on
+    /// ([`faderframe_core::builtin::widens_mono`]).
+    pub fn widens_mono(&self) -> bool {
+        self.format == PluginFormat::Builtin && faderframe_core::builtin::widens_mono(&self.id)
+    }
+
+    /// What this device's slot puts out when `input` reaches it.
+    pub fn output_layout(&self, input: ChannelLayout) -> ChannelLayout {
+        if input == ChannelLayout::Mono && self.widens_mono() {
+            ChannelLayout::Stereo
+        } else {
+            input
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -568,6 +583,16 @@ impl Track {
             .find(|p| p.id == id)
     }
 
+    /// The layout of the track's signal after its inserts, which its strip
+    /// takes: a mono track is stereo from an insert that widens it (the
+    /// Guitar Station's panned microphones) on, bypassed or not, so
+    /// bypassing it does not rebuild the track's routing.
+    pub fn chain_layout(&self) -> ChannelLayout {
+        self.inserts
+            .iter()
+            .fold(self.layout, |l, s| s.plugin.output_layout(l))
+    }
+
     /// The slot with `id` (see [`Self::plugin_mut`]).
     pub fn plugin(&self, id: PluginInstanceId) -> Option<&PluginSlot> {
         self.slots().into_iter().find(|p| p.id == id)
@@ -633,6 +658,40 @@ impl Track {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_guitar_station_turns_a_mono_track_stereo_after_it() {
+        let slot = |id: u64, plugin: &str| PluginSlot {
+            id: PluginInstanceId(id),
+            plugin: PluginRef::builtin(plugin, plugin),
+            bypass: false,
+            parameters: Vec::new(),
+            state: None,
+            sidechain: None,
+        };
+        let mut t = Track::new(
+            TrackId(1),
+            TrackKind::Audio,
+            "Guitar",
+            TrackColor::palette(0),
+        );
+        assert_eq!(t.chain_layout(), ChannelLayout::Mono);
+        t.inserts
+            .push(slot(2, faderframe_core::builtin::COMPRESSOR));
+        assert_eq!(t.chain_layout(), ChannelLayout::Mono);
+        t.inserts
+            .push(slot(3, faderframe_core::builtin::GUITAR_STATION));
+        assert_eq!(t.chain_layout(), ChannelLayout::Stereo);
+        // Bypassed, still: bypassing does not reroute the track.
+        t.inserts[1].bypass = true;
+        assert_eq!(t.chain_layout(), ChannelLayout::Stereo);
+        // Nothing narrows or widens a stereo or surround track.
+        t.layout = ChannelLayout::Stereo;
+        assert_eq!(t.chain_layout(), ChannelLayout::Stereo);
+        let bed = ChannelLayout::Surround(faderframe_core::surround::SurroundFormat::S51);
+        t.layout = bed;
+        assert_eq!(t.chain_layout(), bed);
+    }
 
     #[test]
     fn colours_round_trip_as_hex() {

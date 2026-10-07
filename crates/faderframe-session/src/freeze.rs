@@ -61,7 +61,9 @@ impl Session {
             )));
         }
         let name = t.name.clone();
-        let mono = t.layout == ChannelLayout::Mono;
+        // What the chain makes: a mono track widened by a device (the
+        // Guitar Station) freezes and bounces stereo.
+        let mono = t.chain_layout() == ChannelLayout::Mono;
         let project = self.absolute_copy();
         let (copy, start, end) = render::track_render_project(&project, track)
             .ok_or_else(|| SessionError::Other(format!("'{name}' has no clips to render")))?;
@@ -208,7 +210,7 @@ impl Session {
                 format!("{} Bounce", t.name),
                 TrackColor::palette(p.tracks.len()),
             )
-            .with_layout(t.layout);
+            .with_layout(t.chain_layout());
             new.output = t.output;
             new.volume_db = t.volume_db;
             new.pan = t.pan;
