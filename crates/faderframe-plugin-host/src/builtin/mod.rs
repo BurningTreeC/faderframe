@@ -414,6 +414,11 @@ pub struct BuiltinInstance {
     /// The latency and processor shape last reported (a change asks for a
     /// restart).
     reported: Option<(u32, u64)>,
+    /// Restarts for a new processor shape so far: the instance's
+    /// `activation`, so the engine keeps the new processor instead of
+    /// adopting the old one into the rebuilt graph (the latency, the
+    /// node's other identity, does not change with the shape).
+    reshaped: u64,
     /// The program last selected.
     program: Option<usize>,
     /// The sample rate of the last processor (latencies in samples depend
@@ -500,6 +505,10 @@ impl PluginInstance for BuiltinInstance {
         self.tap.clone()
     }
 
+    fn activation(&self) -> u64 {
+        self.reshaped
+    }
+
     fn programs(&self) -> Vec<String> {
         crate::presets::factory_presets(&self.descriptor.id)
             .into_iter()
@@ -563,6 +572,9 @@ impl PluginInstance for BuiltinInstance {
         }
         let now = (self.latency_samples(), shape);
         let restart = self.reported.is_some_and(|r| r != now);
+        if self.reported.is_some_and(|r| r.1 != shape) {
+            self.reshaped += 1;
+        }
         if self.kind == Kind::Guitar && crate::devices::guitar::tracing_on() {
             if restart {
                 tracing::info!(
@@ -941,6 +953,7 @@ impl PluginFactory for BuiltinFactory {
             params,
             tap,
             reported: None,
+            reshaped: 0,
             program: None,
             rate: 48_000.0,
             samples,
