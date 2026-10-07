@@ -24,7 +24,7 @@ pub const PADS: usize = 16;
 /// Extra stereo outputs pads can go to (output tracks take them).
 pub const AUX: usize = 8;
 /// Parameters per pad.
-const FIELDS: usize = 14;
+const FIELDS: usize = 15;
 const LAYERS: usize = 4;
 
 pub mod id {
@@ -51,6 +51,8 @@ pub mod id {
     /// Where the pad plays: 0 the main output, n extra output n (the main
     /// one while no track takes it).
     pub const OUTPUT: u32 = 13;
+    /// Where the pad stops (reversed: where it starts), past `START`.
+    pub const END: u32 = 14;
 }
 
 /// The output buses' names, main first.
@@ -113,6 +115,7 @@ pub fn parameters() -> Vec<ParameterInfo> {
             param(b + id::VELOCITY, &n("Velocity"), 0.0, 1.0, 0.8, Percent),
             stepped(b + id::KEEP, &n("Keep Length"), 1.0, 0.0),
             stepped(b + id::OUTPUT, &n("Output"), AUX as f64, 0.0),
+            param(b + id::END, &n("End"), 0.05, 1.0, 1.0, Percent),
         ]);
     }
     v
@@ -150,6 +153,9 @@ struct Voice {
     pos: f64,
     step: f64,
     reverse: bool,
+    /// The frames it plays between (start inclusive, end exclusive).
+    from: f64,
+    until: f64,
     env: f32,
     attack_step: f32,
     rising: bool,
@@ -176,6 +182,8 @@ impl Voice {
         pos: 0.0,
         step: 1.0,
         reverse: false,
+        from: 0.0,
+        until: 0.0,
         env: 0.0,
         attack_step: 1.0,
         rising: false,
@@ -223,10 +231,10 @@ fn next_frame(v: &mut Voice, s: &Sample) -> ([f32; 2], bool) {
     let y = [read(s, 0, v.pos), read(s, usize::from(s.stereo), v.pos)];
     let ended = if v.reverse {
         v.pos -= v.step;
-        v.pos < 0.0
+        v.pos < v.from
     } else {
         v.pos += v.step;
-        v.pos >= s.frames as f64
+        v.pos >= v.until.min(s.frames as f64)
     };
     (y, ended)
 }
@@ -314,8 +322,13 @@ impl DrumsProcessor {
                     .unwrap_or(pad * LAYERS)
             });
         let reverse = self.pad(pad, id::REVERSE) >= 0.5;
+        // Between its start and end (reversed: from the end back to the
+        // start), never less than a frame.
         let frames = s.frames as f64;
         let start = self.pad(pad, id::START).clamp(0.0, 0.95) * frames;
+        let end = (self.pad(pad, id::END).clamp(0.0, 1.0) * frames)
+            .max(start + 1.0)
+            .min(frames);
         let vel = f64::from(velocity) / 127.0;
         let vs = self.pad(pad, id::VELOCITY);
         let level = db_to_gain(
@@ -349,9 +362,11 @@ impl DrumsProcessor {
             on: true,
             pad,
             sample,
-            pos: if reverse { frames - 1.0 - start } else { start },
+            pos: if reverse { end - 1.0 } else { start },
             step,
             reverse,
+            from: start,
+            until: end,
             env: if attack < 0.05 { 1.0 } else { 0.0 },
             attack_step: if attack < 0.05 {
                 1.0
@@ -675,6 +690,43 @@ mod tests {
         assert_eq!(status, ProcessStatus::Sleep);
     }
 
+    /// A pad plays from its start to its end -- reversed, from its end back
+    /// to its start -- and nothing else of its sample.
+    #[test]
+    fn a_pad_plays_between_its_start_and_end() {
+        let d = fixtures::dir("drums-span");
+        let mut doc = SampleDoc::default();
+        doc.set(
+            0,
+            Some(fixtures::tone(&d.join("pad.wav"), 220.0, 48_000, 1.0)),
+        );
+        let length = |reverse: bool| {
+            let params = ParamValues::new(parameters());
+            for (f, v) in [(id::START, 0.25), (id::END, 0.5), (id::REVERSE, 0.0)] {
+                let v = if f == id::REVERSE && reverse { 1.0 } else { v };
+                params.set_by_id(ParameterId(id::pad(0) + f), v).unwrap();
+            }
+            let mut host = SampleHost::default();
+            host.set_doc(doc.clone(), None);
+            let mut s = Play::new(DrumsProcessor::new(
+                params,
+                None,
+                &crate::devices::rig::config(),
+                Arc::clone(&host.shared),
+            ));
+            s.send(on(36, 127));
+            let (l, _, _) = s.run(1.0);
+            l.iter().rposition(|x| x.abs() > 1e-3).unwrap_or(0) as f64 / 48_000.0
+        };
+        for reverse in [false, true] {
+            let t = length(reverse);
+            assert!(
+                (0.24..0.26).contains(&t),
+                "reverse {reverse}: sounded {t:.3} s of the quarter second between"
+            );
+        }
+    }
+
     #[test]
     fn a_pad_can_keep_its_length_when_tuned() {
         let d = fixtures::dir("drums-keep");
@@ -777,6 +829,66 @@ mod tests {
         proc.reset();
         let alone = run(&mut proc, 1);
         assert!(alone[0] > e[0], "{alone:?} vs {e:?}");
+    }
+
+    /// Keep Length switched on in a playing instance (as the editor does):
+    /// the instance asks for a processor with stretchers under a new
+    /// activation (it had none: the engine put the old processor back and
+    /// the switch did nothing), and the tuned pad keeps its length.
+    #[test]
+    fn keep_length_switched_on_keeps_a_tuned_pads_length() {
+        use crate::PluginFactory;
+        let d = fixtures::dir("drum-keep-live");
+        let mut doc = SampleDoc::default();
+        doc.set(
+            0,
+            Some(fixtures::tone(&d.join("tom.wav"), 220.0, 48_000, 0.3)),
+        );
+        let mut inst = crate::builtin::BuiltinFactory
+            .instantiate(faderframe_core::builtin::DRUMS)
+            .unwrap();
+        let params = ParamValues::new(parameters());
+        params
+            .set_by_id(ParameterId(id::pad(0) + id::TUNE), -12.0)
+            .unwrap();
+        inst.load_state(&crate::devices::samples::pack(&params.save(), &doc))
+            .unwrap();
+        let config = crate::devices::rig::config();
+        // The instance's processor (boxed, as the engine has it).
+        struct Boxed(Box<dyn PluginProcessor>);
+        impl PluginProcessor for Boxed {
+            fn process(
+                &mut self,
+                ctx: &crate::PluginProcessContext<'_>,
+                io: &mut faderframe_audio_graph::NodeIo<'_>,
+            ) -> ProcessStatus {
+                self.0.process(ctx, io)
+            }
+            fn reset(&mut self) {
+                self.0.reset();
+            }
+        }
+        let sounded = |inst: &mut Box<dyn crate::PluginInstance>| {
+            let mut s = Play::new(Boxed(inst.create_processor(&config).unwrap()));
+            s.send(on(36, 127));
+            let (l, _, _) = s.run(1.5);
+            l.iter().rposition(|x| x.abs() > 1e-3).unwrap_or(0) as f64 / 48_000.0
+        };
+        let _ = inst.poll();
+        let free = sounded(&mut inst);
+        assert!(free > 0.5, "an octave down, twice as long: {free:.2} s");
+        inst.set_parameter(ParameterId(id::pad(0) + id::KEEP), 1.0)
+            .unwrap();
+        let before = inst.activation();
+        assert!(inst.poll().restart, "a processor with stretchers");
+        // A new activation: the engine keeps the new processor rather than
+        // adopting the old one (same latency) into the rebuilt graph.
+        assert_ne!(inst.activation(), before, "the old processor is not kept");
+        let kept = sounded(&mut inst);
+        assert!(
+            (0.25..0.4).contains(&kept),
+            "kept to its 0.3 s: {kept:.2} s (free {free:.2} s)"
+        );
     }
 
     #[test]

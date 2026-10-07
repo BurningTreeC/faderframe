@@ -263,6 +263,24 @@ impl Edit<'_, '_> {
         self.end();
     }
 
+    /// Play `key` on the device's track, as a key held until
+    /// [`Self::release`] (an instrument's editor auditioning it).
+    pub fn audition(&mut self, key: u8, velocity: u8) {
+        if let Some((track, _)) = self.model.plugin_owner(self.device.plugin) {
+            self.cx.emit(Action::Audition {
+                track,
+                key,
+                velocity,
+                channel: 0,
+            });
+        }
+    }
+
+    /// Let go of the key [`Self::audition`] played.
+    pub fn release(&mut self) {
+        self.cx.emit(Action::AuditionOff);
+    }
+
     /// Clear one of a sampler's slots (one undo step).
     pub fn clear_sample(&mut self, slot: usize) {
         self.cx.emit(Action::LoadDeviceSamples {

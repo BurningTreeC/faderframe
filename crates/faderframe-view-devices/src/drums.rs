@@ -1,8 +1,8 @@
 //! The Drum Sampler's face: sixteen pads (each its sample's name and
-//! note; lit when it sounds; click to pick one, double-click to load its
-//! sample, several files fill the pads from there), the picked pad's
-//! waveform with its start and buttons to load or clear it, and that
-//! pad's controls.
+//! note; lit when it sounds; click to pick and play one, double-click to
+//! load its sample, several files fill the pads from there), the picked
+//! pad's waveform with its start and end (drag their markers) and buttons
+//! to load or clear it, and that pad's controls.
 
 use crate::kit::{
     self, Ctl, Ctx, Edit, Face, KNOB, Meter, MeterKind, Panel, SMALL, SWITCH_H, Scale,
@@ -17,7 +17,14 @@ pub(crate) struct DrumsFace {
     accent: Color,
     selected: usize,
     glow: [f32; PADS],
+    /// The marker being dragged (`id::START` or `id::END`).
+    drag: Option<u32>,
+    /// A pad is being played (its key is held while the button is).
+    playing: bool,
 }
+
+/// How close the start and the end may come (of the sample's length).
+const GAP: f64 = 0.01;
 
 impl DrumsFace {
     pub fn new(theme: &faderframe_ui_canvas::Theme) -> Self {
@@ -25,6 +32,8 @@ impl DrumsFace {
             accent: theme.device.accent(Accent::Sampler),
             selected: 0,
             glow: [0.0; PADS],
+            drag: None,
+            playing: false,
         }
     }
 
@@ -62,6 +71,19 @@ impl DrumsFace {
     fn contents(cx: &Ctx<'_>) -> Option<std::sync::Arc<Contents>> {
         cx.tap.assets::<Contents>()
     }
+
+    /// Move the picked pad's start or end to `f` of the sample, keeping
+    /// them apart and in their ranges.
+    fn move_marker(&self, which: u32, f: f64, cx: &Ctx<'_>, edit: &mut Edit<'_, '_>) {
+        let v = if which == id::START {
+            let end = cx.value(self.pid(id::END));
+            f.clamp(0.0, 0.95).min(end - GAP).max(0.0)
+        } else {
+            let start = cx.value(self.pid(id::START));
+            f.clamp(0.05, 1.0).max(start + GAP).min(1.0)
+        };
+        edit.set(self.pid(which), v);
+    }
 }
 
 impl Face for DrumsFace {
@@ -78,7 +100,7 @@ impl Face for DrumsFace {
         let s = kit::sections(
             deck,
             &[
-                ("PAD", 6.2),
+                ("PAD", 7.4),
                 ("ENVELOPE", 3.0),
                 ("FILTER", 3.0),
                 ("PLAY", 4.6),
@@ -89,7 +111,7 @@ impl Face for DrumsFace {
         let r = kit::inside(&s[0]);
         let k = kit::row(
             Rect::new(r.x, r.y + 20.0, r.w, KNOB.1),
-            &[KNOB.0, SMALL.0, SMALL.0, SMALL.0],
+            &[KNOB.0, SMALL.0, SMALL.0, SMALL.0, SMALL.0],
         );
         c.push(Ctl::knob(self.pid(id::LEVEL), "LEVEL", k[0]));
         c.push(
@@ -112,6 +134,11 @@ impl Face for DrumsFace {
             self.pid(id::START),
             "START",
             kit::at(k[3], 0.0, 6.0, SMALL.0, SMALL.1),
+        ));
+        c.push(Ctl::small(
+            self.pid(id::END),
+            "END",
+            kit::at(k[4], 0.0, 6.0, SMALL.0, SMALL.1),
         ));
         c.push(Ctl::toggle(
             self.pid(id::KEEP),
@@ -275,13 +302,34 @@ impl Face for DrumsFace {
         p.fill_rounded(wave, 3.0, &Paint::Solid(th.device.display.darken(0.12)));
         if let Some(s) = sample {
             kit::waveform(p, wave, s, self.accent);
-            let start = cx.value(self.pid(id::START)) as f32;
-            let x = wave.x + wave.w * start;
-            p.fill(
-                Rect::new(wave.x, wave.y, x - wave.x, wave.h),
-                th.device.display.with_alpha(0.6),
+            // What does not play is dimmed; the start and end markers (as
+            // the Sampler's).
+            let x = |f: f64| wave.x + wave.w * (f as f32).clamp(0.0, 1.0);
+            let (a, b) = (
+                x(cx.value(self.pid(id::START))),
+                x(cx.value(self.pid(id::END))),
             );
-            p.vline(x, wave.y, wave.bottom(), th.ui.text);
+            let shade = th.device.display.darken(0.12).with_alpha(0.7);
+            p.fill(
+                Rect::new(wave.x, wave.y, (a - wave.x).max(0.0), wave.h),
+                shade,
+            );
+            p.fill(
+                Rect::new(b, wave.y, (wave.right() - b).max(0.0), wave.h),
+                shade,
+            );
+            for (xx, left) in [(a, true), (b, false)] {
+                p.vline(xx, wave.y, wave.bottom(), th.ui.text);
+                p.fill(
+                    Rect::new(
+                        if left { xx } else { xx - 8.0 },
+                        wave.bottom() - 8.0,
+                        8.0,
+                        8.0,
+                    ),
+                    th.ui.text,
+                );
+            }
         }
     }
 
@@ -289,7 +337,7 @@ impl Face for DrumsFace {
         &mut self,
         ev: &ViewEvent,
         r: Rect,
-        _cx: &Ctx<'_>,
+        cx: &Ctx<'_>,
         edit: &mut Edit<'_, '_>,
     ) -> bool {
         let (pads, wave, load, clear) = Self::split(r);
@@ -299,6 +347,14 @@ impl Face for DrumsFace {
                     self.selected = pad;
                     if clicks >= 2 {
                         edit.choose_samples(pad, "Load Pad Samples", false);
+                    } else {
+                        // Played as a key, held while the button is (a
+                        // gated pad stops when let go).
+                        let base = cx.value(ParameterId(id::BASE_NOTE)).round() as i32;
+                        if let Ok(key) = u8::try_from(base + pad as i32) {
+                            edit.audition(key.min(127), 100);
+                            self.playing = true;
+                        }
                     }
                     return true;
                 }
@@ -311,11 +367,43 @@ impl Face for DrumsFace {
                     return true;
                 }
                 if wave.contains(pos) {
+                    // The nearer marker (the start or the end on its own
+                    // side where they meet), to where the button went down,
+                    // then wherever it is dragged.
                     let f = f64::from((pos.x - wave.x) / wave.w);
-                    edit.set_once(self.pid(id::START), f.clamp(0.0, 0.95));
+                    let (start, end) = (cx.value(self.pid(id::START)), cx.value(self.pid(id::END)));
+                    let which = if (end - f).abs() < (start - f).abs()
+                        || ((end - f).abs() == (start - f).abs() && f > start)
+                    {
+                        id::END
+                    } else {
+                        id::START
+                    };
+                    self.drag = Some(which);
+                    edit.begin("Pad Marker");
+                    self.move_marker(which, f, cx, edit);
                     return true;
                 }
                 false
+            }
+            ViewEvent::PointerMove {
+                pos,
+                dragging: true,
+                ..
+            } => {
+                let Some(which) = self.drag else { return false };
+                let f = f64::from((pos.x - wave.x) / wave.w);
+                self.move_marker(which, f, cx, edit);
+                true
+            }
+            ViewEvent::PointerUp { .. } => {
+                if std::mem::take(&mut self.playing) {
+                    edit.release();
+                }
+                if self.drag.take().is_some() {
+                    edit.end();
+                }
+                true
             }
             _ => false,
         }
@@ -341,7 +429,10 @@ impl Face for DrumsFace {
             id::CHOKE => "Pads in the same group cut each other (0: none)",
             id::MODE => "One-shot plays to the end; Gate stops when the key is let go",
             id::DECAY => "How fast the pad dies away (Full: the whole sample)",
-            id::START => "Where in the sample it starts",
+            id::START => "Where in the sample it starts (drag the left white marker)",
+            id::END => {
+                "Where it stops (drag the right white marker); reversed, it plays from here back to the start"
+            }
             id::KEEP => "The tune changes the pad's pitch, not its length",
             id::OUTPUT => {
                 "Where the pad plays: Main, or an extra output once a track takes it \
