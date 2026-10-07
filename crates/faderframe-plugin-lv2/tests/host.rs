@@ -302,7 +302,11 @@ unsafe extern "C" fn entry(index: u32) -> *const LV2_Descriptor {
 
 /// What its bundle would say about it.
 fn model() -> Arc<scan::Lv2Plugin> {
-    let dir = std::env::temp_dir().join(format!("ff-lv2-host-{}.lv2", std::process::id()));
+    // A bundle of each call's own: the tests run side by side, and one
+    // removing a shared bundle left the other scanning nothing.
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("ff-lv2-host-{}-{call}.lv2", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("manifest.ttl"),
