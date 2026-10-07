@@ -419,7 +419,10 @@ Contrast:
   own, so heavy plugin chains need not finish within one tiny buffer —
   armed and live tracks, tracks with a plugin editor open, faders and
   sends stay immediate. With 64 tracks of six effects at 64-frame buffers
-  the audio thread's worst callback went from 1.3 ms to 81 µs.
+  the audio thread's worst callback went from 1.3 ms to 81 µs. Buses,
+  auxes and the master's devices render ahead too when everything reaching
+  them can, in a second stage only a buffer and a few milliseconds ahead,
+  so the faders feeding them still answer at once (about 10 ms).
 * MIDI effects before the instrument: Arpeggiator (nine orders, synced,
   swing, gate, octaves, hold), Chord (intervals, the key's chords or the
   chord track's), Scale (keeps notes in the key, transposes by degrees)

@@ -66,8 +66,8 @@ pub struct Preferences {
     /// Render tracks nobody plays live this many milliseconds ahead (0:
     /// off).
     pub render_ahead_ms: u32,
-    /// Render buses ahead too (their inputs' faders are heard after the
-    /// lookahead).
+    /// Render buses ahead too (in a shallow second stage: faders stay
+    /// immediate).
     pub render_ahead_buses: bool,
     /// Keyboard shortcuts changed in the shortcut editor (detailed action
     /// → accelerators; empty: none), over the defaults.
@@ -107,7 +107,7 @@ impl Default for Preferences {
             sandbox_plugins: true,
             plugin_double_precision: false,
             render_ahead_ms: 200,
-            render_ahead_buses: false,
+            render_ahead_buses: true,
             shortcuts: Default::default(),
         }
     }

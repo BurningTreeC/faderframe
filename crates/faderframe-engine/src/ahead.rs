@@ -25,6 +25,16 @@
 //!   unchanged). The anticipator processes that graph (in parallel on a
 //!   pool of its own) and adopts processor state across rebuilds like the
 //!   audio thread does; rings persist across rebuilds.
+//! * **Tiers.** Buses rendered ahead (`build::ahead_sets`) take a second,
+//!   shallow anticipator: it reads the deep one's rings for the tracks that
+//!   reach them, runs their strips and sends (faders, pan, mute and send
+//!   levels), the buses' sums and devices, in small blocks only a device
+//!   callback and two blocks ahead of the audio thread
+//!   ([`shallow_lookahead`]), at the audio thread's scheduling. A block is
+//!   rendered there once the deep tier has rendered it (its progress). Fader
+//!   moves are heard after that much, bus devices still leave the audio
+//!   thread. The audio thread hands every sequence to both tiers and
+//!   switches when both are ready.
 //! * **Limits.** Changes to an anticipated track's plugins (from their
 //!   editors, inserted plugins) and to its clips are heard after the
 //!   lookahead. A track that becomes live moves to the realtime graph at
@@ -38,7 +48,7 @@ use faderframe_realtime::{MailboxReceiver, MailboxSender, TryCell, WorkerPool};
 use faderframe_transport::{TransportCommand, TransportState};
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -325,50 +335,92 @@ struct Pending {
     waited: usize,
 }
 
-/// The audio thread's side: the current sequence and transport changes on
-/// their way to the anticipator.
-pub(crate) struct AheadLink {
-    seq: u64,
+/// The audio thread's scheduling, published once by the link for
+/// anticipators that keep pace with it (the shallow tier adopts it).
+pub(crate) struct Scheduling {
+    /// As `faderframe_realtime::thread_scheduling` packs it; 0: not yet.
+    packed: AtomicU64,
+    extra: AtomicU64,
+}
+
+impl Scheduling {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            packed: AtomicU64::new(0),
+            extra: AtomicU64::new(0),
+        })
+    }
+}
+
+/// One anticipator as the audio thread's link sees it.
+pub(crate) struct Tier {
     to_ahead: Producer<Sequence>,
     ready: Arc<AtomicU64>,
+}
+
+/// The audio thread's side: the current sequence and transport changes on
+/// their way to the anticipators.
+pub(crate) struct AheadLink {
+    seq: u64,
+    /// The shallow tier first: it is handed a sequence before the deep
+    /// one, so that it never sees the deep one's progress in a sequence it
+    /// has not been given.
+    tiers: Vec<Tier>,
     pending: Option<Pending>,
-    /// Frames to wait for the anticipator before switching anyway.
+    /// Frames to wait for the anticipators before switching anyway.
     max_wait: usize,
+    scheduling: Arc<Scheduling>,
+    scheduling_read: bool,
 }
 
 impl AheadLink {
+    /// A link to `tiers` (shallow first) at `rate` (control thread).
+    pub(crate) fn new(tiers: Vec<Tier>, rate: f64, scheduling: Arc<Scheduling>) -> Self {
+        Self {
+            seq: 0,
+            tiers,
+            pending: None,
+            max_wait: (rate * 0.25) as usize,
+            scheduling,
+            scheduling_read: false,
+        }
+    }
+
     /// The sequence the audio thread plays.
     pub(crate) fn seq(&self) -> u64 {
         self.seq
     }
 
-    /// Start: the anticipator renders the current state as sequence 1.
+    /// Start: the anticipators render the current state as sequence 1.
     pub(crate) fn begin(&mut self, current: &TransportState) {
         self.hand_over(current.clone());
     }
 
-    /// Hand `next` to the anticipator as a new sequence; the audio thread
-    /// switches once it is ready (realtime-safe).
+    /// Hand `next` to the anticipators as a new sequence; the audio thread
+    /// switches once they are ready (realtime-safe).
     fn hand_over(&mut self, next: TransportState) {
         let seq = self.pending.as_ref().map_or(self.seq, |p| p.seq) + 1;
-        let sent = self
-            .to_ahead
-            .push(Sequence {
-                id: seq,
-                transport: next.clone(),
-            })
-            .is_ok();
+        let mut sent = true;
+        for tier in &mut self.tiers {
+            sent &= tier
+                .to_ahead
+                .push(Sequence {
+                    id: seq,
+                    transport: next.clone(),
+                })
+                .is_ok();
+        }
         self.pending = Some(Pending {
             seq,
             transport: next,
-            // Not sent (the anticipator is far behind): switch at once and
+            // Not sent (an anticipator is far behind): switch at once and
             // live with misses.
             waited: if sent { 0 } else { self.max_wait },
         });
     }
 
     /// A transport command (audio thread). Commands that change what plays
-    /// when are deferred until the anticipator has rendered ahead.
+    /// when are deferred until the anticipators have rendered ahead.
     pub(crate) fn command(&mut self, current: &mut TransportState, cmd: TransportCommand) {
         if let TransportCommand::SetRecording(_) = cmd {
             // Does not move the playhead.
@@ -391,11 +443,22 @@ impl AheadLink {
         self.hand_over(next);
     }
 
-    /// Before a callback: switch to the pending sequence when the
+    /// Before a callback: switch to the pending sequence when every
     /// anticipator has it ready (or it took too long).
     pub(crate) fn poll(&mut self, current: &mut TransportState, frames: usize) {
+        if !self.scheduling_read {
+            // Once, on the audio thread (a system call, no allocation).
+            self.scheduling_read = true;
+            let (packed, extra) = faderframe_realtime::thread_scheduling();
+            self.scheduling.extra.store(extra, Ordering::Relaxed);
+            self.scheduling.packed.store(packed, Ordering::Release);
+        }
         let Some(p) = &mut self.pending else { return };
-        if self.ready.load(Ordering::Acquire) >= p.seq || p.waited >= self.max_wait {
+        let ready = self
+            .tiers
+            .iter()
+            .all(|t| t.ready.load(Ordering::Acquire) >= p.seq);
+        if ready || p.waited >= self.max_wait {
             *current = p.transport.clone();
             self.seq = p.seq;
             self.pending = None;
@@ -430,9 +493,56 @@ pub(crate) struct Anticipator {
     pub garbage: Consumer<AheadGarbage>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
-    /// Lookahead in frames.
+    /// Lookahead in frames (at most: see [`Self::set_lookahead`]).
     pub lookahead: usize,
+    /// The block it renders in.
+    pub block: usize,
+    /// Its progress: [`progress`] packs the sequence it renders and the
+    /// frames of it rendered.
+    pub progress: Arc<AtomicU64>,
+    target: Arc<AtomicUsize>,
 }
+
+impl Anticipator {
+    /// Render this far ahead from now on (at most the lookahead it was
+    /// started with: its rings are sized for that).
+    pub fn set_lookahead(&self, frames: usize) {
+        self.target.store(
+            frames.clamp(self.block * 2, self.lookahead),
+            Ordering::Relaxed,
+        );
+    }
+}
+
+/// Bits of a progress word that count frames.
+const PROGRESS_FRAMES: u32 = 40;
+
+/// A progress word: `seq` rendered for `frames`.
+fn progress(seq: u64, frames: usize) -> u64 {
+    (seq << PROGRESS_FRAMES) | (frames as u64).min((1 << PROGRESS_FRAMES) - 1)
+}
+
+fn unpack_progress(word: u64) -> (u64, usize) {
+    (
+        word >> PROGRESS_FRAMES,
+        (word & ((1 << PROGRESS_FRAMES) - 1)) as usize,
+    )
+}
+
+/// How far ahead the shallow tier renders, in frames, with device
+/// callbacks of `device_block` (0: unknown) and blocks of `block`: a
+/// callback and two blocks, so the audio thread always finds what it needs
+/// and the tier has a block's time to spare. Fader moves on strips it
+/// renders are heard this much later.
+pub fn shallow_lookahead(device_block: usize, block: usize) -> usize {
+    device_block.max(block) + 2 * block
+}
+
+/// The shallow tier's block.
+pub const SHALLOW_BLOCK: usize = 128;
+
+/// Most frames the shallow tier ever renders ahead (its rings' size).
+pub const SHALLOW_MAX: usize = 4096 + 2 * SHALLOW_BLOCK;
 
 impl Drop for Anticipator {
     fn drop(&mut self) {
@@ -456,22 +566,34 @@ struct Worker {
     ctx: EngineContext,
     rate: f64,
     block: usize,
-    lookahead: usize,
+    lookahead: Arc<AtomicUsize>,
     pool: Option<WorkerPool>,
+    progress: Arc<AtomicU64>,
+    /// The tier whose rings this one reads (it renders a block once that
+    /// one has).
+    upstream: Option<Arc<AtomicU64>>,
+    /// The audio thread's scheduling, to adopt.
+    scheduling: Option<Arc<Scheduling>>,
+    idle: Duration,
 }
 
-/// Start an anticipator rendering `lookahead` ahead in blocks of `block`
-/// frames; returns its handle and the audio thread's link. `ctx` is a
-/// context for the ahead graph (shared tables, an empty MIDI input).
-pub(crate) fn start(
-    ctx: EngineContext,
-    rate: f64,
-    block: usize,
-    lookahead: Duration,
-    threads: usize,
-) -> (Anticipator, AheadLink) {
-    let block = block.max(16);
-    let lookahead = ((lookahead.as_secs_f64() * rate) as usize).max(block * 2);
+/// How an anticipator runs.
+pub(crate) struct Options {
+    pub block: usize,
+    pub lookahead: Duration,
+    pub threads: usize,
+    /// Read the rings of the anticipator with this progress.
+    pub upstream: Option<Arc<AtomicU64>>,
+    /// Keep pace with the audio thread: adopt its scheduling, sleep briefly.
+    pub follow: Option<Arc<Scheduling>>,
+}
+
+/// Start an anticipator as `options` say; returns its handle and its tier
+/// for the audio thread's link. `ctx` is a context for its graph (shared
+/// tables, an empty MIDI input).
+pub(crate) fn start(ctx: EngineContext, rate: f64, options: Options) -> (Anticipator, Tier) {
+    let block = options.block.max(16);
+    let lookahead = ((options.lookahead.as_secs_f64() * rate) as usize).max(block * 2);
     let (graph_tx, graph_rx) = faderframe_realtime::mailbox();
     let (timeline_tx, timeline_rx) = faderframe_realtime::mailbox();
     let (modulation_tx, modulation_rx) = faderframe_realtime::mailbox();
@@ -479,6 +601,13 @@ pub(crate) fn start(
     let (garbage_tx, garbage_rx) = RingBuffer::new(64);
     let ready = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
+    let progress_word = Arc::new(AtomicU64::new(0));
+    let target = Arc::new(AtomicUsize::new(lookahead));
+    let idle = if options.follow.is_some() {
+        Duration::from_micros(250)
+    } else {
+        Duration::from_millis(1)
+    };
     let worker = Worker {
         graph_rx,
         timeline_rx,
@@ -490,14 +619,23 @@ pub(crate) fn start(
         ctx,
         rate,
         block,
-        lookahead,
-        pool: (threads > 0).then(|| WorkerPool::new(faderframe_realtime::PoolConfig::new(threads))),
+        lookahead: Arc::clone(&target),
+        pool: (options.threads > 0)
+            .then(|| WorkerPool::new(faderframe_realtime::PoolConfig::new(options.threads))),
+        progress: Arc::clone(&progress_word),
+        upstream: options.upstream,
+        scheduling: options.follow,
+        idle,
+    };
+    let name = if worker.scheduling.is_some() {
+        "ff-ahead-bus"
+    } else {
+        "ff-ahead"
     };
     let thread = std::thread::Builder::new()
-        .name("ff-ahead".into())
+        .name(name.into())
         .spawn(move || worker.run())
         .ok();
-    let max_wait = (rate * 0.25) as usize;
     (
         Anticipator {
             graph_tx,
@@ -507,13 +645,13 @@ pub(crate) fn start(
             stop,
             thread,
             lookahead,
+            block,
+            progress: progress_word,
+            target,
         },
-        AheadLink {
-            seq: 0,
+        Tier {
             to_ahead: seq_tx,
             ready,
-            pending: None,
-            max_wait,
         },
     )
 }
@@ -537,8 +675,19 @@ impl Worker {
         // (sequence, its transport, frames rendered, first block pending)
         let mut current: Option<(u64, TransportState, usize, bool)> = None;
         let startup = STARTUP_BLOCKS * self.block;
-        let idle = Duration::from_millis(1);
+        let idle = self.idle;
+        let mut adopted = 0u64;
         while !self.stop.load(Ordering::Relaxed) {
+            if let Some(s) = &self.scheduling {
+                let packed = s.packed.load(Ordering::Acquire);
+                if packed != adopted {
+                    adopted = packed;
+                    faderframe_realtime::apply_thread_scheduling(
+                        packed,
+                        s.extra.load(Ordering::Relaxed),
+                    );
+                }
+            }
             if let Some(mut new) = self.graph_rx.take() {
                 if let Some(mut old) = graph.take() {
                     new.graph.adopt_state_from(&mut old.graph);
@@ -564,16 +713,27 @@ impl Worker {
             let Some(g) = graph.as_mut().filter(|g| !g.rings.is_empty()) else {
                 // Nothing to render ahead: always ready.
                 self.ready.fetch_max(*seq, Ordering::AcqRel);
-                std::thread::sleep(idle);
+                self.progress
+                    .store(progress(*seq, usize::MAX), Ordering::Release);
+                std::thread::sleep(idle.max(Duration::from_millis(2)));
                 continue;
             };
             let capacity = g.rings.iter().map(|r| r.capacity()).min().unwrap_or(0);
             let free = g.rings.iter().map(|r| r.free_frames()).min().unwrap_or(0);
             let n = transport.frames_until_wrap(self.block);
             let buffered = capacity.saturating_sub(free);
-            if free < n || (buffered >= self.lookahead && *primed >= startup) {
+            let lookahead = self.lookahead.load(Ordering::Relaxed);
+            if free < n || (buffered >= lookahead && *primed >= startup) {
                 std::thread::sleep(idle);
                 continue;
+            }
+            // Reading another tier's rings: only what it has rendered.
+            if let Some(up) = &self.upstream {
+                let (up_seq, up_frames) = unpack_progress(up.load(Ordering::Acquire));
+                if up_seq < *seq || (up_seq == *seq && up_frames < *primed + n) {
+                    std::thread::sleep(idle);
+                    continue;
+                }
             }
             self.ctx.transport = transport.info(&self.ctx.timeline.timeline, self.rate);
             self.ctx.discontinuity = transport.take_discontinuity() || std::mem::take(first);
@@ -589,6 +749,8 @@ impl Worker {
             }
             transport.advance(n);
             *primed += n;
+            self.progress
+                .store(progress(*seq, *primed), Ordering::Release);
             if *primed >= startup {
                 self.ready.fetch_max(*seq, Ordering::AcqRel);
             }

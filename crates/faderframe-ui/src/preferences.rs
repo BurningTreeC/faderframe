@@ -156,9 +156,9 @@ fn audio_page(app: &Rc<AppState>, alive: &Rc<std::cell::Cell<bool>>) -> gtk::Wid
     buses.set_active(app.session.borrow().render_ahead_buses());
     buses.set_tooltip_text(Some(
         "Also render buses, auxes and the master's devices ahead when everything reaching \
-         them is: their plugins leave the audio thread too. The faders, pan, mute and send \
-         levels of the tracks reaching them are then heard after the render-ahead time \
-         (their automation stays exact, their meters in time).",
+         them is: their plugins leave the audio thread too. They and the faders reaching \
+         them run only an audio buffer and a few milliseconds ahead, so faders still \
+         answer at once; automation stays exact, meters in time.",
     ));
     {
         let weak = Rc::downgrade(app);

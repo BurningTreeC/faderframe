@@ -3,6 +3,7 @@
 //! the audio thread renders them — through playback, a locate and loop
 //! wraps — without the audio thread ever waiting for them.
 #![allow(clippy::unwrap_used)]
+mod common;
 
 use faderframe_audio::OwnedBuffers;
 use faderframe_core::{PluginInstanceId, TrackId, builtin};
@@ -86,7 +87,15 @@ impl Run {
 
     /// With render-ahead and `buses` rendered ahead too.
     fn with(project: &Project, ahead: bool, buses: bool) -> Self {
-        let sources = render_generated_sources(project, SR);
+        Self::with_sources(project, render_generated_sources(project, SR), ahead, buses)
+    }
+
+    fn with_sources(
+        project: &Project,
+        sources: faderframe_engine::SourceMap,
+        ahead: bool,
+        buses: bool,
+    ) -> Self {
         let config = EngineConfig {
             sample_rate: SR,
             max_block_size: BLOCK,
@@ -516,4 +525,65 @@ fn latency_reaching_a_bus_rendered_ahead_is_compensated() {
     assert!(both > SR as usize, "heard together: {both}");
     assert_eq!(differ, 0, "{differ} of {both} samples differ");
     assert_eq!(ahead.r.controller.ahead_misses(), 0, "never late");
+}
+
+/// With buses rendered ahead, closing the fader of a track that reaches
+/// one is heard after the shallow tier's few milliseconds, not the deep
+/// tier's lookahead (150 ms here).
+#[test]
+fn faders_reaching_buses_rendered_ahead_answer_within_milliseconds() {
+    use faderframe_core::ChannelLayout;
+    use faderframe_project::{OutputRouting, TrackKind};
+    let mut tp = common::TestProject::new(SR);
+    let track = tp.track(TrackKind::Audio, "Tone", ChannelLayout::Stereo);
+    let bus = tp.track(TrackKind::Bus, "Bus", ChannelLayout::Stereo);
+    let tone: Vec<f32> = (0..30 * SR as usize)
+        .map(|n| 0.25 * (n as f32 * std::f32::consts::TAU * 220.0 / SR as f32).sin())
+        .collect();
+    let src = tp.source(faderframe_audio_files::AudioData::from_channels(
+        SR,
+        vec![tone.clone(), tone],
+    ));
+    tp.clip(
+        track,
+        src,
+        faderframe_timeline::MusicalTime::ZERO,
+        30 * SR as i64,
+    );
+    let gain = |id| PluginSlot {
+        id: PluginInstanceId(id),
+        plugin: PluginRef::builtin(builtin::GAIN, "Utility"),
+        bypass: false,
+        parameters: Vec::new(),
+        state: None,
+        sidechain: None,
+    };
+    let t = tp.project.track_mut(track).unwrap();
+    t.output = OutputRouting::Track { track: bus };
+    t.inserts.push(gain(9_300));
+    tp.project.track_mut(bus).unwrap().inserts.push(gain(9_301));
+    let mut project = tp.project.clone();
+    for buses in [false, true] {
+        let mut run = Run::with_sources(&project, tp.sources.clone(), true, buses);
+        assert_eq!(run.r.controller.ahead_strips().contains(&track), buses);
+        assert_eq!(run.r.controller.ahead_tracks().contains(&bus), buses);
+        run.run(20, true);
+        run.command(TransportCommand::Play);
+        run.run(SR as usize / BLOCK, true);
+        assert!(run.heard.values().any(|s| s.abs() > 0.1), "sounding");
+        // Close the fader.
+        project.track_mut(track).unwrap().volume_db = -144.0;
+        let at = run.r.controller.transport_snapshot().position;
+        run.r.controller.update_params(&project).unwrap();
+        run.run(SR as usize / 2 / BLOCK, true);
+        // Silent from there: a whole cycle of the tone below -80 dB.
+        let silent = (at..at + SR as i64 / 2)
+            .find(|p| (0..240).all(|i| run.heard.get(&(p + i)).is_some_and(|s| s.abs() < 1e-4)))
+            .unwrap();
+        let ms = (silent - at) as f64 * 1000.0 / f64::from(SR);
+        eprintln!("buses {buses}: the fader is heard after {ms:.1} ms");
+        assert!(ms < 30.0, "buses {buses}: heard after {ms:.1} ms");
+        assert_eq!(run.r.controller.ahead_misses(), 0, "never late");
+        project.track_mut(track).unwrap().volume_db = 0.0;
+    }
 }

@@ -1768,9 +1768,9 @@ impl Session {
 
     /// Render buses (auxes, the master's devices) ahead too, when
     /// everything that reaches them can be rendered ahead: their devices
-    /// leave the audio thread, and the faders, pan, mute and send levels of
-    /// the strips reaching them are heard after the lookahead (their
-    /// automation stays exact, their meters in time).
+    /// leave the audio thread. They and the strips reaching them run a
+    /// device callback and two small blocks ahead (about 10 ms), so moving
+    /// those faders stays immediate; automation is exact, meters in time.
     pub fn set_render_ahead_buses(&mut self, on: bool) -> Result<()> {
         if on == self.render_ahead_buses {
             return Ok(());
@@ -1951,9 +1951,10 @@ impl Session {
         {
             self.notify(NoticeLevel::Error, e.to_string());
         }
-        // The device's callbacks changed size: the preamps buffer one.
+        // The device's callbacks changed size: the preamps buffer one, the
+        // buses rendered ahead keep one ahead.
         if self.engine.device_block_changed()
-            && self.project.tracks.iter().any(|t| t.preamp.is_some())
+            && (self.render_ahead_buses || self.project.tracks.iter().any(|t| t.preamp.is_some()))
             && let Err(e) = self.sync(Impact::Graph)
         {
             self.notify(NoticeLevel::Error, e.to_string());

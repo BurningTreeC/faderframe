@@ -17,7 +17,9 @@
 //! With render-ahead ([`AheadPlan`], see [`crate::ahead`]) the sources,
 //! instrument and inserts of the planned tracks go into a second graph
 //! ending in an `AheadWriter`; the realtime graph gets an `AheadReader`
-//! (with the chain's latency) in front of their strips instead.
+//! (with the chain's latency) in front of their strips instead. Buses
+//! rendered ahead, and the strips and sends reaching them, go into a third
+//! graph, the shallow tier's, which reads those tracks' rings.
 
 use crate::EngineError;
 use crate::ahead::{AheadReader, AheadRing, AheadWriter};
@@ -61,6 +63,8 @@ pub struct BuiltGraph {
     /// The render-ahead graph and the rings it fills (with an
     /// [`AheadPlan`]).
     pub ahead: Option<(GraphBuilder<EngineContext>, Vec<Arc<AheadRing>>)>,
+    /// The shallow tier's graph and rings (buses rendered ahead).
+    pub bus_ahead: Option<(GraphBuilder<EngineContext>, Vec<Arc<AheadRing>>)>,
 }
 
 /// Which tracks are rendered ahead, and where their audio goes.
@@ -74,7 +78,29 @@ pub struct AheadPlan<'a> {
     pub rings: &'a mut HashMap<TrackId, Arc<AheadRing>>,
     /// Frames per ring.
     pub ring_frames: usize,
+    /// The shallow tier's rings by track: strips' post-fader audio back to
+    /// the audio thread, buses' outputs to their strips.
+    pub bus_rings: &'a mut HashMap<TrackId, Arc<AheadRing>>,
+    pub bus_ring_frames: usize,
     pub misses: Arc<AtomicU64>,
+}
+
+/// `rings[track]` if it has `channels` and `frames`, else a new one there.
+fn ring_of(
+    rings: &mut HashMap<TrackId, Arc<AheadRing>>,
+    track: TrackId,
+    channels: usize,
+    frames: usize,
+) -> Arc<AheadRing> {
+    let channels = channels.max(1);
+    match rings.get(&track) {
+        Some(r) if r.channels() == channels && r.capacity() == frames => Arc::clone(r),
+        _ => {
+            let r = AheadRing::new(channels, frames);
+            rings.insert(track, Arc::clone(&r));
+            r
+        }
+    }
 }
 
 /// What is rendered ahead: the chains of `tracks`, and of those the
@@ -133,10 +159,11 @@ fn is_bus(kind: TrackKind) -> bool {
 /// `buses`, buses (auxes, the master) too, when everything that reaches
 /// them is a strip rendered ahead: a track (or bus) whose output and sends
 /// all go to buses rendered ahead, that keys no sidechain or follower
-/// (those tap it on the audio thread), without crosstalk. Such strips'
-/// faders, pan, mute and send levels are heard after the lookahead;
-/// automation stays exact. A bus without devices is only worth it as a
-/// stage of a larger tree (its own strip rendered ahead).
+/// (those tap it on the audio thread), without crosstalk. Those strips and
+/// the buses run in the shallow tier (see [`crate::ahead`]): their faders,
+/// pan, mute and send levels are heard after a device callback and two
+/// small blocks; automation stays exact. A bus without devices is only
+/// worth it as a stage of a larger tree (its own strip rendered ahead).
 ///
 /// `keep` (while playing) is what is rendered ahead now: nothing joins,
 /// and a track whose strip has to come back to the audio thread comes
@@ -609,6 +636,9 @@ pub fn build_graph(
     let mut b = GraphBuilder::<EngineContext>::new();
     let mut ab = GraphBuilder::<EngineContext>::new();
     let mut used_rings: Vec<Arc<AheadRing>> = Vec::new();
+    // The shallow tier (buses rendered ahead).
+    let mut bb = GraphBuilder::<EngineContext>::new();
+    let mut bus_used_rings: Vec<Arc<AheadRing>> = Vec::new();
     let mut warnings = Vec::new();
     let double_precision = plugins.double_precision();
     let mut pcx = PluginCx {
@@ -677,31 +707,25 @@ pub fn build_graph(
         let mut tn = TrackNodes::default();
         let layout = t.layout;
         let frozen = t.freeze.is_some();
-        // Rendered ahead: the chain into the ahead graph and a reader here
-        // for the strip, or (a strip rendered ahead) the strip and its
-        // sends there too and its audio back here for the meters.
+        // Rendered ahead: the chain into the deep tier's graph and a
+        // reader here for the strip. A bus's chain is in the shallow tier's
+        // (what reaches it sums there). A strip rendered ahead is there too,
+        // after its track's chain (from the deep tier through a ring), and
+        // its audio comes back here for the meters.
         if let Some(plan) = ahead.as_mut().filter(|p| p.tracks.contains(&t.id)) {
             let strip_ahead = plan.strips.contains(&t.id);
+            let bus = is_bus(t.kind);
             let dest = destination_layout(project, t);
-            let ring_layout = if strip_ahead { dest } else { layout };
-            let channels = ring_layout.channel_count().max(1);
-            let ring = match plan.rings.get(&t.id) {
-                Some(r) if r.channels() == channels && r.capacity() == plan.ring_frames => {
-                    Arc::clone(r)
-                }
-                _ => {
-                    let r = AheadRing::new(channels, plan.ring_frames);
-                    plan.rings.insert(t.id, Arc::clone(&r));
-                    r
-                }
-            };
             let realtime = pcx.realtime;
             pcx.realtime = false;
-            let (input, end, chain_latency) =
-                build_ahead_chain(&mut ab, &mut pcx, slots, project, t, config)?;
+            let (input, end, chain_latency) = if bus {
+                build_ahead_chain(&mut bb, &mut pcx, slots, project, t, config)?
+            } else {
+                build_ahead_chain(&mut ab, &mut pcx, slots, project, t, config)?
+            };
             pcx.realtime = realtime;
-            // What reaches a bus is aligned at its input (in the ahead
-            // graph) to the slowest of it.
+            // What reaches a bus is aligned at its input to the slowest of
+            // it.
             let fed_latency = project
                 .tracks
                 .iter()
@@ -713,41 +737,80 @@ pub fn build_graph(
                 .max()
                 .unwrap_or(0);
             let latency = fed_latency + chain_latency;
-            used_rings.push(Arc::clone(&ring));
-            tn.input = Some(input);
-            tn.input_ahead = true;
-            let reader_key = |sub: u64| {
-                node_key(
-                    t.id,
-                    Role::Ahead,
-                    u64::from(latency) ^ ring.identity().rotate_left(17) ^ sub,
-                    &[ring_layout],
+            if bus {
+                tn.input = Some(input);
+                tn.input_ahead = true;
+            }
+            let channels = layout.channel_count();
+            // A reader of `ring` in graph `g` reporting `latency`.
+            let reader = |g: &mut GraphBuilder<EngineContext>,
+                          ring: &Arc<AheadRing>,
+                          latency: u32,
+                          l: ChannelLayout,
+                          group: Option<u32>,
+                          misses: &Arc<AtomicU64>| {
+                let mut spec = NodeSpec::new(format!("{} · Ahead", t.name))
+                    .key(node_key(
+                        t.id,
+                        Role::Ahead,
+                        u64::from(latency) ^ ring.identity().rotate_left(17),
+                        &[l],
+                    ))
+                    .audio_out(l);
+                if let Some(gi) = group {
+                    spec = spec.group(gi);
+                }
+                g.add_node(
+                    spec,
+                    Box::new(AheadReader::new(
+                        Arc::clone(ring),
+                        latency,
+                        Arc::clone(misses),
+                    )),
                 )
             };
-            if strip_ahead {
-                let strip = add_strip(&mut ab, project, slots, t, None, end, true)?;
-                let writer = ab.add_node(
+            let writer = |g: &mut GraphBuilder<EngineContext>,
+                          ring: &Arc<AheadRing>,
+                          l: ChannelLayout,
+                          from: NodeId|
+             -> Result<(), EngineError> {
+                let w = g.add_node(
                     NodeSpec::new(format!("{} · To Ring", t.name))
-                        .key(node_key(t.id, Role::Ahead, 2 ^ ring.identity(), &[dest]))
-                        .audio_in(dest),
-                    Box::new(AheadWriter::new(Arc::clone(&ring))),
+                        .key(node_key(t.id, Role::Ahead, 1 ^ ring.identity(), &[l]))
+                        .audio_in(l),
+                    Box::new(AheadWriter::new(Arc::clone(ring))),
                 );
-                ab.connect_audio(strip, 0, writer, 0)?;
-                let reader = b.add_node(
-                    NodeSpec::new(format!("{} · Ahead", t.name))
-                        .key(reader_key(0x5157))
-                        .group(gi)
-                        .audio_out(dest),
-                    Box::new(AheadReader::new(ring, latency, Arc::clone(&plan.misses))),
+                g.connect_audio(from, 0, w, 0)?;
+                Ok(())
+            };
+            if strip_ahead {
+                // The chain's end in the shallow tier.
+                let end = if bus {
+                    end
+                } else {
+                    let ring = ring_of(plan.rings, t.id, channels, plan.ring_frames);
+                    used_rings.push(Arc::clone(&ring));
+                    writer(&mut ab, &ring, layout, end)?;
+                    reader(&mut bb, &ring, chain_latency, layout, None, &plan.misses)
+                };
+                let strip = add_strip(&mut bb, project, slots, t, None, end, true)?;
+                let echo = ring_of(
+                    plan.bus_rings,
+                    t.id,
+                    dest.channel_count(),
+                    plan.bus_ring_frames,
                 );
-                own(&mut owners, reader, t.id, None, NodeWork::Ahead);
+                bus_used_rings.push(Arc::clone(&echo));
+                writer(&mut bb, &echo, dest, strip)?;
+                let back = reader(&mut b, &echo, latency, dest, Some(gi), &plan.misses);
+                own(&mut owners, back, t.id, None, NodeWork::Ahead);
                 let sends = t
                     .sends
                     .iter()
                     .filter(|s| s.enabled)
                     .map(|s| Ok((s.id, slots.send(s.id)?)))
                     .collect::<Result<Vec<_>, crate::slots::SlotsExhausted>>()?;
-                let echo = b.add_node(
+                let meters = b.add_node(
                     NodeSpec::new(format!("{} · Meters", t.name))
                         .key(node_key(t.id, Role::StripEcho, 0, &[dest]))
                         .group(gi)
@@ -759,30 +822,30 @@ pub fn build_graph(
                         sends,
                     )),
                 );
-                own(&mut owners, echo, t.id, None, NodeWork::Strip);
-                b.connect_audio(reader, 0, echo, 0)?;
+                own(&mut owners, meters, t.id, None, NodeWork::Strip);
+                b.connect_audio(back, 0, meters, 0)?;
                 tn.post_fx = Some(end);
                 tn.strip = Some(strip);
                 tn.strip_ahead = true;
                 strip_latency.insert(t.id, latency);
             } else {
-                let writer = ab.add_node(
-                    NodeSpec::new(format!("{} · To Ring", t.name))
-                        .key(node_key(t.id, Role::Ahead, 1 ^ ring.identity(), &[layout]))
-                        .audio_in(layout),
-                    Box::new(AheadWriter::new(Arc::clone(&ring))),
-                );
-                ab.connect_audio(end, 0, writer, 0)?;
-                let reader = b.add_node(
-                    NodeSpec::new(format!("{} · Ahead", t.name))
-                        .key(reader_key(0))
-                        .group(gi)
-                        .audio_out(layout),
-                    Box::new(AheadReader::new(ring, latency, Arc::clone(&plan.misses))),
-                );
-                own(&mut owners, reader, t.id, None, NodeWork::Ahead);
-                let strip = add_strip(&mut b, project, slots, t, Some(gi), reader, false)?;
-                tn.post_fx = Some(reader);
+                // The chain's output to the strip here: a bus's from the
+                // shallow tier, a track's from the deep one.
+                let ring = if bus {
+                    let r = ring_of(plan.bus_rings, t.id, channels, plan.bus_ring_frames);
+                    writer(&mut bb, &r, layout, end)?;
+                    bus_used_rings.push(Arc::clone(&r));
+                    r
+                } else {
+                    let r = ring_of(plan.rings, t.id, channels, plan.ring_frames);
+                    writer(&mut ab, &r, layout, end)?;
+                    used_rings.push(Arc::clone(&r));
+                    r
+                };
+                let back = reader(&mut b, &ring, latency, layout, Some(gi), &plan.misses);
+                own(&mut owners, back, t.id, None, NodeWork::Ahead);
+                let strip = add_strip(&mut b, project, slots, t, Some(gi), back, false)?;
+                tn.post_fx = Some(back);
                 tn.strip = Some(own(&mut owners, strip, t.id, None, NodeWork::Strip));
             }
             nodes.insert(t.id, tn);
@@ -1143,7 +1206,7 @@ pub fn build_graph(
         let Some(strip) = tn.strip else { continue };
         // A strip rendered ahead connects there (to buses rendered ahead).
         let ahead_strip = tn.strip_ahead;
-        let g = if ahead_strip { &mut ab } else { &mut b };
+        let g = if ahead_strip { &mut bb } else { &mut b };
         let mut owned = |node: NodeId, work: NodeWork, plugin: Option<PluginInstanceId>| {
             if !ahead_strip {
                 own(&mut owners, node, t.id, plugin, work);
@@ -1308,6 +1371,7 @@ pub fn build_graph(
         builder: b,
         warnings,
         owners,
+        bus_ahead: ahead.as_ref().map(|_| (bb, bus_used_rings)),
         ahead: ahead.map(|_| (ab, used_rings)),
     })
 }

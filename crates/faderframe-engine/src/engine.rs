@@ -314,6 +314,9 @@ pub fn create_with_epoch(
         mod_shape: Vec::new(),
         ahead: None,
         ahead_setting: None,
+        bus_rings: Default::default(),
+        bus_ahead: None,
+        ahead_threads: 0,
         ahead_rings: Default::default(),
         ahead_tracks: Default::default(),
         ahead_strips: Default::default(),
@@ -884,6 +887,11 @@ pub struct EngineController {
     /// Render-ahead: the anticipator, its lookahead, the rings by track,
     /// the tracks rendered ahead in the installed graph, reader misses.
     ahead: Option<crate::ahead::Anticipator>,
+    /// The shallow tier, with buses rendered ahead.
+    bus_ahead: Option<crate::ahead::Anticipator>,
+    ahead_threads: usize,
+    /// The shallow tier's rings by track (strips' echoes, buses' outputs).
+    bus_rings: std::collections::HashMap<faderframe_core::TrackId, Arc<crate::ahead::AheadRing>>,
     ahead_setting: Option<std::time::Duration>,
     ahead_rings: std::collections::HashMap<faderframe_core::TrackId, Arc<crate::ahead::AheadRing>>,
     ahead_tracks: std::collections::HashSet<faderframe_core::TrackId>,
@@ -1387,7 +1395,7 @@ impl EngineController {
         while self.garbage.pop().is_ok() {
             n += 1;
         }
-        if let Some(a) = &mut self.ahead {
+        for a in self.ahead.iter_mut().chain(self.bus_ahead.iter_mut()) {
             while a.garbage.pop().is_ok() {
                 n += 1;
             }
@@ -1456,8 +1464,8 @@ impl EngineController {
             self.modulation_tx
                 .send(Box::new(Arc::clone(&self.modulation))),
         );
-        // The anticipator's modulators too.
-        if let Some(a) = &self.ahead {
+        // The anticipators' modulators too.
+        for a in self.ahead.iter().chain(self.bus_ahead.iter()) {
             drop(a.modulation_tx.send(Box::new(Arc::clone(&self.modulation))));
         }
     }
@@ -1495,11 +1503,23 @@ impl EngineController {
         self.graph_device_block = prepare.device_block;
         let sets = self.ahead_plan(project);
         let lookahead = self.ahead.as_ref().map(|a| a.lookahead);
+        let bus_ring_frames = self
+            .bus_ahead
+            .as_ref()
+            .map_or(0, |a| crate::ahead::ring_frames(a.lookahead, a.block));
+        if let Some(a) = &self.bus_ahead {
+            a.set_lookahead(crate::ahead::shallow_lookahead(
+                prepare.device_block,
+                a.block,
+            ));
+        }
         let plan = lookahead.map(|lookahead| crate::build::AheadPlan {
             tracks: &sets.tracks,
             strips: &sets.strips,
             rings: &mut self.ahead_rings,
             ring_frames: crate::ahead::ring_frames(lookahead, self.config.max_block_size),
+            bus_rings: &mut self.bus_rings,
+            bus_ring_frames,
             misses: Arc::clone(&self.ahead_misses),
         });
         // Album songs' inserts are hosted (editors, parameters) even when
@@ -1523,18 +1543,24 @@ impl EngineController {
             monitor,
         )?;
         let compiled = built.builder.compile(&prepare)?;
-        if let (Some(a), Some((builder, rings))) = (&self.ahead, built.ahead) {
-            let mut ahead_prepare = prepare;
-            // Not on the audio thread: never worth staying serial.
-            ahead_prepare.parallel_min_ns = 0;
-            ahead_prepare.measure_nodes = false;
-            let graph = builder.compile(&ahead_prepare)?;
-            drop(a.graph_tx.send(Box::new(crate::ahead::AheadGraph {
-                graph: Box::new(graph),
-                rings,
-            })));
+        let mut ahead_prepare = prepare;
+        // Not on the audio thread: never worth staying serial.
+        ahead_prepare.parallel_min_ns = 0;
+        ahead_prepare.measure_nodes = false;
+        for (a, built) in [
+            (&self.ahead, built.ahead),
+            (&self.bus_ahead, built.bus_ahead),
+        ] {
+            if let (Some(a), Some((builder, rings))) = (a, built) {
+                let graph = builder.compile(&ahead_prepare)?;
+                drop(a.graph_tx.send(Box::new(crate::ahead::AheadGraph {
+                    graph: Box::new(graph),
+                    rings,
+                })));
+            }
         }
         self.ahead_rings.retain(|t, _| sets.tracks.contains(t));
+        self.bus_rings.retain(|t, _| sets.tracks.contains(t));
         self.ahead_tracks = sets.tracks;
         self.ahead_strips = sets.strips;
         self.voices = voice_needs(project);
@@ -1584,7 +1610,7 @@ impl EngineController {
         let snapshot = Arc::new(snapshot);
         // A snapshot a thread never picked up is dropped right here.
         drop(self.timeline_tx.send(Box::new(Arc::clone(&snapshot))));
-        if let Some(a) = &self.ahead {
+        for a in self.ahead.iter().chain(self.bus_ahead.iter()) {
             drop(a.timeline_tx.send(Box::new(Arc::clone(&snapshot))));
         }
         self.timeline = snapshot;
@@ -1751,18 +1777,30 @@ impl EngineController {
     /// threads of their own (`None`: everything on the audio thread). The
     /// caller rebuilds the graph ([`Self::sync`] with [`Impact::Graph`]).
     pub fn set_render_ahead(&mut self, lookahead: Option<std::time::Duration>, threads: usize) {
-        if lookahead == self.ahead_setting {
+        if lookahead == self.ahead_setting && threads == self.ahead_threads {
             return;
         }
         self.ahead_setting = lookahead;
-        if self.ahead.take().is_some() {
+        self.ahead_threads = threads;
+        self.restart_ahead();
+    }
+
+    /// (Re)start the anticipators for the current settings: the deep one,
+    /// and with buses rendered ahead the shallow one reading its rings.
+    fn restart_ahead(&mut self) {
+        let had = self.ahead.take().is_some();
+        self.bus_ahead = None;
+        if had {
             let _ = self.send(Message::AheadOff);
         }
         self.ahead_rings.clear();
+        self.bus_rings.clear();
         self.ahead_tracks.clear();
         self.ahead_strips.clear();
-        let Some(lookahead) = lookahead else { return };
-        let ctx = EngineContext {
+        let Some(lookahead) = self.ahead_setting else {
+            return;
+        };
+        let ctx = || EngineContext {
             worker_underruns: AtomicU64::new(0),
             callback_deadline: None,
             transport: Default::default(),
@@ -1778,15 +1816,48 @@ impl EngineController {
             preview_active: false,
             launch: crate::launch::LaunchState::new(),
         };
-        let (anticipator, link) = crate::ahead::start(
-            ctx,
-            self.config.sample_rate as f64,
-            self.config.max_block_size,
-            lookahead,
-            threads,
+        let rate = self.config.sample_rate as f64;
+        let (deep, deep_tier) = crate::ahead::start(
+            ctx(),
+            rate,
+            crate::ahead::Options {
+                block: self.config.max_block_size,
+                lookahead,
+                threads: self.ahead_threads,
+                upstream: None,
+                follow: None,
+            },
         );
+        let scheduling = crate::ahead::Scheduling::new();
+        let mut tiers = Vec::new();
+        if self.ahead_buses {
+            let block = crate::ahead::SHALLOW_BLOCK.min(self.config.max_block_size);
+            let (shallow, tier) = crate::ahead::start(
+                ctx(),
+                rate,
+                crate::ahead::Options {
+                    block,
+                    lookahead: std::time::Duration::from_secs_f64(
+                        crate::ahead::SHALLOW_MAX as f64 / rate,
+                    ),
+                    threads: self.ahead_threads.div_ceil(2),
+                    upstream: Some(Arc::clone(&deep.progress)),
+                    follow: Some(Arc::clone(&scheduling)),
+                },
+            );
+            shallow.set_lookahead(crate::ahead::shallow_lookahead(
+                self.stream_buffer_size() as usize,
+                block,
+            ));
+            tiers.push(tier);
+            self.bus_ahead = Some(shallow);
+        }
+        tiers.push(deep_tier);
+        let link = crate::ahead::AheadLink::new(tiers, rate, scheduling);
         if self.send(Message::Ahead(Box::new(link))).is_ok() {
-            self.ahead = Some(anticipator);
+            self.ahead = Some(deep);
+        } else {
+            self.bus_ahead = None;
         }
     }
 
@@ -1811,11 +1882,15 @@ impl EngineController {
     }
 
     /// Render buses ahead too, when everything reaching them can be: their
-    /// inputs' faders, pan, mute and send levels are then heard after the
-    /// lookahead. The caller rebuilds the graph ([`Self::sync`] with
-    /// [`Impact::Graph`]).
+    /// devices, and the strips and sends reaching them, run in a shallow
+    /// second anticipator (moves of those faders are heard after a device
+    /// callback and two small blocks). The caller rebuilds the graph
+    /// ([`Self::sync`] with [`Impact::Graph`]).
     pub fn set_render_ahead_buses(&mut self, on: bool) {
-        self.ahead_buses = on;
+        if on != self.ahead_buses {
+            self.ahead_buses = on;
+            self.restart_ahead();
+        }
     }
 
     pub fn render_ahead_buses(&self) -> bool {

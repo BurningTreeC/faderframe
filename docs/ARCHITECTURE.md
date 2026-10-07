@@ -276,8 +276,28 @@ device buffer and spikes are absorbed by the lookahead.
   editors): its sources, instrument and inserts go into a second graph
   ending in an `AheadWriter`; the realtime graph keeps an `AheadReader`
   with the chain's latency (delay compensation unchanged) in front of its
-  strip, so faders, pan, mute, solo and sends stay immediate. Buses,
-  masters and everything live stay on the audio thread.
+  strip, so faders, pan, mute, solo and sends stay immediate. Everything
+  live stays on the audio thread.
+* **Buses** (Preferences → Audio → Buses too, on by default;
+  `build::ahead_sets`): a bus, aux or the master's devices render ahead
+  when everything reaching it is a strip that can — a track (or bus)
+  whose output and sends all go to buses rendered ahead, that keys no
+  sidechain or follower, without crosstalk (a fixpoint; while playing
+  nothing joins, and a strip that has to come back brings its chain and
+  its buses). They run in a second, *shallow* anticipator: it reads the
+  deep one's rings of those tracks' chains and runs their strips and sends
+  (quiet: their meters, scope and automated values come back through a
+  ring to a `StripEcho` on the audio thread), the buses' sums and devices,
+  in 128-frame blocks only a device callback and two blocks ahead
+  (`ahead::shallow_lookahead`), at the audio thread's scheduling (the link
+  publishes it once). A block is rendered there once the deep tier has
+  (its `progress`); the link hands every sequence to both tiers, shallow
+  first, and switches when both are ready. Fader moves on those strips
+  are heard after about 10 ms (13 ms with 256-frame callbacks; 5 ms
+  live), bus devices still leave the audio thread. Buses are built after
+  what reaches them, so their latency is known; the graph compiler sums a
+  port's audio in the sources' key order, so the different build order
+  keeps the output bit-identical.
 * **Prediction.** The anticipator runs its own copy of the transport
   (`TransportState` is plain data), so it renders exactly the positions
   the audio thread will ask for, loop wraps and scrub snippets included.
@@ -313,9 +333,12 @@ device buffer and spikes are absorbed by the lookahead.
 * **Numbers.** 64 tracks × 6 echoes at 64-frame buffers (4 threads,
   paced): audio-thread callbacks mean 187 → 34 µs, p99 635 → 50 µs, max
   1345 → 81 µs, deadline misses 1 → 0, no late blocks
-  (`faderframe-bench --ahead 200`). Tests: `engine/tests/ahead.rs` (output
+  (`faderframe-bench --ahead 200`); 64 tracks into 4 buses, two echoes
+  each, 64-frame buffers: with the buses rendered ahead too, callbacks
+  mean 36 → 16 µs, p99 53 → 24 µs (`--ahead-buses`). Tests: `engine/tests/ahead.rs` (output
   identical sample for sample through playback, a locate and loop wraps,
-  no late blocks), `realtime_alloc.rs` (the audio thread's side does not
+  with buses rendered ahead and latency reaching them, no late blocks,
+  faders reaching buses answering within milliseconds), `realtime_alloc.rs` (the audio thread's side does not
   allocate), `session/tests/render_ahead.rs`.
 
 ### Engine graph per track
