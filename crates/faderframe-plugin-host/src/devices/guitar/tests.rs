@@ -592,3 +592,51 @@ fn the_solve_cutoff_does_not_follow_the_reservoirs_lagging_pace() {
         .is_none()
     );
 }
+
+/// GainStageFx's noise gate after the Input trim: hiss below the threshold
+/// goes (to the amplifier's output, and the DI), a played guitar does not.
+#[test]
+fn the_noise_gate_takes_hiss_and_leaves_the_guitar() {
+    // Hiss peaking at -80 dBFS, 20 dB under the threshold, where the 2:1
+    // expander takes about 20 dB (at -65 its knee takes 5): a fixed-seed
+    // generator, deterministic.
+    let hiss = |n: usize, _c: usize| {
+        let mut x = (n as u64)
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        x ^= x >> 33;
+        ((x % 2001) as f32 / 1000.0 - 1.0) * 0.000_1
+    };
+    let run = |gate: bool, signal: &dyn Fn(usize, usize) -> f32| {
+        let set = [
+            (id::NOISE_GATE, if gate { 1.0 } else { 0.0 }),
+            (id::DRIVE, 0.7),
+        ];
+        let mut line = Line::new(&set, 1, Run::Inline, 128);
+        let mut main = Vec::new();
+        let mut di = Vec::new();
+        for _ in 0..(1.5 * SR / 256.0) as usize {
+            let (m, d) = line.block(256, &[], signal);
+            main.extend_from_slice(&m[0]);
+            di.extend_from_slice(&d[0]);
+        }
+        let tail = main.len() / 2;
+        (rms_db(&main[tail..]), rms_db(&di[tail..]))
+    };
+    let (open, open_di) = run(false, &hiss);
+    let (gated, gated_di) = run(true, &hiss);
+    assert!(
+        gated < open - 15.0,
+        "hiss {open:.1} dB without the gate, {gated:.1} dB with it"
+    );
+    assert!(
+        gated_di < open_di - 15.0,
+        "the DI is gated too: {open_di:.1} -> {gated_di:.1} dB"
+    );
+    let (played, _) = run(false, &|n, _| pluck(n));
+    let (played_gated, _) = run(true, &|n, _| pluck(n));
+    assert!(
+        (played - played_gated).abs() < 0.5,
+        "a guitar {played:.1} dB, through the gate {played_gated:.1} dB"
+    );
+}

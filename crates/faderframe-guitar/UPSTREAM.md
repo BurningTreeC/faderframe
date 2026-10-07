@@ -51,6 +51,10 @@ out.
 - The variac (`mains`) reaches the amplifier only; the pedals keep their
   batteries.
 
+- The noise gate (`noise_gate`) is upstream's `dsp/noise_reduction.rs`
+  unchanged (renamed `NoiseGate`): the input expander after the Input trim,
+  one detector on the hotter channel, threshold -90…-30 dBFS.
+
 ## Checked
 
 A scratch harness built upstream's untouched `voice.rs` on these modules and

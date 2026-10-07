@@ -11,5 +11,6 @@ pub mod chain;
 pub mod circuits;
 pub mod dsp;
 pub mod lists;
+pub mod noise_gate;
 pub mod pedal;
 pub mod voice;

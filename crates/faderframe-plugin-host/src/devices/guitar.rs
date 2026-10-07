@@ -97,6 +97,12 @@ pub mod id {
     pub const fn slot(s: usize, field: u32) -> u32 {
         SLOTS + STRIDE * s as u32 + field
     }
+
+    /// GainStageFx's noise gate after the Input trim (after the places, so
+    /// no earlier id moved).
+    pub const NOISE_GATE: u32 = SLOTS + STRIDE * super::MAX_PEDALS as u32;
+    /// Where it starts to close, dBFS.
+    pub const NOISE_THRESHOLD: u32 = NOISE_GATE + 1;
 }
 
 /// Published values: the wahs' treadles (one per place), the line's
@@ -282,6 +288,15 @@ pub fn parameters() -> Vec<ParameterInfo> {
         p.push(toggle(slot(s, AUTO), &n("Auto"), false));
         p.push(percent(slot(s, SENSE), &n("Sense"), 0.5));
     }
+    p.push(toggle(NOISE_GATE, "Noise Gate", false));
+    p.push(super::param(
+        NOISE_THRESHOLD,
+        "Gate Threshold",
+        -90.0,
+        -30.0,
+        -60.0,
+        ParameterUnit::Decibels,
+    ));
     debug_assert!(
         p.iter()
             .enumerate()
@@ -447,7 +462,10 @@ pub fn format(id: ParameterId, v: f64) -> Option<String> {
         A_ANGLE | B_ANGLE => Some(format!("{v:.0}°")),
         A_PAN | B_PAN => Some(pan_text(v)),
         DI_SOURCE => lists::DI_SOURCES.get(i).and_then(|d| name(d.0)),
-        BRIGHT | LOW_INPUT | B_INVERT | ALIGN => name(if v >= 0.5 { "On" } else { "Off" }),
+        BRIGHT | LOW_INPUT | B_INVERT | ALIGN | NOISE_GATE => {
+            name(if v >= 0.5 { "On" } else { "Off" })
+        }
+        NOISE_THRESHOLD => Some(format!("{v:.0} dBFS").replace('-', "−")),
         x if x >= SLOTS && x < SLOTS + STRIDE * MAX_PEDALS as u32 => match (x - SLOTS) % STRIDE {
             STOMP => name(Stomp::from_index(i).name()),
             ON => name(if v >= 0.5 { "On" } else { "Bypassed" }),

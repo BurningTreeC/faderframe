@@ -44,6 +44,8 @@ pub struct GuitarProcessor {
     /// The guitar's own lanes (the DI's source), then the DI out.
     raw: Vec<Vec<f32>>,
     input_gain: f32,
+    /// GainStageFx's noise gate, after the Input trim.
+    gate: faderframe_guitar::noise_gate::NoiseGate,
     output_gain: f32,
     mix: f32,
     /// One-pole glide per sample, about 10 ms.
@@ -154,8 +156,11 @@ impl GuitarProcessor {
             tap.set_value(value::DELAY, delay as f32);
         }
         let at = |i: u32| params.get(i as usize);
+        let mut gate = faderframe_guitar::noise_gate::NoiseGate::new(rate);
+        gate.reset(at(id::NOISE_GATE) >= 0.5, at(id::NOISE_THRESHOLD));
         Ok(Self {
             input_gain: db_gain(at(id::INPUT)),
+            gate,
             output_gain: db_gain(at(id::OUTPUT)),
             mix: at(id::MIX).clamp(0.0, 1.0),
             params,
@@ -239,20 +244,33 @@ impl PluginProcessor for GuitarProcessor {
         if frames > self.raw.first().map_or(0, Vec::len) {
             return ProcessStatus::Error;
         }
-        // Input trim (the DI's guitar is taken after it).
+        // Input trim, then the noise gate (the DI's guitar is taken after
+        // both, as GainStageFx does, so the Mix lets no noise back in). The
+        // IN meter shows the input before the gate.
         let target = db_gain(self.params.get(id::INPUT as usize));
         let k = self.glide;
+        self.gate.configure(
+            self.params.get(id::NOISE_GATE as usize) >= 0.5,
+            self.params.get(id::NOISE_THRESHOLD as usize),
+        );
         {
             let mut gain = self.input_gain;
             for i in 0..frames {
                 glide(&mut gain, target, k);
+                // One detector on the hotter side: the balance cannot wander.
+                let mut hottest = 0.0f64;
                 for c in 0..count {
-                    let x = out.channel_mut(c)[i] * gain;
-                    out.channel_mut(c)[i] = x;
-                    self.raw[c][i] = x;
+                    let x = out.channel(c)[i] * gain;
+                    hottest = hottest.max(f64::from(x).abs());
                     if c < METERED {
                         self.meters[0][c].add(x);
                     }
+                }
+                let open = self.gate.next_gain(hottest) as f32;
+                for c in 0..count {
+                    let x = out.channel(c)[i] * gain * open;
+                    out.channel_mut(c)[i] = x;
+                    self.raw[c][i] = x;
                 }
             }
             self.input_gain = gain;
@@ -364,6 +382,10 @@ impl PluginProcessor for GuitarProcessor {
         for m in self.meters.iter_mut().flatten() {
             m.reset();
         }
+        self.gate.reset(
+            self.params.get(id::NOISE_GATE as usize) >= 0.5,
+            self.params.get(id::NOISE_THRESHOLD as usize),
+        );
     }
 
     fn take_underruns(&mut self) -> u64 {

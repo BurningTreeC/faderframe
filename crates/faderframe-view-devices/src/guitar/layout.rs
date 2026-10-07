@@ -553,6 +553,9 @@ fn cab_look(cabinet: usize, mic_b: bool) -> CabLook {
 #[derive(Clone, Debug, PartialEq)]
 pub struct OutLook {
     pub input: KnobAt,
+    /// GainStageFx's noise gate: its switch and threshold.
+    pub gate: Rect,
+    pub threshold: KnobAt,
     pub mix: KnobAt,
     pub output: KnobAt,
     pub meters: [Rect; 2],
@@ -572,14 +575,16 @@ fn out_look() -> OutLook {
     };
     OutLook {
         input: knob(id::INPUT, "INPUT", r.x + 44.0),
-        mix: knob(id::MIX, "MIX", r.x + 632.0),
-        output: knob(id::OUTPUT, "OUTPUT", r.x + 716.0),
+        gate: Rect::new(r.x + 248.0, r.y + 30.0, 58.0, 24.0),
+        threshold: knob(id::NOISE_THRESHOLD, "THRESHOLD", r.x + 346.0),
+        mix: knob(id::MIX, "MIX", r.x + 672.0),
+        output: knob(id::OUTPUT, "OUTPUT", r.x + 756.0),
         meters: [
-            Rect::new(r.x + 86.0, r.y + 26.0, 210.0, 26.0),
-            Rect::new(r.x + 760.0, r.y + 26.0, 210.0, 26.0),
+            Rect::new(r.x + 86.0, r.y + 26.0, 150.0, 26.0),
+            Rect::new(r.x + 800.0, r.y + 26.0, 170.0, 26.0),
         ],
         di: std::array::from_fn(|i| {
-            Rect::new(r.x + 340.0 + i as f32 * 82.0, r.y + 30.0, 78.0, 24.0)
+            Rect::new(r.x + 394.0 + i as f32 * 80.0, r.y + 30.0, 76.0, 24.0)
         }),
         readout: Rect::new(r.x + 996.0, r.y + 12.0, 190.0, 50.0),
     }
@@ -753,9 +758,13 @@ impl Look {
         }
         // The output strip.
         let o = &self.out;
-        for k in [&o.input, &o.mix, &o.output] {
+        for k in [&o.input, &o.threshold, &o.mix, &o.output] {
             knob(&mut h, k, Travel::Linear);
         }
+        h.push(Hot {
+            rect: o.gate,
+            target: Target::Toggle { id: id::NOISE_GATE },
+        });
         for (i, r) in o.di.iter().enumerate() {
             h.push(Hot {
                 rect: *r,

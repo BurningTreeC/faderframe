@@ -1876,7 +1876,53 @@ fn out(p: &mut dyn Painter, sc: &Scene<'_>, needles: &mut [[Needle; 2]; 2], dt: 
     for (i, x) in [r.x + 10.0, r.right() - 10.0].into_iter().enumerate() {
         screw(p, i + 2, Point::new(x, r.center().y), 11.0);
     }
-    for k in [&o.input, &o.mix, &o.output] {
+    // The noise gate's switch (lit while on).
+    {
+        let r = o.gate;
+        let on = sc.get(id::NOISE_GATE) >= 0.5;
+        let hovered = sc.hovered(Target::Toggle { id: id::NOISE_GATE });
+        p.fill_rounded(
+            r,
+            4.0,
+            &Paint::Solid(if on {
+                rgba(ACCENT, 0.28)
+            } else {
+                rgb(0x111316)
+            }),
+        );
+        p.stroke_rounded(
+            r,
+            4.0,
+            1.0,
+            if hovered || on {
+                rgba(ACCENT, 0.8)
+            } else {
+                rgba(0xffffff, 0.1)
+            },
+        );
+        p.circle(
+            Point::new(r.x + 11.0, r.center().y),
+            3.0,
+            if on {
+                rgb(ACCENT)
+            } else {
+                rgba(0xffffff, 0.25)
+            },
+        );
+        p.text(
+            "GATE",
+            Rect::new(r.x + 18.0, r.y, r.w - 20.0, r.h),
+            &style(8.0, rgb(0xe3e7ea)).tracking(1.0),
+        );
+        p.text(
+            "NOISE GATE",
+            Rect::new(r.x, r.y - 13.0, 120.0, 11.0),
+            &TextStyle::new(7.5, rgb(0x9aa5ae))
+                .weight(FontWeight::Bold)
+                .tracking(1.0),
+        );
+    }
+    for k in [&o.input, &o.threshold, &o.mix, &o.output] {
         if sc.knob_hovered(k.id) {
             hover_ring(p, k.at, k.r, rgb(ACCENT));
         }
