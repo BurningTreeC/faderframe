@@ -31,6 +31,7 @@ faderframe-app            binary: CLI parsing, logging, starts the GTK app
             ├─ faderframe-analysis     loudness (EBU R128), true peak, levels, phase, FFT spectrum
             ├─ faderframe-disc         Red Book CD masters: DDP 2.00 filesets, CD-Text, cue sheets, ISRC/UPC
             ├─ faderframe-adm          object-based masters: ADM (BS.2076) axml/chna, Dolby Atmos master profile
+            ├─ faderframe-iamf         IAMF masters: OBUs, MP4 (iamf/iacb), LPCM/FLAC/Opus substreams
             ├─ faderframe-engine       project→graph compiler, RT processor, controller, offline render
             │    ├─ faderframe-binaural     headphone listening: beds through measured HRIRs (SADIE II KU100), rooms
             │    ├─ faderframe-audio-graph   generic DSP graph: ports, edges, PDC, compile, executor
@@ -555,6 +556,38 @@ master's bed and feeding the master directly):
   Far or not set; `Command::SetTrackBinaural`; the track menu's "Headphone
   Render (Dolby)" while the master is a bed). It is delivery metadata only:
   `dbmd` writes it per bed channel (the LFE always Off) and per object.
+
+### IAMF masters
+
+Render → "IAMF · Opus / FLAC / LPCM" (`RenderChannels::Iamf(Codec)`,
+`session::iamf`): the master — mono, stereo or a bed — as an IA Sequence
+of the Alliance for Open Media's Immersive Audio Model and Formats, in an
+MP4 file (`.mp4`, one track with sample entry `iamf`/`iacb`, brands
+`iamf`/`iso6`, edit list for the trims, `roll` group for Opus, `stco`) or
+standalone (`.iamf`, Temporal Delimiters included). `faderframe-iamf`
+writes inside IAMF v1.0.0-errata's Simple profile so every decoder reads
+it: one channel-based Audio Element of one layer (Mono, Stereo, 5.1,
+5.1.2, 5.1.4, 7.1, 7.1.2, 7.1.4 — LCR and 5.0 go into 5.1, quad and 7.0
+into 7.1, the missing speakers silent, x.1.2's top middles as the top
+front pair; `iamf::plan`), its channels as mono and coupled substreams in
+§ 3.6.2.3's order, coded as LPCM (`ipcm`, 1024-sample frames), FLAC
+(`fLaC`, `flacenc`, independent stereo, 1024 — libiamf crashes on longer
+coupled FLAC frames) or Opus (libopus via the `opus` crate, 48 kHz, 960,
+pre-skip trimmed at the start, roll −4), the last frame padded and
+trimmed; one Mix Presentation (one sub-mix, mix gains at their 0 dB
+defaults, a bed binaural on headphones) with the loudness measured on
+Stereo — IAMF's down-mix as the reference decoder renders it
+(`stereo_downmix`: L + 0.707 C + 0.707 surrounds + top fronts + 0.707 top
+backs) — and on its own layout (`faderframe_analysis::integrated_weighted`,
+BS.1770 weights), integrated, sample and true peak. A loudness target of
+the render's finish is reached on that stereo down-mix. Checked from
+outside: AOM's libiamf (`iamfdec`) decodes every codec in both containers
+to 7.1.4 and stereo, FFmpeg's IAMF demuxer reads the stream groups and
+decodes every substream (LPCM/FLAC exact), and the stereo loudness written
+equals FFmpeg's `ebur128` of libiamf's stereo render. The patents
+necessary for IAMF are licensed royalty free by AOM's members
+(`AOM-PATENT-LICENSE.txt`, shipped with every package). MPEG-H is out: no
+open encoder, a paid specification and per-unit patent royalties.
 
 ### Listening: headphones and the mono check
 
@@ -2830,9 +2863,9 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
     *CD-Text languages*, *The DDP player* and *Surround beds*). ~~Object-based
     masters (ADM BWF, Dolby Atmos master profile), export and import~~ —
     done (see *Object-based masters*, with Dolby's `dbmd` chunk).
-    ~~Binaural monitoring~~ — done (see *Listening*). Not yet: consumer
-    object formats (IAMF; MPEG-H is out — no open encoder, a paid spec and
-    per-unit patent royalties).
+    ~~Binaural monitoring~~ — done (see *Listening*). ~~Consumer object
+    formats~~ — IAMF done (see *IAMF masters*; MPEG-H is out — no open
+    encoder, a paid spec and per-unit patent royalties).
 
 
 ### Modelled microphone preamplifiers

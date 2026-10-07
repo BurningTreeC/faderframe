@@ -49,6 +49,7 @@ faderframe-view-ddp = { path = "crates/faderframe-view-ddp" }
 faderframe-view-surround = { path = "crates/faderframe-view-surround" }
 faderframe-adm = { path = "crates/faderframe-adm" }
 faderframe-binaural = { path = "crates/faderframe-binaural" }
+faderframe-iamf = { path = "crates/faderframe-iamf" }
 faderframe-view-devices = { path = "crates/faderframe-view-devices" }
 faderframe-view-automation = { path = "crates/faderframe-view-automation" }
 faderframe-view-album = { path = "crates/faderframe-view-album" }
@@ -109,6 +110,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 unused_must_use = "deny"
+# `--cfg faderframe_check_only` (RUSTFLAGS): cross-checks without a target's
+# SDK leave out what builds C with it (libopus).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(faderframe_check_only)"] }
 
 [workspace.lints.clippy]
 unwrap_used = "warn"

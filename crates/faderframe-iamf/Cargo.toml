@@ -1,0 +1,19 @@
+[package]
+name = "faderframe-iamf"
+description = "IAMF (AOM Immersive Audio Model and Formats) masters for FaderFrame: OBU streams and MP4 with LPCM, FLAC or Opus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+flacenc = { version = "0.5.1", default-features = false }
+
+# libopus (bundled, built with CMake); left out of SDK-less cross-checks.
+[target.'cfg(not(faderframe_check_only))'.dependencies]
+opus = "0.4"

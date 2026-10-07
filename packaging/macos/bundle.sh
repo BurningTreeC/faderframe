@@ -33,7 +33,7 @@ cp "$bin" "$contents/MacOS/faderframe-bin"
 install -m755 packaging/macos/launcher.sh "$contents/MacOS/FaderFrame"
 sed "s/@VERSION@/$version/g" packaging/macos/Info.plist >"$contents/Info.plist"
 python3 packaging/icons.py icns packaging/icons/io.github.BurningTreeC.FaderFrame.svg "$res/FaderFrame.icns"
-cp LICENSE THIRD_PARTY_LICENSES.md "$res/"
+cp LICENSE THIRD_PARTY_LICENSES.md AOM-PATENT-LICENSE.txt "$res/"
 
 # GTK's settings schemas and icon themes.
 cp "$brew"/share/glib-2.0/schemas/org.gtk.gtk4.*.gschema.xml "$res/share/glib-2.0/schemas/"

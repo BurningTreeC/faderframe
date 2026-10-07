@@ -98,7 +98,7 @@ install -Dm644 "packaging/icons/$id.svg" "$out/share/icons/hicolor/scalable/apps
 install -m755 packaging/linux/portable/faderframe "$out/faderframe"
 install -m755 packaging/linux/portable/install.sh "$out/install.sh"
 install -m644 packaging/linux/portable/README.txt "$out/README.txt"
-cp LICENSE THIRD_PARTY_LICENSES.md "$out/"
+cp LICENSE THIRD_PARTY_LICENSES.md AOM-PATENT-LICENSE.txt "$out/"
 mkdir -p "$out/FaderFrame Data"
 
 tarball=dist/$name.tar.xz

@@ -54,7 +54,7 @@ if [ -d "$prefix/lib/gdk-pixbuf-2.0" ]; then
     done
 fi
 
-cp LICENSE THIRD_PARTY_LICENSES.md "$out/"
+cp LICENSE THIRD_PARTY_LICENSES.md AOM-PATENT-LICENSE.txt "$out/"
 python3 packaging/icons.py ico packaging/icons/io.github.BurningTreeC.FaderFrame.svg "$out/faderframe.ico"
 
 # The installer first (an installed copy uses the user's profile), then

@@ -168,7 +168,10 @@ Contrast:
   the master is rendered binaurally (measured KU100 responses, SADIE II;
   Near, Mid or Far), and a MONO button on the master strip checks the mix
   in mono — both for listening only (Audio → Listen); a binaural render is
-  a render option. Heads: two dummy heads and eighteen measured listeners
+  a render option. IAMF (AOM's Immersive Audio Model and Formats) masters
+  of any master — mono, stereo or a bed — as MP4 or `.iamf`, with Opus
+  (to stream), FLAC or LPCM and the loudness IAMF carries; checked against
+  AOM's reference decoder and FFmpeg. Heads: two dummy heads and eighteen measured listeners
   to choose from by ear, or your own as a SOFA file; headphone correction
   from EqualizerAPO/AutoEq presets or an impulse response.
 * Analogue-console mixer: inserts, sends (pre-FX / pre / post), pan, M/S/R,
@@ -557,15 +560,15 @@ build time):
 
 | Distribution | Packages |
 |---|---|
-| Arch / Manjaro | `gtk4 pkgconf pipewire-jack` (or `jack2`) `alsa-lib pipewire clang` |
-| Debian / Ubuntu (24.04+) | `libgtk-4-dev pkg-config libjack-jackd2-dev libasound2-dev libpipewire-0.3-dev libclang-dev` |
-| Fedora | `gtk4-devel pkgconf-pkg-config pipewire-jack-audio-connection-kit-devel alsa-lib-devel pipewire-devel clang-devel` |
+| Arch / Manjaro | `gtk4 pkgconf pipewire-jack` (or `jack2`) `alsa-lib pipewire clang cmake` |
+| Debian / Ubuntu (24.04+) | `libgtk-4-dev pkg-config libjack-jackd2-dev libasound2-dev libpipewire-0.3-dev libclang-dev cmake` |
+| Fedora | `gtk4-devel pkgconf-pkg-config pipewire-jack-audio-connection-kit-devel alsa-lib-devel pipewire-devel clang-devel cmake` |
 
-**macOS** (Apple Silicon or Intel): `brew install gtk4 pkgconf`.
+**macOS** (Apple Silicon or Intel): `brew install gtk4 pkgconf cmake`.
 
 **Windows**: in an [MSYS2](https://www.msys2.org) UCRT64 shell,
 `pacman -S mingw-w64-ucrt-x86_64-gtk4 mingw-w64-ucrt-x86_64-pkgconf
-mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-rust`.
+mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-rust mingw-w64-ucrt-x86_64-cmake`.
 
 Plugin GUIs embed natively everywhere: X11 windows on Linux (through
 XWayland), Win32 windows on Windows, Cocoa views on macOS. CI builds and

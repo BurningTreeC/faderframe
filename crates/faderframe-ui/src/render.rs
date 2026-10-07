@@ -190,6 +190,9 @@ impl Form {
                     RenderChannels::Adm(_) => {
                         faderframe_session::adm::plan(p).map_or(0, |plan| plan.channels())
                     }
+                    RenderChannels::Iamf(_) => {
+                        faderframe_session::iamf::plan(p).layout.channels().len()
+                    }
                 };
                 // An ADM master is 24-bit at 48 kHz (96 kHz if chosen).
                 let (bits, rate) = if adm {
@@ -214,7 +217,32 @@ impl Form {
                         })
                         .count(),
                 };
-                let bytes = secs * rate as f64 * ch as f64 * (bits / 8) as f64 * files as f64;
+                let mut bytes = secs * rate as f64 * ch as f64 * (bits / 8) as f64 * files as f64;
+                let mut what = if adm {
+                    "PCM 24-bit".to_string()
+                } else {
+                    settings.format.label().to_string()
+                };
+                let mut rate = rate;
+                if let RenderChannels::Iamf(codec) = settings.channels {
+                    use faderframe_iamf::Codec;
+                    rate = codec.rate_for(settings.sample_rate);
+                    let pcm = secs * rate as f64 * ch as f64 * 3.0;
+                    let layout = faderframe_session::iamf::plan(p).layout;
+                    bytes = match codec {
+                        Codec::Lpcm { bits } => pcm * f64::from(bits) / 24.0,
+                        // About 60 % of PCM.
+                        Codec::Flac { .. } => pcm * 0.6,
+                        Codec::Opus { stereo_bitrate } => {
+                            let coupled =
+                                layout.substreams().iter().filter(|s| s.len() == 2).count();
+                            let mono = layout.substreams().len() - coupled;
+                            secs * (coupled as f64 + mono as f64 * 0.5) * f64::from(stereo_bitrate)
+                                / 8.0
+                        }
+                    };
+                    what = format!("IAMF {} {}", codec.name(), layout.name());
+                }
                 format!(
                     "{} → {}  ·  {:.1} s  ·  {} file{}  ·  ≈ {:.1} MB  ·  {} · {}",
                     p.timeline.format_bbt(a),
@@ -223,11 +251,7 @@ impl Form {
                     files,
                     if files == 1 { "" } else { "s" },
                     bytes / 1_000_000.0,
-                    if adm {
-                        "PCM 24-bit"
-                    } else {
-                        settings.format.label()
-                    },
+                    what,
                     format_sample_rate(rate)
                 )
             }
@@ -354,6 +378,31 @@ pub fn open(app: &Rc<AppState>) {
             vec![RenderChannels::Stereo, RenderChannels::Mono],
         ),
     };
+    // IAMF masters of any master: Opus to stream, FLAC or LPCM lossless.
+    let (mut channel_names, mut channel_choices) = (channel_names, channel_choices);
+    {
+        let s = app.session.borrow();
+        let what = faderframe_session::iamf::plan(s.project()).describe();
+        for (label, codec) in [
+            (
+                format!("IAMF · Opus ({what}; to stream, .mp4 or .iamf)"),
+                faderframe_iamf::Codec::Opus {
+                    stereo_bitrate: 192_000,
+                },
+            ),
+            (
+                format!("IAMF · FLAC ({what}; lossless)"),
+                faderframe_iamf::Codec::Flac { bits: 24 },
+            ),
+            (
+                format!("IAMF · LPCM ({what}; 24-bit)"),
+                faderframe_iamf::Codec::Lpcm { bits: 24 },
+            ),
+        ] {
+            channel_names.push(label);
+            channel_choices.push(RenderChannels::Iamf(codec));
+        }
+    }
     let names: Vec<&str> = channel_names.iter().map(String::as_str).collect();
     let channels = gtk::DropDown::from_strings(&names);
     labelled(&grid, 5, "Channels", &channels);
@@ -473,6 +522,29 @@ pub fn open(app: &Rc<AppState>) {
         let r = refresh.clone();
         dd.connect_selected_notify(move |_| r());
     }
+    // IAMF masters are .mp4 (or .iamf), the rest .wav.
+    {
+        let f = Rc::clone(&form);
+        form.channels.connect_selected_notify(move |d| {
+            let iamf = matches!(
+                f.channel_choices.get(d.selected() as usize),
+                Some(RenderChannels::Iamf(_))
+            );
+            let mut path = PathBuf::from(f.output.text().as_str());
+            let ext = path
+                .extension()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase());
+            let swap = match ext.as_deref() {
+                Some("wav") if iamf => Some("mp4"),
+                Some("mp4" | "iamf") if !iamf => Some("wav"),
+                _ => None,
+            };
+            if let Some(e) = swap {
+                path.set_extension(e);
+                f.output.set_text(&path.to_string_lossy());
+            }
+        });
+    }
     // What a preset sets: changed by hand, the form is custom again.
     for dd in [
         &form.format,
@@ -578,7 +650,13 @@ pub fn open(app: &Rc<AppState>) {
             }
             let mut settings = form.settings(project_rate);
             if settings.source == RenderSource::Master && settings.output.extension().is_none() {
-                settings.output.set_extension("wav");
+                settings.output.set_extension(
+                    if matches!(settings.channels, RenderChannels::Iamf(_)) {
+                        "mp4"
+                    } else {
+                        "wav"
+                    },
+                );
             }
             if let Some(dir) = settings.output.parent()
                 && !dir.as_os_str().is_empty()

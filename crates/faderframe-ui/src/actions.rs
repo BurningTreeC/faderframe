@@ -1854,6 +1854,42 @@ pub fn install(app: &Rc<AppState>) {
                 Err(e) => tracing::warn!("render-adm: {e}"),
             }
         }),
+        // Development aid: `render-iamf:<path.mp4|path.iamf>[|opus|flac|lpcm]`
+        // (an IAMF master of the project; Opus by default).
+        named("render-iamf", |a, arg| {
+            use faderframe_iamf::Codec;
+            let (path, codec) = match arg.split_once('|') {
+                Some((p, "flac")) => (p, Codec::Flac { bits: 24 }),
+                Some((p, "lpcm")) => (p, Codec::Lpcm { bits: 24 }),
+                Some((p, _)) => (
+                    p,
+                    Codec::Opus {
+                        stereo_bitrate: 192_000,
+                    },
+                ),
+                None => (
+                    arg,
+                    Codec::Opus {
+                        stereo_bitrate: 192_000,
+                    },
+                ),
+            };
+            let job = {
+                let mut s = a.session.borrow_mut();
+                let settings = faderframe_session::render::RenderSettings {
+                    channels: faderframe_session::render::RenderChannels::Iamf(codec),
+                    ..faderframe_session::render::RenderSettings::defaults_for(
+                        s.project(),
+                        path.into(),
+                    )
+                };
+                s.render(settings)
+            };
+            match job.and_then(faderframe_session::render::RenderJob::join) {
+                Ok(_) => tracing::info!("render-iamf: wrote {path}"),
+                Err(e) => tracing::warn!("render-iamf: {e}"),
+            }
+        }),
         // Development aid: `show-surround-panner:<track>`.
         named("show-surround-panner", |a, arg| {
             let track = a

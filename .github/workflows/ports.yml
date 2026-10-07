@@ -52,6 +52,7 @@ jobs:
           update: true
           install: >-
             mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-pkgconf
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-rust

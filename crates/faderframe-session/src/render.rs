@@ -58,6 +58,9 @@ pub enum RenderChannels {
     /// For headphones: the master rendered binaurally (as heard with
     /// Listen → Headphones), stereo.
     Binaural(faderframe_binaural::Room),
+    /// An IAMF master ([`crate::iamf`]): MP4 (`.mp4`) or a standalone IA
+    /// Sequence (`.iamf`).
+    Iamf(faderframe_iamf::Codec),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -124,6 +127,8 @@ pub enum RenderError {
     Cancelled,
     #[error("{0}")]
     Adm(String),
+    #[error("{0}")]
+    Iamf(String),
     #[error(transparent)]
     Engine(#[from] faderframe_engine::EngineError),
     #[error("cannot write {path}: {source}")]
@@ -308,7 +313,7 @@ pub(crate) fn render_span(
 /// `frames` frames from `start` on a "device" of `outputs` channels (a
 /// surround master folds down to fewer).
 #[allow(clippy::too_many_arguments)]
-fn render_one(
+pub(crate) fn render_one(
     project: &Project,
     sample_rate: u32,
     sources: &faderframe_engine::SourceMap,
@@ -605,6 +610,9 @@ pub fn track_render_project(
 pub fn start(project: Project, settings: RenderSettings) -> Result<RenderJob, RenderError> {
     if let RenderChannels::Adm(profile) = settings.channels {
         return crate::adm::start(project, settings, profile);
+    }
+    if let RenderChannels::Iamf(codec) = settings.channels {
+        return crate::iamf::start(project, settings, codec);
     }
     let mut project = project;
     // Never wrap around the loop while bouncing.

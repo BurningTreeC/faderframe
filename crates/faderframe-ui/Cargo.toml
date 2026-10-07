@@ -36,6 +36,7 @@ faderframe-view-ddp.workspace = true
 faderframe-view-surround.workspace = true
 faderframe-adm.workspace = true
 faderframe-binaural.workspace = true
+faderframe-iamf.workspace = true
 faderframe-ui-gpu = { workspace = true, optional = true }
 faderframe-view-arranger.workspace = true
 faderframe-view-mixer.workspace = true

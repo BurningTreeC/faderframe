@@ -41,6 +41,7 @@ mod folders;
 mod freeze;
 pub mod groove;
 mod groups;
+pub mod iamf;
 pub mod lanes;
 pub mod launcher;
 pub mod listening;

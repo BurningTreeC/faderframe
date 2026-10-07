@@ -79,6 +79,20 @@ VENDORED = [
         "https://zenodo.org/records/10886409",
         "crates/faderframe-binaural/data/LICENSE-SADIE.txt",
     ),
+    (
+        "libopus (IAMF masters; bundled by opusic-sys, built with CMake, statically linked)",
+        "1.6.1",
+        "BSD-3-Clause",
+        "https://opus-codec.org",
+        "crates/faderframe-iamf/LICENSE-libopus.txt",
+    ),
+    (
+        "Alliance for Open Media Patent License 1.0 (IAMF)",
+        "1.0",
+        "AOM Patent License 1.0",
+        "https://aomedia.org/license/patent-license/",
+        "AOM-PATENT-LICENSE.txt",
+    ),
 ]
 
 

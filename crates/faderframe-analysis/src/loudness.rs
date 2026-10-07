@@ -153,6 +153,80 @@ impl TruePeak {
     }
 }
 
+/// Integrated loudness (LUFS) of any number of channels with their
+/// ITU-R BS.1770 weights (1.0 for the front and the heights, 1.41 for the
+/// surrounds, 0 for the LFE), and the highest true peak (dBTP) of any of
+/// them — for multichannel deliveries (the meter reads stereo).
+pub fn integrated_weighted(channels: &[&[f32]], weights: &[f64], sample_rate: u32) -> (f64, f64) {
+    let rate = sample_rate.max(8000) as f64;
+    let block = (rate / 10.0).round() as usize;
+    let frames = channels.iter().map(|c| c.len()).max().unwrap_or(0);
+    let blocks = frames / block;
+    let mut energy = vec![0.0f64; blocks];
+    let mut peak = 0.0f64;
+    for (c, ch) in channels.iter().enumerate() {
+        let w = weights.get(c).copied().unwrap_or(1.0);
+        let mut tp = TruePeak::new();
+        for &x in ch.iter() {
+            peak = peak.max(tp.run(x));
+        }
+        // The interpolator's latency: the last samples' peaks.
+        for _ in 0..TP_LATENCY {
+            peak = peak.max(tp.run(0.0));
+        }
+        if w == 0.0 {
+            continue;
+        }
+        let mut k = KWeighting::new(rate);
+        for (b, e) in energy.iter_mut().enumerate() {
+            let mut sum = 0.0;
+            for &x in &ch[b * block..((b + 1) * block).min(ch.len())] {
+                let y = k.run(x);
+                sum += y * y;
+            }
+            *e += w * sum / block as f64;
+        }
+    }
+    // 400 ms gating blocks overlapping by 75 %.
+    let gating: Vec<f64> = energy
+        .windows(4)
+        .map(|w| w.iter().sum::<f64>() / 4.0)
+        .collect();
+    let above: Vec<f64> = gating
+        .into_iter()
+        .filter(|&e| loudness(e) > ABSOLUTE_GATE)
+        .collect();
+    let true_peak = if peak > 0.0 {
+        20.0 * peak.log10()
+    } else {
+        f64::NEG_INFINITY
+    };
+    if above.is_empty() {
+        return (f64::NEG_INFINITY, true_peak);
+    }
+    let gate = loudness(above.iter().sum::<f64>() / above.len() as f64) + RELATIVE_GATE;
+    let kept: Vec<f64> = above.into_iter().filter(|&e| loudness(e) > gate).collect();
+    if kept.is_empty() {
+        return (f64::NEG_INFINITY, true_peak);
+    }
+    (
+        loudness(kept.iter().sum::<f64>() / kept.len() as f64),
+        true_peak,
+    )
+}
+
+/// BS.1770's weight for a speaker at `azimuth` (degrees from the front)
+/// and `elevation`: 1.41 between 60° and 120° to the side at ear level
+/// (below 30°), else 1.0.
+pub fn speaker_weight(azimuth: f64, elevation: f64) -> f64 {
+    let a = azimuth.abs();
+    if elevation.abs() < 30.0 && (60.0..=120.0).contains(&a) {
+        std::f64::consts::SQRT_2
+    } else {
+        1.0
+    }
+}
+
 /// EBU R128 loudness of a stereo signal.
 #[derive(Clone, Debug)]
 pub struct LoudnessMeter {
@@ -411,5 +485,33 @@ mod tests {
         m.process(&s, &s, true);
         let tp = m.read().true_peak;
         assert!(tp > -0.5 && tp < 0.3, "true peak {tp} dBTP");
+    }
+}
+
+#[cfg(test)]
+mod weighted_tests {
+    use super::*;
+
+    /// Stereo measured both ways agrees; a surround channel counts 1.41
+    /// times (+1.5 dB), the LFE not at all.
+    #[test]
+    fn the_weighted_measurement_agrees_with_the_meter() {
+        let rate = 48_000;
+        let tone: Vec<f32> = (0..rate * 5)
+            .map(|i| 0.3 * (i as f32 * 997.0 * std::f32::consts::TAU / rate as f32).sin())
+            .collect();
+        let mut m = LoudnessMeter::new(rate as u32);
+        m.process(&tone, &tone, true);
+        let (w, tp) = integrated_weighted(&[&tone, &tone], &[1.0, 1.0], rate as u32);
+        assert!((w - m.integrated()).abs() < 0.05, "{w} {}", m.integrated());
+        assert!((tp - 20.0 * 0.3f64.log10()).abs() < 0.2, "{tp}");
+        let (side, _) = integrated_weighted(&[&tone], &[std::f64::consts::SQRT_2], rate as u32);
+        let (front, _) = integrated_weighted(&[&tone], &[1.0], rate as u32);
+        assert!((side - front - 1.505).abs() < 0.05, "{}", side - front);
+        let (lfe, _) = integrated_weighted(&[&tone], &[0.0], rate as u32);
+        assert_eq!(lfe, f64::NEG_INFINITY);
+        assert_eq!(speaker_weight(110.0, 0.0), std::f64::consts::SQRT_2);
+        assert_eq!(speaker_weight(30.0, 0.0), 1.0);
+        assert_eq!(speaker_weight(90.0, 45.0), 1.0);
     }
 }

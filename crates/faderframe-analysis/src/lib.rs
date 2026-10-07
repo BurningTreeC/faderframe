@@ -20,7 +20,7 @@ pub mod tempo;
 pub mod vinyl;
 
 pub use dynamics::{Dynamics, DynamicsMeter};
-pub use loudness::{Loudness, LoudnessMeter};
+pub use loudness::{Loudness, LoudnessMeter, integrated_weighted, speaker_weight};
 pub use spectrum::{FLOOR_DB, Spectrum, fft};
 
 use std::collections::VecDeque;
