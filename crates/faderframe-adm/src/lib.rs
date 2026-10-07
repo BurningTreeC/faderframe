@@ -20,14 +20,16 @@
 //! `rtime` and `duration`, Cartesian positions, equal width/depth/height,
 //! a gain and `jumpPosition` 1 with an interpolation of 0.005208 s (0 on the
 //! first block); track UIDs referring to track and pack formats; 48 or
-//! 96 kHz, 24 bit, at most 128 channels. Not written: Dolby's `dbmd` chunk
-//! (trim and downmix metadata, binaural render modes).
+//! 96 kHz, 24 bit, at most 128 channels. Dolby's metadata chunk (`dbmd`:
+//! trims, warp mode, binaural render modes) is written by [`dbmd`].
 
 #![forbid(unsafe_code)]
 
+mod dbmd;
 mod read;
 mod write;
 
+pub use dbmd::{BinauralMode, binaural_modes, dbmd};
 pub use read::{ReadError, Scene, SceneBlock, SceneObject, SceneSpeaker, parse};
 pub use write::{AdmError, axml, chna, validate};
 

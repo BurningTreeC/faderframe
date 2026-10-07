@@ -525,11 +525,16 @@ master's bed and feeding the master directly):
   `jumpPosition` 1 over 0.005208 s, stream formats naming channel and
   pack, at most 118 objects and 128 channels) and ITU-R BS.2076 as the EBU
   ADM renderer reads it (stream formats naming only their channel, BS.2051
-  speaker labels, the LFE marked by a 120 Hz low-pass). Dolby's `dbmd`
-  chunk (trims, downmixes, binaural render modes) is not written. Checked
-  from outside: MediaInfo (pymediainfo) reports no conformance findings for
-  the Dolby flavour, the EBU renderer (`ear-render`) places the ITU
-  flavour's objects as the panner did.
+  speaker labels, the LFE marked by a 120 Hz low-pass). Dolby masters also
+  carry Dolby's metadata chunk (`faderframe_adm::dbmd`; EBU Tech 3285 s6
+  container, Atmos segments 9 and 10 as Dolby's BSD parser and MediaInfo
+  read them: FaderFrame as the creating tool, warp mode not indicated,
+  automatic trims for the nine speaker configurations, each track's
+  binaural render mode — the LFE off). Checked from outside: MediaInfo
+  (pymediainfo) reports no conformance findings and names the file a
+  "Dolby Atmos Master", Dolby's `dbmd_atmos_parse` reads the chunk, the
+  EBU renderer (`ear-render`) places the ITU flavour's objects as the
+  panner did.
 * **Import** (File → Import ADM BWF Master…, `Action::ImportAdm`): the
   reader takes Dolby's beds and other ADM files' BS.2051 labels and the
   common definitions of 5.1, Cartesian objects exactly and polar ones mapped
@@ -2760,9 +2765,9 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
     surround beds and panning before any object-based format~~ — done (see
     *CD-Text languages*, *The DDP player* and *Surround beds*). ~~Object-based
     masters (ADM BWF, Dolby Atmos master profile), export and import~~ —
-    done (see *Object-based masters*). Not yet: Dolby's `dbmd` chunk,
-    binaural monitoring (needs licensed HRTF sets), object formats for
-    consumers (IAMF, MPEG-H).
+    done (see *Object-based masters*, with Dolby's `dbmd` chunk). Not yet:
+    binaural monitoring, consumer object formats (IAMF; MPEG-H is out —
+    no open encoder, a paid spec and per-unit patent royalties).
 
 
 ### Modelled microphone preamplifiers

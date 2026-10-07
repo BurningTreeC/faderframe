@@ -138,6 +138,13 @@ fn a_714_mix_becomes_an_atmos_master() {
     let scene = faderframe_adm::parse(std::str::from_utf8(&axml).unwrap(), &chna).unwrap();
     if profile == faderframe_adm::Profile::DolbyAtmos {
         assert_eq!(scene.programme, "Atmos_Master");
+        // Dolby's metadata chunk: the bed's LFE off for headphones.
+        let dbmd = faderframe_audio_files::wavstream::read_chunk(&out, b"dbmd")
+            .unwrap()
+            .unwrap();
+        let modes = faderframe_adm::binaural_modes(&dbmd).unwrap();
+        assert_eq!(modes.len(), 15);
+        assert_eq!(modes[3], Some(faderframe_adm::BinauralMode::Off));
     }
     assert_eq!(scene.bed.len(), 8);
     let names: Vec<&str> = scene.objects.iter().map(|o| o.name.as_str()).collect();

@@ -338,6 +338,8 @@ pub(crate) fn start(
         return Err(RenderError::EmptyRange);
     }
     let meta = master(&project, &plan, profile, start, frames, rate);
+    // Each object's binaural render mode (fixed bed objects: not indicated).
+    let binaural: Vec<Option<faderframe_adm::BinauralMode>> = vec![None; meta.objects.len()];
     faderframe_adm::validate(&meta).map_err(|e| RenderError::Adm(e.to_string()))?;
     let (routed, order, outputs) = routed(&project, &plan);
     let progress = Arc::new(RenderProgress::default());
@@ -405,8 +407,15 @@ pub(crate) fn start(
             done += take as u64;
             p.done.store(done, Ordering::Relaxed);
         }
-        w.finish(&[(*b"axml", faderframe_adm::axml(&meta).into_bytes())])
-            .map_err(io)?;
+        let mut after = vec![(*b"axml", faderframe_adm::axml(&meta).into_bytes())];
+        // Dolby's tools look for their metadata chunk too.
+        if profile == Profile::DolbyAtmos {
+            after.push((
+                *b"dbmd",
+                faderframe_adm::dbmd(&meta, env!("CARGO_PKG_VERSION"), &binaural),
+            ));
+        }
+        w.finish(&after).map_err(io)?;
         Ok(vec![Rendered {
             path: path.clone(),
             finished: None,
