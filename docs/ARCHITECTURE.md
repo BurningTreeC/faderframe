@@ -2934,12 +2934,13 @@ always-on capture of what was played (Capture MIDI), MIDI learn, MIDI output and
 expressions for CLAP and VST3 instruments, SysEx to devices and plugins,
 Standard MIDI File import and export, and a full piano roll.
 
-Plugins: CLAP and VST3 hosting with crash-safe scanning and Audio Units on
-macOS, sandboxed instances (a process each) on all three platforms, VST3
-program lists, optional 64-bit processing, a plugin browser, embedded
-editors on all three platforms, generic
-parameter windows, presets (user, VST3 factory, `.aupreset`), inserts that
-move and copy between tracks, sidechain inputs.
+Plugins: CLAP and VST3 hosting with crash-safe scanning, LV2 on Linux and
+Audio Units on macOS, sandboxed instances (a process each) on all three
+platforms, VST3 program lists, optional 64-bit processing, a plugin
+browser, embedded editors on all three platforms, generic
+parameter windows, presets (user, VST3 factory, LV2, `.aupreset`), inserts that
+move and copy between tracks, sidechain inputs, multi-output instruments
+with tracks for their extra outputs.
 
 Mixing: an analogue-console mixer, sends in banks, track groups with
 linked controls, VCAs, relative edits of every selected track, track
@@ -2950,7 +2951,9 @@ normalisation and true-peak limiting on export, noise-shaped dither,
 delivery presets, and the album (songs analysed and exported with album or
 per-song levelling, pauses or crossfades, a song's own inserts heard on
 the master, ISRC/UPC and credits, a cue sheet and a verified DDP 2.00 CD
-master with CD-Text).
+master with CD-Text), surround beds and objects with ADM BWF (Dolby Atmos
+master profile) and IAMF masters, and binaural monitoring (measured heads
+or a SOFA file, headphone correction) with a mono check.
 
 Editing: Pro Tools-style edit modes and tools, edit-selection ranges, clip
 gain, shaped fades, transient detection, warp markers and pitch-preserving

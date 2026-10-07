@@ -67,6 +67,22 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.12.0" date="2026-10-07">
+      <description>
+        <p>Immersive delivery, listening and more plugins.</p>
+        <ul>
+          <li>Object-based masters: tracks become objects next to a bed, exported as ADM BWF (Dolby Atmos master profile with Dolby's metadata chunk, or the ITU flavour) and imported back.</li>
+          <li>IAMF masters for consumer immersive audio: Opus, FLAC or LPCM, as MP4 or raw .iamf, with loudness measured as players render it.</li>
+          <li>Listening on headphones: the master and binaural renders through one of 20 measured heads or your own SOFA file, in a near, mid or far room, with headphone correction from an EqualizerAPO/AutoEq file or an impulse response; a mono check on the master strip.</li>
+          <li>LV2 plugins on Linux, with their own editors, presets, state and transport, sandboxed like CLAP and VST3.</li>
+          <li>Multi-output instruments: Create Output Tracks makes a track for each of a plugin's extra outputs in one step, in a folder routed like the instrument; the Drum Sampler sends pads to eight extra outputs.</li>
+          <li>A console Channel Strip device (filters, gate, compressor, four-band EQ, drive).</li>
+          <li>Renders, stems and bounces start exactly on time (the plugins' latency is taken off the front).</li>
+          <li>Presets: saving under an existing name asks before replacing it, and your own presets can be deleted.</li>
+          <li>The GPU painter hands frames to GTK without copying them back: dmabufs on Linux, shared D3D12 textures on Windows.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.11.0" date="2026-10-07">
       <description>
         <p>Performance and mastering.</p>

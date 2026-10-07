@@ -8,10 +8,11 @@ FaderFrame aims to be a professional DAW: graph-based routing with buses,
 aux sends and sidechains, hard-realtime multicore audio processing with
 automatic plugin delay compensation, MIDI and virtual instruments with a
 key, a chord track and MIDI effects, modulators and parallel effect
-containers, automation, CLAP/VST3 (and Audio Unit) hosting, an
-analogue-console-style mixer, a full set of stock devices, mastering
-meters, album delivery down to CD and vinyl masters, and dockable,
-detachable editors.
+containers, automation, CLAP/VST3 hosting (LV2 on Linux, Audio Units on
+macOS), an analogue-console-style mixer, a full set of stock devices,
+mastering meters, surround, object-based (ADM BWF) and IAMF masters with
+binaural monitoring, album delivery down to CD and vinyl masters, and
+dockable, detachable editors.
 
 > **Status: in active development.** Most of a working DAW is there; see
 > [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#status-and-roadmap) for what
@@ -37,6 +38,14 @@ master:
 
 ![Mixing workspace with the analogue-console mixer](docs/screenshots/mixing.png)
 
+A multi-output instrument: the Drum Sampler on the lead synth's track
+plays its pads (loaded with six samples, its editor on the right) into
+extra outputs, and Create Output Tracks gave every output a track of its
+own in one step — Lead Synth Out 1–8, in a folder under the instrument,
+routed like it:
+
+![The Drum Sampler's pads on eight output tracks, and its editor](docs/screenshots/outputs.png)
+
 The MIDI workspace with the piano roll editing the lead synth's melody,
 the key and the chords above the notes and the scale highlighted:
 
@@ -46,6 +55,13 @@ The Mastering workspace with the Tools view (EBU R128 loudness, levels,
 phase and spectrum):
 
 ![Mastering workspace with loudness, level, phase and spectrum meters](docs/screenshots/mastering.png)
+
+Surround and objects: the master as a 7.1.4 bed, the tracks placed in its
+room (the small rooms in the mixer strips, their meters showing every
+channel), the lead synth as an object, and the Surround Panner with the
+pad behind the listener and up high:
+
+![The mixer feeding a 7.1.4 bed, and the Surround Panner](docs/screenshots/surround.png)
 
 The album: the demo's sections as songs, analysed, with what delivery will
 make of them (levelling, limiting) and the CD and vinyl masters a click
@@ -95,8 +111,9 @@ Contrast:
 * GTK 4 application, native on Wayland, HiDPI/fractional scaling via GTK.
   Optionally the analysers, the EQ and the devices' faces are drawn on the
   GPU (vello on wgpu; Preferences → General → Drawing): the mastering tools
-  went from 26 to 55 frames a second, and on Linux the frames go to GTK as
-  dmabufs without a copy through the CPU (60 frames a second).
+  went from 26 to 55 frames a second, and the frames go to GTK without a
+  copy through the CPU — as dmabufs on Linux (60 frames a second), as
+  shared D3D12 textures on Windows.
 * Arranger (virtualised): tracks, audio clips with waveforms, MIDI clips,
   move/split/delete, snapping, zoom down to single samples, loop range,
   playhead, console-style track headers with mute/solo/arm/monitor, volume,
@@ -392,7 +409,9 @@ Contrast:
   SFZ 2 opcodes: keyswitches, release and legato triggers, crossfades,
   two filters and an EQ, three envelopes and LFOs, controller
   modulation with curves, `#define`/`#include`), and a
-  sixteen-pad drum sampler with choke groups. Both samplers can keep a
+  sixteen-pad drum sampler with choke groups and eight extra stereo
+  outputs (each pad's Output; Create Output Tracks gives them tracks).
+  Both samplers can keep a
   sample's length when they change its pitch (Sampler: Keep Length;
   Drum Sampler: per pad), through the same stretcher as warping, without
   added latency.
