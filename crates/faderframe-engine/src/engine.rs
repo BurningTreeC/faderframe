@@ -2014,8 +2014,10 @@ impl EngineController {
     /// Consume the meter values accumulated since the last call.
     pub fn take_meter(&self, track: TrackId) -> Option<TrackMeter> {
         let range = self.slots.meter_of(track)?;
+        // As many as the strip meters now (the range may be larger).
+        let used = self.slots.metered(track).unwrap_or(range.channels);
         let mut m = TrackMeter {
-            count: usize::from(range.channels).min(METER_MAX),
+            count: usize::from(used.min(range.channels)).min(METER_MAX),
             ..TrackMeter::default()
         };
         for (c, reading) in m.channels.iter_mut().enumerate().take(m.count) {

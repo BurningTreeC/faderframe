@@ -49,6 +49,9 @@ pub struct SlotRegistry {
     strips: HashMap<TrackId, StripSlots>,
     sends: HashMap<SendId, ParamSlot>,
     track_meters: HashMap<TrackId, MeterRange>,
+    /// How many of its meter channels a track's strip uses now (the range
+    /// keeps its size when a track goes back to fewer channels).
+    metered: HashMap<TrackId, u16>,
     /// 1.0 while a track takes live MIDI input.
     midi_live: HashMap<TrackId, ParamSlot>,
     /// 1.0 while a MIDI track is muted (by itself, a folder it is in, or
@@ -70,6 +73,7 @@ impl SlotRegistry {
             strips: HashMap::new(),
             sends: HashMap::new(),
             track_meters: HashMap::new(),
+            metered: HashMap::new(),
             midi_live: HashMap::new(),
             midi_mute: HashMap::new(),
             chains: HashMap::new(),
@@ -163,6 +167,7 @@ impl SlotRegistry {
     /// (a range too small for a new format is replaced).
     pub fn meter(&mut self, track: TrackId, channels: usize) -> Result<MeterRange, SlotsExhausted> {
         let want = (channels as u16).max(METER_CHANNELS);
+        self.metered.insert(track, want);
         if let Some(m) = self.track_meters.get(&track) {
             if m.channels >= want {
                 return Ok(*m);
@@ -192,6 +197,11 @@ impl SlotRegistry {
 
     pub fn meter_of(&self, track: TrackId) -> Option<MeterRange> {
         self.track_meters.get(&track).copied()
+    }
+
+    /// How many meter channels a track's strip uses now.
+    pub fn metered(&self, track: TrackId) -> Option<u16> {
+        self.metered.get(&track).copied()
     }
 
     /// Release slots of tracks/sends that no longer exist.
@@ -247,6 +257,7 @@ impl SlotRegistry {
             }
             keep
         });
+        self.metered.retain(|t, _| tracks.contains(t));
         let meters = &mut self.meters;
         self.track_meters.retain(|t, m| {
             let keep = tracks.contains(t);
