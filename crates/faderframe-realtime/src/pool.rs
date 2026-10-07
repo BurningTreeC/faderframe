@@ -95,6 +95,19 @@ pub fn physical_cores() -> usize {
 
 struct JobRef<'a>(&'a dyn PoolJob);
 
+thread_local! {
+    /// 1 + this thread's index among its pool's workers (0: not a worker).
+    static SEAT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Which pool worker this thread is: 1 + its index, 0 for any other
+/// thread (the caller of [`WorkerPool::run`]). Stable for a thread's life,
+/// so a job can be given to the thread that ran it before (its caches).
+#[inline]
+pub fn worker_seat() -> usize {
+    SEAT.with(std::cell::Cell::get)
+}
+
 struct Shared {
     /// Physical cores of the machine.
     physical: usize,
@@ -347,7 +360,8 @@ mod sched {
     }
 }
 
-fn worker(shared: Arc<Shared>, on_start: Option<fn()>) {
+fn worker(shared: Arc<Shared>, on_start: Option<fn()>, index: usize) {
+    SEAT.with(|s| s.set(index + 1));
     flush_denormals_on_this_thread();
     if let Some(f) = on_start {
         f();
@@ -456,7 +470,7 @@ impl WorkerPool {
                 let on_start = config.on_start;
                 std::thread::Builder::new()
                     .name(format!("ff-dsp-{}", i + 1))
-                    .spawn(move || worker(shared, on_start))
+                    .spawn(move || worker(shared, on_start, i))
                     .ok()
             })
             .collect();

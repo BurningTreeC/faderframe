@@ -224,6 +224,18 @@ Preferences → Audio → Processing threads, `--threads`).
   the released dependent of highest rank. A track with several heavy
   plugins therefore starts first instead of becoming the tail of the cycle.
   The verdict on threading carries over when an edit swaps the graph.
+* **Affinity.** Each thread has a seat (the caller 0, pool worker `i`
+  seat `i + 1`, `faderframe_realtime::worker_seat`, folded onto as many
+  queues as the cycle has seats) and a ready job goes to the queue of the
+  seat that ran it last, so its processors' state and buffers tend to stay
+  in that core's caches; a thread takes its own queue's jobs first and
+  steals from the others' when it has none (a seat whose thread did not
+  join is emptied that way). Queue entries carry the cycle, so resetting a
+  cycle clears nothing. Unpaced, 8 threads: 128 tracks of default devices
+  at 64 frames 6–9 % fewer cycles, 32-frame buffers 2–4 %, echo-heavy
+  graphs 3 % (`faderframe-bench … --seconds 30` under `perf stat`). A
+  rank-aware variant (stealing a far more expensive head) cost more than it
+  saved; so did a shared count of queued jobs.
 * **Soundness without trusting the scheduler.** Node buffers and node work
   (processor, input delay lines) live in `TaskCells`: per-cycle
   pending → running → done cells that hand out `&mut` to exactly one
@@ -2535,8 +2547,9 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
    LLM-generated apps).
 8. ~~**MIDI**: MTC output, varispeed chase without a shared word clock~~ —
    done (see *MIDI time code out and varispeed*).
-9. **Performance**: render-ahead for buses whose inputs are all rendered
-   ahead, job affinity for cache locality, an optional wgpu painter for
+9. **Performance**: ~~render-ahead for buses whose inputs are all rendered
+   ahead~~ (done: the shallow tier, see *Render ahead*), ~~job affinity for
+   cache locality~~ (done: see *Affinity*), an optional wgpu painter for
    dense views.
 10. **Mastering**: multiple CD-Text languages, a DDP player/import;
     surround beds and panning before any object-based format.

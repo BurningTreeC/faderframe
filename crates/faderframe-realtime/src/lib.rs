@@ -65,7 +65,7 @@ pub use pages::{Epoch, PageTable, Reclaimer, Retired};
 pub use params::{ParamSlot, ParamTable};
 pub use pool::{
     PoolConfig, PoolJob, WorkerPool, apply_thread_scheduling, default_worker_count, physical_cores,
-    thread_scheduling,
+    thread_scheduling, worker_seat,
 };
 pub use scope::ScopeRing;
 pub use slots::SlotAllocator;

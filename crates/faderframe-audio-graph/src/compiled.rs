@@ -169,6 +169,13 @@ struct Job {
 /// in rank order and a thread finishing a job continues with the released
 /// dependent of highest rank, so long plugin chains start first instead
 /// of becoming the tail of the cycle.
+///
+/// Affinity: every thread has a seat of its own (the caller 0, pool worker
+/// `i` seat `i + 1`, folded onto the queues) and a ready job goes to the
+/// queue of the seat that ran it last, so its processors' state and
+/// buffers tend to stay in that core's caches. A thread takes its own
+/// queue's jobs first and steals from the others when it has none (a seat
+/// whose thread did not join this cycle is emptied that way).
 struct Schedule {
     jobs: Box<[Job]>,
     /// Jobs in topological order.
@@ -184,10 +191,13 @@ struct Schedule {
     /// Worth spreading over threads (hysteresis on the total cost).
     parallel: bool,
     remaining: Box<[AtomicU32]>,
-    /// Ready jobs (`job + 1`; 0 = slot reserved but not yet written).
-    queue: Box<[AtomicU32]>,
-    head: AtomicUsize,
-    tail: AtomicUsize,
+    /// Ready jobs per seat (the first `active` this cycle).
+    queues: Box<[SeatQueue]>,
+    active: usize,
+    /// The seat that last ran each job (`u32::MAX`: none yet).
+    owner: Box<[AtomicU32]>,
+    /// Tags this cycle's queue entries (no clearing between cycles).
+    cycle: u32,
     finished: AtomicUsize,
     /// Threads still allowed to join this cycle.
     seats: AtomicUsize,
@@ -238,39 +248,101 @@ impl Schedule {
     }
 
     fn reset(&mut self, seats: usize) {
+        self.active = seats.clamp(1, self.queues.len());
         for (r, j) in self.remaining.iter_mut().zip(self.jobs.iter()) {
             *r.get_mut() = j.deps;
         }
-        for q in self.queue.iter_mut() {
-            *q.get_mut() = 0;
+        self.cycle = self.cycle.wrapping_add(1);
+        if self.cycle == 0 || self.cycle == u32::MAX {
+            // Wrapped (after months): no slot may still carry a live tag.
+            for q in self.queues.iter_mut() {
+                for slot in q.slots.iter_mut() {
+                    *slot.get_mut() = u64::MAX;
+                }
+            }
+            self.cycle = 1;
         }
-        for (q, &r) in self.queue.iter_mut().zip(self.roots.iter()) {
-            *q.get_mut() = r + 1;
+        let cycle = self.cycle;
+        for q in self.queues.iter_mut() {
+            *q.head.get_mut() = 0;
+            *q.tail.get_mut() = 0;
         }
-        *self.head.get_mut() = 0;
-        *self.tail.get_mut() = self.roots.len();
+        // Roots in rank order, each to the seat that ran it (new ones
+        // spread over the seats).
+        let n = self.active;
+        for (i, &r) in self.roots.iter().enumerate() {
+            let owner = *self.owner[r as usize].get_mut();
+            let q = &mut self.queues[if owner == u32::MAX { i } else { owner as usize } % n];
+            let t = q.tail.get_mut();
+            if let Some(slot) = q.slots.get_mut(*t) {
+                *slot.get_mut() = entry(cycle, r);
+            }
+            *t += 1;
+        }
         *self.finished.get_mut() = 0;
         *self.seats.get_mut() = seats;
     }
 
+    /// A ready job to the queue of the seat that ran it (else `seat`'s).
     #[inline]
-    fn push(&self, job: u32) {
-        let t = self.tail.fetch_add(1, Ordering::AcqRel);
-        // Every job becomes ready once per cycle: `t` stays in bounds.
-        if let Some(slot) = self.queue.get(t) {
-            slot.store(job + 1, Ordering::Release);
+    fn push(&self, job: u32, seat: usize) {
+        let owner = self.owner[job as usize].load(Ordering::Relaxed);
+        let to = if owner == u32::MAX {
+            seat
+        } else {
+            owner as usize
+        };
+        self.queues[to % self.active].push(self.cycle, job);
+    }
+
+    /// The next job for `seat`: its own, else one taken from another seat.
+    #[inline]
+    fn pop(&self, seat: usize) -> Option<u32> {
+        let n = self.active;
+        (0..n).find_map(|k| self.queues[(seat + k) % n].pop(self.cycle))
+    }
+}
+
+/// One seat's ready jobs: a bounded queue (every job is ready once per
+/// cycle, so it never overflows). Entries carry the cycle, so a slot of an
+/// earlier cycle reads as not written yet.
+struct SeatQueue {
+    slots: Box<[AtomicU64]>,
+    head: AtomicUsize,
+    tail: AtomicUsize,
+}
+
+#[inline]
+fn entry(cycle: u32, job: u32) -> u64 {
+    (u64::from(cycle) << 32) | u64::from(job)
+}
+
+impl SeatQueue {
+    fn new(capacity: usize) -> Self {
+        Self {
+            slots: (0..capacity).map(|_| AtomicU64::new(u64::MAX)).collect(),
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
         }
     }
 
     #[inline]
-    fn pop(&self) -> Option<u32> {
+    fn push(&self, cycle: u32, job: u32) {
+        let t = self.tail.fetch_add(1, Ordering::AcqRel);
+        if let Some(slot) = self.slots.get(t) {
+            slot.store(entry(cycle, job), Ordering::Release);
+        }
+    }
+
+    #[inline]
+    fn pop(&self, cycle: u32) -> Option<u32> {
         loop {
             let h = self.head.load(Ordering::Acquire);
             if h >= self.tail.load(Ordering::Acquire) {
                 return None;
             }
-            let v = self.queue.get(h)?.load(Ordering::Acquire);
-            if v == 0 {
+            let v = self.slots.get(h)?.load(Ordering::Acquire);
+            if (v >> 32) as u32 != cycle {
                 // Reserved by a pusher that has not stored yet.
                 return None;
             }
@@ -279,11 +351,14 @@ impl Schedule {
                 .compare_exchange_weak(h, h + 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return Some(v - 1);
+                return Some(v as u32);
             }
         }
     }
 }
+
+/// Most seats a schedule has queues for.
+const MAX_SEATS: usize = 32;
 
 /// An immutable-topology, preallocated, ready-to-run graph.
 ///
@@ -706,9 +781,12 @@ fn build_schedule(
             .collect(),
         roots: roots.into(),
         remaining: (0..jobs_n).map(|_| AtomicU32::new(0)).collect(),
-        queue: (0..jobs_n).map(|_| AtomicU32::new(0)).collect(),
-        head: AtomicUsize::new(0),
-        tail: AtomicUsize::new(0),
+        queues: (0..stats.job_width.clamp(1, MAX_SEATS))
+            .map(|_| SeatQueue::new(jobs_n))
+            .collect(),
+        owner: (0..jobs_n).map(|_| AtomicU32::new(u32::MAX)).collect(),
+        active: 1,
+        cycle: 0,
         finished: AtomicUsize::new(0),
         seats: AtomicUsize::new(0),
     }
@@ -748,9 +826,10 @@ impl<C: Sync> PoolJob for Exec<'_, '_, C> {
             return;
         }
         let total = s.jobs.len();
+        let seat = faderframe_realtime::worker_seat();
         let mut next: Option<u32> = None;
         loop {
-            let j = match next.take().or_else(|| s.pop()) {
+            let j = match next.take().or_else(|| s.pop(seat)) {
                 Some(j) => j,
                 None => {
                     if s.finished.load(Ordering::Acquire) >= total {
@@ -765,18 +844,19 @@ impl<C: Sync> PoolJob for Exec<'_, '_, C> {
             };
             self.graph
                 .run_job(j as usize, self.cx, self.frames, self.measure);
-            // Continue with the most expensive released dependent, queue
-            // the others.
+            s.owner[j as usize].store(seat as u32, Ordering::Relaxed);
+            // Continue with the most expensive released dependent (it reads
+            // what this thread just wrote), queue the others.
             let rank = |d: u32| s.rank[d as usize].load(Ordering::Relaxed);
             for &d in job.dependents.iter() {
                 if s.remaining[d as usize].fetch_sub(1, Ordering::AcqRel) == 1 {
                     match next {
                         None => next = Some(d),
                         Some(n) if rank(d) > rank(n) => {
-                            s.push(n);
+                            s.push(n, seat);
                             next = Some(d);
                         }
-                        Some(_) => s.push(d),
+                        Some(_) => s.push(d, seat),
                     }
                 }
             }
