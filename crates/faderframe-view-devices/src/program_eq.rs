@@ -200,7 +200,9 @@ pub(crate) fn polar(cx: f32, cy: f32, r: f32, degrees: f32) -> (f32, f32) {
     (cx + r * a.sin(), cy - r * a.cos())
 }
 
-fn knob_angle(normalized: f32) -> f32 {
+/// Where a knob's pointer is at `normalized` travel (degrees from the top),
+/// as its filmstrip turns.
+pub(crate) fn knob_angle(normalized: f32) -> f32 {
     (normalized - 0.5) * SWEEP
 }
 
@@ -590,6 +592,52 @@ enum Hit {
     Meter(bool),
     Readout(bool),
     Oversampling(usize),
+}
+
+impl ProgramEqView {
+    /// A control's menu: its default, its automation, MIDI learn and the
+    /// mappings it has.
+    fn control_menu(
+        &self,
+        model: &Session,
+        param: usize,
+        at: faderframe_ui_canvas::Point,
+    ) -> Option<faderframe_ui_canvas::HostRequest<Action>> {
+        use faderframe_ui_canvas::MenuItem;
+        let info = Self::info(param);
+        let (track, _) = model.plugin_owner(self.device.plugin)?;
+        let id = ParameterId(param as u32);
+        let target = faderframe_automation::AutomationTarget::PluginParameter {
+            plugin: self.device.plugin,
+            parameter: id,
+        };
+        let text = faderframe_plugin_host::program_eq::format(id, info.default)
+            .unwrap_or_else(|| format!("{:.2}", info.default));
+        let mut items = vec![
+            MenuItem::disabled(info.name.clone()),
+            MenuItem::new(
+                format!("Default ({text})"),
+                Action::Edit(faderframe_project::Command::SetPluginParameter {
+                    track,
+                    plugin: self.device.plugin,
+                    parameter: id,
+                    value: Some(info.default),
+                }),
+            )
+            .separated(),
+        ];
+        if info.automatable {
+            items.push(
+                MenuItem::new("Show Automation", Action::ShowAutomation { track, target })
+                    .separated(),
+            );
+            items.extend(crate::kit::learn_items(
+                model,
+                faderframe_project::MappingTarget::Parameter { track, target },
+            ));
+        }
+        Some(faderframe_ui_canvas::HostRequest::ContextMenu { at, items })
+    }
 }
 
 pub struct ProgramEqView {
@@ -1249,11 +1297,10 @@ impl CanvasView<Session, Action> for ProgramEqView {
                             }
                         }
                     }
+                    // The control's menu (a double-click resets a knob).
                     (Hit::Control(i), PointerButton::Secondary) => {
-                        let c = CONTROLS[i];
-                        if c.kind == Kind::Knob {
-                            let d = Self::info(c.param).default;
-                            self.set_once(model, cx, c.param, d);
+                        if let Some(req) = self.control_menu(model, CONTROLS[i].param, *pos) {
+                            cx.request(req);
                         }
                     }
                     _ => return false,

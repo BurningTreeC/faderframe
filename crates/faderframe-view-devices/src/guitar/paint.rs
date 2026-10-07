@@ -8,8 +8,8 @@ use super::layout::{
 use super::{AMP_Y, BOARD_H, BOARD_Y, CAB_H, CAB_Y, HEADER_H, OUT_Y, PANEL_W};
 use crate::program_eq::{
     KNOB_FRAMES, KNOB_LARGE, KNOB_LARGE_DRAW, KNOB_LARGE_SPAN, LAMP_DARK, LAMP_DRAW, LAMP_LIT,
-    LAMP_SPAN, Needle, SCREWS, contact_shadow, deflection, linear, polar, radial, rgb, rgba,
-    sprite, whole,
+    LAMP_SPAN, Needle, SCREWS, contact_shadow, deflection, knob_angle, linear, polar, radial, rgb,
+    rgba, sprite, whole,
 };
 use faderframe_guitar::acoustics::cabinet::CabinetProfile;
 use faderframe_guitar::chain::{amp_name, power_name};
@@ -1057,8 +1057,10 @@ fn amp(p: &mut dyn Painter, sc: &Scene<'_>) {
         if sc.knob_hovered(k.id) {
             hover_ring(p, k.at, k.r, pal.ink.mix(rgb(ACCENT), 0.6));
         }
+        // Over the knob's own sweep (its filmstrip's 250°), so 0 and 10
+        // are where the pointer stops.
         for i in 0..=10 {
-            let (nx, ny) = polar(k.at.x, k.at.y, k.r + 13.0, (i as f32 / 10.0 - 0.5) * 300.0);
+            let (nx, ny) = polar(k.at.x, k.at.y, k.r + 13.0, knob_angle(i as f32 / 10.0));
             p.text(
                 &i.to_string(),
                 Rect::new(nx - 8.0, ny - 6.0, 16.0, 12.0),
