@@ -221,3 +221,78 @@ fn surround_automation_moves_the_track() {
     );
     assert!(close(at(1, q * 5 / 2), 0.5) && at(0, q * 5 / 2).abs() < 1e-6);
 }
+
+/// An object joins the master after its strip, as a renderer adds it to
+/// the bed: the master's fader leaves it alone (and turns down the bed),
+/// it sends nothing to the LFE, and the master's meters show it.
+#[test]
+fn objects_skip_the_master_strip() {
+    let mut tp = mono_in_51(SurroundPan {
+        x: -1.0,
+        y: -1.0,
+        lfe_db: 0.0,
+        ..SurroundPan::default()
+    });
+    let master = tp.master();
+    tp.project.track_mut(master).unwrap().volume_db = -20.0;
+    // A bed track at the centre beside it.
+    let bed = tp.track(TrackKind::Audio, "Bed", ChannelLayout::Mono);
+    let src = tp.dc(1, 0.5, 48_000);
+    tp.clip(bed, src, MusicalTime::ZERO, 48_000);
+    let object = tp
+        .project
+        .tracks
+        .iter()
+        .find(|t| t.name == "Mono")
+        .unwrap()
+        .id;
+    let before = levels(&tp, 6);
+    // In the bed: through the master fader, with the LFE send.
+    let g = faderframe_core::db_to_gain(-20.0);
+    assert!(close(before[4], 0.5 * g) && before[3] > 0.01, "{before:?}");
+    tp.project.track_mut(object).unwrap().object = true;
+    assert!(tp.project.is_object(tp.project.track(object).unwrap()));
+    let after = levels(&tp, 6);
+    assert!(close(after[4], 0.5), "the object at full level: {after:?}");
+    assert!(after[3].abs() < 1e-6, "no LFE from an object: {after:?}");
+    assert!(close(after[2], 0.5 * g), "the bed still through the fader");
+    let mut r =
+        OfflineRenderer::new(&tp.project, &tp.sources, EngineConfig::default(), 256, 6).unwrap();
+    r.play_from(0).unwrap();
+    r.render(2048);
+    let m = r.controller.take_meter(master).unwrap();
+    assert!(
+        close(m.channels[4].peak, 0.5),
+        "metered: {:?}",
+        m.channels[4]
+    );
+    assert!(close(m.channels[2].peak, 0.5 * g));
+}
+
+/// A master back from 5.1 to stereo meters two channels again (its meter
+/// range keeps its size, the count follows the format).
+#[test]
+fn meters_follow_the_format_back_to_stereo() {
+    let mut tp = mono_in_51(SurroundPan::default());
+    let master = tp.master();
+    let mut r =
+        OfflineRenderer::new(&tp.project, &tp.sources, EngineConfig::default(), 256, 6).unwrap();
+    r.play_from(0).unwrap();
+    r.render(1024);
+    assert_eq!(r.controller.take_meter(master).unwrap().count, 6);
+    tp.project.track_mut(master).unwrap().layout = ChannelLayout::Stereo;
+    r.controller
+        .sync(&tp.project, &tp.sources, faderframe_project::Impact::Graph)
+        .unwrap();
+    r.render(1024);
+    let m = r.controller.take_meter(master).unwrap();
+    assert_eq!(m.count, 2);
+    let track = tp
+        .project
+        .tracks
+        .iter()
+        .find(|t| t.name == "Mono")
+        .unwrap()
+        .id;
+    assert_eq!(r.controller.take_meter(track).unwrap().count, 2);
+}

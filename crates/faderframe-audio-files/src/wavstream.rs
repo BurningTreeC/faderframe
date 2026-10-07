@@ -135,28 +135,14 @@ impl WavWriter {
         if self.frames + frames as u64 > limit {
             return Err(io::Error::other("WAV size limit (4 GiB) reached"));
         }
-        self.scratch.clear();
-        self.scratch.reserve(frames * self.channels as usize * bps);
-        for i in 0..frames {
-            for c in 0..self.channels as usize {
-                let s = channels
-                    .get(c)
-                    .and_then(|ch| ch.get(i))
-                    .copied()
-                    .unwrap_or(0.0);
-                match self.format {
-                    WavFormat::Float32 => self.scratch.extend_from_slice(&s.to_le_bytes()),
-                    WavFormat::Pcm16 => {
-                        let v = self.quantizer.quantize(c, s) as i16;
-                        self.scratch.extend_from_slice(&v.to_le_bytes());
-                    }
-                    WavFormat::Pcm24 => {
-                        let v = self.quantizer.quantize(c, s);
-                        self.scratch.extend_from_slice(&v.to_le_bytes()[..3]);
-                    }
-                }
-            }
-        }
+        interleave(
+            &mut self.scratch,
+            &mut self.quantizer,
+            self.format,
+            self.channels as usize,
+            channels,
+            frames,
+        );
         self.out.write_all(&self.scratch)?;
         self.frames += frames as u64;
         Ok(())
@@ -182,6 +168,96 @@ impl WavWriter {
         file.sync_data()?;
         Ok(self.path)
     }
+}
+
+/// `frames` frames of non-interleaved `channels` (missing ones silent)
+/// into `out` as interleaved samples of `format`.
+pub(crate) fn interleave(
+    out: &mut Vec<u8>,
+    quantizer: &mut Quantizer,
+    format: WavFormat,
+    count: usize,
+    channels: &[&[f32]],
+    frames: usize,
+) {
+    out.clear();
+    out.reserve(frames * count * (format.bits() / 8) as usize);
+    for i in 0..frames {
+        for c in 0..count {
+            let s = channels
+                .get(c)
+                .and_then(|ch| ch.get(i))
+                .copied()
+                .unwrap_or(0.0);
+            match format {
+                WavFormat::Float32 => out.extend_from_slice(&s.to_le_bytes()),
+                WavFormat::Pcm16 => {
+                    let v = quantizer.quantize(c, s) as i16;
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                WavFormat::Pcm24 => {
+                    let v = quantizer.quantize(c, s);
+                    out.extend_from_slice(&v.to_le_bytes()[..3]);
+                }
+            }
+        }
+    }
+}
+
+/// The chunks of a RIFF, RF64 or BW64 WAVE file: `(id, payload offset,
+/// payload size)`, with 64-bit sizes from its `ds64` chunk.
+pub fn chunks(path: &Path) -> io::Result<Vec<([u8; 4], u64, u64)>> {
+    let file = File::open(path)?;
+    chunks_of(&file)
+}
+
+fn chunks_of(file: &File) -> io::Result<Vec<([u8; 4], u64, u64)>> {
+    let len = file.metadata()?.len();
+    let mut header = [0u8; 12];
+    read_at(file, &mut header, 0)?;
+    let wide = matches!(&header[0..4], b"RF64" | b"BW64");
+    if !(&header[0..4] == b"RIFF" || wide) || &header[8..12] != b"WAVE" {
+        return Err(bad("not a RIFF/WAVE, RF64 or BW64 file"));
+    }
+    let mut out = Vec::new();
+    let mut data64 = None;
+    let mut pos = 12u64;
+    while pos + 8 <= len {
+        let mut chunk = [0u8; 8];
+        read_at(file, &mut chunk, pos)?;
+        let id = [chunk[0], chunk[1], chunk[2], chunk[3]];
+        let mut size = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]) as u64;
+        let body = pos + 8;
+        if &id == b"ds64" && size >= 24 {
+            let mut d = [0u8; 16];
+            read_at(file, &mut d, body)?;
+            data64 = Some(u64::from_le_bytes([
+                d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15],
+            ]));
+        }
+        if &id == b"data" && wide && size == u64::from(u32::MAX) {
+            size = data64.unwrap_or(len - body);
+        }
+        if &id == b"data" && (size == 0 || size > len - body) {
+            // Tolerate files whose size field was never patched.
+            size = len - body;
+        }
+        out.push((id, body, size));
+        pos = body + size + (size & 1);
+    }
+    Ok(out)
+}
+
+/// The payload of the first chunk `id` of a WAVE file (e.g. `axml`).
+pub fn read_chunk(path: &Path, id: &[u8; 4]) -> io::Result<Option<Vec<u8>>> {
+    let file = File::open(path)?;
+    let Some((_, at, size)) = chunks_of(&file)?.into_iter().find(|(c, _, _)| c == id) else {
+        return Ok(None);
+    };
+    let size = usize::try_from(size).map_err(|_| bad("chunk too large"))?;
+    let mut buf = vec![0u8; size];
+    read_at(&file, &mut buf, at)?;
+    Ok(Some(buf))
 }
 
 #[cfg(unix)]
@@ -223,20 +299,9 @@ pub struct WavFile {
 impl WavFile {
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;
-        let len = file.metadata()?.len();
-        let mut header = [0u8; 12];
-        read_at(&file, &mut header, 0)?;
-        if &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" {
-            return Err(bad("not a RIFF/WAVE file"));
-        }
-        let mut pos = 12u64;
         let mut fmt: Option<(u16, u16, u32, u16)> = None;
-        while pos + 8 <= len {
-            let mut chunk = [0u8; 8];
-            read_at(&file, &mut chunk, pos)?;
-            let size = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]) as u64;
-            let body = pos + 8;
-            match &chunk[0..4] {
+        for (id, body, size) in chunks_of(&file)? {
+            match &id {
                 b"fmt " => {
                     let mut f = [0u8; 16];
                     read_at(&file, &mut f, body)?;
@@ -268,13 +333,6 @@ impl WavFile {
                             )));
                         }
                     };
-                    // Tolerate files whose size field was never patched.
-                    let available = len.saturating_sub(body);
-                    let data_len = if size == 0 || size > available {
-                        available
-                    } else {
-                        size
-                    };
                     let block = channels.max(1) as u64 * (bits / 8) as u64;
                     return Ok(Self {
                         file,
@@ -283,12 +341,11 @@ impl WavFile {
                         sample_rate,
                         format,
                         data_offset: body,
-                        frames: data_len / block,
+                        frames: size / block,
                     });
                 }
                 _ => {}
             }
-            pos = body + size + (size & 1);
         }
         Err(bad("no data chunk"))
     }

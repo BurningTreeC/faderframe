@@ -623,6 +623,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af9673d8203fcb076b19dfd17e38b3d4ae9f44959416ea532ce72415a6020365"
 
 [[package]]
+name = "faderframe-adm"
+version = "0.11.0"
+dependencies = [
+ "faderframe-audio-files",
+ "roxmltree",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "faderframe-analysis"
 version = "0.11.0"
 
@@ -917,6 +926,7 @@ dependencies = [
 name = "faderframe-session"
 version = "0.11.0"
 dependencies = [
+ "faderframe-adm",
  "faderframe-analysis",
  "faderframe-audio",
  "faderframe-audio-files",
@@ -993,6 +1003,7 @@ dependencies = [
 name = "faderframe-ui"
 version = "0.11.0"
 dependencies = [
+ "faderframe-adm",
  "faderframe-audio",
  "faderframe-audio-cpal",
  "faderframe-audio-files",

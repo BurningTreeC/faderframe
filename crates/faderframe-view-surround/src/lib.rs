@@ -52,6 +52,8 @@ pub struct SurroundView {
 struct Layout {
     room: Rect,
     knobs: Vec<(SurroundParam, Rect)>,
+    /// The Object toggle (tracks feeding the master's bed).
+    object: Option<Rect>,
 }
 
 /// A knob's position (0…1) for `v`; the LFE send is off at 0, then
@@ -124,10 +126,14 @@ impl SurroundView {
             side,
         );
         let format = model.project().surround_panned(t);
+        let is_object = model.project().is_object(t);
         let mut knobs = Vec::new();
         let mut y = right.y;
         for p in KNOBS {
-            if format.is_some_and(|f| p.applies(t.layout, f)) {
+            // Objects have no LFE send.
+            if format.is_some_and(|f| p.applies(t.layout, f))
+                && !(is_object && p == SurroundParam::Lfe)
+            {
                 knobs.push((
                     p,
                     Rect::new(right.x + (right.w - KNOB) * 0.5, y + 14.0, KNOB, KNOB),
@@ -135,7 +141,15 @@ impl SurroundView {
                 y += KNOB_ROW;
             }
         }
-        Layout { room, knobs }
+        let object = model
+            .project()
+            .may_be_object(t)
+            .then(|| Rect::new(size.w - 14.0 - 96.0, 6.0, 96.0, HEADER_H - 12.0));
+        Layout {
+            room,
+            knobs,
+            object,
+        }
     }
 
     fn set(cx: &mut EventCx<'_, Action>, track: TrackId, pan: SurroundPan) {
@@ -202,14 +216,36 @@ impl CanvasView<Session, Action> for SurroundView {
             head.inset_xy(14.0, 0.0),
             &TextStyle::new(th.fonts.normal, th.ui.text).bold(),
         );
+        let l = self.layout(size, model, t);
+        let mut readout = head.inset_xy(14.0, 0.0);
+        if let Some(r) = l.object {
+            readout.w = r.x - 12.0 - readout.x;
+            // The Object toggle: lit when the track is one.
+            let on = model.project().is_object(t);
+            p.fill_rounded(
+                r,
+                4.0,
+                &(if on {
+                    th.ui.selection
+                } else {
+                    th.ui.surface_alt
+                })
+                .into(),
+            );
+            p.stroke_rounded(r, 4.0, 1.0, th.ui.border);
+            p.text(
+                if on { "■ Object" } else { "Object" },
+                r,
+                &TextStyle::new(th.fonts.small, th.ui.text).align(Align::Center),
+            );
+        }
         p.text(
             &room::format_place(&pan),
-            head.inset_xy(14.0, 0.0),
+            readout,
             &TextStyle::new(th.fonts.normal, th.ui.text_dim)
                 .family(faderframe_ui_canvas::FontFamily::Mono)
                 .align(Align::End),
         );
-        let l = self.layout(size, model, t);
         let meter = model.meter(t.id);
         let levels: Vec<f32> = meter.shown().iter().map(|c| c.level_db).collect();
         let c = t.color;
@@ -220,6 +256,7 @@ impl CanvasView<Session, Action> for SurroundView {
             levels: &levels,
             puck: Color::rgb8(c.r, c.g, c.b).lighten(0.15),
             compact: false,
+            object: model.project().is_object(t),
         }
         .paint(p, l.room, th);
         let look = KnobLook {
@@ -267,6 +304,13 @@ impl CanvasView<Session, Action> for SurroundView {
                 clicks,
                 ..
             } => {
+                if l.object.is_some_and(|r| r.contains(pos)) {
+                    cx.emit(Action::Edit(Command::SetTrackObject {
+                        track: t.id,
+                        on: !t.object,
+                    }));
+                    return true;
+                }
                 if let Some((param, _)) = l.knobs.iter().find(|(_, r)| r.inset(-6.0).contains(pos))
                 {
                     if clicks >= 2 {

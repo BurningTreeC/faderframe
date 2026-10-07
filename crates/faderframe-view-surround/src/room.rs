@@ -69,6 +69,8 @@ pub struct Room<'a> {
     pub puck: Color,
     /// The mixer's small one: no labels, no LFE.
     pub compact: bool,
+    /// An object: its puck is square.
+    pub object: bool,
 }
 
 impl Room<'_> {
@@ -177,8 +179,14 @@ impl Room<'_> {
         }
         for (i, &(x, y)) in places.iter().enumerate() {
             let at = to_view(room, x, y);
-            p.circle(at, size + 1.5, ground);
-            p.circle(at, size, self.puck);
+            if self.object {
+                let r = |d: f32| Rect::new(at.x - d, at.y - d, d * 2.0, d * 2.0);
+                p.fill_rounded(r(size + 1.5), 2.0, &ground.into());
+                p.fill_rounded(r(size), 1.5, &self.puck.into());
+            } else {
+                p.circle(at, size + 1.5, ground);
+                p.circle(at, size, self.puck);
+            }
             if self.pan.z > 0.0 && !self.compact {
                 let mut ring = faderframe_ui_canvas::Path::new();
                 ring.arc(at, size + 4.0, 0.0, std::f32::consts::TAU, false);

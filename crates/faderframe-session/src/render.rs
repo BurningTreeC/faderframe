@@ -52,6 +52,9 @@ pub enum RenderChannels {
     /// The first output channel alone (a mono master, e.g. freezing a mono
     /// track).
     First,
+    /// An object-based master: the surround master's bed and its objects
+    /// as an ADM BWF file ([`crate::adm`]).
+    Adm(faderframe_adm::Profile),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -107,6 +110,8 @@ pub enum RenderError {
     NoStems,
     #[error("render cancelled")]
     Cancelled,
+    #[error("{0}")]
+    Adm(String),
     #[error(transparent)]
     Engine(#[from] faderframe_engine::EngineError),
     #[error("cannot write {path}: {source}")]
@@ -152,6 +157,24 @@ pub struct RenderJob {
 }
 
 impl RenderJob {
+    /// A job running `work` on a thread of its own.
+    pub(crate) fn spawn(
+        progress: Arc<RenderProgress>,
+        work: impl FnOnce() -> Result<Vec<Rendered>, RenderError> + Send + 'static,
+    ) -> Result<Self, RenderError> {
+        let handle = std::thread::Builder::new()
+            .name("faderframe-render".into())
+            .spawn(work)
+            .map_err(|source| RenderError::Io {
+                path: PathBuf::from("<thread>"),
+                source,
+            })?;
+        Ok(Self {
+            progress,
+            handle: Some(handle),
+        })
+    }
+
     pub fn is_finished(&self) -> bool {
         self.handle.as_ref().is_none_or(|h| h.is_finished())
     }
@@ -531,6 +554,9 @@ pub fn track_render_project(
 
 /// Start rendering `project` on a worker thread.
 pub fn start(project: Project, settings: RenderSettings) -> Result<RenderJob, RenderError> {
+    if let RenderChannels::Adm(profile) = settings.channels {
+        return crate::adm::start(project, settings, profile);
+    }
     let mut project = project;
     // Never wrap around the loop while bouncing.
     project.loop_enabled = false;

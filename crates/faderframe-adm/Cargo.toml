@@ -1,0 +1,18 @@
+[package]
+name = "faderframe-adm"
+description = "Object-based masters for FaderFrame: ADM (ITU-R BS.2076) metadata for BW64 files, written to the Dolby Atmos master ADM profile, and read back"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+roxmltree = "0.21"
+
+[dev-dependencies]
+faderframe-audio-files.workspace = true

@@ -2223,6 +2223,9 @@ impl ArrangerView {
         if !formats.is_empty() {
             items.push(MenuItem::submenu("Channel Format", formats).separated());
         }
+        if let Some(c) = model.object_choice(t.id) {
+            items.push(MenuItem::new(c.label, c.action).checked(c.checked));
+        }
         // MIDI learn for the strip controls.
         if t.kind != TrackKind::Midi {
             for (i, (target, name)) in [

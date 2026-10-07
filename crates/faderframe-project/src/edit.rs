@@ -115,6 +115,11 @@ pub enum Command {
         track: TrackId,
         pan: faderframe_core::SurroundPan,
     },
+    /// Deliver the track as an object (see `Project::is_object`).
+    SetTrackObject {
+        track: TrackId,
+        on: bool,
+    },
     SetTrackMute {
         track: TrackId,
         on: bool,
@@ -649,6 +654,8 @@ impl Command {
             SetTrackVolume { .. } => "Change Volume".into(),
             SetTrackPan { .. } => "Change Pan".into(),
             SetTrackSurround { .. } => "Change Surround Pan".into(),
+            SetTrackObject { on: true, .. } => "Make Object".into(),
+            SetTrackObject { on: false, .. } => "Back into the Bed".into(),
             SetTrackMute { .. } => "Toggle Mute".into(),
             SetTrackSolo { .. } => "Toggle Solo".into(),
             SetTrackRecordArm { .. } => "Toggle Record Arm".into(),
@@ -836,6 +843,7 @@ impl Command {
             | SetTrackMidiOutput { .. }
             | SetTrackMpe { .. }
             | SetTrackOutput { .. }
+            | SetTrackObject { .. }
             | SetTrackInput { .. }
             | SetTrackLayout { .. }
             | AddSend { .. }
@@ -903,6 +911,10 @@ impl Command {
                 };
                 let old = std::mem::replace(&mut t.surround, pan);
                 SetTrackSurround { track, pan: old }
+            }
+            SetTrackObject { track, on } => {
+                let old = std::mem::replace(&mut track_mut(p, track)?.object, on);
+                SetTrackObject { track, on: old }
             }
             SetTrackMute { track, on } => {
                 let old = std::mem::replace(&mut track_mut(p, track)?.mute, on);

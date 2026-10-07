@@ -23,6 +23,7 @@ pub mod notes;
 pub mod performance;
 pub mod pitch;
 pub use performance::{Load, PerformanceReport, PluginPerformance, TrackPerformance};
+pub mod adm;
 pub mod album;
 mod album_master;
 mod aliases;
@@ -329,6 +330,8 @@ pub enum Action {
     OpenPitchEditor(ClipId),
     /// Select the track and show the surround panner.
     ShowSurroundPanner(TrackId),
+    /// Read an object-based master (ADM BWF) into the project.
+    ImportAdm(std::path::PathBuf),
     /// Download the speech model (Whisper) once.
     DownloadSpeechModel,
     /// Transcribe an audio clip's words into the lyrics.
@@ -1085,6 +1088,8 @@ pub struct Session {
     pitch_clip: Option<ClipId>,
     /// Track renders for freezing and bouncing.
     bounces: Vec<freeze::PendingBounce>,
+    /// ADM BWF files being read.
+    adm_imports: Vec<adm::ImportJob>,
     samplings: Vec<sampling::PendingSample>,
     /// What the live tracks were played, for Capture MIDI.
     capture: capture::CaptureBuffer,
@@ -1307,6 +1312,7 @@ impl Session {
             pitch_clip: None,
             gesture_base: HashMap::new(),
             bounces: Vec::new(),
+            adm_imports: Vec::new(),
             samplings: Vec::new(),
             capture: capture::CaptureBuffer::default(),
             album_state: album::AlbumState::default(),
@@ -1910,6 +1916,7 @@ impl Session {
     pub fn tick(&mut self, dt: f32) {
         self.poll_jobs();
         self.poll_bounces();
+        self.poll_adm_imports();
         self.poll_samples();
         self.poll_album();
         self.poll_ddp();
@@ -3048,6 +3055,7 @@ impl Session {
             }
             Action::EditLyric { index, text } => self.edit_lyric(index, text)?,
             Action::ClipEffects { clip, op } => self.edit_clip_fx(clip, op)?,
+            Action::ImportAdm(path) => self.start_adm_import(path),
             Action::ShowSurroundPanner(track) => {
                 self.dispatch(Action::SelectTracks {
                     tracks: vec![track],
@@ -4231,6 +4239,21 @@ impl Session {
     }
 
     // --- inputs -----------------------------------------------------------------------
+
+    /// The Object entry of a track's menu (tracks panned into the master's
+    /// bed): delivered as an object rather than mixed into the bed.
+    pub fn object_choice(&self, track: TrackId) -> Option<InputChoice> {
+        let t = self.project.track(track)?;
+        self.project.may_be_object(t).then(|| InputChoice {
+            label: "Object (delivered with its place, not mixed into the bed)".into(),
+            action: Action::Edit(Command::SetTrackObject {
+                track,
+                on: !t.object,
+            }),
+            checked: t.object,
+            group_start: false,
+        })
+    }
 
     /// The channel formats a track can have (audio tracks, buses, auxes and
     /// the master): mono, stereo and each surround bed. Tracks feeding a

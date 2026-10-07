@@ -30,6 +30,7 @@ faderframe-app            binary: CLI parsing, logging, starts the GTK app
        └─ faderframe-session          control-world hub (GTK-free)
             ├─ faderframe-analysis     loudness (EBU R128), true peak, levels, phase, FFT spectrum
             ├─ faderframe-disc         Red Book CD masters: DDP 2.00 filesets, CD-Text, cue sheets, ISRC/UPC
+            ├─ faderframe-adm          object-based masters: ADM (BS.2076) axml/chna, Dolby Atmos master profile
             ├─ faderframe-engine       project→graph compiler, RT processor, controller, offline render
             │    ├─ faderframe-audio-graph   generic DSP graph: ports, edges, PDC, compile, executor
             │    ├─ faderframe-plugin-host   plugin abstraction + built-in plugins
@@ -479,6 +480,63 @@ Format in the track menus, `Session::format_choices`).
   room with its speakers lit by what they play, the puck (a stereo track's
   two channels), its spread and height, and knobs for height, spread, width
   and the LFE send; every move is one gesture.
+
+### Object-based masters
+
+Objects come after beds and build on them. A mono or stereo track panned
+into the master's bed can be an **object** (`Track::object`,
+`Command::SetTrackObject`; `Project::is_object` = marked, panned into the
+master's bed and feeding the master directly):
+
+* **Monitoring is the delivery.** An object skips the master's inserts and
+  fader: its strip (panned as before, without an LFE send — objects have
+  none) joins the master's output in `nodes::ObjectRenderer`, after the
+  master strip, as a renderer adds objects to the bed. The renderer meters
+  what is heard as the master's (the master strip is then metered
+  elsewhere). Projects without objects build exactly as before.
+* **Delivery** (`session::adm`; Render → "ADM BWF · Dolby Atmos master" or
+  "· ITU-R BS.2076"): `adm::plan` takes the master's format as far as one of
+  the profile's eight beds (2.0 … 7.1.2) holds it — channels no bed has (a
+  7.1.4's top front and rear, a quad's rear pair) become objects fixed at
+  their speakers — plus every object track (a stereo one as two objects
+  width apart). One render plays the master (the bed) and every object
+  track (post fader, unpanned) on outputs of their own; the plugins' delay
+  is taken off the front; the audio streams into a BW64 file
+  (`faderframe_audio_files::bw64`: `chna` before the audio, `axml` after
+  it, RF64 with `ds64` past 4 GiB) as 24-bit PCM at 48 or 96 kHz. Object
+  metadata comes from the panner and its automation: blocks start wherever
+  the place has moved by more than `adm::MOVE`, checked every `adm::STEP`
+  frames, each taking the place at the middle of its step.
+* **`faderframe-adm`** (pure; `roxmltree` for reading) writes the ADM
+  document and the `chna` chunk in two profiles: Dolby's Atmos master ADM
+  profile (v1.1, as MediaArea's conformance checker states it — the
+  programme `Atmos_Master`, `ACO_1001…` contents with `dialogue` 2, the
+  bed object `AO_1001`, objects `AO_100b`…`AO_1080`, custom IDs from
+  `1001`, Dolby's bed channels `RoomCentricLeft`/`RC_L`… at their
+  Cartesian places in one timeless block, object blocks with `rtime`,
+  `duration`, Cartesian positions, equal width/depth/height, a gain and
+  `jumpPosition` 1 over 0.005208 s, stream formats naming channel and
+  pack, at most 118 objects and 128 channels) and ITU-R BS.2076 as the EBU
+  ADM renderer reads it (stream formats naming only their channel, BS.2051
+  speaker labels, the LFE marked by a 120 Hz low-pass). Dolby's `dbmd`
+  chunk (trims, downmixes, binaural render modes) is not written. Checked
+  from outside: MediaInfo (pymediainfo) reports no conformance findings for
+  the Dolby flavour, the EBU renderer (`ear-render`) places the ITU
+  flavour's objects as the panner did.
+* **Import** (File → Import ADM BWF Master…, `Action::ImportAdm`): the
+  reader takes Dolby's beds and other ADM files' BS.2051 labels and the
+  common definitions of 5.1, Cartesian objects exactly and polar ones mapped
+  into the room (azimuth through the speakers' angles, elevation up to 30°
+  as height). A job splits the file into a bed file in our channel order
+  and one file per object and brings them in through the importer
+  (resampled to the project's rate); then, in one undo step, the master
+  takes a format that holds them (with heights when an object rises), the
+  bed becomes a track of its layout and each object a mono object track
+  with its first place, its gain as the fader, and lanes for X, Y, Z and
+  spread that follow its blocks (jumps over their interpolation).
+* **Views.** The track menus and the Surround Panner have an Object toggle
+  for tracks that can be one; objects' pucks are square; the panner shows
+  no LFE knob for them and their automation has no LFE lane.
 
 ## 6. Transport and timing
 
@@ -2679,8 +2737,11 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
    readback is the next step there).
 10. ~~**Mastering**: multiple CD-Text languages, a DDP player/import,
     surround beds and panning before any object-based format~~ — done (see
-    *CD-Text languages*, *The DDP player* and *Surround beds*). Object-based
-    formats (ADM BWF, Dolby Atmos masters) come after beds.
+    *CD-Text languages*, *The DDP player* and *Surround beds*). ~~Object-based
+    masters (ADM BWF, Dolby Atmos master profile), export and import~~ —
+    done (see *Object-based masters*). Not yet: Dolby's `dbmd` chunk,
+    binaural monitoring (needs licensed HRTF sets), object formats for
+    consumers (IAMF, MPEG-H).
 
 
 ### Modelled microphone preamplifiers

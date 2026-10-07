@@ -190,6 +190,35 @@ pub fn import_audio(app: &Rc<AppState>) {
     });
 }
 
+/// File → Import ADM BWF…: an object-based master's bed and objects as
+/// tracks (the master takes a format that holds them).
+pub fn import_adm(app: &Rc<AppState>) {
+    let Some(win) = app.window.borrow().clone() else {
+        return;
+    };
+    let f = gtk::FileFilter::new();
+    f.set_name(Some("ADM BWF masters (.wav)"));
+    f.add_suffix("wav");
+    f.add_suffix("WAV");
+    let filters = gio::ListStore::new::<gtk::FileFilter>();
+    filters.append(&f);
+    let dialog = gtk::FileDialog::builder()
+        .title("Import ADM BWF Master")
+        .accept_label("Import")
+        .modal(true)
+        .filters(&filters)
+        .build();
+    let weak = Rc::downgrade(app);
+    dialog.open(Some(&win), gio::Cancellable::NONE, move |res| {
+        let (Ok(file), Some(app)) = (res, weak.upgrade()) else {
+            return;
+        };
+        if let Some(path) = file.path() {
+            app.dispatch(faderframe_session::Action::ImportAdm(path));
+        }
+    });
+}
+
 fn preset_filters() -> gio::ListStore {
     let f = gtk::FileFilter::new();
     f.set_name(Some("FaderFrame track presets"));

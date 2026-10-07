@@ -24,7 +24,7 @@ time; binary distributions that bundle them (e.g. Windows or macOS
 installers) must ship their license texts and comply with the LGPL's
 relinking provisions.
 
-## Rust crates (275)
+## Rust crates (276)
 
 Crates under the MPL-2.0 (the Symphonia audio decoders) are file-level
 copyleft: FaderFrame uses them unmodified from crates.io, where their
@@ -210,6 +210,7 @@ published under the MPL-2.0 as well.
 | regex-lite | 0.1.9 | MIT OR Apache-2.0 | https://github.com/rust-lang/regex |
 | regex-syntax | 0.8.11 | MIT OR Apache-2.0 | https://github.com/rust-lang/regex |
 | renderdoc-sys | 1.1.0 | MIT OR Apache-2.0 | https://github.com/ebkalderon/renderdoc-rs |
+| roxmltree | 0.21.1 | MIT OR Apache-2.0 | https://github.com/RazrFalcon/roxmltree |
 | rtrb | 0.4.0 | MIT OR Apache-2.0 | https://github.com/mgeier/rtrb |
 | rubato | 5.0.1 | MIT OR Apache-2.0 | https://github.com/HEnquist/rubato |
 | rustc-hash | 1.1.0 | Apache-2.0/MIT | https://github.com/rust-lang-nursery/rustc-hash |
@@ -327,7 +328,7 @@ com-scrape-types 0.1.1, cookie-factory 0.3.3, dasp_sample 0.11.0, midly 0.5.3, p
 
 ### LICENSE-APACHE
 
-Applies to: arrayvec 0.7.8, audioadapter 5.0.0, audioadapter-buffers 5.2.0, audioadapter-sample 5.2.0, autocfg 1.5.1, base64 0.22.1, bit-set 0.10.0, bit-vec 0.9.1, bitflags 1.3.2, bitflags 2.13.2, bytemuck 1.25.2, bytemuck_derive 1.12.1, cc 1.6.0, cexpr 0.6.0, cfg-expr 0.20.10, cfg-if 1.0.5, clang-sys 1.9.1, clap-sys 0.5.0, codespan-reporting 0.13.1, core_detect 1.0.0, cpal 0.18.2, displaydoc 0.2.7, document-features 0.2.12, either 1.18.0, encoding_rs 0.8.42, equivalent 1.0.2, errno 0.3.14, euclid 0.22.14, find-msvc-tools 0.1.14, flate2 1.1.10, fontique 0.11.1, gethostname 1.1.0, glob 0.3.4, glow 0.17.0, hashbrown 0.16.1, hashbrown 0.17.1, heck 0.5.0, indexmap 2.14.2, itertools 0.13.0, khronos-egl 6.0.0, kurbo 0.13.1, lazy_static 1.5.1, linux-raw-sys 0.12.1, lock_api 0.4.14, log 0.4.34, minimal-lexical 0.2.1, multiversion_no_op 1.0.0, num-complex 0.4.6, num-integer 0.1.47, num-traits 0.2.19, once_cell 1.21.4, parking_lot 0.12.5, parking_lot_core 0.9.12, parlance 0.1.0, parley 0.11.1, parley_data 0.11.1, peniko 0.6.1, pkg-config 0.3.34, png 0.18.1, pollster 0.4.0, polycool 0.4.0, presser 0.3.1, primal-check 0.3.4, regex 1.13.1, regex-automata 0.4.18, regex-lite 0.1.9, regex-syntax 0.8.11, renderdoc-sys 1.1.0, rtrb 0.4.0, rubato 5.0.1, rustc-hash 1.1.0, rustc_version 0.4.1, rustix 1.1.5, scopeguard 1.2.0, smallvec 1.16.2, stable_deref_trait 1.2.1, static_assertions 1.1.0, system-deps 7.0.8, system-deps 9.0.0, thread_local 1.1.10, unicode-width 0.2.2, utf8_iter 1.0.4, x11rb 0.14.0, x11rb-protocol 0.14.0
+Applies to: arrayvec 0.7.8, audioadapter 5.0.0, audioadapter-buffers 5.2.0, audioadapter-sample 5.2.0, autocfg 1.5.1, base64 0.22.1, bit-set 0.10.0, bit-vec 0.9.1, bitflags 1.3.2, bitflags 2.13.2, bytemuck 1.25.2, bytemuck_derive 1.12.1, cc 1.6.0, cexpr 0.6.0, cfg-expr 0.20.10, cfg-if 1.0.5, clang-sys 1.9.1, clap-sys 0.5.0, codespan-reporting 0.13.1, core_detect 1.0.0, cpal 0.18.2, displaydoc 0.2.7, document-features 0.2.12, either 1.18.0, encoding_rs 0.8.42, equivalent 1.0.2, errno 0.3.14, euclid 0.22.14, find-msvc-tools 0.1.14, flate2 1.1.10, fontique 0.11.1, gethostname 1.1.0, glob 0.3.4, glow 0.17.0, hashbrown 0.16.1, hashbrown 0.17.1, heck 0.5.0, indexmap 2.14.2, itertools 0.13.0, khronos-egl 6.0.0, kurbo 0.13.1, lazy_static 1.5.1, linux-raw-sys 0.12.1, lock_api 0.4.14, log 0.4.34, minimal-lexical 0.2.1, multiversion_no_op 1.0.0, num-complex 0.4.6, num-integer 0.1.47, num-traits 0.2.19, once_cell 1.21.4, parking_lot 0.12.5, parking_lot_core 0.9.12, parlance 0.1.0, parley 0.11.1, parley_data 0.11.1, peniko 0.6.1, pkg-config 0.3.34, png 0.18.1, pollster 0.4.0, polycool 0.4.0, presser 0.3.1, primal-check 0.3.4, regex 1.13.1, regex-automata 0.4.18, regex-lite 0.1.9, regex-syntax 0.8.11, renderdoc-sys 1.1.0, roxmltree 0.21.1, rtrb 0.4.0, rubato 5.0.1, rustc-hash 1.1.0, rustc_version 0.4.1, rustix 1.1.5, scopeguard 1.2.0, smallvec 1.16.2, stable_deref_trait 1.2.1, static_assertions 1.1.0, system-deps 7.0.8, system-deps 9.0.0, thread_local 1.1.10, unicode-width 0.2.2, utf8_iter 1.0.4, x11rb 0.14.0, x11rb-protocol 0.14.0
 
 ```text
 Apache License
@@ -6005,6 +6006,34 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+```
+
+### LICENSE-MIT
+
+Applies to: roxmltree 0.21.1
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2018 Yevhenii Reizner
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 ```
 
 ### LICENSE-MIT

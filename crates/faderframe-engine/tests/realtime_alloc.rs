@@ -2281,6 +2281,12 @@ fn surround_strips_do_not_allocate() {
     let src = tp.dc(2, 0.3, 96_000);
     tp.clip(t, src, MusicalTime::ZERO, 96_000);
     tp.project.track_mut(t).unwrap().output = OutputRouting::Track { track: bus };
+    // An object beside it: it joins the master in its renderer.
+    let o = tp.track(TrackKind::Audio, "Object", ChannelLayout::Mono);
+    let src = tp.dc(1, 0.3, 96_000);
+    tp.clip(o, src, MusicalTime::ZERO, 96_000);
+    tp.project.track_mut(o).unwrap().object = true;
+    assert!(tp.project.is_object(tp.project.track(o).unwrap()));
     let config = EngineConfig {
         sample_rate: 48_000,
         ..EngineConfig::default()
@@ -2301,6 +2307,7 @@ fn surround_strips_do_not_allocate() {
             spread: 0.2,
             ..SurroundPan::default()
         };
+        tp.project.track_mut(o).unwrap().surround.x = -(i as f32 * 0.3).sin();
         r.controller.update_params(&tp.project).unwrap();
         let (_, n) = armed(|| r.processor.process_device(&mut bufs));
         total += n;

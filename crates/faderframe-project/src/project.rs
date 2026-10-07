@@ -367,6 +367,29 @@ impl Project {
         }
     }
 
+    /// Whether `track` is an object: marked so, panned into the master's
+    /// bed and feeding the master directly. Objects skip the master's
+    /// inserts and fader (they join its output, as a renderer adds them)
+    /// and are delivered with their place as metadata.
+    pub fn is_object(&self, track: &Track) -> bool {
+        track.object && self.may_be_object(track)
+    }
+
+    /// Whether `track` can be an object: panned into the master's bed,
+    /// feeding the master directly.
+    pub fn may_be_object(&self, track: &Track) -> bool {
+        track.kind != TrackKind::Master
+            && self.surround_panned(track).is_some()
+            && self
+                .output_target(track)
+                .is_some_and(|d| Some(d) == self.master_id())
+    }
+
+    /// The object tracks, in track order.
+    pub fn objects(&self) -> impl Iterator<Item = &Track> {
+        self.tracks.iter().filter(|t| self.is_object(t))
+    }
+
     /// Track-to-track signal edges (outputs and enabled sends).
     pub fn routing_edges(&self) -> Vec<(TrackId, TrackId)> {
         let mut edges = Vec::new();

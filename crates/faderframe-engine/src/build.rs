@@ -27,7 +27,7 @@ use crate::context::EngineContext;
 use crate::midi::{MidiFilter, MidiInputNode, MidiOutputSink, MidiShared, NO_PORT};
 use crate::nodes::{
     AudioClipPlayer, ChannelStrip, Crosstalk, DeviceInputTap, DeviceOutputSink, FoldDown,
-    MidiClipPlayer, MonitorGate, PluginNode, SendNode, StretchVoices, StripEcho,
+    MidiClipPlayer, MonitorGate, ObjectRenderer, PluginNode, SendNode, StretchVoices, StripEcho,
 };
 use crate::plugins::PluginHost;
 use crate::slots::SlotRegistry;
@@ -364,6 +364,7 @@ enum Role {
     ChainMix = 14,
     ChainNotes = 15,
     StripEcho = 16,
+    Renderer = 17,
 }
 
 /// Stretcher voices a track's clip player needs: one per pitch-preserving
@@ -1198,7 +1199,11 @@ pub fn build_graph(
         }
     }
 
-    // Pass 2: outputs and sends.
+    // Pass 2: outputs and sends. Objects join the master's output in its
+    // renderer (after the loop: the master may come later).
+    let has_objects = project.objects().next().is_some();
+    let mut renderer: Option<NodeId> = None;
+    let mut object_outs: Vec<NodeId> = Vec::new();
     for (gi, t) in project.tracks.iter().enumerate() {
         let gi = gi as u32;
         let Some(tn) = nodes.get(&t.id).copied() else {
@@ -1245,10 +1250,28 @@ pub fn build_graph(
                 g.connect_audio(out, 0, node, 0)?;
                 out = node;
             }
+            if has_objects && !ahead_strip {
+                let meter = slots.meter(t.id, layout.channel_count())?;
+                let node = g.add_node(
+                    NodeSpec::new(format!("{} · Objects", t.name))
+                        .key(node_key(t.id, Role::Renderer, 0, &[layout]))
+                        .group(gi)
+                        .audio_in(layout)
+                        .audio_out(layout),
+                    Box::new(ObjectRenderer::new(t.id, meter)),
+                );
+                owned(node, NodeWork::Strip, None);
+                g.connect_audio(out, 0, node, 0)?;
+                out = node;
+                renderer = Some(node);
+            }
         }
         // The node's graph is `g`'s.
         let reachable = |n: &TrackNodes| n.input.filter(|_| n.input_ahead == ahead_strip);
         match t.output {
+            OutputRouting::Master if has_objects && !ahead_strip && project.is_object(t) => {
+                object_outs.push(out);
+            }
             OutputRouting::Master | OutputRouting::Track { .. } => {
                 if let Some(dst) = project
                     .output_target(t)
@@ -1323,6 +1346,11 @@ pub fn build_graph(
             owned(node, NodeWork::Send, None);
             g.connect_audio(tap_node, tap_port, node, 0)?;
             g.connect_audio(node, 0, dst, 0)?;
+        }
+    }
+    if let Some(r) = renderer {
+        for o in object_outs {
+            b.connect_audio(o, 0, r, 0)?;
         }
     }
     // Sidechains tap their source after its inserts: before its fader,
@@ -1613,16 +1641,32 @@ fn add_strip(
     let dest = destination_layout(project, t);
     let strip_slots = slots.strip(t.id)?;
     let meter = slots.meter(t.id, dest.channel_count())?;
+    // An object pans without its LFE send; with objects the master's
+    // meters follow the renderer that adds them.
+    let object = project.is_object(t);
+    let metered_elsewhere =
+        t.kind == TrackKind::Master && project.objects().next().is_some() && !quiet;
     let mut spec = NodeSpec::new(format!("{} · Strip", t.name))
-        .key(node_key(t.id, Role::Strip, 0, &[layout, dest]))
+        .key(node_key(
+            t.id,
+            Role::Strip,
+            u64::from(object) | (u64::from(metered_elsewhere) << 1),
+            &[layout, dest],
+        ))
         .audio_in(layout)
         .audio_out(dest)
         .audio_out(layout);
     if let Some(g) = group {
         spec = spec.group(g);
     }
-    let strip =
+    let mut strip =
         ChannelStrip::new(t.id, strip_slots, meter, PanLaw::default()).with_layouts(layout, dest);
+    if object {
+        strip = strip.object();
+    }
+    if metered_elsewhere {
+        strip = strip.metered_elsewhere();
+    }
     let strip = b.add_node(spec, Box::new(if quiet { strip.quiet() } else { strip }));
     b.connect_audio(from, 0, strip, 0)?;
     Ok(strip)

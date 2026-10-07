@@ -179,11 +179,28 @@ impl Form {
                 let secs = p.timeline.tempo.musical_to_seconds(b)
                     - p.timeline.tempo.musical_to_seconds(a)
                     + settings.tail_seconds as f64;
+                let adm = matches!(settings.channels, RenderChannels::Adm(_));
                 let ch = match settings.channels {
                     RenderChannels::Mono | RenderChannels::First => 1,
                     RenderChannels::Master => faderframe_session::render::master_bed(p)
                         .map_or(2, faderframe_core::SurroundFormat::channels),
                     RenderChannels::Stereo => 2,
+                    RenderChannels::Adm(_) => {
+                        faderframe_session::adm::plan(p).map_or(0, |plan| plan.channels())
+                    }
+                };
+                // An ADM master is 24-bit at 48 kHz (96 kHz if chosen).
+                let (bits, rate) = if adm {
+                    (
+                        24,
+                        if settings.sample_rate == 96_000 {
+                            96_000
+                        } else {
+                            48_000
+                        },
+                    )
+                } else {
+                    (settings.format.bits(), settings.sample_rate)
                 };
                 let files = match settings.source {
                     RenderSource::Master => 1,
@@ -195,11 +212,7 @@ impl Form {
                         })
                         .count(),
                 };
-                let bytes = secs
-                    * settings.sample_rate as f64
-                    * ch as f64
-                    * (settings.format.bits() / 8) as f64
-                    * files as f64;
+                let bytes = secs * rate as f64 * ch as f64 * (bits / 8) as f64 * files as f64;
                 format!(
                     "{} → {}  ·  {:.1} s  ·  {} file{}  ·  ≈ {:.1} MB  ·  {} · {}",
                     p.timeline.format_bbt(a),
@@ -208,8 +221,12 @@ impl Form {
                     files,
                     if files == 1 { "" } else { "s" },
                     bytes / 1_000_000.0,
-                    settings.format.label(),
-                    format_sample_rate(settings.sample_rate)
+                    if adm {
+                        "PCM 24-bit"
+                    } else {
+                        settings.format.label()
+                    },
+                    format_sample_rate(rate)
                 )
             }
             Err(e) => e.to_string(),
@@ -305,18 +322,27 @@ pub fn open(app: &Rc<AppState>) {
     // A surround master: as it is, or folded down.
     let bed = faderframe_session::render::master_bed(app.session.borrow().project());
     let (channel_names, channel_choices): (Vec<String>, Vec<RenderChannels>) = match bed {
-        Some(f) => (
-            vec![
+        Some(f) => {
+            let mut names = vec![
                 format!("As the master ({}, every channel)", f.name()),
                 "Stereo (folded down)".into(),
                 "Mono (summed)".into(),
-            ],
-            vec![
+            ];
+            let mut choices = vec![
                 RenderChannels::Master,
                 RenderChannels::Stereo,
                 RenderChannels::Mono,
-            ],
-        ),
+            ];
+            // An object-based master: the bed and the object tracks.
+            if let Ok(plan) = faderframe_session::adm::plan(app.session.borrow().project()) {
+                let what = plan.describe();
+                names.push(format!("ADM BWF · Dolby Atmos master ({what})"));
+                choices.push(RenderChannels::Adm(faderframe_adm::Profile::DolbyAtmos));
+                names.push(format!("ADM BWF · ITU-R BS.2076 ({what})"));
+                choices.push(RenderChannels::Adm(faderframe_adm::Profile::Itu));
+            }
+            (names, choices)
+        }
         None => (
             vec!["Stereo".into(), "Mono (summed)".into()],
             vec![RenderChannels::Stereo, RenderChannels::Mono],

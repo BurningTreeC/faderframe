@@ -850,6 +850,7 @@ impl MixerView {
                 levels: &levels,
                 puck: track_color(t.color).lighten(0.2),
                 compact: true,
+                object: model.project().is_object(t),
             }
             .paint(p, l.pan_knob, th);
             controls::readout(
@@ -1720,6 +1721,9 @@ impl MixerView {
                 "Surround Panner…",
                 Action::ShowSurroundPanner(t.id),
             ));
+        }
+        if let Some(c) = model.object_choice(t.id) {
+            items.push(MenuItem::new(c.label, c.action).checked(c.checked));
         }
         if t.kind != TrackKind::Master {
             let now = model.strip_width(t.id);

@@ -52,6 +52,11 @@ pub struct ChannelStrip {
     /// Rendered ahead: no meters, scope or shown values (a [`StripEcho`]
     /// publishes them when the audio is heard).
     quiet: bool,
+    /// An object: no LFE send (objects have none, as in Atmos).
+    object: bool,
+    /// Its meters and scope are fed by another node (the master's, by the
+    /// [`ObjectRenderer`] that adds the objects).
+    metered_elsewhere: bool,
 }
 
 impl ChannelStrip {
@@ -70,6 +75,24 @@ impl ChannelStrip {
             made_for: None,
             pairs: [[f32::NAN; MAX_SPEAKERS]; MAX_SPEAKERS],
             quiet: false,
+            object: false,
+            metered_elsewhere: false,
+        }
+    }
+
+    /// Panned as an object: everything but the LFE send.
+    pub fn object(self) -> Self {
+        Self {
+            object: true,
+            ..self
+        }
+    }
+
+    /// Meters and scope fed by another node.
+    pub fn metered_elsewhere(self) -> Self {
+        Self {
+            metered_elsewhere: true,
+            ..self
         }
     }
 
@@ -294,7 +317,10 @@ impl Processor<EngineContext> for ChannelStrip {
                 )
             };
             if self.surround {
-                let pan = surround_at(&self.slots.surround, params, surround_lanes, at);
+                let mut pan = surround_at(&self.slots.surround, params, surround_lanes, at);
+                if self.object {
+                    pan.lfe_db = surround::LFE_OFF_DB;
+                }
                 if self.made_for != Some(pan) {
                     surround::matrix(self.layouts.0, self.layouts.1, &pan, &mut self.matrix);
                     self.made_for = Some(pan);
@@ -327,8 +353,40 @@ impl Processor<EngineContext> for ChannelStrip {
             }
         }
 
+        if self.metered_elsewhere {
+            return;
+        }
         if let Some(post) = io.audio_out.first() {
             publish(cx, self.track, self.meter, post, n);
+        }
+    }
+}
+
+/// The master's output with the objects added, as a renderer adds them to
+/// the bed after the master strip (objects skip its inserts and fader):
+/// what is heard, metered as the master's.
+pub struct ObjectRenderer {
+    master: TrackId,
+    meter: MeterRange,
+}
+
+impl ObjectRenderer {
+    pub fn new(master: TrackId, meter: MeterRange) -> Self {
+        Self { master, meter }
+    }
+}
+
+impl Processor<EngineContext> for ObjectRenderer {
+    fn process(&mut self, cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
+        let n = io.frames;
+        let (Some(input), Some(out)) = (io.audio_in.first(), io.audio_out.first_mut()) else {
+            return;
+        };
+        for c in 0..input.num_channels().min(out.num_channels()) {
+            out.channel_mut(c)[..n].copy_from_slice(&input.channel(c)[..n]);
+        }
+        if let Some(out) = io.audio_out.first() {
+            publish(cx, self.master, self.meter, out, n);
         }
     }
 }

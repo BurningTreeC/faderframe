@@ -193,8 +193,12 @@ impl Session {
             });
             // Into a surround bed the surround panner places it instead.
             if let Some(format) = self.project.surround_panned(t) {
+                let object = self.project.is_object(t);
                 for p in faderframe_core::SurroundParam::ALL {
-                    if !p.applies(t.layout, format) {
+                    // Objects have no LFE send.
+                    if !p.applies(t.layout, format)
+                        || (object && p == faderframe_core::SurroundParam::Lfe)
+                    {
                         continue;
                     }
                     let (min, max, default) = p.range();

@@ -284,6 +284,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
         None,
         &section(&[
             ("Import Audio…", "app.import-audio"),
+            ("Import ADM BWF Master (Bed and Objects)…", "app.import-adm"),
             ("Import MIDI File…", "app.import-midi"),
             ("Export MIDI File…", "app.export-midi"),
         ]),

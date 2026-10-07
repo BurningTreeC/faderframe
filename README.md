@@ -158,7 +158,12 @@ Contrast:
   beds fold into smaller formats (and down to the interface's outputs, so a
   7.1.4 mix plays on headphones), meters show every channel, and renders
   keep every channel with the speakers in the WAV header — or fold down to
-  stereo.
+  stereo. Objects: any track panned into the master's bed can be an object,
+  heard as a renderer plays it (it skips the master's inserts and fader);
+  the mix is delivered as an ADM BWF master — the bed (up to 7.1.2) and up
+  to 118 objects with their movement — in Dolby's Atmos master ADM profile
+  or as ITU-R BS.2076 for the EBU renderer, and ADM BWF masters import back
+  into tracks with their movement as automation.
 * Analogue-console mixer: inserts, sends (pre-FX / pre / post), pan, M/S/R,
   faders with a console fader law, segmented peak meters, routing menus,
   any number of sends per channel (rows grow, ◂ ▸ pages through banks),

@@ -334,6 +334,10 @@ pub struct Track {
         skip_serializing_if = "faderframe_core::SurroundPan::is_default"
     )]
     pub surround: faderframe_core::SurroundPan,
+    /// Delivered as an object (or two, stereo) with its place as metadata
+    /// rather than mixed into the bed ([`crate::Project::is_object`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub object: bool,
     #[serde(default)]
     pub phase_invert: bool,
 
@@ -460,6 +464,7 @@ impl Track {
             volume_db: 0.0,
             pan: 0.0,
             surround: faderframe_core::SurroundPan::default(),
+            object: false,
             phase_invert: false,
             mute: false,
             solo: false,

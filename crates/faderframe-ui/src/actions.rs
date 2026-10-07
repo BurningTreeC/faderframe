@@ -48,6 +48,7 @@ pub fn install(app: &Rc<AppState>) {
         }),
         entry(app, "clear-recent", crate::recent::clear),
         entry(app, "import-audio", crate::dialogs::import_audio),
+        entry(app, "import-adm", crate::dialogs::import_adm),
         entry(app, "import-midi", crate::dialogs::import_midi),
         entry(app, "export-midi", crate::dialogs::export_midi),
         entry(app, "cancel-import", |a| {
@@ -1802,6 +1803,55 @@ pub fn install(app: &Rc<AppState>) {
             match action {
                 Some(action) => a.dispatch(action),
                 None => tracing::warn!("surround: no track '{name}'"),
+            }
+        }),
+        // Development aid: `object:<track>=<on|off>` (deliver the track as
+        // an object), `import-adm-from:<path>`, `render-adm:<path>[|itu]`
+        // (the whole project as an object-based master).
+        named("object", |a, arg| {
+            let Some((name, on)) = arg.split_once('=') else {
+                return;
+            };
+            let track = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.id);
+            match track {
+                Some(track) => a.dispatch(faderframe_session::Action::Edit(
+                    faderframe_project::Command::SetTrackObject {
+                        track,
+                        on: on == "on",
+                    },
+                )),
+                None => tracing::warn!("object: no track '{name}'"),
+            }
+        }),
+        named("import-adm-from", |a, arg| {
+            a.dispatch(faderframe_session::Action::ImportAdm(arg.into()));
+        }),
+        named("render-adm", |a, arg| {
+            let (path, profile) = match arg.split_once('|') {
+                Some((p, "itu")) => (p, faderframe_adm::Profile::Itu),
+                _ => (arg, faderframe_adm::Profile::DolbyAtmos),
+            };
+            let job = {
+                let mut s = a.session.borrow_mut();
+                let settings = faderframe_session::render::RenderSettings {
+                    channels: faderframe_session::render::RenderChannels::Adm(profile),
+                    ..faderframe_session::render::RenderSettings::defaults_for(
+                        s.project(),
+                        path.into(),
+                    )
+                };
+                s.render(settings)
+            };
+            match job.and_then(faderframe_session::render::RenderJob::join) {
+                Ok(_) => tracing::info!("render-adm: wrote {path}"),
+                Err(e) => tracing::warn!("render-adm: {e}"),
             }
         }),
         // Development aid: `show-surround-panner:<track>`.

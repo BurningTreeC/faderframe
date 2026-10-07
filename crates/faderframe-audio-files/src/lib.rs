@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bw64;
 pub mod decode;
 pub mod dither;
 mod generate;

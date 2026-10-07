@@ -17,7 +17,7 @@ pub use io::{DeviceInputTap, DeviceOutputSink, FoldDown, MonitorGate};
 pub use midi_player::MidiClipPlayer;
 pub use plugin::PluginNode;
 pub use send::SendNode;
-pub use strip::{ChannelStrip, StripEcho};
+pub use strip::{ChannelStrip, ObjectRenderer, StripEcho};
 
 /// Maximum channels a strip/send processes individually.
 pub(crate) const MAX_CHANNELS: usize = 16;
