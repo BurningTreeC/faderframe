@@ -62,6 +62,7 @@ pub mod render;
 mod selection;
 pub mod sync;
 mod sysex;
+pub mod templates;
 mod transients;
 pub mod versions;
 /// A plugin state as projects store it (and back).
@@ -450,6 +451,17 @@ pub enum Action {
     ShowVersions,
     /// Go back to a saved version (the project as it is is kept as one).
     RestoreVersion(PathBuf),
+    /// Keep the project's set-up (everything but its content) as the
+    /// template `name`, replacing one of that name.
+    SaveTemplate {
+        name: String,
+    },
+    /// Ask for a name, then save a template.
+    PromptSaveTemplate,
+    /// Show the templates (new project from one, delete, default).
+    ShowTemplates,
+    /// Delete a template.
+    DeleteTemplate(PathBuf),
     /// An alias of each clip (sharing its content) right after it.
     DuplicateAsAlias(Vec<ClipId>),
     /// The clips are their own again (no longer aliases).
@@ -1211,6 +1223,10 @@ pub enum UiRequest {
     SaveVersion,
     /// The project's versions (compare, restore, save another).
     Versions,
+    /// Ask for a template's name, then save it.
+    SaveTemplate,
+    /// The templates (new project from one, delete, default).
+    Templates,
     /// Ask where to save a sample of `track` from `start` to `end`
     /// (suggesting `name`), then make it there.
     SaveSample {
@@ -3197,6 +3213,15 @@ impl Session {
                 self.ui_requests.push(UiRequest::SaveVersion);
             }
             Action::ShowVersions => self.ui_requests.push(UiRequest::Versions),
+            Action::SaveTemplate { name } => {
+                self.save_template(&name)?;
+            }
+            Action::PromptSaveTemplate => self.ui_requests.push(UiRequest::SaveTemplate),
+            Action::ShowTemplates => self.ui_requests.push(UiRequest::Templates),
+            Action::DeleteTemplate(path) => {
+                templates::delete_template(&path)?;
+                self.notify(NoticeLevel::Info, "deleted the template".to_string());
+            }
             Action::RestoreVersion(path) => self.restore_version(&path)?,
             Action::DuplicateAsAlias(clips) => {
                 self.duplicate_as_alias(&clips)?;

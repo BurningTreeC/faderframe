@@ -37,6 +37,7 @@ mod screenshot;
 pub mod state;
 mod style;
 mod surface_prefs;
+mod templates;
 mod transport_display;
 mod transport_keys;
 mod window;
@@ -59,7 +60,14 @@ pub const APP_ID: &str = "io.github.BurningTreeC.FaderFrame";
 enum Start {
     Open(std::path::PathBuf),
     New,
+    /// A new project from the default template (its file).
+    Template(std::path::PathBuf),
     Demo,
+}
+
+/// A new project: from the default template when one is set.
+fn new_start() -> Start {
+    templates::default_template().map_or(Start::New, |t| Start::Template(t.path))
 }
 
 /// The command line first (`PROJECT`, `--empty`, `--demo`), then the
@@ -80,12 +88,12 @@ fn start_choice(
         return (Start::Demo, None);
     }
     match S::from_id(&prefs.startup_project).unwrap_or_default() {
-        S::New => (Start::New, None),
+        S::New => (new_start(), None),
         S::Demo => (Start::Demo, None),
         S::Last => match recent::startup_path(prefs) {
             Some(p) if p.exists() => (Start::Open(p), None),
             // The last project is gone.
-            Some(p) => (Start::New, Some(p)),
+            Some(p) => (new_start(), Some(p)),
             None => (Start::Demo, None),
         },
     }
@@ -101,15 +109,19 @@ fn build_session(options: &RunOptions, prefs: &prefs::Preferences) -> (Session, 
     match &start {
         Start::Open(p) => tracing::info!("start-up: opening {}", p.display()),
         Start::New => tracing::info!("start-up: a new project"),
+        Start::Template(p) => tracing::info!("start-up: a new project from {}", p.display()),
         Start::Demo => tracing::info!("start-up: the demo session"),
     }
     let make = || -> Result<Session, faderframe_session::SessionError> {
         match start {
             Start::Demo => Session::demo(config),
-            Start::New | Start::Open(_) => {
+            Start::New | Start::Open(_) | Start::Template(_) => {
                 let mut s =
                     Session::new(Project::new("Untitled", config.sample_rate), None, config)?;
-                s.new_project(false)?;
+                match &start {
+                    Start::Template(path) => s.new_from_template(path)?,
+                    _ => s.new_project(false)?,
+                }
                 Ok(s)
             }
         }

@@ -6,7 +6,7 @@ use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
 use std::rc::Rc;
 
-fn project_filters() -> gio::ListStore {
+pub(crate) fn project_filters() -> gio::ListStore {
     let filter = gtk::FileFilter::new();
     filter.set_name(Some("FaderFrame projects"));
     filter.add_pattern(&format!("*.{FILE_EXTENSION}"));
@@ -588,7 +588,7 @@ pub fn save_version(app: &Rc<AppState>) {
 }
 
 /// How long ago `t` was, in words.
-fn ago(t: Option<std::time::SystemTime>) -> String {
+pub(crate) fn ago(t: Option<std::time::SystemTime>) -> String {
     let Some(secs) = t.and_then(|t| t.elapsed().ok()).map(|d| d.as_secs()) else {
         return String::new();
     };
@@ -774,7 +774,7 @@ fn name_prompt(
 /// A name prompt whose name may meet an existing one: `clash` gives the
 /// question and its detail, and the action happens only once the user
 /// agrees (else the prompt stays to take another name).
-fn name_prompt_checked(
+pub(crate) fn name_prompt_checked(
     app: &Rc<AppState>,
     title: &str,
     prompt: &str,

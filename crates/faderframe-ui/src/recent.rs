@@ -41,7 +41,7 @@ impl StartupProject {
     pub fn label(self) -> &'static str {
         match self {
             Self::Last => "Open the last project",
-            Self::New => "Start a new, empty project",
+            Self::New => "Start a new project (from the default template, if one is set)",
             Self::Demo => "Open the demo session",
         }
     }

@@ -82,6 +82,8 @@ pub struct Preferences {
     /// Keyboard shortcuts changed in the shortcut editor (detailed action
     /// → accelerators; empty: none), over the defaults.
     pub shortcuts: std::collections::BTreeMap<String, Vec<String>>,
+    /// The project template New Project starts from (its name).
+    pub default_template: Option<String>,
 }
 
 impl Default for Preferences {
@@ -123,6 +125,7 @@ impl Default for Preferences {
             headphone_head: None,
             headphone_correction: None,
             shortcuts: Default::default(),
+            default_template: None,
         }
     }
 }

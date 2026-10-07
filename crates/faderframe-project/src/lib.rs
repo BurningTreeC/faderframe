@@ -35,6 +35,7 @@ pub mod pitch;
 pub mod preset;
 mod project;
 mod takes;
+pub mod template;
 mod track;
 mod warp;
 

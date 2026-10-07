@@ -383,6 +383,8 @@ impl AppState {
                 }
                 faderframe_session::UiRequest::SaveVersion => crate::dialogs::save_version(self),
                 faderframe_session::UiRequest::Versions => crate::dialogs::versions(self),
+                faderframe_session::UiRequest::SaveTemplate => crate::templates::save_prompt(self),
+                faderframe_session::UiRequest::Templates => crate::templates::window(self),
                 faderframe_session::UiRequest::SaveSample {
                     track,
                     start,

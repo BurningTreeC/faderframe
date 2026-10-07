@@ -263,6 +263,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
     file.append_section(None, &{
         let s = section(&[
             ("New Project", "app.new"),
+            ("New from Template…", "app.new-from-template"),
             ("New Demo Session", "app.new-demo"),
             ("Open…", "app.open"),
         ]);
@@ -271,7 +272,11 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
     });
     file.append_section(
         None,
-        &section(&[("Save", "app.save"), ("Save As…", "app.save-as")]),
+        &section(&[
+            ("Save", "app.save"),
+            ("Save As…", "app.save-as"),
+            ("Save as Template…", "app.save-template"),
+        ]),
     );
     file.append_section(
         None,

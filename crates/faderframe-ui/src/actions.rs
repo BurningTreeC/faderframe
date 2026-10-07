@@ -34,9 +34,7 @@ pub fn install(app: &Rc<AppState>) {
     use WorkspaceAction as W;
     let mut entries = vec![
         entry(app, "new", |a| {
-            crate::dialogs::confirm_discard(a, |a| {
-                a.with_session(|s| s.new_project(false));
-            })
+            crate::dialogs::confirm_discard(a, crate::templates::new_project)
         }),
         entry(app, "new-demo", |a| {
             crate::dialogs::confirm_discard(a, |a| {
@@ -288,6 +286,8 @@ pub fn install(app: &Rc<AppState>) {
         entry(app, "command-palette", crate::palette::open),
         entry(app, "shortcuts", crate::palette::shortcuts),
         dispatch(app, "show-versions", A::ShowVersions),
+        dispatch(app, "save-template", A::PromptSaveTemplate),
+        dispatch(app, "new-from-template", A::ShowTemplates),
         entry(app, "panic", |a| {
             a.with_session(|s| {
                 s.engine_reset_processors()?;
@@ -1170,6 +1170,23 @@ pub fn install(app: &Rc<AppState>) {
                 None => tracing::warn!("chain-insert: no container chain {chain} or no '{id}'"),
             }
         }),
+        // Development aids: `template:<name>` saves the project as a
+        // template, `from-template:<name>` starts a new project from one
+        // (unsaved changes are discarded).
+        named("template", |a, arg| {
+            a.dispatch(Action::SaveTemplate {
+                name: arg.to_string(),
+            });
+        }),
+        named(
+            "from-template",
+            |a, arg| match faderframe_session::templates::existing_template(arg) {
+                Some(t) => {
+                    a.with_session(|s| s.new_from_template(&t.path));
+                }
+                None => tracing::warn!("from-template: no template '{arg}'"),
+            },
+        ),
         // Development aid: `version:<name>` saves a version.
         named("version", |a, arg| {
             a.dispatch(Action::SaveVersion {
