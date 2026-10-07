@@ -4,8 +4,8 @@
 #       packaging/flatpak/io.github.BurningTreeC.FaderFrame.yml
 #
 # Cargo fetches the crates during the build (network access in the build
-# sandbox). A Flathub submission would vendor them instead
-# (flatpak-cargo-generator) and drop `--share=network`.
+# sandbox). The bundle is published on the releases page (Flathub does
+# not take LLM-generated apps).
 app-id: io.github.BurningTreeC.FaderFrame
 runtime: org.gnome.Platform
 runtime-version: '51'

@@ -2502,10 +2502,12 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
 6. ~~**Performance and control**: a clip launcher with scenes recorded
    into the arrangement, control surfaces (Mackie Control/HUI, OSC)~~ —
    done (see *Clip launcher* and *Control surfaces*).
-7. **Ports**: signed and notarised packages, a Flathub submission
-   (vendored crates), ~~sandboxed plugins' audio threads in the device's
-   workgroup~~ (done: `faderframe_plugin_sandbox::workgroup` — a bootstrap
-   service hands helpers the workgroup's Mach port).
+7. **Ports**: signed and notarised packages, ~~sandboxed plugins' audio
+   threads in the device's workgroup~~ (done:
+   `faderframe_plugin_sandbox::workgroup` — a bootstrap service hands
+   helpers the workgroup's Mach port). The Flatpak is a bundle on the
+   releases page, not on Flathub (Flathub does not take LLM-generated
+   apps).
 8. ~~**MIDI**: MTC output, varispeed chase without a shared word clock~~ —
    done (see *MIDI time code out and varispeed*).
 9. **Performance**: render-ahead for buses whose inputs are all rendered
