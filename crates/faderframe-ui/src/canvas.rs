@@ -329,6 +329,76 @@ impl CanvasWidget {
         Some((target, Point::new(local.x(), local.y())))
     }
 
+    /// Files dragged over the view at `pos` (`None`: they left): the
+    /// action asked of the source -- a copy where it offers one, else a link,
+    /// else a move (the files are imported either way) -- or none where the
+    /// view takes no files.
+    fn hover_files(&self, t: &gtk::DropTarget, pos: Option<Point>) -> gdk::DragAction {
+        let Some(app) = self.app() else {
+            return gdk::DragAction::empty();
+        };
+        let Ok(session) = app.session.try_borrow() else {
+            if trace_dnd() {
+                tracing::info!("dnd files: hover: the session is borrowed");
+            }
+            return gdk::DragAction::empty();
+        };
+        let accepted = self
+            .imp()
+            .view
+            .borrow_mut()
+            .as_mut()
+            .is_some_and(|v| v.drag_files(pos, self.size(), &session));
+        self.queue_draw();
+        let offered = t
+            .current_drop()
+            .map_or(gdk::DragAction::COPY, |d| d.actions());
+        let action = [
+            gdk::DragAction::COPY,
+            gdk::DragAction::LINK,
+            gdk::DragAction::MOVE,
+        ]
+        .into_iter()
+        .find(|a| offered.contains(*a))
+        .unwrap_or(gdk::DragAction::COPY);
+        if trace_dnd() {
+            tracing::info!(
+                "dnd files: hover at {pos:?}: accepted {accepted}, offered {offered:?}, asking {action:?}"
+            );
+        }
+        if accepted {
+            action
+        } else {
+            gdk::DragAction::empty()
+        }
+    }
+
+    /// Files dropped at `pos`: what the view makes of them (`false`: none).
+    fn drop_files_at(&self, files: &[std::path::PathBuf], pos: Point) -> bool {
+        if trace_dnd() {
+            tracing::info!("dnd files: drop at {pos:?}: {files:?}");
+        }
+        let Some(app) = self.app() else { return false };
+        let action = {
+            let Ok(session) = app.session.try_borrow() else {
+                return false;
+            };
+            self.imp()
+                .view
+                .borrow_mut()
+                .as_mut()
+                .and_then(|v| v.drop_files(files, pos, self.size(), &session))
+        };
+        self.queue_draw();
+        match action {
+            Some(a) => {
+                app.dispatch(a);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn hover_payload(&self, payload: Option<(&str, Point)>) {
         let Some(app) = self.app() else { return };
         let redraw = {
@@ -759,47 +829,53 @@ impl CanvasWidget {
         ));
         self.add_controller(focus);
 
-        // Files dragged in from a file manager (or another app).
-        let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
-        let hover = |w: &CanvasWidget, pos: Option<Point>| -> gdk::DragAction {
-            let Some(app) = w.app() else {
-                return gdk::DragAction::empty();
-            };
-            let Ok(session) = app.session.try_borrow() else {
-                return gdk::DragAction::empty();
-            };
-            let accepted = w
-                .imp()
-                .view
-                .borrow_mut()
-                .as_mut()
-                .is_some_and(|v| v.drag_files(pos, w.size(), &session));
-            w.queue_draw();
-            if accepted {
-                gdk::DragAction::COPY
-            } else {
-                gdk::DragAction::empty()
-            }
-        };
+        // Files dragged in from a file manager (or another app), imported
+        // (copied in) whatever the source calls the drag: a copy where it
+        // offers one, else a link, else a move -- Nautilus offers a drag to
+        // another program as a move only, and a target that took only
+        // copies turned all of its drags away. Sources with no file list
+        // but text naming files (some drag tools) go through the text
+        // target below.
+        let actions = gdk::DragAction::COPY | gdk::DragAction::MOVE | gdk::DragAction::LINK;
+        let drop = gtk::DropTarget::new(gdk::FileList::static_type(), actions);
+        if trace_dnd() {
+            drop.connect_accept(move |t, d| {
+                // As GTK's own check: what the offered types deserialize to.
+                let ok = d
+                    .formats()
+                    .union_deserialize_types()
+                    .contains_type(gdk::FileList::static_type())
+                    && !(d.actions() & actions).is_empty();
+                tracing::info!(
+                    "dnd files: accept {ok}: formats {}, actions {:?}, local {}, widget {}",
+                    d.formats(),
+                    d.actions(),
+                    d.drag().is_some(),
+                    t.widget()
+                        .map_or_else(String::new, |w| w.type_().name().to_string())
+                );
+                ok
+            });
+        }
         drop.connect_enter(glib::clone!(
             #[weak(rename_to = w)]
             self,
             #[upgrade_or]
             gdk::DragAction::empty(),
-            move |_, x, y| hover(&w, Some(Point::new(x as f32, y as f32)))
+            move |t, x, y| w.hover_files(t, Some(Point::new(x as f32, y as f32)))
         ));
         drop.connect_motion(glib::clone!(
             #[weak(rename_to = w)]
             self,
             #[upgrade_or]
             gdk::DragAction::empty(),
-            move |_, x, y| hover(&w, Some(Point::new(x as f32, y as f32)))
+            move |t, x, y| w.hover_files(t, Some(Point::new(x as f32, y as f32)))
         ));
         drop.connect_leave(glib::clone!(
             #[weak(rename_to = w)]
             self,
-            move |_| {
-                hover(&w, None);
+            move |t| {
+                w.hover_files(t, None);
             }
         ));
         drop.connect_drop(glib::clone!(
@@ -809,47 +885,51 @@ impl CanvasWidget {
             false,
             move |_, value, x, y| {
                 let Ok(list) = value.get::<gdk::FileList>() else {
+                    if trace_dnd() {
+                        tracing::info!("dnd files: drop: not a file list ({:?})", value.type_());
+                    }
                     return false;
                 };
                 let files: Vec<std::path::PathBuf> =
                     list.files().iter().filter_map(|f| f.path()).collect();
-                let Some(app) = w.app() else { return false };
-                let action = {
-                    let Ok(session) = app.session.try_borrow() else {
-                        return false;
-                    };
-                    w.imp().view.borrow_mut().as_mut().and_then(|v| {
-                        v.drop_files(&files, Point::new(x as f32, y as f32), w.size(), &session)
-                    })
-                };
-                w.queue_draw();
-                match action {
-                    Some(a) => {
-                        app.dispatch(a);
-                        true
-                    }
-                    None => false,
-                }
+                w.drop_files_at(&files, Point::new(x as f32, y as f32))
             }
         ));
         self.add_controller(drop);
 
-        // Payloads (clips) dragged from another window's views.
-        let payload = gtk::DropTarget::new(glib::Type::STRING, gdk::DragAction::COPY);
+        // Text: payloads (clips) dragged from another window's views, and
+        // files named as text by sources that offer no file list.
+        let payload = gtk::DropTarget::new(glib::Type::STRING, actions);
         payload.set_preload(true);
-        // Only FaderFrame's own drags (started in this process). A file
-        // manager offers its files as text too: taken here, where they are
-        // no payload, they never reached the file drop above.
+        // FaderFrame's own drags (started in this process), and others' text
+        // only where there is no file list: a file manager offers its files
+        // as text too, and taken here they never reached the file target.
         payload.connect_accept(|_, drop| {
-            drop.drag().is_some() && drop.formats().contains_type(glib::Type::STRING)
+            let types = drop.formats().union_deserialize_types();
+            let text = types.contains_type(glib::Type::STRING);
+            let local = drop.drag().is_some();
+            let ok = text && (local || !types.contains_type(gdk::FileList::static_type()));
+            if trace_dnd() {
+                tracing::info!(
+                    "dnd text: accept {ok}: formats {}, local {local}",
+                    drop.formats()
+                );
+            }
+            ok
         });
         let over = |w: &CanvasWidget, t: &gtk::DropTarget, pos: Option<Point>| -> gdk::DragAction {
             let text = t.value().and_then(|v| v.get::<String>().ok());
-            let Some(text) = text.filter(|s| s.starts_with("clips:")) else {
+            let Some(text) = text else {
                 return gdk::DragAction::empty();
             };
-            w.hover_payload(pos.map(|p| (text.as_str(), p)));
-            gdk::DragAction::COPY
+            if text.starts_with("clips:") {
+                w.hover_payload(pos.map(|p| (text.as_str(), p)));
+                return gdk::DragAction::COPY;
+            }
+            if named_files(&text).is_empty() {
+                return gdk::DragAction::empty();
+            }
+            w.hover_files(t, pos)
         };
         payload.connect_enter(glib::clone!(
             #[weak(rename_to = w)]
@@ -868,7 +948,10 @@ impl CanvasWidget {
         payload.connect_leave(glib::clone!(
             #[weak(rename_to = w)]
             self,
-            move |_| w.hover_payload(None)
+            move |t| {
+                w.hover_payload(None);
+                w.hover_files(t, None);
+            }
         ));
         payload.connect_drop(glib::clone!(
             #[weak(rename_to = w)]
@@ -880,14 +963,20 @@ impl CanvasWidget {
                 let Ok(text) = value.get::<String>() else {
                     return false;
                 };
+                let at = Point::new(x as f32, y as f32);
+                if !text.starts_with("clips:") {
+                    return w.drop_files_at(&named_files(&text), at);
+                }
                 let Some(app) = w.app() else { return false };
                 let action = {
                     let Ok(session) = app.session.try_borrow() else {
                         return false;
                     };
-                    w.imp().view.borrow_mut().as_mut().and_then(|v| {
-                        v.drop_payload(&text, Point::new(x as f32, y as f32), w.size(), &session)
-                    })
+                    w.imp()
+                        .view
+                        .borrow_mut()
+                        .as_mut()
+                        .and_then(|v| v.drop_payload(&text, at, w.size(), &session))
                 };
                 w.queue_draw();
                 match action {
@@ -1533,5 +1622,55 @@ mod paint_stats {
                 *since = Some(Instant::now());
             }
         });
+    }
+}
+
+/// `FADERFRAME_TRACE_DND=1`: log what drags and drops reach the canvases.
+fn trace_dnd() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FADERFRAME_TRACE_DND").is_ok_and(|v| v == "1"))
+}
+
+/// The files a dropped text names, one a line: `file://` URIs (as a URI
+/// list has them) or absolute paths, those that exist.
+fn named_files(text: &str) -> Vec<std::path::PathBuf> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            if l.starts_with("file:") {
+                gio::File::for_uri(l).path()
+            } else {
+                let p = std::path::PathBuf::from(l);
+                p.is_absolute().then_some(p)
+            }
+        })
+        .filter(|p| p.exists())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use gtk::prelude::*;
+
+    #[test]
+    fn dropped_text_names_existing_files_by_uri_or_path() {
+        let dir = std::env::temp_dir().join(format!("ff-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("kick drum.wav");
+        let b = dir.join("snare.wav");
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(&b, b"x").unwrap();
+        let uri = gtk::gio::File::for_path(&a).uri();
+        assert!(uri.contains("%20"), "{uri}");
+        let text = format!(
+            "# a comment\r\n{uri}\r\n{}\r\n{}\r\nnot a path\r\n",
+            b.display(),
+            dir.join("missing.wav").display()
+        );
+        assert_eq!(super::named_files(&text), vec![a, b]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
