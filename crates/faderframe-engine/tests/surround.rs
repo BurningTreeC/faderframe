@@ -167,3 +167,57 @@ fn a_bed_folds_down_to_a_stereo_device() {
     let six = levels(&mono_in_51(SurroundPan::default()), 6);
     assert!(close(six[2], 0.5));
 }
+
+/// An automation lane moves the track through the room: left to right
+/// across the front while it plays, the strip following the curve.
+#[test]
+fn surround_automation_moves_the_track() {
+    use faderframe_automation::{
+        AutomationCurve, AutomationLane, AutomationMode, AutomationPoint, AutomationTarget,
+        CurveShape,
+    };
+    use faderframe_core::SurroundParam;
+    let q = 24_000usize;
+    let mut tp = TestProject::new(48_000);
+    let master = tp.master();
+    tp.project.track_mut(master).unwrap().layout = S51;
+    let t = tp.track(TrackKind::Audio, "Mono", ChannelLayout::Mono);
+    let src = tp.dc(1, 0.5, q * 4);
+    tp.clip(t, src, MusicalTime::ZERO, (q * 4) as i64);
+    let point = |quarters: f64, value: f64| AutomationPoint {
+        time: MusicalTime::from_quarters(quarters),
+        value,
+        shape: CurveShape::Linear,
+    };
+    let id = tp.project.ids.allocate();
+    tp.project
+        .track_mut(t)
+        .unwrap()
+        .automation
+        .lanes
+        .push(AutomationLane {
+            id,
+            target: AutomationTarget::Surround(SurroundParam::X),
+            curve: AutomationCurve::from_points(vec![
+                point(0.0, -1.0),
+                point(1.0, -1.0),
+                point(2.0, 1.0),
+            ]),
+            mode: AutomationMode::Read,
+            visible: true,
+        });
+    let mut r =
+        OfflineRenderer::new(&tp.project, &tp.sources, EngineConfig::default(), 256, 6).unwrap();
+    r.play_from(0).unwrap();
+    let out = r.render(q * 3);
+    assert_eq!(out.len(), 6);
+    let at = |c: usize, f: usize| out[c][f];
+    // Hard left, then (halfway) centre, then hard right.
+    assert!(close(at(0, q / 2), 0.5) && at(1, q / 2).abs() < 1e-6);
+    assert!(
+        (at(2, q + q / 2) - 0.5).abs() < 0.01,
+        "{}",
+        at(2, q + q / 2)
+    );
+    assert!(close(at(1, q * 5 / 2), 0.5) && at(0, q * 5 / 2).abs() < 1e-6);
+}

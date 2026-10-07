@@ -334,6 +334,11 @@ pub fn install(app: &Rc<AppState>) {
         dispatch(app, "show-ddp", A::Workspace(W::ShowView(ViewId::ddp()))),
         dispatch(
             app,
+            "show-surround",
+            A::Workspace(W::ShowView(ViewId::surround())),
+        ),
+        dispatch(
+            app,
             "show-modulators",
             A::Workspace(W::ShowView(ViewId::modulators())),
         ),
@@ -1668,6 +1673,77 @@ pub fn install(app: &Rc<AppState>) {
             match action {
                 Some(action) => a.dispatch(action),
                 None => tracing::warn!("midi-plays: no choice '{arg}'"),
+            }
+        }),
+        // Development aid: `track-format:<track>=<mono|stereo|5.1|7.1.4|…>`
+        // (a track's channel format, as its Channel Format menu sets it).
+        named("track-format", |a, arg| {
+            let Some((name, format)) = arg.split_once('=') else {
+                tracing::warn!("track-format: '{arg}' is not <track>=<format>");
+                return;
+            };
+            let action = {
+                let s = a.session.borrow();
+                s.project()
+                    .tracks
+                    .iter()
+                    .find(|t| t.name == name)
+                    .and_then(|t| {
+                        s.format_choices(t.id).into_iter().find(|c| {
+                            c.label.eq_ignore_ascii_case(format)
+                                || c.label
+                                    .split(' ')
+                                    .next()
+                                    .is_some_and(|l| l.eq_ignore_ascii_case(format))
+                        })
+                    })
+                    .map(|c| c.action)
+            };
+            match action {
+                Some(action) => a.dispatch(action),
+                None => tracing::warn!("track-format: no choice '{arg}'"),
+            }
+        }),
+        // Development aid: `surround:<track>=<x>/<y>[/<z>/<spread>/<width>/<lfe dB>]`
+        // (where the track sits in the bed it feeds).
+        named("surround", |a, arg| {
+            let Some((name, values)) = arg.split_once('=') else {
+                tracing::warn!("surround: '{arg}' is not <track>=<x>/<y>/…");
+                return;
+            };
+            let action = {
+                let s = a.session.borrow();
+                s.project().tracks.iter().find(|t| t.name == name).map(|t| {
+                    let pan = values
+                        .split('/')
+                        .zip(faderframe_core::SurroundParam::ALL)
+                        .fold(t.surround, |pan, (v, p)| match v.trim().parse::<f32>() {
+                            Ok(v) => p.set(pan, v),
+                            Err(_) => pan,
+                        });
+                    faderframe_session::Action::Edit(
+                        faderframe_project::Command::SetTrackSurround { track: t.id, pan },
+                    )
+                })
+            };
+            match action {
+                Some(action) => a.dispatch(action),
+                None => tracing::warn!("surround: no track '{name}'"),
+            }
+        }),
+        // Development aid: `show-surround-panner:<track>`.
+        named("show-surround-panner", |a, arg| {
+            let track = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == arg)
+                .map(|t| t.id);
+            match track {
+                Some(t) => a.dispatch(faderframe_session::Action::ShowSurroundPanner(t)),
+                None => tracing::warn!("show-surround-panner: no track '{arg}'"),
             }
         }),
         // Development aid: `strip-width:<track name|all>=<px|default>`.

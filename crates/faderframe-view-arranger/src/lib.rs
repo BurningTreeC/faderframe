@@ -2208,6 +2208,21 @@ impl ArrangerView {
                 .separated(),
             );
         }
+        let formats: Vec<MenuItem<Action>> = model
+            .format_choices(t.id)
+            .into_iter()
+            .map(|c| {
+                let item = MenuItem::new(c.label, c.action).checked(c.checked);
+                if c.group_start {
+                    item.separated()
+                } else {
+                    item
+                }
+            })
+            .collect();
+        if !formats.is_empty() {
+            items.push(MenuItem::submenu("Channel Format", formats).separated());
+        }
         // MIDI learn for the strip controls.
         if t.kind != TrackKind::Midi {
             for (i, (target, name)) in [

@@ -630,31 +630,15 @@ impl PluginCx<'_> {
 /// `first` is folded down to (`None`: it fits, or it is not a bed, or the
 /// device is unknown): the largest bed that fits, else stereo, else mono.
 fn fold_for(layout: ChannelLayout, outputs: usize, first: usize) -> Option<ChannelLayout> {
-    let ChannelLayout::Surround(_) = layout else {
-        return None;
-    };
-    let room = outputs.saturating_sub(first);
-    if outputs == 0 || layout.channel_count() <= room {
+    if outputs == 0 {
         return None;
     }
-    faderframe_core::SurroundFormat::ALL
-        .iter()
-        .filter(|f| f.channels() <= room)
-        .max_by_key(|f| f.channels())
-        .map(|f| ChannelLayout::Surround(*f))
-        .or(Some(if room >= 2 {
-            ChannelLayout::Stereo
-        } else {
-            ChannelLayout::Mono
-        }))
+    faderframe_core::surround::fold_into(layout, outputs.saturating_sub(first))
 }
 
 /// Destination layout for a track's post-fader output.
 fn destination_layout(project: &Project, track: &Track) -> ChannelLayout {
-    match project.output_target(track).and_then(|t| project.track(t)) {
-        Some(dst) if dst.kind.has_audio() => dst.layout,
-        _ => track.layout,
-    }
+    project.destination_layout(track)
 }
 
 pub fn build_graph(

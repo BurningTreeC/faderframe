@@ -222,3 +222,107 @@ fn touch_and_latch_write_automation_while_playing() {
     s.dispatch(Action::Undo).unwrap();
     assert!(lane_points(&s, t, AutomationTarget::TrackVolume).len() < before);
 }
+
+/// A track panned into a bed automates the surround panner instead of its
+/// pan: the values that apply to its source and the bed, learnable, and
+/// written from the panner like a fader in Latch.
+#[test]
+fn the_surround_panner_is_automated() {
+    use faderframe_core::{ChannelLayout, SurroundFormat, SurroundPan, SurroundParam};
+    let (mut s, t) = session();
+    let master = s.project().master_id().unwrap();
+    s.dispatch(Action::Edit(Command::SetTrackLayout {
+        track: master,
+        layout: ChannelLayout::Surround(SurroundFormat::S51),
+    }))
+    .unwrap();
+    let targets = |s: &Session, t| -> Vec<AutomationTarget> {
+        s.automatable_parameters(t)
+            .into_iter()
+            .map(|p| p.target)
+            .collect()
+    };
+    let mono = targets(&s, t);
+    assert!(!mono.contains(&AutomationTarget::TrackPan));
+    for p in [
+        SurroundParam::X,
+        SurroundParam::Y,
+        SurroundParam::Spread,
+        SurroundParam::Lfe,
+    ] {
+        assert!(mono.contains(&AutomationTarget::Surround(p)), "{p:?}");
+    }
+    // 5.1 has no heights; width is a stereo source's.
+    assert!(!mono.contains(&AutomationTarget::Surround(SurroundParam::Z)));
+    assert!(!mono.contains(&AutomationTarget::Surround(SurroundParam::Width)));
+    let stereo = s.add_track(TrackKind::Audio).unwrap();
+    s.dispatch(Action::Edit(Command::SetTrackLayout {
+        track: stereo,
+        layout: ChannelLayout::Stereo,
+    }))
+    .unwrap();
+    assert!(targets(&s, stereo).contains(&AutomationTarget::Surround(SurroundParam::Width)));
+    // MIDI learn sets one value and keeps the others.
+    match s.command_for(t, AutomationTarget::Surround(SurroundParam::X), -0.5) {
+        Some(Command::SetTrackSurround { pan, .. }) => {
+            assert_eq!(
+                pan,
+                SurroundPan {
+                    x: -0.5,
+                    ..SurroundPan::default()
+                }
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+
+    s.start_audio(
+        vec![Box::new(DummyBackend::default())],
+        &AudioPreferences::default(),
+    )
+    .unwrap();
+    for p in [SurroundParam::X, SurroundParam::Y] {
+        s.dispatch(Action::ShowAutomation {
+            track: t,
+            target: AutomationTarget::Surround(p),
+        })
+        .unwrap();
+    }
+    for lane in s.shown_lanes(t).iter().map(|l| l.id).collect::<Vec<_>>() {
+        s.dispatch(Action::SetAutomationMode {
+            track: t,
+            lane,
+            mode: AutomationMode::Latch,
+        })
+        .unwrap();
+    }
+    s.dispatch(Action::Transport(TransportAction::Play))
+        .unwrap();
+    play_for(&mut s, 100, |_, _| {});
+    // Across the room to the back left.
+    s.dispatch(Action::BeginGesture("Surround Pan".into()))
+        .unwrap();
+    play_for(&mut s, 300, |s, f| {
+        s.dispatch(Action::Edit(Command::SetTrackSurround {
+            track: t,
+            pan: SurroundPan {
+                x: -f,
+                y: 1.0 - 2.0 * f,
+                ..SurroundPan::default()
+            },
+        }))
+        .unwrap();
+    });
+    s.dispatch(Action::EndGesture).unwrap();
+    play_for(&mut s, 100, |_, _| {});
+    s.dispatch(Action::Transport(TransportAction::Stop))
+        .unwrap();
+    let x = lane_points(&s, t, AutomationTarget::Surround(SurroundParam::X));
+    let y = lane_points(&s, t, AutomationTarget::Surround(SurroundParam::Y));
+    assert!(x.len() >= 3 && y.len() >= 3, "{} {}", x.len(), y.len());
+    assert!(x.last().unwrap().value < -0.8, "{:?}", x.last());
+    assert!(y.last().unwrap().value < -0.6, "{:?}", y.last());
+    // Played back, the panner shows the written path.
+    let shown = s.shown_surround(s.project().track(t).unwrap());
+    assert!(shown.x < -0.8 && shown.y < -0.6, "{shown:?}");
+}

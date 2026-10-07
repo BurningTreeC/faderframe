@@ -150,6 +150,15 @@ Contrast:
 * Transport: tap tempo (the TAP pad in the display), editable time
   signature (click it; right-click for common meters and meter changes),
   metronome button (K).
+* Surround: any track, bus or the master can be a bed — LCR, quad, 5.0,
+  5.1, 7.0, 7.1, 5.1.2, 5.1.4, 7.1.2 or 7.1.4 (Channel Format in the track
+  menu). Tracks feeding a bed are placed in a room seen from above, in the
+  mixer strip and in the Surround Panner (View → Surround Panner): left/right,
+  front/back, height, spread, stereo width and an LFE send, all automatable;
+  beds fold into smaller formats (and down to the interface's outputs, so a
+  7.1.4 mix plays on headphones), meters show every channel, and renders
+  keep every channel with the speakers in the WAV header — or fold down to
+  stereo.
 * Analogue-console mixer: inserts, sends (pre-FX / pre / post), pan, M/S/R,
   faders with a console fader law, segmented peak meters, routing menus,
   any number of sends per channel (rows grow, ◂ ▸ pages through banks),
@@ -508,7 +517,8 @@ Contrast:
   reads.
 * Render / export to WAV (16/24-bit with TPDF or noise-shaped dither,
   32-bit float): master or stems, project/loop/bar range, any sample rate,
-  mono or stereo, tail, peak normalisation. Delivery: loudness
+  mono, stereo or a surround master's every channel, tail, peak
+  normalisation. Delivery: loudness
   normalisation to a target (BS.1770 integrated loudness) with a true-peak
   lookahead limiter, presets for streaming, Apple Music, CD, EBU R128 and
   ATSC A/85, and each written file's loudness, range and true peak.

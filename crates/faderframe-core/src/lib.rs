@@ -22,4 +22,4 @@ pub use id::{
     SongId, TrackId,
 };
 pub use pan::PanLaw;
-pub use surround::{SurroundFormat, SurroundPan};
+pub use surround::{SurroundFormat, SurroundPan, SurroundParam};

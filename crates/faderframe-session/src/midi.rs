@@ -1499,6 +1499,10 @@ impl Session {
                 track,
                 pan: v as f32,
             },
+            AutomationTarget::Surround(p) => Command::SetTrackSurround {
+                track,
+                pan: p.set(self.project.track(track)?.surround, v as f32),
+            },
             AutomationTarget::TrackMute => Command::SetTrackMute {
                 track,
                 on: v >= 0.5,

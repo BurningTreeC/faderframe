@@ -456,6 +456,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             ("Performance Meter", "app.show-performance"),
             ("Undo History", "app.show-history"),
             ("Modulators", "app.show-modulators"),
+            ("Surround Panner", "app.show-surround"),
             ("Pitch Editor", "app.show-pitch"),
             ("Clip Effects", "app.show-clip-fx"),
             ("Clip Launcher", "app.show-launcher"),

@@ -80,6 +80,12 @@ fn create_view(app: &Rc<AppState>, kind: ViewKind) -> ViewHost {
             false,
             false,
         ),
+        ViewKind::Surround => ViewHost::new(
+            app,
+            Box::new(faderframe_view_surround::SurroundView::new(theme)),
+            false,
+            false,
+        ),
         ViewKind::Ddp => ViewHost::new(
             app,
             Box::new(faderframe_view_ddp::DdpView::new(theme)),

@@ -480,11 +480,14 @@ pub struct TrackAutomation {
     pub sends: Vec<(SendId, SampleLane)>,
     pub params: Vec<(PluginInstanceId, ParameterId, SampleLane)>,
     pub bypass: Vec<(PluginInstanceId, SampleLane)>,
+    /// The surround panner, by [`faderframe_core::SurroundParam::index`].
+    pub surround: [Option<SampleLane>; 6],
 }
 
 impl TrackAutomation {
     pub fn is_empty(&self) -> bool {
-        self.volume.is_none()
+        self.surround.iter().all(Option::is_none)
+            && self.volume.is_none()
             && self.pan.is_none()
             && self.mute.is_none()
             && self.vca_volume.is_empty()
@@ -962,6 +965,7 @@ impl TimelineSnapshot {
                         a.params.push((plugin, parameter, rt));
                     }
                     AutomationTarget::PluginBypass(p) => a.bypass.push((p, rt)),
+                    AutomationTarget::Surround(p) => a.surround[p.index()] = Some(rt),
                 }
             }
             if !a.is_empty() {

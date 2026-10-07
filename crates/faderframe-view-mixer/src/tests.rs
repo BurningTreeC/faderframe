@@ -64,7 +64,7 @@ fn mute_button_toggles_via_command() {
     // Laid out by a paint, as before any click in the app.
     view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
     let first = MixerView::channel_tracks(&s)[0];
-    let l = view.layout_for(view.strip_rect(0, size), first);
+    let l = view.layout_for(view.strip_rect(0, size), first, s.project());
     let (actions, _) = run(&mut view, down(l.mute.center(), 1), size, &s);
     assert_eq!(
         actions,
@@ -229,7 +229,11 @@ fn many_sends_grow_the_send_section_and_page_in_banks() {
         .iter()
         .position(|t| t.id == source)
         .unwrap();
-    let l = view.layout_for(view.strip_rect(i, size), s.project().track(source).unwrap());
+    let l = view.layout_for(
+        view.strip_rect(i, size),
+        s.project().track(source).unwrap(),
+        s.project(),
+    );
     let slots = l.sends.clone().unwrap();
     assert_eq!(slots.len(), 6);
     assert_eq!(
@@ -264,7 +268,11 @@ fn many_sends_grow_the_send_section_and_page_in_banks() {
     }
     view.paint(&mut RecordingPainter::new(), size, &s, &theme);
     assert_eq!(view.send_rows, MAX_SEND_ROWS);
-    let l = view.layout_for(view.strip_rect(i, size), s.project().track(source).unwrap());
+    let l = view.layout_for(
+        view.strip_rect(i, size),
+        s.project().track(source).unwrap(),
+        s.project(),
+    );
     let next = l.send_next.unwrap();
     assert_eq!(
         view.hit_test(next.center(), size, &s),
@@ -963,7 +971,11 @@ fn midi_tracks_have_a_strip_with_their_instrument_and_effects() {
     for t in ["NOTES", "MIDI OUT —"] {
         assert!(texts.contains(&t), "{t} in {texts:?}");
     }
-    let l = view.layout_for(view.strip_rect(i, size), s.project().track(midi).unwrap());
+    let l = view.layout_for(
+        view.strip_rect(i, size),
+        s.project().track(midi).unwrap(),
+        s.project(),
+    );
     // No fader, pan or sends on it.
     for r in [l.fader, l.pan_knob] {
         assert_eq!(view.hit_test(r.center(), size, &s), Some(Hit::Strip(midi)));
@@ -1007,4 +1019,81 @@ fn sounding_notes_are_named_as_they_fit() {
     assert_eq!(note_names(0, 80.0), "—");
     assert_eq!(note_names(keys, 200.0), "C4 E4 G4 C5");
     assert_eq!(note_names(keys, 60.0), "C4 E4 +2");
+}
+
+/// Into a surround bed a strip pans with a room seen from above: dragging
+/// it moves the track (one gesture), a double-click opens the panner, the
+/// format menu offers the beds, and the meter widens for every channel.
+#[test]
+fn a_strip_feeding_a_bed_pans_in_the_room() {
+    use faderframe_core::{ChannelLayout, SurroundFormat};
+    let mut s = session();
+    let master = s.project().master_id().unwrap();
+    s.dispatch(Action::Edit(Command::SetTrackLayout {
+        track: master,
+        layout: ChannelLayout::Surround(SurroundFormat::S51),
+    }))
+    .unwrap();
+    let pluck = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.name == "Pluck")
+        .unwrap()
+        .id;
+    let theme = Theme::default();
+    let mut view = MixerView::new(theme.clone());
+    let size = Size::new(1400.0, 760.0);
+    view.paint(&mut RecordingPainter::new(), size, &s, &theme);
+    let i = MixerView::channel_tracks(&s)
+        .iter()
+        .position(|t| t.id == pluck)
+        .unwrap();
+    let t = s.project().track(pluck).unwrap();
+    let l = view.layout_for(view.strip_rect(i, size), t, s.project());
+    let plain = view.layout_for(
+        view.strip_rect(i, size),
+        t,
+        &faderframe_project::Project::new("Plain", 48_000),
+    );
+    assert!(l.meter.w > plain.meter.w, "six meters need room");
+    let c = l.pan_knob.center();
+    let (actions, _) = run(&mut view, down(c, 1), size, &s);
+    assert!(
+        matches!(actions[..], [Action::BeginGesture(_)]),
+        "{actions:?}"
+    );
+    let (actions, _) = run(
+        &mut view,
+        ViewEvent::PointerMove {
+            pos: Point::new(c.x - l.pan_knob.w * 0.25, c.y + l.pan_knob.w * 0.5),
+            modifiers: Modifiers::NONE,
+            dragging: true,
+        },
+        size,
+        &s,
+    );
+    match &actions[..] {
+        [Action::Edit(Command::SetTrackSurround { track, pan })] => {
+            assert_eq!(*track, pluck);
+            assert!((pan.x + 0.5).abs() < 1e-4 && pan.y.abs() < 1e-4, "{pan:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+    let (actions, _) = run(
+        &mut view,
+        ViewEvent::PointerUp {
+            pos: c,
+            button: PointerButton::Primary,
+            modifiers: Modifiers::NONE,
+        },
+        size,
+        &s,
+    );
+    assert!(matches!(actions[..], [Action::EndGesture]));
+    let (actions, _) = run(&mut view, down(c, 2), size, &s);
+    assert!(matches!(actions[..], [Action::ShowSurroundPanner(id)] if id == pluck));
+    let formats = s.format_choices(pluck);
+    assert_eq!(formats.len(), 2 + SurroundFormat::ALL.len());
+    assert!(formats.iter().any(|f| f.label.starts_with("7.1.4")));
 }

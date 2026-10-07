@@ -238,11 +238,13 @@ impl Processor<EngineContext> for ChannelStrip {
         });
         let (vca_volume, vca_mute): (&[SampleLane], &[SampleLane]) =
             auto.map_or((&[], &[]), |a| (&a.vca_volume, &a.vca_mute));
+        let surround_lanes = auto.map(|a| &a.surround).filter(|_| self.surround);
         let automated = vol_lane.is_some()
             || pan_lane.is_some()
             || mute_lane.is_some()
             || !vca_volume.is_empty()
-            || !vca_mute.is_empty();
+            || !vca_mute.is_empty()
+            || surround_lanes.is_some_and(|l| l.iter().any(Option::is_some));
 
         let Some(input) = io.audio_in.first() else {
             return;
@@ -292,15 +294,7 @@ impl Processor<EngineContext> for ChannelStrip {
                 )
             };
             if self.surround {
-                let sp = &self.slots.surround;
-                let pan = SurroundPan {
-                    x: params.get(sp[0]),
-                    y: params.get(sp[1]),
-                    z: params.get(sp[2]),
-                    spread: params.get(sp[3]),
-                    width: params.get(sp[4]),
-                    lfe_db: params.get(sp[5]),
-                };
+                let pan = surround_at(&self.slots.surround, params, surround_lanes, at);
                 if self.made_for != Some(pan) {
                     surround::matrix(self.layouts.0, self.layouts.1, &pan, &mut self.matrix);
                     self.made_for = Some(pan);
@@ -328,11 +322,40 @@ impl Processor<EngineContext> for ChannelStrip {
             rb.set(self.slots.volume, values.0);
             rb.set(self.slots.pan, values.1);
             rb.set(self.slots.mute, if values.2 { 1.0 } else { 0.0 });
+            if let Some(pan) = self.made_for {
+                set_surround(rb, &self.slots.surround, &pan);
+            }
         }
 
         if let Some(post) = io.audio_out.first() {
             publish(cx, self.track, self.meter, post, n);
         }
+    }
+}
+
+/// The surround panner at `at`: each value from its lane where one drives
+/// it, else from its slot.
+fn surround_at(
+    slots: &[ParamSlot; 6],
+    params: &faderframe_realtime::ParamTable,
+    lanes: Option<&[Option<SampleLane>; 6]>,
+    at: i64,
+) -> SurroundPan {
+    let mut pan = SurroundPan::default();
+    for p in faderframe_core::SurroundParam::ALL {
+        let i = p.index();
+        let v = lanes
+            .and_then(|l| l[i].as_ref())
+            .and_then(|l| l.value_at(at))
+            .map_or(params.get(slots[i]), |v| v as f32);
+        pan = p.set(pan, v);
+    }
+    pan
+}
+
+fn set_surround(rb: &faderframe_realtime::ParamTable, slots: &[ParamSlot; 6], pan: &SurroundPan) {
+    for p in faderframe_core::SurroundParam::ALL {
+        rb.set(slots[p.index()], p.get(pan));
     }
 }
 
@@ -428,6 +451,10 @@ impl Processor<EngineContext> for StripEcho {
                 rb.set(self.slots.volume, fader);
                 rb.set(self.slots.pan, pan);
                 rb.set(self.slots.mute, if mute { 1.0 } else { 0.0 });
+            }
+            if auto.surround.iter().any(Option::is_some) {
+                let pan = surround_at(&self.slots.surround, params, Some(&auto.surround), at);
+                set_surround(rb, &self.slots.surround, &pan);
             }
             for (send, level) in &self.sends {
                 if let Some(l) = auto.send(*send) {

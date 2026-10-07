@@ -19,6 +19,7 @@ faderframe-app            binary: CLI parsing, logging, starts the GTK app
        │    └─ faderframe-ui-canvas   Painter trait, events, CanvasView, theme, console controls
        ├─ faderframe-ui-gpu       optional GPU painter for dense views (vello on wgpu, parley text)
        ├─ faderframe-view-ddp     DDP player: a CD master checked, played and imported
+       ├─ faderframe-view-surround surround panner: a track in its bed, from above
        ├─ faderframe-audio-pipewire   native PipeWire backend (pw_filter, Linux)
        ├─ faderframe-audio-jack       JACK backend (JACK2 / pipewire-jack, Linux)
        ├─ faderframe-audio-cpal       system backend through cpal: WASAPI, ASIO (opt-in), CoreAudio, ALSA
@@ -130,7 +131,8 @@ persistent data:
   sidechain source), instrument slot, sends (pre-FX / pre-fader /
   post-fader), input and output routing, automation, the VCA and group it
   follows, a freeze (rendered audio) and an explicit `ChannelLayout` (mono,
-  stereo, discrete N).
+  stereo, a surround bed, discrete N), and where it sits in a bed it feeds
+  (`Track::surround`).
 * `groups` — `TrackGroup`s (name, colour, active, `GroupLink`: volume,
   mute, solo, record arm, selection); members name theirs in `Track::group`.
 * `clips: BTreeMap<ClipId, Clip>` — audio clips (source, offset, length in
@@ -427,6 +429,56 @@ of the analysed track (the Tools view) copies its post-fader output into a
 * **Frozen tracks** (`Track::freeze`) skip their MIDI, instrument and insert
   nodes: a clip player plays the rendered file into the strip, and the
   plugin host unloads their plugins (state stays in the slots).
+
+### Surround beds
+
+Channel-based beds before any object-based format: `faderframe_core::surround`
+defines the formats (LCR, quad, 5.0/5.1, 7.0/7.1, 5.1.2/5.1.4, 7.1.2/7.1.4;
+`ChannelLayout::Surround`) with their channels in WAVE channel-mask order —
+files and device outputs need no reordering — and each speaker's place in
+a room box (`x` left/right, `y` back/front, `z` ear level/ceiling; the LFE
+has none). Any audio track, bus, aux or the master can be a bed (Channel
+Format in the track menus, `Session::format_choices`).
+
+* **Panning.** A mono or stereo track feeding a bed
+  (`Project::surround_panned`) is placed by its `SurroundPan` (x, y, z,
+  spread, stereo width, LFE send; `Command::SetTrackSurround`): power-
+  preserving crossfades between the floor and the top layer, the rows of a
+  layer and the speakers of a row, as console and Dolby bed panners work;
+  `spread` blends towards all speakers alike; a stereo source's channels sit
+  `width` either side of the position; the LFE is a separate send. A bed
+  into another format places each of its speakers where it stands (7.1.4
+  into 5.1, 5.1 into stereo, 5.1 opened up into 7.1.4); into its own format
+  it passes straight. `surround::matrix` computes all of these without
+  allocating.
+* **The strip.** Into or out of a bed the `ChannelStrip` mixes through that
+  matrix instead of its pan law (each source/destination pair ramped; the
+  matrix is remade when the panner's six slots move). The pan values are
+  automatable (`AutomationTarget::Surround(SurroundParam)`; the snapshot's
+  `TrackAutomation::surround`, read every `AUTOMATION_STEP` like pan,
+  echoed by `StripEcho` when rendered ahead); a panned track lists them in
+  place of Pan, the session writes them from `SetTrackSurround` in
+  Touch/Latch/Write, MIDI learn sets one value. Node keys tell layouts of
+  equal width apart.
+* **Monitoring.** A bed wider than the device's outputs is folded down to
+  the largest format it can play (`FoldDown` before the device output,
+  `surround::fold_into`; the graph is rebuilt when the device's output count
+  changes), so a 7.1.4 master on a stereo interface is heard whole. The
+  engine carries up to 16 channels; meters cover each of a bed's channels
+  (`TrackMeter::channels`, `MeterDisplay::shown`).
+* **Delivery.** Rendering a surround master "as the master is" writes every
+  channel as `WAVE_FORMAT_EXTENSIBLE` with the bed's channel mask
+  (`write_wav_mask`, `WavWriter::create_with_mask`; `read_wav` reads masks
+  back); stereo folds it down.
+* **Views.** The mixer strip of a track panned into a bed shows the room
+  from above in place of the pan knob (drag the puck, wheel for left/right,
+  double-click or a click on the readout opens the panner), a bed's own
+  strip shows its format, meters widen for every channel and a folded
+  hardware output says so. The Surround Panner (`faderframe-view-surround`,
+  `ViewKind::Surround`, View → Surround Panner) shows the selected track's
+  room with its speakers lit by what they play, the puck (a stereo track's
+  two channels), its spread and height, and knobs for height, spread, width
+  and the LFE send; every move is one gesture.
 
 ## 6. Transport and timing
 
@@ -2625,9 +2677,10 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
    cache locality~~ (done: see *Affinity*), ~~an optional wgpu painter for
    dense views~~ (done: see *The GPU painter*; a dmabuf instead of the
    readback is the next step there).
-10. **Mastering**: ~~multiple CD-Text languages~~ (done: see *CD-Text
-    languages*), ~~a DDP player/import~~ (done: see *The DDP player*);
-    surround beds and panning before any object-based format.
+10. ~~**Mastering**: multiple CD-Text languages, a DDP player/import,
+    surround beds and panning before any object-based format~~ — done (see
+    *CD-Text languages*, *The DDP player* and *Surround beds*). Object-based
+    formats (ADM BWF, Dolby Atmos masters) come after beds.
 
 
 ### Modelled microphone preamplifiers

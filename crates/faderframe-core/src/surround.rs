@@ -276,6 +276,114 @@ impl SurroundPan {
     }
 }
 
+/// What a bed `layout` going to `room` device outputs is folded down to
+/// (`None`: it fits, or it is not a bed): the largest format that fits,
+/// else stereo, else mono.
+pub fn fold_into(layout: ChannelLayout, room: usize) -> Option<ChannelLayout> {
+    let ChannelLayout::Surround(_) = layout else {
+        return None;
+    };
+    if layout.channel_count() <= room {
+        return None;
+    }
+    SurroundFormat::ALL
+        .iter()
+        .filter(|f| f.channels() <= room)
+        .max_by_key(|f| f.channels())
+        .map(|f| ChannelLayout::Surround(*f))
+        .or(Some(if room >= 2 {
+            ChannelLayout::Stereo
+        } else {
+            ChannelLayout::Mono
+        }))
+}
+
+/// One of a [`SurroundPan`]'s values (what an automation lane moves; the
+/// order of the strip's surround slots).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurroundParam {
+    X,
+    Y,
+    Z,
+    Spread,
+    Width,
+    Lfe,
+}
+
+impl SurroundParam {
+    pub const ALL: [SurroundParam; 6] = [
+        SurroundParam::X,
+        SurroundParam::Y,
+        SurroundParam::Z,
+        SurroundParam::Spread,
+        SurroundParam::Width,
+        SurroundParam::Lfe,
+    ];
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            SurroundParam::X => "Surround Left/Right",
+            SurroundParam::Y => "Surround Front/Back",
+            SurroundParam::Z => "Surround Height",
+            SurroundParam::Spread => "Surround Spread",
+            SurroundParam::Width => "Surround Width",
+            SurroundParam::Lfe => "LFE Send",
+        }
+    }
+
+    /// `(min, max, default)`.
+    pub fn range(self) -> (f32, f32, f32) {
+        match self {
+            SurroundParam::X => (-1.0, 1.0, 0.0),
+            SurroundParam::Y => (-1.0, 1.0, 1.0),
+            SurroundParam::Z | SurroundParam::Spread => (0.0, 1.0, 0.0),
+            SurroundParam::Width => (0.0, 1.0, 1.0),
+            SurroundParam::Lfe => (LFE_OFF_DB, 12.0, LFE_OFF_DB),
+        }
+    }
+
+    pub fn get(self, pan: &SurroundPan) -> f32 {
+        match self {
+            SurroundParam::X => pan.x,
+            SurroundParam::Y => pan.y,
+            SurroundParam::Z => pan.z,
+            SurroundParam::Spread => pan.spread,
+            SurroundParam::Width => pan.width,
+            SurroundParam::Lfe => pan.lfe_db,
+        }
+    }
+
+    /// `pan` with this value set to `v` (clamped).
+    pub fn set(self, mut pan: SurroundPan, v: f32) -> SurroundPan {
+        let (lo, hi, default) = self.range();
+        let v = if v.is_nan() { default } else { v.clamp(lo, hi) };
+        match self {
+            SurroundParam::X => pan.x = v,
+            SurroundParam::Y => pan.y = v,
+            SurroundParam::Z => pan.z = v,
+            SurroundParam::Spread => pan.spread = v,
+            SurroundParam::Width => pan.width = v,
+            SurroundParam::Lfe => pan.lfe_db = v,
+        }
+        pan
+    }
+
+    /// Whether it does anything for a `source` panned into `format`.
+    pub fn applies(self, source: ChannelLayout, format: SurroundFormat) -> bool {
+        match self {
+            SurroundParam::Z => format.has_heights(),
+            SurroundParam::Width => source.channel_count() == 2,
+            SurroundParam::Lfe => format.has_lfe(),
+            _ => true,
+        }
+    }
+}
+
 /// Power-preserving crossfade between two neighbours at `t` (0 the
 /// first, 1 the second).
 fn crossfade(t: f32) -> (f32, f32) {

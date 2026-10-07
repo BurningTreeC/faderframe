@@ -73,6 +73,10 @@ impl ViewId {
         Self::new("ddp")
     }
 
+    pub fn surround() -> Self {
+        Self::new("surround")
+    }
+
     pub fn modulators() -> Self {
         Self::new("modulators")
     }

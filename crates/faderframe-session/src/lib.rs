@@ -327,6 +327,8 @@ pub enum Action {
     /// Show an audio clip in the pitch editor (finding its notes first if
     /// it has none).
     OpenPitchEditor(ClipId),
+    /// Select the track and show the surround panner.
+    ShowSurroundPanner(TrackId),
     /// Download the speech model (Whisper) once.
     DownloadSpeechModel,
     /// Transcribe an audio clip's words into the lyrics.
@@ -3046,6 +3048,13 @@ impl Session {
             }
             Action::EditLyric { index, text } => self.edit_lyric(index, text)?,
             Action::ClipEffects { clip, op } => self.edit_clip_fx(clip, op)?,
+            Action::ShowSurroundPanner(track) => {
+                self.dispatch(Action::SelectTracks {
+                    tracks: vec![track],
+                    mode: SelectMode::Replace,
+                })?;
+                self.workspace_action(WorkspaceAction::ShowView(ViewId::surround()))?;
+            }
             Action::OpenPitchEditor(clip) => {
                 let Some(a) = self.project.clip(clip).and_then(|c| c.as_audio()) else {
                     return Ok(());
@@ -4222,6 +4231,41 @@ impl Session {
     }
 
     // --- inputs -----------------------------------------------------------------------
+
+    /// The channel formats a track can have (audio tracks, buses, auxes and
+    /// the master): mono, stereo and each surround bed. Tracks feeding a
+    /// bed are panned into it, a bed feeding a smaller format is folded.
+    pub fn format_choices(&self, track: TrackId) -> Vec<InputChoice> {
+        use faderframe_core::{ChannelLayout, SurroundFormat};
+        let Some(t) = self.project.track(track) else {
+            return Vec::new();
+        };
+        if !matches!(
+            t.kind,
+            TrackKind::Audio | TrackKind::Bus | TrackKind::Aux | TrackKind::Master
+        ) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut push = |label: String, layout: ChannelLayout, group_start: bool| {
+            out.push(InputChoice {
+                label,
+                action: Action::Edit(Command::SetTrackLayout { track, layout }),
+                checked: t.layout == layout,
+                group_start,
+            });
+        };
+        push("Mono".into(), ChannelLayout::Mono, false);
+        push("Stereo".into(), ChannelLayout::Stereo, false);
+        for (i, f) in SurroundFormat::ALL.iter().enumerate() {
+            push(
+                format!("{} ({} channels)", f.name(), f.channels()),
+                ChannelLayout::Surround(*f),
+                i == 0,
+            );
+        }
+        out
+    }
 
     /// The input choices of an audio track for menus: no input, every mono
     /// input, every stereo pair. Choosing one also sets the track format

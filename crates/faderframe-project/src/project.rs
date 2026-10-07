@@ -344,6 +344,29 @@ impl Project {
         }
     }
 
+    /// The channel format `track`'s strip mixes into: its destination
+    /// track's, else its own (hardware outputs, not connected).
+    pub fn destination_layout(&self, track: &Track) -> faderframe_core::ChannelLayout {
+        match self.output_target(track).and_then(|t| self.track(t)) {
+            Some(dst) if dst.kind.has_audio() => dst.layout,
+            _ => track.layout,
+        }
+    }
+
+    /// The surround bed `track` is panned into, if any: a mono or stereo
+    /// track feeding a bed (a bed into another is folded, not panned).
+    pub fn surround_panned(&self, track: &Track) -> Option<faderframe_core::SurroundFormat> {
+        if !track.kind.has_audio()
+            || matches!(track.layout, faderframe_core::ChannelLayout::Surround(_))
+        {
+            return None;
+        }
+        match self.destination_layout(track) {
+            faderframe_core::ChannelLayout::Surround(f) => Some(f),
+            _ => None,
+        }
+    }
+
     /// Track-to-track signal edges (outputs and enabled sends).
     pub fn routing_edges(&self) -> Vec<(TrackId, TrackId)> {
         let mut edges = Vec::new();

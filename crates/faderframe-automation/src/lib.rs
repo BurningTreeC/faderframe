@@ -302,6 +302,8 @@ pub enum AutomationTarget {
         parameter: ParameterId,
     },
     PluginBypass(PluginInstanceId),
+    /// Where the track sits in the surround bed it feeds.
+    Surround(faderframe_core::SurroundParam),
 }
 
 impl AutomationTarget {
@@ -315,6 +317,7 @@ impl AutomationTarget {
                 format!("{plugin} param {}", parameter.0)
             }
             AutomationTarget::PluginBypass(p) => format!("{p} bypass"),
+            AutomationTarget::Surround(p) => p.name().into(),
         }
     }
 }

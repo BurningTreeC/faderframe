@@ -191,7 +191,29 @@ impl Session {
                 kind: ParamKind::Gain,
                 unit: "dB",
             });
-            if !vca {
+            // Into a surround bed the surround panner places it instead.
+            if let Some(format) = self.project.surround_panned(t) {
+                for p in faderframe_core::SurroundParam::ALL {
+                    if !p.applies(t.layout, format) {
+                        continue;
+                    }
+                    let (min, max, default) = p.range();
+                    let (kind, unit) = match p {
+                        faderframe_core::SurroundParam::X => (ParamKind::Pan, ""),
+                        faderframe_core::SurroundParam::Lfe => (ParamKind::Gain, "dB"),
+                        _ => (ParamKind::Linear, ""),
+                    };
+                    out.push(AutomationParam {
+                        target: AutomationTarget::Surround(p),
+                        name: p.name().into(),
+                        min: min as f64,
+                        max: max as f64,
+                        default: default as f64,
+                        kind,
+                        unit,
+                    });
+                }
+            } else if !vca {
                 out.push(AutomationParam {
                     target: AutomationTarget::TrackPan,
                     name: "Pan".into(),
@@ -302,6 +324,7 @@ impl Session {
                 let slot = t.plugin(plugin)?;
                 f64::from(u8::from(slot.bypass))
             }
+            AutomationTarget::Surround(p) => p.get(&t.surround) as f64,
         })
     }
 
@@ -336,6 +359,22 @@ impl Session {
     pub fn shown_pan(&self, t: &Track) -> f32 {
         self.display_value(t.id, AutomationTarget::TrackPan)
             .map_or(t.pan, |v| v as f32)
+    }
+
+    /// Where the surround panner shows the track (automated values while
+    /// lanes drive them).
+    pub fn shown_surround(&self, t: &Track) -> faderframe_core::SurroundPan {
+        faderframe_core::SurroundParam::ALL
+            .iter()
+            .fold(t.surround, |pan, &p| {
+                match self.driving_lane(t, AutomationTarget::Surround(p)) {
+                    Some(l) => l
+                        .curve
+                        .value_at(self.playhead())
+                        .map_or(pan, |v| p.set(pan, v as f32)),
+                    None => pan,
+                }
+            })
     }
 
     pub fn shown_mute(&self, t: &Track) -> bool {
@@ -533,6 +572,19 @@ impl Session {
     /// Called before every edit: record a point if the edit moves a control
     /// whose lane is being (or should start being) written.
     pub(crate) fn capture_automation(&mut self, cmd: &Command) {
+        // The surround panner: each value it moves.
+        if let Command::SetTrackSurround { track, pan } = cmd {
+            let Some(before) = self.project.track(*track).map(|t| self.shown_surround(t)) else {
+                return;
+            };
+            for p in faderframe_core::SurroundParam::ALL {
+                let v = p.get(pan);
+                if (v - p.get(&before)).abs() > 1e-6 {
+                    self.write_point(*track, AutomationTarget::Surround(p), v as f64);
+                }
+            }
+            return;
+        }
         let Some((track, target, value)) = self.write_target(cmd) else {
             return;
         };

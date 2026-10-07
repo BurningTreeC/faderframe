@@ -287,6 +287,23 @@ impl StripLayout {
     }
 }
 
+impl StripLayout {
+    /// Room for `channels` meters (a surround bed's): the meter widens
+    /// (at most to half the fader zone) so each keeps a readable column.
+    pub fn with_meter_channels(mut self, channels: usize) -> Self {
+        if channels <= 2 {
+            return self;
+        }
+        let zone_x = self.fader.x;
+        let zone_r = self.meter.right();
+        let want = 4.0 + channels as f32 * 2.5 + (channels - 1) as f32 * 1.5;
+        let w = want.min((zone_r - zone_x) * 0.5).max(self.meter.w);
+        self.meter = Rect::new(zone_r - w, self.meter.y, w, self.meter.h);
+        self.fader.w = (self.meter.x - zone_x).max(0.0);
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

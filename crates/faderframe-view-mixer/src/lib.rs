@@ -111,6 +111,14 @@ enum Drag {
         start_y: f32,
         start_value: f32,
     },
+    /// A track's place in the surround bed it feeds (the strip's mini
+    /// panner: moved by as much as the pointer, `size` the room's side).
+    Surround {
+        track: TrackId,
+        start: Point,
+        from: faderframe_core::SurroundPan,
+        size: f32,
+    },
     Scroll {
         start_x: f32,
         start_scroll: f32,
@@ -426,8 +434,18 @@ impl MixerView {
         )
     }
 
-    fn layout_for(&self, rect: Rect, t: &Track) -> StripLayout {
+    fn layout_for(
+        &self,
+        rect: Rect,
+        t: &Track,
+        project: &faderframe_project::Project,
+    ) -> StripLayout {
         let vca = t.kind == TrackKind::Vca;
+        // A strip feeding a bed meters each of its channels.
+        let meters = match project.destination_layout(t) {
+            faderframe_core::ChannelLayout::Surround(f) if t.kind.has_audio() => f.channels(),
+            _ => 2,
+        };
         // A MIDI strip keeps the rows of the others (its sections line up
         // with theirs): the preamp's place holds the instrument it plays,
         // the send rows stay empty.
@@ -448,6 +466,7 @@ impl MixerView {
                 0.0
             },
         )
+        .with_meter_channels(meters)
     }
 
     /// Size the send section for the track with the most sends (always
@@ -520,7 +539,7 @@ impl MixerView {
             {
                 continue;
             }
-            let l = self.layout_for(rect, t);
+            let l = self.layout_for(rect, t, model.project());
             let id = t.id;
             if t.kind == TrackKind::Midi {
                 return Some(Self::midi_hit(&l, id, pos));
@@ -534,14 +553,17 @@ impl MixerView {
             let pos_now = self.law.db_to_position(model.shown_volume_db(t));
             // VCAs have only a fader, mute and solo.
             let audio = (t.kind != TrackKind::Vca).then_some(());
+            // A bed's strip has no pan.
+            let pans =
+                audio.filter(|_| !matches!(t.layout, faderframe_core::ChannelLayout::Surround(_)));
             let color = Rect::new(l.color_bar.x, l.color_bar.y, l.color_bar.w, 7.0);
             let checks: [(Option<Rect>, Hit); 14] = [
                 (Some(color), Hit::Color(id)),
                 (Some(geo.cap_rect(pos_now).inset(-2.0)), Hit::FaderCap(id)),
                 (Some(l.fader), Hit::FaderTrack(id)),
                 (audio.map(|_| l.meter), Hit::Meter(id)),
-                (audio.map(|_| l.pan_readout), Hit::PanValue(id)),
-                (audio.map(|_| l.pan_knob), Hit::Pan(id)),
+                (pans.map(|_| l.pan_readout), Hit::PanValue(id)),
+                (pans.map(|_| l.pan_knob), Hit::Pan(id)),
                 (Some(l.mute), Hit::Mute(id)),
                 (Some(l.solo), Hit::Solo(id)),
                 (audio.map(|_| l.record), Hit::Record(id)),
@@ -673,7 +695,7 @@ impl MixerView {
         let th = &self.theme;
         let c = &th.console;
         let is_master = t.kind == TrackKind::Master;
-        let l = self.layout_for(rect, t);
+        let l = self.layout_for(rect, t, model.project());
         let (top, bottom) = if is_master {
             (c.master_panel_top, c.master_panel_bottom)
         } else {
@@ -809,8 +831,33 @@ impl MixerView {
         }
 
         let vca = t.kind == TrackKind::Vca;
+        let bed = model.project().surround_panned(t);
         if vca {
             controls::engraved(p, "VCA", l.pan_knob, th, Align::Center);
+        } else if let faderframe_core::ChannelLayout::Surround(f) = t.layout {
+            // A bed: it passes into its destination as it is (or folded).
+            controls::engraved(p, f.name(), l.pan_knob, th, Align::Center);
+            controls::readout(p, l.pan_readout, "BED", th);
+        } else if let Some(format) = bed {
+            // Into a surround bed: where it sits, seen from above.
+            let pan = model.shown_surround(t);
+            let meter = model.meter(t.id);
+            let levels: Vec<f32> = meter.shown().iter().map(|c| c.level_db).collect();
+            faderframe_view_surround::room::Room {
+                format,
+                source: t.layout,
+                pan,
+                levels: &levels,
+                puck: track_color(t.color).lighten(0.2),
+                compact: true,
+            }
+            .paint(p, l.pan_knob, th);
+            controls::readout(
+                p,
+                l.pan_readout,
+                &faderframe_view_surround::room::format_place(&pan),
+                th,
+            );
         } else {
             controls::knob(
                 p,
@@ -835,7 +882,7 @@ impl MixerView {
             p.circle(at, 3.4, th.ui.background);
             p.circle(at, 2.3, th.ui.text);
         };
-        if pan_mod != 0.0 {
+        if pan_mod != 0.0 && bed.is_none() {
             let now = ((model.shown_pan(t) + pan_mod).clamp(-1.0, 1.0) + 1.0) * 0.5;
             let a = controls::knob_angle(now);
             let (o, r) = (
@@ -903,7 +950,12 @@ impl MixerView {
             hold_db: ch.hold_db,
             clipped: ch.clipped,
         };
-        controls::meter(p, l.meter, &[level(&m.left), level(&m.right)], th);
+        if m.count > 2 {
+            let levels: Vec<MeterLevel> = m.shown().iter().map(level).collect();
+            controls::meter(p, l.meter, &levels, th);
+        } else {
+            controls::meter(p, l.meter, &[level(&m.left), level(&m.right)], th);
+        }
 
         let out = match t.output {
             OutputRouting::Master => "→ Master".to_string(),
@@ -912,7 +964,24 @@ impl MixerView {
                 .track(track)
                 .map_or_else(|| "→ ?".to_string(), |d| format!("→ {}", d.name)),
             OutputRouting::Hardware { first_channel } => {
-                format!("→ Out {}-{}", first_channel + 1, first_channel + 2)
+                let first = first_channel as usize;
+                let outputs = model
+                    .stream_info()
+                    .map_or(0, |i| i.output_channels as usize);
+                // A bed wider than the device is folded down to it.
+                let folded = (outputs > 0)
+                    .then(|| {
+                        faderframe_core::surround::fold_into(
+                            t.layout,
+                            outputs.saturating_sub(first),
+                        )
+                    })
+                    .flatten();
+                let n = folded.unwrap_or(t.layout).channel_count().max(2);
+                match folded {
+                    Some(_) => format!("→ Out {}-{} folded", first + 1, first + n),
+                    None => format!("→ Out {}-{}", first + 1, first + n),
+                }
             }
             OutputRouting::None => "→ none".to_string(),
         };
@@ -1253,12 +1322,13 @@ impl MixerView {
                 );
             }
         }
+        let width = t.layout.channel_count().max(2) as u16;
         for first in [0u16, 2] {
             let out = OutputRouting::Hardware {
                 first_channel: first,
             };
             let mut item = MenuItem::new(
-                format!("Hardware Out {}-{}", first + 1, first + 2),
+                format!("Hardware Out {}-{}", first + 1, first + width),
                 set(out),
             )
             .checked(t.output == out);
@@ -1630,6 +1700,27 @@ impl MixerView {
             .separated(),
         );
         items.extend(model.group_menu(t.id).into_iter().map(menu_item));
+        let formats: Vec<MenuItem<Action>> = model
+            .format_choices(t.id)
+            .into_iter()
+            .map(|c| {
+                let item = MenuItem::new(c.label, c.action).checked(c.checked);
+                if c.group_start {
+                    item.separated()
+                } else {
+                    item
+                }
+            })
+            .collect();
+        if !formats.is_empty() {
+            items.push(MenuItem::submenu("Channel Format", formats).separated());
+        }
+        if model.project().surround_panned(t).is_some() {
+            items.push(MenuItem::new(
+                "Surround Panner…",
+                Action::ShowSurroundPanner(t.id),
+            ));
+        }
         if t.kind != TrackKind::Master {
             let now = model.strip_width(t.id);
             for (i, (label, w)) in STRIP_WIDTHS.iter().enumerate() {
@@ -1824,7 +1915,7 @@ impl MixerView {
         self.visible_strips(model, size)
             .into_iter()
             .find(|(_, t)| t.id == id)
-            .map(|(r, t)| self.layout_for(r, t))
+            .map(|(r, t)| self.layout_for(r, t, model.project()))
     }
 
     /// Insertion boundary in mixer order, and index after removing the
@@ -1953,6 +2044,27 @@ impl MixerView {
                 self.send_bank =
                     (self.send_bank as i64 + delta as i64).clamp(0, pages as i64 - 1) as usize;
                 cx.redraw();
+            }
+            Hit::Pan(id)
+                if Self::track(model, id)
+                    .is_some_and(|t| model.project().surround_panned(t).is_some()) =>
+            {
+                if clicks >= 2 {
+                    cx.emit(Action::ShowSurroundPanner(id));
+                    return true;
+                }
+                let (Some(t), Some(l)) = (Self::track(model, id), self.layout_of(model, id, size))
+                else {
+                    return false;
+                };
+                cx.emit(Action::BeginGesture("Surround Pan".into()));
+                self.drag = Some(Drag::Surround {
+                    track: id,
+                    start: pos,
+                    from: model.shown_surround(t),
+                    size: l.pan_knob.w.max(8.0),
+                });
+                cx.set_cursor(Cursor::Grabbing);
             }
             Hit::Pan(id) | Hit::Send(id, _) | Hit::PreampKnob(id, _) => {
                 let Some(t) = Self::track(model, id) else {
@@ -2142,7 +2254,11 @@ impl MixerView {
                 if let (Some(t), Some(l)) =
                     (Self::track(model, id), self.layout_of(model, id, size))
                 {
-                    cx.request(Self::pan_request(model, t, l.pan_readout));
+                    if model.project().surround_panned(t).is_some() {
+                        cx.emit(Action::ShowSurroundPanner(id));
+                    } else {
+                        cx.request(Self::pan_request(model, t, l.pan_readout));
+                    }
                 }
             }
             Hit::Scribble(id) | Hit::Strip(id) => {
@@ -2301,10 +2417,17 @@ impl MixerView {
             }
             Hit::Pan(id) => {
                 let t = Self::track(model, id)?;
-                format!(
-                    "Pan {} · Double-click to centre",
-                    format_pan(model.shown_pan(t))
-                )
+                match model.project().surround_panned(t) {
+                    Some(f) => format!(
+                        "Surround {} ({}) · Drag to move (Shift/Ctrl: fine) · Double-click: the panner",
+                        faderframe_view_surround::room::format_place(&model.shown_surround(t)),
+                        f.name()
+                    ),
+                    None => format!(
+                        "Pan {} · Double-click to centre",
+                        format_pan(model.shown_pan(t))
+                    ),
+                }
             }
             Hit::Send(id, i) => match Self::track(model, id)?.sends.get(i) {
                 Some(s) => format!(
@@ -2371,10 +2494,17 @@ impl MixerView {
                 format!("{} · {group} · {vca} · Click to change", t.name)
             }
             Hit::Level(_) => "Click to type a level".into(),
-            Hit::PanValue(id) => format!(
-                "Pan {} · Click to type (C, L30, R45 or −100…100)",
-                format_pan(model.shown_pan(Self::track(model, id)?))
-            ),
+            Hit::PanValue(id) => {
+                let t = Self::track(model, id)?;
+                if model.project().surround_panned(t).is_some() {
+                    "Click to open the surround panner".into()
+                } else {
+                    format!(
+                        "Pan {} · Click to type (C, L30, R45 or −100…100)",
+                        format_pan(model.shown_pan(t))
+                    )
+                }
+            }
             Hit::Scribble(_) => {
                 "Drag to reorder · Double-click to rename · Right-click for options".into()
             }
@@ -2559,6 +2689,21 @@ impl CanvasView<Session, Action> for MixerView {
                             db: self.law.position_to_db(pos_new.clamp(0.0, 1.0)),
                         }));
                     }
+                    Some(Drag::Surround {
+                        track,
+                        start,
+                        from,
+                        size,
+                    }) => {
+                        // Fine: a quarter as far.
+                        let k = if modifiers.fine() { 0.5 } else { 2.0 } / size;
+                        let pan = faderframe_core::SurroundPan {
+                            x: (from.x + (pos.x - start.x) * k).clamp(-1.0, 1.0),
+                            y: (from.y - (pos.y - start.y) * k).clamp(-1.0, 1.0),
+                            ..from
+                        };
+                        cx.emit(Action::Edit(Command::SetTrackSurround { track, pan }));
+                    }
                     Some(Drag::Knob {
                         track,
                         target,
@@ -2666,7 +2811,7 @@ impl CanvasView<Session, Action> for MixerView {
                         cx.set_cursor(Cursor::Default);
                         cx.redraw();
                     }
-                    Some(Drag::Fader { .. } | Drag::Knob { .. }) => {
+                    Some(Drag::Fader { .. } | Drag::Knob { .. } | Drag::Surround { .. }) => {
                         cx.emit(Action::EndGesture);
                         cx.set_cursor(Cursor::Default);
                     }
@@ -2730,6 +2875,21 @@ impl CanvasView<Session, Action> for MixerView {
                                 track: id,
                                 db: base - steps * step,
                             }));
+                        }
+                        true
+                    }
+                    // Into a bed the wheel moves the track left and right.
+                    Some(Hit::Pan(id))
+                        if dx == 0.0
+                            && Self::track(model, id)
+                                .is_some_and(|t| model.project().surround_panned(t).is_some()) =>
+                    {
+                        if let Some(t) = Self::track(model, id) {
+                            let step = if modifiers.fine() { 0.01 } else { 0.05 };
+                            let from = model.shown_surround(t);
+                            let pan =
+                                faderframe_core::SurroundParam::X.set(from, from.x - steps * step);
+                            cx.emit(Action::Edit(Command::SetTrackSurround { track: id, pan }));
                         }
                         true
                     }
