@@ -2522,9 +2522,9 @@ the event loop. DAW work surfaces are **custom-rendered views**:
   fader, meter, LED buttons, scribble strips) using a `Theme` (skins
   replace the theme, not the views). Track headers reuse the same
   controls.
-* **Skins.** `Theme::all()` lists seven (`themes.rs` derives each from a
+* **Skins.** `Theme::all()` lists eight (`themes.rs` derives each from a
   compact `Spec` of base colours): Studio, Vintage Console, Daylight
-  (light), Midnight, Frost, Neon and High Contrast. Besides colours a theme
+  (light), Midnight, Frost, Fjord, Neon and High Contrast. Besides colours a theme
   has a `ConsoleLook`: skirted knobs (with or without a value ring), flat
   or glossy controls, brushed-metal panel grain, screws, walnut cheeks
   framing the mixer, and the meter kind — LED ladder, continuous bar,
@@ -2962,7 +2962,7 @@ sections (moved, copied and deleted with their content), time signatures
 and the tempo map, and track colours from a colour chooser.
 
 Shell: docking and detaching, workspaces (Recording, Editing, Mixing,
-MIDI, Mastering), seven skins switched live, performance meter,
+MIDI, Mastering), eight skins switched live, performance meter,
 preferences, recent projects and start-up choice. Windows and macOS builds
 and packages for all three platforms (see §14).
 

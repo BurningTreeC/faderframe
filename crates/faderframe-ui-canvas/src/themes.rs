@@ -545,6 +545,55 @@ pub fn neon() -> Theme {
     })
 }
 
+/// "Fjord": dusk over deep water — dark slate with a hint of teal, petrol
+/// console panels, a soft coral and old-gold light; calm contrast for long
+/// sessions.
+pub fn fjord() -> Theme {
+    build(Spec {
+        id: "fjord",
+        name: "Fjord",
+        dark: true,
+        fonts: fonts(),
+        bg: 0x1d2427,
+        surface: 0x242c30,
+        surface_alt: 0x2e373c,
+        border: 0x13181b,
+        text: 0xdedcd4,
+        text_dim: 0xa3a8a5,
+        text_faint: 0x6b7476,
+        accent: 0xe98a6d,
+        selection: 0x82aadb,
+        lcd: (0x111618, 0xe6c27a, 0x3b3a2e),
+        panel: (0x34494b, 0x283b3d),
+        master_panel: (0x3f4741, 0x2f3632),
+        panel_label: 0xd5dfda,
+        edges: (0.08, 0.5),
+        well: 0x111518,
+        well_text: (0xe8d8b0, 0x4b5557),
+        knob: [0x161b1d, 0x3b4a4c, 0x5e7072, 0x2f3c3e, 0xf1ede3, 0x141a1c],
+        knob_caps: [0x82aadb, 0xa3a8a5, 0xe98a6d],
+        fader: [0x0e1214, 0xebe8df, 0x8f9891, 0xa3a8a5],
+        fader_caps: [0xdcd9cf, 0x82aadb, 0x93be86, 0xe98a6d],
+        meter: ([0x0b0e0f, 0x93c27a, 0xe3c35e, 0xea955b, 0xec6b5f], 0.12),
+        leds: [0xe4b155, 0x93c27a, 0xec6b5f, 0x82aadb, 0xc49ad5],
+        led_off: [0x263133, 0xd5dfda, 0x0e1214],
+        scribble: (0xe9e4d6, 0x23292b),
+        editor_bg: 0x20272b,
+        lanes: (0x242c30, 0x21282c, 0x2b3640),
+        header: (0x283135, 0x324049, 0x161b1e),
+        ruler: (0x252d31, 0xc9cfcc),
+        line: (0xe6efe9, 1.0),
+        clip_text: 0x15191b,
+        outline: 0xf1ede3,
+        keys: [0xe3e0d7, 0xb8bab3, 0x1c2124, 0x6b7476],
+        look: ConsoleLook {
+            sheen: 0.3,
+            engrave: Color::rgba(0.0, 0.0, 0.0, 0.45),
+            ..ConsoleLook::default()
+        },
+    })
+}
+
 /// "High Contrast": black and white with strong colours and larger type.
 pub fn high_contrast() -> Theme {
     build(Spec {
@@ -608,6 +657,7 @@ impl Theme {
             vintage(),
             midnight(),
             frost(),
+            fjord(),
             neon(),
             high_contrast(),
         ]
@@ -629,7 +679,7 @@ mod tests {
     #[test]
     fn skins_are_distinct_and_found_by_id() {
         let all = Theme::all();
-        assert_eq!(all.len(), 7);
+        assert_eq!(all.len(), 8);
         let mut ids: Vec<_> = all.iter().map(|t| t.id).collect();
         ids.sort_unstable();
         ids.dedup();

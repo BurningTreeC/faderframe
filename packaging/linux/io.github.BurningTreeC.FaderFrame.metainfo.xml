@@ -80,6 +80,7 @@
           <li>Renders, stems and bounces start exactly on time (the plugins' latency is taken off the front).</li>
           <li>Presets: saving under an existing name asks before replacing it, and your own presets can be deleted.</li>
           <li>The GPU painter hands frames to GTK without copying them back: dmabufs on Linux, shared D3D12 textures on Windows.</li>
+          <li>A new skin, Fjord: dark slate and petrol console panels with coral and old-gold light, at a calm contrast for long sessions.</li>
         </ul>
       </description>
     </release>
