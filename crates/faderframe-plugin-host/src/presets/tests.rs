@@ -44,11 +44,9 @@ const WITH_PRESETS: [&str; 17] = [
 fn every_effect_and_the_synth_have_ten_to_fifteen_sound_presets() {
     for id in WITH_PRESETS {
         let presets = factory_presets(id);
-        assert!(
-            (10..=15).contains(&presets.len()),
-            "{id}: {} presets",
-            presets.len()
-        );
+        // At the top of the menu; groups (submenus) may hold more.
+        let top = presets.iter().filter(|p| p.group.is_none()).count();
+        assert!((10..=15).contains(&top), "{id}: {top} presets");
         let infos = parameters(id);
         assert!(!infos.is_empty(), "{id}");
         let mut names: Vec<&str> = presets.iter().map(|p| p.name).collect();
@@ -396,6 +394,11 @@ fn every_preset_sounds_and_stays_in_bounds() {
         .filter(|id| !MIDI_EFFECTS.contains(id))
     {
         for (i, preset) in factory_presets(id).iter().enumerate() {
+            // The Guitar Station's submenus are played with a guitar
+            // (`devices::guitar` tests), every one of them.
+            if preset.group.is_some() {
+                continue;
+            }
             let name = preset.name;
             let instrument = id == builtin::SYNTH;
             let r = if instrument {

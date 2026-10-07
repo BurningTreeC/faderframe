@@ -212,6 +212,13 @@ impl PluginHost {
             .map_or_else(Vec::new, |h| h.instance.programs())
     }
 
+    /// The submenu of each program ("" at the top), or empty.
+    pub fn program_groups(&self, plugin: PluginInstanceId) -> Vec<String> {
+        self.instances
+            .get(&plugin)
+            .map_or_else(Vec::new, |h| h.instance.program_groups())
+    }
+
     pub fn current_program(&self, plugin: PluginInstanceId) -> Option<usize> {
         self.instances.get(&plugin)?.instance.current_program()
     }

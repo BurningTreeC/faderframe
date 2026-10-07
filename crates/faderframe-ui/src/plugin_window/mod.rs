@@ -336,11 +336,12 @@ fn presets_button(app: &Rc<AppState>, plugin: PluginInstanceId) -> gtk::MenuButt
         save.append_item(&item);
         menu.append_section(None, &save);
         let list = gtk::gio::Menu::new();
-        let (found, programs, current, builtin) = {
+        let (found, programs, groups, current, builtin) = {
             let s = app.session.borrow();
             (
                 s.plugin_presets(plugin),
                 s.plugin_programs(plugin),
+                s.plugin_program_groups(plugin),
                 s.plugin_current_program(plugin),
                 s.plugin_owner(plugin).is_some_and(|(_, slot)| {
                     slot.plugin.format == faderframe_project::PluginFormat::Builtin
@@ -385,9 +386,11 @@ fn presets_button(app: &Rc<AppState>, plugin: PluginInstanceId) -> gtk::MenuButt
             section.append_submenu(Some("Delete Preset"), &delete);
             menu.append_section(None, &section);
         }
-        // The plugin's own programs.
+        // The plugin's own programs, grouped ones in submenus (the
+        // Guitar Station's Amplifiers and Sounds).
         if !programs.is_empty() {
             let section = gtk::gio::Menu::new();
+            let mut submenus: Vec<(&str, gtk::gio::Menu)> = Vec::new();
             for (i, name) in programs.iter().enumerate() {
                 let mark = if current == Some(i) { "● " } else { "" };
                 let label = format!("{mark}{name}").replace('_', "__");
@@ -397,7 +400,22 @@ fn presets_button(app: &Rc<AppState>, plugin: PluginInstanceId) -> gtk::MenuButt
                     Some("app.select-program"),
                     Some(&target.to_variant()),
                 );
-                section.append_item(&item);
+                match groups.get(i).map(String::as_str).filter(|g| !g.is_empty()) {
+                    None => section.append_item(&item),
+                    Some(g) => match submenus.iter().find(|(n, _)| *n == g) {
+                        Some((_, menu)) => menu.append_item(&item),
+                        None => {
+                            let menu = gtk::gio::Menu::new();
+                            menu.append_item(&item);
+                            submenus.push((g, menu));
+                        }
+                    },
+                }
+            }
+            for (g, menu) in &submenus {
+                let selected = current.is_some_and(|c| groups.get(c).is_some_and(|cg| cg == g));
+                let label = format!("{}{g}", if selected { "● " } else { "" });
+                section.append_submenu(Some(&label.replace('_', "__")), menu);
             }
             menu.append_section(
                 Some(if builtin {

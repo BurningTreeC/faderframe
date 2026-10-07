@@ -28,6 +28,9 @@ use faderframe_core::{ParameterId, builtin};
 #[derive(Clone, Debug, PartialEq)]
 pub struct FactoryPreset {
     pub name: &'static str,
+    /// The submenu it is listed in (the Guitar Station's "Amplifiers" and
+    /// "Sounds"); `None` at the top of the menu.
+    pub group: Option<&'static str>,
     /// The values it sets (parameter id, value); the rest are defaults.
     set: Vec<(u32, f64)>,
 }
@@ -36,11 +39,20 @@ pub struct FactoryPreset {
 pub(crate) fn preset(name: &'static str, set: &[(u32, f64)]) -> FactoryPreset {
     FactoryPreset {
         name,
+        group: None,
         set: set.to_vec(),
     }
 }
 
 impl FactoryPreset {
+    /// Listed in submenu `group`.
+    pub(crate) fn in_group(self, group: &'static str) -> Self {
+        Self {
+            group: Some(group),
+            ..self
+        }
+    }
+
     /// Every parameter of `infos` with this preset's value (its default
     /// where the preset does not set it), clamped to the parameter's range.
     pub fn values(&self, infos: &[ParameterInfo]) -> Vec<(ParameterId, f64)> {

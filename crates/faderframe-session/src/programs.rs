@@ -59,6 +59,17 @@ impl Session {
         }
     }
 
+    /// The submenu each of [`Self::plugin_programs`] goes in ("" at the
+    /// top of the menu; empty: none are grouped).
+    pub fn plugin_program_groups(&self, plugin: PluginInstanceId) -> Vec<String> {
+        let groups = self.engine.plugin_program_groups(plugin);
+        if groups.len() == self.plugin_programs(plugin).len() {
+            groups
+        } else {
+            Vec::new()
+        }
+    }
+
     /// The program the plugin says is selected.
     pub fn plugin_current_program(&self, plugin: PluginInstanceId) -> Option<usize> {
         self.engine.plugin_current_program(plugin)

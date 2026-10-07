@@ -1188,6 +1188,12 @@ impl EngineController {
         self.plugins.programs(plugin)
     }
 
+    /// The submenu of each of [`Self::plugin_programs`] ("" at the top), or
+    /// empty: none are grouped.
+    pub fn plugin_program_groups(&self, plugin: faderframe_core::PluginInstanceId) -> Vec<String> {
+        self.plugins.program_groups(plugin)
+    }
+
     pub fn plugin_current_program(
         &self,
         plugin: faderframe_core::PluginInstanceId,

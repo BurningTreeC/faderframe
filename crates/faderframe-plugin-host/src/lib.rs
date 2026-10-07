@@ -371,6 +371,11 @@ pub trait PluginInstance {
     fn programs(&self) -> Vec<String> {
         Vec::new()
     }
+    /// The submenu each of [`Self::programs`] is listed in ("" at the top),
+    /// or empty: none are grouped.
+    fn program_groups(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// The program selected now, as the plugin reports it.
     fn current_program(&self) -> Option<usize> {
         None

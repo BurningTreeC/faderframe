@@ -433,36 +433,71 @@ fn stage_cost_by_model() {
     }
 }
 
-/// Each factory rig plays a plucked guitar back at about its own level.
+/// Each factory rig (the submenus' too) plays a plucked guitar back at
+/// about its own level, finite and unclipped. Played on every core; a rig
+/// out of line is reported with the Output that would level it.
 #[test]
 fn preset_levels() {
-    for (i, preset) in crate::presets::factory_presets(faderframe_core::builtin::GUITAR_STATION)
-        .iter()
-        .enumerate()
-    {
-        let values =
-            crate::presets::factory_preset_values(faderframe_core::builtin::GUITAR_STATION, i)
-                .unwrap();
-        let set: Vec<(u32, f64)> = values.iter().map(|(p, v)| (p.0, *v)).collect();
-        let mut line = Line::new(&set, 2, Run::Inline, 128);
-        let (main, di) = line.play(2.0);
-        let half = main[0].len() / 2;
-        let peak = main[0][half..].iter().fold(0f32, |m, x| m.max(x.abs()));
-        let guitar: Vec<f32> = (half..main[0].len()).map(pluck).collect();
-        let (out, inp) = (rms_db(&main[0][half..]), rms_db(&guitar));
-        let _ = &di;
+    use faderframe_core::builtin::GUITAR_STATION;
+    let presets = crate::presets::factory_presets(GUITAR_STATION);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let mut results: Vec<(usize, f64, f64, f32, bool)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= presets.len() {
+                            break done;
+                        }
+                        let values =
+                            crate::presets::factory_preset_values(GUITAR_STATION, i).unwrap();
+                        let set: Vec<(u32, f64)> = values.iter().map(|(p, v)| (p.0, *v)).collect();
+                        let mut line = Line::new(&set, 2, Run::Inline, 128);
+                        let (main, _) = line.play(2.0);
+                        let half = main[0].len() / 2;
+                        let finite = main.iter().flatten().all(|x| x.is_finite());
+                        let peak = main
+                            .iter()
+                            .flat_map(|c| &c[half..])
+                            .fold(0f32, |m, x| m.max(x.abs()));
+                        let guitar: Vec<f32> = (half..main[0].len()).map(pluck).collect();
+                        done.push((i, rms_db(&main[0][half..]), rms_db(&guitar), peak, finite));
+                    }
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap())
+            .collect()
+    });
+    results.sort_by_key(|r| r.0);
+    let mut wrong = Vec::new();
+    for &(i, out, inp, peak, finite) in &results {
+        let p = &presets[i];
+        let output = p
+            .set()
+            .iter()
+            .find(|(id, _)| *id == id::OUTPUT)
+            .map_or(0.0, |(_, v)| *v);
         eprintln!(
-            "{:<20} out {out:>6.1} dB RMS, peak {:>6.1} dBFS; in {inp:>6.1} dB",
-            preset.name,
+            "{:<58} out {out:>6.1} dB RMS, peak {:>6.1} dBFS; in {inp:>6.1} dB; level with Output {:+.1}",
+            p.name,
             20.0 * peak.max(1e-9).log10(),
+            output + inp - out,
         );
-        assert!(
-            (out - inp).abs() < 4.0,
-            "{}: {inp:.1} -> {out:.1} dB",
-            preset.name
-        );
-        assert!(peak < 1.0, "{}: clips", preset.name);
+        if !finite || peak >= 1.0 || (out - inp).abs() >= 4.0 {
+            wrong.push(format!(
+                "{}: {inp:.1} -> {out:.1} dB, peak {peak:.2}",
+                p.name
+            ));
+        }
     }
+    assert_eq!(results.len(), presets.len());
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// Every factory rig live, paced like a device, a stereo guitar on its

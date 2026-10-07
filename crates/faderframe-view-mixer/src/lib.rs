@@ -1545,25 +1545,63 @@ impl MixerView {
                 if !own.is_empty() {
                     items.push(MenuItem::submenu("Delete Preset", own));
                 }
-                // The plugin's own programs (VST3 program lists).
+                // The plugin's own programs (VST3 program lists, the
+                // built-ins' factory presets), grouped ones in submenus.
                 let programs = model.plugin_programs(s.id);
+                let groups = model.plugin_program_groups(s.id);
                 let current = model.plugin_current_program(s.id);
-                for (i, name) in programs.iter().enumerate().take(32) {
-                    let item = MenuItem::new(
-                        format!("Program: {name}"),
+                let group_of = |i: usize| groups.get(i).map_or("", String::as_str);
+                let program = |i: usize, label: String| {
+                    MenuItem::new(
+                        label,
                         Action::SelectPluginProgram {
                             plugin: s.id,
                             index: i,
                         },
                     )
-                    .checked(current == Some(i));
-                    items.push(if i == 0 { item.separated() } else { item });
+                    .checked(current == Some(i))
+                };
+                let mut shown = 0;
+                for (i, name) in programs.iter().enumerate() {
+                    if !group_of(i).is_empty() {
+                        continue;
+                    }
+                    if shown == 32 {
+                        break;
+                    }
+                    let item = program(i, format!("Program: {name}"));
+                    items.push(if shown == 0 { item.separated() } else { item });
+                    shown += 1;
                 }
-                if programs.len() > 32 {
+                let top = (0..programs.len())
+                    .filter(|&i| group_of(i).is_empty())
+                    .count();
+                if top > 32 {
                     items.push(MenuItem::disabled(format!(
                         "… {} more programs in the parameter window",
-                        programs.len() - 32
+                        top - 32
                     )));
+                }
+                let mut named: Vec<&str> = Vec::new();
+                for i in 0..programs.len() {
+                    let g = group_of(i);
+                    if !g.is_empty() && !named.contains(&g) {
+                        named.push(g);
+                    }
+                }
+                for (n, g) in named.into_iter().enumerate() {
+                    let entries = programs
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| group_of(*i) == g)
+                        .map(|(i, name)| program(i, name.clone()))
+                        .collect();
+                    let menu = MenuItem::submenu(format!("Programs: {g}"), entries);
+                    items.push(if n == 0 && shown == 0 {
+                        menu.separated()
+                    } else {
+                        menu
+                    });
                 }
                 // Sidechain: which track's pre-fader signal keys the plugin.
                 if model.plugin_has_sidechain(s.id) {

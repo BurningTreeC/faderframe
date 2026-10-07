@@ -507,6 +507,17 @@ impl PluginInstance for BuiltinInstance {
             .collect()
     }
 
+    fn program_groups(&self) -> Vec<String> {
+        let presets = crate::presets::factory_presets(&self.descriptor.id);
+        if presets.iter().all(|p| p.group.is_none()) {
+            return Vec::new();
+        }
+        presets
+            .into_iter()
+            .map(|p| p.group.unwrap_or_default().to_string())
+            .collect()
+    }
+
     fn current_program(&self) -> Option<usize> {
         self.program
     }
