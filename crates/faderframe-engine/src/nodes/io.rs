@@ -51,3 +51,49 @@ impl Processor<EngineContext> for MonitorGate {
         }
     }
 }
+
+/// A surround bed folded down to fewer channels for the device (a 5.1
+/// master on a stereo interface): each speaker where it stands in the
+/// smaller format (`faderframe_core::surround::matrix`), LFE dropped unless
+/// the smaller one has one.
+pub struct FoldDown {
+    matrix:
+        [[f32; faderframe_core::surround::MAX_SPEAKERS]; faderframe_core::surround::MAX_SPEAKERS],
+}
+
+impl FoldDown {
+    pub fn new(from: faderframe_core::ChannelLayout, to: faderframe_core::ChannelLayout) -> Self {
+        let mut matrix = [[0.0; faderframe_core::surround::MAX_SPEAKERS];
+            faderframe_core::surround::MAX_SPEAKERS];
+        faderframe_core::surround::matrix(
+            from,
+            to,
+            &faderframe_core::SurroundPan::default(),
+            &mut matrix,
+        );
+        Self { matrix }
+    }
+}
+
+impl Processor<EngineContext> for FoldDown {
+    fn process(&mut self, _cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
+        let (Some(input), Some(out)) = (io.audio_in.first(), io.audio_out.first_mut()) else {
+            return;
+        };
+        out.clear();
+        let n = io.frames;
+        for (s, row) in self.matrix.iter().enumerate().take(input.num_channels()) {
+            for (d, &g) in row.iter().enumerate().take(out.num_channels()) {
+                if g == 0.0 {
+                    continue;
+                }
+                for (o, &x) in out.channel_mut(d)[..n]
+                    .iter_mut()
+                    .zip(&input.channel(s)[..n])
+                {
+                    *o += x * g;
+                }
+            }
+        }
+    }
+}

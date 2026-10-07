@@ -6,7 +6,7 @@
 //! while it runs.
 
 use crate::delivery::{Finish, Finished};
-use faderframe_audio_files::{Dither, WavFormat, write_wav_with};
+use faderframe_audio_files::{Dither, WavFormat};
 use faderframe_core::{TrackId, db_to_gain};
 use faderframe_engine::offline::OfflineRenderer;
 use faderframe_engine::{EngineConfig, render_generated_sources};
@@ -43,6 +43,10 @@ pub enum RenderSource {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RenderChannels {
+    /// As the master is: a surround bed's every channel (the file carries
+    /// its speakers), else stereo.
+    Master,
+    /// Stereo (a surround master folded down).
     Stereo,
     Mono,
     /// The first output channel alone (a mono master, e.g. freezing a mono
@@ -78,7 +82,11 @@ impl RenderSettings {
             source: RenderSource::Master,
             format: WavFormat::Pcm24,
             sample_rate: project.sample_rate,
-            channels: RenderChannels::Stereo,
+            channels: if master_bed(project).is_some() {
+                RenderChannels::Master
+            } else {
+                RenderChannels::Stereo
+            },
             tail_seconds: 2.0,
             normalize_db: None,
             finish: Finish::default(),
@@ -162,6 +170,14 @@ impl RenderJob {
     }
 }
 
+/// The master's surround format, if it is a bed.
+pub fn master_bed(project: &Project) -> Option<faderframe_core::SurroundFormat> {
+    match project.master_id().and_then(|m| project.track(m))?.layout {
+        faderframe_core::ChannelLayout::Surround(f) => Some(f),
+        _ => None,
+    }
+}
+
 /// Musical range to render (without tail).
 pub fn resolve_range(
     project: &Project,
@@ -240,9 +256,11 @@ pub(crate) fn render_span(
     for (_, path, e) in crate::media::open_file_sources(project, None, &mut sources) {
         tracing::warn!("render: {}: {e}", path.display());
     }
-    render_one(project, sample_rate, &sources, start, frames, progress)
+    render_one(project, sample_rate, &sources, start, frames, progress, 2)
 }
 
+/// `frames` frames from `start` on a "device" of `outputs` channels (a
+/// surround master folds down to fewer).
 fn render_one(
     project: &Project,
     sample_rate: u32,
@@ -250,6 +268,7 @@ fn render_one(
     start: i64,
     frames: usize,
     progress: &RenderProgress,
+    outputs: usize,
 ) -> Result<Vec<Vec<f32>>, RenderError> {
     let config = EngineConfig {
         sample_rate,
@@ -257,7 +276,7 @@ fn render_one(
         measure_nodes: false,
         ..EngineConfig::default()
     };
-    let mut r = OfflineRenderer::new(project, sources, config, 1024, 2)?;
+    let mut r = OfflineRenderer::new(project, sources, config, 1024, outputs.max(1))?;
     progress
         .latency
         .store(r.controller.graph_stats().output_latency, Ordering::Relaxed);
@@ -269,7 +288,7 @@ fn render_one(
         )));
     }
     r.play_from(start)?;
-    let mut out = vec![Vec::with_capacity(frames), Vec::with_capacity(frames)];
+    let mut out = vec![Vec::with_capacity(frames); outputs.max(1)];
     while out[0].len() < frames {
         if progress.cancel.load(Ordering::Relaxed) {
             return Err(RenderError::Cancelled);
@@ -404,10 +423,12 @@ pub(crate) fn process_through(
     Ok(out)
 }
 
+/// Write `audio` (`mask`: a surround bed's speakers) after finishing.
 fn finish(
     mut audio: Vec<Vec<f32>>,
     settings: &RenderSettings,
     path: &Path,
+    mask: Option<u32>,
 ) -> Result<Rendered, RenderError> {
     if settings.channels == RenderChannels::First {
         audio.truncate(1);
@@ -448,12 +469,12 @@ fn finish(
     } else {
         Dither::Off
     };
-    write_wav_with(path, &audio, rate, settings.format, dither).map_err(|source| {
-        RenderError::Io {
+    let mask = mask.filter(|_| audio.len() > 2);
+    faderframe_audio_files::write_wav_mask(path, &audio, rate, settings.format, dither, mask)
+        .map_err(|source| RenderError::Io {
             path: path.to_path_buf(),
             source,
-        }
-    })?;
+        })?;
     Ok(Rendered {
         path: path.to_path_buf(),
         finished,
@@ -549,10 +570,23 @@ pub fn start(project: Project, settings: RenderSettings) -> Result<RenderJob, Re
                 tracing::warn!("render: {}: {e}", path.display());
             }
             let mut written = Vec::new();
+            // As the master is: a bed's every channel.
+            let bed = (settings.channels == RenderChannels::Master)
+                .then(|| master_bed(&project))
+                .flatten();
+            let outputs = bed.map_or(2, |f| f.channels());
+            let mask = bed.map(faderframe_core::SurroundFormat::channel_mask);
             if stems.is_empty() {
-                let audio =
-                    render_one(&project, settings.sample_rate, &sources, start, frames, &p)?;
-                written.push(finish(audio, &settings, &settings.output)?);
+                let audio = render_one(
+                    &project,
+                    settings.sample_rate,
+                    &sources,
+                    start,
+                    frames,
+                    &p,
+                    outputs,
+                )?;
+                written.push(finish(audio, &settings, &settings.output, mask)?);
             } else {
                 std::fs::create_dir_all(&settings.output).map_err(|source| RenderError::Io {
                     path: settings.output.clone(),
@@ -563,14 +597,21 @@ pub fn start(project: Project, settings: RenderSettings) -> Result<RenderJob, Re
                     for t in &mut stem.tracks {
                         t.solo = t.id == *track;
                     }
-                    let audio =
-                        render_one(&stem, settings.sample_rate, &sources, start, frames, &p)?;
+                    let audio = render_one(
+                        &stem,
+                        settings.sample_rate,
+                        &sources,
+                        start,
+                        frames,
+                        &p,
+                        outputs,
+                    )?;
                     let path = settings.output.join(format!(
                         "{} - {}.wav",
                         sanitize(&project.name),
                         sanitize(name)
                     ));
-                    written.push(finish(audio, &settings, &path)?);
+                    written.push(finish(audio, &settings, &path, mask)?);
                 }
             }
             Ok(written)

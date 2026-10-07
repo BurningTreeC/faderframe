@@ -12,6 +12,7 @@ pub mod gain;
 pub mod id;
 pub mod pan;
 pub mod paths;
+pub mod surround;
 
 pub use channel::ChannelLayout;
 pub use gain::{Decibels, FaderLaw, db_to_gain, gain_to_db};
@@ -21,3 +22,4 @@ pub use id::{
     SongId, TrackId,
 };
 pub use pan::PanLaw;
+pub use surround::{SurroundFormat, SurroundPan};

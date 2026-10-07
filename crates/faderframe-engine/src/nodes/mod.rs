@@ -13,14 +13,14 @@ mod strip;
 pub use chain::{ChainMix, ChainNotes};
 pub use clip_player::{AudioClipPlayer, StretchVoices};
 pub use crosstalk::Crosstalk;
-pub use io::{DeviceInputTap, DeviceOutputSink, MonitorGate};
+pub use io::{DeviceInputTap, DeviceOutputSink, FoldDown, MonitorGate};
 pub use midi_player::MidiClipPlayer;
 pub use plugin::PluginNode;
 pub use send::SendNode;
 pub use strip::{ChannelStrip, StripEcho};
 
 /// Maximum channels a strip/send processes individually.
-pub(crate) const MAX_CHANNELS: usize = 8;
+pub(crate) const MAX_CHANNELS: usize = 16;
 
 /// Frames between automation evaluations (and plugin parameter events)
 /// while a curve changes: 0.7 ms at 48 kHz.

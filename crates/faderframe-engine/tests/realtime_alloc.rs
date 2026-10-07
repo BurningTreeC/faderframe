@@ -2260,3 +2260,50 @@ fn the_midi_effects_do_not_allocate() {
     assert_eq!(total + n, 0, "allocations in the MIDI effects");
     assert!(loud > 1e-3, "the synth plays the echoes: {loud}");
 }
+
+/// Surround strips (the panner's matrix made anew as it moves, a bed
+/// folded into another) do not allocate.
+#[test]
+fn surround_strips_do_not_allocate() {
+    let _serial = serial();
+    use faderframe_core::{ChannelLayout, SurroundFormat, SurroundPan};
+    use faderframe_project::{OutputRouting, TrackKind};
+    use faderframe_timeline::MusicalTime;
+    let mut tp = common::TestProject::new(48_000);
+    let master = tp.master();
+    tp.project.track_mut(master).unwrap().layout = ChannelLayout::Surround(SurroundFormat::S51);
+    let bus = tp.track(
+        TrackKind::Bus,
+        "Bed",
+        ChannelLayout::Surround(SurroundFormat::S714),
+    );
+    let t = tp.track(TrackKind::Audio, "Stereo", ChannelLayout::Stereo);
+    let src = tp.dc(2, 0.3, 96_000);
+    tp.clip(t, src, MusicalTime::ZERO, 96_000);
+    tp.project.track_mut(t).unwrap().output = OutputRouting::Track { track: bus };
+    let config = EngineConfig {
+        sample_rate: 48_000,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 6).unwrap();
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 6, 256);
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    let mut total = 0;
+    for i in 0..32 {
+        // The panner moves every block.
+        tp.project.track_mut(t).unwrap().surround = SurroundPan {
+            x: (i as f32 * 0.3).sin(),
+            y: (i as f32 * 0.2).cos(),
+            z: (i % 4) as f32 / 4.0,
+            spread: 0.2,
+            ..SurroundPan::default()
+        };
+        r.controller.update_params(&tp.project).unwrap();
+        let (_, n) = armed(|| r.processor.process_device(&mut bufs));
+        total += n;
+    }
+    assert_eq!(total, 0, "allocations/frees on the audio thread");
+}

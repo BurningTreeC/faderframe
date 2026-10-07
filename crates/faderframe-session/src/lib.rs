@@ -1965,9 +1965,17 @@ impl Session {
             self.notify(NoticeLevel::Error, e.to_string());
         }
         // The device's callbacks changed size: the preamps buffer one, the
-        // buses rendered ahead keep one ahead.
-        if self.engine.device_block_changed()
-            && (self.render_ahead_buses || self.project.tracks.iter().any(|t| t.preamp.is_some()))
+        // buses rendered ahead keep one ahead. Its outputs changed: beds
+        // fold down to them.
+        let beds = || {
+            self.project
+                .tracks
+                .iter()
+                .any(|t| matches!(t.layout, faderframe_core::ChannelLayout::Surround(_)))
+        };
+        if ((self.engine.device_block_changed()
+            && (self.render_ahead_buses || self.project.tracks.iter().any(|t| t.preamp.is_some())))
+            || (self.engine.device_outputs_changed() && beds()))
             && let Err(e) = self.sync(Impact::Graph)
         {
             self.notify(NoticeLevel::Error, e.to_string());

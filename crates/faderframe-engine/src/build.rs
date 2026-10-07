@@ -26,8 +26,8 @@ use crate::ahead::{AheadReader, AheadRing, AheadWriter};
 use crate::context::EngineContext;
 use crate::midi::{MidiFilter, MidiInputNode, MidiOutputSink, MidiShared, NO_PORT};
 use crate::nodes::{
-    AudioClipPlayer, ChannelStrip, Crosstalk, DeviceInputTap, DeviceOutputSink, MidiClipPlayer,
-    MonitorGate, PluginNode, SendNode, StretchVoices, StripEcho,
+    AudioClipPlayer, ChannelStrip, Crosstalk, DeviceInputTap, DeviceOutputSink, FoldDown,
+    MidiClipPlayer, MonitorGate, PluginNode, SendNode, StretchVoices, StripEcho,
 };
 use crate::plugins::PluginHost;
 use crate::slots::SlotRegistry;
@@ -441,7 +441,18 @@ fn node_key(track: TrackId, role: Role, sub: u64, layouts: &[ChannelLayout]) -> 
     eat(role as u64);
     eat(sub);
     for l in layouts {
-        eat(l.channel_count() as u64);
+        // The layout itself: a strip into 5.1 is not one into six
+        // discrete channels.
+        eat(match l {
+            ChannelLayout::Surround(f) => {
+                0x1_0000
+                    + faderframe_core::SurroundFormat::ALL
+                        .iter()
+                        .position(|x| x == f)
+                        .unwrap_or(0) as u64
+            }
+            other => other.channel_count() as u64,
+        });
     }
     NodeKey(h)
 }
@@ -613,6 +624,29 @@ impl PluginCx<'_> {
             }
         }
     }
+}
+
+/// What a `layout` going to a device with `outputs` channels from
+/// `first` is folded down to (`None`: it fits, or it is not a bed, or the
+/// device is unknown): the largest bed that fits, else stereo, else mono.
+fn fold_for(layout: ChannelLayout, outputs: usize, first: usize) -> Option<ChannelLayout> {
+    let ChannelLayout::Surround(_) = layout else {
+        return None;
+    };
+    let room = outputs.saturating_sub(first);
+    if outputs == 0 || layout.channel_count() <= room {
+        return None;
+    }
+    faderframe_core::SurroundFormat::ALL
+        .iter()
+        .filter(|f| f.channels() <= room)
+        .max_by_key(|f| f.channels())
+        .map(|f| ChannelLayout::Surround(*f))
+        .or(Some(if room >= 2 {
+            ChannelLayout::Stereo
+        } else {
+            ChannelLayout::Mono
+        }))
 }
 
 /// Destination layout for a track's post-fader output.
@@ -818,7 +852,7 @@ pub fn build_graph(
                     Box::new(StripEcho::new(
                         t.id,
                         slots.strip(t.id)?,
-                        slots.meter(t.id)?,
+                        slots.meter(t.id, dest.channel_count())?,
                         sends,
                     )),
                 );
@@ -1241,7 +1275,22 @@ pub fn build_graph(
                 }
             }
             OutputRouting::Hardware { first_channel } if !ahead_strip => {
-                let dest = destination_layout(project, t);
+                let mut dest = destination_layout(project, t);
+                // A bed wider than the device: folded down to what it plays.
+                if let Some(to) = fold_for(dest, config.device_outputs, first_channel as usize) {
+                    let fold = g.add_node(
+                        NodeSpec::new(format!("{} · Fold-down", t.name))
+                            .key(node_key(t.id, Role::DeviceOut, 0xF01D, &[dest, to]))
+                            .group(gi)
+                            .audio_in(dest)
+                            .audio_out(to),
+                        Box::new(FoldDown::new(dest, to)),
+                    );
+                    owned(fold, NodeWork::HardwareOut, None);
+                    g.connect_audio(out, 0, fold, 0)?;
+                    out = fold;
+                    dest = to;
+                }
                 let hw = g.add_node(
                     NodeSpec::new(format!("{} · Hardware Out", t.name))
                         .key(node_key(
@@ -1579,7 +1628,7 @@ fn add_strip(
     let layout = t.layout;
     let dest = destination_layout(project, t);
     let strip_slots = slots.strip(t.id)?;
-    let meter = slots.meter(t.id)?;
+    let meter = slots.meter(t.id, dest.channel_count())?;
     let mut spec = NodeSpec::new(format!("{} · Strip", t.name))
         .key(node_key(t.id, Role::Strip, 0, &[layout, dest]))
         .audio_in(layout)
@@ -1588,7 +1637,8 @@ fn add_strip(
     if let Some(g) = group {
         spec = spec.group(g);
     }
-    let strip = ChannelStrip::new(t.id, strip_slots, meter, PanLaw::default());
+    let strip =
+        ChannelStrip::new(t.id, strip_slots, meter, PanLaw::default()).with_layouts(layout, dest);
     let strip = b.add_node(spec, Box::new(if quiet { strip.quiet() } else { strip }));
     b.connect_audio(from, 0, strip, 0)?;
     Ok(strip)

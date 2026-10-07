@@ -1,9 +1,9 @@
 //! Channel layouts.
 //!
 //! Tracks, buses and graph ports carry an explicit layout. Nothing in the DAW
-//! may assume "everything is stereo". New layouts (surround, ambisonics) are
-//! added as variants; [`ChannelLayout::Discrete`] covers arbitrary
-//! multichannel routing in the meantime.
+//! may assume "everything is stereo". Surround beds are
+//! [`ChannelLayout::Surround`] (see [`crate::surround`]); [`ChannelLayout::Discrete`]
+//! covers arbitrary multichannel routing.
 
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +14,8 @@ pub enum ChannelLayout {
     Stereo,
     /// `n` unrelated channels (hardware I/O blocks, multichannel stems).
     Discrete(u16),
+    /// A surround bed (5.1, 7.1.4, …).
+    Surround(crate::surround::SurroundFormat),
 }
 
 impl ChannelLayout {
@@ -24,6 +26,7 @@ impl ChannelLayout {
             ChannelLayout::Mono => 1,
             ChannelLayout::Stereo => 2,
             ChannelLayout::Discrete(n) => n as usize,
+            ChannelLayout::Surround(f) => f.channels(),
         }
     }
 
@@ -33,6 +36,7 @@ impl ChannelLayout {
             ChannelLayout::Mono => "Mono".into(),
             ChannelLayout::Stereo => "Stereo".into(),
             ChannelLayout::Discrete(n) => format!("{n}ch"),
+            ChannelLayout::Surround(f) => f.name().into(),
         }
     }
 

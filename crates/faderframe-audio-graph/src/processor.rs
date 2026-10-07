@@ -20,6 +20,9 @@ pub struct PrepareConfig {
     /// offline). Processors that hand work to threads of their own buffer
     /// at least this much, so the work has a whole callback's time.
     pub device_block: usize,
+    /// The device's output channels (0: unknown): a surround bed wider
+    /// than them is folded down to what they can play.
+    pub device_outputs: usize,
 }
 
 impl PrepareConfig {
@@ -31,6 +34,7 @@ impl PrepareConfig {
             measure_nodes: true,
             parallel_min_ns: 40_000,
             device_block: 0,
+            device_outputs: 0,
         }
     }
 }

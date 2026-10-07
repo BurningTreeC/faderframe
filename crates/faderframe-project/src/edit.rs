@@ -70,6 +70,7 @@ pub enum Impact {
 pub enum CoalesceKey {
     TrackVolume(TrackId),
     TrackPan(TrackId),
+    TrackSurround(TrackId),
     SendLevel(TrackId, SendId),
     Clip(ClipId),
     Note(ClipId, NoteId),
@@ -108,6 +109,11 @@ pub enum Command {
     SetTrackPan {
         track: TrackId,
         pan: f32,
+    },
+    /// Where the track sits in a surround bed (clamped).
+    SetTrackSurround {
+        track: TrackId,
+        pan: faderframe_core::SurroundPan,
     },
     SetTrackMute {
         track: TrackId,
@@ -642,6 +648,7 @@ impl Command {
         match self {
             SetTrackVolume { .. } => "Change Volume".into(),
             SetTrackPan { .. } => "Change Pan".into(),
+            SetTrackSurround { .. } => "Change Surround Pan".into(),
             SetTrackMute { .. } => "Toggle Mute".into(),
             SetTrackSolo { .. } => "Toggle Solo".into(),
             SetTrackRecordArm { .. } => "Toggle Record Arm".into(),
@@ -741,6 +748,7 @@ impl Command {
         Some(match self {
             SetTrackVolume { track, .. } => CoalesceKey::TrackVolume(*track),
             SetTrackPan { track, .. } => CoalesceKey::TrackPan(*track),
+            SetTrackSurround { track, .. } => CoalesceKey::TrackSurround(*track),
             SetSendLevel { track, send, .. } => CoalesceKey::SendLevel(*track, *send),
             MoveClip { clip, .. } | SetClipContent { clip, .. } => CoalesceKey::Clip(*clip),
             UpdateNote { clip, note } => CoalesceKey::Note(*clip, note.id),
@@ -766,6 +774,7 @@ impl Command {
         match self {
             SetTrackVolume { .. }
             | SetTrackPan { .. }
+            | SetTrackSurround { .. }
             | SetTrackMute { .. }
             | SetTrackSolo { .. }
             | SetTrackPhaseInvert { .. }
@@ -881,6 +890,19 @@ impl Command {
                 };
                 let old = std::mem::replace(&mut t.pan, pan);
                 SetTrackPan { track, pan: old }
+            }
+            SetTrackSurround { track, pan } => {
+                let t = track_mut(p, track)?;
+                let pan = if [pan.x, pan.y, pan.z, pan.spread, pan.width, pan.lfe_db]
+                    .iter()
+                    .any(|v| v.is_nan())
+                {
+                    faderframe_core::SurroundPan::default()
+                } else {
+                    pan.clamped()
+                };
+                let old = std::mem::replace(&mut t.surround, pan);
+                SetTrackSurround { track, pan: old }
             }
             SetTrackMute { track, on } => {
                 let old = std::mem::replace(&mut track_mut(p, track)?.mute, on);

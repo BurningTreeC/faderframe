@@ -38,6 +38,8 @@ struct Form {
     format: gtk::DropDown,
     rate: gtk::DropDown,
     channels: gtk::DropDown,
+    /// What each entry of `channels` renders.
+    channel_choices: Vec<RenderChannels>,
     tail: gtk::SpinButton,
     level: gtk::DropDown,
     peak_db: gtk::SpinButton,
@@ -85,11 +87,11 @@ impl Form {
             },
             format: FORMATS[self.format.selected() as usize % FORMATS.len()],
             sample_rate,
-            channels: if self.channels.selected() == 1 {
-                RenderChannels::Mono
-            } else {
-                RenderChannels::Stereo
-            },
+            channels: self
+                .channel_choices
+                .get(self.channels.selected() as usize)
+                .copied()
+                .unwrap_or(RenderChannels::Stereo),
             tail_seconds: self.tail.value() as f32,
             normalize_db: (self.level.selected() == LEVEL_PEAK)
                 .then(|| self.peak_db.value() as f32),
@@ -177,10 +179,11 @@ impl Form {
                 let secs = p.timeline.tempo.musical_to_seconds(b)
                     - p.timeline.tempo.musical_to_seconds(a)
                     + settings.tail_seconds as f64;
-                let ch = if settings.channels == RenderChannels::Mono {
-                    1
-                } else {
-                    2
+                let ch = match settings.channels {
+                    RenderChannels::Mono | RenderChannels::First => 1,
+                    RenderChannels::Master => faderframe_session::render::master_bed(p)
+                        .map_or(2, faderframe_core::SurroundFormat::channels),
+                    RenderChannels::Stereo => 2,
                 };
                 let files = match settings.source {
                     RenderSource::Master => 1,
@@ -299,7 +302,28 @@ pub fn open(app: &Rc<AppState>) {
     let rate_refs: Vec<&str> = rates.iter().map(String::as_str).collect();
     let rate = gtk::DropDown::from_strings(&rate_refs);
     labelled(&grid, 4, "Sample rate", &rate);
-    let channels = gtk::DropDown::from_strings(&["Stereo", "Mono (summed)"]);
+    // A surround master: as it is, or folded down.
+    let bed = faderframe_session::render::master_bed(app.session.borrow().project());
+    let (channel_names, channel_choices): (Vec<String>, Vec<RenderChannels>) = match bed {
+        Some(f) => (
+            vec![
+                format!("As the master ({}, every channel)", f.name()),
+                "Stereo (folded down)".into(),
+                "Mono (summed)".into(),
+            ],
+            vec![
+                RenderChannels::Master,
+                RenderChannels::Stereo,
+                RenderChannels::Mono,
+            ],
+        ),
+        None => (
+            vec!["Stereo".into(), "Mono (summed)".into()],
+            vec![RenderChannels::Stereo, RenderChannels::Mono],
+        ),
+    };
+    let names: Vec<&str> = channel_names.iter().map(String::as_str).collect();
+    let channels = gtk::DropDown::from_strings(&names);
     labelled(&grid, 5, "Channels", &channels);
     let tail = gtk::SpinButton::with_range(0.0, 60.0, 0.5);
     tail.set_digits(1);
@@ -389,6 +413,7 @@ pub fn open(app: &Rc<AppState>) {
         format,
         rate,
         channels,
+        channel_choices,
         tail,
         level,
         peak_db,

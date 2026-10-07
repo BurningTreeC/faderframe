@@ -39,8 +39,8 @@ pub use build::{AheadPlan, BuiltGraph, MidiRouting, NodeOwner, NodeWork, build_g
 pub use click::{MetronomeMode, MetronomeShared};
 pub use context::EngineContext;
 pub use engine::{
-    EngineConfig, EngineController, EngineProcessor, EngineShared, GraphProfile, TrackMeter,
-    create, create_with_epoch,
+    EngineConfig, EngineController, EngineProcessor, EngineShared, GraphProfile, METER_MAX,
+    TrackMeter, create, create_with_epoch,
 };
 pub use plugins::{ActivatedPlugin, PluginHost, decode_state, encode_state};
 pub use record::{RecordBlock, RecordStreams, RecordTarget};

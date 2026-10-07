@@ -23,9 +23,11 @@ pub struct StripSlots {
     /// Linear gain of the track's VCAs whose faders are not automated
     /// (automated ones come with the timeline snapshot).
     pub vca: ParamSlot,
+    /// The surround panner: x, y, z, spread, width, LFE send (dB).
+    pub surround: [ParamSlot; 6],
 }
 
-const STRIP_SLOT_COUNT: u32 = 6;
+const STRIP_SLOT_COUNT: u32 = 12;
 
 /// Parameter slots of a container's chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,7 +37,7 @@ pub struct ChainSlots {
     /// Balance, −1..1.
     pub pan: ParamSlot,
 }
-/// Meter channels reserved per track (stereo).
+/// Meter channels reserved per track at least (stereo).
 const METER_CHANNELS: u16 = 2;
 
 /// Keeps slot assignments stable across graph rebuilds so the UI and
@@ -138,6 +140,7 @@ impl SlotRegistry {
             phase: ParamSlot(base + 3),
             solo_mute: ParamSlot(base + 4),
             vca: ParamSlot(base + 5),
+            surround: std::array::from_fn(|i| ParamSlot(base + 6 + i as u32)),
         };
         self.strips.insert(track, s);
         Ok(s)
@@ -156,17 +159,24 @@ impl SlotRegistry {
         Ok(slot)
     }
 
-    pub fn meter(&mut self, track: TrackId) -> Result<MeterRange, SlotsExhausted> {
+    /// The meter channels of a track's strip, at least `channels` of them
+    /// (a range too small for a new format is replaced).
+    pub fn meter(&mut self, track: TrackId, channels: usize) -> Result<MeterRange, SlotsExhausted> {
+        let want = (channels as u16).max(METER_CHANNELS);
         if let Some(m) = self.track_meters.get(&track) {
-            return Ok(*m);
+            if m.channels >= want {
+                return Ok(*m);
+            }
+            self.meters.release(m.first, u32::from(m.channels));
+            self.track_meters.remove(&track);
         }
         let first = self
             .meters
-            .allocate(METER_CHANNELS as u32)
+            .allocate(u32::from(want))
             .ok_or(SlotsExhausted("meters"))?;
         let m = MeterRange {
             first,
-            channels: METER_CHANNELS,
+            channels: want,
         };
         self.track_meters.insert(track, m);
         Ok(m)
@@ -275,6 +285,14 @@ impl SlotRegistry {
             let s = self.strip(t.id)?;
             table.set(s.volume, faderframe_core::db_to_gain(t.volume_db));
             table.set(s.pan, t.pan);
+            let sp = t.surround;
+            for (slot, v) in s
+                .surround
+                .iter()
+                .zip([sp.x, sp.y, sp.z, sp.spread, sp.width, sp.lfe_db])
+            {
+                table.set(*slot, v);
+            }
             // VCAs: static faders and mutes here, automated ones in the
             // snapshot.
             let (mut vca_gain, mut vca_muted) = (1.0f32, false);

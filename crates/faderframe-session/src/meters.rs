@@ -68,21 +68,40 @@ impl MeterChannel {
 pub struct MeterDisplay {
     pub left: MeterChannel,
     pub right: MeterChannel,
+    /// Every channel (a surround bed's; `count` of them).
+    pub channels: [MeterChannel; faderframe_engine::METER_MAX],
+    pub count: usize,
 }
 
 impl MeterDisplay {
     pub fn update(&mut self, m: &TrackMeter, dt: f32) {
         self.left.update(m.left.peak, m.left.rms, dt);
         self.right.update(m.right.peak, m.right.rms, dt);
+        self.count = m.count;
+        for (d, r) in self.channels.iter_mut().zip(&m.channels).take(m.count) {
+            d.update(r.peak, r.rms, dt);
+        }
+    }
+
+    /// The channels to draw: every one of a bed, else left and right.
+    pub fn shown(&self) -> &[MeterChannel] {
+        &self.channels[..self.count.max(2).min(self.channels.len())]
     }
 
     pub fn is_active(&self) -> bool {
-        self.left.is_active() || self.right.is_active()
+        self.left.is_active()
+            || self.right.is_active()
+            || self.channels[..self.count]
+                .iter()
+                .any(MeterChannel::is_active)
     }
 
     pub fn reset_clip(&mut self) {
         self.left.clipped = false;
         self.right.clipped = false;
+        for c in &mut self.channels {
+            c.clipped = false;
+        }
     }
 }
 

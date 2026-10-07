@@ -26,7 +26,7 @@ pub use dither::Dither;
 pub use generate::{GeneratorSpec, generate};
 pub use peaks::{PeakBuilder, PeakCache, PeakLevel};
 pub use stream::{PAGE_FRAMES, Page, StreamSource};
-pub use wav::{WavData, WavFormat, read_wav, write_wav, write_wav_with};
+pub use wav::{WavData, WavFormat, read_wav, write_wav, write_wav_mask, write_wav_with};
 
 /// Decoded, non-interleaved audio in memory. Immutable once shared, so the
 /// realtime thread may read it through an `Arc` without synchronisation.

@@ -327,6 +327,13 @@ pub struct Track {
     pub volume_db: f32,
     /// Static pan (-1..1); automation in Read mode overrides it.
     pub pan: f32,
+    /// Where the track sits in a surround destination (its output or the
+    /// bus it feeds is a bed): the surround panner. Unused for stereo.
+    #[serde(
+        default,
+        skip_serializing_if = "faderframe_core::SurroundPan::is_default"
+    )]
+    pub surround: faderframe_core::SurroundPan,
     #[serde(default)]
     pub phase_invert: bool,
 
@@ -452,6 +459,7 @@ impl Track {
             },
             volume_db: 0.0,
             pan: 0.0,
+            surround: faderframe_core::SurroundPan::default(),
             phase_invert: false,
             mute: false,
             solo: false,

@@ -24,6 +24,8 @@ pub struct WavWriter {
     quantizer: Quantizer,
     frames: u64,
     scratch: Vec<u8>,
+    /// A surround bed's speakers (extensible header).
+    mask: Option<u32>,
 }
 
 impl WavWriter {
@@ -46,9 +48,23 @@ impl WavWriter {
         format: WavFormat,
         dither: Dither,
     ) -> io::Result<Self> {
+        Self::create_with_mask(path, channels, sample_rate, format, dither, None)
+    }
+
+    /// [`WavWriter::create_with`] carrying a channel mask (a surround
+    /// bed's speakers, `WAVE_FORMAT_EXTENSIBLE`).
+    pub fn create_with_mask(
+        path: &Path,
+        channels: u16,
+        sample_rate: u32,
+        format: WavFormat,
+        dither: Dither,
+        mask: Option<u32>,
+    ) -> io::Result<Self> {
         let mut out = BufWriter::with_capacity(1 << 20, File::create(path)?);
-        Self::write_header(&mut out, channels.max(1), sample_rate, format, 0)?;
+        Self::write_header(&mut out, channels.max(1), sample_rate, format, 0, mask)?;
         Ok(Self {
+            mask,
             out,
             path: path.to_path_buf(),
             channels: channels.max(1),
@@ -75,24 +91,22 @@ impl WavWriter {
         rate: u32,
         format: WavFormat,
         frames: u64,
+        mask: Option<u32>,
     ) -> io::Result<()> {
         let bps = (format.bits() / 8) as u32;
         let data_len = frames * channels as u64 * bps as u64;
         let data_len = u32::try_from(data_len).unwrap_or(u32::MAX - 64);
-        let tag: u16 = if format.is_integer() { 1 } else { 3 };
+        let fmt = crate::wav::fmt_chunk(channels, rate, format, mask);
         // An odd-sized chunk is followed by a pad byte (RIFF).
         out.write_all(b"RIFF")?;
         out.write_all(
-            &(36u32.saturating_add(data_len).saturating_add(data_len & 1)).to_le_bytes(),
+            &(4u32 + fmt.len() as u32 + 8)
+                .saturating_add(data_len)
+                .saturating_add(data_len & 1)
+                .to_le_bytes(),
         )?;
-        out.write_all(b"WAVEfmt ")?;
-        out.write_all(&16u32.to_le_bytes())?;
-        out.write_all(&tag.to_le_bytes())?;
-        out.write_all(&channels.to_le_bytes())?;
-        out.write_all(&rate.to_le_bytes())?;
-        out.write_all(&(rate * channels as u32 * bps).to_le_bytes())?;
-        out.write_all(&(channels * bps as u16).to_le_bytes())?;
-        out.write_all(&format.bits().to_le_bytes())?;
+        out.write_all(b"WAVE")?;
+        out.write_all(&fmt)?;
         out.write_all(b"data")?;
         out.write_all(&data_len.to_le_bytes())
     }
@@ -163,6 +177,7 @@ impl WavWriter {
             self.sample_rate,
             self.format,
             self.frames,
+            self.mask,
         )?;
         file.sync_data()?;
         Ok(self.path)

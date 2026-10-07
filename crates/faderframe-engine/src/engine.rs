@@ -53,7 +53,7 @@ impl Default for EngineConfig {
             sample_rate: 48_000,
             max_block_size: 512,
             param_capacity: 8192,
-            meter_capacity: 2048,
+            meter_capacity: 16_384,
             queue_capacity: 256,
             measure_nodes: true,
             parallel_min_ns: 40_000,
@@ -322,6 +322,7 @@ pub fn create_with_epoch(
         ahead_strips: Default::default(),
         ahead_buses: false,
         graph_device_block: 0,
+        graph_device_outputs: 0,
         ahead_misses: Arc::new(AtomicU64::new(0)),
         varispeed: false,
     };
@@ -821,11 +822,17 @@ impl AudioCallback for EngineProcessor {
     }
 }
 
+/// Most meter channels a track reports.
+pub const METER_MAX: usize = 16;
+
 /// Meter values of one track for the UI (mono tracks report both sides).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TrackMeter {
     pub left: MeterReading,
     pub right: MeterReading,
+    /// Every channel of the strip's output (a surround bed's too).
+    pub channels: [MeterReading; METER_MAX],
+    pub count: usize,
 }
 
 /// The control-thread half: rebuilds graphs, publishes snapshots and
@@ -901,6 +908,8 @@ pub struct EngineController {
     ahead_buses: bool,
     /// The device callback size the graph was built for.
     graph_device_block: usize,
+    /// The device output count it was built for.
+    graph_device_outputs: usize,
     ahead_misses: Arc<AtomicU64>,
     /// Varispeed is on.
     varispeed: bool,
@@ -946,6 +955,12 @@ impl EngineController {
     /// rebuild lets buffered devices (the preamps) follow.
     pub fn device_block_changed(&self) -> bool {
         self.stream_buffer_size() as usize != self.graph_device_block
+    }
+
+    /// The device's output count changed since the graph was built: a
+    /// rebuild folds surround beds down to it (or stops doing so).
+    pub fn device_outputs_changed(&self) -> bool {
+        self.shared.stream_outputs.load(Ordering::Relaxed) as usize != self.graph_device_outputs
     }
 
     /// True while the running graph does not match the stream rate.
@@ -1500,7 +1515,9 @@ impl EngineController {
         prepare.measure_nodes = self.config.measure_nodes;
         prepare.parallel_min_ns = self.config.parallel_min_ns;
         prepare.device_block = self.shared.stream_buffer_size.load(Ordering::Relaxed) as usize;
+        prepare.device_outputs = self.shared.stream_outputs.load(Ordering::Relaxed) as usize;
         self.graph_device_block = prepare.device_block;
+        self.graph_device_outputs = prepare.device_outputs;
         let sets = self.ahead_plan(project);
         let lookahead = self.ahead.as_ref().map(|a| a.lookahead);
         let bus_ring_frames = self
@@ -1997,11 +2014,19 @@ impl EngineController {
     /// Consume the meter values accumulated since the last call.
     pub fn take_meter(&self, track: TrackId) -> Option<TrackMeter> {
         let range = self.slots.meter_of(track)?;
-        Some(TrackMeter {
-            left: self.meters.take(range.first),
-            right: range
-                .channel(1)
-                .map_or_else(|| self.meters.take(range.first), |i| self.meters.take(i)),
-        })
+        let mut m = TrackMeter {
+            count: usize::from(range.channels).min(METER_MAX),
+            ..TrackMeter::default()
+        };
+        for (c, reading) in m.channels.iter_mut().enumerate().take(m.count) {
+            *reading = self.meters.take(range.first + c as u32);
+        }
+        m.left = m.channels[0];
+        m.right = if m.count > 1 {
+            m.channels[1]
+        } else {
+            m.channels[0]
+        };
+        Some(m)
     }
 }
