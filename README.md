@@ -572,8 +572,11 @@ of them for a `v*` tag and attaches them to the GitHub release.
 | macOS | `FaderFrame.app` in a DMG (GTK bundled, ad-hoc signed) | `brew install gtk4 adwaita-icon-theme librsvg pkgconf && packaging/macos/bundle.sh` |
 | Windows | installer (Inno Setup) and portable zip | in MSYS2 UCRT64: `packaging/windows/bundle.sh` |
 
-The macOS app is not notarised: open it the first time with right-click →
-Open.
+The macOS app is signed ad hoc, not notarised, so Gatekeeper stops it the
+first time. On macOS 15 and later, try to open it once, then allow it in
+System Settings → Privacy & Security → Open Anyway (earlier versions:
+right-click → Open). Or clear the download's quarantine flag:
+`xattr -dr com.apple.quarantine /Applications/FaderFrame.app`.
 
 **Portable mode.** With a folder named `FaderFrame Data` next to the
 program, FaderFrame keeps everything it would put into your profile in

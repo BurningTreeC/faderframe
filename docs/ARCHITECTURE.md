@@ -2409,10 +2409,11 @@ Platform specifics are isolated in backends and the GTK shell:
   `macos-15-intel`, GTK from Homebrew) and Windows (MSYS2 UCRT64 with its
   GTK 4 and Rust packages).
 
-Still open for the ports: joining CoreAudio's IO workgroup
-(`os_workgroup`, which keeps workers on performance cores on Apple
-Silicon), Developer ID signing and notarisation of the macOS app, and a
-signed Windows installer.
+Still open for the ports: a signed Windows installer. The macOS app stays
+ad-hoc signed and is not notarised (that would take a paid Apple
+developer account): Gatekeeper asks once (see the README). CoreAudio's IO
+workgroup is joined (see *Multicore*), by sandboxed plugins' audio
+threads too.
 
 ## Status and roadmap
 
@@ -2502,7 +2503,8 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
 6. ~~**Performance and control**: a clip launcher with scenes recorded
    into the arrangement, control surfaces (Mackie Control/HUI, OSC)~~ —
    done (see *Clip launcher* and *Control surfaces*).
-7. **Ports**: signed and notarised packages, ~~sandboxed plugins' audio
+7. **Ports**: a signed Windows installer (the macOS app stays ad-hoc
+   signed, not notarised), ~~sandboxed plugins' audio
    threads in the device's workgroup~~ (done:
    `faderframe_plugin_sandbox::workgroup` — a bootstrap service hands
    helpers the workgroup's Mach port). The Flatpak is a bundle on the

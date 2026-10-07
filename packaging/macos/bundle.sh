@@ -7,9 +7,10 @@
 #   cargo build --release -p faderframe-app
 #   packaging/macos/bundle.sh
 #
-# The app is signed ad hoc (needed to run on Apple Silicon). Without a
-# Developer ID signature and notarisation, Gatekeeper asks once: open it
-# with right-click → Open.
+# The app is signed ad hoc (needed to run on Apple Silicon) and not
+# notarised, so Gatekeeper asks once: macOS 15 and later via System
+# Settings → Privacy & Security → Open Anyway (earlier: right-click →
+# Open), or `xattr -dr com.apple.quarantine FaderFrame.app`.
 set -euo pipefail
 shopt -s nullglob
 root=$(cd "$(dirname "$0")/../.." && pwd)
