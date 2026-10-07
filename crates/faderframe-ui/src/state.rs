@@ -405,15 +405,23 @@ impl AppState {
                         format!("plugin scan: {e}"),
                     );
                 }
-                s.notify(
-                    faderframe_session::NoticeLevel::Info,
+                let text = if r.lv2 > 0 {
+                    format!(
+                        "{} CLAP, {} VST3 and {} LV2 plugin{} available",
+                        r.clap,
+                        r.vst3,
+                        r.lv2,
+                        if r.lv2 == 1 { "" } else { "s" }
+                    )
+                } else {
                     format!(
                         "{} CLAP and {} VST3 plugin{} available",
                         r.clap,
                         r.vst3,
                         if r.vst3 == 1 { "" } else { "s" }
-                    ),
-                );
+                    )
+                };
+                s.notify(faderframe_session::NoticeLevel::Info, text);
             }
         }
         let frame = self.frame.get() + 1;

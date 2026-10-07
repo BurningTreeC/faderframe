@@ -46,6 +46,7 @@ pub enum PluginFormat {
     Clap,
     Vst3,
     AudioUnit,
+    Lv2,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

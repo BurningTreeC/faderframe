@@ -44,3 +44,6 @@ faderframe-audio-graph.workspace = true
 midly.workspace = true
 faderframe-plugin-clap.workspace = true
 faderframe-plugin-vst3.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+faderframe-plugin-lv2.workspace = true

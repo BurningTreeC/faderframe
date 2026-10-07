@@ -117,6 +117,7 @@ scrollbar { background-color: @ff_bg; }
 .badge-builtin { background-color: @ff_surface_alt; color: @ff_dim; }
 .badge-clap { background-color: alpha(@ff_accent, 0.22); color: @ff_fg; }
 .badge-vst3 { background-color: alpha(@ff_selection, 0.3); color: @ff_fg; }
+.badge-lv2 { background-color: alpha(#c6e05c, 0.18); color: @ff_fg; }
 .edit-toggle { font-weight: 700; padding-left: 10px; padding-right: 10px; }
 .edit-toggle.edit-active { background-color: alpha(@ff_accent, 0.35); color: @ff_fg; }
 .badge-other { background-color: @ff_surface_alt; color: @ff_dim; }

@@ -469,8 +469,11 @@ Contrast:
   follow the key and chord track. On instrument tracks before the
   instrument, and on MIDI tracks (track menu → Add MIDI Effect…).
 * Plugins: built-in synth, EQ, Program EQ and the stock devices, CLAP and VST3 effects and
-  instruments on every platform and Audio Units on macOS, found by a
-  crash-safe background scan (Audio Units: the system's registry) and
+  instruments on every platform, LV2 on Linux (X11 editors, presets,
+  state, the worker and transport; `LV2_PATH` or `~/.lv2` and the system
+  folders) and Audio Units on macOS, found by a
+  crash-safe background scan (LV2: its metadata, no code loaded; Audio
+  Units: the system's registry) and
   picked in a plugin browser (click an
   empty insert slot or Track → Plugin Browser…). New instrument tracks
   start empty and open the browser to choose their instrument (an
@@ -483,10 +486,12 @@ Contrast:
   Plugin state, parameters and automation are saved too. Moving a knob in a
   plugin's own GUI writes automation like FaderFrame's controls do. Presets:
   save and load your own for any plugin (insert menu or the parameter
-  window's Presets menu). The stock effects, MIDI effects, EQs and Synth include 216
+  window's Presets menu); saving under an existing name asks before it
+  replaces that preset, and Delete Preset removes your own (factory
+  presets stay). The stock effects, MIDI effects, EQs and Synth include 216
   factory presets, selected from the editor's Presets menu in one undo
   step. Delay and Reverb presets load fully wet on Aux returns. VST3
-  factory presets are listed too, as are
+  factory presets and LV2 presets (the plugin's and preset bundles') are listed too, as are
   VST3 program lists (selecting a program is one undo step; MIDI program
   changes select VST3 programs). Plugins that offer it can process in
   64-bit floating point (Preferences → Audio).

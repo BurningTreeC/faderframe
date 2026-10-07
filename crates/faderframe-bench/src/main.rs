@@ -8,7 +8,7 @@
 //!
 //! The graph runs on `--threads` threads (the audio thread plus a worker
 //! pool, as in the application); `--fx N` adds N echo inserts per track and
-//! `--plugin clap:<id>` / `--plugin vst3:<id>` an installed plugin (from the
+//! `--plugin clap:<id>` / `vst3:<id>` / `lv2:<uri>` an installed plugin (from the
 //! application's scan caches) to every track, to measure plugin load.
 //!
 //! Example: `cargo run -p faderframe-bench --release -- --tracks 128 --block 64 --rate 96000`
@@ -120,11 +120,12 @@ fn parse() -> Result<Args, String> {
                 let v = num("--plugin")?;
                 let (format, id) = v
                     .split_once(':')
-                    .ok_or("--plugin needs clap:<id> or vst3:<id>")?;
+                    .ok_or("--plugin needs clap:<id>, vst3:<id> or lv2:<uri>")?;
                 let format = match format {
                     "clap" => PluginFormat::Clap,
                     "vst3" => PluginFormat::Vst3,
-                    _ => return Err("--plugin needs clap:<id> or vst3:<id>".into()),
+                    "lv2" => PluginFormat::Lv2,
+                    _ => return Err("--plugin needs clap:<id>, vst3:<id> or lv2:<uri>".into()),
                 };
                 a.plugin = Some(PluginRef {
                     format,
@@ -134,7 +135,7 @@ fn parse() -> Result<Args, String> {
             }
             "-h" | "--help" => {
                 println!(
-                    "faderframe-bench [--tracks N] [--block FRAMES] [--rate HZ] [--seconds S] [--buses N] [--no-inserts] [--no-sends] [--measure-nodes] [--threads N] [--fx N] [--plugin clap:<id>|vst3:<id>] [--paced] [--ahead MS] [--ahead-buses] [--crosstalk] [--preamp 0..5] [--mono-source]"
+                    "faderframe-bench [--tracks N] [--block FRAMES] [--rate HZ] [--seconds S] [--buses N] [--no-inserts] [--no-sends] [--measure-nodes] [--threads N] [--fx N] [--plugin clap:<id>|vst3:<id>|lv2:<uri>] [--paced] [--ahead MS] [--ahead-buses] [--crosstalk] [--preamp 0..5] [--mono-source]"
                 );
                 std::process::exit(0);
             }
@@ -311,6 +312,8 @@ fn main() {
         let mut r = faderframe_plugin_host::PluginRegistry::with_builtins();
         r.add_factory(Box::new(faderframe_plugin_clap::ClapFactory::new()));
         r.add_factory(Box::new(faderframe_plugin_vst3::Vst3Factory::new()));
+        #[cfg(target_os = "linux")]
+        r.add_factory(Box::new(faderframe_plugin_lv2::Lv2Factory::new()));
         r
     });
     if let Some(cache) =
@@ -324,6 +327,10 @@ fn main() {
         };
         faderframe_plugin_clap::set_catalog(load("clap-scan.json"));
         faderframe_plugin_vst3::set_catalog(load("vst3-scan.json"));
+        #[cfg(target_os = "linux")]
+        faderframe_plugin_lv2::set_catalog(
+            faderframe_plugin_lv2::scan::Cache::load(&cache.join("lv2-scan.json")).plugins(),
+        );
     }
     let project = build(&args);
     let sources = render_generated_sources(&project, args.rate);

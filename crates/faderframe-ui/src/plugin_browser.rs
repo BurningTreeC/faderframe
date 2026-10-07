@@ -45,6 +45,7 @@ impl Entry {
             PluginFormat::Clap => "CLAP",
             PluginFormat::Vst3 => "VST3",
             PluginFormat::AudioUnit => "AU",
+            PluginFormat::Lv2 => "LV2",
         }
     }
 
@@ -245,6 +246,7 @@ fn row_widget(e: &Entry) -> gtk::Widget {
             PluginFormat::Builtin => "badge-builtin",
             PluginFormat::Clap => "badge-clap",
             PluginFormat::Vst3 => "badge-vst3",
+            PluginFormat::Lv2 => "badge-lv2",
             _ => "badge-other",
         },
     ));
@@ -330,8 +332,13 @@ impl Browser {
             (PluginFormat::Builtin, "Built-in"),
             (PluginFormat::Clap, "CLAP"),
             (PluginFormat::Vst3, "VST3"),
+            (PluginFormat::Lv2, "LV2"),
+            (PluginFormat::AudioUnit, "AU"),
         ] {
             let n = entries.iter().filter(|e| e.plugin.format == f).count();
+            if n == 0 && matches!(f, PluginFormat::Lv2 | PluginFormat::AudioUnit) {
+                continue;
+            }
             let (r, scope) = item(label, n, Scope::Format(f));
             self.sidebar.append(&r);
             scopes.push(Some(scope));
@@ -572,7 +579,11 @@ pub fn open(app: &Rc<AppState>, track: TrackId, target: PluginTarget) {
     });
     header.pack_start(&kinds);
     let rescan = gtk::Button::from_icon_name("view-refresh-symbolic");
-    rescan.set_tooltip_text(Some("Rescan the CLAP and VST3 folders"));
+    rescan.set_tooltip_text(Some(if cfg!(target_os = "linux") {
+        "Rescan the CLAP, VST3 and LV2 folders"
+    } else {
+        "Rescan the CLAP and VST3 folders"
+    }));
     header.pack_end(&rescan);
     window.set_titlebar(Some(&header));
 

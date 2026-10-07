@@ -81,3 +81,4 @@ objc2-app-kit = { workspace = true, features = ["NSGraphics", "NSResponder", "NS
 [target.'cfg(target_os = "linux")'.dependencies]
 faderframe-audio-jack.workspace = true
 faderframe-audio-pipewire.workspace = true
+faderframe-plugin-lv2.workspace = true

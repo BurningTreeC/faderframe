@@ -4268,6 +4268,7 @@ impl Session {
                         F::Clap => faderframe_project::PluginFormat::Clap,
                         F::Vst3 => faderframe_project::PluginFormat::Vst3,
                         F::AudioUnit => faderframe_project::PluginFormat::AudioUnit,
+                        F::Lv2 => faderframe_project::PluginFormat::Lv2,
                     },
                     id: d.id,
                     name: d.name,

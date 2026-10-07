@@ -23,11 +23,43 @@ use std::sync::Arc;
 
 const SR: u32 = 48_000;
 
+/// A bundle's plugins: CLAP, VST3 or (Linux) LV2, made the catalog.
+fn describe(
+    bundle: &std::path::Path,
+) -> (
+    PluginFormat,
+    Vec<faderframe_plugin_host::scan::ScannedPlugin>,
+) {
+    match bundle.extension().and_then(|e| e.to_str()) {
+        Some("vst3") => {
+            let p = faderframe_plugin_vst3::scan::describe_bundle(bundle).unwrap();
+            faderframe_plugin_vst3::set_catalog(p.clone());
+            (PluginFormat::Vst3, p)
+        }
+        #[cfg(target_os = "linux")]
+        Some("lv2") => {
+            let p = faderframe_plugin_lv2::scan::describe_bundle(bundle)
+                .unwrap()
+                .plugins;
+            let scanned = p.iter().map(|x| x.scanned()).collect();
+            faderframe_plugin_lv2::set_catalog(p);
+            (PluginFormat::Lv2, scanned)
+        }
+        _ => {
+            let p = faderframe_plugin_clap::scan::describe_bundle(bundle).unwrap();
+            faderframe_plugin_clap::set_catalog(p.clone());
+            (PluginFormat::Clap, p)
+        }
+    }
+}
+
 fn registry() {
     faderframe_plugin_host::set_default_registry(|| {
         let mut r = faderframe_plugin_host::PluginRegistry::with_builtins();
         r.add_factory(Box::new(faderframe_plugin_clap::ClapFactory::new()));
         r.add_factory(Box::new(faderframe_plugin_vst3::Vst3Factory::new()));
+        #[cfg(target_os = "linux")]
+        r.add_factory(Box::new(faderframe_plugin_lv2::Lv2Factory::new()));
         r
     });
 }
@@ -131,16 +163,7 @@ fn installed_plugins_pass_audio_and_play_notes() {
     registry();
     let mut failures = Vec::new();
     for bundle in bundles() {
-        let vst3 = bundle.extension().is_some_and(|e| e == "vst3");
-        let (format, plugins) = if vst3 {
-            let p = faderframe_plugin_vst3::scan::describe_bundle(&bundle).unwrap();
-            faderframe_plugin_vst3::set_catalog(p.clone());
-            (PluginFormat::Vst3, p)
-        } else {
-            let p = faderframe_plugin_clap::scan::describe_bundle(&bundle).unwrap();
-            faderframe_plugin_clap::set_catalog(p.clone());
-            (PluginFormat::Clap, p)
-        };
+        let (format, plugins) = describe(&bundle);
         for plugin in &plugins {
             let label = format!(
                 "{:?} {} ({:?} in, {:?} out)",

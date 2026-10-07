@@ -16,6 +16,7 @@ pub(crate) fn host_format(f: ProjectFormat) -> PluginFormat {
         ProjectFormat::Clap => PluginFormat::Clap,
         ProjectFormat::Vst3 => PluginFormat::Vst3,
         ProjectFormat::AudioUnit => PluginFormat::AudioUnit,
+        ProjectFormat::Lv2 => PluginFormat::Lv2,
     }
 }
 

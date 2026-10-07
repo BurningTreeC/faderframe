@@ -1,0 +1,33 @@
+[package]
+name = "faderframe-plugin-lv2"
+description = "LV2 plugin hosting for FaderFrame: Turtle metadata, instances, atom MIDI, worker, state, X11 UIs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-core.workspace = true
+faderframe-plugin-host.workspace = true
+faderframe-audio-graph.workspace = true
+faderframe-automation.workspace = true
+faderframe-midi.workspace = true
+faderframe-transport.workspace = true
+faderframe-realtime.workspace = true
+libc.workspace = true
+x11rb.workspace = true
+libloading.workspace = true
+oxttl = { version = "0.2", default-features = false }
+oxrdf = { version = "0.3", default-features = false }
+rtrb.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+cc.workspace = true

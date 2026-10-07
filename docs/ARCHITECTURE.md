@@ -1436,6 +1436,78 @@ reached through it too.
   sample-accurate cutoff automation, a state round trip and notes into the
   synth.
 
+### LV2 (Linux)
+
+`faderframe-plugin-lv2`, hand-written C ABI (`sys.rs`, from the ISC
+headers). The plugin is driven directly, without lilv.
+
+* **Metadata.** It is Turtle (`ttl.rs`: `oxttl` into one graph per bundle,
+  relative IRIs resolved per file).
+  * `scan` reads a bundle's `manifest.ttl` and the files it points to:
+    plugins, UIs, presets.
+  * Nothing is loaded, so scanning needs no helper process. A cache of
+    descriptions (`scan::Cache`, `lv2-scan.json`) is refreshed by `stat`
+    unless a bundle's Turtle files changed.
+  * Paths: `LV2_PATH`, else a portable `Plug-Ins/LV2`, `~/.lv2` and the
+    system directories.
+  * Preset bundles (a user's presets of another bundle's plugin) are
+    merged into their plugin.
+  * Ports become buses: the main input, the sidechain (`lv2:isSideChain`
+    or a `pg:sideChainOf` group), output buses by port group (the main one
+    first), else the first two ports and then pairs.
+* **Instances** (`instance.rs`) start at 48 kHz/8192 frames, because the
+  host learns the rate only at activation.
+  * Another rate or larger blocks instantiates the plugin again, its state
+    carried over.
+  * Host features: URID map/unmap (one table per process), options (block
+    sizes, sequence size, sample rate), bounded block length, the worker,
+    `loadDefaultState` (the plugin's `state:state` restored after
+    instantiation), and the log (formatted by a C shim, `log.c`: stable
+    Rust has no variadic definitions).
+  * Parameters are the input control ports, except the latency, enabled,
+    free-wheeling and `notOnGUI`/`notAutomatic` ones. Their id is the port
+    index.
+  * Latency: the latency port is read from one block of silence after
+    activation (then deactivate/activate). A later change asks for a
+    restart.
+* **State** (`state.rs`) is our own format, `FFL2`: port values by symbol
+  plus the state extension's properties, with URIs instead of URIDs.
+  * Paths are kept absolute (`mapPath` is the identity).
+  * `restore` runs holding the core's cell and the worker's gate (it is
+    an instantiation function).
+  * Presets (`pset:Preset`) are the plugin's programs: port values plus a
+    `state:state` node, typed from the literals' datatypes.
+* **Processing** (`core.rs`, `Core` in a `TryCell` like the other
+  formats). Controls are block-rate, so `run` is split at automation
+  events: audio ports are connected at offsets, and atom inputs are
+  rebuilt per piece.
+  * MIDI and SysEx travel as atom sequences (`atom.rs`: preallocated,
+    8-byte aligned).
+  * `time:Position` goes to ports that support it whenever the transport
+    changes or jumps.
+  * Worker requests and responses use length-prefixed byte rings
+    (`worker.rs`, a thread per instance); `end_run` is called after each
+    `run`.
+  * `reset` sends All Sound/Notes Off, because activation is not realtime
+    safe.
+  * Output control ports (meters, latency) are published as atomics.
+  * No allocation on the audio thread (`tests/host.rs`, which drives a
+    plugin written in the test itself).
+* **Editors** (`ui.rs`): X11 UIs only, embedded with `ui:parent`.
+  * Supported UI features: `ui:resize` (requests), `ui:touch` (gestures),
+    `ui:portMap`, the idle interface on a 30 ms host timer, and options
+    (rate, scale).
+  * The size comes from `ui:resize`, else from the UI window's X11
+    geometry.
+  * UIs reach the plugin only through ports: control writes become
+    `EditorEdit`s, and atom messages travel through rings both ways. No
+    instance-access is given, so UIs survive re-instantiation.
+* The sandbox carries LV2 like the other formats (`Format::Lv2`). Tests:
+  `tests/host.rs` (CI) and the opt-in `tests/bundles.rs`
+  (`FADERFRAME_TEST_LV2_PATH`: the LV2 book's examples and DPF's). The
+  installed-plugin tests and `faderframe-bench --plugin lv2:<uri>` take
+  LV2 too.
+
 ### Editor windows
 
 `faderframe-ui/src/plugin_window/` keeps the shared logic (opening,

@@ -103,6 +103,7 @@ fn format_tag(f: PluginFormat) -> &'static str {
         PluginFormat::Clap => "CLAP",
         PluginFormat::Vst3 => "VST3",
         PluginFormat::AudioUnit => "AU",
+        PluginFormat::Lv2 => "LV2",
     }
 }
 

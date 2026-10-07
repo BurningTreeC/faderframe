@@ -272,6 +272,7 @@ pub enum PluginFormat {
     Clap,
     Vst3,
     AudioUnit,
+    Lv2,
 }
 
 /// Which plugin a slot holds.

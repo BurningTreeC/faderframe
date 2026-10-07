@@ -21,3 +21,6 @@ faderframe-timeline.workspace = true
 faderframe-plugin-host.workspace = true
 faderframe-plugin-clap.workspace = true
 faderframe-plugin-vst3.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+faderframe-plugin-lv2.workspace = true

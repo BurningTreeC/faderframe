@@ -76,6 +76,7 @@ pub enum Format {
     Clap,
     Vst3,
     AudioUnit,
+    Lv2,
 }
 
 impl From<PluginFormat> for Format {
@@ -85,6 +86,7 @@ impl From<PluginFormat> for Format {
             PluginFormat::Clap => Format::Clap,
             PluginFormat::Vst3 => Format::Vst3,
             PluginFormat::AudioUnit => Format::AudioUnit,
+            PluginFormat::Lv2 => Format::Lv2,
         }
     }
 }
@@ -96,6 +98,7 @@ impl From<Format> for PluginFormat {
             Format::Clap => PluginFormat::Clap,
             Format::Vst3 => PluginFormat::Vst3,
             Format::AudioUnit => PluginFormat::AudioUnit,
+            Format::Lv2 => PluginFormat::Lv2,
         }
     }
 }
