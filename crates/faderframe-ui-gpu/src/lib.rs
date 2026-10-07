@@ -139,41 +139,20 @@ impl GpuRenderer {
     /// import the frames). When vello cannot be built there, wgpu's own
     /// choice of adapter is used (frames read back).
     pub fn new_on(luid: Option<[u8; 8]>) -> Result<Self, GpuError> {
-        let fresh = wgpu::InstanceDescriptor::new_without_display_handle_from_env;
-        // One instance both chooses the adapter and requests it, and lives
-        // until the end. Listing D3D12 adapters makes a device on each; an
-        // instance dropped right after (its DLLs unloaded) while the
-        // software rasteriser's threads were still winding down took the
-        // process down (0xc0000005, Windows runners, WARP).
-        let instance = wgpu::Instance::new(fresh());
         #[cfg_attr(not(windows), allow(unused_mut))]
-        let mut backends = fresh().backends;
+        let mut instance = instance(Instances::All);
         #[cfg(windows)]
-        if let Some(adapter) = d3d12_adapter(&instance, luid) {
+        if let Some(adapter) = d3d12_adapter(instance, luid) {
             match Self::on_adapter(adapter) {
                 Ok(r) => return Ok(r),
                 Err(e) => {
                     tracing::warn!("GPU painter on D3D12 ({e}): trying another backend");
-                    backends.remove(wgpu::Backends::DX12);
+                    instance = self::instance(Instances::WithoutDx12);
                 }
             }
         }
         #[cfg(not(windows))]
         let _ = luid;
-        if backends.is_empty() {
-            return Err(GpuError::Adapter("no other backend".into()));
-        }
-        // Without D3D12 after it failed: an instance of its own (the first
-        // one stays alive until this returns).
-        let other;
-        let instance = if backends == fresh().backends {
-            &instance
-        } else {
-            let mut desc = fresh();
-            desc.backends = backends;
-            other = wgpu::Instance::new(desc);
-            &other
-        };
         let adapter =
             pollster::block_on(
                 instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -613,6 +592,34 @@ fn describe(e: &wgpu::Error) -> String {
             description.clone()
         }
         other => other.to_string(),
+    }
+}
+
+/// Which of the process's instances.
+#[derive(Clone, Copy)]
+enum Instances {
+    All,
+    /// For a renderer that could not be built on D3D12.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    WithoutDx12,
+}
+
+/// The process's wgpu instance (one for every renderer, as wgpu would
+/// have it), made once and never dropped. Dropping the last one unloads the
+/// graphics DLLs, and on Windows' software rasteriser (WARP) its threads
+/// can still be winding down then: the GPU tests, which make and drop a
+/// renderer each, died with 0xc0000005 between two of them.
+fn instance(which: Instances) -> &'static wgpu::Instance {
+    static ALL: std::sync::OnceLock<wgpu::Instance> = std::sync::OnceLock::new();
+    static WITHOUT_DX12: std::sync::OnceLock<wgpu::Instance> = std::sync::OnceLock::new();
+    let fresh = wgpu::InstanceDescriptor::new_without_display_handle_from_env;
+    match which {
+        Instances::All => ALL.get_or_init(|| wgpu::Instance::new(fresh())),
+        Instances::WithoutDx12 => WITHOUT_DX12.get_or_init(|| {
+            let mut desc = fresh();
+            desc.backends.remove(wgpu::Backends::DX12);
+            wgpu::Instance::new(desc)
+        }),
     }
 }
 

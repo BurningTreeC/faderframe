@@ -10,16 +10,38 @@ use faderframe_ui_gpu::{Frame, GpuRenderer};
 /// runners' software adapter took the process down (0xc0000005).
 static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Where a test is, written past the test harness's capture (straight to
+/// stderr), so a run that dies -- as on the Windows runners, with
+/// 0xc0000005 -- shows how far it got.
+fn mark(what: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "gpu test: {what}");
+}
+
+/// The turn a test holds while its renderer lives; dropped after the
+/// renderer (declared first), it marks the end.
+struct Turn(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        mark("renderer dropped");
+    }
+}
+
 /// The renderer, and the turn it holds until dropped (after the renderer:
 /// declared first, dropped last).
-fn renderer() -> Option<(std::sync::MutexGuard<'static, ()>, GpuRenderer)> {
+fn renderer() -> Option<(Turn, GpuRenderer)> {
     let turn = ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    mark(&format!(
+        "making a renderer ({})",
+        std::thread::current().name().unwrap_or("?")
+    ));
     match GpuRenderer::new() {
         Ok(r) => {
-            eprintln!("rendering on {}", r.adapter());
-            Some((turn, r))
+            mark(&format!("rendering on {}", r.adapter()));
+            Some((Turn(turn), r))
         }
         Err(e) => {
             eprintln!("skipped: {e}");
