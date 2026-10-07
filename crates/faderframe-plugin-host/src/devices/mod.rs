@@ -97,6 +97,36 @@ pub fn note_name(n: i32) -> String {
 }
 
 /// Copy a processor's main input to its output (or silence it).
+/// How many periods after a segment starts its circuits' solvers may run
+/// before they abandon the samples that will not settle (GainStageFx's
+/// `REALTIME_CUTOFF_PERIODS`). Late on purpose: an abandoned sample is a
+/// click, and the circuit can take from milliseconds to over a second to
+/// find its way back, so the cutoff only fires once the audio is certainly
+/// late.
+pub(crate) const CUTOFF_PERIODS: f64 = 1.5;
+
+/// The live cutoff for the solves of a reservoir segment of `frames` at
+/// `rate` (upstream's rule): from when the worker starts it -- not from the
+/// reservoir's pace, which runs up to 5 ms behind real time by design and
+/// put the cutoff in the past -- `CUTOFF_PERIODS` periods, plus the buffer
+/// beyond one period. `None` offline.
+pub(crate) fn solve_deadline(
+    timing: &faderframe_realtime::reservoir::Timing,
+    frames: usize,
+    rate: f64,
+) -> Option<std::time::Instant> {
+    if !timing.realtime || frames == 0 {
+        return None;
+    }
+    let period = std::time::Duration::from_secs_f64(frames as f64 / rate.max(1.0));
+    let start = if timing.delay.is_zero() {
+        timing.due
+    } else {
+        std::time::Instant::now().max(timing.due)
+    };
+    Some(start + period.mul_f64(CUTOFF_PERIODS) + timing.delay.saturating_sub(period))
+}
+
 pub(crate) fn pass_through(io: &mut faderframe_audio_graph::NodeIo<'_>) -> Option<usize> {
     let out = io.audio_out.first_mut()?;
     match io.audio_in.first() {

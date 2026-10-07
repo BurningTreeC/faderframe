@@ -406,6 +406,8 @@ pub struct BuiltinInstance {
     /// their latency and restart them mid-song. Seen differing since.
     sized_block: usize,
     block_differs: Option<std::time::Instant>,
+    /// When the Guitar Station last wrote its trace.
+    traced: Option<std::time::Instant>,
     descriptor: PluginDescriptor,
     params: ParamValues,
     tap: Option<Arc<AnalysisTap>>,
@@ -550,6 +552,32 @@ impl PluginInstance for BuiltinInstance {
         }
         let now = (self.latency_samples(), shape);
         let restart = self.reported.is_some_and(|r| r != now);
+        if self.kind == Kind::Guitar && crate::devices::guitar::tracing_on() {
+            if restart {
+                tracing::info!(
+                    "guitar: restart: latency {:?} -> {} (device block {}, sized {})",
+                    self.reported.map(|r| r.0),
+                    now.0,
+                    self.device_block,
+                    self.sized_block
+                );
+            }
+            if self
+                .traced
+                .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1))
+            {
+                self.traced = Some(std::time::Instant::now());
+                if let Some(tap) = &self.tap {
+                    let pedals = crate::devices::guitar::pedal_count(&self.params);
+                    tracing::info!(
+                        "guitar: block {} (sized {}) {}",
+                        self.device_block,
+                        self.sized_block,
+                        crate::devices::guitar::trace_line(tap, pedals)
+                    );
+                }
+            }
+        }
         self.reported = Some(now);
         crate::PluginPoll {
             restart,
@@ -746,14 +774,33 @@ impl PluginInstance for BuiltinInstance {
             Kind::ChannelStrip => Box::new(
                 crate::devices::channel_strip::ChannelStripProcessor::new(params, tap()?, config),
             ),
-            Kind::Guitar => Box::new(crate::devices::guitar::GuitarProcessor::new(
-                params,
-                self.tap.clone(),
-                config,
-                self.channels,
-                self.realtime,
-                self.sized_block,
-            )?),
+            Kind::Guitar => {
+                let started = std::time::Instant::now();
+                let p = crate::devices::guitar::GuitarProcessor::new(
+                    params,
+                    self.tap.clone(),
+                    config,
+                    self.channels,
+                    self.realtime,
+                    self.sized_block,
+                )?;
+                if crate::devices::guitar::tracing_on() {
+                    tracing::info!(
+                        "guitar: built a processor in {:.1} ms: {} channels, {} pedals, {}, block {} (sized {})",
+                        started.elapsed().as_secs_f64() * 1e3,
+                        self.channels,
+                        p.pedals(),
+                        if self.realtime {
+                            "live"
+                        } else {
+                            "inline (rendered ahead or offline)"
+                        },
+                        self.device_block,
+                        self.sized_block
+                    );
+                }
+                Box::new(p)
+            }
             Kind::Echo => Box::new(crate::devices::delay::DelayProcessor::new(
                 params,
                 tap()?,
@@ -877,6 +924,7 @@ impl PluginFactory for BuiltinFactory {
             device_block: 0,
             sized_block: 0,
             block_differs: None,
+            traced: None,
             kind,
             descriptor: kind.descriptor(),
             params,

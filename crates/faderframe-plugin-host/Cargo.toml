@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 faderframe-circuit.workspace = true
 faderframe-guitar.workspace = true
+tracing.workspace = true
 faderframe-core.workspace = true
 faderframe-midi.workspace = true
 faderframe-audio-graph.workspace = true

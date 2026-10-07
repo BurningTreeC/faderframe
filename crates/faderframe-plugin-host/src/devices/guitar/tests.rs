@@ -521,3 +521,39 @@ fn presets_live_paced() {
         );
     }
 }
+
+/// The live solve cutoff is measured from when the worker starts a segment:
+/// the reservoir's pace runs up to 5 ms behind real time by design, and a
+/// cutoff taken from it (as it was) was already in the past nine seconds
+/// into a run, abandoning every hard sample.
+#[test]
+fn the_solve_cutoff_does_not_follow_the_reservoirs_lagging_pace() {
+    use faderframe_realtime::reservoir::Timing;
+    use std::time::{Duration, Instant};
+    let period = 64.0 / SR;
+    let timing = Timing {
+        due: Instant::now() - Duration::from_millis(4),
+        delay: Duration::from_secs_f64(128.0 / SR),
+        realtime: true,
+        first: 64,
+    };
+    let now = Instant::now();
+    let cut = crate::devices::solve_deadline(&timing, 64, SR).unwrap();
+    let ahead = cut.saturating_duration_since(now).as_secs_f64();
+    assert!(
+        ahead >= period * crate::devices::CUTOFF_PERIODS,
+        "the cutoff is {:.2} ms ahead",
+        ahead * 1e3
+    );
+    assert!(
+        crate::devices::solve_deadline(
+            &Timing {
+                realtime: false,
+                ..timing
+            },
+            64,
+            SR
+        )
+        .is_none()
+    );
+}

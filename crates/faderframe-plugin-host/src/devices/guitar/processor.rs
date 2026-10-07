@@ -136,7 +136,7 @@ impl GuitarProcessor {
             chain.find_operating_point();
         }
         let amp = StageRun::new(
-            AmpWorker::new(Bank::new(chains)),
+            AmpWorker::new(Bank::new(chains), pedal_count, tap.clone(), rate),
             lanes,
             delay,
             max_block,
@@ -150,6 +150,8 @@ impl GuitarProcessor {
         if let Some(tap) = &tap {
             let stage = super::stage_latency(quality, device_block);
             tap.set_value(value::LATENCY, ((pedal_count as u32 + 1) * stage) as f32);
+            tap.set_value(value::LIVE, if run == Run::Live { 1.0 } else { 0.0 });
+            tap.set_value(value::DELAY, delay as f32);
         }
         let at = |i: u32| params.get(i as usize);
         Ok(Self {
@@ -332,6 +334,18 @@ impl PluginProcessor for GuitarProcessor {
             let underruns =
                 self.pedals.iter().map(StageRun::underruns).sum::<u64>() + self.amp.underruns();
             tap.set_value(value::UNDERRUNS, underruns as f32);
+            let stages = self
+                .pedals
+                .iter()
+                .map(StageRun::trace)
+                .chain([self.amp.trace()]);
+            for (k, t) in stages.enumerate() {
+                let at = value::STAGE + value::STAGE_STRIDE * k;
+                tap.set_value(at + value::LATE, t[0]);
+                tap.set_value(at + value::WAITS, t[1]);
+                tap.set_value(at + value::FILL_MIN, t[2]);
+                tap.set_value(at + value::SEGMENT_MAX, t[3]);
+            }
         }
         if alive {
             ProcessStatus::Continue

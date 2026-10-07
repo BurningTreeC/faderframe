@@ -100,13 +100,75 @@ pub mod id {
 }
 
 /// Published values: the wahs' treadles (one per place), the line's
-/// underruns, its latency in samples.
+/// underruns, its latency in samples, and what each stage is doing (for
+/// the trace, `FADERFRAME_TRACE_GUITAR=1`).
 pub mod value {
     pub const TREADLE: usize = 0;
     pub const UNDERRUNS: usize = super::MAX_PEDALS;
     pub const LATENCY: usize = super::MAX_PEDALS + 1;
+    /// 1 while the stages run on their workers (live), 0 inline.
+    pub const LIVE: usize = super::MAX_PEDALS + 2;
+    /// A stage's buffer, frames.
+    pub const DELAY: usize = super::MAX_PEDALS + 3;
+    /// Stage `k` (the pedals in line order, then the amplifier): field `f`
+    /// at `STAGE + STAGE_STRIDE * k + f`.
+    pub const STAGE: usize = super::MAX_PEDALS + 4;
+    pub const STAGE_STRIDE: usize = 5;
+    /// Frames played late (concealed) or abandoned, so far.
+    pub const LATE: usize = 0;
+    /// Callbacks that waited for the worker, so far.
+    pub const WAITS: usize = 1;
+    /// The least the reservoir held ahead of the callback, frames.
+    pub const FILL_MIN: usize = 2;
+    /// The worker's longest segment, microseconds.
+    pub const SEGMENT_MAX: usize = 3;
+    /// Samples whose solve the deadline cut short, so far.
+    pub const ABORTS: usize = 4;
 }
-pub const TAP_VALUES: usize = MAX_PEDALS + 2;
+/// Stages a line has at most: the pedals and the amplifier.
+pub const STAGES: usize = MAX_PEDALS + 1;
+pub const TAP_VALUES: usize = value::STAGE + value::STAGE_STRIDE * STAGES;
+
+/// Whether the line traces itself (`FADERFRAME_TRACE_GUITAR=1`).
+pub fn tracing_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FADERFRAME_TRACE_GUITAR").is_some_and(|v| v != "0"))
+}
+
+/// One line of the trace, from the published values.
+pub fn trace_line(tap: &crate::tap::AnalysisTap, pedals: usize) -> String {
+    use std::fmt::Write;
+    let v = |i: usize| tap.value(i);
+    let mut line = format!(
+        "{} delay {} latency {} late total {}",
+        if v(value::LIVE) >= 0.5 {
+            "live"
+        } else {
+            "inline"
+        },
+        v(value::DELAY),
+        v(value::LATENCY),
+        v(value::UNDERRUNS)
+    );
+    for k in 0..=pedals.min(MAX_PEDALS) {
+        let at = |f: usize| v(value::STAGE + value::STAGE_STRIDE * k + f);
+        let name = if k == pedals {
+            "amp".to_string()
+        } else {
+            format!("p{}", k + 1)
+        };
+        let _ = write!(
+            line,
+            " | {name}: late {} waits {} fill_min {} seg_max {} us aborts {}",
+            at(value::LATE),
+            at(value::WAITS),
+            at(value::FILL_MIN),
+            at(value::SEGMENT_MAX),
+            at(value::ABORTS)
+        );
+    }
+    line
+}
 
 fn percent(id: u32, name: &str, default: f64) -> ParameterInfo {
     super::param(id, name, 0.0, 1.0, default, ParameterUnit::Percent)

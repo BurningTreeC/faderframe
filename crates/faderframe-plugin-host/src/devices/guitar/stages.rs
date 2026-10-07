@@ -152,6 +152,7 @@ pub(super) struct PedalWorker {
     /// Offline: wait for a delivery rather than play without it.
     wait: bool,
     tap: Option<Arc<AnalysisTap>>,
+    rate: f64,
 }
 
 impl PedalWorker {
@@ -162,6 +163,7 @@ impl PedalWorker {
         wait: bool,
         tap: Option<Arc<AnalysisTap>>,
     ) -> Self {
+        let rate = workshop.rate;
         Self {
             bank,
             workshop,
@@ -170,6 +172,7 @@ impl PedalWorker {
             pending: None,
             wait,
             tap,
+            rate,
         }
     }
 
@@ -256,9 +259,8 @@ impl Segments for PedalWorker {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
-        let deadline = timing
-            .realtime
-            .then(|| timing.due + timing.delay.mul_f64(0.7));
+        let frames = channels.first().map_or(0, |c| c.len());
+        let deadline = crate::devices::solve_deadline(timing, frames, self.rate);
         for unit in self.bank.units_mut() {
             unit.set_realtime_deadline(deadline);
             unit.apply(&settings);
@@ -296,6 +298,15 @@ impl Segments for PedalWorker {
                 right[0][range.clone()].copy_from_slice(&left[0][range]);
             }
         }
+        if let Some(tap) = &self.tap {
+            let aborts: u64 = self.bank.units_mut().map(|u| u.deadline_aborts()).sum();
+            tap.set_value(
+                super::value::STAGE
+                    + super::value::STAGE_STRIDE * self.order
+                    + super::value::ABORTS,
+                aborts as f32,
+            );
+        }
         if let (Some(tap), Some(unit)) = (&self.tap, self.bank.first_mut())
             && let Some(position) = unit.wah_position()
         {
@@ -317,11 +328,25 @@ impl Segments for PedalWorker {
 /// The amplifier stage, for every channel.
 pub(super) struct AmpWorker {
     bank: Bank<Chain>,
+    /// Its place in the line (after the pedals) and the tap it traces to.
+    stage: usize,
+    tap: Option<Arc<AnalysisTap>>,
+    rate: f64,
 }
 
 impl AmpWorker {
-    pub(super) fn new(bank: Bank<Chain>) -> Self {
-        Self { bank }
+    pub(super) fn new(
+        bank: Bank<Chain>,
+        stage: usize,
+        tap: Option<Arc<AnalysisTap>>,
+        rate: f64,
+    ) -> Self {
+        Self {
+            bank,
+            stage,
+            tap,
+            rate,
+        }
     }
 }
 
@@ -378,9 +403,8 @@ impl Segments for AmpWorker {
         if channels.len() < 2 * count {
             return;
         }
-        let deadline = timing
-            .realtime
-            .then(|| timing.due + timing.delay.mul_f64(0.7));
+        let frames = channels.first().map_or(0, |c| c.len());
+        let deadline = crate::devices::solve_deadline(timing, frames, self.rate);
         for chain in self.bank.units_mut() {
             chain.set_realtime_deadline(deadline);
             chain.apply(controls);
@@ -435,6 +459,15 @@ impl Segments for AmpWorker {
                 self.bank
                     .run(audio, &mut raw[..count], active, range, &work);
             }
+        }
+        if let Some(tap) = &self.tap {
+            let aborts: u64 = self.bank.units_mut().map(|c| c.deadline_aborts()).sum();
+            tap.set_value(
+                super::value::STAGE
+                    + super::value::STAGE_STRIDE * self.stage
+                    + super::value::ABORTS,
+                aborts as f32,
+            );
         }
     }
 
@@ -559,6 +592,23 @@ impl<W: Segments<Reset = ()>> StageRun<W> {
                 *cursor = 0;
             }
             Self::Worker(r) => r.reset(()),
+        }
+    }
+
+    /// What the stage's reservoir reports: late frames, waits, the least it
+    /// held, the worker's longest segment (µs). Zeros inline.
+    pub(super) fn trace(&self) -> [f32; 4] {
+        match self {
+            Self::Inline { .. } => [0.0; 4],
+            Self::Worker(r) => {
+                let s = r.stats();
+                [
+                    self.underruns() as f32,
+                    s.callback.structural_waits.load(Ordering::Relaxed) as f32,
+                    s.fill_min().unwrap_or(0) as f32,
+                    s.worker.segment.max() as f32 / 1000.0,
+                ]
+            }
         }
     }
 

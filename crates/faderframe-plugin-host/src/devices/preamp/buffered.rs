@@ -16,6 +16,7 @@ pub fn buffer_delay(device_block: usize) -> usize {
 
 struct CircuitWorker {
     bank: PreampBank,
+    rate: f64,
 }
 
 impl Segments for CircuitWorker {
@@ -41,14 +42,10 @@ impl Segments for CircuitWorker {
         } else {
             frames
         };
-        // Live: the solver keeps to when this audio is played (with the
-        // reservoir's margin), rather than letting a block of samples that
-        // will not settle run on past it.
-        self.bank.set_deadline(
-            timing
-                .realtime
-                .then(|| timing.due + timing.delay.mul_f64(0.7)),
-        );
+        // Live: a block of samples that will not settle does not run on
+        // past the point where its audio is certainly late.
+        self.bank
+            .set_deadline(crate::devices::solve_deadline(timing, frames, self.rate));
         let active = {
             let (audio, lanes) = channels.split_at_mut(count);
             let active = self.bank.active(audio);
@@ -113,7 +110,10 @@ impl BufferedPreampProcessor {
                         sample_rate: config.sample_rate,
                         offline: false,
                     },
-                    Box::new(CircuitWorker { bank: dsp.bank }),
+                    Box::new(CircuitWorker {
+                        bank: dsp.bank,
+                        rate: config.sample_rate,
+                    }),
                 )
                 .map_err(|e| PluginError::Failed(format!("Microphone preamp worker: {e}")))?,
             ))
@@ -262,7 +262,10 @@ mod tests {
                                 // Deterministic parity: scheduling cannot drop audio.
                                 offline: true,
                             },
-                            Box::new(CircuitWorker { bank: dsp.bank }),
+                            Box::new(CircuitWorker {
+                                bank: dsp.bank,
+                                rate: config.sample_rate,
+                            }),
                         )
                         .unwrap(),
                     )),
