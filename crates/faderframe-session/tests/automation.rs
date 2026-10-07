@@ -170,15 +170,37 @@ fn touch_and_latch_write_automation_while_playing() {
     s.dispatch(Action::Transport(TransportAction::Play))
         .unwrap();
     play_for(&mut s, 150, |_, _| {});
-    // A fader gesture: ramp from 0 dB down to -24 dB.
+    // A fader gesture: ramp from 0 dB down to -24 dB over 0.8 quarters
+    // (400 ms) of the playhead — by the playhead, not the wall clock, so a
+    // loaded machine (callbacks late) still writes a straight ramp.
     s.dispatch(Action::BeginGesture("Volume".into())).unwrap();
-    play_for(&mut s, 400, |s, f| {
+    let from = s.playhead();
+    let ramp = MusicalTime::from_quarters(0.8);
+    play_for(&mut s, 400, |s, _| {
+        let done = ((s.playhead() - from).ticks() as f64 / ramp.ticks() as f64).clamp(0.0, 1.0);
         s.dispatch(Action::Edit(Command::SetTrackVolume {
             track: t,
-            db: -24.0 * f,
+            db: -24.0 * done as f32,
         }))
         .unwrap();
     });
+    // Until the ramp's end (a late playhead keeps it going).
+    let started = Instant::now();
+    while s.playhead() - from < ramp && started.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(10));
+        s.tick(0.01);
+        let done = ((s.playhead() - from).ticks() as f64 / ramp.ticks() as f64).clamp(0.0, 1.0);
+        s.dispatch(Action::Edit(Command::SetTrackVolume {
+            track: t,
+            db: -24.0 * done as f32,
+        }))
+        .unwrap();
+    }
+    s.dispatch(Action::Edit(Command::SetTrackVolume {
+        track: t,
+        db: -24.0,
+    }))
+    .unwrap();
     assert!(s.is_lane_writing(lane));
     s.dispatch(Action::EndGesture).unwrap();
     assert!(!s.is_lane_writing(lane), "touch ends with the gesture");

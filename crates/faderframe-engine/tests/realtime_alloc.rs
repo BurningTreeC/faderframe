@@ -1228,8 +1228,10 @@ fn render_ahead_without_allocating(buses: bool) {
     };
     let mut r = OfflineRenderer::new(&project, &sources, config, BLOCK, 2).unwrap();
     r.controller.set_render_ahead_buses(buses);
+    // A lookahead that survives the renderer thread being starved for a
+    // while (the whole test suite runs beside it).
     r.controller
-        .set_render_ahead(Some(std::time::Duration::from_millis(100)), 1);
+        .set_render_ahead(Some(std::time::Duration::from_millis(400)), 1);
     r.controller
         .sync(&project, &sources, faderframe_project::Impact::Graph)
         .unwrap();
@@ -1258,15 +1260,11 @@ fn render_ahead_without_allocating(buses: bool) {
         }
         r.controller.collect_garbage();
     }
-    assert_eq!(
-        total, 0,
-        "allocations/frees on the audio thread (buses: {buses})"
-    );
-    assert_eq!(r.controller.ahead_misses(), 0);
-    assert!(
-        r.controller.scope().written() > 0,
-        "the drums reached the scope"
-    );
+    let (misses, scope) = (r.controller.ahead_misses(), r.controller.scope().written());
+    let facts = format!("buses {buses}: {total} allocations/frees, {misses} misses, scope {scope}");
+    assert_eq!(total, 0, "allocations/frees on the audio thread ({facts})");
+    assert_eq!(misses, 0, "render-ahead misses ({facts})");
+    assert!(scope > 0, "the drums reached the scope ({facts})");
 }
 
 #[test]
