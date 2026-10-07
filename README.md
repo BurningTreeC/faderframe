@@ -364,6 +364,12 @@ Contrast:
   sidechain), a true-peak lookahead limiter that never passes its ceiling,
   a gate/expander/ducker with hysteresis and hold, and a split-band
   de-esser with relative detection.
+* A console channel strip in one insert: input trim, high and low pass
+  (optionally only into the dynamics' key), gate/expander, compressor
+  (peak or RMS, soft knee, make-up, parallel mix, sidechain key), a
+  four-band EQ with "Brown" or "Black" (proportional Q) bands, the
+  dynamics before or after the EQ, console drive and output, with its EQ
+  curve and gain-reduction history.
 * Stock effects: an oversampled saturator (six curves), a utility (width,
   balance, mono bass, polarity, channel modes, vectorscope), a tempo-synced
   delay (ping-pong, tape and analog styles, freeze, ducking), an

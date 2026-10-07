@@ -13,6 +13,9 @@ pub const COMPRESSOR: &str = "faderframe.compressor";
 pub const LIMITER: &str = "faderframe.limiter";
 /// Gate, expander and ducker with a sidechain (effect).
 pub const GATE: &str = "faderframe.gate";
+/// Channel strip: filters, gate, compressor, four-band EQ and drive in
+/// one insert (effect).
+pub const CHANNEL_STRIP: &str = "faderframe.channel-strip";
 /// De-esser: split or wide, relative or absolute (effect).
 pub const DEESSER: &str = "faderframe.deesser";
 /// Saturator: six curves, oversampled (effect).
@@ -64,6 +67,7 @@ pub fn has_editor(id: &str) -> bool {
             | SATURATOR
             | DEESSER
             | GATE
+            | CHANNEL_STRIP
             | GAIN
             | ECHO
             | MODULATION

@@ -2664,7 +2664,7 @@ bands triggered by their region, free cuts or the sidechain; EQ Match,
 Sketch, Spectrum Grab, an analyser with collisions, the instance list), the Program
 EQ (PultEQFx's circuit-modelled passive tube EQ with its panel), the stock
 devices with editors of their own (compressor, true-peak limiter,
-gate/expander/ducker, de-esser, saturator, utility, delay, algorithmic
+gate/expander/ducker, de-esser, a console channel strip, saturator, utility, delay, algorithmic
 reverb, chorus/flanger/phaser, tuner; a virtual analogue synth, a sampler
 with SFZ import and a drum sampler); offline render and export (stems,
 normalise, dither); freeze and bounce in place. Audio: native PipeWire,

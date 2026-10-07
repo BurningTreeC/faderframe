@@ -8,6 +8,7 @@
 //! [`AnalysisTap`]: crate::tap::AnalysisTap
 
 pub mod arpeggiator;
+pub mod channel_strip;
 pub mod chord;
 pub mod compressor;
 pub mod deesser;

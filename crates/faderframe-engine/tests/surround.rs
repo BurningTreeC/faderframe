@@ -306,7 +306,13 @@ fn sends_follow_the_panner_into_beds_and_fold_out_of_them() {
     use faderframe_project::{AuxSend, SendTap};
     let send_to = |pan: SurroundPan, aux_layout: ChannelLayout, tap: SendTap| {
         let mut tp = mono_in_51(pan);
-        let track = tp.project.tracks.iter().find(|t| t.name == "Mono").unwrap().id;
+        let track = tp
+            .project
+            .tracks
+            .iter()
+            .find(|t| t.name == "Mono")
+            .unwrap()
+            .id;
         // The track itself silent at the master: only the send is heard.
         tp.project.track_mut(track).unwrap().output = OutputRouting::None;
         let aux = tp.track(TrackKind::Aux, "Verb", aux_layout);
@@ -337,7 +343,13 @@ fn sends_follow_the_panner_into_beds_and_fold_out_of_them() {
     // reverb: the centre folded into both sides at −3 dB (the reverb's
     // own meter, its output not connected).
     let mut tp = mono_in_51(SurroundPan::default());
-    let track = tp.project.tracks.iter().find(|t| t.name == "Mono").unwrap().id;
+    let track = tp
+        .project
+        .tracks
+        .iter()
+        .find(|t| t.name == "Mono")
+        .unwrap()
+        .id;
     let aux = tp.track(TrackKind::Aux, "Verb", ChannelLayout::Stereo);
     tp.project.track_mut(aux).unwrap().output = OutputRouting::None;
     let id = tp.project.ids.allocate();

@@ -1596,6 +1596,40 @@ fn the_stock_devices_do_not_allocate() {
             1,
             (-30.0, -3.0),
         ),
+        // The channel strip: gate, compressor, bands, drive; then keyed
+        // from the sidechain with the dynamics first and filters to the key.
+        (
+            builtin::CHANNEL_STRIP,
+            vec![
+                set(5, 1.0),
+                set(6, -40.0),
+                set(13, -30.0),
+                set(14, 4.0),
+                set(23, 4.0),
+                set(29, -3.0),
+                set(1, 80.0),
+                set(37, 0.4),
+            ],
+            false,
+            13,
+            (-30.0, 0.0),
+        ),
+        (
+            builtin::CHANNEL_STRIP,
+            vec![
+                set(21, 1.0),
+                set(4, 1.0),
+                set(36, 1.0),
+                set(19, 1.0),
+                set(35, 1.0),
+                set(32, 6.0),
+                set(34, 1.0),
+                set(20, 0.5),
+            ],
+            true,
+            30,
+            (1_000.0, 5_000.0),
+        ),
         (
             builtin::DEESSER,
             vec![set(0, -40.0), set(10, 2.0), set(8, 0.0)],

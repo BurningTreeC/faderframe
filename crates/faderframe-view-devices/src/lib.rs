@@ -4,6 +4,7 @@
 //! own for a plugin whose id [`editor_for`] knows.
 
 mod arpeggiator;
+mod channel_strip;
 mod chord;
 mod common;
 mod compressor;
@@ -105,6 +106,11 @@ pub fn editor_for(
             theme,
             gate::GateFace::new(theme),
         ))),
+        builtin::CHANNEL_STRIP => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            channel_strip::ChannelStripFace::new(theme),
+        ))),
         builtin::ARPEGGIATOR => Some(Box::new(kit::DeviceView::new(
             plugin,
             theme,
@@ -152,6 +158,7 @@ pub fn editor_size(plugin_id: &str) -> Option<(i32, i32)> {
         builtin::SATURATOR => Some((960, 520 + HEADER_BAR)),
         builtin::DEESSER => Some((1000, 520 + HEADER_BAR)),
         builtin::GATE => Some((1000, 520 + HEADER_BAR)),
+        builtin::CHANNEL_STRIP => Some((1360, 560 + HEADER_BAR)),
         builtin::ARPEGGIATOR => Some((920, 480 + HEADER_BAR)),
         builtin::CHORD => Some((1000, 480 + HEADER_BAR)),
         builtin::SCALE => Some((880, 470 + HEADER_BAR)),

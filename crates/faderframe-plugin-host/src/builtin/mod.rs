@@ -32,6 +32,7 @@ enum Kind {
     Saturator,
     Deesser,
     Gate,
+    ChannelStrip,
     Arpeggiator,
     Chord,
     Scale,
@@ -41,7 +42,7 @@ enum Kind {
 }
 
 impl Kind {
-    const ALL: [Kind; 27] = [
+    const ALL: [Kind; 28] = [
         Kind::Preamp(0),
         Kind::Preamp(1),
         Kind::Preamp(2),
@@ -59,6 +60,7 @@ impl Kind {
         Kind::Saturator,
         Kind::Deesser,
         Kind::Gate,
+        Kind::ChannelStrip,
         Kind::Synth,
         Kind::Echo,
         Kind::Compressor,
@@ -96,6 +98,7 @@ impl Kind {
             builtin::SATURATOR => Kind::Saturator,
             builtin::DEESSER => Kind::Deesser,
             builtin::GATE => Kind::Gate,
+            builtin::CHANNEL_STRIP => Kind::ChannelStrip,
             builtin::CONTAINER => Kind::Container,
             _ => return None,
         })
@@ -163,6 +166,13 @@ impl Kind {
             Kind::Gate => (
                 builtin::GATE,
                 "Gate",
+                PluginCategory::Effect,
+                vec![stereo, sidechain],
+                0,
+            ),
+            Kind::ChannelStrip => (
+                builtin::CHANNEL_STRIP,
+                "Channel Strip",
                 PluginCategory::Effect,
                 vec![stereo, sidechain],
                 0,
@@ -318,6 +328,7 @@ impl Kind {
             Kind::Saturator => crate::devices::saturator::parameters(),
             Kind::Deesser => crate::devices::deesser::parameters(),
             Kind::Gate => crate::devices::gate::parameters(),
+            Kind::ChannelStrip => crate::devices::channel_strip::parameters(),
             Kind::Echo => crate::devices::delay::parameters(),
             Kind::Synth => crate::devices::synth::parameters(),
             Kind::LatencyProbe => vec![ParameterInfo {
@@ -352,6 +363,7 @@ impl Kind {
             Kind::Saturator => Some(crate::devices::saturator::TAP_VALUES),
             Kind::Deesser => Some(crate::devices::deesser::TAP_VALUES),
             Kind::Gate => Some(crate::devices::gate::TAP_VALUES),
+            Kind::ChannelStrip => Some(crate::devices::channel_strip::TAP_VALUES),
             Kind::ProgramEq => Some(0),
             _ => None,
         }
@@ -435,6 +447,7 @@ impl PluginInstance for BuiltinInstance {
             Kind::Saturator => crate::devices::saturator::format(id, value),
             Kind::Deesser => crate::devices::deesser::format(id, value),
             Kind::Gate => crate::devices::gate::format(id, value),
+            Kind::ChannelStrip => crate::devices::channel_strip::format(id, value),
             _ => None,
         }
     }
@@ -534,6 +547,7 @@ impl PluginInstance for BuiltinInstance {
             | Kind::Compressor
             | Kind::Limiter
             | Kind::Gate
+            | Kind::ChannelStrip
             | Kind::Deesser
             | Kind::Saturator
             | Kind::Tuner
@@ -673,6 +687,9 @@ impl PluginInstance for BuiltinInstance {
                 tap()?,
                 config,
             )),
+            Kind::ChannelStrip => Box::new(
+                crate::devices::channel_strip::ChannelStripProcessor::new(params, tap()?, config),
+            ),
             Kind::Echo => Box::new(crate::devices::delay::DelayProcessor::new(
                 params,
                 tap()?,
