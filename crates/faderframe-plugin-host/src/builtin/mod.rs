@@ -295,11 +295,14 @@ impl Kind {
             category,
             audio_inputs: inputs,
             // A MIDI effect: notes in, notes out, no audio. The Drum
-            // Sampler's pads can play into extra outputs.
+            // Sampler's pads can play into extra outputs, the Guitar
+            // Station's DI into a second one.
             audio_outputs: if category == PluginCategory::MidiEffect {
                 vec![]
             } else if self == Kind::Drums {
                 vec![stereo; 1 + crate::devices::drums::AUX]
+            } else if self == Kind::Guitar {
+                vec![stereo; 2]
             } else {
                 vec![stereo]
             },

@@ -40,6 +40,7 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+faderframe-guitar.workspace = true
 faderframe-audio-graph.workspace = true
 midly.workspace = true
 faderframe-plugin-clap.workspace = true

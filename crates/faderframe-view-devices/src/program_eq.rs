@@ -110,48 +110,48 @@ const YELLOW: u32 = 0xe2cf3c;
 const ORANGE: u32 = 0xf29a2e;
 const RED: u32 = 0xef4136;
 
-fn rgb(hex: u32) -> Color {
+pub(crate) fn rgb(hex: u32) -> Color {
     Color::hex(hex)
 }
 
-fn rgba(hex: u32, a: f32) -> Color {
+pub(crate) fn rgba(hex: u32, a: f32) -> Color {
     Color::hex(hex).with_alpha(a)
 }
 
 // --- the renders -------------------------------------------------------------------
 
-const KNOB_LARGE: Image = Image {
+pub(crate) const KNOB_LARGE: Image = Image {
     key: "program-eq/knob_large",
     png: include_bytes!("../assets/program-eq/knob_large.png"),
     width: 176,
     height: 8448,
 };
-const KNOB_FRAMES: usize = 48;
-const KNOB_LARGE_SPAN: f32 = 0.9852;
-const KNOB_LARGE_DRAW: f32 = 2.50;
-const KNOB_METAL: Image = Image {
+pub(crate) const KNOB_FRAMES: usize = 48;
+pub(crate) const KNOB_LARGE_SPAN: f32 = 0.9852;
+pub(crate) const KNOB_LARGE_DRAW: f32 = 2.50;
+pub(crate) const KNOB_METAL: Image = Image {
     key: "program-eq/knob_metal",
     png: include_bytes!("../assets/program-eq/knob_metal.png"),
     width: 320,
     height: 320,
 };
-const KNOB_METAL_SPAN: f32 = 0.9804;
-const KNOB_METAL_DRAW: f32 = 2.44;
-const LAMP_LIT: Image = Image {
+pub(crate) const KNOB_METAL_SPAN: f32 = 0.9804;
+pub(crate) const KNOB_METAL_DRAW: f32 = 2.44;
+pub(crate) const LAMP_LIT: Image = Image {
     key: "program-eq/lamp_lit",
     png: include_bytes!("../assets/program-eq/lamp_lit.png"),
     width: 256,
     height: 256,
 };
-const LAMP_DARK: Image = Image {
+pub(crate) const LAMP_DARK: Image = Image {
     key: "program-eq/lamp_dark",
     png: include_bytes!("../assets/program-eq/lamp_dark.png"),
     width: 256,
     height: 256,
 };
-const LAMP_SPAN: f32 = 0.9434;
-const LAMP_DRAW: f32 = 2.30;
-const SCREWS: [Image; 4] = [
+pub(crate) const LAMP_SPAN: f32 = 0.9434;
+pub(crate) const LAMP_DRAW: f32 = 2.30;
+pub(crate) const SCREWS: [Image; 4] = [
     Image {
         key: "program-eq/screw_1",
         png: include_bytes!("../assets/program-eq/screw_1.png"),
@@ -195,7 +195,7 @@ pub fn light_at(x: f32, y: f32) -> f32 {
 }
 
 /// Position on a circle, angles clockwise from twelve o'clock.
-fn polar(cx: f32, cy: f32, r: f32, degrees: f32) -> (f32, f32) {
+pub(crate) fn polar(cx: f32, cy: f32, r: f32, degrees: f32) -> (f32, f32) {
     let a = degrees.to_radians();
     (cx + r * a.sin(), cy - r * a.cos())
 }
@@ -217,7 +217,7 @@ pub fn selector_angle(index: usize, count: usize) -> f32 {
     -step * (count - 1) as f32 / 2.0 + step * index as f32
 }
 
-fn radial(cx: f32, cy: f32, inner: f32, outer: f32, c0: Color, c1: Color) -> Paint {
+pub(crate) fn radial(cx: f32, cy: f32, inner: f32, outer: f32, c0: Color, c1: Color) -> Paint {
     Paint::Radial {
         center: Point::new(cx, cy),
         radius: outer,
@@ -225,7 +225,7 @@ fn radial(cx: f32, cy: f32, inner: f32, outer: f32, c0: Color, c1: Color) -> Pai
     }
 }
 
-fn linear(x0: f32, y0: f32, x1: f32, y1: f32, stops: Vec<(f32, Color)>) -> Paint {
+pub(crate) fn linear(x0: f32, y0: f32, x1: f32, y1: f32, stops: Vec<(f32, Color)>) -> Paint {
     Paint::Linear {
         start: Point::new(x0, y0),
         end: Point::new(x1, y1),
@@ -233,7 +233,7 @@ fn linear(x0: f32, y0: f32, x1: f32, y1: f32, stops: Vec<(f32, Color)>) -> Paint
     }
 }
 
-fn line(p: &mut dyn Painter, a: (f32, f32), b: (f32, f32), width: f32, color: Color) {
+pub(crate) fn line(p: &mut dyn Painter, a: (f32, f32), b: (f32, f32), width: f32, color: Color) {
     let mut path = Path::new();
     path.move_to(Point::new(a.0, a.1))
         .line_to(Point::new(b.0, b.1));
@@ -241,7 +241,7 @@ fn line(p: &mut dyn Painter, a: (f32, f32), b: (f32, f32), width: f32, color: Co
 }
 
 /// The shadow a control casts onto the panel.
-fn contact_shadow(p: &mut dyn Painter, cx: f32, cy: f32, r: f32) {
+pub(crate) fn contact_shadow(p: &mut dyn Painter, cx: f32, cy: f32, r: f32) {
     let (ox, oy) = (cx + r * SHADOW_X, cy + r * SHADOW_Y);
     p.fill_path_paint(
         &Path::ellipse(Point::new(ox, oy), r * 1.20, r * 1.14),
@@ -250,7 +250,7 @@ fn contact_shadow(p: &mut dyn Painter, cx: f32, cy: f32, r: f32) {
 }
 
 /// The pointer painted on a switch knob, with its groove's shadow.
-fn switch_pointer(p: &mut dyn Painter, cx: f32, cy: f32, r: f32, angle: f32, bar: bool) {
+pub(crate) fn switch_pointer(p: &mut dyn Painter, cx: f32, cy: f32, r: f32, angle: f32, bar: bool) {
     let (sa, ca) = angle.to_radians().sin_cos();
     let (from, to) = if bar { (0.26, 0.94) } else { (0.42, 0.94) };
     let at = |t: f32| (cx + r * t * sa, cy - r * t * ca);
@@ -268,7 +268,15 @@ fn switch_pointer(p: &mut dyn Painter, cx: f32, cy: f32, r: f32, angle: f32, bar
 }
 
 /// A square render centred on a point, `height` high.
-fn sprite(p: &mut dyn Painter, image: &Image, src: Rect, cx: f32, cy: f32, height: f32, lit: f32) {
+pub(crate) fn sprite(
+    p: &mut dyn Painter,
+    image: &Image,
+    src: Rect,
+    cx: f32,
+    cy: f32,
+    height: f32,
+    lit: f32,
+) {
     let w = height * src.w / src.h;
     p.image(
         image,
@@ -278,7 +286,7 @@ fn sprite(p: &mut dyn Painter, image: &Image, src: Rect, cx: f32, cy: f32, heigh
     );
 }
 
-fn whole(image: &Image) -> Rect {
+pub(crate) fn whole(image: &Image) -> Rect {
     Rect::new(0.0, 0.0, image.width as f32, image.height as f32)
 }
 

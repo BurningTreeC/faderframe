@@ -138,3 +138,162 @@ fn the_program_eq_panel_turns_switches_and_knobs() {
     assert!(light_at(0.0, 0.0) > light_at(1160.0, 322.0));
     let _ = ParameterId(0);
 }
+
+mod guitar_station {
+    use super::*;
+    use crate::guitar::GuitarView;
+    use faderframe_guitar::pedal::Stomp;
+    use faderframe_guitar::voice::Pedal;
+    use faderframe_plugin_host::devices::guitar::id;
+    use faderframe_ui_canvas::MenuItem;
+
+    const SIZE: Size = Size::new(crate::guitar::PANEL_W, crate::guitar::TOTAL_H);
+
+    /// A panel point at scale 1 (the panel starts below the header).
+    fn at(x: f32, y: f32) -> Point {
+        Point::new(x, y + crate::guitar::HEADER_H)
+    }
+
+    fn value(s: &Session, plugin: PluginInstanceId, id: u32) -> f64 {
+        f64::from(s.plugin_tap(plugin).unwrap().params.get(id as usize))
+    }
+
+    fn click(view: &mut GuitarView, s: &mut Session, p: Point) -> Vec<HostRequest<Action>> {
+        let r = run(view, s, down(p, PointerButton::Primary, 1), SIZE);
+        run(view, s, up(p, PointerButton::Primary), SIZE);
+        r
+    }
+
+    /// The action of a menu's item called `label`.
+    fn pick(requests: Vec<HostRequest<Action>>, label: &str) -> Action {
+        fn find(items: Vec<MenuItem<Action>>, label: &str) -> Option<Action> {
+            items.into_iter().find_map(|i| {
+                if i.label == label {
+                    i.action
+                } else {
+                    find(i.children, label)
+                }
+            })
+        }
+        let Some(HostRequest::ContextMenu { items, .. }) = requests.into_iter().next() else {
+            panic!("no menu");
+        };
+        find(items, label).unwrap_or_else(|| panic!("no {label}"))
+    }
+
+    #[test]
+    fn pedals_are_added_switched_moved_and_removed_on_the_line() {
+        let (mut s, plugin) = session(builtin::GUITAR_STATION, "Guitar Station");
+        let mut view = GuitarView::new(plugin, &Theme::default());
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, SIZE, &s, &Theme::default());
+        assert!(p.balanced_clips());
+        assert!(p.texts().contains(&"BRIT 800"));
+        assert!(p.texts().contains(&"ADD PEDAL"));
+        // Add two pedals through the empty place's menu.
+        let add = |view: &mut GuitarView, s: &mut Session, n: usize, name: &str| {
+            let r = crate::guitar::layout::pedal_rect(n);
+            let menu = click(view, s, at(r.center().x, r.center().y));
+            s.dispatch(pick(menu, name)).unwrap();
+        };
+        add(&mut view, &mut s, 0, "Green 808");
+        add(&mut view, &mut s, 1, "Ram Fuzz");
+        assert_eq!(
+            value(&s, plugin, id::slot(0, id::STOMP)),
+            Stomp::Pedal(Pedal::Green808).index() as f64
+        );
+        assert_eq!(
+            value(&s, plugin, id::slot(1, id::STOMP)),
+            Stomp::Pedal(Pedal::BigMuff).index() as f64
+        );
+        // The footswitch of the first.
+        let r = crate::guitar::layout::pedal_rect(0);
+        click(&mut view, &mut s, at(r.center().x, r.y + 172.0));
+        assert_eq!(value(&s, plugin, id::slot(0, id::ON)), 0.0);
+        // Its drive knob, dragged up.
+        let knob = at(r.x + 8.0 + (r.w - 16.0) / 6.0, r.y + 14.0 + 46.0 - 4.0);
+        let before = value(&s, plugin, id::slot(0, id::P_DRIVE));
+        run(
+            &mut view,
+            &mut s,
+            down(knob, PointerButton::Primary, 1),
+            SIZE,
+        );
+        run(
+            &mut view,
+            &mut s,
+            drag(Point::new(knob.x, knob.y - 60.0)),
+            SIZE,
+        );
+        run(
+            &mut view,
+            &mut s,
+            up(Point::new(knob.x, knob.y - 60.0), PointerButton::Primary),
+            SIZE,
+        );
+        assert!(value(&s, plugin, id::slot(0, id::P_DRIVE)) > before + 0.2);
+        // Carry the second pedal before the first: its knobs go with it.
+        let second = crate::guitar::layout::pedal_rect(1);
+        let grab = at(second.x + 20.0, second.y + 150.0);
+        run(
+            &mut view,
+            &mut s,
+            down(grab, PointerButton::Primary, 1),
+            SIZE,
+        );
+        run(
+            &mut view,
+            &mut s,
+            drag(Point::new(grab.x - 136.0, grab.y)),
+            SIZE,
+        );
+        run(
+            &mut view,
+            &mut s,
+            up(Point::new(grab.x - 136.0, grab.y), PointerButton::Primary),
+            SIZE,
+        );
+        assert_eq!(
+            value(&s, plugin, id::slot(0, id::STOMP)),
+            Stomp::Pedal(Pedal::BigMuff).index() as f64
+        );
+        assert_eq!(
+            value(&s, plugin, id::slot(1, id::STOMP)),
+            Stomp::Pedal(Pedal::Green808).index() as f64
+        );
+        assert_eq!(
+            value(&s, plugin, id::slot(1, id::ON)),
+            0.0,
+            "its footswitch moved with it"
+        );
+        // One undo step brings the order back.
+        s.dispatch(Action::Undo).unwrap();
+        assert_eq!(
+            value(&s, plugin, id::slot(0, id::STOMP)),
+            Stomp::Pedal(Pedal::Green808).index() as f64
+        );
+        // Remove the first: the line closes up.
+        let menu = run(
+            &mut view,
+            &mut s,
+            down(at(r.center().x, r.y + 137.0), PointerButton::Secondary, 1),
+            SIZE,
+        );
+        s.dispatch(pick(menu, "Remove Pedal")).unwrap();
+        assert_eq!(
+            value(&s, plugin, id::slot(0, id::STOMP)),
+            Stomp::Pedal(Pedal::BigMuff).index() as f64
+        );
+        assert_eq!(value(&s, plugin, id::slot(1, id::STOMP)), 0.0);
+        // The amplifier's menu.
+        let name = crate::guitar::layout::amp_look_for_tests();
+        let menu = click(&mut view, &mut s, at(name.center().x, name.center().y));
+        s.dispatch(pick(menu, "American Twin")).unwrap();
+        assert_eq!(value(&s, plugin, id::AMP), 8.0);
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, SIZE, &s, &Theme::default());
+        assert!(p.texts().contains(&"AMERICAN TWIN"));
+        assert!(p.texts().contains(&"REVERB"), "the Twin's own controls");
+        assert!(!p.texts().contains(&"MASTER"), "an AB763 has no master");
+    }
+}

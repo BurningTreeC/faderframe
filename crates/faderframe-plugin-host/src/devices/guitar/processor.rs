@@ -1,5 +1,6 @@
 //! The Guitar Station on the audio thread: input trim, the line's stages
-//! one after another (each its own reservoir), then Mix, Output and the DI.
+//! one after another (each its own reservoir), then Mix and Output on the
+//! main bus and the DI, at unity, on the second.
 
 use super::bank::Bank;
 use super::stages::{AmpWorker, PedalWorker, Run, StageRun, Workshop};
@@ -140,6 +141,10 @@ impl GuitarProcessor {
         let builder = workshop
             .start()
             .map_err(|e| failed("workshop", e.to_string()))?;
+        if let Some(tap) = &tap {
+            let stage = super::stage_latency(quality, device_block);
+            tap.set_value(value::LATENCY, ((pedal_count as u32 + 1) * stage) as f32);
+        }
         let at = |i: u32| params.get(i as usize);
         Ok(Self {
             input_gain: db_gain(at(id::INPUT)),
@@ -293,10 +298,12 @@ impl PluginProcessor for GuitarProcessor {
                 if c < METERED {
                     self.meters[1][c].add(y);
                 }
+                // The DI at unity: it is the guitar (or the pedals, or the
+                // preamp) for reamping, not the amplifier's level.
                 if let Some(bus) = di.as_mut()
                     && c < bus.num_channels()
                 {
-                    bus.channel_mut(c)[i] = dry * gain;
+                    bus.channel_mut(c)[i] = dry;
                 }
             }
         }

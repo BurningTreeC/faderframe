@@ -2917,7 +2917,8 @@ bands triggered by their region, free cuts or the sidechain; EQ Match,
 Sketch, Spectrum Grab, an analyser with collisions, the instance list), the Program
 EQ (PultEQFx's circuit-modelled passive tube EQ with its panel), the stock
 devices with editors of their own (compressor, true-peak limiter,
-gate/expander/ducker, de-esser, a console channel strip, saturator, utility, delay, algorithmic
+gate/expander/ducker, de-esser, a console channel strip, the Guitar Station (GainStageFx's pedals,
+amplifiers, power stages and miked cabinets), saturator, utility, delay, algorithmic
 reverb, chorus/flanger/phaser, tuner; a virtual analogue synth, a sampler
 with SFZ import and a drum sampler); offline render and export (stems,
 normalise, dither); freeze and bounce in place. Audio: native PipeWire,
@@ -3019,6 +3020,31 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
     formats~~ — IAMF done (see *IAMF masters*; MPEG-H is out — no open
     encoder, a paid spec and per-unit patent royalties).
 
+
+### Guitar Station
+
+`faderframe-guitar` is GainStageFx's guitar half on `faderframe-circuit`'s
+solver (`UPSTREAM.md`): the pedal, wah, amplifier and power-stage netlists,
+the loudspeaker/cabinet/microphone models and the measured calibration,
+unchanged; upstream's `Chain` split into the amplifier stage (`chain`) and a
+stage per pedal (`pedal`). Against upstream's untouched chain the amplifiers
+are bit-identical and the pedals within 1e-8.
+
+The built-in `faderframe.guitar-station` (`plugin_host::devices::guitar`)
+runs the line as a pipeline: each added pedal and the amplifier is a
+reservoir worker of its own, one device callback behind the stage before
+it, so a pedal's cost never adds to another's thread, and each stage
+reports its buffer (and at 2x its oversampler) as latency; adding or
+removing a pedal therefore restarts the device, a footswitch or a model
+change does not. Per stage a stereo signal is two threads (a `WorkerPool`
+helper) and a duplicated mono one circuit that wakes the other from its
+history, as the preamps do. A place's circuit is built by the workshop
+thread and swapped in on the stage's worker without allocating (offline the
+stage waits for it). Guitar lanes travel beside the audio through every
+stage for the DI, which leaves on the second output bus at unity. Offline
+and ahead the stages run inline with the same delays (bit-identical to the
+workers). The editor (`view-devices::guitar`) draws the rig as hardware
+with the Program EQ's renders.
 
 ### Modelled microphone preamplifiers
 

@@ -20,7 +20,7 @@ const MIDI_EFFECTS: [&str; 4] = [
 ];
 
 /// Every built-in with factory presets.
-const WITH_PRESETS: [&str; 16] = [
+const WITH_PRESETS: [&str; 17] = [
     builtin::ARPEGGIATOR,
     builtin::CHORD,
     builtin::SCALE,
@@ -37,6 +37,7 @@ const WITH_PRESETS: [&str; 16] = [
     builtin::EQ,
     builtin::PROGRAM_EQ,
     builtin::SYNTH,
+    builtin::GUITAR_STATION,
 ];
 
 #[test]
@@ -426,7 +427,9 @@ fn every_preset_sounds_and_stays_in_bounds() {
             }
             assert!(level > -50.0, "{id} '{name}': silent ({level:.1} dB)");
             assert!(peak < 6.0, "{id} '{name}': peak {peak:.1} dBFS");
-            if id != builtin::GAIN {
+            // An amplifier's level depends on what is played into it (the
+            // rigs are levelled with a guitar: `devices::guitar` tests).
+            if id != builtin::GAIN && id != builtin::GUITAR_STATION {
                 assert!(
                     (level - in_db).abs() < 12.0,
                     "{id} '{name}': {in_db:.1} → {level:.1} dB"

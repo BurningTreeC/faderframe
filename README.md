@@ -431,6 +431,18 @@ long sessions), Neon and High Contrast:
 * Program EQ: PultEQFx's circuit-modelled passive tube program equaliser
   (the low end trick falls out of the circuit), with its hardware panel,
   input and output meters, drive and oversampling.
+* Guitar Station: GainStageFx's guitar rig as one device. A pedal line of
+  up to eight pedals and wahs (drives, distortions, fuzzes, a bass preamp,
+  a phaser, a chorus, two wahs with an envelope follower), each on a
+  true-bypass footswitch, dragged into any order; twenty circuit-modelled
+  guitar and bass amplifiers with their own switches, reverbs, tremolos and
+  power stages (or another amplifier's), the power stage working into a
+  physical loudspeaker in a cabinet, and two microphones placed on the cone
+  (position, distance, angle, pan). A DI on a second output (the input,
+  after the pedals or the preamp's direct out), factory rigs, and a panel
+  drawn like the hardware: the pedalboard, the amplifier's head, the cabinet
+  with its microphones. Every pedal is a stage of its own on its own thread
+  (a stereo signal on two), which reports its buffer as latency.
 * Audio: native PipeWire (one node with a port per channel, linked to your
   default devices), JACK (JACK2 or PipeWire-JACK), ALSA, WASAPI and ASIO
   (Windows; ASIO in builds with the `asio` feature, see below), CoreAudio

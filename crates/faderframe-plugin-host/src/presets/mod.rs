@@ -15,6 +15,7 @@
 mod dynamics;
 mod effects;
 mod equalisers;
+mod guitar;
 mod midi;
 mod synth;
 #[cfg(test)]
@@ -82,6 +83,7 @@ pub fn factory_presets(plugin_id: &str) -> Vec<FactoryPreset> {
         builtin::CHORD => midi::chord(),
         builtin::SCALE => midi::scale(),
         builtin::NOTE_ECHO => midi::note_echo(),
+        builtin::GUITAR_STATION => guitar::guitar(),
         _ => Vec::new(),
     }
 }
@@ -106,6 +108,7 @@ pub fn parameters(plugin_id: &str) -> Vec<ParameterInfo> {
         builtin::CHORD => chord::parameters(),
         builtin::SCALE => scale::parameters(),
         builtin::NOTE_ECHO => note_echo::parameters(),
+        builtin::GUITAR_STATION => guitar::parameters(),
         _ => Vec::new(),
     }
 }

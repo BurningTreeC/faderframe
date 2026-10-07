@@ -374,3 +374,93 @@ fn a_mono_source_on_a_stereo_bus_places_the_microphones() {
     assert!(rms_db(&main[0][12_000..]) > -60.0 && rms_db(&main[1][12_000..]) > -60.0);
     assert!(line.tap.value(value::UNDERRUNS) == 0.0);
 }
+
+/// What each stage costs one channel, against the 48 kHz budget: every
+/// amplifier through the default cabinet and microphone, every pedal on its
+/// own. Run in release with --ignored --nocapture, nothing else running.
+#[test]
+#[ignore]
+fn stage_cost_by_model() {
+    use faderframe_guitar::chain::{self, AMPS, Chain};
+    use faderframe_guitar::pedal::{PedalStage, StompCircuit, StompSettings};
+    use std::time::Instant;
+    let n = 48_000 * 3;
+    let input: Vec<f64> = (0..n).map(|k| f64::from(pluck(k)) * 1.4).collect();
+    let budget = |secs: f64| 100.0 * secs / (n as f64 / SR);
+    let p = params(&[]);
+    for amp in AMPS {
+        let mut c = Chain::new(SR, 1).unwrap();
+        let mut s = amp_settings(&p);
+        s.amp = amp;
+        s.drive = 0.7;
+        c.apply(&s);
+        c.reset();
+        c.apply(&s);
+        c.find_operating_point();
+        let t = Instant::now();
+        for &x in &input {
+            std::hint::black_box(c.process(x, x, false));
+        }
+        let (solves, passes, unsettled, _) = c.statistics();
+        eprintln!(
+            "{:<24} {:>5.1} % of a core, {:.2} passes/solve, {unsettled} unsettled",
+            chain::amp_name(amp),
+            budget(t.elapsed().as_secs_f64()),
+            passes as f64 / solves.max(1) as f64
+        );
+    }
+    for stomp in Stomp::ALL.into_iter().skip(1) {
+        let mut st = PedalStage::new(SR, 1);
+        let mut circuit = StompCircuit::build(stomp, SR, 1).unwrap();
+        st.swap(&mut circuit);
+        let s = StompSettings {
+            stomp,
+            drive: 0.7,
+            ..StompSettings::default()
+        };
+        st.apply(&s);
+        st.reset();
+        st.find_operating_point();
+        let t = Instant::now();
+        for &x in &input {
+            std::hint::black_box(st.process(x));
+        }
+        eprintln!(
+            "{:<24} {:>5.1} % of a core",
+            stomp.name(),
+            budget(t.elapsed().as_secs_f64())
+        );
+    }
+}
+
+/// Each factory rig plays a plucked guitar back at about its own level.
+#[test]
+fn preset_levels() {
+    for (i, preset) in crate::presets::factory_presets(faderframe_core::builtin::GUITAR_STATION)
+        .iter()
+        .enumerate()
+    {
+        let values =
+            crate::presets::factory_preset_values(faderframe_core::builtin::GUITAR_STATION, i)
+                .unwrap();
+        let set: Vec<(u32, f64)> = values.iter().map(|(p, v)| (p.0, *v)).collect();
+        let mut line = Line::new(&set, 2, Run::Inline, 128);
+        let (main, di) = line.play(2.0);
+        let half = main[0].len() / 2;
+        let peak = main[0][half..].iter().fold(0f32, |m, x| m.max(x.abs()));
+        let guitar: Vec<f32> = (half..main[0].len()).map(pluck).collect();
+        let (out, inp) = (rms_db(&main[0][half..]), rms_db(&guitar));
+        let _ = &di;
+        eprintln!(
+            "{:<20} out {out:>6.1} dB RMS, peak {:>6.1} dBFS; in {inp:>6.1} dB",
+            preset.name,
+            20.0 * peak.max(1e-9).log10(),
+        );
+        assert!(
+            (out - inp).abs() < 4.0,
+            "{}: {inp:.1} -> {out:.1} dB",
+            preset.name
+        );
+        assert!(peak < 1.0, "{}: clips", preset.name);
+    }
+}

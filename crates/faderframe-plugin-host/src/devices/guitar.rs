@@ -100,12 +100,13 @@ pub mod id {
 }
 
 /// Published values: the wahs' treadles (one per place), the line's
-/// underruns.
+/// underruns, its latency in samples.
 pub mod value {
     pub const TREADLE: usize = 0;
     pub const UNDERRUNS: usize = super::MAX_PEDALS;
+    pub const LATENCY: usize = super::MAX_PEDALS + 1;
 }
-pub const TAP_VALUES: usize = MAX_PEDALS + 1;
+pub const TAP_VALUES: usize = MAX_PEDALS + 2;
 
 fn percent(id: u32, name: &str, default: f64) -> ParameterInfo {
     super::param(id, name, 0.0, 1.0, default, ParameterUnit::Percent)
