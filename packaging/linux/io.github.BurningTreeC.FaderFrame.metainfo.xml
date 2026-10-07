@@ -67,6 +67,18 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.14.0" date="2026-10-07">
+      <description>
+        <p>Video for working to picture, and project templates.</p>
+        <ul>
+          <li>Video: movies imported with their sound and timecode onto a Video lane with a filmstrip, in absolute time; the video window shows the frame for the sample heard, frame-exact while playing and scrubbing (every file indexed, proxies made in the background), docked, detached or full screen, with a timecode overlay.</li>
+          <li>Every SMPTE frame rate, 23.976 to 120, with drop-frame for 29.97 and 59.94; the project takes a movie's rate and start timecode.</li>
+          <li>Picture offset by frames or milliseconds, spot to timecode, and a flash-and-beep sync test.</li>
+          <li>Export Movie: the mix next to the picture copied as it is coded, without re-encoding (QuickTime or Matroska with PCM, MPEG-4 with Opus).</li>
+          <li>Project templates: save a project's set-up without its clips, start new projects from one, and make one the default for New Project.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.13.0" date="2026-10-07">
       <description>
         <p>MIDI learn everywhere, a noise gate for the Guitar Station and fixes.</p>
