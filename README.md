@@ -577,6 +577,8 @@ first time. On macOS 15 and later, try to open it once, then allow it in
 System Settings → Privacy & Security → Open Anyway (earlier versions:
 right-click → Open). Or clear the download's quarantine flag:
 `xattr -dr com.apple.quarantine /Applications/FaderFrame.app`.
+The Windows installer and zip are not signed either: if SmartScreen
+stops the installer, choose More info → Run anyway.
 
 **Portable mode.** With a folder named `FaderFrame Data` next to the
 program, FaderFrame keeps everything it would put into your profile in
