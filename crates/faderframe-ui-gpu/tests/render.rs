@@ -5,11 +5,21 @@
 use faderframe_ui_canvas::{Align, Color, Paint, Rect, TextStyle};
 use faderframe_ui_gpu::{Frame, GpuRenderer};
 
-fn renderer() -> Option<GpuRenderer> {
+/// One renderer at a time, as the application has (one, on the main
+/// thread). Tests making and dropping devices side by side on the Windows
+/// runners' software adapter took the process down (0xc0000005).
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The renderer, and the turn it holds until dropped (after the renderer:
+/// declared first, dropped last).
+fn renderer() -> Option<(std::sync::MutexGuard<'static, ()>, GpuRenderer)> {
+    let turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match GpuRenderer::new() {
         Ok(r) => {
             eprintln!("rendering on {}", r.adapter());
-            Some(r)
+            Some((turn, r))
         }
         Err(e) => {
             eprintln!("skipped: {e}");
@@ -26,7 +36,9 @@ fn px(f: &Frame, x: u32, y: u32) -> [u8; 4] {
 
 #[test]
 fn shapes_land_where_painted_with_straight_alpha() {
-    let Some(mut r) = renderer() else { return };
+    let Some((_turn, mut r)) = renderer() else {
+        return;
+    };
     let f = r
         .render(64, 64, 1.0, |p| {
             p.fill(Rect::new(10.0, 10.0, 20.0, 20.0), Color::rgb(1.0, 0.0, 0.0));
@@ -49,7 +61,9 @@ fn shapes_land_where_painted_with_straight_alpha() {
 
 #[test]
 fn clips_and_transforms_apply_and_unbalanced_clips_do_not_leak() {
-    let Some(mut r) = renderer() else { return };
+    let Some((_turn, mut r)) = renderer() else {
+        return;
+    };
     for _ in 0..2 {
         let f = r
             .render(40, 40, 1.0, |p| {
@@ -72,7 +86,9 @@ fn clips_and_transforms_apply_and_unbalanced_clips_do_not_leak() {
 
 #[test]
 fn text_is_drawn_measured_and_ellipsised() {
-    let Some(mut r) = renderer() else { return };
+    let Some((_turn, mut r)) = renderer() else {
+        return;
+    };
     let style = TextStyle {
         align: Align::Start,
         ..TextStyle::new(14.0, Color::rgb(1.0, 1.0, 1.0))
@@ -108,7 +124,9 @@ fn text_is_drawn_measured_and_ellipsised() {
 
 #[test]
 fn hidpi_frames_have_the_device_pixels() {
-    let Some(mut r) = renderer() else { return };
+    let Some((_turn, mut r)) = renderer() else {
+        return;
+    };
     let f = r
         .render(64, 64, 2.0, |p| {
             p.fill(Rect::new(0.0, 0.0, 16.0, 16.0), Color::rgb(1.0, 0.0, 0.0));
@@ -128,7 +146,9 @@ fn hidpi_frames_have_the_device_pixels() {
 /// its destination.
 #[test]
 fn a_filmstrip_frame_is_drawn() {
-    let Some(mut r) = renderer() else { return };
+    let Some((_turn, mut r)) = renderer() else {
+        return;
+    };
     // 4 × 16384 pixels: frame k (4 × 4) is grey level k.
     let (w, h) = (4u32, 16_384u32);
     let mut raw = Vec::new();
@@ -174,7 +194,9 @@ fn a_filmstrip_frame_is_drawn() {
 #[test]
 fn frames_go_out_as_dmabufs() {
     use faderframe_ui_gpu::Output;
-    let Some(mut r) = renderer() else { return };
+    let Some((_turn, mut r)) = renderer() else {
+        return;
+    };
     if !r.exports_dmabufs() {
         eprintln!("skipped: no dmabuf export on {}", r.adapter());
         return;
@@ -233,7 +255,9 @@ fn frames_go_out_as_dmabufs() {
 #[test]
 fn frames_go_out_as_shared_textures() {
     use faderframe_ui_gpu::Output;
-    let Some(mut r) = renderer() else { return };
+    let Some((_turn, mut r)) = renderer() else {
+        return;
+    };
     let Some(luid) = r.shared_luid() else {
         eprintln!("skipped: no shared textures on {}", r.adapter());
         return;

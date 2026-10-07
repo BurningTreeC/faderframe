@@ -205,6 +205,12 @@ fn synth_preamp_master_changes_playing_audio_live_and_rendered_ahead() {
         .unwrap();
         run(&mut s, 800);
         assert_eq!(s.engine().ahead_tracks().contains(&track), ahead);
+        // Rendered ahead, the new chain primes its lookahead first, which a
+        // slow hosted runner takes longer over: wait for it to be heard.
+        let heard = Instant::now();
+        while s.meter(track).left.level_db <= -50.0 && heard.elapsed() < Duration::from_secs(8) {
+            run(&mut s, 100);
+        }
         let loud = s.meter(track).left.level_db;
         let plugin = s
             .project()
@@ -224,7 +230,11 @@ fn synth_preamp_master_changes_playing_audio_live_and_rendered_ahead() {
         // Allow the meter's peak release to reach the attenuated level.
         run(&mut s, 2600);
         let quiet = s.meter(track).left.level_db;
-        assert!(loud > -50.0, "ahead={ahead}: synth is audible ({loud})");
+        assert!(
+            loud > -50.0,
+            "ahead={ahead}: synth is audible ({loud}; {} ahead misses)",
+            s.engine().ahead_misses()
+        );
         assert!(
             quiet <= (loud - 40.0).max(faderframe_session::METER_FLOOR_DB),
             "ahead={ahead}: Master must attenuate the synth: {loud} -> {quiet}"

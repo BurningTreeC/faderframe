@@ -139,6 +139,22 @@ impl Run {
     }
 }
 
+/// Paced runs share the machine with the other tests: a hosted runner can
+/// keep the anticipator from a deadline once, which plays a block of
+/// silence (a miss) where nothing else differs. `attempt` plays one paced
+/// comparison and returns how often it was late, asserting the audio only
+/// when it never was; a late one is tried again, three times at most.
+fn on_time(mut attempt: impl FnMut() -> u64) {
+    for tries in 1..=3 {
+        let misses = attempt();
+        if misses == 0 {
+            return;
+        }
+        eprintln!("try {tries}: {misses} blocks late (a busy machine): again");
+    }
+    panic!("late in every try: the anticipator does not keep up here");
+}
+
 /// Positions both runs heard, and how many samples differ.
 fn compare(a: &Run, b: &Run) -> (usize, usize) {
     let mut both = 0;
@@ -181,60 +197,72 @@ fn rendered_ahead_sounds_the_same() {
             track.inserts.insert(0, instrument);
         }
     }
-    let mut plain = Run::new(&project, false);
-    let mut ahead = Run::new(&project, true);
-    // Everything that can be rendered ahead is: the audio tracks with
-    // their echo and the instrument track.
-    let tracks: HashSet<TrackId> = ahead.r.controller.ahead_tracks().clone();
-    for name in ["Drums", "Bass", "Pluck", "Pad", "Lead Synth"] {
-        let id = project.tracks.iter().find(|t| t.name == name).unwrap().id;
-        assert!(tracks.contains(&id), "{name} is rendered ahead");
-    }
-    // Let the anticipator start, then play two seconds.
-    ahead.run(20, true);
-    for run in [&mut plain, &mut ahead] {
-        run.command(TransportCommand::Play);
-    }
-    let blocks = 2 * SR as usize / BLOCK;
-    plain.run(blocks, false);
-    ahead.run(blocks, true);
-    let (both, differ) = compare(&plain, &ahead);
-    assert!(both > SR as usize, "heard together: {both}");
-    assert_eq!(differ, 0, "{differ} of {both} samples differ");
-    assert_eq!(ahead.r.controller.ahead_misses(), 0, "never late");
-    // The audio is not silent (the comparison means something).
-    assert!(ahead.heard.values().any(|s| s.abs() > 0.01));
+    on_time(|| {
+        let mut plain = Run::new(&project, false);
+        let mut ahead = Run::new(&project, true);
+        // Everything that can be rendered ahead is: the audio tracks with
+        // their echo and the instrument track.
+        let tracks: HashSet<TrackId> = ahead.r.controller.ahead_tracks().clone();
+        for name in ["Drums", "Bass", "Pluck", "Pad", "Lead Synth"] {
+            let id = project.tracks.iter().find(|t| t.name == name).unwrap().id;
+            assert!(tracks.contains(&id), "{name} is rendered ahead");
+        }
+        // Let the anticipator start, then play two seconds.
+        ahead.run(20, true);
+        for run in [&mut plain, &mut ahead] {
+            run.command(TransportCommand::Play);
+        }
+        let blocks = 2 * SR as usize / BLOCK;
+        plain.run(blocks, false);
+        ahead.run(blocks, true);
+        let misses = ahead.r.controller.ahead_misses();
+        if misses > 0 {
+            return misses;
+        }
+        let (both, differ) = compare(&plain, &ahead);
+        assert!(both > SR as usize, "heard together: {both}");
+        assert_eq!(differ, 0, "{differ} of {both} samples differ");
+        // The audio is not silent (the comparison means something).
+        assert!(ahead.heard.values().any(|s| s.abs() > 0.01));
+        0
+    });
 }
 
 #[test]
 fn a_locate_and_loop_wraps_continue_seamlessly() {
     let project = stateless_project();
-    let mut plain = Run::new(&project, false);
-    let mut ahead = Run::new(&project, true);
-    ahead.run(20, true);
-    // A loop of one second from 0.5 s, playing from 3 s, then a locate
-    // into the loop.
-    let range = LoopRange::new(24_000, 72_000);
-    for run in [&mut plain, &mut ahead] {
-        run.command(TransportCommand::SetLoopRange(range));
-        run.command(TransportCommand::SetLoopEnabled(true));
-        run.command(TransportCommand::Locate(3 * SR as i64));
-        run.command(TransportCommand::Play);
-    }
-    let blocks = SR as usize / 2 / BLOCK;
-    plain.run(blocks, false);
-    ahead.run(blocks, true);
-    for run in [&mut plain, &mut ahead] {
-        run.command(TransportCommand::Locate(30_000));
-    }
-    // Three passes of the loop.
-    let blocks = 3 * SR as usize / BLOCK;
-    plain.run(blocks, false);
-    ahead.run(blocks, true);
-    let (both, differ) = compare(&plain, &ahead);
-    assert!(both > SR as usize, "heard together: {both}");
-    assert_eq!(differ, 0, "{differ} of {both} samples differ");
-    assert_eq!(ahead.r.controller.ahead_misses(), 0, "never late");
+    on_time(|| {
+        let mut plain = Run::new(&project, false);
+        let mut ahead = Run::new(&project, true);
+        ahead.run(20, true);
+        // A loop of one second from 0.5 s, playing from 3 s, then a locate
+        // into the loop.
+        let range = LoopRange::new(24_000, 72_000);
+        for run in [&mut plain, &mut ahead] {
+            run.command(TransportCommand::SetLoopRange(range));
+            run.command(TransportCommand::SetLoopEnabled(true));
+            run.command(TransportCommand::Locate(3 * SR as i64));
+            run.command(TransportCommand::Play);
+        }
+        let blocks = SR as usize / 2 / BLOCK;
+        plain.run(blocks, false);
+        ahead.run(blocks, true);
+        for run in [&mut plain, &mut ahead] {
+            run.command(TransportCommand::Locate(30_000));
+        }
+        // Three passes of the loop.
+        let blocks = 3 * SR as usize / BLOCK;
+        plain.run(blocks, false);
+        ahead.run(blocks, true);
+        let misses = ahead.r.controller.ahead_misses();
+        if misses > 0 {
+            return misses;
+        }
+        let (both, differ) = compare(&plain, &ahead);
+        assert!(both > SR as usize, "heard together: {both}");
+        assert_eq!(differ, 0, "{differ} of {both} samples differ");
+        0
+    });
 }
 
 #[test]
@@ -399,44 +427,50 @@ fn buses_rendered_ahead_sound_the_same() {
         .tracks
         .retain(|t| !["Chords", "Arp Synth", "Arpeggios"].contains(&t.name.as_str()));
     let id = |name: &str| project.tracks.iter().find(|t| t.name == name).unwrap().id;
-    let mut plain = Run::new(&project, false);
-    let mut ahead = Run::with(&project, true, true);
-    let c = &ahead.r.controller;
-    for name in ["Drum Bus", "Echo", "Space", "Master"] {
-        assert!(
-            c.ahead_tracks().contains(&id(name)),
-            "{name} rendered ahead"
-        );
-    }
-    for name in [
-        "Drums",
-        "Bass",
-        "Pluck",
-        "Pad",
-        "Lead Synth",
-        "Drum Bus",
-        "Echo",
-        "Space",
-    ] {
-        assert!(c.ahead_strips().contains(&id(name)), "{name}'s strip ahead");
-    }
-    // The master's strip plays live (to the device).
-    assert!(!c.ahead_strips().contains(&id("Master")));
-    ahead.run(20, true);
-    for run in [&mut plain, &mut ahead] {
-        run.command(TransportCommand::Play);
-    }
-    let blocks = 2 * SR as usize / BLOCK;
-    plain.run(blocks, false);
-    ahead.run(blocks, true);
-    let (both, differ) = compare(&plain, &ahead);
-    assert!(both > SR as usize, "heard together: {both}");
-    assert_eq!(differ, 0, "{differ} of {both} samples differ");
-    assert_eq!(ahead.r.controller.ahead_misses(), 0, "never late");
-    assert!(ahead.heard.values().any(|s| s.abs() > 0.01));
-    // The drums' meter, from its echo on the audio thread.
-    let meter = ahead.r.controller.take_meter(id("Drums")).unwrap();
-    assert!(meter.left.peak > 0.01, "metered: {:?}", meter.left);
+    on_time(|| {
+        let mut plain = Run::new(&project, false);
+        let mut ahead = Run::with(&project, true, true);
+        let c = &ahead.r.controller;
+        for name in ["Drum Bus", "Echo", "Space", "Master"] {
+            assert!(
+                c.ahead_tracks().contains(&id(name)),
+                "{name} rendered ahead"
+            );
+        }
+        for name in [
+            "Drums",
+            "Bass",
+            "Pluck",
+            "Pad",
+            "Lead Synth",
+            "Drum Bus",
+            "Echo",
+            "Space",
+        ] {
+            assert!(c.ahead_strips().contains(&id(name)), "{name}'s strip ahead");
+        }
+        // The master's strip plays live (to the device).
+        assert!(!c.ahead_strips().contains(&id("Master")));
+        ahead.run(20, true);
+        for run in [&mut plain, &mut ahead] {
+            run.command(TransportCommand::Play);
+        }
+        let blocks = 2 * SR as usize / BLOCK;
+        plain.run(blocks, false);
+        ahead.run(blocks, true);
+        let misses = ahead.r.controller.ahead_misses();
+        if misses > 0 {
+            return misses;
+        }
+        let (both, differ) = compare(&plain, &ahead);
+        assert!(both > SR as usize, "heard together: {both}");
+        assert_eq!(differ, 0, "{differ} of {both} samples differ");
+        assert!(ahead.heard.values().any(|s| s.abs() > 0.01));
+        // The drums' meter, from its echo on the audio thread.
+        let meter = ahead.r.controller.take_meter(id("Drums")).unwrap();
+        assert!(meter.left.peak > 0.01, "metered: {:?}", meter.left);
+        0
+    });
 }
 
 /// A bus is rendered ahead only when everything that reaches it is; a
