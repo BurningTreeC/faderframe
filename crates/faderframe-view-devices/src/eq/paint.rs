@@ -3,6 +3,9 @@
 //! frequency scale, the output meter.
 
 use super::analyser::{self, Analyser, FLOOR, Line};
+
+/// How deep the black keys reach (the piano roll's `BLACK_KEY_W`).
+const BLACK_KEY_W: f32 = 0.62;
 use super::geometry::{
     Layout, NODE_R, analyser_y, freq_of, is_black, note_label, note_name, note_of, sweep,
 };
@@ -957,47 +960,111 @@ impl EqView {
         tap: &AnalysisTap,
         bands: &[(usize, BandParams)],
     ) {
+        // The piano roll's keyboard on its side: one column a semitone (the
+        // axis is logarithmic), low notes left, the keys' backs at the top
+        // and their fronts at the bottom; white keys reach halfway under
+        // the black keys beside them, as on a real keyboard.
         let th = &self.theme;
+        let pr = &th.piano;
         let g = &l.graph;
         let a = &l.axis;
         let axis = self.axis(model);
-        p.fill(*a, th.device.key_black.darken(0.2));
-        let lo = note_of(axis.lo).floor() as i32;
-        let hi = note_of(axis.hi).ceil() as i32;
+        p.fill(*a, pr.key_white_shade);
+        p.push_clip(*a);
+        let lo = note_of(axis.lo).floor() as i32 - 1;
+        let hi = note_of(axis.hi).ceil() as i32 + 1;
         let hover_note = self
             .pointer
             .filter(|pos| g.contains(*pos) || a.contains(*pos))
             .map(|pos| note_of(axis.f(g, pos.x)).round() as i32);
-        for n in lo..=hi {
-            let x0 = axis.x(g, freq_of(f64::from(n) - 0.5)).max(a.x);
-            let x1 = axis.x(g, freq_of(f64::from(n) + 0.5)).min(a.right());
-            if x1 <= x0 {
+        let column = |n: i32| {
+            (
+                axis.x(g, freq_of(f64::from(n) - 0.5)),
+                axis.x(g, freq_of(f64::from(n) + 0.5)),
+            )
+        };
+        // An 88-key piano is lit; the rest is dim.
+        let shade = |n: i32, c: Color| {
+            if (21..=108).contains(&n) {
+                c
+            } else {
+                c.mix(th.device.display, 0.6)
+            }
+        };
+        let black_h = a.h * BLACK_KEY_W;
+        for n in (lo..=hi).filter(|n| !is_black(*n)) {
+            let (x0, x1) = column(n);
+            let left = if is_black(n - 1) {
+                (column(n - 1).0 + x0) / 2.0
+            } else {
+                x0
+            };
+            let right = if is_black(n + 1) {
+                (x1 + column(n + 1).1) / 2.0
+            } else {
+                x1
+            };
+            if right < a.x || left > a.right() {
                 continue;
             }
-            // An 88-key piano is lit; the rest is dim.
-            let on_piano = (21..=108).contains(&n);
-            let hovered = hover_note == Some(n);
-            let (color, h) = if is_black(n) {
-                (th.device.key_black, a.h * 0.62)
-            } else {
-                (th.device.key_white, a.h)
-            };
-            let color = if hovered {
-                th.device.curve
-            } else if on_piano {
-                color
-            } else {
-                color.mix(th.device.display, 0.6)
-            };
-            p.fill(Rect::new(x0 + 0.5, a.y, (x1 - x0 - 1.0).max(0.5), h), color);
-            if n.rem_euclid(12) == 0 && x1 - x0 > 3.0 {
+            let shape = Rect::new(left, a.y, right - left, a.h);
+            let c = shade(
+                n,
+                if hover_note == Some(n) {
+                    th.ui.selection.lighten(0.5)
+                } else {
+                    pr.key_white
+                },
+            );
+            p.fill_rect(shape, &Paint::vertical(shape, c.darken(0.06), c));
+            p.vline(right - 0.5, a.y, a.bottom(), pr.key_white_shade.darken(0.2));
+        }
+        let wide = column(60).1 - column(60).0 >= 15.0;
+        for n in lo..=hi {
+            let (x0, x1) = column(n);
+            if x1 < a.x || x0 > a.right() {
+                continue;
+            }
+            if is_black(n) {
+                let key = Rect::new(x0 + 1.0, a.y, (x1 - x0 - 2.0).max(0.5), black_h);
+                let c = shade(
+                    n,
+                    if hover_note == Some(n) {
+                        th.ui.selection.darken(0.3)
+                    } else {
+                        pr.key_black
+                    },
+                );
+                p.fill_rounded(key, 1.5, &Paint::vertical(key, c.lighten(0.15), c));
+            }
+            // Names at the keys' fronts: the Cs, and every key where there
+            // is room (a black key's on the key itself).
+            if n.rem_euclid(12) == 0 || wide {
+                let (area, color) = if is_black(n) {
+                    (
+                        Rect::new(x0 - 6.0, a.y + black_h - 13.0, x1 - x0 + 12.0, 11.0),
+                        pr.key_white.with_alpha(0.75),
+                    )
+                } else {
+                    (
+                        Rect::new(x0 - 8.0, a.bottom() - 13.0, x1 - x0 + 16.0, 11.0),
+                        pr.key_text,
+                    )
+                };
                 p.text(
                     &note_name(n),
-                    Rect::new(x0 - 8.0, a.y + a.h - 12.0, 28.0, 11.0),
-                    &TextStyle::new(th.fonts.tiny - 1.0, th.device.key_black).center(),
+                    area,
+                    &TextStyle::new(th.fonts.tiny, color).center(),
                 );
             }
         }
+        p.pop_clip();
+        p.hline(
+            a.x,
+            a.right(),
+            a.bottom() - 1.0,
+            Color::rgba(0.0, 0.0, 0.0, 0.6),
+        );
         if let (Some(n), Some(pos)) = (hover_note, self.pointer) {
             let r = Rect::new(pos.x - 22.0, a.y - 16.0, 44.0, 14.0);
             p.fill_rounded(r, 3.0, &Paint::Solid(th.device.panel));
