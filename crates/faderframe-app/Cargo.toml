@@ -11,8 +11,11 @@ license.workspace = true
 workspace = true
 
 [features]
+default = ["gpu-painter"]
 # Steinberg ASIO drivers on Windows (see faderframe-audio-cpal).
 asio = ["faderframe-ui/asio"]
+# The GPU painter for dense views.
+gpu-painter = ["faderframe-ui/gpu-painter"]
 
 [dependencies]
 faderframe-plugin-clap.workspace = true

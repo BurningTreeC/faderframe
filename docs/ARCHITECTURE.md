@@ -17,6 +17,7 @@ faderframe-app            binary: CLI parsing, logging, starts the GTK app
   └─ faderframe-ui        GTK 4 shell: windows, menus, dialogs, docking, canvas host
        ├─ faderframe-view-arranger / -mixer / -pianoroll / -performance / -tools / -automation / -devices   (GTK-free views)
        │    └─ faderframe-ui-canvas   Painter trait, events, CanvasView, theme, console controls
+       ├─ faderframe-ui-gpu       optional GPU painter for dense views (vello on wgpu, parley text)
        ├─ faderframe-audio-pipewire   native PipeWire backend (pw_filter, Linux)
        ├─ faderframe-audio-jack       JACK backend (JACK2 / pipewire-jack, Linux)
        ├─ faderframe-audio-cpal       system backend through cpal: WASAPI, ASIO (opt-in), CoreAudio, ALSA
@@ -53,8 +54,8 @@ offline rendering, the benchmark).
 `faderframe-plugin-au` implement the `faderframe-plugin-host` traits and are
 registered by the shell (`set_default_registry`), so the engine never names
 a plugin format. ASIO is a host of the cpal backend behind its `asio`
-feature, not a crate of its own. Planned: an optional wgpu painter for
-dense views.
+feature, not a crate of its own. The GPU painter (`faderframe-ui-gpu`,
+feature `gpu-painter`) is optional; see *Canvas views*.
 
 `packaging/` holds what turns a release build into packages: the
 application icon (SVG; `icons.py` makes `.ico`/`.icns` from it), the
@@ -2169,6 +2170,31 @@ when the session's revision changed during the tick — finished recordings,
 imports and analyses arrive there, not through a user action. Warnings and
 errors also pop up as a toast at the top of the main window.
 
+**The GPU painter.** GTK 4.22's renderer rasterises every fill and stroke
+node with cairo on the CPU when its path changes, over the path's bounds:
+analysers and curves redrawn each frame cost the main thread most of its
+time (the mastering tools at 2524×747 ran at 26 fps, `cairo_stroke` 23 %
+of the profile). Views whose geometry is dense and changes every frame
+say so (`CanvasView::dense`: the tools, the EQ, the Program EQ and the
+stock devices' faces) and, with Preferences → General → Drawing (or
+`FADERFRAME_GPU_PAINTER=1`), are painted by `faderframe-ui-gpu`:
+`ScenePainter` turns `Painter` calls into a vello scene (compute-shader
+rasterisation on wgpu: Vulkan, Metal, DX12) — clips as clip layers, outset
+shadows as blurred rounded rectangles clipped even-odd to outside the
+shape, inset shadows as the colour less a blurred copy (`Compose::DestOut`),
+images cropped to the frame drawn (vello's atlas does not take a tall
+filmstrip), text laid out with parley in the same font families (cached,
+ellipsised by binary search, hinted) — rendered into a texture and read
+back (`GpuRenderer::render`, straight-alpha RGBA, buffers recycled) into a
+`gdk::MemoryTexture`. Measured: the tools 26 → 55 fps, tools and EQ editor
+together 17–19 → 39 fps. Rectangle-heavy views stay with GSK (the mixer:
+its 3800 rectangles cost GSK 2 ms, while a 1.5×-scaled readback of 22 MB a
+frame costs more); the transfer is the remaining cost (a dmabuf would
+remove it). Without a GPU adapter, or after any error, views keep the GSK
+painter. `FADERFRAME_PAINT_STATS=1` logs each canvas's paint time, frame
+rate and primitives per frame. Tests: `faderframe-ui-gpu/tests/render.rs`
+(skipped without an adapter).
+
 Each canvas keeps a bounded `painter::PathCache` alongside its text cache.
 Unchanged geometry must reuse the same `GskPath`: GSK caches rasterized
 fills and strokes by path identity. Rebuilding native paths on every paint
@@ -2549,8 +2575,9 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
    done (see *MIDI time code out and varispeed*).
 9. **Performance**: ~~render-ahead for buses whose inputs are all rendered
    ahead~~ (done: the shallow tier, see *Render ahead*), ~~job affinity for
-   cache locality~~ (done: see *Affinity*), an optional wgpu painter for
-   dense views.
+   cache locality~~ (done: see *Affinity*), ~~an optional wgpu painter for
+   dense views~~ (done: see *The GPU painter*; a dmabuf instead of the
+   readback is the next step there).
 10. **Mastering**: multiple CD-Text languages, a DDP player/import;
     surround beds and panning before any object-based format.
 

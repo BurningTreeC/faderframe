@@ -1128,6 +1128,11 @@ impl<F: Face> DeviceView<F> {
 }
 
 impl<F: Face> CanvasView<Session, Action> for DeviceView<F> {
+    /// Analysers, meters and curves redrawn every frame.
+    fn dense(&self) -> bool {
+        true
+    }
+
     fn set_theme(&mut self, theme: &Theme) {
         self.theme = theme.clone();
     }

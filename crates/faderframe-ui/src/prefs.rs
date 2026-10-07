@@ -69,6 +69,8 @@ pub struct Preferences {
     /// Render buses ahead too (in a shallow second stage: faders stay
     /// immediate).
     pub render_ahead_buses: bool,
+    /// Draw dense views (analysers, meters, curves) on the GPU.
+    pub gpu_painter: bool,
     /// Keyboard shortcuts changed in the shortcut editor (detailed action
     /// → accelerators; empty: none), over the defaults.
     pub shortcuts: std::collections::BTreeMap<String, Vec<String>>,
@@ -108,6 +110,7 @@ impl Default for Preferences {
             plugin_double_precision: false,
             render_ahead_ms: 200,
             render_ahead_buses: true,
+            gpu_painter: false,
             shortcuts: Default::default(),
         }
     }

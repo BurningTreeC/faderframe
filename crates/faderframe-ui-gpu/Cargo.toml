@@ -1,0 +1,20 @@
+[package]
+name = "faderframe-ui-gpu"
+description = "GPU painter (vello on wgpu) for dense custom views"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-ui-canvas.workspace = true
+vello = "0.11"
+parley = "0.11"
+pollster = "0.4"
+png = "0.18"
+thiserror.workspace = true
+tracing.workspace = true

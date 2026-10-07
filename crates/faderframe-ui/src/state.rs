@@ -160,6 +160,8 @@ pub struct AppState {
     pub window: RefCell<Option<gtk::ApplicationWindow>>,
     pub chrome: RefCell<Option<Chrome>>,
     canvases: RefCell<Vec<glib::WeakRef<CanvasWidget>>>,
+    /// Draw dense views on the GPU (Preferences → General).
+    pub gpu_painter: Cell<bool>,
     layout_rev: Cell<u64>,
     /// Session revision the widgets show (changes made by the frame tick —
     /// finished recordings, imports, analyses — redraw too).
@@ -187,6 +189,9 @@ impl AppState {
             window: RefCell::new(None),
             chrome: RefCell::new(None),
             canvases: RefCell::new(Vec::new()),
+            gpu_painter: Cell::new(crate::gpu::wanted(
+                crate::prefs::Preferences::load().gpu_painter,
+            )),
             last_tick: Cell::new(None),
             frame: Cell::new(0),
             plugin_scan: RefCell::new(None),

@@ -75,12 +75,49 @@ mod imp {
                 return;
             };
             let size = Size::new(widget.width() as f32, widget.height() as f32);
+            // Dense views on the GPU (Preferences → General).
+            if app.gpu_painter.get()
+                && let Some(view) = self.view.borrow_mut().as_mut()
+                && view.dense()
+            {
+                let w: &gtk::Widget = widget.upcast_ref();
+                let scale =
+                    w.native()
+                        .and_then(|n| n.surface())
+                        .map_or(w.scale_factor() as f64, |s| s.scale()) as f32;
+                let theme = app.theme.borrow();
+                let started = paint_stats::enabled().then(std::time::Instant::now);
+                let mut counts = None;
+                let painted = crate::gpu::paint(snapshot, size.w, size.h, scale, |p| {
+                    if started.is_some() {
+                        let mut counting = paint_stats::Counting::new(p);
+                        view.paint(&mut counting, size, &session, &theme);
+                        counts = Some(counting.counts);
+                    } else {
+                        view.paint(p, size, &session, &theme);
+                    }
+                });
+                if painted {
+                    if let (Some(t), Some(c)) = (started, counts) {
+                        paint_stats::note(w, t.elapsed(), c, true);
+                    }
+                    return;
+                }
+            }
             self.text_cache.borrow_mut().begin_frame();
             self.path_cache.borrow_mut().begin_frame();
             snapshot.push_clip(&graphene::Rect::new(0.0, 0.0, size.w, size.h));
             let w: &gtk::Widget = widget.upcast_ref();
             let mut painter = SnapshotPainter::new(snapshot, w, &self.text_cache, &self.path_cache);
-            if let Some(view) = self.view.borrow_mut().as_mut() {
+            if paint_stats::enabled() {
+                let started = std::time::Instant::now();
+                let mut counting = paint_stats::Counting::new(&mut painter);
+                if let Some(view) = self.view.borrow_mut().as_mut() {
+                    view.paint(&mut counting, size, &session, &app.theme.borrow());
+                }
+                let counts = counting.counts;
+                paint_stats::note(w, started.elapsed(), counts, false);
+            } else if let Some(view) = self.view.borrow_mut().as_mut() {
                 view.paint(&mut painter, size, &session, &app.theme.borrow());
             }
             snapshot.pop();
@@ -1260,5 +1297,175 @@ impl ViewHost {
         canvas.imp().overlaid.set(true);
         canvas.bind_scrollbars(Some(hbar), Some(vbar));
         Self { root, canvas }
+    }
+}
+
+/// Development aid: with `FADERFRAME_PAINT_STATS` set, every canvas logs
+/// how long its view took to paint (building the frame's render nodes) and
+/// the window's frame rate, every two seconds.
+mod paint_stats {
+    use gtk::prelude::*;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    pub fn enabled() -> bool {
+        thread_local!(static ON: bool = std::env::var_os("FADERFRAME_PAINT_STATS").is_some());
+        ON.with(|on| *on)
+    }
+
+    #[derive(Default)]
+    struct Stats {
+        frames: u32,
+        total: Duration,
+        max: Duration,
+        counts: [u64; KINDS.len()],
+    }
+
+    const KINDS: [&str; 12] = [
+        "rect",
+        "rounded",
+        "border",
+        "fill",
+        "stroke",
+        "gradient-fill",
+        "image",
+        "shadow",
+        "inset",
+        "text",
+        "clip",
+        "transform",
+    ];
+
+    /// Forwards to a painter and counts the primitives by kind.
+    pub struct Counting<'a> {
+        inner: &'a mut dyn faderframe_ui_canvas::Painter,
+        pub counts: [u64; KINDS.len()],
+    }
+
+    impl<'a> Counting<'a> {
+        pub fn new(inner: &'a mut dyn faderframe_ui_canvas::Painter) -> Self {
+            Self {
+                inner,
+                counts: [0; KINDS.len()],
+            }
+        }
+    }
+
+    use faderframe_ui_canvas::{Color, Image, Paint, Path, Rect, TextStyle};
+    impl faderframe_ui_canvas::Painter for Counting<'_> {
+        fn fill_rect(&mut self, rect: Rect, paint: &Paint) {
+            self.counts[0] += 1;
+            self.inner.fill_rect(rect, paint);
+        }
+        fn fill_rounded(&mut self, rect: Rect, radius: f32, paint: &Paint) {
+            self.counts[1] += 1;
+            self.inner.fill_rounded(rect, radius, paint);
+        }
+        fn stroke_rounded(&mut self, rect: Rect, radius: f32, width: f32, color: Color) {
+            self.counts[2] += 1;
+            self.inner.stroke_rounded(rect, radius, width, color);
+        }
+        fn fill_path(&mut self, path: &Path, color: Color) {
+            self.counts[3] += 1;
+            self.inner.fill_path(path, color);
+        }
+        fn stroke_path(&mut self, path: &Path, width: f32, color: Color) {
+            self.counts[4] += 1;
+            self.inner.stroke_path(path, width, color);
+        }
+        fn fill_path_paint(&mut self, path: &Path, paint: &Paint) {
+            self.counts[5] += 1;
+            self.inner.fill_path_paint(path, paint);
+        }
+        fn image(&mut self, image: &Image, src: Rect, dst: Rect, brightness: f32) {
+            self.counts[6] += 1;
+            self.inner.image(image, src, dst, brightness);
+        }
+        fn push_transform(&mut self, dx: f32, dy: f32, scale: f32) {
+            self.counts[11] += 1;
+            self.inner.push_transform(dx, dy, scale);
+        }
+        fn pop_transform(&mut self) {
+            self.inner.pop_transform();
+        }
+        fn shadow(&mut self, rect: Rect, radius: f32, color: Color, dx: f32, dy: f32, blur: f32) {
+            self.counts[7] += 1;
+            self.inner.shadow(rect, radius, color, dx, dy, blur);
+        }
+        fn inset_shadow(
+            &mut self,
+            rect: Rect,
+            radius: f32,
+            color: Color,
+            dx: f32,
+            dy: f32,
+            blur: f32,
+        ) {
+            self.counts[8] += 1;
+            self.inner.inset_shadow(rect, radius, color, dx, dy, blur);
+        }
+        fn text(&mut self, text: &str, rect: Rect, style: &TextStyle) {
+            self.counts[9] += 1;
+            self.inner.text(text, rect, style);
+        }
+        fn text_width(&mut self, text: &str, style: &TextStyle) -> f32 {
+            self.inner.text_width(text, style)
+        }
+        fn push_clip(&mut self, rect: Rect) {
+            self.counts[10] += 1;
+            self.inner.push_clip(rect);
+        }
+        fn pop_clip(&mut self) {
+            self.inner.pop_clip();
+        }
+        fn scale_factor(&self) -> f32 {
+            self.inner.scale_factor()
+        }
+    }
+
+    thread_local! {
+        static STATS: RefCell<(HashMap<String, Stats>, Option<Instant>)> =
+            RefCell::new((HashMap::new(), None));
+    }
+
+    pub fn note(widget: &gtk::Widget, took: Duration, counts: [u64; KINDS.len()], gpu: bool) {
+        let name = format!(
+            "{}x{}@{:p}{}",
+            widget.width(),
+            widget.height(),
+            widget.as_ptr(),
+            if gpu { " (GPU)" } else { "" }
+        );
+        let fps = widget.frame_clock().map_or(0.0, |c| c.fps());
+        STATS.with(|s| {
+            let (stats, since) = &mut *s.borrow_mut();
+            let e = stats.entry(name).or_default();
+            e.frames += 1;
+            e.total += took;
+            e.max = e.max.max(took);
+            for (a, b) in e.counts.iter_mut().zip(counts) {
+                *a += b;
+            }
+            let start = *since.get_or_insert_with(Instant::now);
+            if start.elapsed() >= Duration::from_secs(2) {
+                for (name, st) in stats.drain() {
+                    let per_frame: Vec<String> = KINDS
+                        .iter()
+                        .zip(st.counts)
+                        .filter(|(_, c)| *c > 0)
+                        .map(|(k, c)| format!("{k} {}", c / u64::from(st.frames.max(1))))
+                        .collect();
+                    tracing::info!(
+                        "paint {name}: {} frames, mean {:.2} ms, max {:.2} ms, {fps:.0} fps; per frame {}",
+                        st.frames,
+                        st.total.as_secs_f64() * 1e3 / f64::from(st.frames.max(1)),
+                        st.max.as_secs_f64() * 1e3,
+                        per_frame.join(", "),
+                    );
+                }
+                *since = Some(Instant::now());
+            }
+        });
     }
 }

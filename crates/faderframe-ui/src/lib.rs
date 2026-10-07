@@ -15,6 +15,7 @@ mod actions;
 pub mod canvas;
 mod dialogs;
 pub mod dock;
+pub mod gpu;
 mod icons;
 mod midi_prefs;
 pub mod painter;

@@ -186,6 +186,13 @@ pub trait CanvasView<M, A> {
         false
     }
 
+    /// Is the view's geometry dense and changing every frame (analysers,
+    /// meters, curves)? A host with a GPU painter draws such views with it
+    /// (the toolkit's renderer rasterises every changed path on the CPU).
+    fn dense(&self) -> bool {
+        false
+    }
+
     fn tooltip(&self, _pos: Point, _size: Size, _model: &M) -> Option<String> {
         None
     }

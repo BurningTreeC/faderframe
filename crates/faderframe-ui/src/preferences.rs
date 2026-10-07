@@ -407,6 +407,29 @@ fn general_page(app: &Rc<AppState>) -> gtk::Widget {
     });
     sandbox_note.set_wrap(true);
     g.attach(&sandbox_note, 1, 6, 1, 1);
+    let gpu = gtk::CheckButton::with_label("Draw analysers, meters and curves on the GPU");
+    gpu.set_active(app.gpu_painter.get() && crate::gpu::available());
+    gpu.set_sensitive(crate::gpu::available());
+    gpu.set_tooltip_text(Some(
+        "The mixer, the mastering tools and device editors such as the EQ are drawn with \
+         the graphics card (vello on wgpu) instead of GTK's renderer, which rasterises \
+         every changing curve on the CPU. Without a usable GPU they stay as they are.",
+    ));
+    row(&g, 7, "Drawing", &gpu);
+    {
+        let weak = Rc::downgrade(app);
+        gpu.connect_toggled(move |b| {
+            let mut p = Preferences::load();
+            p.gpu_painter = b.is_active();
+            if let Err(e) = p.save() {
+                tracing::warn!("cannot save preferences: {e}");
+            }
+            if let Some(app) = weak.upgrade() {
+                app.gpu_painter.set(crate::gpu::wanted(b.is_active()));
+                app.redraw_all();
+            }
+        });
+    }
     {
         let weak = Rc::downgrade(app);
         sandbox.connect_toggled(move |b| {

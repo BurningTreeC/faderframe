@@ -479,6 +479,11 @@ impl EqView {
 }
 
 impl CanvasView<Session, Action> for EqView {
+    /// Analysers, meters and curves redrawn every frame.
+    fn dense(&self) -> bool {
+        true
+    }
+
     fn set_theme(&mut self, theme: &Theme) {
         self.theme = theme.clone();
     }

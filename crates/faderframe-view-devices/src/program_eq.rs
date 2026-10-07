@@ -1145,6 +1145,11 @@ impl ProgramEqView {
 }
 
 impl CanvasView<Session, Action> for ProgramEqView {
+    /// Analysers, meters and curves redrawn every frame.
+    fn dense(&self) -> bool {
+        true
+    }
+
     fn paint(&mut self, p: &mut dyn Painter, size: Size, model: &Session, theme: &Theme) {
         p.fill(Rect::from_size(size), theme.ui.background);
         let tap = self.device.tap(model);
