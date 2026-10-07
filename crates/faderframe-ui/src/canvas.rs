@@ -88,7 +88,7 @@ mod imp {
                 let theme = app.theme.borrow();
                 let started = paint_stats::enabled().then(std::time::Instant::now);
                 let mut counts = None;
-                let painted = crate::gpu::paint(snapshot, size.w, size.h, scale, |p| {
+                let painted = crate::gpu::paint(w, snapshot, size.w, size.h, scale, |p| {
                     if started.is_some() {
                         let mut counting = paint_stats::Counting::new(p);
                         view.paint(&mut counting, size, &session, &theme);

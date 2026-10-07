@@ -16,6 +16,8 @@ pub mod canvas;
 mod dialogs;
 pub mod dock;
 pub mod gpu;
+#[cfg(all(feature = "gpu-painter", windows))]
+mod gpu_win32;
 mod icons;
 mod listen;
 mod midi_prefs;

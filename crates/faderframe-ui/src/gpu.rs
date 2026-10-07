@@ -36,10 +36,15 @@ mod imp {
         /// Never dropped: at exit, when thread-locals are torn down, wgpu's
         /// own may be gone already (the system reclaims the GPU's memory).
         /// `dmabuf`: frames go to GTK as dmabufs (Linux, when the GPU
-        /// exports and the display imports them).
+        /// exports and the display imports them). `share`: as shared D3D12
+        /// textures (Windows), `checked` once the first matched.
         Ready {
             renderer: std::mem::ManuallyDrop<Box<GpuRenderer>>,
             dmabuf: bool,
+            #[cfg(windows)]
+            share: Option<crate::gpu_win32::Handover>,
+            #[cfg(windows)]
+            checked: bool,
         },
         Failed,
     }
@@ -52,6 +57,7 @@ mod imp {
     /// with `paint` on the GPU into `snapshot`; false when it cannot (the
     /// caller paints with GTK).
     pub fn paint(
+        widget: &gtk::Widget,
         snapshot: &gtk::Snapshot,
         width: f32,
         height: f32,
@@ -61,14 +67,33 @@ mod imp {
         GPU.with(|g| {
             let mut g = g.borrow_mut();
             if matches!(*g, State::Untried) {
-                *g = match GpuRenderer::new() {
+                // Windows: on the GPU GTK's GL draws with, to hand frames
+                // over.
+                #[cfg(windows)]
+                let (share, luid) = crate::gpu_win32::handover(widget);
+                #[cfg(not(windows))]
+                let (luid, _) = (None, widget);
+                *g = match GpuRenderer::new_on(luid) {
                     Ok(r) => {
                         let dmabuf = r.exports_dmabufs() && imports_dmabufs(snapshot);
+                        #[cfg(windows)]
+                        let share = share.filter(|s| match s {
+                            crate::gpu_win32::Handover::Gl(gl) => {
+                                r.shared_luid() == Some(gl.luid())
+                            }
+                            crate::gpu_win32::Handover::D3d12 => r.shared_luid().is_some(),
+                        });
+                        #[cfg(windows)]
+                        let shared = share.is_some();
+                        #[cfg(not(windows))]
+                        let shared = false;
                         tracing::info!(
                             "dense views drawn on {}{}",
                             r.adapter(),
                             if dmabuf {
                                 ", handed over as dmabufs"
+                            } else if shared {
+                                ", handed over as shared D3D12 textures"
                             } else {
                                 ", read back"
                             }
@@ -76,6 +101,10 @@ mod imp {
                         State::Ready {
                             renderer: std::mem::ManuallyDrop::new(Box::new(r)),
                             dmabuf,
+                            #[cfg(windows)]
+                            share,
+                            #[cfg(windows)]
+                            checked: false,
                         }
                     }
                     Err(e) => {
@@ -87,13 +116,21 @@ mod imp {
             let State::Ready {
                 renderer: r,
                 dmabuf,
+                #[cfg(windows)]
+                share,
+                #[cfg(windows)]
+                checked,
             } = &mut *g
             else {
                 return false;
             };
             let pw = (width * scale).ceil().max(1.0) as u32;
             let ph = (height * scale).ceil().max(1.0) as u32;
-            match r.render_to(pw, ph, scale, *dmabuf, paint) {
+            #[cfg(windows)]
+            let handover = *dmabuf || share.is_some();
+            #[cfg(not(windows))]
+            let handover = *dmabuf;
+            match r.render_to(pw, ph, scale, handover, paint) {
                 Ok(faderframe_ui_gpu::Output::Pixels(frame)) => {
                     let stride = frame.stride();
                     let texture = gdk::MemoryTexture::new(
@@ -123,6 +160,26 @@ mod imp {
                         false
                     }
                 },
+                #[cfg(windows)]
+                Ok(faderframe_ui_gpu::Output::Shared(frame)) => {
+                    match super::shared_texture(r, share, checked, frame) {
+                        Ok(texture) => {
+                            snapshot.append_texture(
+                                &texture,
+                                &graphene::Rect::new(0.0, 0.0, width, height),
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            // This frame is lost; the next ones are read back.
+                            tracing::warn!(
+                                "GTK did not take the shared texture ({e}): reading frames back"
+                            );
+                            *share = None;
+                            false
+                        }
+                    }
+                }
                 Err(e) => {
                     tracing::warn!("GPU painter failed, using GTK's: {e}");
                     *g = State::Failed;
@@ -131,6 +188,44 @@ mod imp {
             }
         })
     }
+}
+
+/// A shared frame as a GTK texture by the hand-over in use; the first one
+/// is checked against the painter's own readback.
+#[cfg(all(feature = "gpu-painter", windows))]
+fn shared_texture(
+    r: &faderframe_ui_gpu::GpuRenderer,
+    share: &mut Option<crate::gpu_win32::Handover>,
+    checked: &mut bool,
+    frame: faderframe_ui_gpu::SharedFrame,
+) -> Result<gtk::gdk::Texture, String> {
+    use crate::gpu_win32::{Handover, d3d12_texture, download, same};
+    let expected = if *checked {
+        None
+    } else {
+        Some(r.read_shared(&frame).map_err(|e| e.to_string())?)
+    };
+    let texture = match share.as_mut().ok_or("no hand-over")? {
+        Handover::Gl(gl) => {
+            if let Some(want) = &expected
+                && !same(&gl.read(&frame)?, want)
+            {
+                return Err("GL sees other pixels".into());
+            }
+            gl.texture(frame)?
+        }
+        Handover::D3d12 => {
+            let t = d3d12_texture(frame)?;
+            if let Some(want) = &expected
+                && !same(&download(&t), want)
+            {
+                return Err("GTK sees other pixels".into());
+            }
+            t
+        }
+    };
+    *checked = true;
+    Ok(texture)
 }
 
 #[cfg(feature = "gpu-painter")]
@@ -186,6 +281,7 @@ fn dmabuf_texture(frame: faderframe_ui_gpu::DmabufFrame) -> Result<gtk::gdk::Tex
 
 #[cfg(not(feature = "gpu-painter"))]
 pub fn paint(
+    _widget: &gtk::Widget,
     _snapshot: &gtk::Snapshot,
     _width: f32,
     _height: f32,

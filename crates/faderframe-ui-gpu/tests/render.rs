@@ -225,3 +225,54 @@ fn frames_go_out_as_dmabufs() {
     assert_eq!(again.fd, fd);
     drop((second, third, again));
 }
+
+/// On Windows (D3D12) a frame can go out as a shared texture: the same
+/// pixels as read back, at most three shown at once, a texture reused once
+/// the toolkit lets go of it, on an adapter with a LUID.
+#[cfg(windows)]
+#[test]
+fn frames_go_out_as_shared_textures() {
+    use faderframe_ui_gpu::Output;
+    let Some(mut r) = renderer() else { return };
+    let Some(luid) = r.shared_luid() else {
+        eprintln!("skipped: no shared textures on {}", r.adapter());
+        return;
+    };
+    assert_ne!(luid, [0; 8]);
+    let paint = |p: &mut dyn faderframe_ui_canvas::Painter| {
+        p.fill(Rect::new(0.0, 0.0, 30.0, 70.0), Color::rgb(1.0, 0.5, 0.0));
+        p.fill(
+            Rect::new(30.0, 20.0, 40.0, 10.0),
+            Color::rgba(0.0, 0.0, 1.0, 0.5),
+        );
+    };
+    let pixels = r.render(70, 70, 1.0, paint).unwrap();
+    let Output::Shared(frame) = r.render_to(70, 70, 1.0, true, paint).unwrap() else {
+        panic!("no shared texture");
+    };
+    assert_eq!((frame.width, frame.height), (70, 70));
+    assert_ne!(frame.handle, 0);
+    assert!(frame.size >= 70 * 70 * 4);
+    assert_eq!(r.read_shared(&frame).unwrap(), pixels.pixels.as_ref());
+    let second = r.render_to(70, 70, 1.0, true, paint).unwrap();
+    let third = r.render_to(70, 70, 1.0, true, paint).unwrap();
+    let Output::Shared(second) = second else {
+        panic!()
+    };
+    assert_ne!(second.slot, frame.slot);
+    assert!(matches!(third, Output::Shared(_)));
+    assert!(
+        matches!(
+            r.render_to(70, 70, 1.0, true, paint).unwrap(),
+            Output::Pixels(_)
+        ),
+        "every texture shown: read back"
+    );
+    let slot = frame.slot;
+    drop(frame);
+    let Output::Shared(again) = r.render_to(70, 70, 1.0, true, paint).unwrap() else {
+        panic!("no shared texture after a release");
+    };
+    assert_eq!(again.slot, slot);
+    drop((second, third, again));
+}

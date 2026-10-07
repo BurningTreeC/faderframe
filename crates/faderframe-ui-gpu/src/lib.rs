@@ -7,17 +7,23 @@
 //!
 //! GTK-free: the host turns [`GpuRenderer::render`]'s pixels into a
 //! texture. Creating a renderer fails without a usable GPU adapter; the
-//! host then keeps its own painter. On Linux, frames can skip the readback
-//! altogether ([`GpuRenderer::render_to`] with dmabuf export, `dmabuf`).
+//! host then keeps its own painter. On Linux and Windows, frames can skip
+//! the readback altogether ([`GpuRenderer::render_to`]: dmabufs, `dmabuf`;
+//! shared D3D12 textures, `d3d12`).
 
 #![deny(unsafe_code)]
 
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod d3d12;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 mod dmabuf;
 mod scene;
 mod text;
 
+#[cfg(windows)]
+pub use d3d12::SharedFrame;
 #[cfg(target_os = "linux")]
 pub use dmabuf::{DmabufFrame, FOURCC_AB24, MODIFIER_LINEAR, Release};
 
@@ -91,12 +97,14 @@ struct Target {
     padded_row: u32,
 }
 
-/// What a frame became: pixels read back, or (Linux) a dmabuf the toolkit
-/// imports.
+/// What a frame became: pixels read back, or a dmabuf (Linux) or a shared
+/// D3D12 texture (Windows) the toolkit imports.
 pub enum Output {
     Pixels(Frame),
     #[cfg(target_os = "linux")]
     Dmabuf(DmabufFrame),
+    #[cfg(windows)]
+    Shared(SharedFrame),
 }
 
 /// The GPU, vello and the text and image caches; one per UI thread.
@@ -104,6 +112,9 @@ pub struct GpuRenderer {
     /// Dmabuf export (dropped before the device it uses).
     #[cfg(target_os = "linux")]
     dmabuf: Option<dmabuf::Exporter>,
+    /// Shared texture export (dropped before the device it uses).
+    #[cfg(windows)]
+    shared: Option<d3d12::Exporter>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     renderer: vello::Renderer,
@@ -120,8 +131,35 @@ impl GpuRenderer {
     /// Find a GPU and build vello's pipelines (blocks for a moment: shader
     /// compilation).
     pub fn new() -> Result<Self, GpuError> {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        Self::new_on(None)
+    }
+
+    /// [`Self::new`] on the adapter with this LUID where there is one (on
+    /// Windows: the D3D12 adapter the toolkit's GL draws with, so it can
+    /// import the frames). When vello cannot be built there, wgpu's own
+    /// choice of adapter is used (frames read back).
+    pub fn new_on(luid: Option<[u8; 8]>) -> Result<Self, GpuError> {
+        let fresh = wgpu::InstanceDescriptor::new_without_display_handle_from_env;
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut backends = fresh().backends;
+        #[cfg(windows)]
+        if let Some(adapter) = d3d12_adapter(&wgpu::Instance::new(fresh()), luid) {
+            match Self::on_adapter(adapter) {
+                Ok(r) => return Ok(r),
+                Err(e) => {
+                    tracing::warn!("GPU painter on D3D12 ({e}): trying another backend");
+                    backends.remove(wgpu::Backends::DX12);
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = luid;
+        if backends.is_empty() {
+            return Err(GpuError::Adapter("no other backend".into()));
+        }
+        let mut desc = fresh();
+        desc.backends = backends;
+        let instance = wgpu::Instance::new(desc);
         let adapter =
             pollster::block_on(
                 instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -133,6 +171,10 @@ impl GpuRenderer {
                 }),
             )
             .map_err(|e| GpuError::Adapter(e.to_string()))?;
+        Self::on_adapter(adapter)
+    }
+
+    fn on_adapter(adapter: wgpu::Adapter) -> Result<Self, GpuError> {
         let info = adapter.get_info();
         let desc = wgpu::DeviceDescriptor {
             label: Some("faderframe-ui-gpu"),
@@ -156,6 +198,16 @@ impl GpuRenderer {
         };
         #[cfg(target_os = "linux")]
         let dmabuf = dmabuf::Exporter::new(&device);
+        #[cfg(windows)]
+        let shared = if std::env::var("FADERFRAME_GPU_SHARE").as_deref() == Ok("0") {
+            None
+        } else {
+            d3d12::Exporter::new(&device)
+        };
+        // Shaders the backend's compiler refuses (internal errors: FXC) or
+        // that do not validate are an error, not a panic.
+        let invalid = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
         let renderer = vello::Renderer::new(
             &device,
             vello::RendererOptions {
@@ -164,11 +216,18 @@ impl GpuRenderer {
                 num_init_threads: NonZeroUsize::new(1),
                 pipeline_cache: None,
             },
-        )
-        .map_err(|e| GpuError::Render(e.to_string()))?;
+        );
+        let failed = pollster::block_on(internal.pop());
+        let failed = pollster::block_on(invalid.pop()).or(failed);
+        if let Some(e) = failed {
+            return Err(GpuError::Render(describe(&e)));
+        }
+        let renderer = renderer.map_err(|e| GpuError::Render(e.to_string()))?;
         Ok(Self {
             #[cfg(target_os = "linux")]
             dmabuf,
+            #[cfg(windows)]
+            shared,
             device,
             queue,
             renderer,
@@ -184,6 +243,15 @@ impl GpuRenderer {
     /// Which GPU renders (for logs).
     pub fn adapter(&self) -> &str {
         &self.adapter
+    }
+
+    /// Whether frames can go out as shared D3D12 textures, and the LUID of
+    /// the adapter they are on.
+    pub fn shared_luid(&self) -> Option<[u8; 8]> {
+        #[cfg(windows)]
+        return self.shared.as_ref().map(d3d12::Exporter::luid);
+        #[cfg(not(windows))]
+        None
     }
 
     /// Whether frames can go out as dmabufs.
@@ -207,11 +275,16 @@ impl GpuRenderer {
             Output::Pixels(frame) => Ok(frame),
             #[cfg(target_os = "linux")]
             Output::Dmabuf(_) => Err(GpuError::Readback("a dmabuf was not asked for".into())),
+            #[cfg(windows)]
+            Output::Shared(_) => Err(GpuError::Readback(
+                "a shared texture was not asked for".into(),
+            )),
         }
     }
 
-    /// [`Self::render`], as a dmabuf when `dmabuf` (and a buffer is free:
-    /// the toolkit may still show the others), else read back.
+    /// [`Self::render`], handed over without a readback when `dmabuf` — a
+    /// dmabuf (Linux) or a shared texture (Windows), when one is free (the
+    /// toolkit may still show the others) — else read back.
     pub fn render_to(
         &mut self,
         width: u32,
@@ -282,7 +355,34 @@ impl GpuRenderer {
                 .map_err(|e| GpuError::Readback(e.to_string()))?;
             return Ok(Output::Dmabuf(frame));
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        if dmabuf
+            && let Some(exporter) = self.shared.as_mut()
+            && let Some((texture, frame)) = exporter.slot(&self.device, width, height)
+        {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("to shared texture"),
+                });
+            encoder.copy_texture_to_texture(
+                target.texture.as_image_copy(),
+                texture.as_image_copy(),
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.queue.submit([encoder.finish()]);
+            // Done (and decayed to the common state) before the toolkit
+            // reads it: no fences cross over.
+            self.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(|e| GpuError::Readback(e.to_string()))?;
+            return Ok(Output::Shared(frame));
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         let _ = dmabuf;
         let mut encoder = self
             .device
@@ -390,6 +490,67 @@ impl GpuRenderer {
         Ok(bytes)
     }
 
+    /// A shared frame's pixels (rows of `width * 4` bytes): what the
+    /// toolkit reads, copied back for checks.
+    #[cfg(windows)]
+    #[doc(hidden)]
+    pub fn read_shared(&self, frame: &SharedFrame) -> Result<Vec<u8>, GpuError> {
+        let texture = self
+            .shared
+            .as_ref()
+            .and_then(|e| e.texture_of(frame.slot))
+            .ok_or_else(|| GpuError::Readback("no such shared texture".into()))?;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded = (frame.width * 4).div_ceil(align) * align;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shared check"),
+            size: u64::from(padded) * u64::from(frame.height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width: frame.width,
+                height: frame.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit([encoder.finish()]);
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| GpuError::Readback(e.to_string()))?;
+        rx.recv()
+            .map_err(|e| GpuError::Readback(e.to_string()))?
+            .map_err(|e| GpuError::Readback(e.to_string()))?;
+        let mapped = slice
+            .get_mapped_range()
+            .map_err(|e| GpuError::Readback(e.to_string()))?;
+        let row = frame.width as usize * 4;
+        let mut out = Vec::with_capacity(row * frame.height as usize);
+        for y in 0..frame.height as usize {
+            let start = y * padded as usize;
+            out.extend_from_slice(&mapped[start..start + row]);
+        }
+        Ok(out)
+    }
+
     fn ensure_target(&mut self, width: u32, height: u32) {
         if self
             .target
@@ -428,5 +589,43 @@ impl GpuRenderer {
                 padded_row,
             });
         }
+    }
+}
+
+/// A wgpu error with its description (its display is only the kind).
+fn describe(e: &wgpu::Error) -> String {
+    match e {
+        wgpu::Error::Validation { description, .. } | wgpu::Error::Internal { description, .. } => {
+            description.clone()
+        }
+        other => other.to_string(),
+    }
+}
+
+/// The D3D12 adapter with `luid` (or, without one, the system's preferred
+/// D3D12 adapter): frames shared with the toolkit must stay on its GPU.
+/// `None`: keep wgpu's own choice.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn d3d12_adapter(instance: &wgpu::Instance, luid: Option<[u8; 8]>) -> Option<wgpu::Adapter> {
+    if std::env::var("FADERFRAME_GPU_SHARE").as_deref() == Ok("0") {
+        return None;
+    }
+    let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::DX12));
+    let luid_of = |a: &wgpu::Adapter| -> Option<[u8; 8]> {
+        // SAFETY: the guard is only used here, while `a` lives.
+        let hal = unsafe { a.as_hal::<wgpu::hal::api::Dx12>() }?;
+        // SAFETY: a valid adapter.
+        let desc = unsafe { hal.raw_adapter().GetDesc1() }.ok()?;
+        let mut b = [0u8; 8];
+        b[..4].copy_from_slice(&desc.AdapterLuid.LowPart.to_le_bytes());
+        b[4..].copy_from_slice(&desc.AdapterLuid.HighPart.to_le_bytes());
+        Some(b)
+    };
+    match luid {
+        Some(want) => adapters.into_iter().find(|a| luid_of(a) == Some(want)),
+        None => adapters
+            .into_iter()
+            .find(|a| a.get_info().device_type != wgpu::DeviceType::Cpu),
     }
 }

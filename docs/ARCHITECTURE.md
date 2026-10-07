@@ -2467,8 +2467,25 @@ It is used when the display imports linear `AB24` (`dmabuf_formats`);
 if GTK refuses a frame, frames are read back from then on
 (`FADERFRAME_GPU_DMABUF=0` turns it off). Measured on a Radeon iGPU
 (RADV): the mastering tools at 2411×711 device pixels 4.98 → 3.80 ms per
-paint, 52 → 60 fps. Windows and macOS keep the readback (no dmabufs; a
-Direct3D import exists in newer GTK on Windows). Without a GPU adapter, or
+paint, 52 → 60 fps. On Windows the frames go over as shared D3D12
+textures (`d3d12::Exporter`: pooled committed textures on a shared heap
+with simultaneous access, so they decay to the common state after the
+copy, and an NT handle each; `Output::Shared`): the painter renders on the
+D3D12 adapter with the LUID of GTK's GL device (`GpuRenderer::new_on`),
+falling back to wgpu's choice without D3D12 when vello cannot be built
+there (shader compilation errors are caught in error scopes, not
+panics). With GTK's GL renderer — the default on Windows — the texture is
+imported into a WGL context of GTK's display through
+`EXT_memory_object_win32` (once per pooled texture, dedicated, `GL_RGBA8`;
+`faderframe-ui/src/gpu_win32.rs`) and handed over as a `GdkGLTexture`:
+GTK's own D3D12 import into GL imports the resource handle as the fence
+too and falls back to a copy through the CPU. With GTK's Vulkan renderer
+it is a `GdkD3D12Texture` (GTK ≥ 4.20 imports it itself). The first frame
+is read back both ways and compared; any difference or error and frames
+are read back from then on (`FADERFRAME_GPU_SHARE=0` turns it off). Not
+measured on hardware here: Wine's vkd3d stubs `CreateSharedHandle` and
+cannot compile vello's shaders, so the exporter's test runs on the Windows
+CI runners (WARP). macOS keeps the readback. Without a GPU adapter, or
 after any error, views keep the GSK painter. `FADERFRAME_PAINT_STATS=1` logs each canvas's paint time, frame
 rate and primitives per frame. Tests: `faderframe-ui-gpu/tests/render.rs`
 (skipped without an adapter).
@@ -2715,8 +2732,10 @@ for its editor.
     `faderframe-plugin-sandbox` (pipes, `poll`, shared memory, descriptors
     for helper processes, Win32 pipes/events/mappings, AppKit windows), `faderframe-stretch` (the C shim of the vendored
     stretcher), `faderframe-ui` (GObject subclassing macros, dmabuf
-    textures) and `faderframe-ui-gpu`'s `dmabuf` module (Vulkan external
-    memory through wgpu's hal and ash; the rest of the crate denies it).
+    textures, WGL/D3D12 texture import) and `faderframe-ui-gpu`'s `dmabuf`
+    and `d3d12` modules (Vulkan external memory through wgpu's hal and
+    ash; shared D3D12 textures through wgpu's hal and the windows crate;
+    the rest of the crate denies it).
 12. Vendored C/C++ code is listed in `THIRD_PARTY_LICENSES.md` and its
     realtime entry points are proven allocation-free by counting C++
     allocations in tests (`faderframe-stretch/tests/stretch.rs`; the Rust
@@ -2857,7 +2876,7 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
    ahead~~ (done: the shallow tier, see *Render ahead*), ~~job affinity for
    cache locality~~ (done: see *Affinity*), ~~an optional wgpu painter for
    dense views~~ (done: see *The GPU painter*, with dmabuf hand-over on
-   Linux).
+   Linux and shared D3D12 textures on Windows).
 10. ~~**Mastering**: multiple CD-Text languages, a DDP player/import,
     surround beds and panning before any object-based format~~ — done (see
     *CD-Text languages*, *The DDP player* and *Surround beds*). ~~Object-based

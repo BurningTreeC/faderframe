@@ -24,3 +24,16 @@ tracing.workspace = true
 # uses).
 wgpu = { version = "30", default-features = false, features = ["vulkan", "std", "wgsl"] }
 ash = "0.38"
+
+[target.'cfg(windows)'.dependencies]
+# Shared D3D12 textures through wgpu's DX12 backend (the windows crate
+# version wgpu-hal uses).
+wgpu = { version = "30", default-features = false, features = ["dx12", "std", "wgsl"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Security",
+] }
