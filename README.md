@@ -68,10 +68,13 @@ saturator and a reverb rendered into the audio it plays):
 
 The clip launcher: the demo's clips sent to it in four scenes, the Verse
 playing (green, each clip's loop progress under its name) and the Chorus
-waiting for the next bar (yellow); Record to Arrangement is on, and the
-tracks that play the launcher are dimmed in the arranger above:
+waiting for the next bar (yellow). The letters are launch modes (G gate,
+T toggle, R repeat, L legato), the chevrons follow actions. Record to
+Arrangement is on: the Pluck's launched loop is already being written
+into the arrangement above, where the tracks that play the launcher are
+dimmed:
 
-![The clip launcher with four scenes, one playing and one queued](docs/screenshots/launcher.png)
+![The clip launcher with four scenes, one playing and one queued, launch modes and follow actions](docs/screenshots/launcher.png)
 
 Device editors: the EQ (dynamic and spectral bands, analyser), the synth
 (the dots on Cutoff and Resonance show where its modulators have them

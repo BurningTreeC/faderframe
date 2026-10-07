@@ -67,6 +67,20 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.10.0" date="2026-10-07">
+      <description>
+        <p>Performance and control, finished.</p>
+        <ul>
+          <li>The clip launcher: launch modes (trigger, gate, toggle, repeat), clips' own quantisation and legato, follow actions with a second action, a chance and jumps to scenes, launched audio that follows the tempo; slot recording with a fixed length, a count-in and MIDI overdubs; Record to Arrangement writes as it plays, with the mixer's moves; clips drag back into the arrangement and between windows; MIDI learn for slots, scenes and stops.</li>
+          <li>Grid controllers play the launcher in the clips' colours: Launchpad Mini MK3, X and Pro MK3, APC mini and mk2, Push 2. OSC shows the launcher.</li>
+          <li>Mackie Control and HUI: channel-strip pages for the selected track's parameters, devices, EQ and instrument, track-type filters, F-keys for workspaces, modifiers, timecode, zoom, nudge, scrub and shuttle, punch and edit keys, HUI's numeric keypad; a surface may have a bank of its own.</li>
+          <li>MIDI time code out, varispeed chase of MIDI clock and MIDI time code without a shared word clock, and a manual varispeed.</li>
+          <li>Modulators reach VST3 and Audio Unit parameters.</li>
+          <li>The sampler imports SFZ instruments in full: filters, envelopes, LFOs, controller modulation with curves, keyswitches, release and legato triggers, crossfades, #include and #define.</li>
+          <li>On macOS, sandboxed plugins' audio threads join the audio device's workgroup.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.9.0" date="2026-10-06">
       <description>
         <p>Performance and control.</p>
