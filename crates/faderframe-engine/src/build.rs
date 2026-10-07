@@ -1329,13 +1329,22 @@ pub fn build_graph(
                 SendTap::PostFader => (strip, 0, destination_layout(project, t)),
             };
             let level = slots.send(send.id)?;
-            let node = SendNode::new(t.id, send.id, level);
+            // Taken before the panner, a mono or stereo track's send
+            // follows the panner into a bed.
+            let surround = |l: ChannelLayout| matches!(l, ChannelLayout::Surround(_));
+            let follow = (matches!(send.tap, SendTap::PreFx | SendTap::PreFader)
+                && !surround(t.layout)
+                && surround(target.layout))
+            .then(|| slots.strip_of(t.id).map(|s| s.surround))
+            .flatten();
+            let node =
+                SendNode::new(t.id, send.id, level).with_layouts(tap_layout, target.layout, follow);
             let node = g.add_node(
                 NodeSpec::new(format!("{} → {}", t.name, target.name))
                     .key(node_key(
                         t.id,
                         Role::Send,
-                        send.id.raw(),
+                        send.id.raw() | (u64::from(follow.is_some()) << 63),
                         &[tap_layout, target.layout],
                     ))
                     .group(gi)

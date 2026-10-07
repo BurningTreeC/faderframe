@@ -461,6 +461,13 @@ Format in the track menus, `Session::format_choices`).
   place of Pan, the session writes them from `SetTrackSurround` in
   Touch/Latch/Write, MIDI learn sets one value. Node keys tell layouts of
   equal width apart.
+* **Sends** into or out of a bed mix through the same matrix
+  (`nodes::strip::MatrixMix`, shared with the strip): a mono or stereo
+  track's pre-FX or pre-fader send into a bed follows the track's panner
+  and its automation (as console sends follow the main pan); any other
+  send between layouts where one is a bed places by the speakers (a 5.1
+  post-fader send into a stereo reverb folds the bed). Elsewhere the
+  graph's channel rules still apply.
 * **Monitoring.** A bed wider than the device's outputs is folded down to
   the largest format it can play (`FoldDown` before the device output,
   `surround::fold_into`; the graph is rebuilt when the device's output count

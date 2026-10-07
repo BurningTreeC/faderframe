@@ -2287,6 +2287,24 @@ fn surround_strips_do_not_allocate() {
     tp.clip(o, src, MusicalTime::ZERO, 96_000);
     tp.project.track_mut(o).unwrap().object = true;
     assert!(tp.project.is_object(tp.project.track(o).unwrap()));
+    // A pre-fader send that follows the moving panner into a 5.1 reverb.
+    let verb = tp.track(
+        TrackKind::Aux,
+        "Verb",
+        ChannelLayout::Surround(SurroundFormat::S51),
+    );
+    let send = tp.project.ids.allocate();
+    tp.project
+        .track_mut(t)
+        .unwrap()
+        .sends
+        .push(faderframe_project::AuxSend {
+            id: send,
+            target: verb,
+            level_db: -6.0,
+            tap: faderframe_project::SendTap::PreFader,
+            enabled: true,
+        });
     let config = EngineConfig {
         sample_rate: 48_000,
         ..EngineConfig::default()

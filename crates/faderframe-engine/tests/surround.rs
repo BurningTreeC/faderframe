@@ -296,3 +296,68 @@ fn meters_follow_the_format_back_to_stereo() {
         .id;
     assert_eq!(r.controller.take_meter(track).unwrap().count, 2);
 }
+
+/// Sends meet beds through the panner: taken before the panner, a mono
+/// track's send follows it into a 5.1 reverb (not every channel at full
+/// level); a send after a 5.1 panner into a stereo reverb carries the bed
+/// folded (not just its L and R).
+#[test]
+fn sends_follow_the_panner_into_beds_and_fold_out_of_them() {
+    use faderframe_project::{AuxSend, SendTap};
+    let send_to = |pan: SurroundPan, aux_layout: ChannelLayout, tap: SendTap| {
+        let mut tp = mono_in_51(pan);
+        let track = tp.project.tracks.iter().find(|t| t.name == "Mono").unwrap().id;
+        // The track itself silent at the master: only the send is heard.
+        tp.project.track_mut(track).unwrap().output = OutputRouting::None;
+        let aux = tp.track(TrackKind::Aux, "Verb", aux_layout);
+        let id = tp.project.ids.allocate();
+        tp.project.track_mut(track).unwrap().sends.push(AuxSend {
+            id,
+            target: aux,
+            level_db: 0.0,
+            tap,
+            enabled: true,
+        });
+        levels(&tp, 6)
+    };
+    let back_left = SurroundPan {
+        x: -1.0,
+        y: -1.0,
+        ..SurroundPan::default()
+    };
+    // Pre-fader into a 5.1 reverb: at Ls only.
+    let pre = send_to(back_left, S51, SendTap::PreFader);
+    assert!(close(pre[4], 0.5), "Ls: {pre:?}");
+    for c in [0, 1, 2, 3, 5] {
+        assert!(pre[c].abs() < 1e-6, "{c}: {pre:?}");
+    }
+    let pre_fx = send_to(back_left, S51, SendTap::PreFx);
+    assert!(close(pre_fx[4], 0.5), "pre-FX Ls: {pre_fx:?}");
+    // Panned to the centre of the 5.1 master, post-fader into a stereo
+    // reverb: the centre folded into both sides at −3 dB (the reverb's
+    // own meter, its output not connected).
+    let mut tp = mono_in_51(SurroundPan::default());
+    let track = tp.project.tracks.iter().find(|t| t.name == "Mono").unwrap().id;
+    let aux = tp.track(TrackKind::Aux, "Verb", ChannelLayout::Stereo);
+    tp.project.track_mut(aux).unwrap().output = OutputRouting::None;
+    let id = tp.project.ids.allocate();
+    tp.project.track_mut(track).unwrap().sends.push(AuxSend {
+        id,
+        target: aux,
+        level_db: 0.0,
+        tap: SendTap::PostFader,
+        enabled: true,
+    });
+    let mut r =
+        OfflineRenderer::new(&tp.project, &tp.sources, EngineConfig::default(), 256, 6).unwrap();
+    r.play_from(0).unwrap();
+    r.render(2048);
+    let m = r.controller.take_meter(aux).unwrap();
+    let h = 0.5 * std::f32::consts::FRAC_1_SQRT_2;
+    assert!(
+        close(m.channels[0].peak, h) && close(m.channels[1].peak, h),
+        "{:?} {:?}",
+        m.channels[0],
+        m.channels[1]
+    );
+}

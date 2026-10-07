@@ -40,15 +40,8 @@ pub struct ChannelStrip {
     law: FaderLaw,
     post: [f32; MAX_CHANNELS],
     pre: f32,
-    /// The layouts in and out (for the surround matrix).
-    layouts: (ChannelLayout, ChannelLayout),
-    /// Mixing through `matrix` (a surround bed in or out).
-    surround: bool,
-    matrix: [[f32; MAX_SPEAKERS]; MAX_SPEAKERS],
-    /// The panner `matrix` was made for.
-    made_for: Option<SurroundPan>,
-    /// Each pair's gain at the end of the last block.
-    pairs: [[f32; MAX_SPEAKERS]; MAX_SPEAKERS],
+    /// Mixing through the surround panner's matrix (a bed in or out).
+    mix: Option<MatrixMix>,
     /// Rendered ahead: no meters, scope or shown values (a [`StripEcho`]
     /// publishes them when the audio is heard).
     quiet: bool,
@@ -69,11 +62,7 @@ impl ChannelStrip {
             law: FaderLaw::console(),
             post: [f32::NAN; MAX_CHANNELS],
             pre: f32::NAN,
-            layouts: (ChannelLayout::Stereo, ChannelLayout::Stereo),
-            surround: false,
-            matrix: [[0.0; MAX_SPEAKERS]; MAX_SPEAKERS],
-            made_for: None,
-            pairs: [[f32::NAN; MAX_SPEAKERS]; MAX_SPEAKERS],
+            mix: None,
             quiet: false,
             object: false,
             metered_elsewhere: false,
@@ -99,11 +88,8 @@ impl ChannelStrip {
     /// From `input` into `output` (the matrix when either is a surround
     /// bed).
     pub fn with_layouts(self, input: ChannelLayout, output: ChannelLayout) -> Self {
-        let mut m = [[0.0; MAX_SPEAKERS]; MAX_SPEAKERS];
-        let surround = surround::matrix(input, output, &SurroundPan::default(), &mut m);
         Self {
-            layouts: (input, output),
-            surround,
+            mix: MatrixMix::new(input, output),
             ..self
         }
     }
@@ -142,30 +128,8 @@ impl ChannelStrip {
             }
             self.pre = audible;
         }
-        let Some(post) = outs.first_mut() else {
-            return;
-        };
-        let ins = input.num_channels().min(MAX_SPEAKERS);
-        let outs_n = post.num_channels().min(MAX_SPEAKERS);
-        for s in 0..ins {
-            for d in 0..outs_n {
-                let target = self.matrix[s][d] * gain;
-                let last = self.pairs[s][d];
-                let from = if last.is_nan() { target } else { last };
-                self.pairs[s][d] = target;
-                if from == 0.0 && target == 0.0 {
-                    continue;
-                }
-                let step = ramp_step(from, target, m);
-                let mut g = from;
-                for (o, &x) in post.channel_mut(d)[off..off + m]
-                    .iter_mut()
-                    .zip(&input.channel(s)[off..off + m])
-                {
-                    g += step;
-                    *o += x * g;
-                }
-            }
+        if let (Some(post), Some(mix)) = (outs.first_mut(), self.mix.as_mut()) {
+            mix.mix(input, post, off, m, gain);
         }
     }
 
@@ -261,7 +225,7 @@ impl Processor<EngineContext> for ChannelStrip {
         });
         let (vca_volume, vca_mute): (&[SampleLane], &[SampleLane]) =
             auto.map_or((&[], &[]), |a| (&a.vca_volume, &a.vca_mute));
-        let surround_lanes = auto.map(|a| &a.surround).filter(|_| self.surround);
+        let surround_lanes = auto.map(|a| &a.surround).filter(|_| self.mix.is_some());
         let automated = vol_lane.is_some()
             || pan_lane.is_some()
             || mute_lane.is_some()
@@ -316,15 +280,12 @@ impl Processor<EngineContext> for ChannelStrip {
                     (pan + pan_mod).clamp(-1.0, 1.0),
                 )
             };
-            if self.surround {
+            if let Some(mix) = self.mix.as_mut() {
                 let mut pan = surround_at(&self.slots.surround, params, surround_lanes, at);
                 if self.object {
                     pan.lfe_db = surround::LFE_OFF_DB;
                 }
-                if self.made_for != Some(pan) {
-                    surround::matrix(self.layouts.0, self.layouts.1, &pan, &mut self.matrix);
-                    self.made_for = Some(pan);
-                }
+                mix.pan(&pan);
                 self.render_matrix(
                     input,
                     io.audio_out,
@@ -348,7 +309,7 @@ impl Processor<EngineContext> for ChannelStrip {
             rb.set(self.slots.volume, values.0);
             rb.set(self.slots.pan, values.1);
             rb.set(self.slots.mute, if values.2 { 1.0 } else { 0.0 });
-            if let Some(pan) = self.made_for {
+            if let Some(pan) = self.mix.as_ref().and_then(MatrixMix::made_for) {
                 set_surround(rb, &self.slots.surround, &pan);
             }
         }
@@ -391,9 +352,81 @@ impl Processor<EngineContext> for ObjectRenderer {
     }
 }
 
+/// One layout mixed into another through the surround panner's matrix
+/// (`faderframe_core::surround::matrix`): every pair of channels ramped to
+/// its new gain over a range. Strips and sends into or out of a bed.
+pub(crate) struct MatrixMix {
+    layouts: (ChannelLayout, ChannelLayout),
+    matrix: [[f32; MAX_SPEAKERS]; MAX_SPEAKERS],
+    /// The panner `matrix` was made for.
+    made_for: Option<SurroundPan>,
+    /// Each pair's gain at the end of the last range.
+    pairs: [[f32; MAX_SPEAKERS]; MAX_SPEAKERS],
+}
+
+impl MatrixMix {
+    /// `None` when neither side is a bed (the graph's channel rules do).
+    pub(crate) fn new(input: ChannelLayout, output: ChannelLayout) -> Option<Self> {
+        let mut matrix = [[0.0; MAX_SPEAKERS]; MAX_SPEAKERS];
+        let pan = SurroundPan::default();
+        surround::matrix(input, output, &pan, &mut matrix).then_some(Self {
+            layouts: (input, output),
+            matrix,
+            made_for: Some(pan),
+            pairs: [[f32::NAN; MAX_SPEAKERS]; MAX_SPEAKERS],
+        })
+    }
+
+    /// Place by `pan` (the matrix is remade when it changed).
+    pub(crate) fn pan(&mut self, pan: &SurroundPan) {
+        if self.made_for != Some(*pan) {
+            surround::matrix(self.layouts.0, self.layouts.1, pan, &mut self.matrix);
+            self.made_for = Some(*pan);
+        }
+    }
+
+    pub(crate) fn made_for(&self) -> Option<SurroundPan> {
+        self.made_for
+    }
+
+    /// Add frames `off..off + m` of `input` into `out`, each pair reaching
+    /// its matrix entry × `gain` at the end of the range.
+    pub(crate) fn mix(
+        &mut self,
+        input: &AudioBuffer,
+        out: &mut AudioBuffer,
+        off: usize,
+        m: usize,
+        gain: f32,
+    ) {
+        let ins = input.num_channels().min(MAX_SPEAKERS);
+        let outs = out.num_channels().min(MAX_SPEAKERS);
+        for s in 0..ins {
+            for d in 0..outs {
+                let target = self.matrix[s][d] * gain;
+                let last = self.pairs[s][d];
+                let from = if last.is_nan() { target } else { last };
+                self.pairs[s][d] = target;
+                if from == 0.0 && target == 0.0 {
+                    continue;
+                }
+                let step = ramp_step(from, target, m);
+                let mut g = from;
+                for (o, &x) in out.channel_mut(d)[off..off + m]
+                    .iter_mut()
+                    .zip(&input.channel(s)[off..off + m])
+                {
+                    g += step;
+                    *o += x * g;
+                }
+            }
+        }
+    }
+}
+
 /// The surround panner at `at`: each value from its lane where one drives
 /// it, else from its slot.
-fn surround_at(
+pub(crate) fn surround_at(
     slots: &[ParamSlot; 6],
     params: &faderframe_realtime::ParamTable,
     lanes: Option<&[Option<SampleLane>; 6]>,
