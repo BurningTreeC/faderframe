@@ -20,7 +20,7 @@ pub const FOURCC_AB24: u32 = u32::from_le_bytes(*b"AB24");
 /// DRM `FORMAT_MOD_LINEAR`.
 pub const MODIFIER_LINEAR: u64 = 0;
 /// Buffers kept for frames the toolkit may still show.
-const POOL: usize = 3;
+const POOL: usize = 4;
 
 /// The device extensions dmabuf export needs.
 fn extensions() -> [&'static std::ffi::CStr; 2] {
@@ -90,6 +90,8 @@ struct Slot {
     fd: OwnedFd,
     /// Not shown by the toolkit (any more).
     free: Arc<AtomicBool>,
+    /// The frame at which it was first seen free (the fallback's grace).
+    freed_at: Option<u64>,
 }
 
 /// Exports frames as dmabufs from a device opened by [`open_device`].
@@ -98,7 +100,17 @@ pub(crate) struct Exporter {
     fd_ext: ash::khr::external_memory_fd::Device,
     memory: vk::PhysicalDeviceMemoryProperties,
     slots: Vec<Slot>,
+    /// Frames handed out so far.
+    frame: u64,
+    /// The kernel exports the readers' fences of a dmabuf
+    /// (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`, Linux 6.0); without, a released
+    /// buffer waits [`GRACE`] frames instead.
+    sync_files: bool,
 }
+
+/// Frames a released buffer is left alone where its readers cannot be
+/// waited for.
+const GRACE: u64 = 2;
 
 /// A frame in a dmabuf: one plane, `fd` valid until `release` is dropped
 /// (the toolkit drops it when it no longer shows the frame).
@@ -147,6 +159,8 @@ impl Exporter {
             fd_ext,
             memory,
             slots: Vec::new(),
+            frame: 0,
+            sync_files: true,
         })
     }
 
@@ -160,23 +174,47 @@ impl Exporter {
         height: u32,
         stride: u32,
     ) -> Option<(&wgpu::Buffer, DmabufFrame)> {
+        self.frame += 1;
+        let frame = self.frame;
         // Buffers of another size go once they are free.
         self.slots.retain(|s| {
             (s.width == width && s.height == height) || !s.free.load(Ordering::Acquire)
         });
-        let index =
-            match self.slots.iter().position(|s| {
-                s.width == width && s.height == height && s.free.load(Ordering::Acquire)
-            }) {
-                Some(i) => i,
-                None if self.slots.len() < POOL => {
-                    let slot = self.make(device, width, height, stride)?;
-                    self.slots.push(slot);
-                    self.slots.len() - 1
-                }
-                None => return None,
-            };
-        let s = &self.slots[index];
+        for s in &mut self.slots {
+            if s.free.load(Ordering::Acquire) {
+                s.freed_at.get_or_insert(frame);
+            }
+        }
+        let sync_files = self.sync_files;
+        let index = match self.slots.iter().position(|s| {
+            s.width == width
+                && s.height == height
+                && s.free.load(Ordering::Acquire)
+                && (sync_files || s.freed_at.is_some_and(|f| frame - f >= GRACE))
+        }) {
+            Some(i) => i,
+            None if self.slots.len() < POOL => {
+                let slot = self.make(device, width, height, stride)?;
+                self.slots.push(slot);
+                self.slots.len() - 1
+            }
+            None => return None,
+        };
+        // The toolkit let go of it, but its GPU may still be reading it:
+        // Vulkan does not wait for that by itself (no implicit sync for
+        // exported memory), and a buffer written while still on screen
+        // showed tiles of two frames (striped meters).
+        if self.sync_files && !wait_for_readers(self.slots[index].fd.as_raw_fd(), 50) {
+            self.sync_files = false;
+            tracing::info!(
+                "dmabuf frames: the kernel exports no reader fences; released buffers wait {GRACE} frames"
+            );
+            if self.slots[index].freed_at.is_none_or(|f| frame - f < GRACE) {
+                return None;
+            }
+        }
+        let s = &mut self.slots[index];
+        s.freed_at = None;
         s.free.store(false, Ordering::Release);
         let frame = DmabufFrame {
             width,
@@ -307,6 +345,43 @@ impl Exporter {
             buffer,
             fd,
             free: Arc::new(AtomicBool::new(true)),
+            freed_at: None,
         })
     }
+}
+
+/// Wait, at most `limit_ms`, until whatever still reads or writes the
+/// dmabuf `fd` (the toolkit's renderer, through the kernel's implicit
+/// fences) is done. `false` when the kernel cannot say
+/// (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE` is Linux 6.0+); a wait that ran out
+/// counts as done.
+fn wait_for_readers(fd: RawFd, limit_ms: i32) -> bool {
+    #[repr(C)]
+    struct ExportSyncFile {
+        flags: u32,
+        fd: i32,
+    }
+    // _IOWR('b', 2, struct dma_buf_export_sync_file)
+    const EXPORT_SYNC_FILE: libc::c_ulong = 0xC008_6202;
+    // DMA_BUF_SYNC_WRITE: every fence a writer must wait for.
+    const SYNC_WRITE: u32 = 2;
+    let mut arg = ExportSyncFile {
+        flags: SYNC_WRITE,
+        fd: -1,
+    };
+    // SAFETY: `fd` is a dmabuf this exporter owns; the kernel writes `arg`.
+    let r = unsafe { libc::ioctl(fd, EXPORT_SYNC_FILE as _, &mut arg) };
+    if r != 0 || arg.fd < 0 {
+        return false;
+    }
+    // SAFETY: the kernel handed over a new sync-file descriptor.
+    let sync = unsafe { OwnedFd::from_raw_fd(arg.fd) };
+    let mut poll = libc::pollfd {
+        fd: sync.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd.
+    let _ = unsafe { libc::poll(&mut poll, 1, limit_ms) };
+    true
 }

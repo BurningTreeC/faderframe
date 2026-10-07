@@ -1190,6 +1190,7 @@ version = "0.12.0"
 dependencies = [
  "ash",
  "faderframe-ui-canvas",
+ "libc",
  "parley",
  "png",
  "pollster",

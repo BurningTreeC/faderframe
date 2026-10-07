@@ -24,6 +24,8 @@ tracing.workspace = true
 # uses).
 wgpu = { version = "30", default-features = false, features = ["vulkan", "std", "wgsl"] }
 ash = "0.38"
+# Waiting for a dmabuf's readers (DMA_BUF_IOCTL_EXPORT_SYNC_FILE, poll).
+libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # Shared D3D12 textures through wgpu's DX12 backend (the windows crate

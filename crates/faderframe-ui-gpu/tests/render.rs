@@ -245,14 +245,16 @@ fn frames_go_out_as_dmabufs() {
         let b = &pixels.pixels.as_ref()[y * 280..(y + 1) * 280];
         assert_eq!(a, b, "row {y}");
     }
-    // Shown: the next frames take other buffers, at most three at once.
+    // Shown: the next frames take other buffers, at most four at once.
     let second = r.render_to(70, 70, 1.0, true, paint).unwrap();
     let third = r.render_to(70, 70, 1.0, true, paint).unwrap();
+    let fourth = r.render_to(70, 70, 1.0, true, paint).unwrap();
     let Output::Dmabuf(second) = second else {
         panic!()
     };
     assert_ne!(second.fd, frame.fd);
     assert!(matches!(third, Output::Dmabuf(_)));
+    assert!(matches!(fourth, Output::Dmabuf(_)));
     assert!(
         matches!(
             r.render_to(70, 70, 1.0, true, paint).unwrap(),
@@ -267,7 +269,7 @@ fn frames_go_out_as_dmabufs() {
         panic!("no dmabuf after a release");
     };
     assert_eq!(again.fd, fd);
-    drop((second, third, again));
+    drop((second, third, fourth, again));
 }
 
 /// On Windows (D3D12) a frame can go out as a shared texture: the same
