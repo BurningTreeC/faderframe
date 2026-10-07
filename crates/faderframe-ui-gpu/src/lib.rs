@@ -140,10 +140,16 @@ impl GpuRenderer {
     /// choice of adapter is used (frames read back).
     pub fn new_on(luid: Option<[u8; 8]>) -> Result<Self, GpuError> {
         let fresh = wgpu::InstanceDescriptor::new_without_display_handle_from_env;
+        // One instance both chooses the adapter and requests it, and lives
+        // until the end. Listing D3D12 adapters makes a device on each; an
+        // instance dropped right after (its DLLs unloaded) while the
+        // software rasteriser's threads were still winding down took the
+        // process down (0xc0000005, Windows runners, WARP).
+        let instance = wgpu::Instance::new(fresh());
         #[cfg_attr(not(windows), allow(unused_mut))]
         let mut backends = fresh().backends;
         #[cfg(windows)]
-        if let Some(adapter) = d3d12_adapter(&wgpu::Instance::new(fresh()), luid) {
+        if let Some(adapter) = d3d12_adapter(&instance, luid) {
             match Self::on_adapter(adapter) {
                 Ok(r) => return Ok(r),
                 Err(e) => {
@@ -157,9 +163,17 @@ impl GpuRenderer {
         if backends.is_empty() {
             return Err(GpuError::Adapter("no other backend".into()));
         }
-        let mut desc = fresh();
-        desc.backends = backends;
-        let instance = wgpu::Instance::new(desc);
+        // Without D3D12 after it failed: an instance of its own (the first
+        // one stays alive until this returns).
+        let other;
+        let instance = if backends == fresh().backends {
+            &instance
+        } else {
+            let mut desc = fresh();
+            desc.backends = backends;
+            other = wgpu::Instance::new(desc);
+            &other
+        };
         let adapter =
             pollster::block_on(
                 instance.request_adapter(&wgpu::RequestAdapterOptions {
