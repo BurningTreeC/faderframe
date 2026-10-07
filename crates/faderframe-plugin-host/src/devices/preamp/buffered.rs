@@ -3,11 +3,19 @@
 use super::*;
 use faderframe_realtime::reservoir::{self, Reservoir, Segments, Timing};
 
+/// The least the worker buffers (and its chunk size).
 pub const BUFFER_LATENCY: usize = 128;
 
+/// How much a preamp buffers with device callbacks of `device_block`
+/// frames: at least one callback, so the worker always has a whole
+/// callback's time for a chunk (with less, part of each callback's circuit
+/// work would be done while the audio thread waits for it).
+pub fn buffer_delay(device_block: usize) -> usize {
+    device_block.clamp(BUFFER_LATENCY, 8192)
+}
+
 struct CircuitWorker {
-    channels: Vec<Preamp>,
-    stereo_seen: bool,
+    bank: PreampBank,
 }
 
 impl Segments for CircuitWorker {
@@ -21,56 +29,50 @@ impl Segments for CircuitWorker {
         timing: &Timing,
         publish: &mut dyn FnMut(&[&mut [f32]], usize),
     ) {
-        let mono = if !self.stereo_seen && self.channels.len() == 2 {
-            if channels[0] == channels[1] {
-                true
-            } else {
-                let (left, right) = self.channels.split_at_mut(1);
-                right[0].copy_runtime_state_from(&left[0]);
-                self.stereo_seen = true;
-                false
-            }
-        } else {
-            false
-        };
-        let count = self.channels.len();
-        let active = if mono { 1 } else { count };
+        // The audio, then the two control lanes (gain, master).
+        let count = self.bank.len();
+        if channels.len() < count + 2 {
+            return;
+        }
         let frames = channels.first().map_or(0, |c| c.len());
-        for i in 0..frames {
-            let gain = f64::from(channels[count][i]);
-            let master = f64::from(channels[count + 1][i]);
-            // Controls also follow the dormant channel, allowing an exact
-            // runtime-state copy before the first divergent stereo block.
-            for p in &mut self.channels {
-                p.set_controls(gain, master);
-            }
-            for (p, samples) in self
-                .channels
-                .iter_mut()
-                .zip(channels.iter_mut())
-                .take(active)
-            {
-                samples[i] = p.process(f64::from(samples[i])) as f32;
-            }
-            if mono {
-                channels[1][i] = channels[0][i];
-            }
-            if i + 1 == timing.first {
-                publish(channels, i + 1);
-            }
+        // What the host waits for comes first.
+        let first = if (1..frames).contains(&timing.first) {
+            timing.first
+        } else {
+            frames
+        };
+        // Live: the solver keeps to when this audio is played (with the
+        // reservoir's margin), rather than letting a block of samples that
+        // will not settle run on past it.
+        self.bank.set_deadline(
+            timing
+                .realtime
+                .then(|| timing.due + timing.delay.mul_f64(0.7)),
+        );
+        let active = {
+            let (audio, lanes) = channels.split_at_mut(count);
+            let active = self.bank.active(audio);
+            self.bank
+                .process(audio, active, 0..first, lanes[0], lanes[1]);
+            active
+        };
+        if first < frames {
+            publish(channels, first);
+            let (audio, lanes) = channels.split_at_mut(count);
+            self.bank
+                .process(audio, active, first..frames, lanes[0], lanes[1]);
         }
     }
 
     fn reset(&mut self, _: &()) {
-        self.channels.iter_mut().for_each(Preamp::reset);
-        self.stereo_seen = false;
+        self.bank.reset();
     }
 }
 
 enum Processing {
     Inline {
         dsp: PreampProcessor,
-        delay: Vec<[f32; BUFFER_LATENCY]>,
+        delay: Vec<Vec<f32>>,
         cursor: usize,
     },
     Worker(Box<Reservoir<CircuitWorker>>),
@@ -89,35 +91,36 @@ pub struct BufferedPreampProcessor {
 }
 
 impl BufferedPreampProcessor {
+    /// `delay`: [`buffer_delay`] of the device's callbacks (what the
+    /// instance reports as its latency, live or not).
     pub fn new(
         model: usize,
         params: ParamValues,
         config: &ProcessConfig,
         channels: usize,
         realtime: bool,
+        delay: usize,
     ) -> Result<Self, PluginError> {
+        let delay = delay.max(BUFFER_LATENCY);
         let dsp = PreampProcessor::new(model, params.clone(), config, channels)?;
         let processing = if realtime && (1..=reservoir::MAX_CHANNELS - 2).contains(&channels) {
             Processing::Worker(Box::new(
                 Reservoir::try_new(
                     reservoir::Config {
-                        delay: BUFFER_LATENCY,
+                        delay,
                         channels: channels + 2,
                         max_block: config.max_block_size as usize,
                         sample_rate: config.sample_rate,
                         offline: false,
                     },
-                    Box::new(CircuitWorker {
-                        channels: dsp.channels,
-                        stereo_seen: false,
-                    }),
+                    Box::new(CircuitWorker { bank: dsp.bank }),
                 )
                 .map_err(|e| PluginError::Failed(format!("Microphone preamp worker: {e}")))?,
             ))
         } else {
             Processing::Inline {
                 dsp,
-                delay: vec![[0.0; BUFFER_LATENCY]; channels],
+                delay: vec![vec![0.0; delay]; channels],
                 cursor: 0,
             }
         };
@@ -149,12 +152,13 @@ impl PluginProcessor for BufferedPreampProcessor {
             Processing::Inline { dsp, delay, cursor } => {
                 let status = dsp.process(ctx, io);
                 if let Some(out) = io.audio_out.first_mut() {
+                    let len = delay.first().map_or(1, Vec::len);
                     for (samples, ring) in out.channels_mut().zip(delay.iter_mut()) {
                         for (i, sample) in samples.iter_mut().enumerate() {
-                            std::mem::swap(sample, &mut ring[(*cursor + i) % BUFFER_LATENCY]);
+                            std::mem::swap(sample, &mut ring[(*cursor + i) % len]);
                         }
                     }
-                    *cursor = (*cursor + io.frames) % BUFFER_LATENCY;
+                    *cursor = (*cursor + io.frames) % len;
                 }
                 status
             }
@@ -258,10 +262,7 @@ mod tests {
                                 // Deterministic parity: scheduling cannot drop audio.
                                 offline: true,
                             },
-                            Box::new(CircuitWorker {
-                                channels: dsp.channels,
-                                stereo_seen: false,
-                            }),
+                            Box::new(CircuitWorker { bank: dsp.bank }),
                         )
                         .unwrap(),
                     )),
@@ -276,6 +277,7 @@ mod tests {
                     &config,
                     count,
                     false,
+                    BUFFER_LATENCY,
                 )
                 .unwrap();
                 let layout = ChannelLayout::from_channel_count(count);

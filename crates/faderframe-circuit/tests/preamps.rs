@@ -106,3 +106,61 @@ fn preamp_throughput() {
         );
     }
 }
+
+/// Cost by gain and level: per 128-frame block of one channel at 48 kHz
+/// (the budget is 2667 us), and Newton passes per solve. A test signal with
+/// harmonics and transients (a decaying chord, retriggered). Run with
+/// --ignored --nocapture in release mode.
+#[test]
+#[ignore]
+fn preamp_cost_by_gain() {
+    const SR: f64 = 48_000.0;
+    let signal = |level_db: f64| -> Vec<f64> {
+        let amp = 10f64.powf(level_db / 20.0);
+        (0..96_000)
+            .map(|n| {
+                let t = n as f64 / SR;
+                let env = (-(t % 0.25) * 12.0).exp();
+                let x = [110.0, 220.0 * 1.26, 330.0, 880.0]
+                    .iter()
+                    .map(|f| (std::f64::consts::TAU * f * t).sin())
+                    .sum::<f64>()
+                    / 4.0;
+                amp * env * x
+            })
+            .collect()
+    };
+    let models: Vec<usize> = std::env::var("MODELS")
+        .ok()
+        .map(|m| m.split(',').filter_map(|x| x.parse().ok()).collect())
+        .unwrap_or_else(|| (0..MODELS).collect());
+    for model in models {
+        for gain in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            for level in [-30.0, -18.0, -6.0] {
+                let mut p = Preamp::new(model, SR, gain, 0.0).unwrap();
+                let input = signal(level);
+                let before = p.solver_statistics();
+                let mut worst = 0f64;
+                let mut total = 0f64;
+                for block in input.chunks(128) {
+                    let start = Instant::now();
+                    for &x in block {
+                        std::hint::black_box(p.process(x));
+                    }
+                    let us = start.elapsed().as_secs_f64() * 1e6;
+                    worst = worst.max(us);
+                    total += us;
+                }
+                let after = p.solver_statistics();
+                let solves = (after.0 - before.0).max(1);
+                eprintln!(
+                    "model {model} gain {gain:.2} level {level:>4} dB: mean {:>7.1} us, worst {:>7.1} us / 128 frames, {:.2} passes/solve, {} unsettled",
+                    total / (input.len() / 128) as f64,
+                    worst,
+                    (after.1 - before.1) as f64 / solves as f64,
+                    after.2 - before.2,
+                );
+            }
+        }
+    }
+}

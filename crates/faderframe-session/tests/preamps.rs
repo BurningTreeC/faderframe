@@ -232,3 +232,81 @@ fn synth_preamp_master_changes_playing_audio_live_and_rendered_ahead() {
         s.stop_audio();
     }
 }
+
+/// Playback with a stereo British 73 at full gain on the demo's drums, as
+/// a user hears it: rendered ahead, then armed (live, through the preamp's
+/// worker). Prints xruns and late blocks; run with --ignored --nocapture.
+#[test]
+#[ignore]
+fn a_full_gain_preamp_plays_without_dropouts() {
+    use faderframe_audio::dummy::DummyBackend;
+    use faderframe_session::{AudioPreferences, TransportAction};
+    use std::time::{Duration, Instant};
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    s.start_audio(
+        vec![Box::new(DummyBackend::default())],
+        &AudioPreferences::default(),
+    )
+    .unwrap();
+    s.set_render_ahead(Some(Duration::from_millis(200)))
+        .unwrap();
+    let drums = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.name == "Drums")
+        .unwrap()
+        .id;
+    let model: usize = std::env::var("MODEL")
+        .ok()
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(0);
+    s.dispatch(Action::SetPreamp {
+        track: drums,
+        model: Some(model),
+    })
+    .unwrap();
+    let slot = s.project().track(drums).unwrap().preamp.clone().unwrap();
+    s.dispatch(Action::Edit(Command::SetPluginParameter {
+        track: drums,
+        plugin: slot.id,
+        parameter: ParameterId(0),
+        value: Some(1.0),
+    }))
+    .unwrap();
+    let run = |s: &mut Session, what: &str| {
+        s.engine().reset_metrics();
+        let late = s.render_ahead_status().1;
+        s.dispatch(Action::Transport(TransportAction::Play))
+            .unwrap();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(6) {
+            std::thread::sleep(Duration::from_millis(10));
+            s.tick(0.01);
+        }
+        s.dispatch(Action::Transport(TransportAction::Stop))
+            .unwrap();
+        let m = s.engine().metrics();
+        eprintln!(
+            "{what}: {} xruns, {} late blocks, callback mean {:.0} us, p99 {:.0} us, max {:.0} us",
+            m.xruns,
+            s.render_ahead_status().1 - late,
+            m.mean_ns as f64 / 1e3,
+            m.p99_ns as f64 / 1e3,
+            m.max_ns as f64 / 1e3,
+        );
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(300) {
+            std::thread::sleep(Duration::from_millis(10));
+            s.tick(0.01);
+        }
+    };
+    assert!(s.render_ahead_status().0 > 0);
+    run(&mut s, "rendered ahead");
+    s.dispatch(Action::Edit(Command::SetTrackRecordArm {
+        track: drums,
+        on: true,
+    }))
+    .unwrap();
+    run(&mut s, "armed (live)");
+}

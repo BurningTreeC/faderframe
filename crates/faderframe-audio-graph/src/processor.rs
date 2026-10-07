@@ -16,6 +16,10 @@ pub struct PrepareConfig {
     /// parallel executor stays on the calling thread: waking workers would
     /// cost more than it saves.
     pub parallel_min_ns: u64,
+    /// Frames per device callback, when a device runs (0: unknown or
+    /// offline). Processors that hand work to threads of their own buffer
+    /// at least this much, so the work has a whole callback's time.
+    pub device_block: usize,
 }
 
 impl PrepareConfig {
@@ -26,6 +30,7 @@ impl PrepareConfig {
             event_capacity: faderframe_midi::MidiBuffer::DEFAULT_CAPACITY,
             measure_nodes: true,
             parallel_min_ns: 40_000,
+            device_block: 0,
         }
     }
 }

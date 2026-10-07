@@ -363,6 +363,8 @@ pub struct BuiltinInstance {
     kind: Kind,
     channels: usize,
     realtime: bool,
+    /// Frames per device callback (0: unknown).
+    device_block: usize,
     descriptor: PluginDescriptor,
     params: ParamValues,
     tap: Option<Arc<AnalysisTap>>,
@@ -384,6 +386,9 @@ impl PluginInstance for BuiltinInstance {
     }
     fn configure_realtime(&mut self, realtime: bool) {
         self.realtime = realtime;
+    }
+    fn configure_device_block(&mut self, frames: usize) {
+        self.device_block = frames;
     }
     fn descriptor(&self) -> &PluginDescriptor {
         &self.descriptor
@@ -490,7 +495,7 @@ impl PluginInstance for BuiltinInstance {
         match self.kind {
             Kind::Preamp(_) => {
                 faderframe_circuit::preamp::Preamp::latency()
-                    + crate::devices::preamp::BUFFER_LATENCY as u32
+                    + crate::devices::preamp::buffer_delay(self.device_block) as u32
             }
             Kind::LatencyProbe => self.params.get(0).max(0.0) as u32,
             Kind::ProgramEq => crate::program_eq::LATENCY,
@@ -585,6 +590,7 @@ impl PluginInstance for BuiltinInstance {
                 config,
                 self.channels,
                 self.realtime,
+                crate::devices::preamp::buffer_delay(self.device_block),
             )?),
             Kind::Gain => Box::new(crate::devices::utility::UtilityProcessor::new(
                 params,
@@ -787,6 +793,7 @@ impl PluginFactory for BuiltinFactory {
         Ok(Box::new(BuiltinInstance {
             channels: 2,
             realtime: false,
+            device_block: 0,
             kind,
             descriptor: kind.descriptor(),
             params,

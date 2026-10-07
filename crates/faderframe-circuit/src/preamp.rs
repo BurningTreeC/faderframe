@@ -160,6 +160,34 @@ impl Preamp {
         self.output_scale = self.output_target;
     }
 
+    /// When the current audio is due (live use): past it, samples that do
+    /// not settle stop after a few passes instead of the full recovery
+    /// (half-step rescue), so a block of hard transients cannot take
+    /// several times its duration. `None` (rendering): always the full
+    /// solve.
+    pub fn set_realtime_deadline(&mut self, deadline: Option<std::time::Instant>) {
+        self.circuit.set_realtime_deadline(deadline);
+        if let Some(sim) = &mut self.line {
+            sim.set_realtime_deadline(deadline);
+        }
+    }
+
+    /// Samples whose recovery the realtime deadline cut short.
+    pub fn deadline_aborts(&self) -> u64 {
+        self.circuit.deadline_aborts() + self.line.as_ref().map_or(0, Simulation::deadline_aborts)
+    }
+
+    /// Solver work so far, both circuits together: (solves, Newton passes,
+    /// samples left unsettled, rebuilds).
+    pub fn solver_statistics(&self) -> (u64, u64, u64, u64) {
+        let (a, b, c, d) = self.circuit.statistics();
+        let (e, f, g, h) = self
+            .line
+            .as_ref()
+            .map_or((0, 0, 0, 0), Simulation::statistics);
+        (a + e, b + f, c + g, d + h)
+    }
+
     /// Wake an identically configured channel from this stream's exact history.
     /// Both channels must have received the same controls. Copies into existing
     /// storage, including solver caches and resampler history; never allocates.

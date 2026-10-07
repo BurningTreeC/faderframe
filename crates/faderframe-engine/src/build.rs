@@ -442,6 +442,8 @@ struct PluginCx<'a> {
     plugins: &'a mut PluginHost,
     process: ProcessConfig,
     realtime: bool,
+    /// Frames per device callback (0: unknown).
+    device_block: usize,
     warnings: &'a mut Vec<String>,
 }
 
@@ -536,6 +538,8 @@ impl PluginCx<'_> {
         };
         if let Ok(instance) = self.plugins.instance(slot) {
             instance.configure_realtime(self.realtime && !slot.bypass);
+            // The same in both graphs: latency must not depend on which.
+            instance.configure_device_block(self.device_block);
             instance
                 .configure_channels(spec.audio_outputs.first().map_or(0, |l| l.channel_count()));
         }
@@ -609,6 +613,13 @@ pub fn build_graph(
     let double_precision = plugins.double_precision();
     let mut pcx = PluginCx {
         realtime: plugins.realtime(),
+        // Offline renders have no device: their output must not depend on
+        // the block they are rendered in.
+        device_block: if plugins.realtime() {
+            config.device_block
+        } else {
+            0
+        },
         plugins,
         process: ProcessConfig {
             sample_rate: config.sample_rate,

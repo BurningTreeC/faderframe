@@ -318,6 +318,7 @@ pub fn create_with_epoch(
         ahead_tracks: Default::default(),
         ahead_strips: Default::default(),
         ahead_buses: false,
+        graph_device_block: 0,
         ahead_misses: Arc::new(AtomicU64::new(0)),
         varispeed: false,
     };
@@ -890,6 +891,8 @@ pub struct EngineController {
     ahead_strips: std::collections::HashSet<faderframe_core::TrackId>,
     /// Render buses ahead (and the strips that reach them).
     ahead_buses: bool,
+    /// The device callback size the graph was built for.
+    graph_device_block: usize,
     ahead_misses: Arc<AtomicU64>,
     /// Varispeed is on.
     varispeed: bool,
@@ -929,6 +932,12 @@ impl EngineController {
 
     pub fn stream_buffer_size(&self) -> u32 {
         self.shared.stream_buffer_size.load(Ordering::Relaxed)
+    }
+
+    /// The device's callbacks changed size since the graph was built: a
+    /// rebuild lets buffered devices (the preamps) follow.
+    pub fn device_block_changed(&self) -> bool {
+        self.stream_buffer_size() as usize != self.graph_device_block
     }
 
     /// True while the running graph does not match the stream rate.
@@ -1482,6 +1491,8 @@ impl EngineController {
             PrepareConfig::new(self.config.sample_rate as f64, self.config.max_block_size);
         prepare.measure_nodes = self.config.measure_nodes;
         prepare.parallel_min_ns = self.config.parallel_min_ns;
+        prepare.device_block = self.shared.stream_buffer_size.load(Ordering::Relaxed) as usize;
+        self.graph_device_block = prepare.device_block;
         let sets = self.ahead_plan(project);
         let lookahead = self.ahead.as_ref().map(|a| a.lookahead);
         let plan = lookahead.map(|lookahead| crate::build::AheadPlan {

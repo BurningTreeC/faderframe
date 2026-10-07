@@ -124,6 +124,10 @@ opt-level = 3
 [profile.dev.package.faderframe-speech]
 opt-level = 3
 
+# The preamps' circuit solver: real time needs it optimised.
+[profile.dev.package.faderframe-circuit]
+opt-level = 3
+
 [profile.release]
 debug = "line-tables-only"
 lto = "thin"

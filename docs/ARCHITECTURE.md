@@ -2543,12 +2543,23 @@ with other tracks and sends; bounced clips skip that leading delay instead.
 The six models retain upstream impedances, resting controls, and measured
 calibration curves. British 73 includes its separate line driver. Each channel
 has independent circuit state and uses fixed 2x oversampling with reported
-latency. Live preamps run on a dedicated worker through GainStageFx's generic
-reservoir in `faderframe-realtime`, adding exactly 128 host samples, reported
-alongside the FIR latency for graph compensation. Monitoring stays available:
-the live signal necessarily incurs that delay (2.67 ms at 48 kHz). Offline
-and already anticipated chains use inline DSP plus the same delay, keeping
-renders deterministic without adding nested workers. Parameter values travel
+latency. A track's channels are solved side by side (`PreampBank`: the
+calling thread and helper threads of a `WorkerPool`, which adopt its
+scheduling, take a channel each; the output is what one thread computes).
+Live preamps run on a dedicated worker through GainStageFx's generic
+reservoir in `faderframe-realtime`, buffering one device callback (at least
+128 host samples, `preamp::buffer_delay`; the engine passes the callback
+size as `PrepareConfig::device_block` and rebuilds when it changes),
+reported alongside the FIR latency for graph compensation: with less, part
+of each callback's circuit work would be done while the audio thread
+waits. Live, the solver keeps to when the audio is due
+(`Preamp::set_realtime_deadline`): past it, a sample that will not settle
+stops after a few passes instead of the half-step rescue, so a block of hard
+transients (the German 76 at full gain on drums costs up to 3.5× real time
+for a block) cannot drop out. Monitoring stays available: the live signal
+necessarily incurs that delay (2.67 ms at 48 kHz and up to 128-frame
+callbacks). Offline and already anticipated chains use inline DSP plus the
+same delay and the full solve, keeping renders deterministic. Parameter values travel
 with each input sample in fixed storage; resets discard the previous epoch.
 Worker underruns join the existing xrun counter. Live graphs honor processors'
 preferred 128-frame quantum so

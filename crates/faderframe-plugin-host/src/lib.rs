@@ -325,6 +325,9 @@ pub trait PluginInstance {
     /// Whether processing has a live deadline. Offline/ahead graphs can run
     /// buffered built-ins synchronously, with identical reported latency.
     fn configure_realtime(&mut self, _realtime: bool) {}
+    /// Frames per device callback (0: unknown, offline), supplied before
+    /// activation: buffered built-ins buffer at least this much.
+    fn configure_device_block(&mut self, _frames: usize) {}
     fn descriptor(&self) -> &PluginDescriptor;
     fn parameters(&self) -> &[ParameterInfo];
     fn parameter(&mut self, id: ParameterId) -> Option<f64>;

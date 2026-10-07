@@ -37,11 +37,14 @@ track can enqueue work before the next chunk needs its output. All chunks
 share the device callback's remaining budget, with 10% (at least 100 us)
 reserved for downstream work; they do not infer separate deadlines from pace.
 
-Live preamps use that worker with an exact 128-sample reservoir, in addition
-to FIR latency. Automation travels per input sample in two extra reservoir lanes, keeping
+Live preamps use that worker with a reservoir of one device callback (at
+least 128 samples), in addition to FIR latency, and give the solver the
+audio's due time as its realtime deadline (`Preamp::set_realtime_deadline`).
+A track's channels are solved in parallel by the worker and helper threads.
+Automation travels per input sample in two extra reservoir lanes, keeping
 host callback sizes and structural wait budgets intact.
-Offline/ahead graphs instead process inline with the same 128-sample delay;
-the host reports the same latency in both modes. Underruns are included in
+Offline/ahead graphs instead process inline with the same delay and no
+deadline; the host reports the same latency in both modes. Underruns are included in
 the engine's xrun counter. Layouts above the reservoir's channel limit retain
 the synchronous path and identical latency.
 

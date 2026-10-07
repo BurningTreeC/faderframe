@@ -1951,6 +1951,13 @@ impl Session {
         {
             self.notify(NoticeLevel::Error, e.to_string());
         }
+        // The device's callbacks changed size: the preamps buffer one.
+        if self.engine.device_block_changed()
+            && self.project.tracks.iter().any(|t| t.preamp.is_some())
+            && let Err(e) = self.sync(Impact::Graph)
+        {
+            self.notify(NoticeLevel::Error, e.to_string());
+        }
         for t in &self.project.tracks {
             if let Some(m) = self.engine.take_meter(t.id) {
                 self.meters.entry(t.id).or_default().update(&m, dt);
