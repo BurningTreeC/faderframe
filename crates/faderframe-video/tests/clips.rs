@@ -41,13 +41,18 @@ fn make_clip(path: &Path, encoder: &str, mux: &str, sound: bool) {
         String::new()
     };
     let desc = format!(
-        "appsrc name=src format=time caps=video/x-raw,format=RGBA,width={W},height={H},framerate={FPS}/1 ! videoconvert ! {encoder} ! queue ! {mux} name=m ! filesink location=\"{}\"{sound}",
-        path.display()
+        "appsrc name=src format=time caps=video/x-raw,format=RGBA,width={W},height={H},framerate={FPS}/1 ! videoconvert ! {encoder} ! queue ! {mux} name=m ! filesink name=out{sound}"
     );
     let pipeline = gst::parse::launch(&desc)
         .unwrap()
         .downcast::<gst::Pipeline>()
         .unwrap();
+    // The path as a property: in a pipeline description Windows'
+    // backslashes would be escapes.
+    pipeline
+        .by_name("out")
+        .unwrap()
+        .set_property("location", path.to_string_lossy().as_ref());
     let src = pipeline
         .by_name("src")
         .unwrap()

@@ -114,9 +114,27 @@ impl Pipeline {
         Ok(())
     }
 
-    /// A decoder for a parsed stream, its raw output linked to `next` (the
-    /// sink pad of what follows); the decoder's sink pad.
-    pub(crate) fn decoder_into(&self, next: gst::Pad) -> Result<gst::Pad> {
+    /// A decoder for the parsed stream on `parsed`, its raw output linked to
+    /// `next` (the sink pad of what follows); the decoder's sink pad. JPEG
+    /// always goes to the software `jpegdec`: exact on every system (Apple
+    /// Silicon's hardware decoder, which `decodebin` prefers, got proxies'
+    /// colours wrong), and fast enough for any proxy.
+    pub(crate) fn decoder_into(&self, parsed: &gst::Pad, next: gst::Pad) -> Result<gst::Pad> {
+        let caps = parsed
+            .current_caps()
+            .unwrap_or_else(|| parsed.query_caps(None));
+        let jpeg = caps.structure(0).is_some_and(|s| s.name() == "image/jpeg");
+        if jpeg && let Ok(dec) = make("jpegdec") {
+            self.pipeline.add(&dec)?;
+            dec.static_pad("src")
+                .ok_or_else(|| VideoError::Gst("jpegdec without a source".into()))?
+                .link(&next)
+                .map_err(|e| VideoError::Gst(format!("jpegdec: {e:?}")))?;
+            dec.sync_state_with_parent()?;
+            return dec
+                .static_pad("sink")
+                .ok_or_else(|| VideoError::Gst("jpegdec without a sink".into()));
+        }
         let decode = make("decodebin")?;
         self.pipeline.add(&decode)?;
         decode.connect_pad_added(move |_, pad| {

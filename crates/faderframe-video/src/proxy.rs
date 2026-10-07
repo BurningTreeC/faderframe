@@ -69,9 +69,9 @@ pub fn make_proxy(
     let next = elements[0]
         .static_pad("sink")
         .ok_or_else(|| VideoError::Gst("videoconvertscale without a sink".into()))?;
-    p.parse(move |p, kind, n, _| {
+    p.parse(move |p, kind, n, pad| {
         (kind == Kind::Picture && n == 0)
-            .then(|| p.decoder_into(next.clone()).ok())
+            .then(|| p.decoder_into(pad, next.clone()).ok())
             .flatten()
     })?;
     let result = p.run(cancel, progress);

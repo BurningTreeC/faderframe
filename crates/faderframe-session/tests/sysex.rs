@@ -125,13 +125,15 @@ fn looped_sysex_goes_out_once_per_pass() {
     let got = until_sent(&mut s, &captured, 3, Duration::from_secs(12));
     s.stop_audio();
     assert!(got.len() >= 3, "{got:?}");
-    // Never twice in a pass. The dummy device catches up after oversleeping
-    // (up to 500 ms of audio at once on a busy machine), which brings two
-    // passes closer on the wall clock — but not to within a second.
+    // Never twice in a pass: a pass sent again comes at once (a clock
+    // wobble taken for a jump re-sent within milliseconds). The dummy
+    // device catches up after oversleeping (1.5 s of audio at once on a
+    // busy CI Mac), which brings two passes closer on the wall clock -- but
+    // not to within a quarter of a second.
     for pair in got.windows(2) {
         let apart = pair[1].0.saturating_sub(pair[0].0);
         assert!(
-            apart > 1_000_000_000,
+            apart > 250_000_000,
             "sent {} ms apart: {got:?}",
             apart / 1_000_000
         );
