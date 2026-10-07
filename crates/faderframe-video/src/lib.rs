@@ -13,6 +13,8 @@
 //! - [`audio`]: a sound stream as a project's media, aligned to the
 //!   picture's time zero.
 //! - [`mux`]: a movie with the picture copied untouched and new sound.
+//! - [`service`]: decoders on threads and a frame cache, answering at once
+//!   with the best frame there is.
 //!
 //! Each job decodes only the streams it needs: parsing (`parsebin`) comes
 //! first and only the stream asked for is decoded.
@@ -25,11 +27,13 @@ pub mod index;
 pub mod mux;
 pub mod probe;
 pub mod proxy;
+pub mod service;
 mod streams;
 
 pub use decode::{Decoder, Frame, fit};
 pub use index::FrameIndex;
 pub use probe::{AudioStream, MediaInfo, VideoStream};
+pub use service::{FrameService, Media, Picture, Want};
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

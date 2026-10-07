@@ -287,3 +287,108 @@ fn a_long_gop_clip_is_exact_frame_for_frame() {
     }
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// The service: a still frame arrives exact (a keyframe or an earlier
+/// frame meanwhile), playing reads ahead in order, the proxy stands in.
+#[test]
+fn the_service_answers_at_once_and_catches_up() {
+    use faderframe_video::{FrameService, Media, Want};
+    use std::time::{Duration, Instant};
+    let d = dir().join("service");
+    std::fs::create_dir_all(&d).unwrap();
+    let clip = d.join("svc.mkv");
+    make_clip(&clip, "jpegenc", "matroskamux", false);
+    let cancel = AtomicBool::new(false);
+    let ix = std::sync::Arc::new(index::index(&clip, &cancel, |_| {}).unwrap());
+    let svc = FrameService::new(64 << 20);
+    let media = Media {
+        original: clip.clone(),
+        index: ix.clone(),
+        size: (W, H),
+        par: (1, 1),
+        proxy: None,
+    };
+    svc.set_media(7, media.clone());
+    let until = |f: &mut dyn FnMut() -> bool| {
+        let end = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < end {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    };
+    // Nothing yet, then the exact frame.
+    let t = ix.times[40] + 10_000_000;
+    let mut got = None;
+    assert!(until(&mut || {
+        got = svc.picture(7, t, (W, H), Want::Still).filter(|p| p.exact);
+        got.is_some()
+    }));
+    let p = got.unwrap();
+    assert_eq!(p.number, 40);
+    assert_frame(&p.frame, 40);
+    // Outside the video: nothing.
+    assert!(svc.picture(7, ix.end + 1, (W, H), Want::Still).is_none());
+    // Playing: frame after frame, each exact once there.
+    for n in 10..40u32 {
+        let t = ix.times[n as usize];
+        let mut got = None;
+        assert!(until(&mut || {
+            got = svc.picture(7, t, (W, H), Want::Play).filter(|p| p.exact);
+            got.is_some()
+        }));
+        let p = got.unwrap();
+        assert_eq!(p.number, n as usize);
+        assert_frame(&p.frame, n);
+    }
+    // With a proxy: playing reads it (its size), still frames come sharp.
+    let proxy = d.join("svc.proxy.mkv");
+    make_proxy(
+        &clip,
+        &proxy,
+        (W, H, (1, 1)),
+        ProxySpec {
+            height: 120,
+            quality: 80,
+        },
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    svc.set_media(
+        7,
+        Media {
+            proxy: Some((proxy, (160, 120))),
+            ..media
+        },
+    );
+    let t = ix.times[60];
+    let mut got = None;
+    assert!(until(&mut || {
+        got = svc
+            .picture(7, t, (W, H), Want::Play)
+            .filter(|p| p.number == 60);
+        got.is_some()
+    }));
+    assert_eq!(got.take().unwrap().frame.width, 160, "the proxy while playing");
+    assert!(until(&mut || {
+        got = svc
+            .picture(7, t, (W, H), Want::Still)
+            .filter(|p| p.exact && p.number == 60);
+        got.is_some()
+    }));
+    let p = got.unwrap();
+    assert_eq!(p.frame.width, W, "sharp when stopped");
+    assert_frame(&p.frame, 60);
+    // Thumbnails.
+    let mut thumb = None;
+    assert!(until(&mut || {
+        thumb = svc.thumbnail(7, 5, 60);
+        thumb.is_some()
+    }));
+    assert_eq!(thumb.unwrap().height, 60);
+    svc.remove(7);
+    assert!(svc.picture(7, t, (W, H), Want::Still).is_none());
+}
