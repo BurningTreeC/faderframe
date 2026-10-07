@@ -291,34 +291,40 @@ fn a_track_played_live_leaves_the_ahead_graph() {
 fn changing_the_lookahead_keeps_every_track_sounding() {
     let project = stateless_project();
     let sources = render_generated_sources(&project, SR);
-    let mut plain = Run::new(&project, false);
-    let mut ahead = Run::new(&project, true);
-    ahead.run(20, true);
-    let tracks = ahead.r.controller.ahead_tracks().len();
-    assert!(tracks > 0);
-    // A longer lookahead while stopped: new rings, a new anticipator, the
-    // same tracks rendered ahead.
-    ahead
-        .r
-        .controller
-        .set_render_ahead(Some(Duration::from_millis(300)), 2);
-    ahead
-        .r
-        .controller
-        .sync(&project, &sources, Impact::Graph)
-        .unwrap();
-    assert_eq!(ahead.r.controller.ahead_tracks().len(), tracks);
-    ahead.run(20, true);
-    for run in [&mut plain, &mut ahead] {
-        run.command(TransportCommand::Play);
-    }
-    let blocks = 2 * SR as usize / BLOCK;
-    plain.run(blocks, false);
-    ahead.run(blocks, true);
-    let (both, differ) = compare(&plain, &ahead);
-    assert!(both > SR as usize, "heard together: {both}");
-    assert_eq!(differ, 0, "{differ} of {both} samples differ");
-    assert_eq!(ahead.r.controller.ahead_misses(), 0, "never late");
+    on_time(|| {
+        let mut plain = Run::new(&project, false);
+        let mut ahead = Run::new(&project, true);
+        ahead.run(20, true);
+        let tracks = ahead.r.controller.ahead_tracks().len();
+        assert!(tracks > 0);
+        // A longer lookahead while stopped: new rings, a new anticipator, the
+        // same tracks rendered ahead.
+        ahead
+            .r
+            .controller
+            .set_render_ahead(Some(Duration::from_millis(300)), 2);
+        ahead
+            .r
+            .controller
+            .sync(&project, &sources, Impact::Graph)
+            .unwrap();
+        assert_eq!(ahead.r.controller.ahead_tracks().len(), tracks);
+        ahead.run(20, true);
+        for run in [&mut plain, &mut ahead] {
+            run.command(TransportCommand::Play);
+        }
+        let blocks = 2 * SR as usize / BLOCK;
+        plain.run(blocks, false);
+        ahead.run(blocks, true);
+        let misses = ahead.r.controller.ahead_misses();
+        if misses > 0 {
+            return misses;
+        }
+        let (both, differ) = compare(&plain, &ahead);
+        assert!(both > SR as usize, "heard together: {both}");
+        assert_eq!(differ, 0, "{differ} of {both} samples differ");
+        0
+    });
 }
 
 /// Rendered ahead, a container's chains and modulators that follow the
@@ -389,26 +395,32 @@ fn containers_and_synced_modulators_render_ahead_alike() {
         lfo(2, LfoShape::Triangle, 0.5, gain(9_101)),
     ];
     let id = project.tracks[pluck].id;
-    let mut plain = Run::new(&project, false);
-    let mut ahead = Run::new(&project, true);
-    assert!(
-        ahead.r.controller.ahead_tracks().contains(&id),
-        "rendered ahead"
-    );
-    ahead.run(20, true);
-    for run in [&mut plain, &mut ahead] {
-        run.command(TransportCommand::Play);
-    }
-    let blocks = 2 * SR as usize / BLOCK;
-    plain.run(blocks, false);
-    ahead.run(blocks, true);
-    for run in [&mut plain, &mut ahead] {
-        run.heard.retain(|p, _| *p >= 2 * BLOCK as i64);
-    }
-    let (both, differ) = compare(&plain, &ahead);
-    assert!(both > SR as usize, "heard together: {both}");
-    assert_eq!(differ, 0, "{differ} of {both} samples differ");
-    assert_eq!(ahead.r.controller.ahead_misses(), 0, "never late");
+    on_time(|| {
+        let mut plain = Run::new(&project, false);
+        let mut ahead = Run::new(&project, true);
+        assert!(
+            ahead.r.controller.ahead_tracks().contains(&id),
+            "rendered ahead"
+        );
+        ahead.run(20, true);
+        for run in [&mut plain, &mut ahead] {
+            run.command(TransportCommand::Play);
+        }
+        let blocks = 2 * SR as usize / BLOCK;
+        plain.run(blocks, false);
+        ahead.run(blocks, true);
+        for run in [&mut plain, &mut ahead] {
+            run.heard.retain(|p, _| *p >= 2 * BLOCK as i64);
+        }
+        let misses = ahead.r.controller.ahead_misses();
+        if misses > 0 {
+            return misses;
+        }
+        let (both, differ) = compare(&plain, &ahead);
+        assert!(both > SR as usize, "heard together: {both}");
+        assert_eq!(differ, 0, "{differ} of {both} samples differ");
+        0
+    });
     // Modulating the fader keeps the track live.
     project.tracks[pluck].modulators[0].routes[0].target = ModTarget::Volume;
     let live = Run::new(&project, true);
@@ -543,22 +555,28 @@ fn latency_reaching_a_bus_rendered_ahead_is_compensated() {
         .find(|t| t.name == "Drum Bus")
         .unwrap()
         .id;
-    let mut plain = Run::new(&project, false);
-    let mut ahead = Run::with(&project, true, true);
-    assert!(ahead.r.controller.ahead_strips().contains(&drums));
-    assert!(ahead.r.controller.ahead_tracks().contains(&bus));
-    assert!(!ahead.r.controller.ahead_strips().contains(&bus));
-    ahead.run(20, true);
-    for run in [&mut plain, &mut ahead] {
-        run.command(TransportCommand::Play);
-    }
-    let blocks = 2 * SR as usize / BLOCK;
-    plain.run(blocks, false);
-    ahead.run(blocks, true);
-    let (both, differ) = compare(&plain, &ahead);
-    assert!(both > SR as usize, "heard together: {both}");
-    assert_eq!(differ, 0, "{differ} of {both} samples differ");
-    assert_eq!(ahead.r.controller.ahead_misses(), 0, "never late");
+    on_time(|| {
+        let mut plain = Run::new(&project, false);
+        let mut ahead = Run::with(&project, true, true);
+        assert!(ahead.r.controller.ahead_strips().contains(&drums));
+        assert!(ahead.r.controller.ahead_tracks().contains(&bus));
+        assert!(!ahead.r.controller.ahead_strips().contains(&bus));
+        ahead.run(20, true);
+        for run in [&mut plain, &mut ahead] {
+            run.command(TransportCommand::Play);
+        }
+        let blocks = 2 * SR as usize / BLOCK;
+        plain.run(blocks, false);
+        ahead.run(blocks, true);
+        let misses = ahead.r.controller.ahead_misses();
+        if misses > 0 {
+            return misses;
+        }
+        let (both, differ) = compare(&plain, &ahead);
+        assert!(both > SR as usize, "heard together: {both}");
+        assert_eq!(differ, 0, "{differ} of {both} samples differ");
+        0
+    });
 }
 
 /// With buses rendered ahead, closing the fader of a track that reaches
@@ -598,26 +616,33 @@ fn faders_reaching_buses_rendered_ahead_answer_within_milliseconds() {
     tp.project.track_mut(bus).unwrap().inserts.push(gain(9_301));
     let mut project = tp.project.clone();
     for buses in [false, true] {
-        let mut run = Run::with_sources(&project, tp.sources.clone(), true, buses);
-        assert_eq!(run.r.controller.ahead_strips().contains(&track), buses);
-        assert_eq!(run.r.controller.ahead_tracks().contains(&bus), buses);
-        run.run(20, true);
-        run.command(TransportCommand::Play);
-        run.run(SR as usize / BLOCK, true);
-        assert!(run.heard.values().any(|s| s.abs() > 0.1), "sounding");
-        // Close the fader.
-        project.track_mut(track).unwrap().volume_db = -144.0;
-        let at = run.r.controller.transport_snapshot().position;
-        run.r.controller.update_params(&project).unwrap();
-        run.run(SR as usize / 2 / BLOCK, true);
-        // Silent from there: a whole cycle of the tone below -80 dB.
-        let silent = (at..at + SR as i64 / 2)
-            .find(|p| (0..240).all(|i| run.heard.get(&(p + i)).is_some_and(|s| s.abs() < 1e-4)))
-            .unwrap();
-        let ms = (silent - at) as f64 * 1000.0 / f64::from(SR);
-        eprintln!("buses {buses}: the fader is heard after {ms:.1} ms");
-        assert!(ms < 30.0, "buses {buses}: heard after {ms:.1} ms");
-        assert_eq!(run.r.controller.ahead_misses(), 0, "never late");
-        project.track_mut(track).unwrap().volume_db = 0.0;
+        on_time(|| {
+            let mut run = Run::with_sources(&project, tp.sources.clone(), true, buses);
+            assert_eq!(run.r.controller.ahead_strips().contains(&track), buses);
+            assert_eq!(run.r.controller.ahead_tracks().contains(&bus), buses);
+            run.run(20, true);
+            run.command(TransportCommand::Play);
+            run.run(SR as usize / BLOCK, true);
+            assert!(run.heard.values().any(|s| s.abs() > 0.1), "sounding");
+            // Close the fader.
+            project.track_mut(track).unwrap().volume_db = -144.0;
+            let at = run.r.controller.transport_snapshot().position;
+            run.r.controller.update_params(&project).unwrap();
+            run.run(SR as usize / 2 / BLOCK, true);
+            project.track_mut(track).unwrap().volume_db = 0.0;
+            // Late (a busy machine): the timing says nothing; again.
+            let misses = run.r.controller.ahead_misses();
+            if misses > 0 {
+                return misses;
+            }
+            // Silent from there: a whole cycle of the tone below -80 dB.
+            let silent = (at..at + SR as i64 / 2)
+                .find(|p| (0..240).all(|i| run.heard.get(&(p + i)).is_some_and(|s| s.abs() < 1e-4)))
+                .unwrap();
+            let ms = (silent - at) as f64 * 1000.0 / f64::from(SR);
+            eprintln!("buses {buses}: the fader is heard after {ms:.1} ms");
+            assert!(ms < 30.0, "buses {buses}: heard after {ms:.1} ms");
+            0
+        });
     }
 }

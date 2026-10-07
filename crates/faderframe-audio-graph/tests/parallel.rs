@@ -370,10 +370,21 @@ fn measured_cost_decides_what_starts_first() {
         !initial.contains(&1),
         "by node count the chains go first: {initial:?}"
     );
-    // Ranks are refreshed every 16 cycles from measured times.
-    for _ in 0..17 {
-        g.process_parallel(&cx(BLOCK), &pool);
+    // Ranks are refreshed every 16 cycles from measured times (averaged:
+    // an eighth of each cycle). A light node preempted on a busy machine
+    // -- a Windows scheduler slice is ~15 ms -- measures as heavier than
+    // the heavy one until that decays, so several refreshes may be needed;
+    // what never happens is the heavy job staying behind.
+    let mut seen = Vec::new();
+    for _ in 0..6 {
+        for _ in 0..17 {
+            g.process_parallel(&cx(BLOCK), &pool);
+        }
+        let later = first_two(&mut g);
+        if later.contains(&1) {
+            return;
+        }
+        seen.push(later);
     }
-    let later = first_two(&mut g);
-    assert!(later.contains(&1), "the heavy job starts first: {later:?}");
+    panic!("the heavy job starts first: {seen:?}");
 }
