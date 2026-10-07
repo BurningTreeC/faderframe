@@ -837,6 +837,12 @@ impl CanvasWidget {
         // Payloads (clips) dragged from another window's views.
         let payload = gtk::DropTarget::new(glib::Type::STRING, gdk::DragAction::COPY);
         payload.set_preload(true);
+        // Only FaderFrame's own drags (started in this process). A file
+        // manager offers its files as text too: taken here, where they are
+        // no payload, they never reached the file drop above.
+        payload.connect_accept(|_, drop| {
+            drop.drag().is_some() && drop.formats().contains_type(glib::Type::STRING)
+        });
         let over = |w: &CanvasWidget, t: &gtk::DropTarget, pos: Option<Point>| -> gdk::DragAction {
             let text = t.value().and_then(|v| v.get::<String>().ok());
             let Some(text) = text.filter(|s| s.starts_with("clips:")) else {
