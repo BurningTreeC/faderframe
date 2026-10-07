@@ -43,7 +43,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libgtk-4-dev pkg-config libjack-jackd2-dev libasound2-dev \
-            libpipewire-0.3-dev libclang-dev librsvg2-common adwaita-icon-theme
+            libpipewire-0.3-dev libclang-dev librsvg2-common adwaita-icon-theme \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
         run: cargo build --release -p faderframe-app
@@ -68,7 +70,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: System dependencies
-        run: brew install gtk4 adwaita-icon-theme librsvg pkgconf
+        run: brew install gtk4 adwaita-icon-theme librsvg pkgconf gstreamer
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
         run: cargo build --release -p faderframe-app
@@ -93,6 +95,9 @@ jobs:
           update: true
           install: >-
             mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-gstreamer
+            mingw-w64-ucrt-x86_64-gst-plugins-base
+            mingw-w64-ucrt-x86_64-gst-plugins-good
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-adwaita-icon-theme
             mingw-w64-ucrt-x86_64-librsvg

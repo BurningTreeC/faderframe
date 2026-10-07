@@ -1,0 +1,27 @@
+[package]
+name = "faderframe-video"
+description = "Video for FaderFrame: probing, frame index, exact-frame decoding, proxies, audio from video and muxing, on GStreamer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-core.workspace = true
+faderframe-audio-files.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+gst.workspace = true
+gst-app.workspace = true
+gst-video.workspace = true
+gst-pbutils.workspace = true
+
+[dev-dependencies]
+gst.workspace = true
+gst-app.workspace = true

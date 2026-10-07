@@ -102,6 +102,18 @@ define_id!(
     /// A scene (row) of the clip launcher.
     SceneId, "scene#"
 );
+define_id!(
+    /// A video file the project shows.
+    VideoSourceId, "video#"
+);
+define_id!(
+    /// A placed stretch of a video on a video track.
+    VideoClipId, "vclip#"
+);
+define_id!(
+    /// A video track.
+    VideoTrackId, "vtrack#"
+);
 
 /// Identifier of a parameter *within* a processor or plugin.
 ///

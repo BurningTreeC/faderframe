@@ -13,13 +13,14 @@ pub mod id;
 pub mod pan;
 pub mod paths;
 pub mod surround;
+pub mod timecode;
 
 pub use channel::ChannelLayout;
 pub use gain::{Decibels, FaderLaw, db_to_gain, gain_to_db};
 pub use id::{
     AudioSourceId, AutomationLaneId, ClipId, ClipLinkId, GroupId, IdAllocator, MarkerId,
     MidiMappingId, ModulatorId, NoteId, ParameterId, PluginInstanceId, SceneId, SectionId, SendId,
-    SongId, TrackId,
+    SongId, TrackId, VideoClipId, VideoSourceId, VideoTrackId,
 };
 pub use pan::PanLaw;
 pub use surround::{SurroundFormat, SurroundPan, SurroundParam};
