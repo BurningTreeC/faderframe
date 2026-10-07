@@ -1,0 +1,16 @@
+[package]
+name = "faderframe-binaural"
+description = "Binaural monitoring for FaderFrame: surround beds on headphones through measured HRIRs (SADIE II, KU100)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-core.workspace = true
+realfft.workspace = true
+thiserror.workspace = true

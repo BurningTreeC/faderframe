@@ -104,8 +104,14 @@ fn tool_version(version: &str) -> [u8; 3] {
 }
 
 /// The `dbmd` chunk's payload for `m` (`version`: FaderFrame's, e.g.
-/// "0.11.0"); `binaural`: each object's mode (missing: not indicated).
-pub fn dbmd(m: &Master, version: &str, binaural: &[Option<BinauralMode>]) -> Vec<u8> {
+/// "0.11.0"); `bed`: the bed channels' mode (the LFE is always Off);
+/// `binaural`: each object's mode (missing: not indicated).
+pub fn dbmd(
+    m: &Master,
+    version: &str,
+    bed: Option<BinauralMode>,
+    binaural: &[Option<BinauralMode>],
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(512 + 2 * m.channels());
     out.extend_from_slice(&VERSION);
     // Dolby Digital Plus, as Dolby's tools write it.
@@ -152,19 +158,16 @@ pub fn dbmd(m: &Master, version: &str, binaural: &[Option<BinauralMode>]) -> Vec
         s.extend_from_slice(&[0u8; 14]);
     }
     s.extend(std::iter::repeat_n(0u8, n));
-    for (i, c) in m.bed.iter().enumerate() {
-        let _ = i;
+    let byte = |mode: Option<BinauralMode>| mode.map_or(HEADPHONE_DEFAULT, |m| 0x80 | m.code());
+    for c in &m.bed {
         s.push(if *c == BedChannel::Lfe {
-            0x80 | BinauralMode::Off.code()
+            byte(Some(BinauralMode::Off))
         } else {
-            HEADPHONE_DEFAULT
+            byte(bed)
         });
     }
     for k in 0..m.objects.len() {
-        s.push(match binaural.get(k).copied().flatten() {
-            Some(mode) => 0x80 | mode.code(),
-            None => HEADPHONE_DEFAULT,
-        });
+        s.push(byte(binaural.get(k).copied().flatten()));
     }
     segment(&mut out, SUPPLEMENTAL, &s);
     out.push(0);
@@ -240,6 +243,7 @@ mod tests {
         let c = dbmd(
             &m,
             "0.11.0",
+            None,
             &[Some(BinauralMode::Near), None, Some(BinauralMode::Mid)],
         );
         assert_eq!(&c[..4], &VERSION);
@@ -255,6 +259,9 @@ mod tests {
         assert_eq!(modes.len(), 13);
         assert_eq!(modes[3], Some(BinauralMode::Off), "the LFE");
         assert_eq!(modes[0], None);
+        let far = binaural_modes(&dbmd(&m, "0.11.0", Some(BinauralMode::Far), &[])).unwrap();
+        assert_eq!(far[0], Some(BinauralMode::Far));
+        assert_eq!(far[3], Some(BinauralMode::Off), "the LFE");
         assert_eq!(modes[10], Some(BinauralMode::Near));
         assert_eq!(modes[12], Some(BinauralMode::Mid));
         // A broken checksum is refused.

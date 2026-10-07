@@ -184,7 +184,7 @@ impl Form {
                     RenderChannels::Mono | RenderChannels::First => 1,
                     RenderChannels::Master => faderframe_session::render::master_bed(p)
                         .map_or(2, faderframe_core::SurroundFormat::channels),
-                    RenderChannels::Stereo => 2,
+                    RenderChannels::Stereo | RenderChannels::Binaural(_) => 2,
                     RenderChannels::Adm(_) => {
                         faderframe_session::adm::plan(p).map_or(0, |plan| plan.channels())
                     }
@@ -333,6 +333,10 @@ pub fn open(app: &Rc<AppState>) {
                 RenderChannels::Stereo,
                 RenderChannels::Mono,
             ];
+            // For headphones, in the room listened with (Mid otherwise).
+            let room = app.session.borrow().headphones().unwrap_or_default();
+            names.push(format!("Headphones (binaural · {})", room.name()));
+            choices.push(RenderChannels::Binaural(room));
             // An object-based master: the bed and the object tracks.
             if let Ok(plan) = faderframe_session::adm::plan(app.session.borrow().project()) {
                 let what = plan.describe();

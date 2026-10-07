@@ -27,7 +27,8 @@ use crate::context::EngineContext;
 use crate::midi::{MidiFilter, MidiInputNode, MidiOutputSink, MidiShared, NO_PORT};
 use crate::nodes::{
     AudioClipPlayer, ChannelStrip, Crosstalk, DeviceInputTap, DeviceOutputSink, FoldDown,
-    MidiClipPlayer, MonitorGate, ObjectRenderer, PluginNode, SendNode, StretchVoices, StripEcho,
+    ListenOut, MidiClipPlayer, MonitorGate, ObjectRenderer, PluginNode, SendNode, StretchVoices,
+    StripEcho,
 };
 use crate::plugins::PluginHost;
 use crate::slots::SlotRegistry;
@@ -642,6 +643,14 @@ fn destination_layout(project: &Project, track: &Track) -> ChannelLayout {
     project.destination_layout(track)
 }
 
+/// How the master is listened to (never part of a render unless asked).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Listen {
+    /// On headphones: rendered binaurally with this room.
+    pub binaural: Option<faderframe_binaural::Room>,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn build_graph(
     project: &Project,
     slots: &mut SlotRegistry,
@@ -650,6 +659,7 @@ pub fn build_graph(
     routing: &MidiRouting,
     mut ahead: Option<AheadPlan<'_>>,
     monitor: &[PluginSlot],
+    listen: Listen,
 ) -> Result<BuiltGraph, EngineError> {
     let midi_ports = &routing.inputs;
     let mut b = GraphBuilder::<EngineContext>::new();
@@ -1283,8 +1293,41 @@ pub fn build_graph(
             }
             OutputRouting::Hardware { first_channel } if !ahead_strip => {
                 let mut dest = destination_layout(project, t);
-                // A bed wider than the device: folded down to what it plays.
-                if let Some(to) = fold_for(dest, config.device_outputs, first_channel as usize) {
+                if t.kind == TrackKind::Master {
+                    // Listening: headphones (binaural), a bed folded to the
+                    // device, the mono check.
+                    let to = if listen.binaural.is_some() {
+                        ChannelLayout::Stereo
+                    } else {
+                        fold_for(dest, config.device_outputs, first_channel as usize)
+                            .unwrap_or(dest)
+                    };
+                    let room = listen.binaural.map_or(0, |r| 1 + r as u64);
+                    let mono = slots.monitor_mono()?;
+                    let node = g.add_node(
+                        NodeSpec::new(format!("{} · Listen", t.name))
+                            .key(node_key(t.id, Role::DeviceOut, 0x115E0 + room, &[dest, to]))
+                            .group(gi)
+                            .audio_in(dest)
+                            .audio_out(to),
+                        Box::new(ListenOut::new(
+                            dest,
+                            to,
+                            listen.binaural,
+                            config.sample_rate as u32,
+                            config.max_block_size,
+                            mono,
+                        )),
+                    );
+                    owned(node, NodeWork::HardwareOut, None);
+                    g.connect_audio(out, 0, node, 0)?;
+                    out = node;
+                    dest = to;
+                } else if let Some(to) =
+                    fold_for(dest, config.device_outputs, first_channel as usize)
+                {
+                    // A bed wider than the device: folded down to what it
+                    // plays.
                     let fold = g.add_node(
                         NodeSpec::new(format!("{} · Fold-down", t.name))
                             .key(node_key(t.id, Role::DeviceOut, 0xF01D, &[dest, to]))

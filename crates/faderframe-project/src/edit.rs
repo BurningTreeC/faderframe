@@ -120,6 +120,11 @@ pub enum Command {
         track: TrackId,
         on: bool,
     },
+    /// How a headphone render places the track.
+    SetTrackBinaural {
+        track: TrackId,
+        mode: Option<crate::track::BinauralRender>,
+    },
     SetTrackMute {
         track: TrackId,
         on: bool,
@@ -656,6 +661,7 @@ impl Command {
             SetTrackSurround { .. } => "Change Surround Pan".into(),
             SetTrackObject { on: true, .. } => "Make Object".into(),
             SetTrackObject { on: false, .. } => "Back into the Bed".into(),
+            SetTrackBinaural { .. } => "Change Binaural Render Mode".into(),
             SetTrackMute { .. } => "Toggle Mute".into(),
             SetTrackSolo { .. } => "Toggle Solo".into(),
             SetTrackRecordArm { .. } => "Toggle Record Arm".into(),
@@ -789,6 +795,7 @@ impl Command {
             | SetPluginParameter { .. }
             | SetPluginState { .. } => Impact::Params,
             RenameTrack { .. }
+            | SetTrackBinaural { .. }
             | SetTrackColor { .. }
             | AddMarker { .. }
             | RemoveMarker { .. }
@@ -915,6 +922,10 @@ impl Command {
             SetTrackObject { track, on } => {
                 let old = std::mem::replace(&mut track_mut(p, track)?.object, on);
                 SetTrackObject { track, on: old }
+            }
+            SetTrackBinaural { track, mode } => {
+                let old = std::mem::replace(&mut track_mut(p, track)?.binaural, mode);
+                SetTrackBinaural { track, mode: old }
             }
             SetTrackMute { track, on } => {
                 let old = std::mem::replace(&mut track_mut(p, track)?.mute, on);

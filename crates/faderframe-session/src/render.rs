@@ -55,6 +55,9 @@ pub enum RenderChannels {
     /// An object-based master: the surround master's bed and its objects
     /// as an ADM BWF file ([`crate::adm`]).
     Adm(faderframe_adm::Profile),
+    /// For headphones: the master rendered binaurally (as heard with
+    /// Listen → Headphones), stereo.
+    Binaural(faderframe_binaural::Room),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -279,11 +282,21 @@ pub(crate) fn render_span(
     for (_, path, e) in crate::media::open_file_sources(project, None, &mut sources) {
         tracing::warn!("render: {}: {e}", path.display());
     }
-    render_one(project, sample_rate, &sources, start, frames, progress, 2)
+    render_one(
+        project,
+        sample_rate,
+        &sources,
+        start,
+        frames,
+        progress,
+        2,
+        None,
+    )
 }
 
 /// `frames` frames from `start` on a "device" of `outputs` channels (a
 /// surround master folds down to fewer).
+#[allow(clippy::too_many_arguments)]
 fn render_one(
     project: &Project,
     sample_rate: u32,
@@ -292,6 +305,7 @@ fn render_one(
     frames: usize,
     progress: &RenderProgress,
     outputs: usize,
+    binaural: Option<faderframe_binaural::Room>,
 ) -> Result<Vec<Vec<f32>>, RenderError> {
     let config = EngineConfig {
         sample_rate,
@@ -300,6 +314,11 @@ fn render_one(
         ..EngineConfig::default()
     };
     let mut r = OfflineRenderer::new(project, sources, config, 1024, outputs.max(1))?;
+    if binaural.is_some() {
+        r.controller.set_binaural(binaural);
+        r.controller
+            .sync(project, sources, faderframe_project::Impact::Graph)?;
+    }
     progress
         .latency
         .store(r.controller.graph_stats().output_latency, Ordering::Relaxed);
@@ -601,6 +620,10 @@ pub fn start(project: Project, settings: RenderSettings) -> Result<RenderJob, Re
                 .then(|| master_bed(&project))
                 .flatten();
             let outputs = bed.map_or(2, |f| f.channels());
+            let binaural = match settings.channels {
+                RenderChannels::Binaural(room) => Some(room),
+                _ => None,
+            };
             let mask = bed.map(faderframe_core::SurroundFormat::channel_mask);
             if stems.is_empty() {
                 let audio = render_one(
@@ -611,6 +634,7 @@ pub fn start(project: Project, settings: RenderSettings) -> Result<RenderJob, Re
                     frames,
                     &p,
                     outputs,
+                    binaural,
                 )?;
                 written.push(finish(audio, &settings, &settings.output, mask)?);
             } else {
@@ -631,6 +655,7 @@ pub fn start(project: Project, settings: RenderSettings) -> Result<RenderJob, Re
                         frames,
                         &p,
                         outputs,
+                        binaural,
                     )?;
                     let path = settings.output.join(format!(
                         "{} - {}.wav",

@@ -285,6 +285,7 @@ impl AppState {
         self.redraw_all();
         self.update_chrome(true);
         crate::recent::note_session_path(self);
+        crate::listen::follow(self);
     }
 
     /// Show an error: always in the status bar, optionally as a dialog.

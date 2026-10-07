@@ -332,6 +332,10 @@ pub enum Action {
     ShowSurroundPanner(TrackId),
     /// Read an object-based master (ADM BWF) into the project.
     ImportAdm(std::path::PathBuf),
+    /// The mono check (listening only).
+    SetMonoCheck(bool),
+    /// Listen on headphones (binaural, with a room) or speakers (`None`).
+    SetHeadphones(Option<faderframe_binaural::Room>),
     /// Download the speech model (Whisper) once.
     DownloadSpeechModel,
     /// Transcribe an audio clip's words into the lyrics.
@@ -1088,6 +1092,8 @@ pub struct Session {
     pitch_clip: Option<ClipId>,
     /// Track renders for freezing and bouncing.
     bounces: Vec<freeze::PendingBounce>,
+    /// The mono check is on (listening only).
+    mono_check: bool,
     /// ADM BWF files being read.
     adm_imports: Vec<adm::ImportJob>,
     samplings: Vec<sampling::PendingSample>,
@@ -1312,6 +1318,7 @@ impl Session {
             pitch_clip: None,
             gesture_base: HashMap::new(),
             bounces: Vec::new(),
+            mono_check: false,
             adm_imports: Vec::new(),
             samplings: Vec::new(),
             capture: capture::CaptureBuffer::default(),
@@ -1784,6 +1791,35 @@ impl Session {
     /// leave the audio thread. They and the strips reaching them run a
     /// device callback and two small blocks ahead (about 10 ms), so moving
     /// those faders stays immediate; automation is exact, meters in time.
+    /// The mono check: what is heard summed to both speakers (listening
+    /// only: renders stay as mixed).
+    pub fn set_mono_check(&mut self, on: bool) -> Result<()> {
+        self.engine.set_mono_check(on)?;
+        self.mono_check = on;
+        self.revision += 1;
+        Ok(())
+    }
+
+    pub fn mono_check(&self) -> bool {
+        self.mono_check
+    }
+
+    /// Listen on headphones: the master rendered binaurally with `room`
+    /// (`None`: speakers). Listening only.
+    pub fn set_headphones(&mut self, room: Option<faderframe_binaural::Room>) -> Result<()> {
+        if room == self.engine.binaural() {
+            return Ok(());
+        }
+        self.engine.set_binaural(room);
+        self.sync(Impact::Graph)?;
+        self.revision += 1;
+        Ok(())
+    }
+
+    pub fn headphones(&self) -> Option<faderframe_binaural::Room> {
+        self.engine.binaural()
+    }
+
     pub fn set_render_ahead_buses(&mut self, on: bool) -> Result<()> {
         if on == self.render_ahead_buses {
             return Ok(());
@@ -3056,6 +3092,8 @@ impl Session {
             Action::EditLyric { index, text } => self.edit_lyric(index, text)?,
             Action::ClipEffects { clip, op } => self.edit_clip_fx(clip, op)?,
             Action::ImportAdm(path) => self.start_adm_import(path),
+            Action::SetMonoCheck(on) => self.set_mono_check(on)?,
+            Action::SetHeadphones(room) => self.set_headphones(room)?,
             Action::ShowSurroundPanner(track) => {
                 self.dispatch(Action::SelectTracks {
                     tracks: vec![track],
@@ -4253,6 +4291,69 @@ impl Session {
             checked: t.object,
             group_start: false,
         })
+    }
+
+    /// How the master is listened to: speakers, headphones (binaural, with
+    /// a room), the mono check. Listening only — renders stay as mixed.
+    pub fn listen_choices(&self) -> Vec<InputChoice> {
+        use faderframe_binaural::Room;
+        let now = self.headphones();
+        let mut out = vec![InputChoice {
+            label: "Speakers".into(),
+            action: Action::SetHeadphones(None),
+            checked: now.is_none(),
+            group_start: false,
+        }];
+        for room in Room::ALL {
+            out.push(InputChoice {
+                label: format!("Headphones · {} (binaural)", room.name()),
+                action: Action::SetHeadphones(Some(room)),
+                checked: now == Some(room),
+                group_start: false,
+            });
+        }
+        out.push(InputChoice {
+            label: "Mono Check".into(),
+            action: Action::SetMonoCheck(!self.mono_check),
+            checked: self.mono_check,
+            group_start: true,
+        });
+        out
+    }
+
+    /// How a headphone render of a delivered master places the track
+    /// (Dolby's binaural render modes, written with ADM masters): the
+    /// master (its bed) and object tracks, while the master is a bed.
+    pub fn binaural_render_choices(&self, track: TrackId) -> Vec<InputChoice> {
+        use faderframe_project::BinauralRender;
+        let Some(t) = self.project.track(track) else {
+            return Vec::new();
+        };
+        let bed = self
+            .project
+            .master()
+            .is_some_and(|m| matches!(m.layout, faderframe_core::ChannelLayout::Surround(_)));
+        if !bed || !(t.kind == TrackKind::Master || self.project.is_object(t)) {
+            return Vec::new();
+        }
+        let mut out = vec![InputChoice {
+            label: "Not Set".into(),
+            action: Action::Edit(Command::SetTrackBinaural { track, mode: None }),
+            checked: t.binaural.is_none(),
+            group_start: false,
+        }];
+        for (i, m) in BinauralRender::ALL.into_iter().enumerate() {
+            out.push(InputChoice {
+                label: m.name().into(),
+                action: Action::Edit(Command::SetTrackBinaural {
+                    track,
+                    mode: Some(m),
+                }),
+                checked: t.binaural == Some(m),
+                group_start: i == 0,
+            });
+        }
+        out
     }
 
     /// The channel formats a track can have (audio tracks, buses, auxes and

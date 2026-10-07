@@ -164,7 +164,11 @@ Contrast:
   the mix is delivered as an ADM BWF master — the bed (up to 7.1.2) and up
   to 118 objects with their movement — in Dolby's Atmos master ADM profile
   or as ITU-R BS.2076 for the EBU renderer, and ADM BWF masters import back
-  into tracks with their movement as automation.
+  into tracks with their movement as automation. Listening: on headphones
+  the master is rendered binaurally (measured KU100 responses, SADIE II;
+  Near, Mid or Far), and a MONO button on the master strip checks the mix
+  in mono — both for listening only (Audio → Listen); a binaural render is
+  a render option.
 * Analogue-console mixer: inserts, sends (pre-FX / pre / post), pan, M/S/R,
   faders with a console fader law, segmented peak meters, routing menus,
   any number of sends per channel (rows grow, ◂ ▸ pages through banks),

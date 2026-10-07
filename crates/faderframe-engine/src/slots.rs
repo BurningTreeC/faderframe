@@ -59,6 +59,8 @@ pub struct SlotRegistry {
     midi_mute: HashMap<TrackId, ParamSlot>,
     /// Container chains, by container and chain.
     chains: HashMap<(PluginInstanceId, usize), ChainSlots>,
+    /// 1.0 while the mono check is on (listening only).
+    monitor_mono: Option<ParamSlot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -77,6 +79,7 @@ impl SlotRegistry {
             midi_live: HashMap::new(),
             midi_mute: HashMap::new(),
             chains: HashMap::new(),
+            monitor_mono: None,
         }
     }
 
@@ -127,6 +130,20 @@ impl SlotRegistry {
         );
         self.midi_live.insert(track, slot);
         Ok(slot)
+    }
+
+    /// The mono check's switch (one for the session).
+    pub fn monitor_mono(&mut self) -> Result<ParamSlot, SlotsExhausted> {
+        if let Some(s) = self.monitor_mono {
+            return Ok(s);
+        }
+        let s = ParamSlot(
+            self.params
+                .allocate(1)
+                .ok_or(SlotsExhausted("parameters"))?,
+        );
+        self.monitor_mono = Some(s);
+        Ok(s)
     }
 
     pub fn strip(&mut self, track: TrackId) -> Result<StripSlots, SlotsExhausted> {

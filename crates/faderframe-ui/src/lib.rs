@@ -17,6 +17,7 @@ mod dialogs;
 pub mod dock;
 pub mod gpu;
 mod icons;
+mod listen;
 mod midi_prefs;
 pub mod painter;
 mod palette;
@@ -131,6 +132,13 @@ fn build_session(options: &RunOptions, prefs: &prefs::Preferences) -> (Session, 
     {
         tracing::warn!("render ahead: {e}");
     }
+    let room = prefs
+        .headphones
+        .as_deref()
+        .and_then(faderframe_binaural::Room::from_id);
+    if let Err(e) = session.set_headphones(room) {
+        tracing::warn!("headphones: {e}");
+    }
     if let Some(p) = gone {
         session.notify(
             faderframe_session::NoticeLevel::Warning,
@@ -198,6 +206,7 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
     let window = window::build(&state);
     actions::install(&state);
     recording::install_actions(&state);
+    listen::install_actions(&state);
     actions::install_window_keys(&state, &window);
     dialogs::install_close_guard(&state, &window);
     dock::realize(&state);

@@ -108,6 +108,17 @@ fn a_714_mix_becomes_an_atmos_master() {
         }),
     }))
     .unwrap();
+    // Headphone render modes for Dolby's metadata.
+    for (track, mode) in [
+        (master, faderframe_project::BinauralRender::Near),
+        (mover, faderframe_project::BinauralRender::Far),
+    ] {
+        s.dispatch(Action::Edit(Command::SetTrackBinaural {
+            track,
+            mode: Some(mode),
+        }))
+        .unwrap();
+    }
     let plan = faderframe_session::adm::plan(s.project()).unwrap();
     assert_eq!(plan.describe(), "7.1 bed and 7 objects");
     let out = std::env::var("FADERFRAME_ADM_SESSION_OUT")
@@ -145,6 +156,13 @@ fn a_714_mix_becomes_an_atmos_master() {
         let modes = faderframe_adm::binaural_modes(&dbmd).unwrap();
         assert_eq!(modes.len(), 15);
         assert_eq!(modes[3], Some(faderframe_adm::BinauralMode::Off));
+        // The bed (and its height objects) Near as the master says, the
+        // mover Far, the pair not indicated.
+        use faderframe_adm::BinauralMode as B;
+        assert_eq!(modes[0], Some(B::Near));
+        assert_eq!(&modes[8..12], &[Some(B::Near); 4]);
+        assert_eq!(modes[12], Some(B::Far));
+        assert_eq!(&modes[13..], &[None, None]);
     }
     assert_eq!(scene.bed.len(), 8);
     let names: Vec<&str> = scene.objects.iter().map(|o| o.name.as_str()).collect();

@@ -308,6 +308,7 @@ pub fn create_with_epoch(
         midi_live: Default::default(),
         edited: Default::default(),
         album_monitor: None,
+        listen: crate::build::Listen::default(),
         timeline: Arc::new(TimelineSnapshot::empty(config.sample_rate as f64)),
         modulation: Arc::default(),
         mod_buses: Default::default(),
@@ -879,6 +880,8 @@ pub struct EngineController {
     edited: std::collections::HashSet<faderframe_core::TrackId>,
     /// The album song whose inserts run after the master strip.
     album_monitor: Option<faderframe_core::SongId>,
+    /// How the master is listened to.
+    listen: crate::build::Listen,
     /// Stretcher voices per track in the installed graph (a timeline edit
     /// that changes them rebuilds the graph).
     voices: Vec<(faderframe_core::TrackId, crate::nodes::StretchVoices)>,
@@ -1558,6 +1561,7 @@ impl EngineController {
             &self.midi_routing,
             plan,
             monitor,
+            self.listen,
         )?;
         let compiled = built.builder.compile(&prepare)?;
         let mut ahead_prepare = prepare;
@@ -1782,6 +1786,23 @@ impl EngineController {
 
     /// Run an album song's inserts after the master strip, to hear them on
     /// the project (applies with the next graph build).
+    /// Listen on headphones (binaural, with a room) or speakers; takes a
+    /// graph rebuild (the caller syncs with `Impact::Graph`).
+    pub fn set_binaural(&mut self, room: Option<faderframe_binaural::Room>) {
+        self.listen.binaural = room;
+    }
+
+    pub fn binaural(&self) -> Option<faderframe_binaural::Room> {
+        self.listen.binaural
+    }
+
+    /// The mono check (immediate, no rebuild).
+    pub fn set_mono_check(&mut self, on: bool) -> Result<(), EngineError> {
+        let slot = self.slots.monitor_mono()?;
+        self.params.set(slot, if on { 1.0 } else { 0.0 });
+        Ok(())
+    }
+
     pub fn set_album_monitor(&mut self, song: Option<faderframe_core::SongId>) {
         self.album_monitor = song;
     }

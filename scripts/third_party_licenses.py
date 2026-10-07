@@ -72,6 +72,13 @@ VENDORED = [
         "https://github.com/spotify/basic-pitch",
         "crates/faderframe-transcribe/model/LICENSE",
     ),
+    (
+        "SADIE II head-related impulse responses (KU100, University of York)",
+        "v2-1 (subset)",
+        "Apache-2.0",
+        "https://zenodo.org/records/10886409",
+        "crates/faderframe-binaural/data/LICENSE-SADIE.txt",
+    ),
 ]
 
 

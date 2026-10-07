@@ -87,5 +87,27 @@ fn a_51_mix_renders_with_its_speakers_or_folded_down() {
         "Ls folds to the left"
     );
     assert!(folded.channels[1][at].abs() < 1e-6);
+    // Listening on headphones in mono changes no render…
+    s.dispatch(Action::SetHeadphones(Some(faderframe_binaural::Room::Mid)))
+        .unwrap();
+    s.dispatch(Action::SetMonoCheck(true)).unwrap();
+    assert!(s.mono_check());
+    let again = render(&mut s, RenderChannels::Stereo, "again.wav");
+    assert_eq!(again.channels, folded.channels);
+    // …but a render for headphones is binaural: the rear left speaker
+    // louder in the left ear, both ears hearing it (a DC source: at low
+    // frequencies the head shadows little).
+    let ears = render(
+        &mut s,
+        RenderChannels::Binaural(faderframe_binaural::Room::Near),
+        "headphones.wav",
+    );
+    assert_eq!(ears.channels.len(), 2);
+    let rms = |x: &[f32]| (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt();
+    let (l, r) = (
+        rms(&ears.channels[0][4_000..40_000]),
+        rms(&ears.channels[1][4_000..40_000]),
+    );
+    assert!(l > 1.25 * r && r > 1e-3, "left {l} right {r}");
     std::fs::remove_dir_all(&dir).unwrap();
 }

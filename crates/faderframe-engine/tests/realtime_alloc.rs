@@ -2342,6 +2342,13 @@ fn surround_strips_do_not_allocate() {
         ..EngineConfig::default()
     };
     let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 6).unwrap();
+    // Heard on headphones (with a room) and in mono.
+    r.controller
+        .set_binaural(Some(faderframe_binaural::Room::Mid));
+    r.controller
+        .sync(&tp.project, &tp.sources, faderframe_project::Impact::Graph)
+        .unwrap();
+    r.controller.set_mono_check(true).unwrap();
     r.play_from(0).unwrap();
     let mut bufs = OwnedBuffers::new(2, 6, 256);
     for _ in 0..4 {

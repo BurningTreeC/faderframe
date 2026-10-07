@@ -53,8 +53,8 @@ pub use preset::{PresetError, TrackPreset};
 pub use project::{AudioSource, Marker, MusicalRange, Project, Section, SourceSpec};
 pub use takes::{CompPiece, CompSegment, DEFAULT_COMP_CROSSFADE, Take, TakeFolder};
 pub use track::{
-    AuxSend, Freeze, GroupLink, InputRouting, MidiOutputRouting, MonitorMode, OutputRouting,
-    PluginFormat, PluginRef, PluginSlot, SavedParameter, SendTap, Track, TrackColor, TrackGroup,
-    TrackKind, midi_port_display,
+    AuxSend, BinauralRender, Freeze, GroupLink, InputRouting, MidiOutputRouting, MonitorMode,
+    OutputRouting, PluginFormat, PluginRef, PluginSlot, SavedParameter, SendTap, Track, TrackColor,
+    TrackGroup, TrackKind, midi_port_display,
 };
 pub use warp::{Warp, WarpAlgorithm, WarpMarker};

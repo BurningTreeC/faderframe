@@ -48,6 +48,7 @@ faderframe-view-tools = { path = "crates/faderframe-view-tools" }
 faderframe-view-ddp = { path = "crates/faderframe-view-ddp" }
 faderframe-view-surround = { path = "crates/faderframe-view-surround" }
 faderframe-adm = { path = "crates/faderframe-adm" }
+faderframe-binaural = { path = "crates/faderframe-binaural" }
 faderframe-view-devices = { path = "crates/faderframe-view-devices" }
 faderframe-view-automation = { path = "crates/faderframe-view-automation" }
 faderframe-view-album = { path = "crates/faderframe-view-album" }

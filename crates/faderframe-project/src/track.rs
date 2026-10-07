@@ -162,6 +162,35 @@ pub enum InputRouting {
     },
 }
 
+/// How a headphone render places a track (Dolby's binaural render
+/// modes): not virtualised, or near, mid or far from the listener.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BinauralRender {
+    Off,
+    Near,
+    Mid,
+    Far,
+}
+
+impl BinauralRender {
+    pub const ALL: [BinauralRender; 4] = [
+        BinauralRender::Off,
+        BinauralRender::Near,
+        BinauralRender::Mid,
+        BinauralRender::Far,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            BinauralRender::Off => "Off",
+            BinauralRender::Near => "Near",
+            BinauralRender::Mid => "Mid",
+            BinauralRender::Far => "Far",
+        }
+    }
+}
+
 /// An external MIDI device a track plays (MIDI tracks).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MidiOutputRouting {
@@ -338,6 +367,10 @@ pub struct Track {
     /// rather than mixed into the bed ([`crate::Project::is_object`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub object: bool,
+    /// How a headphone render places it (Dolby's binaural render mode;
+    /// `None`: not set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binaural: Option<BinauralRender>,
     #[serde(default)]
     pub phase_invert: bool,
 
@@ -465,6 +498,7 @@ impl Track {
             pan: 0.0,
             surround: faderframe_core::SurroundPan::default(),
             object: false,
+            binaural: None,
             phase_invert: false,
             mute: false,
             solo: false,

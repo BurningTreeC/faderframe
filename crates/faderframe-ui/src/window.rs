@@ -517,6 +517,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             ("Restart Audio", "app.restart-audio"),
         ]),
     );
+    audio.append_submenu(Some("Listen"), &crate::listen::menu());
     audio.append_section(
         None,
         &section(&[(

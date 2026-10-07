@@ -737,6 +737,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "faderframe-binaural"
+version = "0.11.0"
+dependencies = [
+ "faderframe-core",
+ "realfft",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "faderframe-circuit"
 version = "0.11.0"
 
@@ -769,6 +778,7 @@ dependencies = [
  "faderframe-audio-files",
  "faderframe-audio-graph",
  "faderframe-automation",
+ "faderframe-binaural",
  "faderframe-core",
  "faderframe-midi",
  "faderframe-plugin-host",
@@ -932,6 +942,7 @@ dependencies = [
  "faderframe-audio-files",
  "faderframe-audio-graph",
  "faderframe-automation",
+ "faderframe-binaural",
  "faderframe-control",
  "faderframe-core",
  "faderframe-disc",
@@ -1010,6 +1021,7 @@ dependencies = [
  "faderframe-audio-jack",
  "faderframe-audio-pipewire",
  "faderframe-automation",
+ "faderframe-binaural",
  "faderframe-core",
  "faderframe-engine",
  "faderframe-plugin-au",

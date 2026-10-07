@@ -769,6 +769,27 @@ pub fn led_button(
     p.text(label, rect, &style);
 }
 
+/// [`led_button`] with the first of `labels` that fits (the last
+/// otherwise).
+pub fn led_button_fit(
+    p: &mut dyn Painter,
+    rect: Rect,
+    labels: &[&str],
+    on: bool,
+    color: Color,
+    theme: &Theme,
+) {
+    let style =
+        TextStyle::new(theme.fonts.tiny + 0.5, theme.console.led.label_on).weight(FontWeight::Bold);
+    let label = labels
+        .iter()
+        .find(|l| p.text_width(l, &style) <= rect.w - 4.0)
+        .or(labels.last())
+        .copied()
+        .unwrap_or("");
+    led_button(p, rect, label, on, color, theme);
+}
+
 /// Cream "tape" label with a track-colour stripe, like console scribble strips.
 pub fn scribble(p: &mut dyn Painter, rect: Rect, text: &str, stripe: Color, theme: &Theme) {
     let c = &theme.console;

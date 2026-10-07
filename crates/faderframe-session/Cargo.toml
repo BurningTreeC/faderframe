@@ -30,6 +30,7 @@ faderframe-audio.workspace = true
 faderframe-audio-files.workspace = true
 faderframe-disc.workspace = true
 faderframe-adm.workspace = true
+faderframe-binaural.workspace = true
 faderframe-plugin-host.workspace = true
 faderframe-automation.workspace = true
 faderframe-transport.workspace = true

@@ -63,6 +63,8 @@ pub enum Hit {
     Mute(TrackId),
     Solo(TrackId),
     Record(TrackId),
+    /// The master's mono check (listening only).
+    MonoCheck,
     Phase(TrackId),
     Monitor(TrackId),
     Input(TrackId),
@@ -566,7 +568,14 @@ impl MixerView {
                 (pans.map(|_| l.pan_knob), Hit::Pan(id)),
                 (Some(l.mute), Hit::Mute(id)),
                 (Some(l.solo), Hit::Solo(id)),
-                (audio.map(|_| l.record), Hit::Record(id)),
+                (
+                    audio.map(|_| l.record),
+                    if t.kind == TrackKind::Master {
+                        Hit::MonoCheck
+                    } else {
+                        Hit::Record(id)
+                    },
+                ),
                 (Some(l.level_readout), Hit::Level(id)),
                 (audio.map(|_| l.output), Hit::Output(id)),
                 (Some(l.scribble), Hit::Scribble(id)),
@@ -897,6 +906,15 @@ impl MixerView {
         controls::led_button(p, l.solo, "S", t.solo, c.led.solo, th);
         if vca {
             controls::led_button(p, l.record, "·", false, c.led.record, th);
+        } else if t.kind == TrackKind::Master {
+            controls::led_button_fit(
+                p,
+                l.record,
+                &["MONO", "MO"],
+                model.mono_check(),
+                c.led.monitor,
+                th,
+            );
         } else if t.kind.has_clips() {
             controls::led_button(p, l.record, "R", t.record_arm, c.led.record, th);
         } else {
@@ -1725,6 +1743,25 @@ impl MixerView {
         if let Some(c) = model.object_choice(t.id) {
             items.push(MenuItem::new(c.label, c.action).checked(c.checked));
         }
+        let choices = |list: Vec<faderframe_session::InputChoice>| -> Vec<MenuItem<Action>> {
+            list.into_iter()
+                .map(|c| {
+                    let item = MenuItem::new(c.label, c.action).checked(c.checked);
+                    if c.group_start {
+                        item.separated()
+                    } else {
+                        item
+                    }
+                })
+                .collect()
+        };
+        let render = choices(model.binaural_render_choices(t.id));
+        if !render.is_empty() {
+            items.push(MenuItem::submenu("Headphone Render (Dolby)", render));
+        }
+        if t.kind == TrackKind::Master {
+            items.push(MenuItem::submenu("Listen", choices(model.listen_choices())).separated());
+        }
         if t.kind != TrackKind::Master {
             let now = model.strip_width(t.id);
             for (i, (label, w)) in STRIP_WIDTHS.iter().enumerate() {
@@ -2133,6 +2170,7 @@ impl MixerView {
                     );
                 }
             }
+            Hit::MonoCheck => cx.emit(Action::SetMonoCheck(!model.mono_check())),
             Hit::Record(id) => {
                 if let Some(t) = Self::track(model, id).filter(|t| t.kind.has_clips()) {
                     toggle(
@@ -2457,6 +2495,7 @@ impl MixerView {
             Hit::Mute(id) => format!("Mute {}", name(id)),
             Hit::Solo(id) => format!("Solo {}", name(id)),
             Hit::Record(id) => format!("Record-arm {}", name(id)),
+            Hit::MonoCheck => "Mono check: hear the mix summed to mono (listening only, renders stay as mixed) · Right-click the strip: Listen (headphones)".into(),
             Hit::Phase(_) => "Invert polarity".into(),
             Hit::Monitor(id)
                 if Self::track(model, id)

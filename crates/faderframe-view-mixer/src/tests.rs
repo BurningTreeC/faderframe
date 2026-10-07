@@ -1097,3 +1097,62 @@ fn a_strip_feeding_a_bed_pans_in_the_room() {
     assert_eq!(formats.len(), 2 + SurroundFormat::ALL.len());
     assert!(formats.iter().any(|f| f.label.starts_with("7.1.4")));
 }
+
+/// The master's record slot is its mono check; its menu chooses how it is
+/// listened to (speakers or headphones) and, on a bed, its headphone
+/// render mode for delivery.
+#[test]
+fn the_master_strip_has_a_mono_check_and_listening_choices() {
+    use faderframe_core::{ChannelLayout, SurroundFormat};
+    let mut s = session();
+    let master = s.project().master_id().unwrap();
+    let theme = Theme::default();
+    let mut view = MixerView::new(theme.clone());
+    let size = Size::new(1400.0, 760.0);
+    view.paint(&mut RecordingPainter::new(), size, &s, &theme);
+    let l = view.layout_of(&s, master, size).unwrap();
+    let (actions, _) = run(&mut view, down(l.record.center(), 1), size, &s);
+    assert_eq!(actions, vec![Action::SetMonoCheck(true)]);
+    s.dispatch(Action::SetMonoCheck(true)).unwrap();
+    let (actions, _) = run(&mut view, down(l.record.center(), 1), size, &s);
+    assert_eq!(actions, vec![Action::SetMonoCheck(false)]);
+    let menu = |view: &mut MixerView, s: &Session| {
+        let l = view.layout_of(s, master, size).unwrap();
+        let ev = ViewEvent::PointerDown {
+            pos: l.scribble.center(),
+            button: PointerButton::Secondary,
+            modifiers: Modifiers::NONE,
+            clicks: 1,
+        };
+        let (_, req) = run(view, ev, size, s);
+        match req
+            .into_iter()
+            .find(|r| matches!(r, HostRequest::ContextMenu { .. }))
+        {
+            Some(HostRequest::ContextMenu { items, .. }) => items,
+            _ => panic!("expected the master's menu"),
+        }
+    };
+    let items = menu(&mut view, &s);
+    let listen = items.iter().find(|i| i.label == "Listen").unwrap();
+    let labels: Vec<&str> = listen.children.iter().map(|i| i.label.as_str()).collect();
+    assert_eq!(labels[0], "Speakers");
+    assert!(labels.contains(&"Headphones · Mid (binaural)"));
+    assert_eq!(listen.children[0].checked, Some(true));
+    assert!(
+        !items
+            .iter()
+            .any(|i| i.label.starts_with("Headphone Render"))
+    );
+    s.dispatch(Action::Edit(Command::SetTrackLayout {
+        track: master,
+        layout: ChannelLayout::Surround(SurroundFormat::S714),
+    }))
+    .unwrap();
+    let items = menu(&mut view, &s);
+    assert!(
+        items
+            .iter()
+            .any(|i| i.label.starts_with("Headphone Render"))
+    );
+}

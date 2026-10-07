@@ -373,3 +373,71 @@ fn sends_follow_the_panner_into_beds_and_fold_out_of_them() {
         m.channels[1]
     );
 }
+
+/// Listening: the mono check sums what is heard to both speakers; on
+/// headphones a 5.1 master is rendered binaurally (a source at the front
+/// left louder in the left ear). Neither touches the master's meters.
+#[test]
+fn the_master_can_be_heard_in_mono_and_binaurally() {
+    let render = |tp: &TestProject,
+                  outputs: usize,
+                  set: &dyn Fn(&mut faderframe_engine::EngineController)| {
+        let mut r = OfflineRenderer::new(
+            &tp.project,
+            &tp.sources,
+            EngineConfig::default(),
+            256,
+            outputs,
+        )
+        .unwrap();
+        set(&mut r.controller);
+        r.controller
+            .sync(&tp.project, &tp.sources, faderframe_project::Impact::Graph)
+            .unwrap();
+        r.play_from(0).unwrap();
+        r.render(8192)
+    };
+    let rms = |x: &[f32]| (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt();
+    // A stereo master, a track hard left.
+    let mut tp = TestProject::new(48_000);
+    let t = tp.track(TrackKind::Audio, "Left", ChannelLayout::Mono);
+    let src = tp.dc(1, 0.5, 48_000);
+    tp.clip(t, src, MusicalTime::ZERO, 48_000);
+    tp.project.track_mut(t).unwrap().pan = -1.0;
+    let plain = render(&tp, 2, &|_| {});
+    assert!(plain[1][4000].abs() < 1e-4, "hard left: {}", plain[1][4000]);
+    let mono = render(&tp, 2, &|c| c.set_mono_check(true).unwrap());
+    assert!((mono[0][4000] - mono[1][4000]).abs() < 1e-6);
+    assert!(
+        (mono[0][4000] - 0.5 * plain[0][4000]).abs() < 1e-4,
+        "{}",
+        mono[0][4000]
+    );
+    // A 5.1 master on headphones: a tone at the front left.
+    let mut tp = TestProject::new(48_000);
+    let master = tp.master();
+    tp.project.track_mut(master).unwrap().layout = S51;
+    let track = tp.track(TrackKind::Audio, "Tone", ChannelLayout::Mono);
+    tp.project.track_mut(track).unwrap().surround = SurroundPan {
+        x: -1.0,
+        ..SurroundPan::default()
+    };
+    let tone = tp.source(faderframe_audio_files::AudioData::from_channels(
+        48_000,
+        vec![
+            (0..48_000)
+                .map(|i| 0.25 * (i as f32 * 1_000.0 * std::f32::consts::TAU / 48_000.0).sin())
+                .collect(),
+        ],
+    ));
+    tp.clip(track, tone, MusicalTime::ZERO, 48_000);
+    let ears = render(&tp, 2, &|c| {
+        c.set_binaural(Some(faderframe_binaural::Room::Near))
+    });
+    let (l, r) = (rms(&ears[0][2048..]), rms(&ears[1][2048..]));
+    // At 1 kHz the front left speaker: a little louder on the left, much
+    // quieter on the right (the head shadows it).
+    let tone_rms = 0.25 * std::f32::consts::FRAC_1_SQRT_2;
+    assert!(l > 2.0 * r, "left {l} right {r}");
+    assert!(l > tone_rms && l < 2.0 * tone_rms, "left {l}");
+}

@@ -105,6 +105,18 @@ fn bed_channel(
     })
 }
 
+/// A track's binaural render mode as Dolby's metadata says it.
+fn binaural_mode(m: faderframe_project::BinauralRender) -> faderframe_adm::BinauralMode {
+    use faderframe_adm::BinauralMode as B;
+    use faderframe_project::BinauralRender as R;
+    match m {
+        R::Off => B::Off,
+        R::Near => B::Near,
+        R::Mid => B::Mid,
+        R::Far => B::Far,
+    }
+}
+
 /// How the project's master would be delivered.
 pub fn plan(project: &Project) -> Result<AdmPlan, String> {
     let format = crate::render::master_bed(project)
@@ -338,8 +350,19 @@ pub(crate) fn start(
         return Err(RenderError::EmptyRange);
     }
     let meta = master(&project, &plan, profile, start, frames, rate);
-    // Each object's binaural render mode (fixed bed objects: not indicated).
-    let binaural: Vec<Option<faderframe_adm::BinauralMode>> = vec![None; meta.objects.len()];
+    // Binaural render modes: the master's for the bed (and the bed's
+    // channels delivered as objects), each object track's for its objects.
+    let mode = |id: TrackId| {
+        project
+            .track(id)
+            .and_then(|t| t.binaural)
+            .map(binaural_mode)
+    };
+    let bed_mode = project.master().and_then(|t| t.binaural).map(binaural_mode);
+    let mut binaural: Vec<Option<faderframe_adm::BinauralMode>> = vec![bed_mode; plan.fixed.len()];
+    for (id, _, channels) in &plan.tracks {
+        binaural.extend(std::iter::repeat_n(mode(*id), *channels));
+    }
     faderframe_adm::validate(&meta).map_err(|e| RenderError::Adm(e.to_string()))?;
     let (routed, order, outputs) = routed(&project, &plan);
     let progress = Arc::new(RenderProgress::default());
@@ -412,7 +435,7 @@ pub(crate) fn start(
         if profile == Profile::DolbyAtmos {
             after.push((
                 *b"dbmd",
-                faderframe_adm::dbmd(&meta, env!("CARGO_PKG_VERSION"), &binaural),
+                faderframe_adm::dbmd(&meta, env!("CARGO_PKG_VERSION"), bed_mode, &binaural),
             ));
         }
         w.finish(&after).map_err(io)?;

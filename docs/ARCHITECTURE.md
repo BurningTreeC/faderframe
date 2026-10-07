@@ -32,6 +32,7 @@ faderframe-app            binary: CLI parsing, logging, starts the GTK app
             ├─ faderframe-disc         Red Book CD masters: DDP 2.00 filesets, CD-Text, cue sheets, ISRC/UPC
             ├─ faderframe-adm          object-based masters: ADM (BS.2076) axml/chna, Dolby Atmos master profile
             ├─ faderframe-engine       project→graph compiler, RT processor, controller, offline render
+            │    ├─ faderframe-binaural     headphone listening: beds through measured HRIRs (SADIE II KU100), rooms
             │    ├─ faderframe-audio-graph   generic DSP graph: ports, edges, PDC, compile, executor
             │    ├─ faderframe-plugin-host   plugin abstraction + built-in plugins
             │    ├─ faderframe-transport     RT transport state, TransportInfo
@@ -549,6 +550,41 @@ master's bed and feeding the master directly):
 * **Views.** The track menus and the Surround Panner have an Object toggle
   for tracks that can be one; objects' pucks are square; the panner shows
   no LFE knob for them and their automation has no LFE lane.
+* **Headphone render modes.** The master (for its bed) and object tracks
+  carry Dolby's binaural render mode (`Track::binaural`: Off, Near, Mid,
+  Far or not set; `Command::SetTrackBinaural`; the track menu's "Headphone
+  Render (Dolby)" while the master is a bed). It is delivery metadata only:
+  `dbmd` writes it per bed channel (the LFE always Off) and per object.
+
+### Listening: headphones and the mono check
+
+What the master does on its way to the interface is listening, never part
+of a render (renders build their own engine, which listens on speakers):
+the master's hardware output always passes `nodes::ListenOut`
+(`build::Listen` from `EngineController::set_binaural`, a graph rebuild;
+other tracks with hardware outputs keep the plain fold-down).
+
+* **Headphones** (Audio → Listen, or Listen in the master strip's menu;
+  `Session::set_headphones`, `Preferences::headphones`): the master —
+  a bed, stereo or mono — rendered binaurally by `faderframe-binaural`.
+  Each speaker's feed is convolved with the impulse responses measured at
+  the ears of a KU100 dummy head from its direction (SADIE II, University
+  of York, Apache-2.0: fifteen BS.2051 directions baked by
+  `scripts/binaural_hrirs.py` into `data/sadie-d1.ffhr` at 44.1/48/96 kHz,
+  other rates resampled from the nearest; `binaural::direction` maps
+  speaker labels — quad's rears sit at ±135°, 5.x surrounds at ±110°).
+  The convolution is uniformly partitioned (blocks of 64 frames, 128 above
+  50 kHz; one forward FFT per speaker, one inverse per ear), so it adds
+  one block of latency, reported by the node. The LFE reaches both ears
+  low-passed at 120 Hz and +10 dB. Rooms: Near is the dry measurement, Mid
+  and Far add an eight-line feedback delay network fed in mono (about 8
+  and 3 dB under the direct sound). Render → "Headphones (binaural · room)"
+  writes the same render to a stereo file.
+* **The mono check** (the MONO button in the master strip's record slot,
+  Audio → Listen → Mono Check, `Session::set_mono_check`): a parameter slot
+  (`SlotRegistry::monitor_mono`), no rebuild; what is heard is folded to
+  stereo and summed to (L + R) / 2 on both speakers, after the binaural
+  render when both are on. Per session, not saved.
 
 ## 6. Transport and timing
 
@@ -2765,9 +2801,10 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
     surround beds and panning before any object-based format~~ — done (see
     *CD-Text languages*, *The DDP player* and *Surround beds*). ~~Object-based
     masters (ADM BWF, Dolby Atmos master profile), export and import~~ —
-    done (see *Object-based masters*, with Dolby's `dbmd` chunk). Not yet:
-    binaural monitoring, consumer object formats (IAMF; MPEG-H is out —
-    no open encoder, a paid spec and per-unit patent royalties).
+    done (see *Object-based masters*, with Dolby's `dbmd` chunk).
+    ~~Binaural monitoring~~ — done (see *Listening*). Not yet: consumer
+    object formats (IAMF; MPEG-H is out — no open encoder, a paid spec and
+    per-unit patent royalties).
 
 
 ### Modelled microphone preamplifiers

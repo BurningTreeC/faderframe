@@ -71,6 +71,9 @@ pub struct Preferences {
     pub render_ahead_buses: bool,
     /// Draw dense views (analysers, meters, curves) on the GPU.
     pub gpu_painter: bool,
+    /// Listening on headphones: the room of the binaural render ("near",
+    /// "mid", "far"); `None`: speakers.
+    pub headphones: Option<String>,
     /// Keyboard shortcuts changed in the shortcut editor (detailed action
     /// → accelerators; empty: none), over the defaults.
     pub shortcuts: std::collections::BTreeMap<String, Vec<String>>,
@@ -111,6 +114,7 @@ impl Default for Preferences {
             render_ahead_ms: 200,
             render_ahead_buses: true,
             gpu_painter: false,
+            headphones: None,
             shortcuts: Default::default(),
         }
     }
