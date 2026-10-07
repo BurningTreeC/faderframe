@@ -1631,6 +1631,8 @@ impl Session {
     /// Anything animating (playback, meters falling)?
     pub fn is_animating(&self) -> bool {
         self.transport.playing
+            // A locate the engine has not applied yet: painted until it has.
+            || self.shown_position.is_some()
             || self.meters.values().any(MeterDisplay::is_active)
             || !self.imports.is_empty()
             || !self.peak_jobs.is_empty()
