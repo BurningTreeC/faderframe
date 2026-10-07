@@ -434,8 +434,10 @@ Contrast:
   (keep as takes / replace) and loop-record mode (takes / last pass / new
   track per pass) are selectable in Transport and Preferences → Recording.
 * Track presets: save a track's channel settings (format, input, plugins
-  with state, fader, pan, sends, output, colour) and recall them as a new
-  track or onto another track. Resizable tracks (drag a header's bottom
+  with state, fader, pan, sends, output, colour) under a name and recall
+  them as a new track or onto another track. A name that exists already
+  is replaced only after you confirm (several tracks at once: replace or
+  keep both); the track menu's Delete Track Preset removes one. Resizable tracks (drag a header's bottom
   edge, Alt+wheel for all, View → Track Height).
 * Automation for every automatable parameter — volume, pan, mute, sends,
   plugin parameters and bypass: lanes under each track (A button / A key),

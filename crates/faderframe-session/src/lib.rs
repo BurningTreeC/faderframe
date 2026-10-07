@@ -726,9 +726,26 @@ pub enum Action {
         track: TrackId,
         plugin: Option<PluginRef>,
     },
-    /// Save a track's settings into the track preset library.
+    /// Ask (in the shell) for names to save the tracks' settings under.
+    PromptSaveTrackPreset {
+        tracks: Vec<TrackId>,
+    },
+    /// Ask (in the shell) whether to delete a user preset (a plugin's or
+    /// a track preset).
+    PromptDeletePreset {
+        path: PathBuf,
+    },
+    /// Delete a user preset file (never a factory one).
+    DeletePreset {
+        path: PathBuf,
+    },
+    /// Save a track's settings into the track preset library, as `name`
+    /// (`None`: the track's). A preset of that name is replaced when
+    /// `replace`, else both are kept (the new one numbered).
     SaveTrackPreset {
         track: TrackId,
+        name: Option<String>,
+        replace: bool,
     },
     /// Add a new track from a track preset file.
     AddTrackFromPreset {
@@ -1171,6 +1188,10 @@ pub enum UiRequest {
     SavePluginPreset {
         plugin: faderframe_core::PluginInstanceId,
     },
+    /// Ask for names and save the tracks as track presets.
+    SaveTrackPreset { tracks: Vec<TrackId> },
+    /// Ask whether to delete the user preset at `path` (named `name`).
+    DeletePreset { path: PathBuf, name: String },
     /// Ask for a group's new name.
     RenameGroup(faderframe_core::GroupId),
     /// Pick a colour (track or section).
@@ -3296,7 +3317,22 @@ impl Session {
                     })?;
                 }
             }
-            Action::SaveTrackPreset { track } => self.save_track_preset(track)?,
+            Action::PromptSaveTrackPreset { tracks } => {
+                self.ui_requests.push(UiRequest::SaveTrackPreset { tracks });
+            }
+            Action::PromptDeletePreset { path } => {
+                let name = path
+                    .file_stem()
+                    .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+                self.ui_requests
+                    .push(UiRequest::DeletePreset { path, name });
+            }
+            Action::DeletePreset { path } => self.delete_preset(&path)?,
+            Action::SaveTrackPreset {
+                track,
+                name,
+                replace,
+            } => self.save_track_preset(track, name.as_deref(), replace)?,
             Action::OpenPluginBrowser { track, target } => {
                 self.ui_requests
                     .push(UiRequest::PluginBrowser { track, target });
@@ -4535,23 +4571,94 @@ impl Session {
             .map_err(|e| SessionError::Other(e.to_string()))
     }
 
-    fn save_track_preset(&mut self, track: TrackId) -> Result<()> {
-        let name = self
-            .project
-            .track(track)
-            .ok_or(EditError::UnknownTrack(track))?
-            .name
-            .clone();
+    /// Delete a user preset: a track preset in the library or a plugin
+    /// preset FaderFrame saved (the plugin formats' own files stay).
+    pub fn delete_preset(&mut self, path: &Path) -> Result<()> {
+        let ext = path.extension().map(|e| e.to_string_lossy().into_owned());
+        // Compared as the file system sees them (no `..` way out).
+        let real = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let file = real(path);
+        let inside = |dir: &Path| file.parent().is_some_and(|p| p.starts_with(real(dir)));
+        let track = inside(&self.preset_dir)
+            && ext.as_deref() == Some(faderframe_project::preset::PRESET_EXTENSION);
+        let plugin =
+            inside(&crate::media::data_dir().join("presets")) && ext.as_deref() == Some("ffpreset");
+        if !(track || plugin) {
+            return Err(SessionError::Other(format!(
+                "{} is not one of your presets",
+                path.display()
+            )));
+        }
+        std::fs::remove_file(path)
+            .map_err(|e| SessionError::Other(format!("{}: {e}", path.display())))?;
+        let name = path
+            .file_stem()
+            .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+        if track {
+            self.rescan_track_presets();
+        } else {
+            self.revision += 1;
+        }
+        self.notify(NoticeLevel::Info, format!("deleted preset '{name}'"));
+        Ok(())
+    }
+
+    /// The library's preset that saving as `name` would meet (the same
+    /// file name, ignoring case).
+    pub fn existing_track_preset(&self, name: &str) -> Option<&PresetEntry> {
+        let want = faderframe_audio_files::import::clean_stem(name).to_lowercase();
+        self.presets.iter().find(|e| e.name.to_lowercase() == want)
+    }
+
+    fn save_track_preset(
+        &mut self,
+        track: TrackId,
+        name: Option<&str>,
+        replace: bool,
+    ) -> Result<()> {
+        let name = match name.map(str::trim).filter(|n| !n.is_empty()) {
+            Some(n) => n.to_string(),
+            None => self
+                .project
+                .track(track)
+                .ok_or(EditError::UnknownTrack(track))?
+                .name
+                .clone(),
+        };
         std::fs::create_dir_all(&self.preset_dir)
             .map_err(|e| SessionError::Other(format!("{}: {e}", self.preset_dir.display())))?;
-        let path = faderframe_audio_files::import::unique_path(
-            &self.preset_dir,
-            &name,
-            faderframe_project::preset::PRESET_EXTENSION,
-        );
+        let ext = faderframe_project::preset::PRESET_EXTENSION;
+        let replaced = if replace {
+            self.existing_track_preset(&name).map(|e| e.path.clone())
+        } else {
+            None
+        };
+        let path = match &replaced {
+            Some(old) => {
+                // Written under the new spelling of the name.
+                let stem = faderframe_audio_files::import::clean_stem(&name);
+                let path = self.preset_dir.join(format!("{stem}.{ext}"));
+                if *old != path {
+                    std::fs::remove_file(old)
+                        .map_err(|e| SessionError::Other(format!("{}: {e}", old.display())))?;
+                }
+                path
+            }
+            None => faderframe_audio_files::import::unique_path(&self.preset_dir, &name, ext),
+        };
         self.export_track_preset(track, &path)?;
         self.rescan_track_presets();
-        self.notify(NoticeLevel::Info, format!("saved track preset '{name}'"));
+        self.notify(
+            NoticeLevel::Info,
+            format!(
+                "{} track preset '{name}'",
+                if replaced.is_some() {
+                    "replaced"
+                } else {
+                    "saved"
+                }
+            ),
+        );
         Ok(())
     }
 

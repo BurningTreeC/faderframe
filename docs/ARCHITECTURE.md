@@ -1153,7 +1153,13 @@ covered by `the_stock_devices_do_not_allocate`.
   (`.vstpreset` from the standard folders, matched by class id) are listed
   too and loaded into the plugin's state. Loading is
   `Command::SetPluginState` — one undo step; the engine follows a changed
-  slot state.
+  slot state. A name is one file whatever its case
+  (`Session::existing_plugin_preset`): the shell asks before saving over
+  it, and the new spelling replaces the old file.
+  `Action::DeletePreset` removes only the user's own files (a
+  `.ffpreset` under the presets folder, or a track preset in the
+  library, compared as canonical paths); the menus list only those. The
+  shell confirms first (`PromptDeletePreset`).
   Built-in factory presets live in `plugin_host::presets`: 216 across
   the EQ, Program EQ, compressor, limiter, gate, de-esser, saturator,
   utility, delay, reverb, modulation, the four MIDI effects and Synth
@@ -2369,7 +2375,10 @@ Other tracks are referenced by name and resolved on use; unknown targets
 are reported and dropped. The session keeps a library folder
 (`$XDG_DATA_HOME/faderframe/track-presets`): save a track into it, add a
 new track from a preset, or apply one onto an existing track as one undo
-step.
+step. Saving asks for a name (`PromptSaveTrackPreset`; several tracks
+keep their names). `SaveTrackPreset { name, replace }` overwrites the
+preset of that name, ignoring case (`existing_track_preset`), only with
+`replace`; otherwise the new file is numbered (keep both).
 
 ## 11. UI architecture
 
@@ -2855,9 +2864,7 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
 5. **Vocals and audio intelligence**: ~~native pitch editing~~ (done:
    TD-PSOLA rather than the Stretch engine, see *Pitch editing*),
    ~~audio-to-MIDI (basic-pitch, Apache-2.0)~~ (done: *Audio to MIDI*), ~~tempo and key
-   detection~~ (done: *Tempo and key from clips*), ~~per-clip effects rendered offline~~ (done: *Clip effects*), ARA 2 hosting (waits for
-   an ARA plugin to test with: none runs on Linux, yabridge does not
-   bridge ARA), ~~a speech and lyrics transcription track (Whisper,
+   detection~~ (done: *Tempo and key from clips*), ~~per-clip effects rendered offline~~ (done: *Clip effects*), ~~a speech and lyrics transcription track (Whisper,
    MIT)~~ (done: *Speech and lyrics*). Stem separation waits
    for permissively licensed model weights.
 6. ~~**Performance and control**: a clip launcher with scenes recorded

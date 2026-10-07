@@ -2272,7 +2272,7 @@ impl ArrangerView {
             items.push(
                 MenuItem::new(
                     "Save as Track Preset",
-                    Action::SaveTrackPreset { track: t.id },
+                    Action::PromptSaveTrackPreset { tracks: vec![t.id] },
                 )
                 .separated(),
             );
@@ -2302,6 +2302,22 @@ impl ArrangerView {
                 item = item.separated();
             }
             items.push(item);
+        }
+        if !presets.is_empty() {
+            items.push(MenuItem::submenu(
+                "Delete Track Preset",
+                presets
+                    .iter()
+                    .map(|p| {
+                        MenuItem::new(
+                            p.name.clone(),
+                            Action::PromptDeletePreset {
+                                path: p.path.clone(),
+                            },
+                        )
+                    })
+                    .collect(),
+            ));
         }
         let current = model.track_height(t.id);
         for (i, (name, h)) in TRACK_HEIGHTS.iter().enumerate() {

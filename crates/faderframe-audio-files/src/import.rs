@@ -65,8 +65,9 @@ pub fn peaks_path_for(media: &Path) -> PathBuf {
     media.with_extension("ffpk")
 }
 
-/// A file name in `dir` based on `stem` that does not exist yet.
-pub fn unique_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
+/// `stem` as a file name: characters outside letters, digits and
+/// ` -_.()` become `_` ("audio" when nothing is left).
+pub fn clean_stem(stem: &str) -> String {
     let clean: String = stem
         .chars()
         .map(|c| {
@@ -78,7 +79,16 @@ pub fn unique_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
         })
         .collect();
     let clean = clean.trim().trim_matches('.');
-    let clean = if clean.is_empty() { "audio" } else { clean };
+    if clean.is_empty() {
+        "audio".into()
+    } else {
+        clean.into()
+    }
+}
+
+/// A file name in `dir` based on `stem` that does not exist yet.
+pub fn unique_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
+    let clean = clean_stem(stem);
     let mut candidate = dir.join(format!("{clean}.{ext}"));
     let mut n = 2;
     while candidate.exists() {

@@ -136,8 +136,27 @@ impl Session {
             .collect()
     }
 
-    /// Save the plugin's current settings as a user preset.
+    /// The user preset that saving as `name` would replace (the same name,
+    /// ignoring case: one file on every system).
+    pub fn existing_plugin_preset(
+        &self,
+        plugin: PluginInstanceId,
+        name: &str,
+    ) -> Option<PluginPreset> {
+        let want = file_name(name).to_lowercase();
+        self.plugin_presets(plugin).into_iter().find(|p| {
+            !p.factory
+                && p.path
+                    .file_name()
+                    .is_some_and(|f| f.to_string_lossy().to_lowercase() == want)
+        })
+    }
+
+    /// Save the plugin's current settings as a user preset, replacing one
+    /// of the same name (the shell asks first:
+    /// [`existing_plugin_preset`](Self::existing_plugin_preset)).
     pub fn save_plugin_preset(&mut self, plugin: PluginInstanceId, name: &str) -> Result<PathBuf> {
+        let existing = self.existing_plugin_preset(plugin, name);
         self.capture_plugin_states();
         let (_, slot) = self
             .plugin_owner(plugin)
@@ -170,6 +189,11 @@ impl Session {
         let dir = user_dir(&slot.plugin);
         std::fs::create_dir_all(&dir)
             .map_err(|e| SessionError::Other(format!("{}: {e}", dir.display())))?;
+        if let Some(old) = &existing {
+            // Another spelling of the name: the new one takes its place.
+            std::fs::remove_file(&old.path)
+                .map_err(|e| SessionError::Other(format!("{}: {e}", old.path.display())))?;
+        }
         let path = dir.join(file_name(name));
         let json =
             serde_json::to_string_pretty(&file).map_err(|e| SessionError::Other(e.to_string()))?;
@@ -177,7 +201,16 @@ impl Session {
             .map_err(|e| SessionError::Other(format!("{}: {e}", path.display())))?;
         self.notify(
             crate::NoticeLevel::Info,
-            format!("saved preset '{}' for {}", name.trim(), slot.plugin.name),
+            format!(
+                "{} preset '{}' for {}",
+                if existing.is_some() {
+                    "replaced"
+                } else {
+                    "saved"
+                },
+                name.trim(),
+                slot.plugin.name
+            ),
         );
         Ok(path)
     }

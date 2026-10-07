@@ -203,17 +203,7 @@ pub fn install(app: &Rc<AppState>) {
                 .iter()
                 .copied()
                 .collect();
-            if tracks.is_empty() {
-                a.report(
-                    faderframe_session::SessionError::Other(
-                        "select a track to save as a preset".into(),
-                    ),
-                    false,
-                );
-            }
-            for track in tracks {
-                a.dispatch(Action::SaveTrackPreset { track });
-            }
+            crate::dialogs::save_track_presets(a, tracks);
         }),
         entry(app, "track-from-preset", |a| {
             crate::dialogs::track_preset(a, false)
@@ -2049,7 +2039,13 @@ pub fn install(app: &Rc<AppState>) {
                 );
             }
         }),
-        // Presets (menus): `save-preset:<plugin id>`, `load-preset:<id>\n<path>`.
+        // Presets (menus): `save-preset:<plugin id>`, `load-preset:<id>\n<path>`,
+        // `delete-preset:<path>` (asks first).
+        named("delete-preset", |a, arg| {
+            a.dispatch(Action::PromptDeletePreset {
+                path: std::path::PathBuf::from(arg),
+            });
+        }),
         named("save-preset", |a, arg| {
             if let Ok(id) = arg.parse::<u64>() {
                 a.dispatch(Action::PromptSavePluginPreset(

@@ -307,6 +307,28 @@ fn presets_button(app: &Rc<AppState>, plugin: PluginInstanceId) -> gtk::MenuButt
             list.append_item(&item);
         }
         menu.append_section(None, &list);
+        // The user's presets can go.
+        let own: Vec<_> = {
+            let s = app.session.borrow();
+            s.plugin_presets(plugin)
+                .into_iter()
+                .filter(|p| !p.factory)
+                .collect()
+        };
+        if !own.is_empty() {
+            let delete = gtk::gio::Menu::new();
+            for p in own {
+                let item = gtk::gio::MenuItem::new(Some(&p.name.replace('_', "__")), None);
+                item.set_action_and_target_value(
+                    Some("app.delete-preset"),
+                    Some(&p.path.display().to_string().to_variant()),
+                );
+                delete.append_item(&item);
+            }
+            let section = gtk::gio::Menu::new();
+            section.append_submenu(Some("Delete Preset"), &delete);
+            menu.append_section(None, &section);
+        }
         // The plugin's own programs.
         if !programs.is_empty() {
             let section = gtk::gio::Menu::new();

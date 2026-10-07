@@ -369,6 +369,12 @@ impl AppState {
                 faderframe_session::UiRequest::SavePluginPreset { plugin } => {
                     crate::dialogs::save_preset(self, plugin);
                 }
+                faderframe_session::UiRequest::SaveTrackPreset { tracks } => {
+                    crate::dialogs::save_track_presets(self, tracks);
+                }
+                faderframe_session::UiRequest::DeletePreset { path, name } => {
+                    crate::dialogs::delete_preset(self, path, &name);
+                }
                 faderframe_session::UiRequest::RenameGroup(group) => {
                     crate::dialogs::rename_group(self, group);
                 }

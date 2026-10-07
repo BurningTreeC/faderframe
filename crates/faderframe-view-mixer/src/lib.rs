@@ -1491,6 +1491,21 @@ impl MixerView {
                         presets.len() - 24
                     )));
                 }
+                let own: Vec<MenuItem<Action>> = presets
+                    .iter()
+                    .filter(|p| !p.factory)
+                    .map(|p| {
+                        MenuItem::new(
+                            p.name.clone(),
+                            Action::PromptDeletePreset {
+                                path: p.path.clone(),
+                            },
+                        )
+                    })
+                    .collect();
+                if !own.is_empty() {
+                    items.push(MenuItem::submenu("Delete Preset", own));
+                }
                 // The plugin's own programs (VST3 program lists).
                 let programs = model.plugin_programs(s.id);
                 let current = model.plugin_current_program(s.id);

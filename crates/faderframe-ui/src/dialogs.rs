@@ -412,14 +412,141 @@ pub fn save_preset(app: &Rc<AppState>, plugin: faderframe_core::PluginInstanceId
         .plugin_owner(plugin)
         .map(|(_, s)| s.plugin.name.clone())
         .unwrap_or_default();
-    name_prompt(
+    let owner = plugin_name.clone();
+    name_prompt_checked(
         app,
         &format!("Save Preset — {plugin_name}"),
         "Save the current settings as a preset:",
         "",
         "Save",
+        move |app, name| {
+            let old = app.session.borrow().existing_plugin_preset(plugin, name)?;
+            Some((
+                format!("Replace the preset “{}”?", old.name),
+                format!(
+                    "{owner} already has a preset with this name. Replacing it overwrites its settings."
+                ),
+            ))
+        },
         move |name| faderframe_session::Action::SavePluginPreset { plugin, name },
     );
+}
+
+/// Ask, then delete a user preset.
+pub fn delete_preset(app: &Rc<AppState>, path: std::path::PathBuf, name: &str) {
+    let Some(win) = app.window.borrow().clone() else {
+        return;
+    };
+    let dialog = gtk::AlertDialog::builder()
+        .message(format!("Delete the preset “{name}”?"))
+        .detail("Its file is removed; this cannot be undone.")
+        .buttons(["Cancel", "Delete"])
+        .cancel_button(0)
+        .default_button(0)
+        .modal(true)
+        .build();
+    let weak = Rc::downgrade(app);
+    dialog.choose(Some(&win), gio::Cancellable::NONE, move |res| {
+        if res == Ok(1)
+            && let Some(app) = weak.upgrade()
+        {
+            app.dispatch(faderframe_session::Action::DeletePreset { path });
+        }
+    });
+}
+
+/// Save tracks as track presets: one track asks for a name (its own to
+/// begin with); either way a name the library has already is replaced
+/// only when the user says so.
+pub fn save_track_presets(app: &Rc<AppState>, tracks: Vec<faderframe_core::TrackId>) {
+    use faderframe_session::Action;
+    let named: Vec<(faderframe_core::TrackId, String)> = {
+        let s = app.session.borrow();
+        tracks
+            .iter()
+            .filter_map(|t| s.project().track(*t).map(|t| (t.id, t.name.clone())))
+            .collect()
+    };
+    match named.as_slice() {
+        [] => app.report(
+            faderframe_session::SessionError::Other("select a track to save as a preset".into()),
+            false,
+        ),
+        [(track, name)] => {
+            let track = *track;
+            name_prompt_checked(
+                app,
+                "Save Track Preset",
+                "Save the track's settings as a preset named:",
+                name,
+                "Save",
+                |app, name| {
+                    let s = app.session.borrow();
+                    let old = s.existing_track_preset(name)?;
+                    Some((
+                        format!("Replace the track preset “{}”?", old.name),
+                        "The library has a track preset with this name. Replacing it overwrites it."
+                            .into(),
+                    ))
+                },
+                move |name| Action::SaveTrackPreset {
+                    track,
+                    name: Some(name),
+                    replace: true,
+                },
+            );
+        }
+        _ => {
+            let clashes: Vec<String> = {
+                let s = app.session.borrow();
+                named
+                    .iter()
+                    .filter_map(|(_, n)| s.existing_track_preset(n).map(|e| e.name.clone()))
+                    .collect()
+            };
+            let save = move |app: &Rc<AppState>, replace: bool| {
+                for (track, _) in &named {
+                    app.dispatch(Action::SaveTrackPreset {
+                        track: *track,
+                        name: None,
+                        replace,
+                    });
+                }
+            };
+            if clashes.is_empty() {
+                save(app, false);
+                return;
+            }
+            let Some(win) = app.window.borrow().clone() else {
+                return;
+            };
+            let quoted: Vec<String> = clashes.iter().map(|n| format!("“{n}”")).collect();
+            let dialog = gtk::AlertDialog::builder()
+                .message(if clashes.len() == 1 {
+                    format!("Replace the track preset {}?", quoted[0])
+                } else {
+                    format!("Replace {} track presets?", clashes.len())
+                })
+                .detail(format!(
+                    "The library already has presets named {}. Replace them, or keep both (the new ones numbered)?",
+                    quoted.join(", ")
+                ))
+                .buttons(["Cancel", "Keep Both", "Replace"])
+                .cancel_button(0)
+                .default_button(0)
+                .modal(true)
+                .build();
+            let weak = Rc::downgrade(app);
+            dialog.choose(Some(&win), gio::Cancellable::NONE, move |res| {
+                let Some(app) = weak.upgrade() else { return };
+                match res {
+                    Ok(1) => save(&app, false),
+                    Ok(2) => save(&app, true),
+                    _ => {}
+                }
+            });
+        }
+    }
 }
 
 pub fn rename_group(app: &Rc<AppState>, group: faderframe_core::GroupId) {
@@ -641,6 +768,21 @@ fn name_prompt(
     ok: &str,
     action: impl Fn(String) -> faderframe_session::Action + 'static,
 ) {
+    name_prompt_checked(app, title, prompt, initial, ok, |_, _| None, action);
+}
+
+/// A name prompt whose name may meet an existing one: `clash` gives the
+/// question and its detail, and the action happens only once the user
+/// agrees (else the prompt stays to take another name).
+fn name_prompt_checked(
+    app: &Rc<AppState>,
+    title: &str,
+    prompt: &str,
+    initial: &str,
+    ok: &str,
+    clash: impl Fn(&Rc<AppState>, &str) -> Option<(String, String)> + 'static,
+    action: impl Fn(String) -> faderframe_session::Action + 'static,
+) {
     let Some(main) = app.window.borrow().clone() else {
         return;
     };
@@ -677,15 +819,45 @@ fn name_prompt(
     cancel.connect_clicked(move |_| w.close());
     let weak = Rc::downgrade(app);
     let w = win.clone();
+    let action = Rc::new(action);
     confirm.connect_clicked(move |_| {
         let name = entry.text().trim().to_string();
         if name.is_empty() {
             return;
         }
-        if let Some(app) = weak.upgrade() {
+        let Some(app) = weak.upgrade() else {
+            return;
+        };
+        let Some((message, detail)) = clash(&app, &name) else {
             app.dispatch(action(name));
-        }
-        w.close();
+            w.close();
+            return;
+        };
+        let dialog = gtk::AlertDialog::builder()
+            .message(message)
+            .detail(detail)
+            .buttons(["Cancel", "Replace"])
+            .cancel_button(0)
+            .default_button(0)
+            .modal(true)
+            .build();
+        let (weak, w2, entry, action) = (
+            Rc::downgrade(&app),
+            w.clone(),
+            entry.clone(),
+            Rc::clone(&action),
+        );
+        dialog.choose(Some(&w), gio::Cancellable::NONE, move |res| {
+            if res == Ok(1) {
+                if let Some(app) = weak.upgrade() {
+                    app.dispatch(action(name));
+                }
+                w2.close();
+            } else {
+                entry.grab_focus();
+                entry.select_region(0, -1);
+            }
+        });
     });
     win.present();
 }
