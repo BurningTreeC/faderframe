@@ -18,6 +18,7 @@ faderframe-app            binary: CLI parsing, logging, starts the GTK app
        ├─ faderframe-view-arranger / -mixer / -pianoroll / -performance / -tools / -automation / -devices   (GTK-free views)
        │    └─ faderframe-ui-canvas   Painter trait, events, CanvasView, theme, console controls
        ├─ faderframe-ui-gpu       optional GPU painter for dense views (vello on wgpu, parley text)
+       ├─ faderframe-view-ddp     DDP player: a CD master checked, played and imported
        ├─ faderframe-audio-pipewire   native PipeWire backend (pw_filter, Linux)
        ├─ faderframe-audio-jack       JACK backend (JACK2 / pipewire-jack, Linux)
        ├─ faderframe-audio-cpal       system backend through cpal: WASAPI, ASIO (opt-in), CoreAudio, ALSA
@@ -1359,6 +1360,28 @@ Japanese text decode; libcdio takes the character code of the last
 block's size information for every block, so it misreads a Latin-1 block
 when a Japanese one follows. Cue sheets carry the main language only.
 Validation: at most eight languages, none twice, 256 packs per block.
+
+**The DDP player** (`session::ddp`, view `faderframe-view-ddp`,
+`ViewKind::Ddp`, File → DDP Player) opens any DDP fileset on a worker:
+`ddp::inspect` (sizes, PQ against the image, CD-Text CRCs and every
+block, `CHECKSUM.MD5`) with the Red Book rules reported instead of
+refused, the image's byte order found by its sound
+(`ddp::image_big_endian`: the order with the smaller sum of sample steps),
+an overview of its peaks, and the image converted to a float file at the
+engine's rate that the engine plays instead of the project
+(`engine::preview`, as album playback; the two never play at once, and the
+project starting takes the outputs back). `DdpDisc::locate` turns a
+sector into track, index and the time from index 01 — negative in a
+pregap, as a CD player counts. Import (`DdpAction::Import`) writes each
+track's samples unchanged into a 16-bit WAV in the media folder (a pregap
+with more than dither noise — 8 LSB — stays with the track before; a
+silent one becomes the song's pause) and adds the songs with their titles,
+credits and ISRC, the UPC and every CD-Text language, as one step; the
+first save moves those files into the project with the album following
+(`remap_album_files`). Dev action `ddp:<open=<folder>|play|pause|stop|
+next|previous|import|close>`. Tests: `session/tests/ddp_player.rs` (a
+master FaderFrame wrote: checked, played by track, imported bit for bit,
+saved; a byte-swapped image recognised).
 `Session::album_delivered` previews the gains from the analyses (album
 loudness approximated from the songs' loudness and length).
 
@@ -2603,7 +2626,7 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
    dense views~~ (done: see *The GPU painter*; a dmabuf instead of the
    readback is the next step there).
 10. **Mastering**: ~~multiple CD-Text languages~~ (done: see *CD-Text
-    languages*), a DDP player/import;
+    languages*), ~~a DDP player/import~~ (done: see *The DDP player*);
     surround beds and panning before any object-based format.
 
 

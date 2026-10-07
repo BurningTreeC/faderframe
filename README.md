@@ -254,8 +254,12 @@ Contrast:
   songs keep their balance) or per-song levelling, true-peak limiting,
   dither, one file per song (cut gaplessly when songs crossfade), the whole
   album with a cue sheet and a CD master for replication: a DDP 2.00
-  fileset (44.1 kHz/16-bit, PQ codes, CD-Text, checksums) verified after
-  writing; and a vinyl premaster (12″ 33⅓ or 45, 10″, 7″): sides split
+  fileset (44.1 kHz/16-bit, PQ codes, CD-Text in up to eight languages —
+  Japanese too — checksums) verified after writing; a DDP player that
+  checks any fileset as a plant would (checksums, PQ, Red Book rules,
+  every CD-Text language), plays it like a CD player (track, index, the
+  pregap counting down) and imports its tracks back as album songs,
+  bit for bit; and a vinyl premaster (12″ 33⅓ or 45, 10″, 7″): sides split
   automatically or by hand with their times against the format's limits,
   checks for out-of-phase bass, esses, hard limiting and the inner
   grooves, one continuous 24-bit file per side (gain only, no limiting),

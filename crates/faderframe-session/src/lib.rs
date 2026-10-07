@@ -32,6 +32,7 @@ pub mod clip_fx;
 pub mod containers;
 pub mod control;
 mod control_extra;
+pub mod ddp;
 pub mod delivery;
 pub mod detect;
 pub mod editing;
@@ -297,6 +298,8 @@ pub enum Action {
     SetLevelScale(analysis::LevelScale),
     /// Album songs, settings, analysis and export.
     Album(album::AlbumAction),
+    /// The DDP player (`session::ddp`).
+    Ddp(ddp::DdpAction),
     /// Start a plugin again from its slot (after a crash, or to move it
     /// into or out of a sandbox).
     ReloadPlugin(faderframe_core::PluginInstanceId),
@@ -1085,6 +1088,7 @@ pub struct Session {
     capture: capture::CaptureBuffer,
     /// Album analyses and the running album job.
     album_state: album::AlbumState,
+    ddp_state: ddp::DdpState,
     /// Plugin failures noticed, sandboxed plugins' unsaved state.
     plugin_care: sandbox::PluginCare,
     /// Render tracks nobody plays live this far ahead (`None`: off).
@@ -1304,6 +1308,7 @@ impl Session {
             samplings: Vec::new(),
             capture: capture::CaptureBuffer::default(),
             album_state: album::AlbumState::default(),
+            ddp_state: ddp::DdpState::default(),
             plugin_care: sandbox::PluginCare::default(),
             render_ahead: None,
             render_ahead_buses: false,
@@ -1905,6 +1910,7 @@ impl Session {
         self.poll_bounces();
         self.poll_samples();
         self.poll_album();
+        self.poll_ddp();
         self.poll_analysis(dt);
         self.pump_idle();
         self.poll_recording();
@@ -1922,6 +1928,13 @@ impl Session {
                 self.album_stop_playing();
             }
             // The album's playhead moves.
+            self.revision += 1;
+        }
+        if self.ddp_state.is_playing() {
+            // As the album: the project takes the outputs back.
+            if !was_playing && self.transport.playing {
+                self.ddp_stop();
+            }
             self.revision += 1;
         }
         let plugin_poll = self.engine.poll_plugins();
@@ -2567,6 +2580,8 @@ impl Session {
                 *path = new.clone();
             }
         }
+        // Album songs made in the media folder (an imported DDP's tracks).
+        remap_album_files(&mut self.project, &self.media_moves);
         if self.remap_sample_paths()
             && let Err(e) = self.sync(Impact::Params)
         {
@@ -2593,6 +2608,7 @@ impl Session {
         if self.media_moves.is_empty() {
             return false;
         }
+        remap_album_files(&mut self.project, &self.media_moves);
         let moves = &self.media_moves;
         samples::map_states(&mut self.project, |p| {
             moves.get(p).cloned().unwrap_or_else(|| p.to_path_buf())
@@ -2994,6 +3010,7 @@ impl Session {
                 self.update_analysis_settings(|s| s.target_lufs = lufs);
             }
             Action::Album(a) => self.album_action(a)?,
+            Action::Ddp(a) => self.ddp_action(a)?,
             Action::ReloadPlugin(plugin) => self.reload_plugins(&[plugin])?,
             Action::LoadDeviceSamples {
                 plugin,
@@ -4600,6 +4617,7 @@ impl Drop for Session {
         self.cancel_imports();
         // The album rendered to play it.
         self.album_state.discard_preview();
+        self.ddp_state.discard();
         // Scratch media of a project that was never saved is discarded with
         // it (the shell asks before closing unsaved work).
         self.discard_unsaved_media();
@@ -4611,6 +4629,17 @@ fn render_ahead_threads() -> usize {
     faderframe_realtime::physical_cores()
         .saturating_sub(1)
         .min(8)
+}
+
+/// Point album songs' files at where a save moved them.
+fn remap_album_files(project: &mut Project, moves: &HashMap<PathBuf, PathBuf>) {
+    for song in &mut project.album.songs {
+        if let faderframe_project::album::SongSource::AudioFile(path) = &mut song.source
+            && let Some(new) = moves.get(path.as_path())
+        {
+            *path = new.clone();
+        }
+    }
 }
 
 #[cfg(test)]

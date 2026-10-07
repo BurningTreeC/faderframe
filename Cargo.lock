@@ -1016,6 +1016,7 @@ dependencies = [
  "faderframe-view-arranger",
  "faderframe-view-automation",
  "faderframe-view-clipfx",
+ "faderframe-view-ddp",
  "faderframe-view-devices",
  "faderframe-view-history",
  "faderframe-view-launcher",
@@ -1108,6 +1109,17 @@ dependencies = [
  "faderframe-project",
  "faderframe-session",
  "faderframe-timeline",
+ "faderframe-ui-canvas",
+]
+
+[[package]]
+name = "faderframe-view-ddp"
+version = "0.10.0"
+dependencies = [
+ "faderframe-disc",
+ "faderframe-engine",
+ "faderframe-project",
+ "faderframe-session",
  "faderframe-ui-canvas",
 ]
 

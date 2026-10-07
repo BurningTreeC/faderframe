@@ -1,0 +1,20 @@
+[package]
+name = "faderframe-view-ddp"
+description = "DDP player: a CD master's fileset checked, shown track by track and played"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-session.workspace = true
+faderframe-ui-canvas.workspace = true
+faderframe-disc.workspace = true
+
+[dev-dependencies]
+faderframe-engine.workspace = true
+faderframe-project.workspace = true

@@ -45,6 +45,7 @@ faderframe-ui-gpu = { path = "crates/faderframe-ui-gpu" }
 faderframe-view-arranger = { path = "crates/faderframe-view-arranger" }
 faderframe-view-mixer = { path = "crates/faderframe-view-mixer" }
 faderframe-view-tools = { path = "crates/faderframe-view-tools" }
+faderframe-view-ddp = { path = "crates/faderframe-view-ddp" }
 faderframe-view-devices = { path = "crates/faderframe-view-devices" }
 faderframe-view-automation = { path = "crates/faderframe-view-automation" }
 faderframe-view-album = { path = "crates/faderframe-view-album" }

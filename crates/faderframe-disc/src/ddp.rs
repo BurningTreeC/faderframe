@@ -371,6 +371,14 @@ fn msf_of(b: &[u8]) -> Option<u32> {
 /// Read a fileset in `dir` and check it: sizes, PQ against the image,
 /// CD-Text CRCs, the Red Book rules, and `CHECKSUM.MD5` when present.
 pub fn read(dir: &Path) -> Result<ReadFileset, DdpError> {
+    let f = inspect(dir)?;
+    f.disc.validate()?;
+    Ok(f)
+}
+
+/// [`read`] without the Red Book rules (a player shows what breaks them
+/// instead of refusing the fileset; `Disc::validate` says).
+pub fn inspect(dir: &Path) -> Result<ReadFileset, DdpError> {
     let bad = |what: &str| DdpError::Format(what.to_string());
     let id = std::fs::read(dir.join("DDPID"))?;
     if id.len() != 128 || !id.starts_with(b"DDP 2.0") {
@@ -471,7 +479,6 @@ pub fn read(dir: &Path) -> Result<ReadFileset, DdpError> {
     } else {
         disc.text = CdText::default();
     }
-    disc.validate()?;
     let checksums = match std::fs::read_to_string(dir.join("CHECKSUM.MD5")) {
         Ok(list) => {
             let mut ok = true;
@@ -503,4 +510,34 @@ pub fn read(dir: &Path) -> Result<ReadFileset, DdpError> {
         image,
         checksums,
     })
+}
+
+/// Whether an image's audio is stored big-endian: DDP images are normally
+/// little-endian (Intel order), some tools write the other. Music is
+/// smooth from sample to sample in the right order and noise in the wrong
+/// one: the order with the smaller sum of steps wins (silence: little).
+pub fn image_big_endian(image: &Path) -> io::Result<bool> {
+    let len = std::fs::metadata(image)?.len();
+    let mut f = File::open(image)?;
+    let window = 1 << 16;
+    let (mut le, mut be) = (0u64, 0u64);
+    for k in 1..=4u64 {
+        let at = (len * k / 5) & !3;
+        io::Seek::seek(&mut f, io::SeekFrom::Start(at))?;
+        let mut buf = vec![0u8; window];
+        let n = io::Read::read(&mut f, &mut buf)?;
+        let frames = buf[..n & !3].as_chunks::<4>().0;
+        for w in frames.windows(2) {
+            let step = |a: i16, b: i16| u64::from((i32::from(a) - i32::from(b)).unsigned_abs());
+            le += step(
+                i16::from_le_bytes([w[0][0], w[0][1]]),
+                i16::from_le_bytes([w[1][0], w[1][1]]),
+            );
+            be += step(
+                i16::from_be_bytes([w[0][0], w[0][1]]),
+                i16::from_be_bytes([w[1][0], w[1][1]]),
+            );
+        }
+    }
+    Ok(be < le)
 }

@@ -26,10 +26,12 @@ pub enum ViewKind {
     ClipFx,
     /// Scenes of clips launched while the song plays.
     Launcher,
+    /// A CD master's DDP fileset, checked and played.
+    Ddp,
 }
 
 impl ViewKind {
-    pub const ALL: [ViewKind; 12] = [
+    pub const ALL: [ViewKind; 13] = [
         ViewKind::Arranger,
         ViewKind::Mixer,
         ViewKind::PianoRoll,
@@ -42,6 +44,7 @@ impl ViewKind {
         ViewKind::Pitch,
         ViewKind::ClipFx,
         ViewKind::Launcher,
+        ViewKind::Ddp,
     ];
 
     /// The kind whose default view has this id (views added after a layout
@@ -64,6 +67,7 @@ impl ViewKind {
             ViewKind::Pitch => "Pitch",
             ViewKind::ClipFx => "Clip Effects",
             ViewKind::Launcher => "Clip Launcher",
+            ViewKind::Ddp => "DDP Player",
         }
     }
 
@@ -81,6 +85,7 @@ impl ViewKind {
             ViewKind::Pitch => ViewId::pitch(),
             ViewKind::ClipFx => ViewId::clip_fx(),
             ViewKind::Launcher => ViewId::launcher(),
+            ViewKind::Ddp => ViewId::ddp(),
         }
     }
 }

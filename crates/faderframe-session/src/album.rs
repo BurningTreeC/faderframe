@@ -1477,6 +1477,8 @@ impl Session {
             return Ok(());
         };
         if self.album_state.playing.is_none() {
+            // A DDP playing stops for the album.
+            self.ddp_stop();
             let source = faderframe_audio_files::StreamSource::open(&p.path)
                 .map_err(|e| SessionError::Other(format!("{}: {e}", p.path.display())))?;
             // The project stops: the album plays instead.

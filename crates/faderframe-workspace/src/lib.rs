@@ -69,6 +69,10 @@ impl ViewId {
         Self::new("history")
     }
 
+    pub fn ddp() -> Self {
+        Self::new("ddp")
+    }
+
     pub fn modulators() -> Self {
         Self::new("modulators")
     }

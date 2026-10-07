@@ -288,7 +288,13 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             ("Export MIDI File…", "app.export-midi"),
         ]),
     );
-    file.append_section(None, &section(&[("Render / Export…", "app.render")]));
+    file.append_section(
+        None,
+        &section(&[
+            ("Render / Export…", "app.render"),
+            ("DDP Player (Check and Play a CD Master)", "app.show-ddp"),
+        ]),
+    );
     file.append_section(None, &section(&[("Preferences…", "app.preferences")]));
     file.append_section(None, &section(&[("Quit", "app.quit")]));
     menu.append_submenu(Some("_File"), &file);
@@ -453,6 +459,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             ("Pitch Editor", "app.show-pitch"),
             ("Clip Effects", "app.show-clip-fx"),
             ("Clip Launcher", "app.show-launcher"),
+            ("DDP Player", "app.show-ddp"),
             ("Show / Hide Bottom Dock", "app.toggle-dock"),
             ("Master Strip at the Side", "app.master-panel"),
         ]),

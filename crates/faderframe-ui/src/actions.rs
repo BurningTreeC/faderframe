@@ -331,6 +331,7 @@ pub fn install(app: &Rc<AppState>) {
             "show-history",
             A::Workspace(W::ShowView(ViewId::history())),
         ),
+        dispatch(app, "show-ddp", A::Workspace(W::ShowView(ViewId::ddp()))),
         dispatch(
             app,
             "show-modulators",
@@ -1878,6 +1879,32 @@ pub fn install(app: &Rc<AppState>) {
                 s.render_ahead_buses(),
                 s.render_ahead_strips(),
             );
+        }),
+        // Development aid: `ddp:<open=<folder>|play|pause|stop|next|previous|import|close>`
+        // (the DDP player; `open` also shows it).
+        named("ddp", |a, arg| {
+            use faderframe_session::ddp::DdpAction as D;
+            let arg = arg.trim();
+            let action = if let Some(dir) = arg.strip_prefix("open=") {
+                a.dispatch(Action::Workspace(
+                    faderframe_session::WorkspaceAction::ShowView(
+                        faderframe_workspace::ViewId::ddp(),
+                    ),
+                ));
+                D::Open(std::path::PathBuf::from(dir))
+            } else {
+                match arg {
+                    "play" => D::Play(None),
+                    "pause" => D::Pause,
+                    "stop" => D::Stop,
+                    "next" => D::Skip(1),
+                    "previous" => D::Skip(-1),
+                    "import" => D::Import,
+                    "close" => D::Close,
+                    _ => return,
+                }
+            };
+            a.dispatch(Action::Ddp(action));
         }),
         // Development aid: `render-ahead-buses:<0|1>`.
         named("render-ahead-buses", |a, arg| {
