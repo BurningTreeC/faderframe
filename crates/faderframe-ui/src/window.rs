@@ -289,6 +289,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
         None,
         &section(&[
             ("Import Audio…", "app.import-audio"),
+            ("Import Video…", "app.import-video"),
             ("Import ADM BWF Master (Bed and Objects)…", "app.import-adm"),
             ("Import MIDI File…", "app.import-midi"),
             ("Export MIDI File…", "app.export-midi"),
@@ -298,6 +299,10 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
         None,
         &section(&[
             ("Render / Export…", "app.render"),
+            (
+                "Export Movie (Picture Copied, New Sound)…",
+                "app.export-movie",
+            ),
             ("DDP Player (Check and Play a CD Master)", "app.show-ddp"),
         ]),
     );
@@ -467,6 +472,8 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             ("Clip Effects", "app.show-clip-fx"),
             ("Clip Launcher", "app.show-launcher"),
             ("DDP Player", "app.show-ddp"),
+            ("Video", "app.show-video"),
+            ("Video Full Screen", "app.video-full-screen"),
             ("Show / Hide Bottom Dock", "app.toggle-dock"),
             ("Master Strip at the Side", "app.master-panel"),
         ]),

@@ -10,6 +10,8 @@ use faderframe_timeline::{MusicalTime, TempoCurve, TempoMap, TempoPoint};
 /// One of the lanes under the arranger's ruler.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GlobalLane {
+    /// The picture (shown once there is video).
+    Video,
     Markers,
     Arranger,
     Key,
@@ -21,7 +23,8 @@ pub enum GlobalLane {
 }
 
 impl GlobalLane {
-    pub const ALL: [GlobalLane; 7] = [
+    pub const ALL: [GlobalLane; 8] = [
+        GlobalLane::Video,
         GlobalLane::Markers,
         GlobalLane::Arranger,
         GlobalLane::Key,
@@ -33,6 +36,7 @@ impl GlobalLane {
 
     pub fn title(self) -> &'static str {
         match self {
+            GlobalLane::Video => "Video",
             GlobalLane::Markers => "Markers",
             GlobalLane::Arranger => "Arranger",
             GlobalLane::Key => "Key",
@@ -47,6 +51,7 @@ impl GlobalLane {
 /// Which global lanes the arranger shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GlobalLanes {
+    pub video: bool,
     pub markers: bool,
     pub arranger: bool,
     pub key: bool,
@@ -59,6 +64,7 @@ pub struct GlobalLanes {
 impl Default for GlobalLanes {
     fn default() -> Self {
         Self {
+            video: true,
             markers: true,
             arranger: true,
             key: true,
@@ -73,6 +79,7 @@ impl Default for GlobalLanes {
 impl GlobalLanes {
     pub fn shows(&self, lane: GlobalLane) -> bool {
         match lane {
+            GlobalLane::Video => self.video,
             GlobalLane::Markers => self.markers,
             GlobalLane::Arranger => self.arranger,
             GlobalLane::Key => self.key,
@@ -85,6 +92,7 @@ impl GlobalLanes {
 
     pub fn set(&mut self, lane: GlobalLane, on: bool) {
         match lane {
+            GlobalLane::Video => self.video = on,
             GlobalLane::Markers => self.markers = on,
             GlobalLane::Arranger => self.arranger = on,
             GlobalLane::Key => self.key = on,

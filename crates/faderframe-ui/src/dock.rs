@@ -92,6 +92,12 @@ fn create_view(app: &Rc<AppState>, kind: ViewKind) -> ViewHost {
             false,
             true,
         ),
+        ViewKind::Video => ViewHost::new(
+            app,
+            Box::new(faderframe_view_video::VideoView::new(theme)),
+            false,
+            false,
+        ),
         ViewKind::History => ViewHost::new(
             app,
             Box::new(faderframe_view_history::HistoryView::new(theme)),

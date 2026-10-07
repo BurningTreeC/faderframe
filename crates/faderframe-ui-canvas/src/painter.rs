@@ -19,6 +19,10 @@ pub trait Painter {
     /// scaled by `brightness` (1: as it is; alpha untouched).
     fn image(&mut self, image: &Image, src: Rect, dst: Rect, brightness: f32);
 
+    /// Draw run-time pixels (a video frame) scaled into `dst`. Backends
+    /// without it draw nothing.
+    fn pixels(&mut self, _pixels: &crate::Pixels<'_>, _dst: Rect) {}
+
     /// Draw what follows translated by `(dx, dy)` and then scaled by
     /// `scale` (a view laid out in its own coordinates), until
     /// [`Painter::pop_transform`].

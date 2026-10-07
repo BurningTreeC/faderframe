@@ -108,6 +108,9 @@ mod imp {
             self.path_cache.borrow_mut().begin_frame();
             snapshot.push_clip(&graphene::Rect::new(0.0, 0.0, size.w, size.h));
             let w: &gtk::Widget = widget.upcast_ref();
+            if let Some(view) = self.view.borrow_mut().as_mut() {
+                view.frame_lead(frame_lead(w));
+            }
             let mut painter = SnapshotPainter::new(snapshot, w, &self.text_cache, &self.path_cache);
             if paint_stats::enabled() {
                 let started = std::time::Instant::now();
@@ -142,6 +145,24 @@ glib::wrapper! {
     pub struct CanvasWidget(ObjectSubclass<imp::CanvasWidget>)
         @extends gtk::Widget,
         @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+}
+
+/// How far ahead (ns) the frame now being drawn is expected on screen: the
+/// frame clock's next predicted presentation (a refresh away when it has
+/// no history yet).
+fn frame_lead(widget: &gtk::Widget) -> i64 {
+    let now = glib::monotonic_time();
+    let Some(clock) = widget.frame_clock() else {
+        return 16_666_667;
+    };
+    let (interval, predicted) = clock.refresh_info(now);
+    let interval = if interval > 0 { interval } else { 16_667 };
+    let at = if predicted > now {
+        predicted
+    } else {
+        now + interval
+    };
+    (at - now) * 1000
 }
 
 fn modifiers(state: gdk::ModifierType) -> Modifiers {
@@ -658,6 +679,32 @@ impl CanvasWidget {
                                 .filter_map(|f| f.path())
                                 .collect();
                             finish(paths);
+                        });
+                    }
+                    FileChoice::Save {
+                        title,
+                        name,
+                        filters,
+                    } => {
+                        let list = gio::ListStore::new::<gtk::FileFilter>();
+                        for (fname, patterns) in &filters {
+                            let f = gtk::FileFilter::new();
+                            f.set_name(Some(fname));
+                            for p in patterns {
+                                f.add_pattern(p);
+                            }
+                            list.append(&f);
+                        }
+                        let dialog = gtk::FileDialog::builder()
+                            .title(title.as_str())
+                            .modal(true)
+                            .initial_name(name.as_str())
+                            .filters(&list)
+                            .build();
+                        dialog.save(window.as_ref(), gio::Cancellable::NONE, move |res| {
+                            if let Some(p) = res.ok().and_then(|f| f.path()) {
+                                finish(vec![p]);
+                            }
                         });
                     }
                     FileChoice::Folder { title, initial } => {

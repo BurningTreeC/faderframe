@@ -1158,6 +1158,7 @@ dependencies = [
  "faderframe-transport",
  "faderframe-ui-canvas",
  "faderframe-ui-gpu",
+ "faderframe-video",
  "faderframe-view-album",
  "faderframe-view-arranger",
  "faderframe-view-automation",
@@ -1173,6 +1174,7 @@ dependencies = [
  "faderframe-view-pitch",
  "faderframe-view-surround",
  "faderframe-view-tools",
+ "faderframe-view-video",
  "faderframe-workspace",
  "gdk4-win32",
  "glib-unix",
@@ -1411,6 +1413,18 @@ dependencies = [
  "faderframe-project",
  "faderframe-session",
  "faderframe-ui-canvas",
+]
+
+[[package]]
+name = "faderframe-view-video"
+version = "0.13.0"
+dependencies = [
+ "faderframe-engine",
+ "faderframe-project",
+ "faderframe-session",
+ "faderframe-ui-canvas",
+ "faderframe-video",
+ "faderframe-workspace",
 ]
 
 [[package]]

@@ -385,6 +385,11 @@ impl AppState {
                 faderframe_session::UiRequest::Versions => crate::dialogs::versions(self),
                 faderframe_session::UiRequest::SaveTemplate => crate::templates::save_prompt(self),
                 faderframe_session::UiRequest::Templates => crate::templates::window(self),
+                faderframe_session::UiRequest::ImportVideo => crate::video::import(self),
+                faderframe_session::UiRequest::ExportMovie => crate::video::export(self),
+                faderframe_session::UiRequest::FullScreen(view) => {
+                    crate::video::full_screen(self, view);
+                }
                 faderframe_session::UiRequest::SaveSample {
                     track,
                     start,

@@ -76,6 +76,12 @@ pub enum FileChoice {
         title: String,
         initial: Option<std::path::PathBuf>,
     },
+    /// A file to write, `name` offered.
+    Save {
+        title: String,
+        name: String,
+        filters: Vec<(String, Vec<String>)>,
+    },
 }
 
 /// Things only the toolkit host can do on a view's behalf (native popovers,
@@ -180,6 +186,11 @@ pub trait CanvasView<M, A> {
 
     /// The skin changed (views that keep a copy of the theme replace it).
     fn set_theme(&mut self, _theme: &Theme) {}
+
+    /// Before each paint: how far ahead (ns) the frame being drawn is
+    /// expected on screen, from the toolkit's frame clock (video shows the
+    /// picture for that moment).
+    fn frame_lead(&mut self, _lead_ns: i64) {}
 
     /// Should the host keep redrawing every frame (meters, playhead)?
     fn wants_frames(&self, _model: &M) -> bool {

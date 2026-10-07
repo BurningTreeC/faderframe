@@ -69,6 +69,10 @@ impl ViewId {
         Self::new("history")
     }
 
+    pub fn video() -> Self {
+        Self::new("video")
+    }
+
     pub fn ddp() -> Self {
         Self::new("ddp")
     }

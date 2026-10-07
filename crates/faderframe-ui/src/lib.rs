@@ -40,6 +40,7 @@ mod surface_prefs;
 mod templates;
 mod transport_display;
 mod transport_keys;
+mod video;
 mod window;
 
 pub use state::{BackendChoice, RunOptions};

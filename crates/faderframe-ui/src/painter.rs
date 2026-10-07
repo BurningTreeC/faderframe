@@ -127,6 +127,38 @@ fn texture(image: &Image) -> Option<gdk::Texture> {
     })
 }
 
+thread_local! {
+    /// The textures of the last few run-time pictures (a video frame is
+    /// drawn again on every repaint until the next one).
+    static PIXELS: RefCell<std::collections::VecDeque<(u64, gdk::Texture)>> =
+        const { RefCell::new(std::collections::VecDeque::new()) };
+}
+
+fn pixel_texture(p: &faderframe_ui_canvas::Pixels<'_>) -> Option<gdk::Texture> {
+    PIXELS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some((_, t)) = cache.iter().find(|(k, _)| *k == p.key) {
+            return Some(t.clone());
+        }
+        let stride = p.width as usize * 4;
+        if p.rgba.len() < stride * p.height as usize {
+            return None;
+        }
+        let bytes = gtk::glib::Bytes::from(&p.rgba[..stride * p.height as usize]);
+        let tex: gdk::Texture = gdk::MemoryTexture::new(
+            p.width as i32,
+            p.height as i32,
+            gdk::MemoryFormat::R8g8b8a8,
+            &bytes,
+            stride,
+        )
+        .upcast();
+        cache.push_front((p.key, tex.clone()));
+        cache.truncate(6);
+        Some(tex)
+    })
+}
+
 /// Cache key of a shaped text layout.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct TextKey {
@@ -378,6 +410,19 @@ impl Painter for SnapshotPainter<'_> {
         if dim {
             s.pop();
         }
+        s.pop();
+    }
+
+    fn pixels(&mut self, pixels: &faderframe_ui_canvas::Pixels<'_>, dst: Rect) {
+        if dst.is_empty() || pixels.width == 0 || pixels.height == 0 {
+            return;
+        }
+        let Some(tex) = pixel_texture(pixels) else {
+            return;
+        };
+        let s = self.snapshot;
+        s.push_clip(&grect(dst));
+        s.append_scaled_texture(&tex, gsk::ScalingFilter::Linear, &grect(dst));
         s.pop();
     }
 

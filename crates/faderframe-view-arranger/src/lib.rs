@@ -14,6 +14,7 @@ pub mod edit_bar;
 mod global;
 mod harmony;
 mod header;
+mod video_lane;
 
 pub use automation::AUTO_LANE_H;
 pub use clip_edit::ClipZone;
@@ -276,6 +277,7 @@ pub struct ArrangerView {
     /// Shown global lanes (from the editor settings).
     lanes: faderframe_session::lanes::GlobalLanes,
     global_drag: Option<global::GlobalDrag>,
+    video_drag: Option<video_lane::VideoDrag>,
 }
 
 /// A folder header's triangle.
@@ -337,12 +339,14 @@ impl ArrangerView {
             zone_hover: None,
             zoom_seen: 0,
             view_w: f32::MAX,
-            // No lyrics yet: their lane shows once there are some.
+            // No lyrics or video yet: their lanes show once there are some.
             lanes: faderframe_session::lanes::GlobalLanes {
                 lyrics: false,
+                video: false,
                 ..Default::default()
             },
             global_drag: None,
+            video_drag: None,
         }
     }
 
@@ -355,9 +359,13 @@ impl ArrangerView {
     /// Pick up the saved header width (called before painting/events).
     fn update_header_width(&mut self, model: &Session) {
         self.lanes = model.editor.lanes;
-        // The Lyrics lane shows once there are lyrics.
+        // The Lyrics lane shows once there are lyrics, the Video lane once
+        // there is video.
         if model.project().lyrics.is_empty() {
             self.lanes.lyrics = false;
+        }
+        if !video_lane::has_video(model) {
+            self.lanes.video = false;
         }
         self.header_width = model
             .header_width()

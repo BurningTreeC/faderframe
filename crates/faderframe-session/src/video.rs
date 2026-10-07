@@ -255,6 +255,10 @@ pub enum VideoOp {
     SyncTest,
     /// Stop the running jobs.
     Cancel,
+    /// Ask for a video to import (the shell's chooser).
+    ChooseImport,
+    /// Ask where to write the movie (the shell's chooser).
+    ChooseExport,
 }
 
 impl crate::Session {
@@ -944,6 +948,17 @@ impl crate::Session {
                         .map_err(|e| e.to_string())?;
                     Ok(Done::SyncTest { video, sound })
                 });
+                Ok(())
+            }
+            VideoOp::ChooseImport => {
+                self.ui_requests.push(crate::UiRequest::ImportVideo);
+                Ok(())
+            }
+            VideoOp::ChooseExport => {
+                if self.project.video.tracks.iter().all(|t| t.clips.is_empty()) {
+                    return Err(SessionError::Other("there is no video to export".into()));
+                }
+                self.ui_requests.push(crate::UiRequest::ExportMovie);
                 Ok(())
             }
             VideoOp::Cancel => {

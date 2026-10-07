@@ -30,10 +30,12 @@ pub enum ViewKind {
     Ddp,
     /// Where the selected track sits in the surround bed it feeds.
     Surround,
+    /// The picture.
+    Video,
 }
 
 impl ViewKind {
-    pub const ALL: [ViewKind; 14] = [
+    pub const ALL: [ViewKind; 15] = [
         ViewKind::Arranger,
         ViewKind::Mixer,
         ViewKind::PianoRoll,
@@ -48,6 +50,7 @@ impl ViewKind {
         ViewKind::Launcher,
         ViewKind::Ddp,
         ViewKind::Surround,
+        ViewKind::Video,
     ];
 
     /// The kind whose default view has this id (views added after a layout
@@ -72,6 +75,7 @@ impl ViewKind {
             ViewKind::Launcher => "Clip Launcher",
             ViewKind::Ddp => "DDP Player",
             ViewKind::Surround => "Surround Panner",
+            ViewKind::Video => "Video",
         }
     }
 
@@ -91,6 +95,7 @@ impl ViewKind {
             ViewKind::Launcher => ViewId::launcher(),
             ViewKind::Ddp => ViewId::ddp(),
             ViewKind::Surround => ViewId::surround(),
+            ViewKind::Video => ViewId::video(),
         }
     }
 }

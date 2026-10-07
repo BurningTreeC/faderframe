@@ -70,6 +70,17 @@ pub struct Image {
     pub height: u32,
 }
 
+/// Pixels made at run time (a video frame): rows of RGBA, `width * 4`
+/// bytes each, drawn with [`crate::Painter::pixels`]. `key` names this
+/// picture for the backend's texture cache (a new key for new pixels).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pixels<'a> {
+    pub key: u64,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: &'a [u8],
+}
+
 /// A vector path built from lines and cubic Béziers. Arcs are converted to
 /// cubics here, so painter backends only need move/line/cubic/close.
 #[derive(Clone, Debug, Default, PartialEq)]

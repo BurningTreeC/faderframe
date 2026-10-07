@@ -287,6 +287,23 @@ pub fn install(app: &Rc<AppState>) {
         entry(app, "shortcuts", crate::palette::shortcuts),
         dispatch(app, "show-versions", A::ShowVersions),
         dispatch(app, "save-template", A::PromptSaveTemplate),
+        dispatch(
+            app,
+            "show-video",
+            A::Workspace(W::ShowView(ViewId::video())),
+        ),
+        entry(app, "import-video", crate::video::import),
+        dispatch(
+            app,
+            "export-movie",
+            A::Video(faderframe_session::video::VideoOp::ChooseExport),
+        ),
+        dispatch(
+            app,
+            "video-sync-test",
+            A::Video(faderframe_session::video::VideoOp::SyncTest),
+        ),
+        dispatch(app, "video-full-screen", A::FullScreen(ViewId::video())),
         dispatch(app, "new-from-template", A::ShowTemplates),
         entry(app, "panic", |a| {
             a.with_session(|s| {
@@ -1169,6 +1186,31 @@ pub fn install(app: &Rc<AppState>) {
                 Some(action) => a.dispatch(action),
                 None => tracing::warn!("chain-insert: no container chain {chain} or no '{id}'"),
             }
+        }),
+        // Development aids: `import-video-from:<path>` imports a video with
+        // its sound, `video-offset:<ms>` sets the picture offset,
+        // `export-movie-to:<path>` writes the movie (container by the
+        // extension).
+        named("import-video-from", |a, arg| {
+            a.dispatch(Action::Video(faderframe_session::video::VideoOp::Import {
+                path: arg.into(),
+                sound: true,
+            }));
+        }),
+        named("video-offset", |a, arg| match arg.trim().parse::<f64>() {
+            Ok(ms) => a.dispatch(Action::Video(
+                faderframe_session::video::VideoOp::SetOffset(ms),
+            )),
+            Err(_) => tracing::warn!("video-offset: not a number: {arg}"),
+        }),
+        named("export-movie-to", |a, arg| {
+            let path = std::path::PathBuf::from(arg);
+            let container = faderframe_video::mux::Container::for_path(&path).unwrap_or_default();
+            a.dispatch(Action::Video(faderframe_session::video::VideoOp::Export {
+                clip: None,
+                path,
+                container,
+            }));
         }),
         // Development aids: `template:<name>` saves the project as a
         // template, `from-template:<name>` starts a new project from one

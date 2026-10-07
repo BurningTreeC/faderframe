@@ -454,6 +454,8 @@ pub enum Action {
     RestoreVersion(PathBuf),
     /// Picture: import, clip edits, offset, export, sync test.
     Video(video::VideoOp),
+    /// Show a view full screen in a window of its own (again: leave).
+    FullScreen(ViewId),
     /// Keep the project's set-up (everything but its content) as the
     /// template `name`, replacing one of that name.
     SaveTemplate {
@@ -1229,6 +1231,12 @@ pub enum UiRequest {
     Versions,
     /// Ask for a template's name, then save it.
     SaveTemplate,
+    /// Show this view full screen in a window of its own (or leave).
+    FullScreen(ViewId),
+    /// Choose a video to import.
+    ImportVideo,
+    /// Choose where to write the movie.
+    ExportMovie,
     /// The templates (new project from one, delete, default).
     Templates,
     /// Ask where to save a sample of `track` from `start` to `end`
@@ -3231,6 +3239,7 @@ impl Session {
             }
             Action::PromptSaveTemplate => self.ui_requests.push(UiRequest::SaveTemplate),
             Action::Video(op) => self.video_op(op)?,
+            Action::FullScreen(view) => self.ui_requests.push(UiRequest::FullScreen(view)),
             Action::ShowTemplates => self.ui_requests.push(UiRequest::Templates),
             Action::DeleteTemplate(path) => {
                 templates::delete_template(&path)?;

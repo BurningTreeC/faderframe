@@ -12,6 +12,7 @@ use faderframe_timeline::{TempoCurve, TempoMap, TimeSignature};
 /// Lane heights.
 fn lane_height(lane: GlobalLane) -> f32 {
     match lane {
+        GlobalLane::Video => 40.0,
         GlobalLane::Markers => 18.0,
         GlobalLane::Arranger => 22.0,
         GlobalLane::Key => 18.0,
@@ -63,6 +64,8 @@ pub enum GlobalHit {
     Chord(usize, SectionPart),
     /// A lyric line (its index).
     Lyric(usize),
+    /// In the Video lane: a clip, or none.
+    Video(Option<faderframe_core::VideoClipId>),
 }
 
 #[derive(Clone, Debug)]
@@ -184,6 +187,7 @@ impl ArrangerView {
         let p = model.project();
         let near = |t: MusicalTime, w: f32| (self.x_of(t) - pos.x).abs() <= w;
         Some(match lane {
+            GlobalLane::Video => GlobalHit::Video(self.video_hit(pos, r, model)),
             GlobalLane::Markers => p
                 .markers
                 .iter()
@@ -263,6 +267,7 @@ impl ArrangerView {
             p.fill(r, a.ruler_bg.darken(0.22 * depth));
             p.push_clip(r);
             match lane {
+                GlobalLane::Video => self.paint_video(p, r, model),
                 GlobalLane::Markers => self.paint_markers(p, r, model),
                 GlobalLane::Arranger => self.paint_sections(p, r, model),
                 GlobalLane::Key => self.paint_keys(p, r, model),
@@ -533,6 +538,7 @@ impl ArrangerView {
         let snap = |t: MusicalTime| self.snap(t, model, mods);
         match hit {
             GlobalHit::Label(lane) => cx.request(Self::lanes_menu(model, lane, pos)),
+            GlobalHit::Video(clip) => self.video_press(clip, pos, clicks, model, cx),
             GlobalHit::Empty(GlobalLane::Markers, t) if clicks >= 2 => {
                 cx.emit(Action::AddMarker(snap(t)));
             }
@@ -674,6 +680,9 @@ impl ArrangerView {
         model: &Session,
         cx: &mut EventCx<'_, Action>,
     ) -> bool {
+        if self.video_drag.is_some() {
+            return self.video_drag_move(pos, mods, model, cx);
+        }
         let Some(mut drag) = self.global_drag.take() else {
             return false;
         };
@@ -792,6 +801,9 @@ impl ArrangerView {
         size: Size,
         cx: &mut EventCx<'_, Action>,
     ) -> bool {
+        if self.video_drag.is_some() {
+            return self.video_release(model, cx);
+        }
         let Some(drag) = self.global_drag.take() else {
             return false;
         };
@@ -875,6 +887,7 @@ impl ArrangerView {
         let p = model.project();
         match hit {
             GlobalHit::Label(lane) => Self::lanes_menu(model, lane, pos),
+            GlobalHit::Video(clip) => self.video_menu(clip, model, pos),
             GlobalHit::Marker(id) => {
                 let m = p.markers.iter().find(|m| m.id == id);
                 let mut items = Vec::new();
@@ -1258,6 +1271,8 @@ impl ArrangerView {
             GlobalHit::Empty(GlobalLane::Lyrics, _) => {
                 "Transcribe an audio clip (its menu) to fill this lane".into()
             }
+            GlobalHit::Video(clip) => self.video_tooltip(clip, model),
+            GlobalHit::Empty(GlobalLane::Video, _) => self.video_tooltip(None, model),
         })
     }
 }
