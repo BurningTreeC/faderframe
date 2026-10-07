@@ -3,7 +3,7 @@
 # from a release build, with Homebrew's GTK 4 and its dependencies copied
 # into the bundle (bundle_dylibs.py rewrites the library paths).
 #
-#   brew install gtk4 adwaita-icon-theme librsvg pkgconf
+#   brew install gtk4 adwaita-icon-theme librsvg pkgconf gstreamer
 #   cargo build --release -p faderframe-app
 #   packaging/macos/bundle.sh
 #
@@ -58,13 +58,37 @@ if [ ${#loaders[@]} -gt 0 ]; then
             >"$loader_dir/loaders.cache.in"
 fi
 
-# Every non-system library the binary and the loaders use.
+# GStreamer's plugins video uses (demuxers and muxers, JPEG, conversion,
+# Opus, the H.264/H.265 parsers, VideoToolbox decoding) and its plugin
+# scanner; the launcher points GStreamer at them.
+gst_src=$brew/lib/gstreamer-1.0
+gst_dir=$res/lib/gstreamer-1.0
+mkdir -p "$gst_dir"
+for plugin in coreelements app playback typefindfunctions isomp4 matroska jpeg \
+    videoconvertscale audioconvert audioresample audiorate wavparse opus \
+    videoparsersbad applemedia; do
+    if [ -f "$gst_src/libgst$plugin.dylib" ]; then
+        cp "$gst_src/libgst$plugin.dylib" "$gst_dir/"
+    else
+        echo "GStreamer plugin $plugin not found: video will lack it" >&2
+    fi
+done
+# The scanner beside the program: its libraries resolve from
+# @executable_path/../Frameworks too.
+scanner=$(pkg-config --variable=pluginscannerdir gstreamer-1.0)/gst-plugin-scanner
+[ -x "$scanner" ] && cp "$scanner" "$contents/MacOS/gst-plugin-scanner"
+gst_parts=("$gst_dir"/*.dylib)
+[ -f "$contents/MacOS/gst-plugin-scanner" ] && gst_parts+=("$contents/MacOS/gst-plugin-scanner")
+
+# Every non-system library the binary, the loaders and GStreamer's plugins
+# use.
 python3 packaging/macos/bundle_dylibs.py "$contents/Frameworks" \
-    "$contents/MacOS/faderframe-bin" "$loader_dir"/loaders/*.so
+    "$contents/MacOS/faderframe-bin" "$loader_dir"/loaders/*.so "${gst_parts[@]}"
 
 # Ad-hoc signatures (install_name_tool invalidated the original ones).
-find "$contents/Frameworks" "$loader_dir/loaders" -type f \( -name '*.dylib' -o -name '*.so' \) \
+find "$contents/Frameworks" "$loader_dir/loaders" "$gst_dir" -type f \( -name '*.dylib' -o -name '*.so' \) \
     -exec codesign --force --sign - {} \;
+[ -f "$contents/MacOS/gst-plugin-scanner" ] && codesign --force --sign - "$contents/MacOS/gst-plugin-scanner"
 codesign --force --sign - "$contents/MacOS/faderframe-bin"
 codesign --force --sign - "$app"
 

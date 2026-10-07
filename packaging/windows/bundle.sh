@@ -5,12 +5,13 @@
 # dist/FaderFrame-<version>-windows-x64-portable.zip — the folder with a
 # "FaderFrame Data" folder, which makes it portable. Run in an MSYS2 UCRT64 shell:
 #
-#   pacman -S mingw-w64-ucrt-x86_64-{gtk4,rust,pkgconf,gcc,librsvg,python,adwaita-icon-theme} zip
+#   pacman -S mingw-w64-ucrt-x86_64-{gtk4,rust,pkgconf,gcc,librsvg,python,adwaita-icon-theme} zip \
+#       mingw-w64-ucrt-x86_64-{gstreamer,gst-plugins-base,gst-plugins-good,gst-plugins-bad}
 #   cargo build --release -p faderframe-app
 #   packaging/windows/bundle.sh
 #
-# GLib and gdk-pixbuf find their data relative to their DLLs, so the folder
-# runs from anywhere.
+# GLib, gdk-pixbuf and GStreamer find their data and plugins relative to
+# their DLLs, so the folder runs from anywhere.
 set -euo pipefail
 shopt -s nullglob
 root=$(cd "$(dirname "$0")/../.." && pwd)
@@ -52,6 +53,27 @@ if [ -d "$prefix/lib/gdk-pixbuf-2.0" ]; then
     for loader in "$out"/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.dll; do
         copy_deps "$loader"
     done
+fi
+
+# GStreamer's plugins video uses (demuxers and muxers, JPEG, conversion,
+# Opus, the H.264/H.265 parsers, Direct3D hardware decoding) and its
+# plugin scanner, where GStreamer looks for them beside its DLL.
+mkdir -p "$out/lib/gstreamer-1.0" "$out/libexec/gstreamer-1.0"
+for plugin in coreelements app playback typefindfunctions isomp4 matroska jpeg \
+    videoconvertscale audioconvert audioresample audiorate wavparse opus \
+    videoparsersbad d3d11 d3d12; do
+    dll=$prefix/lib/gstreamer-1.0/libgst$plugin.dll
+    if [ -f "$dll" ]; then
+        cp "$dll" "$out/lib/gstreamer-1.0/"
+        copy_deps "$dll"
+    else
+        echo "GStreamer plugin $plugin not found: video will lack it" >&2
+    fi
+done
+scanner=$prefix/libexec/gstreamer-1.0/gst-plugin-scanner.exe
+if [ -f "$scanner" ]; then
+    cp "$scanner" "$out/libexec/gstreamer-1.0/"
+    copy_deps "$scanner"
 fi
 
 cp LICENSE THIRD_PARTY_LICENSES.md AOM-PATENT-LICENSE.txt "$out/"

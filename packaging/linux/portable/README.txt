@@ -24,4 +24,12 @@ Audio: PipeWire is used directly; JACK and ALSA work too
 a distribution with glibc 2.39 or newer (e.g. Ubuntu 24.04, Fedora 40,
 Debian 13, Arch).
 
+Video: the system's GStreamer is used when there is one (its plugins and
+codecs, e.g. a distribution's H.264 decoder, come with it); otherwise the
+GStreamer in this folder, with the plugins video needs and hardware
+decoding through VA-API (the graphics driver's). Nothing to install.
+Proxies and frame indexes go to ~/.cache/faderframe/video, also in
+portable mode (they take gigabytes per hour of picture); delete that
+folder whenever you like.
+
 FaderFrame is MIT licensed; see LICENSE and THIRD_PARTY_LICENSES.md.

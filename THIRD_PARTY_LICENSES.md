@@ -16,6 +16,7 @@ binaries, followed by the full text of every distinct license.
 | Cairo | LGPL-2.1-only OR MPL-1.1 | https://gitlab.freedesktop.org/cairo/cairo | used by GTK (dynamically linked) |
 | Graphene | MIT | https://github.com/ebassi/graphene | geometry types (dynamically linked) |
 | HarfBuzz | MIT-like (Old MIT) | https://github.com/harfbuzz/harfbuzz | text shaping via Pango |
+| GStreamer (core; base, good and bad plugins) | LGPL-2.1-or-later | https://gitlab.freedesktop.org/gstreamer/gstreamer | video: demuxing, decoding, encoding, muxing (dynamically linked; plugins loaded at run time) |
 | libjack (JACK2) | LGPL-2.1-or-later | https://github.com/jackaudio/jack2 | loaded at runtime with dlopen |
 | pipewire-jack | MIT | https://gitlab.freedesktop.org/pipewire/pipewire | alternative libjack provider, loaded at runtime |
 

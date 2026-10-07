@@ -8,6 +8,8 @@
 #                             --uninstall removes it again
 #     bin/faderframe          the program
 #     lib/                    GTK 4 and the libraries it needs, image loaders
+#     lib/gstreamer/          GStreamer, used only where the system has none
+#     lib/gstreamer-1.0/      its plugins video uses (with libexec/'s scanner)
 #     share/                  GTK's settings schemas and icon themes, the
 #                             desktop entry, AppStream data, MIME type, icon
 #     FaderFrame Data/        portable mode: settings, caches, presets and
@@ -39,7 +41,7 @@ strip --strip-debug "$out/bin/faderframe" 2>/dev/null || true
 # Libraries the system must provide (C runtime, graphics, display and audio
 # servers, D-Bus/udev, fonts, compression).
 # (Names ending in "\." are exact; the others are families.)
-system='^(ld-linux|linux-vdso|libc\.|libm\.|libdl\.|libpthread\.|librt\.|libresolv\.|libutil\.|libgcc_s\.|libstdc\+\+\.|libGL|libEGL|libOpenGL|libgbm\.|libdrm|libvulkan\.|libwayland-|libX|libxcb|libxkbcommon|libasound\.|libjack|libpipewire|libpulse|libdbus|libsystemd\.|libudev\.|libcap\.|libfontconfig\.|libfreetype\.|libexpat\.|libz\.|libbz2\.|liblzma\.|libzstd\.|libgcrypt\.|libgpg-error\.)'
+system='^(ld-linux|linux-vdso|libc\.|libm\.|libdl\.|libpthread\.|librt\.|libresolv\.|libutil\.|libgcc_s\.|libstdc\+\+\.|libGL|libEGL|libOpenGL|libgbm\.|libdrm|libvulkan\.|libwayland-|libX|libxcb|libxkbcommon|libasound\.|libjack|libpipewire|libpulse|libdbus|libsystemd\.|libudev\.|libcap\.|libfontconfig\.|libfreetype\.|libexpat\.|libz\.|libbz2\.|liblzma\.|libzstd\.|libgcrypt\.|libgpg-error\.|libva\.|libva-)'
 copy_deps() {
     ldd "$1" | awk '$3 ~ /^\// { print $3 }' | sort -u | while read -r lib; do
         base=$(basename "$lib")
@@ -76,6 +78,36 @@ if [ -z "$query" ]; then
 fi
 "$query" "$loaders"/loaders/*.so |
     sed "s|$root/$out|@ROOT@|g" >"$loaders/loaders.cache.in"
+# GStreamer for systems without one (the launcher uses the system's when
+# there is one: its plugins and codecs match it): the plugins video uses
+# (demuxers and muxers, JPEG, conversion, Opus, the H.264/H.265 parsers,
+# VA hardware decoding -- libva and its drivers are the system's) and the
+# plugin scanner; GStreamer's own libraries are moved to lib/gstreamer
+# below.
+gst_dir=$(pkg-config --variable=pluginsdir gstreamer-1.0)
+gst_scanner=$(pkg-config --variable=pluginscannerdir gstreamer-1.0)/gst-plugin-scanner
+mkdir -p "$out/lib/gstreamer-1.0" "$out/libexec"
+for plugin in coreelements app playback typefindfunctions isomp4 matroska jpeg \
+    videoconvertscale audioconvert audioresample audiorate wavparse opus \
+    videoparsersbad va; do
+    so=$gst_dir/libgst$plugin.so
+    if [ -f "$so" ]; then
+        cp -L "$so" "$out/lib/gstreamer-1.0/"
+        copy_deps "$so"
+    else
+        echo "GStreamer plugin $plugin not found: video will lack it" >&2
+    fi
+done
+if [ -x "$gst_scanner" ]; then
+    cp -L "$gst_scanner" "$out/libexec/"
+    copy_deps "$gst_scanner"
+fi
+# GStreamer's own libraries apart: on the library path only where the
+# system has no GStreamer.
+mkdir -p "$out/lib/gstreamer"
+for lib in "$out"/lib/libgst*.so* "$out"/lib/liborc-*.so*; do
+    mv "$lib" "$out/lib/gstreamer/"
+done
 # No GIO modules from the system (built against its own GLib).
 mkdir -p "$out/lib/gio/modules"
 
