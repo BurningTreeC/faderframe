@@ -2210,6 +2210,128 @@ fn microphone_preamps_do_not_allocate_while_automating_or_resetting() {
     }
 }
 
+/// The Guitar Station in a graph, inline and on its stages' workers: a line
+/// of three pedals, a wah's treadle and the amplifier's drive automated, a
+/// footswitch, a stereo signal waking the second channel, a reset.
+#[test]
+fn the_guitar_station_does_not_allocate() {
+    let _serial = serial();
+    use faderframe_automation::{
+        AutomationCurve, AutomationLane, AutomationMode, AutomationPoint, AutomationTarget,
+        CurveShape,
+    };
+    use faderframe_core::{ChannelLayout, ParameterId, builtin};
+    use faderframe_guitar::pedal::Stomp;
+    use faderframe_guitar::voice::Pedal;
+    use faderframe_plugin_host::devices::guitar::id;
+    use faderframe_project::{PluginRef, PluginSlot, SavedParameter, TrackKind};
+    use faderframe_timeline::MusicalTime;
+    let mut tp = common::TestProject::new(48_000);
+    let t = tp.track(TrackKind::Audio, "Guitar", ChannelLayout::Stereo);
+    let left: Vec<f32> = (0..48_000)
+        .map(|n| (0.2 * (std::f64::consts::TAU * 110.0 * n as f64 / 48_000.0).sin()) as f32)
+        .collect();
+    let mut right = left.clone();
+    right[6_000..9_000].iter_mut().for_each(|x| *x *= 0.5);
+    let src = tp.source(faderframe_audio_files::AudioData::from_channels(
+        48_000,
+        vec![left, right],
+    ));
+    tp.clip(t, src, MusicalTime::ZERO, 48_000);
+    let plugin = tp.project.ids.allocate();
+    let set = |id: u32, value: f64| SavedParameter {
+        id: ParameterId(id),
+        value,
+    };
+    let lanes: Vec<_> = (0..3).map(|_| tp.project.ids.allocate()).collect();
+    let track = tp.project.track_mut(t).unwrap();
+    track.inserts.push(PluginSlot {
+        id: plugin,
+        plugin: PluginRef::builtin(builtin::GUITAR_STATION, "Guitar Station"),
+        bypass: false,
+        parameters: vec![
+            set(
+                id::slot(0, id::STOMP),
+                Stomp::Wah(faderframe_guitar::circuits::wah::Build::V847).index() as f64,
+            ),
+            set(
+                id::slot(1, id::STOMP),
+                Stomp::Pedal(Pedal::BlueChorus).index() as f64,
+            ),
+            set(
+                id::slot(2, id::STOMP),
+                Stomp::Pedal(Pedal::MetalZone).index() as f64,
+            ),
+            set(id::AMP, 8.0),
+            set(id::REVERB, 0.3),
+            set(id::INTENSITY, 0.4),
+            set(id::MIC_B, 6.0),
+        ],
+        state: None,
+        sidechain: None,
+    });
+    let automate = |lane, parameter: u32, values: [f64; 3]| AutomationLane {
+        id: lane,
+        target: AutomationTarget::PluginParameter {
+            plugin,
+            parameter: ParameterId(parameter),
+        },
+        curve: AutomationCurve::from_points(
+            values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| AutomationPoint {
+                    time: MusicalTime::from_quarters(0.04 * i as f64),
+                    value: *v,
+                    shape: CurveShape::Step,
+                })
+                .collect(),
+        ),
+        mode: AutomationMode::Read,
+        visible: true,
+    };
+    track
+        .automation
+        .lanes
+        .push(automate(lanes[0], id::DRIVE, [0.2, 0.8, 0.4]));
+    track.automation.lanes.push(automate(
+        lanes[1],
+        id::slot(0, id::TREADLE),
+        [0.1, 0.9, 0.5],
+    ));
+    track
+        .automation
+        .lanes
+        .push(automate(lanes[2], id::slot(2, id::ON), [1.0, 0.0, 1.0]));
+    for realtime in [false, true] {
+        let mut r = OfflineRenderer::new(&tp.project, &tp.sources, EngineConfig::default(), 128, 2)
+            .unwrap();
+        r.controller.plugins().set_realtime(realtime);
+        r.controller.rebuild_graph(&tp.project).unwrap();
+        let mut buffers = OwnedBuffers::new(2, 2, 128);
+        r.play_from(0).unwrap();
+        for _ in 0..8 {
+            r.processor.process_device(&mut buffers);
+        }
+        let (_, count) = armed(|| {
+            for _ in 0..96 {
+                r.processor.process_device(&mut buffers);
+            }
+        });
+        assert_eq!(
+            count, 0,
+            "realtime {realtime}: playing and automating allocate"
+        );
+        r.play_from(0).unwrap();
+        let (_, count) = armed(|| {
+            for _ in 0..24 {
+                r.processor.process_device(&mut buffers);
+            }
+        });
+        assert_eq!(count, 0, "realtime {realtime}: a transport reset allocates");
+    }
+}
+
 /// The MIDI effects, chained before a synth, played live and from the key
 /// track: arpeggios, strummed chords, scale moves and echoes allocate
 /// nothing.

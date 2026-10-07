@@ -30,4 +30,5 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+faderframe-guitar.workspace = true
 faderframe-analysis.workspace = true

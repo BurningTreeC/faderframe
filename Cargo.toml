@@ -13,6 +13,7 @@ repository = "https://github.com/BurningTreeC/faderframe"
 
 [workspace.dependencies]
 faderframe-circuit = { path = "crates/faderframe-circuit" }
+faderframe-guitar = { path = "crates/faderframe-guitar" }
 # --- internal crates -------------------------------------------------------
 faderframe-core = { path = "crates/faderframe-core" }
 faderframe-control = { path = "crates/faderframe-control" }
@@ -136,6 +137,9 @@ opt-level = 3
 
 # The preamps' circuit solver: real time needs it optimised.
 [profile.dev.package.faderframe-circuit]
+opt-level = 3
+
+[profile.dev.package.faderframe-guitar]
 opt-level = 3
 
 [profile.release]

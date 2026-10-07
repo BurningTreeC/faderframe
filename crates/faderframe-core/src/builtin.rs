@@ -49,6 +49,11 @@ pub const EQ: &str = "faderframe.eq";
 /// from PultEQFx (effect).
 pub const PROGRAM_EQ: &str = "faderframe.program-eq";
 
+/// Guitar Station: a line of pedals, a modelled amplifier with its power
+/// stage, a loudspeaker in a cabinet and two microphones, and a DI, from
+/// GainStageFx (effect).
+pub const GUITAR_STATION: &str = "faderframe.guitar-station";
+
 /// Parallel chains of devices, mixed (see `faderframe_project::container`).
 pub const CONTAINER: &str = "faderframe.container";
 
@@ -68,6 +73,7 @@ pub fn has_editor(id: &str) -> bool {
             | DEESSER
             | GATE
             | CHANNEL_STRIP
+            | GUITAR_STATION
             | GAIN
             | ECHO
             | MODULATION

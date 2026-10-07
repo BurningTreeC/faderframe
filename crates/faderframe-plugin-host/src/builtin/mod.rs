@@ -33,6 +33,7 @@ enum Kind {
     Deesser,
     Gate,
     ChannelStrip,
+    Guitar,
     Arpeggiator,
     Chord,
     Scale,
@@ -42,7 +43,7 @@ enum Kind {
 }
 
 impl Kind {
-    const ALL: [Kind; 28] = [
+    const ALL: [Kind; 29] = [
         Kind::Preamp(0),
         Kind::Preamp(1),
         Kind::Preamp(2),
@@ -61,6 +62,7 @@ impl Kind {
         Kind::Deesser,
         Kind::Gate,
         Kind::ChannelStrip,
+        Kind::Guitar,
         Kind::Synth,
         Kind::Echo,
         Kind::Compressor,
@@ -99,6 +101,7 @@ impl Kind {
             builtin::DEESSER => Kind::Deesser,
             builtin::GATE => Kind::Gate,
             builtin::CHANNEL_STRIP => Kind::ChannelStrip,
+            builtin::GUITAR_STATION => Kind::Guitar,
             builtin::CONTAINER => Kind::Container,
             _ => return None,
         })
@@ -175,6 +178,13 @@ impl Kind {
                 "Channel Strip",
                 PluginCategory::Effect,
                 vec![stereo, sidechain],
+                0,
+            ),
+            Kind::Guitar => (
+                builtin::GUITAR_STATION,
+                "Guitar Station",
+                PluginCategory::Effect,
+                vec![stereo],
                 0,
             ),
             Kind::Deesser => (
@@ -332,6 +342,7 @@ impl Kind {
             Kind::Deesser => crate::devices::deesser::parameters(),
             Kind::Gate => crate::devices::gate::parameters(),
             Kind::ChannelStrip => crate::devices::channel_strip::parameters(),
+            Kind::Guitar => crate::devices::guitar::parameters(),
             Kind::Echo => crate::devices::delay::parameters(),
             Kind::Synth => crate::devices::synth::parameters(),
             Kind::LatencyProbe => vec![ParameterInfo {
@@ -367,6 +378,7 @@ impl Kind {
             Kind::Deesser => Some(crate::devices::deesser::TAP_VALUES),
             Kind::Gate => Some(crate::devices::gate::TAP_VALUES),
             Kind::ChannelStrip => Some(crate::devices::channel_strip::TAP_VALUES),
+            Kind::Guitar => Some(crate::devices::guitar::TAP_VALUES),
             Kind::ProgramEq => Some(0),
             _ => None,
         }
@@ -408,6 +420,7 @@ impl PluginInstance for BuiltinInstance {
     fn output_bus_names(&mut self) -> Vec<String> {
         match self.kind {
             Kind::Drums => crate::devices::drums::output_bus_names(),
+            Kind::Guitar => crate::devices::guitar::output_bus_names(),
             _ => Vec::new(),
         }
     }
@@ -458,6 +471,7 @@ impl PluginInstance for BuiltinInstance {
             Kind::Deesser => crate::devices::deesser::format(id, value),
             Kind::Gate => crate::devices::gate::format(id, value),
             Kind::ChannelStrip => crate::devices::channel_strip::format(id, value),
+            Kind::Guitar => crate::devices::guitar::format(id, value),
             _ => None,
         }
     }
@@ -520,6 +534,7 @@ impl PluginInstance for BuiltinInstance {
                 faderframe_circuit::preamp::Preamp::latency()
                     + crate::devices::preamp::buffer_delay(self.device_block) as u32
             }
+            Kind::Guitar => crate::devices::guitar::latency(&self.params, self.device_block),
             Kind::LatencyProbe => self.params.get(0).max(0.0) as u32,
             Kind::ProgramEq => crate::program_eq::LATENCY,
             Kind::Eq => crate::eq::latency(&self.params),
@@ -549,6 +564,8 @@ impl PluginInstance for BuiltinInstance {
     fn tail(&self) -> TailLength {
         match self.kind {
             Kind::Preamp(_) => TailLength::Samples(48_000),
+            // A spring tank's tail and a power stage's recovery.
+            Kind::Guitar => TailLength::Samples(96_000),
             Kind::Echo | Kind::Reverb => TailLength::Infinite,
             Kind::Modulation => TailLength::Samples(4_096),
             Kind::Synth => TailLength::Samples(48_000 * 5),
@@ -700,6 +717,14 @@ impl PluginInstance for BuiltinInstance {
             Kind::ChannelStrip => Box::new(
                 crate::devices::channel_strip::ChannelStripProcessor::new(params, tap()?, config),
             ),
+            Kind::Guitar => Box::new(crate::devices::guitar::GuitarProcessor::new(
+                params,
+                self.tap.clone(),
+                config,
+                self.channels,
+                self.realtime,
+                self.device_block,
+            )?),
             Kind::Echo => Box::new(crate::devices::delay::DelayProcessor::new(
                 params,
                 tap()?,

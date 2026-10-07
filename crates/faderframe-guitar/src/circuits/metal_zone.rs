@@ -1,0 +1,583 @@
+//! The Metal Zone: two gain stages, a diode pair, and seven filters.
+//!
+//! Engineering reference (developer documentation, not panel text): Boss MT-2
+//! Metal Zone, built from Boss's own drawing and cross-checked against Electric
+//! Druid's analysis of the same sheet. See `docs/models/metal_zone.md`.
+//!
+//! This pedal is made of **frequency response**, not of diodes. Its own analyst
+//! puts it better than a comment can: "It's really all about frequency
+//! response. It's heavily shaped every step of the way, and those frequency
+//! responses determine the sound of the pedal, much more than diode choice ever
+//! would." Before the clipper there is a hump at a kilohertz that decides what
+//! gets distorted; after it, two resonances at the ends of the band with a
+//! scoop between them; and then a three-band equaliser with a **swept middle**,
+//! which is a control nothing else in this plugin has.
+//!
+//! Every one of those is a **gyrator**: an op-amp wired so the current into it
+//! lags the voltage, which is an inductor made without winding one. They are
+//! built here as the inductances they stand for, `L = R1 x R2 x C`, the same
+//! way `heavy_metal` and the Mark IIC+'s graphic are. Working them out from the
+//! drawing's values and pairing each with its series capacitor gives 953 Hz,
+//! 4894 Hz, 105 Hz and 106 Hz -- against the published 1 kHz, 4,898 Hz, 105 Hz
+//! and 105 Hz. That agreement is the check this model rests on.
+
+use crate::dsp::netlist::{BipolarSpec, Circuit, DiodeSpec, Fault, JfetSpec, Netlist, Taper};
+
+/// VR01, the Dist control, 250 k audio.
+pub const DIST: usize = 0;
+/// VR03a, Low, 100 k.
+pub const LOW: usize = 1;
+/// VR02b, Middle, 100 k.
+pub const MIDDLE: usize = 2;
+/// VR02a, the Mid Freq control: a 50 k dual gang, both sections of the one knob,
+/// which is what lets the centre move without the shape moving with it.
+pub const MID_FREQ: usize = 3;
+/// VR03b, High, 100 k.
+pub const HIGH: usize = 4;
+/// VR04, the Level control, 50 k audio.
+pub const LEVEL: usize = 5;
+
+/// Where the level control rests: **unity through the pedal**, which is what
+/// the panel's Level knob means at noon. See `rodent::VOLUME_REST`.
+///
+/// Measured *broadband* (`examples/pedallevel.rs`) rather than on one tone, and
+/// for this pedal the two are eight decibels apart: it is shaped hard enough --
+/// a hump at 950 Hz, a scoop, then a three-band equaliser -- that its level at
+/// 220 Hz says very little about how loud it is. The other pedals are flat
+/// enough for the distinction not to arise. At this position it sits 1.6 dB
+/// above no pedal at all, in the middle of the list.
+pub const LEVEL_REST: f64 = 0.45;
+
+/// M5218AL: a 10 MHz, 5 V/us dual. The op-amps are built as ideal amplifiers
+/// with a rail, as the Green 808's are; what that leaves out is the slew limit,
+/// which matters far less here than in a Rodent because nothing in this pedal
+/// asks an amplifier to follow an edge it cannot.
+const SWING: f64 = 4.0;
+
+/// 1SS133, a small-signal silicon switching diode. No SPICE model located, so
+/// it takes 1N4148-class constants. APPROXIMATED.
+const CLIPPER: DiodeSpec = DiodeSpec::SILICON;
+
+/// 2SK184GR / 2SK118Y, the JFETs either end of the pedal.
+const JFET: JfetSpec = JfetSpec::J201;
+/// 2SC3378GR, which the catalogue already carries.
+const NPN: BipolarSpec = BipolarSpec::NPN_2SC3378;
+
+/// One resonant leg: a gyrator's inductance, its series resistance and the
+/// capacitor in front of it.
+///
+/// | | from the drawing | L | with | resonance |
+/// |---|---|---|---|---|
+/// | the hump | 47k, 2.2k, .01 | 1.034 H | .027 uF | **953 Hz** |
+/// | post high | 47k, 1k, .015 | 0.705 H | .0015 uF | **4894 Hz** |
+/// | post low | 470k, 470, .22 | 48.6 H | .047 uF | **105 Hz** |
+/// | Low control | 100k, 2.2k, .22 | 48.4 H | .047 uF | **106 Hz** |
+type Leg = (f64, f64, f64);
+
+const HUMP: Leg = (1.034, 2_200.0, 0.027e-6);
+const POST_HIGH: Leg = (0.705, 1_000.0, 0.0015e-6);
+const POST_LOW: Leg = (48.598, 470.0, 0.047e-6);
+const LOW_BAND: Leg = (48.4, 2_200.0, 0.047e-6);
+
+/// Hangs one resonant leg between a node and ground.
+fn leg(net: &mut Netlist, from: &str, prefix: &str, (l, r, c): Leg) {
+    let a = format!("{prefix}_a");
+    let b = format!("{prefix}_b");
+    net.capacitor(from, &a, c)
+        .inductor(&a, &b, l)
+        .resistor(&b, "gnd", r);
+}
+
+pub fn build(source: f64, load: f64) -> Result<Circuit, Fault> {
+    tap(source, load, "out")
+}
+
+/// The original April 1991 U2a/U2b middle EQ on its own, for validating the
+/// stage the pedal is built with (`middle_stage`) against the AC solver.
+///
+/// Both op-amps keep their rails here; a small-signal AC reference may
+/// linearise them around zero.
+pub fn mid_eq_reference(source: f64, load: f64) -> Result<Circuit, Fault> {
+    let mut net = Netlist::new("MT-2 April 1991 isolated middle EQ");
+    net.input("in", source);
+    middle_stage(&mut net, "in", false);
+    net.resistor("u2a", "gnd", load);
+    net.build("u2a")
+}
+
+/// The Middle and Mid Freq controls: the factory U2a/U2b stage, from `from`
+/// to `u2a`. See `docs/models/metal_zone.md`.
+///
+/// U2a is an inverting unity-gain stage (R038, R035 47 k) whose non-inverting
+/// input is fed by a Wien bridge -- C036 in series with R048 and one gang,
+/// the other gang with R062 and C043 to ground -- and the Wien bridge is
+/// driven by U2b, a follower on the Middle control's wiper. Middle blends
+/// U2a's input against its output, so turned one way the bridge's band is
+/// added and turned the other it is taken away, by the same amount: **+-15 dB
+/// held across the whole sweep**, 240 Hz to 4.8 kHz, which is what the
+/// gyrator this replaced (2026-09-25) could not do.
+///
+/// `MIDDLE` uses the existing estimated symmetric law. `MID_FREQ` sweeps
+/// electrical gang resistance linearly, from 50 k to zero as the control
+/// rises, as the gyrator did; the factory pot is a C taper whose curve is not
+/// published. APPROXIMATED.
+///
+/// Both keep their rails in the pedal. U2b looks as though it could be built
+/// linear (`linear_u2b`) -- it follows a passive blend of U4A's output and
+/// U2a's, both rail-limited -- but those arrive through C011 and C037, and
+/// when the stages before them clip unevenly the capacitors carry the blend
+/// past the rail for a moment. Measured by the wide partition probe below:
+/// 6.4 mV of error, which is not numerical noise, so it stays rail-aware.
+fn middle_stage(net: &mut Netlist, from: &str, linear_u2b: bool) {
+    net.capacitor(from, "mid_in", 1e-6) // C011
+        .resistor("mid_in", "u2a_m", 47_000.0) // R038
+        .resistor("u2a", "u2a_m", 47_000.0) // R035
+        .capacitor("u2a", "u2a_m", 100e-12) // C026
+        .opamp("u2a", "u2a_p", "u2a_m", SWING)
+        .resistor("mid_in", "mid_cut", 330.0) // R050, VR02b pin 1
+        .capacitor("u2a", "mid_feedback", 1e-6) // C037
+        .resistor("mid_feedback", "mid_boost", 330.0) // R049, VR02b pin 3
+        .rest(MIDDLE, 0.5)
+        .pot(
+            "mid_boost",
+            "mid_wiper",
+            "mid_cut",
+            100_000.0,
+            Taper::Symmetric { span: 150.0 },
+            MIDDLE,
+        );
+    if linear_u2b {
+        net.linear_opamp("u2b", "mid_wiper", "u2b");
+    } else {
+        net.opamp("u2b", "mid_wiper", "u2b", SWING);
+    }
+    net.capacitor("u2b", "mid_series", 0.022e-6) // C036
+        .resistor("mid_series", "mid_gang1", 2_200.0) // R048
+        .rest(MID_FREQ, 0.5)
+        .pot(
+            "mid_gang1",
+            "mid_bridge",
+            "mid_bridge",
+            50_000.0,
+            Taper::Linear,
+            MID_FREQ,
+        )
+        .pot(
+            "mid_bridge",
+            "mid_gang2",
+            "mid_gang2",
+            50_000.0,
+            Taper::Linear,
+            MID_FREQ,
+        )
+        .resistor("mid_gang2", "gnd", 2_200.0) // R062
+        .capacitor("mid_bridge", "gnd", 0.0082e-6) // C043
+        .capacitor("mid_bridge", "u2a_p", 0.1e-6) // C038
+        .resistor("u2a_p", "gnd", 1_000_000.0); // R039, AC-referenced bias
+}
+
+#[cfg(test)]
+pub fn build_full_newton_reference(source: f64, load: f64) -> Result<Circuit, Fault> {
+    tap_impl(source, load, "out", false, false, false)
+}
+
+pub fn tap(source: f64, load: f64, at: &str) -> Result<Circuit, Fault> {
+    // U4A and U4B must remain rail-aware: the wide operating-envelope probe
+    // shows real response changes when either stage is forced linear (U4B is
+    // especially visible around its 105 Hz resonance at large input). So must
+    // U2b, the Middle stage's follower: forced linear it is 6.4 mV out at the
+    // wide probe's worst case (every control up, 105 Hz, 0.12 V) -- see
+    // `middle_stage` for why. Nothing in this pedal is partitioned now.
+    tap_impl(source, load, at, false, false, false)
+}
+
+#[cfg(test)]
+fn build_partition_candidate(
+    source: f64,
+    load: f64,
+    linear_u4b: bool,
+    linear_u4a: bool,
+    linear_u2b: bool,
+) -> Result<Circuit, Fault> {
+    tap_impl(source, load, "out", linear_u4b, linear_u4a, linear_u2b)
+}
+
+fn tap_impl(
+    source: f64,
+    load: f64,
+    at: &str,
+    linear_u4b: bool,
+    linear_u4a: bool,
+    linear_u2b: bool,
+) -> Result<Circuit, Fault> {
+    let mut net = Netlist::new("Metal Zone");
+
+    // --- supply and bias --------------------------------------------------------------
+    // R056/R057 10 k each make the 4.5 V the input buffer sits on.
+    net.supply("v9", 47.0, 9.0)
+        .capacitor("v9", "gnd", 100e-6) // C040
+        .resistor("v9", "vref", 10_000.0) // R056
+        .resistor("vref", "gnd", 10_000.0) // R057
+        .capacitor("vref", "gnd", 100e-6); // C019
+
+    // --- input buffer, Q011 -------------------------------------------------------------
+    net.input("in", source)
+        .resistor("in", "c042", 10_000.0) // R059
+        .capacitor("c042", "g1", 0.047e-6) // C042
+        .resistor("g1", "vref", 1_000_000.0) // R058
+        .jfet("v9", "g1", "s1", JFET)
+        .resistor("s1", "gnd", 10_000.0); // R060
+
+    // Ground-referenced from here on, with the buffer coupled in. The pedal
+    // itself runs everything on the 4.5 V bias; an amplifier clipping at
+    // 4.5 V +- 4 V and one clipping at 0 V +- 4 V do the same thing to a
+    // signal, and the solver is far happier with the second. The same
+    // construction `heavy_metal` and `rodent` use, and for the same reason.
+    net.capacitor("s1", "pre", 1e-6)
+        .resistor("pre", "gnd", 1_000_000.0);
+
+    // --- the hump, op-amp 3b ------------------------------------------------------------
+    // A non-inverting stage whose gain leg is a resonant shunt: at 953 Hz the
+    // leg is only its own resistance, so the gain rises to about 1 + 220k/2.2k
+    // there and sits near unity everywhere else. That is the mid hump, and it
+    // is *before* the clipper -- it decides which part of the guitar gets
+    // distorted, which is most of why this pedal sounds the way it does.
+    net.capacitor("pre", "u3b_p", 0.015e-6) // C033
+        .resistor("u3b_p", "gnd", 100_000.0) // R043, 106 Hz with C033
+        .opamp("u3b", "u3b_p", "u3b_m", SWING)
+        .resistor("u3b", "u3b_m", 220_000.0) // R044
+        .capacitor("u3b", "u3b_m", 100e-12); // C032, 7.2 kHz
+    leg(&mut net, "u3b_m", "hump", HUMP);
+
+    // Out through the divider and its lowpass: R045/R042 10 k each, and R045
+    // against C031 turns the top over at about 340 Hz.
+    net.resistor("u3b", "mid", 10_000.0) // R045
+        .resistor("mid", "gnd", 10_000.0) // R042
+        .capacitor("mid", "gnd", 0.047e-6); // C031
+
+    // --- the gain stage, op-amp 3a -------------------------------------------------------
+    // Non-inverting, with the Dist control in the feedback: R041 1 k and VR01
+    // 250 k against R051 1 k, so the gain runs from 1 + 1k/1k = 2 to
+    // 1 + 251k/1k = 252. C028 47 p holds the top down above 13 kHz.
+    net.capacitor("mid", "u3a_p", 0.033e-6) // C029
+        .resistor("u3a_p", "gnd", 100_000.0) // R040, 48 Hz
+        .opamp("u3a", "u3a_p", "u3a_m", SWING)
+        .resistor("u3a", "dist_w", 1_000.0) // R041
+        // A rheostat with its wiper tied to `b`, so what is in circuit is the
+        // a-to-wiper leg, `R x (1 - f)`. A forward taper would run the control
+        // backwards; the reverse one puts the gain up as the knob goes up.
+        .pot(
+            "dist_w",
+            "u3a_m",
+            "u3a_m",
+            250_000.0,
+            Taper::ReverseAudio,
+            DIST,
+        ) // VR01
+        .capacitor("u3a", "u3a_m", 47e-12) // C028
+        .resistor("u3a_m", "gnd", 1_000.0); // R051
+
+    // --- the clipper ----------------------------------------------------------------------
+    // R033 2.2 k into a 1SS133 pair to ground, then the divider that follows it.
+    net.resistor("u3a", "clip", 2_200.0) // R033
+        .diode("clip", "gnd", CLIPPER) // D003
+        .diode("gnd", "clip", CLIPPER) // D004
+        .resistor("clip", "post", 10_000.0) // R032
+        .resistor("post", "gnd", 4_700.0) // R031
+        .capacitor("post", "gnd", 0.015e-6); // C023
+
+    // --- the scoop, op-amp 4b -------------------------------------------------------------
+    // Two resonant legs in the gain leg at once: the stage lifts 105 Hz and
+    // 4894 Hz and leaves the middle where it was, which is the double peak --
+    // and the scoop between them -- this pedal is bought for.
+    // R030 sits *in series* with the legs rather than across them. Across, it
+    // is a gain leg of its own and the stage lifts everything by thirty-one
+    // times, resonance or not, which is not a scoop but a gain stage; in
+    // series, the legs are a high impedance away from their resonances and the
+    // stage sits at unity everywhere except the two ends of the band.
+    if linear_u4b {
+        net.linear_opamp("u4b", "post", "u4b_m");
+    } else {
+        net.opamp("u4b", "post", "u4b_m", SWING);
+    }
+    net.resistor("u4b", "u4b_m", 100_000.0) // R029
+        .capacitor("u4b", "u4b_m", 47e-12) // C022
+        .resistor("u4b_m", "u4b_legs", 3_300.0); // R030
+    leg(&mut net, "u4b_legs", "plow", POST_LOW);
+    leg(&mut net, "u4b_legs", "phigh", POST_HIGH);
+
+    // --- the equaliser ---------------------------------------------------------------------
+    // The three tone controls, built the way the Mark IIC+'s graphic is: each
+    // track runs between the two inputs of one amplifier with its own leg on
+    // the wiper, so it boosts toward one end, cuts toward the other and is flat
+    // in the middle. Published range: +-20 dB on Low and High, +-15 dB on the
+    // middle.
+    net.resistor("u4b", "cut", 22_000.0); // R028
+    if linear_u4a {
+        net.linear_opamp("u4a", "cut", "boost");
+    } else {
+        net.opamp("u4a", "cut", "boost", SWING);
+    }
+    net.resistor("u4a", "boost", 22_000.0) // R026
+        .capacitor("u4a", "boost", 10e-12); // C018
+
+    // VR03a Low: the 106 Hz resonance.
+    net.pot(
+        "boost",
+        "w_low",
+        "cut",
+        100_000.0,
+        Taper::Symmetric { span: 150.0 },
+        LOW,
+    );
+    leg(&mut net, "w_low", "blow", LOW_BAND);
+
+    // VR03b High: a shelf rather than a resonance -- R061 2.2 k and C044 .01
+    // let everything above about 7 kHz through the track and nothing below it.
+    net.pot(
+        "boost",
+        "w_high",
+        "cut",
+        100_000.0,
+        Taper::Symmetric { span: 150.0 },
+        HIGH,
+    )
+    .capacitor("w_high", "bhigh", 0.01e-6) // C044
+    .resistor("bhigh", "gnd", 2_200.0); // R061
+
+    // --- the middle, U2a and U2b ------------------------------------------------------------
+    // Not a third leg on the equaliser's track: the factory middle is a stage
+    // of its own after it, with the Wien bridge in its own feedback, which is
+    // what holds its depth across the sweep. See `middle_stage`.
+    middle_stage(&mut net, "u4a", linear_u2b);
+
+    // --- Level and the output buffer --------------------------------------------------------
+    net.resistor("u2a", "lvl_top", 22_000.0) // R014
+        .rest(LEVEL, LEVEL_REST)
+        .pot("lvl_top", "lvl", "gnd", 50_000.0, Taper::Audio, LEVEL) // VR04
+        .capacitor("lvl", "b1", 10e-6) // C005
+        .resistor("b1", "vref", 1_000_000.0) // R005
+        .bipolar("v9", "b1", "e1", NPN)
+        .resistor("e1", "gnd", 10_000.0) // R002
+        .capacitor("e1", "out", 10e-6) // C001
+        .resistor("out", "gnd", 100_000.0) // R003
+        .resistor("out", "gnd", load);
+
+    net.build(at)
+}
+
+#[cfg(test)]
+mod partition_tests {
+    use super::*;
+    use crate::dsp::time::Simulation;
+
+    fn configure(sim: &mut Simulation) {
+        for (control, value) in [
+            (DIST, 0.7),
+            (LOW, 0.7),
+            (MIDDLE, 0.65),
+            (MID_FREQ, 0.4),
+            (HIGH, 0.7),
+            (LEVEL, 0.45),
+        ] {
+            sim.set_control(control, value);
+        }
+    }
+
+    fn worst_difference(candidate: Circuit) -> (usize, usize, f64) {
+        let mut partitioned = Simulation::new(candidate, 48_000.0);
+        let mut reference = Simulation::new(
+            build_full_newton_reference(10_000.0, 470_000.0).unwrap(),
+            48_000.0,
+        );
+        configure(&mut partitioned);
+        configure(&mut reference);
+
+        let before = reference
+            .nonlinear_reduction()
+            .map(|(boundary, _)| boundary)
+            .unwrap_or(reference.unknowns());
+        let after = partitioned
+            .nonlinear_reduction()
+            .map(|(boundary, _)| boundary)
+            .unwrap_or(partitioned.unknowns());
+
+        let mut worst = 0.0_f64;
+        for k in 0..12_000 {
+            let t = k as f64 / 48_000.0;
+            let x = 0.018
+                * ((std::f64::consts::TAU * 110.0 * t).sin() * 0.65
+                    + (std::f64::consts::TAU * 220.0 * t).sin() * 0.35);
+            let a = partitioned.process(x);
+            let b = reference.process(x);
+            worst = worst.max((a - b).abs());
+        }
+        (before, after, worst)
+    }
+
+    /// Every op-amp in the pedal is rail-aware since the factory middle stage
+    /// went in (2026-09-25), so production is the full-Newton reference: the
+    /// same boundary and the same samples.
+    #[test]
+    fn production_mt2_is_the_full_newton_reference() {
+        let (before, after, worst) = worst_difference(build(10_000.0, 470_000.0).unwrap());
+        assert_eq!(before, 29, "unexpected MT-2 reference Newton boundary");
+        assert_eq!(after, 29, "production MT-2 is not partitioned");
+        assert!(
+            worst < 1e-12,
+            "production MT-2 differs from its reference: {worst:e}"
+        );
+    }
+
+    /// Why U2b is not partitioned: forced linear, it is millivolts out at the
+    /// wide probe's worst case -- every control up, 105 Hz, 0.12 V -- because
+    /// C011 and C037 carry its input past the rail when the stages before it
+    /// clip unevenly. The old gyrator follower was 1e-12 out at the same case.
+    #[test]
+    fn a_linear_middle_follower_would_change_the_sound() {
+        let mut candidate = Simulation::new(
+            build_partition_candidate(10_000.0, 470_000.0, false, false, true).unwrap(),
+            48_000.0,
+        );
+        let mut reference = Simulation::new(
+            build_full_newton_reference(10_000.0, 470_000.0).unwrap(),
+            48_000.0,
+        );
+        for (control, value) in [
+            (DIST, 1.0),
+            (LOW, 1.0),
+            (MIDDLE, 1.0),
+            (MID_FREQ, 0.5),
+            (HIGH, 1.0),
+            (LEVEL, 0.45),
+        ] {
+            candidate.set_control(control, value);
+            reference.set_control(control, value);
+        }
+        let mut worst = 0.0_f64;
+        for k in 0..4_096 {
+            let t = k as f64 / 48_000.0;
+            let x = 0.12 * (std::f64::consts::TAU * 105.0 * t).sin();
+            worst = worst.max((candidate.process(x) - reference.process(x)).abs());
+        }
+        assert!(
+            worst > 1e-3,
+            "a linear U2b is now exact ({worst:e}); partition it"
+        );
+    }
+
+    /// Diagnostic for the next partitioning step. Run with:
+    ///
+    /// cargo test --release report_post_eq_partition_candidates -- --ignored --nocapture
+    ///
+    /// A candidate is safe to promote into the production netlist only if its
+    /// worst error is effectively zero across this probe (and later the audio
+    /// fixture probe). Keeping this ignored avoids baking an intentionally
+    /// exploratory measurement into the normal test suite.
+    #[test]
+    #[ignore]
+    fn report_post_eq_partition_candidates() {
+        for (name, flags) in [
+            ("u4b_scoop", (true, false, false)),
+            ("u4a_eq", (false, true, false)),
+            ("middle_follower_u2b", (false, false, true)),
+            ("u4b_plus_middle_follower", (true, false, true)),
+        ] {
+            let circuit =
+                build_partition_candidate(10_000.0, 470_000.0, flags.0, flags.1, flags.2).unwrap();
+            let (before, after, worst) = worst_difference(circuit);
+            println!(
+                "MT-2 candidate={name:<22} boundary={before}->{after} worst_abs_error={worst:e}"
+            );
+        }
+    }
+    /// Wider operating-envelope validation for candidates that look safe in the
+    /// narrow probe above. This deliberately drives the resonant post-EQ stages
+    /// at their important frequencies and across realistic guitar peak levels.
+    /// A candidate must remain effectively identical here before it may replace
+    /// a rail-aware op-amp in the production netlist.
+    #[test]
+    #[ignore]
+    fn report_post_eq_partition_candidates_wide() {
+        const SETTINGS: [[f64; 6]; 7] = [
+            // dist, low, middle, mid-freq, high, level
+            [0.5, 0.5, 0.5, 0.5, 0.5, 0.45],
+            [1.0, 1.0, 1.0, 0.5, 1.0, 0.45],
+            [1.0, 1.0, 0.5, 0.5, 0.0, 0.45],
+            [1.0, 0.0, 0.5, 0.5, 1.0, 0.45],
+            [1.0, 0.5, 1.0, 0.0, 0.5, 0.45],
+            [1.0, 0.5, 1.0, 1.0, 0.5, 0.45],
+            [1.0, 0.0, 0.0, 0.5, 0.0, 0.45],
+        ];
+        const FREQUENCIES: [f64; 4] = [105.0, 220.0, 950.0, 4_890.0];
+        const INPUTS: [f64; 3] = [0.03, 0.12, 0.30];
+
+        for (name, flags) in [
+            ("u4b_scoop", (true, false, false)),
+            ("middle_follower_u2b", (false, false, true)),
+            ("u4b_plus_middle_follower", (true, false, true)),
+        ] {
+            let mut worst = 0.0_f64;
+            let mut worst_case = (0usize, 0.0_f64, 0.0_f64);
+            for (setting_index, values) in SETTINGS.iter().enumerate() {
+                for &hz in &FREQUENCIES {
+                    for &volts in &INPUTS {
+                        let mut candidate = Simulation::new(
+                            build_partition_candidate(
+                                10_000.0, 470_000.0, flags.0, flags.1, flags.2,
+                            )
+                            .unwrap(),
+                            48_000.0,
+                        );
+                        let mut reference = Simulation::new(
+                            build_full_newton_reference(10_000.0, 470_000.0).unwrap(),
+                            48_000.0,
+                        );
+                        for (control, value) in [
+                            (DIST, values[0]),
+                            (LOW, values[1]),
+                            (MIDDLE, values[2]),
+                            (MID_FREQ, values[3]),
+                            (HIGH, values[4]),
+                            (LEVEL, values[5]),
+                        ] {
+                            candidate.set_control(control, value);
+                            reference.set_control(control, value);
+                        }
+
+                        let mut case_worst = 0.0_f64;
+                        for k in 0..4_096 {
+                            let t = k as f64 / 48_000.0;
+                            let x = volts * (std::f64::consts::TAU * hz * t).sin();
+                            case_worst =
+                                case_worst.max((candidate.process(x) - reference.process(x)).abs());
+                        }
+                        if case_worst > worst {
+                            worst = case_worst;
+                            worst_case = (setting_index, hz, volts);
+                        }
+                    }
+                }
+            }
+            let circuit =
+                build_partition_candidate(10_000.0, 470_000.0, flags.0, flags.1, flags.2).unwrap();
+            let reference = Simulation::new(
+                build_full_newton_reference(10_000.0, 470_000.0).unwrap(),
+                48_000.0,
+            );
+            let candidate = Simulation::new(circuit, 48_000.0);
+            let before = reference
+                .nonlinear_reduction()
+                .map(|(boundary, _)| boundary)
+                .unwrap_or(reference.unknowns());
+            let after = candidate
+                .nonlinear_reduction()
+                .map(|(boundary, _)| boundary)
+                .unwrap_or(candidate.unknowns());
+            println!(
+                "MT-2 wide candidate={name:<22} boundary={before}->{after} worst_abs_error={worst:e} setting={} hz={} input_v={}",
+                worst_case.0, worst_case.1, worst_case.2
+            );
+        }
+    }
+}
