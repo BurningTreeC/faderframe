@@ -21,8 +21,10 @@ use std::f32::consts::PI;
 use std::sync::Arc;
 
 pub const PADS: usize = 16;
+/// Extra stereo outputs pads can go to (output tracks take them).
+pub const AUX: usize = 8;
 /// Parameters per pad.
-const FIELDS: usize = 13;
+const FIELDS: usize = 14;
 const LAYERS: usize = 4;
 
 pub mod id {
@@ -46,6 +48,16 @@ pub mod id {
     pub const VELOCITY: u32 = 11;
     /// The pad's tune moves its pitch, not its length.
     pub const KEEP: u32 = 12;
+    /// Where the pad plays: 0 the main output, n extra output n (the main
+    /// one while no track takes it).
+    pub const OUTPUT: u32 = 13;
+}
+
+/// The output buses' names, main first.
+pub fn output_bus_names() -> Vec<String> {
+    std::iter::once("Main".to_string())
+        .chain((1..=AUX).map(|n| format!("Out {n}")))
+        .collect()
 }
 
 /// Published: per pad how hard it sounds now (0–1), then voices sounding.
@@ -100,6 +112,7 @@ pub fn parameters() -> Vec<ParameterInfo> {
             param(b + id::RESONANCE, &n("Resonance"), 0.0, 1.0, 0.1, Percent),
             param(b + id::VELOCITY, &n("Velocity"), 0.0, 1.0, 0.8, Percent),
             stepped(b + id::KEEP, &n("Keep Length"), 1.0, 0.0),
+            stepped(b + id::OUTPUT, &n("Output"), AUX as f64, 0.0),
         ]);
     }
     v
@@ -115,6 +128,8 @@ pub fn format(pid: ParameterId, v: f64) -> Option<String> {
     Some(match (pid.0 - id::pad(0)) % 16 {
         id::MODE => pick(&MODES, v),
         id::REVERSE | id::KEEP => on_off(v),
+        id::OUTPUT if v < 0.5 => "Main".into(),
+        id::OUTPUT => format!("Out {:.0}", v.round()),
         id::CHOKE if v < 0.5 => "None".into(),
         id::CHOKE => format!("{:.0}", v.round()),
         id::TUNE => format!("{v:+.2} st").replace("+0.00 st", "0 st"),
@@ -188,7 +203,10 @@ pub struct DrumsProcessor {
     generation: u64,
     fade: f32,
     hits: [f32; PADS],
-    mix: [Vec<f32>; 2],
+    /// The main output's mix, then each extra output's.
+    mixes: Vec<[Vec<f32>; 2]>,
+    /// Per pad the mix it plays into this block.
+    routes: [usize; PADS],
     meters: [MeterTap; 2],
     /// Stretchers for pads that keep their length (made when one does).
     keep: Option<KeepLength>,
@@ -254,12 +272,15 @@ impl DrumsProcessor {
             generation: 0,
             fade: (-6.9 / (0.004 * sr) as f32).exp(),
             hits: [0.0; PADS],
-            mix: [vec![0.0; block], vec![0.0; block]],
+            mixes: (0..=AUX)
+                .map(|_| [vec![0.0; block], vec![0.0; block]])
+                .collect(),
+            routes: [0; PADS],
             meters: [MeterTap::new(sr as f32); 2],
         }
     }
 
-    /// A pad's parameter (they follow the two globals, twelve a pad).
+    /// A pad's parameter (they follow the two globals, `FIELDS` a pad).
     fn pad(&self, p: usize, field: u32) -> f64 {
         f64::from(self.params.get(2 + p * FIELDS + field as usize))
     }
@@ -363,17 +384,16 @@ impl DrumsProcessor {
 
     // Each frame writes both output sides at its index.
     #[allow(clippy::needless_range_loop)]
-    fn render(
-        &mut self,
-        set: Option<&super::samples::SampleSet>,
-        out: &mut [&mut [f32]; 2],
-        start: usize,
-        end: usize,
-    ) {
+    fn render(&mut self, set: Option<&super::samples::SampleSet>, start: usize, end: usize) {
         let Some(set) = set else { return };
         let fade = self.fade;
         let Self {
-            voices, keep, hits, ..
+            voices,
+            keep,
+            hits,
+            mixes,
+            routes,
+            ..
         } = self;
         for v in voices.iter_mut().filter(|v| v.on) {
             let Some(s) = set.samples.get(v.sample) else {
@@ -437,7 +457,7 @@ impl DrumsProcessor {
                     }
                     let o = x * amp * v.gain[ch];
                     loudest = loudest.max(o.abs());
-                    out[ch][i] += o;
+                    mixes[routes[v.pad]][ch][i] += o;
                 }
                 if !v.on {
                     break;
@@ -453,7 +473,7 @@ impl PluginProcessor for DrumsProcessor {
         for e in ctx.param_events {
             self.params.apply_event(e.parameter, e.value);
         }
-        let frames = io.frames.min(self.mix[0].len());
+        let frames = io.frames.min(self.mixes[0][0].len());
         let watched = self
             .tap
             .as_ref()
@@ -477,18 +497,23 @@ impl PluginProcessor for DrumsProcessor {
                 voices[o].on && voices[o].slot == Some(slot)
             });
         }
-        let mut mix = std::mem::take(&mut self.mix);
+        // Pads go to their output where a track takes it.
+        let buses = io.audio_out.len().clamp(1, AUX + 1);
+        for p in 0..PADS {
+            let o = self.pad(p, id::OUTPUT).round().max(0.0) as usize;
+            self.routes[p] = if o < buses { o } else { 0 };
+        }
+        for m in &mut self.mixes[..buses] {
+            m[0][..frames].fill(0.0);
+            m[1][..frames].fill(0.0);
+        }
         {
-            let [l, r] = &mut mix;
-            l[..frames].fill(0.0);
-            r[..frames].fill(0.0);
-            let mut sides: [&mut [f32]; 2] = [&mut l[..frames], &mut r[..frames]];
             let mut pos = 0usize;
             if let Some(events) = io.events_in.first() {
                 for e in events.iter() {
                     let at = (e.sample_offset as usize).min(frames);
                     if at > pos {
-                        self.render(set, &mut sides, pos, at);
+                        self.render(set, pos, at);
                         pos = at;
                     }
                     match e.event {
@@ -519,30 +544,34 @@ impl PluginProcessor for DrumsProcessor {
                 }
             }
             if frames > pos {
-                self.render(set, &mut sides, pos, frames);
+                self.render(set, pos, frames);
             }
         }
         drop(guard);
-        let Some(out) = io.audio_out.first_mut() else {
-            self.mix = mix;
-            return ProcessStatus::Continue;
-        };
-        out.clear();
-        let channels = out.num_channels();
-        if channels >= 2 {
-            out.channel_mut(0)[..frames].copy_from_slice(&mix[0][..frames]);
-            out.channel_mut(1)[..frames].copy_from_slice(&mix[1][..frames]);
-        } else if channels == 1 {
-            for (o, (a, b)) in out
-                .channel_mut(0)
-                .iter_mut()
-                .zip(mix[0].iter().zip(&mix[1]))
-                .take(frames)
-            {
-                *o = 0.5 * (a + b);
+        for (b, out) in io.audio_out.iter_mut().enumerate() {
+            out.clear();
+            let Some(mix) = self.mixes.get(b) else {
+                continue;
+            };
+            let channels = out.num_channels();
+            if channels >= 2 {
+                out.channel_mut(0)[..frames].copy_from_slice(&mix[0][..frames]);
+                out.channel_mut(1)[..frames].copy_from_slice(&mix[1][..frames]);
+            } else if channels == 1 {
+                for (o, (a, b)) in out
+                    .channel_mut(0)
+                    .iter_mut()
+                    .zip(mix[0].iter().zip(&mix[1]))
+                    .take(frames)
+                {
+                    *o = 0.5 * (a + b);
+                }
             }
         }
-        self.mix = mix;
+        let Some(out) = io.audio_out.first() else {
+            return ProcessStatus::Continue;
+        };
+        let channels = out.num_channels();
         if let Some(tap) = &self.tap {
             for (p, h) in self.hits.iter().enumerate() {
                 tap.raise_value(value::pad(p), *h);
@@ -681,6 +710,73 @@ mod tests {
         let (long, hi) = play(1.0);
         assert!((long - 0.4).abs() < 0.05, "{long}");
         assert!(hi > -14.0, "{hi}");
+    }
+
+    #[test]
+    fn pads_play_into_the_outputs_tracks_take() {
+        use faderframe_audio_graph::{AudioBuffer, NodeIo};
+        use faderframe_core::ChannelLayout;
+        use faderframe_midi::{MidiBuffer, TimedMidiEvent};
+        let d = fixtures::dir("drums-outs");
+        let mut doc = SampleDoc::default();
+        doc.set(
+            0,
+            Some(fixtures::tone(&d.join("kick.wav"), 60.0, 48_000, 0.3)),
+        );
+        doc.set(
+            1,
+            Some(fixtures::tone(&d.join("snare.wav"), 2_000.0, 48_000, 0.3)),
+        );
+        let params = ParamValues::new(parameters());
+        // Pad 2 to the second extra output.
+        params
+            .set_by_id(ParameterId(id::pad(1) + id::OUTPUT), 2.0)
+            .unwrap();
+        let mut host = SampleHost::default();
+        host.set_doc(doc, None);
+        let config = crate::devices::rig::config();
+        let mut proc = DrumsProcessor::new(params, None, &config, Arc::clone(&host.shared));
+        let frames = 1024.min(config.max_block_size as usize);
+        let run = |proc: &mut DrumsProcessor, buses: usize| -> Vec<f32> {
+            let mut outs: Vec<AudioBuffer> = (0..buses)
+                .map(|_| {
+                    let mut b = AudioBuffer::new(ChannelLayout::Stereo, frames);
+                    b.set_len(frames);
+                    b
+                })
+                .collect();
+            let mut midi = vec![MidiBuffer::with_capacity(8)];
+            for key in [36, 37] {
+                midi[0].push(TimedMidiEvent::new(0, on(key, 127))).unwrap();
+            }
+            let transport = faderframe_transport::TransportInfo::default();
+            let ctx = PluginProcessContext {
+                transport: &transport,
+                param_events: &[],
+                harmony: &crate::NO_HARMONY,
+                param_mods: &[],
+                note_mods: &[],
+            };
+            let mut io = NodeIo {
+                frames,
+                audio_in: &[],
+                audio_out: &mut outs,
+                events_in: &midi,
+                events_out: &mut [],
+            };
+            proc.process(&ctx, &mut io);
+            outs.iter()
+                .map(|b| b.channel(0).iter().map(|v| v * v).sum::<f32>())
+                .collect()
+        };
+        // Taken: the snare on output 2, the kick on the main one.
+        let e = run(&mut proc, 3);
+        assert!(e[0] > 0.0 && e[2] > 0.0, "{e:?}");
+        assert_eq!(e[1], 0.0, "nothing plays into output 1");
+        // Not taken: everything on the main output.
+        proc.reset();
+        let alone = run(&mut proc, 1);
+        assert!(alone[0] > e[0], "{alone:?} vs {e:?}");
     }
 
     #[test]

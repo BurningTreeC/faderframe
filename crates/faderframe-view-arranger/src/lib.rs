@@ -2267,6 +2267,33 @@ impl ArrangerView {
                 });
             }
         }
+        // Multi-output plugins: tracks for their extra outputs.
+        for slot in t.inserts.iter().chain(t.instrument.iter()) {
+            if !model.plugin_has_extra_outputs(slot.id) {
+                continue;
+            }
+            let missing = model
+                .plugin_output_buses(slot.id)
+                .iter()
+                .skip(1)
+                .filter(|o| o.track.is_none())
+                .count();
+            let label = format!("Create Output Tracks · {} ({missing})", slot.plugin.name);
+            items.push(
+                if missing == 0 {
+                    MenuItem::disabled(label)
+                } else {
+                    MenuItem::new(
+                        label,
+                        Action::CreateOutputTracks {
+                            plugin: slot.id,
+                            buses: None,
+                        },
+                    )
+                }
+                .separated(),
+            );
+        }
         // Track presets.
         if t.kind != TrackKind::Master {
             items.push(

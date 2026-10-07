@@ -54,6 +54,12 @@ impl Session {
                 t.name
             )));
         }
+        if freeze && !self.output_tracks_of(track).is_empty() {
+            return Err(SessionError::Other(format!(
+                "'{}' feeds output tracks from its plugin: freezing it would silence them",
+                t.name
+            )));
+        }
         let name = t.name.clone();
         let mono = t.layout == ChannelLayout::Mono;
         let project = self.absolute_copy();

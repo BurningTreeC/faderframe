@@ -457,7 +457,7 @@ impl MixerView {
             matches!(
                 t.kind,
                 TrackKind::Audio | TrackKind::Instrument | TrackKind::Midi
-            ),
+            ) || t.input.plugin_output().is_some(),
             t.kind != TrackKind::Master && !vca,
             self.send_rows,
             if vca { 0 } else { self.insert_slots.max(1) },
@@ -757,6 +757,12 @@ impl MixerView {
                 InputRouting::Midi {
                     channel: Some(c), ..
                 } => format!("MIDI {}", c + 1),
+                // A plugin's extra output: its name there.
+                InputRouting::Plugin { plugin, bus } => model
+                    .plugin_output_buses(*plugin)
+                    .into_iter()
+                    .find(|o| o.bus == *bus)
+                    .map_or_else(|| "PLUG —".to_string(), |o| o.name.to_uppercase()),
             };
             controls::well_label(p, row.input, &label, t.input == InputRouting::None, th);
             controls::led_button(p, row.phase, "Ø", t.phase_invert, c.led.phase, th);
@@ -1465,6 +1471,39 @@ impl MixerView {
                             plugin: s.id,
                             generic: true,
                         },
+                    ));
+                }
+                // A multi-output plugin: tracks for its extra outputs.
+                if model.plugin_has_extra_outputs(s.id) {
+                    let outs = model.plugin_output_buses(s.id);
+                    let missing = outs.iter().skip(1).filter(|o| o.track.is_none()).count();
+                    let mut item = MenuItem::new(
+                        format!("Create Output Tracks ({missing})"),
+                        Action::CreateOutputTracks {
+                            plugin: s.id,
+                            buses: None,
+                        },
+                    )
+                    .separated();
+                    if missing == 0 {
+                        item = MenuItem::disabled("Every Output Has a Track").separated();
+                    }
+                    items.push(item);
+                    items.push(MenuItem::submenu(
+                        "Outputs",
+                        outs.iter()
+                            .skip(1)
+                            .map(|o| {
+                                MenuItem::new(
+                                    o.name.clone(),
+                                    Action::CreateOutputTracks {
+                                        plugin: s.id,
+                                        buses: Some(vec![o.bus]),
+                                    },
+                                )
+                                .checked(o.track.is_some())
+                            })
+                            .collect(),
                     ));
                 }
                 // Presets: the user's and the plugin format's own.

@@ -251,7 +251,11 @@ impl TrackPreset {
             kind: track.kind,
             layout: track.layout,
             color: track.color,
-            input: track.input.clone(),
+            // A plugin's output belongs to another track of this project.
+            input: match track.input {
+                InputRouting::Plugin { .. } => InputRouting::None,
+                ref other => other.clone(),
+            },
             output,
             volume_db: track.volume_db,
             pan: track.pan,

@@ -53,6 +53,8 @@ pub(crate) struct RtState {
     transport: *mut HostTransport,
     outputs: Vec<Vec<f32>>,
     list: AudioBufferList<MAX_CHANNELS>,
+    /// The extra output elements the graph takes: their buffers and lists.
+    aux: Vec<(Vec<Vec<f32>>, AudioBufferList<MAX_CHANNELS>)>,
     events: Vec<AudioUnitParameterEvent>,
     sample_time: f64,
     max_frames: usize,
@@ -96,6 +98,7 @@ impl RtState {
         unit: AudioUnit,
         inputs: usize,
         outputs: usize,
+        aux: &[usize],
         max_frames: usize,
         midi: bool,
         modulation: Modulation,
@@ -117,6 +120,17 @@ impl RtState {
                 .map(|_| vec![0.0; max_frames])
                 .collect(),
             list: AudioBufferList::new(),
+            aux: aux
+                .iter()
+                .map(|&c| {
+                    (
+                        (0..c.min(MAX_CHANNELS))
+                            .map(|_| vec![0.0; max_frames])
+                            .collect(),
+                        AudioBufferList::new(),
+                    )
+                })
+                .collect(),
             events: Vec::with_capacity(EVENT_CAPACITY),
             sample_time: 0.0,
             max_frames,
@@ -495,6 +509,46 @@ impl PluginProcessor for AuProcessor {
                 }
                 // SAFETY: the unit rendered `n` frames into this buffer
                 // (ours, or one of its own it pointed us to).
+                let src = unsafe { std::slice::from_raw_parts(b.mData.cast::<f32>(), n) };
+                out.channel_mut(c)[..n].copy_from_slice(src);
+            }
+        }
+        // Extra output elements: rendered for the same time stamp (the
+        // first render made them all).
+        for (k, out) in io.audio_out.iter_mut().enumerate().skip(1) {
+            let Some((bufs, list)) = st.aux.get_mut(k - 1).filter(|(b, _)| !b.is_empty()) else {
+                out.clear();
+                continue;
+            };
+            list.mNumberBuffers = bufs.len() as u32;
+            for (b, buf) in list.mBuffers.iter_mut().zip(bufs.iter_mut()) {
+                *b = AudioBuffer {
+                    mNumberChannels: 1,
+                    mDataByteSize: (n * 4) as u32,
+                    mData: buf.as_mut_ptr().cast(),
+                };
+            }
+            let mut flags = 0u32;
+            // SAFETY: an initialised unit on the thread holding the cell;
+            // the list describes buffers of at least `n` frames.
+            let status = unsafe {
+                AudioUnitRender(
+                    unit,
+                    &mut flags,
+                    &stamp,
+                    k as u32,
+                    n as u32,
+                    (list as *mut AudioBufferList<MAX_CHANNELS>).cast(),
+                )
+            };
+            let got = (list.mNumberBuffers as usize).min(bufs.len());
+            for c in 0..out.num_channels() {
+                let b = list.mBuffers[c.min(got.max(1) - 1)];
+                if status != 0 || got == 0 || b.mData.is_null() {
+                    out.channel_mut(c)[..n].fill(0.0);
+                    continue;
+                }
+                // SAFETY: the unit rendered `n` frames into this buffer.
                 let src = unsafe { std::slice::from_raw_parts(b.mData.cast::<f32>(), n) };
                 out.channel_mut(c)[..n].copy_from_slice(src);
             }

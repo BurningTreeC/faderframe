@@ -354,6 +354,10 @@ impl PluginInstance for Lv2Instance {
         self.shared.freewheel.store(!realtime, Ordering::Relaxed);
     }
 
+    fn output_bus_names(&mut self) -> Vec<String> {
+        self.model.output_bus_names()
+    }
+
     fn descriptor(&self) -> &PluginDescriptor {
         &self.descriptor
     }

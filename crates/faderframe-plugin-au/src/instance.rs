@@ -124,6 +124,10 @@ pub struct AuInstance {
     /// Gestures open in the unit's editor (values outside one, of a
     /// modulated parameter, are the modulation's echo).
     gestures: Vec<ParameterId>,
+    /// Output elements the graph takes, and how many the active processor
+    /// renders.
+    output_buses: usize,
+    active_outputs: usize,
 }
 
 impl AuInstance {
@@ -165,9 +169,53 @@ impl AuInstance {
             bases_tx: None,
             mod_bases: Arc::default(),
             gestures: Vec::new(),
+            output_buses: 1,
+            active_outputs: 1,
         };
         s.query_params();
+        s.describe_outputs();
         Ok(s)
+    }
+
+    /// Output elements (a multi-output instrument's) and their channels,
+    /// into the descriptor: the main element first.
+    fn describe_outputs(&mut self) {
+        let count = self.output_elements();
+        if count <= 1 {
+            return;
+        }
+        let main = self.descriptor.audio_outputs.first().copied();
+        let mut outs = Vec::with_capacity(count);
+        for e in 0..count as u32 {
+            let ch = self
+                .get(
+                    kAudioUnitProperty_StreamFormat,
+                    kAudioUnitScope_Output,
+                    e,
+                    AudioStreamBasicDescription::default(),
+                )
+                .map_or(2, |f| {
+                    f.mChannelsPerFrame.clamp(1, MAX_CHANNELS as u32) as u16
+                });
+            outs.push(match (e, main) {
+                (0, Some(m)) => m,
+                _ => faderframe_plugin_host::AudioPortInfo {
+                    channels: ch,
+                    is_main: e == 0,
+                },
+            });
+        }
+        self.descriptor.audio_outputs = outs;
+    }
+
+    fn output_elements(&self) -> usize {
+        self.get(
+            kAudioUnitProperty_ElementCount,
+            kAudioUnitScope_Output,
+            0,
+            0u32,
+        )
+        .map_or(1, |n| (n as usize).clamp(1, 64))
     }
 
     fn get<T: Copy>(&self, id: u32, scope: u32, element: u32, mut value: T) -> Option<T> {
@@ -296,6 +344,10 @@ impl AuInstance {
     /// Set the stream format of one bus to the first channel count it
     /// takes; returns that count (0: none).
     fn set_format(&self, scope: u32, rate: f64, choices: &[u32]) -> usize {
+        self.set_element_format(scope, 0, rate, choices)
+    }
+
+    fn set_element_format(&self, scope: u32, element: u32, rate: f64, choices: &[u32]) -> usize {
         for &ch in choices {
             let fmt = AudioStreamBasicDescription {
                 mSampleRate: rate,
@@ -308,7 +360,7 @@ impl AuInstance {
                 mBitsPerChannel: 32,
                 mReserved: 0,
             };
-            if self.set(kAudioUnitProperty_StreamFormat, scope, 0, &fmt) == 0 {
+            if self.set(kAudioUnitProperty_StreamFormat, scope, element, &fmt) == 0 {
                 return ch as usize;
             }
         }
@@ -338,6 +390,22 @@ impl AuInstance {
                 self.scanned.name, config.sample_rate
             )));
         }
+        // The extra output elements the graph takes.
+        let aux: Vec<usize> = (1..self.output_elements().min(self.output_buses))
+            .map(|e| {
+                let want = self
+                    .descriptor
+                    .audio_outputs
+                    .get(e)
+                    .map_or(2, |p| u32::from(p.channels).min(MAX_CHANNELS as u32));
+                self.set_element_format(
+                    kAudioUnitScope_Output,
+                    e as u32,
+                    config.sample_rate,
+                    &[want, 2, 1],
+                )
+            })
+            .collect();
         let has_input = self
             .get(
                 kAudioUnitProperty_ElementCount,
@@ -367,6 +435,7 @@ impl AuInstance {
             self.unit,
             inputs,
             outputs,
+            &aux,
             max as usize,
             self.descriptor.note_inputs > 0,
             Modulation {
@@ -620,6 +689,36 @@ fn plist_from(data: &[u8]) -> CFPropertyListRef {
 }
 
 impl PluginInstance for AuInstance {
+    fn configure_outputs(&mut self, buses: usize) {
+        self.output_buses = buses.max(1);
+    }
+
+    fn output_bus_names(&mut self) -> Vec<String> {
+        (0..self.output_elements() as u32)
+            .map(|e| {
+                let mut name: CFStringRef = std::ptr::null();
+                let mut size = std::mem::size_of::<CFStringRef>() as u32;
+                // SAFETY: a CFString property; the copy is released below.
+                let status = unsafe {
+                    AudioUnitGetProperty(
+                        self.unit,
+                        kAudioUnitProperty_ElementName,
+                        kAudioUnitScope_Output,
+                        e,
+                        (&mut name as *mut CFStringRef).cast(),
+                        &mut size,
+                    )
+                };
+                if status != 0 {
+                    return String::new();
+                }
+                let text = cf_string(name);
+                release(name);
+                text
+            })
+            .collect()
+    }
+
     fn descriptor(&self) -> &PluginDescriptor {
         &self.descriptor
     }
@@ -880,8 +979,13 @@ impl PluginInstance for AuInstance {
         &mut self,
         config: &ProcessConfig,
     ) -> Result<Box<dyn PluginProcessor>, PluginError> {
-        if self.config.as_ref() != Some(config) || self.rt.is_none() || self.needs_restart {
+        if self.config.as_ref() != Some(config)
+            || self.rt.is_none()
+            || self.needs_restart
+            || self.active_outputs != self.output_buses
+        {
             self.needs_restart = false;
+            self.active_outputs = self.output_buses;
             self.activate(config)?;
         }
         let cell = self

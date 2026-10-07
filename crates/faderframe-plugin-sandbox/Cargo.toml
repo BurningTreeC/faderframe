@@ -24,6 +24,9 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+faderframe-audio-files.workspace = true
+
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 

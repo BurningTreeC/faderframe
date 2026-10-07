@@ -479,7 +479,13 @@ Contrast:
   start empty and open the browser to choose their instrument (an
   instrument picked for an empty instrument track's insert slot becomes
   its instrument); plugins that take notes in insert slots get the
-  track's MIDI too. Click a filled insert slot
+  track's MIDI too. Multi-output instruments (a drum plugin's kit pieces
+  on outputs of their own): Create Output Tracks in the insert menu, the
+  track menu or the editor's Outputs menu makes an Aux track for each
+  extra output in one step, in a folder under the instrument and routed
+  like it (Outputs → one output; any track can also take one as its
+  input). The Drum Sampler sends pads to its eight extra outputs (the
+  pad's Output). Click a filled insert slot
   for the plugin's own GUI (Ctrl-click bypasses, right-click for the
   parameter window, presets, sidechain and more); editors open centred or
   where they were last, and their positions are saved with the project.

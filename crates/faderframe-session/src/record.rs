@@ -710,7 +710,8 @@ impl Session {
                     })
                 }
                 faderframe_project::InputRouting::None
-                | faderframe_project::InputRouting::Midi { .. } => None,
+                | faderframe_project::InputRouting::Midi { .. }
+                | faderframe_project::InputRouting::Plugin { .. } => None,
             })
             .collect()
     }

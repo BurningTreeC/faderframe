@@ -180,6 +180,43 @@ impl Lv2Plugin {
             .map(|p| p.index)
     }
 
+    /// A name per output bus: what its ports' names share ("Out 3 L" and
+    /// "Out 3 R" make "Out 3"), else the first port's name.
+    pub fn output_bus_names(&self) -> Vec<String> {
+        self.output_buses()
+            .iter()
+            .map(|bus| {
+                let names: Vec<&str> = bus
+                    .iter()
+                    .filter_map(|i| self.ports.get(*i as usize))
+                    .map(|p| p.name.as_str())
+                    .collect();
+                let Some(first) = names.first() else {
+                    return String::new();
+                };
+                let mut common = first.len();
+                for n in &names[1..] {
+                    common = common.min(
+                        first
+                            .char_indices()
+                            .zip(n.chars())
+                            .take_while(|((_, a), b)| a == b)
+                            .last()
+                            .map_or(0, |((i, a), _)| i + a.len_utf8()),
+                    );
+                }
+                let shared = first[..common]
+                    .trim_end_matches([' ', '-', '_', '('])
+                    .trim();
+                if names.len() > 1 && !shared.is_empty() {
+                    shared.to_string()
+                } else {
+                    first.to_string()
+                }
+            })
+            .collect()
+    }
+
     /// The catalog's description of it.
     pub fn scanned(&self) -> ScannedPlugin {
         let (main, side) = self.audio_inputs();

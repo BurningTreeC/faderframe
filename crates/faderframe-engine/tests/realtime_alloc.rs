@@ -1955,7 +1955,16 @@ fn the_instruments_do_not_allocate() {
             builtin::DRUMS,
             Some(state(
                 builtin::DRUMS,
-                &[(1, 48.0), (102, 7.0), (112, 1.0), (118, -5.0), (128, 1.0)],
+                // Pads 1 and 2 on extra outputs (tracks take them below).
+                &[
+                    (1, 48.0),
+                    (102, 7.0),
+                    (112, 1.0),
+                    (118, -5.0),
+                    (128, 1.0),
+                    (113, 2.0),
+                    (129, 1.0),
+                ],
                 &drum_doc,
             )),
             vec![],
@@ -1980,6 +1989,14 @@ fn the_instruments_do_not_allocate() {
         });
         tracks.insert(t);
         ids.push(id);
+    }
+    // The last kit's extra outputs on tracks of their own.
+    for bus in [1u16, 2] {
+        let t = tp.track(TrackKind::Aux, &format!("Out {bus}"), ChannelLayout::Stereo);
+        tp.project.track_mut(t).unwrap().input = faderframe_project::InputRouting::Plugin {
+            plugin: ids[5],
+            bus,
+        };
     }
     let config = EngineConfig {
         sample_rate: SR,

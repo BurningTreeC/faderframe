@@ -20,8 +20,45 @@ pub(crate) fn host_format(f: ProjectFormat) -> PluginFormat {
     }
 }
 
+/// One of a plugin's output buses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputBus {
+    pub name: String,
+    pub channels: u16,
+}
+
+/// A plugin's output buses, main first, named by the plugin (or numbered).
+fn output_buses(instance: &mut dyn PluginInstance) -> Vec<OutputBus> {
+    let names = instance.output_bus_names();
+    instance
+        .descriptor()
+        .audio_outputs
+        .iter()
+        .enumerate()
+        .map(|(i, p)| OutputBus {
+            name: names
+                .get(i)
+                .map(|n| n.trim())
+                .filter(|n| !n.is_empty())
+                .map_or_else(
+                    || {
+                        if i == 0 {
+                            "Main".to_string()
+                        } else {
+                            format!("Output {}", i + 1)
+                        }
+                    },
+                    str::to_string,
+                ),
+            channels: p.channels,
+        })
+        .collect()
+}
+
 struct Hosted {
     instance: Box<dyn PluginInstance>,
+    /// Its output buses (as instantiated).
+    outputs: Vec<OutputBus>,
     failed: Arc<AtomicBool>,
     /// Explicit slot values last pushed to the instance.
     applied: HashMap<ParameterId, f64>,
@@ -117,10 +154,12 @@ impl PluginHost {
                 let _ = instance.set_parameter(p.id, p.value);
                 applied.insert(p.id, p.value);
             }
+            let outputs = output_buses(instance.as_mut());
             self.instances.insert(
                 slot.id,
                 Hosted {
                     instance,
+                    outputs,
                     failed: Arc::new(AtomicBool::new(false)),
                     applied,
                     baseline,
@@ -454,6 +493,11 @@ impl PluginHost {
         plugin: PluginInstanceId,
     ) -> Option<Vec<faderframe_midi::NoteExpressionKind>> {
         self.instances.get(&plugin)?.instance.note_expressions()
+    }
+
+    /// An instantiated plugin's output buses, main first.
+    pub fn outputs(&self, plugin: PluginInstanceId) -> Option<&[OutputBus]> {
+        self.instances.get(&plugin).map(|h| h.outputs.as_slice())
     }
 
     pub fn is_instrument(&self, plugin: PluginInstanceId) -> bool {

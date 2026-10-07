@@ -1,9 +1,9 @@
 use crate::{Clip, OutputRouting, Track, TrackColor, TrackKind};
 use faderframe_audio_files::GeneratorSpec;
-use faderframe_core::{AudioSourceId, ClipId, IdAllocator, MarkerId, TrackId};
+use faderframe_core::{AudioSourceId, ClipId, IdAllocator, MarkerId, PluginInstanceId, TrackId};
 use faderframe_timeline::{MusicalTime, Timeline};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 /// Where an audio source's samples come from.
@@ -400,8 +400,46 @@ impl Project {
             for s in t.sends.iter().filter(|s| s.enabled) {
                 edges.push((t.id, s.target));
             }
+            // A plugin's extra output feeding this track.
+            if let Some(src) = self.plugin_output_source(t) {
+                edges.push((src, t.id));
+            }
         }
         edges
+    }
+
+    /// The track whose plugin's output bus `t` takes as its input.
+    pub fn plugin_output_source(&self, t: &Track) -> Option<TrackId> {
+        let (plugin, _) = t.input.plugin_output()?;
+        self.tracks
+            .iter()
+            .find(|o| o.id != t.id && o.slots().iter().any(|s| s.id == plugin))
+            .map(|o| o.id)
+    }
+
+    /// Per plugin, the highest of its output buses a track takes (tracks
+    /// that take its main bus 0 do not count).
+    pub fn taken_plugin_outputs(&self) -> HashMap<PluginInstanceId, u16> {
+        let mut out: HashMap<PluginInstanceId, u16> = HashMap::new();
+        for t in &self.tracks {
+            if let Some((plugin, bus)) = t.input.plugin_output()
+                && bus > 0
+                && t.kind.has_audio()
+                && t.kind != TrackKind::Midi
+            {
+                let e = out.entry(plugin).or_default();
+                *e = (*e).max(bus);
+            }
+        }
+        out
+    }
+
+    /// Tracks taking output buses of `plugin`.
+    pub fn plugin_output_tracks(&self, plugin: PluginInstanceId) -> Vec<&Track> {
+        self.tracks
+            .iter()
+            .filter(|t| t.input.plugin_output().is_some_and(|(p, _)| p == plugin))
+            .collect()
     }
 
     /// Routing edges plus sidechain feeds (the source must be processed

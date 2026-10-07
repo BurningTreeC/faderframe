@@ -116,6 +116,10 @@ pub struct Vst3Instance {
     latency: u32,
     tail: TailLength,
     needs_restart: bool,
+    /// Output buses the graph takes, and how many the active processor
+    /// switched on.
+    output_buses: usize,
+    active_outputs: usize,
     /// Activations so far (see `PluginInstance::activation`).
     activations: u64,
     /// Editor gestures and values for automation writing.
@@ -193,6 +197,8 @@ impl Vst3Instance {
             latency: 0,
             tail: TailLength::None,
             needs_restart: false,
+            output_buses: 1,
+            active_outputs: 1,
             activations: 0,
             editor_edits: Vec::new(),
             note_expressions: Vec::new(),
@@ -480,8 +486,8 @@ impl Vst3Instance {
         any.then_some(map)
     }
 
-    /// Activate the main buses, the default-active ones and, with a
-    /// sidechain, the second input bus.
+    /// Activate the main buses, the default-active ones, the output buses
+    /// the graph takes and, with a sidechain, the second input bus.
     fn set_bus_states(&self, sidechain: bool) -> (Vec<u16>, Vec<u16>, bool) {
         use vst3::Steinberg::Vst::BusDirections_::{kInput, kOutput};
         use vst3::Steinberg::Vst::BusInfo_::BusFlags_::kDefaultActive;
@@ -497,10 +503,12 @@ impl Vst3Instance {
                 for i in 0..count as i32 {
                     let mut info: BusInfo = std::mem::zeroed();
                     let side = sidechain && dir == kInput && i == 1;
+                    let taken = dir == kOutput && (i as usize) < self.output_buses;
                     let active = c.getBusInfo(kAudio as i32, dir as i32, i, &mut info) == kResultOk
                         && (info.busType == kMain as i32
                             || info.flags as u32 & kDefaultActive as u32 != 0
-                            || side);
+                            || side
+                            || taken);
                     c.activateBus(kAudio as i32, dir as i32, i, active as u8);
                 }
             }
@@ -634,6 +642,31 @@ impl Vst3Instance {
 }
 
 impl FfInstance for Vst3Instance {
+    fn configure_outputs(&mut self, buses: usize) {
+        self.output_buses = buses.max(1);
+    }
+
+    fn output_bus_names(&mut self) -> Vec<String> {
+        use vst3::Steinberg::Vst::BusDirections_::kOutput;
+        use vst3::Steinberg::Vst::MediaTypes_::kAudio;
+        let c = &self.component;
+        let mut out = Vec::new();
+        // SAFETY: plain queries with valid out pointers.
+        unsafe {
+            for i in 0..c.getBusCount(kAudio as i32, kOutput as i32).max(0) {
+                let mut info: BusInfo = std::mem::zeroed();
+                out.push(
+                    if c.getBusInfo(kAudio as i32, kOutput as i32, i, &mut info) == kResultOk {
+                        crate::util::wstr(&info.name)
+                    } else {
+                        String::new()
+                    },
+                );
+            }
+        }
+        out
+    }
+
     fn descriptor(&self) -> &PluginDescriptor {
         &self.descriptor
     }
@@ -911,8 +944,13 @@ impl FfInstance for Vst3Instance {
         &mut self,
         config: &ProcessConfig,
     ) -> Result<Box<dyn PluginProcessor>, PluginError> {
-        if self.config.as_ref() != Some(config) || self.rt.is_none() || self.needs_restart {
+        if self.config.as_ref() != Some(config)
+            || self.rt.is_none()
+            || self.needs_restart
+            || self.active_outputs != self.output_buses
+        {
             self.needs_restart = false;
+            self.active_outputs = self.output_buses;
             self.deactivate();
             let fail = |what: &str| PluginError::Failed(format!("{}: {what}", self.scanned.name));
             use vst3::Steinberg::Vst::ProcessModes_::kRealtime;

@@ -53,6 +53,7 @@ pub const kAudioUnitProperty_MaximumFramesPerSlice: u32 = 14;
 pub const kAudioUnitProperty_TailTime: u32 = 20;
 pub const kAudioUnitProperty_SetRenderCallback: u32 = 23;
 pub const kAudioUnitProperty_HostCallbacks: u32 = 27;
+pub const kAudioUnitProperty_ElementName: u32 = 30;
 pub const kAudioUnitProperty_CocoaUI: u32 = 31;
 pub const kAudioUnitProperty_ParameterStringFromValue: u32 = 33;
 

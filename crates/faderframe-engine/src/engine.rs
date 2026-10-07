@@ -1336,6 +1336,14 @@ impl EngineController {
         self.plugins.has_sidechain(plugin)
     }
 
+    /// An instantiated plugin's output buses, main first.
+    pub fn plugin_outputs(
+        &self,
+        plugin: faderframe_core::PluginInstanceId,
+    ) -> Option<&[crate::plugins::OutputBus]> {
+        self.plugins.outputs(plugin)
+    }
+
     /// Parameters of an instantiated plugin (for automation lists).
     pub fn plugin_parameters(
         &self,

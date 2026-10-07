@@ -45,6 +45,7 @@ pub mod iamf;
 pub mod lanes;
 pub mod launcher;
 pub mod listening;
+pub mod outputs;
 mod programs;
 mod redraw;
 pub mod samples;
@@ -729,6 +730,12 @@ pub enum Action {
     /// Ask (in the shell) for names to save the tracks' settings under.
     PromptSaveTrackPreset {
         tracks: Vec<TrackId>,
+    },
+    /// Tracks for a plugin's extra output buses (`buses`: those, else all
+    /// that have none), routed like its track, in a folder under it.
+    CreateOutputTracks {
+        plugin: faderframe_core::PluginInstanceId,
+        buses: Option<Vec<u16>>,
     },
     /// Ask (in the shell) whether to delete a user preset (a plugin's or
     /// a track preset).
@@ -3320,6 +3327,9 @@ impl Session {
             Action::PromptSaveTrackPreset { tracks } => {
                 self.ui_requests.push(UiRequest::SaveTrackPreset { tracks });
             }
+            Action::CreateOutputTracks { plugin, buses } => {
+                self.create_output_tracks(plugin, buses.as_deref())?;
+            }
             Action::PromptDeletePreset { path } => {
                 let name = path
                     .file_stem()
@@ -4499,6 +4509,33 @@ impl Session {
                 group_start: first == 0,
             });
         }
+        // Extra outputs of plugins on other tracks (a multi-output
+        // instrument's).
+        if t.kind != TrackKind::Master {
+            let mut first = true;
+            for other in self.project.tracks.iter().filter(|o| o.id != track) {
+                for slot in other.inserts.iter().chain(other.instrument.iter()) {
+                    if self.project.reaches(track, other.id, None) {
+                        continue;
+                    }
+                    for o in self.plugin_output_buses(slot.id).into_iter().skip(1) {
+                        let input = InputRouting::Plugin {
+                            plugin: slot.id,
+                            bus: o.bus,
+                        };
+                        let layout =
+                            ChannelLayout::from_channel_count(usize::from(o.channels.max(1)));
+                        out.push(InputChoice {
+                            label: format!("{} · {} · {}", other.name, slot.plugin.name, o.name),
+                            action: set(input.clone(), layout),
+                            checked: t.input == input,
+                            group_start: first,
+                        });
+                        first = false;
+                    }
+                }
+            }
+        }
         out
     }
 
@@ -4520,6 +4557,17 @@ impl Session {
                     Some(c) => format!("MIDI · {port} · Ch {}", c + 1),
                     None => format!("MIDI · {port}"),
                 }
+            }
+            faderframe_project::InputRouting::Plugin { plugin, bus } => {
+                let Some((_, slot)) = self.plugin_slot(*plugin) else {
+                    return "Plugin output (missing)".into();
+                };
+                let name = self
+                    .plugin_output_buses(*plugin)
+                    .into_iter()
+                    .find(|o| o.bus == *bus)
+                    .map_or_else(|| format!("Output {}", bus + 1), |o| o.name);
+                format!("{} · {name}", slot.plugin.name)
             }
         }
     }

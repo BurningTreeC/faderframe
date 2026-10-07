@@ -329,6 +329,16 @@ pub trait PluginInstance {
     /// Frames per device callback (0: unknown, offline), supplied before
     /// activation: buffered built-ins buffer at least this much.
     fn configure_device_block(&mut self, _frames: usize) {}
+    /// The graph takes the plugin's first `buses` output buses (the main
+    /// one and extra ones that tracks take): the processor fills graph
+    /// output `b` from bus `b`. Formats that switch buses on (VST3) switch
+    /// these on at the next activation.
+    fn configure_outputs(&mut self, _buses: usize) {}
+    /// Names of the output buses, main first (empty: the format has none;
+    /// the host numbers them).
+    fn output_bus_names(&mut self) -> Vec<String> {
+        Vec::new()
+    }
     fn descriptor(&self) -> &PluginDescriptor;
     fn parameters(&self) -> &[ParameterInfo];
     fn parameter(&mut self, id: ParameterId) -> Option<f64>;

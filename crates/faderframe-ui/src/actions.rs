@@ -2041,6 +2041,30 @@ pub fn install(app: &Rc<AppState>) {
         }),
         // Presets (menus): `save-preset:<plugin id>`, `load-preset:<id>\n<path>`,
         // `delete-preset:<path>` (asks first).
+        // Tracks for a multi-output plugin's extra outputs (menus):
+        // `create-output-tracks:<plugin id>[\n<bus>]`, or `insert=<n>` for
+        // insert n of the selected (or first audio) track.
+        named("create-output-tracks", |a, arg| {
+            let (id, bus) = match arg.split_once('\n') {
+                Some((id, bus)) => (id, bus.trim().parse::<u16>().ok()),
+                None => (arg, None),
+            };
+            let plugin = match id.strip_prefix("insert=") {
+                Some(n) => n.trim().parse::<usize>().ok().and_then(|n| insert_of(a, n)),
+                None => id
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    .map(faderframe_core::PluginInstanceId),
+            };
+            match plugin {
+                Some(plugin) => a.dispatch(Action::CreateOutputTracks {
+                    plugin,
+                    buses: bus.map(|b| vec![b]),
+                }),
+                None => tracing::warn!("create-output-tracks: no plugin {arg}"),
+            }
+        }),
         named("delete-preset", |a, arg| {
             a.dispatch(Action::PromptDeletePreset {
                 path: std::path::PathBuf::from(arg),

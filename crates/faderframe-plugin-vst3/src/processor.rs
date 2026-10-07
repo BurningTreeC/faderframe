@@ -907,19 +907,20 @@ impl Active {
             }
         }
 
-        // Main output bus to the graph (no output bus: pass through).
-        if let Some(out) = io.audio_out.first_mut() {
-            match self.outputs.channels(0) {
-                main if main > 0 => {
+        // Output bus `b` to graph output `b` (the main one first; no
+        // output bus: pass through).
+        for (b, out) in io.audio_out.iter_mut().enumerate() {
+            match self.outputs.channels(b) {
+                bus if bus > 0 => {
                     for c in 0..out.num_channels() {
-                        self.outputs
-                            .store(0, c.min(main - 1), out.channel_mut(c), n);
+                        self.outputs.store(b, c.min(bus - 1), out.channel_mut(c), n);
                     }
                 }
-                _ => match io.audio_in.first() {
+                _ if b == 0 => match io.audio_in.first() {
                     Some(inp) => out.copy_from(inp),
                     None => out.clear(),
                 },
+                _ => out.clear(),
             }
         }
         if result == kResultOk || result == kResultTrue {

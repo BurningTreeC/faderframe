@@ -274,16 +274,22 @@ impl Helper {
                 shm,
                 shm_size,
                 double_precision,
-            } => self.activate(
-                ProcessConfig {
-                    sample_rate,
-                    max_block_size: max_block,
-                    sidechain,
-                    double_precision,
-                },
-                &shm,
-                shm_size as usize,
-            ),
+                output_buses,
+            } => {
+                if let Some(inst) = self.instance.as_mut() {
+                    inst.configure_outputs(usize::from(output_buses.max(1)));
+                }
+                self.activate(
+                    ProcessConfig {
+                        sample_rate,
+                        max_block_size: max_block,
+                        sidechain,
+                        double_precision,
+                    },
+                    &shm,
+                    shm_size as usize,
+                )
+            }
             Request::Editor(call) => self.editor(call),
             other => {
                 let Some(inst) = self.instance.as_mut() else {
@@ -357,6 +363,7 @@ impl Helper {
                 .map(|v| v.into_iter().map(wire::expression_index).collect()),
             has_editor: inst.editor().is_some(),
             programs: inst.programs(),
+            output_names: inst.output_bus_names(),
         };
         self.instance = Some(inst);
         (Response::Instantiated(Box::new(info)), Vec::new())

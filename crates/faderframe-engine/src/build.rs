@@ -148,6 +148,12 @@ fn plays_from_timeline(project: &Project, t: &Track, live: &HashSet<TrackId>) ->
             .iter()
             .all(|s| !s.enabled || s.tap != SendTap::PreFx)
         && project.track(t.id).is_some()
+        // Plugin outputs other tracks take, or one it takes: those tracks
+        // and this one connect on the audio thread.
+        && t.input.plugin_output().is_none()
+        && t.slots()
+            .iter()
+            .all(|s| project.plugin_output_tracks(s.id).is_empty())
         // Launched clips are played as they are launched.
         && !project.launcher.slots.keys().any(|k| k.track == t.id)
 }
@@ -311,6 +317,9 @@ pub fn fed_tracks(project: &Project) -> HashSet<TrackId> {
         }
         for s in t.sends.iter().filter(|s| s.enabled) {
             fed.insert(s.target);
+        }
+        if project.plugin_output_source(t).is_some() {
+            fed.insert(t.id);
         }
     }
     fed
@@ -485,6 +494,9 @@ struct PluginCx<'a> {
     /// Frames per device callback (0: unknown).
     device_block: usize,
     warnings: &'a mut Vec<String>,
+    /// Per plugin, the highest of its output buses tracks take (their
+    /// nodes get outputs up to it).
+    taken: HashMap<PluginInstanceId, u16>,
 }
 
 impl PluginCx<'_> {
@@ -566,6 +578,23 @@ impl PluginCx<'_> {
                 *l = ChannelLayout::from_channel_count(p.channels as usize);
             }
         }
+        // Extra output buses tracks take, up to the highest (the channels
+        // the plugin gives them).
+        let extra = self.taken.get(&slot.id).copied().unwrap_or(0);
+        if extra > 0
+            && let Ok(inst) = self.plugins.instance(slot)
+        {
+            let buses: Vec<u16> = inst
+                .descriptor()
+                .audio_outputs
+                .iter()
+                .map(|p| p.channels)
+                .collect();
+            for b in 1..=usize::from(extra) {
+                let channels = buses.get(b).copied().filter(|c| *c > 0).unwrap_or(2);
+                spec = spec.audio_out(ChannelLayout::from_channel_count(usize::from(channels)));
+            }
+        }
         let layouts: Vec<ChannelLayout> = spec
             .audio_inputs
             .iter()
@@ -582,6 +611,7 @@ impl PluginCx<'_> {
             instance.configure_device_block(self.device_block);
             instance
                 .configure_channels(spec.audio_outputs.first().map_or(0, |l| l.channel_count()));
+            instance.configure_outputs(spec.audio_outputs.len().max(1));
         }
         match self.plugins.activate(slot, &process) {
             Ok(p) => {
@@ -705,7 +735,11 @@ pub fn build_graph(
             double_precision,
         },
         warnings: &mut warnings,
+        taken: project.taken_plugin_outputs(),
     };
+    // Nodes (in the audio thread's graph) of plugins whose extra outputs
+    // tracks take.
+    let mut output_nodes: HashMap<PluginInstanceId, NodeId> = HashMap::new();
     let mut nodes: HashMap<TrackId, TrackNodes> = HashMap::new();
     // Per instrument track: the nodes taking its own MIDI as it comes (the
     // first MIDI effect, else the instrument and every insert that takes
@@ -1128,6 +1162,9 @@ pub fn build_graph(
                         .audio_out(layout);
                     let (inst, _) = pcx.node(&mut b, slot, t, spec, Role::Instrument);
                     own(&mut owners, inst, t.id, Some(slot.id), NodeWork::Instrument);
+                    if pcx.taken.contains_key(&slot.id) {
+                        output_nodes.insert(slot.id, inst);
+                    }
                     for f in &all_fx {
                         b.connect_events(*f, 0, inst, 0)?;
                     }
@@ -1200,6 +1237,9 @@ pub fn build_graph(
             if let Some((src, _)) = key {
                 sidechains.push((node, src));
             }
+            if pcx.taken.contains_key(&slot.id) {
+                output_nodes.insert(slot.id, node);
+            }
             own(&mut owners, node, t.id, Some(slot.id), NodeWork::Insert);
             if t.preamp.as_ref().is_some_and(|p| p.id == slot.id) {
                 tn.preamp = Some(node);
@@ -1224,6 +1264,20 @@ pub fn build_graph(
         nodes.insert(t.id, tn);
         if !takes_notes.is_empty() {
             note_inputs.insert(t.id, takes_notes);
+        }
+    }
+
+    // Plugins' extra outputs into the tracks taking them (both on the
+    // audio thread: neither renders ahead).
+    for t in &project.tracks {
+        let Some((plugin, bus)) = t.input.plugin_output() else {
+            continue;
+        };
+        if let (Some(&node), Some(tn)) = (output_nodes.get(&plugin), nodes.get(&t.id))
+            && let Some(input) = tn.input.filter(|_| !tn.input_ahead)
+            && bus > 0
+        {
+            b.connect_audio(node, bus, input, 0)?;
         }
     }
 

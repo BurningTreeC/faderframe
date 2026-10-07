@@ -284,9 +284,12 @@ impl Kind {
             version: env!("CARGO_PKG_VERSION").into(),
             category,
             audio_inputs: inputs,
-            // A MIDI effect: notes in, notes out, no audio.
+            // A MIDI effect: notes in, notes out, no audio. The Drum
+            // Sampler's pads can play into extra outputs.
             audio_outputs: if category == PluginCategory::MidiEffect {
                 vec![]
+            } else if self == Kind::Drums {
+                vec![stereo; 1 + crate::devices::drums::AUX]
             } else {
                 vec![stereo]
             },
@@ -402,6 +405,13 @@ impl PluginInstance for BuiltinInstance {
     fn configure_device_block(&mut self, frames: usize) {
         self.device_block = frames;
     }
+    fn output_bus_names(&mut self) -> Vec<String> {
+        match self.kind {
+            Kind::Drums => crate::devices::drums::output_bus_names(),
+            _ => Vec::new(),
+        }
+    }
+
     fn descriptor(&self) -> &PluginDescriptor {
         &self.descriptor
     }

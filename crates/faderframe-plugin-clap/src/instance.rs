@@ -118,6 +118,24 @@ impl ClapInstance {
         any
     }
 
+    /// The output ports' names.
+    fn port_names(&mut self) -> Vec<String> {
+        use clack_extensions::audio_ports::AudioPortInfoBuffer;
+        let Some(ports) = self.ext().audio_ports else {
+            return Vec::new();
+        };
+        let handle = self.instance.plugin_handle();
+        let mut buffer = AudioPortInfoBuffer::new();
+        (0..ports.count(&handle, false))
+            .map(|i| {
+                ports
+                    .get(&handle, i, false, &mut buffer)
+                    .map(|info| text(info.name))
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
     fn query_params(&mut self) {
         let Some(params) = self.ext().params else {
             self.params.clear();
@@ -270,6 +288,10 @@ impl ClapInstance {
 }
 
 impl FfInstance for ClapInstance {
+    fn output_bus_names(&mut self) -> Vec<String> {
+        self.port_names()
+    }
+
     fn descriptor(&self) -> &PluginDescriptor {
         &self.descriptor
     }

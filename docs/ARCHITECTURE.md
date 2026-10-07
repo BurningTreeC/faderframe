@@ -1436,6 +1436,57 @@ reached through it too.
   sample-accurate cutoff automation, a state round trip and notes into the
   synth.
 
+### Multi-output plugins
+
+A plugin's output buses are listed main first
+(`PluginDescriptor::audio_outputs`), and `PluginInstance::output_bus_names`
+gives their names. The engine caches buses and names per instance
+(`PluginHost::outputs`, `OutputBus`).
+
+* **Taking a bus.** A track takes an extra bus with
+  `InputRouting::Plugin { plugin, bus }`; bus 0, the main one, is the
+  plugin's own track.
+  * `Project::taken_plugin_outputs` gives the highest bus taken per
+    plugin. `plugin_output_source` adds a routing edge from the plugin's
+    track to the taking track, so solo keeps both audible and cycle
+    checks see the route.
+  * `build_graph` gives such a plugin's node outputs up to that bus,
+    with each bus's channels, and connects bus *n* to the taking track's
+    input after pass 1. Delay compensation is the graph's.
+  * Neither track renders ahead: `plays_from_timeline` refuses both.
+* **Formats** fill graph output *b* from bus *b*, after
+  `configure_outputs(n)` before activation:
+  * CLAP copies its ports.
+  * VST3 switches on output buses below *n* (`set_bus_states`) and
+    reactivates when *n* changes.
+  * Audio Units set a float format on each taken output element and
+    render element *k* with the main render's time stamp
+    (`tests/apple_units.rs` uses AUSplitter).
+  * LV2 groups its ports into buses (`Lv2Plugin::output_buses`).
+  * The sandbox packs channels (`shm`: `IN_SLOTS`/`OUT_SLOTS` channel
+    slots, up to `MAX_OUT_BUFFERS` = 32 output buffers; format version 4)
+    and forwards `configure_outputs` with `Activate` and the names with
+    `Instantiated`.
+* **The Drum Sampler** has eight stereo extra outputs. Each pad's
+  `id::OUTPUT` sends it to one, or to the main output while no track
+  takes that output.
+* **Session** (`session::outputs`):
+  * `plugin_output_buses` gives each bus with the track taking it.
+  * `Action::CreateOutputTracks { plugin, buses }` is one undo step. It
+    makes Aux tracks named after the buses (prefixed with the plugin's
+    track when a name is only a number), with the layout from the bus's
+    channels, routed like the plugin's track, in a new folder under it or
+    in the folder earlier ones are in.
+  * The input choices list other tracks' extra outputs (not ones that
+    would loop).
+  * Freezing a track whose plugin feeds output tracks is refused. Track
+    presets drop a plugin-output input.
+* **UI**: the insert menu (Create Output Tracks, an Outputs submenu),
+  the arranger's track menu, the editor header's Outputs menu
+  (`app.create-output-tracks`, dev form `insert=<n>`), and the mixer's
+  input well (the bus name; Aux/Bus strips taking a bus get the input
+  row).
+
 ### LV2 (Linux)
 
 `faderframe-plugin-lv2`, hand-written C ABI (`sys.rs`, from the ISC

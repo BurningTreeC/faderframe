@@ -971,6 +971,7 @@ dependencies = [
 name = "faderframe-plugin-sandbox"
 version = "0.11.0"
 dependencies = [
+ "faderframe-audio-files",
  "faderframe-audio-graph",
  "faderframe-automation",
  "faderframe-core",

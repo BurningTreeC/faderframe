@@ -160,6 +160,10 @@ pub enum InputRouting {
         #[serde(default)]
         channel: Option<u8>,
     },
+    /// An output bus of a plugin on another track (a multi-output
+    /// instrument's extra outputs; `bus` 1 is the first after the main
+    /// one).
+    Plugin { plugin: PluginInstanceId, bus: u16 },
 }
 
 /// How a headphone render places a track (Dolby's binaural render
@@ -220,6 +224,14 @@ impl InputRouting {
 
     pub fn is_midi(&self) -> bool {
         matches!(self, InputRouting::Midi { .. })
+    }
+
+    /// The plugin output bus it takes, if it takes one.
+    pub fn plugin_output(&self) -> Option<(PluginInstanceId, u16)> {
+        match *self {
+            InputRouting::Plugin { plugin, bus } => Some((plugin, bus)),
+            _ => None,
+        }
     }
 }
 

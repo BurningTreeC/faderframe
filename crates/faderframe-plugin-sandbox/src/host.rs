@@ -3,7 +3,7 @@
 //! the last poll brought); [`RemoteProcessor`] runs a block through shared
 //! memory and waits for it with a deadline.
 
-use crate::shm::{Block, BlockIn, MAX_BUFFERS, block_size};
+use crate::shm::{Block, BlockIn, MAX_OUT_BUFFERS, block_size};
 use crate::sys::{self, Control, Ready, Signal, Waiter};
 use crate::wire::{self, EditorCall, Request, Response};
 use crate::{BLOCK_TIMEOUT, Launcher};
@@ -70,8 +70,8 @@ impl Channel {
         if joined != 0 {
             crate::workgroup::note_joined(joined);
         }
-        let mut out_channels = [0usize; MAX_BUFFERS];
-        let n_out = io.audio_out.len().min(MAX_BUFFERS);
+        let mut out_channels = [0usize; MAX_OUT_BUFFERS];
+        let n_out = io.audio_out.len().min(MAX_OUT_BUFFERS);
         for (c, b) in out_channels.iter_mut().zip(io.audio_out.iter()) {
             *c = b.num_channels();
         }
@@ -163,6 +163,10 @@ pub struct RemoteInstance {
     editor_open: bool,
     programs: Vec<String>,
     program: Option<usize>,
+    output_names: Vec<String>,
+    /// Output buses the graph takes, and how many the active helper has.
+    output_buses: usize,
+    active_outputs: usize,
     /// The helper's processor has changes to take (as of the last poll, or
     /// since a program was selected).
     pending: bool,
@@ -217,6 +221,9 @@ impl RemoteInstance {
             editor_open: false,
             programs: Vec::new(),
             program: None,
+            output_names: Vec::new(),
+            output_buses: 1,
+            active_outputs: 1,
             pending: false,
             requests: EditorRequests::default(),
             edits: Vec::new(),
@@ -249,6 +256,7 @@ impl RemoteInstance {
                     .map(|v| v.into_iter().filter_map(wire::expression_kind).collect());
                 inst.has_editor = i.has_editor;
                 inst.programs = i.programs;
+                inst.output_names = i.output_names;
                 tracing::info!(
                     "{} runs in a sandbox (process {})",
                     inst.descriptor.name,
@@ -435,6 +443,14 @@ impl PluginInstance for RemoteInstance {
         self.programs.clone()
     }
 
+    fn configure_outputs(&mut self, buses: usize) {
+        self.output_buses = buses.max(1);
+    }
+
+    fn output_bus_names(&mut self) -> Vec<String> {
+        self.output_names.clone()
+    }
+
     fn current_program(&self) -> Option<usize> {
         self.program
     }
@@ -564,7 +580,11 @@ impl PluginInstance for RemoteInstance {
         if self.dead.load(Ordering::Relaxed) {
             return Err(failed("the plugin's process is gone"));
         }
-        if self.config.as_ref() != Some(config) || self.active.is_none() || self.needs_restart {
+        if self.config.as_ref() != Some(config)
+            || self.active.is_none()
+            || self.needs_restart
+            || self.active_outputs != self.output_buses
+        {
             self.needs_restart = false;
             self.deactivate();
             let mut block = Block::create(config.max_block_size.max(1) as usize).map_err(failed)?;
@@ -575,6 +595,7 @@ impl PluginInstance for RemoteInstance {
                 shm: block.name().to_string(),
                 shm_size: block.size() as u64,
                 double_precision: config.double_precision,
+                output_buses: self.output_buses.min(u16::MAX as usize) as u16,
             };
             let latency = match self.request(&req, &[], LOAD_TIMEOUT)? {
                 (Response::Activated { latency }, _) => latency,
@@ -586,6 +607,7 @@ impl PluginInstance for RemoteInstance {
             debug_assert_eq!(block.size(), block_size(block.max_frames()));
             self.latency = latency;
             self.config = Some(*config);
+            self.active_outputs = self.output_buses;
             self.activations += 1;
             self.active = Some((
                 Arc::new(TryCell::new(Channel {

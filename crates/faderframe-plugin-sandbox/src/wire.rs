@@ -383,6 +383,9 @@ pub struct Instantiated {
     /// The plugin's program list.
     #[serde(default)]
     pub programs: Vec<String>,
+    /// Its output buses' names.
+    #[serde(default)]
+    pub output_names: Vec<String>,
 }
 
 /// What happened in the helper since the last poll.
@@ -470,6 +473,9 @@ pub enum Request {
         shm_size: u64,
         #[serde(default)]
         double_precision: bool,
+        /// Output buses the graph takes (0: only the main one).
+        #[serde(default)]
+        output_buses: u16,
     },
     Deactivate,
     Editor(EditorCall),

@@ -311,3 +311,59 @@ fn reactivation_follows_the_configuration() {
     rig.run(&mut *p, &[]);
     assert!(inst.latency_samples() < 48_000);
 }
+
+/// AUSplitter (a format converter, not in the catalog): one input, two
+/// output elements carrying it. The graph's second output is element 1.
+#[test]
+fn extra_output_elements_reach_the_graph() {
+    const SPLITTER: &str = "aufc:splt:appl";
+    let p = faderframe_plugin_host::scan::ScannedPlugin {
+        id: SPLITTER.into(),
+        name: "AUSplitter".into(),
+        vendor: "Apple".into(),
+        version: String::new(),
+        features: Vec::new(),
+        bundle: std::path::PathBuf::new(),
+        audio_inputs: vec![2],
+        audio_outputs: vec![2],
+        note_inputs: 0,
+        note_outputs: 0,
+    };
+    let mut inst = match faderframe_plugin_au::AuInstance::new(&p) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("no AUSplitter here: {e}");
+            return;
+        }
+    };
+    assert_eq!(
+        inst.descriptor().audio_outputs.len(),
+        2,
+        "both output elements are described"
+    );
+    assert_eq!(inst.output_bus_names().len(), 2);
+    inst.configure_outputs(2);
+    let mut proc = inst.create_processor(&CONFIG).unwrap();
+    let mut rig = Rig::new();
+    rig.output.push({
+        let mut b = AudioBuffer::new(ChannelLayout::Stereo, BLOCK);
+        b.set_len(BLOCK);
+        b
+    });
+    rig.input(|i| 0.5 * (i as f32 * 0.05).sin());
+    rig.run(proc.as_mut(), &[]);
+    let input = rig.input[0].channel(0).to_vec();
+    for (bus, out) in rig.output.iter().enumerate() {
+        let got = out.channel(0);
+        let err = got
+            .iter()
+            .zip(&input)
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(err < 1e-5, "output {bus} carries the input (error {err})");
+    }
+    // Back to the main element only: the processor is made again.
+    let before = inst.activation();
+    inst.configure_outputs(1);
+    let _ = inst.create_processor(&CONFIG).unwrap();
+    assert!(inst.activation() > before);
+}

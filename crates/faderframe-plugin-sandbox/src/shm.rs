@@ -1,8 +1,11 @@
 //! The shared memory of one activation ([`Block`]): a [`Header`] — sync
 //! words, the block's size and buffer shapes, transport, parameter events,
 //! MIDI events both ways, the bytes of incoming SysEx — followed by the
-//! audio, [`MAX_BUFFERS`] buffers
-//! of [`MAX_CHANNELS`] channels of `max_frames` samples each way.
+//! audio: [`IN_SLOTS`] input channels, then [`OUT_SLOTS`] output channels
+//! of `max_frames` samples, the buffers' channels packed in order (up to
+//! [`MAX_IN_BUFFERS`] input and [`MAX_OUT_BUFFERS`] output buffers — a
+//! plugin's main and sidechain inputs, its main and extra output buses —
+//! of up to [`MAX_CHANNELS`] each).
 //!
 //! Every value crosses as a plain fixed-layout record (`Wire*`), never as
 //! a Rust enum, and the host decodes what the helper wrote defensively:
@@ -24,8 +27,13 @@ use std::io;
 use std::ptr::{addr_of, addr_of_mut};
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
-pub const MAX_BUFFERS: usize = 4;
+pub const MAX_IN_BUFFERS: usize = 4;
+pub const MAX_OUT_BUFFERS: usize = 32;
+/// Channels of one buffer.
 pub const MAX_CHANNELS: usize = 16;
+/// Channel slots of all the input buffers, and of all the outputs.
+pub const IN_SLOTS: usize = 64;
+pub const OUT_SLOTS: usize = 96;
 pub const MAX_EVENTS: usize = 1024;
 pub const MAX_PARAMS: usize = 1024;
 /// Most parameters modulated in a block.
@@ -35,7 +43,7 @@ pub const MAX_NOTE_MODS: usize = 256;
 /// Bytes of SysEx per block (to the plugin).
 pub const MAX_SYSEX: usize = 16 * 1024;
 const MAGIC: u32 = 0x4646_5348;
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 /// A SysEx event: `value` holds the start of its bytes in `sysex_in`
 /// (low 16 bits) and their count (high 16 bits).
 const SYSEX_KIND: u8 = 9;
@@ -254,8 +262,8 @@ pub struct Header {
     pub status: u32,
     pub n_in: u32,
     pub n_out: u32,
-    pub in_channels: [u32; MAX_BUFFERS],
-    pub out_channels: [u32; MAX_BUFFERS],
+    pub in_channels: [u32; MAX_IN_BUFFERS],
+    pub out_channels: [u32; MAX_OUT_BUFFERS],
     pub has_events_in: u32,
     pub has_events_out: u32,
     pub n_events_in: u32,
@@ -281,7 +289,21 @@ const fn header_size() -> usize {
 
 /// Bytes of a block for `max_frames`.
 pub const fn block_size(max_frames: usize) -> usize {
-    header_size() + 2 * MAX_BUFFERS * MAX_CHANNELS * max_frames * 4
+    header_size() + (IN_SLOTS + OUT_SLOTS) * max_frames * 4
+}
+
+/// The first channel slot of each buffer (`None`: it does not fit).
+fn first_slots<const N: usize>(channels: &[usize], total: usize) -> [Option<usize>; N] {
+    let mut out = [None; N];
+    let mut at = 0;
+    for (o, &c) in out.iter_mut().zip(channels) {
+        let c = c.min(MAX_CHANNELS);
+        if at + c <= total {
+            *o = Some(at);
+            at += c;
+        }
+    }
+    out
 }
 
 /// What the host posts for one block.
@@ -377,11 +399,15 @@ impl Block {
         unsafe { &*self.h() }
     }
 
-    /// The samples of channel `ch` of buffer `buf` (`out`: the outputs).
-    fn audio(&self, out: bool, buf: usize, ch: usize) -> *mut f32 {
-        let index = (out as usize * MAX_BUFFERS + buf) * MAX_CHANNELS + ch;
-        // SAFETY: within the mapping: block_size covers every buffer and
-        // channel below the maxima for max_frames.
+    /// The samples of channel slot `slot` (`out`: of the outputs).
+    fn audio(&self, out: bool, slot: usize) -> *mut f32 {
+        let index = if out {
+            IN_SLOTS + slot.min(OUT_SLOTS - 1)
+        } else {
+            slot.min(IN_SLOTS - 1)
+        };
+        // SAFETY: within the mapping: block_size covers every slot for
+        // max_frames.
         unsafe {
             self.shm
                 .ptr()
@@ -407,8 +433,13 @@ impl Block {
         } = *r;
         let frames = frames.min(self.max_frames);
         let h = self.h();
-        let n_in = audio_in.len().min(MAX_BUFFERS);
-        let n_out = out_channels.len().min(MAX_BUFFERS);
+        let n_in = audio_in.len().min(MAX_IN_BUFFERS);
+        let n_out = out_channels.len().min(MAX_OUT_BUFFERS);
+        let mut chans_in = [0usize; MAX_IN_BUFFERS];
+        for (c, b) in chans_in.iter_mut().zip(audio_in) {
+            *c = b.num_channels().min(MAX_CHANNELS);
+        }
+        let first: [Option<usize>; MAX_IN_BUFFERS] = first_slots(&chans_in[..n_in], IN_SLOTS);
         // SAFETY: the host owns the request part until it bumps `seq`; all
         // writes stay within the header (SysEx bytes within `sysex_in`,
         // checked) and the audio areas.
@@ -417,12 +448,13 @@ impl Block {
             addr_of_mut!((*h).n_in).write_volatile(n_in as u32);
             addr_of_mut!((*h).n_out).write_volatile(n_out as u32);
             for (i, b) in audio_in.iter().take(n_in).enumerate() {
-                let chans = b.num_channels().min(MAX_CHANNELS);
+                let chans = chans_in[i];
                 addr_of_mut!((*h).in_channels[i]).write_volatile(chans as u32);
+                let Some(first) = first[i] else { continue };
                 for c in 0..chans {
                     let src = b.channel(c);
                     let n = frames.min(src.len());
-                    std::ptr::copy_nonoverlapping(src.as_ptr(), self.audio(false, i, c), n);
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), self.audio(false, first + c), n);
                 }
             }
             for (i, &chans) in out_channels.iter().take(n_out).enumerate() {
@@ -507,11 +539,21 @@ impl Block {
         // SAFETY: the helper finished (`done`); reads stay within the
         // mapping, counts are clamped before use.
         unsafe {
-            for (i, out) in audio_out.iter_mut().take(MAX_BUFFERS).enumerate() {
-                for c in 0..out.num_channels().min(MAX_CHANNELS) {
+            let n_out = (addr_of!((*h).n_out).read_volatile() as usize).min(MAX_OUT_BUFFERS);
+            let mut chans = [0usize; MAX_OUT_BUFFERS];
+            for (i, c) in chans.iter_mut().enumerate().take(n_out) {
+                *c = (addr_of!((*h).out_channels[i]).read_volatile() as usize).min(MAX_CHANNELS);
+            }
+            let first: [Option<usize>; MAX_OUT_BUFFERS] = first_slots(&chans[..n_out], OUT_SLOTS);
+            for (i, out) in audio_out.iter_mut().take(n_out).enumerate() {
+                let Some(first) = first[i] else {
+                    out.clear();
+                    continue;
+                };
+                for c in 0..out.num_channels().min(chans[i]) {
                     let dst = out.channel_mut(c);
                     let n = frames.min(dst.len());
-                    std::ptr::copy_nonoverlapping(self.audio(true, i, c), dst.as_mut_ptr(), n);
+                    std::ptr::copy_nonoverlapping(self.audio(true, first + c), dst.as_mut_ptr(), n);
                     for s in &mut dst[..n] {
                         if !s.is_finite() {
                             *s = 0.0;
@@ -548,10 +590,10 @@ impl Block {
         // (checked) before its length is set.
         unsafe {
             let frames = (addr_of!((*h).frames).read_volatile() as usize).min(self.max_frames);
-            let n_in = (addr_of!((*h).n_in).read_volatile() as usize).min(MAX_BUFFERS);
-            let n_out = (addr_of!((*h).n_out).read_volatile() as usize).min(MAX_BUFFERS);
-            let mut ins = [0usize; MAX_BUFFERS];
-            let mut outs = [0usize; MAX_BUFFERS];
+            let n_in = (addr_of!((*h).n_in).read_volatile() as usize).min(MAX_IN_BUFFERS);
+            let n_out = (addr_of!((*h).n_out).read_volatile() as usize).min(MAX_OUT_BUFFERS);
+            let mut ins = [0usize; MAX_IN_BUFFERS];
+            let mut outs = [0usize; MAX_OUT_BUFFERS];
             for (i, c) in ins.iter_mut().enumerate().take(n_in) {
                 *c = (addr_of!((*h).in_channels[i]).read_volatile() as usize).min(MAX_CHANNELS);
             }
@@ -559,11 +601,16 @@ impl Block {
                 *c = (addr_of!((*h).out_channels[i]).read_volatile() as usize).min(MAX_CHANNELS);
             }
             io.shape(&ins[..n_in], &outs[..n_out], self.max_frames);
+            let first: [Option<usize>; MAX_IN_BUFFERS] = first_slots(&ins[..n_in], IN_SLOTS);
             for (i, b) in io.ins.iter_mut().enumerate() {
                 b.set_len(frames);
+                let Some(first) = first[i] else {
+                    b.clear();
+                    continue;
+                };
                 for c in 0..b.num_channels() {
                     std::ptr::copy_nonoverlapping(
-                        self.audio(false, i, c),
+                        self.audio(false, first + c),
                         b.channel_mut(c).as_mut_ptr(),
                         frames,
                     );
@@ -655,11 +702,18 @@ impl Block {
         // SAFETY: the helper owns the response part until it sets `done`;
         // writes stay within the mapping.
         unsafe {
-            for (i, b) in io.outs.iter().take(MAX_BUFFERS).enumerate() {
-                for c in 0..b.num_channels().min(MAX_CHANNELS) {
+            let mut chans = [0usize; MAX_OUT_BUFFERS];
+            for (c, b) in chans.iter_mut().zip(&io.outs) {
+                *c = b.num_channels().min(MAX_CHANNELS);
+            }
+            let n_out = io.outs.len().min(MAX_OUT_BUFFERS);
+            let first: [Option<usize>; MAX_OUT_BUFFERS] = first_slots(&chans[..n_out], OUT_SLOTS);
+            for (i, b) in io.outs.iter().take(n_out).enumerate() {
+                let Some(first) = first[i] else { continue };
+                for c in 0..chans[i] {
                     let src = b.channel(c);
                     let n = frames.min(src.len()).min(self.max_frames);
-                    std::ptr::copy_nonoverlapping(src.as_ptr(), self.audio(true, i, c), n);
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), self.audio(true, first + c), n);
                 }
             }
             let mut n = 0;
@@ -805,6 +859,55 @@ mod tests {
         let d = nonsense.decode();
         assert_eq!(d.tempo, 120.0);
         assert_eq!(d.time_signature, TimeSignature::FOUR_FOUR);
+    }
+
+    #[test]
+    fn many_output_buffers_of_any_width_come_back_in_place() {
+        let frames = 32;
+        let host = Block::create(frames).unwrap();
+        let helper = Block::open(host.name(), host.size()).unwrap();
+        // A main stereo bus, a mono one, then stereo pairs up to the
+        // limit of buffers (the slots are packed, not 16 a buffer).
+        let mut shape = vec![2, 1];
+        shape.extend(std::iter::repeat_n(2, MAX_OUT_BUFFERS - 2));
+        host.write_request(&BlockIn {
+            frames,
+            transport: &TransportInfo::default(),
+            params: &[],
+            mods: &[],
+            note_mods: &[],
+            audio_in: &[],
+            events_in: None,
+            out_channels: &shape,
+            events_out: false,
+        });
+        let mut io = HelperIo::default();
+        assert_eq!(helper.read_request(&mut io), frames);
+        assert_eq!(io.outs.len(), MAX_OUT_BUFFERS);
+        for (b, out) in io.outs.iter_mut().enumerate() {
+            assert_eq!(out.num_channels(), shape[b]);
+            for c in 0..out.num_channels() {
+                out.channel_mut(c).fill((b * 10 + c) as f32);
+            }
+        }
+        helper.write_response(frames, ProcessStatus::Continue, &mut io);
+        let mut outs: Vec<AudioBuffer> = shape
+            .iter()
+            .map(|&c| {
+                let mut b = AudioBuffer::new(ChannelLayout::from_channel_count(c), frames);
+                b.set_len(frames);
+                b
+            })
+            .collect();
+        host.read_response(frames, &mut outs, None);
+        for (b, out) in outs.iter().enumerate() {
+            for c in 0..out.num_channels() {
+                assert!(
+                    out.channel(c).iter().all(|v| *v == (b * 10 + c) as f32),
+                    "buffer {b} channel {c}"
+                );
+            }
+        }
     }
 
     #[test]

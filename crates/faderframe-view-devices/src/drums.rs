@@ -79,9 +79,9 @@ impl Face for DrumsFace {
             deck,
             &[
                 ("PAD", 6.2),
-                ("ENVELOPE", 3.6),
-                ("FILTER", 3.6),
-                ("PLAY", 3.4),
+                ("ENVELOPE", 3.0),
+                ("FILTER", 3.0),
+                ("PLAY", 4.6),
                 ("KIT", 3.2),
             ],
         );
@@ -140,10 +140,11 @@ impl Face for DrumsFace {
         ));
         let k = kit::row(
             Rect::new(r.x, r.y + 32.0, r.w, SMALL.1),
-            &[SMALL.0, SMALL.0],
+            &[SMALL.0, SMALL.0, SMALL.0],
         );
         c.push(Ctl::small(self.pid(id::CHOKE), "CHOKE", k[0]));
         c.push(Ctl::small(self.pid(id::VELOCITY), "VEL", k[1]));
+        c.push(Ctl::small(self.pid(id::OUTPUT), "OUTPUT", k[2]));
         c.push(Ctl::toggle(
             self.pid(id::REVERSE),
             "Reverse",
@@ -342,6 +343,10 @@ impl Face for DrumsFace {
             id::DECAY => "How fast the pad dies away (Full: the whole sample)",
             id::START => "Where in the sample it starts",
             id::KEEP => "The tune changes the pad's pitch, not its length",
+            id::OUTPUT => {
+                "Where the pad plays: Main, or an extra output once a track takes it \
+                 (insert menu → Create Output Tracks)"
+            }
             _ => return None,
         })
     }

@@ -496,31 +496,33 @@ impl PluginProcessor for ClapProcessor {
             }
         }
 
-        // Main output port to the graph (no output ports: pass through).
-        if let Some(out) = io.audio_out.first_mut() {
-            let main = if st.double {
-                st.out_bufs64.first().map_or(0, Vec::len)
+        // Output port `p` to graph output `p` (the main one first; no
+        // output ports: pass through).
+        for (p, out) in io.audio_out.iter_mut().enumerate() {
+            let port = if st.double {
+                st.out_bufs64.get(p).map_or(0, Vec::len)
             } else {
-                st.out_bufs.first().map_or(0, Vec::len)
+                st.out_bufs.get(p).map_or(0, Vec::len)
             };
-            match main {
-                main if main > 0 => {
+            match port {
+                port if port > 0 => {
                     for c in 0..out.num_channels() {
                         let dst = &mut out.channel_mut(c)[..n];
-                        let src = c.min(main - 1);
+                        let src = c.min(port - 1);
                         if st.double {
-                            for (d, s) in dst.iter_mut().zip(&st.out_bufs64[0][src][..n]) {
+                            for (d, s) in dst.iter_mut().zip(&st.out_bufs64[p][src][..n]) {
                                 *d = *s as f32;
                             }
                         } else {
-                            dst.copy_from_slice(&st.out_bufs[0][src][..n]);
+                            dst.copy_from_slice(&st.out_bufs[p][src][..n]);
                         }
                     }
                 }
-                _ => match io.audio_in.first() {
+                _ if p == 0 => match io.audio_in.first() {
                     Some(inp) => out.copy_from(inp),
                     None => out.clear(),
                 },
+                _ => out.clear(),
             }
         }
         st.proc = Some(RtProc::Started(started));

@@ -262,6 +262,62 @@ fn bypass_button(
     bypass
 }
 
+/// A multi-output plugin's Outputs menu (rebuilt each time it opens):
+/// tracks for all its extra outputs, or for one.
+fn outputs_button(app: &Rc<AppState>, plugin: PluginInstanceId) -> Option<gtk::MenuButton> {
+    if !app.session.borrow().plugin_has_extra_outputs(plugin) {
+        return None;
+    }
+    let button = gtk::MenuButton::new();
+    button.set_label("Outputs");
+    button.set_tooltip_text(Some("Tracks for the plugin's extra outputs"));
+    let weak = Rc::downgrade(app);
+    button.set_create_popup_func(move |button| {
+        let Some(app) = weak.upgrade() else { return };
+        let outs = app.session.borrow().plugin_output_buses(plugin);
+        let missing = outs.iter().skip(1).filter(|o| o.track.is_none()).count();
+        let menu = gtk::gio::Menu::new();
+        let all = gtk::gio::Menu::new();
+        let item = gtk::gio::MenuItem::new(
+            Some(&if missing == 0 {
+                "Every Output Has a Track".to_string()
+            } else {
+                format!("Create Output Tracks ({missing})")
+            }),
+            None,
+        );
+        if missing > 0 {
+            item.set_action_and_target_value(
+                Some("app.create-output-tracks"),
+                Some(&plugin.raw().to_string().to_variant()),
+            );
+        }
+        all.append_item(&item);
+        menu.append_section(None, &all);
+        let one = gtk::gio::Menu::new();
+        for o in outs.iter().skip(1) {
+            let label = if o.track.is_some() {
+                format!("✓ {}", o.name)
+            } else {
+                o.name.clone()
+            }
+            .replace('_', "__");
+            let item = gtk::gio::MenuItem::new(Some(&label), None);
+            if o.track.is_none() {
+                let target = format!("{}\n{}", plugin.raw(), o.bus);
+                item.set_action_and_target_value(
+                    Some("app.create-output-tracks"),
+                    Some(&target.to_variant()),
+                );
+            }
+            one.append_item(&item);
+        }
+        menu.append_section(Some("One Output"), &one);
+        button.set_menu_model(Some(&menu));
+    });
+    Some(button)
+}
+
 /// The Presets menu of an editor window's header (rebuilt each time it
 /// opens): save, the user's and factory presets, the plugin's programs.
 fn presets_button(app: &Rc<AppState>, plugin: PluginInstanceId) -> gtk::MenuButton {
@@ -453,6 +509,9 @@ fn open_device(app: &Rc<AppState>, plugin: PluginInstanceId) -> bool {
     header.set_title_widget(Some(&heading));
     header.pack_start(&bypass_button(app, plugin, track, bypassed));
     header.pack_start(&presets_button(app, plugin));
+    if let Some(outputs) = outputs_button(app, plugin) {
+        header.pack_start(&outputs);
+    }
     let params = gtk::Button::with_label("Parameters");
     params.set_tooltip_text(Some("Every parameter in a list"));
     {
@@ -1135,6 +1194,9 @@ fn open_generic(app: &Rc<AppState>, plugin: PluginInstanceId) {
 
     header.pack_start(&bypass_button(app, plugin, track, bypassed));
     header.pack_start(&presets_button(app, plugin));
+    if let Some(outputs) = outputs_button(app, plugin) {
+        header.pack_start(&outputs);
+    }
     if has_native(app, plugin) {
         let native = gtk::Button::with_label("Plugin GUI");
         native.set_tooltip_text(Some("Open the plugin's own editor"));

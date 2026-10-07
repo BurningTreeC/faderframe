@@ -375,6 +375,92 @@ fn a_sandboxed_synth_plays_notes_and_note_expressions_like_in_process() {
     assert_eq!(probe.latency_samples(), 100);
 }
 
+/// A multi-output plugin in a helper: its output names cross, and a pad
+/// sent to an extra output arrives there (main silent), as in process.
+#[test]
+fn a_sandboxed_kit_plays_into_its_extra_outputs() {
+    use faderframe_plugin_host::ParamValues;
+    use faderframe_plugin_host::devices::drums;
+    use faderframe_plugin_host::devices::samples::{SampleDoc, pack};
+    let dir = std::env::temp_dir().join(format!("ff-sandbox-kit-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let wav = dir.join("kick.wav");
+    let x: Vec<f32> = (0..12_000)
+        .map(|n| (0.5 * (n as f64 * 0.02).sin()) as f32)
+        .collect();
+    faderframe_audio_files::write_wav(
+        &wav,
+        &[x],
+        48_000,
+        faderframe_audio_files::WavFormat::Float32,
+        false,
+    )
+    .unwrap();
+    let mut doc = SampleDoc::default();
+    doc.set(0, Some(wav.to_string_lossy().into_owned()));
+    let params = ParamValues::new(drums::parameters());
+    params
+        .set_by_id(ParameterId(drums::id::pad(0) + drums::id::OUTPUT), 2.0)
+        .unwrap();
+    let state = pack(&params.save(), &doc);
+    let play = |inst: &mut Box<dyn PluginInstance>| -> Vec<f32> {
+        inst.load_state(&state).unwrap();
+        inst.configure_outputs(3);
+        let mut p = inst.create_processor(&CONFIG).unwrap();
+        let mut energy = vec![0f32; 3];
+        for b in 0..8 {
+            let mut outs: Vec<AudioBuffer> = (0..3)
+                .map(|_| {
+                    let mut o = AudioBuffer::new(ChannelLayout::Stereo, FRAMES);
+                    o.set_len(FRAMES);
+                    o
+                })
+                .collect();
+            let mut midi = MidiBuffer::with_capacity(8);
+            if b == 1 {
+                midi.push(TimedMidiEvent::new(
+                    0,
+                    MidiEvent::NoteOn {
+                        channel: 0,
+                        key: 36,
+                        velocity: 120,
+                    },
+                ))
+                .unwrap();
+            }
+            let events_in = [midi];
+            let transport = TransportInfo::default();
+            let ctx = PluginProcessContext {
+                transport: &transport,
+                param_events: &[],
+                harmony: &faderframe_plugin_host::NO_HARMONY,
+                param_mods: &[],
+                note_mods: &[],
+            };
+            let mut io = NodeIo {
+                frames: FRAMES,
+                audio_in: &[],
+                audio_out: &mut outs,
+                events_in: &events_in,
+                events_out: &mut [],
+            };
+            p.process(&ctx, &mut io);
+            for (e, o) in energy.iter_mut().zip(&outs) {
+                *e += o.channel(0).iter().map(|v| v * v).sum::<f32>();
+            }
+        }
+        energy
+    };
+    let mut a = local(builtin::DRUMS);
+    let mut b = remote(PluginFormat::Builtin, builtin::DRUMS);
+    assert_eq!(b.output_bus_names(), drums::output_bus_names());
+    assert_eq!(b.descriptor().audio_outputs.len(), 1 + drums::AUX);
+    let (ea, eb) = (play(&mut a), play(&mut b));
+    assert!(eb[2] > 1.0 && eb[0] == 0.0 && eb[1] == 0.0, "{eb:?}");
+    assert_eq!(ea, eb, "as in process");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_crashing_plugin_takes_only_its_own_process_down() {
     let mut inst = remote(PluginFormat::Vst3, "test.crash");
