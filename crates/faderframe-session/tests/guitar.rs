@@ -226,9 +226,21 @@ fn a_mono_track_is_stereo_from_the_guitar_station_on() {
         if !ahead {
             s.set_render_ahead(None).unwrap();
         }
+        // Until it sounds: a busy runner's debug build may take a while to
+        // bring the restarted line up (it passed after 2 s here, failed at
+        // CI); a line that never sounds still fails.
         run(&mut s, 2.0);
-        let m = s.meter(t);
-        assert!(m.left.level_db > -50.0, "left {:.1} dB", m.left.level_db);
+        let end = Instant::now() + Duration::from_secs(20);
+        let mut m = s.meter(t);
+        while m.left.level_db <= -50.0 && Instant::now() < end {
+            run(&mut s, 0.05);
+            m = s.meter(t);
+        }
+        assert!(
+            m.left.level_db > -50.0,
+            "left {:.1} dB (ahead {ahead})",
+            m.left.level_db
+        );
         assert!(
             m.right.level_db < m.left.level_db - 30.0,
             "panned left, live (ahead {ahead}): {:.1} / {:.1} dB",
