@@ -346,7 +346,7 @@ pub(crate) struct MidiState {
     /// MTC full frames: the transport as last seen (playing, position) and
     /// when.
     mtc_seen: Option<(bool, i64, Instant)>,
-    sender: MidiInputSender,
+    pub(crate) sender: MidiInputSender,
     feed: MidiControlFeed,
     keyboard: VirtualMidiInput,
     last_scan: Option<Instant>,

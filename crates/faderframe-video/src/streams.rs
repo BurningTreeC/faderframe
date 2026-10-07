@@ -202,20 +202,30 @@ impl Pipeline {
 }
 
 /// A stream nobody wants ends in a fakesink (an unlinked stream would stop
-/// the others).
+/// the others) behind a leaky one-buffer queue: a paused sink holds its
+/// first buffer, which would stall a demuxer's one streaming thread before
+/// the wanted stream's first frame arrives.
 fn discard(pipeline: &gst::Pipeline, pad: &gst::Pad) {
-    let Ok(sink) = gst::ElementFactory::make("fakesink")
-        .property("sync", false)
-        .property("async", false)
-        .build()
-    else {
+    let (Ok(queue), Ok(sink)) = (
+        gst::ElementFactory::make("queue")
+            .property_from_str("leaky", "downstream")
+            .property("max-size-buffers", 1u32)
+            .property("max-size-bytes", 0u32)
+            .property("max-size-time", 0u64)
+            .build(),
+        gst::ElementFactory::make("fakesink")
+            .property("sync", false)
+            .property("async", false)
+            .build(),
+    ) else {
         return;
     };
-    if pipeline.add(&sink).is_err() {
+    if pipeline.add_many([&queue, &sink]).is_err() || queue.link(&sink).is_err() {
         return;
     }
     let _ = sink.sync_state_with_parent();
-    if let Some(sinkpad) = sink.static_pad("sink") {
+    let _ = queue.sync_state_with_parent();
+    if let Some(sinkpad) = queue.static_pad("sink") {
         let _ = pad.link(&sinkpad);
     }
 }

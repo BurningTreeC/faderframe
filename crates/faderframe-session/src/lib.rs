@@ -65,6 +65,7 @@ mod sysex;
 pub mod templates;
 mod transients;
 pub mod versions;
+pub mod video;
 /// A plugin state as projects store it (and back).
 pub use faderframe_engine::{
     decode_state as decode_plugin_state, encode_state as encode_plugin_state,
@@ -451,6 +452,8 @@ pub enum Action {
     ShowVersions,
     /// Go back to a saved version (the project as it is is kept as one).
     RestoreVersion(PathBuf),
+    /// Picture: import, clip edits, offset, export, sync test.
+    Video(video::VideoOp),
     /// Keep the project's set-up (everything but its content) as the
     /// template `name`, replacing one of that name.
     SaveTemplate {
@@ -1145,6 +1148,7 @@ pub struct Session {
     /// ADM BWF files being read.
     adm_imports: Vec<adm::ImportJob>,
     samplings: Vec<sampling::PendingSample>,
+    video: video::VideoState,
     /// What the live tracks were played, for Capture MIDI.
     capture: capture::CaptureBuffer,
     /// Album analyses and the running album job.
@@ -1379,6 +1383,7 @@ impl Session {
             correction_path: None,
             adm_imports: Vec::new(),
             samplings: Vec::new(),
+            video: video::VideoState::default(),
             capture: capture::CaptureBuffer::default(),
             album_state: album::AlbumState::default(),
             ddp_state: ddp::DdpState::default(),
@@ -2026,6 +2031,7 @@ impl Session {
         self.poll_bounces();
         self.poll_adm_imports();
         self.poll_samples();
+        self.poll_video();
         self.poll_album();
         self.poll_ddp();
         self.poll_analysis(dt);
@@ -2564,6 +2570,7 @@ impl Session {
     }
 
     fn replace_project(&mut self, project: Project, workspace: Option<WorkspaceSet>) -> Result<()> {
+        self.forget_video();
         self.project = project;
         if let Some(ws) = workspace {
             self.workspace = ws;
@@ -2633,6 +2640,9 @@ impl Session {
             }
         }
         samples::map_states(&mut project, |p| media::resolve(p, dir.as_deref()));
+        for v in project.video.sources.values_mut() {
+            v.path = media::resolve(&v.path, dir.as_deref());
+        }
         let mut adopted = Vec::new();
         for t in &mut project.tracks {
             adopted.extend(self.adopt_instrument(t));
@@ -2667,6 +2677,9 @@ impl Session {
             }
         }
         samples::map_states(&mut stored, |p| media::to_stored(p, Some(&dir)));
+        for v in stored.video.sources.values_mut() {
+            v.path = media::to_stored(&v.path, Some(&dir));
+        }
         file::save(&path, &stored, Some(&self.workspace))?;
         self.media_dir = project_media;
         self.unsaved_media = false;
@@ -3217,6 +3230,7 @@ impl Session {
                 self.save_template(&name)?;
             }
             Action::PromptSaveTemplate => self.ui_requests.push(UiRequest::SaveTemplate),
+            Action::Video(op) => self.video_op(op)?,
             Action::ShowTemplates => self.ui_requests.push(UiRequest::Templates),
             Action::DeleteTemplate(path) => {
                 templates::delete_template(&path)?;

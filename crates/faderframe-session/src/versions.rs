@@ -107,6 +107,9 @@ impl crate::Session {
             }
         }
         samples::map_states(&mut stored, |p| media::to_stored(p, Some(&project_dir)));
+        for v in stored.video.sources.values_mut() {
+            v.path = media::to_stored(&v.path, Some(&project_dir));
+        }
         file::save(&path, &stored, Some(&self.workspace))?;
         self.notify(
             NoticeLevel::Info,
@@ -131,6 +134,9 @@ impl crate::Session {
             }
         }
         samples::map_states(&mut project, |p| media::resolve(p, dir.as_deref()));
+        for v in project.video.sources.values_mut() {
+            v.path = media::resolve(&v.path, dir.as_deref());
+        }
         for t in &mut project.tracks {
             // Older versions may keep an instrument apart (see `open`).
             let _ = self.adopt_instrument(t);

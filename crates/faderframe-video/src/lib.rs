@@ -29,6 +29,7 @@ pub mod probe;
 pub mod proxy;
 pub mod service;
 mod streams;
+pub mod sync_test;
 
 pub use decode::{Decoder, Frame, fit};
 pub use index::FrameIndex;

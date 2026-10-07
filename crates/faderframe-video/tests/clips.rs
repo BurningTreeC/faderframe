@@ -372,7 +372,11 @@ fn the_service_answers_at_once_and_catches_up() {
             .filter(|p| p.number == 60);
         got.is_some()
     }));
-    assert_eq!(got.take().unwrap().frame.width, 160, "the proxy while playing");
+    assert_eq!(
+        got.take().unwrap().frame.width,
+        160,
+        "the proxy while playing"
+    );
     assert!(until(&mut || {
         got = svc
             .picture(7, t, (W, H), Want::Still)

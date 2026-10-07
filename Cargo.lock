@@ -1078,6 +1078,7 @@ dependencies = [
  "faderframe-timeline",
  "faderframe-transcribe",
  "faderframe-transport",
+ "faderframe-video",
  "faderframe-workspace",
  "midly",
  "rtrb",
