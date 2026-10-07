@@ -67,6 +67,18 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.13.0" date="2026-10-07">
+      <description>
+        <p>MIDI learn everywhere, a noise gate for the Guitar Station and fixes.</p>
+        <ul>
+          <li>Every MIDI-learnable control offers MIDI Learn and removes its mappings where they were learned: device editors (Guitar Station, EQ, Program EQ, the stock devices), track headers, the mixer (plugin bypass, surround pans), the transport buttons and editor windows' Bypass; Preferences → MIDI removes learned transport controls.</li>
+          <li>The Guitar Station has GainStageFx's noise gate after its Input, with its own switch and threshold.</li>
+          <li>The amplifiers' 0–10 scales in the Guitar Station match where their knobs turn.</li>
+          <li>A click in the arranger moves the playhead at once, also while render-ahead primes the new position.</li>
+          <li>The GPU painter no longer shows striped meters: a frame buffer is drawn again only once the screen has finished with it.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.12.0" date="2026-10-07">
       <description>
         <p>Immersive delivery, listening and more plugins.</p>
