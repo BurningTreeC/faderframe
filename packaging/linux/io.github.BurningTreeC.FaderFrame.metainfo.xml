@@ -67,6 +67,19 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.11.0" date="2026-10-07">
+      <description>
+        <p>Performance and mastering.</p>
+        <ul>
+          <li>Surround beds: any track, bus or the master can be LCR, quad, 5.0, 5.1, 7.0, 7.1, 5.1.2, 5.1.4, 7.1.2 or 7.1.4. Tracks feeding a bed are placed in a room seen from above, in the mixer strip and in the Surround Panner (left/right, front/back, height, spread, stereo width, LFE send), all automatable; beds fold into smaller formats and down to the interface's outputs; meters show every channel; renders keep every channel with the speakers in the WAV header, or fold down to stereo.</li>
+          <li>A DDP player: checks a CD master's fileset as a plant would, plays it like a CD player and imports its tracks back as album songs.</li>
+          <li>CD-Text in up to eight languages, Japanese too.</li>
+          <li>Buses render ahead as well, in a second tier that keeps faders answering within milliseconds.</li>
+          <li>The modelled preamps play at full gain without dropouts: their channels are solved in parallel, with one device buffer of headroom and a deadline while playing live.</li>
+          <li>The graph keeps work on the core that ran it last, and dense views (meters, EQ, device editors) can be drawn on the GPU (Preferences → General → Drawing).</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.10.0" date="2026-10-07">
       <description>
         <p>Performance and control, finished.</p>
