@@ -37,6 +37,7 @@ mod project;
 mod takes;
 pub mod template;
 mod track;
+pub mod video;
 mod warp;
 
 pub use clip::{

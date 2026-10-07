@@ -83,6 +83,7 @@ pub enum CoalesceKey {
     Section(faderframe_core::SectionId),
     Modulators(TrackId),
     ChainMix(PluginInstanceId, usize),
+    Video,
 }
 
 /// State needed to undo a track removal.
@@ -418,6 +419,15 @@ pub enum Command {
     SetLyrics {
         lyrics: Vec<crate::lyrics::LyricLine>,
     },
+    /// Replace the picture (video tracks, clips, files, offset;
+    /// normalised: clips by start).
+    SetVideo {
+        video: Box<crate::video::Video>,
+    },
+    /// Set the project's timecode (rate and start label).
+    SetTimecode {
+        timecode: Option<crate::video::ProjectTimecode>,
+    },
     /// Put a clip in a launcher slot (`None`: empty it); the clip it held
     /// goes.
     SetLauncherSlot {
@@ -730,6 +740,8 @@ impl Command {
             SetKeys { .. } => "Change Key".into(),
             SetChords { .. } => "Edit Chords".into(),
             SetLyrics { .. } => "Edit Lyrics".into(),
+            SetVideo { .. } => "Edit Video".into(),
+            SetTimecode { .. } => "Change Timecode".into(),
             SetLauncherSlot { .. } => "Launcher Clip".into(),
             SetScenes { .. } => "Scenes".into(),
             SetLaunchQuantize { .. } => "Launch Quantize".into(),
@@ -766,6 +778,7 @@ impl Command {
             MoveClip { clip, .. } | SetClipContent { clip, .. } => CoalesceKey::Clip(*clip),
             UpdateNote { clip, note } => CoalesceKey::Note(*clip, note.id),
             SetTempo { .. } => CoalesceKey::Tempo,
+            SetVideo { .. } => CoalesceKey::Video,
             SetLoop { .. } => CoalesceKey::Loop,
             SetPunch { .. } => CoalesceKey::Punch,
             UpdateMarker { marker } => CoalesceKey::Marker(marker.id),
@@ -816,6 +829,8 @@ impl Command {
             | SetClipLink { .. }
             | SetAlbum { .. }
             | SetLyrics { .. }
+            | SetVideo { .. }
+            | SetTimecode { .. }
             | SetScenes { .. }
             | SetLaunchQuantize { .. }
             | SetClipLaunch { .. }
@@ -1737,6 +1752,15 @@ impl Command {
                     lyrics: std::mem::replace(&mut p.lyrics, lyrics),
                 }
             }
+            SetVideo { mut video } => {
+                video.normalize();
+                SetVideo {
+                    video: Box::new(std::mem::replace(&mut p.video, *video)),
+                }
+            }
+            SetTimecode { timecode } => SetTimecode {
+                timecode: std::mem::replace(&mut p.timecode, timecode),
+            },
             SetLauncherSlot { track, scene, clip } => {
                 track_mut(p, track)?;
                 let key = crate::launcher::SlotKey { track, scene };

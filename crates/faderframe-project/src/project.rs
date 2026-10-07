@@ -142,6 +142,13 @@ pub struct Project {
     /// one's own).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub clip_links: BTreeMap<ClipId, faderframe_core::ClipLinkId>,
+    /// Picture: video tracks, their clips and files.
+    #[serde(default, skip_serializing_if = "crate::video::Video::is_empty")]
+    pub video: crate::video::Video,
+    /// The timecode the project counts in (`None`: not set; the display
+    /// then counts from 00:00:00:00 at 25 fps).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timecode: Option<crate::video::ProjectTimecode>,
     #[serde(default)]
     pub ids: IdAllocator,
 }
@@ -179,6 +186,8 @@ impl Project {
             lyrics: Vec::new(),
             launcher: crate::launcher::Launcher::default(),
             clip_links: BTreeMap::new(),
+            video: crate::video::Video::default(),
+            timecode: None,
             ids,
         }
     }

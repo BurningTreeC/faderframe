@@ -5,7 +5,7 @@
 //! modulators, MIDI mappings, automation, tempo, meter, key and chords,
 //! markers and sections, loop and punch, the album's delivery settings and
 //! the launcher's scenes — and leaves out what was recorded or imported:
-//! clips (arranger and launcher), their media, freezes, aliases, lyrics
+//! clips (arranger, launcher and video), their media, freezes, aliases, lyrics
 //! (transcribed from the audio) and album songs that are files.
 
 use crate::Project;
@@ -21,6 +21,11 @@ pub fn without_content(project: &Project) -> Project {
     for t in &mut p.tracks {
         t.clips.clear();
         t.freeze = None;
+    }
+    // Video tracks stay, their clips and files go.
+    p.video.sources.clear();
+    for t in &mut p.video.tracks {
+        t.clips.clear();
     }
     let launcher = &mut p.launcher;
     launcher.slots.clear();

@@ -119,6 +119,17 @@ pub fn differences(then: &Project, now: &Project) -> Vec<String> {
     if then.launcher != now.launcher {
         out.push("Clip launcher changed".into());
     }
+    if then.video != now.video {
+        let clips = |p: &Project| p.video.tracks.iter().map(|t| t.clips.len()).sum::<usize>();
+        out.push(format!(
+            "Video changed ({} → {} clips)",
+            clips(then),
+            clips(now)
+        ));
+    }
+    if then.timecode != now.timecode {
+        out.push("Timecode changed".into());
+    }
     out
 }
 
