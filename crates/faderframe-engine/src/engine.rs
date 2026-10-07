@@ -1561,7 +1561,7 @@ impl EngineController {
             &self.midi_routing,
             plan,
             monitor,
-            self.listen,
+            &self.listen,
         )?;
         let compiled = built.builder.compile(&prepare)?;
         let mut ahead_prepare = prepare;
@@ -1794,6 +1794,27 @@ impl EngineController {
 
     pub fn binaural(&self) -> Option<faderframe_binaural::Room> {
         self.listen.binaural
+    }
+
+    /// The head and the headphone correction listening on headphones uses
+    /// (a graph rebuild, as `set_binaural`).
+    pub fn set_head(&mut self, head: faderframe_binaural::Head) {
+        self.listen.head = head;
+    }
+
+    pub fn head(&self) -> &faderframe_binaural::Head {
+        &self.listen.head
+    }
+
+    pub fn set_headphone_correction(
+        &mut self,
+        correction: Option<Arc<faderframe_binaural::Correction>>,
+    ) {
+        self.listen.correction = correction;
+    }
+
+    pub fn headphone_correction(&self) -> Option<&Arc<faderframe_binaural::Correction>> {
+        self.listen.correction.as_ref()
     }
 
     /// The mono check (immediate, no rebuild).

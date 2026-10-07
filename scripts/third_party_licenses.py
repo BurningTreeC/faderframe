@@ -73,7 +73,7 @@ VENDORED = [
         "crates/faderframe-transcribe/model/LICENSE",
     ),
     (
-        "SADIE II head-related impulse responses (KU100, University of York)",
+        "SADIE II head-related impulse responses (KU100, KEMAR, 18 listeners; University of York)",
         "v2-1 (subset)",
         "Apache-2.0",
         "https://zenodo.org/records/10886409",

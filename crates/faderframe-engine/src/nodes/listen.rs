@@ -23,21 +23,28 @@ pub struct ListenOut {
 }
 
 impl ListenOut {
-    /// From `input` to `output`; `binaural`: render `input` for headphones
-    /// (the output is then stereo) at `rate`; `block`: the largest call.
+    /// From `input` to `output`; `listen.binaural`: render `input` for
+    /// headphones (the output is then stereo) at `rate`; `block`: the
+    /// largest call.
     pub fn new(
         input: ChannelLayout,
         output: ChannelLayout,
-        binaural: Option<faderframe_binaural::Room>,
+        listen: &crate::build::Listen,
         rate: u32,
         block: usize,
         mono: ParamSlot,
     ) -> Self {
-        let renderer = binaural.and_then(|room| {
-            faderframe_binaural::Renderer::new(input, rate, room)
-                .map_err(|e| tracing::warn!("binaural: {e}"))
-                .ok()
-                .map(Box::new)
+        let renderer = listen.binaural.and_then(|room| {
+            faderframe_binaural::Renderer::new(
+                input,
+                rate,
+                room,
+                &listen.head,
+                listen.correction.as_deref(),
+            )
+            .map_err(|e| tracing::warn!("binaural: {e}"))
+            .ok()
+            .map(Box::new)
         });
         let matrix = |from, to| {
             let mut m = Box::new([[0.0f32; MAX_SPEAKERS]; MAX_SPEAKERS]);

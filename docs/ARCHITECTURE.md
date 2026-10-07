@@ -568,18 +568,36 @@ other tracks with hardware outputs keep the plain fold-down).
   `Session::set_headphones`, `Preferences::headphones`): the master —
   a bed, stereo or mono — rendered binaurally by `faderframe-binaural`.
   Each speaker's feed is convolved with the impulse responses measured at
-  the ears of a KU100 dummy head from its direction (SADIE II, University
-  of York, Apache-2.0: fifteen BS.2051 directions baked by
-  `scripts/binaural_hrirs.py` into `data/sadie-d1.ffhr` at 44.1/48/96 kHz,
-  other rates resampled from the nearest; `binaural::direction` maps
-  speaker labels — quad's rears sit at ±135°, 5.x surrounds at ±110°).
+  the ears of a `Head` from its direction: fifteen BS.2051 directions
+  (`binaural::direction` maps speaker labels — quad's rears sit at ±135°,
+  5.x surrounds at ±110°) baked by `scripts/binaural_hrirs.py` at
+  44.1/48/96 kHz (other rates resampled from the nearest) for twenty SADIE
+  II subjects (University of York, Apache-2.0: the KU100 — the default —
+  and KEMAR dummy heads and the listeners H3–H20, `BUILTIN_HEADS`,
+  `data/sadie-*.ffhr`), all at unity at 1 kHz from the front so they
+  compare by ear. **Your own ears**: `Head::from_sofa` reads a SOFA file
+  (AES69 SimpleFreeFieldHRIR/GeneralFIR, e.g. from Mesh2HRTF or a lab;
+  `hdf5-reader`, pure Rust) — the nearest measurement for each direction,
+  `Data.Delay` in front, prepared as the bake script does (SADIE's own
+  KU100 file reproduces the baked head to 1e-5); a set whose measurements
+  lie far from the speakers gets a notice. Heads are chosen by id
+  (`Session::set_head`: `ku100`, `kemar`, `sadie-h3`…, `sofa:<path>`;
+  `Preferences::headphone_head`). **Headphone correction**
+  (`Session::set_headphone_correction`, `binaural::Correction`,
+  `Preferences::headphone_correction`): EqualizerAPO/AutoEq text (Preamp,
+  PK/LSC/HSC/LS/HS/LP/HP/NO/BP/AP filters as RBJ biquads, `BW Oct`;
+  `GraphicEQ:` curves as minimum-phase FIRs from the real cepstrum) or an
+  impulse response (one channel or one per ear, resampled), applied per
+  ear after the room in the same block — no added latency.
   The convolution is uniformly partitioned (blocks of 64 frames, 128 above
   50 kHz; one forward FFT per speaker, one inverse per ear), so it adds
   one block of latency, reported by the node. The LFE reaches both ears
   low-passed at 120 Hz and +10 dB. Rooms: Near is the dry measurement, Mid
   and Far add an eight-line feedback delay network fed in mono (about 8
   and 3 dB under the direct sound). Render → "Headphones (binaural · room)"
-  writes the same render to a stereo file.
+  writes the same render to a stereo file through the head listened with
+  (`RenderSettings::head`), without the headphone correction (it belongs
+  to the listener's headphones, not to the mix).
 * **The mono check** (the MONO button in the master strip's record slot,
   Audio → Listen → Mono Check, `Session::set_mono_check`): a parameter slot
   (`SlotRegistry::monitor_mono`), no rebuild; what is heard is folded to

@@ -74,6 +74,11 @@ pub struct Preferences {
     /// Listening on headphones: the room of the binaural render ("near",
     /// "mid", "far"); `None`: speakers.
     pub headphones: Option<String>,
+    /// Whose ears on headphones: a built-in head's id ("ku100" when
+    /// unset) or `sofa:<path>`.
+    pub headphone_head: Option<String>,
+    /// The headphone correction's file.
+    pub headphone_correction: Option<String>,
     /// Keyboard shortcuts changed in the shortcut editor (detailed action
     /// → accelerators; empty: none), over the defaults.
     pub shortcuts: std::collections::BTreeMap<String, Vec<String>>,
@@ -115,6 +120,8 @@ impl Default for Preferences {
             render_ahead_buses: true,
             gpu_painter: false,
             headphones: None,
+            headphone_head: None,
+            headphone_correction: None,
             shortcuts: Default::default(),
         }
     }

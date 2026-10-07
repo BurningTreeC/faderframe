@@ -644,10 +644,28 @@ fn destination_layout(project: &Project, track: &Track) -> ChannelLayout {
 }
 
 /// How the master is listened to (never part of a render unless asked).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Listen {
-    /// On headphones: rendered binaurally with this room.
+    /// On headphones: rendered binaurally with this room …
     pub binaural: Option<faderframe_binaural::Room>,
+    /// … through this head's ears …
+    pub head: faderframe_binaural::Head,
+    /// … evened out for the headphones.
+    pub correction: Option<Arc<faderframe_binaural::Correction>>,
+}
+
+impl Listen {
+    /// What tells one listening node from another (its node key): a new
+    /// room, head or correction makes a new renderer.
+    fn key(&self) -> u64 {
+        match self.binaural {
+            None => 0,
+            Some(room) => {
+                let c = self.correction.as_ref().map_or(0, |c| c.serial());
+                (1 + room as u64) ^ (self.head.serial() << 8) ^ (c << 36)
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -659,7 +677,7 @@ pub fn build_graph(
     routing: &MidiRouting,
     mut ahead: Option<AheadPlan<'_>>,
     monitor: &[PluginSlot],
-    listen: Listen,
+    listen: &Listen,
 ) -> Result<BuiltGraph, EngineError> {
     let midi_ports = &routing.inputs;
     let mut b = GraphBuilder::<EngineContext>::new();
@@ -1302,18 +1320,22 @@ pub fn build_graph(
                         fold_for(dest, config.device_outputs, first_channel as usize)
                             .unwrap_or(dest)
                     };
-                    let room = listen.binaural.map_or(0, |r| 1 + r as u64);
                     let mono = slots.monitor_mono()?;
                     let node = g.add_node(
                         NodeSpec::new(format!("{} · Listen", t.name))
-                            .key(node_key(t.id, Role::DeviceOut, 0x115E0 + room, &[dest, to]))
+                            .key(node_key(
+                                t.id,
+                                Role::DeviceOut,
+                                0x115E0 ^ (listen.key() << 20),
+                                &[dest, to],
+                            ))
                             .group(gi)
                             .audio_in(dest)
                             .audio_out(to),
                         Box::new(ListenOut::new(
                             dest,
                             to,
-                            listen.binaural,
+                            listen,
                             config.sample_rate as u32,
                             config.max_block_size,
                             mono,

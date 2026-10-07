@@ -13,4 +13,5 @@ workspace = true
 [dependencies]
 faderframe-core.workspace = true
 realfft.workspace = true
+hdf5-reader = { version = "0.9.1", default-features = false }
 thiserror.workspace = true

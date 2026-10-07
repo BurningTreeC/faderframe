@@ -24,7 +24,7 @@ time; binary distributions that bundle them (e.g. Windows or macOS
 installers) must ship their license texts and comply with the LGPL's
 relinking provisions.
 
-## Rust crates (276)
+## Rust crates (282)
 
 Crates under the MPL-2.0 (the Symphonia audio decoders) are file-level
 copyleft: FaderFrame uses them unmodified from crates.io, where their
@@ -128,6 +128,8 @@ published under the MPL-2.0 as well.
 | harfrust | 0.12.0 | MIT | https://github.com/harfbuzz/harfrust |
 | hashbrown | 0.16.1 | MIT OR Apache-2.0 | https://github.com/rust-lang/hashbrown |
 | hashbrown | 0.17.1 | MIT OR Apache-2.0 | https://github.com/rust-lang/hashbrown |
+| hdf5-core | 0.9.1 | MIT OR Apache-2.0 | https://github.com/roteiro-gis/netcdf-rust |
+| hdf5-reader | 0.9.1 | MIT OR Apache-2.0 | https://github.com/roteiro-gis/netcdf-rust |
 | heck | 0.5.0 | MIT OR Apache-2.0 | https://github.com/withoutboats/heck |
 | icu_collections | 2.3.0 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | icu_locale_core | 2.3.0 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
@@ -160,7 +162,9 @@ published under the MPL-2.0 as well.
 | litrs | 1.0.0 | MIT OR Apache-2.0 | https://github.com/LukasKalbertodt/litrs |
 | lock_api | 0.4.14 | MIT OR Apache-2.0 | https://github.com/Amanieu/parking_lot |
 | log | 0.4.34 | MIT OR Apache-2.0 | https://github.com/rust-lang/log |
+| lru | 0.16.4 | MIT | https://github.com/jeromefroe/lru-rs.git |
 | matchers | 0.2.0 | MIT | https://github.com/hawkw/matchers |
+| matrixmultiply | 0.3.11 | MIT/Apache-2.0 | https://github.com/bluss/matrixmultiply/ |
 | memchr | 2.8.3 | Unlicense OR MIT | https://github.com/BurntSushi/memchr |
 | memmap2 | 0.9.11 | MIT OR Apache-2.0 | https://github.com/RazrFalcon/memmap2-rs |
 | memoffset | 0.9.1 | MIT | https://github.com/Gilnaa/memoffset |
@@ -172,6 +176,7 @@ published under the MPL-2.0 as well.
 | multiversion_no_op | 1.0.0 | Apache-2.0 OR MIT | https://github.com/hsivonen/multiversion_no_op |
 | naga | 30.0.1 | MIT OR Apache-2.0 | https://github.com/gfx-rs/wgpu |
 | naga-types | 30.0.1 | MIT OR Apache-2.0 | https://github.com/gfx-rs/wgpu |
+| ndarray | 0.17.2 | MIT OR Apache-2.0 | https://github.com/rust-ndarray/ndarray |
 | nom | 7.1.3 | MIT | https://github.com/Geal/nom |
 | nom | 8.0.0 | MIT | https://github.com/rust-bakery/nom |
 | nu-ansi-term | 0.50.3 | MIT | https://github.com/nushell/nu-ansi-term |
@@ -203,6 +208,7 @@ published under the MPL-2.0 as well.
 | profiling | 1.0.18 | MIT OR Apache-2.0 | https://github.com/aclysma/profiling |
 | quote | 1.0.47 | MIT OR Apache-2.0 | https://github.com/dtolnay/quote |
 | raw-window-handle | 0.6.2 | MIT OR Apache-2.0 OR Zlib | https://github.com/rust-windowing/raw-window-handle |
+| rawpointer | 0.2.1 | MIT/Apache-2.0 | https://github.com/bluss/rawpointer/ |
 | read-fonts | 0.41.0 | MIT OR Apache-2.0 | https://github.com/googlefonts/fontations |
 | realfft | 3.5.0 | MIT | https://github.com/HEnquist/realfft |
 | regex | 1.13.1 | MIT OR Apache-2.0 | https://github.com/rust-lang/regex |
@@ -318,18 +324,18 @@ published under the MPL-2.0 as well.
 | Signalsmith Stretch | 1.3.1 | MIT | https://github.com/Signalsmith-Audio/signalsmith-stretch |
 | Signalsmith Linear | (with Stretch 1.3.1) | MIT | https://github.com/Signalsmith-Audio/linear |
 | basic-pitch model and note creation (Spotify) | icassp_2022 (fa5997a) | Apache-2.0 | https://github.com/spotify/basic-pitch |
-| SADIE II head-related impulse responses (KU100, University of York) | v2-1 (subset) | Apache-2.0 | https://zenodo.org/records/10886409 |
+| SADIE II head-related impulse responses (KU100, KEMAR, 18 listeners; University of York) | v2-1 (subset) | Apache-2.0 | https://zenodo.org/records/10886409 |
 
 Crates without a license file in their published package (license per
 their SPDX expression above; texts at https://spdx.org/licenses/):
 
-com-scrape-types 0.1.1, cookie-factory 0.3.3, dasp_sample 0.11.0, midly 0.5.3, profiling 1.0.18, realfft 3.5.0, spirv 0.4.0+sdk-1.4.341.0, svg_fmt 0.4.5
+com-scrape-types 0.1.1, cookie-factory 0.3.3, dasp_sample 0.11.0, hdf5-core 0.9.1, hdf5-reader 0.9.1, midly 0.5.3, profiling 1.0.18, realfft 3.5.0, spirv 0.4.0+sdk-1.4.341.0, svg_fmt 0.4.5
 
 ## License texts
 
 ### LICENSE-APACHE
 
-Applies to: arrayvec 0.7.8, audioadapter 5.0.0, audioadapter-buffers 5.2.0, audioadapter-sample 5.2.0, autocfg 1.5.1, base64 0.22.1, bit-set 0.10.0, bit-vec 0.9.1, bitflags 1.3.2, bitflags 2.13.2, bytemuck 1.25.2, bytemuck_derive 1.12.1, cc 1.6.0, cexpr 0.6.0, cfg-expr 0.20.10, cfg-if 1.0.5, clang-sys 1.9.1, clap-sys 0.5.0, codespan-reporting 0.13.1, core_detect 1.0.0, cpal 0.18.2, displaydoc 0.2.7, document-features 0.2.12, either 1.18.0, encoding_rs 0.8.42, equivalent 1.0.2, errno 0.3.14, euclid 0.22.14, find-msvc-tools 0.1.14, flate2 1.1.10, fontique 0.11.1, gethostname 1.1.0, glob 0.3.4, glow 0.17.0, hashbrown 0.16.1, hashbrown 0.17.1, heck 0.5.0, indexmap 2.14.2, itertools 0.13.0, khronos-egl 6.0.0, kurbo 0.13.1, lazy_static 1.5.1, linux-raw-sys 0.12.1, lock_api 0.4.14, log 0.4.34, minimal-lexical 0.2.1, multiversion_no_op 1.0.0, num-complex 0.4.6, num-integer 0.1.47, num-traits 0.2.19, once_cell 1.21.4, parking_lot 0.12.5, parking_lot_core 0.9.12, parlance 0.1.0, parley 0.11.1, parley_data 0.11.1, peniko 0.6.1, pkg-config 0.3.34, png 0.18.1, pollster 0.4.0, polycool 0.4.0, presser 0.3.1, primal-check 0.3.4, regex 1.13.1, regex-automata 0.4.18, regex-lite 0.1.9, regex-syntax 0.8.11, renderdoc-sys 1.1.0, roxmltree 0.21.1, rtrb 0.4.0, rubato 5.0.1, rustc-hash 1.1.0, rustc_version 0.4.1, rustix 1.1.5, scopeguard 1.2.0, smallvec 1.16.2, stable_deref_trait 1.2.1, static_assertions 1.1.0, system-deps 7.0.8, system-deps 9.0.0, thread_local 1.1.10, unicode-width 0.2.2, utf8_iter 1.0.4, x11rb 0.14.0, x11rb-protocol 0.14.0
+Applies to: arrayvec 0.7.8, audioadapter 5.0.0, audioadapter-buffers 5.2.0, audioadapter-sample 5.2.0, autocfg 1.5.1, base64 0.22.1, bit-set 0.10.0, bit-vec 0.9.1, bitflags 1.3.2, bitflags 2.13.2, bytemuck 1.25.2, bytemuck_derive 1.12.1, cc 1.6.0, cexpr 0.6.0, cfg-expr 0.20.10, cfg-if 1.0.5, clang-sys 1.9.1, clap-sys 0.5.0, codespan-reporting 0.13.1, core_detect 1.0.0, cpal 0.18.2, displaydoc 0.2.7, document-features 0.2.12, either 1.18.0, encoding_rs 0.8.42, equivalent 1.0.2, errno 0.3.14, euclid 0.22.14, find-msvc-tools 0.1.14, flate2 1.1.10, fontique 0.11.1, gethostname 1.1.0, glob 0.3.4, glow 0.17.0, hashbrown 0.16.1, hashbrown 0.17.1, heck 0.5.0, indexmap 2.14.2, itertools 0.13.0, khronos-egl 6.0.0, kurbo 0.13.1, lazy_static 1.5.1, linux-raw-sys 0.12.1, lock_api 0.4.14, log 0.4.34, matrixmultiply 0.3.11, minimal-lexical 0.2.1, multiversion_no_op 1.0.0, ndarray 0.17.2, num-complex 0.4.6, num-integer 0.1.47, num-traits 0.2.19, once_cell 1.21.4, parking_lot 0.12.5, parking_lot_core 0.9.12, parlance 0.1.0, parley 0.11.1, parley_data 0.11.1, peniko 0.6.1, pkg-config 0.3.34, png 0.18.1, pollster 0.4.0, polycool 0.4.0, presser 0.3.1, primal-check 0.3.4, rawpointer 0.2.1, regex 1.13.1, regex-automata 0.4.18, regex-lite 0.1.9, regex-syntax 0.8.11, renderdoc-sys 1.1.0, roxmltree 0.21.1, rtrb 0.4.0, rubato 5.0.1, rustc-hash 1.1.0, rustc_version 0.4.1, rustix 1.1.5, scopeguard 1.2.0, smallvec 1.16.2, stable_deref_trait 1.2.1, static_assertions 1.1.0, system-deps 7.0.8, system-deps 9.0.0, thread_local 1.1.10, unicode-width 0.2.2, utf8_iter 1.0.4, x11rb 0.14.0, x11rb-protocol 0.14.0
 
 ```text
 Apache License
@@ -2009,6 +2015,38 @@ You may choose either license, at your option.
 
 ### LICENSE-MIT
 
+Applies to: either 1.18.0, itertools 0.13.0, rawpointer 0.2.1
+
+```text
+Copyright (c) 2015
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+```
+
+### LICENSE-MIT
+
 Applies to: encoding_rs 0.8.42, multiversion_no_op 1.0.0, utf8_iter 1.0.4
 
 ```text
@@ -2742,38 +2780,6 @@ DEALINGS IN THE SOFTWARE.
 
 ### LICENSE-MIT
 
-Applies to: either 1.18.0, itertools 0.13.0
-
-```text
-Copyright (c) 2015
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-```
-
-### LICENSE-MIT
-
 Applies to: hashbrown 0.16.1, hashbrown 0.17.1
 
 ```text
@@ -3336,11 +3342,12 @@ SOFTWARE.
 
 ### LICENSE-SADIE.txt
 
-Applies to: SADIE II head-related impulse responses (KU100, University of York) (vendored)
+Applies to: SADIE II head-related impulse responses (KU100, KEMAR, 18 listeners; University of York) (vendored)
 
 ```text
-sadie-d1.ffhr is derived from the SADIE II database (University of York):
-the KU100 dummy head's HRIRs (subject D1) at 44.1, 48 and 96 kHz.
+The sadie-*.ffhr files are derived from the SADIE II database (University
+of York): the HRIRs of the KU100 (subject D1) and KEMAR (D2) dummy heads
+and of the listeners H3 to H20, at 44.1, 48 and 96 kHz.
 
     Copyright 2018, University of York
     Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -3352,9 +3359,10 @@ the KU100 dummy head's HRIRs (subject D1) at 44.1, 48 and 96 kHz.
     See the License for the specific language governing permissions and
     limitations under the License.
 
-Modified by FaderFrame (scripts/binaural_hrirs.py): fifteen directions
-chosen from the 8802 measured, trimmed by their common onset, shortened to
-192 (384) taps with a fade, normalised to unity at 1 kHz at the front.
+Modified by FaderFrame (scripts/binaural_hrirs.py): for each subject
+fifteen directions chosen from those measured (8802 for the dummy heads,
+2818 for the listeners), trimmed by their common onset, shortened to 192
+(384) taps with a fade, normalised to unity at 1 kHz at the front.
 
 Source: https://zenodo.org/records/10886409 (SADIE II Database, v2-1).
 Please cite: C. Armstrong, L. Thresh, D. Murphy, G. Kearney, "A Perceptual
@@ -5668,6 +5676,68 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
+### LICENSE
+
+Applies to: lru 0.16.4
+
+```text
+MIT License
+
+Copyright (c) 2016 Jerome Froelich
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### LICENSE-MIT
+
+Applies to: matrixmultiply 0.3.11
+
+```text
+Copyright (c) 2016 - 2023 Ulrik Sverdrup "bluss"
+Copyirhgt (c) 2018 R. Janis Goldschmidt
+Copyright (c) 2021 DutchGhost [constparse.rs]
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+```
+
 ### LICENSE-APACHE
 
 Applies to: memmap2 0.9.11
@@ -6005,6 +6075,40 @@ DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
 THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+### LICENSE-MIT
+
+Applies to: ndarray 0.17.2
+
+```text
+Copyright (c) 2015 - 2021 Ulrik Sverdrup "bluss",
+			  Jim Turner,
+			  and ndarray developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
 ```
 
 ### LICENSE

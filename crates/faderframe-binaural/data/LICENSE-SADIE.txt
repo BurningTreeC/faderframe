@@ -1,5 +1,6 @@
-sadie-d1.ffhr is derived from the SADIE II database (University of York):
-the KU100 dummy head's HRIRs (subject D1) at 44.1, 48 and 96 kHz.
+The sadie-*.ffhr files are derived from the SADIE II database (University
+of York): the HRIRs of the KU100 (subject D1) and KEMAR (D2) dummy heads
+and of the listeners H3 to H20, at 44.1, 48 and 96 kHz.
 
     Copyright 2018, University of York
     Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -11,9 +12,10 @@ the KU100 dummy head's HRIRs (subject D1) at 44.1, 48 and 96 kHz.
     See the License for the specific language governing permissions and
     limitations under the License.
 
-Modified by FaderFrame (scripts/binaural_hrirs.py): fifteen directions
-chosen from the 8802 measured, trimmed by their common onset, shortened to
-192 (384) taps with a fade, normalised to unity at 1 kHz at the front.
+Modified by FaderFrame (scripts/binaural_hrirs.py): for each subject
+fifteen directions chosen from those measured (8802 for the dummy heads,
+2818 for the listeners), trimmed by their common onset, shortened to 192
+(384) taps with a fade, normalised to unity at 1 kHz at the front.
 
 Source: https://zenodo.org/records/10886409 (SADIE II Database, v2-1).
 Please cite: C. Armstrong, L. Thresh, D. Murphy, G. Kearney, "A Perceptual

@@ -1760,7 +1760,9 @@ impl MixerView {
             items.push(MenuItem::submenu("Headphone Render (Dolby)", render));
         }
         if t.kind == TrackKind::Master {
-            items.push(MenuItem::submenu("Listen", choices(model.listen_choices())).separated());
+            let mut listen = choices(model.listen_choices());
+            listen.push(MenuItem::submenu("Head", choices(model.head_choices())).separated());
+            items.push(MenuItem::submenu("Listen", listen).separated());
         }
         if t.kind != TrackKind::Master {
             let now = model.strip_width(t.id);

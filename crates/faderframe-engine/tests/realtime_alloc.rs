@@ -2342,9 +2342,19 @@ fn surround_strips_do_not_allocate() {
         ..EngineConfig::default()
     };
     let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 6).unwrap();
-    // Heard on headphones (with a room) and in mono.
+    // Heard on headphones (with a room, another head, a correction of
+    // filters and a graphic EQ) and in mono.
     r.controller
         .set_binaural(Some(faderframe_binaural::Room::Mid));
+    r.controller
+        .set_head(faderframe_binaural::Head::builtin("sadie-h5").unwrap());
+    r.controller.set_headphone_correction(Some(std::sync::Arc::new(
+        faderframe_binaural::Correction::parse(
+            "test",
+            "Preamp: -3 dB\nFilter 1: ON PK Fc 1000 Hz Gain 3 dB Q 1\nGraphicEQ: 20 0; 1000 2; 20000 -2",
+        )
+        .unwrap(),
+    )));
     r.controller
         .sync(&tp.project, &tp.sources, faderframe_project::Impact::Graph)
         .unwrap();

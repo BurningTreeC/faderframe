@@ -1165,13 +1165,15 @@ pub fn open_menu() -> Option<(gtk::Popover, String)> {
     })
 }
 
-/// Click the entry of the open context menu's shown level whose label
-/// contains `label` (as a pointer click would; scripted checks).
+/// Click the entry of the open context menu's shown level labelled
+/// `label` — or, failing that, the first whose label contains it (as a
+/// pointer click would; scripted checks).
 pub fn activate_menu_entry(label: &str) -> bool {
     let Some(page) = OPEN_MENU.with(|m| m.borrow().as_ref().and_then(|(_, s)| s.visible_child()))
     else {
         return false;
     };
+    let mut entries = Vec::new();
     let mut child = page.first_child();
     while let Some(c) = child {
         if let Ok(button) = c.clone().downcast::<gtk::Button>()
@@ -1179,14 +1181,26 @@ pub fn activate_menu_entry(label: &str) -> bool {
                 .child()
                 .and_then(|l| l.downcast::<gtk::Label>().ok())
                 .map(|l| l.text())
-            && text.contains(label)
         {
-            button.emit_clicked();
-            return true;
+            entries.push((button, text));
         }
         child = c.next_sibling();
     }
-    false
+    // Without the check mark and the submenu arrow.
+    let bare = |t: &str| {
+        t.trim_start_matches(['✓', ' '])
+            .trim_end_matches(['›', ' '])
+            .to_string()
+    };
+    let exact = entries.iter().position(|(_, t)| bare(t) == label);
+    let found = exact.or_else(|| entries.iter().position(|(_, t)| t.contains(label)));
+    match found {
+        Some(i) => {
+            entries[i].0.emit_clicked();
+            true
+        }
+        None => false,
+    }
 }
 
 /// The stack page of the menu level at `path` (indices into submenus).

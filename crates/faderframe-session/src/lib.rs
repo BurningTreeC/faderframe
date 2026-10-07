@@ -43,6 +43,7 @@ pub mod groove;
 mod groups;
 pub mod lanes;
 pub mod launcher;
+pub mod listening;
 mod programs;
 mod redraw;
 pub mod samples;
@@ -336,6 +337,10 @@ pub enum Action {
     SetMonoCheck(bool),
     /// Listen on headphones (binaural, with a room) or speakers (`None`).
     SetHeadphones(Option<faderframe_binaural::Room>),
+    /// Listen through a head (a built-in id, or `sofa:<path>`).
+    SetHead(String),
+    /// Even out the headphones with a correction file (`None`: none).
+    SetHeadphoneCorrection(Option<std::path::PathBuf>),
     /// Download the speech model (Whisper) once.
     DownloadSpeechModel,
     /// Transcribe an audio clip's words into the lyrics.
@@ -1094,6 +1099,8 @@ pub struct Session {
     bounces: Vec<freeze::PendingBounce>,
     /// The mono check is on (listening only).
     mono_check: bool,
+    /// The headphone correction's file.
+    correction_path: Option<std::path::PathBuf>,
     /// ADM BWF files being read.
     adm_imports: Vec<adm::ImportJob>,
     samplings: Vec<sampling::PendingSample>,
@@ -1319,6 +1326,7 @@ impl Session {
             gesture_base: HashMap::new(),
             bounces: Vec::new(),
             mono_check: false,
+            correction_path: None,
             adm_imports: Vec::new(),
             samplings: Vec::new(),
             capture: capture::CaptureBuffer::default(),
@@ -1910,8 +1918,13 @@ impl Session {
     /// Start an offline render of the current project state.
     pub fn render(
         &mut self,
-        settings: render::RenderSettings,
+        mut settings: render::RenderSettings,
     ) -> std::result::Result<render::RenderJob, render::RenderError> {
+        if matches!(settings.channels, render::RenderChannels::Binaural(_))
+            && settings.head.is_none()
+        {
+            settings.head = Some(self.head().clone());
+        }
         render::start(self.render_copy(), settings)
     }
 
@@ -3094,6 +3107,10 @@ impl Session {
             Action::ImportAdm(path) => self.start_adm_import(path),
             Action::SetMonoCheck(on) => self.set_mono_check(on)?,
             Action::SetHeadphones(room) => self.set_headphones(room)?,
+            Action::SetHead(id) => self.set_head(&id)?,
+            Action::SetHeadphoneCorrection(path) => {
+                self.set_headphone_correction(path.as_deref())?
+            }
             Action::ShowSurroundPanner(track) => {
                 self.dispatch(Action::SelectTracks {
                     tracks: vec![track],

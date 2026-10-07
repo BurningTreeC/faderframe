@@ -81,6 +81,9 @@ pub struct RenderSettings {
     /// frozen track claims it, so it plays exactly as before). Otherwise
     /// it is taken off and the file starts where the range does.
     pub keep_latency: bool,
+    /// The head a binaural render listens through (`None`: the KU100;
+    /// `Session::render` fills in the one listened with).
+    pub head: Option<faderframe_binaural::Head>,
     /// File for a master render, directory for stems.
     pub output: PathBuf,
 }
@@ -103,6 +106,7 @@ impl RenderSettings {
             dither: Dither::Tpdf,
             report: true,
             keep_latency: false,
+            head: None,
             output,
         }
     }
@@ -312,7 +316,10 @@ fn render_one(
     frames: usize,
     progress: &RenderProgress,
     outputs: usize,
-    binaural: Option<faderframe_binaural::Room>,
+    binaural: Option<(
+        faderframe_binaural::Room,
+        Option<&faderframe_binaural::Head>,
+    )>,
     keep_latency: bool,
 ) -> Result<Vec<Vec<f32>>, RenderError> {
     let config = EngineConfig {
@@ -322,8 +329,13 @@ fn render_one(
         ..EngineConfig::default()
     };
     let mut r = OfflineRenderer::new(project, sources, config, 1024, outputs.max(1))?;
-    if binaural.is_some() {
-        r.controller.set_binaural(binaural);
+    if let Some((room, head)) = binaural {
+        // As heard, without the listener's headphone correction (it is
+        // theirs, not the mix's).
+        r.controller.set_binaural(Some(room));
+        if let Some(h) = head {
+            r.controller.set_head(h.clone());
+        }
         r.controller
             .sync(project, sources, faderframe_project::Impact::Graph)?;
     }
@@ -639,7 +651,7 @@ pub fn start(project: Project, settings: RenderSettings) -> Result<RenderJob, Re
                 .flatten();
             let outputs = bed.map_or(2, |f| f.channels());
             let binaural = match settings.channels {
-                RenderChannels::Binaural(room) => Some(room),
+                RenderChannels::Binaural(room) => Some((room, settings.head.as_ref())),
                 _ => None,
             };
             let mask = bed.map(faderframe_core::SurroundFormat::channel_mask);

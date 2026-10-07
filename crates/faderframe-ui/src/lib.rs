@@ -132,6 +132,7 @@ fn build_session(options: &RunOptions, prefs: &prefs::Preferences) -> (Session, 
     {
         tracing::warn!("render ahead: {e}");
     }
+    listen::apply_preferences(&mut session, prefs);
     let room = prefs
         .headphones
         .as_deref()

@@ -168,7 +168,9 @@ Contrast:
   the master is rendered binaurally (measured KU100 responses, SADIE II;
   Near, Mid or Far), and a MONO button on the master strip checks the mix
   in mono — both for listening only (Audio → Listen); a binaural render is
-  a render option.
+  a render option. Heads: two dummy heads and eighteen measured listeners
+  to choose from by ear, or your own as a SOFA file; headphone correction
+  from EqualizerAPO/AutoEq presets or an impulse response.
 * Analogue-console mixer: inserts, sends (pre-FX / pre / post), pan, M/S/R,
   faders with a console fader law, segmented peak meters, routing menus,
   any number of sends per channel (rows grow, ◂ ▸ pages through banks),
