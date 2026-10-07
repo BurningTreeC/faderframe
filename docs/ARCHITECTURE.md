@@ -1335,6 +1335,30 @@ Book rules, every checksum) before the export reports success. The layout
 follows the open description of the ddp-reverse-eng project (MIT); the
 crate's tests compare every descriptor file byte for byte with reference
 filesets recorded there (`crates/faderframe-disc/tests/reference`).
+
+**CD-Text languages.** The release's text may come in up to eight
+languages: `AlbumInfo::language` is the main one (CD-Text block 0,
+English by default) and `AlbumInfo::translations` the others — per
+language the album's title and credits and the songs' (`SongText` by song
+id), a field left empty being the main text's (`album::fall_back`). The
+Details form (File → Album → Release…/a song's Details) chooses the
+language shown, adds and removes languages and sets the main one;
+`AlbumAction::Texts` saves the release and a song in one step and drops
+duplicate languages. `album_master::disc` turns them into
+`faderframe_disc::TextBlock`s; `cdtext::packs` writes a block per
+language (sequence numbers from 0 in each, the block number in bits 4–6
+of the fourth header byte, three size packs per block with its character
+code and the last sequence numbers and languages of all blocks — after
+libburn's description of MMC-3 Annex J and Sony's format). Latin-script
+languages are ISO 8859-1; Japanese is MS-JIS, double-byte (bit 7, two
+NULs end a string), every character two bytes (ASCII full-width) so the
+stream stays on character boundaries. `cdtext::decode_blocks` reads every
+block (`ddp::read` fills `Disc::text_language`/`more_text`). Checked
+against libcdio's parser (`cdtext_data_init`): all blocks, languages and
+Japanese text decode; libcdio takes the character code of the last
+block's size information for every block, so it misreads a Latin-1 block
+when a Japanese one follows. Cue sheets carry the main language only.
+Validation: at most eight languages, none twice, 256 packs per block.
 `Session::album_delivered` previews the gains from the analyses (album
 loudness approximated from the songs' loudness and length).
 
@@ -2578,7 +2602,8 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
    cache locality~~ (done: see *Affinity*), ~~an optional wgpu painter for
    dense views~~ (done: see *The GPU painter*; a dmabuf instead of the
    readback is the next step there).
-10. **Mastering**: multiple CD-Text languages, a DDP player/import;
+10. **Mastering**: ~~multiple CD-Text languages~~ (done: see *CD-Text
+    languages*), a DDP player/import;
     surround beds and panning before any object-based format.
 
 

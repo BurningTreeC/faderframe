@@ -24,7 +24,7 @@ time; binary distributions that bundle them (e.g. Windows or macOS
 installers) must ship their license texts and comply with the LGPL's
 relinking provisions.
 
-## Rust crates (270)
+## Rust crates (275)
 
 Crates under the MPL-2.0 (the Symphonia audio decoders) are file-level
 copyleft: FaderFrame uses them unmodified from crates.io, where their
@@ -72,6 +72,7 @@ published under the MPL-2.0 as well.
 | color | 0.3.3 | Apache-2.0 OR MIT | https://github.com/linebender/color |
 | com-scrape-types | 0.1.1 | MIT OR Apache-2.0 | https://github.com/coupler-rs/vst3-rs |
 | cookie-factory | 0.3.3 | MIT | https://github.com/rust-bakery/cookie-factory |
+| core_detect | 1.0.0 | MIT/Apache-2.0 | https://github.com/thomcc/core_detect |
 | cpal | 0.18.2 | Apache-2.0 | https://github.com/RustAudio/cpal |
 | crc32fast | 1.5.2 | MIT OR Apache-2.0 | https://github.com/srijs/rust-crc32fast |
 | dasp_sample | 0.11.0 | MIT OR Apache-2.0 | https://github.com/rustaudio/sample.git |
@@ -79,6 +80,7 @@ published under the MPL-2.0 as well.
 | dlib | 0.5.3 | MIT | https://github.com/elinorbgr/dlib |
 | document-features | 0.2.12 | MIT OR Apache-2.0 | https://github.com/slint-ui/document-features |
 | either | 1.18.0 | MIT OR Apache-2.0 | https://github.com/rayon-rs/either |
+| encoding_rs | 0.8.42 | (Apache-2.0 OR MIT) AND BSD-3-Clause | https://github.com/hsivonen/encoding_rs |
 | equivalent | 1.0.2 | Apache-2.0 OR MIT | https://github.com/indexmap-rs/equivalent |
 | errno | 0.3.14 | MIT OR Apache-2.0 | https://github.com/lambda-fairy/rust-errno |
 | euclid | 0.22.14 | MIT OR Apache-2.0 | https://github.com/servo/euclid |
@@ -167,6 +169,7 @@ published under the MPL-2.0 as well.
 | minimal-lexical | 0.2.1 | MIT/Apache-2.0 | https://github.com/Alexhuszagh/minimal-lexical |
 | miniz_oxide | 0.8.9 | MIT OR Zlib OR Apache-2.0 | https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide |
 | miniz_oxide | 0.9.1 | MIT OR Zlib OR Apache-2.0 | https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide |
+| multiversion_no_op | 1.0.0 | Apache-2.0 OR MIT | https://github.com/hsivonen/multiversion_no_op |
 | naga | 30.0.1 | MIT OR Apache-2.0 | https://github.com/gfx-rs/wgpu |
 | naga-types | 30.0.1 | MIT OR Apache-2.0 | https://github.com/gfx-rs/wgpu |
 | nom | 7.1.3 | MIT | https://github.com/Geal/nom |
@@ -214,6 +217,7 @@ published under the MPL-2.0 as well.
 | rustc_version | 0.4.1 | MIT OR Apache-2.0 | https://github.com/djc/rustc-version-rs |
 | rustfft | 6.4.1 | MIT OR Apache-2.0 | https://github.com/ejmahler/RustFFT |
 | rustix | 1.1.5 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://github.com/bytecodealliance/rustix |
+| rustversion | 1.0.23 | MIT OR Apache-2.0 | https://github.com/dtolnay/rustversion |
 | scopeguard | 1.2.0 | MIT OR Apache-2.0 | https://github.com/bluss/scopeguard |
 | semver | 1.0.28 | MIT OR Apache-2.0 | https://github.com/dtolnay/semver |
 | serde | 1.0.229 | MIT OR Apache-2.0 | https://github.com/serde-rs/serde |
@@ -225,6 +229,7 @@ published under the MPL-2.0 as well.
 | shlex | 1.3.0 | MIT OR Apache-2.0 | https://github.com/comex/rust-shlex |
 | shlex | 2.0.1 | MIT OR Apache-2.0 | https://github.com/comex/rust-shlex |
 | simd-adler32 | 0.3.10 | MIT | https://github.com/mcountryman/simd-adler32 |
+| simdutf8 | 0.1.5 | MIT OR Apache-2.0 | https://github.com/rusticstuff/simdutf8 |
 | skrifa | 0.44.0 | MIT OR Apache-2.0 | https://github.com/googlefonts/fontations |
 | slab | 0.4.12 | MIT | https://github.com/tokio-rs/slab |
 | smallvec | 1.16.2 | MIT OR Apache-2.0 | https://github.com/servo/rust-smallvec |
@@ -322,7 +327,7 @@ com-scrape-types 0.1.1, cookie-factory 0.3.3, dasp_sample 0.11.0, midly 0.5.3, p
 
 ### LICENSE-APACHE
 
-Applies to: arrayvec 0.7.8, audioadapter 5.0.0, audioadapter-buffers 5.2.0, audioadapter-sample 5.2.0, autocfg 1.5.1, base64 0.22.1, bit-set 0.10.0, bit-vec 0.9.1, bitflags 1.3.2, bitflags 2.13.2, bytemuck 1.25.2, bytemuck_derive 1.12.1, cc 1.6.0, cexpr 0.6.0, cfg-expr 0.20.10, cfg-if 1.0.5, clang-sys 1.9.1, clap-sys 0.5.0, codespan-reporting 0.13.1, cpal 0.18.2, displaydoc 0.2.7, document-features 0.2.12, either 1.18.0, equivalent 1.0.2, errno 0.3.14, euclid 0.22.14, find-msvc-tools 0.1.14, flate2 1.1.10, fontique 0.11.1, gethostname 1.1.0, glob 0.3.4, glow 0.17.0, hashbrown 0.16.1, hashbrown 0.17.1, heck 0.5.0, indexmap 2.14.2, itertools 0.13.0, khronos-egl 6.0.0, kurbo 0.13.1, lazy_static 1.5.1, linux-raw-sys 0.12.1, lock_api 0.4.14, log 0.4.34, minimal-lexical 0.2.1, num-complex 0.4.6, num-integer 0.1.47, num-traits 0.2.19, once_cell 1.21.4, parking_lot 0.12.5, parking_lot_core 0.9.12, parlance 0.1.0, parley 0.11.1, parley_data 0.11.1, peniko 0.6.1, pkg-config 0.3.34, png 0.18.1, pollster 0.4.0, polycool 0.4.0, presser 0.3.1, primal-check 0.3.4, regex 1.13.1, regex-automata 0.4.18, regex-lite 0.1.9, regex-syntax 0.8.11, renderdoc-sys 1.1.0, rtrb 0.4.0, rubato 5.0.1, rustc-hash 1.1.0, rustc_version 0.4.1, rustix 1.1.5, scopeguard 1.2.0, smallvec 1.16.2, stable_deref_trait 1.2.1, static_assertions 1.1.0, system-deps 7.0.8, system-deps 9.0.0, thread_local 1.1.10, unicode-width 0.2.2, utf8_iter 1.0.4, x11rb 0.14.0, x11rb-protocol 0.14.0
+Applies to: arrayvec 0.7.8, audioadapter 5.0.0, audioadapter-buffers 5.2.0, audioadapter-sample 5.2.0, autocfg 1.5.1, base64 0.22.1, bit-set 0.10.0, bit-vec 0.9.1, bitflags 1.3.2, bitflags 2.13.2, bytemuck 1.25.2, bytemuck_derive 1.12.1, cc 1.6.0, cexpr 0.6.0, cfg-expr 0.20.10, cfg-if 1.0.5, clang-sys 1.9.1, clap-sys 0.5.0, codespan-reporting 0.13.1, core_detect 1.0.0, cpal 0.18.2, displaydoc 0.2.7, document-features 0.2.12, either 1.18.0, encoding_rs 0.8.42, equivalent 1.0.2, errno 0.3.14, euclid 0.22.14, find-msvc-tools 0.1.14, flate2 1.1.10, fontique 0.11.1, gethostname 1.1.0, glob 0.3.4, glow 0.17.0, hashbrown 0.16.1, hashbrown 0.17.1, heck 0.5.0, indexmap 2.14.2, itertools 0.13.0, khronos-egl 6.0.0, kurbo 0.13.1, lazy_static 1.5.1, linux-raw-sys 0.12.1, lock_api 0.4.14, log 0.4.34, minimal-lexical 0.2.1, multiversion_no_op 1.0.0, num-complex 0.4.6, num-integer 0.1.47, num-traits 0.2.19, once_cell 1.21.4, parking_lot 0.12.5, parking_lot_core 0.9.12, parlance 0.1.0, parley 0.11.1, parley_data 0.11.1, peniko 0.6.1, pkg-config 0.3.34, png 0.18.1, pollster 0.4.0, polycool 0.4.0, presser 0.3.1, primal-check 0.3.4, regex 1.13.1, regex-automata 0.4.18, regex-lite 0.1.9, regex-syntax 0.8.11, renderdoc-sys 1.1.0, rtrb 0.4.0, rubato 5.0.1, rustc-hash 1.1.0, rustc_version 0.4.1, rustix 1.1.5, scopeguard 1.2.0, smallvec 1.16.2, stable_deref_trait 1.2.1, static_assertions 1.1.0, system-deps 7.0.8, system-deps 9.0.0, thread_local 1.1.10, unicode-width 0.2.2, utf8_iter 1.0.4, x11rb 0.14.0, x11rb-protocol 0.14.0
 
 ```text
 Apache License
@@ -530,7 +535,7 @@ limitations under the License.
 
 ### LICENSE-MIT
 
-Applies to: adler2 2.0.1, allocator-api2 0.2.21, cairo-rs 0.22.9, cairo-sys-rs 0.22.9, clap-sys 0.5.0, displaydoc 0.2.7, gdk-pixbuf 0.22.0, gdk-pixbuf-sys 0.22.9, gdk4 0.11.5, gdk4-sys 0.11.5, gio 0.22.10, gio-sys 0.22.9, glib 0.22.10, glib-macros 0.22.9, glib-sys 0.22.9, glib-unix 0.22.8, glib-unix-sys 0.22.9, glow 0.17.0, gobject-sys 0.22.9, graphene-rs 0.22.8, graphene-sys 0.22.9, gsk4 0.11.5, gsk4-sys 0.11.5, gtk4 0.11.5, gtk4-macros 0.11.5, gtk4-sys 0.11.5, itoa 1.0.18, khronos-egl 6.0.0, lazy_static 1.5.1, linux-raw-sys 0.12.1, minimal-lexical 0.2.1, once_cell 1.21.4, pango 0.22.9, pango-sys 0.22.9, pin-project-lite 0.2.17, proc-macro-crate 3.5.0, proc-macro2 1.0.107, quote 1.0.47, rtrb 0.4.0, rustc-hash 1.1.0, rustc-hash 2.1.3, rustix 1.1.5, semver 1.0.28, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_json 1.0.151, syn 2.0.119, syn 3.0.6, system-deps 7.0.8, system-deps 9.0.0, thiserror 2.0.21, thiserror-impl 2.0.21, unicode-ident 1.0.26, vst3 0.3.0, winnow 1.0.4, zmij 1.0.23
+Applies to: adler2 2.0.1, allocator-api2 0.2.21, cairo-rs 0.22.9, cairo-sys-rs 0.22.9, clap-sys 0.5.0, displaydoc 0.2.7, gdk-pixbuf 0.22.0, gdk-pixbuf-sys 0.22.9, gdk4 0.11.5, gdk4-sys 0.11.5, gio 0.22.10, gio-sys 0.22.9, glib 0.22.10, glib-macros 0.22.9, glib-sys 0.22.9, glib-unix 0.22.8, glib-unix-sys 0.22.9, glow 0.17.0, gobject-sys 0.22.9, graphene-rs 0.22.8, graphene-sys 0.22.9, gsk4 0.11.5, gsk4-sys 0.11.5, gtk4 0.11.5, gtk4-macros 0.11.5, gtk4-sys 0.11.5, itoa 1.0.18, khronos-egl 6.0.0, lazy_static 1.5.1, linux-raw-sys 0.12.1, minimal-lexical 0.2.1, once_cell 1.21.4, pango 0.22.9, pango-sys 0.22.9, pin-project-lite 0.2.17, proc-macro-crate 3.5.0, proc-macro2 1.0.107, quote 1.0.47, rtrb 0.4.0, rustc-hash 1.1.0, rustc-hash 2.1.3, rustix 1.1.5, rustversion 1.0.23, semver 1.0.28, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_json 1.0.151, syn 2.0.119, syn 3.0.6, system-deps 7.0.8, system-deps 9.0.0, thiserror 2.0.21, thiserror-impl 2.0.21, unicode-ident 1.0.26, vst3 0.3.0, winnow 1.0.4, zmij 1.0.23
 
 ```text
 Permission is hereby granted, free of charge, to any
@@ -560,7 +565,7 @@ DEALINGS IN THE SOFTWARE.
 
 ### LICENSE-APACHE
 
-Applies to: allocator-api2 0.2.21, alsa 0.11.0, audio-codec-algorithms 0.8.1, clack-common 0.2.0, clack-extensions 0.2.0, clack-host 0.2.0, clack-plugin 0.2.0, color 0.3.3, fdeflate 0.3.7, field-offset 0.3.6, half 2.7.1, itoa 1.0.18, libc 0.2.190, linebender_resource_handle 0.1.1, litrs 1.0.0, miniz_oxide 0.8.9, miniz_oxide 0.9.1, naga 30.0.1, naga-types 30.0.1, pin-project-lite 0.2.17, proc-macro2 1.0.107, quote 1.0.47, raw-window-handle 0.6.2, rustc-hash 2.1.3, semver 1.0.28, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_json 1.0.151, syn 2.0.119, syn 3.0.6, thiserror 2.0.21, thiserror-impl 2.0.21, unicode-ident 1.0.26, vello 0.11.0, vello_encoding 0.11.0, vello_shaders 0.11.0, vst3 0.3.0, wgpu 30.0.1, wgpu-core 30.0.1, wgpu-core-deps-windows-linux-android 30.0.1, wgpu-hal 30.0.1, wgpu-naga-bridge 30.0.1, wgpu-types 30.0.1
+Applies to: allocator-api2 0.2.21, alsa 0.11.0, audio-codec-algorithms 0.8.1, clack-common 0.2.0, clack-extensions 0.2.0, clack-host 0.2.0, clack-plugin 0.2.0, color 0.3.3, fdeflate 0.3.7, field-offset 0.3.6, half 2.7.1, itoa 1.0.18, libc 0.2.190, linebender_resource_handle 0.1.1, litrs 1.0.0, miniz_oxide 0.8.9, miniz_oxide 0.9.1, naga 30.0.1, naga-types 30.0.1, pin-project-lite 0.2.17, proc-macro2 1.0.107, quote 1.0.47, raw-window-handle 0.6.2, rustc-hash 2.1.3, rustversion 1.0.23, semver 1.0.28, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_json 1.0.151, simdutf8 0.1.5, syn 2.0.119, syn 3.0.6, thiserror 2.0.21, thiserror-impl 2.0.21, unicode-ident 1.0.26, vello 0.11.0, vello_encoding 0.11.0, vello_shaders 0.11.0, vst3 0.3.0, wgpu 30.0.1, wgpu-core 30.0.1, wgpu-core-deps-windows-linux-android 30.0.1, wgpu-hal 30.0.1, wgpu-naga-bridge 30.0.1, wgpu-types 30.0.1
 
 ```text
 Apache License
@@ -1712,6 +1717,32 @@ DEALINGS IN THE SOFTWARE.
 
 ### LICENSE-MIT
 
+Applies to: color 0.3.3, fdeflate 0.3.7, half 2.7.1, linebender_resource_handle 0.1.1, simdutf8 0.1.5
+
+```text
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### LICENSE-MIT
+
 Applies to: lock_api 0.4.14, parking_lot 0.12.5, parking_lot_core 0.9.12, rustc_version 0.4.1, thread_local 1.1.10
 
 ```text
@@ -1836,32 +1867,6 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
-```
-
-### LICENSE-MIT
-
-Applies to: color 0.3.3, fdeflate 0.3.7, half 2.7.1, linebender_resource_handle 0.1.1
-
-```text
-MIT License
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
 ```
 
 ### LICENSE
@@ -1998,6 +2003,38 @@ This crate is dual-licensed under either of:
 - MIT license (see `LICENSE-MIT`)
 
 You may choose either license, at your option.
+```
+
+### LICENSE-MIT
+
+Applies to: encoding_rs 0.8.42, multiversion_no_op 1.0.0, utf8_iter 1.0.4
+
+```text
+Copyright Mozilla Foundation
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
 ```
 
 ### LICENSE-APACHE
@@ -4038,6 +4075,38 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 
 ### LICENSE-MIT
 
+Applies to: core_detect 1.0.0
+
+```text
+Copyright (c) 2017-2020 The Rust Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+```
+
+### LICENSE-MIT
+
 Applies to: crc32fast 1.5.2
 
 ```text
@@ -4114,6 +4183,39 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+```
+
+### LICENSE-WHATWG
+
+Applies to: encoding_rs 0.8.42
+
+```text
+Copyright © WHATWG (Apple, Google, Mozilla, Microsoft).
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
 ### LICENSE-MIT
@@ -6426,38 +6528,6 @@ Except as contained in this notice, the name of a copyright holder shall
 not be used in advertising or otherwise to promote the sale, use or other
 dealings in these Data Files or Software without prior written
 authorization of the copyright holder.
-```
-
-### LICENSE-MIT
-
-Applies to: utf8_iter 1.0.4
-
-```text
-Copyright Mozilla Foundation
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
 ```
 
 ### LICENSE

@@ -12,3 +12,5 @@ workspace = true
 
 [dependencies]
 thiserror.workspace = true
+# Shift-JIS for Japanese CD-Text (MS-JIS blocks).
+encoding_rs = "0.8"

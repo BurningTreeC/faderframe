@@ -665,38 +665,60 @@ fn name_prompt(
 /// (title, ISRC, credits) for the cue sheet, CD-Text and the CD master's
 /// codes. Codes are checked before anything is changed.
 pub fn album_details(app: &Rc<AppState>, song: Option<faderframe_core::SongId>) {
-    use faderframe_project::album::Credits;
-    use faderframe_session::album::{AlbumAction, normalize_isrc, normalize_upc};
+    album_details_in(app, song, None);
+}
+
+/// The details form showing the text in `language` (`None`: the main one;
+/// a translation into it is made when missing).
+pub fn album_details_in(
+    app: &Rc<AppState>,
+    song: Option<faderframe_core::SongId>,
+    language: Option<u8>,
+) {
+    use faderframe_project::album::{AlbumInfo, Credits, Song};
+    use faderframe_session::album::{AlbumAction, Language, normalize_isrc, normalize_upc};
     let Some(main) = app.window.borrow().clone() else {
         return;
     };
-    let (title, credits, code, heading) = {
+    /// What the form edits: the release's information with its
+    /// translations and (for a song's form) the song; the language shown
+    /// (`None`: the main one).
+    struct Edit {
+        info: AlbumInfo,
+        song: Option<Song>,
+        current: Option<u8>,
+    }
+    let (info, song_now, heading) = {
         let s = app.session.borrow();
         let album = &s.project().album;
-        match song.and_then(|id| album.song(id)) {
-            Some(x) => (
-                x.title.clone(),
-                x.credits.clone(),
-                x.isrc.clone(),
+        match song.map(|id| album.song(id)) {
+            Some(Some(x)) => (
+                album.info.clone(),
+                Some(x.clone()),
                 format!("Song — {}", x.title),
             ),
-            None if song.is_some() => return,
-            None => (
-                album.info.title.clone(),
-                album.info.credits.clone(),
-                album.info.upc.clone(),
-                "Release".to_string(),
-            ),
+            Some(None) => return,
+            None => (album.info.clone(), None, "Release".to_string()),
         }
     };
     let project_name = app.session.borrow().project().name.clone();
+    let mut info = info;
+    let current = language.filter(|l| *l != info.language);
+    if let Some(l) = current {
+        info.translation_mut(l);
+    }
+    let edit = Rc::new(std::cell::RefCell::new(Edit {
+        info,
+        song: song_now,
+        current,
+    }));
     let win = gtk::Window::builder()
         .application(&app.app)
         .title(format!("{heading} — Details"))
         .modal(true)
         .transient_for(&main)
         .resizable(false)
-        .default_width(440)
+        .default_width(460)
         .build();
     let body = gtk::Box::new(gtk::Orientation::Vertical, 10);
     body.set_margin_top(14);
@@ -706,36 +728,53 @@ pub fn album_details(app: &Rc<AppState>, song: Option<faderframe_core::SongId>) 
     let grid = gtk::Grid::new();
     grid.set_row_spacing(6);
     grid.set_column_spacing(10);
+    let label = |text: &str, row: i32| {
+        let l = gtk::Label::new(Some(text));
+        l.set_halign(gtk::Align::End);
+        grid.attach(&l, 0, row, 1, 1);
+    };
+    // The languages: shown, added, the main one.
+    let shown = gtk::DropDown::from_strings(&[]);
+    let remove = gtk::Button::with_label("Remove");
+    let shown_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    shown.set_hexpand(true);
+    shown_row.append(&shown);
+    shown_row.append(&remove);
+    label("Language", 0);
+    grid.attach(&shown_row, 1, 0, 1, 1);
+    let add = gtk::DropDown::from_strings(&[]);
+    label("Add language", 1);
+    grid.attach(&add, 1, 1, 1, 1);
+    let main_language = gtk::DropDown::from_strings(&[]);
+    if song.is_none() {
+        label("Main language", 2);
+        grid.attach(&main_language, 1, 2, 1, 1);
+    }
     let code_label = if song.is_some() { "ISRC" } else { "UPC / EAN" };
-    let fields = [
-        ("Title", title.as_str()),
-        (code_label, code.as_str()),
-        ("Performer", credits.performer.as_str()),
-        ("Songwriter", credits.songwriter.as_str()),
-        ("Composer", credits.composer.as_str()),
-        ("Arranger", credits.arranger.as_str()),
-        ("Message", credits.message.as_str()),
+    let names = [
+        "Title",
+        code_label,
+        "Performer",
+        "Songwriter",
+        "Composer",
+        "Arranger",
+        "Message",
     ];
     let mut entries = Vec::new();
-    for (row, (label, value)) in fields.iter().enumerate() {
-        let l = gtk::Label::new(Some(label));
-        l.set_halign(gtk::Align::End);
+    for (i, name) in names.iter().enumerate() {
+        let row = 3 + i as i32;
+        label(name, row);
         let e = gtk::Entry::new();
-        e.set_text(value);
         e.set_hexpand(true);
         e.set_activates_default(true);
-        grid.attach(&l, 0, row as i32, 1, 1);
-        grid.attach(&e, 1, row as i32, 1, 1);
+        grid.attach(&e, 1, row, 1, 1);
         entries.push(e);
     }
-    if song.is_none() {
-        entries[0].set_placeholder_text(Some(&project_name));
-        entries[1].set_placeholder_text(Some("12 or 13 digits"));
-    } else {
-        entries[1].set_placeholder_text(Some("CC-XXX-YY-NNNNN"));
-    }
+    let entries = Rc::new(entries);
     let note = gtk::Label::new(Some(
-        "Written to the cue sheet and, as CD-Text and PQ codes, to the CD master.",
+        "Written to the cue sheet and, as CD-Text and PQ codes, to the CD master. Text in \
+         further languages becomes further CD-Text blocks (up to eight); a field left empty \
+         there is the main language's.",
     ));
     note.add_css_class("dim-label");
     note.set_wrap(true);
@@ -747,6 +786,276 @@ pub fn album_details(app: &Rc<AppState>, song: Option<faderframe_core::SongId>) 
     body.append(&grid);
     body.append(&note);
     body.append(&error);
+
+    // The fields of the language shown, and back.
+    let credits_of = |c: &Credits| {
+        [
+            c.performer.clone(),
+            c.songwriter.clone(),
+            c.composer.clone(),
+            c.arranger.clone(),
+            c.message.clone(),
+        ]
+    };
+    let set_credits = |c: &mut Credits, v: &[String]| {
+        c.performer.clone_from(&v[0]);
+        c.songwriter.clone_from(&v[1]);
+        c.composer.clone_from(&v[2]);
+        c.arranger.clone_from(&v[3]);
+        c.message.clone_from(&v[4]);
+    };
+    // (title, code, credits) of the main text.
+    let main_text = move |e: &Edit| -> (String, String, [String; 5]) {
+        match &e.song {
+            Some(x) => (x.title.clone(), x.isrc.clone(), credits_of(&x.credits)),
+            None => (
+                e.info.title.clone(),
+                e.info.upc.clone(),
+                credits_of(&e.info.credits),
+            ),
+        }
+    };
+    let load = {
+        let entries = Rc::clone(&entries);
+        let project_name = project_name.clone();
+        move |e: &Edit| {
+            let (title, code, credits) = main_text(e);
+            let (own_title, own_credits) = match e.current {
+                None => (title.clone(), credits.clone()),
+                Some(l) => {
+                    let tr = e.info.translation(l);
+                    match &e.song {
+                        Some(x) => {
+                            let t = tr.and_then(|t| t.song(x.id));
+                            (
+                                t.map(|t| t.title.clone()).unwrap_or_default(),
+                                t.map_or_else(Default::default, |t| credits_of(&t.credits)),
+                            )
+                        }
+                        None => (
+                            tr.map(|t| t.title.clone()).unwrap_or_default(),
+                            tr.map_or_else(Default::default, |t| credits_of(&t.credits)),
+                        ),
+                    }
+                }
+            };
+            entries[0].set_text(&own_title);
+            entries[1].set_text(if e.current.is_none() { &code } else { "" });
+            entries[1].set_sensitive(e.current.is_none());
+            for (i, v) in own_credits.iter().enumerate() {
+                entries[2 + i].set_text(v);
+            }
+            // A translation shows what an empty field will be.
+            let hint = |main: &str, fallback: &str| {
+                if main.is_empty() {
+                    fallback.to_string()
+                } else {
+                    main.to_string()
+                }
+            };
+            match e.current {
+                None => {
+                    if e.song.is_none() {
+                        entries[0].set_placeholder_text(Some(&project_name));
+                        entries[1].set_placeholder_text(Some("12 or 13 digits"));
+                    } else {
+                        entries[0].set_placeholder_text(None);
+                        entries[1].set_placeholder_text(Some("CC-XXX-YY-NNNNN"));
+                    }
+                    for e in &entries[2..] {
+                        e.set_placeholder_text(None);
+                    }
+                }
+                Some(_) => {
+                    entries[0].set_placeholder_text(Some(&hint(&title, &project_name)));
+                    entries[1].set_placeholder_text(Some("only in the main language"));
+                    for (i, v) in credits.iter().enumerate() {
+                        entries[2 + i].set_placeholder_text(Some(v));
+                    }
+                }
+            }
+        }
+    };
+    let store = {
+        let entries = Rc::clone(&entries);
+        move |e: &mut Edit| {
+            let v: Vec<String> = entries
+                .iter()
+                .map(|x| x.text().trim().to_string())
+                .collect();
+            match (e.current, &mut e.song) {
+                (None, Some(x)) => {
+                    if !v[0].is_empty() {
+                        x.title.clone_from(&v[0]);
+                    }
+                    x.isrc.clone_from(&v[1]);
+                    set_credits(&mut x.credits, &v[2..]);
+                }
+                (None, None) => {
+                    e.info.title.clone_from(&v[0]);
+                    e.info.upc.clone_from(&v[1]);
+                    set_credits(&mut e.info.credits, &v[2..]);
+                }
+                (Some(l), Some(x)) => {
+                    let t = e.info.translation_mut(l).song_mut(x.id);
+                    t.title.clone_from(&v[0]);
+                    set_credits(&mut t.credits, &v[2..]);
+                }
+                (Some(l), None) => {
+                    let t = e.info.translation_mut(l);
+                    t.title.clone_from(&v[0]);
+                    set_credits(&mut t.credits, &v[2..]);
+                }
+            }
+        }
+    };
+    let load = Rc::new(load);
+    let store = Rc::new(store);
+    // The dropdowns' lists from the languages in use.
+    let busy = Rc::new(std::cell::Cell::new(false));
+    let refill = {
+        let (shown, add, main_language, remove) = (
+            shown.clone(),
+            add.clone(),
+            main_language.clone(),
+            remove.clone(),
+        );
+        let busy = Rc::clone(&busy);
+        move |e: &Edit| {
+            busy.set(true);
+            let main = Language(e.info.language);
+            let mut list = vec![format!("{} (main)", main.name())];
+            list.extend(
+                e.info
+                    .translations
+                    .iter()
+                    .map(|t| Language(t.language).name().to_string()),
+            );
+            let refs: Vec<&str> = list.iter().map(String::as_str).collect();
+            shown.set_model(Some(&gtk::StringList::new(&refs)));
+            let at = e
+                .current
+                .and_then(|l| e.info.translations.iter().position(|t| t.language == l))
+                .map_or(0, |i| i + 1);
+            shown.set_selected(at as u32);
+            remove.set_sensitive(e.current.is_some());
+            let used: Vec<u8> = std::iter::once(e.info.language)
+                .chain(e.info.translations.iter().map(|t| t.language))
+                .collect();
+            let mut free = vec!["—".to_string()];
+            free.extend(
+                Language::all()
+                    .filter(|l| !used.contains(&l.0))
+                    .map(|l| l.name().to_string()),
+            );
+            let refs: Vec<&str> = free.iter().map(String::as_str).collect();
+            add.set_model(Some(&gtk::StringList::new(&refs)));
+            add.set_selected(0);
+            add.set_sensitive(e.info.translations.len() < 7);
+            // The main language: any not translated into.
+            let mains: Vec<Language> = Language::all()
+                .filter(|l| l.0 == e.info.language || e.info.translation(l.0).is_none())
+                .collect();
+            let names: Vec<&str> = mains.iter().map(|l| l.name()).collect();
+            main_language.set_model(Some(&gtk::StringList::new(&names)));
+            main_language.set_selected(
+                mains
+                    .iter()
+                    .position(|l| l.0 == e.info.language)
+                    .unwrap_or(0) as u32,
+            );
+            busy.set(false);
+        }
+    };
+    let refill = Rc::new(refill);
+    refill(&edit.borrow());
+    load(&edit.borrow());
+    {
+        let (edit, load, store, busy) = (
+            Rc::clone(&edit),
+            Rc::clone(&load),
+            Rc::clone(&store),
+            Rc::clone(&busy),
+        );
+        let refill = Rc::clone(&refill);
+        shown.connect_selected_notify(move |d| {
+            if busy.get() {
+                return;
+            }
+            let mut e = edit.borrow_mut();
+            store(&mut e);
+            let i = d.selected() as usize;
+            e.current = i
+                .checked_sub(1)
+                .and_then(|i| e.info.translations.get(i))
+                .map(|t| t.language);
+            refill(&e);
+            load(&e);
+        });
+    }
+    {
+        let (edit, load, store, busy) = (
+            Rc::clone(&edit),
+            Rc::clone(&load),
+            Rc::clone(&store),
+            Rc::clone(&busy),
+        );
+        let refill = Rc::clone(&refill);
+        add.connect_selected_notify(move |d| {
+            if busy.get() || d.selected() == 0 {
+                return;
+            }
+            let mut e = edit.borrow_mut();
+            store(&mut e);
+            let used: Vec<u8> = std::iter::once(e.info.language)
+                .chain(e.info.translations.iter().map(|t| t.language))
+                .collect();
+            let Some(l) = Language::all()
+                .filter(|l| !used.contains(&l.0))
+                .nth(d.selected() as usize - 1)
+            else {
+                return;
+            };
+            e.info.translation_mut(l.0);
+            e.current = Some(l.0);
+            refill(&e);
+            load(&e);
+        });
+    }
+    {
+        let (edit, load, busy) = (Rc::clone(&edit), Rc::clone(&load), Rc::clone(&busy));
+        let refill = Rc::clone(&refill);
+        remove.connect_clicked(move |_| {
+            if busy.get() {
+                return;
+            }
+            let mut e = edit.borrow_mut();
+            if let Some(l) = e.current.take() {
+                e.info.translations.retain(|t| t.language != l);
+            }
+            refill(&e);
+            load(&e);
+        });
+    }
+    {
+        let (edit, store, busy) = (Rc::clone(&edit), Rc::clone(&store), Rc::clone(&busy));
+        let refill = Rc::clone(&refill);
+        main_language.connect_selected_notify(move |d| {
+            if busy.get() {
+                return;
+            }
+            let mut e = edit.borrow_mut();
+            store(&mut e);
+            let current = e.info.language;
+            let mains: Vec<Language> = Language::all()
+                .filter(|l| l.0 == current || e.info.translation(l.0).is_none())
+                .collect();
+            if let Some(l) = mains.get(d.selected() as usize) {
+                e.info.language = l.0;
+            }
+            refill(&e);
+        });
+    }
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     buttons.set_halign(gtk::Align::End);
     let cancel = gtk::Button::with_label("Cancel");
@@ -765,54 +1074,37 @@ pub fn album_details(app: &Rc<AppState>, song: Option<faderframe_core::SongId>) 
         let Some(app) = weak.upgrade() else {
             return;
         };
-        let text: Vec<String> = entries
-            .iter()
-            .map(|e| e.text().trim().to_string())
-            .collect();
-        let code = match (&text[1], song) {
-            (c, _) if c.is_empty() => Ok(String::new()),
+        let mut e = edit.borrow_mut();
+        store(&mut e);
+        // Codes are checked before anything is saved.
+        let code = match &e.song {
+            Some(x) => x.isrc.clone(),
+            None => e.info.upc.clone(),
+        };
+        let checked = match (code.as_str(), &e.song) {
+            ("", _) => Ok(String::new()),
             (c, Some(_)) => normalize_isrc(c),
             (c, None) => normalize_upc(c),
         };
-        let code = match code {
+        let code = match checked {
             Ok(c) => c,
-            Err(e) => {
-                error.set_text(&e.to_string());
-                entries[1].grab_focus();
+            Err(err) => {
+                error.set_text(&err.to_string());
+                if e.current.is_none() {
+                    entries[1].grab_focus();
+                }
                 return;
             }
         };
-        let credits = Credits {
-            performer: text[2].clone(),
-            songwriter: text[3].clone(),
-            composer: text[4].clone(),
-            arranger: text[5].clone(),
-            message: text[6].clone(),
+        match &mut e.song {
+            Some(x) => x.isrc = code,
+            None => e.info.upc = code,
+        }
+        let action = AlbumAction::Texts {
+            info: e.info.clone(),
+            song: e.song.clone().map(Box::new),
         };
-        let action = {
-            let s = app.session.borrow();
-            let album = &s.project().album;
-            match song {
-                Some(id) => {
-                    let Some(mut x) = album.song(id).cloned() else {
-                        return;
-                    };
-                    if !text[0].is_empty() {
-                        x.title = text[0].clone();
-                    }
-                    x.isrc = code;
-                    x.credits = credits;
-                    AlbumAction::Update(x)
-                }
-                None => {
-                    let mut info = album.info.clone();
-                    info.title = text[0].clone();
-                    info.upc = code;
-                    info.credits = credits;
-                    AlbumAction::Info(info)
-                }
-            }
-        };
+        drop(e);
         app.dispatch(faderframe_session::Action::Album(action));
         w.close();
     });

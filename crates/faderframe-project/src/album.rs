@@ -84,8 +84,79 @@ impl Credits {
     }
 }
 
-/// The release as a whole.
+/// English, as CD-Text codes languages (EBU Tech 3264).
+pub const ENGLISH: u8 = 0x09;
+
+fn english() -> u8 {
+    ENGLISH
+}
+
+fn is_english(v: &u8) -> bool {
+    *v == ENGLISH
+}
+
+/// A song's title and credits in a [`Translation`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SongText {
+    pub song: SongId,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Credits::is_empty")]
+    pub credits: Credits,
+}
+
+/// The release's text in one more language (a further CD-Text block):
+/// the album's title and credits and the songs'. A field left empty is
+/// the main text's.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Translation {
+    /// CD-Text language code (EBU Tech 3264, see `faderframe_disc::Language`).
+    pub language: u8,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(skip_serializing_if = "Credits::is_empty")]
+    pub credits: Credits,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub songs: Vec<SongText>,
+}
+
+impl Translation {
+    pub fn song(&self, id: SongId) -> Option<&SongText> {
+        self.songs.iter().find(|s| s.song == id)
+    }
+
+    /// The text of `id`, made when missing.
+    pub fn song_mut(&mut self, id: SongId) -> &mut SongText {
+        match self.songs.iter().position(|s| s.song == id) {
+            Some(i) => &mut self.songs[i],
+            None => {
+                self.songs.push(SongText {
+                    song: id,
+                    title: String::new(),
+                    credits: Credits::default(),
+                });
+                let last = self.songs.len() - 1;
+                &mut self.songs[last]
+            }
+        }
+    }
+}
+
+/// `own` where it says something, else `main` (field by field).
+pub fn fall_back(own: &Credits, main: &Credits) -> Credits {
+    let pick = |a: &String, b: &String| if a.is_empty() { b.clone() } else { a.clone() };
+    Credits {
+        performer: pick(&own.performer, &main.performer),
+        songwriter: pick(&own.songwriter, &main.songwriter),
+        composer: pick(&own.composer, &main.composer),
+        arranger: pick(&own.arranger, &main.arranger),
+        message: pick(&own.message, &main.message),
+    }
+}
+
+/// The release as a whole.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AlbumInfo {
     /// Empty: the project's name.
@@ -96,11 +167,53 @@ pub struct AlbumInfo {
     /// UPC-A or EAN-13 (the CD's media catalog number); empty: none.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub upc: String,
+    /// The language of the title, the credits and the songs' (CD-Text
+    /// block 0; EBU Tech 3264 code).
+    #[serde(default = "english", skip_serializing_if = "is_english")]
+    pub language: u8,
+    /// The text in further languages (CD-Text blocks 1 to 7).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub translations: Vec<Translation>,
+}
+
+impl Default for AlbumInfo {
+    fn default() -> Self {
+        Self {
+            title: String::new(),
+            credits: Credits::default(),
+            upc: String::new(),
+            language: ENGLISH,
+            translations: Vec::new(),
+        }
+    }
 }
 
 impl AlbumInfo {
     pub fn is_empty(&self) -> bool {
         *self == AlbumInfo::default()
+    }
+
+    pub fn translation(&self, language: u8) -> Option<&Translation> {
+        self.translations.iter().find(|t| t.language == language)
+    }
+
+    /// The translation into `language`, made when missing.
+    pub fn translation_mut(&mut self, language: u8) -> &mut Translation {
+        match self
+            .translations
+            .iter()
+            .position(|t| t.language == language)
+        {
+            Some(i) => &mut self.translations[i],
+            None => {
+                self.translations.push(Translation {
+                    language,
+                    ..Translation::default()
+                });
+                let last = self.translations.len() - 1;
+                &mut self.translations[last]
+            }
+        }
     }
 }
 

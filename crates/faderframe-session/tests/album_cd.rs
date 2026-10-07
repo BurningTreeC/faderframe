@@ -236,3 +236,72 @@ fn a_cd_track_lasts_four_seconds() {
     assert!(notices.contains("at least 4 s"), "{notices}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The release's text in further languages: CD-Text blocks after the main
+/// one (English here), each field the translation leaves empty the main
+/// text's; read back from the CD master.
+#[test]
+fn cd_text_in_three_languages() {
+    use faderframe_project::album::Translation;
+    let dir = tmp("languages");
+    let mut s = demo();
+    s.dispatch(Action::AddSection {
+        start: MusicalTime::from_quarters(0.0),
+        end: MusicalTime::from_quarters(16.0),
+    })
+    .unwrap();
+    album(&mut s, AlbumAction::AddSections);
+    let mut info = s.project().album.info.clone();
+    info.title = "Test Album".into();
+    info.credits.performer = "The Testers".into();
+    let song = s.project().album.songs[0].clone();
+    let mut german = Translation {
+        language: 0x08,
+        title: "Testalbum".into(),
+        ..Translation::default()
+    };
+    german.song_mut(song.id).title = "Erster Teil".into();
+    let mut japanese = Translation {
+        language: 0x69,
+        title: "テストアルバム".into(),
+        ..Translation::default()
+    };
+    japanese.credits.performer = "テスターズ".into();
+    info.translations = vec![german, japanese.clone(), japanese];
+    album(&mut s, AlbumAction::Texts { info, song: None });
+    assert_eq!(
+        s.project().album.info.translations.len(),
+        2,
+        "no language twice"
+    );
+    let mut settings = s.project().album.settings.clone();
+    settings.loudness = None;
+    settings.output = Some(dir.join("out"));
+    settings.tail = 0.0;
+    settings.ddp = true;
+    album(&mut s, AlbumAction::Settings(settings));
+    album(&mut s, AlbumAction::Export);
+    s.wait_album();
+    let done = s
+        .album_export()
+        .unwrap_or_else(|| panic!("{:?}", s.notices().collect::<Vec<_>>()))
+        .clone();
+    let back = faderframe_disc::ddp::read(&done.ddp.unwrap().0).unwrap();
+    let d = back.disc;
+    assert_eq!(d.text_language, faderframe_disc::Language::ENGLISH);
+    assert_eq!(d.text.title, "Test Album");
+    assert_eq!(d.more_text.len(), 2);
+    let (de, ja) = (&d.more_text[0], &d.more_text[1]);
+    assert_eq!(de.language.name(), "German");
+    assert_eq!(de.disc.title, "Testalbum");
+    assert_eq!(de.disc.performer, "The Testers", "the main text's");
+    assert_eq!(de.tracks[0].title, "Erster Teil");
+    assert_eq!(ja.language, faderframe_disc::Language::JAPANESE);
+    assert_eq!(ja.disc.title, "テストアルバム");
+    assert_eq!(ja.disc.performer, "テスターズ");
+    assert_eq!(
+        ja.tracks[0].title, song.title,
+        "untranslated: the main title"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}

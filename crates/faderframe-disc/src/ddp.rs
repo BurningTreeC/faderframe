@@ -457,11 +457,16 @@ pub fn read(dir: &Path) -> Result<ReadFileset, DdpError> {
     }
     if let Some(name) = cdtext {
         let data = std::fs::read(dir.join(name))?;
-        let (d, tracks) = crate::cdtext::decode(&data, disc.tracks.len())
+        let mut blocks = crate::cdtext::decode_blocks(&data, disc.tracks.len())
             .map_err(|i| bad(&format!("CD-Text pack {i} has a bad CRC")))?;
-        disc.text = d;
-        for (t, text) in disc.tracks.iter_mut().zip(tracks) {
-            t.text = text;
+        if !blocks.is_empty() {
+            let first = blocks.remove(0);
+            disc.text = first.disc;
+            disc.text_language = first.language;
+            for (t, text) in disc.tracks.iter_mut().zip(first.tracks) {
+                t.text = text;
+            }
+            disc.more_text = blocks;
         }
     } else {
         disc.text = CdText::default();

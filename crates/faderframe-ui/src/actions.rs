@@ -695,6 +695,14 @@ pub fn install(app: &Rc<AppState>) {
         // work on song n (1-based).
         named("album", |a, arg| {
             use faderframe_session::album::AlbumAction as AA;
+            // `details-in=<language code, hex>`: the release's details in a
+            // language (made a translation when missing).
+            if let Some(code) = arg.trim().strip_prefix("details-in=") {
+                if let Ok(l) = u8::from_str_radix(code.trim_start_matches("0x"), 16) {
+                    crate::dialogs::album_details_in(a, None, Some(l));
+                }
+                return;
+            }
             let action = match arg.trim() {
                 "sections" => AA::AddSections,
                 "project" => AA::AddThisProject,

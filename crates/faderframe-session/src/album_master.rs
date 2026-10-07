@@ -13,7 +13,7 @@ use faderframe_audio_files::dither::Quantizer;
 use faderframe_audio_files::resample::StreamResampler;
 use faderframe_audio_files::wavstream::WavWriter;
 use faderframe_disc::ddp::{DdpNames, DdpWriter, Fileset};
-use faderframe_disc::{CD_RATE, CdText, Disc, MIN_PREGAP, Track, TrackFlags};
+use faderframe_disc::{CD_RATE, CdText, Disc, Language, MIN_PREGAP, TextBlock, Track, TrackFlags};
 use faderframe_project::album::{Album, Credits};
 use std::path::{Path, PathBuf};
 
@@ -360,6 +360,44 @@ pub(crate) fn disc(
     } else {
         &album.info.title
     };
+    // Further languages: each field the translation leaves empty is the
+    // main text's.
+    let more_text = if text {
+        album
+            .info
+            .translations
+            .iter()
+            .map(|tr| TextBlock {
+                language: Language(tr.language),
+                disc: cd_text(
+                    if tr.title.is_empty() {
+                        album_title
+                    } else {
+                        &tr.title
+                    },
+                    &faderframe_project::album::fall_back(&tr.credits, &album.info.credits),
+                ),
+                tracks: album
+                    .songs
+                    .iter()
+                    .map(|song| {
+                        let own = tr.song(song.id);
+                        let title = own
+                            .map(|t| t.title.as_str())
+                            .filter(|t| !t.is_empty())
+                            .unwrap_or(&song.title);
+                        let credits = own.map_or_else(
+                            || song.credits.clone(),
+                            |t| faderframe_project::album::fall_back(&t.credits, &song.credits),
+                        );
+                        cd_text(title, &credits)
+                    })
+                    .collect(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     Disc {
         upc: faderframe_disc::normalize_upc(&album.info.upc).ok(),
         master_id: album_title.chars().take(48).collect(),
@@ -368,6 +406,8 @@ pub(crate) fn disc(
         } else {
             CdText::default()
         },
+        text_language: Language(album.info.language),
+        more_text,
         tracks,
         sectors: to_cd(length) + offset,
     }

@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
-pub use faderframe_disc::{normalize_isrc, normalize_upc};
+pub use faderframe_disc::{Language, normalize_isrc, normalize_upc};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AlbumAction {
@@ -87,6 +87,12 @@ pub enum AlbumAction {
     /// Ask the shell for the details form of the release (`None`) or a
     /// song.
     Details(Option<SongId>),
+    /// The release's information (with its translations) and, edited
+    /// along with it, a song's: one step.
+    Texts {
+        info: AlbumInfo,
+        song: Option<Box<Song>>,
+    },
     Analyse,
     Export,
     Cancel,
@@ -989,6 +995,32 @@ impl Session {
                     code => faderframe_disc::normalize_upc(code)
                         .map_err(|e| SessionError::Other(e.to_string()))?,
                 };
+                album.info = info;
+            }
+            AlbumAction::Texts { mut info, song } => {
+                info.upc = match info.upc.trim() {
+                    "" => String::new(),
+                    code => faderframe_disc::normalize_upc(code)
+                        .map_err(|e| SessionError::Other(e.to_string()))?,
+                };
+                // No language twice, the main one not again.
+                let main = info.language;
+                let mut seen = Vec::new();
+                info.translations.retain(|t| {
+                    let keep = t.language != main && !seen.contains(&t.language);
+                    seen.push(t.language);
+                    keep
+                });
+                if let Some(mut song) = song.map(|s| *s) {
+                    song.isrc = match song.isrc.trim() {
+                        "" => String::new(),
+                        code => faderframe_disc::normalize_isrc(code)
+                            .map_err(|e| SessionError::Other(e.to_string()))?,
+                    };
+                    if let Some(s) = album.song_mut(song.id) {
+                        *s = song;
+                    }
+                }
                 album.info = info;
             }
             AlbumAction::AddInsert { song, plugin } => {

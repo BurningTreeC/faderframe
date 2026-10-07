@@ -9,7 +9,8 @@
 //! * [`ddp`] writes (and reads back) a DDP 2.00 fileset: `DDPID`,
 //!   `DDPMS`, the PQ descriptor, `CDTEXT.BIN`, `IMAGE.DAT` and the
 //!   `CHECKSUM.MD5`/`CHECKSUM.TXT` files plants check.
-//! * [`cdtext`] encodes CD-Text lead-in packs, [`cue`] writes cue sheets.
+//! * [`cdtext`] encodes CD-Text lead-in packs (up to eight languages),
+//!   [`cue`] writes cue sheets.
 //!
 //! The DDP layout follows the open, reverse-engineered description of the
 //! format by the ddp-reverse-eng project (MIT licence), and this crate's
@@ -63,8 +64,207 @@ pub enum DiscError {
     CopyFlags(usize),
     #[error("the master id is longer than 48 characters")]
     MasterId,
-    #[error("CD-Text needs {0} packs, a disc holds 256")]
-    CdTextTooLong(usize),
+    #[error("CD-Text in {language}: {packs} packs, a language holds 256 (shorter texts help)")]
+    CdTextTooLong {
+        language: &'static str,
+        packs: usize,
+    },
+    #[error("CD-Text holds at most 8 languages, not {0}")]
+    TooManyLanguages(usize),
+    #[error("CD-Text: {0} twice")]
+    LanguageTwice(&'static str),
+}
+
+/// How a CD-Text block's characters are encoded (its size information's
+/// character code).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Charset {
+    /// ISO 8859-1 (characters outside it become `?`).
+    #[default]
+    Latin1,
+    /// 7-bit ASCII.
+    Ascii,
+    /// MS-JIS (Shift-JIS, double-byte characters): Japanese.
+    MsJis,
+}
+
+impl Charset {
+    pub fn code(self) -> u8 {
+        match self {
+            Charset::Latin1 => 0x00,
+            Charset::Ascii => 0x01,
+            Charset::MsJis => 0x80,
+        }
+    }
+
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0x00 => Some(Charset::Latin1),
+            0x01 => Some(Charset::Ascii),
+            0x80 => Some(Charset::MsJis),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn double_byte(self) -> bool {
+        self == Charset::MsJis
+    }
+
+    /// `s` in this encoding (characters it lacks become `?`).
+    pub fn encode(self, s: &str) -> Vec<u8> {
+        match self {
+            Charset::Latin1 => latin1(s),
+            Charset::Ascii => s
+                .chars()
+                .map(|c| if c.is_ascii() { c as u8 } else { b'?' })
+                .collect(),
+            Charset::MsJis => shift_jis(s),
+        }
+    }
+
+    pub fn decode(self, bytes: &[u8]) -> String {
+        match self {
+            Charset::Latin1 | Charset::Ascii => bytes.iter().map(|&b| char::from(b)).collect(),
+            Charset::MsJis => encoding_rs::SHIFT_JIS
+                .decode_without_bom_handling(bytes)
+                .0
+                .into_owned(),
+        }
+    }
+}
+
+fn shift_jis(s: &str) -> Vec<u8> {
+    use encoding_rs::EncoderResult;
+    let mut encoder = encoding_rs::SHIFT_JIS.new_encoder();
+    let mut out = vec![0u8; s.len() * 2 + 8];
+    let mut written = 0;
+    let mut rest = s;
+    loop {
+        let (result, read, w) =
+            encoder.encode_from_utf8_without_replacement(rest, &mut out[written..], true);
+        written += w;
+        rest = &rest[read..];
+        match result {
+            EncoderResult::InputEmpty => break,
+            // A character Shift-JIS lacks: a full-width question mark.
+            EncoderResult::Unmappable(_) => {
+                if out.len() < written + 2 {
+                    out.resize(written + 2, 0);
+                }
+                out[written..written + 2].copy_from_slice(&[0x81, 0x48]);
+                written += 2;
+            }
+            EncoderResult::OutputFull => out.resize(out.len() * 2, 0),
+        }
+    }
+    out.truncate(written);
+    out
+}
+
+/// A CD-Text language (EBU Tech 3264 code, as the size information
+/// carries it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Language(pub u8);
+
+impl Default for Language {
+    fn default() -> Self {
+        Language::ENGLISH
+    }
+}
+
+/// The languages CD-Text can carry readably: those written in the Latin
+/// alphabet (ISO 8859-1) and Japanese (MS-JIS).
+const LANGUAGES: &[(u8, &str)] = &[
+    (0x09, "English"),
+    (0x08, "German"),
+    (0x0f, "French"),
+    (0x0a, "Spanish"),
+    (0x15, "Italian"),
+    (0x1d, "Dutch"),
+    (0x21, "Portuguese"),
+    (0x28, "Swedish"),
+    (0x07, "Danish"),
+    (0x1e, "Norwegian"),
+    (0x27, "Finnish"),
+    (0x14, "Icelandic"),
+    (0x69, "Japanese"),
+    (0x20, "Polish"),
+    (0x06, "Czech"),
+    (0x25, "Slovak"),
+    (0x26, "Slovenian"),
+    (0x04, "Croatian"),
+    (0x1b, "Hungarian"),
+    (0x22, "Romanian"),
+    (0x29, "Turkish"),
+    (0x0c, "Estonian"),
+    (0x18, "Latvian"),
+    (0x1a, "Lithuanian"),
+    (0x01, "Albanian"),
+    (0x02, "Breton"),
+    (0x03, "Catalan"),
+    (0x05, "Welsh"),
+    (0x0b, "Esperanto"),
+    (0x0d, "Basque"),
+    (0x0e, "Faroese"),
+    (0x10, "Frisian"),
+    (0x11, "Irish"),
+    (0x12, "Gaelic"),
+    (0x13, "Galician"),
+    (0x16, "Lappish"),
+    (0x17, "Latin"),
+    (0x19, "Luxembourgian"),
+    (0x1c, "Maltese"),
+    (0x1f, "Occitan"),
+    (0x23, "Romansh"),
+    (0x24, "Serbian (Latin)"),
+    (0x2a, "Flemish"),
+    (0x2b, "Walloon"),
+    (0x45, "Zulu"),
+    (0x4f, "Swahili"),
+    (0x61, "Malaysian"),
+    (0x6a, "Indonesian"),
+];
+
+impl Language {
+    pub const ENGLISH: Language = Language(0x09);
+    pub const JAPANESE: Language = Language(0x69);
+
+    /// Every language CD-Text can carry readably, English first.
+    pub fn all() -> impl Iterator<Item = Language> {
+        LANGUAGES.iter().map(|&(c, _)| Language(c))
+    }
+
+    /// Its name (`Language 0x..` for one not in [`Language::all`]).
+    pub fn name(self) -> &'static str {
+        LANGUAGES
+            .iter()
+            .find(|(c, _)| *c == self.0)
+            .map_or("another language", |(_, n)| n)
+    }
+
+    /// How its text is encoded.
+    pub fn charset(self) -> Charset {
+        if self == Language::JAPANESE {
+            Charset::MsJis
+        } else {
+            Charset::Latin1
+        }
+    }
+}
+
+/// CD-Text in one more language: the disc's and each track's (`tracks`
+/// in track order; missing ones are empty).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TextBlock {
+    pub language: Language,
+    pub disc: CdText,
+    pub tracks: Vec<CdText>,
+}
+
+impl TextBlock {
+    pub fn is_empty(&self) -> bool {
+        self.disc.is_empty() && self.tracks.iter().all(CdText::is_empty)
+    }
 }
 
 /// CD-Text of the disc or a track (empty: none). Characters outside ISO
@@ -151,6 +351,10 @@ pub struct Disc {
     /// Free text identifying the master (DDPID; not on the disc).
     pub master_id: String,
     pub text: CdText,
+    /// The language of `text` and the tracks' text (CD-Text block 0).
+    pub text_language: Language,
+    /// CD-Text in further languages (blocks 1 to 7).
+    pub more_text: Vec<TextBlock>,
     pub tracks: Vec<Track>,
     /// The program's length in sectors: the lead-out's address.
     pub sectors: u32,
@@ -212,9 +416,22 @@ impl Disc {
             }
             last = *t.indexes.last().unwrap_or(&start);
         }
-        let packs = cdtext::packs(self).len();
-        if packs > 256 {
-            return Err(DiscError::CdTextTooLong(packs));
+        let blocks = cdtext::blocks(self);
+        if blocks.len() > 8 {
+            return Err(DiscError::TooManyLanguages(blocks.len()));
+        }
+        for (i, b) in blocks.iter().enumerate() {
+            if blocks[..i].iter().any(|o| o.language == b.language) {
+                return Err(DiscError::LanguageTwice(b.language.name()));
+            }
+        }
+        for (language, packs) in cdtext::block_sizes(self) {
+            if packs > 256 {
+                return Err(DiscError::CdTextTooLong {
+                    language: language.name(),
+                    packs,
+                });
+            }
         }
         Ok(())
     }
