@@ -11,10 +11,10 @@
 //!   scheduled ahead (100 ms) to the output sender with exact due times,
 //!   derived from the engine's position at each callback. Each window
 //!   continues in the timeline where the last one ended (position estimates
-//!   wobble a little between ticks; going by the clock alone could repeat
-//!   or skip a message at the seam). Loop wraps are followed; a locate or
-//!   stop is noticed (the engine is not where it was predicted to be) and
-//!   cancels what was scheduled.
+//!   wobble between ticks -- by a whole stalled callback when a device
+//!   sleeps late; going by the clock alone could repeat or skip a message at
+//!   the seam). Loop wraps are followed; a locate or stop is noticed (the
+//!   transport counts its jumps) and cancels what was scheduled.
 //! * Editing: messages can be added (e.g. from a `.syx` file), removed and
 //!   sent straight to an output.
 
@@ -34,8 +34,8 @@ pub(crate) struct SysexPlayback {
     until_ns: u64,
     /// The timeline position (looped) where that window ended.
     until_pos: i64,
-    /// (time, engine position) at the last tick, to notice jumps.
-    last: Option<(u64, i64)>,
+    /// The transport's jumps at the last tick, to notice the next one.
+    last: Option<u32>,
 }
 
 impl Session {
@@ -84,9 +84,9 @@ impl Session {
 
     /// Schedule the clips' SysEx that plays within the next moments.
     pub(crate) fn tick_sysex(&mut self, now_ns: u64) {
-        let pos_now = self.engine.position_at(now_ns);
+        let now = self.engine.position_and_jumps_at(now_ns);
         let rate = self.engine.stream_sample_rate().max(1) as f64;
-        let (Some(pos_now), true) = (pos_now, self.transport.playing) else {
+        let (Some((pos_now, jumps)), true) = (now, self.transport.playing) else {
             if self.midi.sysex.last.take().is_some() {
                 self.midi.outputs.cancel_sysex();
             }
@@ -109,14 +109,11 @@ impl Session {
             Some((a, b)) if p >= b => a + (p - b) % (b - a),
             _ => p,
         };
-        // Did playback jump since the last tick?
-        let jumped = match self.midi.sysex.last {
-            None => true,
-            Some((t, p)) => {
-                let predicted = wrap(p, p + ((now_ns - t) as f64 * rate / 1e9) as i64);
-                (predicted - pos_now).abs() as f64 > rate * 0.02
-            }
-        };
+        // Did playback jump since the last tick? The transport says so: an
+        // estimate that wobbled (a device that slept late renders one block
+        // where a callback's worth of time has passed) is not a jump, and
+        // taking it for one sent a message again.
+        let jumped = self.midi.sysex.last != Some(jumps);
         if jumped {
             if self.midi.sysex.last.is_some() {
                 self.midi.outputs.cancel_sysex();
@@ -124,7 +121,7 @@ impl Session {
             self.midi.sysex.until_ns = now_ns;
             self.midi.sysex.until_pos = pos_now;
         }
-        self.midi.sysex.last = Some((now_ns, pos_now));
+        self.midi.sysex.last = Some(jumps);
         let from_ns = self.midi.sysex.until_ns.max(now_ns);
         let to_ns = now_ns + LOOKAHEAD_NS;
         if to_ns <= from_ns {

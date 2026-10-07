@@ -84,6 +84,9 @@ pub struct TransportState {
     /// Set whenever playback becomes discontinuous (stop, locate, loop
     /// wrap) so that note-generating processors can release notes.
     discontinuity: bool,
+    /// Jumps so far: stops, locates and scrub returns, not loop wraps
+    /// (wrapping, for the control side to notice one).
+    jumps: u32,
     scrub: Option<Scrub>,
 }
 
@@ -106,6 +109,17 @@ impl TransportState {
 
     pub fn looping(&self) -> bool {
         self.loop_enabled && self.loop_range.is_some()
+    }
+
+    /// How often playback has jumped (stop, locate, scrub): loop wraps are
+    /// not jumps. Wraps around.
+    pub fn jumps(&self) -> u32 {
+        self.jumps
+    }
+
+    fn jumped(&mut self) {
+        self.discontinuity = true;
+        self.jumps = self.jumps.wrapping_add(1);
     }
 
     /// Playing a scrub snippet (not normal playback).
@@ -135,7 +149,7 @@ impl TransportState {
             }
             TransportCommand::Stop => {
                 if self.playing {
-                    self.discontinuity = true;
+                    self.jumped();
                 }
                 self.end_scrub();
                 self.playing = false;
@@ -189,7 +203,7 @@ impl TransportState {
             TransportCommand::Locate(pos) => {
                 if pos != self.position {
                     self.position = pos;
-                    self.discontinuity = true;
+                    self.jumped();
                 }
             }
             TransportCommand::SetLoopRange(range) => {
@@ -240,7 +254,7 @@ impl TransportState {
                         self.playing = false;
                     }
                 }
-                self.discontinuity = true;
+                self.jumped();
             }
             return false;
         }
@@ -260,7 +274,7 @@ impl TransportState {
         if let Some(s) = self.scrub.take() {
             self.position = s.home;
             self.playing = false;
-            self.discontinuity = true;
+            self.jumped();
         }
     }
 
@@ -380,6 +394,32 @@ impl TransportShared {
 mod tests {
     use super::*;
     use faderframe_timeline::MusicalTime;
+
+    #[test]
+    fn locates_stops_and_scrubs_are_jumps_and_loop_wraps_are_not() {
+        let mut t = TransportState::default();
+        t.apply(TransportCommand::SetLoopRange(LoopRange::new(0, 100)));
+        t.apply(TransportCommand::SetLoopEnabled(true));
+        t.apply(TransportCommand::Play);
+        assert_eq!(t.jumps(), 0, "starting is not a jump");
+        for _ in 0..10 {
+            t.advance(64);
+        }
+        assert_eq!(t.jumps(), 0, "nor are loop wraps");
+        t.apply(TransportCommand::Locate(30));
+        assert_eq!(t.jumps(), 1);
+        t.apply(TransportCommand::Locate(30));
+        assert_eq!(t.jumps(), 1, "a locate to where it is moves nothing");
+        t.apply(TransportCommand::Stop);
+        assert_eq!(t.jumps(), 2);
+        t.apply(TransportCommand::Scrub {
+            position: 500,
+            frames: 32,
+        });
+        assert_eq!(t.jumps(), 3, "a scrub snippet starts where it is asked");
+        t.advance(32);
+        assert_eq!(t.jumps(), 4, "and ends");
+    }
 
     #[test]
     fn play_stop_locate() {

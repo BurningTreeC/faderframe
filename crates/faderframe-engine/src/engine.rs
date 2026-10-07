@@ -117,28 +117,33 @@ struct CallbackStamp {
     seq: AtomicU32,
     ns: AtomicU64,
     position: AtomicI64,
+    /// The transport's jumps by then (`TransportState::jumps`), with the
+    /// position they put it at.
+    jumps: AtomicU32,
 }
 
 impl CallbackStamp {
     /// The audio thread (the only writer); wait-free.
-    fn store(&self, ns: u64, position: i64) {
+    fn store(&self, ns: u64, position: i64, jumps: u32) {
         let s = self.seq.load(Ordering::Relaxed);
         self.seq.store(s.wrapping_add(1), Ordering::Relaxed);
         std::sync::atomic::fence(Ordering::Release);
         self.ns.store(ns, Ordering::Relaxed);
         self.position.store(position, Ordering::Relaxed);
+        self.jumps.store(jumps, Ordering::Relaxed);
         self.seq.store(s.wrapping_add(2), Ordering::Release);
     }
 
-    fn load(&self) -> (u64, i64) {
+    fn load(&self) -> (u64, i64, u32) {
         loop {
             let s = self.seq.load(Ordering::Acquire);
             if s & 1 == 0 {
                 let ns = self.ns.load(Ordering::Relaxed);
                 let position = self.position.load(Ordering::Relaxed);
+                let jumps = self.jumps.load(Ordering::Relaxed);
                 std::sync::atomic::fence(Ordering::Acquire);
                 if self.seq.load(Ordering::Relaxed) == s {
-                    return (ns, position);
+                    return (ns, position, jumps);
                 }
             }
             std::hint::spin_loop();
@@ -575,9 +580,11 @@ impl EngineProcessor {
         let callback_ns = self.midi_out.as_ref().map_or(0, |q| q.clock.now_ns());
 
         if let Some(clock) = self.midi.clock() {
-            self.shared
-                .callback
-                .store(clock.now_ns(), self.transport.position());
+            self.shared.callback.store(
+                clock.now_ns(),
+                self.transport.position(),
+                self.transport.jumps(),
+            );
         }
         let mut graph_ns = 0u64;
         let mut offset = 0;
@@ -1100,16 +1107,24 @@ impl EngineController {
     /// (extrapolated from the last callback while playing); `None` before
     /// the first callback with a MIDI clock.
     pub fn position_at(&self, t_ns: u64) -> Option<i64> {
-        let (cb, pos) = self.shared.callback.load();
+        self.position_and_jumps_at(t_ns).map(|(p, _)| p)
+    }
+
+    /// [`Self::position_at`], and how often the transport had jumped
+    /// (stop, locate, scrub; not loop wraps) by the callback it is
+    /// extrapolated from -- read together, so a jump is never seen with the
+    /// position from before it, or the other way round.
+    pub fn position_and_jumps_at(&self, t_ns: u64) -> Option<(i64, u32)> {
+        let (cb, pos, jumps) = self.shared.callback.load();
         if cb == 0 {
             return None;
         }
         if !self.shared.transport.snapshot().playing {
-            return Some(pos);
+            return Some((pos, jumps));
         }
         // At the varispeed's speed.
         let rate = self.stream_sample_rate() as f64 * self.speed();
-        Some(pos + ((t_ns as f64 - cb as f64) * rate / 1e9) as i64)
+        Some((pos + ((t_ns as f64 - cb as f64) * rate / 1e9) as i64, jumps))
     }
 
     /// Frames from processing to hearing (device buffer + output latency,
