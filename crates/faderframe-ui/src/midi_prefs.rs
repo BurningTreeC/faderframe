@@ -514,6 +514,9 @@ pub fn page(app: &Rc<AppState>) -> gtk::Widget {
     let transport = gtk::Grid::new();
     transport.set_row_spacing(6);
     transport.set_column_spacing(6);
+    // Each control's learn button, and beside it (while it is mapped) the
+    // mapping's removal.
+    let mut unlearn: Vec<(TransportControl, gtk::Button)> = Vec::new();
     for (i, control) in TransportControl::ALL.into_iter().enumerate() {
         let b = gtk::Button::with_label(&format!("Learn {}", control.label()));
         b.set_tooltip_text(Some("Then press a pad or button on your device"));
@@ -523,7 +526,31 @@ pub fn page(app: &Rc<AppState>) -> gtk::Widget {
                 a.dispatch(Action::MidiLearn(MappingTarget::Transport { control }));
             }
         });
-        transport.attach(&b, (i % 3) as i32, (i / 3) as i32, 1, 1);
+        let remove = gtk::Button::from_icon_name("user-trash-symbolic");
+        remove.add_css_class("flat");
+        remove.set_visible(false);
+        let weak = Rc::downgrade(app);
+        remove.connect_clicked(move |_| {
+            let Some(a) = weak.upgrade() else { return };
+            let ids: Vec<_> = a
+                .session
+                .borrow()
+                .midi_mappings_for(MappingTarget::Transport { control })
+                .into_iter()
+                .map(|m| m.id)
+                .collect();
+            for mapping in ids {
+                a.dispatch(Action::Edit(
+                    faderframe_project::Command::RemoveMidiMapping { mapping },
+                ));
+            }
+        });
+        let cell = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        b.set_hexpand(true);
+        cell.append(&b);
+        cell.append(&remove);
+        transport.attach(&cell, (i % 3) as i32, (i / 3) as i32, 1, 1);
+        unlearn.push((control, remove));
     }
     body.append(&transport);
 
@@ -569,6 +596,20 @@ pub fn page(app: &Rc<AppState>) -> gtk::Widget {
             .into_iter()
             .filter(|o| !o.is_virtual)
             .collect();
+        for (control, remove) in &unlearn {
+            let sources: Vec<String> = a
+                .session
+                .borrow()
+                .midi_mappings_for(MappingTarget::Transport { control: *control })
+                .iter()
+                .map(|m| m.source.label())
+                .collect();
+            remove.set_visible(!sources.is_empty());
+            let tip = format!("Remove MIDI Mapping ({})", sources.join(", "));
+            if remove.tooltip_text().as_deref() != Some(tip.as_str()) {
+                remove.set_tooltip_text(Some(&tip));
+            }
+        }
         if outputs_seen.borrow().as_ref() != Some(&outs) {
             *outputs_seen.borrow_mut() = Some(outs.clone());
             output_rows(&a, &outputs, &outs);

@@ -549,16 +549,18 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
 
     let transport = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     transport.add_css_class("transport");
-    transport.append(&icon_button(
+    let to_start = icon_button(
         "media-skip-backward-symbolic",
         "Return to start (Home)",
         "app.to-start",
-    ));
-    transport.append(&icon_button(
+    );
+    transport.append(&to_start);
+    let stop = icon_button(
         "media-playback-stop-symbolic",
         "Stop (twice: to start)",
         "app.stop",
-    ));
+    );
+    transport.append(&stop);
     let play = icon_button(
         "media-playback-start-symbolic",
         "Play / pause (Space)",
@@ -584,6 +586,19 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
     transport.append(&capture);
     let looping = icon_button("media-playlist-repeat-symbolic", "Loop (L)", "app.loop");
     transport.append(&looping);
+    // A right-click on each learns a MIDI control for it (or forgets one).
+    {
+        use faderframe_project::{MappingTarget, TransportControl as T};
+        for (b, control) in [
+            (&to_start, T::ToStart),
+            (&stop, T::Stop),
+            (&play, T::PlayStop),
+            (&record, T::Record),
+            (&looping, T::Loop),
+        ] {
+            crate::learn::on_right_click(app, b, MappingTarget::Transport { control });
+        }
+    }
     let metronome = gtk::Button::new();
     metronome.set_child(Some(&crate::icons::image(
         "faderframe-metronome-symbolic",

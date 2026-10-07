@@ -310,6 +310,20 @@ impl Edit<'_, '_> {
     }
 }
 
+/// "MIDI Learn…" and "Remove MIDI Mapping (<source>)" for each mapping
+/// `target` has, the first separated: every learnable control's entries.
+pub(crate) fn learn_items(model: &Session, target: MappingTarget) -> Vec<MenuItem<Action>> {
+    model
+        .midi_learn_menu(target)
+        .into_iter()
+        .enumerate()
+        .map(|(i, (label, action))| {
+            let item = MenuItem::new(label, action);
+            if i == 0 { item.separated() } else { item }
+        })
+        .collect()
+}
+
 /// File chooser filters for samples (and SFZ instruments).
 fn sample_filters(sfz: bool) -> Vec<(String, Vec<String>)> {
     let mut patterns: Vec<String> = faderframe_audio_files::decode::SUPPORTED_EXTENSIONS
@@ -809,9 +823,9 @@ impl<F: Face> DeviceView<F> {
                 MenuItem::new("Show Automation", Action::ShowAutomation { track, target })
                     .separated(),
             );
-            items.push(MenuItem::new(
-                "Learn MIDI Controller",
-                Action::MidiLearn(MappingTarget::Parameter { track, target }),
+            items.extend(learn_items(
+                model,
+                MappingTarget::Parameter { track, target },
             ));
         }
         Some(HostRequest::ContextMenu { at, items })

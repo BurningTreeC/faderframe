@@ -249,6 +249,14 @@ fn bypass_button(
     let bypass = gtk::ToggleButton::with_label("Bypass");
     bypass.set_active(bypassed);
     bypass.add_css_class("bypass-toggle");
+    crate::learn::on_right_click(
+        app,
+        &bypass,
+        faderframe_project::MappingTarget::Parameter {
+            track,
+            target: faderframe_automation::AutomationTarget::PluginBypass(plugin),
+        },
+    );
     let weak = Rc::downgrade(app);
     bypass.connect_toggled(move |b| {
         if let Some(a) = weak.upgrade() {

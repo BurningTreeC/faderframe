@@ -251,9 +251,9 @@ impl GuitarView {
                 MenuItem::new("Show Automation", Action::ShowAutomation { track, target })
                     .separated(),
             );
-            items.push(MenuItem::new(
-                "Learn MIDI Controller",
-                Action::MidiLearn(MappingTarget::Parameter { track, target }),
+            items.extend(crate::kit::learn_items(
+                model,
+                MappingTarget::Parameter { track, target },
             ));
         }
         Some(HostRequest::ContextMenu { at, items })

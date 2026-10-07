@@ -1369,6 +1369,34 @@ impl MixerView {
         HostRequest::ContextMenu { at, items }
     }
 
+    /// A submenu `name` with MIDI learn for `target` and its mappings'
+    /// removal.
+    fn learn_submenu(
+        model: &Session,
+        t: &Track,
+        target: faderframe_automation::AutomationTarget,
+        name: &str,
+    ) -> MenuItem<Action> {
+        let target = faderframe_project::MappingTarget::Parameter {
+            track: t.id,
+            target,
+        };
+        let entries = model
+            .midi_learn_menu(target)
+            .into_iter()
+            .map(|(label, action)| MenuItem::new(label, action))
+            .collect();
+        let mapped = model.midi_mappings_for(target).len();
+        MenuItem::submenu(
+            if mapped > 0 {
+                format!("{name} (mapped)")
+            } else {
+                name.to_string()
+            },
+            entries,
+        )
+    }
+
     /// MIDI learn for a control (and removing its mappings).
     fn learn_menu(
         model: &Session,
@@ -1635,6 +1663,12 @@ impl MixerView {
                     )
                     .separated(),
                 );
+                items.push(Self::learn_submenu(
+                    model,
+                    t,
+                    faderframe_automation::AutomationTarget::PluginBypass(s.id),
+                    "Bypass: MIDI",
+                ));
                 if !builtin && !model.plugin_failed(s.id) {
                     items.push(MenuItem::new(
                         if model.plugin_sandboxed(s.id) {
@@ -2488,14 +2522,33 @@ impl MixerView {
                     pos,
                 )
             }),
-            Hit::Pan(id) => Self::track(model, id).map(|t| {
-                Self::learn_menu(
-                    model,
-                    t,
-                    faderframe_automation::AutomationTarget::TrackPan,
-                    pos,
-                )
-            }),
+            // Panned into a surround bed: the room's parameters, each its
+            // own submenu.
+            Hit::Pan(id) => {
+                Self::track(model, id).map(|t| match model.project().surround_panned(t) {
+                    Some(format) => {
+                        let items = faderframe_core::SurroundParam::ALL
+                            .into_iter()
+                            .filter(|p| p.applies(t.layout, format))
+                            .map(|p| {
+                                Self::learn_submenu(
+                                    model,
+                                    t,
+                                    faderframe_automation::AutomationTarget::Surround(p),
+                                    p.name(),
+                                )
+                            })
+                            .collect();
+                        HostRequest::ContextMenu { at: pos, items }
+                    }
+                    None => Self::learn_menu(
+                        model,
+                        t,
+                        faderframe_automation::AutomationTarget::TrackPan,
+                        pos,
+                    ),
+                })
+            }
             Hit::Mute(id) => Self::track(model, id).map(|t| {
                 Self::learn_menu(
                     model,

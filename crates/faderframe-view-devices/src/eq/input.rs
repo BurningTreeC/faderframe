@@ -256,10 +256,26 @@ impl EqView {
             Hit::Panel(item) if primary => {
                 self.panel_press(item, pos, clicks, mods, size, model, cx)
             }
+            // The parameter's menu (a double-click types a value).
             Hit::Panel(PanelItem::Knob(f)) if button == PointerButton::Secondary => {
-                if let Some(band) = self.focus {
-                    let at = Rect::new(pos.x - 40.0, pos.y - 10.0, 80.0, 20.0);
-                    self.type_value(model, cx, band, f, at);
+                if let Some(band) = self.focus
+                    && let Some(req) = self.param_menu(model, band_id(band, f), pos)
+                {
+                    cx.request(req);
+                }
+            }
+            Hit::Output(item) if button == PointerButton::Secondary => {
+                let index = match item {
+                    OutputItem::Gain => Some(global::OUTPUT),
+                    OutputItem::Pan => Some(global::PAN),
+                    OutputItem::Scale => Some(global::GAIN_SCALE),
+                    OutputItem::PanMode => Some(global::PAN_MODE),
+                    OutputItem::Invert => Some(global::INVERT),
+                    OutputItem::AutoGain => Some(global::AUTO_GAIN),
+                    OutputItem::Panel => None,
+                };
+                if let Some(req) = index.and_then(|i| self.param_menu(model, global_id(i), pos)) {
+                    cx.request(req);
                 }
             }
             Hit::Value(b, f) if primary => {
@@ -1564,6 +1580,40 @@ impl EqView {
     }
 
     /// The menu of a band (the selected bands).
+    /// A parameter's menu: its default, its automation, MIDI learn and the
+    /// mappings it has.
+    fn param_menu(
+        &self,
+        model: &Session,
+        id: faderframe_core::ParameterId,
+        at: Point,
+    ) -> Option<HostRequest<Action>> {
+        let tap = self.device.tap(model)?;
+        let info = tap.params.infos().iter().find(|i| i.id == id)?.clone();
+        let track = self.owner(model)?;
+        let target = faderframe_automation::AutomationTarget::PluginParameter {
+            plugin: self.device.plugin,
+            parameter: id,
+        };
+        let mut items = vec![MenuItem::disabled(info.name.clone())];
+        if let Some(a) = self.batch(model, "EQ", &[(id, info.default)]) {
+            let text = faderframe_plugin_host::eq::format(id, info.default)
+                .unwrap_or_else(|| format!("{:.2}", info.default));
+            items.push(MenuItem::new(format!("Default ({text})"), a).separated());
+        }
+        if info.automatable {
+            items.push(
+                MenuItem::new("Show Automation", Action::ShowAutomation { track, target })
+                    .separated(),
+            );
+            items.extend(crate::kit::learn_items(
+                model,
+                faderframe_project::MappingTarget::Parameter { track, target },
+            ));
+        }
+        Some(HostRequest::ContextMenu { at, items })
+    }
+
     pub(crate) fn band_menu(
         &self,
         model: &Session,

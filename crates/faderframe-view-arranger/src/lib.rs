@@ -2253,6 +2253,12 @@ impl ArrangerView {
                     Action::MidiLearn(target),
                 );
                 items.push(if i == 0 { item.separated() } else { item });
+                for m in model.midi_mappings_for(target) {
+                    items.push(MenuItem::new(
+                        format!("Remove MIDI Mapping from {name} ({})", m.source.label()),
+                        Action::Edit(Command::RemoveMidiMapping { mapping: m.id }),
+                    ));
+                }
             }
         }
         // Input source (audio tracks): mono or stereo, which input(s).

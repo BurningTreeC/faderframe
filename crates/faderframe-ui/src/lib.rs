@@ -19,6 +19,7 @@ pub mod gpu;
 #[cfg(all(feature = "gpu-painter", windows))]
 mod gpu_win32;
 mod icons;
+mod learn;
 mod listen;
 mod midi_prefs;
 pub mod painter;

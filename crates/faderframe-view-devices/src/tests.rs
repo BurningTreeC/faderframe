@@ -297,3 +297,50 @@ mod guitar_station {
         assert!(!p.texts().contains(&"MASTER"), "an AB763 has no master");
     }
 }
+
+/// Every device control's menu learns a MIDI controller and, once one is
+/// mapped, removes it (the Guitar Station's, the stock devices', the EQs').
+#[test]
+fn a_mapped_control_can_be_unmapped_from_its_menu() {
+    use faderframe_automation::AutomationTarget;
+    use faderframe_project::{
+        Command, MappingMode, MappingTarget, MidiControl, MidiMapping, MidiSource,
+    };
+    let (mut s, plugin) = session(builtin::GUITAR_STATION, "Guitar Station");
+    let (track, _) = s.plugin_owner(plugin).unwrap();
+    let target = MappingTarget::Parameter {
+        track,
+        target: AutomationTarget::PluginParameter {
+            plugin,
+            parameter: ParameterId(faderframe_plugin_host::devices::guitar::id::DRIVE),
+        },
+    };
+    let labels = |s: &Session| -> Vec<String> {
+        crate::kit::learn_items(s, target)
+            .into_iter()
+            .map(|i| i.label)
+            .collect()
+    };
+    assert_eq!(labels(&s), vec!["MIDI Learn…".to_string()]);
+    s.dispatch(Action::Edit(Command::AddMidiMapping {
+        index: 0,
+        mapping: MidiMapping {
+            id: faderframe_core::MidiMappingId(77),
+            source: MidiSource {
+                port: None,
+                channel: 0,
+                control: MidiControl::Cc { number: 21 },
+            },
+            target,
+            mode: MappingMode::default(),
+        },
+    }))
+    .unwrap();
+    let items = crate::kit::learn_items(&s, target);
+    let remove = items
+        .iter()
+        .find(|i| i.label.starts_with("Remove MIDI Mapping"))
+        .expect("a removal once mapped");
+    s.dispatch(remove.action.clone().unwrap()).unwrap();
+    assert!(s.midi_mappings_for(target).is_empty(), "removed");
+}
