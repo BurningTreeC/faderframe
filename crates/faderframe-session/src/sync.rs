@@ -631,7 +631,7 @@ impl Session {
                 if !self.transport.playing {
                     self.engine
                         .transport(faderframe_transport::TransportCommand::Locate(target))?;
-                    self.transport.position = target;
+                    self.show_position(target);
                 }
             }
         }
@@ -763,7 +763,7 @@ impl Session {
             self.start_recording(target)?;
         }
         self.engine.chase(target, at_ns, true)?;
-        self.transport.position = target;
+        self.show_position(target);
         self.loader.wake();
         if !self.transport.playing {
             self.transport.playing = true;

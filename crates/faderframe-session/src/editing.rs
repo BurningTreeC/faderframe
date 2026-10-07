@@ -283,7 +283,7 @@ impl Session {
             let s = self.engine.musical_to_samples(&self.project, r.start);
             self.engine
                 .transport(faderframe_transport::TransportCommand::Locate(s))?;
-            self.transport.position = s;
+            self.show_position(s);
         }
         self.revision += 1;
         Ok(())
@@ -966,7 +966,7 @@ impl Session {
         let s = self.engine.musical_to_samples(&self.project, to);
         self.engine
             .transport(faderframe_transport::TransportCommand::Locate(s))?;
-        self.transport.position = s;
+        self.show_position(s);
         if extend {
             let anchor = match self.selection.range {
                 Some(r) if r.end == here => r.start,

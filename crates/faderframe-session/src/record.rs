@@ -671,7 +671,7 @@ impl Session {
                     .musical_to_samples(&self.project, meter.bar_start(bar));
                 self.engine
                     .transport(TransportCommand::Locate(start.min(from)))?;
-                self.transport.position = start.min(from);
+                self.show_position(start.min(from));
             }
         }
         self.engine.transport(TransportCommand::Play)?;

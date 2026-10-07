@@ -13,7 +13,7 @@
 
 use faderframe_timeline::{TimeSignature, Timeline};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 
 /// A loop range in absolute samples (`start < end`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -351,6 +351,7 @@ pub struct TransportShared {
     recording: AtomicBool,
     looping: AtomicBool,
     scrubbing: AtomicBool,
+    jumps: AtomicU32,
 }
 
 /// What the UI reads.
@@ -363,6 +364,10 @@ pub struct TransportSnapshot {
     pub looping: bool,
     /// Playing a scrub snippet: the control side treats this as stopped.
     pub scrubbing: bool,
+    /// [`TransportState::jumps`] as of the end of the last callback (the
+    /// display's: a locate the session showed has happened once it
+    /// changes).
+    pub jumps: u32,
 }
 
 impl TransportShared {
@@ -376,6 +381,7 @@ impl TransportShared {
         self.recording.store(state.recording, Ordering::Relaxed);
         self.looping.store(state.looping(), Ordering::Relaxed);
         self.scrubbing.store(scrubbing, Ordering::Relaxed);
+        self.jumps.store(state.jumps, Ordering::Relaxed);
     }
 
     /// Read (control thread).
@@ -386,6 +392,7 @@ impl TransportShared {
             recording: self.recording.load(Ordering::Relaxed),
             looping: self.looping.load(Ordering::Relaxed),
             scrubbing: self.scrubbing.load(Ordering::Relaxed),
+            jumps: self.jumps.load(Ordering::Relaxed),
         }
     }
 }

@@ -1068,6 +1068,10 @@ pub struct Session {
     editor_clip: Option<ClipId>,
     meters: HashMap<TrackId, MeterDisplay>,
     transport: TransportSnapshot,
+    /// A position shown before the engine got there (a locate it applies
+    /// later, e.g. once render-ahead has primed it): the target, the
+    /// engine's jumps when it was asked, and when.
+    shown_position: Option<(i64, u32, Instant)>,
     metrics: MetricsSnapshot,
     last_metrics: Instant,
     path: Option<PathBuf>,
@@ -1313,6 +1317,7 @@ impl Session {
             editor_clip: None,
             meters: HashMap::new(),
             transport: TransportSnapshot::default(),
+            shown_position: None,
             metrics: MetricsSnapshot::default(),
             last_metrics: Instant::now(),
             path: None,
@@ -1486,6 +1491,13 @@ impl Session {
 
     pub fn meter(&self, track: TrackId) -> MeterDisplay {
         self.meters.get(&track).copied().unwrap_or_default()
+    }
+
+    /// Show `position` as the playhead's now, and until the engine has
+    /// applied the locate that moves it there.
+    pub(crate) fn show_position(&mut self, position: i64) {
+        self.transport.position = position;
+        self.shown_position = Some((position, self.transport.jumps, Instant::now()));
     }
 
     pub fn transport(&self) -> TransportSnapshot {
@@ -2004,6 +2016,16 @@ impl Session {
         self.engine.collect_garbage();
         let was_playing = self.transport.playing;
         self.transport = self.engine.transport_snapshot();
+        // A locate the engine has not applied yet (render-ahead primes the
+        // new position first) stays shown, not the position it left.
+        if let Some((target, jumps, at)) = self.shown_position {
+            let arrived = self.transport.jumps != jumps || self.transport.position == target;
+            if arrived || at.elapsed() > std::time::Duration::from_secs(2) {
+                self.shown_position = None;
+            } else {
+                self.transport.position = target;
+            }
+        }
         if !was_playing && self.transport.playing {
             self.automation_play_requested();
         }
@@ -3728,7 +3750,7 @@ impl Session {
                 let s = to_samples(self, pos.max(MusicalTime::ZERO));
                 self.engine.transport(TransportCommand::Locate(s))?;
                 // Show the new position immediately, even while stopped.
-                self.transport.position = s;
+                self.show_position(s);
             }
             TransportAction::Scrub(pos) => {
                 let s = to_samples(self, pos.max(MusicalTime::ZERO));
@@ -3739,11 +3761,11 @@ impl Session {
                     position: s,
                     frames,
                 })?;
-                self.transport.position = s;
+                self.show_position(s);
             }
             TransportAction::ReturnToStart => {
                 self.engine.transport(TransportCommand::Locate(0))?;
-                self.transport.position = 0;
+                self.show_position(0);
             }
             TransportAction::ToggleLoop => {
                 let range = self.project.loop_range.or_else(|| {
@@ -4928,7 +4950,7 @@ impl Session {
             && !self.editor.insertion_follows_playback
         {
             self.engine.transport(TransportCommand::Locate(pos))?;
-            self.transport.position = pos;
+            self.show_position(pos);
         }
         Ok(())
     }

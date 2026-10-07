@@ -100,3 +100,38 @@ fn tracks_render_ahead_until_armed() {
     assert!(late <= 4, "late {late} times");
     s.stop_audio();
 }
+
+/// A locate while stopped shows at once and stays shown: render-ahead holds
+/// it back until the new position is primed, and the playhead used to fall
+/// back to where it was until then (the session took the engine's old
+/// position on the next tick).
+#[test]
+fn a_locate_shows_at_once_while_render_ahead_primes_it() {
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    s.set_render_ahead(Some(Duration::from_millis(200)))
+        .unwrap();
+    s.start_audio(
+        vec![Box::new(DummyBackend::default())],
+        &AudioPreferences::default(),
+    )
+    .unwrap();
+    run(&mut s, Duration::from_millis(300));
+    assert!(!s.engine().ahead_tracks().is_empty(), "rendered ahead");
+    let bar3 = faderframe_timeline::MusicalTime::from_quarters_i(8);
+    let target = s.engine().musical_to_samples(s.project(), bar3);
+    s.dispatch(Action::Transport(TransportAction::Locate(bar3)))
+        .unwrap();
+    // Every tick until the engine has it, the playhead is there.
+    let end = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < end {
+        s.tick(0.016);
+        assert_eq!(s.transport().position, target, "the playhead stays put");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        s.engine().transport_snapshot().position,
+        target,
+        "and the engine got there"
+    );
+    s.stop_audio();
+}
