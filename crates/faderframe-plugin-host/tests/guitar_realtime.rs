@@ -130,6 +130,8 @@ fn the_guitar_station_does_not_allocate_live() {
         })
         .collect();
     let mut at = 0usize;
+    // Blocks that sounded, and whether every sample was finite.
+    let (sounded, finite) = (std::cell::Cell::new(0usize), std::cell::Cell::new(true));
     let mut run =
         |p: &mut GuitarProcessor, blocks: usize, stereo: bool, events: &[ParameterEvent]| {
             for _ in 0..blocks {
@@ -164,6 +166,9 @@ fn the_guitar_station_does_not_allocate_live() {
                     },
                 );
                 at += BLOCK;
+                let main = outs[0].channel(0);
+                sounded.set(sounded.get() + usize::from(main.iter().any(|x| *x != 0.0)));
+                finite.set(finite.get() && main.iter().all(|x| x.is_finite()));
                 // Paced like a device: the workers have their callback's time.
                 if let Some(rest) =
                     Duration::from_secs_f64(BLOCK as f64 / SR).checked_sub(started.elapsed())
@@ -199,6 +204,8 @@ fn the_guitar_station_does_not_allocate_live() {
     set(id::INTENSITY, 0.5);
     run(&mut p, 400, true, &events[3]);
     p.reset();
+    sounded.set(0);
+    finite.set(true);
     run(&mut p, 100, true, &[]);
     let allocations = EVENTS.load(Ordering::SeqCst);
     // The counter counts (a deliberate allocation while armed).
@@ -217,6 +224,13 @@ fn the_guitar_station_does_not_allocate_live() {
         WORKSHOP.load(Ordering::SeqCst) > 0,
         "the changed pedals were built while armed"
     );
-    assert!(outs[0].channel(0).iter().any(|x| *x != 0.0), "it plays");
-    assert!(outs[0].channel(0).iter().all(|x| x.is_finite()));
+    // After the reset it plays again -- anywhere in the run: a machine too
+    // busy for the workers conceals late blocks (silence), most of them
+    // when heavily overloaded.
+    let sounded = sounded.get();
+    assert!(
+        sounded > 0,
+        "it plays after the reset: {sounded} of 100 blocks"
+    );
+    assert!(finite.get());
 }

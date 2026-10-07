@@ -153,6 +153,13 @@ pub(super) struct PedalWorker {
     wait: bool,
     tap: Option<Arc<AnalysisTap>>,
     rate: f64,
+    /// Reset: the next segment takes its settings and resets again before
+    /// it plays, so what glides starts at them. A reset snaps glides to the
+    /// settings last applied, and those must not matter: on a worker, the
+    /// segments queued before a host reset are dropped unplayed when the
+    /// reset came first (a new epoch), so which were applied last depends on
+    /// how fast the worker was.
+    fresh: bool,
 }
 
 impl PedalWorker {
@@ -173,6 +180,7 @@ impl PedalWorker {
             wait,
             tap,
             rate,
+            fresh: false,
         }
     }
 
@@ -261,8 +269,13 @@ impl Segments for PedalWorker {
         }
         let frames = channels.first().map_or(0, |c| c.len());
         let deadline = crate::devices::solve_deadline(timing, frames, self.rate);
+        let fresh = std::mem::take(&mut self.fresh);
         for unit in self.bank.units_mut() {
             unit.set_realtime_deadline(deadline);
+            if fresh {
+                unit.apply(&settings);
+                unit.reset();
+            }
             unit.apply(&settings);
         }
         let frames = channels.first().map_or(0, |c| c.len());
@@ -322,6 +335,7 @@ impl Segments for PedalWorker {
             unit.reset();
         }
         self.bank.reset();
+        self.fresh = true;
     }
 }
 
@@ -332,6 +346,9 @@ pub(super) struct AmpWorker {
     stage: usize,
     tap: Option<Arc<AnalysisTap>>,
     rate: f64,
+    /// Reset: the next segment starts at its own settings (as the
+    /// pedals' `fresh`).
+    fresh: bool,
 }
 
 impl AmpWorker {
@@ -346,6 +363,7 @@ impl AmpWorker {
             stage,
             tap,
             rate,
+            fresh: false,
         }
     }
 }
@@ -405,8 +423,13 @@ impl Segments for AmpWorker {
         }
         let frames = channels.first().map_or(0, |c| c.len());
         let deadline = crate::devices::solve_deadline(timing, frames, self.rate);
+        let fresh = std::mem::take(&mut self.fresh);
         for chain in self.bank.units_mut() {
             chain.set_realtime_deadline(deadline);
+            if fresh {
+                chain.apply(controls);
+                chain.reset();
+            }
             chain.apply(controls);
         }
         let frames = channels.first().map_or(0, |c| c.len());
@@ -476,6 +499,7 @@ impl Segments for AmpWorker {
             chain.reset();
         }
         self.bank.reset();
+        self.fresh = true;
     }
 }
 
