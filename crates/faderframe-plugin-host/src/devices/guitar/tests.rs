@@ -464,3 +464,60 @@ fn preset_levels() {
         assert!(peak < 1.0, "{}: clips", preset.name);
     }
 }
+
+/// Every factory rig live, paced like a device, a stereo guitar on its
+/// workers: late frames, and the output's peak. Run in release with
+/// --ignored --nocapture.
+#[test]
+#[ignore]
+fn presets_live_paced() {
+    use std::time::{Duration, Instant};
+    let block: usize = std::env::var("GS_BLOCK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128);
+    let seconds: f64 = std::env::var("GS_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4.0);
+    let gain: f32 = std::env::var("GS_GAIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2.0);
+    for (i, preset) in crate::presets::factory_presets(faderframe_core::builtin::GUITAR_STATION)
+        .iter()
+        .enumerate()
+    {
+        let values =
+            crate::presets::factory_preset_values(faderframe_core::builtin::GUITAR_STATION, i)
+                .unwrap();
+        let set: Vec<(u32, f64)> = values.iter().map(|(p, v)| (p.0, *v)).collect();
+        let mut line = Line::new(&set, 2, Run::Live, block);
+        let blocks = (seconds * SR / block as f64) as usize;
+        let mut peak = 0f32;
+        let mut worst = Duration::ZERO;
+        let start = Instant::now();
+        for b in 0..blocks {
+            let due = start + Duration::from_secs_f64(((b + 1) * block) as f64 / SR);
+            line.p.set_callback_deadline(Some(due));
+            let t = Instant::now();
+            let (main, _) = line.block(block, &[], |n, c| {
+                pluck(n) * gain * if c == 1 { 0.9 } else { 1.0 }
+            });
+            worst = worst.max(t.elapsed());
+            if b > blocks / 4 {
+                peak = main.iter().flatten().fold(peak, |m, x| m.max(x.abs()));
+            }
+            if let Some(rest) = due.checked_duration_since(Instant::now()) {
+                std::thread::sleep(rest);
+            }
+        }
+        let late = line.p.take_underruns();
+        eprintln!(
+            "{:<20} late {late:>6} frames, worst callback {:>6.0} us, peak {:>6.1} dBFS",
+            preset.name,
+            worst.as_secs_f64() * 1e6,
+            20.0 * peak.max(1e-9).log10()
+        );
+    }
+}

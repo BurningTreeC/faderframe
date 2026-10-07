@@ -344,3 +344,27 @@ fn synth_voices_follow_their_note_expressions() {
     assert!(right < level * 0.01, "{right}");
     assert!((left / level - 1.0).abs() < 0.02, "{left}");
 }
+
+/// A device cycle that changes for a moment (another client asking the
+/// audio server for a longer one) leaves the buffered devices' latency, and
+/// so their processors, alone; one that lasts is followed, once.
+#[test]
+fn a_short_cycle_change_does_not_restart_the_buffered_devices() {
+    for id in [builtin::GUITAR_STATION, builtin::PREAMPS[0].0] {
+        let mut inst = BuiltinFactory.instantiate(id).unwrap();
+        inst.configure_device_block(64);
+        let _ = inst.poll();
+        let at_64 = inst.latency_samples();
+        inst.configure_device_block(1024);
+        assert!(!inst.poll().restart, "{id}");
+        assert_eq!(inst.latency_samples(), at_64, "{id}: a moment's change");
+        inst.configure_device_block(64);
+        assert!(!inst.poll().restart, "{id}");
+        inst.configure_device_block(1024);
+        let _ = inst.poll();
+        std::thread::sleep(BLOCK_SETTLE + std::time::Duration::from_millis(100));
+        assert!(inst.poll().restart, "{id}: a lasting change is followed");
+        assert!(inst.latency_samples() > at_64, "{id}");
+        assert!(!inst.poll().restart, "{id}: once");
+    }
+}

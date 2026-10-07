@@ -110,6 +110,10 @@ impl GuitarProcessor {
                 unit.swap(circuit);
                 unit.apply(&settings);
                 unit.reset();
+                unit.apply(&settings);
+                // Settled here, not on the stage's worker in its first
+                // segment.
+                unit.find_operating_point();
             }
             let worker = PedalWorker::new(
                 Bank::new(units),
@@ -128,6 +132,8 @@ impl GuitarProcessor {
         for chain in &mut chains {
             chain.apply(&settings);
             chain.reset();
+            chain.apply(&settings);
+            chain.find_operating_point();
         }
         let amp = StageRun::new(
             AmpWorker::new(Bank::new(chains)),

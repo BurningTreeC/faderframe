@@ -147,3 +147,49 @@ fn renders_are_the_same_every_time() {
     assert!(a == b, "two renders differ");
     assert!(a.iter().any(|x| x.abs() > 1e-4));
 }
+
+/// Every factory rig on the demo's Pluck, played: what render-ahead misses,
+/// what the device callbacks miss, how loud. Run in release with --ignored
+/// --nocapture.
+#[test]
+#[ignore]
+fn presets_in_the_demo() {
+    let (mut s, t, plugin) = rig();
+    s.start_audio(
+        vec![Box::new(DummyBackend::default())],
+        &AudioPreferences::default(),
+    )
+    .unwrap();
+    let presets = faderframe_plugin_host::presets::factory_presets(builtin::GUITAR_STATION);
+    for (i, preset) in presets.iter().enumerate() {
+        s.dispatch(Action::SelectPluginProgram { plugin, index: i })
+            .unwrap();
+        run(&mut s, 0.5);
+        s.dispatch(Action::Transport(TransportAction::Play))
+            .unwrap();
+        let (ahead0, xruns0) = (s.engine().ahead_misses(), s.performance().xruns);
+        let mut peak = f32::NEG_INFINITY;
+        let end = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < end {
+            s.tick(0.016);
+            peak = peak
+                .max(s.meter(t).left.hold_db)
+                .max(s.meter(t).right.hold_db);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        s.poll_performance();
+        let p = s.performance();
+        eprintln!(
+            "{:<20} ahead misses {:>6}, xruns {:>4}, deadline misses {:>4}, load max {:>5.2}, track peak {:>6.1} dBFS",
+            preset.name,
+            s.engine().ahead_misses() - ahead0,
+            p.xruns - xruns0,
+            p.deadline_misses,
+            p.max_load,
+            peak
+        );
+        s.dispatch(Action::Transport(TransportAction::Stop))
+            .unwrap();
+        run(&mut s, 0.3);
+    }
+}

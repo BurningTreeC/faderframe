@@ -421,6 +421,40 @@ fn cable(p: &mut dyn Painter, a: Point, b: Point, lift: f32) {
     }
 }
 
+/// The amplifier's lead: down from the last jack, along the board's floor
+/// under the pedals, and up into the plate.
+fn floor_cable(p: &mut dyn Painter, a: Point, b: Point) {
+    let floor = BOARD_Y + BOARD_H - 13.0;
+    let mut path = Path::new();
+    path.move_to(a)
+        .cubic_to(
+            Point::new(a.x + 26.0, a.y),
+            Point::new(a.x + 10.0, floor),
+            Point::new(a.x + 46.0, floor),
+        )
+        .line_to(Point::new(b.x - 46.0, floor))
+        .cubic_to(
+            Point::new(b.x - 10.0, floor),
+            Point::new(b.x - 26.0, b.y),
+            b,
+        );
+    p.stroke_path(&path, 6.0, rgba(0, 0.55));
+    p.stroke_path(&path, 4.6, rgb(0x141417));
+    p.stroke_path(&path, 1.4, rgba(0xffffff, 0.12));
+    let plug = Rect::new(b.x - 9.0, b.y - 3.5, 9.0, 7.0);
+    p.fill_rounded(
+        plug,
+        2.0,
+        &linear(
+            plug.x,
+            plug.y,
+            plug.x,
+            plug.bottom(),
+            vec![(0.0, rgb(0xe6e8ea)), (1.0, rgb(0x6b6f74))],
+        ),
+    );
+}
+
 fn board(p: &mut dyn Painter, sc: &Scene<'_>) {
     let r = Rect::new(0.0, BOARD_Y, PANEL_W, BOARD_H);
     p.fill_rect(
@@ -505,12 +539,7 @@ fn board(p: &mut dyn Painter, sc: &Scene<'_>) {
         cable(p, from, l, 26.0);
         from = rgt;
     }
-    cable(
-        p,
-        from,
-        Point::new(plate_out.center().x - 6.0, jack_y),
-        26.0,
-    );
+    floor_cable(p, from, Point::new(plate_out.center().x - 6.0, jack_y));
     for (place, ped) in sc.look.pedals.iter().enumerate() {
         if Some(place) != carried {
             pedal(p, sc, place, ped, 0.0, false);
@@ -671,6 +700,25 @@ fn pedal(
             Rect::new(at.x - 24.0, at.y + k.r + 3.0, 48.0, 10.0),
             &label,
         );
+        if sc.knob_hovered(k.id) {
+            let v = super::GuitarView::text(sc.tap, k.id, sc.get(k.id));
+            let tag = Rect::new(at.x - 22.0, at.y - k.r - 15.0, 44.0, 13.0);
+            p.fill_rounded(tag, 3.0, &Paint::Solid(rgba(0, 0.78)));
+            p.text(&v, tag, &style(8.0, rgb(0xf6f1e4)));
+        }
+    }
+    if !round {
+        for (i, (x, y)) in [
+            (r.x + 7.0, r.y + 7.0),
+            (r.right() - 7.0, r.y + 7.0),
+            (r.x + 7.0, r.bottom() - 7.0),
+            (r.right() - 7.0, r.bottom() - 7.0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            screw(p, i + place, Point::new(x, y), 6.5);
+        }
     }
     if wah && let (Some(t), Some(a)) = (ped.treadle, ped.auto) {
         treadle(p, sc, place, ped, t.translate(dx, dy));

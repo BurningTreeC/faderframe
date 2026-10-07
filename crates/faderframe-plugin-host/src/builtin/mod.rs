@@ -388,6 +388,10 @@ impl Kind {
     }
 }
 
+/// How long a new device block must hold before the buffered devices size
+/// their buffers by it (see `BuiltinInstance::sized_block`).
+const BLOCK_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Control-side instance shared by all built-ins.
 pub struct BuiltinInstance {
     kind: Kind,
@@ -395,6 +399,13 @@ pub struct BuiltinInstance {
     realtime: bool,
     /// Frames per device callback (0: unknown).
     device_block: usize,
+    /// The device block the buffered devices (preamps, the Guitar Station)
+    /// size their buffers by: it follows `device_block` once that has held
+    /// for [`BLOCK_SETTLE`], so a cycle that changes for a moment (another
+    /// client asking the audio server for a longer one) does not change
+    /// their latency and restart them mid-song. Seen differing since.
+    sized_block: usize,
+    block_differs: Option<std::time::Instant>,
     descriptor: PluginDescriptor,
     params: ParamValues,
     tap: Option<Arc<AnalysisTap>>,
@@ -419,6 +430,10 @@ impl PluginInstance for BuiltinInstance {
     }
     fn configure_device_block(&mut self, frames: usize) {
         self.device_block = frames;
+        if self.sized_block == 0 {
+            // Known now: no change to wait out.
+            self.sized_block = frames;
+        }
     }
     fn output_bus_names(&mut self) -> Vec<String> {
         match self.kind {
@@ -522,6 +537,17 @@ impl PluginInstance for BuiltinInstance {
             Kind::Drums => u64::from(crate::devices::drums::keeps_length(&self.params)),
             _ => 0,
         };
+        if self.device_block == self.sized_block {
+            self.block_differs = None;
+        } else {
+            let since = *self
+                .block_differs
+                .get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() >= BLOCK_SETTLE {
+                self.sized_block = self.device_block;
+                self.block_differs = None;
+            }
+        }
         let now = (self.latency_samples(), shape);
         let restart = self.reported.is_some_and(|r| r != now);
         self.reported = Some(now);
@@ -535,9 +561,9 @@ impl PluginInstance for BuiltinInstance {
         match self.kind {
             Kind::Preamp(_) => {
                 faderframe_circuit::preamp::Preamp::latency()
-                    + crate::devices::preamp::buffer_delay(self.device_block) as u32
+                    + crate::devices::preamp::buffer_delay(self.sized_block) as u32
             }
-            Kind::Guitar => crate::devices::guitar::latency(&self.params, self.device_block),
+            Kind::Guitar => crate::devices::guitar::latency(&self.params, self.sized_block),
             Kind::LatencyProbe => self.params.get(0).max(0.0) as u32,
             Kind::ProgramEq => crate::program_eq::LATENCY,
             Kind::Eq => crate::eq::latency(&self.params),
@@ -634,7 +660,7 @@ impl PluginInstance for BuiltinInstance {
                 config,
                 self.channels,
                 self.realtime,
-                crate::devices::preamp::buffer_delay(self.device_block),
+                crate::devices::preamp::buffer_delay(self.sized_block),
             )?),
             Kind::Gain => Box::new(crate::devices::utility::UtilityProcessor::new(
                 params,
@@ -726,7 +752,7 @@ impl PluginInstance for BuiltinInstance {
                 config,
                 self.channels,
                 self.realtime,
-                self.device_block,
+                self.sized_block,
             )?),
             Kind::Echo => Box::new(crate::devices::delay::DelayProcessor::new(
                 params,
@@ -849,6 +875,8 @@ impl PluginFactory for BuiltinFactory {
             channels: 2,
             realtime: false,
             device_block: 0,
+            sized_block: 0,
+            block_differs: None,
             kind,
             descriptor: kind.descriptor(),
             params,

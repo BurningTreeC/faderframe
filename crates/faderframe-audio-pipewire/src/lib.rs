@@ -669,21 +669,95 @@ fn run(
         }
     };
     let try_link = Rc::new(try_link);
+    // The server's default cycle (`clock.quantum` in the settings
+    // metadata), for a node with no buffer size of its own to ask for.
+    let quantum = Rc::new(std::cell::Cell::new(0u32));
+    let settings: Rc<RefCell<Option<(pw::metadata::Metadata, pw::metadata::MetadataListener)>>> =
+        Rc::default();
     let _registry_listener = {
         let (graph, g2, try_link) = (Rc::clone(&graph), Rc::clone(&graph), Rc::clone(&try_link));
+        let (registry2, settings, quantum) =
+            (registry.clone(), Rc::clone(&settings), Rc::clone(&quantum));
         registry
             .add_listener_local()
             .global(move |global| {
                 graph.borrow_mut().record(global);
                 try_link();
+                let is_settings = global.type_ == pw::types::ObjectType::Metadata
+                    && global
+                        .props
+                        .is_some_and(|p| p.get("metadata.name") == Some("settings"));
+                if is_settings
+                    && settings.borrow().is_none()
+                    && let Ok(meta) = registry2.bind::<pw::metadata::Metadata, _>(global)
+                {
+                    let q = Rc::clone(&quantum);
+                    let listener = meta
+                        .add_listener_local()
+                        .property(move |subject, key, _, value| {
+                            if subject == 0 && key == Some("clock.quantum") {
+                                q.set(value.and_then(|v| v.parse().ok()).unwrap_or(0));
+                            }
+                            0
+                        })
+                        .register();
+                    *settings.borrow_mut() = Some((meta, listener));
+                }
             })
             .global_remove(move |id| g2.borrow_mut().remove(id))
             .register()
     };
     let ml = mainloop.clone();
     let _quit = quit.attach(mainloop.loop_(), move |()| ml.quit());
+    // With no buffer size asked for, the node takes the graph's cycle -- and
+    // then asks for exactly that one. A node that asks for nothing lets any
+    // client with a longer latency (a browser, a notification through
+    // pipewire-pulse) drag the whole graph up, and every such change
+    // re-prepares the engine and rebuilds whatever buffers by the device's
+    // callbacks (the preamps, the Guitar Station) mid-song.
+    let pin = (config.buffer_size.is_none()).then(|| {
+        let (monitor, raw, quantum) = (Arc::clone(&monitor), filter.raw, Rc::clone(&quantum));
+        let pinned = Rc::new(std::cell::Cell::new(false));
+        let done = Rc::clone(&pinned);
+        let timer = mainloop.loop_().add_timer(move |_| {
+            if done.get() {
+                return;
+            }
+            let status = monitor.status();
+            if status.callbacks == 0 || status.buffer_size == 0 || status.sample_rate == 0 {
+                return;
+            }
+            // The configured default, not whatever the graph runs at now (a
+            // browser playing when the stream opened); the cycle it found
+            // where the server says nothing.
+            let frames = match quantum.get() {
+                0 => status.buffer_size,
+                q => q,
+            };
+            let props = properties! {
+                "node.latency" => format!("{frames}/{}", status.sample_rate),
+            };
+            let props = props.into_raw();
+            // SAFETY: the filter outlives the main loop run, this runs on
+            // the loop's thread, and the properties are freed after the
+            // call that copies them.
+            unsafe {
+                pw_sys::pw_filter_update_properties(raw, std::ptr::null_mut(), &(*props).dict);
+                pw_sys::pw_properties_free(props);
+            }
+            tracing::info!("PipeWire: asking the graph for {frames} frames");
+            done.set(true);
+        });
+        timer.update_timer(
+            Some(Duration::from_millis(100)),
+            Some(Duration::from_millis(250)),
+        );
+        (timer, pinned)
+    });
     let _ = ready.send(Ok(()));
     mainloop.run();
+    drop(pin);
+    settings.borrow_mut().take();
 
     // Links first, then the node, then the connection.
     links.borrow_mut().clear();
