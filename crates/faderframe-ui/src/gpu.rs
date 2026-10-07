@@ -23,6 +23,9 @@ pub fn available() -> bool {
 #[cfg(feature = "gpu-painter")]
 mod imp {
     use super::Painter;
+    #[cfg(target_os = "linux")]
+    use super::dmabuf_texture;
+    use super::imports_dmabufs;
     use faderframe_ui_gpu::GpuRenderer;
     use gtk::prelude::*;
     use gtk::{gdk, glib, graphene};
@@ -32,7 +35,12 @@ mod imp {
         Untried,
         /// Never dropped: at exit, when thread-locals are torn down, wgpu's
         /// own may be gone already (the system reclaims the GPU's memory).
-        Ready(std::mem::ManuallyDrop<Box<GpuRenderer>>),
+        /// `dmabuf`: frames go to GTK as dmabufs (Linux, when the GPU
+        /// exports and the display imports them).
+        Ready {
+            renderer: std::mem::ManuallyDrop<Box<GpuRenderer>>,
+            dmabuf: bool,
+        },
         Failed,
     }
 
@@ -55,8 +63,20 @@ mod imp {
             if matches!(*g, State::Untried) {
                 *g = match GpuRenderer::new() {
                     Ok(r) => {
-                        tracing::info!("dense views drawn on {}", r.adapter());
-                        State::Ready(std::mem::ManuallyDrop::new(Box::new(r)))
+                        let dmabuf = r.exports_dmabufs() && imports_dmabufs(snapshot);
+                        tracing::info!(
+                            "dense views drawn on {}{}",
+                            r.adapter(),
+                            if dmabuf {
+                                ", handed over as dmabufs"
+                            } else {
+                                ", read back"
+                            }
+                        );
+                        State::Ready {
+                            renderer: std::mem::ManuallyDrop::new(Box::new(r)),
+                            dmabuf,
+                        }
                     }
                     Err(e) => {
                         tracing::warn!("GPU painter unavailable: {e}");
@@ -64,13 +84,17 @@ mod imp {
                     }
                 };
             }
-            let State::Ready(r) = &mut *g else {
+            let State::Ready {
+                renderer: r,
+                dmabuf,
+            } = &mut *g
+            else {
                 return false;
             };
             let pw = (width * scale).ceil().max(1.0) as u32;
             let ph = (height * scale).ceil().max(1.0) as u32;
-            match r.render(pw, ph, scale, paint) {
-                Ok(frame) => {
+            match r.render_to(pw, ph, scale, *dmabuf, paint) {
+                Ok(faderframe_ui_gpu::Output::Pixels(frame)) => {
                     let stride = frame.stride();
                     let texture = gdk::MemoryTexture::new(
                         frame.width as i32,
@@ -83,6 +107,22 @@ mod imp {
                         .append_texture(&texture, &graphene::Rect::new(0.0, 0.0, width, height));
                     true
                 }
+                #[cfg(target_os = "linux")]
+                Ok(faderframe_ui_gpu::Output::Dmabuf(frame)) => match dmabuf_texture(frame) {
+                    Ok(texture) => {
+                        snapshot.append_texture(
+                            &texture,
+                            &graphene::Rect::new(0.0, 0.0, width, height),
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        // This frame is lost; the next ones are read back.
+                        tracing::warn!("GTK did not take the dmabuf ({e}): reading frames back");
+                        *dmabuf = false;
+                        false
+                    }
+                },
                 Err(e) => {
                     tracing::warn!("GPU painter failed, using GTK's: {e}");
                     *g = State::Failed;
@@ -95,6 +135,54 @@ mod imp {
 
 #[cfg(feature = "gpu-painter")]
 pub use imp::paint;
+
+/// Whether the display imports linear RGBA dmabufs (what the GPU painter
+/// hands over); `FADERFRAME_GPU_DMABUF=0` turns the hand-over off.
+#[cfg(all(feature = "gpu-painter", target_os = "linux"))]
+fn imports_dmabufs(snapshot: &gtk::Snapshot) -> bool {
+    use gtk::prelude::*;
+    let _ = snapshot;
+    std::env::var("FADERFRAME_GPU_DMABUF").as_deref() != Ok("0")
+        && gtk::gdk::Display::default().is_some_and(|d| {
+            d.dmabuf_formats().contains(
+                faderframe_ui_gpu::FOURCC_AB24,
+                faderframe_ui_gpu::MODIFIER_LINEAR,
+            )
+        })
+}
+
+#[cfg(all(feature = "gpu-painter", not(target_os = "linux")))]
+fn imports_dmabufs(_snapshot: &gtk::Snapshot) -> bool {
+    false
+}
+
+/// A GTK texture of a dmabuf frame; its buffer goes back to the painter's
+/// pool when GTK releases the texture.
+#[cfg(all(feature = "gpu-painter", target_os = "linux"))]
+fn dmabuf_texture(frame: faderframe_ui_gpu::DmabufFrame) -> Result<gtk::gdk::Texture, String> {
+    use gtk::gdk;
+    let display = gdk::Display::default().ok_or("no display")?;
+    let builder = gdk::DmabufTextureBuilder::new()
+        .set_display(&display)
+        .set_width(frame.width)
+        .set_height(frame.height)
+        .set_fourcc(frame.fourcc)
+        .set_modifier(frame.modifier)
+        .set_n_planes(1)
+        .set_offset(0, frame.offset)
+        .set_stride(0, frame.stride)
+        .set_premultiplied(false);
+    let release = frame.release;
+    // SAFETY: the descriptor stays open while `release` lives (the pool
+    // keeps the buffer until then); GTK drops the closure, and with it
+    // `release`, when it no longer uses the descriptor.
+    unsafe {
+        builder
+            .set_fd(0, frame.fd)
+            .build_with_release_func(move || drop(release))
+    }
+    .map_err(|e| e.to_string())
+}
 
 #[cfg(not(feature = "gpu-painter"))]
 pub fn paint(

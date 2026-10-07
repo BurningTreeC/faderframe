@@ -95,7 +95,8 @@ Contrast:
 * GTK 4 application, native on Wayland, HiDPI/fractional scaling via GTK.
   Optionally the analysers, the EQ and the devices' faces are drawn on the
   GPU (vello on wgpu; Preferences → General → Drawing): the mastering tools
-  went from 26 to 55 frames a second.
+  went from 26 to 55 frames a second, and on Linux the frames go to GTK as
+  dmabufs without a copy through the CPU (60 frames a second).
 * Arranger (virtualised): tracks, audio clips with waveforms, MIDI clips,
   move/split/delete, snapping, zoom down to single samples, loop range,
   playhead, console-style track headers with mute/solo/arm/monitor, volume,

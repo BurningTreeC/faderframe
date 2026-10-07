@@ -7,10 +7,19 @@
 //!
 //! GTK-free: the host turns [`GpuRenderer::render`]'s pixels into a
 //! texture. Creating a renderer fails without a usable GPU adapter; the
-//! host then keeps its own painter.
+//! host then keeps its own painter. On Linux, frames can skip the readback
+//! altogether ([`GpuRenderer::render_to`] with dmabuf export, `dmabuf`).
 
+#![deny(unsafe_code)]
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+mod dmabuf;
 mod scene;
 mod text;
+
+#[cfg(target_os = "linux")]
+pub use dmabuf::{DmabufFrame, FOURCC_AB24, MODIFIER_LINEAR, Release};
 
 use faderframe_ui_canvas::Painter;
 use std::num::NonZeroUsize;
@@ -82,8 +91,19 @@ struct Target {
     padded_row: u32,
 }
 
+/// What a frame became: pixels read back, or (Linux) a dmabuf the toolkit
+/// imports.
+pub enum Output {
+    Pixels(Frame),
+    #[cfg(target_os = "linux")]
+    Dmabuf(DmabufFrame),
+}
+
 /// The GPU, vello and the text and image caches; one per UI thread.
 pub struct GpuRenderer {
+    /// Dmabuf export (dropped before the device it uses).
+    #[cfg(target_os = "linux")]
+    dmabuf: Option<dmabuf::Exporter>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     renderer: vello::Renderer,
@@ -114,13 +134,28 @@ impl GpuRenderer {
             )
             .map_err(|e| GpuError::Adapter(e.to_string()))?;
         let info = adapter.get_info();
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        let desc = wgpu::DeviceDescriptor {
             label: Some("faderframe-ui-gpu"),
             required_features: wgpu::Features::empty(),
             required_limits: adapter.limits(),
             ..Default::default()
-        }))
-        .map_err(|e| GpuError::Device(e.to_string()))?;
+        };
+        // With dmabuf export where the GPU has it (Vulkan on Linux).
+        #[cfg(target_os = "linux")]
+        let opened = if std::env::var("FADERFRAME_GPU_DMABUF").as_deref() == Ok("0") {
+            None
+        } else {
+            dmabuf::open_device(&adapter, &desc)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let opened = None;
+        let (device, queue) = match opened {
+            Some(d) => d,
+            None => pollster::block_on(adapter.request_device(&desc))
+                .map_err(|e| GpuError::Device(e.to_string()))?,
+        };
+        #[cfg(target_os = "linux")]
+        let dmabuf = dmabuf::Exporter::new(&device);
         let renderer = vello::Renderer::new(
             &device,
             vello::RendererOptions {
@@ -132,6 +167,8 @@ impl GpuRenderer {
         )
         .map_err(|e| GpuError::Render(e.to_string()))?;
         Ok(Self {
+            #[cfg(target_os = "linux")]
+            dmabuf,
             device,
             queue,
             renderer,
@@ -149,6 +186,14 @@ impl GpuRenderer {
         &self.adapter
     }
 
+    /// Whether frames can go out as dmabufs.
+    pub fn exports_dmabufs(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        return self.dmabuf.is_some();
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
     /// Render a frame of `width × height` device pixels: `paint` draws in
     /// logical pixels, `scale` device pixels each.
     pub fn render(
@@ -158,6 +203,23 @@ impl GpuRenderer {
         scale: f32,
         paint: impl FnOnce(&mut dyn Painter),
     ) -> Result<Frame, GpuError> {
+        match self.render_to(width, height, scale, false, paint)? {
+            Output::Pixels(frame) => Ok(frame),
+            #[cfg(target_os = "linux")]
+            Output::Dmabuf(_) => Err(GpuError::Readback("a dmabuf was not asked for".into())),
+        }
+    }
+
+    /// [`Self::render`], as a dmabuf when `dmabuf` (and a buffer is free:
+    /// the toolkit may still show the others), else read back.
+    pub fn render_to(
+        &mut self,
+        width: u32,
+        height: u32,
+        scale: f32,
+        dmabuf: bool,
+        paint: impl FnOnce(&mut dyn Painter),
+    ) -> Result<Output, GpuError> {
         let max = self.device.limits().max_texture_dimension_2d;
         if width == 0 || height == 0 || width > max || height > max {
             return Err(GpuError::Size(width, height));
@@ -186,6 +248,42 @@ impl GpuRenderer {
                 },
             )
             .map_err(|e| GpuError::Render(e.to_string()))?;
+        #[cfg(target_os = "linux")]
+        if dmabuf
+            && let Some(exporter) = self.dmabuf.as_mut()
+            && let Some((buffer, frame)) =
+                exporter.slot(&self.device, width, height, target.padded_row)
+        {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("to dmabuf"),
+                });
+            encoder.copy_texture_to_buffer(
+                target.texture.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(target.padded_row),
+                        rows_per_image: None,
+                    },
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.queue.submit([encoder.finish()]);
+            // Done before the toolkit reads it (no fences cross over).
+            self.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(|e| GpuError::Readback(e.to_string()))?;
+            return Ok(Output::Dmabuf(frame));
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = dmabuf;
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -242,14 +340,54 @@ impl GpuRenderer {
         }
         target.buffer.unmap();
 
-        Ok(Frame {
+        Ok(Output::Pixels(Frame {
             width,
             height,
             pixels: Pixels {
                 bytes: pixels,
                 pool: std::sync::Arc::downgrade(&self.pool),
             },
-        })
+        }))
+    }
+
+    /// A dmabuf frame's rows as they are in its buffer (each `stride`
+    /// bytes): what the toolkit reads, copied back for tests.
+    #[cfg(target_os = "linux")]
+    #[doc(hidden)]
+    pub fn read_dmabuf(&self, frame: &DmabufFrame) -> Result<Vec<u8>, GpuError> {
+        let source = self
+            .dmabuf
+            .as_ref()
+            .and_then(|e| e.buffer_of(frame.fd))
+            .ok_or_else(|| GpuError::Readback("no such dmabuf".into()))?;
+        let size = u64::from(frame.stride) * u64::from(frame.height);
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dmabuf check"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_buffer_to_buffer(source, 0, &staging, 0, size);
+        self.queue.submit([encoder.finish()]);
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| GpuError::Readback(e.to_string()))?;
+        rx.recv()
+            .map_err(|e| GpuError::Readback(e.to_string()))?
+            .map_err(|e| GpuError::Readback(e.to_string()))?;
+        let bytes = slice
+            .get_mapped_range()
+            .map_err(|e| GpuError::Readback(e.to_string()))?
+            .to_vec();
+        Ok(bytes)
     }
 
     fn ensure_target(&mut self, width: u32, height: u32) {

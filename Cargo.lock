@@ -1059,6 +1059,7 @@ version = "0.11.0"
 name = "faderframe-ui-gpu"
 version = "0.11.0"
 dependencies = [
+ "ash",
  "faderframe-ui-canvas",
  "parley",
  "png",
@@ -1066,6 +1067,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "vello",
+ "wgpu",
 ]
 
 [[package]]

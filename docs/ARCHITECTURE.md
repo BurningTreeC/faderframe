@@ -2346,9 +2346,21 @@ back (`GpuRenderer::render`, straight-alpha RGBA, buffers recycled) into a
 `gdk::MemoryTexture`. Measured: the tools 26 → 55 fps, tools and EQ editor
 together 17–19 → 39 fps. Rectangle-heavy views stay with GSK (the mixer:
 its 3800 rectangles cost GSK 2 ms, while a 1.5×-scaled readback of 22 MB a
-frame costs more); the transfer is the remaining cost (a dmabuf would
-remove it). Without a GPU adapter, or after any error, views keep the GSK
-painter. `FADERFRAME_PAINT_STATS=1` logs each canvas's paint time, frame
+frame costs more). On Linux the readback goes too: the painter opens its
+Vulkan device with dma-buf export (`dmabuf::open_device`, through wgpu's
+hal: `VK_KHR_external_memory_fd`, `VK_EXT_external_memory_dma_buf`),
+copies each frame on the GPU into a pooled buffer whose memory is a
+dmabuf — linear rows padded to 256 bytes, DRM `AB24`, straight alpha —
+and GTK takes it as a `GdkDmabufTexture` (`GpuRenderer::render_to`,
+`Output::Dmabuf`); a buffer is reused only once GTK's release callback
+gave it back (three at most; with all of them shown a frame is read back).
+It is used when the display imports linear `AB24` (`dmabuf_formats`);
+if GTK refuses a frame, frames are read back from then on
+(`FADERFRAME_GPU_DMABUF=0` turns it off). Measured on a Radeon iGPU
+(RADV): the mastering tools at 2411×711 device pixels 4.98 → 3.80 ms per
+paint, 52 → 60 fps. Windows and macOS keep the readback (no dmabufs; a
+Direct3D import exists in newer GTK on Windows). Without a GPU adapter, or
+after any error, views keep the GSK painter. `FADERFRAME_PAINT_STATS=1` logs each canvas's paint time, frame
 rate and primitives per frame. Tests: `faderframe-ui-gpu/tests/render.rs`
 (skipped without an adapter).
 
@@ -2593,7 +2605,9 @@ for its editor.
     editors), `faderframe-plugin-vst3` (COM bindings, module loading),
     `faderframe-plugin-sandbox` (pipes, `poll`, shared memory, descriptors
     for helper processes, Win32 pipes/events/mappings, AppKit windows), `faderframe-stretch` (the C shim of the vendored
-    stretcher) and `faderframe-ui` (GObject subclassing macros).
+    stretcher), `faderframe-ui` (GObject subclassing macros, dmabuf
+    textures) and `faderframe-ui-gpu`'s `dmabuf` module (Vulkan external
+    memory through wgpu's hal and ash; the rest of the crate denies it).
 12. Vendored C/C++ code is listed in `THIRD_PARTY_LICENSES.md` and its
     realtime entry points are proven allocation-free by counting C++
     allocations in tests (`faderframe-stretch/tests/stretch.rs`; the Rust
@@ -2733,8 +2747,8 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
 9. **Performance**: ~~render-ahead for buses whose inputs are all rendered
    ahead~~ (done: the shallow tier, see *Render ahead*), ~~job affinity for
    cache locality~~ (done: see *Affinity*), ~~an optional wgpu painter for
-   dense views~~ (done: see *The GPU painter*; a dmabuf instead of the
-   readback is the next step there).
+   dense views~~ (done: see *The GPU painter*, with dmabuf hand-over on
+   Linux).
 10. ~~**Mastering**: multiple CD-Text languages, a DDP player/import,
     surround beds and panning before any object-based format~~ — done (see
     *CD-Text languages*, *The DDP player* and *Surround beds*). ~~Object-based

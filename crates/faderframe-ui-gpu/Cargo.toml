@@ -18,3 +18,9 @@ pollster = "0.4"
 png = "0.18"
 thiserror.workspace = true
 tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Dmabuf export through wgpu's Vulkan backend (the versions vello's wgpu
+# uses).
+wgpu = { version = "30", default-features = false, features = ["vulkan", "std", "wgsl"] }
+ash = "0.38"

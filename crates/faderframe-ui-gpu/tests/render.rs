@@ -166,3 +166,62 @@ fn a_filmstrip_frame_is_drawn() {
     assert!((195..=205).contains(&c[0]) && c[3] == 255, "{c:?}");
     assert_eq!(px(&f, 2, 2), [0, 0, 0, 0]);
 }
+
+/// On Linux a frame can go out as a dmabuf: the same pixels as read back,
+/// in linear rows padded to 256 bytes, in a real dma-buf; its buffer is
+/// reused only once the toolkit lets go of it.
+#[cfg(target_os = "linux")]
+#[test]
+fn frames_go_out_as_dmabufs() {
+    use faderframe_ui_gpu::Output;
+    let Some(mut r) = renderer() else { return };
+    if !r.exports_dmabufs() {
+        eprintln!("skipped: no dmabuf export on {}", r.adapter());
+        return;
+    }
+    let paint = |p: &mut dyn faderframe_ui_canvas::Painter| {
+        p.fill(Rect::new(0.0, 0.0, 30.0, 70.0), Color::rgb(1.0, 0.5, 0.0));
+        p.fill(
+            Rect::new(30.0, 20.0, 40.0, 10.0),
+            Color::rgba(0.0, 0.0, 1.0, 0.5),
+        );
+    };
+    let pixels = r.render(70, 70, 1.0, paint).unwrap();
+    let Output::Dmabuf(frame) = r.render_to(70, 70, 1.0, true, paint).unwrap() else {
+        panic!("no dmabuf");
+    };
+    assert_eq!((frame.width, frame.height), (70, 70));
+    assert_eq!(frame.stride, 512, "rows padded to 256 bytes");
+    assert_eq!(frame.fourcc, faderframe_ui_gpu::FOURCC_AB24);
+    let link = std::fs::read_link(format!("/proc/self/fd/{}", frame.fd)).unwrap();
+    assert!(link.to_string_lossy().contains("dmabuf"), "{link:?}");
+    let rows = r.read_dmabuf(&frame).unwrap();
+    for y in 0..70usize {
+        let a = &rows[y * 512..y * 512 + 280];
+        let b = &pixels.pixels.as_ref()[y * 280..(y + 1) * 280];
+        assert_eq!(a, b, "row {y}");
+    }
+    // Shown: the next frames take other buffers, at most three at once.
+    let second = r.render_to(70, 70, 1.0, true, paint).unwrap();
+    let third = r.render_to(70, 70, 1.0, true, paint).unwrap();
+    let Output::Dmabuf(second) = second else {
+        panic!()
+    };
+    assert_ne!(second.fd, frame.fd);
+    assert!(matches!(third, Output::Dmabuf(_)));
+    assert!(
+        matches!(
+            r.render_to(70, 70, 1.0, true, paint).unwrap(),
+            Output::Pixels(_)
+        ),
+        "every buffer shown: read back"
+    );
+    // Released, a buffer is used again.
+    let fd = frame.fd;
+    drop(frame);
+    let Output::Dmabuf(again) = r.render_to(70, 70, 1.0, true, paint).unwrap() else {
+        panic!("no dmabuf after a release");
+    };
+    assert_eq!(again.fd, fd);
+    drop((second, third, again));
+}
