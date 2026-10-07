@@ -243,8 +243,9 @@ fn launched_clips_play_and_are_recorded_into_the_arrangement() {
     assert_eq!(ids, before);
     // Back to the arrangement.
     op(&mut s, LauncherOp::BackToArrangement);
-    run(&mut s, 50);
-    assert!(s.launch_state(drums).unwrap().arrangement);
+    wait_for(&mut s, "back to the arrangement", |s| {
+        s.launch_state(drums).is_some_and(|l| l.arrangement)
+    });
 }
 
 /// A session with an armed audio track on the dummy device's 1 kHz tone
