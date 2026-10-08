@@ -2,5 +2,6 @@
 //! The imported solver retains its upstream SIMD kernels and safety comments.
 #![allow(clippy::all)]
 pub mod circuits;
+pub mod console;
 pub mod dsp;
 pub mod preamp;
