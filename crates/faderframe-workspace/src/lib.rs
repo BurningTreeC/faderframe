@@ -108,6 +108,10 @@ impl ViewId {
     pub fn album() -> Self {
         Self::new("album")
     }
+
+    pub fn lead_sheet() -> Self {
+        Self::new("lead-sheet")
+    }
 }
 
 impl fmt::Debug for ViewId {

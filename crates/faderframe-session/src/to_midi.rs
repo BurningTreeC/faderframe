@@ -41,11 +41,11 @@ impl ToMidi {
 
 /// A note found: seconds into the clip's part of the source.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Found {
-    start: f64,
-    end: f64,
-    key: u8,
-    velocity: u8,
+pub(crate) struct Found {
+    pub(crate) start: f64,
+    pub(crate) end: f64,
+    pub(crate) key: u8,
+    pub(crate) velocity: u8,
 }
 
 /// A conversion running: its clip, how, and the notes it will find.
@@ -62,7 +62,7 @@ const KICK: u8 = 36;
 const SNARE: u8 = 38;
 const HAT: u8 = 42;
 
-fn melody(x: &[f32], rate: f64) -> Vec<Found> {
+pub(crate) fn melody(x: &[f32], rate: f64) -> Vec<Found> {
     use faderframe_analysis::melody;
     let tr = melody::track(x, rate);
     let secs = |f: usize| (f * tr.hop) as f64 / rate;

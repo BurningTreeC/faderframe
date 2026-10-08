@@ -2479,6 +2479,18 @@ impl ArrangerView {
                 clip: clip.id,
                 what,
             };
+            if matches!(clip.content, ClipContent::Midi(_)) {
+                items.push(
+                    MenuItem::new(
+                        "Lead Sheet (Melody, Chords, Words)",
+                        Action::MakeLeadSheet {
+                            clip: clip.id,
+                            grid: faderframe_session::leadsheet::Grid::Auto,
+                        },
+                    )
+                    .separated(),
+                );
+            }
             if clip.as_audio().is_some() {
                 use faderframe_session::to_midi::ToMidi;
                 for (i, how) in [ToMidi::Melody, ToMidi::Harmony, ToMidi::Drums]
@@ -2498,6 +2510,13 @@ impl ArrangerView {
                 items.push(MenuItem::new(
                     "Transcribe Words to the Lyrics Lane",
                     Action::Transcribe(clip.id),
+                ));
+                items.push(MenuItem::new(
+                    "Lead Sheet (Melody, Chords, Words)",
+                    Action::MakeLeadSheet {
+                        clip: clip.id,
+                        grid: faderframe_session::leadsheet::Grid::Auto,
+                    },
                 ));
                 items.push(
                     MenuItem::new("Set Project Tempo from Clip", from(FromClip::SetTempo))

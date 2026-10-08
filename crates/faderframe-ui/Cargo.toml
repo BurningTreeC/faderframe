@@ -42,6 +42,7 @@ faderframe-view-arranger.workspace = true
 faderframe-view-mixer.workspace = true
 faderframe-view-performance.workspace = true
 faderframe-view-history.workspace = true
+faderframe-view-leadsheet.workspace = true
 faderframe-view-adr.workspace = true
 faderframe-view-video.workspace = true
 faderframe-video.workspace = true

@@ -299,6 +299,11 @@ pub fn install(app: &Rc<AppState>) {
             A::Workspace(W::ShowView(ViewId::video())),
         ),
         dispatch(app, "show-adr", A::Workspace(W::ShowView(ViewId::adr()))),
+        dispatch(
+            app,
+            "show-lead-sheet",
+            A::Workspace(W::ShowView(ViewId::lead_sheet())),
+        ),
         entry(app, "import-video", crate::video::import),
         entry(app, "conform-lists", crate::video::conform_lists),
         dispatch(
@@ -1753,6 +1758,32 @@ pub fn install(app: &Rc<AppState>) {
             if let Some(clip) = clip {
                 a.dispatch(Action::ConvertToMidi { clip, how });
             }
+        }),
+        // Development aid: `lead-sheet:<track>[@auto|straight|triplets]`
+        // (its first clip) and `export-lead-sheet:<path.pdf|.musicxml>`.
+        named("lead-sheet", |a, arg| {
+            use faderframe_session::leadsheet::Grid;
+            let (name, grid) = match arg.split_once('@') {
+                Some((n, "straight")) => (n, Grid::Straight),
+                Some((n, "triplets")) => (n, Grid::Triplets),
+                Some((n, _)) => (n, Grid::Auto),
+                None => (arg, Grid::Auto),
+            };
+            let clip = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == name)
+                .and_then(|t| t.clips.first().copied());
+            match clip {
+                Some(clip) => a.dispatch(Action::MakeLeadSheet { clip, grid }),
+                None => tracing::warn!("lead-sheet: no clip on '{name}'"),
+            }
+        }),
+        named("export-lead-sheet", |a, arg| {
+            a.dispatch(Action::ExportLeadSheet(std::path::PathBuf::from(arg)));
         }),
         // Development aid: `from-clip:<tempo|warp|key>=<track>` (its first
         // clip).

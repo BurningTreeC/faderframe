@@ -38,6 +38,7 @@ faderframe-plugin-clap = { path = "crates/faderframe-plugin-clap" }
 faderframe-plugin-vst3 = { path = "crates/faderframe-plugin-vst3" }
 faderframe-plugin-sandbox = { path = "crates/faderframe-plugin-sandbox" }
 faderframe-disc = { path = "crates/faderframe-disc" }
+faderframe-leadsheet = { path = "crates/faderframe-leadsheet" }
 faderframe-conform = { path = "crates/faderframe-conform" }
 faderframe-view-adr = { path = "crates/faderframe-view-adr" }
 faderframe-video = { path = "crates/faderframe-video" }
@@ -61,6 +62,7 @@ faderframe-view-automation = { path = "crates/faderframe-view-automation" }
 faderframe-view-album = { path = "crates/faderframe-view-album" }
 faderframe-view-performance = { path = "crates/faderframe-view-performance" }
 faderframe-view-history = { path = "crates/faderframe-view-history" }
+faderframe-view-leadsheet = { path = "crates/faderframe-view-leadsheet" }
 faderframe-view-launcher = { path = "crates/faderframe-view-launcher" }
 faderframe-view-modulators = { path = "crates/faderframe-view-modulators" }
 faderframe-view-pitch = { path = "crates/faderframe-view-pitch" }

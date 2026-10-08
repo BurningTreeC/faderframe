@@ -34,10 +34,12 @@ pub enum ViewKind {
     Video,
     /// The ADR cue list.
     Adr,
+    /// A clip's lead sheet, engraved.
+    LeadSheet,
 }
 
 impl ViewKind {
-    pub const ALL: [ViewKind; 16] = [
+    pub const ALL: [ViewKind; 17] = [
         ViewKind::Arranger,
         ViewKind::Mixer,
         ViewKind::PianoRoll,
@@ -54,11 +56,12 @@ impl ViewKind {
         ViewKind::Surround,
         ViewKind::Video,
         ViewKind::Adr,
+        ViewKind::LeadSheet,
     ];
 
     /// The order tabs keep, whichever opened first: the arranger, the
     /// mixer, then as the View menu lists them.
-    pub const TAB_ORDER: [ViewKind; 16] = [
+    pub const TAB_ORDER: [ViewKind; 17] = [
         ViewKind::Arranger,
         ViewKind::Mixer,
         ViewKind::PianoRoll,
@@ -75,6 +78,7 @@ impl ViewKind {
         ViewKind::Ddp,
         ViewKind::Video,
         ViewKind::Adr,
+        ViewKind::LeadSheet,
     ];
 
     /// Its place in [`Self::TAB_ORDER`].
@@ -109,6 +113,7 @@ impl ViewKind {
             ViewKind::Surround => "Surround Panner",
             ViewKind::Video => "Video",
             ViewKind::Adr => "ADR Cues",
+            ViewKind::LeadSheet => "Lead Sheet",
         }
     }
 
@@ -130,6 +135,7 @@ impl ViewKind {
             ViewKind::Surround => ViewId::surround(),
             ViewKind::Video => ViewId::video(),
             ViewKind::Adr => ViewId::adr(),
+            ViewKind::LeadSheet => ViewId::lead_sheet(),
         }
     }
 }

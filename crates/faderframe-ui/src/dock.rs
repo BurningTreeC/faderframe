@@ -104,6 +104,12 @@ fn create_view(app: &Rc<AppState>, kind: ViewKind) -> ViewHost {
             false,
             true,
         ),
+        ViewKind::LeadSheet => ViewHost::new(
+            app,
+            Box::new(faderframe_view_leadsheet::LeadSheetView::new(theme)),
+            false,
+            false,
+        ),
         ViewKind::History => ViewHost::new(
             app,
             Box::new(faderframe_view_history::HistoryView::new(theme)),
@@ -513,7 +519,7 @@ pub fn realize(app: &Rc<AppState>) {
 /// A dock view: its action's name and its id.
 type DockView = (&'static str, fn() -> ViewId);
 
-pub(crate) const DOCK_VIEWS: [DockView; 15] = [
+pub(crate) const DOCK_VIEWS: [DockView; 16] = [
     ("mixer", ViewId::mixer),
     ("piano-roll", ViewId::piano_roll),
     ("automation", ViewId::automation),
@@ -529,6 +535,7 @@ pub(crate) const DOCK_VIEWS: [DockView; 15] = [
     ("ddp", ViewId::ddp),
     ("video", ViewId::video),
     ("adr", ViewId::adr),
+    ("lead-sheet", ViewId::lead_sheet),
 ];
 
 /// Tick the View menu's views that are on screen, and the bottom dock

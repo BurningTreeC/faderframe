@@ -48,6 +48,7 @@ pub mod hardware;
 pub mod iamf;
 pub mod lanes;
 pub mod launcher;
+pub mod leadsheet;
 pub mod listening;
 pub mod outputs;
 mod programs;
@@ -380,6 +381,14 @@ pub enum Action {
         clip: ClipId,
         how: to_midi::ToMidi,
     },
+    /// A lead sheet of a clip's melody (an audio clip is listened to
+    /// first), with the chords and the words, in the Lead Sheet view.
+    MakeLeadSheet {
+        clip: ClipId,
+        grid: leadsheet::Grid,
+    },
+    /// Write the lead sheet as PDF or MusicXML (by the extension).
+    ExportLeadSheet(PathBuf),
     /// Set the project's tempo or key from a clip, or warp it to the
     /// tempo (after analysing it).
     FromClip {
@@ -1186,6 +1195,7 @@ pub struct Session {
     pitch: pitch::PitchCache,
     clip_analyses: detect::ClipAnalyses,
     conversions: to_midi::Conversions,
+    lead_sheets: leadsheet::LeadSheets,
     clip_fx: clip_fx::ClipFxState,
     speech: speech::SpeechState,
     launcher: launcher::LauncherState,
@@ -1439,6 +1449,7 @@ impl Session {
             pitch: pitch::PitchCache::default(),
             clip_analyses: detect::ClipAnalyses::default(),
             conversions: to_midi::Conversions::default(),
+            lead_sheets: leadsheet::LeadSheets::default(),
             clip_fx: clip_fx::ClipFxState::default(),
             speech: speech::SpeechState::default(),
             launcher: launcher::LauncherState::default(),
@@ -2369,6 +2380,7 @@ impl Session {
         self.poll_pitch();
         self.poll_clip_analyses();
         self.poll_conversions();
+        self.poll_lead_sheets();
         self.poll_clip_fx();
         self.poll_speech();
         let mut i = 0;
@@ -3269,6 +3281,10 @@ impl Session {
             Action::DetectPitch { clips } => self.detect_pitch(&clips)?,
             Action::FromClip { clip, what } => self.from_clip(clip, what)?,
             Action::ConvertToMidi { clip, how } => self.convert_to_midi(clip, how)?,
+            Action::MakeLeadSheet { clip, grid } => self.make_lead_sheet(clip, grid)?,
+            Action::ExportLeadSheet(path) => {
+                self.export_lead_sheet(&path)?;
+            }
             Action::OpenClipEffects(clip) => self.open_clip_fx(clip)?,
             Action::DownloadSpeechModel => self.download_speech_model()?,
             Action::Transcribe(clip) => self.transcribe(clip)?,

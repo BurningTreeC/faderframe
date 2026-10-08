@@ -892,6 +892,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "faderframe-leadsheet"
+version = "0.16.0"
+dependencies = [
+ "faderframe-midi",
+]
+
+[[package]]
 name = "faderframe-midi"
 version = "0.16.0"
 dependencies = [
@@ -1076,6 +1083,7 @@ dependencies = [
  "faderframe-engine",
  "faderframe-guitar",
  "faderframe-iamf",
+ "faderframe-leadsheet",
  "faderframe-midi",
  "faderframe-midi-io",
  "faderframe-plugin-clap",
@@ -1180,6 +1188,7 @@ dependencies = [
  "faderframe-view-devices",
  "faderframe-view-history",
  "faderframe-view-launcher",
+ "faderframe-view-leadsheet",
  "faderframe-view-mixer",
  "faderframe-view-modulators",
  "faderframe-view-performance",
@@ -1354,6 +1363,19 @@ dependencies = [
  "faderframe-engine",
  "faderframe-project",
  "faderframe-session",
+ "faderframe-ui-canvas",
+]
+
+[[package]]
+name = "faderframe-view-leadsheet"
+version = "0.16.0"
+dependencies = [
+ "faderframe-core",
+ "faderframe-engine",
+ "faderframe-leadsheet",
+ "faderframe-project",
+ "faderframe-session",
+ "faderframe-timeline",
  "faderframe-ui-canvas",
 ]
 

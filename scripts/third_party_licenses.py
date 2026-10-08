@@ -84,6 +84,20 @@ VENDORED = [
         "crates/faderframe-binaural/data/LICENSE-SADIE.txt",
     ),
     (
+        "Bravura music font (glyph outlines for lead sheets; Steinberg Media Technologies)",
+        "1.482 (34 glyphs)",
+        "OFL-1.1",
+        "https://github.com/steinbergmedia/bravura",
+        "crates/faderframe-leadsheet/data/OFL-Bravura.txt",
+    ),
+    (
+        "Adobe Core 14 AFM font metrics (Helvetica and Times widths for lead sheet PDFs)",
+        "4.1 (widths only)",
+        "Adobe AFM notice",
+        "https://github.com/foliojs/pdfkit/tree/master/lib/font/data",
+        "crates/faderframe-leadsheet/data/AFM-NOTICE.txt",
+    ),
+    (
         "libopus (IAMF masters; bundled by opusic-sys, built with CMake, statically linked)",
         "1.6.1",
         "BSD-3-Clause",

@@ -496,6 +496,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             ("Video", "app.view-video"),
             ("Video Full Screen", "app.video-full-screen"),
             ("ADR Cue List", "app.view-adr"),
+            ("Lead Sheet", "app.view-lead-sheet"),
             ("Bottom Dock", "app.dock-bottom"),
             ("Master Strip at the Side", "app.master-panel"),
         ]),

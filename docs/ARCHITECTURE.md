@@ -2332,6 +2332,47 @@ playing), a click goes there, a double-click edits, right-click deletes;
 `arrange` moves, copies and cuts them with sections; `Session::
 lyrics_text` writes LRC or SRT.
 
+### Lead sheets
+
+A clip's melody with its chords and words, written out as notation
+(`faderframe-leadsheet`, pure; `session::leadsheet`; view
+`faderframe-view-leadsheet`, `ViewKind::LeadSheet`):
+
+* **Hearing.** An audio clip's melody comes from the pitch analysis
+  (`to_midi::melody`, in a thread; kept, so writing it again with another
+  grid does not listen again); a MIDI clip's notes are read. Bars come from
+  the meter map over the clip, the chords from the chord track — or, with
+  none there, from what the other tracks' MIDI plays
+  (`harmony::detect_chords`, half a bar at a time) —, the key from the key
+  track (else detected from the melody and the chords, which keep a tune
+  from leaning on its fifth's key), words from the lyrics lane.
+* **Writing** (`build`): one voice; per beat sixteenths or eighth
+  triplets, whichever fits the onsets (`Grid::{Auto, Straight,
+  Triplets}`), short gaps closed; notes cut at bar lines with ties and
+  split into the values a reader expects (nothing crosses a beat unless it
+  starts on one, nor the middle of a 4/4 bar unless it starts the bar;
+  compound metres count dotted quarters); spelt in the key with
+  accidentals once a bar; beams by the beat (sixteenths' second beams,
+  hooks); triplet brackets; chord symbols on the nearest beat, a repeat
+  not written again; each lyric line's words matched in order to the
+  onsets in the line (by time, words shared out by their syllables), a
+  word over several notes drawing its line.
+* **MusicXML 4.0** (`musicxml`, `score-partwise`, valid against the
+  schema): harmony with kinds and degrees, ties, beams, tuplets, lyrics
+  with extenders, the tempo, a final bar line.
+* **Engraving** (`engrave`): a display list (filled outlines, lines,
+  text; points, y down) of A4 pages — systems of up to four bars (bars
+  close up to 80 % to share a line), justified; each note's room grows
+  with its value, accidental, dot, word and the chord over it. Glyphs are
+  34 of Bravura's (SIL OFL 1.1), baked with their SMuFL metadata (stem
+  anchors, engraving defaults) by `scripts/notation_assets.py`; text
+  measured with the Adobe Core 14 widths. **PDF** (`pdf`): a hand-written
+  PDF 1.4 with the paths and the standard fonts (WinAnsi, nothing
+  embedded). The view draws the same display list on paper.
+* Actions `MakeLeadSheet { clip, grid }`, `ExportLeadSheet(path)` (by
+  the extension); the arranger's clip menu; dev actions
+  `lead-sheet:<track>[@straight|triplets]`, `export-lead-sheet:<path>`.
+
 ### MIDI time code out and varispeed
 
 MTC output: outputs with MTC on (`MidiShared::mtc_ports`, rate and the
@@ -3139,10 +3180,9 @@ DAW does well yet):
     `rendering_ahead_does_not_allocate_on_the_audio_thread`'s rare timing
     failure under load.
 15. **Ideas from what FaderFrame has**:
-    - *Lead sheets from a recording*: the melody (audio to MIDI, the pitch
-      editor), chords (the chord track or their detection), words
-      (Whisper), key and tempo, as MusicXML or a PDF — end to end, which
-      no DAW does.
+    - ~~*Lead sheets from a recording*~~ — done (see Lead sheets): the
+      melody heard, chords from the chord track or the other tracks' MIDI,
+      words from the lyrics, key and tempo, as MusicXML or a PDF.
     - *Comping by lyric*: Whisper's word timings on every take; choose
       the best take word by word, the syllable shown under each note in
       the pitch editor.
