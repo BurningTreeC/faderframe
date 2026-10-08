@@ -1444,3 +1444,111 @@ fn a_compressing_track_shows_its_gain_reduction() {
     .unwrap();
     assert!(s.gain_reduction(bass).is_none());
 }
+
+/// A meter's right-click menu sets what it shows (this strip or every
+/// one); each mode paints, and the tooltip reads it in its terms.
+#[test]
+fn a_meters_menu_chooses_what_it_shows() {
+    let mut s = session();
+    let mut view = MixerView::new(Theme::default());
+    let size = Size::new(1600.0, 900.0);
+    view.update_sends(&s);
+    view.update_strips(&s);
+    let bass = MixerView::channel_tracks(&s)
+        .iter()
+        .find(|t| t.name == "Bass")
+        .unwrap()
+        .id;
+    let l = view.layout_of(&s, bass, size).unwrap();
+    let (_, requests) = run(&mut view, right(l.meter.center()), size, &s);
+    let Some(HostRequest::ContextMenu { items, .. }) = requests.into_iter().next() else {
+        panic!("a menu");
+    };
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    for want in [
+        "Peak",
+        "Peak + RMS",
+        "VU",
+        "PPM (EBU)",
+        "K-20",
+        "K-14",
+        "K-12",
+    ] {
+        assert!(labels.contains(&want), "{labels:?}");
+    }
+    assert_eq!(items[0].checked, Some(true), "Peak now");
+    let vu = items.iter().find(|i| i.label == "VU").unwrap();
+    s.dispatch(vu.action.clone().unwrap()).unwrap();
+    assert_eq!(s.meter_mode(bass), MeterMode::Vu);
+    let other = MixerView::channel_tracks(&s)
+        .iter()
+        .find(|t| t.name == "Drums")
+        .unwrap()
+        .id;
+    assert_eq!(s.meter_mode(other), MeterMode::Peak, "only this strip");
+    assert!(
+        view.tooltip(l.meter.center(), size, &s)
+            .unwrap()
+            .starts_with("VU meter")
+    );
+    // Every strip: K-14.
+    let every = items.iter().find(|i| i.label == "Every Strip").unwrap();
+    let k14 = every.children.iter().find(|i| i.label == "K-14").unwrap();
+    s.dispatch(k14.action.clone().unwrap()).unwrap();
+    assert_eq!(s.meter_mode(bass), MeterMode::K14);
+    assert_eq!(s.meter_mode(other), MeterMode::K14);
+    for mode in MeterMode::ALL {
+        s.dispatch(Action::SetMeterMode {
+            track: None,
+            mode: Some(mode),
+        })
+        .unwrap();
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, size, &s, &Theme::default());
+        assert!(
+            view.tooltip(l.meter.center(), size, &s).is_some(),
+            "{mode:?}"
+        );
+    }
+}
+
+/// The VU meter bridge: a VU meter over the strips; the strips below it
+/// answer where they are drawn.
+#[test]
+fn the_meter_bridge_puts_vu_meters_over_the_strips() {
+    let mut s = session();
+    let mut view = MixerView::new(Theme::default());
+    let size = Size::new(1600.0, 900.0);
+    s.dispatch(Action::SetMeterBridge(true)).unwrap();
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    let vus = p.texts().iter().filter(|t| **t == "VU").count();
+    assert!(
+        vus >= MixerView::channel_tracks(&s)
+            .iter()
+            .filter(|t| t.kind.has_audio())
+            .count()
+    );
+    // The bridge's tooltip names the strip under it.
+    let body = Size::new(size.w, size.h - BRIDGE_H);
+    let bass = MixerView::channel_tracks(&s)
+        .iter()
+        .find(|t| t.name == "Bass")
+        .unwrap()
+        .id;
+    let l = view.layout_of(&s, bass, body).unwrap();
+    let over = Point::new(l.meter.center().x, BRIDGE_H / 2.0);
+    assert!(view.tooltip(over, size, &s).unwrap().starts_with("Bass"));
+    // The strip's meter, drawn lower by the bridge, answers there.
+    let meter = Point::new(l.meter.center().x, l.meter.center().y + BRIDGE_H);
+    assert!(
+        view.tooltip(meter, size, &s)
+            .unwrap()
+            .contains("Peak meter")
+    );
+    let (_, requests) = run(&mut view, right(over), size, &s);
+    assert!(matches!(
+        requests.first(),
+        Some(HostRequest::ContextMenu { .. })
+    ));
+}

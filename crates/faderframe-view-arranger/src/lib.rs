@@ -1706,10 +1706,8 @@ impl ArrangerView {
                     .right(),
             );
             let m = model.meter(t.id);
-            let lv = |ch: &faderframe_session::MeterChannel| MeterLevel {
-                level_db: ch.level_db,
-                hold_db: ch.hold_db,
-                clipped: ch.clipped,
+            let lv = |ch: &faderframe_session::MeterChannel| {
+                MeterLevel::new(ch.level_db, ch.hold_db, ch.clipped)
             };
             controls::meter(p, l.meter, &[lv(&m.left), lv(&m.right)], th);
         }

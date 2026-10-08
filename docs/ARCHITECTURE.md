@@ -3547,3 +3547,31 @@ Crossings (`EditFlag::SnapToZeroCrossings`) moves the cuts of Separate,
 split at the playhead and Trim to Selection, and audio trims, to the
 nearest zero crossing of the clip's audio (channels summed, within 5 ms;
 `Session::cut_at`), per clip.
+
+### Meter styles and the VU meter bridge
+
+The engine's `MeterBank` keeps per channel the sample peak, the loudest
+block's mean square, the **energy and frames** since the last read (a
+compare-and-swap add, so the session gets the true RMS of every UI frame)
+and, for channels a PPM shows (`MeterBank::set_ppm`, switched per track by
+the session's tick through `EngineController::set_meter_ppm`), a
+sample-accurate **EBU quasi-peak** envelope (`PPM_ATTACK_S` 3.3 ms: a 10 ms
+burst reads −2 dB; 24 dB fall in 2.8 s). The session's `MeterChannel` turns
+that into the peak with its hold, an RMS integrated on the power (300 ms),
+a **VU needle** (second order, 99 % in 300 ms, 1.5 % overshoot, run in
+linear volts so the 0 VU reference only scales it: `vu_db(reference)`) and
+the PPM level.
+
+What a strip's meter shows is presentation (`WorkspaceSet::{meter_mode,
+meter_modes, vu_reference, meter_bridge}`, `MeterMode::{Peak, PeakRms, Vu,
+Ppm, K20, K14, K12}`; `Action::{SetMeterMode, SetVuReference,
+SetMeterBridge}`), chosen from the meter's right-click menu or the strip's
+Meter submenu, for one strip or every one. Every style is drawn in the
+skin's own look (LED ladder, bar, plasma; edgewise needles only in a skin
+whose meters are edgewise) with its standard's colours and scale
+(`controls::MeterZones::{Digital, Ppm, K(zero), Vu(reference)}` —
+`position` places a level, a VU on the voltage scale); with an RMS the lit
+bar is the RMS and the peak one LED (or line) above it. The mixer's meter
+bridge (`BRIDGE_H` over the strips; `paint`/`event`/`tooltip` shift the
+strips below it) shows a moving-coil VU (`controls::vu_arc`) per audio
+strip and the master, two for a wide stereo strip.

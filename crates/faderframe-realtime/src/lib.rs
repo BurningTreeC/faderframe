@@ -59,7 +59,7 @@ pub use atomic::AtomicF32;
 pub use cells::{Claim, TaskCells};
 pub use denormals::{ScopedFlushDenormals, flush_denormals_on_this_thread};
 pub use mailbox::{MailboxReceiver, MailboxSender, mailbox};
-pub use meters::{MeterBank, MeterRange, MeterReading};
+pub use meters::{MeterBank, MeterRange, MeterReading, PPM_ATTACK_S, PPM_FALL_DB_PER_S};
 pub use metrics::{CallbackMetrics, MetricsSnapshot};
 pub use pages::{Epoch, PageTable, Reclaimer, Retired};
 pub use params::{ParamSlot, ParamTable};

@@ -24,6 +24,7 @@ use faderframe_core::{FaderLaw, TrackId};
 use faderframe_project::{
     Command, InputRouting, MonitorMode, OutputRouting, SendTap, Track, TrackColor, TrackKind,
 };
+use faderframe_session::MeterMode;
 use faderframe_session::{Action, MeterDisplay, SelectMode, Session};
 use faderframe_ui_canvas::controls::{self, FaderGeometry, KnobLook, MeterLevel};
 use faderframe_ui_canvas::{
@@ -1126,17 +1127,19 @@ impl MixerView {
             return;
         }
         let m: MeterDisplay = model.meter(t.id);
-        let level = |ch: &faderframe_session::MeterChannel| MeterLevel {
-            level_db: ch.level_db,
-            hold_db: ch.hold_db,
-            clipped: ch.clipped,
-        };
-        if m.count > 2 {
-            let levels: Vec<MeterLevel> = m.shown().iter().map(level).collect();
-            controls::meter(p, l.meter, &levels, th);
+        let channels: Vec<faderframe_session::MeterChannel> = if m.count > 2 {
+            m.shown().to_vec()
         } else {
-            controls::meter(p, l.meter, &[level(&m.left), level(&m.right)], th);
-        }
+            vec![m.left, m.right]
+        };
+        paint_meter(
+            p,
+            l.meter,
+            &channels,
+            model.meter_mode(t.id),
+            model.vu_reference(),
+            th,
+        );
         // The track's compression, from the top down on the meter's own
         // scale (6 dB taken off reaches the meter's −6).
         if model.gain_reduction(t.id).is_some() {
@@ -2123,6 +2126,9 @@ impl MixerView {
                 },
             ));
         }
+        if t.kind.has_audio() {
+            items.push(MenuItem::submenu("Meter", meter_menu(model, Some(t.id))).separated());
+        }
         for (i, c) in TrackColor::PALETTE.iter().enumerate() {
             let mut item = MenuItem::new(
                 format!("Colour {}", i + 1),
@@ -2765,6 +2771,10 @@ impl MixerView {
             Hit::Scribble(id) | Hit::Strip(id) | Hit::Tags(id) => {
                 Self::track(model, id).map(|t| Self::track_menu(model, t, pos))
             }
+            Hit::Meter(id) => Some(HostRequest::ContextMenu {
+                at: pos,
+                items: meter_menu(model, Some(id)),
+            }),
             Hit::Level(id) => match (Self::track(model, id), self.layout_of(model, id, size)) {
                 (Some(t), Some(l)) => Some(Self::level_request(t, l.level_readout)),
                 _ => None,
@@ -2986,7 +2996,10 @@ impl MixerView {
             Hit::Scribble(_) => {
                 "Drag to reorder · Double-click to rename · Right-click for options".into()
             }
-            Hit::Meter(_) => "Peak meter · Click to clear clip indicators".into(),
+            Hit::Meter(id) => format!(
+                "{} · Click to clear clip indicators · Right-click: what the meter shows",
+                meter_reading(model, id)
+            ),
             Hit::InsertsGrip(_) => format!(
                 "Drag to show more or fewer insert slots (now {}) · Double-click for {}",
                 self.insert_slots,
@@ -2999,13 +3012,143 @@ impl MixerView {
     }
 }
 
-impl CanvasView<Session, Action> for MixerView {
-    fn set_theme(&mut self, theme: &Theme) {
-        self.base_theme = theme.clone();
-        self.theme = self.looked();
+/// The meter bridge's height.
+const BRIDGE_H: f32 = 78.0;
+
+/// `ev` with its position moved up by `dy` (into the strips' frame).
+fn shifted(ev: &ViewEvent, dy: f32) -> ViewEvent {
+    let mut e = *ev;
+    match &mut e {
+        ViewEvent::PointerDown { pos, .. }
+        | ViewEvent::PointerMove { pos, .. }
+        | ViewEvent::PointerUp { pos, .. }
+        | ViewEvent::Scroll { pos, .. } => pos.y -= dy,
+        _ => {}
+    }
+    e
+}
+
+/// A strip's VU reading for the bridge's tooltip.
+fn meter_reading_vu(model: &Session, track: TrackId) -> String {
+    let m = model.meter(track);
+    let r = model.vu_reference();
+    let name = model
+        .project()
+        .track(track)
+        .map_or(String::new(), |t| t.name.clone());
+    let vu = |c: &faderframe_session::MeterChannel| {
+        let v = c.vu_db(r);
+        if v < -40.0 {
+            "−∞".to_string()
+        } else {
+            format!("{v:+.1}").replace('-', "−")
+        }
+    };
+    if m.count > 2 {
+        format!("{name} · VU (loudest channel)")
+    } else {
+        format!(
+            "{name} · {} / {} VU (0 VU = {} dBFS RMS)",
+            vu(&m.left),
+            vu(&m.right),
+            format!("{r:.0}").replace('-', "−")
+        )
+    }
+}
+
+impl MixerView {
+    fn bridge_h(model: &Session) -> f32 {
+        if model.meter_bridge() { BRIDGE_H } else { 0.0 }
     }
 
-    fn paint(&mut self, p: &mut dyn Painter, size: Size, model: &Session, theme: &Theme) {
+    /// The strips of the bridge: (track, x, width), the master's last.
+    fn bridge_columns(&self, body: Size, model: &Session) -> Vec<(TrackId, f32, f32)> {
+        let tracks = Self::channel_tracks(model);
+        let mut out = Vec::new();
+        if !self.master_only {
+            for i in self.visible_range(tracks.len(), body) {
+                let t = tracks[i];
+                if !t.kind.has_audio() {
+                    continue;
+                }
+                let r = self.strip_rect(i, body);
+                out.push((t.id, r.x, r.w));
+            }
+        }
+        if !self.hide_master
+            && let Some(m) = model.project().master()
+        {
+            let r = self.master_rect(body);
+            out.push((m.id, r.x, r.w));
+        }
+        out
+    }
+
+    fn bridge_track_at(&self, x: f32, body: Size, model: &Session) -> Option<TrackId> {
+        self.bridge_columns(body, model)
+            .into_iter()
+            .find(|(_, x0, w)| x >= *x0 && x < x0 + w)
+            .map(|(t, _, _)| t)
+    }
+
+    /// The meter bridge: a moving-coil VU meter over every strip (two for a
+    /// wide stereo strip, the loudest channel of a bed), on the console's
+    /// panel.
+    fn paint_bridge(&self, p: &mut dyn Painter, width: f32, h: f32, body: Size, model: &Session) {
+        let th = &self.theme;
+        let c = &th.console;
+        let band = Rect::new(0.0, 0.0, width, h);
+        p.fill_rect(
+            band,
+            &faderframe_ui_canvas::Paint::vertical(band, c.panel_top, c.panel_bottom),
+        );
+        p.hline(0.0, width, h - 0.5, c.panel_edge_dark);
+        let reference = model.vu_reference();
+        let viewport = Rect::new(self.cheek(), 0.0, self.viewport_w(body), h);
+        for (track, x, w) in self.bridge_columns(body, model) {
+            let master = model.project().master().is_some_and(|m| m.id == track);
+            if !master {
+                p.push_clip(viewport);
+            }
+            let m = model.meter(track);
+            let name = model
+                .project()
+                .track(track)
+                .map_or(String::new(), |t| t.name.clone());
+            let cell = Rect::new(x + 2.0, 4.0, (w - 4.0).max(0.0), h - 8.0);
+            let deflection = |ch: &faderframe_session::MeterChannel| {
+                controls::vu_deflection(ch.vu_db(reference))
+            };
+            let peak = |ch: &faderframe_session::MeterChannel| ch.level_db >= -2.0;
+            if m.count > 2 {
+                let shown = m.shown();
+                let d = shown.iter().map(deflection).fold(-0.01, f32::max);
+                let lit = shown.iter().any(peak);
+                controls::vu_arc(p, cell, d, lit, &name, th);
+            } else if cell.w >= 128.0 {
+                let half = (cell.w - 3.0) / 2.0;
+                let left = Rect::new(cell.x, cell.y, half, cell.h);
+                let right = Rect::new(cell.x + half + 3.0, cell.y, half, cell.h);
+                controls::vu_arc(
+                    p,
+                    left,
+                    deflection(&m.left),
+                    peak(&m.left),
+                    &format!("{name} L"),
+                    th,
+                );
+                controls::vu_arc(p, right, deflection(&m.right), peak(&m.right), "R", th);
+            } else {
+                let d = deflection(&m.left).max(deflection(&m.right));
+                controls::vu_arc(p, cell, d, peak(&m.left) || peak(&m.right), &name, th);
+            }
+            if !master {
+                p.pop_clip();
+            }
+        }
+    }
+
+    fn paint_body(&mut self, p: &mut dyn Painter, size: Size, model: &Session, theme: &Theme) {
         self.follow_console(model);
         // The gain reduction shown: up at once, back slowly.
         let mut shown = std::mem::take(&mut self.reduction);
@@ -3149,7 +3292,7 @@ impl CanvasView<Session, Action> for MixerView {
         self.paint_insert_drag(p, size, model);
     }
 
-    fn event(
+    fn event_body(
         &mut self,
         ev: &ViewEvent,
         size: Size,
@@ -3460,13 +3603,74 @@ impl CanvasView<Session, Action> for MixerView {
         }
     }
 
+    fn tooltip_body(&self, pos: Point, size: Size, model: &Session) -> Option<String> {
+        self.hit_test(pos, size, model)
+            .and_then(|h| self.tooltip_for(h, model))
+    }
+}
+
+impl CanvasView<Session, Action> for MixerView {
+    fn set_theme(&mut self, theme: &Theme) {
+        self.base_theme = theme.clone();
+        self.theme = self.looked();
+    }
+
+    fn paint(&mut self, p: &mut dyn Painter, size: Size, model: &Session, theme: &Theme) {
+        let b = Self::bridge_h(model);
+        if b <= 0.0 {
+            return self.paint_body(p, size, model, theme);
+        }
+        let body = Size::new(size.w, (size.h - b).max(0.0));
+        p.push_transform(0.0, b, 1.0);
+        self.paint_body(p, body, model, theme);
+        p.pop_transform();
+        self.paint_bridge(p, size.w, b, body, model);
+    }
+
+    fn event(
+        &mut self,
+        ev: &ViewEvent,
+        size: Size,
+        model: &Session,
+        cx: &mut EventCx<'_, Action>,
+    ) -> bool {
+        let b = Self::bridge_h(model);
+        if b <= 0.0 {
+            return self.event_body(ev, size, model, cx);
+        }
+        let body = Size::new(size.w, (size.h - b).max(0.0));
+        // Presses in the bridge are its own; everything else (and every
+        // drag) goes to the strips below it.
+        if let ViewEvent::PointerDown { pos, button, .. } = *ev
+            && pos.y < b
+        {
+            if button == PointerButton::Secondary {
+                let track = self.bridge_track_at(pos.x, body, model);
+                cx.request(HostRequest::ContextMenu {
+                    at: pos,
+                    items: meter_menu(model, track),
+                });
+            }
+            return true;
+        }
+        self.event_body(&shifted(ev, b), body, model, cx)
+    }
+
     fn wants_frames(&self, model: &Session) -> bool {
         model.is_animating() || matches!(self.drag, Some(Drag::Track { moved: true, .. }))
     }
 
     fn tooltip(&self, pos: Point, size: Size, model: &Session) -> Option<String> {
-        self.hit_test(pos, size, model)
-            .and_then(|h| self.tooltip_for(h, model))
+        let b = Self::bridge_h(model);
+        let body = Size::new(size.w, (size.h - b).max(0.0));
+        if pos.y < b {
+            let track = self.bridge_track_at(pos.x, body, model)?;
+            return Some(format!(
+                "{} · Right-click: meters",
+                meter_reading_vu(model, track)
+            ));
+        }
+        self.tooltip_body(Point::new(pos.x, pos.y - b), body, model)
     }
 
     fn min_size(&self) -> Size {
@@ -3492,6 +3696,176 @@ impl CanvasView<Session, Action> for MixerView {
             self.scroll_x = offset.max(0.0);
         }
     }
+}
+
+/// A strip's meter as its mode shows it: peaks (with the RMS inside),
+/// a VU needle, the EBU quasi-peak or a K-System meter.
+fn paint_meter(
+    p: &mut dyn Painter,
+    rect: Rect,
+    channels: &[faderframe_session::MeterChannel],
+    mode: MeterMode,
+    reference: f32,
+    th: &Theme,
+) {
+    use controls::MeterZones;
+    let floor = faderframe_session::METER_FLOOR_DB;
+    match mode {
+        MeterMode::Vu => {
+            // A skin with edgewise meters shows needles; the others light
+            // their LEDs, bars or columns on the VU's scale.
+            if th.console.look.meter == faderframe_ui_canvas::MeterKind::Edgewise {
+                let needles: Vec<(f32, bool)> = channels
+                    .iter()
+                    .map(|c| (controls::vu_deflection(c.vu_db(reference)), c.clipped))
+                    .collect();
+                controls::vu_edgewise(p, rect, &needles, th);
+            } else {
+                let levels: Vec<MeterLevel> = channels
+                    .iter()
+                    .map(|c| MeterLevel::new(c.vu_db(reference) + reference, floor, c.clipped))
+                    .collect();
+                controls::meter_zoned(p, rect, &levels, MeterZones::Vu(reference), th);
+            }
+        }
+        MeterMode::Ppm => {
+            let levels: Vec<MeterLevel> = channels
+                .iter()
+                .map(|c| MeterLevel::new(c.ppm_db, floor, c.clipped))
+                .collect();
+            controls::meter_zoned(p, rect, &levels, MeterZones::Ppm, th);
+        }
+        MeterMode::K20 | MeterMode::K14 | MeterMode::K12 => {
+            // The RMS bar, the peak as a line above it.
+            let zero = mode.k_zero().unwrap_or(-20.0);
+            let levels: Vec<MeterLevel> = channels
+                .iter()
+                .map(|c| MeterLevel::new(c.rms_db, c.level_db, c.clipped))
+                .collect();
+            controls::meter_zoned(p, rect, &levels, MeterZones::K(zero), th);
+        }
+        MeterMode::Peak | MeterMode::PeakRms => {
+            let levels: Vec<MeterLevel> = channels
+                .iter()
+                .map(|c| MeterLevel {
+                    inner_db: (mode == MeterMode::PeakRms).then_some(c.rms_db),
+                    ..MeterLevel::new(c.level_db, c.hold_db, c.clipped)
+                })
+                .collect();
+            controls::meter_zoned(p, rect, &levels, MeterZones::Digital, th);
+        }
+    }
+}
+
+/// What a strip's meter reads now, in its mode's terms ("VU · −3.2 VU").
+fn meter_reading(model: &Session, track: TrackId) -> String {
+    let m = model.meter(track);
+    let mode = model.meter_mode(track);
+    let channels: Vec<faderframe_session::MeterChannel> = if m.count > 2 {
+        m.shown().to_vec()
+    } else {
+        vec![m.left, m.right]
+    };
+    let loudest = |f: &dyn Fn(&faderframe_session::MeterChannel) -> f32| {
+        channels.iter().map(f).fold(f32::MIN, f32::max)
+    };
+    let db = |v: f32| {
+        if v <= faderframe_session::METER_FLOOR_DB + 0.01 {
+            "−∞".to_string()
+        } else {
+            format!("{v:+.1}").replace('-', "−")
+        }
+    };
+    let reference = model.vu_reference();
+    match mode {
+        MeterMode::Peak => format!("Peak meter · {} dBFS", db(loudest(&|c| c.level_db))),
+        MeterMode::PeakRms => format!(
+            "Peak + RMS · peak {} dBFS, RMS {} dBFS",
+            db(loudest(&|c| c.level_db)),
+            db(loudest(&|c| c.rms_db))
+        ),
+        MeterMode::Vu => format!(
+            "VU meter · {} VU (0 VU = {} dBFS RMS)",
+            db(loudest(&|c| c.vu_db(reference)).max(-40.0)),
+            db(reference)
+        ),
+        MeterMode::Ppm => format!(
+            "PPM (EBU) · {} (TEST = −18 dBFS)",
+            db(loudest(&|c| c.ppm_db) + 18.0)
+        ),
+        MeterMode::K20 | MeterMode::K14 | MeterMode::K12 => {
+            let zero = mode.k_zero().unwrap_or(-20.0);
+            format!(
+                "{} · {} (RMS), peak {} dBFS",
+                mode.label(),
+                db(loudest(&|c| c.rms_db) - zero),
+                db(loudest(&|c| c.level_db))
+            )
+        }
+    }
+}
+
+/// The meter menu: what this strip's meter shows (or every strip's), the
+/// 0 VU reference, the meter bridge, the clip indicators.
+fn meter_menu(model: &Session, track: Option<TrackId>) -> Vec<MenuItem<Action>> {
+    let now = track.map(|t| model.meter_mode(t));
+    let mut items: Vec<MenuItem<Action>> = MeterMode::ALL
+        .iter()
+        .map(|&mode| {
+            MenuItem::new(
+                mode.label(),
+                Action::SetMeterMode {
+                    track,
+                    mode: Some(mode),
+                },
+            )
+            .checked(now == Some(mode))
+        })
+        .collect();
+    if track.is_some() {
+        items.push(
+            MenuItem::submenu(
+                "Every Strip",
+                MeterMode::ALL
+                    .iter()
+                    .map(|&mode| {
+                        MenuItem::new(
+                            mode.label(),
+                            Action::SetMeterMode {
+                                track: None,
+                                mode: Some(mode),
+                            },
+                        )
+                    })
+                    .collect(),
+            )
+            .separated(),
+        );
+    }
+    let reference = model.vu_reference();
+    items.push(MenuItem::submenu(
+        "0 VU Reference",
+        [-20.0f32, -18.0, -16.0, -14.0, -12.0]
+            .into_iter()
+            .map(|r| {
+                MenuItem::new(
+                    format!("{} dBFS RMS", format!("{r:.0}").replace('-', "−")),
+                    Action::SetVuReference(r),
+                )
+                .checked((reference - r).abs() < 0.01)
+            })
+            .collect(),
+    ));
+    items.push(
+        MenuItem::new(
+            "VU Meter Bridge",
+            Action::SetMeterBridge(!model.meter_bridge()),
+        )
+        .checked(model.meter_bridge())
+        .separated(),
+    );
+    items.push(MenuItem::new("Clear Clip Indicators", Action::ResetClipIndicators).separated());
+    items
 }
 
 #[cfg(test)]

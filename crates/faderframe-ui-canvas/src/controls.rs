@@ -486,28 +486,144 @@ pub fn meter_scale(db: f32) -> f32 {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MeterLevel {
+    /// The bar's level (dBFS).
     pub level_db: f32,
     pub hold_db: f32,
     pub clipped: bool,
+    /// A second level drawn inside the bar (the RMS of a Peak + RMS meter).
+    pub inner_db: Option<f32>,
+}
+
+impl MeterLevel {
+    pub fn new(level_db: f32, hold_db: f32, clipped: bool) -> Self {
+        Self {
+            level_db,
+            hold_db,
+            clipped,
+            inner_db: None,
+        }
+    }
+}
+
+/// How a meter's colours are laid out.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MeterZones {
+    /// Digital peaks: yellow from −18 dBFS, orange from −6, red from −2.
+    Digital,
+    /// The EBU PPM: yellow from TEST (−18 dBFS), orange from +6 (−12),
+    /// red from +9 (−9 dBFS, the permitted maximum).
+    Ppm,
+    /// A K-System meter with its 0 at this dBFS: green below 0, yellow up
+    /// to +4, red above.
+    K(f32),
+    /// A VU meter with 0 VU at this dBFS RMS, on the VU's own scale (by
+    /// voltage, +3 VU at the top): green below −3 VU, yellow to 0, red
+    /// above.
+    Vu(f32),
+}
+
+impl MeterZones {
+    /// Where yellow, orange and red begin (dBFS).
+    pub fn bounds(self) -> (f32, f32, f32) {
+        match self {
+            MeterZones::Digital => (-18.0, -6.0, -2.0),
+            MeterZones::Ppm => (-18.0, -12.0, -9.0),
+            MeterZones::K(zero) => (zero, zero + 4.0, zero + 4.0),
+            MeterZones::Vu(zero) => (zero - 3.0, zero, zero),
+        }
+    }
+
+    /// Where a level stands on the meter (0 bottom, 1 top).
+    pub fn position(self, db: f32) -> f32 {
+        match self {
+            MeterZones::Vu(zero) => vu_deflection(db - zero).min(1.0),
+            _ => meter_scale(db),
+        }
+    }
+
+    /// The level at a position (the inverse of [`Self::position`]).
+    fn level_at(self, norm: f32) -> f32 {
+        let (mut lo, mut hi) = (-100.0f32, 10.0f32);
+        for _ in 0..28 {
+            let mid = (lo + hi) / 2.0;
+            if self.position(mid) < norm {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        hi
+    }
+
+    fn colour(self, db: f32, theme: &Theme) -> Color {
+        let m = &theme.console.meter;
+        let (y, o, r) = self.bounds();
+        if db >= r {
+            m.red
+        } else if db >= o {
+            m.orange
+        } else if db >= y {
+            m.yellow
+        } else {
+            m.green
+        }
+    }
+
+    /// Gradient stops for a bar body (top = 0).
+    fn stops(self, theme: &Theme) -> Vec<(f32, Color)> {
+        let m = &theme.console.meter;
+        let (y, o, r) = self.bounds();
+        let at = |db: f32| 1.0 - self.position(db);
+        vec![
+            (0.0, m.red),
+            (at(r), m.orange),
+            (at(o), m.yellow),
+            (at(y), m.green),
+            (1.0, m.green.darken(0.2)),
+        ]
+    }
 }
 
 /// A level meter with peak hold and clip indicators, drawn as the theme
-/// says: a segmented LED ladder, a continuous bar or edgewise VU meters.
+/// says: a segmented LED ladder, a continuous bar, plasma columns or
+/// edgewise VU meters (driven by the bar's level).
 pub fn meter(p: &mut dyn Painter, rect: Rect, levels: &[MeterLevel], theme: &Theme) {
+    meter_zoned(p, rect, levels, MeterZones::Digital, theme);
+}
+
+/// [`meter`] with the colours of a metering standard.
+pub fn meter_zoned(
+    p: &mut dyn Painter,
+    rect: Rect,
+    levels: &[MeterLevel],
+    zones: MeterZones,
+    theme: &Theme,
+) {
     match theme.console.look.meter {
-        MeterKind::Ladder => ladder_meter(p, rect, levels, theme),
-        MeterKind::Bar => bar_meter(p, rect, levels, theme),
-        MeterKind::Edgewise => vu_meter(p, rect, levels, theme),
-        MeterKind::Plasma => plasma_meter(p, rect, levels, theme),
+        MeterKind::Ladder => ladder_meter(p, rect, levels, zones, theme),
+        MeterKind::Bar => bar_meter(p, rect, levels, zones, theme),
+        MeterKind::Edgewise => {
+            let needles: Vec<(f32, bool)> = levels
+                .iter()
+                .map(|l| (vu_scale(l.level_db), l.clipped))
+                .collect();
+            vu_edgewise(p, rect, &needles, theme)
+        }
+        MeterKind::Plasma => plasma_meter(p, rect, levels, zones, theme),
     }
 }
 
 /// VU deflection (0..1) of a level: 0 VU = −18 dBFS, scale −20…+3 VU,
 /// deflection proportional to voltage like a moving-coil meter.
 pub fn vu_scale(dbfs: f32) -> f32 {
-    let vu = (dbfs + 18.0).clamp(-20.0, 3.0);
-    let v = |db: f32| 10f32.powf(db / 20.0);
-    (v(vu) - v(-20.0)) / (v(3.0) - v(-20.0))
+    vu_deflection(dbfs + 18.0)
+}
+
+/// The deflection of a VU reading: proportional to voltage like a
+/// moving coil's, +3 VU full scale (0 VU at 71 %, −20 VU at 7 %), resting
+/// on the stop at 0 and pinning a little past full scale.
+pub fn vu_deflection(vu: f32) -> f32 {
+    (10f32.powf((vu.min(4.0) - 3.0) / 20.0)).clamp(0.0, 1.06)
 }
 
 /// Columns of a meter: (clip LED, body) per channel.
@@ -540,33 +656,43 @@ fn clip_led(p: &mut dyn Painter, r: Rect, clipped: bool, theme: &Theme) {
     );
 }
 
-/// A continuous bar coloured by zone, with a hold line.
-fn bar_meter(p: &mut dyn Painter, rect: Rect, levels: &[MeterLevel], theme: &Theme) {
+/// A continuous bar coloured by zone, with a hold line; with a second
+/// level (RMS) the bar is that and the peak a line above it.
+fn bar_meter(
+    p: &mut dyn Painter,
+    rect: Rect,
+    levels: &[MeterLevel],
+    zones: MeterZones,
+    theme: &Theme,
+) {
     let m = &theme.console.meter;
     p.fill_rounded(rect, 2.0, &Paint::Solid(m.background));
     for (lv, (clip, body)) in levels.iter().zip(meter_columns(rect, levels.len())) {
         clip_led(p, clip, lv.clipped, theme);
         p.fill(body, m.green.mix(m.background, 1.0 - m.unlit));
-        let lit = meter_scale(lv.level_db);
-        if lit > 0.0 {
+        let fill_to = |db: f32| {
+            let lit = zones.position(db);
             let top = body.bottom() - body.h * lit;
-            let fill = Rect::new(body.x, top, body.w, body.bottom() - top);
-            let y = |db: f32| 1.0 - meter_scale(db);
-            p.fill_rect(
-                fill,
-                &Paint::vertical_stops(
-                    body,
-                    vec![
-                        (0.0, m.red),
-                        (y(-2.0), m.orange),
-                        (y(-6.0), m.yellow),
-                        (y(-18.0), m.green),
-                        (1.0, m.green.darken(0.2)),
-                    ],
-                ),
-            );
+            (lit > 0.0).then(|| Rect::new(body.x, top, body.w, body.bottom() - top))
+        };
+        let gradient = Paint::vertical_stops(body, zones.stops(theme));
+        // With a second level (RMS) that is the bar, and the peak a line
+        // above it.
+        let bar = lv.inner_db.unwrap_or(lv.level_db);
+        if let Some(fill) = fill_to(bar) {
+            p.fill_rect(fill, &gradient);
         }
-        let hold = meter_scale(lv.hold_db);
+        if lv.inner_db.is_some() {
+            let lit = zones.position(lv.level_db);
+            if lit > 0.0 {
+                let y = body.bottom() - body.h * lit;
+                p.fill(
+                    Rect::new(body.x, y - 1.0, body.w, 2.0),
+                    zones.colour(lv.level_db, theme),
+                );
+            }
+        }
+        let hold = zones.position(lv.hold_db);
         if hold > 0.01 {
             let y = body.bottom() - body.h * hold;
             p.fill(Rect::new(body.x, y - 1.0, body.w, 2.0), m.peak);
@@ -577,31 +703,46 @@ fn bar_meter(p: &mut dyn Painter, rect: Rect, levels: &[MeterLevel], theme: &The
 /// Gas-plasma bar graphs: each channel a glowing column up to its level
 /// (zone colours from the theme), with fine dark lines across it like the
 /// discharge cells of a plasma display, a dimly lit unlit part and a peak
-/// hold mark.
-fn plasma_meter(p: &mut dyn Painter, rect: Rect, levels: &[MeterLevel], theme: &Theme) {
+/// hold mark; with a second level (RMS) the column is that and the peak a
+/// glowing line above it.
+fn plasma_meter(
+    p: &mut dyn Painter,
+    rect: Rect,
+    levels: &[MeterLevel],
+    zones: MeterZones,
+    theme: &Theme,
+) {
     let m = &theme.console.meter;
     p.fill_rounded(rect, 2.0, &Paint::Solid(m.background));
-    let y = |db: f32| 1.0 - meter_scale(db);
     for (lv, (clip, body)) in levels.iter().zip(meter_columns(rect, levels.len())) {
         clip_led(p, clip, lv.clipped, theme);
-        let zones = vec![
-            (0.0, m.red),
-            (y(-2.0), m.orange),
-            (y(-18.0), m.yellow),
-            (1.0, m.green),
-        ];
+        let stops = zones.stops(theme);
         // The unlit cells glow faintly.
-        let dim: Vec<(f32, Color)> = zones
+        let dim: Vec<(f32, Color)> = stops
             .iter()
             .map(|(t, c)| (*t, c.mix(m.background, 1.0 - m.unlit)))
             .collect();
         p.fill_rect(body, &Paint::vertical_stops(body, dim));
-        let lit = meter_scale(lv.level_db);
-        if lit > 0.0 {
+        let column = |db: f32| {
+            let lit = zones.position(db);
             let top = body.bottom() - body.h * lit;
-            let fill = Rect::new(body.x, top, body.w, body.bottom() - top);
+            (lit > 0.0).then(|| Rect::new(body.x, top, body.w, body.bottom() - top))
+        };
+        // With a second level (RMS) that is the column, and the peak a
+        // glowing line above it.
+        if let Some(fill) = column(lv.inner_db.unwrap_or(lv.level_db)) {
             p.shadow(fill, 1.0, m.orange.with_alpha(0.45), 0.0, 0.0, 4.0);
-            p.fill_rect(fill, &Paint::vertical_stops(body, zones));
+            p.fill_rect(fill, &Paint::vertical_stops(body, stops));
+        }
+        if lv.inner_db.is_some() {
+            let lit = zones.position(lv.level_db);
+            if lit > 0.0 {
+                let y = body.bottom() - body.h * lit;
+                let line = Rect::new(body.x, y - 1.0, body.w, 2.0);
+                let c = zones.colour(lv.level_db, theme);
+                p.shadow(line, 1.0, c.with_alpha(0.5), 0.0, 0.0, 3.0);
+                p.fill(line, c);
+            }
         }
         // Cell lines.
         let pitch = (m.segment + m.gap).max(2.0);
@@ -611,7 +752,7 @@ fn plasma_meter(p: &mut dyn Painter, rect: Rect, levels: &[MeterLevel], theme: &
             p.fill(Rect::new(body.x, yy, body.w, m.gap.clamp(0.6, 1.2)), line);
             yy -= pitch;
         }
-        let hold = meter_scale(lv.hold_db);
+        let hold = zones.position(lv.hold_db);
         if hold > 0.01 {
             let yh = body.bottom() - body.h * hold;
             p.fill(Rect::new(body.x, yh - 1.0, body.w, 2.0), m.peak);
@@ -620,12 +761,15 @@ fn plasma_meter(p: &mut dyn Painter, rect: Rect, levels: &[MeterLevel], theme: &
 }
 
 /// Edgewise moving-coil VU meters: a backlit scale with a red zone above
-/// 0 VU and a needle across it.
-fn vu_meter(p: &mut dyn Painter, rect: Rect, levels: &[MeterLevel], theme: &Theme) {
+/// 0 VU and a needle across it at each channel's deflection
+/// ([`vu_deflection`]); the clip LED with it.
+pub fn vu_edgewise(p: &mut dyn Painter, rect: Rect, needles: &[(f32, bool)], theme: &Theme) {
     let m = &theme.console.meter;
     p.fill_rounded(rect, 2.0, &Paint::Solid(m.background));
-    for (lv, (clip, face)) in levels.iter().zip(meter_columns(rect, levels.len())) {
-        clip_led(p, clip, lv.clipped, theme);
+    for (&(deflection, clipped), (clip, face)) in
+        needles.iter().zip(meter_columns(rect, needles.len()))
+    {
+        clip_led(p, clip, clipped, theme);
         // The backlit face: brightest in the middle.
         p.fill_rect(
             face,
@@ -638,9 +782,9 @@ fn vu_meter(p: &mut dyn Painter, rect: Rect, levels: &[MeterLevel], theme: &Them
                 ],
             ),
         );
-        let y_of = |dbfs: f32| face.bottom() - face.h * vu_scale(dbfs);
+        let y_of = |d: f32| face.bottom() - face.h * d;
         // Red zone above 0 VU.
-        let zero = y_of(-18.0);
+        let zero = y_of(vu_deflection(0.0));
         p.fill(
             Rect::new(face.x, face.y, face.w, zero - face.y),
             m.red.with_alpha(0.35),
@@ -649,7 +793,7 @@ fn vu_meter(p: &mut dyn Painter, rect: Rect, levels: &[MeterLevel], theme: &Them
         for vu in [
             -20.0f32, -10.0, -7.0, -5.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0,
         ] {
-            let y = y_of(vu - 18.0);
+            let y = y_of(vu_deflection(vu));
             let major = vu == 0.0 || vu == -10.0 || vu == -20.0 || vu == 3.0;
             let w = if major { face.w * 0.4 } else { face.w * 0.22 };
             let color = if vu > 0.0 {
@@ -661,7 +805,7 @@ fn vu_meter(p: &mut dyn Painter, rect: Rect, levels: &[MeterLevel], theme: &Them
         }
         // The needle: a dark bar across the face with a soft shadow below,
         // resting on its stop at the bottom when there is no signal.
-        let y = y_of(lv.level_db).clamp(face.y + 1.5, face.bottom() - 1.5);
+        let y = y_of(deflection).clamp(face.y + 1.5, face.bottom() - 1.5);
         p.fill(
             Rect::new(face.x, y + 1.0, face.w, 2.5),
             Color::rgba(0.0, 0.0, 0.0, 0.22),
@@ -671,8 +815,157 @@ fn vu_meter(p: &mut dyn Painter, rect: Rect, levels: &[MeterLevel], theme: &Them
     }
 }
 
-/// Segmented LED-ladder meter with peak hold and clip indicators.
-fn ladder_meter(p: &mut dyn Painter, rect: Rect, levels: &[MeterLevel], theme: &Theme) {
+/// A moving-coil VU meter with an arc scale (the meter bridge's): the
+/// backlit face, −20…+3 VU with the red arc past 0, the needle at
+/// `deflection` ([`vu_deflection`]) rising from behind the bezel at the
+/// bottom, a peak LED, and the caption under the meter on the panel.
+pub fn vu_arc(
+    p: &mut dyn Painter,
+    rect: Rect,
+    deflection: f32,
+    peak: bool,
+    caption: &str,
+    theme: &Theme,
+) {
+    let m = &theme.console.meter;
+    let caption_h = if caption.is_empty() { 0.0 } else { 12.0 };
+    let face = Rect::new(
+        rect.x + 1.0,
+        rect.y + 1.0,
+        rect.w - 2.0,
+        rect.h - 2.0 - caption_h,
+    );
+    if face.w < 8.0 || face.h < 8.0 {
+        return;
+    }
+    p.shadow(face, 3.0, Color::rgba(0.0, 0.0, 0.0, 0.5), 0.0, 1.0, 3.0);
+    p.fill_rounded(
+        face,
+        3.0,
+        &Paint::vertical_stops(
+            face,
+            vec![
+                (0.0, m.vu_face.darken(0.18)),
+                (0.45, m.vu_face),
+                (1.0, m.vu_face.darken(0.28)),
+            ],
+        ),
+    );
+    p.push_clip(face);
+    // The pivot sits behind the bezel at the bottom; the scale swings 40°
+    // each side of upright.
+    const SWING: f32 = 40.0;
+    let bezel_h = (face.h * 0.2).clamp(6.0, 14.0);
+    let radius = (face.w * 0.66).min((face.h - bezel_h) * 1.15).max(8.0);
+    let top = face.y + face.h * 0.16;
+    let pivot = Point::new(face.x + face.w / 2.0, top + radius);
+    let angle = |d: f32| (-90.0 - SWING + d * 2.0 * SWING).to_radians();
+    let at = |d: f32, r: f32| {
+        let a = angle(d);
+        Point::new(pivot.x + r * a.cos(), pivot.y + r * a.sin())
+    };
+    let arc_r = radius * 0.9;
+    // The scale's arc: dark up to 0 VU, red past it.
+    let zero = vu_deflection(0.0);
+    let mut scale = Path::new();
+    scale.arc(pivot, arc_r, angle(0.0), angle(zero), false);
+    p.stroke_path(&scale, 1.0, m.vu_needle.with_alpha(0.8));
+    let mut red = Path::new();
+    red.arc(pivot, arc_r, angle(zero), angle(1.0), false);
+    p.stroke_path(&red, 2.5, m.red.darken(0.1));
+    // Numerals as the width allows.
+    let numerals: &[f32] = if face.w >= 120.0 {
+        &[-20.0, -10.0, -7.0, -5.0, -3.0, 0.0, 3.0]
+    } else if face.w >= 64.0 {
+        &[-20.0, -10.0, -5.0, 0.0, 3.0]
+    } else {
+        &[]
+    };
+    for vu in [
+        -20.0f32, -10.0, -7.0, -5.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0,
+    ] {
+        let d = vu_deflection(vu);
+        let major = matches!(vu as i32, -20 | -10 | -7 | -5 | -3 | 0 | 3);
+        let len = if major { radius * 0.11 } else { radius * 0.06 };
+        let color = if vu > 0.0 {
+            m.red.darken(0.1)
+        } else {
+            m.vu_needle
+        };
+        p.line(at(d, arc_r), at(d, arc_r - len), 1.0, color);
+        if numerals.contains(&vu) {
+            let n = at(d, arc_r + 6.0);
+            let label = if vu > 0.0 {
+                format!("+{}", vu as i32)
+            } else {
+                format!("{}", (vu as i32).abs())
+            };
+            p.text(
+                &label,
+                Rect::new(n.x - 9.0, n.y - 5.0, 18.0, 10.0),
+                &TextStyle::new(theme.fonts.tiny - 1.0, color).center(),
+            );
+        }
+    }
+    // "VU" on the face.
+    let bezel = Rect::new(face.x, face.bottom() - bezel_h, face.w, bezel_h);
+    p.text(
+        "VU",
+        Rect::new(pivot.x - 14.0, bezel.y - 15.0, 28.0, 12.0),
+        &TextStyle::new(theme.fonts.tiny, m.vu_needle.with_alpha(0.75))
+            .weight(FontWeight::Bold)
+            .center(),
+    );
+    // The needle and its shadow.
+    let tip = at(deflection.clamp(-0.01, 1.06), radius * 0.97);
+    p.line(
+        Point::new(pivot.x + 1.5, pivot.y + 2.0),
+        Point::new(tip.x + 1.5, tip.y + 2.0),
+        1.6,
+        Color::rgba(0.0, 0.0, 0.0, 0.16),
+    );
+    p.line(pivot, tip, 1.2, m.vu_needle);
+    // The bezel over the pivot.
+    p.fill_rect(
+        bezel,
+        &Paint::vertical(bezel, m.vu_needle.mix(m.background, 0.6), m.background),
+    );
+    p.pop_clip();
+    // The peak LED, in the bezel.
+    let led = Rect::new(
+        face.x + face.w - 9.0,
+        bezel.y + (bezel.h - 5.0) / 2.0,
+        5.0,
+        5.0,
+    );
+    p.fill_rounded(
+        led,
+        2.5,
+        &Paint::Solid(if peak {
+            m.clip
+        } else {
+            m.clip.mix(m.background, 0.7)
+        }),
+    );
+    p.inset_shadow(face, 3.0, Color::rgba(0.0, 0.0, 0.0, 0.45), 0.0, 1.0, 3.0);
+    if !caption.is_empty() {
+        p.text(
+            caption,
+            Rect::new(rect.x, rect.bottom() - caption_h, rect.w, caption_h),
+            &TextStyle::new(theme.fonts.tiny, theme.console.panel_label).center(),
+        );
+    }
+}
+
+/// Segmented LED-ladder meter with peak hold and clip indicators; with a
+/// second level (RMS) the lit bar is that and the peak one LED above it.
+fn ladder_meter(
+    p: &mut dyn Painter,
+    rect: Rect,
+    levels: &[MeterLevel],
+    zones: MeterZones,
+    theme: &Theme,
+) {
     let m = &theme.console.meter;
     p.fill_rounded(rect, 2.0, &Paint::Solid(m.background));
     p.inset_shadow(rect, 2.0, Color::rgba(0.0, 0.0, 0.0, 0.9), 0.0, 1.0, 2.0);
@@ -692,21 +985,13 @@ fn ladder_meter(p: &mut dyn Painter, rect: Rect, levels: &[MeterLevel], theme: &
     );
     let pitch = m.segment + m.gap;
     let segments = (ladder.h / pitch).floor().max(1.0) as usize;
-    let zone = |norm: f32| -> Color {
-        if norm >= meter_scale(-2.0) {
-            m.red
-        } else if norm >= meter_scale(-6.0) {
-            m.orange
-        } else if norm >= meter_scale(-18.0) {
-            m.yellow
-        } else {
-            m.green
-        }
-    };
+    // The level a segment stands for (to colour it).
+    let db_of = |norm: f32| zones.level_at(norm);
     for (i, lv) in levels.iter().enumerate() {
         let x = inner.x + i as f32 * (col_w + col_gap);
-        let lit = meter_scale(lv.level_db);
-        let hold = meter_scale(lv.hold_db);
+        let lit = zones.position(lv.level_db);
+        let inner_lit = lv.inner_db.map(meter_scale);
+        let hold = zones.position(lv.hold_db);
         // Clip LED.
         let clip = Rect::new(x, inner.y, col_w, clip_h);
         p.fill(
@@ -717,14 +1002,20 @@ fn ladder_meter(p: &mut dyn Painter, rect: Rect, levels: &[MeterLevel], theme: &
                 m.clip.mix(m.background, 0.82)
             },
         );
-        let hold_seg = ((hold * segments as f32).ceil() as usize).min(segments);
+        let segment_of = |v: f32| ((v * segments as f32).ceil() as usize).min(segments);
+        let hold_seg = segment_of(hold);
+        // With a second level (RMS) the bar is that, and the peak one LED
+        // lit at its level (an average meter with a peak dot).
+        let bar = inner_lit.unwrap_or(lit);
+        let peak_seg = inner_lit.map(|_| segment_of(lit));
         for s in 0..segments {
             let norm = (s as f32 + 0.5) / segments as f32;
             let y = ladder.bottom() - (s as f32 + 1.0) * pitch + m.gap;
-            let base = zone(norm);
-            let on = norm <= lit;
+            let base = zones.colour(db_of(norm), theme);
+            let on = norm <= bar;
             let is_hold = hold_seg > 0 && s + 1 == hold_seg && hold > 0.01;
-            let color = if on || is_hold {
+            let is_peak = peak_seg.is_some_and(|p| p > 0 && s + 1 == p && lit > 0.01);
+            let color = if on || is_hold || is_peak {
                 base
             } else {
                 base.mix(m.background, 1.0 - m.unlit)
@@ -952,15 +1243,72 @@ mod tests {
         meter(
             &mut p,
             Rect::new(0.0, 0.0, 12.0, 200.0),
-            &[MeterLevel {
-                level_db: -6.0,
-                hold_db: -3.0,
-                clipped: false,
-            }],
+            &[MeterLevel::new(-6.0, -3.0, false)],
             &theme,
         );
+        // Every metering standard, with an RMS inside; the VU faces.
+        for zones in [MeterZones::Digital, MeterZones::Ppm, MeterZones::K(-14.0)] {
+            meter_zoned(
+                &mut p,
+                Rect::new(0.0, 0.0, 12.0, 200.0),
+                &[MeterLevel {
+                    inner_db: Some(-20.0),
+                    ..MeterLevel::new(-6.0, -3.0, false)
+                }],
+                zones,
+                &theme,
+            );
+        }
+        vu_edgewise(
+            &mut p,
+            Rect::new(0.0, 0.0, 12.0, 200.0),
+            &[(0.5, false)],
+            &theme,
+        );
+        vu_arc(
+            &mut p,
+            Rect::new(0.0, 0.0, 90.0, 70.0),
+            0.7,
+            true,
+            "Bass",
+            &theme,
+        );
+        assert!(p.texts().contains(&"Bass"));
         assert!(p.ops.len() > 20);
         assert!(p.texts().contains(&"M"));
         assert!(p.balanced_clips());
+    }
+}
+
+#[cfg(test)]
+mod meter_tests {
+    use super::*;
+
+    #[test]
+    fn vu_deflection_is_proportional_to_voltage() {
+        assert!((vu_deflection(3.0) - 1.0).abs() < 1e-6);
+        // 0 VU sits at about 71 % of the swing, −10 VU near 22 %, −20 VU
+        // at 7 %.
+        assert!((vu_deflection(0.0) - 0.708).abs() < 0.002);
+        assert!((vu_deflection(-10.0) - 0.224).abs() < 0.002);
+        assert!((vu_deflection(-20.0) - 0.0708).abs() < 0.001);
+        // The stops.
+        assert!(vu_deflection(-90.0) < 1e-4);
+        assert_eq!(vu_deflection(20.0), 1.06);
+        assert_eq!(vu_scale(-18.0), vu_deflection(0.0));
+    }
+
+    #[test]
+    fn the_standards_colour_where_they_should() {
+        assert_eq!(MeterZones::Digital.bounds(), (-18.0, -6.0, -2.0));
+        assert_eq!(MeterZones::Ppm.bounds(), (-18.0, -12.0, -9.0));
+        assert_eq!(MeterZones::K(-14.0).bounds(), (-14.0, -10.0, -10.0));
+        // A VU on LEDs: green below −3 VU, red from 0 VU; on its own
+        // scale, 0 VU at 71 % of the height.
+        let vu = MeterZones::Vu(-18.0);
+        assert_eq!(vu.bounds(), (-21.0, -18.0, -18.0));
+        assert!((vu.position(-18.0) - 0.708).abs() < 0.002);
+        assert!((vu.level_at(vu.position(-24.0)) + 24.0).abs() < 0.01);
+        assert!((MeterZones::Digital.level_at(0.5) + 20.0).abs() < 0.01);
     }
 }

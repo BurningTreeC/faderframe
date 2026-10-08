@@ -2322,6 +2322,47 @@ pub fn install(app: &Rc<AppState>) {
             };
             a.dispatch(Action::SetStripWidth { track, width });
         }),
+        // Development aid: `meter-mode:<track|all>=<peak|peak-rms|vu|ppm|k20|k14|k12>`.
+        named("meter-mode", |a, arg| {
+            use faderframe_session::MeterMode as M;
+            let Some((name, mode)) = arg.split_once('=') else {
+                tracing::warn!("meter-mode: '{arg}' is not <track>=<mode>");
+                return;
+            };
+            let mode = match mode {
+                "peak" => M::Peak,
+                "peak-rms" => M::PeakRms,
+                "vu" => M::Vu,
+                "ppm" => M::Ppm,
+                "k20" => M::K20,
+                "k14" => M::K14,
+                "k12" => M::K12,
+                _ => return tracing::warn!("meter-mode: unknown mode '{mode}'"),
+            };
+            let track = if name == "all" {
+                None
+            } else {
+                let id = a
+                    .session
+                    .borrow()
+                    .project()
+                    .tracks
+                    .iter()
+                    .find(|t| t.name == name)
+                    .map(|t| t.id);
+                let Some(id) = id else {
+                    return tracing::warn!("meter-mode: no track '{name}'");
+                };
+                Some(id)
+            };
+            a.dispatch(Action::SetMeterMode {
+                track,
+                mode: Some(mode),
+            });
+        }),
+        named("meter-bridge", |a, arg| {
+            a.dispatch(Action::SetMeterBridge(arg != "off"));
+        }),
         // Development aid: `track-height:<track|all>=<px>` (arranger rows).
         named("track-height", |a, arg| {
             let Some((name, height)) = arg.split_once('=') else {

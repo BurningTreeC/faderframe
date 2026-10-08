@@ -14,7 +14,7 @@ use faderframe_audio_graph::{
 use faderframe_core::TrackId;
 use faderframe_project::{Impact, Project};
 use faderframe_realtime::{
-    CallbackMetrics, Epoch, MailboxReceiver, MailboxSender, MeterBank, MeterReading,
+    CallbackMetrics, Epoch, MailboxReceiver, MailboxSender, MeterBank, MeterRange, MeterReading,
     MetricsSnapshot, ParamTable, ScopedFlushDenormals, WorkerPool, mailbox,
 };
 use faderframe_timeline::MusicalTime;
@@ -258,6 +258,7 @@ pub fn create_with_epoch(
     let params = Arc::new(ParamTable::new(config.param_capacity));
     let readback = Arc::new(ParamTable::new(config.param_capacity));
     let meters = Arc::new(MeterBank::new(config.meter_capacity));
+    meters.set_rate(config.sample_rate as f32);
     let scope = Arc::new(faderframe_realtime::ScopeRing::new(SCOPE_FRAMES));
     let (midi_input, live_sysex) = crate::midi::MidiInputState::new();
     let processor = EngineProcessor {
@@ -2228,6 +2229,22 @@ impl EngineController {
         project
             .timeline
             .to_musical(samples, self.config.sample_rate as f64)
+    }
+
+    /// Quasi-peak (PPM) metering for a track's meter channels, on or off;
+    /// returns the range it applied to (it moves when the strip's channels
+    /// change, so the caller applies it again then).
+    pub fn set_meter_ppm(&self, track: TrackId, on: bool) -> Option<MeterRange> {
+        let range = self.slots.meter_of(track)?;
+        for c in 0..u32::from(range.channels) {
+            self.meters.set_ppm(range.first + c, on);
+        }
+        Some(range)
+    }
+
+    /// The meter channels of a track.
+    pub fn meter_range(&self, track: TrackId) -> Option<MeterRange> {
+        self.slots.meter_of(track)
     }
 
     /// Consume the meter values accumulated since the last call.

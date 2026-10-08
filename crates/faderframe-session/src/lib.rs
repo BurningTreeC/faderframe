@@ -86,7 +86,9 @@ pub use editing::{
     ClipEdge, CounterUnit, EditFlag, EditMode, EditRange, EditTool, GridMode, NudgeTarget,
     NudgeValue, ZoomRequest, format_position, format_timecode_length, parse_position,
 };
-pub use faderframe_workspace::{DEFAULT_INSERT_SLOTS, INSERT_SLOTS_RANGE, STRIP_WIDTH_RANGE};
+pub use faderframe_workspace::{
+    DEFAULT_INSERT_SLOTS, INSERT_SLOTS_RANGE, MeterMode, STRIP_WIDTH_RANGE, VU_REFERENCE,
+};
 pub use sync::{MANUAL_SPEED_RANGE, MtcRate, SyncSettings, SyncSource, SyncStatus, Timecode};
 
 pub use meters::{METER_FLOOR_DB, MeterChannel, MeterDisplay};
@@ -885,6 +887,16 @@ pub enum Action {
     },
     /// Width of the arranger's track header column (saved with the layout).
     SetHeaderWidth(f32),
+    /// What one strip's meter shows, or every strip's (`None`); `mode:
+    /// None` goes back to the default. Not undoable, saved with the layout.
+    SetMeterMode {
+        track: Option<TrackId>,
+        mode: Option<faderframe_workspace::MeterMode>,
+    },
+    /// The level (dBFS RMS) that reads 0 VU.
+    SetVuReference(f32),
+    /// The mixer's meter bridge of VU meters on or off.
+    SetMeterBridge(bool),
     /// Mixer strip width of one track, or of all (`None`); `width: None`
     /// goes back to the default. Not undoable, saved with the layout.
     SetStripWidth {
@@ -1200,6 +1212,8 @@ pub struct Session {
     pub editor: EditorSettings,
     editor_clip: Option<ClipId>,
     meters: HashMap<TrackId, MeterDisplay>,
+    /// Quasi-peak metering as applied to the engine (its range, on).
+    ppm_meters: HashMap<TrackId, (Option<faderframe_realtime::MeterRange>, bool)>,
     transport: TransportSnapshot,
     /// A position shown before the engine got there (a locate it applies
     /// later, e.g. once render-ahead has primed it): the target, the
@@ -1477,6 +1491,7 @@ impl Session {
             editor: EditorSettings::default(),
             editor_clip: None,
             meters: HashMap::new(),
+            ppm_meters: HashMap::new(),
             transport: TransportSnapshot::default(),
             shown_position: None,
             shuttle: None,
@@ -1841,6 +1856,21 @@ impl Session {
         self.workspace.strip_width(track)
     }
 
+    /// What a strip's meter shows.
+    pub fn meter_mode(&self, track: TrackId) -> faderframe_workspace::MeterMode {
+        self.workspace.meter_mode(track)
+    }
+
+    /// The level (dBFS RMS) that reads 0 VU.
+    pub fn vu_reference(&self) -> f32 {
+        self.workspace.vu_reference()
+    }
+
+    /// Is the mixer's meter bridge shown?
+    pub fn meter_bridge(&self) -> bool {
+        self.workspace.meter_bridge
+    }
+
     /// Are the take lanes of this take folder shown?
     pub fn takes_open(&self, clip: ClipId) -> bool {
         self.open_takes.contains(&clip)
@@ -1860,6 +1890,8 @@ impl Session {
         let (engine, processor) =
             faderframe_engine::create_with_epoch(self.engine_config, Arc::clone(&self.epoch));
         self.engine = engine;
+        // A new meter bank: quasi-peak metering applied again.
+        self.ppm_meters.clear();
         self.engine.set_midi_input(self.midi.renew_queue())?;
         self.engine
             .set_midi_output(self.midi.renew_output_queue())?;
@@ -2282,6 +2314,15 @@ impl Session {
             && let Err(e) = self.sync(Impact::Graph)
         {
             self.notify(NoticeLevel::Error, e.to_string());
+        }
+        // Quasi-peak metering where a PPM shows it (and where it moved).
+        for t in &self.project.tracks {
+            let wanted = self.workspace.meter_mode(t.id) == faderframe_workspace::MeterMode::Ppm;
+            let range = self.engine.meter_range(t.id);
+            if self.ppm_meters.get(&t.id) != Some(&(range, wanted)) {
+                self.engine.set_meter_ppm(t.id, wanted);
+                self.ppm_meters.insert(t.id, (range, wanted));
+            }
         }
         for t in &self.project.tracks {
             if let Some(m) = self.engine.take_meter(t.id) {
@@ -2752,6 +2793,7 @@ impl Session {
         self.saved_revision = self.history.revision();
         self.selection.clear();
         self.meters.clear();
+        self.ppm_meters.clear();
         self.sources.clear();
         self.peaks.clear();
         self.missing.clear();
@@ -3792,6 +3834,18 @@ impl Session {
             }
             Action::SetStripWidth { track, width } => {
                 self.workspace.set_strip_width(track, width);
+                self.revision += 1;
+            }
+            Action::SetMeterMode { track, mode } => {
+                self.workspace.set_meter_mode(track, mode);
+                self.revision += 1;
+            }
+            Action::SetVuReference(db) => {
+                self.workspace.vu_reference = Some(db.clamp(-30.0, -6.0));
+                self.revision += 1;
+            }
+            Action::SetMeterBridge(on) => {
+                self.workspace.meter_bridge = on;
                 self.revision += 1;
             }
             Action::SetPluginWindowPosition { plugin, x, y } => {

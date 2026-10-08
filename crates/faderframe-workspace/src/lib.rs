@@ -174,7 +174,78 @@ pub struct WorkspaceSet {
     /// Folder tracks shown closed (their tracks hidden).
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub closed_folders: std::collections::BTreeSet<faderframe_core::TrackId>,
+    /// What every strip's meter shows (`None` = [`MeterMode::Peak`]) and
+    /// per-track overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meter_mode: Option<MeterMode>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub meter_modes: std::collections::BTreeMap<faderframe_core::TrackId, MeterMode>,
+    /// The level (dBFS RMS) that reads 0 VU (`None` = [`VU_REFERENCE`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vu_reference: Option<f32>,
+    /// The mixer's meter bridge: a moving-coil VU meter over every strip.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub meter_bridge: bool,
 }
+
+/// What a level meter shows and how it moves.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeterMode {
+    /// Sample peaks: instant rise, falling 26 dB/s, a held peak.
+    #[default]
+    Peak,
+    /// Peaks with the RMS level (300 ms) inside the bar.
+    PeakRms,
+    /// A moving-coil VU meter: the RMS level through the needle's 300 ms
+    /// movement, 0 VU at the reference level.
+    Vu,
+    /// The EBU quasi-peak programme meter: 10 ms integration, 24 dB fall in
+    /// 2.8 s, alignment (TEST) at −18 dBFS.
+    Ppm,
+    /// Bob Katz's K-System: RMS on a scale whose 0 is −20, −14 or −12
+    /// dBFS, peaks above it.
+    K20,
+    K14,
+    K12,
+}
+
+impl MeterMode {
+    pub const ALL: [MeterMode; 7] = [
+        MeterMode::Peak,
+        MeterMode::PeakRms,
+        MeterMode::Vu,
+        MeterMode::Ppm,
+        MeterMode::K20,
+        MeterMode::K14,
+        MeterMode::K12,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MeterMode::Peak => "Peak",
+            MeterMode::PeakRms => "Peak + RMS",
+            MeterMode::Vu => "VU",
+            MeterMode::Ppm => "PPM (EBU)",
+            MeterMode::K20 => "K-20",
+            MeterMode::K14 => "K-14",
+            MeterMode::K12 => "K-12",
+        }
+    }
+
+    /// A K-System meter's 0 (dBFS).
+    pub fn k_zero(self) -> Option<f32> {
+        match self {
+            MeterMode::K20 => Some(-20.0),
+            MeterMode::K14 => Some(-14.0),
+            MeterMode::K12 => Some(-12.0),
+            _ => None,
+        }
+    }
+}
+
+/// The level that reads 0 VU unless set: −18 dBFS RMS (EBU R68).
+pub const VU_REFERENCE: f32 = -18.0;
 
 /// Narrowest and widest mixer channel strips.
 pub const STRIP_WIDTH_RANGE: (f32, f32) = (64.0, 240.0);
@@ -210,6 +281,10 @@ impl Default for WorkspaceSet {
             strip_width: None,
             strip_widths: Default::default(),
             closed_folders: Default::default(),
+            meter_mode: None,
+            meter_modes: Default::default(),
+            vu_reference: None,
+            meter_bridge: false,
         }
     }
 }
@@ -258,6 +333,41 @@ impl WorkspaceSet {
                 self.strip_widths.clear();
             }
         }
+    }
+
+    /// What a strip's meter shows.
+    pub fn meter_mode(&self, track: faderframe_core::TrackId) -> MeterMode {
+        self.meter_modes
+            .get(&track)
+            .copied()
+            .or(self.meter_mode)
+            .unwrap_or_default()
+    }
+
+    /// Set one strip's meter, or (with `None`) every strip's; a `None`
+    /// mode goes back to the default.
+    pub fn set_meter_mode(
+        &mut self,
+        track: Option<faderframe_core::TrackId>,
+        mode: Option<MeterMode>,
+    ) {
+        match (track, mode) {
+            (Some(t), Some(m)) => {
+                self.meter_modes.insert(t, m);
+            }
+            (Some(t), None) => {
+                self.meter_modes.remove(&t);
+            }
+            (None, m) => {
+                self.meter_mode = m.filter(|m| *m != MeterMode::Peak);
+                self.meter_modes.clear();
+            }
+        }
+    }
+
+    /// The level that reads 0 VU (dBFS RMS).
+    pub fn vu_reference(&self) -> f32 {
+        self.vu_reference.unwrap_or(VU_REFERENCE)
     }
 
     pub fn active(&self) -> &Workspace {

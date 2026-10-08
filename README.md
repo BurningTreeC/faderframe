@@ -380,6 +380,11 @@ long sessions), Neon and High Contrast:
 * Clip effects (an audio clip's menu → Clip Effects…): a chain of devices
   on one clip, rendered into the audio it plays as you change it; the
   original stays with the clip, so the effects can change again or go.
+* Meters: each strip's meter shows sample peaks, peaks with the RMS, a
+  VU (0 VU at −18 dBFS or another reference), the EBU PPM or a K-System
+  meter (K-20, K-14, K-12) — chosen from its right-click menu, per strip
+  or for every one — and the mixer's meter bridge puts a moving-coil VU
+  meter over every strip.
 * Snap to Samples (on by default) and Snap to Zero Crossings (the edit
   toolbar, beside the grid): free positions land on whole samples, and
   cuts and trims of audio clips move to the nearest zero crossing so they
