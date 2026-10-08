@@ -451,6 +451,23 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             ("Varispeed…", "app.varispeed"),
         ]),
     );
+    let shuttle = gio::Menu::new();
+    shuttle.append_section(
+        Some("J/K/L with picture in the project"),
+        &section(&[
+            ("Shuttle Reverse (J)", "app.shuttle-reverse"),
+            ("Shuttle Stop (K)", "app.shuttle-stop"),
+            ("Shuttle Forward (L)", "app.shuttle-forward"),
+        ]),
+    );
+    shuttle.append_section(
+        None,
+        &section(&[
+            ("Previous Frame (K+J)", "app.previous-frame"),
+            ("Next Frame (K+L)", "app.next-frame"),
+        ]),
+    );
+    transport.append_submenu(Some("Shuttle"), &shuttle);
     transport.append_section(None, &crate::recording::menu());
     transport.append_section(None, &section(&[("Panic (All Notes Off)", "app.panic")]));
     menu.append_submenu(Some("T_ransport"), &transport);

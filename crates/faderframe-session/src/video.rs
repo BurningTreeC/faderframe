@@ -504,7 +504,10 @@ impl crate::Session {
         let rate = self.project.sample_rate;
         let playing = self.transport.playing;
         let offset = (self.project.video.offset_ms * 1e6) as i64;
-        let position = if playing {
+        let shuttled = self.shuttle_position(lead_ns - offset);
+        let position = if let Some(p) = shuttled {
+            p
+        } else if playing {
             let now = self.midi.sender.clock().now_ns() as i64;
             let at = (now + lead_ns - offset).max(0) as u64;
             let (p, _) = self.engine.position_and_jumps_at(at)?;
@@ -521,7 +524,13 @@ impl crate::Session {
         let known = self.video.known.get(&source)?;
         let index = known.index.as_ref()?;
         let frame = index.frame_at(file_time)?;
-        let want = if playing { Want::Play } else { Want::Still };
+        // Shuttling seeks (in reverse too): from the proxy where there is
+        // one.
+        let want = if playing && shuttled.is_none() {
+            Want::Play
+        } else {
+            Want::Still
+        };
         let picture = self
             .video
             .service
@@ -576,6 +585,27 @@ impl crate::Session {
     /// The project's timecode (its own, else 25 fps from 00:00:00:00).
     pub fn timecode(&self) -> ProjectTimecode {
         self.project.timecode.unwrap_or_default()
+    }
+
+    /// The timeline position `n` frames of the picture showing at `pos`
+    /// away (its own frames: variable rates step exactly).
+    pub(crate) fn video_frame_step(&self, pos: i64, n: i32) -> Option<i64> {
+        let rate = self.project.sample_rate;
+        let (clip, file_time) = self.project.video.at(pos, rate)?;
+        let index = self.video.known.get(&clip.source)?.index.as_ref()?;
+        let frame = index.frame_at(file_time)? as i64 + n as i64;
+        let first = index.frame_at(clip.offset).unwrap_or(0) as i64;
+        let last = index
+            .frame_at(clip.offset + clip.length - 1)
+            .unwrap_or(index.len().saturating_sub(1)) as i64;
+        if frame < first || frame > last {
+            return None;
+        }
+        let t = *index.times.get(frame as usize)?;
+        // The frame's first sample (rounded up: never the frame before).
+        let ns = (t - clip.offset).max(0) as u128;
+        let samples = (ns * rate as u128).div_ceil(1_000_000_000) as i64;
+        Some(clip.start + samples)
     }
 
     /// Start importing a video.

@@ -60,6 +60,7 @@ pub mod presets;
 pub mod record;
 pub mod render;
 mod selection;
+pub mod shuttle;
 pub mod sync;
 mod sysex;
 pub mod templates;
@@ -454,6 +455,8 @@ pub enum Action {
     RestoreVersion(PathBuf),
     /// Picture: import, clip edits, offset, export, sync test.
     Video(video::VideoOp),
+    /// J/K/L shuttle and frame steps.
+    Shuttle(shuttle::ShuttleOp),
     /// Show a view full screen in a window of its own (again: leave).
     FullScreen(ViewId),
     /// Keep the project's set-up (everything but its content) as the
@@ -1102,6 +1105,8 @@ pub struct Session {
     /// later, e.g. once render-ahead has primed it): the target, the
     /// engine's jumps when it was asked, and when.
     shown_position: Option<(i64, u32, Instant)>,
+    /// J/K/L shuttle in motion.
+    shuttle: Option<shuttle::Shuttle>,
     metrics: MetricsSnapshot,
     last_metrics: Instant,
     path: Option<PathBuf>,
@@ -1359,6 +1364,7 @@ impl Session {
             meters: HashMap::new(),
             transport: TransportSnapshot::default(),
             shown_position: None,
+            shuttle: None,
             metrics: MetricsSnapshot::default(),
             last_metrics: Instant::now(),
             path: None,
@@ -2071,6 +2077,7 @@ impl Session {
                 self.transport.position = target;
             }
         }
+        self.tick_shuttle(!was_playing && self.transport.playing);
         if !was_playing && self.transport.playing {
             self.automation_play_requested();
             self.reset_video_stats();
@@ -3255,6 +3262,7 @@ impl Session {
             }
             Action::PromptSaveTemplate => self.ui_requests.push(UiRequest::SaveTemplate),
             Action::Video(op) => self.video_op(op)?,
+            Action::Shuttle(op) => self.shuttle_op(op)?,
             Action::FullScreen(view) => self.ui_requests.push(UiRequest::FullScreen(view)),
             Action::ShowTemplates => self.ui_requests.push(UiRequest::Templates),
             Action::DeleteTemplate(path) => {
@@ -3796,6 +3804,9 @@ impl Session {
 
     fn transport_action(&mut self, action: TransportAction) -> Result<()> {
         let to_samples = |s: &Self, pos: MusicalTime| s.engine.musical_to_samples(&s.project, pos);
+        if self.shuttle_transport(&action)? {
+            return Ok(());
+        }
         match action {
             TransportAction::Play => self.play()?,
             TransportAction::Stop => {

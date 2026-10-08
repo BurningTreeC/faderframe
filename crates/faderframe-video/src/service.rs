@@ -134,6 +134,16 @@ impl Cache {
         self.get(found).map(|f| (found.1, f))
     }
 
+    /// The nearest frame after `n` (any width) up to `to`.
+    fn after(&mut self, key: Key, n: u32, to: u32) -> Option<(u32, Arc<Frame>)> {
+        let found = self
+            .frames
+            .range((key, n.saturating_add(1), 0)..=(key, to, u32::MAX))
+            .next()
+            .map(|(s, _)| *s)?;
+        self.get(found).map(|f| (found.1, f))
+    }
+
     fn drop_video(&mut self, key: Key) {
         let gone: Vec<Slot> = self
             .frames
@@ -314,10 +324,16 @@ impl FrameService {
             });
         }
         let mut c = lock(&self.shared.cache);
-        let near = c
-            .any_width(key, n)
-            .map(|f| (n, f))
-            .or_else(|| c.before(key, n.saturating_sub(250), n));
+        // The nearest frame there is: before it, or (running in reverse)
+        // after it.
+        let near = c.any_width(key, n).map(|f| (n, f)).or_else(|| {
+            let before = c.before(key, n.saturating_sub(250), n);
+            let after = c.after(key, n, n.saturating_add(250));
+            match (before, after) {
+                (Some(b), Some(a)) => Some(if n - b.0 <= a.0 - n { b } else { a }),
+                (b, a) => b.or(a),
+            }
+        });
         near.map(|(m, frame)| Picture {
             frame,
             number: m as usize,

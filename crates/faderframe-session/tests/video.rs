@@ -347,3 +347,72 @@ fn video_tracks_compare_and_cuts_become_markers() {
     assert!((18..=20).contains(&cuts), "{cuts} cut markers");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// J/K/L: reverse at 2× runs the playhead and the picture back about two
+/// seconds a second, heard as scrub snippets (never plain playback);
+/// stopping leaves the playhead where it got to; K with J/L steps the
+/// movie's own frames.
+#[test]
+fn the_shuttle_runs_back_and_frames_step() {
+    use faderframe_session::shuttle::ShuttleOp;
+    let _turn = turn();
+    let d = dir("shuttle");
+    let file = movie(&d);
+    let mut s = Session::new(Project::new("Film", 48_000), None, EngineConfig::default()).unwrap();
+    s.import_video(file, false);
+    s.wait_for_video();
+    s.start_audio(
+        vec![Box::new(DummyBackend::default())],
+        &AudioPreferences::default(),
+    )
+    .unwrap();
+    let locate = |s: &mut Session, samples: i64| {
+        let at = s.engine().samples_to_musical(s.project(), samples);
+        s.dispatch(Action::Transport(TransportAction::Locate(at)))
+            .unwrap();
+        for _ in 0..50 {
+            s.tick(0.01);
+            if s.transport().position == samples {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    locate(&mut s, 6 * 48_000);
+    s.dispatch(Action::Shuttle(ShuttleOp::Reverse)).unwrap();
+    s.dispatch(Action::Shuttle(ShuttleOp::Reverse)).unwrap();
+    assert_eq!(s.shuttle_speed(), Some(-2.0));
+    let start = Instant::now();
+    let mut frames = Vec::new();
+    let mut heard = 0;
+    while start.elapsed() < Duration::from_millis(1000) {
+        s.tick(0.01);
+        assert!(!s.transport().playing, "snippets, not playback");
+        heard += usize::from(s.transport().scrubbing);
+        if let Some(v) = s.video_picture(0, (64, 36)) {
+            frames.push(v.frame);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    s.dispatch(Action::Shuttle(ShuttleOp::Stop)).unwrap();
+    assert_eq!(s.shuttle_speed(), None);
+    assert!(heard > 10, "snippets heard in {heard} ticks");
+    s.tick(0.01);
+    let at = s.transport().position as f64 / 48_000.0;
+    // Six seconds, back two a second for one: about four (a slow runner
+    // ticks late, never early).
+    assert!((3.5..4.3).contains(&at), "stopped at {at} s");
+    assert!(frames.windows(2).all(|w| w[1] <= w[0]), "never forward");
+    let (first, last) = (frames[0], *frames.last().unwrap());
+    assert!(first >= 145 && last <= 110, "frames {first} → {last}");
+    // Frame steps from frame 100: its start, then the next frames'.
+    locate(&mut s, 4 * 48_000);
+    s.dispatch(Action::Shuttle(ShuttleOp::Step(1))).unwrap();
+    assert_eq!(s.video_picture(0, (64, 36)).unwrap().frame, 101);
+    assert_eq!(s.transport().position, 4 * 48_000 + 1920);
+    s.dispatch(Action::Shuttle(ShuttleOp::Step(-1))).unwrap();
+    s.dispatch(Action::Shuttle(ShuttleOp::Step(-1))).unwrap();
+    assert_eq!(s.video_picture(0, (64, 36)).unwrap().frame, 99);
+    s.stop_audio();
+    let _ = std::fs::remove_dir_all(&d);
+}

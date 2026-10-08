@@ -266,7 +266,14 @@ impl CanvasView<Session, Action> for TransportDisplay {
         );
         // Varispeed: the speed in place of "BPM".
         let speed = s.engine().speed();
-        if (speed - 1.0).abs() > 1e-6 {
+        if let Some(v) = s.shuttle_speed() {
+            let arrows = if v < 0.0 { "◀◀" } else { "▶▶" };
+            p.text(
+                &format!("{arrows} {}×", v.abs()),
+                z.bpm,
+                &small(Color::hex(0x6fd0ff)).align(Align::End),
+            );
+        } else if (speed - 1.0).abs() > 1e-6 {
             p.text(
                 &format!("VARI {:+.1}%", (speed - 1.0) * 100.0),
                 z.bpm,

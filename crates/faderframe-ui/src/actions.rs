@@ -3,6 +3,7 @@
 use crate::state::AppState;
 use faderframe_project::TrackKind;
 use faderframe_session::launcher::LauncherOp;
+use faderframe_session::shuttle::ShuttleOp;
 use faderframe_session::{Action, TransportAction, WorkspaceAction};
 use faderframe_workspace::{DockAreaId, ViewId};
 use gtk::prelude::*;
@@ -278,6 +279,11 @@ pub fn install(app: &Rc<AppState>) {
         dispatch(app, "play", A::Transport(T::TogglePlay)),
         dispatch(app, "stop", A::Transport(T::Stop)),
         dispatch(app, "to-start", A::Transport(T::ReturnToStart)),
+        dispatch(app, "shuttle-reverse", A::Shuttle(ShuttleOp::Reverse)),
+        dispatch(app, "shuttle-stop", A::Shuttle(ShuttleOp::Stop)),
+        dispatch(app, "shuttle-forward", A::Shuttle(ShuttleOp::Forward)),
+        dispatch(app, "previous-frame", A::Shuttle(ShuttleOp::Step(-1))),
+        dispatch(app, "next-frame", A::Shuttle(ShuttleOp::Step(1))),
         dispatch(app, "loop", A::Transport(T::ToggleLoop)),
         dispatch(app, "record", A::Transport(T::ToggleRecord)),
         dispatch(app, "capture-midi", A::CaptureMidi),
@@ -1259,6 +1265,11 @@ pub fn install(app: &Rc<AppState>) {
                 path: arg.into(),
                 sound: true,
             }));
+        }),
+        // Development aid: `shuttle-speed:<v>` (negative: reverse; 0: stop).
+        named("shuttle-speed", |a, arg| match arg.trim().parse::<f64>() {
+            Ok(v) => a.dispatch(Action::Shuttle(ShuttleOp::Speed(v))),
+            Err(_) => tracing::warn!("shuttle-speed: cannot read '{arg}'"),
         }),
         // Development aid: `counter:<main|sub>=<bars|minsec|timecode|samples|auto>`.
         named("counter", |a, arg| {
@@ -2655,9 +2666,18 @@ pub fn install(app: &Rc<AppState>) {
 
 /// Remaining single-key shortcuts run after focused widgets. Space is
 /// captured separately by `transport_keys` before GTK button activation.
+/// With picture in the project, J/K/L shuttle (K held with J or L steps a
+/// frame) in place of L's loop and K's metronome.
 pub fn install_window_keys(app: &Rc<AppState>, window: &impl IsA<gtk::Widget>) {
     let keys = gtk::EventControllerKey::new();
     keys.set_propagation_phase(gtk::PropagationPhase::Bubble);
+    let k_held = Rc::new(std::cell::Cell::new(false));
+    let held = Rc::clone(&k_held);
+    keys.connect_key_released(move |_, key, _, _| {
+        if matches!(key, gdk::Key::k | gdk::Key::K) {
+            held.set(false);
+        }
+    });
     let weak = Rc::downgrade(app);
     keys.connect_key_pressed(move |_, key, _, state| {
         let Some(app) = weak.upgrade() else {
@@ -2674,6 +2694,24 @@ pub fn install_window_keys(app: &Rc<AppState>, window: &impl IsA<gtk::Widget>) {
         if key == gdk::Key::Escape && app.session.borrow().midi_learning().is_some() {
             app.dispatch(Action::CancelMidiLearn);
             return glib::Propagation::Stop;
+        }
+        let picture = !app.session.borrow().project().video.tracks.is_empty();
+        if picture && !shift {
+            let op = match key {
+                gdk::Key::j | gdk::Key::J if k_held.get() => Some(ShuttleOp::Step(-1)),
+                gdk::Key::l | gdk::Key::L if k_held.get() => Some(ShuttleOp::Step(1)),
+                gdk::Key::j | gdk::Key::J => Some(ShuttleOp::Reverse),
+                gdk::Key::l | gdk::Key::L => Some(ShuttleOp::Forward),
+                gdk::Key::k | gdk::Key::K => {
+                    k_held.set(true);
+                    Some(ShuttleOp::Stop)
+                }
+                _ => None,
+            };
+            if let Some(op) = op {
+                app.dispatch(Action::Shuttle(op));
+                return glib::Propagation::Stop;
+            }
         }
         let action = match key {
             gdk::Key::Home => TransportAction::ReturnToStart,
