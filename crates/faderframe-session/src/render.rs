@@ -443,6 +443,7 @@ pub(crate) fn process_through(
                 warp: None,
                 pitch: None,
                 effects: None,
+                spectral: None,
             }),
         },
     );

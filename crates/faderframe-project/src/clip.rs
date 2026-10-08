@@ -75,6 +75,10 @@ pub struct AudioClip {
     /// Effects rendered onto the clip (the original audio kept).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effects: Option<Box<crate::clip_fx::ClipEffects>>,
+    /// Spectral edits (the unedited source kept): the source played is
+    /// their processed copy (before the effects, when there are any).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spectral: Option<Box<crate::spectral::SpectralEdits>>,
 }
 
 impl AudioClip {
@@ -670,6 +674,7 @@ mod tests {
                 warp: None,
                 pitch: None,
                 effects: None,
+                spectral: None,
             }),
         };
         assert_eq!(clip.end(&timeline, 48_000), MusicalTime::from_quarters_i(6));

@@ -230,6 +230,7 @@ mod tests {
                 warp: None,
                 pitch: None,
                 effects: None,
+                spectral: None,
             }),
         };
         t.clips.push(id);

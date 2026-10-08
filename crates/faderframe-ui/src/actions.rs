@@ -309,6 +309,11 @@ pub fn install(app: &Rc<AppState>) {
             "show-events",
             A::Workspace(W::ShowView(ViewId::events())),
         ),
+        dispatch(
+            app,
+            "show-spectral",
+            A::Workspace(W::ShowView(ViewId::spectral())),
+        ),
         entry(app, "import-video", crate::video::import),
         entry(app, "conform-lists", crate::video::conform_lists),
         dispatch(
@@ -1668,6 +1673,73 @@ pub fn install(app: &Rc<AppState>) {
         // Development aids: `clip-fx:<track>` (its first clip in the clip
         // effects editor), `clip-fx-add:<plugin id>`,
         // `clip-fx-set:<n>:<parameter>=<value>` (on that clip).
+        named("spectral", |a, arg| {
+            let clip = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == arg)
+                .and_then(|t| t.clips.first().copied());
+            if let Some(clip) = clip {
+                a.dispatch(Action::OpenSpectralEditor(clip));
+            }
+        }),
+        named("spectral-add", |a, arg| {
+            // `<remove|attenuate|heal|gain=<db>>@<from s>-<to s>/<low Hz>-<high Hz>`
+            // on the spectral editor's clip (seconds from the clip's start).
+            use faderframe_project::spectral::{SpectralEdit, SpectralOp, SpectralShape};
+            let parsed = (|| {
+                let (op, rest) = arg.split_once('@')?;
+                let (time, band) = rest.split_once('/')?;
+                let (t0, t1) = time.split_once('-')?;
+                let (f0, f1) = band.split_once('-')?;
+                let op = match op {
+                    "remove" => SpectralOp::Remove,
+                    "attenuate" => SpectralOp::Attenuate,
+                    "heal" => SpectralOp::Heal,
+                    g => SpectralOp::Gain {
+                        db: g.strip_prefix("gain=")?.parse().ok()?,
+                    },
+                };
+                Some((
+                    op,
+                    t0.parse::<f64>().ok()?,
+                    t1.parse::<f64>().ok()?,
+                    f0.parse::<f32>().ok()?,
+                    f1.parse::<f32>().ok()?,
+                ))
+            })();
+            let Some((op, t0, t1, f0, f1)) = parsed else {
+                tracing::warn!("spectral-add: {arg}?");
+                return;
+            };
+            let found = {
+                let s = a.session.borrow();
+                s.spectral_clip().and_then(|clip| {
+                    let au = s.project().clip(clip)?.as_audio()?;
+                    let (now, _) = s.spectral_sources(clip)?;
+                    let (rate, _, _) = s.source_format(now)?;
+                    Some((clip, au.source_offset, f64::from(rate)))
+                })
+            };
+            if let Some((clip, offset, rate)) = found {
+                let at = |t: f64| offset + (t * rate) as i64;
+                a.dispatch(Action::EditSpectral {
+                    clip,
+                    change: faderframe_session::spectral::SpectralChange::Add(SpectralEdit::new(
+                        SpectralShape::Rect {
+                            start: at(t0),
+                            end: at(t1),
+                            low: f0,
+                            high: f1,
+                        },
+                        op,
+                    )),
+                });
+            }
+        }),
         named("clip-fx", |a, arg| {
             let clip = a
                 .session

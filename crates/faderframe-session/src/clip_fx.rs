@@ -220,6 +220,24 @@ impl Session {
         Ok(())
     }
 
+    /// Render a clip's chain again (its original audio changed).
+    pub(crate) fn rerender_clip_fx(&mut self, clip: ClipId) {
+        let chain = self.clip_fx_chain(clip);
+        if chain.is_empty() {
+            return;
+        }
+        self.clip_fx.generation += 1;
+        let generation = self.clip_fx.generation;
+        self.clip_fx.pending.insert(
+            clip,
+            Pending {
+                chain,
+                changed: Instant::now(),
+                generation,
+            },
+        );
+    }
+
     /// Start renders of chains that have rested; place the finished ones
     /// (from the session tick).
     pub(crate) fn poll_clip_fx(&mut self) {
@@ -337,6 +355,7 @@ impl Session {
                     warp: original.warp.clone(),
                     pitch: original.pitch.clone(),
                     effects: None,
+                    spectral: None,
                 }),
             },
         );

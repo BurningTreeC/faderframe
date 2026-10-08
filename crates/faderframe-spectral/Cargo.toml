@@ -1,0 +1,15 @@
+[package]
+name = "faderframe-spectral"
+description = "Spectral editing for FaderFrame: regions of a sound's spectrum reduced, removed or healed (STFT), and spectrograms"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-project.workspace = true
+realfft.workspace = true

@@ -38,10 +38,12 @@ pub enum ViewKind {
     LeadSheet,
     /// A MIDI clip's events, one row each.
     Events,
+    /// An audio clip's spectrum, edited.
+    Spectral,
 }
 
 impl ViewKind {
-    pub const ALL: [ViewKind; 18] = [
+    pub const ALL: [ViewKind; 19] = [
         ViewKind::Arranger,
         ViewKind::Mixer,
         ViewKind::PianoRoll,
@@ -60,11 +62,12 @@ impl ViewKind {
         ViewKind::Adr,
         ViewKind::LeadSheet,
         ViewKind::Events,
+        ViewKind::Spectral,
     ];
 
     /// The order tabs keep, whichever opened first: the arranger, the
     /// mixer, then as the View menu lists them.
-    pub const TAB_ORDER: [ViewKind; 18] = [
+    pub const TAB_ORDER: [ViewKind; 19] = [
         ViewKind::Arranger,
         ViewKind::Mixer,
         ViewKind::PianoRoll,
@@ -77,6 +80,7 @@ impl ViewKind {
         ViewKind::Modulators,
         ViewKind::Surround,
         ViewKind::Pitch,
+        ViewKind::Spectral,
         ViewKind::ClipFx,
         ViewKind::Launcher,
         ViewKind::Ddp,
@@ -119,6 +123,7 @@ impl ViewKind {
             ViewKind::Adr => "ADR Cues",
             ViewKind::LeadSheet => "Lead Sheet",
             ViewKind::Events => "Event List",
+            ViewKind::Spectral => "Spectral Editor",
         }
     }
 
@@ -142,6 +147,7 @@ impl ViewKind {
             ViewKind::Adr => ViewId::adr(),
             ViewKind::LeadSheet => ViewId::lead_sheet(),
             ViewKind::Events => ViewId::events(),
+            ViewKind::Spectral => ViewId::spectral(),
         }
     }
 }

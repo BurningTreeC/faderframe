@@ -73,6 +73,7 @@ fn setup() -> (Session, TrackId, ClipId) {
                 warp: None,
                 pitch: None,
                 effects: None,
+                spectral: None,
             }),
         }),
     });

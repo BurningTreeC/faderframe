@@ -2625,6 +2625,10 @@ impl ArrangerView {
                     Action::OpenClipEffects(clip.id),
                 ));
                 items.push(MenuItem::new(
+                    "Spectral Editor (Remove Noises, Heal)…",
+                    Action::OpenSpectralEditor(clip.id),
+                ));
+                items.push(MenuItem::new(
                     "Transcribe Words to the Lyrics Lane",
                     Action::Transcribe(clip.id),
                 ));

@@ -844,6 +844,7 @@ impl crate::Session {
                         warp: None,
                         pitch: None,
                         effects: None,
+                        spectral: None,
                     }),
                 };
                 if let Ok(st) = crate::media::open_stream(&audio.path) {

@@ -116,6 +116,10 @@ impl ViewId {
     pub fn events() -> Self {
         Self::new("events")
     }
+
+    pub fn spectral() -> Self {
+        Self::new("spectral")
+    }
 }
 
 impl fmt::Debug for ViewId {

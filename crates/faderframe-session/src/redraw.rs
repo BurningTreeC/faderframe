@@ -79,9 +79,49 @@ impl Session {
         if samples.is_empty() {
             return Ok(());
         }
+        let (id, source) = self.redrawn_copy(audio.source, channel, start, samples)?;
+        let mut content = audio.clone();
+        content.source = id;
+        let mut commands = vec![Command::AddSource {
+            source: Box::new(source),
+        }];
+        // Spectral edits render from the unedited source: it is redrawn
+        // too, so the drawing stays under them.
+        if let Some(sp) = content.spectral.as_mut() {
+            let (id, source) = self.redrawn_copy(sp.original, channel, start, samples)?;
+            sp.original = id;
+            commands.push(Command::AddSource {
+                source: Box::new(source),
+            });
+        }
+        commands.push(Command::SetClipContent {
+            clip,
+            start: c.start,
+            content: Box::new(ClipContent::Audio(content)),
+        });
+        self.edit(Command::Batch {
+            label: "Redraw Waveform".into(),
+            commands,
+        })?;
+        self.notify(
+            NoticeLevel::Info,
+            format!("redrew {} samples of '{}'", samples.len(), c.name),
+        );
+        Ok(())
+    }
+
+    /// A copy of `source` with `samples` drawn in from frame `start` (one
+    /// channel, or all), as a new source (not yet in the project).
+    fn redrawn_copy(
+        &mut self,
+        source: AudioSourceId,
+        channel: Option<usize>,
+        start: i64,
+        samples: &[f32],
+    ) -> Result<(AudioSourceId, AudioSource)> {
         let src = self
             .sources
-            .get(&audio.source)
+            .get(&source)
             .ok_or_else(|| SessionError::Other("the clip's audio is not loaded".into()))?;
         let (channels, frames, rate) = match src {
             Source::Memory(d) => (
@@ -94,7 +134,7 @@ impl Session {
         let name = self
             .project
             .sources
-            .get(&audio.source)
+            .get(&source)
             .map_or_else(|| "Audio".to_string(), |s| s.name.clone());
         std::fs::create_dir_all(&self.media_dir)
             .map_err(|e| SessionError::Other(format!("{}: {e}", self.media_dir.display())))?;
@@ -111,7 +151,7 @@ impl Session {
             for ch in chunk.iter_mut() {
                 ch.resize(n, 0.0);
             }
-            self.read_source(audio.source, at, &mut chunk)?;
+            self.read_source(source, at, &mut chunk)?;
             // The drawn samples.
             let (a, b) = (start.max(at), end.min(at + n as i64));
             for f in a..b {
@@ -127,36 +167,19 @@ impl Session {
             at += n as i64;
         }
         w.finish().map_err(io)?;
-
         let id: AudioSourceId = self.project.ids.allocate();
-        let mut content = audio.clone();
-        content.source = id;
-        self.edit(Command::Batch {
-            label: "Redraw Waveform".into(),
-            commands: vec![
-                Command::AddSource {
-                    source: Box::new(AudioSource {
-                        id,
-                        name: stem,
-                        spec: SourceSpec::File {
-                            path: path.clone(),
-                            channels: channels as u16,
-                            frames,
-                            sample_rate: rate,
-                        },
-                    }),
+        Ok((
+            id,
+            AudioSource {
+                id,
+                name: stem,
+                spec: SourceSpec::File {
+                    path: path.clone(),
+                    channels: channels as u16,
+                    frames,
+                    sample_rate: rate,
                 },
-                Command::SetClipContent {
-                    clip,
-                    start: c.start,
-                    content: Box::new(ClipContent::Audio(content)),
-                },
-            ],
-        })?;
-        self.notify(
-            NoticeLevel::Info,
-            format!("redrew {} samples of '{}'", samples.len(), c.name),
-        );
-        Ok(())
+            },
+        ))
     }
 }

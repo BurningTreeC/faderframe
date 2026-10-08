@@ -493,6 +493,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             ("Modulators", "app.view-modulators"),
             ("Surround Panner", "app.view-surround"),
             ("Pitch Editor", "app.view-pitch"),
+            ("Spectral Editor", "app.view-spectral"),
             ("Clip Effects", "app.view-clip-fx"),
             ("Clip Launcher", "app.view-launcher"),
             ("DDP Player", "app.view-ddp"),

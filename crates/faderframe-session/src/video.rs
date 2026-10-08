@@ -1084,6 +1084,7 @@ impl crate::Session {
                     warp: None,
                     pitch: None,
                     effects: None,
+                    spectral: None,
                 }),
             };
             let mut clip = clip;

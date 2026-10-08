@@ -37,6 +37,7 @@ pub mod modulation;
 pub mod pitch;
 pub mod preset;
 mod project;
+pub mod spectral;
 mod takes;
 pub mod template;
 mod track;

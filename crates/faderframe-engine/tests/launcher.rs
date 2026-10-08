@@ -62,6 +62,7 @@ fn audio(source: faderframe_core::AudioSourceId, length: usize) -> ClipContent {
         warp: None,
         pitch: None,
         effects: None,
+        spectral: None,
     })
 }
 

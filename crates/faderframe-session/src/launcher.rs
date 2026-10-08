@@ -833,6 +833,7 @@ impl Session {
                             warp: None,
                             pitch: None,
                             effects: None,
+                            spectral: None,
                         }),
                     });
                     opened = Some((source.id, take.path.clone(), take.peaks));

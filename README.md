@@ -380,6 +380,20 @@ long sessions), Neon and High Contrast:
 * Clip effects (an audio clip's menu → Clip Effects…): a chain of devices
   on one clip, rendered into the audio it plays as you change it; the
   original stays with the clip, so the effects can change again or go.
+* Spectral editing (an audio clip's menu → Spectral Editor): the clip's
+  spectrogram, regions drawn on it (rectangle, time range, frequency band,
+  lasso, brush) with soft edges, and turned into edits: Attenuate (down to
+  the sound around it, only where it stands out — coughs, clicks,
+  squeaks), Heal (replaced by the sound around it, tones carried through a
+  dropout), Remove or Gain. Edits stay editable (select, move, change,
+  delete); they render into a copy of the clip's audio, bit-identical
+  wherever no edit reaches, and the original is kept.
+* MIDI event list (View → MIDI Event List, or a MIDI clip's menu): every
+  event of a clip a row — notes with release velocity, control and program
+  changes (with their General MIDI names), pitch bend, channel and poly
+  pressure, the notes' expression points, SysEx — each field typed or
+  dragged. MIDI files keep program changes, poly pressure and release
+  velocities in and out.
 * Speech and lyrics (an audio clip's menu → Transcribe Words): a clip's
   words, sung or spoken, as lines on the arranger's Lyrics lane (OpenAI's
   Whisper running in FaderFrame; the model, 290 MB, is downloaded once

@@ -3499,3 +3499,39 @@ key }}`), a note's release velocity is `MidiNote::release` (`None` sends
 0). MIDI file import and export, recording (`MidiTake`), Capture MIDI and
 playback carry them; the clip player chases programs on locate after the
 CCs, so a bank select goes first.
+
+### Spectral editing
+
+`faderframe_project::spectral` keeps a clip's edits in its source's own
+frames and hertz (`AudioClip::spectral: Option<Box<SpectralEdits>>` — keep
+it `None` in new `AudioClip` literals; `SpectralEdits::original` is the
+unedited source): shapes `Rect` (a time range has `low` ≤ 1 Hz and `high`
+at Nyquist, a band spans the clip), `Lasso`, `Brush`; ops `Gain`, `Remove`,
+`Attenuate`, `Heal`; a feather in ms and semitones; one channel or all.
+
+`faderframe-spectral` (pure; realfft) does the DSP: `apply` runs each edit
+as its own STFT pass over the span it reaches, frames as long as fit the
+edit (`frame_for`: up to `frame_size` ≈ 85 ms, down to 256 samples, so a
+click is not smeared), Hann, a quarter-frame hop, an identity frame (`w²x`)
+wherever the mask is empty, and copies everything else bit for bit. Masks
+(`mask::Mask`) weigh bins in (frames, octaves) with raised-cosine
+feathers. Attenuate caps each bin at the level around the edit in time
+(mean magnitudes of 8 frames before and after, interpolated in dB); Heal
+replaces it by that level, each bin's phase carried on from the frames
+before (measured phase advance), so tones continue through a dropout.
+`Spectrogram::compute` makes the editor's picture (log rows from 20 Hz,
+loudest bin per row, mean power over channels, bytes from −120 dB).
+
+`session::spectral`: changes (`Action::EditSpectral { clip, change:
+SpectralChange::{Add, Set, Remove, Clear} }`) are pending at once
+(`spectral_edits`), render after `SETTLE` in a worker from the unedited
+source into a float WAV beside the media, then `AddSource` + `SetClipContent`
+as one "Spectral Edit" step (overtaken renders dropped); with clip effects
+the processed copy becomes the effects' original and they render again
+(`rerender_clip_fx`); no edits left = the original back. The Pencil redraws
+the unedited source too. Pictures: `Session::spectrogram(PictureKey)` asks
+a worker (newest request wins) and returns the closest picture of that
+source meanwhile. View `faderframe-view-spectral` (`ViewKind::Spectral`,
+`Action::OpenSpectralEditor`, the audio clip menu); it repaints until the
+picture it asked for has come (`waiting`), since a result can land between
+two frames.

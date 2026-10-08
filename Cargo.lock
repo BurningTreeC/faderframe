@@ -1093,6 +1093,7 @@ dependencies = [
  "faderframe-plugin-vst3",
  "faderframe-project",
  "faderframe-realtime",
+ "faderframe-spectral",
  "faderframe-speech",
  "faderframe-timeline",
  "faderframe-transcribe",
@@ -1107,6 +1108,14 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tracing",
+]
+
+[[package]]
+name = "faderframe-spectral"
+version = "0.16.0"
+dependencies = [
+ "faderframe-project",
+ "realfft",
 ]
 
 [[package]]
@@ -1196,6 +1205,7 @@ dependencies = [
  "faderframe-view-performance",
  "faderframe-view-pianoroll",
  "faderframe-view-pitch",
+ "faderframe-view-spectral",
  "faderframe-view-surround",
  "faderframe-view-tools",
  "faderframe-view-video",
@@ -1451,6 +1461,20 @@ dependencies = [
  "faderframe-engine",
  "faderframe-project",
  "faderframe-session",
+ "faderframe-timeline",
+ "faderframe-ui-canvas",
+]
+
+[[package]]
+name = "faderframe-view-spectral"
+version = "0.16.0"
+dependencies = [
+ "faderframe-audio-files",
+ "faderframe-core",
+ "faderframe-engine",
+ "faderframe-project",
+ "faderframe-session",
+ "faderframe-spectral",
  "faderframe-timeline",
  "faderframe-ui-canvas",
 ]

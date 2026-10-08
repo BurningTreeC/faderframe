@@ -590,6 +590,7 @@ mod tests {
                 warp: Some(warp),
                 pitch: None,
                 effects: None,
+                spectral: None,
             }),
         };
         let mut tl = Timeline::default();

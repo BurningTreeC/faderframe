@@ -76,6 +76,7 @@ fn the_round_trip_is_pinged_and_compensated() {
                 warp: None,
                 pitch: None,
                 effects: None,
+                spectral: None,
             }),
         }),
     }))

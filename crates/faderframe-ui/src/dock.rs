@@ -104,6 +104,12 @@ fn create_view(app: &Rc<AppState>, kind: ViewKind) -> ViewHost {
             false,
             true,
         ),
+        ViewKind::Spectral => ViewHost::new(
+            app,
+            Box::new(faderframe_view_spectral::SpectralView::new(theme)),
+            true,
+            false,
+        ),
         ViewKind::Events => ViewHost::new(
             app,
             Box::new(faderframe_view_events::EventsView::new(theme)),
@@ -541,7 +547,7 @@ pub fn realize(app: &Rc<AppState>) {
 /// A dock view: its action's name and its id.
 type DockView = (&'static str, fn() -> ViewId);
 
-pub(crate) const DOCK_VIEWS: [DockView; 17] = [
+pub(crate) const DOCK_VIEWS: [DockView; 18] = [
     ("mixer", ViewId::mixer),
     ("piano-roll", ViewId::piano_roll),
     ("events", ViewId::events),
@@ -553,6 +559,7 @@ pub(crate) const DOCK_VIEWS: [DockView; 17] = [
     ("modulators", ViewId::modulators),
     ("surround", ViewId::surround),
     ("pitch", ViewId::pitch),
+    ("spectral", ViewId::spectral),
     ("clip-fx", ViewId::clip_fx),
     ("launcher", ViewId::launcher),
     ("ddp", ViewId::ddp),

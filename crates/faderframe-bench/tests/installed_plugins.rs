@@ -136,6 +136,7 @@ fn tone_track(p: &mut Project, sources: &mut SourceMap, layout: ChannelLayout) -
                 warp: None,
                 pitch: None,
                 effects: None,
+                spectral: None,
             }),
         },
     );

@@ -25,6 +25,7 @@ pub mod notes;
 pub mod performance;
 pub mod picture_out;
 pub mod pitch;
+pub mod spectral;
 pub use performance::{Load, PerformanceReport, PluginPerformance, TrackPerformance};
 pub mod adm;
 pub mod album;
@@ -387,6 +388,13 @@ pub enum Action {
     },
     /// Show an audio clip's effects in their editor.
     OpenClipEffects(ClipId),
+    /// Show an audio clip in the spectral editor.
+    OpenSpectralEditor(ClipId),
+    /// Change an audio clip's spectral edits.
+    EditSpectral {
+        clip: ClipId,
+        change: spectral::SpectralChange,
+    },
     /// Edit an audio clip's effects (rendered once the chain rests).
     ClipEffects {
         clip: ClipId,
@@ -1249,6 +1257,7 @@ pub struct Session {
     conversions: to_midi::Conversions,
     lead_sheets: leadsheet::LeadSheets,
     clip_fx: clip_fx::ClipFxState,
+    spectral: spectral::SpectralState,
     speech: speech::SpeechState,
     launcher: launcher::LauncherState,
     control: control::ControlState,
@@ -1505,6 +1514,7 @@ impl Session {
             conversions: to_midi::Conversions::default(),
             lead_sheets: leadsheet::LeadSheets::default(),
             clip_fx: clip_fx::ClipFxState::default(),
+            spectral: spectral::SpectralState::default(),
             speech: speech::SpeechState::default(),
             launcher: launcher::LauncherState::default(),
             control: control::ControlState::default(),
@@ -2436,6 +2446,7 @@ impl Session {
         self.poll_conversions();
         self.poll_lead_sheets();
         self.poll_clip_fx();
+        self.poll_spectral();
         self.poll_speech();
         let mut i = 0;
         while i < self.peak_jobs.len() {
@@ -2672,6 +2683,7 @@ impl Session {
                     warp: None,
                     pitch: None,
                     effects: None,
+                    spectral: None,
                 }),
             };
             clips.push(clip.id);
@@ -3358,6 +3370,8 @@ impl Session {
                 self.export_lead_sheet(&path)?;
             }
             Action::OpenClipEffects(clip) => self.open_clip_fx(clip)?,
+            Action::OpenSpectralEditor(clip) => self.open_spectral(clip)?,
+            Action::EditSpectral { clip, change } => self.edit_spectral(clip, change)?,
             Action::DownloadSpeechModel => self.download_speech_model()?,
             Action::Transcribe(clip) => self.transcribe(clip)?,
             Action::ExportLyrics => {

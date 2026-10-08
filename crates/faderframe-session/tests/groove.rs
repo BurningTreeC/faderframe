@@ -60,6 +60,7 @@ fn session() -> (Session, TrackId, ClipId) {
                 warp: None,
                 pitch: None,
                 effects: None,
+                spectral: None,
             }),
         }),
     })

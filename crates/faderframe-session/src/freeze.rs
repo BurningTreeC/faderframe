@@ -237,6 +237,7 @@ impl Session {
                         warp: None,
                         pitch: None,
                         effects: None,
+                        spectral: None,
                     }),
                 }),
             });

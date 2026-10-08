@@ -80,6 +80,7 @@ fn hits_land_on_beats_and_audio_stays_where_it_sounds() {
                 warp: None,
                 pitch: None,
                 effects: None,
+                spectral: None,
             }),
         }),
     }))
