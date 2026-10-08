@@ -67,6 +67,15 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.15.0" date="2026-10-08">
+      <description>
+        <p>The Linux tarball starts everywhere again.</p>
+        <ul>
+          <li>The portable Linux tarball always uses its own GStreamer: on distributions newer than Ubuntu 24.04 with GStreamer installed (Arch, for one), 0.14.0's tarball did not start, because the system's GStreamer needs a newer GLib than the one bundled.</li>
+          <li>Video decoding in the tarball goes through VA-API (your graphics driver) for H.264 and H.265.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.14.0" date="2026-10-07">
       <description>
         <p>Video for working to picture, and project templates.</p>
