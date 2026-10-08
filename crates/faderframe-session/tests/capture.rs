@@ -150,10 +150,12 @@ fn notes_played_while_playing_land_where_they_were_heard() {
     let clock = s.midi_keyboard().clock();
     let at = s.engine().position_at(clock.now_ns()).unwrap();
     s.midi_keyboard().send(&[0x90, 67, 100]);
+    let held_from = (Instant::now(), callbacks(&s));
     run(&mut s, 200);
     // The same for the key coming up.
     let up = s.engine().position_at(clock.now_ns()).unwrap();
     s.midi_keyboard().send(&[0x80, 67, 0]);
+    let held_for = (held_from.0.elapsed(), callbacks(&s) - held_from.1);
     let held = (up - at) as f64 / f64::from(s.engine().sample_rate());
     run(&mut s, 100);
     s.dispatch(Action::Transport(TransportAction::Stop))
@@ -168,7 +170,11 @@ fn notes_played_while_playing_land_where_they_were_heard() {
     let expected = paced_from.0.elapsed().as_secs_f64() * f64::from(st.sample_rate)
         / f64::from(st.buffer_size.max(1));
     let got = (callbacks(&s) - paced_from.1) as f64;
-    if xruns(&s) != xruns_before || (got - expected).abs() > 2.0 + expected * 0.05 {
+    // And while the key was held (a burst there moves the key's ends).
+    let held_expected =
+        held_for.0.as_secs_f64() * f64::from(st.sample_rate) / f64::from(st.buffer_size.max(1));
+    let held_paced = (held_for.1 as f64 - held_expected).abs() <= 2.0;
+    if xruns(&s) != xruns_before || (got - expected).abs() > 2.0 + expected * 0.05 || !held_paced {
         // The device lost time or fell behind the wall clock (a busy
         // runner): the playhead's extrapolations do not hold across that.
         eprintln!(
