@@ -299,6 +299,7 @@ pub fn install(app: &Rc<AppState>) {
             A::Workspace(W::ShowView(ViewId::video())),
         ),
         entry(app, "import-video", crate::video::import),
+        entry(app, "conform-lists", crate::video::conform_lists),
         dispatch(
             app,
             "export-movie",
@@ -1245,6 +1246,12 @@ pub fn install(app: &Rc<AppState>) {
                 "cuts" => clips
                     .get(nth(rest).unwrap_or(0))
                     .map(|c| VideoOp::DetectCuts(c.id)),
+                "conform" => rest.split_once('@').and_then(|(o, n)| {
+                    Some(VideoOp::ConformPicture {
+                        old: clips.get(nth(o)?)?.id,
+                        new: clips.get(nth(n)?)?.id,
+                    })
+                }),
                 _ => None,
             };
             match op {
@@ -1265,6 +1272,16 @@ pub fn install(app: &Rc<AppState>) {
                 path: arg.into(),
                 sound: true,
             }));
+        }),
+        // Development aid: `conform-lists:<old list>|<new list>`.
+        named("conform-lists", |a, arg| match arg.split_once('|') {
+            Some((old, new)) => a.dispatch(Action::Conform(
+                faderframe_session::conform::ConformOp::Lists {
+                    old: old.trim().into(),
+                    new: new.trim().into(),
+                },
+            )),
+            None => tracing::warn!("conform-lists: give <old>|<new>"),
         }),
         // Development aid: `shuttle-speed:<v>` (negative: reverse; 0: stop).
         named("shuttle-speed", |a, arg| match arg.trim().parse::<f64>() {

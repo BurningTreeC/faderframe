@@ -290,6 +290,10 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
         &section(&[
             ("Import Audio…", "app.import-audio"),
             ("Import Video…", "app.import-video"),
+            (
+                "Conform to a New Cut (EDL, OpenTimelineIO)…",
+                "app.conform-lists",
+            ),
             ("Import ADM BWF Master (Bed and Objects)…", "app.import-adm"),
             ("Import MIDI File…", "app.import-midi"),
             ("Export MIDI File…", "app.export-midi"),

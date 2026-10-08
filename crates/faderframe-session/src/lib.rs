@@ -30,6 +30,7 @@ mod aliases;
 pub mod analysis;
 pub mod capture;
 pub mod clip_fx;
+pub mod conform;
 pub mod containers;
 pub mod control;
 mod control_extra;
@@ -457,6 +458,8 @@ pub enum Action {
     Video(video::VideoOp),
     /// J/K/L shuttle and frame steps.
     Shuttle(shuttle::ShuttleOp),
+    /// Conform the session to a new picture cut.
+    Conform(conform::ConformOp),
     /// Show a view full screen in a window of its own (again: leave).
     FullScreen(ViewId),
     /// Keep the project's set-up (everything but its content) as the
@@ -3263,6 +3266,7 @@ impl Session {
             Action::PromptSaveTemplate => self.ui_requests.push(UiRequest::SaveTemplate),
             Action::Video(op) => self.video_op(op)?,
             Action::Shuttle(op) => self.shuttle_op(op)?,
+            Action::Conform(op) => self.conform_op(op)?,
             Action::FullScreen(view) => self.ui_requests.push(UiRequest::FullScreen(view)),
             Action::ShowTemplates => self.ui_requests.push(UiRequest::Templates),
             Action::DeleteTemplate(path) => {

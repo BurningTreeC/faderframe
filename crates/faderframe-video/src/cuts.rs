@@ -91,3 +91,54 @@ pub fn detect_cuts(
     }
     Ok(cuts)
 }
+
+/// Every frame's look for matching two pictures (see
+/// `faderframe_conform::shots`): its start (ns) and its luma at 16×9. With
+/// where the picture ends. `progress`: the share done.
+pub fn signatures(
+    path: &Path,
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(f64),
+) -> Result<(Vec<i64>, Vec<[u8; 144]>, i64)> {
+    let duration = crate::probe::probe(path)?.duration_ns.max(1);
+    let mut dec = Decoder::open(path, 64, 36)?;
+    dec.play_from(0)?;
+    let (mut times, mut sigs) = (Vec::new(), Vec::new());
+    let mut end = 0;
+    while let Some(f) = dec.next_frame()? {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(VideoError::Cancelled);
+        }
+        progress((f.time as f64 / duration as f64).clamp(0.0, 1.0));
+        let mut sig = [0u8; 144];
+        let (w, h) = (f.width as usize, f.height as usize);
+        for (i, v) in sig.iter_mut().enumerate() {
+            let (gx, gy) = (i % 16, i / 16);
+            let (x0, x1) = (gx * w / 16, ((gx + 1) * w / 16).max(gx * w / 16 + 1));
+            let (y0, y1) = (gy * h / 9, ((gy + 1) * h / 9).max(gy * h / 9 + 1));
+            let mut sum = 0u32;
+            let mut n = 0u32;
+            for y in y0..y1.min(h) {
+                for x in x0..x1.min(w) {
+                    let p = f.pixel(x as u32, y as u32);
+                    sum += (299 * p[0] as u32 + 587 * p[1] as u32 + 114 * p[2] as u32) / 1000;
+                    n += 1;
+                }
+            }
+            *v = (sum / n.max(1)) as u8;
+        }
+        if let Some(&last) = times.last()
+            && f.time <= last
+        {
+            continue;
+        }
+        end = end.max(f.time);
+        times.push(f.time);
+        sigs.push(sig);
+    }
+    // The last frame lasts as long as the one before.
+    if times.len() >= 2 {
+        end += times[times.len() - 1] - times[times.len() - 2];
+    }
+    Ok((times, sigs, end))
+}

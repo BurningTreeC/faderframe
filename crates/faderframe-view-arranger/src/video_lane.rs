@@ -381,6 +381,29 @@ impl ArrangerView {
                     "Detect Cuts (Markers)",
                     Action::Video(VideoOp::DetectCuts(id)),
                 ));
+                // The sound follows this picture from another one (the
+                // cut found by matching their frames).
+                let others: Vec<MenuItem<Action>> = p
+                    .video
+                    .tracks
+                    .iter()
+                    .flat_map(|t| &t.clips)
+                    .filter(|c| c.id != id)
+                    .map(|c| {
+                        let name = p
+                            .video
+                            .sources
+                            .get(&c.source)
+                            .map_or_else(|| "Video".into(), |s| s.name());
+                        MenuItem::new(
+                            format!("from {name}"),
+                            Action::Video(VideoOp::ConformPicture { old: c.id, new: id }),
+                        )
+                    })
+                    .collect();
+                if !others.is_empty() {
+                    items.push(MenuItem::submenu("Conform Sound to This Picture", others));
+                }
                 items.push(MenuItem::new(
                     "Export Movie…",
                     Action::Video(VideoOp::ChooseExport),

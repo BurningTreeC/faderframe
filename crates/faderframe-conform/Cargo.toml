@@ -1,0 +1,16 @@
+[package]
+name = "faderframe-conform"
+description = "Conforming to a new picture cut for FaderFrame: CMX3600 EDLs and OpenTimelineIO read into cut lists, the changes between two cuts, and shots matched between two pictures"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-core.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

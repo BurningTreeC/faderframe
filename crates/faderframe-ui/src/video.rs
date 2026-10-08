@@ -51,6 +51,42 @@ pub fn import(app: &Rc<AppState>) {
     });
 }
 
+/// Conform to a new cut: choose the old cut list, then the new one (EDL
+/// or OpenTimelineIO).
+pub fn conform_lists(app: &Rc<AppState>) {
+    let Some(win) = app.window.borrow().clone() else {
+        return;
+    };
+    let lists = ["*.edl", "*.otio"].map(String::from);
+    let chooser = |title: &str| {
+        gtk::FileDialog::builder()
+            .title(title)
+            .accept_label("Choose")
+            .modal(true)
+            .filters(&filters("Cut lists (EDL, OpenTimelineIO)", &lists))
+            .build()
+    };
+    let new_dialog = chooser("The New Cut (EDL or OpenTimelineIO)");
+    let weak = Rc::downgrade(app);
+    let w2 = win.clone();
+    chooser("The Old Cut — the One the Sound Follows Now").open(
+        Some(&win),
+        gio::Cancellable::NONE,
+        move |res| {
+            let Some(old) = res.ok().and_then(|f| f.path()) else {
+                return;
+            };
+            new_dialog.open(Some(&w2), gio::Cancellable::NONE, move |res| {
+                if let (Some(new), Some(app)) = (res.ok().and_then(|f| f.path()), weak.upgrade()) {
+                    app.dispatch(Action::Conform(
+                        faderframe_session::conform::ConformOp::Lists { old, new },
+                    ));
+                }
+            });
+        },
+    );
+}
+
 /// Choose where the movie goes (the container by its extension).
 pub fn export(app: &Rc<AppState>) {
     let Some(win) = app.window.borrow().clone() else {

@@ -33,6 +33,7 @@ faderframe-adm.workspace = true
 faderframe-binaural.workspace = true
 faderframe-iamf.workspace = true
 faderframe-video.workspace = true
+faderframe-conform.workspace = true
 faderframe-plugin-host.workspace = true
 faderframe-automation.workspace = true
 faderframe-transport.workspace = true
@@ -42,6 +43,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 faderframe-guitar.workspace = true
+gst.workspace = true
+gst-app.workspace = true
 faderframe-audio-graph.workspace = true
 midly.workspace = true
 faderframe-plugin-clap.workspace = true

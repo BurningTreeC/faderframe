@@ -18,6 +18,7 @@ pub mod arrange;
 mod clip;
 pub mod clip_fx;
 pub mod compare;
+pub mod conform;
 pub mod container;
 pub mod demo;
 mod edit;

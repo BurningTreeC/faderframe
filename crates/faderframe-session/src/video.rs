@@ -209,6 +209,14 @@ enum Done {
         /// Shot starts in the file (ns).
         at: Vec<i64>,
     },
+    Matched {
+        changes: faderframe_conform::Changes,
+        /// Each picture's file time zero on the timeline (seconds), and the
+        /// clips' spans there.
+        zeros: (f64, f64),
+        spans: ((f64, f64), (f64, f64)),
+        name: String,
+    },
 }
 
 struct Job {
@@ -327,6 +335,12 @@ pub enum VideoOp {
     RemoveTrack(VideoTrackId),
     /// Markers where a clip's picture changes shot.
     DetectCuts(VideoClipId),
+    /// Conform the sound to the picture of clip `new` from that of `old`
+    /// (the cut found by matching their frames).
+    ConformPicture {
+        old: VideoClipId,
+        new: VideoClipId,
+    },
     /// Trim a clip: its start, in-point (ns in the file) and length (ns).
     TrimClip {
         clip: VideoClipId,
@@ -857,6 +871,19 @@ impl crate::Session {
                 }
                 Ok(())
             }
+            Done::Matched {
+                changes,
+                zeros,
+                spans,
+                name,
+            } => self.apply_conform(
+                &changes,
+                |t| zeros.0 + t,
+                |t| zeros.1 + t,
+                spans,
+                &name,
+                None,
+            ),
             Done::Cuts { clip, at } => {
                 let Some((_, c)) = self.project.video.clip(clip) else {
                     return Ok(());
@@ -1256,6 +1283,65 @@ impl crate::Session {
                     return Err(SessionError::Other("there is no video to export".into()));
                 }
                 self.ui_requests.push(crate::UiRequest::ExportMovie);
+                Ok(())
+            }
+            VideoOp::ConformPicture { old, new } => {
+                let rate = self.project.sample_rate as f64;
+                let side = |s: &Self, id: VideoClipId| {
+                    let (_, c) = s.project.video.clip(id)?;
+                    let src = s.project.video.sources.get(&c.source)?;
+                    let file = s
+                        .video
+                        .known
+                        .get(&c.source)
+                        .and_then(|k| k.proxy.as_ref().map(|(p, _)| p.clone()))
+                        .unwrap_or(src.path.clone());
+                    let start = c.start as f64 / rate;
+                    let zero = start - c.offset as f64 / 1e9;
+                    let span = (start, start + c.length as f64 / 1e9);
+                    Some((file, zero, span, src.name()))
+                };
+                let (Some(o), Some(n)) = (side(self, old), side(self, new)) else {
+                    return Err(SessionError::Other("no such video clips".into()));
+                };
+                if old == new {
+                    return Err(SessionError::Other(
+                        "the old and the new picture are the same clip".into(),
+                    ));
+                }
+                let label = format!("Matching {} with {}", n.3, o.3);
+                self.spawn_video(label, None, move |share, cancel| {
+                    let half = |x: f64| x * 0.5;
+                    let (ot, os, oe) =
+                        faderframe_video::cuts::signatures(&o.0, cancel, |x| share.set(half(x)))
+                            .map_err(|e| e.to_string())?;
+                    let (nt, ns, ne) = faderframe_video::cuts::signatures(&n.0, cancel, |x| {
+                        share.set(0.5 + half(x))
+                    })
+                    .map_err(|e| e.to_string())?;
+                    let secs = |v: &[i64]| v.iter().map(|t| *t as f64 / 1e9).collect::<Vec<_>>();
+                    let (ots, nts) = (secs(&ot), secs(&nt));
+                    let changes = faderframe_conform::shots::match_pictures(
+                        &faderframe_conform::shots::Frames {
+                            times: &ots,
+                            signatures: &os,
+                            end: oe as f64 / 1e9,
+                        },
+                        &faderframe_conform::shots::Frames {
+                            times: &nts,
+                            signatures: &ns,
+                            end: ne as f64 / 1e9,
+                        },
+                    );
+                    // The clips' spans in file time.
+                    let spans = ((o.2.0 - o.1, o.2.1 - o.1), (n.2.0 - n.1, n.2.1 - n.1));
+                    Ok(Done::Matched {
+                        changes,
+                        zeros: (o.1, n.1),
+                        spans,
+                        name: n.3,
+                    })
+                });
                 Ok(())
             }
             VideoOp::DetectCuts(clip) => {

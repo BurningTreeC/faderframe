@@ -823,6 +823,15 @@ name = "faderframe-circuit"
 version = "0.16.0"
 
 [[package]]
+name = "faderframe-conform"
+version = "0.16.0"
+dependencies = [
+ "faderframe-core",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "faderframe-control"
 version = "0.16.0"
 
@@ -1060,6 +1069,7 @@ dependencies = [
  "faderframe-audio-graph",
  "faderframe-automation",
  "faderframe-binaural",
+ "faderframe-conform",
  "faderframe-control",
  "faderframe-core",
  "faderframe-disc",
@@ -1080,6 +1090,8 @@ dependencies = [
  "faderframe-transport",
  "faderframe-video",
  "faderframe-workspace",
+ "gstreamer",
+ "gstreamer-app",
  "midly",
  "rtrb",
  "serde",
