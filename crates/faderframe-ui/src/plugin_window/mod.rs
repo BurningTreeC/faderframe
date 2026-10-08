@@ -278,12 +278,12 @@ fn outputs_button(app: &Rc<AppState>, plugin: PluginInstanceId) -> Option<gtk::M
     }
     let button = gtk::MenuButton::new();
     button.set_label("Outputs");
-    button.set_tooltip_text(Some("Tracks for the plugin's extra outputs"));
+    button.set_tooltip_text(Some("Tracks for the plugin's outputs (the main too)"));
     let weak = Rc::downgrade(app);
     button.set_create_popup_func(move |button| {
         let Some(app) = weak.upgrade() else { return };
         let outs = app.session.borrow().plugin_output_buses(plugin);
-        let missing = outs.iter().skip(1).filter(|o| o.track.is_none()).count();
+        let missing = outs.iter().filter(|o| o.track.is_none()).count();
         let menu = gtk::gio::Menu::new();
         let all = gtk::gio::Menu::new();
         let item = gtk::gio::MenuItem::new(
@@ -303,7 +303,7 @@ fn outputs_button(app: &Rc<AppState>, plugin: PluginInstanceId) -> Option<gtk::M
         all.append_item(&item);
         menu.append_section(None, &all);
         let one = gtk::gio::Menu::new();
-        for o in outs.iter().skip(1) {
+        for o in &outs {
             let label = if o.track.is_some() {
                 format!("✓ {}", o.name)
             } else {

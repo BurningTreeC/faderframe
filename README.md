@@ -40,11 +40,12 @@ master:
 
 A multi-output instrument: the Drum Sampler on the lead synth's track
 plays its pads (loaded with six samples, its editor on the right) into
-extra outputs, and Create Output Tracks gave every output a track of its
-own in one step — Lead Synth Out 1–8, in a folder under the instrument,
-routed like it:
+its outputs, and Create Output Tracks gave every output a track of its
+own in one step — Lead Synth Main and Out 1–8, in a folder under the
+instrument, routed where it went (its own track now only carries the
+instrument):
 
-![The Drum Sampler's pads on eight output tracks, and its editor](docs/screenshots/outputs.png)
+![The Drum Sampler's main and eight extra outputs on tracks of their own, and its editor](docs/screenshots/outputs.png)
 
 The MIDI workspace with the piano roll editing the lead synth's melody,
 the key and the chords above the notes and the scale highlighted:
@@ -456,8 +457,8 @@ long sessions), Neon and High Contrast:
   modulation with curves, `#define`/`#include`), and a
   sixteen-pad drum sampler with choke groups, each pad's start and end
   dragged on its waveform, a click on a pad to hear it, and eight extra
-  stereo outputs (each pad's Output; Create Output Tracks gives them
-  tracks).
+  stereo outputs (each pad's Output; Create Output Tracks gives them and
+  the main tracks).
   Both samplers can keep a
   sample's length when they change its pitch (Sampler: Keep Length;
   Drum Sampler: per pad), through the same stretcher as warping, without
@@ -564,13 +565,16 @@ long sessions), Neon and High Contrast:
   start empty and open the browser to choose their instrument (an
   instrument picked for an empty instrument track's insert slot becomes
   its instrument); plugins that take notes in insert slots get the
-  track's MIDI too. Multi-output instruments (a drum plugin's kit pieces
-  on outputs of their own): Create Output Tracks in the insert menu, the
-  track menu or the editor's Outputs menu makes an Aux track for each
-  extra output in one step, in a folder under the instrument and routed
-  like it (Outputs → one output; any track can also take one as its
-  input). The Drum Sampler sends pads to its eight extra outputs (the
-  pad's Output). Click a filled insert slot
+  track's MIDI too. Multi-output plugins (a drum plugin's kit pieces on
+  outputs of their own, the Guitar Station's amplifier and DI): Create
+  Output Tracks in the insert menu, the track menu or the editor's
+  Outputs menu makes an Aux track for every output in one step, the main
+  one too, in a folder under the plugin's track and routed where that
+  went; the plugin's own track then only carries the plugin (its output
+  off, so nothing plays twice), and removing the Main track gives it its
+  routing back (Outputs → one output; any track can also take an extra
+  output as its input). The Drum Sampler sends pads to its eight extra
+  outputs (the pad's Output). Click a filled insert slot
   for the plugin's own GUI (Ctrl-click bypasses, right-click for the
   parameter window, presets, sidechain and more); editors open centred or
   where they were last, and their positions are saved with the project.

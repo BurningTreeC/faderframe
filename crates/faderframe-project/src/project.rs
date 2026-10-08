@@ -426,13 +426,12 @@ impl Project {
             .map(|o| o.id)
     }
 
-    /// Per plugin, the highest of its output buses a track takes (tracks
-    /// that take its main bus 0 do not count).
+    /// Per plugin, the highest of its output buses a track takes (0: only
+    /// its main one).
     pub fn taken_plugin_outputs(&self) -> HashMap<PluginInstanceId, u16> {
         let mut out: HashMap<PluginInstanceId, u16> = HashMap::new();
         for t in &self.tracks {
             if let Some((plugin, bus)) = t.input.plugin_output()
-                && bus > 0
                 && t.kind.has_audio()
                 && t.kind != TrackKind::Midi
             {

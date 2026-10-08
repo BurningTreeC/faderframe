@@ -1,7 +1,10 @@
 //! Multi-output plugins (a drum instrument's kit pieces on outputs of
-//! their own): tracks take a plugin's extra output buses as their input
-//! (`InputRouting::Plugin`), and one action makes them all, routed like the
-//! plugin's track, in a folder under it.
+//! their own, the Guitar Station's amplifier and DI): tracks take a
+//! plugin's output buses as their input (`InputRouting::Plugin`), and one
+//! action makes a track for every one, the main one too, routed like the
+//! plugin's track, in a folder under it; the plugin's own track then only
+//! carries the plugin (its output off, so the main is not heard twice).
+//! Removing the track that takes the main gives its routing back.
 
 use crate::{Result, Session, SessionError};
 use faderframe_core::{ChannelLayout, PluginInstanceId, TrackId};
@@ -13,8 +16,7 @@ pub struct PluginOutput {
     pub bus: u16,
     pub name: String,
     pub channels: u16,
-    /// The track that takes it (the main bus: none; it is the plugin's
-    /// own track's signal).
+    /// The track that takes it.
     pub track: Option<TrackId>,
 }
 
@@ -64,7 +66,7 @@ impl Session {
                     channels: b.channels,
                     track: takers
                         .iter()
-                        .find(|t| t.input.plugin_output() == Some((plugin, bus)) && bus > 0)
+                        .find(|t| t.input.plugin_output() == Some((plugin, bus)))
                         .map(|t| t.id),
                 }
             })
@@ -90,11 +92,12 @@ impl Session {
         }
     }
 
-    /// Tracks for the plugin's extra output buses (`buses`: those, else
-    /// every one) that no track takes yet: Aux tracks fed by them, routed
-    /// where the plugin's track goes, in a folder right under it (the
-    /// folder earlier ones are in, if they are). One undo step; returns
-    /// the new tracks.
+    /// Tracks for the plugin's output buses (`buses`: those, else every
+    /// one, the main too) that no track takes yet: Aux tracks fed by them,
+    /// routed where the plugin's track went, in a folder right under it
+    /// (the folder earlier ones are in, if they are). A track for the main
+    /// switches the plugin's track's output off. One undo step; returns the
+    /// new tracks.
     pub(crate) fn create_output_tracks(
         &mut self,
         plugin: PluginInstanceId,
@@ -113,7 +116,7 @@ impl Session {
         let all = self.plugin_output_buses(plugin);
         let wanted: Vec<PluginOutput> = all
             .into_iter()
-            .filter(|o| o.bus > 0 && o.track.is_none())
+            .filter(|o| o.track.is_none())
             .filter(|o| buses.is_none_or(|b| b.contains(&o.bus)))
             .collect();
         if wanted.is_empty() {
@@ -130,6 +133,17 @@ impl Session {
         let host_index = p.track_index(host.id).unwrap_or(p.tracks.len());
         // Earlier output tracks' folder, else a new one under the track.
         let existing = p.plugin_output_tracks(plugin);
+        // Where the outputs go: where the plugin's track went (or, once a
+        // track takes its main and its own output is off, that track's).
+        let route = existing
+            .iter()
+            .find(|t| t.input.plugin_output() == Some((plugin, 0)))
+            .map_or(host.output, |t| t.output);
+        let route = if route == OutputRouting::None && host.output == OutputRouting::None {
+            OutputRouting::Master
+        } else {
+            route
+        };
         let folder = existing
             .iter()
             .find_map(|t| t.folder)
@@ -184,7 +198,7 @@ impl Session {
                 o.channels.max(1),
             )));
             t.input = InputRouting::Plugin { plugin, bus: o.bus };
-            t.output = host.output;
+            t.output = route;
             t.folder = Some(folder);
             commands.push(Command::AddTrack {
                 track: Box::new(t),
@@ -192,6 +206,13 @@ impl Session {
             });
             index += 1;
             made.push(id);
+        }
+        // The main has a track now: the plugin's track would play it twice.
+        if wanted.iter().any(|o| o.bus == 0) && host.output != OutputRouting::None {
+            commands.push(Command::SetTrackOutput {
+                track: host.id,
+                output: OutputRouting::None,
+            });
         }
         self.batch("Create Output Tracks", commands)?;
         self.notify(
@@ -204,6 +225,53 @@ impl Session {
             ),
         );
         Ok(made)
+    }
+
+    /// Removing the track that takes a plugin's main gives its routing back
+    /// to the plugin's track, when that one's output is off (hooked into
+    /// `Session::edit`): the plugin is heard again, where the track went.
+    pub(crate) fn keep_main_heard(&self, cmd: Command) -> Command {
+        fn removed(cmd: &Command, out: &mut Vec<TrackId>) {
+            match cmd {
+                Command::RemoveTrack { track } => out.push(*track),
+                Command::Batch { commands, .. } => {
+                    for c in commands {
+                        removed(c, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut gone = Vec::new();
+        removed(&cmd, &mut gone);
+        let p = &self.project;
+        let back: Vec<Command> = gone
+            .iter()
+            .filter_map(|t| p.track(*t))
+            .filter_map(|t| {
+                let (plugin, bus) = t.input.plugin_output()?;
+                if bus != 0 {
+                    return None;
+                }
+                let host = p
+                    .tracks
+                    .iter()
+                    .find(|h| h.id != t.id && h.slots().iter().any(|s| s.id == plugin))?;
+                (host.output == OutputRouting::None && !gone.contains(&host.id)).then_some(
+                    Command::SetTrackOutput {
+                        track: host.id,
+                        output: t.output,
+                    },
+                )
+            })
+            .collect();
+        if back.is_empty() {
+            return cmd;
+        }
+        Command::Batch {
+            label: cmd.label(),
+            commands: std::iter::once(cmd).chain(back).collect(),
+        }
     }
 
     /// Tracks taking outputs of `track`'s plugins.

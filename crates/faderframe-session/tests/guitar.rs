@@ -106,7 +106,22 @@ fn it_plays_live_and_a_pedal_added_while_playing_restarts_the_line() {
         buses: None,
     })
     .unwrap();
-    let di = s.project().plugin_output_tracks(plugin)[0].id;
+    // Main and DI on tracks of their own; the station's track plays
+    // nothing itself.
+    let outs = s.project().plugin_output_tracks(plugin);
+    assert_eq!(outs.len(), 2, "Main and DI");
+    let main = outs[0].id;
+    let di = outs[1].id;
+    assert_eq!(
+        s.project().track(t).unwrap().output,
+        faderframe_project::OutputRouting::None
+    );
+    run(&mut s, 0.5);
+    let level = level_once_over(&mut s, main, -50.0);
+    assert!(
+        level > -50.0,
+        "the Main track plays the amplifier: {level:.1} dB"
+    );
     run(&mut s, 1.0);
     let level = level_once_over(&mut s, di, -60.0);
     assert!(

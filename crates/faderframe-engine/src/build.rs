@@ -1282,15 +1282,15 @@ pub fn build_graph(
         }
     }
 
-    // Plugins' extra outputs into the tracks taking them (both on the
-    // audio thread: neither renders ahead).
+    // Plugins' outputs into the tracks taking them, the main one (right
+    // after the plugin) too; both on the audio thread: neither renders
+    // ahead.
     for t in &project.tracks {
         let Some((plugin, bus)) = t.input.plugin_output() else {
             continue;
         };
         if let (Some(&node), Some(tn)) = (output_nodes.get(&plugin), nodes.get(&t.id))
             && let Some(input) = tn.input.filter(|_| !tn.input_ahead)
-            && bus > 0
         {
             b.connect_audio(node, bus, input, 0)?;
         }

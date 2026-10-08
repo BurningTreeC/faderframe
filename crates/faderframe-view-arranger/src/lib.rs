@@ -2281,7 +2281,7 @@ impl ArrangerView {
                 });
             }
         }
-        // Multi-output plugins: tracks for their extra outputs.
+        // Multi-output plugins: tracks for their outputs (the main too).
         for slot in t.inserts.iter().chain(t.instrument.iter()) {
             if !model.plugin_has_extra_outputs(slot.id) {
                 continue;
@@ -2289,7 +2289,6 @@ impl ArrangerView {
             let missing = model
                 .plugin_output_buses(slot.id)
                 .iter()
-                .skip(1)
                 .filter(|o| o.track.is_none())
                 .count();
             let label = format!("Create Output Tracks · {} ({missing})", slot.plugin.name);

@@ -7,7 +7,7 @@ use faderframe_audio::dummy::DummyBackend;
 use faderframe_core::{ParameterId, PluginInstanceId, TrackId, builtin};
 use faderframe_engine::EngineConfig;
 use faderframe_plugin_host::devices::drums;
-use faderframe_project::{Command, InputRouting, PluginRef, Project, TrackKind};
+use faderframe_project::{Command, InputRouting, OutputRouting, PluginRef, Project, TrackKind};
 use faderframe_session::{Action, AudioPreferences, PluginTarget, SelectMode, Session};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -73,6 +73,7 @@ fn output_tracks_are_made_in_one_step_and_carry_their_pads() {
     assert_eq!(buses[0].name, "Main");
     assert!(s.plugin_has_extra_outputs(plugin));
     let before = s.project().tracks.len();
+    let routed = s.project().track(kit_track).unwrap().output;
     s.dispatch(Action::CreateOutputTracks {
         plugin,
         buses: None,
@@ -81,12 +82,14 @@ fn output_tracks_are_made_in_one_step_and_carry_their_pads() {
     let p = s.project();
     assert_eq!(
         p.tracks.len(),
-        before + 1 + drums::AUX,
-        "a folder and a track each"
+        before + 1 + 1 + drums::AUX,
+        "a folder and a track each, the main too"
     );
     let outs = p.plugin_output_tracks(plugin);
-    assert_eq!(outs.len(), drums::AUX);
+    assert_eq!(outs.len(), 1 + drums::AUX);
     let host = p.track(kit_track).unwrap();
+    // The main has its track: the kit's own plays nothing.
+    assert_eq!(host.output, OutputRouting::None);
     let folder = outs[0].folder.unwrap();
     assert_eq!(p.track(folder).unwrap().kind, TrackKind::Folder);
     for (i, t) in outs.iter().enumerate() {
@@ -95,15 +98,21 @@ fn output_tracks_are_made_in_one_step_and_carry_their_pads() {
             t.input,
             InputRouting::Plugin {
                 plugin,
-                bus: i as u16 + 1
+                bus: i as u16
             }
         );
-        assert_eq!(t.output, host.output);
+        assert_eq!(t.output, routed, "where the kit's track went");
         assert_eq!(t.folder, Some(folder));
-        // "Out 3" is only a number: the kit's track name goes first.
-        assert_eq!(t.name, format!("{} Out {}", host.name, i + 1));
+        // "Main" and "Out 3" say nothing alone: the kit's track name first.
+        let name = if i == 0 {
+            "Main".to_string()
+        } else {
+            format!("Out {i}")
+        };
+        assert_eq!(t.name, format!("{} {name}", host.name));
     }
-    assert_eq!(s.input_label(outs[2]), "Drums · Out 3");
+    assert_eq!(s.input_label(outs[3]), "Drums · Out 3");
+    assert_eq!(s.input_label(outs[0]), "Drums · Main");
     // Again: nothing left to make.
     assert!(
         s.dispatch(Action::CreateOutputTracks {
@@ -115,9 +124,11 @@ fn output_tracks_are_made_in_one_step_and_carry_their_pads() {
     // One undo step.
     s.dispatch(Action::Undo).unwrap();
     assert_eq!(s.project().tracks.len(), before);
+    assert_eq!(s.project().track(kit_track).unwrap().output, routed);
     s.dispatch(Action::Redo).unwrap();
-    let out3 = s.project().plugin_output_tracks(plugin)[2].id;
-    let out1 = s.project().plugin_output_tracks(plugin)[0].id;
+    let main = s.project().plugin_output_tracks(plugin)[0].id;
+    let out3 = s.project().plugin_output_tracks(plugin)[3].id;
+    let out1 = s.project().plugin_output_tracks(plugin)[1].id;
     // Freezing the kit would silence them: refused.
     assert!(s.dispatch(Action::FreezeTrack(kit_track)).is_err());
 
@@ -153,6 +164,33 @@ fn output_tracks_are_made_in_one_step_and_carry_their_pads() {
     );
     assert!(on1 < -70.0, "nor on another output");
     s.midi_keyboard().send(&[0x80, 36, 0]);
+    // A pad on the main plays on the Main track.
+    s.dispatch(Action::Edit(Command::SetPluginParameter {
+        track: kit_track,
+        plugin,
+        parameter: ParameterId(drums::id::pad(0) + drums::id::OUTPUT),
+        value: Some(0.0),
+    }))
+    .unwrap();
+    run(&mut s, 0.3);
+    s.midi_keyboard().send(&[0x90, 36, 120]);
+    run(&mut s, 0.15);
+    let on_main = s.meter(main).left.level_db;
+    assert!(
+        on_main > -30.0,
+        "the main's track takes it: {on_main:.1} dBFS"
+    );
+    s.midi_keyboard().send(&[0x80, 36, 0]);
+    s.stop_audio();
+    // Removing the Main track gives the kit's track its routing back.
+    s.dispatch(Action::Edit(Command::RemoveTrack { track: main }))
+        .unwrap();
+    assert_eq!(s.project().track(kit_track).unwrap().output, routed);
+    s.dispatch(Action::Undo).unwrap();
+    assert_eq!(
+        s.project().track(kit_track).unwrap().output,
+        OutputRouting::None
+    );
 }
 
 #[test]
@@ -178,11 +216,14 @@ fn a_track_can_take_one_output_by_hand() {
             .iter()
             .any(|c| matches!(c.action, Action::Edit(_)) && c.label.contains("Out 2"))
     );
-    // Only the missing ones are made now.
+    // Only the missing ones are made now (the main among them).
     s.dispatch(Action::CreateOutputTracks {
         plugin,
         buses: None,
     })
     .unwrap();
-    assert_eq!(s.project().plugin_output_tracks(plugin).len(), drums::AUX);
+    assert_eq!(
+        s.project().plugin_output_tracks(plugin).len(),
+        1 + drums::AUX
+    );
 }

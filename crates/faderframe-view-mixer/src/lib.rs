@@ -1501,10 +1501,11 @@ impl MixerView {
                         },
                     ));
                 }
-                // A multi-output plugin: tracks for its extra outputs.
+                // A multi-output plugin: tracks for its outputs (the main
+                // too).
                 if model.plugin_has_extra_outputs(s.id) {
                     let outs = model.plugin_output_buses(s.id);
-                    let missing = outs.iter().skip(1).filter(|o| o.track.is_none()).count();
+                    let missing = outs.iter().filter(|o| o.track.is_none()).count();
                     let mut item = MenuItem::new(
                         format!("Create Output Tracks ({missing})"),
                         Action::CreateOutputTracks {
@@ -1520,7 +1521,6 @@ impl MixerView {
                     items.push(MenuItem::submenu(
                         "Outputs",
                         outs.iter()
-                            .skip(1)
                             .map(|o| {
                                 MenuItem::new(
                                     o.name.clone(),

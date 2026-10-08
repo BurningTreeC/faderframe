@@ -2830,8 +2830,10 @@ impl Session {
                 commands: std::iter::once(cmd).chain(linked).collect(),
             }
         };
-        // Removing a folder keeps its tracks.
+        // Removing a folder keeps its tracks; removing the track taking a
+        // plugin's main gives the plugin's track its routing back.
         let cmd = self.keep_folder_contents(cmd);
+        let cmd = self.keep_main_heard(cmd);
         // Splitting an alias makes it its own; content edits reach the
         // others (one undo step).
         let cmd = self.unlink_split_aliases(cmd);
