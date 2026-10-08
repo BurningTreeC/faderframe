@@ -1,5 +1,6 @@
 //! Frames rendered on the GPU: shapes land where the painter put them,
-//! clips clip, text draws, HiDPI scales. Skipped without a GPU adapter.
+//! clips clip, text draws, HiDPI scales. Software rasterisers count (CI has
+//! no GPU); skipped without any adapter.
 #![allow(clippy::unwrap_used)]
 
 use faderframe_ui_canvas::{Align, Color, Paint, Rect, TextStyle};
@@ -38,7 +39,7 @@ fn renderer() -> Option<(Turn, GpuRenderer)> {
         "making a renderer ({})",
         std::thread::current().name().unwrap_or("?")
     ));
-    match GpuRenderer::new() {
+    match GpuRenderer::new_any() {
         Ok(r) => {
             mark(&format!("rendering on {}", r.adapter()));
             Some((Turn(turn), r))

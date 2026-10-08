@@ -6,7 +6,7 @@
 # "FaderFrame Data" folder, which makes it portable. Run in an MSYS2 UCRT64 shell:
 #
 #   pacman -S mingw-w64-ucrt-x86_64-{gtk4,rust,pkgconf,gcc,librsvg,python,adwaita-icon-theme} zip \
-#       mingw-w64-ucrt-x86_64-{gstreamer,gst-plugins-base,gst-plugins-good,gst-plugins-bad}
+#       mingw-w64-ucrt-x86_64-{gstreamer,gst-plugins-base,gst-plugins-good,gst-plugins-bad} unzip
 #   cargo build --release -p faderframe-app
 #   packaging/windows/bundle.sh
 #
@@ -75,6 +75,10 @@ if [ -f "$scanner" ]; then
     cp "$scanner" "$out/libexec/gstreamer-1.0/"
     copy_deps "$scanner"
 fi
+
+# The GPU painter's shader compiler (DXC) beside the program, with its
+# licences: without it wgpu falls back to FXC.
+packaging/windows/fetch_dxc.sh "$out/bin" "$out"
 
 cp LICENSE THIRD_PARTY_LICENSES.md AOM-PATENT-LICENSE.txt "$out/"
 python3 packaging/icons.py ico packaging/icons/io.github.BurningTreeC.FaderFrame.svg "$out/faderframe.ico"

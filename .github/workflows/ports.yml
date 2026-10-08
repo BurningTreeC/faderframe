@@ -59,8 +59,13 @@ jobs:
             mingw-w64-ucrt-x86_64-pkgconf
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-rust
+            unzip
       - name: Build application
         run: cargo build -p faderframe-app
+      # The GPU painter's shaders through DXC (as the packages ship it): with
+      # FXC's, the runner's software rasteriser crashed on the first frame.
+      - name: DXC for the GPU tests
+        run: packaging/windows/fetch_dxc.sh "$MINGW_PREFIX/bin"
       - name: Tests
         run: cargo test --workspace --no-fail-fast
 

@@ -38,6 +38,7 @@ SYSTEM_LIBRARIES = [
     ("Graphene", "MIT", "https://github.com/ebassi/graphene", "geometry types (dynamically linked)"),
     ("HarfBuzz", "MIT-like (Old MIT)", "https://github.com/harfbuzz/harfbuzz", "text shaping via Pango"),
     ("GStreamer (core; base, good and bad plugins)", "LGPL-2.1-or-later", "https://gitlab.freedesktop.org/gstreamer/gstreamer", "video: demuxing, decoding, encoding, muxing (dynamically linked; plugins loaded at run time)"),
+    ("DirectXShaderCompiler (dxcompiler.dll, Windows packages)", "NCSA (LLVM) AND MIT", "https://github.com/microsoft/DirectXShaderCompiler", "shader compiler of the GPU painter, loaded at run time; licences in the package (DXC-LICENSE-*.txt)"),
     ("libjack (JACK2)", "LGPL-2.1-or-later", "https://github.com/jackaudio/jack2", "loaded at runtime with dlopen"),
     ("pipewire-jack", "MIT", "https://gitlab.freedesktop.org/pipewire/pipewire", "alternative libjack provider, loaded at runtime"),
 ]

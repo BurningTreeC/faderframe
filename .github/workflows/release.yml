@@ -107,6 +107,7 @@ jobs:
             mingw-w64-ucrt-x86_64-rust
             mingw-w64-ucrt-x86_64-python
             zip
+            unzip
       - name: Inno Setup
         shell: pwsh
         run: |

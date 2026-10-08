@@ -37,6 +37,11 @@ pub use scene::ScenePainter;
 pub enum GpuError {
     #[error("no GPU adapter: {0}")]
     Adapter(String),
+    /// Only a software rasteriser (WARP, llvmpipe, lavapipe): the toolkit
+    /// draws faster on the CPU than vello there, and Windows' WARP crashed
+    /// on shaders FXC had compiled.
+    #[error("{0} is a software renderer: the toolkit draws instead")]
+    Software(String),
     #[error("GPU device: {0}")]
     Device(String),
     #[error("vello: {0}")]
@@ -134,15 +139,34 @@ impl GpuRenderer {
         Self::new_on(None)
     }
 
+    /// [`Self::new`], software rasterisers too (tests on machines without a
+    /// GPU; `FADERFRAME_GPU_SOFTWARE=1` allows them in [`Self::new_on`]).
+    pub fn new_any() -> Result<Self, GpuError> {
+        Self::build(None, true)
+    }
+
     /// [`Self::new`] on the adapter with this LUID where there is one (on
     /// Windows: the D3D12 adapter the toolkit's GL draws with, so it can
     /// import the frames). When vello cannot be built there, wgpu's own
     /// choice of adapter is used (frames read back).
     pub fn new_on(luid: Option<[u8; 8]>) -> Result<Self, GpuError> {
+        let software = std::env::var("FADERFRAME_GPU_SOFTWARE").as_deref() == Ok("1");
+        Self::build(luid, software)
+    }
+
+    fn build(luid: Option<[u8; 8]>, software: bool) -> Result<Self, GpuError> {
+        let refuse = |a: &wgpu::Adapter| {
+            let info = a.get_info();
+            (!software && info.device_type == wgpu::DeviceType::Cpu)
+                .then(|| GpuError::Software(format!("{} ({:?})", info.name, info.backend)))
+        };
         #[cfg_attr(not(windows), allow(unused_mut))]
         let mut instance = instance(Instances::All);
         #[cfg(windows)]
         if let Some(adapter) = d3d12_adapter(instance, luid) {
+            if let Some(e) = refuse(&adapter) {
+                return Err(e);
+            }
             match Self::on_adapter(adapter) {
                 Ok(r) => return Ok(r),
                 Err(e) => {
@@ -164,6 +188,9 @@ impl GpuRenderer {
                 }),
             )
             .map_err(|e| GpuError::Adapter(e.to_string()))?;
+        if let Some(e) = refuse(&adapter) {
+            return Err(e);
+        }
         Self::on_adapter(adapter)
     }
 
