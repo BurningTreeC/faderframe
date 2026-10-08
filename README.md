@@ -389,6 +389,12 @@ long sessions), Neon and High Contrast:
   toolbar, beside the grid): free positions land on whole samples, and
   cuts and trims of audio clips move to the nearest zero crossing so they
   do not click.
+* Screen readers and the keyboard: the mixer, arranger, piano roll, event
+  list, setlist, history, transport display and the device editors list
+  their controls to screen readers (Orca and other AT-SPI readers on
+  Linux); Tab moves along a view's controls with a focus ring, Enter
+  presses, the arrows move faders, knobs and values, and transport changes
+  and messages are announced.
 * MIDI 2.0 (Linux): MIDI 2.0 devices and programs as inputs and outputs
   through the ALSA sequencer; per-note pitch bend and controllers are
   played, recorded and captured as note expression, and clips' note

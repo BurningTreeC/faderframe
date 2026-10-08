@@ -522,6 +522,72 @@ fn track_color(model: &Session, clip: &Clip) -> Color {
 }
 
 impl faderframe_ui_canvas::CanvasView<Session, faderframe_session::Action> for PianoRollView {
+    /// The clip's notes in time order (name, where, how long, how loud);
+    /// Enter selects one and puts the playhead on it, the arrows transpose
+    /// it a semitone.
+    fn accessible(
+        &self,
+        _size: Size,
+        model: &Session,
+    ) -> Vec<faderframe_ui_canvas::AccessNode<faderframe_session::Action>> {
+        use faderframe_session::{Action, NoteOp, SelectMode, TransportAction};
+        use faderframe_ui_canvas::{AccessNode, AccessRole, access_id};
+        let Some((id, clip, m)) = Self::clip(model) else {
+            return Vec::new();
+        };
+        let tl = &model.project().timeline;
+        let mut notes: Vec<&MidiNote> = m.notes.iter().collect();
+        notes.sort_by_key(|n| (n.start, n.key));
+        let items = notes.into_iter().map(|n| {
+            let at = clip.start + n.start;
+            let mut label = format!(
+                "{}, at {}, {:.2} beats, velocity {}",
+                note_name(n.key),
+                tl.format_bbt(at),
+                n.length.quarters(),
+                n.velocity
+            );
+            if n.channel > 0 {
+                label.push_str(&format!(", channel {}", n.channel + 1));
+            }
+            if n.muted {
+                label.push_str(", muted");
+            }
+            let transpose = |by: i32| Action::NoteOperation {
+                clip: id,
+                notes: vec![n.id],
+                op: NoteOp::Transpose(by),
+            };
+            let mut node = AccessNode::new(access_id(&[81, n.id.0]), AccessRole::ListItem, label)
+                .selected(model.selection.notes.contains(&n.id))
+                .described("Enter selects it; Up and Down transpose it")
+                .on_activate(Action::Several(vec![
+                    Action::SelectNotes {
+                        notes: vec![n.id],
+                        mode: SelectMode::Replace,
+                    },
+                    Action::Transport(TransportAction::Locate(at)),
+                ]))
+                .on_step(transpose(1), transpose(-1));
+            if let Some(r) = self.note_rect(n) {
+                node = node.at(r);
+            }
+            node
+        });
+        vec![
+            AccessNode::new(
+                access_id(&[80, id.0]),
+                AccessRole::List,
+                format!("Notes of {}", clip.name),
+            )
+            .with_children(items),
+        ]
+    }
+
+    fn accessible_name(&self) -> Option<String> {
+        Some("Piano Roll".into())
+    }
+
     fn set_theme(&mut self, theme: &Theme) {
         self.theme = theme.clone();
     }

@@ -13,6 +13,7 @@
 
 #![forbid(unsafe_code)]
 
+mod access;
 mod layout;
 mod preamp;
 
@@ -3610,6 +3611,18 @@ impl MixerView {
 }
 
 impl CanvasView<Session, Action> for MixerView {
+    fn accessible(
+        &self,
+        size: Size,
+        model: &Session,
+    ) -> Vec<faderframe_ui_canvas::AccessNode<Action>> {
+        self.access_nodes(size, model)
+    }
+
+    fn accessible_name(&self) -> Option<String> {
+        Some(if self.master_only { "Master" } else { "Mixer" }.into())
+    }
+
     fn set_theme(&mut self, theme: &Theme) {
         self.base_theme = theme.clone();
         self.theme = self.looked();

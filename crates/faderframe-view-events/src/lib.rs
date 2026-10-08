@@ -814,6 +814,67 @@ impl EventsView {
 }
 
 impl faderframe_ui_canvas::CanvasView<Session, Action> for EventsView {
+    /// Each event a list item read as its row (position, type, channel,
+    /// key, value, length…); Enter moves the playhead to it.
+    fn accessible(
+        &self,
+        size: Size,
+        model: &Session,
+    ) -> Vec<faderframe_ui_canvas::AccessNode<Action>> {
+        use faderframe_ui_canvas::{AccessNode, AccessRole, access_id};
+        let rows = self.rows(model);
+        let items = rows.iter().enumerate().map(|(i, r)| {
+            let note = matches!(r.kind, faderframe_session::midi_events::EventKind::Note);
+            let mut parts = Vec::new();
+            for (col, _, _) in COLUMNS {
+                let text = self.cell_text(r, col, model);
+                let t = text.trim();
+                if t.is_empty() || t == "–" || t == "-" {
+                    continue;
+                }
+                let said = match col {
+                    Column::Position | Column::Type | Column::Info => text.clone(),
+                    Column::Channel => format!("channel {t}"),
+                    Column::Data1 if note => format!("key {t}"),
+                    Column::Data1 => format!("number {t}"),
+                    Column::Data2 if note => format!("velocity {t}"),
+                    Column::Data2 => format!("value {t}"),
+                    Column::Length => format!("length {t}"),
+                    Column::End => format!("ends at {t}"),
+                    Column::Release => format!("release velocity {t}"),
+                    Column::Locate | Column::Mute => continue,
+                };
+                parts.push(said);
+            }
+            if r.muted {
+                parts.push("muted".into());
+            }
+            AccessNode::new(
+                access_id(&[21, i as u64, r.at.ticks() as u64]),
+                AccessRole::ListItem,
+                parts.join(", "),
+            )
+            .at(self.row_rect(i, size))
+            .selected(self.is_selected(r, model))
+            .on_activate(Action::Transport(
+                faderframe_session::TransportAction::Locate(r.at),
+            ))
+        });
+        let name = match Self::clip(model).and_then(|c| model.project().clip(c)) {
+            Some(c) => format!("Events of {}", c.name),
+            None => "No MIDI clip".into(),
+        };
+        vec![
+            AccessNode::new(access_id(&[20]), AccessRole::List, name)
+                .at(Self::list(size))
+                .with_children(items),
+        ]
+    }
+
+    fn accessible_name(&self) -> Option<String> {
+        Some("MIDI Event List".into())
+    }
+
     fn set_theme(&mut self, theme: &Theme) {
         self.theme = theme.clone();
     }

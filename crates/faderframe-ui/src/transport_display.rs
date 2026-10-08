@@ -226,6 +226,48 @@ fn meter_menu(s: &Session, at: Point) -> HostRequest<Action> {
 }
 
 impl CanvasView<Session, Action> for TransportDisplay {
+    /// The position (both counters), the tempo (the arrows change it by a
+    /// BPM) and the meter.
+    fn accessible(&self, size: Size, s: &Session) -> Vec<faderframe_ui_canvas::AccessNode<Action>> {
+        use faderframe_ui_canvas::{AccessNode, AccessRole, access_id};
+        let z = zones(size);
+        let pos = s.playhead();
+        let project = s.project();
+        let bpm = project.timeline.tempo.bpm_at(pos);
+        let sig = project.timeline.meter.signature_at(pos);
+        let set = |bpm: f64| {
+            Action::Edit(Command::SetTempo {
+                bpm: bpm.clamp(20.0, 999.0),
+            })
+        };
+        vec![
+            AccessNode::new(
+                access_id(&[61]),
+                AccessRole::Label,
+                format!(
+                    "Position {}, {}",
+                    readout(s, s.editor.main_counter),
+                    readout(s, sub_unit(s))
+                ),
+            )
+            .at(z.bbt.union(&z.time)),
+            AccessNode::new(access_id(&[62]), AccessRole::SpinButton, "Tempo")
+                .at(z.tempo.union(&z.bpm))
+                .value(bpm, 20.0, 999.0, format!("{bpm:.2} BPM"))
+                .on_step(set(bpm.floor() + 1.0), set(bpm.ceil() - 1.0)),
+            AccessNode::new(
+                access_id(&[63]),
+                AccessRole::Label,
+                format!("Meter {}/{}", sig.numerator, sig.denominator),
+            )
+            .at(z.meter.union(&z.meter_label)),
+        ]
+    }
+
+    fn accessible_name(&self) -> Option<String> {
+        Some("Transport".into())
+    }
+
     fn paint(&mut self, p: &mut dyn Painter, size: Size, s: &Session, theme: &Theme) {
         let (lcd_bg, lcd_text, lcd_dim) = (theme.ui.lcd_bg, theme.ui.lcd_text, theme.ui.lcd_dim);
         let r = Rect::from_size(size);

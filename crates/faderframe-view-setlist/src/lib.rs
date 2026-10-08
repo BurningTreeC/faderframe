@@ -629,6 +629,123 @@ struct StageLayout {
 }
 
 impl CanvasView<Session, Action> for SetlistView {
+    /// The list: its buttons and songs (Enter goes to a song). In show
+    /// mode: the song stood on, the show's buttons and its songs (Enter
+    /// plays one).
+    fn accessible(
+        &self,
+        size: Size,
+        model: &Session,
+    ) -> Vec<faderframe_ui_canvas::AccessNode<Action>> {
+        use faderframe_ui_canvas::{AccessNode, AccessRole, access_id};
+        let songs = &model.setlist().songs;
+        let tl = &model.project().timeline;
+        if model.show_mode() {
+            let l = Self::stage(size);
+            let show = model.show();
+            let i = show.current.min(songs.len().saturating_sub(1));
+            let mut out = Vec::new();
+            if let Some(song) = songs.get(i) {
+                let state = match (model.transport().playing, model.show_countdown()) {
+                    (true, _) => "playing".to_string(),
+                    (false, Some(c)) => format!("starts in {:.0} seconds", c.ceil()),
+                    (false, None) => "ready".to_string(),
+                };
+                let mut label =
+                    format!("Song {} of {}: {}, {state}", i + 1, songs.len(), song.name);
+                if !song.notes.is_empty() {
+                    label.push_str(&format!(". Notes: {}", song.notes.replace('\n', ", ")));
+                }
+                out.push(AccessNode::new(access_id(&[41]), AccessRole::Heading, label).at(l.main));
+            }
+            let playing = model.transport().playing;
+            for (k, r, label, op) in [
+                (42, l.previous, "Previous song", ShowOp::Previous),
+                (
+                    43,
+                    l.play,
+                    if playing { "Stop" } else { "Play" },
+                    ShowOp::PlayStop,
+                ),
+                (44, l.next, "Next song", ShowOp::Next),
+                (45, l.leave, "Leave the show", ShowOp::Leave),
+            ] {
+                out.push(
+                    AccessNode::new(access_id(&[k]), AccessRole::Button, label)
+                        .at(r)
+                        .on_activate(Action::Show(op)),
+                );
+            }
+            let items = songs.iter().enumerate().map(|(k, s)| {
+                AccessNode::new(
+                    access_id(&[46, k as u64]),
+                    AccessRole::ListItem,
+                    format!("{}. {}, {}", k + 1, s.name, mmss(model.song_seconds(s))),
+                )
+                .at(Self::stage_row(&l, k))
+                .selected(k == i)
+                .on_activate(Action::Show(ShowOp::Go(k)))
+            });
+            out.push(
+                AccessNode::new(access_id(&[47]), AccessRole::List, "Setlist")
+                    .at(l.list)
+                    .with_children(items),
+            );
+            return out;
+        }
+        let mut out: Vec<AccessNode<Action>> = Self::buttons(size)
+            .into_iter()
+            .map(|(hit, r, label)| {
+                let action = match hit {
+                    Hit::FromSections => Action::Setlist(SetlistOp::FromSections),
+                    Hit::EnterShow => Action::Show(ShowOp::Enter),
+                    _ => match model.selection.range.filter(|r| !r.is_empty()) {
+                        Some(range) => Action::Setlist(SetlistOp::Add {
+                            name: format!("Song {}", songs.len() + 1),
+                            start: range.start,
+                            end: range.end,
+                        }),
+                        None => Action::Several(Vec::new()),
+                    },
+                };
+                AccessNode::new(
+                    faderframe_ui_canvas::access_id_str(label, &[48]),
+                    AccessRole::Button,
+                    label.trim_start_matches("▶ ").trim_start_matches("+ "),
+                )
+                .at(r)
+                .on_activate(action)
+            })
+            .collect();
+        let items = songs.iter().enumerate().map(|(k, s)| {
+            let mut label = format!(
+                "{}. {}, at {}, {}, then {}",
+                k + 1,
+                s.name,
+                tl.format_bbt(s.start),
+                mmss(model.song_seconds(s)),
+                s.then.label().to_lowercase()
+            );
+            if !s.notes.is_empty() {
+                label.push_str(&format!(", notes: {}", s.notes.replace('\n', ", ")));
+            }
+            AccessNode::new(access_id(&[49, k as u64]), AccessRole::ListItem, label)
+                .at(self.row_rect(k, size))
+                .selected(self.selected == Some(k))
+                .on_activate(Action::Transport(TransportAction::Locate(s.start)))
+        });
+        out.push(
+            AccessNode::new(access_id(&[50]), AccessRole::List, "Songs")
+                .at(Self::list_rect(size))
+                .with_children(items),
+        );
+        out
+    }
+
+    fn accessible_name(&self) -> Option<String> {
+        Some("Setlist".into())
+    }
+
     fn set_theme(&mut self, theme: &Theme) {
         self.theme = theme.clone();
     }

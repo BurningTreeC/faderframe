@@ -21,6 +21,7 @@ use faderframe_plugin_host::{ParameterInfo, ParameterUnit};
 use faderframe_project::{Command, MappingTarget};
 use faderframe_session::{Action, Session};
 use faderframe_ui_canvas::controls::{self, KnobLook};
+use faderframe_ui_canvas::{AccessNode, AccessRole, access_id, access_id_str};
 use faderframe_ui_canvas::{
     CanvasView, Color, Cursor, EventCx, FontWeight, HostRequest, MenuItem, Modifiers, Paint,
     Painter, Point, PointerButton, Rect, Size, TextStyle, Theme, ViewEvent,
@@ -1169,10 +1170,104 @@ impl<F: Face> DeviceView<F> {
     }
 }
 
+impl<F: Face> DeviceView<F> {
+    /// The panel's controls for screen readers and the keyboard: knobs and
+    /// sliders as sliders (the arrows move them a hundredth of their travel),
+    /// switches as toggles, stepped values a step at a time; in groups by
+    /// the panel's sections.
+    fn access_nodes(&self, size: Size, model: &Session) -> Vec<AccessNode<Action>> {
+        let Some(tap) = self.device.tap(model) else {
+            return Vec::new();
+        };
+        let panel = self.face.panel(size);
+        let infos = tap.params.infos();
+        let control = |c: &Ctl| -> Option<AccessNode<Action>> {
+            let i = infos.iter().position(|i| i.id == c.id)?;
+            let info = &infos[i];
+            let v = self.device.value(model, i);
+            let text = self.text(&tap, c.id, v);
+            let id = access_id(&[71, u64::from(c.id.0)]);
+            let set = |v: f64| self.action(model, c.id, info.clamp(v));
+            Some(match c.kind {
+                Kind::Toggle => {
+                    let on = v >= 0.5;
+                    let mut n = AccessNode::new(id, AccessRole::ToggleButton, info.name.clone())
+                        .at(c.rect)
+                        .checked(on);
+                    if let Some(a) = set(if on { info.min } else { info.max }) {
+                        n = n.on_activate(a);
+                    }
+                    n
+                }
+                _ if info.stepped => {
+                    let mut n = AccessNode::new(id, AccessRole::SpinButton, info.name.clone())
+                        .at(c.rect)
+                        .value(v, info.min, info.max, text);
+                    if let (Some(up), Some(down)) = (set(v + 1.0), set(v - 1.0)) {
+                        n = n.on_step(up, down);
+                    }
+                    n
+                }
+                _ => {
+                    let scale = c.scale.unwrap_or_else(|| Scale::of(info));
+                    let t = scale.to_norm(info, v);
+                    let mut n = AccessNode::new(id, AccessRole::Slider, info.name.clone())
+                        .at(c.rect)
+                        .value(v, info.min, info.max, text);
+                    if let (Some(up), Some(down)) = (
+                        set(scale.to_value(info, (t + 0.01).min(1.0))),
+                        set(scale.to_value(info, (t - 0.01).max(0.0))),
+                    ) {
+                        n = n.on_step(up, down);
+                    }
+                    n
+                }
+            })
+        };
+        let mut out = Vec::new();
+        let mut placed = vec![false; panel.controls.len()];
+        for (k, s) in panel.sections.iter().enumerate() {
+            let mut group = AccessNode::new(
+                access_id_str(s.title, &[70, k as u64]),
+                AccessRole::Group,
+                s.title,
+            )
+            .at(s.rect);
+            for (j, c) in panel.controls.iter().enumerate() {
+                if !placed[j] && s.rect.contains(c.rect.center()) {
+                    placed[j] = true;
+                    if let Some(n) = control(c) {
+                        group = group.child(n);
+                    }
+                }
+            }
+            if !group.children.is_empty() {
+                out.push(group);
+            }
+        }
+        for (j, c) in panel.controls.iter().enumerate() {
+            if !placed[j]
+                && let Some(n) = control(c)
+            {
+                out.push(n);
+            }
+        }
+        out
+    }
+}
+
 impl<F: Face> CanvasView<Session, Action> for DeviceView<F> {
     /// Analysers, meters and curves redrawn every frame.
     fn dense(&self) -> bool {
         true
+    }
+
+    fn accessible(&self, size: Size, model: &Session) -> Vec<AccessNode<Action>> {
+        self.access_nodes(size, model)
+    }
+
+    fn accessible_name(&self) -> Option<String> {
+        Some("Device editor".into())
     }
 
     fn set_theme(&mut self, theme: &Theme) {

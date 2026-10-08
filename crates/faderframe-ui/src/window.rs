@@ -9,7 +9,7 @@ use faderframe_engine::MetronomeMode;
 use faderframe_session::{Action, NoticeLevel, Session, WorkspaceAction};
 use gtk::prelude::*;
 use gtk::{gio, glib};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 /// Widgets the frame tick updates.
@@ -35,6 +35,10 @@ pub struct Chrome {
     pub import_bar: gtk::ProgressBar,
     pub workspaces: gtk::DropDown,
     pub workspace_guard: Rc<Cell<bool>>,
+    /// What screen readers were last told: the notice, the transport
+    /// (playing, recording).
+    pub said_notice: RefCell<String>,
+    pub said_transport: Cell<Option<(bool, bool)>>,
 }
 
 /// A message that slides in at the top of the window.
@@ -54,6 +58,7 @@ impl Toast {
         label.set_max_width_chars(80);
         label.set_xalign(0.0);
         let close = gtk::Button::from_icon_name("window-close-symbolic");
+        close.set_tooltip_text(Some("Close the message"));
         close.add_css_class("flat");
         close.set_valign(gtk::Align::Center);
         let frame = gtk::Box::new(gtk::Orientation::Horizontal, 10);
@@ -113,6 +118,21 @@ fn set_class(w: &impl IsA<gtk::Widget>, class: &str, on: bool) {
     }
 }
 
+/// An on/off button: its look and its state for screen readers (told when
+/// it changes, and the first time: the `a11y-pressed` class marks that).
+fn set_pressed(w: &gtk::Button, class: &str, on: bool) {
+    if w.has_css_class(class) == on && w.has_css_class("a11y-pressed") {
+        return;
+    }
+    set_class(w, class, on);
+    w.add_css_class("a11y-pressed");
+    w.update_state(&[gtk::accessible::State::Pressed(if on {
+        gtk::AccessibleTristate::True
+    } else {
+        gtk::AccessibleTristate::False
+    })]);
+}
+
 impl Chrome {
     pub fn update(&self, s: &Session, full: bool) {
         let t = s.transport();
@@ -124,16 +144,29 @@ impl Chrome {
         } else {
             "media-playback-start-symbolic"
         });
-        set_class(&self.play, "play-active", t.playing);
-        set_class(&self.record, "rec-active", t.recording);
-        set_class(&self.looping, "loop-active", s.project().loop_enabled);
+        set_pressed(&self.play, "play-active", t.playing);
+        set_pressed(&self.record, "rec-active", t.recording);
+        set_pressed(&self.looping, "loop-active", s.project().loop_enabled);
+        // The transport, said when it changes.
+        let now = (t.playing, t.recording);
+        if let Some(before) = self.said_transport.replace(Some(now))
+            && before != now
+        {
+            let text = match now {
+                (true, true) => "Recording",
+                (true, false) => "Playing",
+                (false, _) => "Stopped",
+            };
+            self.display
+                .announce(text, gtk::AccessibleAnnouncementPriority::Medium);
+        }
         let can = s.can_capture_midi();
         if self.capture.is_sensitive() != can {
             self.capture.set_sensitive(can);
         }
         let click = s.record.metronome;
         if self.metronome.has_css_class("click-active") != (click != MetronomeMode::Off) {
-            set_class(&self.metronome, "click-active", click != MetronomeMode::Off);
+            set_pressed(&self.metronome, "click-active", click != MetronomeMode::Off);
             self.metronome
                 .set_tooltip_text(Some(&format!("Metronome: {} (K)", click.label())));
         }
@@ -141,7 +174,7 @@ impl Chrome {
         if self.edit_bar.is_visible() != show {
             self.edit_bar.set_visible(show);
         }
-        set_class(&self.edit_button, "edit-active", show);
+        set_pressed(&self.edit_button, "edit-active", show);
         if show {
             let w = self.edit_bar.width();
             if w > 0 {
@@ -160,6 +193,18 @@ impl Chrome {
         match s.latest_notice().filter(|n| n.at.elapsed().as_secs() < 10) {
             Some(n) => {
                 self.notice.set_text(&n.text);
+                // Said once, errors before anything else.
+                if *self.said_notice.borrow() != n.text {
+                    *self.said_notice.borrow_mut() = n.text.clone();
+                    self.notice.announce(
+                        &n.text,
+                        if n.level == NoticeLevel::Error {
+                            gtk::AccessibleAnnouncementPriority::High
+                        } else {
+                            gtk::AccessibleAnnouncementPriority::Medium
+                        },
+                    );
+                }
                 set_class(&self.notice, "notice-error", n.level == NoticeLevel::Error);
                 set_class(
                     &self.notice,
@@ -815,6 +860,8 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
         import_bar,
         workspaces,
         workspace_guard: guard,
+        said_notice: RefCell::default(),
+        said_transport: Cell::new(None),
     });
     *app.window.borrow_mut() = Some(window.clone());
     window

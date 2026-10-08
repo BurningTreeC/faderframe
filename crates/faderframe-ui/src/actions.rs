@@ -2111,6 +2111,50 @@ pub fn install(app: &Rc<AppState>) {
         // click in a docked view; negative coordinates count from its right
         // and bottom edges), then `menu:<label>` clicks an entry of the
         // context menu it opened and `menu-state:x` logs whether it is open.
+        // Development aid: `access-key:<view id>=<tab|backtab|enter|up|down|
+        // left|right|escape>[/…]` — the keyboard on a view's accessible
+        // controls (as Tab, Enter and the arrows reach them).
+        named("access-key", |a, arg| {
+            use faderframe_ui_canvas::{Key, Modifiers};
+            let Some((view, keys)) = arg.split_once('=') else {
+                return tracing::warn!("access-key: '{arg}' is not <view id>=<keys>");
+            };
+            let canvas = a
+                .dock
+                .borrow()
+                .hosts
+                .get(&faderframe_workspace::ViewId::new(view))
+                .map(|(_, h)| h.canvas.clone());
+            let Some(canvas) = canvas else {
+                return tracing::warn!("access-key: no view '{view}'");
+            };
+            for k in keys.split('/') {
+                let key = match k {
+                    "tab" => {
+                        canvas.tab(true);
+                        continue;
+                    }
+                    "backtab" => {
+                        canvas.tab(false);
+                        continue;
+                    }
+                    "enter" => Key::Enter,
+                    "up" => Key::Up,
+                    "down" => Key::Down,
+                    "left" => Key::Left,
+                    "right" => Key::Right,
+                    "escape" => Key::Escape,
+                    other => {
+                        tracing::warn!("access-key: unknown key '{other}'");
+                        continue;
+                    }
+                };
+                canvas.access_key(key, Modifiers::NONE);
+            }
+            if let Some(n) = canvas.focused_control() {
+                tracing::info!("access: on {}", n);
+            }
+        }),
         named("right-click", |a, arg| {
             use faderframe_ui_canvas::{Modifiers, Point, PointerButton, ViewEvent};
             let Some((view, at)) = arg.split_once('@') else {

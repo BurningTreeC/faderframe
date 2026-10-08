@@ -65,6 +65,8 @@ serde.workspace = true
 serde_json.workspace = true
 faderframe-engine.workspace = true
 faderframe-audio-files.workspace = true
+# GTK 4.18's accessible focus call, looked up where the running GTK has it.
+libloading.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 glib-unix.workspace = true

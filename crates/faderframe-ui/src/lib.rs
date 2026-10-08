@@ -11,6 +11,7 @@
 //! active GDK backend. HiDPI and fractional scaling are handled by GTK —
 //! views work in logical pixels.
 
+pub mod access;
 mod actions;
 pub mod canvas;
 mod console;

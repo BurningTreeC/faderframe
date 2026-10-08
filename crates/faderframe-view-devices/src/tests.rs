@@ -455,3 +455,40 @@ fn the_76_buttons_go_in_together_as_on_the_hardware() {
     );
     assert!(value(&s, id::MIX) < 0.01);
 }
+
+/// A stock device's panel for screen readers: its sections as groups, its
+/// knobs as sliders the arrows move, its switches as toggles.
+#[test]
+fn a_stock_devices_controls_are_reachable_by_the_keyboard() {
+    use faderframe_ui_canvas::{AccessRole, access};
+    let (mut s, plugin) = session(builtin::COMPRESSOR, "Compressor");
+    let view = crate::editor_for(builtin::COMPRESSOR, plugin, &Theme::default()).unwrap();
+    let (w, h) = crate::editor_size(builtin::COMPRESSOR).unwrap_or((900, 420));
+    let size = Size::new(w as f32, h as f32);
+    let nodes = view.accessible(size, &s);
+    let order = access::focus_order(&nodes);
+    assert!(
+        order.len() >= 5,
+        "{:?}",
+        order.iter().map(|n| &n.label).collect::<Vec<_>>()
+    );
+    let threshold = order
+        .iter()
+        .find(|n| n.label == "Threshold")
+        .expect("a Threshold control");
+    assert_eq!(threshold.role, AccessRole::Slider);
+    let before = threshold.value.as_ref().unwrap().now;
+    let text = threshold.value.as_ref().unwrap().text.clone();
+    assert!(text.contains("dB"), "{text}");
+    s.dispatch(threshold.increment.clone().unwrap()).unwrap();
+    let nodes = view.accessible(size, &s);
+    let after = access::find_node(&nodes, threshold.id).unwrap();
+    assert!(
+        after.value.as_ref().unwrap().now > before,
+        "the arrow moved it up"
+    );
+    assert!(
+        nodes.iter().any(|n| n.role == AccessRole::Group),
+        "sections as groups"
+    );
+}

@@ -54,6 +54,14 @@ mod imp {
         /// How much later than predicted frames have reached the screen
         /// (µs, averaged from the frame clock's completed timings).
         pub presentation_bias: Cell<i64>,
+        /// The view's controls for assistive technology and the keyboard
+        /// (taken out while GTK is told about them: GTK calls back).
+        pub access: RefCell<crate::access::AccessTree>,
+        /// The tree's top-level objects, for GTK's callbacks (never
+        /// borrowed across a call into GTK).
+        pub access_roots: RefCell<Vec<gtk::Accessible>>,
+        /// When the controls were last asked for.
+        pub access_at: Cell<Option<std::time::Instant>>,
     }
 
     #[glib::object_subclass]
@@ -61,9 +69,23 @@ mod imp {
         const NAME: &'static str = "FaderFrameCanvas";
         type Type = super::CanvasWidget;
         type ParentType = gtk::Widget;
+        type Interfaces = (gtk::Accessible,);
+
+        fn class_init(klass: &mut Self::Class) {
+            klass.set_accessible_role(gtk::AccessibleRole::Group);
+        }
     }
 
     impl ObjectImpl for CanvasWidget {}
+
+    /// The view's controls come first among the canvas's accessible
+    /// children (then its child widgets: popovers).
+    impl AccessibleImpl for CanvasWidget {
+        fn first_accessible_child(&self) -> Option<gtk::Accessible> {
+            let first = self.access_roots.borrow().first().cloned();
+            first.or_else(|| self.parent_first_accessible_child())
+        }
+    }
 
     impl WidgetImpl for CanvasWidget {
         fn snapshot(&self, snapshot: &gtk::Snapshot) {
@@ -126,7 +148,30 @@ mod imp {
             } else if let Some(view) = self.view.borrow_mut().as_mut() {
                 view.paint(&mut painter, size, &session, &app.theme.borrow());
             }
+            // The keyboard's place among the view's controls.
+            let access = self.access.borrow();
+            if access.keyboard
+                && widget.has_focus()
+                && let Some(n) = access.focused()
+            {
+                use faderframe_ui_canvas::Painter;
+                let th = app.theme.borrow();
+                let r = n.bounds.inset(-2.0);
+                painter.stroke_rounded(r, 4.0, 2.0, th.ui.accent);
+                painter.stroke_rounded(r.inset(-2.0), 5.0, 1.0, th.ui.text.with_alpha(0.6));
+            }
             snapshot.pop();
+        }
+
+        /// Tab into the view, and along its controls (see [`super::CanvasWidget::tab`]).
+        fn focus(&self, direction: gtk::DirectionType) -> bool {
+            match direction {
+                gtk::DirectionType::TabForward | gtk::DirectionType::TabBackward => self
+                    .obj()
+                    .tab(direction == gtk::DirectionType::TabForward)
+                    .unwrap_or_else(|| self.parent_focus(direction)),
+                _ => self.parent_focus(direction),
+            }
         }
 
         fn measure(&self, orientation: gtk::Orientation, _for_size: i32) -> (i32, i32, i32, i32) {
@@ -269,6 +314,9 @@ impl CanvasWidget {
     pub fn new(app: &Rc<AppState>, view: DynView) -> Self {
         let w: Self = glib::Object::new();
         let imp = w.imp();
+        if let Some(name) = view.accessible_name() {
+            w.update_property(&[gtk::accessible::Property::Label(&name)]);
+        }
         *imp.view.borrow_mut() = Some(view);
         *imp.app.borrow_mut() = Rc::downgrade(app);
         w.set_focusable(true);
@@ -284,6 +332,204 @@ impl CanvasWidget {
 
     fn app(&self) -> Option<Rc<AppState>> {
         self.imp().app.borrow().upgrade()
+    }
+
+    /// Work on the accessible tree with no borrow held (GTK, told about
+    /// it, calls back into the canvas).
+    fn with_access<R>(&self, f: impl FnOnce(&mut crate::access::AccessTree) -> R) -> R {
+        let imp = self.imp();
+        let mut tree = std::mem::take(&mut *imp.access.borrow_mut());
+        let r = f(&mut tree);
+        let roots = tree.roots();
+        *imp.access.borrow_mut() = tree;
+        *imp.access_roots.borrow_mut() = roots;
+        r
+    }
+
+    /// Ask the view for its controls and update the accessible tree.
+    pub fn refresh_access(&self) {
+        let imp = self.imp();
+        imp.access_at.set(Some(std::time::Instant::now()));
+        let Some(app) = self.app() else { return };
+        let nodes = {
+            let Ok(session) = app.session.try_borrow() else {
+                return;
+            };
+            match imp.view.borrow().as_ref() {
+                Some(v) => v.accessible(self.size(), &session),
+                None => return,
+            }
+        };
+        let host: gtk::Accessible = self.clone().upcast();
+        let after: Option<gtk::Accessible> = self.first_child().map(|c| c.upcast());
+        self.with_access(|t| t.update(nodes, &host, after.as_ref()));
+    }
+
+    /// Tab (forward or back) into or along the view's controls: `Some(true)`
+    /// when the keyboard is now on one, `Some(false)` when it leaves the
+    /// view, `None` when the view has no controls (GTK's own focus).
+    pub fn tab(&self, forward: bool) -> Option<bool> {
+        self.refresh_access();
+        let (controls, keyboard) = {
+            let a = self.imp().access.borrow();
+            (a.has_controls(), a.keyboard)
+        };
+        if !controls {
+            return None;
+        }
+        let entering = !self.has_focus() || !keyboard;
+        let next = {
+            let mut a = self.imp().access.borrow_mut();
+            if entering {
+                a.focus = None;
+            }
+            a.step(forward)
+        };
+        if next.is_some() && !self.has_focus() {
+            self.grab_focus();
+        }
+        let host: gtk::Accessible = self.clone().upcast();
+        self.with_access(|a| {
+            a.keyboard = next.is_some();
+            a.set_focus(next, &host);
+        });
+        if next.is_some() {
+            self.scroll_to_focus();
+            self.refresh_access();
+        }
+        self.queue_draw();
+        Some(next.is_some())
+    }
+
+    /// A key while the keyboard is on the view's controls: Tab moves (GTK's
+    /// focus handling, [`Self::tab`]), Enter activates, the arrows step,
+    /// Escape leaves them. Ctrl+Tab starts on the controls of a view that
+    /// takes Tab itself. `None`: the view's key.
+    pub(crate) fn access_key(&self, key: Key, m: Modifiers) -> Option<glib::Propagation> {
+        let imp = self.imp();
+        let uses_tab = imp.view.borrow().as_ref().is_some_and(|v| v.uses_tab());
+        let keyboard = imp.access.borrow().keyboard;
+        if key == Key::Tab {
+            // Into the controls with Ctrl+Tab; along them with Tab.
+            if keyboard || !uses_tab || m.ctrl {
+                if !keyboard && m.ctrl {
+                    return self.tab(!m.shift).map(|_| glib::Propagation::Stop);
+                }
+                return keyboard.then_some(glib::Propagation::Proceed);
+            }
+            return None;
+        }
+        if !keyboard {
+            return None;
+        }
+        let node = imp.access.borrow().focused().cloned()?;
+        let action = match key {
+            Key::Enter => node.activate.clone(),
+            Key::Up | Key::Right | Key::PageUp => node.increment.clone(),
+            Key::Down | Key::Left | Key::PageDown => node.decrement.clone(),
+            Key::Escape => {
+                let host: gtk::Accessible = self.clone().upcast();
+                self.with_access(|a| {
+                    a.keyboard = false;
+                    let f = a.focus;
+                    a.set_focus(f, &host);
+                });
+                self.queue_draw();
+                return None;
+            }
+            _ => None,
+        }?;
+        let app = self.app()?;
+        app.dispatch(action);
+        self.refresh_access();
+        // Page Up/Down: ten steps, each from where the last one left it.
+        if matches!(key, Key::PageUp | Key::PageDown) {
+            for _ in 1..10 {
+                let next = imp.access.borrow().focused().and_then(|n| {
+                    if key == Key::PageUp {
+                        n.increment.clone()
+                    } else {
+                        n.decrement.clone()
+                    }
+                });
+                let Some(a) = next else { break };
+                app.dispatch(a);
+                self.refresh_access();
+            }
+        }
+        // Say what it is now (a toggle's state, a value's text).
+        let spoken = imp.access.borrow().focused().map(|n| n.spoken());
+        if let Some(text) = spoken {
+            self.announce(&text, gtk::AccessibleAnnouncementPriority::Medium);
+        }
+        self.queue_draw();
+        Some(glib::Propagation::Stop)
+    }
+
+    /// After a key the view took (its own list selection moved): the
+    /// keyboard follows the newly selected item.
+    fn follow_selection(&self) {
+        if !self.imp().access.borrow().keyboard {
+            return;
+        }
+        self.refresh_access();
+        let target = {
+            let a = self.imp().access.borrow();
+            let Some(f) = a.focused() else { return };
+            if f.selected != Some(false) {
+                return;
+            }
+            faderframe_ui_canvas::access::focus_order(&a.nodes)
+                .into_iter()
+                .find(|n| n.selected == Some(true) && n.role == f.role)
+                .map(|n| n.id)
+        };
+        if let Some(id) = target {
+            let host: gtk::Accessible = self.clone().upcast();
+            self.with_access(|a| a.set_focus(Some(id), &host));
+            self.scroll_to_focus();
+            self.queue_draw();
+        }
+    }
+
+    /// What the keyboard is on, as a screen reader says it (scripts).
+    pub fn focused_control(&self) -> Option<String> {
+        self.imp().access.borrow().focused().map(|n| n.spoken())
+    }
+
+    /// Bring the focused control into view where the view scrolls.
+    fn scroll_to_focus(&self) {
+        let Some(r) = self.imp().access.borrow().focused().map(|n| n.bounds) else {
+            return;
+        };
+        let size = self.size();
+        let Some(app) = self.app() else { return };
+        let Ok(session) = app.session.try_borrow() else {
+            return;
+        };
+        let mut view = self.imp().view.borrow_mut();
+        let Some(view) = view.as_mut() else { return };
+        for axis in [ScrollAxis::Horizontal, ScrollAxis::Vertical] {
+            let Some(info) = view.scroll_info(axis, size, &session) else {
+                continue;
+            };
+            let (lo, hi, extent) = match axis {
+                ScrollAxis::Horizontal => (r.x, r.x + r.w, size.w),
+                ScrollAxis::Vertical => (r.y, r.y + r.h, size.h),
+            };
+            let start = info.start;
+            let end = extent - info.end;
+            let delta = if lo < start {
+                lo - start
+            } else if hi > end {
+                hi - end
+            } else {
+                0.0
+            };
+            if delta != 0.0 {
+                view.set_scroll(axis, (info.offset + delta).max(0.0));
+            }
+        }
     }
 
     /// Paint the view into a fresh render node, independent of GTK's
@@ -632,6 +878,9 @@ impl CanvasWidget {
             HostRequest::GrabFocus => {
                 self.grab_focus();
             }
+            HostRequest::Announce(text) => {
+                self.announce(&text, gtk::AccessibleAnnouncementPriority::Medium);
+            }
             HostRequest::ContextMenu { at, items } => show_menu(self.upcast_ref(), at, items, app),
             HostRequest::TextInput {
                 at,
@@ -762,6 +1011,10 @@ impl CanvasWidget {
             move |g, n, x, y| {
                 let b = g.current_button();
                 w.imp().drag_button.set(b);
+                // The pointer takes over from the keyboard.
+                if std::mem::take(&mut w.imp().access.borrow_mut().keyboard) {
+                    w.queue_draw();
+                }
                 w.deliver(ViewEvent::PointerDown {
                     pos: Point::new(x as f32, y as f32),
                     button: button(b),
@@ -881,10 +1134,14 @@ impl CanvasWidget {
                 if k == Key::Space {
                     return glib::Propagation::Proceed;
                 }
+                if let Some(p) = w.access_key(k, modifiers(state)) {
+                    return p;
+                }
                 if w.deliver(ViewEvent::Key {
                     key: k,
                     modifiers: modifiers(state),
                 }) {
+                    w.follow_selection();
                     glib::Propagation::Stop
                 } else {
                     glib::Propagation::Proceed
@@ -1117,6 +1374,15 @@ impl CanvasWidget {
                     w.queue_draw();
                 }
                 w.sync_scrollbars();
+                // The controls a screen reader sees, a few times a second.
+                let due = w
+                    .imp()
+                    .access_at
+                    .get()
+                    .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(250));
+                if due && w.is_mapped() {
+                    w.refresh_access();
+                }
             }
             glib::ControlFlow::Continue
         });

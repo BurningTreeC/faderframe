@@ -1,4 +1,4 @@
-use crate::{Cursor, Painter, Point, Rect, Size, Theme, ViewEvent};
+use crate::{AccessNode, Cursor, Painter, Point, Rect, Size, Theme, ViewEvent};
 
 /// An entry of a context menu requested by a view.
 #[derive(Clone)]
@@ -98,6 +98,9 @@ pub enum HostRequest<A> {
         commit: TextCommit<A>,
     },
     GrabFocus,
+    /// Say something to a screen reader (a value changed by the keyboard,
+    /// a mode switched).
+    Announce(String),
     /// A native file or folder chooser.
     ChooseFiles {
         choice: FileChoice,
@@ -262,5 +265,23 @@ pub trait CanvasView<M, A> {
     /// Another view's payload was dropped at `pos`.
     fn drop_payload(&mut self, _payload: &str, _pos: Point, _size: Size, _model: &M) -> Option<A> {
         None
+    }
+
+    /// The view's controls for assistive technology (screen readers) and
+    /// keyboard focus (see [`crate::access`]): built from what it shows, ids
+    /// stable while the same things are shown.
+    fn accessible(&self, _size: Size, _model: &M) -> Vec<AccessNode<A>> {
+        Vec::new()
+    }
+
+    /// What a screen reader calls the view ("Mixer").
+    fn accessible_name(&self) -> Option<String> {
+        None
+    }
+
+    /// The view handles Tab itself (it then moves keyboard focus between
+    /// its controls only with Ctrl+Tab).
+    fn uses_tab(&self) -> bool {
+        false
     }
 }

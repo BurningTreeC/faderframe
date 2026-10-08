@@ -174,6 +174,9 @@ fn ensure_hosts(app: &Rc<AppState>, views: &[(ViewId, ViewKind)]) {
             .is_some_and(|(k, _)| k == kind);
         if !exists {
             let host = create_view(app, *kind);
+            // Screen readers call the view by its tab's name.
+            host.canvas
+                .update_property(&[gtk::accessible::Property::Label(kind.title())]);
             app.dock
                 .borrow_mut()
                 .hosts

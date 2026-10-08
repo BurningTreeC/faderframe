@@ -230,6 +230,9 @@ pub enum Action {
         clips: Vec<ClipId>,
         mode: SelectMode,
     },
+    /// Several actions in order (one key on an accessible control that does
+    /// more than one thing).
+    Several(Vec<Action>),
     SelectNotes {
         notes: Vec<NoteId>,
         mode: SelectMode,
@@ -3178,6 +3181,11 @@ impl Session {
                 let tracks = self.with_group_selection(&tracks);
                 self.selection.select_tracks(&tracks, mode);
                 self.revision += 1;
+            }
+            Action::Several(actions) => {
+                for a in actions {
+                    self.dispatch(a)?;
+                }
             }
             Action::SelectClips { clips, mode } => {
                 self.selection.select_clips(&clips, mode);

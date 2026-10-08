@@ -76,6 +76,37 @@ impl HistoryView {
 }
 
 impl CanvasView<Session, Action> for HistoryView {
+    /// The steps as a list (the current one selected); Enter goes back or
+    /// forward to a step.
+    fn accessible(
+        &self,
+        size: Size,
+        model: &Session,
+    ) -> Vec<faderframe_ui_canvas::AccessNode<Action>> {
+        use faderframe_ui_canvas::{AccessNode, AccessRole, access_id};
+        let (rows, done) = Self::rows(model);
+        let items = rows.iter().enumerate().map(|(i, label)| {
+            let state = if i > done { ", undone" } else { "" };
+            AccessNode::new(
+                access_id(&[31, i as u64]),
+                AccessRole::ListItem,
+                format!("{label}{state}"),
+            )
+            .at(self.row_rect(i, size))
+            .selected(i == done)
+            .on_activate(Action::HistoryTo(i))
+        });
+        vec![
+            AccessNode::new(access_id(&[30]), AccessRole::List, "Undo history")
+                .at(self.list(size))
+                .with_children(items),
+        ]
+    }
+
+    fn accessible_name(&self) -> Option<String> {
+        Some("Undo History".into())
+    }
+
     fn set_theme(&mut self, theme: &Theme) {
         self.theme = theme.clone();
     }

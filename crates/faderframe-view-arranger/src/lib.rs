@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+mod access;
 mod automation;
 mod clip_edit;
 pub mod edit_bar;
@@ -3296,6 +3297,23 @@ impl ArrangerView {
 }
 
 impl CanvasView<Session, Action> for ArrangerView {
+    fn accessible(
+        &self,
+        size: Size,
+        model: &Session,
+    ) -> Vec<faderframe_ui_canvas::AccessNode<Action>> {
+        self.access_nodes(size, model)
+    }
+
+    fn accessible_name(&self) -> Option<String> {
+        Some("Arranger".into())
+    }
+
+    /// Tab goes to the next transient or clip boundary.
+    fn uses_tab(&self) -> bool {
+        true
+    }
+
     fn set_theme(&mut self, theme: &Theme) {
         self.theme = theme.clone();
     }

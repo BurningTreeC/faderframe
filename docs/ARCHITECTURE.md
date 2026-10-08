@@ -3253,8 +3253,7 @@ DAW does well yet):
 17. **Further out**: MIDI 2.0 on macOS (CoreMIDI's `MIDIEventList`) and
     Windows (Windows MIDI Services), and clips that keep MIDI 2.0's
     resolution (16-bit velocities, 32-bit controllers: today they arrive
-    and leave at it, and clips hold MIDI 1.0's); screen-reader accessibility (the canvas views
-    need an accessibility tree — rare among DAWs and meaningful); merging
+    and leave at it, and clips hold MIDI 1.0's); more views for screen readers (the Album, Launcher, Automation, Tools and Video views, the edit toolbar; a canvas only names itself until it lists its controls); merging
     project versions (three-way, from `faderframe_project::compare`) for
     collaborators; singing into MIDI live (real-time pitch tracking of an
     input driving an instrument).
@@ -3663,3 +3662,46 @@ project's tempo/meter/key and the clip's name; `import_midi2_clip` reads
 MIDI 1.0 and 2.0 messages into a clip on a new instrument track, poly
 pressure during its note as the note's pressure). Import MIDI takes
 `.midi2`; File → Export MIDI 2.0 Clip….
+
+### Screen readers and the keyboard
+
+Every canvas view can describe its controls (`CanvasView::accessible` →
+`faderframe_ui_canvas::access::AccessNode`: role, name, value with its text,
+checked/selected, bounds, and the actions Enter and the arrows send; ids
+from `access_id` stay the same while the same things are shown) and names
+itself (`accessible_name`; docked views take their tab's title).
+`faderframe-ui::access` turns the tree into GObjects implementing
+`gtk::Accessible` (`AccessObject`, an `ATContext` each) under the canvas,
+whose `first_accessible_child` lists them before its child widgets; the
+canvas asks for the tree four times a second and on every keyboard action,
+rebuilding objects only when the shape (ids, roles, child counts) changes,
+else telling GTK the names, values and states that changed. The tree is
+taken out of its `RefCell` while GTK is told (GTK calls back), and GTK's
+callbacks read the separate `access_roots`.
+
+Keyboard: Tab into a view (GTK's focus chain reaches the canvas's `focus`
+vfunc) moves onto its first control; Tab and Shift+Tab move along them, off
+the end to the next widget; Enter activates, the arrows step (Page keys:
+ten steps, each from where the last left it), Escape or a click leaves; a
+focus ring marks the control. Views that take Tab themselves (`uses_tab`:
+the arranger's tab to transient) start on their controls with Ctrl+Tab.
+After the view moves its own list selection with a key, the focus follows
+the selected item. The focused control is the canvas's active descendant
+and, on GTK 4.18 and later, its focused platform state
+(`gtk_accessible_update_platform_state`, looked up in the running process
+so FaderFrame still runs on GTK 4.14); after an action the control's new
+state is announced. The chrome: on/off transport buttons report `Pressed`,
+transport changes ("Playing", "Stopped", "Recording") and session notices
+(errors at high priority) are announced. `HostRequest::Announce` lets views
+say something.
+
+Views: the mixer (strips: volume and pan sliders, mute/solo/arm toggles,
+inserts that open their editors), the arranger (tracks: header toggles,
+volume, clips with their spans — Enter selects and locates), the transport
+display (position, tempo spin button, meter), the piano roll (notes —
+Enter selects, arrows transpose), the event list, setlist (and its stage
+screen), undo history, and every kit device editor (sections as groups,
+knobs as sliders by a hundredth of their travel, switches as toggles,
+stepped values a step at a time). Check with the system's AT-SPI (the
+scratchpad's `a11y_dump.py` / `a11y_events.py` on `/usr/bin/python3` with
+`gi` Atspi) and the dev action `access-key:<view>=<tab|backtab|enter|up|…>`.

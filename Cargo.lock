@@ -1224,6 +1224,7 @@ dependencies = [
  "gdk4-win32",
  "glib-unix",
  "gtk4",
+ "libloading 0.8.9",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
