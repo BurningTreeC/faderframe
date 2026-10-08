@@ -37,6 +37,7 @@ pub mod modulation;
 pub mod pitch;
 pub mod preset;
 mod project;
+pub mod setlist;
 pub mod spectral;
 mod takes;
 pub mod template;
@@ -53,7 +54,7 @@ pub use expression::{ExpressionKind, ExpressionPoint, MpeConfig, NoteExpression}
 pub use harmony::{ChordEvent, KeyChange};
 pub use history::{History, Replayed};
 pub use midimap::{
-    MappingMode, MappingTarget, MidiControl, MidiMapping, MidiSource, TransportControl,
+    MappingMode, MappingTarget, MidiControl, MidiMapping, MidiSource, ShowControl, TransportControl,
 };
 pub use preset::{PresetError, TrackPreset};
 pub use project::{AudioSource, Marker, MusicalRange, Project, Section, SourceSpec};

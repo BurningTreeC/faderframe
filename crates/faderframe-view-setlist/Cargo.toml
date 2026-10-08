@@ -1,0 +1,20 @@
+[package]
+name = "faderframe-view-setlist"
+description = "Setlist and show mode: a show's songs in order, and the stage screen that plays them"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-project.workspace = true
+faderframe-session.workspace = true
+faderframe-timeline.workspace = true
+faderframe-ui-canvas.workspace = true
+
+[dev-dependencies]
+faderframe-engine.workspace = true

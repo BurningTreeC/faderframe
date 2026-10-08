@@ -501,6 +501,8 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             ("Video Full Screen", "app.video-full-screen"),
             ("ADR Cue List", "app.view-adr"),
             ("Lead Sheet", "app.view-lead-sheet"),
+            ("Setlist", "app.view-setlist"),
+            ("Show Mode (Setlist on Stage)", "app.show-mode"),
             ("Bottom Dock", "app.dock-bottom"),
             ("Master Strip at the Side", "app.master-panel"),
         ]),

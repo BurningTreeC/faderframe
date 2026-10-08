@@ -25,6 +25,7 @@ pub mod notes;
 pub mod performance;
 pub mod picture_out;
 pub mod pitch;
+pub mod setlist;
 pub mod spectral;
 mod structure;
 pub use performance::{Load, PerformanceReport, PluginPerformance, TrackPerformance};
@@ -427,6 +428,10 @@ pub enum Action {
     SongStructure {
         clips: Vec<ClipId>,
     },
+    /// Edit the setlist.
+    Setlist(setlist::SetlistOp),
+    /// Show mode's controls.
+    Show(setlist::ShowOp),
     /// Set the project's tempo or key from a clip, or warp it to the
     /// tempo (after analysing it).
     FromClip {
@@ -1281,6 +1286,7 @@ pub struct Session {
     pitch: pitch::PitchCache,
     clip_analyses: detect::ClipAnalyses,
     structure_jobs: structure::StructureJobs,
+    show: setlist::ShowState,
     conversions: to_midi::Conversions,
     lead_sheets: leadsheet::LeadSheets,
     clip_fx: clip_fx::ClipFxState,
@@ -1540,6 +1546,7 @@ impl Session {
             pitch: pitch::PitchCache::default(),
             clip_analyses: detect::ClipAnalyses::default(),
             structure_jobs: structure::StructureJobs::default(),
+            show: setlist::ShowState::default(),
             conversions: to_midi::Conversions::default(),
             lead_sheets: leadsheet::LeadSheets::default(),
             clip_fx: clip_fx::ClipFxState::default(),
@@ -2499,6 +2506,7 @@ impl Session {
         self.poll_pitch();
         self.poll_clip_analyses();
         self.poll_structure();
+        self.tick_show();
         self.poll_conversions();
         self.poll_lead_sheets();
         self.poll_clip_fx();
@@ -3420,6 +3428,8 @@ impl Session {
             Action::DetectPitch { clips } => self.detect_pitch(&clips)?,
             Action::FromClip { clip, what } => self.from_clip(clip, what)?,
             Action::SongStructure { clips } => self.song_structure(&clips)?,
+            Action::Setlist(op) => self.edit_setlist(op)?,
+            Action::Show(op) => self.show_op(op)?,
             Action::ConvertToMidi { clip, how } => self.convert_to_midi(clip, how)?,
             Action::MakeLeadSheet { of, grid } => self.make_lead_sheet(of, grid)?,
             Action::TempoFromHits(req) => self.tempo_from_hits(&req)?,

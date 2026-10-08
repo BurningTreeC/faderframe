@@ -314,6 +314,16 @@ pub fn install(app: &Rc<AppState>) {
             "show-spectral",
             A::Workspace(W::ShowView(ViewId::spectral())),
         ),
+        dispatch(
+            app,
+            "show-setlist",
+            A::Workspace(W::ShowView(ViewId::setlist())),
+        ),
+        dispatch(
+            app,
+            "show-mode",
+            A::Show(faderframe_session::setlist::ShowOp::Enter),
+        ),
         entry(app, "import-video", crate::video::import),
         entry(app, "conform-lists", crate::video::conform_lists),
         dispatch(
@@ -2376,6 +2386,31 @@ pub fn install(app: &Rc<AppState>) {
                 track,
                 mode: Some(mode),
             });
+        }),
+        // Development aid: `setlist:<from-sections|clear>` and
+        // `show:<enter|leave|next|previous|play|go=<n>>`.
+        named("setlist", |a, arg| {
+            use faderframe_session::setlist::SetlistOp;
+            match arg {
+                "from-sections" => a.dispatch(Action::Setlist(SetlistOp::FromSections)),
+                "clear" => a.dispatch(Action::Setlist(SetlistOp::Clear)),
+                _ => tracing::warn!("setlist: unknown '{arg}'"),
+            }
+        }),
+        named("show", |a, arg| {
+            use faderframe_session::setlist::ShowOp;
+            let op = match arg {
+                "enter" => ShowOp::Enter,
+                "leave" => ShowOp::Leave,
+                "next" => ShowOp::Next,
+                "previous" => ShowOp::Previous,
+                "play" => ShowOp::PlayStop,
+                g => match g.strip_prefix("go=").and_then(|n| n.parse::<usize>().ok()) {
+                    Some(n) => ShowOp::Go(n.saturating_sub(1)),
+                    None => return tracing::warn!("show: unknown '{arg}'"),
+                },
+            };
+            a.dispatch(Action::Show(op));
         }),
         named("meter-bridge", |a, arg| {
             a.dispatch(Action::SetMeterBridge(arg != "off"));

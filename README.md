@@ -389,6 +389,12 @@ long sessions), Neon and High Contrast:
   toolbar, beside the grid): free positions land on whole samples, and
   cuts and trims of audio clips move to the nearest zero crossing so they
   do not click.
+* Setlist and show mode (View → Setlist): a show's songs in order — one
+  per section, or ranges of the project — with what follows each (stop,
+  the next song after a gap, play on) and the performer's notes; Show Mode
+  is a full-screen stage screen (the song, its time left, the part now and
+  next, the lyric line, the notes, the list) where every song stops on its
+  last frame, controlled by Space and the arrows or MIDI foot switches.
 * Song structure from a jam (an audio clip's menu, or several clips of a
   multitrack jam): the recording's parts found — Intro, Verse, Chorus,
   Bridge, Solo, Outro — and laid on the arranger's section lane, on the

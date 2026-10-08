@@ -433,6 +433,10 @@ pub enum Command {
     SetLyrics {
         lyrics: Vec<crate::lyrics::LyricLine>,
     },
+    /// Replace the setlist.
+    SetSetlist {
+        setlist: Box<crate::setlist::Setlist>,
+    },
     /// Replace the ADR cue list and its settings.
     SetAdr {
         adr: Box<crate::adr::Adr>,
@@ -762,6 +766,7 @@ impl Command {
             SetKeys { .. } => "Change Key".into(),
             SetChords { .. } => "Edit Chords".into(),
             SetLyrics { .. } => "Edit Lyrics".into(),
+            SetSetlist { .. } => "Edit Setlist".into(),
             SetAdr { .. } => "Edit ADR Cues".into(),
             SetVideo { .. } => "Edit Video".into(),
             SetTimecode { .. } => "Change Timecode".into(),
@@ -855,6 +860,7 @@ impl Command {
             | SetClipLink { .. }
             | SetAlbum { .. }
             | SetLyrics { .. }
+            | SetSetlist { .. }
             | SetAdr { .. }
             | SetVideo { .. }
             | SetTimecode { .. }
@@ -1814,6 +1820,12 @@ impl Command {
                 crate::lyrics::normalize(&mut lyrics);
                 SetLyrics {
                     lyrics: std::mem::replace(&mut p.lyrics, lyrics),
+                }
+            }
+            SetSetlist { mut setlist } => {
+                setlist.tidy();
+                SetSetlist {
+                    setlist: Box::new(std::mem::replace(&mut p.setlist, *setlist)),
                 }
             }
             SetAdr { mut adr } => {

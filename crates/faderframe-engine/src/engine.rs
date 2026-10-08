@@ -70,6 +70,8 @@ enum Message {
     Ahead(Box<crate::ahead::AheadLink>),
     AheadOff,
     ResetProcessors,
+    /// Stop when playback reaches this position (once), or never.
+    StopAt(Option<i64>),
     BeginRecord(Box<Recorder>),
     EndRecord,
     MidiInput(Box<faderframe_midi::MidiInputQueue>),
@@ -296,6 +298,7 @@ pub fn create_with_epoch(
         midi_out: None,
         clock: crate::midi::ClockGen::default(),
         clock_due: 0,
+        stop_at: None,
         mtc_due: 0,
         output_latency: 0,
         pool: None,
@@ -378,6 +381,8 @@ pub struct EngineProcessor {
     /// The last MIDI clock and MTC messages' due times: callbacks run late
     /// now and then, so later messages are kept after earlier ones.
     clock_due: u64,
+    /// Stop when playback reaches this position (a setlist song's end).
+    stop_at: Option<i64>,
     mtc_due: u64,
     /// Frames from a callback to its audio being heard (buffer + device).
     output_latency: u32,
@@ -445,6 +450,7 @@ impl EngineProcessor {
                         self.retire(Garbage::AheadLink(old));
                     }
                 }
+                Message::StopAt(at) => self.stop_at = at,
                 Message::ResetProcessors => {
                     if let Some(g) = &mut self.graph {
                         g.reset_all();
@@ -663,9 +669,19 @@ impl EngineProcessor {
         let mut graph_ns = 0u64;
         let mut offset = 0;
         while offset < frames {
-            let n = self
+            let mut n = self
                 .transport
                 .frames_until_wrap((frames - offset).min(max_block));
+            // A stop on the exact frame: the chunk ends there.
+            if let Some(at) = self.stop_at
+                && self.transport.playing()
+                && !self.transport.scrubbing()
+            {
+                let pos = self.transport.position();
+                if pos < at {
+                    n = n.min((at - pos) as usize).max(1);
+                }
+            }
             self.midi.chunk(offset, n, &mut self.ctx.midi_input);
             let info = self.transport.info(&self.ctx.timeline.timeline, rate);
             self.ctx.transport = info;
@@ -843,6 +859,14 @@ impl EngineProcessor {
             self.ctx.launch.played(pos, n);
             self.ctx.launch.follow(&self.ctx.timeline);
             self.transport.advance(n);
+            if let Some(at) = self.stop_at
+                && self.transport.playing()
+                && pos < at
+                && self.transport.position() >= at
+            {
+                self.stop_at = None;
+                self.transport_command(TransportCommand::Stop);
+            }
             offset += n;
         }
         self.ctx.launch.publish(&self.shared.launch);
@@ -1827,6 +1851,12 @@ impl EngineController {
 
     pub fn transport(&mut self, cmd: TransportCommand) -> Result<(), EngineError> {
         self.send(Message::Transport(cmd))
+    }
+
+    /// Stop playback on the exact frame `at` when it gets there (once), or
+    /// not (`None`).
+    pub fn stop_at(&mut self, at: Option<i64>) -> Result<(), EngineError> {
+        self.send(Message::StopAt(at))
     }
 
     /// Varispeed on (for the stream as it runs) or off; see

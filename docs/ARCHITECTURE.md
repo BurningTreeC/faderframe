@@ -3596,3 +3596,23 @@ clips to mono in project time, analyses in a thread and lays the parts on
 the section lane in one "Song Structure" step (replacing the sections they
 overlap, coloured by letter, snapped to the project's bars when it plays at
 the jam's tempo).
+
+### Setlist and show mode
+
+`Project::setlist` (`faderframe_project::setlist`: `SetSong { name, start,
+end, then: AfterSong::{Stop, Next { gap }, Continue}, notes }`,
+`Command::SetSetlist`) holds a show: one project, each song a range of it.
+`session::setlist`: `Action::Setlist(SetlistOp)` edits it (songs from the
+sections, from the edit selection, move, rename, then, notes; one undo step
+each); `Action::Show(ShowOp::{Enter, Leave, Cue, Go, Next, Previous,
+PlayStop})` runs it (not saved). While a song plays the session asks the
+engine to stop on its exact last frame (`EngineController::stop_at`: the
+callback is cut there and the transport stopped, once); stopped there, the
+show stands on the next song and, for `Next`, plays it after the gap
+(`tick_show`); `Continue` plays on (a song elsewhere is jumped to). MIDI
+learn targets `MappingTarget::Show { control: ShowControl::{Next,
+Previous, PlayStop} }` (foot switches). View `faderframe-view-setlist`
+(`ViewKind::Setlist`): the list, and in show mode the stage screen (full
+screen via `UiRequest::FullScreen`): song, time and what is left, the part
+now and next, the lyric line, notes, the list, big buttons; Space, arrows,
+Enter, Esc.

@@ -120,6 +120,10 @@ impl ViewId {
     pub fn spectral() -> Self {
         Self::new("spectral")
     }
+
+    pub fn setlist() -> Self {
+        Self::new("setlist")
+    }
 }
 
 impl fmt::Debug for ViewId {

@@ -1273,6 +1273,7 @@ impl Session {
             ),
             MappingTarget::LauncherStop { track: None } => "Launcher · Stop All".into(),
             MappingTarget::TrackSolo { track } => format!("{} · Solo", self.track_label(*track)),
+            MappingTarget::Show { control } => format!("Show · {}", control.label()),
             MappingTarget::TrackArm { track } => {
                 format!("{} · Record Arm", self.track_label(*track))
             }
@@ -1427,7 +1428,9 @@ impl Session {
                             });
                         }
                     }
-                    MappingTarget::TrackSolo { .. } | MappingTarget::TrackArm { .. } => {
+                    MappingTarget::TrackSolo { .. }
+                    | MappingTarget::TrackArm { .. }
+                    | MappingTarget::Show { .. } => {
                         if pressed {
                             buttons.push(m.target);
                         }
@@ -1507,6 +1510,19 @@ impl Session {
             self.apply_mapped(values, toggles);
         }
         for b in buttons {
+            if let MappingTarget::Show { control } = b {
+                use crate::setlist::ShowOp;
+                use faderframe_project::ShowControl as C;
+                let op = match control {
+                    C::Next => ShowOp::Next,
+                    C::Previous => ShowOp::Previous,
+                    C::PlayStop => ShowOp::PlayStop,
+                };
+                if let Err(e) = self.dispatch(Action::Show(op)) {
+                    self.notify(NoticeLevel::Warning, format!("MIDI controller: {e}"));
+                }
+                continue;
+            }
             let cmd = match b {
                 MappingTarget::TrackSolo { track } => self
                     .project

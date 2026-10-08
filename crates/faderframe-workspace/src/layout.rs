@@ -40,10 +40,12 @@ pub enum ViewKind {
     Events,
     /// An audio clip's spectrum, edited.
     Spectral,
+    /// The show's songs; show mode.
+    Setlist,
 }
 
 impl ViewKind {
-    pub const ALL: [ViewKind; 19] = [
+    pub const ALL: [ViewKind; 20] = [
         ViewKind::Arranger,
         ViewKind::Mixer,
         ViewKind::PianoRoll,
@@ -63,11 +65,12 @@ impl ViewKind {
         ViewKind::LeadSheet,
         ViewKind::Events,
         ViewKind::Spectral,
+        ViewKind::Setlist,
     ];
 
     /// The order tabs keep, whichever opened first: the arranger, the
     /// mixer, then as the View menu lists them.
-    pub const TAB_ORDER: [ViewKind; 19] = [
+    pub const TAB_ORDER: [ViewKind; 20] = [
         ViewKind::Arranger,
         ViewKind::Mixer,
         ViewKind::PianoRoll,
@@ -87,6 +90,7 @@ impl ViewKind {
         ViewKind::Video,
         ViewKind::Adr,
         ViewKind::LeadSheet,
+        ViewKind::Setlist,
     ];
 
     /// Its place in [`Self::TAB_ORDER`].
@@ -124,6 +128,7 @@ impl ViewKind {
             ViewKind::LeadSheet => "Lead Sheet",
             ViewKind::Events => "Event List",
             ViewKind::Spectral => "Spectral Editor",
+            ViewKind::Setlist => "Setlist",
         }
     }
 
@@ -148,6 +153,7 @@ impl ViewKind {
             ViewKind::LeadSheet => ViewId::lead_sheet(),
             ViewKind::Events => ViewId::events(),
             ViewKind::Spectral => ViewId::spectral(),
+            ViewKind::Setlist => ViewId::setlist(),
         }
     }
 }

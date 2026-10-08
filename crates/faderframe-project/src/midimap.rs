@@ -135,6 +135,29 @@ pub enum MappingTarget {
         track: TrackId,
         modulator: faderframe_core::ModulatorId,
     },
+    /// Show mode's buttons (a foot switch on stage).
+    Show {
+        control: ShowControl,
+    },
+}
+
+/// Show mode's buttons.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShowControl {
+    Next,
+    Previous,
+    PlayStop,
+}
+
+impl ShowControl {
+    pub fn label(self) -> &'static str {
+        match self {
+            ShowControl::Next => "Next Song",
+            ShowControl::Previous => "Previous Song",
+            ShowControl::PlayStop => "Play / Stop",
+        }
+    }
 }
 
 impl MappingTarget {
@@ -155,7 +178,9 @@ impl MappingTarget {
             | MappingTarget::TrackArm { track }
             | MappingTarget::Macro { track, .. } => Some(*track),
             MappingTarget::LauncherStop { track } => *track,
-            MappingTarget::Transport { .. } | MappingTarget::LauncherScene { .. } => None,
+            MappingTarget::Transport { .. }
+            | MappingTarget::LauncherScene { .. }
+            | MappingTarget::Show { .. } => None,
         }
     }
 }

@@ -45,6 +45,7 @@ faderframe-view-history.workspace = true
 faderframe-view-leadsheet.workspace = true
 faderframe-view-events.workspace = true
 faderframe-view-spectral.workspace = true
+faderframe-view-setlist.workspace = true
 faderframe-view-adr.workspace = true
 faderframe-view-video.workspace = true
 faderframe-video.workspace = true

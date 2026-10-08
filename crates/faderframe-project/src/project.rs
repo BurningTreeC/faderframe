@@ -140,6 +140,9 @@ pub struct Project {
     /// The ADR cue list.
     #[serde(default, skip_serializing_if = "crate::adr::Adr::is_empty")]
     pub adr: crate::adr::Adr,
+    /// The show's songs in order (show mode).
+    #[serde(default, skip_serializing_if = "crate::setlist::Setlist::is_empty")]
+    pub setlist: crate::setlist::Setlist,
     /// The clip launcher's scenes and slots.
     #[serde(default, skip_serializing_if = "crate::launcher::Launcher::is_empty")]
     pub launcher: crate::launcher::Launcher,
@@ -192,6 +195,7 @@ impl Project {
             chords: Vec::new(),
             lyrics: Vec::new(),
             adr: Default::default(),
+            setlist: Default::default(),
             launcher: crate::launcher::Launcher::default(),
             clip_links: BTreeMap::new(),
             video: crate::video::Video::default(),
