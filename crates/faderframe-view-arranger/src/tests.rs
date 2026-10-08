@@ -1521,3 +1521,38 @@ fn launcher_clips_drop_into_the_arrangement() {
     let own = faderframe_session::launcher::clips_payload(&[first]);
     assert!(view.drop_payload(&own, pos, size, &s).is_none());
 }
+
+/// A click in a clip's header strip selects it and leaves the playhead
+/// where it is; a click in its body (Link Timeline) still moves it there.
+#[test]
+fn a_click_on_a_clips_header_does_not_move_the_playhead() {
+    let mut s = session();
+    s.editor.link_timeline = true;
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 700.0);
+    let tracks = ArrangerView::lane_tracks(&s);
+    let bass_row = tracks.iter().position(|t| t.name == "Bass").unwrap();
+    let bass = tracks[bass_row].id;
+    let clip = s.project().track(bass).unwrap().clips[0];
+    let start = s.project().clip(clip).unwrap().start;
+    let row = view.row_rect(bass_row, size);
+    let x = view.x_of(start) + 40.0;
+    let located = |a: &[Action]| {
+        a.iter()
+            .any(|a| matches!(a, Action::Transport(TransportAction::Locate(_))))
+    };
+    // The header strip: the clip's top few pixels.
+    let header = Point::new(x, row.y + 4.0);
+    let mut a = run(&mut view, down(header), size, &s).0;
+    a.extend(run(&mut view, up(header), size, &s).0);
+    assert!(a.contains(&Action::SelectClips {
+        clips: vec![clip],
+        mode: SelectMode::Replace
+    }));
+    assert!(!located(&a), "a header click keeps the playhead: {a:?}");
+    // The lower half: the playhead goes to the click.
+    let body = Point::new(x, row.y + row.h * 0.8);
+    let mut a = run(&mut view, down(body), size, &s).0;
+    a.extend(run(&mut view, up(body), size, &s).0);
+    assert!(located(&a), "{a:?}");
+}

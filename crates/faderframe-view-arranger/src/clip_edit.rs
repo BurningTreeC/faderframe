@@ -72,6 +72,9 @@ pub(crate) enum EditDrag {
         /// Shuffle mode: where the clip would land (painted, applied on
         /// release).
         ghost: Option<(TrackId, MusicalTime)>,
+        /// Pressed in the clip's header strip: a click there selects the
+        /// clip and leaves the playhead where it is.
+        in_header: bool,
     },
     Trim {
         clips: Vec<ClipId>,
@@ -690,6 +693,7 @@ impl ArrangerView {
                     moved: false,
                     additive,
                     ghost: None,
+                    in_header: pos.y < rect.y + self.header_band(rect),
                 }
             }
         });
@@ -1293,6 +1297,7 @@ impl ArrangerView {
                             moved: false,
                             additive: false,
                             ghost: None,
+                            in_header: false,
                         };
                         self.edit_drag = Some(drag);
                         return self.edit_drag_move(pos, mods, model, cx);
@@ -1350,6 +1355,7 @@ impl ArrangerView {
                 moved,
                 additive,
                 ghost,
+                in_header,
                 ..
             } => {
                 if moved {
@@ -1365,14 +1371,21 @@ impl ArrangerView {
                         None => {}
                     }
                 } else {
-                    // A click: only this clip, and the playhead goes there.
+                    // A click: only this clip, and (in its body, not its
+                    // header strip) the playhead goes there.
                     if !additive && model.selection.clips.len() > 1 {
                         cx.emit(Action::SelectClips {
                             clips: vec![anchor],
                             mode: SelectMode::Replace,
                         });
                     }
-                    self.click_locate(click, model, cx);
+                    if in_header {
+                        if model.selection.range.is_some() {
+                            cx.emit(Action::SetEditRange(None));
+                        }
+                    } else {
+                        self.click_locate(click, model, cx);
+                    }
                 }
             }
             EditDrag::Trim { moved, .. }
