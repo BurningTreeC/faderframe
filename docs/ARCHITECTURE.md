@@ -20,6 +20,7 @@ faderframe-app            binary: CLI parsing, logging, starts the GTK app
        ├─ faderframe-ui-gpu       optional GPU painter for dense views (vello on wgpu, parley text)
        ├─ faderframe-view-ddp     DDP player: a CD master checked, played and imported
        ├─ faderframe-view-surround surround panner: a track in its bed, from above
+       ├─ faderframe-view-adr     ADR cue list: lines rehearsed and recorded with beeps and streamers
        ├─ faderframe-audio-pipewire   native PipeWire backend (pw_filter, Linux)
        ├─ faderframe-audio-jack       JACK backend (JACK2 / pipewire-jack, Linux)
        ├─ faderframe-audio-cpal       system backend through cpal: WASAPI, ASIO (opt-in), CoreAudio, ALSA
@@ -30,6 +31,7 @@ faderframe-app            binary: CLI parsing, logging, starts the GTK app
        └─ faderframe-session          control-world hub (GTK-free)
             ├─ faderframe-analysis     loudness (EBU R128), true peak, levels, phase, FFT spectrum
             ├─ faderframe-disc         Red Book CD masters: DDP 2.00 filesets, CD-Text, cue sheets, ISRC/UPC
+            ├─ faderframe-conform      new picture cuts: CMX3600 EDLs, OpenTimelineIO, cut-to-cut changes, shot matching
             ├─ faderframe-adm          object-based masters: ADM (BS.2076) axml/chna, Dolby Atmos master profile
             ├─ faderframe-iamf         IAMF masters: OBUs, MP4 (iamf/iacb), LPCM/FLAC/Opus substreams
             ├─ faderframe-engine       project→graph compiler, RT processor, controller, offline render
@@ -2979,6 +2981,34 @@ screen, timecode overlay), the arranger's Video lane, picture offset,
 the flash-and-beep sync test and Export Movie. Create Output Tracks gives
 every output of a multi-output plugin, the main too, a track of its own.
 
+Picture, phases 2 and 3: zero-copy display on Linux (VA-API decodes and
+scales into an RGB dmabuf the display takes, `faderframe_video::zero_copy`,
+`Painter::external`; RGBA otherwise), decoding at device pixels, a
+late-frame meter with presentation feedback; J/K/L shuttle in reverse and
+up to 8× heard as scrub snippets (`session::shuttle`), frame steps;
+several video tracks compared side by side or wiped; trims in the lane;
+export of a clip's span cut at keyframes with a timecode track
+(`qt_timecode` reads them back); timecode counters on the transport
+display and in Spot; proxy settings and the cache; cut detection to
+markers. Colour management: the stream's colours kept with the frame
+index, HDR (PQ, HLG) and wide gamut mapped for an SDR screen
+(`faderframe_video::colour`: BT.2390's EETF to reference white, BT.709
+primaries), proxies mapped the same way (and proxies keep full-range JPEG
+colours now). MXF and DV demuxed in every package; ProRes, DNxHD and the
+other intermediates decoded through an LGPL FFmpeg the Linux tarball
+builds (`packaging/linux/lgpl_libav.sh`). Conform to a new cut from EDLs
+or OpenTimelineIO, or by matching the old and new picture shot by shot
+(`faderframe-conform`, `faderframe_project::conform`, `session::conform`;
+one undo step, new shots marked). ADR (`faderframe_project::adr`,
+`session::adr`, the cue list view): cues from the transcript, beeps on a
+track of their own, rehearsing and recording a cue with pre-roll, punch
+and streamer over the picture, takes rated. Picture outputs
+(`faderframe_video::output`, `session::picture_out`): a Blackmagic
+DeckLink card's SDI or HDMI paced by the card, and full screen on a
+monitor of its own. Not done: shared D3D12 frames on Windows (nothing
+here can run D3D12 sharing), video tried in the Windows and macOS packages
+on real machines, and a DeckLink card tried (none here).
+
 **Next**, roughly in order (waves from a survey of what Live, Bitwig,
 Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
 2024–2026):
@@ -3040,7 +3070,9 @@ DAW does well yet):
     video tracks are. Audio clips are placed musically today, so a
     movie's sound moves with a tempo change while its picture does not —
     the gap that matters most for scoring to picture.
-12. **Video, phase 2 — display and playback**: zero-copy display (dmabuf
+12. ~~**Video, phase 2 — display and playback**~~ — done but for shared
+    D3D12 frames on Windows and real-machine tries (see *Picture, phases
+    2 and 3* above): zero-copy display (dmabuf
     on Wayland, shared D3D12 textures on Windows) and decoding at device
     pixels on HiDPI screens; a late-frame meter (the session counts
     already) and presentation feedback; shuttle and reverse play from the
@@ -3051,7 +3083,8 @@ DAW does well yet):
     display; proxy settings (size, where they live, clearing the cache);
     cut detection to markers. Try video in the Windows and macOS packages
     on real machines.
-13. **Video, phase 3 — post-production**: ADR (cues from Whisper's
+13. ~~**Video, phase 3 — post-production**~~ — done (see above; the
+    DeckLink output untried without a card): ADR (cues from Whisper's
     transcript, streamers and punches over the picture, beeps, takes
     rated in their folders); conform from EDL/OTIO, helped by cut
     detection; SDI output through Blackmagic DeckLink (read its SDK's
