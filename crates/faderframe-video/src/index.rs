@@ -203,7 +203,10 @@ pub fn index(path: &Path, cancel: &AtomicBool, progress: impl FnMut(f64)) -> Res
         times,
         keys,
         end: s.end,
-        timecode: s.timecode,
+        // From the frames' meta, else a QuickTime/MPEG-4 timecode track.
+        timecode: s
+            .timecode
+            .or_else(|| crate::qt_timecode::start_timecode(path)),
     };
     // A last frame without a duration lasts as long as the others.
     if let Some(&last) = index.times.last()

@@ -60,13 +60,31 @@ impl Container {
     }
 }
 
-/// Write `out`: the picture of `video` (copied) and the sound of each of
-/// `sounds` (WAV files, one track each, in order), as `container`.
+/// What of the picture goes in, and its timecode.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MuxOptions {
+    /// The picture from the keyframe starting at `from` (ns, the file's
+    /// timeline) up to the keyframe at `to` (not included; `None`: the
+    /// end). Copying cuts only at keyframes; the movie starts at 0.
+    pub from: i64,
+    pub to: Option<i64>,
+    /// The label at the movie's start, written as a timecode track
+    /// (QuickTime).
+    pub timecode: Option<(
+        faderframe_core::timecode::Timecode,
+        faderframe_core::timecode::FrameRate,
+    )>,
+}
+
+/// Write `out`: the picture of `video` (copied, `options` say which of
+/// it) and the sound of each of `sounds` (WAV files from the movie's
+/// start, one track each, in order), as `container`.
 pub fn mux(
     video: &Path,
     sounds: &[PathBuf],
     out: &Path,
     container: Container,
+    options: MuxOptions,
     cancel: &AtomicBool,
     progress: impl FnMut(f64),
 ) -> Result<()> {
@@ -172,12 +190,74 @@ pub fn mux(
     let next = queue
         .static_pad("sink")
         .ok_or_else(|| VideoError::Gst("a queue without a sink".into()))?;
-    // A frame without a duration (Matroska's last) would end the movie a
-    // frame early in QuickTime and MPEG-4: it gets one frame's length.
-    next.add_probe(gst::PadProbeType::BUFFER, |pad, info| {
-        if let Some(gst::PadProbeData::Buffer(buffer)) = info.data.as_mut()
-            && buffer.duration().is_none()
+    // The span (whole GOPs, in decoding order): from the keyframe at
+    // `from` until the keyframe at `to`; the movie starts at 0.
+    let tc = options.timecode.and_then(|(t, rate)| {
+        let (n, d) = rate.ratio();
+        let flags = if rate.is_drop() {
+            gst_video::VideoTimeCodeFlags::DROP_FRAME
+        } else {
+            gst_video::VideoTimeCodeFlags::empty()
+        };
+        gst_video::ValidVideoTimeCode::new(
+            gst::Fraction::new(n as i32, d as i32),
+            None,
+            flags,
+            u32::from(t.hours),
+            u32::from(t.minutes),
+            u32::from(t.seconds),
+            u32::from(t.frames),
+            0,
+        )
+        .ok()
+    });
+    let span = std::sync::Mutex::new((false, false, tc));
+    let (from, to) = (options.from, options.to);
+    queue
+        .static_pad("src")
+        .ok_or_else(|| VideoError::Gst("a queue without a source".into()))?
+        .set_offset(-from);
+    next.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
+        let Some(gst::PadProbeData::Buffer(buffer)) = info.data.as_mut() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let key = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
+        let time = buffer.pts().map(|pts| {
+            pad.sticky_event::<gst::event::Segment>(0)
+                .and_then(|e| {
+                    e.segment()
+                        .downcast_ref::<gst::ClockTime>()
+                        .and_then(|s| s.to_stream_time(pts))
+                })
+                .map_or(crate::ns(pts), crate::ns)
+        });
+        let Ok(mut state) = span.lock() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let (started, stopped, tc) = &mut *state;
+        if !*started {
+            if key && time.is_some_and(|t| t >= from - 1_000_000) {
+                *started = true;
+            } else {
+                return gst::PadProbeReturn::Drop;
+            }
+        }
+        if let Some(to) = to
+            && key
+            && time.is_some_and(|t| t >= to - 1_000_000)
         {
+            *stopped = true;
+        }
+        if *stopped {
+            return gst::PadProbeReturn::Drop;
+        }
+        if let Some(tc) = tc.take() {
+            gst_video::VideoTimeCodeMeta::add(buffer.make_mut(), &tc);
+        }
+        // A frame without a duration (Matroska's last) would end the movie
+        // a frame early in QuickTime and MPEG-4: it gets one frame's
+        // length.
+        if buffer.duration().is_none() {
             let len = pad
                 .current_caps()
                 .and_then(|c| c.structure(0)?.get::<gst::Fraction>("framerate").ok())

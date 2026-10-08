@@ -28,6 +28,7 @@ pub mod index;
 pub mod mux;
 pub mod probe;
 pub mod proxy;
+pub mod qt_timecode;
 pub mod service;
 mod streams;
 pub mod sync_test;

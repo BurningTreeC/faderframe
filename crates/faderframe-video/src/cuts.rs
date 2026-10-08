@@ -1,6 +1,6 @@
 //! Cut detection: where a picture changes shot. Frames are decoded in
-//! order at a tiny size and compared by their colour histograms (four bits
-//! a channel); a frame whose histogram differs from the one before by much
+//! order at a tiny size and compared by their colour histograms (16 soft
+//! bins a channel); a frame whose histogram differs from the one before by much
 //! more than the picture's own frame-to-frame motion starts a new shot.
 //! Gradual changes (fades, dissolves) are not cuts.
 

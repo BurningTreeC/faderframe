@@ -1284,16 +1284,45 @@ impl crate::Session {
             .get(&c.source)
             .cloned()
             .ok_or_else(|| SessionError::Other("the video's file is unknown".into()))?;
-        // The file's time zero and end on the timeline.
+        // The picture is copied, so it is cut at keyframes: from the one
+        // at or before the clip's in-point up to the one at or after its
+        // out-point (the end of the file without one).
+        let index = self
+            .video
+            .known
+            .get(&c.source)
+            .and_then(|k| k.index.clone())
+            .ok_or_else(|| SessionError::Other("the video is still being read".into()))?;
+        let first = index.frame_at(c.offset).unwrap_or(0);
+        let k0 = index
+            .times
+            .get(index.key_before(first))
+            .copied()
+            .unwrap_or(0);
+        let out = c.offset + c.length;
+        let k_end = index
+            .keys
+            .iter()
+            .filter_map(|&k| index.times.get(k as usize).copied())
+            .find(|&t| t >= out && t > k0);
+        let span_end = k_end.unwrap_or(index.end);
+        // That span on the timeline.
         let zero = c.start - ns_to_samples(c.offset, rate);
-        let end = zero + ns_to_samples(source.duration, rate);
-        let lead = (-zero).max(0) as usize;
-        let from = zero.max(0);
+        let seg_start = zero + ns_to_samples(k0, rate);
+        let end = zero + ns_to_samples(span_end, rate);
+        let lead = (-seg_start).max(0) as usize;
+        let from = seg_start.max(0);
         if end <= from {
             return Err(SessionError::Other(
                 "the video ends before the project starts".into(),
             ));
         }
+        let tc = self.timecode();
+        let options = faderframe_video::mux::MuxOptions {
+            from: k0,
+            to: k_end,
+            timecode: Some((tc.at(seg_start, rate), tc.rate)),
+        };
         let start = self.engine.samples_to_musical(&self.project, from);
         let stop = self.engine.samples_to_musical(&self.project, end);
         std::fs::create_dir_all(cache_dir()).map_err(|e| SessionError::Other(e.to_string()))?;
@@ -1337,7 +1366,7 @@ impl crate::Session {
                 r
             });
             watch.map_err(|e| e.to_string())?;
-            // Silence before the project's start; exactly the file's length.
+            // Silence before the project's start; exactly the span's length.
             let mut data = faderframe_audio_files::read_wav(&wav).map_err(|e| e.to_string())?;
             for ch in &mut data.channels {
                 let mut c = vec![0.0; lead];
@@ -1356,6 +1385,7 @@ impl crate::Session {
                 std::slice::from_ref(&wav),
                 &path,
                 container,
+                options,
                 cancel,
                 |x| share.set(0.8 + 0.2 * x),
             );

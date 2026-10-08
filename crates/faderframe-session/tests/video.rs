@@ -39,7 +39,16 @@ fn movie(d: &std::path::Path) -> PathBuf {
     faderframe_video::sync_test::make_sync_test(&v, &w, 10, 25).unwrap();
     let out = d.join("movie.mkv");
     let cancel = AtomicBool::new(false);
-    faderframe_video::mux::mux(&v, &[w], &out, Container::Mkv, &cancel, |_| {}).unwrap();
+    faderframe_video::mux::mux(
+        &v,
+        &[w],
+        &out,
+        Container::Mkv,
+        Default::default(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
     out
 }
 
@@ -175,6 +184,42 @@ fn a_movie_is_imported_shown_saved_and_written_out() {
         "{}",
         info.duration_ns
     );
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let ix = faderframe_video::index::index(&out, &cancel, |_| {}).unwrap();
+    let tc = s.project().timecode.unwrap();
+    assert_eq!(
+        ix.timecode,
+        Some((tc.start, tc.rate)),
+        "the project's timecode"
+    );
+
+    // A trimmed clip writes only its span (an intra-coded movie cuts at
+    // any frame), labelled with the timecode where it sits.
+    let clip = s.project().video.tracks[0].clips[0].clone();
+    s.dispatch(Action::Video(VideoOp::TrimClip {
+        clip: clip.id,
+        start: clip.start + 2 * 48_000,
+        offset: clip.offset + 2_000_000_000,
+        length: 3_000_000_000,
+    }))
+    .unwrap();
+    let out = d.join("part.mov");
+    s.dispatch(Action::Video(VideoOp::Export {
+        clip: Some(clip.id),
+        path: out.clone(),
+        container: Container::Mov,
+    }))
+    .unwrap();
+    s.wait_for_video();
+    let info = faderframe_video::probe::probe(&out).unwrap();
+    assert!(
+        (info.duration_ns - 3_000_000_000).abs() < 100_000_000,
+        "{}",
+        info.duration_ns
+    );
+    let ix = faderframe_video::index::index(&out, &cancel, |_| {}).unwrap();
+    let at = tc.at(clip.start + 2 * 48_000, 48_000);
+    assert_eq!(ix.timecode, Some((at, tc.rate)));
     let _ = std::fs::remove_dir_all(&d);
 }
 

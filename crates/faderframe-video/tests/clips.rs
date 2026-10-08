@@ -204,6 +204,7 @@ fn an_intra_clip_is_probed_indexed_decoded_proxied_and_remuxed() {
         std::slice::from_ref(&a.path),
         &refused,
         Container::Mp4,
+        Default::default(),
         &cancel,
         |_| {},
     );
@@ -216,6 +217,7 @@ fn an_intra_clip_is_probed_indexed_decoded_proxied_and_remuxed() {
             std::slice::from_ref(&a.path),
             &out,
             container,
+            Default::default(),
             &cancel,
             |_| {},
         )
@@ -274,6 +276,7 @@ fn a_long_gop_clip_is_exact_frame_for_frame() {
             std::slice::from_ref(&wav),
             &out,
             container,
+            Default::default(),
             &cancel,
             |_| {},
         )
@@ -288,6 +291,40 @@ fn a_long_gop_clip_is_exact_frame_for_frame() {
             mix.times, ix.times,
             "{container:?}: every frame where it was"
         );
+    }
+    // A span copied: the GOP from frame 25 up to the keyframe at 50, into
+    // a QuickTime movie that starts at 0 with a timecode track.
+    {
+        use faderframe_core::timecode::{FrameRate, Timecode};
+        let out = d.join("span.mov");
+        let tc = Timecode::parse("01:00:00:00", FrameRate::Fps25).unwrap();
+        mux(
+            &clip,
+            std::slice::from_ref(&wav),
+            &out,
+            Container::Mov,
+            faderframe_video::mux::MuxOptions {
+                from: ix.times[25],
+                to: Some(ix.times[50]),
+                timecode: Some((tc, FrameRate::Fps25)),
+            },
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        let six = index::index(&out, &cancel, |_| {}).unwrap();
+        assert_eq!(six.len(), 25, "the frames of one GOP");
+        assert_eq!(six.times[0], 0, "from the movie's start");
+        assert_eq!(
+            six.timecode,
+            Some((tc, FrameRate::Fps25)),
+            "its timecode track"
+        );
+        let mut dec = Decoder::open(&out, W, H).unwrap();
+        let f = dec.frame_at(six.times[0], true).unwrap().unwrap();
+        assert_frame(&f, 25);
+        let f = dec.frame_at(six.times[24], true).unwrap().unwrap();
+        assert_frame(&f, 49);
     }
     let mut dec = Decoder::open(&clip, W, H).unwrap();
     for n in [37, 12, 74, 1, 26] {
