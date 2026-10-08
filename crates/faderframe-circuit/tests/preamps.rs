@@ -206,5 +206,25 @@ fn gain_moves_the_level_as_the_circuit_does() {
     }
     assert_eq!(level_change_db(2, REFERENCE), 0.0);
     // The British 73 reaches below its circuit's range by its divider.
-    assert!(level(0, 0.0) < level(0, REFERENCE) - 30.0);
+    assert!(level(0, 0.05) < level(0, REFERENCE) - 30.0);
+    // 0 % is silence on every model, reached gradually: from a fifth of
+    // the travel down the level falls step by step, never at once.
+    for model in 0..MODELS {
+        assert!(
+            level(model, 0.0) < -120.0,
+            "model {model}: {}",
+            level(model, 0.0)
+        );
+        let mut last = level(model, 0.2);
+        for step in (1..10).rev() {
+            let now = level(model, 0.02 * f64::from(step));
+            assert!(now < last + 0.5, "model {model}: rises toward 0 %");
+            assert!(
+                last - now < 15.0,
+                "model {model}: falls {} dB at once",
+                last - now
+            );
+            last = now;
+        }
+    }
 }

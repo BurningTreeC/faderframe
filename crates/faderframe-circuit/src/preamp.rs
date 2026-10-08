@@ -75,9 +75,32 @@ fn divider_db(model: usize, gain: f64) -> f64 {
     }
 }
 
+/// The bottom of the Gain's travel closes the input, gradually (square
+/// law, like a level pot: −12 dB at half of it, −24 at a quarter), so 0 %
+/// is silence on every model. The Tube 610's Level pot closes by itself
+/// (to about −80 dBFS): only its last 2 % finish the way.
+fn closing(model: usize) -> f64 {
+    if model == 3 {
+        0.02
+    } else {
+        0.2
+    }
+}
+
+/// What reaches the circuit (linear): the divider and the closing.
+fn pad(model: usize, gain: f64) -> f64 {
+    let end = closing(model);
+    let closing = if gain < end {
+        (gain.max(0.0) / end).powi(2)
+    } else {
+        1.0
+    };
+    10f64.powf(divider_db(model, gain) / 20.0) * closing
+}
+
 /// How much louder (dB) model `model` is with its Gain at `gain` than at
-/// [`REFERENCE`]: the circuit's own gain change (from its calibration) and
-/// its input divider.
+/// [`REFERENCE`]: the circuit's own gain change (from its calibration), its
+/// input divider and the closing at the bottom (−200 dB for silence).
 pub fn level_change_db(model: usize, gain: f64) -> f64 {
     let model = model.min(MODELS - 1);
     let table = &CALIBRATION[model].make_up_db;
@@ -87,7 +110,8 @@ pub fn level_change_db(model: usize, gain: f64) -> f64 {
     } else {
         REFERENCE
     };
-    makeup(table, REFERENCE, steps) - makeup(table, gain, steps) + divider_db(model, gain)
+    makeup(table, REFERENCE, steps) - makeup(table, gain, steps)
+        + (20.0 * pad(model, gain).log10()).max(-200.0)
 }
 
 pub struct Preamp {
@@ -236,7 +260,7 @@ impl Preamp {
         // drive control, and on the 610 boosted the C15 feedthrough when
         // the pot closed.)
         let db = makeup(&cal.make_up_db, REFERENCE, self.circuit.control_steps(0));
-        self.pad_target = 10f64.powf(divider_db(self.model, gain) / 20.0);
+        self.pad_target = pad(self.model, gain);
         // Circuit gain and its calibration must change together. Smoothing
         // their product held the old (sometimes +70 dB) correction while the
         // new circuit gain was already active. Only the independent Master

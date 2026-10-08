@@ -3316,7 +3316,10 @@ the circuit from there (`preamp::level_change_db`) — the Tube 610's Level pot
 closes to silence, the British 47's switch has its three positions, and the
 British 73's lower half of the travel is its gain switch's input divider (up
 to 35 dB; the circuit is wired as the 70 dB position, its feedback leg
-covering only 10 dB). Master trims after. Each channel
+covering only 10 dB). The bottom fifth of the travel closes the input
+gradually (square law: −12 dB at 10 %, −24 dB at 5 %), so 0 % is silence on
+every model (the 610's own pot closes to about −80 dBFS; only its last 2 %
+finish the way). Master trims after. Each channel
 has independent circuit state and uses fixed 2x oversampling with reported
 latency. A track's channels are solved side by side (`PreampBank`: the
 calling thread and helper threads of a `WorkerPool`, which adopt its
