@@ -2026,9 +2026,11 @@ impl ArrangerView {
 
     // --- interaction ----------------------------------------------------------------
 
+    /// To the grid (unless Alt or snapping is off), else to a whole sample
+    /// (with Snap to Samples).
     fn snap(&self, t: MusicalTime, model: &Session, mods: Modifiers) -> MusicalTime {
-        if mods.alt {
-            t
+        if mods.alt || !model.editor.snap {
+            model.on_sample(t)
         } else {
             model.editor.snap(t, &model.project().timeline.meter)
         }

@@ -1050,6 +1050,10 @@ pub struct EditorSettings {
     pub show_transients: bool,
     pub warp: bool,
     pub show_edit_toolbar: bool,
+    /// Positions off the grid land on whole samples.
+    pub snap_samples: bool,
+    /// Cuts and trims of audio clips move to the nearest zero crossing.
+    pub zero_crossings: bool,
     pub counter_unit: CounterUnit,
     /// The transport display's big and small counters (`None` for the
     /// small one: timecode when the project has video or a timecode,
@@ -1087,6 +1091,8 @@ impl Default for EditorSettings {
             show_transients: false,
             warp: false,
             show_edit_toolbar: false,
+            snap_samples: true,
+            zero_crossings: false,
             counter_unit: CounterUnit::BarsBeats,
             main_counter: CounterUnit::BarsBeats,
             sub_counter: None,
@@ -3867,6 +3873,8 @@ impl Session {
                     EditFlag::ShowTransients => e.show_transients = on,
                     EditFlag::Warp => e.warp = on,
                     EditFlag::EditToolbar => e.show_edit_toolbar = on,
+                    EditFlag::SnapToSamples => e.snap_samples = on,
+                    EditFlag::SnapToZeroCrossings => e.zero_crossings = on,
                 }
                 if matches!(
                     flag,
@@ -5300,6 +5308,7 @@ impl Session {
         let mut commands = Vec::new();
         for clip in targets {
             let new_clip: ClipId = self.project.ids.allocate();
+            let at = self.project.clip(clip).map_or(at, |c| self.cut_at(c, at));
             commands.push(Command::SplitClip { clip, at, new_clip });
         }
         self.edit(Command::Batch {

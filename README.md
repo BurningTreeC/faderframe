@@ -380,6 +380,10 @@ long sessions), Neon and High Contrast:
 * Clip effects (an audio clip's menu → Clip Effects…): a chain of devices
   on one clip, rendered into the audio it plays as you change it; the
   original stays with the clip, so the effects can change again or go.
+* Snap to Samples (on by default) and Snap to Zero Crossings (the edit
+  toolbar, beside the grid): free positions land on whole samples, and
+  cuts and trims of audio clips move to the nearest zero crossing so they
+  do not click.
 * Spectral editing (an audio clip's menu → Spectral Editor): the clip's
   spectrogram, regions drawn on it (rectangle, time range, frequency band,
   lasso, brush) with soft edges, and turned into edits: Attenuate (down to

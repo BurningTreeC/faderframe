@@ -1636,3 +1636,33 @@ fn track_headers_drag_to_reorder_and_into_folders() {
     }
     assert_eq!(ids(&s), before);
 }
+
+/// Slip (free) moves land on whole samples with Snap to Samples (at the
+/// demo's 112 BPM a free tick position rarely is one).
+#[test]
+fn free_moves_land_on_whole_samples() {
+    let mut s = session();
+    s.dispatch(Action::SetEditMode(faderframe_session::EditMode::Slip))
+        .unwrap();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 700.0);
+    let tracks = ArrangerView::lane_tracks(&s);
+    let bass_row = tracks.iter().position(|t| t.name == "Bass").unwrap();
+    let clip = s.project().track(tracks[bass_row].id).unwrap().clips[0];
+    let start = s.project().clip(clip).unwrap().start;
+    let row = view.row_rect(bass_row, size);
+    let grab = Point::new(view.x_of(start) + 30.0, row.y + row.h * 0.8);
+    let target = Point::new(grab.x + 37.3, grab.y);
+    let mut actions = run(&mut view, down(grab), size, &s).0;
+    actions.extend(run(&mut view, mv(Point::new(grab.x + 10.0, grab.y)), size, &s).0);
+    actions.extend(run(&mut view, mv(target), size, &s).0);
+    actions.extend(run(&mut view, up(target), size, &s).0);
+    for a in actions {
+        s.dispatch(a).unwrap();
+    }
+    let moved = s.project().clip(clip).unwrap().start;
+    assert_ne!(moved, start);
+    let tl = &s.project().timeline;
+    let rate = f64::from(s.project().sample_rate);
+    assert_eq!(tl.to_musical(tl.to_samples(moved, rate), rate), moved);
+}

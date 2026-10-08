@@ -661,6 +661,8 @@ pub fn install(app: &Rc<AppState>) {
                 "link" => (F::LinkTimeline, e.link_timeline),
                 "insertion-follows" => (F::InsertionFollowsPlayback, e.insertion_follows_playback),
                 "follow" => (F::FollowPlayhead, e.follow_playhead),
+                "samples" => (F::SnapToSamples, e.snap_samples),
+                "zero-crossings" => (F::SnapToZeroCrossings, e.zero_crossings),
                 _ => return tracing::warn!("edit-flag: unknown '{arg}'"),
             };
             a.dispatch(Action::SetEditFlag(flag, !on));

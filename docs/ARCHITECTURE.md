@@ -3535,3 +3535,15 @@ source meanwhile. View `faderframe-view-spectral` (`ViewKind::Spectral`,
 `Action::OpenSpectralEditor`, the audio clip menu); it repaints until the
 picture it asked for has come (`waiting`), since a result can land between
 two frames.
+
+### Snapping to samples and zero crossings
+
+Grid positions stay musical (a grid line at 112 BPM is not a whole sample,
+and rounding it would pull it off the grid), so the session never rounds
+moves or trims. The arranger rounds the positions it makes freely — snap
+off, Alt, Slip, the relative grid — with `Session::on_sample` when Snap to
+Samples is on (`EditFlag::SnapToSamples`, the default). Snap to Zero
+Crossings (`EditFlag::SnapToZeroCrossings`) moves the cuts of Separate,
+split at the playhead and Trim to Selection, and audio trims, to the
+nearest zero crossing of the clip's audio (channels summed, within 5 ms;
+`Session::cut_at`), per clip.

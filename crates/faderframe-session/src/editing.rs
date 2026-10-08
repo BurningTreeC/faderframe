@@ -210,7 +210,14 @@ pub enum EditFlag {
     Warp,
     /// The edit toolbar under the transport.
     EditToolbar,
+    /// Positions off the grid (free edits, Alt, Slip) land on whole samples.
+    SnapToSamples,
+    /// Cuts and trims of audio clips move to the nearest zero crossing.
+    SnapToZeroCrossings,
 }
+
+/// How far a cut looks for a zero crossing, each side (seconds).
+pub const ZERO_CROSSING_REACH: f64 = 0.005;
 
 /// A time range (start ≤ end; a cursor when equal).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -271,6 +278,68 @@ pub enum NudgeTarget {
 pub(crate) struct RangeClipboard {
     pub(crate) length: MusicalTime,
     pub(crate) parts: Vec<(usize, Clip)>,
+}
+
+impl Session {
+    /// `t` on the nearest whole sample when Snap to Samples is on.
+    pub fn on_sample(&self, t: MusicalTime) -> MusicalTime {
+        if !self.editor.snap_samples {
+            return t;
+        }
+        let p = &self.project;
+        let rate = f64::from(p.sample_rate.max(1));
+        p.timeline.to_musical(p.timeline.to_samples(t, rate), rate)
+    }
+
+    /// Where a cut of clip `c` at `at` goes: the nearest zero crossing of
+    /// its audio within [`ZERO_CROSSING_REACH`] when Snap to Zero
+    /// Crossings is on (audio clips played forwards), else `at`.
+    pub fn cut_at(&self, c: &faderframe_project::Clip, at: MusicalTime) -> MusicalTime {
+        if !self.editor.zero_crossings {
+            return at;
+        }
+        let ClipContent::Audio(a) = &c.content else {
+            return at;
+        };
+        if a.reversed {
+            return at;
+        }
+        let p = &self.project;
+        let rate = f64::from(p.sample_rate.max(1));
+        let start = p.timeline.to_samples(c.start, rate);
+        let rel = p.timeline.to_samples(at, rate) - start;
+        let source = if a.warp.is_some() {
+            a.source_at(rel as f64).round() as i64
+        } else {
+            a.source_offset + rel
+        };
+        let reach = (ZERO_CROSSING_REACH * rate) as i64;
+        let Some(frames) = self.source_frames(a.source, source - reach, (2 * reach + 1) as usize)
+        else {
+            return at;
+        };
+        // The channels summed; the crossing nearest the cut (the sample of
+        // the pair nearer zero).
+        let mono: Vec<f32> = (0..frames.first().map_or(0, Vec::len))
+            .map(|i| frames.iter().map(|ch| ch[i]).sum())
+            .collect();
+        let best = (1..mono.len())
+            .filter(|&i| (mono[i - 1] <= 0.0) != (mono[i] <= 0.0) || mono[i] == 0.0)
+            .map(|i| {
+                if mono[i - 1].abs() < mono[i].abs() {
+                    i - 1
+                } else {
+                    i
+                }
+            })
+            .min_by_key(|&i| (i as i64 - reach).abs());
+        match best {
+            Some(i) => p
+                .timeline
+                .to_musical(start + rel + (i as i64 - reach), rate),
+            None => at,
+        }
+    }
 }
 
 impl Session {
@@ -449,17 +518,17 @@ impl Session {
                         let right: ClipId = self.project.ids.allocate();
                         cmds.push(Command::SplitClip {
                             clip: c.id,
-                            at: r.start,
+                            at: self.cut_at(&c, r.start),
                             new_clip: mid,
                         });
                         cmds.push(Command::SplitClip {
                             clip: mid,
-                            at: r.end,
+                            at: self.cut_at(&c, r.end),
                             new_clip: right,
                         });
                     }
                     (true, false) | (false, true) => {
-                        let at = if cut_a { r.start } else { r.end };
+                        let at = self.cut_at(&c, if cut_a { r.start } else { r.end });
                         let new_clip: ClipId = self.project.ids.allocate();
                         cmds.push(Command::SplitClip {
                             clip: c.id,
@@ -493,7 +562,7 @@ impl Session {
                     let mid: ClipId = self.project.ids.allocate();
                     cmds.push(Command::SplitClip {
                         clip: c.id,
-                        at: r.start,
+                        at: self.cut_at(&c, r.start),
                         new_clip: mid,
                     });
                     cmds.push(Command::RemoveClip { clip: c.id });
@@ -503,7 +572,7 @@ impl Session {
                     let right: ClipId = self.project.ids.allocate();
                     cmds.push(Command::SplitClip {
                         clip: keep,
-                        at: r.end,
+                        at: self.cut_at(&c, r.end),
                         new_clip: right,
                     });
                     cmds.push(Command::RemoveClip { clip: right });
@@ -1099,6 +1168,7 @@ impl Session {
             if stretch {
                 cmds.extend(self.stretch_commands(*id, edge, to)?);
             } else {
+                let to = self.cut_at(&c, to);
                 cmds.extend(self.trim_commands(&c, edge, to)?);
             }
         }

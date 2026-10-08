@@ -441,7 +441,7 @@ impl ArrangerView {
     ) -> MusicalTime {
         let e = &model.editor;
         if mods.alt || e.edit_mode != EditMode::Grid {
-            return raw;
+            return model.on_sample(raw);
         }
         match e.grid_mode {
             GridMode::Absolute => self.snap(raw, model, mods),
@@ -452,7 +452,7 @@ impl ArrangerView {
                     .max(1);
                 let d = raw.ticks() - origin.ticks();
                 let k = (d as f64 / step as f64).round() as i64;
-                MusicalTime((origin.ticks() + k * step).max(0))
+                model.on_sample(MusicalTime((origin.ticks() + k * step).max(0)))
             }
         }
     }
