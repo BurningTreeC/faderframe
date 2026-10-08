@@ -214,6 +214,18 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
         faderframe_video::zero_copy::set_display_formats(formats);
         faderframe_video::zero_copy::set_allowed(prefs.video_zero_copy);
     }
+    // The picture on a DeckLink output, when one was chosen and is there.
+    if let Some((device, mode)) = prefs.video_output.clone()
+        && faderframe_video::output::decklink_devices()
+            .iter()
+            .any(|(n, _)| *n == device)
+        && let Err(e) = session.set_picture_output(Some(faderframe_video::output::Sink::DeckLink {
+            device,
+            mode,
+        }))
+    {
+        tracing::warn!("picture output: {e}");
+    }
     session.editor.show_edit_toolbar = prefs.show_edit_toolbar;
     // MIDI keyboards and controllers (FADERFRAME_NO_MIDI=1 keeps the
     // system's devices closed, e.g. for scripted runs).

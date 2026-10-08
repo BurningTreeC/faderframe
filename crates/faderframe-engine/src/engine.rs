@@ -855,6 +855,43 @@ pub struct GraphProfile {
     pub groups: Arc<[faderframe_core::TrackId]>,
 }
 
+/// Where the engine is, from any thread: [`EngineController::clock`].
+#[derive(Clone)]
+pub struct EngineClock {
+    shared: Arc<EngineShared>,
+    varispeed_delay: u32,
+}
+
+impl EngineClock {
+    /// The playhead as of `t_ns` on the MIDI clock (extrapolated from the
+    /// last callback while playing); `None` before the first callback.
+    pub fn position_at(&self, t_ns: u64) -> Option<i64> {
+        let (cb, pos, _) = self.shared.callback.load();
+        if cb == 0 {
+            return None;
+        }
+        if !self.shared.transport.snapshot().playing {
+            return Some(pos);
+        }
+        let rate =
+            self.shared.stream_sample_rate.load(Ordering::Relaxed) as f64 * self.shared.speed();
+        Some(pos + ((t_ns as f64 - cb as f64) * rate / 1e9) as i64)
+    }
+
+    /// Frames from processing to hearing.
+    pub fn output_latency(&self) -> u32 {
+        self.shared.output_latency.load(Ordering::Relaxed) + self.varispeed_delay
+    }
+
+    pub fn speed(&self) -> f64 {
+        self.shared.speed()
+    }
+
+    pub fn playing(&self) -> bool {
+        self.shared.transport.snapshot().playing
+    }
+}
+
 pub struct EngineController {
     /// Live SysEx to the tracks playing from an input port.
     live_sysex: crate::midi::LiveSysexSender,
@@ -1125,6 +1162,15 @@ impl EngineController {
         // At the varispeed's speed.
         let rate = self.stream_sample_rate() as f64 * self.speed();
         Some((pos + ((t_ns as f64 - cb as f64) * rate / 1e9) as i64, jumps))
+    }
+
+    /// A handle that tells where the engine is from any thread (picture
+    /// outputs).
+    pub fn clock(&self) -> EngineClock {
+        EngineClock {
+            shared: Arc::clone(&self.shared),
+            varispeed_delay: self.varispeed_delay(),
+        }
     }
 
     /// Frames from processing to hearing (device buffer + output latency,

@@ -372,7 +372,7 @@ pub enum VideoOp {
 }
 
 impl crate::Session {
-    fn video_service(&mut self) -> &FrameService {
+    pub(crate) fn video_service(&mut self) -> &FrameService {
         self.video
             .service
             .get_or_insert_with(|| FrameService::new(FRAME_BUDGET))

@@ -591,6 +591,67 @@ fn video_page(app: &Rc<AppState>) -> gtk::Widget {
         1,
         1,
     );
+    // Full screen on a monitor of its own (a second screen as the
+    // picture's).
+    let mut monitors = vec!["Where the window is".to_string()];
+    if let Some(display) = gtk::gdk::Display::default() {
+        let list = display.monitors();
+        for i in 0..list.n_items() {
+            if let Some(m) = list.item(i).and_downcast::<gtk::gdk::Monitor>() {
+                monitors.push(crate::video::monitor_name(&m));
+            }
+        }
+    }
+    let refs: Vec<&str> = monitors.iter().map(String::as_str).collect();
+    let screen = gtk::DropDown::from_strings(&refs);
+    screen.set_selected(
+        prefs
+            .video_fullscreen_monitor
+            .as_ref()
+            .and_then(|m| monitors.iter().position(|x| x == m))
+            .unwrap_or(0) as u32,
+    );
+    row(&g, 6, "Full screen on", &screen);
+    // A DeckLink card's SDI/HDMI output.
+    let devices = faderframe_video::output::decklink_devices();
+    let modes = faderframe_video::output::decklink_modes();
+    let output_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let mut device_labels = vec!["Off".to_string()];
+    device_labels.extend(devices.iter().map(|(_, n)| n.clone()));
+    let refs: Vec<&str> = device_labels.iter().map(String::as_str).collect();
+    let device = gtk::DropDown::from_strings(&refs);
+    let mode_labels: Vec<&str> = modes.iter().map(|(_, l)| l.as_str()).collect();
+    let mode = gtk::DropDown::from_strings(&mode_labels);
+    let (cur_dev, cur_mode) = prefs
+        .video_output
+        .clone()
+        .map_or((None, "1080p25".to_string()), |(d, m)| (Some(d), m));
+    device.set_selected(
+        cur_dev
+            .and_then(|d| devices.iter().position(|(n, _)| *n == d))
+            .map_or(0, |i| i as u32 + 1),
+    );
+    mode.set_selected(
+        modes
+            .iter()
+            .position(|(id, _)| *id == cur_mode)
+            .unwrap_or(0) as u32,
+    );
+    mode.set_sensitive(device.selected() > 0);
+    output_box.append(&device);
+    output_box.append(&mode);
+    row(&g, 7, "Picture output", &output_box);
+    g.attach(
+        &note(if devices.is_empty() {
+            "No Blackmagic DeckLink output found (its Desktop Video driver must be installed)."
+        } else {
+            "The picture on a Blackmagic DeckLink card's SDI or HDMI output, in step with the sound."
+        }),
+        1,
+        8,
+        1,
+        1,
+    );
 
     let apply = {
         let weak = Rc::downgrade(app);
@@ -617,6 +678,48 @@ fn video_page(app: &Rc<AppState>) -> gtk::Widget {
             let h = if i == 0 { 0 } else { PROXY_HEIGHTS[i - 1] };
             apply(&|p| p.video_proxy_height = h);
         });
+    }
+    {
+        let names = monitors.clone();
+        screen.connect_selected_notify(move |d| {
+            let i = d.selected() as usize;
+            let mut p = Preferences::load();
+            p.video_fullscreen_monitor = (i > 0).then(|| names[i].clone());
+            if let Err(e) = p.save() {
+                tracing::warn!("could not save the preferences: {e}");
+            }
+        });
+    }
+    {
+        let weak = Rc::downgrade(app);
+        let choose = std::rc::Rc::new({
+            let device = device.clone();
+            let mode = mode.clone();
+            move || {
+                let d = device.selected() as usize;
+                mode.set_sensitive(d > 0);
+                let output = (d > 0).then(|| {
+                    let m = modes
+                        .get(mode.selected() as usize)
+                        .map_or_else(|| "1080p25".to_string(), |(id, _)| id.clone());
+                    (devices[d - 1].0, m)
+                });
+                let mut p = Preferences::load();
+                p.video_output = output.clone();
+                if let Err(e) = p.save() {
+                    tracing::warn!("could not save the preferences: {e}");
+                }
+                if let Some(app) = weak.upgrade() {
+                    let sink = output.map(|(device, mode)| {
+                        faderframe_video::output::Sink::DeckLink { device, mode }
+                    });
+                    app.with_session(|s| s.set_picture_output(sink));
+                }
+            }
+        });
+        let c = std::rc::Rc::clone(&choose);
+        device.connect_selected_notify(move |_| c());
+        mode.connect_selected_notify(move |_| choose());
     }
     {
         let apply = Rc::clone(&apply);

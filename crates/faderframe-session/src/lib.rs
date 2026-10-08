@@ -22,6 +22,7 @@ pub mod midi;
 pub mod modulators;
 pub mod notes;
 pub mod performance;
+pub mod picture_out;
 pub mod pitch;
 pub use performance::{Load, PerformanceReport, PluginPerformance, TrackPerformance};
 pub mod adm;
@@ -1115,6 +1116,8 @@ pub struct Session {
     shuttle: Option<shuttle::Shuttle>,
     /// An ADR cue playing (or recording).
     adr_run: Option<adr::AdrRun>,
+    /// The picture on an output of its own.
+    picture_out: Option<picture_out::PictureOut>,
     metrics: MetricsSnapshot,
     last_metrics: Instant,
     path: Option<PathBuf>,
@@ -1374,6 +1377,7 @@ impl Session {
             shown_position: None,
             shuttle: None,
             adr_run: None,
+            picture_out: None,
             metrics: MetricsSnapshot::default(),
             last_metrics: Instant::now(),
             path: None,
@@ -2088,6 +2092,7 @@ impl Session {
         }
         self.tick_shuttle(!was_playing && self.transport.playing);
         self.tick_adr();
+        self.publish_picture_map();
         if !was_playing && self.transport.playing {
             self.automation_play_requested();
             self.reset_video_stats();

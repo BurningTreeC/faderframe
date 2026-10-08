@@ -229,12 +229,34 @@ struct Shared {
     thumb_budget: usize,
 }
 
+/// Change what is asked and wake the decoders.
+fn ask(shared: &Shared, f: impl FnOnce(&mut Asked)) {
+    let mut a = lock(&shared.asked);
+    f(&mut a);
+    a.generation += 1;
+    drop(a);
+    shared.wake.notify_all();
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 /// Frames read ahead of the one showing while playing.
 const AHEAD: u32 = 12;
+
+/// [`FrameService::picture`] from any thread.
+#[derive(Clone)]
+pub struct FrameHandle {
+    shared: Arc<Shared>,
+}
+
+impl FrameHandle {
+    /// What [`FrameService::picture`] answers.
+    pub fn picture(&self, key: Key, t: i64, max: (u32, u32), want: Want) -> Option<Picture> {
+        FrameService::picture_in(&self.shared, key, t, max, want)
+    }
+}
 
 pub struct FrameService {
     shared: Arc<Shared>,
@@ -274,11 +296,7 @@ impl FrameService {
     }
 
     fn ask(&self, f: impl FnOnce(&mut Asked)) {
-        let mut a = lock(&self.shared.asked);
-        f(&mut a);
-        a.generation += 1;
-        drop(a);
-        self.shared.wake.notify_all();
+        ask(&self.shared, f);
     }
 
     /// Decode `media` as `key` (replacing what was there, e.g. once its
@@ -316,19 +334,29 @@ impl FrameService {
     /// `max` size at most: the best there is now; asking also has it
     /// decoded. `None` outside the video or before anything is decoded.
     pub fn picture(&self, key: Key, t: i64, max: (u32, u32), want: Want) -> Option<Picture> {
+        Self::picture_in(&self.shared, key, t, max, want)
+    }
+
+    fn picture_in(
+        shared: &Arc<Shared>,
+        key: Key,
+        t: i64,
+        max: (u32, u32),
+        want: Want,
+    ) -> Option<Picture> {
         let (n, size) = {
-            let a = lock(&self.shared.asked);
+            let a = lock(&shared.asked);
             let m = a.media.get(&key)?;
             (m.index.frame_at(t)? as u32, m.fit(max))
         };
         let exact = {
-            let mut c = lock(&self.shared.cache);
+            let mut c = lock(&shared.cache);
             c.get((key, n, size.0)).or_else(|| {
                 // A proxy-size frame stands in until the sharp one.
                 c.any_width(key, n).filter(|_| want == Want::Play)
             })
         };
-        self.ask(|a| {
+        ask(shared, |a| {
             let t = Target {
                 n,
                 size,
@@ -353,7 +381,7 @@ impl FrameService {
                 exact: sharp || want == Want::Play,
             });
         }
-        let mut c = lock(&self.shared.cache);
+        let mut c = lock(&shared.cache);
         // The nearest frame there is: before it, or (running in reverse)
         // after it.
         let near = c.any_width(key, n).map(|f| (n, f)).or_else(|| {
@@ -369,6 +397,13 @@ impl FrameService {
             number: m as usize,
             exact: false,
         })
+    }
+
+    /// A handle asking for pictures from another thread (picture outputs).
+    pub fn handle(&self) -> FrameHandle {
+        FrameHandle {
+            shared: Arc::clone(&self.shared),
+        }
     }
 
     /// A filmstrip picture of `key` at frame `n`, `height` pixels high

@@ -80,7 +80,8 @@ fi
     sed "s|$root/$out|@ROOT@|g" >"$loaders/loaders.cache.in"
 # GStreamer, always the bundled one (a system's may need a newer GLib than
 # the bundled one): the plugins video uses (demuxers and muxers, JPEG,
-# conversion, Opus, the H.264/H.265 parsers, MXF and DV, VA hardware decoding -- libva
+# conversion, Opus, the H.264/H.265 parsers, MXF and DV, DeckLink output (the
+# card's driver loaded at run time), VA hardware decoding -- libva
 # and its drivers are the system's) and the plugin scanner; GStreamer's
 # own libraries are moved to lib/gstreamer below.
 gst_dir=$(pkg-config --variable=pluginsdir gstreamer-1.0)
@@ -88,7 +89,7 @@ gst_scanner=$(pkg-config --variable=pluginscannerdir gstreamer-1.0)/gst-plugin-s
 mkdir -p "$out/lib/gstreamer-1.0" "$out/libexec"
 for plugin in coreelements app playback typefindfunctions isomp4 matroska jpeg \
     videoconvertscale audioconvert audioresample audiorate wavparse opus \
-    videoparsersbad va mxf dv; do
+    videoparsersbad va mxf dv decklink; do
     so=$gst_dir/libgst$plugin.so
     if [ -f "$so" ]; then
         cp -L "$so" "$out/lib/gstreamer-1.0/"

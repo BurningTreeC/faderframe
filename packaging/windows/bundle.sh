@@ -61,7 +61,7 @@ fi
 mkdir -p "$out/lib/gstreamer-1.0" "$out/libexec/gstreamer-1.0"
 for plugin in coreelements app playback typefindfunctions isomp4 matroska jpeg \
     videoconvertscale audioconvert audioresample audiorate wavparse opus \
-    videoparsersbad d3d11 d3d12 mxf dv; do
+    videoparsersbad d3d11 d3d12 mxf dv decklink; do
     dll=$prefix/lib/gstreamer-1.0/libgst$plugin.dll
     if [ -f "$dll" ]; then
         cp "$dll" "$out/lib/gstreamer-1.0/"

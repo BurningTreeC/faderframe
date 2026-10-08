@@ -90,6 +90,10 @@ pub struct Preferences {
     pub video_cache_dir: Option<String>,
     /// Video frames shown straight from the decoder (dmabufs, Linux).
     pub video_zero_copy: bool,
+    /// The monitor Video Full Screen goes to (connector and model).
+    pub video_fullscreen_monitor: Option<String>,
+    /// The picture on a Blackmagic DeckLink output: device and mode.
+    pub video_output: Option<(u32, String)>,
 }
 
 impl Default for Preferences {
@@ -135,6 +139,8 @@ impl Default for Preferences {
             video_proxy_height: 540,
             video_cache_dir: None,
             video_zero_copy: true,
+            video_fullscreen_monitor: None,
+            video_output: None,
         }
     }
 }

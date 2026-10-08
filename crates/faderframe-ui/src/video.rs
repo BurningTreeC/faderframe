@@ -138,6 +138,34 @@ fn window_of(app: &Rc<AppState>, view: &ViewId) -> Option<gtk::Window> {
 }
 
 /// Show `view` full screen in a window of its own, or leave full screen.
+/// The monitor full screen goes to (Preferences → Video), if it is
+/// connected.
+fn full_screen_monitor() -> Option<gtk::gdk::Monitor> {
+    let want = crate::prefs::Preferences::load().video_fullscreen_monitor?;
+    let display = gtk::gdk::Display::default()?;
+    let monitors = display.monitors();
+    (0..monitors.n_items())
+        .filter_map(|i| monitors.item(i).and_downcast::<gtk::gdk::Monitor>())
+        .find(|m| monitor_name(m) == want)
+}
+
+/// A monitor's name as Preferences show it (its connector and model).
+pub fn monitor_name(m: &gtk::gdk::Monitor) -> String {
+    let connector = m.connector().map(|c| c.to_string()).unwrap_or_default();
+    match m.model() {
+        Some(model) => format!("{connector} ({model})"),
+        None => connector,
+    }
+}
+
+/// Full screen on the chosen monitor (else where the window is).
+fn go_full_screen(w: &gtk::Window) {
+    match full_screen_monitor() {
+        Some(m) => w.fullscreen_on_monitor(&m),
+        None => w.fullscreen(),
+    }
+}
+
 pub fn full_screen(app: &Rc<AppState>, view: ViewId) {
     let main = app
         .window
@@ -150,7 +178,7 @@ pub fn full_screen(app: &Rc<AppState>, view: ViewId) {
                 w.unfullscreen();
             } else {
                 leave_on_escape(&w);
-                w.fullscreen();
+                go_full_screen(&w);
             }
         }
         // Docked in the main window (or not shown): detach it, then make
@@ -170,7 +198,7 @@ pub fn full_screen(app: &Rc<AppState>, view: ViewId) {
                 match window_of(&app, &view) {
                     Some(w) if Some(&w) != main.as_ref() => {
                         leave_on_escape(&w);
-                        w.fullscreen();
+                        go_full_screen(&w);
                         glib::ControlFlow::Break
                     }
                     _ if tries > 40 => glib::ControlFlow::Break,

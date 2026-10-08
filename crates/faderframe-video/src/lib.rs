@@ -31,6 +31,7 @@ pub mod cuts;
 pub mod decode;
 pub mod index;
 pub mod mux;
+pub mod output;
 pub mod probe;
 pub mod proxy;
 pub mod qt_timecode;
@@ -43,7 +44,7 @@ pub mod zero_copy;
 pub use decode::{Decoder, Frame, fit};
 pub use index::FrameIndex;
 pub use probe::{AudioStream, MediaInfo, VideoStream};
-pub use service::{FrameService, Media, Picture, Want};
+pub use service::{FrameHandle, FrameService, Media, Picture, Want};
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

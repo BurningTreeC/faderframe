@@ -416,3 +416,50 @@ fn the_shuttle_runs_back_and_frames_step() {
     s.stop_audio();
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A picture output of its own (as a DeckLink card): paced by the output
+/// (25 frames a second here), showing the picture the sound is at.
+#[test]
+fn the_picture_goes_to_an_output_of_its_own() {
+    use faderframe_video::output::Sink;
+    let _turn = turn();
+    let d = dir("output");
+    let file = movie(&d);
+    let mut s = Session::new(Project::new("Film", 48_000), None, EngineConfig::default()).unwrap();
+    s.import_video(file, false);
+    s.wait_for_video();
+    s.start_audio(
+        vec![Box::new(DummyBackend::default())],
+        &AudioPreferences::default(),
+    )
+    .unwrap();
+    s.set_picture_output(Some(Sink::Test {
+        size: (160, 90),
+        fps: (25, 1),
+    }))
+    .unwrap();
+    s.dispatch(Action::Transport(TransportAction::Play))
+        .unwrap();
+    let start = Instant::now();
+    let mut seen = Vec::new();
+    while start.elapsed() < Duration::from_millis(2000) {
+        s.tick(0.01);
+        if let Some((_, n, last)) = s.picture_output() {
+            seen.push((start.elapsed(), n, last));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    s.dispatch(Action::Transport(TransportAction::Stop))
+        .unwrap();
+    let (t0, n0, _) = seen[seen.len() / 4];
+    let (t1, n1, last) = *seen.last().unwrap();
+    let rate = (n1 - n0) as f64 / (t1 - t0).as_secs_f64();
+    assert!((20.0..30.0).contains(&rate), "{rate} frames a second out");
+    // The picture moves with the sound: about two seconds in.
+    let last = last.expect("a picture, not black");
+    assert!((25..=60).contains(&last), "frame {last} after 2 s");
+    s.set_picture_output(None).unwrap();
+    assert!(s.picture_output().is_none());
+    s.stop_audio();
+    let _ = std::fs::remove_dir_all(&d);
+}
