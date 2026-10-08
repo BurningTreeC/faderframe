@@ -134,6 +134,9 @@ pub struct Project {
     /// The words along the timeline (transcribed or typed), by start.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lyrics: Vec<crate::lyrics::LyricLine>,
+    /// The ADR cue list.
+    #[serde(default, skip_serializing_if = "crate::adr::Adr::is_empty")]
+    pub adr: crate::adr::Adr,
     /// The clip launcher's scenes and slots.
     #[serde(default, skip_serializing_if = "crate::launcher::Launcher::is_empty")]
     pub launcher: crate::launcher::Launcher,
@@ -184,6 +187,7 @@ impl Project {
             keys: Vec::new(),
             chords: Vec::new(),
             lyrics: Vec::new(),
+            adr: Default::default(),
             launcher: crate::launcher::Launcher::default(),
             clip_links: BTreeMap::new(),
             video: crate::video::Video::default(),
@@ -645,6 +649,7 @@ impl Project {
         max_id = max_id
             .max(self.sources.keys().map(|k| k.raw()).max().unwrap_or(0))
             .max(self.markers.iter().map(|m| m.id.raw()).max().unwrap_or(0))
+            .max(self.adr.cues.iter().map(|c| c.id.raw()).max().unwrap_or(0))
             .max(
                 self.launcher
                     .scenes

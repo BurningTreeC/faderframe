@@ -132,6 +132,14 @@ impl Session {
         if let Some(t) = timecode {
             commands.push(Command::SetTimecode { timecode: Some(t) });
         }
+        if !self.project.adr.cues.is_empty() {
+            commands.push(Command::SetAdr {
+                adr: Box::new(faderframe_project::conform::conformed_cues(
+                    &self.project,
+                    &pieces,
+                )),
+            });
+        }
         commands.push(Command::SetArrangement {
             arrangement: Box::new(arrangement),
         });

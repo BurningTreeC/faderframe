@@ -495,6 +495,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             ("DDP Player", "app.show-ddp"),
             ("Video", "app.show-video"),
             ("Video Full Screen", "app.video-full-screen"),
+            ("ADR Cue List", "app.show-adr"),
             ("Show / Hide Bottom Dock", "app.toggle-dock"),
             ("Master Strip at the Side", "app.master-panel"),
         ]),

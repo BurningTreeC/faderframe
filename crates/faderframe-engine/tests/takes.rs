@@ -42,6 +42,7 @@ fn comp_selects_takes_with_crossfades() {
         start,
         end,
         gain_db: 0.0,
+        rating: 0,
     };
     let ta = f.add_take(take("A", a, 0, 16_000));
     let tb = f.add_take(take("B", b, 4_000, 16_000));

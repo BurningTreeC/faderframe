@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod adr;
 pub mod automation;
 pub mod media;
 mod meters;
@@ -460,6 +461,8 @@ pub enum Action {
     Shuttle(shuttle::ShuttleOp),
     /// Conform the session to a new picture cut.
     Conform(conform::ConformOp),
+    /// ADR: the cue list, beeps, cue runs, take ratings.
+    Adr(adr::AdrOp),
     /// Show a view full screen in a window of its own (again: leave).
     FullScreen(ViewId),
     /// Keep the project's set-up (everything but its content) as the
@@ -1110,6 +1113,8 @@ pub struct Session {
     shown_position: Option<(i64, u32, Instant)>,
     /// J/K/L shuttle in motion.
     shuttle: Option<shuttle::Shuttle>,
+    /// An ADR cue playing (or recording).
+    adr_run: Option<adr::AdrRun>,
     metrics: MetricsSnapshot,
     last_metrics: Instant,
     path: Option<PathBuf>,
@@ -1368,6 +1373,7 @@ impl Session {
             transport: TransportSnapshot::default(),
             shown_position: None,
             shuttle: None,
+            adr_run: None,
             metrics: MetricsSnapshot::default(),
             last_metrics: Instant::now(),
             path: None,
@@ -2081,6 +2087,7 @@ impl Session {
             }
         }
         self.tick_shuttle(!was_playing && self.transport.playing);
+        self.tick_adr();
         if !was_playing && self.transport.playing {
             self.automation_play_requested();
             self.reset_video_stats();
@@ -3267,6 +3274,7 @@ impl Session {
             Action::Video(op) => self.video_op(op)?,
             Action::Shuttle(op) => self.shuttle_op(op)?,
             Action::Conform(op) => self.conform_op(op)?,
+            Action::Adr(op) => self.adr_op(op)?,
             Action::FullScreen(view) => self.ui_requests.push(UiRequest::FullScreen(view)),
             Action::ShowTemplates => self.ui_requests.push(UiRequest::Templates),
             Action::DeleteTemplate(path) => {

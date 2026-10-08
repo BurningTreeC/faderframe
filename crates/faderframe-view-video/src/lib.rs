@@ -201,6 +201,68 @@ impl VideoView {
         }
     }
 
+    /// The cue over the picture `a`.
+    fn paint_adr(p: &mut dyn Painter, a: Rect, o: &faderframe_session::adr::AdrOverlay) {
+        let white = Color::rgb(1.0, 1.0, 1.0);
+        let solid = faderframe_ui_canvas::Paint::Solid;
+        p.push_clip(a);
+        if let Some(x) = o.streamer {
+            let x = a.x + x * a.w;
+            p.fill(Rect::new(x - 4.0, a.y, 8.0, a.h), white.with_alpha(0.85));
+            p.fill(Rect::new(x - 10.0, a.y, 6.0, a.h), white.with_alpha(0.25));
+        }
+        if o.punch {
+            let d = a.h.min(a.w) * 0.35;
+            let r = Rect::new(a.x + (a.w - d) / 2.0, a.y + (a.h - d) / 2.0, d, d);
+            p.fill_rounded(r, d / 2.0, &solid(white.with_alpha(0.8)));
+        }
+        // The line, boxed at the bottom third.
+        let who = if o.character.is_empty() {
+            format!("{} ·", o.number)
+        } else {
+            format!("{} · {}:", o.number, o.character)
+        };
+        let line = format!("{who} {}", o.text);
+        let colour = if o.speaking {
+            Color::rgb(1.0, 0.95, 0.55)
+        } else {
+            white
+        };
+        let style = TextStyle::new(16.0, colour)
+            .weight(FontWeight::Bold)
+            .align(Align::Center);
+        let bw = (p.text_width(&line, &style) + 32.0).min(a.w - 16.0);
+        let b = Rect::new(a.x + (a.w - bw) / 2.0, a.y + a.h * 0.72, bw, 30.0);
+        p.fill_rounded(b, 5.0, &solid(Color::rgba(0.0, 0.0, 0.0, 0.7)));
+        p.text(&line, b, &style);
+        // Recording, and the beeps to come.
+        let mut x = a.x + 12.0;
+        let y = a.y + 40.0;
+        if o.recording {
+            let r = Rect::new(x, y, 44.0, 20.0);
+            p.fill_rounded(r, 4.0, &solid(Color::hex(0xd83030)));
+            p.text(
+                "REC",
+                r,
+                &TextStyle::new(11.0, white)
+                    .weight(FontWeight::Bold)
+                    .align(Align::Center),
+            );
+            x += 52.0;
+        }
+        if let Some(n) = o.beeps_left
+            && n > 0
+        {
+            let back = Rect::new(x - 4.0, y, n as f32 * 18.0 + 2.0, 20.0);
+            p.fill_rounded(back, 4.0, &solid(Color::rgba(0.0, 0.0, 0.0, 0.7)));
+            for i in 0..n {
+                let r = Rect::new(x + i as f32 * 18.0, y + 4.0, 12.0, 12.0);
+                p.fill_rounded(r, 6.0, &solid(white.with_alpha(0.9)));
+            }
+        }
+        p.pop_clip();
+    }
+
     /// A small label in the corner of a compared picture.
     fn tag(p: &mut dyn Painter, text: &str, at: Point) {
         let w = text.chars().count() as f32 * 6.4 + 12.0;
@@ -342,6 +404,21 @@ impl CanvasView<Session, Action> for VideoView {
                 &faderframe_ui_canvas::Paint::Solid(Color::rgba(0.0, 0.0, 0.0, 0.6)),
             );
             p.text(&what, ib, &info);
+        }
+        // ADR: the streamer crossing the picture before the line, the punch
+        // where it starts, the line and the beeps still to come.
+        let at = shown
+            .as_ref()
+            .map_or(model.transport().position, |v| v.position);
+        if let Some(o) = model.adr_overlay(at) {
+            // Over the picture (not the letterbox).
+            let area = shown
+                .as_ref()
+                .and_then(|v| v.picture.as_ref())
+                .map_or(Rect::from_size(size), |pic| {
+                    Self::fit(pic.frame.width as f32, pic.frame.height as f32, size)
+                });
+            Self::paint_adr(p, area, &o);
         }
         // The late-frame meter: frames shown while playing and how many
         // were not the one wanted when they reached the screen.

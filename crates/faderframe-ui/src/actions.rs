@@ -298,6 +298,7 @@ pub fn install(app: &Rc<AppState>) {
             "show-video",
             A::Workspace(W::ShowView(ViewId::video())),
         ),
+        dispatch(app, "show-adr", A::Workspace(W::ShowView(ViewId::adr()))),
         entry(app, "import-video", crate::video::import),
         entry(app, "conform-lists", crate::video::conform_lists),
         dispatch(
@@ -1272,6 +1273,65 @@ pub fn install(app: &Rc<AppState>) {
                 path: arg.into(),
                 sound: true,
             }));
+        }),
+        // Development aid: `adr:<from-transcript|add=<s>-<s>[=<line>]|beeps|
+        // run=<n>|record=<n>|track=<n>=<track name>>` (cues counted from 0).
+        named("adr", |a, arg| {
+            use faderframe_session::adr::AdrOp;
+            let (cmd, rest) = arg.split_once('=').unwrap_or((arg, ""));
+            let (cues, at, track_of) = {
+                let s = a.session.borrow();
+                let p = s.project();
+                let cues: Vec<_> = p.adr.cues.clone();
+                let rate = p.sample_rate as f64;
+                let tl = p.timeline.clone();
+                let track_of = |name: &str| p.tracks.iter().find(|t| t.name == name).map(|t| t.id);
+                let first_audio = p
+                    .tracks
+                    .iter()
+                    .find(|t| t.kind == faderframe_project::TrackKind::Audio)
+                    .map(|t| t.id);
+                (
+                    cues,
+                    move |secs: f64| tl.to_musical((secs * rate) as i64, rate),
+                    (
+                        track_of(rest.split_once('=').map_or("", |x| x.1)),
+                        first_audio,
+                    ),
+                )
+            };
+            let nth = |t: &str| t.trim().parse::<usize>().ok().and_then(|n| cues.get(n));
+            let op = match cmd {
+                "from-transcript" => Some(AdrOp::FromTranscript { track: track_of.1 }),
+                "beeps" => Some(AdrOp::MakeBeeps),
+                "add" => {
+                    let (span, text) = rest.split_once('=').unwrap_or((rest, ""));
+                    span.split_once('-').and_then(|(x, y)| {
+                        Some(AdrOp::Add {
+                            start: at(x.trim().parse().ok()?),
+                            end: at(y.trim().parse().ok()?),
+                            text: text.to_string(),
+                            track: track_of.1,
+                        })
+                    })
+                }
+                "run" | "record" => nth(rest).map(|c| AdrOp::Run {
+                    cue: c.id,
+                    record: cmd == "record",
+                }),
+                "track" => rest.split_once('=').and_then(|(n, _)| {
+                    let c = nth(n)?;
+                    Some(AdrOp::Set(faderframe_project::adr::AdrCue {
+                        track: track_of.0,
+                        ..c.clone()
+                    }))
+                }),
+                _ => None,
+            };
+            match op {
+                Some(op) => a.dispatch(Action::Adr(op)),
+                None => tracing::warn!("adr: cannot do '{arg}'"),
+            }
         }),
         // Development aid: `conform-lists:<old list>|<new list>`.
         named("conform-lists", |a, arg| match arg.split_once('|') {

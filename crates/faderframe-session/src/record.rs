@@ -570,6 +570,7 @@ pub(crate) fn place_takes(
                     start: rel,
                     end: rel + a.length,
                     gain_db: a.gain_db,
+                    rating: 0,
                 });
                 folder.set_comp(rel, rel + a.length, Some(i));
             }
@@ -605,6 +606,7 @@ pub(crate) fn place_takes(
             start: rel,
             end: rel + len,
             gain_db: 0.0,
+            rating: 0,
         });
         folder.set_comp(rel, rel + len, Some(i));
     }

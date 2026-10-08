@@ -256,6 +256,7 @@ fn session_with_takes() -> (Session, ClipId, usize) {
             start: 0,
             end: a.length,
             gain_db: 0.0,
+            rating: 0,
         });
     }
     f.use_take(2);

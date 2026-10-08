@@ -98,6 +98,12 @@ fn create_view(app: &Rc<AppState>, kind: ViewKind) -> ViewHost {
             false,
             false,
         ),
+        ViewKind::Adr => ViewHost::new(
+            app,
+            Box::new(faderframe_view_adr::AdrView::new(theme)),
+            false,
+            true,
+        ),
         ViewKind::History => ViewHost::new(
             app,
             Box::new(faderframe_view_history::HistoryView::new(theme)),

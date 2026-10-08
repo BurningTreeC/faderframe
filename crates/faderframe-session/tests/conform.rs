@@ -134,6 +134,21 @@ fn a_new_cut_from_two_edls() {
          003  A001  V  C  10:00:03:00 10:00:10:00 01:00:07:00 01:00:14:00\n",
     )
     .unwrap();
+    // An ADR cue on the line at 12 s.
+    let (c0, c1) = {
+        let tl = &s.project().timeline;
+        (
+            tl.to_musical(12 * S, SR as f64),
+            tl.to_musical(13 * S, SR as f64),
+        )
+    };
+    s.dispatch(Action::Adr(faderframe_session::adr::AdrOp::Add {
+        start: c0,
+        end: c1,
+        text: "line 4".into(),
+        track: Some(t),
+    }))
+    .unwrap();
     let before = parts(&s, t);
     s.dispatch(Action::Conform(ConformOp::Lists {
         old: old.clone(),
@@ -158,6 +173,9 @@ fn a_new_cut_from_two_edls() {
         .collect();
     assert!(names.contains(&("line 4", 2 * S)), "{names:?}");
     assert!(names.contains(&("New shot 1", 5 * S)), "{names:?}");
+    // The cue went with its line.
+    let cue = &p.adr.cues[0];
+    assert_eq!(p.timeline.to_samples(cue.start, SR as f64), 2 * S);
     // One undo step.
     s.dispatch(Action::Undo).unwrap();
     assert_eq!(parts(&s, t), before);

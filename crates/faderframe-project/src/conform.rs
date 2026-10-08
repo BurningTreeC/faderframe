@@ -36,6 +36,30 @@ fn edit_fade(rate: u32) -> i64 {
     (rate as i64 / 200).max(1)
 }
 
+/// `p`'s ADR cues moved with their pieces (those cut out go).
+pub fn conformed_cues(p: &Project, pieces: &[Piece]) -> crate::adr::Adr {
+    let r = p.sample_rate as f64;
+    let tl = &p.timeline;
+    let mut adr = p.adr.clone();
+    adr.cues = p
+        .adr
+        .cues
+        .iter()
+        .filter_map(|c| {
+            let s = tl.to_samples(c.start, r);
+            let q = pieces.iter().find(|q| q.holds(s))?;
+            let len = tl.to_samples(c.end, r) - s;
+            let start = q.place(s);
+            Some(crate::adr::AdrCue {
+                start: tl.to_musical(start.max(0), r),
+                end: tl.to_musical((start + len).max(0), r),
+                ..c.clone()
+            })
+        })
+        .collect();
+    adr
+}
+
 /// `p`'s timeline content rearranged by `pieces`.
 pub fn conformed(p: &Project, pieces: &[Piece]) -> Arrangement {
     let rate = p.sample_rate;

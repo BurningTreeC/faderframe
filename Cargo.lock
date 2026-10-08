@@ -1171,6 +1171,7 @@ dependencies = [
  "faderframe-ui-canvas",
  "faderframe-ui-gpu",
  "faderframe-video",
+ "faderframe-view-adr",
  "faderframe-view-album",
  "faderframe-view-arranger",
  "faderframe-view-automation",
@@ -1237,6 +1238,18 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tracing",
+]
+
+[[package]]
+name = "faderframe-view-adr"
+version = "0.16.0"
+dependencies = [
+ "faderframe-core",
+ "faderframe-engine",
+ "faderframe-project",
+ "faderframe-session",
+ "faderframe-timeline",
+ "faderframe-ui-canvas",
 ]
 
 [[package]]

@@ -419,6 +419,10 @@ pub enum Command {
     SetLyrics {
         lyrics: Vec<crate::lyrics::LyricLine>,
     },
+    /// Replace the ADR cue list and its settings.
+    SetAdr {
+        adr: Box<crate::adr::Adr>,
+    },
     /// Replace the picture (video tracks, clips, files, offset;
     /// normalised: clips by start).
     SetVideo {
@@ -740,6 +744,7 @@ impl Command {
             SetKeys { .. } => "Change Key".into(),
             SetChords { .. } => "Edit Chords".into(),
             SetLyrics { .. } => "Edit Lyrics".into(),
+            SetAdr { .. } => "Edit ADR Cues".into(),
             SetVideo { .. } => "Edit Video".into(),
             SetTimecode { .. } => "Change Timecode".into(),
             SetLauncherSlot { .. } => "Launcher Clip".into(),
@@ -829,6 +834,7 @@ impl Command {
             | SetClipLink { .. }
             | SetAlbum { .. }
             | SetLyrics { .. }
+            | SetAdr { .. }
             | SetVideo { .. }
             | SetTimecode { .. }
             | SetScenes { .. }
@@ -1750,6 +1756,12 @@ impl Command {
                 crate::lyrics::normalize(&mut lyrics);
                 SetLyrics {
                     lyrics: std::mem::replace(&mut p.lyrics, lyrics),
+                }
+            }
+            SetAdr { mut adr } => {
+                adr.tidy();
+                SetAdr {
+                    adr: Box::new(std::mem::replace(&mut p.adr, *adr)),
                 }
             }
             SetVideo { mut video } => {

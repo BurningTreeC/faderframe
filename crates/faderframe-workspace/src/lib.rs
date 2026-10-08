@@ -81,6 +81,10 @@ impl ViewId {
         Self::new("surround")
     }
 
+    pub fn adr() -> Self {
+        Self::new("adr")
+    }
+
     pub fn modulators() -> Self {
         Self::new("modulators")
     }

@@ -32,10 +32,12 @@ pub enum ViewKind {
     Surround,
     /// The picture.
     Video,
+    /// The ADR cue list.
+    Adr,
 }
 
 impl ViewKind {
-    pub const ALL: [ViewKind; 15] = [
+    pub const ALL: [ViewKind; 16] = [
         ViewKind::Arranger,
         ViewKind::Mixer,
         ViewKind::PianoRoll,
@@ -51,6 +53,7 @@ impl ViewKind {
         ViewKind::Ddp,
         ViewKind::Surround,
         ViewKind::Video,
+        ViewKind::Adr,
     ];
 
     /// The kind whose default view has this id (views added after a layout
@@ -76,6 +79,7 @@ impl ViewKind {
             ViewKind::Ddp => "DDP Player",
             ViewKind::Surround => "Surround Panner",
             ViewKind::Video => "Video",
+            ViewKind::Adr => "ADR Cues",
         }
     }
 
@@ -96,6 +100,7 @@ impl ViewKind {
             ViewKind::Ddp => ViewId::ddp(),
             ViewKind::Surround => ViewId::surround(),
             ViewKind::Video => ViewId::video(),
+            ViewKind::Adr => ViewId::adr(),
         }
     }
 }

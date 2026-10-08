@@ -75,6 +75,10 @@ define_id!(
     MarkerId, "marker#"
 );
 define_id!(
+    /// A cue of dialogue to replace (ADR).
+    AdrCueId, "cue#"
+);
+define_id!(
     /// A song of the album.
     SongId, "song#"
 );

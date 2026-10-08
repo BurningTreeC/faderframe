@@ -35,6 +35,13 @@ pub struct Take {
     pub end: i64,
     #[serde(default)]
     pub gain_db: f32,
+    /// How good it is: 0 (not rated) to 5 stars.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rating: u8,
+}
+
+fn is_zero(v: &u8) -> bool {
+    *v == 0
 }
 
 impl Take {
@@ -304,6 +311,7 @@ mod tests {
                 start: 0,
                 end: len,
                 gain_db: 0.0,
+                rating: 0,
             });
         }
         f

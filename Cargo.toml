@@ -39,6 +39,7 @@ faderframe-plugin-vst3 = { path = "crates/faderframe-plugin-vst3" }
 faderframe-plugin-sandbox = { path = "crates/faderframe-plugin-sandbox" }
 faderframe-disc = { path = "crates/faderframe-disc" }
 faderframe-conform = { path = "crates/faderframe-conform" }
+faderframe-view-adr = { path = "crates/faderframe-view-adr" }
 faderframe-video = { path = "crates/faderframe-video" }
 faderframe-view-video = { path = "crates/faderframe-view-video" }
 faderframe-plugin-au = { path = "crates/faderframe-plugin-au" }
