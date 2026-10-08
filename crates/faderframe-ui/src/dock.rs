@@ -556,6 +556,15 @@ pub(crate) const DOCK_VIEWS: [DockView; 16] = [
 
 /// Tick the View menu's views that are on screen, and the bottom dock
 /// when it shows.
+/// The View menu's checks: every view in the layout (docked, in a tab
+/// behind another or in a window of its own), not only the ones in front.
+fn checked_views(layout: &faderframe_workspace::WorkspaceLayout) -> Vec<(&'static str, bool)> {
+    DOCK_VIEWS
+        .iter()
+        .map(|(name, id)| (*name, layout.is_placed(&id())))
+        .collect()
+}
+
 pub(crate) fn sync_view_actions(app: &Rc<AppState>) {
     let Ok(s) = app.session.try_borrow() else {
         return;
@@ -571,8 +580,8 @@ pub(crate) fn sync_view_actions(app: &Rc<AppState>) {
             a.set_state(&on.to_variant());
         }
     };
-    for (name, id) in DOCK_VIEWS {
-        set(&format!("view-{name}"), layout.is_showing(&id()));
+    for (name, on) in checked_views(layout) {
+        set(&format!("view-{name}"), on);
     }
     set(
         "dock-bottom",
@@ -580,4 +589,35 @@ pub(crate) fn sync_view_actions(app: &Rc<AppState>) {
             .area(&DockAreaId::bottom())
             .is_some_and(|g| g.is_visible()),
     );
+}
+
+#[cfg(test)]
+mod view_menu_tests {
+    use super::*;
+
+    /// Every docked view is checked, those in tabs behind another too.
+    #[test]
+    fn every_docked_view_is_checked() {
+        let set = faderframe_workspace::WorkspaceSet::default();
+        let mut behind = 0;
+        for w in &set.workspaces {
+            let layout = &w.layout;
+            let checked = checked_views(layout);
+            for (name, id) in DOCK_VIEWS {
+                let on = checked.iter().find(|(n, _)| *n == name).map(|c| c.1);
+                assert_eq!(on, Some(layout.is_placed(&id())), "{name}");
+            }
+            // A layout with tabs behind others checks them all.
+            let hidden: Vec<_> = DOCK_VIEWS
+                .iter()
+                .filter(|(_, id)| layout.is_placed(&id()) && !layout.is_showing(&id()))
+                .map(|(n, _)| *n)
+                .collect();
+            behind += hidden.len();
+            for n in hidden {
+                assert!(checked.contains(&(n, true)), "{n} is docked but unchecked");
+            }
+        }
+        assert!(behind > 0, "the default workspaces have tabs behind others");
+    }
 }
