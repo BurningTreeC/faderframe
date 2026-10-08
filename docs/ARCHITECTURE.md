@@ -2964,8 +2964,20 @@ and the tempo map, and track colours from a colour chooser.
 
 Shell: docking and detaching, workspaces (Recording, Editing, Mixing,
 MIDI, Mastering), eight skins switched live, performance meter,
-preferences, recent projects and start-up choice. Windows and macOS builds
-and packages for all three platforms (see §14).
+preferences, recent projects and start-up choice, project templates (a
+project's set-up without its content; a default one for New Project).
+Windows and macOS builds and packages for all three platforms (see §14).
+
+Picture (video, phase 1): `faderframe-video` on GStreamer as a library
+(probe, a demux-only frame index, exact-frame decoding, MJPEG proxies,
+sound from video, muxing with the picture copied, a frame service with
+player, seeker and thumbnailer threads); video tracks in absolute time
+with the project's SMPTE timecode (every rate, drop-frame); the presenter
+showing the frame for the sample heard when it reaches the screen (the
+audio engine is the clock); the video window (docked, detached, full
+screen, timecode overlay), the arranger's Video lane, picture offset,
+the flash-and-beep sync test and Export Movie. Create Output Tracks gives
+every output of a multi-output plugin, the main too, a track of its own.
 
 **Next**, roughly in order (waves from a survey of what Live, Bitwig,
 Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
@@ -3019,6 +3031,93 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
     ~~Binaural monitoring~~ — done (see *Listening*). ~~Consumer object
     formats~~ — IAMF done (see *IAMF masters*; MPEG-H is out — no open
     encoder, a paid spec and per-unit patent royalties).
+
+**Then**, after the survey's waves, roughly in order (open work first,
+then ideas: what FaderFrame's pieces make possible, and pro features no
+DAW does well yet):
+
+11. **Time-locked audio**: tracks (or clips) placed in absolute time, as
+    video tracks are. Audio clips are placed musically today, so a
+    movie's sound moves with a tempo change while its picture does not —
+    the gap that matters most for scoring to picture.
+12. **Video, phase 2 — display and playback**: zero-copy display (dmabuf
+    on Wayland, shared D3D12 textures on Windows) and decoding at device
+    pixels on HiDPI screens; a late-frame meter (the session counts
+    already) and presentation feedback; shuttle and reverse play from the
+    proxies; several video tracks with A/B (side by side or wiped; the
+    model has tracks, the UI adds none yet); trimming clips in the lane
+    and exporting a trimmed span (cut at keyframes, or an edit list); a
+    timecode track in exported movies and timecode in the transport
+    display; proxy settings (size, where they live, clearing the cache);
+    cut detection to markers. Try video in the Windows and macOS packages
+    on real machines.
+13. **Video, phase 3 — post-production**: ADR (cues from Whisper's
+    transcript, streamers and punches over the picture, beeps, takes
+    rated in their folders); conform from EDL/OTIO, helped by cut
+    detection; SDI output through Blackmagic DeckLink (read its SDK's
+    licence first); MXF through an LGPL FFmpeg; colour management and HDR.
+14. **Gaps**: MIDI learn for solo, record arm, modulator macros and the
+    Surround Panner window; hardware inserts (a send and return with the
+    round trip measured by a ping and compensated); the Guitar Station's
+    microphones as outputs of their own (close and room on separate
+    tracks); ARA hosting (Melodyne, SpectraLayers; the ARA SDK is
+    Apache-2.0); Comp76Fx's port (with its author's go-ahead); stem
+    separation (still waiting for permissively licensed weights);
+    `rendering_ahead_does_not_allocate_on_the_audio_thread`'s rare timing
+    failure under load.
+15. **Ideas from what FaderFrame has**:
+    - *Lead sheets from a recording*: the melody (audio to MIDI, the pitch
+      editor), chords (the chord track or their detection), words
+      (Whisper), key and tempo, as MusicXML or a PDF — end to end, which
+      no DAW does.
+    - *Comping by lyric*: Whisper's word timings on every take; choose
+      the best take word by word, the syllable shown under each note in
+      the pitch editor.
+    - *Tempo through hit points*: cut detection on the picture and
+      markers, and a solver for the smoothest tempo curve that lands
+      every hit on a beat.
+    - *A/V calibration by itself*: the flash-and-beep test seen by a
+      webcam (GStreamer captures it) and heard by a microphone gives the
+      picture offset.
+    - *Head-tracked binaural monitoring*: a phone's motion sensors over
+      OSC (supported already) turn the binaural scene.
+    - *Panning that follows the picture*: an object tracked on screen
+      becomes the automation of an object or surround pan.
+    - *Circuit-modelled console summing*: the circuit solver behind the
+      preamps and the Guitar Station as transformer and summing colour
+      per channel and bus.
+    - *Auditioning the undo history*: every edit is a command, so the
+      mix as it was some steps ago can play beside the mix as it is (A/B)
+      without undoing anything.
+16. **Pro features no DAW does well yet**:
+    - *Auto-align*: delay and polarity between overheads, close and room
+      microphones by cross-correlation, set in one undo step; and a
+      project health check (phase, DC offset, clipping inside chains,
+      unused plugins costing DSP).
+    - *Reference tracks*: a loudness-matched A/B player in the monitor
+      path, its spectral balance compared and handed to EQ Match.
+    - *A masking map*: the EQ's collision detection between every pair
+      of tracks, with suggested cuts.
+    - *Spectral editing*: a spectrogram to paint noises away in (from the
+      EQ's STFT stage and the warp engine).
+    - *Mix scenes*: console snapshots recalled, compared and crossfaded.
+    - *Song structure from a jam*: self-similarity of the chroma finds
+      verses and choruses as sections and markers.
+    - *Adaptive music for games*: sections and launcher scenes with
+      transition rules, exported as stems and metadata for Wwise or FMOD.
+    - *Show mode*: songs back to back with click and backing tracks to
+      in-ear outputs and program changes to external gear per song (from
+      the album).
+17. **Further out**: MIDI 2.0 (UMP: high-resolution controllers; ALSA and
+    CoreMIDI carry it now); screen-reader accessibility (the canvas views
+    need an accessibility tree — rare among DAWs and meaningful); merging
+    project versions (three-way, from `faderframe_project::compare`) for
+    collaborators; singing into MIDI live (real-time pitch tracking of an
+    input driving an instrument).
+
+Suggested next: 11 and the auto-align of 16, then reference tracks and
+lead sheets — the first three everyday tools, the last one FaderFrame's
+own.
 
 
 ### Guitar Station
