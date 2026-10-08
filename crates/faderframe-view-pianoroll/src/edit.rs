@@ -1190,6 +1190,25 @@ impl PianoRollView {
         items.push(op("Double Length", NoteOp::ScaleLength(2.0)).separated());
         items.push(op("Half Length", NoteOp::ScaleLength(0.5)));
         items.push(op("Mute / Unmute (M)", NoteOp::ToggleMuted).separated());
+        // The channel the notes play on (checked when they share one).
+        let shared = Self::clip(model).and_then(|(_, _, m)| {
+            let mut picked = m
+                .notes
+                .iter()
+                .filter(|n| notes.is_empty() || notes.contains(&n.id))
+                .map(|n| n.channel);
+            let first = picked.next()?;
+            picked.all(|c| c == first).then_some(first)
+        });
+        items.push(MenuItem::submenu(
+            "Channel",
+            (0..16u8)
+                .map(|c| {
+                    op(&format!("Channel {}", c + 1), NoteOp::SetChannel(c))
+                        .checked(shared == Some(c))
+                })
+                .collect(),
+        ));
         for (i, v) in [40u8, 64, 90, 110, 127].into_iter().enumerate() {
             let item = op(&format!("Velocity {v}"), NoteOp::SetVelocity(v));
             items.push(if i == 0 { item.separated() } else { item });

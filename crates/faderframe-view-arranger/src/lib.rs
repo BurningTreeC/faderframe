@@ -2534,6 +2534,33 @@ impl ArrangerView {
                 "Edit in Piano Roll",
                 Action::OpenClipEditor(clip.id),
             ));
+            // Every note and controller value of the clips onto a channel.
+            let midi: Vec<ClipId> = targets
+                .iter()
+                .copied()
+                .filter(|c| {
+                    model
+                        .project()
+                        .clip(*c)
+                        .is_some_and(|c| c.as_midi().is_some())
+                })
+                .collect();
+            let now = model.midi_channel_of(&midi);
+            items.push(MenuItem::submenu(
+                "MIDI Channel",
+                (0..16u8)
+                    .map(|c| {
+                        MenuItem::new(
+                            format!("Channel {}", c + 1),
+                            Action::SetMidiChannel {
+                                clips: midi.clone(),
+                                channel: c,
+                            },
+                        )
+                        .checked(now == Some(c))
+                    })
+                    .collect(),
+            ));
         }
         if let Some(a) = clip.as_audio() {
             items.push(MenuItem::new(

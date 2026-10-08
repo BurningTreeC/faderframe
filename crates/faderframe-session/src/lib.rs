@@ -19,6 +19,7 @@ pub mod automation;
 pub mod media;
 mod meters;
 pub mod midi;
+pub mod midi_events;
 pub mod modulators;
 pub mod notes;
 pub mod performance;
@@ -734,6 +735,29 @@ pub enum Action {
     RemoveSysex {
         clip: ClipId,
         index: usize,
+    },
+    /// The event list: change one field of one event.
+    EditMidiEvent {
+        clip: ClipId,
+        event: midi_events::EventRef,
+        field: midi_events::EventField,
+        value: midi_events::EventValue,
+    },
+    RemoveMidiEvents {
+        clip: ClipId,
+        events: Vec<midi_events::EventRef>,
+    },
+    /// A new event at a project position on a channel.
+    AddMidiEvent {
+        clip: ClipId,
+        what: midi_events::NewEvent,
+        at: MusicalTime,
+        channel: u8,
+    },
+    /// Every note and controller value of MIDI clips onto one channel.
+    SetMidiChannel {
+        clips: Vec<ClipId>,
+        channel: u8,
     },
     /// Ask the shell for a `.syx` file to add to a clip at `at`.
     RequestSysexImport {
@@ -3627,6 +3651,22 @@ impl Session {
             } => self.set_note_expression(clip, note, kind, from, to, &points)?,
             Action::AddSysex { clip, at, messages } => self.add_sysex(clip, at, messages)?,
             Action::RemoveSysex { clip, index } => self.remove_sysex(clip, index)?,
+            Action::EditMidiEvent {
+                clip,
+                event,
+                field,
+                value,
+            } => self.edit_midi_event(clip, event, field, value)?,
+            Action::RemoveMidiEvents { clip, events } => self.remove_midi_events(clip, &events)?,
+            Action::AddMidiEvent {
+                clip,
+                what,
+                at,
+                channel,
+            } => {
+                self.add_midi_event(clip, what, at, channel)?;
+            }
+            Action::SetMidiChannel { clips, channel } => self.set_midi_channel(&clips, channel)?,
             Action::SendSysex { output, messages } => self.send_sysex(&output, messages)?,
             Action::RequestSysexImport { clip, at } => {
                 self.ui_requests.push(UiRequest::ImportSysex { clip, at });
