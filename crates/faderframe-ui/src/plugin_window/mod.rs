@@ -311,13 +311,16 @@ fn outputs_button(app: &Rc<AppState>, plugin: PluginInstanceId) -> Option<gtk::M
             }
             .replace('_', "__");
             let item = gtk::gio::MenuItem::new(Some(&label), None);
-            if o.track.is_none() {
-                let target = format!("{}\n{}", plugin.raw(), o.bus);
-                item.set_action_and_target_value(
-                    Some("app.create-output-tracks"),
-                    Some(&target.to_variant()),
-                );
-            }
+            // Ticked: a track takes it, and choosing it again removes that.
+            let target = format!("{}\n{}", plugin.raw(), o.bus);
+            item.set_action_and_target_value(
+                Some(if o.track.is_none() {
+                    "app.create-output-tracks"
+                } else {
+                    "app.remove-output-track"
+                }),
+                Some(&target.to_variant()),
+            );
             one.append_item(&item);
         }
         menu.append_section(Some("One Output"), &one);

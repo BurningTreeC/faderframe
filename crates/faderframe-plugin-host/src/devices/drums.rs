@@ -215,6 +215,8 @@ pub struct DrumsProcessor {
     mixes: Vec<[Vec<f32>; 2]>,
     /// Per pad the mix it plays into this block.
     routes: [usize; PADS],
+    /// The output buses tracks take (bit per bus).
+    taken: Arc<std::sync::atomic::AtomicU64>,
     meters: [MeterTap; 2],
     /// Stretchers for pads that keep their length (made when one does).
     keep: Option<KeepLength>,
@@ -285,7 +287,15 @@ impl DrumsProcessor {
                 .collect(),
             routes: [0; PADS],
             meters: [MeterTap::new(sr as f32); 2],
+            taken: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
         }
+    }
+
+    /// The output buses tracks take, as the instance hears of them (all,
+    /// until it is told).
+    pub fn with_taken(mut self, taken: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        self.taken = taken;
+        self
     }
 
     /// A pad's parameter (they follow the two globals, `FIELDS` a pad).
@@ -512,11 +522,17 @@ impl PluginProcessor for DrumsProcessor {
                 voices[o].on && voices[o].slot == Some(slot)
             });
         }
-        // Pads go to their output where a track takes it.
+        // Pads go to their output where a track takes it, else to the
+        // main (an output between taken ones has a buffer nobody hears).
         let buses = io.audio_out.len().clamp(1, AUX + 1);
+        let taken = self.taken.load(std::sync::atomic::Ordering::Relaxed);
         for p in 0..PADS {
             let o = self.pad(p, id::OUTPUT).round().max(0.0) as usize;
-            self.routes[p] = if o < buses { o } else { 0 };
+            self.routes[p] = if o < buses && taken >> o & 1 == 1 {
+                o
+            } else {
+                0
+            };
         }
         for m in &mut self.mixes[..buses] {
             m[0][..frames].fill(0.0);

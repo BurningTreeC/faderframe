@@ -2307,6 +2307,21 @@ pub fn install(app: &Rc<AppState>) {
                 None => tracing::warn!("create-output-tracks: no plugin {arg}"),
             }
         }),
+        named("remove-output-track", |a, arg| {
+            let (id, bus) = arg.split_once('\n').unwrap_or((arg, "0"));
+            let plugin = match id.strip_prefix("insert=") {
+                Some(n) => n.trim().parse::<usize>().ok().and_then(|n| insert_of(a, n)),
+                None => id
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    .map(faderframe_core::PluginInstanceId),
+            };
+            match (plugin, bus.trim().parse::<u16>()) {
+                (Some(plugin), Ok(bus)) => a.dispatch(Action::RemoveOutputTrack { plugin, bus }),
+                _ => tracing::warn!("remove-output-track: no plugin output {arg}"),
+            }
+        }),
         named("delete-preset", |a, arg| {
             a.dispatch(Action::PromptDeletePreset {
                 path: std::path::PathBuf::from(arg),

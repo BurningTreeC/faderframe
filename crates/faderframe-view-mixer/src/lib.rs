@@ -1531,14 +1531,20 @@ impl MixerView {
                         "Outputs",
                         outs.iter()
                             .map(|o| {
-                                MenuItem::new(
-                                    o.name.clone(),
+                                // Checked: a track takes it; unchecking
+                                // removes that track.
+                                let action = if o.track.is_some() {
+                                    Action::RemoveOutputTrack {
+                                        plugin: s.id,
+                                        bus: o.bus,
+                                    }
+                                } else {
                                     Action::CreateOutputTracks {
                                         plugin: s.id,
                                         buses: Some(vec![o.bus]),
-                                    },
-                                )
-                                .checked(o.track.is_some())
+                                    }
+                                };
+                                MenuItem::new(o.name.clone(), action).checked(o.track.is_some())
                             })
                             .collect(),
                     ));

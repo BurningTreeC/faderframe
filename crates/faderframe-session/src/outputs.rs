@@ -4,7 +4,9 @@
 //! action makes a track for every one, the main one too, routed like the
 //! plugin's track, in a folder under it; the plugin's own track then only
 //! carries the plugin (its output off, so the main is not heard twice).
-//! Removing the track that takes the main gives its routing back.
+//! Removing the track that takes the main gives its routing back; removing
+//! one that takes an extra bus puts that bus back in the plugin's main
+//! where the plugin can (the Drum Sampler's pads), else it goes unheard.
 
 use crate::{Result, Session, SessionError};
 use faderframe_core::{ChannelLayout, PluginInstanceId, TrackId};
@@ -225,6 +227,35 @@ impl Session {
             ),
         );
         Ok(made)
+    }
+
+    /// Remove the track taking `plugin`'s output `bus`, and the folder it
+    /// is in when nothing else is (one undo step): the main gives the
+    /// plugin's track its routing back, an extra bus goes back into the
+    /// main (built-ins that route into buses fold untaken ones there).
+    pub(crate) fn remove_output_track(&mut self, plugin: PluginInstanceId, bus: u16) -> Result<()> {
+        let p = &self.project;
+        let track = p
+            .plugin_output_tracks(plugin)
+            .into_iter()
+            .find(|t| t.input.plugin_output() == Some((plugin, bus)))
+            .ok_or_else(|| SessionError::Other("no track takes that output".into()))?;
+        let (id, name) = (track.id, track.name.clone());
+        let mut commands = vec![Command::RemoveTrack { track: id }];
+        if let Some(folder) = track.folder
+            && !p
+                .tracks
+                .iter()
+                .any(|t| t.id != id && t.folder == Some(folder))
+        {
+            commands.push(Command::RemoveTrack { track: folder });
+        }
+        self.batch("Remove Output Track", commands)?;
+        self.notify(
+            crate::NoticeLevel::Info,
+            format!("'{name}' removed: its output is back in the plugin's mix"),
+        );
+        Ok(())
     }
 
     /// Removing the track that takes a plugin's main gives its routing back

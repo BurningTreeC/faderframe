@@ -770,6 +770,12 @@ pub enum Action {
         plugin: faderframe_core::PluginInstanceId,
         buses: Option<Vec<u16>>,
     },
+    /// Remove the track taking a plugin's output `bus` (its folder too
+    /// when that empties): the output is back in the plugin's own mix.
+    RemoveOutputTrack {
+        plugin: faderframe_core::PluginInstanceId,
+        bus: u16,
+    },
     /// Ask (in the shell) whether to delete a user preset (a plugin's or
     /// a track preset).
     PromptDeletePreset {
@@ -3478,6 +3484,9 @@ impl Session {
             }
             Action::CreateOutputTracks { plugin, buses } => {
                 self.create_output_tracks(plugin, buses.as_deref())?;
+            }
+            Action::RemoveOutputTrack { plugin, bus } => {
+                self.remove_output_track(plugin, bus)?;
             }
             Action::PromptDeletePreset { path } => {
                 let name = path

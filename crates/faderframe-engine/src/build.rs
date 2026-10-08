@@ -503,6 +503,8 @@ struct PluginCx<'a> {
     /// Per plugin, the highest of its output buses tracks take (their
     /// nodes get outputs up to it).
     taken: HashMap<PluginInstanceId, u16>,
+    /// Per plugin, which of its buses tracks take.
+    taken_buses: HashMap<PluginInstanceId, u64>,
 }
 
 impl PluginCx<'_> {
@@ -618,6 +620,8 @@ impl PluginCx<'_> {
             instance
                 .configure_channels(spec.audio_outputs.first().map_or(0, |l| l.channel_count()));
             instance.configure_outputs(spec.audio_outputs.len().max(1));
+            instance
+                .configure_taken_outputs(self.taken_buses.get(&slot.id).copied().unwrap_or(0) | 1);
         }
         match self.plugins.activate(slot, &process) {
             Ok(p) => {
@@ -863,6 +867,7 @@ pub fn build_graph(
         },
         warnings: &mut warnings,
         taken: project.taken_plugin_outputs(),
+        taken_buses: project.taken_plugin_buses(),
     };
     // Nodes (in the audio thread's graph) of plugins whose extra outputs
     // tracks take.

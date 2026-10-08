@@ -227,3 +227,75 @@ fn a_track_can_take_one_output_by_hand() {
         1 + drums::AUX
     );
 }
+
+/// An output given back (unticked in the Outputs menu): its track goes
+/// and the pad plays in the kit's main again — even while a higher output
+/// keeps its track, so that bus still has a buffer; the last one takes the
+/// folder with it.
+#[test]
+fn an_output_given_back_plays_in_the_main_again() {
+    let (mut s, kit_track, plugin) = kit();
+    let before = s.project().tracks.len();
+    for bus in [3, 5] {
+        s.dispatch(Action::CreateOutputTracks {
+            plugin,
+            buses: Some(vec![bus]),
+        })
+        .unwrap();
+    }
+    let outs = s.project().plugin_output_tracks(plugin);
+    let (out3, out5) = (outs[0].id, outs[1].id);
+    let folder = outs[0].folder.unwrap();
+    assert_eq!(outs[1].folder, Some(folder));
+    s.dispatch(Action::Edit(Command::SetPluginParameter {
+        track: kit_track,
+        plugin,
+        parameter: ParameterId(drums::id::pad(0) + drums::id::OUTPUT),
+        value: Some(3.0),
+    }))
+    .unwrap();
+    s.start_audio(
+        vec![Box::new(DummyBackend::default())],
+        &AudioPreferences::default(),
+    )
+    .unwrap();
+    s.dispatch(Action::SelectTracks {
+        tracks: vec![kit_track],
+        mode: SelectMode::Replace,
+    })
+    .unwrap();
+    let hit = |s: &mut Session, track: TrackId| {
+        run(s, 0.3);
+        s.midi_keyboard().send(&[0x90, 36, 120]);
+        run(s, 0.15);
+        let level = s.meter(track).left.level_db;
+        s.midi_keyboard().send(&[0x80, 36, 0]);
+        level
+    };
+    let on3 = hit(&mut s, out3);
+    assert!(on3 > -30.0, "on output 3's track: {on3:.1} dBFS");
+    assert!(s.meter(kit_track).left.level_db < -70.0);
+    // Output 3 given back: in the kit's main, while output 5 has its track.
+    s.dispatch(Action::RemoveOutputTrack { plugin, bus: 3 })
+        .unwrap();
+    assert!(s.project().track(out3).is_none());
+    assert!(
+        s.project().track(folder).is_some(),
+        "output 5 is still in it"
+    );
+    let main = hit(&mut s, kit_track);
+    assert!(main > -30.0, "back in the kit's main: {main:.1} dBFS");
+    s.stop_audio();
+    // The last one: the folder goes too, in the same step.
+    s.dispatch(Action::RemoveOutputTrack { plugin, bus: 5 })
+        .unwrap();
+    assert!(s.project().track(out5).is_none());
+    assert!(s.project().track(folder).is_none());
+    assert_eq!(s.project().tracks.len(), before);
+    assert!(
+        s.dispatch(Action::RemoveOutputTrack { plugin, bus: 5 })
+            .is_err()
+    );
+    s.dispatch(Action::Undo).unwrap();
+    assert!(s.project().track(out5).is_some() && s.project().track(folder).is_some());
+}

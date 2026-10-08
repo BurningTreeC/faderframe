@@ -446,6 +446,22 @@ impl Project {
         out
     }
 
+    /// Per plugin, which of its output buses tracks take (bit `b` for bus
+    /// `b` < 64; the main's bit only when a track takes it).
+    pub fn taken_plugin_buses(&self) -> HashMap<PluginInstanceId, u64> {
+        let mut out: HashMap<PluginInstanceId, u64> = HashMap::new();
+        for t in &self.tracks {
+            if let Some((plugin, bus)) = t.input.plugin_output()
+                && t.kind.has_audio()
+                && t.kind != TrackKind::Midi
+                && bus < 64
+            {
+                *out.entry(plugin).or_default() |= 1 << bus;
+            }
+        }
+        out
+    }
+
     /// Tracks taking output buses of `plugin`.
     pub fn plugin_output_tracks(&self, plugin: PluginInstanceId) -> Vec<&Track> {
         self.tracks

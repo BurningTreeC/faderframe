@@ -441,6 +441,9 @@ pub struct BuiltinInstance {
     rate: f64,
     /// The samplers' samples.
     samples: Option<crate::devices::samples::SampleHost>,
+    /// The output buses tracks take (the Drum Sampler's processors read it
+    /// every block: an adopted processor follows it too).
+    taken: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl PluginInstance for BuiltinInstance {
@@ -449,6 +452,10 @@ impl PluginInstance for BuiltinInstance {
     }
     fn configure_realtime(&mut self, realtime: bool) {
         self.realtime = realtime;
+    }
+    fn configure_taken_outputs(&mut self, taken: u64) {
+        self.taken
+            .store(taken | 1, std::sync::atomic::Ordering::Relaxed);
     }
     fn configure_device_block(&mut self, frames: usize) {
         self.device_block = frames;
@@ -751,14 +758,17 @@ impl PluginInstance for BuiltinInstance {
                 tap()?,
                 config,
             )),
-            Kind::Drums => Box::new(crate::devices::drums::DrumsProcessor::new(
-                params,
-                self.tap.clone(),
-                config,
-                self.samples
-                    .as_ref()
-                    .map_or_else(crate::devices::samples::empty, |h| Arc::clone(&h.shared)),
-            )),
+            Kind::Drums => Box::new(
+                crate::devices::drums::DrumsProcessor::new(
+                    params,
+                    self.tap.clone(),
+                    config,
+                    self.samples
+                        .as_ref()
+                        .map_or_else(crate::devices::samples::empty, |h| Arc::clone(&h.shared)),
+                )
+                .with_taken(Arc::clone(&self.taken)),
+            ),
             Kind::Sampler => Box::new(crate::devices::sampler::SamplerProcessor::new(
                 params,
                 self.tap.clone(),
@@ -968,6 +978,7 @@ impl PluginFactory for BuiltinFactory {
             host
         });
         Ok(Box::new(BuiltinInstance {
+            taken: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
             channels: 2,
             realtime: false,
             device_block: 0,

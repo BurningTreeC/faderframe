@@ -334,6 +334,10 @@ pub trait PluginInstance {
     /// output `b` from bus `b`. Formats that switch buses on (VST3) switch
     /// these on at the next activation.
     fn configure_outputs(&mut self, _buses: usize) {}
+    /// Which of those buses a track takes (bit `b` for bus `b`, the main's
+    /// always set): devices that route into buses (the Drum Sampler's pads)
+    /// put what goes to an untaken one into the main instead of losing it.
+    fn configure_taken_outputs(&mut self, _taken: u64) {}
     /// Names of the output buses, main first (empty: the format has none;
     /// the host numbers them).
     fn output_bus_names(&mut self) -> Vec<String> {
