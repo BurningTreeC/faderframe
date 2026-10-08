@@ -228,6 +228,9 @@ pub struct AcousticStage {
     invert: bool,
     align: bool,
     ramp_left: usize,
+    /// Each microphone's signal of the last sample, calibrated, before the
+    /// blend and the pan (B's polarity as set; an Off one silent).
+    last_mics: [f64; 2],
 }
 
 fn off_axis_corner(off_db: f64, cos_psi: f64) -> f64 {
@@ -273,6 +276,7 @@ impl AcousticStage {
             pan: [Ramped::default(); 2],
             invert: false,
             align: false,
+            last_mics: [0.0; 2],
             ramp_left: 0,
         };
         s.mics[0].slot = MicSlot::Profile(&MicProfile::DYNAMIC_57);
@@ -836,9 +840,24 @@ impl AcousticStage {
     }
 
     /// `process`, with the horn's driver at `horn` volts as well.
+    /// Each microphone's signal of the last sample processed, calibrated,
+    /// before the blend and the pan (their own outputs).
+    pub fn mics(&self) -> [f64; 2] {
+        self.last_mics
+    }
+
+    fn keep_mics(&mut self, a: f64, b: f64) {
+        let on = |i: usize| self.mics[i].slot != MicSlot::Off;
+        self.last_mics = [
+            if on(0) { a * self.calibration } else { 0.0 },
+            if on(1) { b * self.calibration } else { 0.0 },
+        ];
+    }
+
     pub fn process_with_horn(&mut self, acceleration: f64, horn: f64) -> f64 {
         let [a, b] = self.pressure_with_horn(acceleration, horn);
         let b = if self.invert { -b } else { b };
+        self.keep_mics(a, b);
         self.calibration
             * match (
                 self.mics[0].slot != MicSlot::Off,
@@ -859,6 +878,7 @@ impl AcousticStage {
     pub fn process_stereo_with_horn(&mut self, acceleration: f64, horn: f64) -> (f64, f64) {
         let [a, b] = self.pressure_with_horn(acceleration, horn);
         let b = if self.invert { -b } else { b };
+        self.keep_mics(a, b);
         let (la, ra) = pan_gains(self.pan[0].now);
         let (lb, rb) = pan_gains(self.pan[1].now);
         let (left, right) = match (

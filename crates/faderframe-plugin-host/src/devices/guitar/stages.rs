@@ -304,8 +304,14 @@ impl Segments for PedalWorker {
                 publish(channels, range.start);
             }
             let (audio, raw) = channels.split_at_mut(count);
-            self.bank
-                .run(audio, &mut raw[..count], active, range.clone(), &work);
+            self.bank.run(
+                audio,
+                &mut raw[..count],
+                &mut [],
+                active,
+                range.clone(),
+                &work,
+            );
             if active == 1 && count == 2 {
                 let (left, right) = audio.split_at_mut(1);
                 right[0][range.clone()].copy_from_slice(&left[0][range]);
@@ -442,10 +448,15 @@ impl Segments for AmpWorker {
             if chain.needs_operating_point() {
                 chain.find_operating_point();
             }
-            for (x, raw) in lanes.audio.iter_mut().zip(lanes.raw.iter_mut()) {
+            let mics = !lanes.mic_a.is_empty() && !lanes.mic_b.is_empty();
+            for (i, (x, raw)) in lanes.audio.iter_mut().zip(lanes.raw.iter_mut()).enumerate() {
                 let f = chain.process(f64::from(*x), f64::from(*raw), false);
                 *x = f.left as f32;
                 *raw = f.dry as f32;
+                if mics {
+                    lanes.mic_a[i] = f.mics[0] as f32;
+                    lanes.mic_b[i] = f.mics[1] as f32;
+                }
             }
         };
         let active = {
@@ -459,7 +470,8 @@ impl Segments for AmpWorker {
             if range.start > 0 {
                 publish(channels, range.start);
             }
-            let (audio, raw) = channels.split_at_mut(count);
+            let (audio, rest) = channels.split_at_mut(count);
+            let (raw, mics) = rest.split_at_mut(count);
             if active == 1 && count == 2 {
                 // One amplifier for a mono source on a stereo bus: its two
                 // microphones are placed in the stereo field.
@@ -470,17 +482,25 @@ impl Segments for AmpWorker {
                     chain.find_operating_point();
                 }
                 let (left, right) = audio.split_at_mut(1);
-                let (raw_left, raw_right) = raw[..count].split_at_mut(1);
+                let (raw_left, raw_right) = raw.split_at_mut(1);
+                // Microphone lanes: A then B, a lane a channel; the mono
+                // source's on both sides.
+                let with_mics = mics.len() >= 2 * count;
                 for i in range {
                     let f = chain.process(f64::from(left[0][i]), f64::from(raw_left[0][i]), true);
                     left[0][i] = f.left as f32;
                     right[0][i] = f.right as f32;
                     raw_left[0][i] = f.dry as f32;
                     raw_right[0][i] = f.dry as f32;
+                    if with_mics {
+                        for c in 0..count {
+                            mics[c][i] = f.mics[0] as f32;
+                            mics[count + c][i] = f.mics[1] as f32;
+                        }
+                    }
                 }
             } else {
-                self.bank
-                    .run(audio, &mut raw[..count], active, range, &work);
+                self.bank.run(audio, raw, mics, active, range, &work);
             }
         }
         if let Some(tap) = &self.tap {

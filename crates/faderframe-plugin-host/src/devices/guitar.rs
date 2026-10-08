@@ -432,7 +432,12 @@ pub fn latency(p: &ParamValues, device_block: usize) -> u32 {
 
 /// The output buses, main first.
 pub fn output_bus_names() -> Vec<String> {
-    vec!["Main".to_string(), "DI".to_string()]
+    vec![
+        "Main".to_string(),
+        "DI".to_string(),
+        "Mic A".to_string(),
+        "Mic B".to_string(),
+    ]
 }
 
 fn pan_text(v: f64) -> String {

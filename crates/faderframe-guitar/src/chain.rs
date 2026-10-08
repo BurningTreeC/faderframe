@@ -189,6 +189,10 @@ pub struct Frame {
     pub right: f64,
     /// The DI: the chain's input, the guitar's or the preamplifier's, in step.
     pub dry: f64,
+    /// Each microphone on its own (A, B), before the blend and the pan, at
+    /// the output's level; without microphones (a direct or legacy
+    /// cabinet) both are the output.
+    pub mics: [f64; 2],
 }
 
 /// A speaker-loaded simulation and where to read its cone.
@@ -270,6 +274,7 @@ pub struct Chain {
     fade_remaining: usize,
     prev_output: f64,
     prev_output_right: f64,
+    prev_mics: [f64; 2],
     deadline: Option<Instant>,
 }
 
@@ -467,6 +472,7 @@ impl Chain {
             fade_remaining: 0,
             prev_output: 0.0,
             prev_output_right: 0.0,
+            prev_mics: [0.0; 2],
             deadline: None,
         };
         chain.tap_over.set_factor(factor);
@@ -1158,16 +1164,27 @@ impl Chain {
             let wet = self.bbd.process(y);
             right = y + (wet - y) * self.chorus;
         }
+        // The microphones on their own (or, without any, the output).
+        let mut mics = if radiating {
+            self.acoustic.mics().map(|m| m * out_of)
+        } else {
+            [y, y]
+        };
         if self.fade_remaining > 0 {
             let t = self.fade_remaining as f64 / FADE_LEN as f64;
             self.fade_remaining -= 1;
             y = self.prev_output * t + y * (1.0 - t);
             right = self.prev_output_right * t + right * (1.0 - t);
+            for (m, p) in mics.iter_mut().zip(self.prev_mics) {
+                *m = p * t + *m * (1.0 - t);
+            }
         }
         let finite = |v: f64| if v.is_finite() { v } else { 0.0 };
         let (y, right) = (finite(y), finite(right));
+        let mics = mics.map(finite);
         self.prev_output = y;
         self.prev_output_right = right;
+        self.prev_mics = mics;
         let dry = match self.dry_source {
             DrySource::Input => dry_raw,
             DrySource::Pedal => dry_input,
@@ -1177,6 +1194,7 @@ impl Chain {
             left: y,
             right,
             dry: finite(dry),
+            mics,
         }
     }
 
@@ -1342,6 +1360,7 @@ impl Chain {
         self.fade_remaining = source.fade_remaining;
         self.prev_output = source.prev_output;
         self.prev_output_right = source.prev_output_right;
+        self.prev_mics = source.prev_mics;
     }
 
     pub fn reset(&mut self) {
@@ -1349,6 +1368,7 @@ impl Chain {
         self.fade_remaining = 0;
         self.prev_output = 0.0;
         self.prev_output_right = 0.0;
+        self.prev_mics = [0.0; 2];
         for sim in self
             .gains
             .iter_mut()

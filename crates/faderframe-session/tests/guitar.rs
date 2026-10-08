@@ -82,7 +82,13 @@ fn it_plays_live_and_a_pedal_added_while_playing_restarts_the_line() {
     let level = level_once_over(&mut s, t, -50.0);
     assert!(level > -50.0, "the amplifier sounds: {level:.1} dB");
     let latency = s.engine().plugin_latency(plugin).unwrap();
-    assert_eq!(s.plugin_output_buses(plugin).len(), 2, "main and DI");
+    assert_eq!(
+        s.plugin_output_buses(plugin)
+            .iter()
+            .map(|o| o.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Main", "DI", "Mic A", "Mic B"]
+    );
     // A pedal: one more stage, one more buffer of latency.
     set(
         &mut s,
@@ -106,12 +112,13 @@ fn it_plays_live_and_a_pedal_added_while_playing_restarts_the_line() {
         buses: None,
     })
     .unwrap();
-    // Main and DI on tracks of their own; the station's track plays
-    // nothing itself.
+    // Main, DI and each microphone on tracks of their own; the station's
+    // track plays nothing itself.
     let outs = s.project().plugin_output_tracks(plugin);
-    assert_eq!(outs.len(), 2, "Main and DI");
+    assert_eq!(outs.len(), 4, "Main, DI, Mic A, Mic B");
     let main = outs[0].id;
     let di = outs[1].id;
+    let (mic_a, mic_b) = (outs[2].id, outs[3].id);
     assert_eq!(
         s.project().track(t).unwrap().output,
         faderframe_project::OutputRouting::None
@@ -128,6 +135,16 @@ fn it_plays_live_and_a_pedal_added_while_playing_restarts_the_line() {
         level > -60.0,
         "the DI track takes the guitar: {level:.1} dB"
     );
+    // A second microphone (the default has one).
+    set(&mut s, t, plugin, id::MIC_B, 6.0);
+    run(&mut s, 0.5);
+    for (mic, name) in [(mic_a, "A"), (mic_b, "B")] {
+        let level = level_once_over(&mut s, mic, -50.0);
+        assert!(
+            level > -50.0,
+            "microphone {name}'s track hears the cabinet: {level:.1} dB"
+        );
+    }
     s.dispatch(Action::Transport(TransportAction::Stop))
         .unwrap();
 }

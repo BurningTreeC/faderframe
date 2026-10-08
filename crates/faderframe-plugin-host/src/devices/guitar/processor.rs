@@ -43,6 +43,8 @@ pub struct GuitarProcessor {
     channels: usize,
     /// The guitar's own lanes (the DI's source), then the DI out.
     raw: Vec<Vec<f32>>,
+    /// The amplifier's microphones, A then B, a lane a channel.
+    mics: Vec<Vec<f32>>,
     input_gain: f32,
     /// GainStageFx's noise gate, after the Input trim.
     gate: faderframe_guitar::noise_gate::NoiseGate,
@@ -137,9 +139,10 @@ impl GuitarProcessor {
             chain.apply(&settings);
             chain.find_operating_point();
         }
+        // The amplifier's stage carries the microphones' lanes too.
         let amp = StageRun::new(
             AmpWorker::new(Bank::new(chains), pedal_count, tap.clone(), rate),
-            lanes,
+            2 * lanes,
             delay,
             max_block,
             rate,
@@ -171,6 +174,7 @@ impl GuitarProcessor {
             builder,
             channels,
             raw: vec![vec![0.0; max_block]; channels],
+            mics: vec![vec![0.0; max_block]; 2 * channels],
             glide: 1.0 - (-1.0 / (0.01 * rate)).exp() as f32,
             meters: [[MeterTap::new(rate as f32); METERED]; 2],
             deadline: None,
@@ -290,7 +294,9 @@ impl PluginProcessor for GuitarProcessor {
             let end = events.peek().map_or(frames, |e| {
                 (e.sample_offset as usize).clamp(start + 1, frames)
             });
-            let mut lanes: [&mut [f32]; 2 * super::bank::BATCH] =
+            // Audio, DI and the microphones (A, B), a lane a channel each;
+            // the pedals take the first two.
+            let mut lanes: [&mut [f32]; 4 * super::bank::BATCH] =
                 std::array::from_fn(|_| &mut [][..]);
             let n = count.min(super::bank::BATCH);
             for (slot, channel) in lanes.iter_mut().zip(out.channels_mut()).take(n) {
@@ -299,20 +305,36 @@ impl PluginProcessor for GuitarProcessor {
             for (slot, raw) in lanes[n..].iter_mut().zip(self.raw.iter_mut()).take(n) {
                 *slot = &mut raw[start..end];
             }
-            let lanes = &mut lanes[..2 * n];
+            let (mics_a, mics_b) = self.mics.split_at_mut(self.channels);
+            for (slot, mic) in lanes[2 * n..].iter_mut().zip(mics_a.iter_mut()).take(n) {
+                *slot = &mut mic[start..end];
+            }
+            for (slot, mic) in lanes[3 * n..].iter_mut().zip(mics_b.iter_mut()).take(n) {
+                *slot = &mut mic[start..end];
+            }
+            let lanes = &mut lanes[..4 * n];
             for (k, stage) in self.pedals.iter_mut().enumerate() {
-                alive &= stage.process(lanes, nth_pedal(&self.params, k), self.deadline);
+                alive &= stage.process(
+                    &mut lanes[..2 * n],
+                    nth_pedal(&self.params, k),
+                    self.deadline,
+                );
             }
             alive &= self
                 .amp
                 .process(lanes, amp_settings(&self.params), self.deadline);
             start = end;
         }
-        // Mix, Output, the DI bus.
+        // Mix, Output, the DI bus and the microphones' (at the Output's
+        // level, as the amplifier is heard).
         let mix_target = self.params.get(id::MIX as usize).clamp(0.0, 1.0);
         let out_target = db_gain(self.params.get(id::OUTPUT as usize));
         let (mut mix, mut gain) = (self.mix, self.output_gain);
-        let mut di = extra.first_mut();
+        let (di, mic_buses) = match extra.split_first_mut() {
+            Some((di, rest)) => (Some(di), rest),
+            None => (None, &mut [][..]),
+        };
+        let mut di = di;
         for i in 0..frames {
             glide(&mut mix, mix_target, k);
             glide(&mut gain, out_target, k);
@@ -330,6 +352,20 @@ impl PluginProcessor for GuitarProcessor {
                     && c < bus.num_channels()
                 {
                     bus.channel_mut(c)[i] = dry;
+                }
+                for (m, bus) in mic_buses.iter_mut().take(2).enumerate() {
+                    if c < bus.num_channels() {
+                        bus.channel_mut(c)[i] = self.mics[m * self.channels + c][i] * gain;
+                    }
+                }
+            }
+        }
+        // A mono line on wider microphone buses: the same on every side.
+        for bus in mic_buses.iter_mut().take(2) {
+            for c in count..bus.num_channels() {
+                for i in 0..frames {
+                    let v = bus.channel(0)[i];
+                    bus.channel_mut(c)[i] = v;
                 }
             }
         }

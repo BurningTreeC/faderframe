@@ -19,10 +19,13 @@ pub(super) trait Unit: Send {
     fn wake_from(&mut self, other: &Self);
 }
 
-/// One channel's audio and its guitar (DI) lane.
+/// One channel's audio, its guitar (DI) lane and (the amplifier's)
+/// microphones' lanes (empty where a stage has none).
 pub(super) struct Lanes<'a> {
     pub audio: &'a mut [f32],
     pub raw: &'a mut [f32],
+    pub mic_a: &'a mut [f32],
+    pub mic_b: &'a mut [f32],
 }
 
 pub(super) struct Bank<U> {
@@ -82,6 +85,7 @@ impl<U: Unit> Bank<U> {
         &mut self,
         audio: &mut [&mut [f32]],
         raw: &mut [&mut [f32]],
+        mics: &mut [&mut [f32]],
         active: usize,
         range: Range<usize>,
         work: &F,
@@ -89,20 +93,36 @@ impl<U: Unit> Bank<U> {
         F: Fn(&mut U, Lanes<'_>) + Sync,
     {
         let active = active.min(self.units.len()).min(audio.len()).min(raw.len());
+        // A channel's microphone lanes: A at `c`, B at `active + c` (or
+        // none).
+        let with_mics = mics.len() >= 2 * active;
+        let (mics_a, mics_b) = if with_mics {
+            let (a, b) = mics.split_at_mut(active);
+            (a, b)
+        } else {
+            let (a, b) = mics.split_at_mut(0);
+            (a, b)
+        };
         match &self.helpers {
             Some(helpers) if active > 1 => {
                 for start in (0..active).step_by(BATCH) {
                     let n = (active - start).min(BATCH);
                     let mut lanes: [TryCell<Option<Lanes<'_>>>; BATCH] =
                         std::array::from_fn(|_| TryCell::new(None));
+                    let mut ma = mics_a.iter_mut().skip(start);
+                    let mut mb = mics_b.iter_mut().skip(start);
                     for ((cell, a), r) in lanes
                         .iter_mut()
                         .zip(audio[start..start + n].iter_mut())
                         .zip(raw[start..start + n].iter_mut())
                     {
+                        let mic_a = ma.next().map_or(&mut [][..], |m| &mut m[range.clone()]);
+                        let mic_b = mb.next().map_or(&mut [][..], |m| &mut m[range.clone()]);
                         *cell.get_mut() = Some(Lanes {
                             audio: &mut a[range.clone()],
                             raw: &mut r[range.clone()],
+                            mic_a,
+                            mic_b,
                         });
                     }
                     let job = Job {
@@ -115,6 +135,8 @@ impl<U: Unit> Bank<U> {
                 }
             }
             _ => {
+                let mut ma = mics_a.iter_mut();
+                let mut mb = mics_b.iter_mut();
                 for ((unit, a), r) in self
                     .units
                     .iter_mut()
@@ -122,11 +144,15 @@ impl<U: Unit> Bank<U> {
                     .zip(raw.iter_mut())
                     .take(active)
                 {
+                    let mic_a = ma.next().map_or(&mut [][..], |m| &mut m[range.clone()]);
+                    let mic_b = mb.next().map_or(&mut [][..], |m| &mut m[range.clone()]);
                     work(
                         unit.get_mut(),
                         Lanes {
                             audio: &mut a[range.clone()],
                             raw: &mut r[range.clone()],
+                            mic_a,
+                            mic_b,
                         },
                     );
                 }

@@ -72,10 +72,10 @@ impl Line {
             params,
             tap,
             ins: vec![AudioBuffer::new(layout, MAX_BLOCK)],
-            outs: vec![
-                AudioBuffer::new(layout, MAX_BLOCK),
-                AudioBuffer::new(layout, MAX_BLOCK),
-            ],
+            // Main, DI, microphone A and B.
+            outs: (0..4)
+                .map(|_| AudioBuffer::new(layout, MAX_BLOCK))
+                .collect(),
             at: 0,
         }
     }
@@ -639,4 +639,40 @@ fn the_noise_gate_takes_hiss_and_leaves_the_guitar() {
         (played - played_gated).abs() < 0.5,
         "a guitar {played:.1} dB, through the gate {played_gated:.1} dB"
     );
+}
+
+/// The microphones have outputs of their own (close and room on tracks of
+/// their own): with the blend all on A the main is microphone A's output,
+/// all on B it is B's, and the two differ (two microphones in two places).
+#[test]
+fn the_microphones_have_outputs_of_their_own() {
+    let take = |blend: f64| {
+        let mut line = Line::new(
+            &[(id::MIC_B, 6.0), (id::BLEND, blend), (id::MIX, 1.0)],
+            1,
+            Run::Inline,
+            128,
+        );
+        let mut main = Vec::new();
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for _ in 0..(0.5 * SR / 256.0) as usize {
+            line.block(256, &[], |n, _| pluck(n));
+            main.extend_from_slice(line.outs[0].channel(0));
+            a.extend_from_slice(line.outs[2].channel(0));
+            b.extend_from_slice(line.outs[3].channel(0));
+        }
+        (main, a, b)
+    };
+    let close = |x: &[f32], y: &[f32]| {
+        x.iter()
+            .zip(y)
+            .skip(6_000)
+            .all(|(p, q)| (p - q).abs() <= 1e-6 * p.abs().max(1.0))
+    };
+    let (main, a, b) = take(0.0);
+    assert!(rms_db(&a[6_000..]) > -60.0, "microphone A sounds");
+    assert!(close(&main, &a), "all on A: the main is A");
+    assert!(!close(&a, &b), "two different microphones");
+    let (main, _, b) = take(1.0);
+    assert!(close(&main, &b), "all on B: the main is B");
 }

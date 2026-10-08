@@ -313,7 +313,8 @@ impl Kind {
             } else if self == Kind::Drums {
                 vec![stereo; 1 + crate::devices::drums::AUX]
             } else if self == Kind::Guitar {
-                vec![stereo; 2]
+                // Main, the DI, microphone A and microphone B.
+                vec![stereo; 4]
             } else {
                 vec![stereo]
             },
