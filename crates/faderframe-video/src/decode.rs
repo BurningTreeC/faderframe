@@ -258,10 +258,37 @@ impl Decoder {
     /// [`Frame::time`] is only its own start when asked for that.
     pub fn frame_at(&mut self, t: i64, exact: bool) -> Result<Option<Frame>> {
         self.seek(t, exact)?;
-        match self.sink.try_pull_preroll(self.timeout) {
-            Some(s) => self.frame_of(&s).map(Some),
-            None => Ok(None),
+        let first = match self.sink.try_pull_preroll(self.timeout) {
+            Some(s) => self.frame_of(&s)?,
+            None => return Ok(None),
+        };
+        // Past it: the demuxer started at the keyframe after (some MXF
+        // index tables) — from further back, decoded up to the frame.
+        const HAIR: i64 = 1_000_000;
+        if first.time <= t + HAIR {
+            return Ok(Some(first));
         }
+        let mut back = 1_000_000_000;
+        for _ in 0..4 {
+            self.play_from((t - back).max(0))?;
+            let mut last = None;
+            while let Some(f) = self.next_frame()? {
+                if f.time > t + HAIR {
+                    break;
+                }
+                let at = f.time >= t - HAIR;
+                last = Some(f);
+                if at {
+                    break;
+                }
+            }
+            match last {
+                Some(f) if !exact || f.time >= t - HAIR => return Ok(Some(f)),
+                Some(_) | None if t - back <= 0 => return Ok(Some(first)),
+                _ => back *= 4,
+            }
+        }
+        Ok(Some(first))
     }
 
     /// Play from the frame showing at `t`: [`Self::next_frame`] then gives it

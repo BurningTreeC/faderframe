@@ -80,7 +80,7 @@ fi
     sed "s|$root/$out|@ROOT@|g" >"$loaders/loaders.cache.in"
 # GStreamer, always the bundled one (a system's may need a newer GLib than
 # the bundled one): the plugins video uses (demuxers and muxers, JPEG,
-# conversion, Opus, the H.264/H.265 parsers, VA hardware decoding -- libva
+# conversion, Opus, the H.264/H.265 parsers, MXF and DV, VA hardware decoding -- libva
 # and its drivers are the system's) and the plugin scanner; GStreamer's
 # own libraries are moved to lib/gstreamer below.
 gst_dir=$(pkg-config --variable=pluginsdir gstreamer-1.0)
@@ -88,7 +88,7 @@ gst_scanner=$(pkg-config --variable=pluginscannerdir gstreamer-1.0)/gst-plugin-s
 mkdir -p "$out/lib/gstreamer-1.0" "$out/libexec"
 for plugin in coreelements app playback typefindfunctions isomp4 matroska jpeg \
     videoconvertscale audioconvert audioresample audiorate wavparse opus \
-    videoparsersbad va; do
+    videoparsersbad va mxf dv; do
     so=$gst_dir/libgst$plugin.so
     if [ -f "$so" ]; then
         cp -L "$so" "$out/lib/gstreamer-1.0/"
@@ -97,6 +97,16 @@ for plugin in coreelements app playback typefindfunctions isomp4 matroska jpeg \
         echo "GStreamer plugin $plugin not found: video will lack it" >&2
     fi
 done
+# ProRes, DNxHD and the other post-production decoders: GStreamer's libav
+# plugin on an LGPL FFmpeg built by lgpl_libav.sh (never the system's,
+# which is usually built with GPL parts).
+if [ -n "${FADERFRAME_LIBAV:-}" ]; then
+    cp -L "$FADERFRAME_LIBAV/lib/gstreamer-1.0/libgstlibav.so" "$out/lib/gstreamer-1.0/"
+    LD_LIBRARY_PATH="$FADERFRAME_LIBAV/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+        copy_deps "$FADERFRAME_LIBAV/lib/gstreamer-1.0/libgstlibav.so"
+else
+    echo "FADERFRAME_LIBAV not set: no ProRes or DNxHD decoders" >&2
+fi
 if [ -x "$gst_scanner" ]; then
     cp -L "$gst_scanner" "$out/libexec/"
     copy_deps "$gst_scanner"

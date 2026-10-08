@@ -45,7 +45,7 @@ fn make_clip_with(
     faderframe_video::init().unwrap();
     let sound = if sound {
         format!(
-            " audiotestsrc num-buffers={} samplesperbuffer=441 freq=440 ! audio/x-raw,format=F32LE,rate=44100,channels=2 ! audioconvert ! queue ! m.",
+            " audiotestsrc num-buffers={} samplesperbuffer=480 freq=440 ! audio/x-raw,format=F32LE,rate=48000,channels=2 ! audioconvert ! queue ! m.",
             FRAMES as u64 * 100 / FPS as u64
         )
     } else {
@@ -559,6 +559,76 @@ fn proxies_keep_the_colours() {
                 (p[i] as i32 - c[i] as i32).abs() <= 8,
                 "frame {n}: {c:?} came back as {p:?}"
             );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// MXF (broadcast and Avid's container): an uncompressed picture (no
+/// codec needed) with sound; indexed and decoded frame-exact, its sound
+/// read. (GStreamer's own muxer writes long-GOP H.264 its demuxer cannot
+/// seek in — and asserts on —, so that is left out.)
+#[test]
+fn an_mxf_clip_is_read() {
+    if !(has_element("mxfmux") && has_element("mxfdemux")) {
+        eprintln!("skipped: no MXF elements here");
+        return;
+    }
+    let d = dir();
+    let kinds = [("raw", "video/x-raw,format=UYVY")];
+    for (name, encoder) in kinds {
+        let clip = d.join(format!("{name}.mxf"));
+        make_clip(&clip, encoder, "mxfmux", true);
+        let info = probe::probe(&clip).unwrap();
+        let v = info.video.as_ref().expect("a picture");
+        assert_eq!(info.audio.len(), 1, "{name}: its sound");
+        let cancel = AtomicBool::new(false);
+        let ix = index::index(&clip, &cancel, |_| {}).unwrap();
+        assert_eq!(ix.len(), FRAMES as usize, "{name}: every frame");
+        let (w, h) = faderframe_video::fit(v.width, v.height, v.par, 160, 120);
+        let mut dec = Decoder::open(&clip, w, h).unwrap();
+        for n in [37, 12, 74, 1] {
+            let f = dec.frame_at(ix.times[n as usize], true).unwrap().unwrap();
+            assert_frame(&f, n);
+        }
+        let progress = Default::default();
+        let a = audio::extract_audio(&clip, 0, &d.join(name), 48_000, &progress, &cancel).unwrap();
+        let seconds = a.frames as f64 / 48_000.0;
+        assert!((seconds - 3.0).abs() < 0.05, "{name}: {seconds} s of sound");
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Post-production intermediates: ProRes in QuickTime and DNxHR in MXF
+/// (where FFmpeg's encoders are here — the packages carry the decoders
+/// only), decoded frame-exact.
+#[test]
+fn prores_and_dnxhr_decode() {
+    let d = dir();
+    let kinds = [
+        ("prores.mov", "avenc_prores_ks", "avenc_prores_ks", "qtmux"),
+        (
+            "dnxhr.mxf",
+            "avenc_dnxhd",
+            "videoscale ! video/x-raw,width=1280,height=720 ! videoconvert ! video/x-raw,format=Y42B ! avenc_dnxhd profile=dnxhr_lb",
+            "mxfmux",
+        ),
+    ];
+    for (name, needs, encoder, mux) in kinds {
+        if !(has_element(needs) && has_element(mux)) {
+            eprintln!("skipped {name}: no {needs} here");
+            continue;
+        }
+        let clip = d.join(name);
+        make_clip(&clip, encoder, mux, false);
+        let cancel = AtomicBool::new(false);
+        let ix = index::index(&clip, &cancel, |_| {}).unwrap();
+        assert_eq!(ix.len(), FRAMES as usize, "{name}: every frame");
+        assert_eq!(ix.longest_gop(), 1, "{name}: intra-coded");
+        let mut dec = Decoder::open(&clip, 160, 120).unwrap();
+        for n in [37, 12, 74, 1] {
+            let f = dec.frame_at(ix.times[n as usize], true).unwrap().unwrap();
+            assert_frame(&f, n);
         }
     }
     let _ = std::fs::remove_dir_all(&d);

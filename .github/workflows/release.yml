@@ -45,12 +45,16 @@ jobs:
             libgtk-4-dev pkg-config libjack-jackd2-dev libasound2-dev \
             libpipewire-0.3-dev libclang-dev librsvg2-common adwaita-icon-theme \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-            gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+            meson ninja-build nasm curl xz-utils
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
         run: cargo build --release -p faderframe-app
+      - name: LGPL FFmpeg decoders (ProRes, DNxHD, …)
+        # GStreamer 1.24's libav plugin takes FFmpeg 6.1.
+        run: FFMPEG_VERSION=6.1.2 packaging/linux/lgpl_libav.sh "$RUNNER_TEMP/libav"
       - name: Portable tarball
-        run: packaging/linux/tarball.sh
+        run: FADERFRAME_LIBAV="$RUNNER_TEMP/libav" packaging/linux/tarball.sh
       - uses: actions/upload-artifact@v4
         with:
           name: linux-tarball

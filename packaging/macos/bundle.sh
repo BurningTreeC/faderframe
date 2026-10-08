@@ -66,7 +66,7 @@ gst_dir=$res/lib/gstreamer-1.0
 mkdir -p "$gst_dir"
 for plugin in coreelements app playback typefindfunctions isomp4 matroska jpeg \
     videoconvertscale audioconvert audioresample audiorate wavparse opus \
-    videoparsersbad applemedia; do
+    videoparsersbad applemedia mxf dv; do
     if [ -f "$gst_src/libgst$plugin.dylib" ]; then
         cp "$gst_src/libgst$plugin.dylib" "$gst_dir/"
     else
