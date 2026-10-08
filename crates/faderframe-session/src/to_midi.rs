@@ -83,7 +83,7 @@ pub(crate) fn melody(x: &[f32], rate: f64) -> Vec<Found> {
         .collect()
 }
 
-fn harmony(x: &[f32], rate: f64) -> Option<Vec<Found>> {
+pub(crate) fn harmony(x: &[f32], rate: f64) -> Option<Vec<Found>> {
     let audio = resample(x, rate, faderframe_transcribe::RATE)?;
     let threads = std::thread::available_parallelism().map_or(2, |n| n.get());
     let notes = faderframe_transcribe::transcribe(

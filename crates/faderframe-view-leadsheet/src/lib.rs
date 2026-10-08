@@ -297,10 +297,7 @@ impl CanvasView<Session, Action> for LeadSheetView {
                     format!("{} Lead Sheet.{ext}", t.trim())
                 };
                 match b {
-                    Button::Grid(grid) => cx.emit(Action::MakeLeadSheet {
-                        clip: doc.clip,
-                        grid,
-                    }),
+                    Button::Grid(grid) => cx.emit(Action::MakeLeadSheet { of: doc.of, grid }),
                     Button::Pdf => cx.request(HostRequest::ChooseFiles {
                         choice: FileChoice::Save {
                             title: "Export the Lead Sheet as PDF".into(),
@@ -359,6 +356,7 @@ mod tests {
     use super::*;
     use faderframe_engine::EngineConfig;
     use faderframe_project::{Clip, ClipContent, Command, MidiClip, MidiNote, TrackKind};
+    use faderframe_session::leadsheet::LeadSheetOf;
     use faderframe_timeline::MusicalTime;
     use faderframe_ui_canvas::RecordingPainter;
 
@@ -408,7 +406,7 @@ mod tests {
         }))
         .unwrap();
         s.dispatch(Action::MakeLeadSheet {
-            clip,
+            of: LeadSheetOf::Clip(clip),
             grid: Grid::Auto,
         })
         .unwrap();
@@ -444,7 +442,7 @@ mod tests {
         assert_eq!(
             actions,
             [Action::MakeLeadSheet {
-                clip,
+                of: LeadSheetOf::Clip(clip),
                 grid: Grid::Triplets
             }]
         );

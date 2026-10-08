@@ -1807,16 +1807,27 @@ pub fn install(app: &Rc<AppState>) {
                 Some((n, _)) => (n, Grid::Auto),
                 None => (arg, Grid::Auto),
             };
-            let clip = a
-                .session
-                .borrow()
-                .project()
-                .tracks
-                .iter()
-                .find(|t| t.name == name)
-                .and_then(|t| t.clips.first().copied());
-            match clip {
-                Some(clip) => a.dispatch(Action::MakeLeadSheet { clip, grid }),
+            // `track:<name>` for the whole track, else its first clip.
+            let (whole, name) = match name.strip_prefix("track:") {
+                Some(n) => (true, n),
+                None => (false, name),
+            };
+            let of = {
+                let s = a.session.borrow();
+                let t = s.project().tracks.iter().find(|t| t.name == name);
+                match (t, whole) {
+                    (Some(t), true) => {
+                        Some(faderframe_session::leadsheet::LeadSheetOf::Track(t.id))
+                    }
+                    (Some(t), false) => t
+                        .clips
+                        .first()
+                        .map(|c| faderframe_session::leadsheet::LeadSheetOf::Clip(*c)),
+                    (None, _) => None,
+                }
+            };
+            match of {
+                Some(of) => a.dispatch(Action::MakeLeadSheet { of, grid }),
                 None => tracing::warn!("lead-sheet: no clip on '{name}'"),
             }
         }),

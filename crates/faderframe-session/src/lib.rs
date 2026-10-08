@@ -385,7 +385,7 @@ pub enum Action {
     /// A lead sheet of a clip's melody (an audio clip is listened to
     /// first), with the chords and the words, in the Lead Sheet view.
     MakeLeadSheet {
-        clip: ClipId,
+        of: leadsheet::LeadSheetOf,
         grid: leadsheet::Grid,
     },
     /// Write the lead sheet as PDF or MusicXML (by the extension).
@@ -3289,7 +3289,7 @@ impl Session {
             Action::DetectPitch { clips } => self.detect_pitch(&clips)?,
             Action::FromClip { clip, what } => self.from_clip(clip, what)?,
             Action::ConvertToMidi { clip, how } => self.convert_to_midi(clip, how)?,
-            Action::MakeLeadSheet { clip, grid } => self.make_lead_sheet(clip, grid)?,
+            Action::MakeLeadSheet { of, grid } => self.make_lead_sheet(of, grid)?,
             Action::TempoFromHits(req) => self.tempo_from_hits(&req)?,
             Action::PromptTempoFromHits => self.ui_requests.push(UiRequest::TempoFromHits),
             Action::ExportLeadSheet(path) => {

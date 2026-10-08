@@ -2315,6 +2315,23 @@ impl ArrangerView {
                 .separated(),
             );
         }
+        // A lead sheet of the whole track (its clips' melody).
+        if matches!(
+            t.kind,
+            TrackKind::Audio | TrackKind::Midi | TrackKind::Instrument
+        ) && !model.project().clips_of(t.id).is_empty()
+        {
+            items.push(
+                MenuItem::new(
+                    "Lead Sheet of This Track",
+                    Action::MakeLeadSheet {
+                        of: faderframe_session::leadsheet::LeadSheetOf::Track(t.id),
+                        grid: faderframe_session::leadsheet::Grid::Auto,
+                    },
+                )
+                .separated(),
+            );
+        }
         // Track presets.
         if t.kind != TrackKind::Master {
             items.push(
@@ -2484,7 +2501,7 @@ impl ArrangerView {
                     MenuItem::new(
                         "Lead Sheet (Melody, Chords, Words)",
                         Action::MakeLeadSheet {
-                            clip: clip.id,
+                            of: faderframe_session::leadsheet::LeadSheetOf::Clip(clip.id),
                             grid: faderframe_session::leadsheet::Grid::Auto,
                         },
                     )
@@ -2514,7 +2531,7 @@ impl ArrangerView {
                 items.push(MenuItem::new(
                     "Lead Sheet (Melody, Chords, Words)",
                     Action::MakeLeadSheet {
-                        clip: clip.id,
+                        of: faderframe_session::leadsheet::LeadSheetOf::Clip(clip.id),
                         grid: faderframe_session::leadsheet::Grid::Auto,
                     },
                 ));

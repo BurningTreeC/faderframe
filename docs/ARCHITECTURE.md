@@ -2338,14 +2338,19 @@ A clip's melody with its chords and words, written out as notation
 (`faderframe-leadsheet`, pure; `session::leadsheet`; view
 `faderframe-view-leadsheet`, `ViewKind::LeadSheet`):
 
-* **Hearing.** An audio clip's melody comes from the pitch analysis
+* **Hearing.** Of a clip or of a whole track (`LeadSheetOf`; all its
+  clips, the song): audio clips' melody comes from the pitch analysis
   (`to_midi::melody`, in a thread; kept, so writing it again with another
-  grid does not listen again); a MIDI clip's notes are read. Bars come from
-  the meter map over the clip, the chords from the chord track — or, with
+  grid does not listen again), MIDI clips' notes are read. Bars come from
+  the meter map over the clips, the chords from the chord track — or, with
   none there, from what the other tracks' MIDI plays
-  (`harmony::detect_chords`, half a bar at a time) —, the key from the key
-  track (else detected from the melody and the chords, which keep a tune
-  from leaning on its fifth's key), words from the lyrics lane.
+  (`harmony::detect_chords`, half a bar at a time), or, with no MIDI
+  either, from what the other audio tracks play, heard by basic-pitch in
+  the same thread (tracks named like drums left out) —, the key from the
+  key track (else detected from the melody and the chords, which keep a
+  tune from leaning on its fifth's key), words from the lyrics lane. The
+  clef follows the part's middle note (treble; treble 8vb for a tenor;
+  bass for a bass line).
 * **Writing** (`build`): one voice; per beat sixteenths or eighth
   triplets, whichever fits the onsets (`Grid::{Auto, Straight,
   Triplets}`), short gaps closed; notes cut at bar lines with ties and
@@ -2369,9 +2374,10 @@ A clip's melody with its chords and words, written out as notation
   measured with the Adobe Core 14 widths. **PDF** (`pdf`): a hand-written
   PDF 1.4 with the paths and the standard fonts (WinAnsi, nothing
   embedded). The view draws the same display list on paper.
-* Actions `MakeLeadSheet { clip, grid }`, `ExportLeadSheet(path)` (by
-  the extension); the arranger's clip menu; dev actions
-  `lead-sheet:<track>[@straight|triplets]`, `export-lead-sheet:<path>`.
+* Actions `MakeLeadSheet { of, grid }`, `ExportLeadSheet(path)` (by
+  the extension); the arranger's clip menu and track menu ("Lead Sheet of
+  This Track"); dev actions `lead-sheet:[track:]<track>[@straight|
+  triplets]`, `export-lead-sheet:<path>`.
 
 ### Tempo through hit points
 

@@ -455,9 +455,11 @@ pub fn build(input: &Input) -> LeadSheet {
     let mut pitches: Vec<u8> = placed.iter().map(|p| p.2).collect();
     pitches.sort_unstable();
     let median = pitches.get(pitches.len() / 2).copied().unwrap_or(67);
-    let clef = if median >= 57 {
+    // A high part on the treble staff, a tenor's an octave down on it, a
+    // bass line (or a baritone) on the bass staff.
+    let clef = if median >= 59 {
         Clef::Treble
-    } else if median >= 45 {
+    } else if median >= 52 {
         Clef::Treble8vb
     } else {
         Clef::Bass

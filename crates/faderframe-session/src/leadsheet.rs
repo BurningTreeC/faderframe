@@ -1,42 +1,74 @@
-//! Lead sheets from a recording: a clip's melody (heard by the pitch
-//! analysis in a thread for audio, read for MIDI), the bars it sits in,
-//! the chord track's chords (or, without them, the chords the other
-//! tracks' MIDI plays), the key, the tempo and the lyrics — written out by
+//! Lead sheets from a recording: the melody of a clip or of a whole track
+//! (audio heard by the pitch analysis in a thread, MIDI read), the bars it
+//! sits in, the chords — the chord track's; without one, what the other
+//! tracks' MIDI plays; without that, what the other audio tracks play,
+//! heard by basic-pitch —, the key, the tempo and the lyrics, written out by
 //! [`faderframe_leadsheet`] and engraved for the Lead Sheet view, exported
 //! as MusicXML or PDF.
 
-use crate::to_midi::{Found, melody};
+use crate::to_midi::{Found, harmony, melody};
 use crate::{NoticeLevel, Result, Session, SessionError};
-use faderframe_core::ClipId;
+use faderframe_core::{ClipId, TrackId};
+use faderframe_engine::Source;
 pub use faderframe_leadsheet::Grid;
 use faderframe_leadsheet::engrave::{Layout, Page, engrave};
 use faderframe_leadsheet::{Bar, ChordAt, Input, LeadSheet, Line, Note};
-use faderframe_project::ClipContent;
+use faderframe_project::{Clip, ClipContent, Project};
 use faderframe_timeline::MusicalTime;
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 
-/// A lead sheet made: its clip, how it was written and its pages.
+/// What a lead sheet is of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeadSheetOf {
+    Clip(ClipId),
+    /// All of a track's clips, the whole song.
+    Track(TrackId),
+}
+
+/// A lead sheet made: what of, how it was written and its pages.
 #[derive(Clone, Debug)]
 pub struct LeadSheetDoc {
-    pub clip: ClipId,
+    pub of: LeadSheetOf,
     pub grid: Grid,
     pub sheet: LeadSheet,
     pub pages: Vec<Page>,
-    /// The part's name (the clip's track).
+    /// The part's name (the track).
     pub part: String,
 }
 
-/// A melody being heard: its clip, the grid asked for, the thread.
-type Job = (ClipId, Grid, JoinHandle<Option<Vec<Found>>>);
+/// Audio to listen to: a clip's part of its source.
+struct Part {
+    clip: ClipId,
+    source: Source,
+    from: i64,
+    span: i64,
+}
 
-/// The lead sheet and the melody being heard for one.
+/// What a listening thread hears: the melody's notes and the chords'
+/// notes, each by clip (seconds into the clip's part).
+type Heard = (Vec<(ClipId, Vec<Found>)>, Vec<(ClipId, Vec<Found>)>);
+
+/// How audio is heard as notes (the melody, or chords).
+type Listener = dyn Fn(&[f32], f64) -> Option<Vec<Found>>;
+
+/// A listening job: what of, the grid, the MIDI melody already read, the
+/// thread.
+type Job = (LeadSheetOf, Grid, Vec<Note>, JoinHandle<Heard>);
+
+/// The melody and the chords heard for a lead sheet (kept, so another
+/// grid does not listen again).
+#[derive(Clone)]
+struct Kept {
+    of: LeadSheetOf,
+    melody: Vec<Note>,
+    chords: Vec<ChordAt>,
+}
+
 #[derive(Default)]
 pub(crate) struct LeadSheets {
     job: Option<Job>,
-    /// The last melody heard (clip, notes in quarters), so a new grid does
-    /// not listen again.
-    heard: Option<(ClipId, Vec<Note>)>,
+    kept: Option<Kept>,
     pub(crate) doc: Option<LeadSheetDoc>,
 }
 
@@ -59,68 +91,232 @@ fn today() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// A clip's MIDI notes in quarters on the timeline.
+fn midi_notes(c: &Clip) -> Vec<Note> {
+    match &c.content {
+        ClipContent::Midi(m) => m
+            .notes
+            .iter()
+            .filter(|n| !n.muted)
+            .map(|n| Note {
+                start: (c.start + n.start).quarters(),
+                end: (c.start + n.start + n.length).quarters(),
+                key: n.key,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Seconds into an audio clip's part → quarters on the timeline.
+fn clip_quarters(p: &Project, c: &Clip, secs: f64) -> f64 {
+    let Some(a) = c.as_audio() else {
+        return c.start.quarters();
+    };
+    let rate = p.sample_rate as f64;
+    let base = p.timeline.to_samples(c.start, rate);
+    let f = a.source_offset + (secs * rate).round() as i64;
+    let out = match &a.warp {
+        Some(w) => w.output_of(a.source_offset, a.length, f),
+        None => f - a.source_offset,
+    };
+    p.timeline
+        .to_musical(base + out.clamp(0, a.length), rate)
+        .quarters()
+}
+
+/// Tracks whose name says they are drums (no chords in them).
+fn drum_track(name: &str) -> bool {
+    let n = name.to_lowercase();
+    ["drum", "kick", "snare", "hat", "perc", "cymbal", "tom"]
+        .iter()
+        .any(|w| n.contains(w))
+}
+
 impl Session {
-    /// Make a lead sheet of `clip` (an audio clip is listened to first;
-    /// the result arrives from the tick).
-    pub fn make_lead_sheet(&mut self, clip: ClipId, grid: Grid) -> Result<()> {
-        let c = self
-            .project
-            .clip(clip)
-            .cloned()
-            .ok_or_else(|| SessionError::Other(format!("no clip {clip}")))?;
-        match &c.content {
-            ClipContent::Midi(m) => {
-                let notes = m
-                    .notes
-                    .iter()
-                    .filter(|n| !n.muted)
-                    .map(|n| Note {
-                        start: (c.start + n.start).quarters(),
-                        end: (c.start + n.start + n.length).quarters(),
-                        key: n.key,
-                    })
-                    .collect();
-                self.lead_sheets.heard = Some((clip, notes));
-                self.write_lead_sheet(clip, grid)
-            }
-            ClipContent::Audio(_) | ClipContent::Takes(_) => {
-                if let Some((heard, _)) = &self.lead_sheets.heard
-                    && *heard == clip
-                {
-                    return self.write_lead_sheet(clip, grid);
-                }
-                let Some(a) = c.as_audio() else {
-                    return Err(SessionError::Other("the clip has no audio".into()));
-                };
-                let source = self
-                    .sources
-                    .get(&a.source)
+    /// The clips a lead sheet covers (in order) and its part's track.
+    fn lead_sheet_clips(&self, of: LeadSheetOf) -> Result<(Vec<Clip>, TrackId)> {
+        let p = &self.project;
+        match of {
+            LeadSheetOf::Clip(id) => {
+                let c = p
+                    .clip(id)
                     .cloned()
-                    .ok_or_else(|| SessionError::Other("the clip's audio is missing".into()))?;
-                let (from, span) = (a.source_offset, a.source_span());
-                let project_rate = self.project.sample_rate as f64;
-                let job = std::thread::Builder::new()
-                    .name("faderframe-lead-sheet".into())
-                    .spawn(move || {
-                        let (mono, rate) = crate::pitch::mono_of(&source)?;
-                        let k = rate / project_rate;
-                        let a = ((from as f64 * k) as usize).min(mono.len());
-                        let b = (((from + span) as f64 * k) as usize).clamp(a, mono.len());
-                        Some(melody(&mono[a..b], rate))
-                    })
-                    .map_err(|e| SessionError::Other(e.to_string()))?;
-                self.lead_sheets.job = Some((clip, grid, job));
-                self.notify(
-                    NoticeLevel::Info,
-                    format!("Listening to the melody of ‘{}’…", c.name),
-                );
-                self.revision += 1;
-                Ok(())
+                    .ok_or_else(|| SessionError::Other(format!("no clip {id}")))?;
+                let t = c.track;
+                Ok((vec![c], t))
+            }
+            LeadSheetOf::Track(t) => {
+                let mut clips: Vec<Clip> = p
+                    .clips_of(t)
+                    .into_iter()
+                    .filter(|c| !c.muted)
+                    .cloned()
+                    .collect();
+                clips.sort_by_key(|c| c.start);
+                if clips.is_empty() {
+                    return Err(SessionError::Other("the track has no clips".into()));
+                }
+                Ok((clips, t))
             }
         }
     }
 
-    /// Whether a melody is being heard for a lead sheet.
+    /// The span a lead sheet covers.
+    fn lead_sheet_span(&self, clips: &[Clip]) -> (MusicalTime, MusicalTime) {
+        let p = &self.project;
+        let start = clips
+            .iter()
+            .map(|c| c.start)
+            .min()
+            .unwrap_or(MusicalTime::ZERO);
+        let end = clips
+            .iter()
+            .map(|c| c.end(&p.timeline, p.sample_rate))
+            .max()
+            .unwrap_or(start);
+        (start, end)
+    }
+
+    /// The chords the chord track or the other tracks' MIDI give over
+    /// `from..to` (empty: none).
+    fn known_chords(&self, part: TrackId, from: MusicalTime, to: MusicalTime) -> Vec<ChordAt> {
+        let p = &self.project;
+        let chords: Vec<ChordAt> = p
+            .chords
+            .iter()
+            .filter(|ch| ch.end > from && ch.start < to)
+            .map(|ch| ChordAt {
+                start: ch.start.max(from).quarters(),
+                chord: ch.chord,
+            })
+            .collect();
+        if !chords.is_empty() {
+            return chords;
+        }
+        let mut sounding = Vec::new();
+        for t in &p.tracks {
+            if t.id == part || drum_track(&t.name) {
+                continue;
+            }
+            for other in p.clips_of(t.id) {
+                for n in midi_notes(other) {
+                    sounding.push(faderframe_project::harmony::Sounding {
+                        start: MusicalTime::from_quarters(n.start),
+                        end: MusicalTime::from_quarters(n.end),
+                        key: n.key,
+                    });
+                }
+            }
+        }
+        self.chords_of(&sounding, from, to)
+    }
+
+    fn chords_of(
+        &self,
+        sounding: &[faderframe_project::harmony::Sounding],
+        from: MusicalTime,
+        to: MusicalTime,
+    ) -> Vec<ChordAt> {
+        let meter = &self.project.timeline.meter;
+        let half = meter.signature_at(from).bar_length() / 2;
+        faderframe_project::harmony::detect_chords(sounding, from, to, half)
+            .into_iter()
+            .map(|ch| ChordAt {
+                start: ch.start.quarters(),
+                chord: ch.chord,
+            })
+            .collect()
+    }
+
+    /// Make a lead sheet (audio is listened to first: the melody's clips,
+    /// and the other audio tracks when nothing else gives the chords; the
+    /// result arrives from the tick).
+    pub fn make_lead_sheet(&mut self, of: LeadSheetOf, grid: Grid) -> Result<()> {
+        if let Some(k) = &self.lead_sheets.kept
+            && k.of == of
+        {
+            return self.write_lead_sheet(of, grid);
+        }
+        let (clips, part) = self.lead_sheet_clips(of)?;
+        let (start, end) = self.lead_sheet_span(&clips);
+        let source = |c: &Clip| -> Option<Part> {
+            let a = c.as_audio()?;
+            Some(Part {
+                clip: c.id,
+                source: self.sources.get(&a.source)?.clone(),
+                from: a.source_offset,
+                span: a.source_span(),
+            })
+        };
+        let melody_parts: Vec<Part> = clips.iter().filter_map(source).collect();
+        let midi: Vec<Note> = clips.iter().flat_map(midi_notes).collect();
+        // Chords to hear: the other audio tracks' clips over the span, when
+        // neither the chord track nor MIDI gives any.
+        let chord_parts: Vec<Part> = if self.known_chords(part, start, end).is_empty() {
+            let p = &self.project;
+            p.tracks
+                .iter()
+                .filter(|t| t.id != part && !drum_track(&t.name))
+                .flat_map(|t| p.clips_of(t.id))
+                .filter(|c| !c.muted && c.start < end && c.end(&p.timeline, p.sample_rate) > start)
+                .filter_map(source)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if melody_parts.is_empty() && chord_parts.is_empty() {
+            self.lead_sheets.kept = Some(Kept {
+                of,
+                melody: midi,
+                chords: Vec::new(),
+            });
+            return self.write_lead_sheet(of, grid);
+        }
+        let project_rate = self.project.sample_rate as f64;
+        let listen_chords = !chord_parts.is_empty();
+        let job = std::thread::Builder::new()
+            .name("faderframe-lead-sheet".into())
+            .spawn(move || {
+                let hear = |part: &Part, how: &Listener| {
+                    let (mono, rate) = crate::pitch::mono_of(&part.source)?;
+                    let k = rate / project_rate;
+                    let a = ((part.from as f64 * k) as usize).min(mono.len());
+                    let b = (((part.from + part.span) as f64 * k) as usize).clamp(a, mono.len());
+                    how(&mono[a..b], rate)
+                };
+                let melody_found = melody_parts
+                    .iter()
+                    .filter_map(|p| Some((p.clip, hear(p, &|x, r| Some(melody(x, r)))?)))
+                    .collect();
+                let chords_found = chord_parts
+                    .iter()
+                    .filter_map(|p| Some((p.clip, hear(p, &harmony)?)))
+                    .collect();
+                (melody_found, chords_found)
+            })
+            .map_err(|e| SessionError::Other(e.to_string()))?;
+        self.lead_sheets.job = Some((of, grid, midi, job));
+        let name = match of {
+            LeadSheetOf::Clip(_) => clips[0].name.clone(),
+            LeadSheetOf::Track(t) => self
+                .project
+                .track(t)
+                .map_or_else(String::new, |t| t.name.clone()),
+        };
+        self.notify(
+            NoticeLevel::Info,
+            if listen_chords {
+                format!("Listening to the melody of ‘{name}’ and to the chords around it…")
+            } else {
+                format!("Listening to the melody of ‘{name}’…")
+            },
+        );
+        self.revision += 1;
+        Ok(())
+    }
+
+    /// Whether audio is being listened to for a lead sheet.
     pub fn making_lead_sheet(&self) -> bool {
         self.lead_sheets.job.is_some()
     }
@@ -130,60 +326,61 @@ impl Session {
         self.lead_sheets.doc.as_ref()
     }
 
-    /// The melody heard: write the sheet (from the tick).
+    /// The audio heard: write the sheet (from the tick).
     pub(crate) fn poll_lead_sheets(&mut self) {
         let finished = self
             .lead_sheets
             .job
             .as_ref()
-            .is_some_and(|(_, _, j)| j.is_finished());
+            .is_some_and(|(_, _, _, j)| j.is_finished());
         if !finished {
             return;
         }
-        let Some((clip, grid, job)) = self.lead_sheets.job.take() else {
+        let Some((of, grid, midi, job)) = self.lead_sheets.job.take() else {
             return;
         };
         self.revision += 1;
-        let Some(found) = job.join().ok().flatten() else {
-            self.notify(NoticeLevel::Warning, "the clip's audio could not be read");
-            return;
-        };
-        let Some(c) = self.project.clip(clip).cloned() else {
-            return;
-        };
-        let Some(a) = c.as_audio().cloned() else {
+        let Ok((melody_found, chords_found)) = job.join() else {
+            self.notify(NoticeLevel::Warning, "listening to the audio failed");
             return;
         };
         let p = &self.project;
-        let rate = p.sample_rate as f64;
-        let base = p.timeline.to_samples(c.start, rate);
-        let at = |s: f64| {
-            let f = a.source_offset + (s * rate).round() as i64;
-            let out = match &a.warp {
-                Some(w) => w.output_of(a.source_offset, a.length, f),
-                None => f - a.source_offset,
-            };
-            p.timeline
-                .to_musical(base + out.clamp(0, a.length), rate)
-                .quarters()
-        };
-        let notes = found
-            .iter()
-            .map(|n| Note {
-                start: at(n.start),
-                end: at(n.end),
+        let mut melody: Vec<Note> = midi;
+        for (clip, found) in &melody_found {
+            let Some(c) = p.clip(*clip) else { continue };
+            melody.extend(found.iter().map(|n| Note {
+                start: clip_quarters(p, c, n.start),
+                end: clip_quarters(p, c, n.end),
                 key: n.key,
-            })
-            .collect();
-        self.lead_sheets.heard = Some((clip, notes));
-        if let Err(e) = self.write_lead_sheet(clip, grid) {
+            }));
+        }
+        let mut sounding = Vec::new();
+        for (clip, found) in &chords_found {
+            let Some(c) = p.clip(*clip) else { continue };
+            sounding.extend(found.iter().map(|n| faderframe_project::harmony::Sounding {
+                start: MusicalTime::from_quarters(clip_quarters(p, c, n.start)),
+                end: MusicalTime::from_quarters(clip_quarters(p, c, n.end)),
+                key: n.key,
+            }));
+        }
+        let chords = match self.lead_sheet_clips(of) {
+            Ok((clips, _)) if !sounding.is_empty() => {
+                let (start, end) = self.lead_sheet_span(&clips);
+                let meter = &self.project.timeline.meter;
+                let from = meter.bar_start(meter.bar_at(start));
+                self.chords_of(&sounding, from, end)
+            }
+            _ => Vec::new(),
+        };
+        self.lead_sheets.kept = Some(Kept { of, melody, chords });
+        if let Err(e) = self.write_lead_sheet(of, grid) {
             self.notify(NoticeLevel::Warning, e.to_string());
         }
     }
 
-    /// Wait for a melody being heard (scripts and tests).
+    /// Wait for the audio being heard (scripts and tests).
     pub fn wait_for_lead_sheet(&mut self) {
-        while let Some((_, _, j)) = &self.lead_sheets.job {
+        while let Some((_, _, _, j)) = &self.lead_sheets.job {
             if j.is_finished() {
                 self.poll_lead_sheets();
                 return;
@@ -192,26 +389,23 @@ impl Session {
         }
     }
 
-    /// Write the sheet from the melody heard and the project around it.
-    fn write_lead_sheet(&mut self, clip: ClipId, grid: Grid) -> Result<()> {
-        let Some((_, notes)) = self.lead_sheets.heard.clone() else {
-            return Err(SessionError::Other("no melody heard yet".into()));
+    /// Write the sheet from what was heard and the project around it.
+    fn write_lead_sheet(&mut self, of: LeadSheetOf, grid: Grid) -> Result<()> {
+        let Some(kept) = self.lead_sheets.kept.clone().filter(|k| k.of == of) else {
+            return Err(SessionError::Other("nothing heard yet".into()));
         };
+        let (clips, part_track) = self.lead_sheet_clips(of)?;
+        let (start, end) = self.lead_sheet_span(&clips);
         let p = &self.project;
-        let c = p
-            .clip(clip)
-            .cloned()
-            .ok_or_else(|| SessionError::Other("the clip is gone".into()))?;
-        if notes.is_empty() {
-            return Err(SessionError::Other(format!(
-                "no melody heard in ‘{}’",
-                c.name
-            )));
+        let what = match of {
+            LeadSheetOf::Clip(_) => clips[0].name.clone(),
+            LeadSheetOf::Track(t) => p.track(t).map_or_else(String::new, |t| t.name.clone()),
+        };
+        if kept.melody.is_empty() {
+            return Err(SessionError::Other(format!("no melody heard in ‘{what}’")));
         }
         let meter = &p.timeline.meter;
-        let start = c.start;
-        let end = c.end(&p.timeline, p.sample_rate);
-        // The bars from the clip's first to its last.
+        // The bars from the first clip's to the last's.
         let (first, last) = (
             meter.bar_at(start),
             meter.bar_at(end - MusicalTime::from_ticks(1).max(MusicalTime::ZERO)),
@@ -227,43 +421,11 @@ impl Session {
             .collect();
         let from = meter.bar_start(first);
         let to = meter.bar_start(last.max(first) + 1);
-        // Chords: the chord track's, else what the other tracks' MIDI plays.
-        let mut chords: Vec<ChordAt> = p
-            .chords
-            .iter()
-            .filter(|ch| ch.end > from && ch.start < to)
-            .map(|ch| ChordAt {
-                start: ch.start.max(from).quarters(),
-                chord: ch.chord,
-            })
-            .collect();
+        let mut chords = self.known_chords(part_track, from, to);
         if chords.is_empty() {
-            let mut sounding = Vec::new();
-            for t in &p.tracks {
-                if t.id == c.track {
-                    continue;
-                }
-                for other in p.clips_of(t.id) {
-                    if let ClipContent::Midi(m) = &other.content {
-                        for n in m.notes.iter().filter(|n| !n.muted) {
-                            sounding.push(faderframe_project::harmony::Sounding {
-                                start: other.start + n.start,
-                                end: other.start + n.start + n.length,
-                                key: n.key,
-                            });
-                        }
-                    }
-                }
-            }
-            let half = meter.signature_at(from).bar_length() / 2;
-            chords = faderframe_project::harmony::detect_chords(&sounding, from, to, half)
-                .into_iter()
-                .map(|ch| ChordAt {
-                    start: ch.start.quarters(),
-                    chord: ch.chord,
-                })
-                .collect();
+            chords = kept.chords.clone();
         }
+        let p = &self.project;
         let key = p
             .keys
             .iter()
@@ -282,10 +444,10 @@ impl Session {
             })
             .collect();
         let part = p
-            .track(c.track)
+            .track(part_track)
             .map_or_else(String::new, |t| t.name.clone());
         let title = if p.name.trim().is_empty() {
-            c.name.clone()
+            what.clone()
         } else {
             p.name.clone()
         };
@@ -295,7 +457,7 @@ impl Session {
             key,
             bars,
             tempo: Some(p.timeline.tempo.bpm_at(start)),
-            notes,
+            notes: kept.melody,
             chords,
             lines,
             grid,
@@ -304,7 +466,7 @@ impl Session {
         let pages = engrave(&sheet, &Layout::default());
         let count = sheet.measures.len();
         self.lead_sheets.doc = Some(LeadSheetDoc {
-            clip,
+            of,
             grid,
             sheet,
             pages,
@@ -315,7 +477,7 @@ impl Session {
         ))?;
         self.notify(
             NoticeLevel::Info,
-            format!("Lead sheet of ‘{}’: {count} bars", c.name),
+            format!("Lead sheet of ‘{what}’: {count} bars"),
         );
         self.revision += 1;
         Ok(())
