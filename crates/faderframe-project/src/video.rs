@@ -134,6 +134,22 @@ impl Video {
         })
     }
 
+    /// The clip of `track` showing at `pos` (samples), with the time in
+    /// its file.
+    pub fn at_track(&self, track: VideoTrackId, pos: i64, rate: u32) -> Option<(&VideoClip, i64)> {
+        let t = self.tracks.iter().find(|t| t.id == track)?;
+        let i = t.clips.partition_point(|c| c.start <= pos);
+        t.clips[..i]
+            .iter()
+            .rev()
+            .find_map(|c| c.file_time(pos, rate).map(|ft| (c, ft)))
+    }
+
+    /// The shown tracks, top first.
+    pub fn shown_tracks(&self) -> impl Iterator<Item = &VideoTrack> {
+        self.tracks.iter().filter(|t| !t.hidden)
+    }
+
     pub fn clip(&self, id: VideoClipId) -> Option<(&VideoTrack, &VideoClip)> {
         self.tracks
             .iter()

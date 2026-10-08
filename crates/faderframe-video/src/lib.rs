@@ -22,6 +22,7 @@
 #![forbid(unsafe_code)]
 
 pub mod audio;
+pub mod cuts;
 pub mod decode;
 pub mod index;
 pub mod mux;

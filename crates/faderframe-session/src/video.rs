@@ -202,6 +202,11 @@ enum Done {
         video: PathBuf,
         sound: PathBuf,
     },
+    Cuts {
+        clip: VideoClipId,
+        /// Shot starts in the file (ns).
+        at: Vec<i64>,
+    },
 }
 
 struct Job {
@@ -244,6 +249,7 @@ pub struct VideoSourceState {
 #[derive(Default)]
 pub(crate) struct VideoState {
     settings: VideoSettings,
+    compare: VideoCompare,
     service: Option<FrameService>,
     known: HashMap<VideoSourceId, Known>,
     jobs: Vec<Job>,
@@ -276,9 +282,23 @@ pub struct VideoShown {
     pub position: i64,
 }
 
+/// How the video window shows the picture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VideoCompare {
+    /// The top shown track.
+    #[default]
+    Single,
+    /// The first two shown tracks next to each other (A | B).
+    SideBySide,
+    /// The first shown track over the second, a divider between (A / B).
+    Wipe,
+}
+
 /// Picture edits and jobs.
 #[derive(Clone, Debug, PartialEq)]
 pub enum VideoOp {
+    /// How the video window shows the picture (not an edit).
+    SetCompare(VideoCompare),
     /// Import a video (with its first sound stream on a new audio track
     /// when `sound`).
     Import {
@@ -289,7 +309,19 @@ pub enum VideoOp {
     MoveClip {
         clip: VideoClipId,
         start: i64,
+        /// Onto this track (`None`: the one it is on).
+        track: Option<VideoTrackId>,
     },
+    /// A new video track under the others.
+    AddTrack,
+    RenameTrack {
+        track: VideoTrackId,
+        name: String,
+    },
+    /// Remove a video track and its clips.
+    RemoveTrack(VideoTrackId),
+    /// Markers where a clip's picture changes shot.
+    DetectCuts(VideoClipId),
     /// Trim a clip: its start, in-point (ns in the file) and length (ns).
     TrimClip {
         clip: VideoClipId,
@@ -392,6 +424,11 @@ impl crate::Session {
         self.video.late.store(0, Ordering::Relaxed);
     }
 
+    /// How the video window shows the picture.
+    pub fn video_compare(&self) -> VideoCompare {
+        self.video.compare
+    }
+
     pub fn video_settings(&self) -> &VideoSettings {
         &self.video.settings
     }
@@ -453,6 +490,17 @@ impl crate::Session {
     /// The picture for the moment `lead_ns` from now (when the frame being
     /// drawn reaches the screen), at most `max` pixels.
     pub fn video_picture(&self, lead_ns: i64, max: (u32, u32)) -> Option<VideoShown> {
+        self.video_picture_on(None, lead_ns, max)
+    }
+
+    /// [`Self::video_picture`] of one video track (`None`: the top shown
+    /// one with a clip there), for A/B comparisons.
+    pub fn video_picture_on(
+        &self,
+        track: Option<VideoTrackId>,
+        lead_ns: i64,
+        max: (u32, u32),
+    ) -> Option<VideoShown> {
         let rate = self.project.sample_rate;
         let playing = self.transport.playing;
         let offset = (self.project.video.offset_ms * 1e6) as i64;
@@ -465,7 +513,10 @@ impl crate::Session {
         } else {
             self.transport.position
         };
-        let (clip, file_time) = self.project.video.at(position, rate)?;
+        let (clip, file_time) = match track {
+            Some(t) => self.project.video.at_track(t, position, rate)?,
+            None => self.project.video.at(position, rate)?,
+        };
         let (clip, source) = (clip.id, clip.source);
         let known = self.video.known.get(&source)?;
         let index = known.index.as_ref()?;
@@ -476,7 +527,7 @@ impl crate::Session {
             .service
             .as_ref()
             .and_then(|s| s.picture(source.raw(), file_time, max, want));
-        if playing {
+        if playing && track.is_none() {
             let mut last = self.video.last.lock().unwrap_or_else(|p| p.into_inner());
             if *last != Some((source, frame)) {
                 *last = Some((source, frame));
@@ -760,6 +811,36 @@ impl crate::Session {
                 }
                 Ok(())
             }
+            Done::Cuts { clip, at } => {
+                let Some((_, c)) = self.project.video.clip(clip) else {
+                    return Ok(());
+                };
+                let rate = self.project.sample_rate;
+                let (start, offset) = (c.start, c.offset);
+                let mut commands = Vec::new();
+                for (i, t) in at.iter().enumerate() {
+                    let pos = start + ns_to_samples(t - offset, rate);
+                    commands.push(Command::AddMarker {
+                        marker: faderframe_project::Marker {
+                            id: self.project.ids.allocate(),
+                            position: self.engine.samples_to_musical(&self.project, pos),
+                            name: format!("Cut {}", i + 1),
+                        },
+                    });
+                }
+                let n = commands.len();
+                if n > 0 {
+                    self.edit(Command::Batch {
+                        label: "Detect Cuts".into(),
+                        commands,
+                    })?;
+                }
+                self.notify(
+                    NoticeLevel::Info,
+                    format!("{n} cut{} found", if n == 1 { "" } else { "s" }),
+                );
+                Ok(())
+            }
             Done::Exported { out } => {
                 self.notify(NoticeLevel::Info, format!("wrote {}", out.display()));
                 Ok(())
@@ -986,12 +1067,64 @@ impl crate::Session {
             s.edit(Command::SetVideo { video: Box::new(v) })
         };
         match op {
+            VideoOp::SetCompare(c) => {
+                self.video.compare = c;
+                self.revision += 1;
+                Ok(())
+            }
             VideoOp::Import { path, sound } => {
                 self.import_video(path, sound);
                 Ok(())
             }
-            VideoOp::MoveClip { clip, start } => edit(self, &|v| {
-                v.clip_mut(clip).map(|c| c.start = start).is_some()
+            VideoOp::MoveClip { clip, start, track } => edit(self, &|v| {
+                let Some(from) = v.clip(clip).map(|(t, _)| t.id) else {
+                    return false;
+                };
+                match track.filter(|t| *t != from) {
+                    Some(to) if v.tracks.iter().any(|t| t.id == to) => {
+                        let Some(src) = v.tracks.iter_mut().find(|t| t.id == from) else {
+                            return false;
+                        };
+                        let Some(i) = src.clips.iter().position(|c| c.id == clip) else {
+                            return false;
+                        };
+                        let mut c = src.clips.remove(i);
+                        c.start = start;
+                        if let Some(dst) = v.tracks.iter_mut().find(|t| t.id == to) {
+                            dst.clips.push(c);
+                        }
+                        true
+                    }
+                    _ => v.clip_mut(clip).map(|c| c.start = start).is_some(),
+                }
+            }),
+            VideoOp::AddTrack => {
+                let id: VideoTrackId = self.project.ids.allocate();
+                let n = self.project.video.tracks.len() + 1;
+                edit(self, &|v| {
+                    v.tracks.push(VideoTrack {
+                        id,
+                        name: format!("Video {n}"),
+                        clips: Vec::new(),
+                        hidden: false,
+                    });
+                    true
+                })
+            }
+            VideoOp::RenameTrack { track, name } => {
+                let name = name.trim().to_string();
+                edit(self, &|v| {
+                    v.tracks
+                        .iter_mut()
+                        .find(|t| t.id == track)
+                        .map(|t| t.name = name.clone())
+                        .is_some()
+                })
+            }
+            VideoOp::RemoveTrack(track) => edit(self, &|v| {
+                let n = v.tracks.len();
+                v.tracks.retain(|t| t.id != track);
+                v.tracks.len() != n
             }),
             VideoOp::TrimClip {
                 clip,
@@ -1077,6 +1210,44 @@ impl crate::Session {
                     return Err(SessionError::Other("there is no video to export".into()));
                 }
                 self.ui_requests.push(crate::UiRequest::ExportMovie);
+                Ok(())
+            }
+            VideoOp::DetectCuts(clip) => {
+                let (c, source) = self
+                    .project
+                    .video
+                    .clip(clip)
+                    .and_then(|(_, c)| {
+                        self.project
+                            .video
+                            .sources
+                            .get(&c.source)
+                            .map(|s| (c.clone(), s.clone()))
+                    })
+                    .ok_or_else(|| SessionError::Other("no such video clip".into()))?;
+                // From the proxy where there is one (fast to decode).
+                let file = self
+                    .video
+                    .known
+                    .get(&c.source)
+                    .and_then(|k| k.proxy.as_ref().map(|(p, _)| p.clone()))
+                    .unwrap_or(source.path.clone());
+                let name = source.name();
+                self.spawn_video(
+                    format!("Finding cuts in {name}"),
+                    Some(c.source),
+                    move |share, cancel| {
+                        let at = faderframe_video::cuts::detect_cuts(
+                            &file,
+                            c.offset,
+                            c.offset + c.length,
+                            cancel,
+                            |x| share.set(x),
+                        )
+                        .map_err(|e| e.to_string())?;
+                        Ok(Done::Cuts { clip, at })
+                    },
+                );
                 Ok(())
             }
             VideoOp::Cancel => {

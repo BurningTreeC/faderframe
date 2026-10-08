@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The caller's name for a video (a project's source id).
 pub type Key = u64;
@@ -148,14 +148,31 @@ impl Cache {
     }
 }
 
+/// A frame wanted of a video (the newest asked).
+#[derive(Clone, Copy, Debug)]
+struct Target {
+    n: u32,
+    size: (u32, u32),
+    at: Instant,
+}
+
+/// A target nobody asked for this long is not shown any more.
+const STALE: Duration = Duration::from_millis(400);
+
+impl Target {
+    fn fresh(&self) -> bool {
+        self.at.elapsed() < STALE
+    }
+}
+
 /// What the threads are asked to do.
 #[derive(Default)]
 struct Asked {
     media: HashMap<Key, Media>,
-    /// Playing: video, frame, size (latest only).
-    play: Option<(Key, u32, (u32, u32))>,
-    /// Still: video, frame, size (latest only).
-    still: Option<(Key, u32, (u32, u32))>,
+    /// Playing, per video (several play at once side by side).
+    play: HashMap<Key, Target>,
+    /// Still or scrubbing, per video.
+    still: HashMap<Key, Target>,
     /// Thumbnails wanted: video, frame, height (newest last).
     thumbs: Vec<(Key, u32, u32)>,
     errors: HashMap<Key, String>,
@@ -271,14 +288,21 @@ impl FrameService {
                 c.any_width(key, n).filter(|_| want == Want::Play)
             })
         };
-        self.ask(|a| match want {
-            Want::Play => {
-                a.play = Some((key, n, size));
-                a.still = None;
-            }
-            Want::Still => {
-                a.still = Some((key, n, size));
-                a.play = None;
+        self.ask(|a| {
+            let t = Target {
+                n,
+                size,
+                at: Instant::now(),
+            };
+            match want {
+                Want::Play => {
+                    a.play.insert(key, t);
+                    a.still.remove(&key);
+                }
+                Want::Still => {
+                    a.still.insert(key, t);
+                    a.play.remove(&key);
+                }
             }
         });
         if let Some(frame) = exact {
@@ -323,8 +347,8 @@ impl FrameService {
     /// Forget what was asked (the transport stopped showing pictures).
     pub fn idle(&self) {
         self.ask(|a| {
-            a.play = None;
-            a.still = None;
+            a.play.clear();
+            a.still.clear();
         });
     }
 }
@@ -408,141 +432,184 @@ fn moving_source(m: &Media, size: (u32, u32)) -> (PathBuf, (u32, u32)) {
     }
 }
 
+/// A video the player reads ahead: its decoder and the next frame it
+/// gives.
+#[derive(Default)]
+struct Lane {
+    open: Option<Open>,
+    cursor: Option<u32>,
+}
+
+/// The frame wanted of `key` now (fresh targets only).
+fn wanted(s: &Shared, key: Key, play: bool) -> Option<(u32, (u32, u32))> {
+    let a = lock(&s.asked);
+    let map = if play { &a.play } else { &a.still };
+    map.get(&key).filter(|t| t.fresh()).map(|t| (t.n, t.size))
+}
+
+/// One step of reading `key` ahead: a frame decoded (true), or nothing to
+/// do now.
+fn play_step(s: &Shared, lane: &mut Lane, key: Key, m: &Media) -> bool {
+    let Some((want, size)) = wanted(s, key, true) else {
+        lane.cursor = None;
+        return false;
+    };
+    let (file, dsize) = moving_source(m, size);
+    let cached = |n: u32| lock(&s.cache).get((key, n, dsize.0)).is_some();
+    let at = match lane.cursor {
+        Some(c) if c >= want && c <= want + AHEAD + 2 => c,
+        Some(c) if c < want && want - c <= 2 => c,
+        _ => {
+            // A jump (or the start): play from the frame wanted, unless the
+            // frames ahead are there already.
+            let mut n = want;
+            while n < want + AHEAD && cached(n) {
+                n += 1;
+            }
+            if n >= want + AHEAD {
+                return false;
+            }
+            let Some(t) = m.index.times.get(want as usize).copied() else {
+                return false;
+            };
+            let Some(d) = decoder_for(&mut lane.open, key, &file, dsize, s) else {
+                return false;
+            };
+            if let Err(e) = d.play_from(t) {
+                tracing::warn!("{}: {e}", file.display());
+                return false;
+            }
+            lane.cursor = Some(want);
+            want
+        }
+    };
+    if at > want + AHEAD {
+        return false;
+    }
+    let Some(d) = decoder_for(&mut lane.open, key, &file, dsize, s) else {
+        return false;
+    };
+    match d.next_frame() {
+        Ok(Some(f)) => {
+            lock(&s.cache).put((key, at, dsize.0), Arc::new(f), s.budget);
+            lane.cursor = Some(at + 1);
+            true
+        }
+        Ok(None) => {
+            lane.cursor = None;
+            false
+        }
+        Err(e) => {
+            tracing::warn!("{}: {e}", file.display());
+            lane.cursor = None;
+            lane.open = None;
+            false
+        }
+    }
+}
+
+/// The videos with fresh targets in `map`, with their media.
+fn targets(a: &Asked, play: bool) -> Vec<(Key, Media)> {
+    let map = if play { &a.play } else { &a.still };
+    map.iter()
+        .filter(|(_, t)| t.fresh())
+        .filter_map(|(k, _)| a.media.get(k).map(|m| (*k, m.clone())))
+        .collect()
+}
+
 fn player(s: &Shared) {
-    let mut open: Option<Open> = None;
-    // Next frame the decoder gives, of which video.
-    let mut cursor: Option<(Key, u32)> = None;
+    let mut lanes: HashMap<Key, Lane> = HashMap::new();
     let mut seen = 0;
     loop {
         let Some(a) = wait(s, seen) else { return };
         seen = a.generation;
-        let Some((key, _, size)) = a.play else {
-            cursor = None;
-            continue;
-        };
-        let Some(m) = a.media.get(&key).cloned() else {
-            continue;
-        };
+        let playing = targets(&a, true);
         drop(a);
-        let (file, dsize) = moving_source(&m, size);
-        let cached = |n: u32| lock(&s.cache).get((key, n, dsize.0)).is_some();
-        // Read ahead while what is wanted is near.
+        lanes.retain(|k, _| playing.iter().any(|(p, _)| p == k));
+        // Every video playing read ahead in turn, a frame each, until all
+        // are far enough ahead.
         loop {
             if s.stop.load(Ordering::Relaxed) {
                 return;
             }
-            let now = lock(&s.asked).play;
-            let Some((k, want_now, _)) = now else { break };
-            if k != key {
-                break;
+            let mut any = false;
+            for (key, m) in &playing {
+                let lane = lanes.entry(*key).or_default();
+                any |= play_step(s, lane, *key, m);
             }
-            let at = match cursor {
-                Some((ck, c)) if ck == key && c >= want_now && c <= want_now + AHEAD + 2 => c,
-                Some((ck, c)) if ck == key && c < want_now && want_now - c <= 2 => c,
-                _ => {
-                    // A jump (or the start): play from the frame wanted,
-                    // unless it and the next are already there.
-                    if cached(want_now) && cached(want_now + 1) {
-                        let mut n = want_now;
-                        while n < want_now + AHEAD && cached(n + 1) {
-                            n += 1;
-                        }
-                        if n >= want_now + AHEAD {
-                            break;
-                        }
-                    }
-                    let Some(t) = m.index.times.get(want_now as usize).copied() else {
-                        break;
-                    };
-                    let Some(d) = decoder_for(&mut open, key, &file, dsize, s) else {
-                        break;
-                    };
-                    if let Err(e) = d.play_from(t) {
-                        tracing::warn!("{}: {e}", file.display());
-                        break;
-                    }
-                    cursor = Some((key, want_now));
-                    want_now
-                }
-            };
-            if at > want_now + AHEAD {
+            if !any {
                 break;
-            }
-            let Some(d) = decoder_for(&mut open, key, &file, dsize, s) else {
-                break;
-            };
-            match d.next_frame() {
-                Ok(Some(f)) => {
-                    lock(&s.cache).put((key, at, dsize.0), Arc::new(f), s.budget);
-                    cursor = Some((key, at + 1));
-                }
-                Ok(None) => {
-                    cursor = None;
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!("{}: {e}", file.display());
-                    cursor = None;
-                    open = None;
-                    break;
-                }
             }
         }
     }
 }
 
+/// The decoders a still picture of one video uses: what scrubbing reads,
+/// and the original for the sharp picture.
+#[derive(Default)]
+struct Stills {
+    moving: Option<Open>,
+    sharp: Option<Open>,
+}
+
 fn seeker(s: &Shared) {
-    let mut moving: Option<Open> = None;
-    let mut sharp: Option<Open> = None;
+    let mut decoders: HashMap<Key, Stills> = HashMap::new();
     let mut seen = 0;
     loop {
         let Some(a) = wait(s, seen) else { return };
         seen = a.generation;
-        let Some((key, n, size)) = a.still else {
-            continue;
-        };
-        let Some(m) = a.media.get(&key).cloned() else {
-            continue;
-        };
+        let stills = targets(&a, false);
         drop(a);
-        let Some(t) = m.index.times.get(n as usize).copied() else {
-            continue;
-        };
-        let (file, dsize) = moving_source(&m, size);
-        let have = |w: u32| lock(&s.cache).get((key, n, w)).is_some();
-        // The frame from what scrubbing reads (the proxy, or the original
-        // with a keyframe first where that is far).
-        if !have(dsize.0) {
-            let far = m.proxy.is_none() && n as usize - m.index.key_before(n as usize) > 2;
-            let k = m.index.key_before(n as usize);
-            if far
-                && !have_frame(s, key, k as u32, dsize.0)
-                && let Some(&kt) = m.index.times.get(k)
-                && let Some(d) = decoder_for(&mut moving, key, &file, dsize, s)
-                && let Ok(Some(f)) = d.frame_at(kt, false)
-            {
-                lock(&s.cache).put((key, k as u32, dsize.0), Arc::new(f), s.budget);
-            }
-            if newer(s, key, n) {
-                continue;
-            }
-            if let Some(d) = decoder_for(&mut moving, key, &file, dsize, s) {
-                match d.frame_at(t, true) {
-                    Ok(Some(f)) => lock(&s.cache).put((key, n, dsize.0), Arc::new(f), s.budget),
-                    Ok(None) => {}
-                    Err(e) => tracing::warn!("{}: {e}", file.display()),
-                }
+        decoders.retain(|k, _| stills.iter().any(|(p, _)| p == k));
+        for (key, m) in &stills {
+            let d = decoders.entry(*key).or_default();
+            still_step(s, d, *key, m);
+        }
+    }
+}
+
+/// The still frame wanted of `key`: from what scrubbing reads (a keyframe
+/// first where the exact one is far), then sharp from the original.
+fn still_step(s: &Shared, d: &mut Stills, key: Key, m: &Media) {
+    let Some((n, size)) = wanted(s, key, false) else {
+        return;
+    };
+    let Some(t) = m.index.times.get(n as usize).copied() else {
+        return;
+    };
+    let (file, dsize) = moving_source(m, size);
+    let have = |w: u32| lock(&s.cache).get((key, n, w)).is_some();
+    let newer = || wanted(s, key, false).is_none_or(|(m2, _)| m2 != n);
+    if !have(dsize.0) {
+        let far = m.proxy.is_none() && n as usize - m.index.key_before(n as usize) > 2;
+        let k = m.index.key_before(n as usize);
+        if far
+            && !have_frame(s, key, k as u32, dsize.0)
+            && let Some(&kt) = m.index.times.get(k)
+            && let Some(dec) = decoder_for(&mut d.moving, key, &file, dsize, s)
+            && let Ok(Some(f)) = dec.frame_at(kt, false)
+        {
+            lock(&s.cache).put((key, k as u32, dsize.0), Arc::new(f), s.budget);
+        }
+        if newer() {
+            return;
+        }
+        if let Some(dec) = decoder_for(&mut d.moving, key, &file, dsize, s) {
+            match dec.frame_at(t, true) {
+                Ok(Some(f)) => lock(&s.cache).put((key, n, dsize.0), Arc::new(f), s.budget),
+                Ok(None) => {}
+                Err(e) => tracing::warn!("{}: {e}", file.display()),
             }
         }
-        // Sharp when stopped: the original at the full size wanted.
-        if dsize != size && !have(size.0) && !newer(s, key, n) {
-            let original = m.original.clone();
-            if let Some(d) = decoder_for(&mut sharp, key, &original, size, s) {
-                match d.frame_at(t, true) {
-                    Ok(Some(f)) => lock(&s.cache).put((key, n, size.0), Arc::new(f), s.budget),
-                    Ok(None) => {}
-                    Err(e) => tracing::warn!("{}: {e}", original.display()),
-                }
+    }
+    // Sharp when stopped: the original at the full size wanted.
+    if dsize != size && !have(size.0) && !newer() {
+        let original = m.original.clone();
+        if let Some(dec) = decoder_for(&mut d.sharp, key, &original, size, s) {
+            match dec.frame_at(t, true) {
+                Ok(Some(f)) => lock(&s.cache).put((key, n, size.0), Arc::new(f), s.budget),
+                Ok(None) => {}
+                Err(e) => tracing::warn!("{}: {e}", original.display()),
             }
         }
     }
@@ -550,13 +617,6 @@ fn seeker(s: &Shared) {
 
 fn have_frame(s: &Shared, key: Key, n: u32, width: u32) -> bool {
     lock(&s.cache).get((key, n, width)).is_some()
-}
-
-/// Whether a newer still frame than `n` of `key` is wanted.
-fn newer(s: &Shared, key: Key, n: u32) -> bool {
-    lock(&s.asked)
-        .still
-        .is_some_and(|(k, m, _)| k != key || m != n)
 }
 
 fn thumbnailer(s: &Shared) {

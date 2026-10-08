@@ -252,3 +252,53 @@ fn the_video_cache_is_kept_where_set_and_cleared() {
     assert!(std::fs::read_dir(&other).unwrap().count() > 0);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// Two video tracks: a clip moved onto the second shows there (A/B), and
+/// the flash test's flashes come back as cut markers.
+#[test]
+fn video_tracks_compare_and_cuts_become_markers() {
+    let _turn = turn();
+    let d = dir("tracks");
+    let file = movie(&d);
+    let mut s = Session::new(Project::new("Film", 48_000), None, EngineConfig::default()).unwrap();
+    s.import_video(file.clone(), false);
+    s.wait_for_video();
+    s.import_video(file, false);
+    s.wait_for_video();
+    s.dispatch(Action::Video(VideoOp::AddTrack)).unwrap();
+    let v = &s.project().video;
+    assert_eq!(v.tracks.len(), 2);
+    let second = v.tracks[0].clips[1].clone();
+    let to = v.tracks[1].id;
+    s.dispatch(Action::Video(VideoOp::MoveClip {
+        clip: second.id,
+        start: 48_000,
+        track: Some(to),
+    }))
+    .unwrap();
+    let v = &s.project().video;
+    assert_eq!(v.tracks[0].clips.len(), 1);
+    assert_eq!(v.tracks[1].clips.len(), 1);
+    assert_eq!(v.tracks[1].clips[0].start, 48_000);
+    // At 1.5 s: track B shows its clip half a second in, A a second and a half.
+    s.dispatch(Action::Transport(TransportAction::Locate(
+        s.engine().samples_to_musical(s.project(), 72_000),
+    )))
+    .unwrap();
+    s.tick(0.01);
+    let a = s
+        .video_picture_on(Some(s.project().video.tracks[0].id), 0, (64, 36))
+        .unwrap();
+    let b = s.video_picture_on(Some(to), 0, (64, 36)).unwrap();
+    assert_eq!(a.frame, 37);
+    assert_eq!(b.frame, 12);
+    // A flash a second: a cut into each flash and out of it.
+    let markers = s.project().markers.len();
+    let first = s.project().video.tracks[0].clips[0].id;
+    s.dispatch(Action::Video(VideoOp::DetectCuts(first)))
+        .unwrap();
+    s.wait_for_video();
+    let cuts = s.project().markers.len() - markers;
+    assert!((18..=20).contains(&cuts), "{cuts} cut markers");
+    let _ = std::fs::remove_dir_all(&d);
+}

@@ -31,6 +31,17 @@ fn dir() -> PathBuf {
 /// A clip of `FRAMES` frames through `encoder` (after videoconvert) into
 /// `mux`, with 3 s of a 440 Hz tone at 44.1 kHz when `sound`.
 fn make_clip(path: &Path, encoder: &str, mux: &str, sound: bool) {
+    make_clip_with(path, encoder, mux, sound, colour);
+}
+
+/// [`make_clip`] with frame `n` in `paint(n)`.
+fn make_clip_with(
+    path: &Path,
+    encoder: &str,
+    mux: &str,
+    sound: bool,
+    paint: impl Fn(u32) -> [u8; 3],
+) {
     faderframe_video::init().unwrap();
     let sound = if sound {
         format!(
@@ -60,7 +71,7 @@ fn make_clip(path: &Path, encoder: &str, mux: &str, sound: bool) {
         .unwrap();
     pipeline.set_state(gst::State::Playing).unwrap();
     for n in 0..FRAMES {
-        let c = colour(n);
+        let c = paint(n);
         let mut data = Vec::with_capacity((W * H * 4) as usize);
         for _ in 0..W * H {
             data.extend_from_slice(&[c[0], c[1], c[2], 255]);
@@ -400,4 +411,32 @@ fn the_service_answers_at_once_and_catches_up() {
     assert_eq!(thumb.unwrap().height, 60);
     svc.remove(7);
     assert!(svc.picture(7, t, (W, H), Want::Still).is_none());
+}
+
+/// Shots that change at frames 30 and 60, each moving a little (its
+/// brightness wobbles): the cuts are found, the wobble is not one.
+#[test]
+fn cuts_are_found_where_shots_change() {
+    let d = dir().join("cuts");
+    std::fs::create_dir_all(&d).unwrap();
+    let clip = d.join("shots.mkv");
+    let shot = |n: u32| -> [u8; 3] {
+        let wobble = (n % 4) as u8 * 3;
+        match n {
+            0..30 => [180 + wobble, 60, 40],
+            30..60 => [40, 70 + wobble, 190],
+            _ => [120 + wobble, 120, 120],
+        }
+    };
+    make_clip_with(&clip, "jpegenc", "matroskamux", false, shot);
+    let cancel = AtomicBool::new(false);
+    let cuts =
+        faderframe_video::cuts::detect_cuts(&clip, 0, frame_ns(FRAMES), &cancel, |_| {}).unwrap();
+    assert_eq!(cuts, vec![frame_ns(30), frame_ns(60)]);
+    // Within a span: only the cut inside it.
+    let some =
+        faderframe_video::cuts::detect_cuts(&clip, frame_ns(40), frame_ns(FRAMES), &cancel, |_| {})
+            .unwrap();
+    assert_eq!(some, vec![frame_ns(60)]);
+    let _ = std::fs::remove_dir_all(&d);
 }

@@ -7,11 +7,11 @@
 
 #![forbid(unsafe_code)]
 
-use faderframe_session::video::{VideoOp, VideoShown};
+use faderframe_session::video::{VideoCompare, VideoOp, VideoShown};
 use faderframe_session::{Action, Session};
 use faderframe_ui_canvas::{
     Align, CanvasView, Color, EventCx, FontFamily, FontWeight, HostRequest, MenuItem, Painter,
-    Pixels, PointerButton, Rect, Size, TextStyle, Theme, ViewEvent,
+    Pixels, Point, PointerButton, Rect, Size, TextStyle, Theme, ViewEvent,
 };
 use faderframe_workspace::ViewId;
 
@@ -31,6 +31,10 @@ pub struct VideoView {
     overlay: bool,
     /// Waiting for the exact frame (keep drawing).
     waiting: bool,
+    /// Where the wipe divides A from B (share of the width), and whether
+    /// it is being dragged.
+    wipe: f32,
+    wiping: bool,
 }
 
 impl VideoView {
@@ -41,6 +45,8 @@ impl VideoView {
             scale: 1.0,
             overlay: true,
             waiting: false,
+            wipe: 0.5,
+            wiping: false,
         }
     }
 
@@ -77,6 +83,26 @@ impl VideoView {
             .separated(),
             MenuItem::new("Flash-and-Beep Sync Test", Action::Video(VideoOp::SyncTest)),
         ];
+        let two = model.project().video.shown_tracks().count() >= 2;
+        let now = model.video_compare();
+        let compare = |label: &str, c: VideoCompare| {
+            if two || c == VideoCompare::Single {
+                MenuItem::new(label, Action::Video(VideoOp::SetCompare(c))).checked(now == c)
+            } else {
+                MenuItem::disabled(label)
+            }
+        };
+        items.push(
+            MenuItem::submenu(
+                "Compare",
+                vec![
+                    compare("Top Track", VideoCompare::Single),
+                    compare("Side by Side (A | B)", VideoCompare::SideBySide),
+                    compare("Wipe (A / B, drag the divider)", VideoCompare::Wipe),
+                ],
+            )
+            .separated(),
+        );
         if let Some(v) = &shown {
             let has_tc = model
                 .project()
@@ -97,6 +123,80 @@ impl VideoView {
         }
         items.push(MenuItem::new("Full Screen", Action::FullScreen(ViewId::video())).separated());
         items
+    }
+
+    /// Draw `shown` letterboxed in `area` (or what stands for it); whether
+    /// the exact frame is still to come.
+    fn draw_picture(
+        p: &mut dyn Painter,
+        model: &Session,
+        shown: &Option<VideoShown>,
+        area: Rect,
+        theme: &Theme,
+    ) -> bool {
+        let small = TextStyle::new(11.0, theme.ui.text_dim).align(Align::Center);
+        let middle = Rect::new(area.x, area.y + area.h / 2.0 - 10.0, area.w, 20.0);
+        match shown {
+            None => {
+                let empty = model
+                    .project()
+                    .video
+                    .tracks
+                    .iter()
+                    .all(|t| t.clips.is_empty());
+                let text = if empty {
+                    "No video — File → Import Video…, or drop a movie here"
+                } else {
+                    "No picture here"
+                };
+                p.text(text, middle, &small);
+                false
+            }
+            Some(v) => match &v.picture {
+                Some(pic) => {
+                    let f = &pic.frame;
+                    let fit = Self::fit(f.width as f32, f.height as f32, Size::new(area.w, area.h));
+                    let dst = Rect::new(area.x + fit.x, area.y + fit.y, fit.w, fit.h);
+                    let key = (v.source.raw() << 40) ^ ((pic.number as u64) << 12) ^ f.width as u64;
+                    p.pixels(
+                        &Pixels {
+                            key,
+                            width: f.width,
+                            height: f.height,
+                            rgba: &f.rgba,
+                        },
+                        dst,
+                    );
+                    !pic.exact
+                }
+                None => {
+                    let state = model.video_source_state(v.source);
+                    let text = match &state.error {
+                        Some(e) => e.clone(),
+                        None if !state.indexed => "Reading the video…".into(),
+                        None => "…".into(),
+                    };
+                    p.text(&text, middle, &small);
+                    true
+                }
+            },
+        }
+    }
+
+    /// A small label in the corner of a compared picture.
+    fn tag(p: &mut dyn Painter, text: &str, at: Point) {
+        let w = text.chars().count() as f32 * 6.4 + 12.0;
+        let r = Rect::new(at.x, at.y, w, 18.0);
+        p.fill_rounded(
+            r,
+            4.0,
+            &faderframe_ui_canvas::Paint::Solid(Color::rgba(0.0, 0.0, 0.0, 0.6)),
+        );
+        p.text(
+            text,
+            r,
+            &TextStyle::new(10.0, Color::rgb(1.0, 1.0, 1.0)).align(Align::Center),
+        );
     }
 
     fn overlay_text(model: &Session, v: &VideoShown) -> (String, String) {
@@ -131,66 +231,68 @@ impl CanvasView<Session, Action> for VideoView {
         let area = Rect::new(0.0, 0.0, size.w, size.h);
         // Picture is framed in black, whatever the skin.
         p.fill(area, Color::rgb(0.0, 0.0, 0.0));
-        let ui = &theme.ui;
         // At device pixels: sharp on HiDPI screens.
         let max = (
             (size.w * self.scale).max(1.0) as u32,
             (size.h * self.scale).max(1.0) as u32,
         );
-        let shown = model.video_picture(self.lead, max);
-        self.waiting = false;
-        let small = TextStyle::new(11.0, ui.text_dim).align(Align::Center);
-        match &shown {
-            None => {
-                let empty = model
-                    .project()
-                    .video
-                    .tracks
-                    .iter()
-                    .all(|t| t.clips.is_empty());
-                let text = if empty {
-                    "No video — File → Import Video…, or drop a movie here"
-                } else {
-                    "No picture here"
-                };
-                p.text(
-                    text,
-                    Rect::new(0.0, size.h / 2.0 - 10.0, size.w, 20.0),
-                    &small,
-                );
+        // A/B: the first two shown tracks, side by side or wiped.
+        let pair: Vec<(faderframe_core::VideoTrackId, String)> = model
+            .project()
+            .video
+            .shown_tracks()
+            .take(2)
+            .map(|t| (t.id, t.name.clone()))
+            .collect();
+        let compare = if pair.len() == 2 {
+            model.video_compare()
+        } else {
+            VideoCompare::Single
+        };
+        let shown = match compare {
+            VideoCompare::Single => {
+                let shown = model.video_picture(self.lead, max);
+                self.waiting = Self::draw_picture(p, model, &shown, area, theme);
+                shown
             }
-            Some(v) => match &v.picture {
-                Some(pic) => {
-                    let f = &pic.frame;
-                    let dst = Self::fit(f.width as f32, f.height as f32, size);
-                    let key = (v.source.raw() << 40) ^ ((pic.number as u64) << 12) ^ f.width as u64;
-                    p.pixels(
-                        &Pixels {
-                            key,
-                            width: f.width,
-                            height: f.height,
-                            rgba: &f.rgba,
-                        },
-                        dst,
-                    );
-                    self.waiting = !pic.exact;
-                }
-                None => {
-                    self.waiting = true;
-                    let state = model.video_source_state(v.source);
-                    let text = match &state.error {
-                        Some(e) => e.clone(),
-                        None if !state.indexed => "Reading the video…".into(),
-                        None => "…".into(),
-                    };
-                    p.text(
-                        &text,
-                        Rect::new(0.0, size.h / 2.0 - 10.0, size.w, 20.0),
-                        &small,
-                    );
-                }
-            },
-        }
+            VideoCompare::SideBySide => {
+                let half = (max.0 / 2, max.1);
+                let a = model.video_picture_on(Some(pair[0].0), self.lead, half);
+                let b = model.video_picture_on(Some(pair[1].0), self.lead, half);
+                let left = Rect::new(0.0, 0.0, size.w / 2.0 - 1.0, size.h);
+                let right = Rect::new(size.w / 2.0 + 1.0, 0.0, size.w / 2.0 - 1.0, size.h);
+                let wa = Self::draw_picture(p, model, &a, left, theme);
+                let wb = Self::draw_picture(p, model, &b, right, theme);
+                self.waiting = wa || wb;
+                Self::tag(p, &format!("A · {}", pair[0].1), Point::new(8.0, 40.0));
+                Self::tag(
+                    p,
+                    &format!("B · {}", pair[1].1),
+                    Point::new(size.w / 2.0 + 8.0, 40.0),
+                );
+                a
+            }
+            VideoCompare::Wipe => {
+                let a = model.video_picture_on(Some(pair[0].0), self.lead, max);
+                let b = model.video_picture_on(Some(pair[1].0), self.lead, max);
+                let wb = Self::draw_picture(p, model, &b, area, theme);
+                let x = (self.wipe * size.w).round();
+                p.push_clip(Rect::new(0.0, 0.0, x, size.h));
+                p.fill(area, Color::rgb(0.0, 0.0, 0.0));
+                let wa = Self::draw_picture(p, model, &a, area, theme);
+                p.pop_clip();
+                p.fill(
+                    Rect::new(x - 1.0, 0.0, 2.0, size.h),
+                    Color::rgba(1.0, 1.0, 1.0, 0.85),
+                );
+                self.waiting = wa || wb;
+                Self::tag(p, &format!("A · {}", pair[0].1), Point::new(8.0, 40.0));
+                let bt = format!("B · {}", pair[1].1);
+                let bw = bt.chars().count() as f32 * 6.4 + 12.0;
+                Self::tag(p, &bt, Point::new(size.w - bw - 8.0, 40.0));
+                a
+            }
+        };
         if self.overlay
             && let Some(v) = &shown
         {
@@ -253,7 +355,7 @@ impl CanvasView<Session, Action> for VideoView {
     fn event(
         &mut self,
         ev: &ViewEvent,
-        _size: Size,
+        size: Size,
         model: &Session,
         cx: &mut EventCx<'_, Action>,
     ) -> bool {
@@ -273,6 +375,29 @@ impl CanvasView<Session, Action> for VideoView {
                 ..
             } => {
                 cx.emit(Action::FullScreen(ViewId::video()));
+                true
+            }
+            ViewEvent::PointerDown {
+                pos,
+                button: PointerButton::Primary,
+                ..
+            } if model.video_compare() == VideoCompare::Wipe => {
+                self.wiping = true;
+                self.wipe = (pos.x / size.w.max(1.0)).clamp(0.0, 1.0);
+                cx.redraw();
+                true
+            }
+            ViewEvent::PointerMove {
+                pos,
+                dragging: true,
+                ..
+            } if self.wiping => {
+                self.wipe = (pos.x / size.w.max(1.0)).clamp(0.0, 1.0);
+                cx.redraw();
+                true
+            }
+            ViewEvent::PointerUp { .. } if self.wiping => {
+                self.wiping = false;
                 true
             }
             _ => false,

@@ -278,6 +278,8 @@ pub struct ArrangerView {
     lanes: faderframe_session::lanes::GlobalLanes,
     global_drag: Option<global::GlobalDrag>,
     video_drag: Option<video_lane::VideoDrag>,
+    /// Rows of the Video lane (a video track each).
+    video_rows: usize,
 }
 
 /// A folder header's triangle.
@@ -347,6 +349,7 @@ impl ArrangerView {
             },
             global_drag: None,
             video_drag: None,
+            video_rows: 1,
         }
     }
 
@@ -367,6 +370,7 @@ impl ArrangerView {
         if !video_lane::has_video(model) {
             self.lanes.video = false;
         }
+        self.video_rows = Self::video_rows(model);
         self.header_width = model
             .header_width()
             .unwrap_or(self.theme.arranger.header_width);
@@ -374,7 +378,7 @@ impl ArrangerView {
 
     /// The ruler and the global lanes under it.
     fn ruler_h(&self) -> f32 {
-        self.base_ruler_h() + Self::global_lanes_h(&self.lanes)
+        self.base_ruler_h() + self.global_lanes_h()
     }
 
     fn row_h(&self) -> f32 {

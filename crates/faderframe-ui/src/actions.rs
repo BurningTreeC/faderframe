@@ -1187,6 +1187,65 @@ pub fn install(app: &Rc<AppState>) {
                 None => tracing::warn!("chain-insert: no container chain {chain} or no '{id}'"),
             }
         }),
+        // Development aid: `video:<add-track|compare=<single|side|wipe>|
+        // to-track=<clip>@<track>|trim=<clip>@<from frame>/<to frame>|
+        // cuts=<clip>>` (clips and tracks counted from 0).
+        named("video", |a, arg| {
+            use faderframe_session::video::{VideoCompare, VideoOp};
+            let (cmd, rest) = arg.split_once('=').unwrap_or((arg, ""));
+            let (clips, tracks) = {
+                let s = a.session.borrow();
+                let v = &s.project().video;
+                let clips: Vec<_> = v
+                    .tracks
+                    .iter()
+                    .flat_map(|t| t.clips.iter().cloned())
+                    .collect();
+                let tracks: Vec<_> = v.tracks.iter().map(|t| t.id).collect();
+                (clips, tracks)
+            };
+            let nth = |t: &str| t.trim().parse::<usize>().ok();
+            let op = match cmd {
+                "add-track" => Some(VideoOp::AddTrack),
+                "compare" => Some(VideoOp::SetCompare(match rest {
+                    "side" => VideoCompare::SideBySide,
+                    "wipe" => VideoCompare::Wipe,
+                    _ => VideoCompare::Single,
+                })),
+                "to-track" => rest.split_once('@').and_then(|(c, t)| {
+                    let c = clips.get(nth(c)?)?;
+                    Some(VideoOp::MoveClip {
+                        clip: c.id,
+                        start: c.start,
+                        track: Some(*tracks.get(nth(t)?)?),
+                    })
+                }),
+                "trim" => rest.split_once('@').and_then(|(c, span)| {
+                    let c = clips.get(nth(c)?)?;
+                    let (from, to) = span.split_once('/')?;
+                    let (from, to) = (nth(from)? as i64, nth(to)? as i64);
+                    let s = a.session.borrow();
+                    let rate = s.project().sample_rate;
+                    let fr = s.timecode().rate;
+                    let ns = |f: i64| (fr.seconds_of(f) * 1e9) as i64;
+                    Some(VideoOp::TrimClip {
+                        clip: c.id,
+                        start: c.start
+                            + faderframe_project::video::ns_to_samples(ns(from) - c.offset, rate),
+                        offset: ns(from),
+                        length: ns(to) - ns(from),
+                    })
+                }),
+                "cuts" => clips
+                    .get(nth(rest).unwrap_or(0))
+                    .map(|c| VideoOp::DetectCuts(c.id)),
+                _ => None,
+            };
+            match op {
+                Some(op) => a.dispatch(Action::Video(op)),
+                None => tracing::warn!("video: cannot do '{arg}'"),
+            }
+        }),
         // Development aid: `preferences-page:<general|audio|video|…>`.
         named("preferences-page", |a, arg| {
             crate::preferences::open(a, Some(arg));

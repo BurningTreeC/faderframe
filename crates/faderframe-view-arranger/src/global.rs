@@ -6,13 +6,13 @@ use super::*;
 use faderframe_core::{MarkerId, SectionId};
 use faderframe_project::{Marker, Section};
 use faderframe_session::ColorTarget;
-use faderframe_session::lanes::{GlobalLane, GlobalLanes};
+use faderframe_session::lanes::GlobalLane;
 use faderframe_timeline::{TempoCurve, TempoMap, TimeSignature};
 
 /// Lane heights.
 fn lane_height(lane: GlobalLane) -> f32 {
     match lane {
-        GlobalLane::Video => 40.0,
+        GlobalLane::Video => crate::video_lane::ROW_H,
         GlobalLane::Markers => 18.0,
         GlobalLane::Arranger => 22.0,
         GlobalLane::Key => 18.0,
@@ -64,8 +64,8 @@ pub enum GlobalHit {
     Chord(usize, SectionPart),
     /// A lyric line (its index).
     Lyric(usize),
-    /// In the Video lane: a clip, or none.
-    Video(Option<faderframe_core::VideoClipId>),
+    /// In the Video lane (or a row's name in its header column).
+    Video(crate::video_lane::VideoHit),
 }
 
 #[derive(Clone, Debug)]
@@ -127,7 +127,7 @@ impl ArrangerView {
         self.lanes
             .shown()
             .map(|l| {
-                let h = lane_height(l);
+                let h = self.lane_h(l);
                 let r = (l, y, h);
                 y += h;
                 r
@@ -135,8 +135,16 @@ impl ArrangerView {
             .collect()
     }
 
-    pub(crate) fn global_lanes_h(lanes: &GlobalLanes) -> f32 {
-        lanes.shown().map(lane_height).sum()
+    pub(crate) fn global_lanes_h(&self) -> f32 {
+        self.lanes.shown().map(|l| self.lane_h(l)).sum()
+    }
+
+    /// A lane's height (the Video lane: a row per video track).
+    fn lane_h(&self, lane: GlobalLane) -> f32 {
+        match lane {
+            GlobalLane::Video => lane_height(lane) * self.video_rows as f32,
+            _ => lane_height(lane),
+        }
     }
 
     pub(crate) fn lane_rect(&self, lane: GlobalLane, size: Size) -> Option<Rect> {
@@ -180,6 +188,10 @@ impl ArrangerView {
             .into_iter()
             .find(|(_, y, h)| pos.y >= *y && pos.y < y + h)?;
         if pos.x < self.header_w() {
+            if lane == GlobalLane::Video {
+                let label = Rect::new(0.0, y, self.header_w(), h);
+                return Some(GlobalHit::Video(self.video_label_hit(pos, label, model)));
+            }
             return Some(GlobalHit::Label(lane));
         }
         let r = Rect::new(self.header_w(), y, size.w - self.header_w(), h);
@@ -263,7 +275,11 @@ impl ArrangerView {
             // Recessed below the ruler (less so on light skins).
             let depth = if th.dark { 1.0 } else { 0.3 };
             p.fill(label, a.ruler_bg.darken(0.12 * depth));
-            controls::engraved(p, lane.title(), label.inset_xy(10.0, 0.0), th, Align::Start);
+            if lane == GlobalLane::Video {
+                self.paint_video_labels(p, label, model);
+            } else {
+                controls::engraved(p, lane.title(), label.inset_xy(10.0, 0.0), th, Align::Start);
+            }
             p.fill(r, a.ruler_bg.darken(0.22 * depth));
             p.push_clip(r);
             match lane {
@@ -538,7 +554,18 @@ impl ArrangerView {
         let snap = |t: MusicalTime| self.snap(t, model, mods);
         match hit {
             GlobalHit::Label(lane) => cx.request(Self::lanes_menu(model, lane, pos)),
-            GlobalHit::Video(clip) => self.video_press(clip, pos, clicks, model, cx),
+            GlobalHit::Video(hit @ crate::video_lane::VideoHit::Track(_)) if clicks >= 2 => {
+                if let Some(label) = self
+                    .global_lanes()
+                    .into_iter()
+                    .find(|(l, ..)| *l == GlobalLane::Video)
+                    .map(|(_, y, h)| Rect::new(0.0, y, self.header_w(), h))
+                    && let Some(req) = self.video_rename(hit, label, model)
+                {
+                    cx.request(req);
+                }
+            }
+            GlobalHit::Video(hit) => self.video_press(hit, pos, clicks, model, cx),
             GlobalHit::Empty(GlobalLane::Markers, t) if clicks >= 2 => {
                 cx.emit(Action::AddMarker(snap(t)));
             }
@@ -681,7 +708,7 @@ impl ArrangerView {
         cx: &mut EventCx<'_, Action>,
     ) -> bool {
         if self.video_drag.is_some() {
-            return self.video_drag_move(pos, mods, model, cx);
+            return self.video_drag_move(pos, mods, size, model, cx);
         }
         let Some(mut drag) = self.global_drag.take() else {
             return false;
@@ -887,7 +914,7 @@ impl ArrangerView {
         let p = model.project();
         match hit {
             GlobalHit::Label(lane) => Self::lanes_menu(model, lane, pos),
-            GlobalHit::Video(clip) => self.video_menu(clip, model, pos),
+            GlobalHit::Video(hit) => self.video_menu(hit, model, pos),
             GlobalHit::Marker(id) => {
                 let m = p.markers.iter().find(|m| m.id == id);
                 let mut items = Vec::new();
@@ -1271,8 +1298,10 @@ impl ArrangerView {
             GlobalHit::Empty(GlobalLane::Lyrics, _) => {
                 "Transcribe an audio clip (its menu) to fill this lane".into()
             }
-            GlobalHit::Video(clip) => self.video_tooltip(clip, model),
-            GlobalHit::Empty(GlobalLane::Video, _) => self.video_tooltip(None, model),
+            GlobalHit::Video(hit) => self.video_tooltip(hit, model),
+            GlobalHit::Empty(GlobalLane::Video, _) => {
+                self.video_tooltip(crate::video_lane::VideoHit::Empty(None), model)
+            }
         })
     }
 }
