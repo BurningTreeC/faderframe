@@ -1257,8 +1257,8 @@ mod position_tests {
             Some(q(4.0))
         );
         assert_eq!(
-            parse_position("1:0:1:12", CounterUnit::Timecode, &tl, 48_000, tc),
-            Some(q(3.0))
+            parse_position("1:0:3:0", CounterUnit::Timecode, &tl, 48_000, tc),
+            Some(q(6.0))
         );
         assert_eq!(
             parse_position("10:00", CounterUnit::Timecode, &tl, 48_000, tc),
