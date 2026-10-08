@@ -664,6 +664,9 @@ struct Family {
     faders: [u32; 4],
     scribble: (u32, u32),
     well: u32,
+    /// Its wood (light, dark): its cheeks when the look has them, or when
+    /// the skin has wooden cheeks of its own (Vintage Console).
+    wood: (u32, u32),
     look: ConsoleLook,
 }
 
@@ -680,6 +683,8 @@ fn family(f: usize) -> Family {
             faders: [0x1d1e21, 0x8c7a52, 0x4f6b57, 0x9a3b2f],
             scribble: (0xe4d9bd, 0x221d14),
             well: 0x101113,
+            // Walnut.
+            wood: (0x5e3d26, 0x301e12),
             look: ConsoleLook {
                 knob_skirt: Some(c(0x1b1c1f)),
                 knob_ring: false,
@@ -687,7 +692,7 @@ fn family(f: usize) -> Family {
                 brushed: 0.55,
                 screws: true,
                 wood: None,
-                meter: MeterKind::Edgewise,
+                meter: MeterKind::Ladder,
                 engrave: Color::rgba(0.0, 0.0, 0.0, 0.6),
                 flat: false,
             },
@@ -702,6 +707,8 @@ fn family(f: usize) -> Family {
             faders: [0xdcddd8, 0x2f6f8f, 0x4f8a55, 0xa83a32],
             scribble: (0xf3f1e8, 0x1d2024),
             well: 0x16181b,
+            // Ash.
+            wood: (0xb4925f, 0x735634),
             look: ConsoleLook {
                 knob_skirt: None,
                 knob_ring: false,
@@ -725,14 +732,16 @@ fn family(f: usize) -> Family {
             faders: [0xe8e2d3, 0x6c7a5d, 0x5d7a78, 0x8d2f27],
             scribble: (0xeee6d0, 0x241f17),
             well: 0x14130f,
+            // Teak.
+            wood: (0x8a5a32, 0x4a2c18),
             look: ConsoleLook {
                 knob_skirt: Some(c(0x2a2925)),
                 knob_ring: false,
                 sheen: 0.3,
                 brushed: 0.2,
                 screws: true,
-                wood: Some((c(0x7a4b2a), c(0x46291a))),
-                meter: MeterKind::Edgewise,
+                wood: Some((c(0x8a5a32), c(0x4a2c18))),
+                meter: MeterKind::Plasma,
                 engrave: Color::rgba(0.0, 0.0, 0.0, 0.6),
                 flat: false,
             },
@@ -765,7 +774,11 @@ impl Theme {
         k.fader_cap_aux = c(s.faders[2]);
         k.fader_cap_master = c(s.faders[3]);
         (k.scribble_bg, k.scribble_text) = (c(s.scribble.0), c(s.scribble.1));
+        let skin_wood = k.look.wood.is_some();
         k.look = s.look;
+        if skin_wood {
+            k.look.wood = Some((c(s.wood.0), c(s.wood.1)));
+        }
         t
     }
 
@@ -819,6 +832,17 @@ mod tests {
                 t.console.panel_top.luminance(),
             );
             assert!((a - b).abs() > 0.4, "family {f}: label contrast");
+            // Meters that show the level (a VU face fills a narrow strip).
+            assert_ne!(t.console.look.meter, MeterKind::Edgewise, "family {f}");
+            // A skin with wooden cheeks keeps them, in the family's wood.
+            assert!(
+                Theme::by_id("vintage")
+                    .with_console_family(f)
+                    .console
+                    .look
+                    .wood
+                    .is_some()
+            );
         }
         // Text stands out from the background in every skin.
         for t in &all {
