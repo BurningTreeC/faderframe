@@ -15,8 +15,8 @@ use faderframe_project::{Command, Track};
 use faderframe_session::{Action, Session};
 use faderframe_ui_canvas::controls::{self, KnobLook};
 use faderframe_ui_canvas::{
-    Align, CanvasView, Color, Cursor, EventCx, Painter, Point, PointerButton, Rect, Size,
-    TextStyle, Theme, ViewEvent,
+    Align, CanvasView, Color, Cursor, EventCx, HostRequest, MenuItem, Painter, Point,
+    PointerButton, Rect, Size, TextStyle, Theme, ViewEvent,
 };
 
 const HEADER_H: f32 = 34.0;
@@ -298,6 +298,53 @@ impl CanvasView<Session, Action> for SurroundView {
         let l = self.layout(size, model, t);
         let pan = model.shown_surround(t);
         match *ev {
+            // MIDI learn: a knob's parameter, or (on the room) each of
+            // them.
+            ViewEvent::PointerDown {
+                pos,
+                button: PointerButton::Secondary,
+                ..
+            } => {
+                let Some(format) = model.project().surround_panned(t) else {
+                    return false;
+                };
+                let learn = |param: SurroundParam| faderframe_project::MappingTarget::Parameter {
+                    track: t.id,
+                    target: faderframe_automation::AutomationTarget::Surround(param),
+                };
+                let entries = |target| -> Vec<MenuItem<Action>> {
+                    model
+                        .midi_learn_menu(target)
+                        .into_iter()
+                        .map(|(label, action)| MenuItem::new(label, action))
+                        .collect()
+                };
+                let items = match l.knobs.iter().find(|(_, r)| r.inset(-6.0).contains(pos)) {
+                    Some((param, _)) => {
+                        let target = learn(*param);
+                        let mut items =
+                            vec![MenuItem::disabled(model.mapping_target_label(&target))];
+                        items.extend(entries(target));
+                        items
+                    }
+                    None => SurroundParam::ALL
+                        .into_iter()
+                        .filter(|p| p.applies(t.layout, format))
+                        .map(|p| {
+                            let target = learn(p);
+                            let mapped = !model.midi_mappings_for(target).is_empty();
+                            let name = if mapped {
+                                format!("{} (mapped)", p.name())
+                            } else {
+                                p.name().to_string()
+                            };
+                            MenuItem::submenu(format!("MIDI · {name}"), entries(target))
+                        })
+                        .collect(),
+                };
+                cx.request(HostRequest::ContextMenu { at: pos, items });
+                true
+            }
             ViewEvent::PointerDown {
                 pos,
                 button: PointerButton::Primary,

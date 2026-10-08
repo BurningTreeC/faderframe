@@ -122,12 +122,41 @@ pub enum MappingTarget {
         #[serde(default)]
         track: Option<TrackId>,
     },
+    /// A track's solo button (a press toggles it).
+    TrackSolo {
+        track: TrackId,
+    },
+    /// A track's record-arm button (a press toggles it).
+    TrackArm {
+        track: TrackId,
+    },
+    /// A macro of a track's modulators: its value.
+    Macro {
+        track: TrackId,
+        modulator: faderframe_core::ModulatorId,
+    },
 }
 
 impl MappingTarget {
     /// A button (pads and keys fit it), not a value.
     pub fn is_button(&self) -> bool {
-        !matches!(self, MappingTarget::Parameter { .. })
+        !matches!(
+            self,
+            MappingTarget::Parameter { .. } | MappingTarget::Macro { .. }
+        )
+    }
+
+    /// The track it belongs to, if any.
+    pub fn track(&self) -> Option<TrackId> {
+        match self {
+            MappingTarget::Parameter { track, .. }
+            | MappingTarget::LauncherSlot { track, .. }
+            | MappingTarget::TrackSolo { track }
+            | MappingTarget::TrackArm { track }
+            | MappingTarget::Macro { track, .. } => Some(*track),
+            MappingTarget::LauncherStop { track } => *track,
+            MappingTarget::Transport { .. } | MappingTarget::LauncherScene { .. } => None,
+        }
     }
 }
 

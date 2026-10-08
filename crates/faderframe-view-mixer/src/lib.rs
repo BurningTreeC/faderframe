@@ -1408,6 +1408,15 @@ impl MixerView {
             track: t.id,
             target,
         };
+        Self::learn_target_menu(model, target, at)
+    }
+
+    /// MIDI learn for any mapping target (and removing its mappings).
+    fn learn_target_menu(
+        model: &Session,
+        target: faderframe_project::MappingTarget,
+        at: Point,
+    ) -> HostRequest<Action> {
         let mut items = vec![MenuItem::disabled(model.mapping_target_label(&target))];
         for (i, (label, action)) in model.midi_learn_menu(target).into_iter().enumerate() {
             let item = MenuItem::new(label, action);
@@ -2557,6 +2566,16 @@ impl MixerView {
                     pos,
                 )
             }),
+            Hit::Solo(id) => Some(Self::learn_target_menu(
+                model,
+                faderframe_project::MappingTarget::TrackSolo { track: id },
+                pos,
+            )),
+            Hit::Record(id) => Some(Self::learn_target_menu(
+                model,
+                faderframe_project::MappingTarget::TrackArm { track: id },
+                pos,
+            )),
             _ => None,
         };
         if let Some(r) = req {

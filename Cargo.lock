@@ -1422,6 +1422,7 @@ dependencies = [
 name = "faderframe-view-surround"
 version = "0.16.0"
 dependencies = [
+ "faderframe-automation",
  "faderframe-core",
  "faderframe-engine",
  "faderframe-project",

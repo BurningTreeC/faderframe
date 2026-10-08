@@ -2240,21 +2240,25 @@ impl ArrangerView {
         }
         // MIDI learn for the strip controls.
         if t.kind != TrackKind::Midi {
-            for (i, (target, name)) in [
-                (
-                    faderframe_automation::AutomationTarget::TrackVolume,
-                    "Volume",
-                ),
-                (faderframe_automation::AutomationTarget::TrackPan, "Pan"),
-                (faderframe_automation::AutomationTarget::TrackMute, "Mute"),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let target = faderframe_project::MappingTarget::Parameter {
-                    track: t.id,
-                    target,
-                };
+            use faderframe_automation::AutomationTarget as A;
+            use faderframe_project::MappingTarget as M;
+            let param = |target| M::Parameter {
+                track: t.id,
+                target,
+            };
+            let mut targets = vec![
+                (param(A::TrackVolume), "Volume"),
+                (param(A::TrackPan), "Pan"),
+                (param(A::TrackMute), "Mute"),
+                (M::TrackSolo { track: t.id }, "Solo"),
+            ];
+            if matches!(
+                t.kind,
+                TrackKind::Audio | TrackKind::Instrument | TrackKind::Midi
+            ) {
+                targets.push((M::TrackArm { track: t.id }, "Record Arm"));
+            }
+            for (i, (target, name)) in targets.into_iter().enumerate() {
                 let mapped = model
                     .midi_mappings_for(target)
                     .first()

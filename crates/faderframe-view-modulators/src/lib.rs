@@ -1304,6 +1304,38 @@ impl CanvasView<Session, Action> for ModulatorsView {
                 cx.redraw();
                 true
             }
+            // A macro's display or knob: MIDI learn for its value.
+            ViewEvent::PointerDown {
+                pos,
+                button: PointerButton::Secondary,
+                ..
+            } => {
+                let (Some(hit), Some(t)) = (self.hit_test(pos, size, model), Self::track(model))
+                else {
+                    return false;
+                };
+                let (Hit::Display(id) | Hit::Knob(id, _)) = hit else {
+                    return false;
+                };
+                let is_macro = t
+                    .modulators
+                    .iter()
+                    .any(|m| m.id == id && matches!(m.source, ModSource::Macro { .. }));
+                if !is_macro {
+                    return false;
+                }
+                let target = faderframe_project::MappingTarget::Macro {
+                    track: t.id,
+                    modulator: id,
+                };
+                let mut items = vec![MenuItem::disabled(model.mapping_target_label(&target))];
+                for (i, (label, action)) in model.midi_learn_menu(target).into_iter().enumerate() {
+                    let item = MenuItem::new(label, action);
+                    items.push(if i == 0 { item.separated() } else { item });
+                }
+                cx.request(HostRequest::ContextMenu { at: pos, items });
+                true
+            }
             ViewEvent::PointerMove {
                 pos,
                 modifiers,

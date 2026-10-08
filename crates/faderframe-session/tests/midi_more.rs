@@ -417,3 +417,93 @@ fn pads_learned_for_launcher_slots_scenes_and_stops() {
     s.midi_keyboard().send(&[0x90, 38, 100]);
     wait(&mut s, "stop all", false);
 }
+
+/// Solo and record arm toggle on a press (a key, or a CC switch's rising
+/// edge — letting go does nothing), a macro follows a CC, and the
+/// Surround Panner's parameters are parameters like any.
+#[test]
+fn solo_arm_macros_and_the_surround_panner_are_mappable() {
+    use faderframe_core::{ChannelLayout, SurroundFormat, SurroundParam};
+    use faderframe_project::modulation::ModSource;
+    let mut s = Session::new(Project::new("M", 48_000), None, EngineConfig::default()).unwrap();
+    let master = s.project().master_id().unwrap();
+    s.dispatch(Action::Edit(Command::SetTrackLayout {
+        track: master,
+        layout: ChannelLayout::Surround(SurroundFormat::S51),
+    }))
+    .unwrap();
+    let t = s.add_track(TrackKind::Audio).unwrap();
+    s.dispatch(Action::Edit(Command::SetTrackLayout {
+        track: t,
+        layout: ChannelLayout::Mono,
+    }))
+    .unwrap();
+    let track = |s: &Session| s.project().track(t).unwrap().clone();
+    // Solo on a key.
+    learn(
+        &mut s,
+        MappingTarget::TrackSolo { track: t },
+        &[0x90, 36, 100],
+    );
+    assert!(!track(&s).solo, "learning does not toggle");
+    s.midi_keyboard().send(&[0x90, 36, 100]);
+    s.midi_keyboard().send(&[0x80, 36, 0]);
+    s.tick(0.0);
+    assert!(track(&s).solo);
+    s.midi_keyboard().send(&[0x90, 36, 100]);
+    s.tick(0.0);
+    assert!(!track(&s).solo);
+    // Record arm on a CC switch.
+    learn(
+        &mut s,
+        MappingTarget::TrackArm { track: t },
+        &[0xB0, 21, 127],
+    );
+    s.midi_keyboard().send(&[0xB0, 21, 0]);
+    s.tick(0.0);
+    s.midi_keyboard().send(&[0xB0, 21, 127]);
+    s.tick(0.0);
+    assert!(track(&s).record_arm);
+    s.midi_keyboard().send(&[0xB0, 21, 0]);
+    s.tick(0.0);
+    assert!(track(&s).record_arm, "letting go leaves it");
+    // A macro on a knob.
+    s.dispatch(Action::AddModulator {
+        track: t,
+        source: ModSource::Macro { value: 0.0 },
+    })
+    .unwrap();
+    let id = track(&s).modulators[0].id;
+    let target = MappingTarget::Macro {
+        track: t,
+        modulator: id,
+    };
+    learn(&mut s, target, &[0xB0, 22, 0]);
+    assert!(
+        s.mapping_target_label(&target)
+            .ends_with(&track(&s).modulators[0].name)
+    );
+    s.midi_keyboard().send(&[0xB0, 22, 127]);
+    s.tick(0.0);
+    let value = |s: &Session| match track(s).modulators[0].source {
+        ModSource::Macro { value } => value,
+        _ => -1.0,
+    };
+    assert!((value(&s) - 1.0).abs() < 1e-3, "{}", value(&s));
+    s.midi_keyboard().send(&[0xB0, 22, 32]);
+    s.tick(0.0);
+    assert!((value(&s) - 32.0 / 127.0).abs() < 0.01, "{}", value(&s));
+    // The surround panner's X across the room.
+    let x = MappingTarget::Parameter {
+        track: t,
+        target: AutomationTarget::Surround(SurroundParam::X),
+    };
+    learn(&mut s, x, &[0xB0, 23, 64]);
+    s.midi_keyboard().send(&[0xB0, 23, 127]);
+    s.tick(0.0);
+    let pan = track(&s).surround;
+    assert!(
+        (SurroundParam::X.get(&pan) - SurroundParam::X.range().1).abs() < 0.02,
+        "{pan:?}"
+    );
+}

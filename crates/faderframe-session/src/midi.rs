@@ -1261,6 +1261,38 @@ impl Session {
                     .map_or("(removed track)", |t| t.name.as_str())
             ),
             MappingTarget::LauncherStop { track: None } => "Launcher · Stop All".into(),
+            MappingTarget::TrackSolo { track } => format!("{} · Solo", self.track_label(*track)),
+            MappingTarget::TrackArm { track } => {
+                format!("{} · Record Arm", self.track_label(*track))
+            }
+            MappingTarget::Macro { track, modulator } => format!(
+                "{} · {}",
+                self.track_label(*track),
+                self.project
+                    .track(*track)
+                    .and_then(|t| t.modulators.iter().find(|m| m.id == *modulator))
+                    .map_or("(removed macro)", |m| m.name.as_str())
+            ),
+        }
+    }
+
+    fn track_label(&self, track: TrackId) -> &str {
+        self.project
+            .track(track)
+            .map_or("(removed track)", |t| t.name.as_str())
+    }
+
+    /// A macro's value (0–1).
+    fn macro_value(&self, track: TrackId, modulator: faderframe_core::ModulatorId) -> Option<f64> {
+        let m = self
+            .project
+            .track(track)?
+            .modulators
+            .iter()
+            .find(|m| m.id == modulator)?;
+        match m.source {
+            faderframe_project::modulation::ModSource::Macro { value } => Some(f64::from(value)),
+            _ => None,
         }
     }
 
@@ -1290,6 +1322,7 @@ impl Session {
             MappingTarget::Parameter { track, target } => self
                 .automation_param(*track, *target)
                 .is_some_and(|p| p.kind == crate::ParamKind::Toggle),
+            MappingTarget::Macro { .. } => false,
             _ => true,
         }
     }
@@ -1301,6 +1334,9 @@ impl Session {
         let mut toggles: Vec<(TrackId, AutomationTarget)> = Vec::new();
         let mut transport: Vec<TransportControl> = Vec::new();
         let mut launcher: Vec<crate::launcher::LauncherOp> = Vec::new();
+        // Solo and arm presses; macro values (the latest a tick).
+        let mut buttons: Vec<MappingTarget> = Vec::new();
+        let mut macros: Vec<(TrackId, faderframe_core::ModulatorId, f64)> = Vec::new();
         for raw in events {
             let Some(ev) = raw.event() else { continue };
             let Some((channel, control, value)) = control_of(ev) else {
@@ -1380,7 +1416,29 @@ impl Session {
                             });
                         }
                     }
+                    MappingTarget::TrackSolo { .. } | MappingTarget::TrackArm { .. } => {
+                        if pressed {
+                            buttons.push(m.target);
+                        }
+                    }
                     _ if note_off => {}
+                    MappingTarget::Macro { track, modulator } => {
+                        let current = macros
+                            .iter()
+                            .find(|(t, id, _)| *t == track && *id == modulator)
+                            .map(|(_, _, v)| *v)
+                            .or_else(|| self.macro_value(track, modulator))
+                            .unwrap_or(0.0);
+                        let next = match (m.mode, control) {
+                            (mode, MidiControl::Cc { .. }) if mode.is_relative() => {
+                                let ticks = mode.ticks((value * 127.0).round() as u8);
+                                (current + ticks as f64 / 128.0).clamp(0.0, 1.0)
+                            }
+                            _ => value,
+                        };
+                        macros.retain(|(t, id, _)| !(*t == track && *id == modulator));
+                        macros.push((track, modulator, next));
+                    }
                     MappingTarget::Parameter { track, target } => {
                         let toggle =
                             self.is_toggle_target(&MappingTarget::Parameter { track, target });
@@ -1436,6 +1494,31 @@ impl Session {
         }
         if !values.is_empty() || !toggles.is_empty() {
             self.apply_mapped(values, toggles);
+        }
+        for b in buttons {
+            let cmd = match b {
+                MappingTarget::TrackSolo { track } => self
+                    .project
+                    .track(track)
+                    .map(|t| Command::SetTrackSolo { track, on: !t.solo }),
+                MappingTarget::TrackArm { track } => {
+                    self.project
+                        .track(track)
+                        .map(|t| Command::SetTrackRecordArm {
+                            track,
+                            on: !t.record_arm,
+                        })
+                }
+                _ => None,
+            };
+            if let Some(c) = cmd
+                && let Err(e) = self.dispatch(Action::Edit(c))
+            {
+                self.notify(NoticeLevel::Warning, format!("MIDI controller: {e}"));
+            }
+        }
+        if !macros.is_empty() {
+            self.apply_macros(macros);
         }
         for tc in transport {
             let action = match tc {
@@ -1555,6 +1638,38 @@ impl Session {
         }
         for c in commands {
             if let Err(e) = self.dispatch(Action::Edit(c)) {
+                self.notify(NoticeLevel::Warning, format!("MIDI controller: {e}"));
+            }
+        }
+    }
+
+    /// Macros set by controllers: inside the controller gesture (one undo
+    /// step a move).
+    fn apply_macros(&mut self, macros: Vec<(TrackId, faderframe_core::ModulatorId, f64)>) {
+        if self.midi.gesture.is_none() && !self.history.in_gesture() {
+            let _ = self.dispatch(Action::BeginGesture("MIDI Controller".into()));
+            self.midi.gesture = Some(Instant::now());
+        } else if self.midi.gesture.is_some() {
+            self.midi.gesture = Some(Instant::now());
+        }
+        for (track, id, v) in macros {
+            let Some(mut m) = self
+                .project
+                .track(track)
+                .and_then(|t| t.modulators.iter().find(|m| m.id == id))
+                .cloned()
+            else {
+                continue;
+            };
+            if let faderframe_project::modulation::ModSource::Macro { value } = &mut m.source {
+                *value = v as f32;
+            } else {
+                continue;
+            }
+            if let Err(e) = self.dispatch(Action::SetModulator {
+                track,
+                modulator: m,
+            }) {
                 self.notify(NoticeLevel::Warning, format!("MIDI controller: {e}"));
             }
         }

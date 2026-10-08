@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 faderframe-core.workspace = true
+faderframe-automation.workspace = true
 faderframe-project.workspace = true
 faderframe-session.workspace = true
 faderframe-ui-canvas.workspace = true
