@@ -105,6 +105,140 @@ impl MixerView {
         }
         Some(Hit::PreampChoose(t.id))
     }
+    /// The input stage's menu: on the master the console (the whole mix),
+    /// on a bus or return its bus amplifier, on a channel the microphone
+    /// preamps.
+    pub(super) fn stage_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
+        match t.kind {
+            TrackKind::Master => Self::console_menu(model, at),
+            TrackKind::Bus | TrackKind::Aux => Self::bus_amp_menu(model, t, at),
+            _ => Self::preamp_menu(t, at),
+        }
+    }
+
+    /// The console for the whole mix (the master's input stage).
+    fn console_menu(model: &Session, at: Point) -> HostRequest<Action> {
+        let items = model
+            .console_choices()
+            .into_iter()
+            .map(|c| {
+                let item = MenuItem::new(c.label, c.action).checked(c.checked);
+                if c.group_start {
+                    item.separated()
+                } else {
+                    item
+                }
+            })
+            .collect();
+        HostRequest::ContextMenu { at, items }
+    }
+
+    /// A bus's own amplifier: following the console, through another
+    /// console's (hybrid summing), its drive, bypass, in the box, or a
+    /// microphone preamp's colour instead.
+    fn bus_amp_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
+        use faderframe_project::console::FAMILIES;
+        let track = t.id;
+        let amp = t
+            .preamp
+            .as_ref()
+            .and_then(|s| console_bus_index(&s.plugin.id));
+        let mut items = Vec::new();
+        let console = model.console();
+        if let Some(c) = console {
+            items.push(
+                MenuItem::new(
+                    format!("Follow the Console ({})", c.name()),
+                    Action::SetBusAmplifier {
+                        track,
+                        family: Some(c.family),
+                    },
+                )
+                .checked(amp == Some(usize::from(c.family))),
+            );
+        }
+        let families: Vec<_> = FAMILIES
+            .iter()
+            .enumerate()
+            .map(|(f, name)| {
+                MenuItem::new(
+                    format!("{name} Bus"),
+                    Action::SetBusAmplifier {
+                        track,
+                        family: Some(f as u8),
+                    },
+                )
+                .checked(amp == Some(f))
+            })
+            .collect();
+        items.push(MenuItem::submenu(
+            if console.is_some() {
+                "Through Another Console's Bus Amplifier"
+            } else {
+                "Bus Amplifier"
+            },
+            families,
+        ));
+        if let Some(slot) = t.preamp.as_ref().filter(|_| amp.is_some()) {
+            let now = value(slot, 0);
+            let drive: Vec<_> = [-6.0, -3.0, 0.0, 3.0, 6.0, 9.0, 12.0]
+                .into_iter()
+                .map(|db| {
+                    MenuItem::new(
+                        format!("{db:+} dB"),
+                        Action::Edit(Command::SetPluginParameter {
+                            track,
+                            plugin: slot.id,
+                            parameter: ParameterId(0),
+                            value: Some(db),
+                        }),
+                    )
+                    .checked((now - db).abs() < 0.05)
+                })
+                .collect();
+            items.push(MenuItem::submenu("Drive", drive).separated());
+            items.push(
+                MenuItem::new(
+                    "Bypass",
+                    Action::Edit(Command::SetPluginBypass {
+                        track,
+                        plugin: slot.id,
+                        bypass: !slot.bypass,
+                    }),
+                )
+                .checked(slot.bypass),
+            );
+        }
+        if t.preamp.is_some() {
+            items.push(
+                MenuItem::new(
+                    "In the Box on This Bus",
+                    Action::SetBusAmplifier {
+                        track,
+                        family: None,
+                    },
+                )
+                .separated(),
+            );
+        }
+        let preamps: Vec<_> = PREAMPS
+            .iter()
+            .enumerate()
+            .map(|(i, &(id, name, _))| {
+                MenuItem::new(
+                    name,
+                    Action::SetPreamp {
+                        track,
+                        model: Some(i),
+                    },
+                )
+                .checked(t.preamp.as_ref().is_some_and(|p| p.plugin.id == id))
+            })
+            .collect();
+        items.push(MenuItem::submenu("Colour Through a Microphone Preamp", preamps).separated());
+        HostRequest::ContextMenu { at, items }
+    }
+
     pub(super) fn preamp_menu(t: &Track, at: Point) -> HostRequest<Action> {
         let mut items: Vec<_> = PREAMPS
             .iter()
@@ -137,7 +271,12 @@ impl MixerView {
     pub(super) fn paint_preamp(&self, p: &mut dyn Painter, area: Rect, t: &Track, model: &Session) {
         let th = &self.theme;
         let Some(slot) = &t.preamp else {
-            controls::well_label(p, area, "+ PREAMP", true, th);
+            let label = match t.kind {
+                TrackKind::Master => "+ CONSOLE",
+                TrackKind::Bus | TrackKind::Aux => "+ BUS AMP",
+                _ => "+ PREAMP",
+            };
+            controls::well_label(p, area, label, true, th);
             return;
         };
         let f = face(slot);

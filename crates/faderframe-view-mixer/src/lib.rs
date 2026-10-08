@@ -2220,13 +2220,19 @@ impl MixerView {
             }
             Hit::PreampChoose(id) => {
                 if let Some(t) = Self::track(model, id) {
-                    cx.request(Self::preamp_menu(t, pos));
+                    cx.request(Self::stage_menu(model, t, pos));
                 }
             }
             Hit::PreampRemove(id) => {
-                cx.emit(Action::SetPreamp {
-                    track: id,
-                    model: None,
+                // The master's is the console's: off is the console off.
+                let master = Self::track(model, id).is_some_and(|t| t.kind == TrackKind::Master);
+                cx.emit(if master {
+                    Action::SetConsole { family: None }
+                } else {
+                    Action::SetPreamp {
+                        track: id,
+                        model: None,
+                    }
                 });
             }
             Hit::FaderCap(id) | Hit::FaderTrack(id) => {
@@ -2526,7 +2532,7 @@ impl MixerView {
         };
         let req = match hit {
             Hit::PreampChoose(id) | Hit::PreampRemove(id) => {
-                Self::track(model, id).map(|t| Self::preamp_menu(t, pos))
+                Self::track(model, id).map(|t| Self::stage_menu(model, t, pos))
             }
             Hit::PreampKnob(id, param) => Self::track(model, id).and_then(|t| {
                 t.preamp.as_ref().map(|slot| {
@@ -2633,8 +2639,20 @@ impl MixerView {
                 .unwrap_or_default()
         };
         Some(match hit {
-            Hit::PreampChoose(_) => "Choose microphone preamplifier".into(),
-            Hit::PreampRemove(_) => "Remove microphone preamplifier".into(),
+            Hit::PreampChoose(id) | Hit::PreampRemove(id) => {
+                let kind = Self::track(model, id)?.kind;
+                let remove = matches!(hit, Hit::PreampRemove(_));
+                match (kind, remove) {
+                    (TrackKind::Master, false) => "Choose the console the whole mix runs through".into(),
+                    (TrackKind::Master, true) => "Console off: the mix in the box".into(),
+                    (TrackKind::Bus | TrackKind::Aux, false) => {
+                        "This bus's amplifier: follow the console, another console's, drive, in the box".into()
+                    }
+                    (TrackKind::Bus | TrackKind::Aux, true) => "In the box on this bus".into(),
+                    (_, false) => "Choose microphone preamplifier".into(),
+                    (_, true) => "Remove microphone preamplifier".into(),
+                }
+            }
             Hit::PreampKnob(id, param) => {
                 let slot = Self::track(model, id)?.preamp.as_ref()?;
                 let v = model

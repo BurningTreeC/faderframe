@@ -249,6 +249,12 @@ pub enum Action {
     SetConsole {
         family: Option<u8>,
     },
+    /// A bus's or return's own bus amplifier (a console family; None: in
+    /// the box on this bus), whatever the console.
+    SetBusAmplifier {
+        track: TrackId,
+        family: Option<u8>,
+    },
     InsertPlugin {
         track: TrackId,
         index: usize,
@@ -3137,6 +3143,7 @@ impl Session {
             }
             Action::SplitSelectedAtPlayhead => self.split_at_playhead()?,
             Action::SetConsole { family } => self.set_console(family)?,
+            Action::SetBusAmplifier { track, family } => self.set_bus_amplifier(track, family)?,
             Action::SetPreamp { track, model } => {
                 let slot = if let Some(model) = model {
                     let &(id, name, _) = faderframe_core::builtin::PREAMPS

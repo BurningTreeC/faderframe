@@ -3377,7 +3377,13 @@ calibrated so −18 dBFS is +4 dBu at the line.
   places, replaces (keeping drive and output) or removes them in the same
   undo step as the setting; a bus whose input stage holds a microphone
   preamp keeps it; buses added while a console is set get theirs
-  (`console_buses_for_new_tracks`, a hook in `Session::edit`).
+  (`console_buses_for_new_tracks`, a hook in `Session::edit`). Each bus's
+  amplifier is its own (`Action::SetBusAmplifier`): following the console,
+  through another console's (hybrid summing) or in the box; a console
+  switch moves only the followers, the master's is always the console's.
+  In the mixer the master's input slot chooses the console, a bus's slot
+  its amplifier (follow, another console's, drive, bypass, in the box, a
+  microphone preamp's colour instead).
 * **Audio and instrument channels** go through the console's line
   amplifier as a light model (`faderframe_circuit::console::ConsoleStage`,
   0.3 % of a core per channel against 3.5–6.3 % for the circuits), in

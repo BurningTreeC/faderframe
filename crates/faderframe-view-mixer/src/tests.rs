@@ -1279,3 +1279,62 @@ fn a_console_shows_its_bus_amplifiers_and_its_look() {
         Theme::default().console.panel_top
     );
 }
+
+/// The input stage's menu: on the master the console for the whole mix, on
+/// a bus its own amplifier (following the console, another console's, in
+/// the box), on a channel the microphone preamps.
+#[test]
+fn the_master_chooses_the_console_and_a_bus_its_amplifier() {
+    let mut s = session();
+    let mut view = MixerView::new(Theme::default());
+    let size = Size::new(1400.0, 900.0);
+    s.dispatch(Action::SetConsole { family: Some(2) }).unwrap();
+    view.update_sends(&s);
+    let labels = |req: &[HostRequest<Action>]| -> Vec<String> {
+        match req {
+            [HostRequest::ContextMenu { items, .. }] => {
+                items.iter().map(|i| i.label.clone()).collect()
+            }
+            _ => Vec::new(),
+        }
+    };
+    let master = s.project().master_id().unwrap();
+    let area = view.layout_of(&s, master, size).unwrap().preamp.unwrap();
+    let (_, req) = run(
+        &mut view,
+        down(Point::new(area.center().x, area.y + 8.0), 1),
+        size,
+        &s,
+    );
+    let menu = labels(&req);
+    assert!(menu.iter().any(|l| l == "British 73"), "{menu:?}");
+    assert!(menu.iter().any(|l| l.starts_with("Off")), "{menu:?}");
+    let bus = MixerView::channel_tracks(&s)
+        .iter()
+        .find(|t| t.kind == TrackKind::Bus)
+        .unwrap()
+        .id;
+    let area = view.layout_of(&s, bus, size).unwrap().preamp.unwrap();
+    let (_, req) = run(
+        &mut view,
+        down(Point::new(area.center().x, area.y + 8.0), 1),
+        size,
+        &s,
+    );
+    let menu = labels(&req);
+    assert!(
+        menu.iter().any(|l| l.starts_with("Follow the Console")),
+        "{menu:?}"
+    );
+    assert!(
+        menu.iter().any(|l| l == "In the Box on This Bus"),
+        "{menu:?}"
+    );
+    let audio = MixerView::channel_tracks(&s)[0].id;
+    let area = view.layout_of(&s, audio, size).unwrap().preamp.unwrap();
+    let (_, req) = run(&mut view, down(area.center(), 1), size, &s);
+    assert!(
+        labels(&req).iter().any(|l| l == "British 73"),
+        "the preamps"
+    );
+}

@@ -189,3 +189,56 @@ fn a_console_runs_the_mix_and_comes_off_in_one_step() {
     assert_eq!(s.project().tracks, before.tracks);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Each bus has its own amplifier: one through another console's stays
+/// when the console changes (the followers move), one in the box stays in
+/// the box, and the master's is always the console's.
+#[test]
+fn each_bus_has_its_own_amplifier() {
+    let mut s = Session::new(Project::new("Hybrid", SR), None, EngineConfig::default()).unwrap();
+    let drums = s.add_track(TrackKind::Bus).unwrap();
+    let vocals = s.add_track(TrackKind::Bus).unwrap();
+    let fx = s.add_track(TrackKind::Aux).unwrap();
+    let master_id = s.project().master_id().unwrap();
+    s.dispatch(Action::SetConsole { family: Some(0) }).unwrap();
+    // The drums through the British 73, the return in the box.
+    s.dispatch(Action::SetBusAmplifier {
+        track: drums,
+        family: Some(2),
+    })
+    .unwrap();
+    s.dispatch(Action::SetBusAmplifier {
+        track: fx,
+        family: None,
+    })
+    .unwrap();
+    assert!(
+        s.dispatch(Action::SetBusAmplifier {
+            track: master_id,
+            family: Some(1),
+        })
+        .is_err(),
+        "the master's is the console's"
+    );
+    s.dispatch(Action::SetConsole { family: Some(1) }).unwrap();
+    assert_eq!(bus_amp(&s, vocals), Some(1), "follows the console");
+    assert_eq!(bus_amp(&s, master_id), Some(1));
+    assert_eq!(bus_amp(&s, drums), Some(2), "its own stays");
+    assert!(
+        s.project().track(fx).unwrap().preamp.is_none(),
+        "in the box stays"
+    );
+    // Following again.
+    s.dispatch(Action::SetBusAmplifier {
+        track: drums,
+        family: Some(1),
+    })
+    .unwrap();
+    s.dispatch(Action::SetConsole { family: Some(0) }).unwrap();
+    assert_eq!(bus_amp(&s, drums), Some(0));
+    // Off: the followers go.
+    s.dispatch(Action::SetConsole { family: None }).unwrap();
+    for t in [drums, vocals, master_id] {
+        assert!(s.project().track(t).unwrap().preamp.is_none());
+    }
+}
