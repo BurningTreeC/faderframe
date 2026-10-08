@@ -180,6 +180,12 @@ pub enum TransportAction {
 #[derive(Clone, Debug, PartialEq)]
 pub enum WorkspaceAction {
     ShowView(ViewId),
+    /// Take a view out of the layout (not the arranger); showing it again
+    /// puts it back where views of its kind go.
+    CloseView(ViewId),
+    /// Close the view if it is on screen, else show it (the View menu's
+    /// check items).
+    ToggleView(ViewId),
     Detach(ViewId),
     Attach(ViewId),
     CloseWindow(WindowId),
@@ -3972,6 +3978,20 @@ impl Session {
                     layout.views.insert(v.clone(), kind);
                 }
                 layout.activate(&v)?;
+            }
+            WorkspaceAction::CloseView(v) => {
+                if v == ViewId::arranger() {
+                    return Err(SessionError::Other("the arranger stays open".into()));
+                }
+                layout.remove_view(&v);
+            }
+            WorkspaceAction::ToggleView(v) => {
+                let action = if layout.is_showing(&v) {
+                    WorkspaceAction::CloseView(v)
+                } else {
+                    WorkspaceAction::ShowView(v)
+                };
+                return self.workspace_action(action);
             }
             WorkspaceAction::Detach(v) => {
                 layout.detach(&v, WindowGeometry::default())?;

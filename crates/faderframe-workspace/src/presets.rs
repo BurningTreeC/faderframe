@@ -70,6 +70,7 @@ impl Preset {
             }),
         );
         let mut layout = WorkspaceLayout::new(views, main);
+        layout.order_tabs();
         // Mastering keeps the master fader in view whatever is shown.
         layout.master_panel = self == Preset::Mastering;
         layout
@@ -79,6 +80,41 @@ impl Preset {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tabs keep one order: the mixer first, then as the View menu lists
+    /// the views; a view closed and shown again goes back to its place.
+    #[test]
+    fn tabs_keep_their_order() {
+        let order = |l: &WorkspaceLayout| {
+            l.area(&DockAreaId::bottom())
+                .map(|g| g.views.clone())
+                .unwrap_or_default()
+        };
+        let ranks = |views: &[ViewId], l: &WorkspaceLayout| {
+            views
+                .iter()
+                .map(|v| l.kind_of(v).map_or(usize::MAX, |k| k.rank()))
+                .collect::<Vec<_>>()
+        };
+        for p in Preset::ALL {
+            let mut l = p.layout();
+            let before = order(&l);
+            assert_eq!(before.first(), Some(&ViewId::mixer()), "{p:?}");
+            let r = ranks(&before, &l);
+            assert!(r.windows(2).all(|w| w[0] < w[1]), "{p:?}: {before:?}");
+            // The mixer closed and shown again: first again, and active.
+            l.remove_view(&ViewId::mixer());
+            l.activate(&ViewId::mixer()).unwrap();
+            assert_eq!(order(&l), before);
+            assert!(l.is_showing(&ViewId::mixer()));
+            // A view that was not there joins in its place.
+            l.activate(&ViewId::history()).unwrap();
+            let after = order(&l);
+            let r = ranks(&after, &l);
+            assert!(r.windows(2).all(|w| w[0] < w[1]), "{after:?}");
+            assert!(l.is_showing(&ViewId::history()));
+        }
+    }
 
     #[test]
     fn presets_are_valid_and_distinct() {

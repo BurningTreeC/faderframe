@@ -2739,6 +2739,39 @@ pub fn install(app: &Rc<AppState>) {
         })
         .build();
     app.app.add_action_entries([master_panel]);
+    // View → the dock's views as check items (ticked while on screen),
+    // and the bottom dock.
+    for (name, id) in crate::dock::DOCK_VIEWS {
+        let weak = Rc::downgrade(app);
+        let entry = gio::ActionEntry::builder(&format!("view-{name}"))
+            .state(false.to_variant())
+            .activate(move |_, _, _| {
+                if let Some(a) = weak.upgrade() {
+                    a.dispatch(Action::Workspace(
+                        faderframe_session::WorkspaceAction::ToggleView(id()),
+                    ));
+                    crate::dock::sync_view_actions(&a);
+                }
+            })
+            .build();
+        app.app.add_action_entries([entry]);
+    }
+    let weak = Rc::downgrade(app);
+    let dock_bottom = gio::ActionEntry::builder("dock-bottom")
+        .state(true.to_variant())
+        .activate(move |_, _, _| {
+            if let Some(a) = weak.upgrade() {
+                a.dispatch(Action::Workspace(
+                    faderframe_session::WorkspaceAction::ToggleArea(
+                        faderframe_workspace::DockAreaId::bottom(),
+                    ),
+                ));
+                crate::dock::sync_view_actions(&a);
+            }
+        })
+        .build();
+    app.app.add_action_entries([dock_bottom]);
+    crate::dock::sync_view_actions(app);
     app.app.add_action_entries([
         insert,
         midi,

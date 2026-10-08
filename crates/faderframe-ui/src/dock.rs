@@ -267,6 +267,8 @@ fn build_tabs(app: &Rc<AppState>, g: &TabGroup, window: WindowRef, path: &[u8]) 
             s.workspace_mut()
                 .active_layout_mut()
                 .set_active(window, &path, index as usize);
+            drop(s);
+            sync_view_actions(&app);
         }
     });
     nb.upcast()
@@ -501,5 +503,58 @@ pub fn realize(app: &Rc<AppState>) {
     {
         a.set_state(&layout.master_panel.to_variant());
     }
+    sync_view_actions(app);
     app.redraw_all();
+}
+
+/// The views the View menu ticks while they are on screen (its
+/// `app.view-<name>` actions: unticking closes the view, ticking shows it
+/// or brings its tab forward).
+/// A dock view: its action's name and its id.
+type DockView = (&'static str, fn() -> ViewId);
+
+pub(crate) const DOCK_VIEWS: [DockView; 15] = [
+    ("mixer", ViewId::mixer),
+    ("piano-roll", ViewId::piano_roll),
+    ("automation", ViewId::automation),
+    ("tools", ViewId::tools),
+    ("album", ViewId::album),
+    ("performance", ViewId::performance),
+    ("history", ViewId::history),
+    ("modulators", ViewId::modulators),
+    ("surround", ViewId::surround),
+    ("pitch", ViewId::pitch),
+    ("clip-fx", ViewId::clip_fx),
+    ("launcher", ViewId::launcher),
+    ("ddp", ViewId::ddp),
+    ("video", ViewId::video),
+    ("adr", ViewId::adr),
+];
+
+/// Tick the View menu's views that are on screen, and the bottom dock
+/// when it shows.
+pub(crate) fn sync_view_actions(app: &Rc<AppState>) {
+    let Ok(s) = app.session.try_borrow() else {
+        return;
+    };
+    let layout = s.workspace().active_layout();
+    let set = |name: &str, on: bool| {
+        if let Some(a) = app
+            .app
+            .lookup_action(name)
+            .and_then(|a| a.downcast::<gtk::gio::SimpleAction>().ok())
+            && a.state().and_then(|v| v.get::<bool>()) != Some(on)
+        {
+            a.set_state(&on.to_variant());
+        }
+    };
+    for (name, id) in DOCK_VIEWS {
+        set(&format!("view-{name}"), layout.is_showing(&id()));
+    }
+    set(
+        "dock-bottom",
+        layout
+            .area(&DockAreaId::bottom())
+            .is_some_and(|g| g.is_visible()),
+    );
 }

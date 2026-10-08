@@ -56,6 +56,35 @@ impl ViewKind {
         ViewKind::Adr,
     ];
 
+    /// The order tabs keep, whichever opened first: the arranger, the
+    /// mixer, then as the View menu lists them.
+    pub const TAB_ORDER: [ViewKind; 16] = [
+        ViewKind::Arranger,
+        ViewKind::Mixer,
+        ViewKind::PianoRoll,
+        ViewKind::Automation,
+        ViewKind::Tools,
+        ViewKind::Album,
+        ViewKind::Performance,
+        ViewKind::History,
+        ViewKind::Modulators,
+        ViewKind::Surround,
+        ViewKind::Pitch,
+        ViewKind::ClipFx,
+        ViewKind::Launcher,
+        ViewKind::Ddp,
+        ViewKind::Video,
+        ViewKind::Adr,
+    ];
+
+    /// Its place in [`Self::TAB_ORDER`].
+    pub fn rank(self) -> usize {
+        Self::TAB_ORDER
+            .iter()
+            .position(|k| *k == self)
+            .unwrap_or(Self::TAB_ORDER.len())
+    }
+
     /// The kind whose default view has this id (views added after a layout
     /// was saved are registered on first use).
     pub fn of_default_id(id: &ViewId) -> Option<ViewKind> {
@@ -177,6 +206,16 @@ impl TabGroup {
         !self.hidden && !self.views.is_empty()
     }
 
+    /// Put the tabs in their order ([`ViewKind::TAB_ORDER`] by `rank`),
+    /// the active one staying active.
+    fn order(&mut self, rank: impl Fn(&ViewId) -> usize) {
+        let active = self.active_view().cloned();
+        self.views.sort_by_key(|v| rank(v));
+        if let Some(a) = active {
+            self.active = self.views.iter().position(|v| *v == a).unwrap_or(0);
+        }
+    }
+
     fn remove(&mut self, view: &ViewId) -> Option<usize> {
         let i = self.views.iter().position(|v| v == view)?;
         self.views.remove(i);
@@ -211,6 +250,16 @@ impl DockNode {
     }
 
     /// Visit every tab group with its path (0 = first, 1 = second child).
+    fn for_each_group_mut(&mut self, f: &mut impl FnMut(&mut TabGroup)) {
+        match self {
+            DockNode::Tabs(g) => f(g),
+            DockNode::Split { first, second, .. } => {
+                first.for_each_group_mut(f);
+                second.for_each_group_mut(f);
+            }
+        }
+    }
+
     pub fn for_each_group<'a>(
         &'a self,
         path: &mut Vec<u8>,
@@ -594,7 +643,20 @@ impl WorkspaceLayout {
         group.active = group.views.len() - 1;
         group.hidden = false;
         self.home.insert(view.clone(), target);
+        // Back in its place among the tabs, not at the end.
+        self.order_tabs();
         Ok(())
+    }
+
+    /// Every tab group in [`ViewKind::TAB_ORDER`] (views of unknown kinds
+    /// last, as they were).
+    pub fn order_tabs(&mut self) {
+        let views = &self.views;
+        let rank = |v: &ViewId| views.get(v).map_or(usize::MAX, |k| k.rank());
+        self.main.for_each_group_mut(&mut |g| g.order(rank));
+        for w in &mut self.floating {
+            w.root.for_each_group_mut(&mut |g| g.order(rank));
+        }
     }
 
     /// Close a floating window, returning its views to their home areas.

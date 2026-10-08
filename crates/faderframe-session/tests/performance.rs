@@ -117,3 +117,44 @@ fn the_meter_opens_in_layouts_saved_before_it_existed() {
             .is_showing(&ViewId::performance())
     );
 }
+
+/// The View menu's check items: a view on screen closes, a closed one
+/// opens, one in a background tab comes forward; the arranger stays.
+#[test]
+fn views_toggle_closed_and_open_again() {
+    use faderframe_session::WorkspaceAction as W;
+    use faderframe_workspace::ViewId;
+    let mut s = Session::new(Project::new("Views", 48_000), None, EngineConfig::default()).unwrap();
+    let showing = |s: &Session, v: &ViewId| s.workspace().active_layout().is_showing(v);
+    let placed = |s: &Session, v: &ViewId| s.workspace().active_layout().is_placed(v);
+    let tools = ViewId::tools();
+    s.dispatch(Action::Workspace(W::ShowView(tools.clone())))
+        .unwrap();
+    assert!(showing(&s, &tools));
+    let revision = s.layout_revision();
+    // On screen: the toggle closes it.
+    s.dispatch(Action::Workspace(W::ToggleView(tools.clone())))
+        .unwrap();
+    assert!(!placed(&s, &tools), "closed, out of the layout");
+    assert!(s.layout_revision() > revision, "the dock is rebuilt");
+    // Closed: it opens again.
+    s.dispatch(Action::Workspace(W::ToggleView(tools.clone())))
+        .unwrap();
+    assert!(showing(&s, &tools));
+    // Another view in front of it in the same tabs: the toggle brings it
+    // forward rather than closing it.
+    let history = ViewId::history();
+    s.dispatch(Action::Workspace(W::ShowView(history.clone())))
+        .unwrap();
+    if placed(&s, &tools) && !showing(&s, &tools) {
+        s.dispatch(Action::Workspace(W::ToggleView(tools.clone())))
+            .unwrap();
+        assert!(showing(&s, &tools));
+    }
+    // The arranger is not closed.
+    assert!(
+        s.dispatch(Action::Workspace(W::CloseView(ViewId::arranger())))
+            .is_err()
+    );
+    assert!(placed(&s, &ViewId::arranger()));
+}

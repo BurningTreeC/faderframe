@@ -297,6 +297,8 @@ impl WorkspaceSet {
                     .map(|p| p.layout())
                     .unwrap_or_else(|| Preset::Recording.layout());
             }
+            // Layouts saved before the tabs kept one order.
+            ws.layout.order_tabs();
         }
     }
 }
