@@ -360,6 +360,12 @@ impl ConsoleStage {
         }
     }
 
+    /// The drive (linear; cheap enough to ramp sample by sample).
+    #[inline]
+    pub fn set_drive(&mut self, drive: f64) {
+        self.drive = drive.clamp(0.063, 16.0);
+    }
+
     /// Other band gains (fitting a model).
     pub fn set_bands(&mut self, bands: &[[f64; 4]; LEVEL_COUNT]) {
         self.bands = *bands;

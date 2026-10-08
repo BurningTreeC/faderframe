@@ -107,6 +107,9 @@ pub struct Project {
     /// Subtle analogue leakage between adjacent mixer audio/instrument channels.
     #[serde(default)]
     pub crosstalk: bool,
+    /// The console the mix runs through (None: in the box).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console: Option<crate::console::Console>,
     /// Display order. Contains exactly one [`TrackKind::Master`].
     pub tracks: Vec<Track>,
     #[serde(default)]
@@ -177,6 +180,7 @@ impl Project {
             punch_range: None,
             punch_enabled: false,
             crosstalk: false,
+            console: None,
             tracks: vec![master],
             clips: BTreeMap::new(),
             sources: BTreeMap::new(),

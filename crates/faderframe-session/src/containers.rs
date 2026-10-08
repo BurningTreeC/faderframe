@@ -122,7 +122,7 @@ impl Session {
         plugin: PluginRef,
     ) -> Result<PluginInstanceId> {
         if plugin.format == faderframe_project::PluginFormat::Builtin
-            && faderframe_core::builtin::preamp_index(&plugin.id).is_some()
+            && faderframe_core::builtin::is_input_stage(&plugin.id)
         {
             return Err(SessionError::Other(
                 "microphone preamps go in the mixer's preamp section".into(),

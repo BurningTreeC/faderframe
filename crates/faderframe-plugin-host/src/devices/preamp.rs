@@ -21,6 +21,16 @@ pub fn parameters() -> Vec<ParameterInfo> {
     ]
 }
 
+/// A console bus amplifier's: the drive into it (dB; taken off after it,
+/// so it changes the colour, not the level) and its output.
+pub fn bus_parameters() -> Vec<ParameterInfo> {
+    let drive = faderframe_circuit::preamp::BUS_DRIVE_DB;
+    vec![
+        super::param(GAIN, "Drive", -drive, drive, 0.0, ParameterUnit::Decibels),
+        super::param(MASTER, "Output", -24.0, 12.0, 0.0, ParameterUnit::Decibels),
+    ]
+}
+
 /// Channels solved in one pass of the helpers (more follow in further
 /// passes).
 const BATCH: usize = 64;

@@ -861,6 +861,7 @@ dependencies = [
  "faderframe-audio-graph",
  "faderframe-automation",
  "faderframe-binaural",
+ "faderframe-circuit",
  "faderframe-core",
  "faderframe-guitar",
  "faderframe-midi",

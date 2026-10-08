@@ -18,6 +18,7 @@ faderframe-timeline.workspace = true
 faderframe-midi.workspace = true
 faderframe-realtime.workspace = true
 faderframe-stretch.workspace = true
+faderframe-circuit.workspace = true
 faderframe-audio-graph.workspace = true
 faderframe-transport.workspace = true
 faderframe-project.workspace = true

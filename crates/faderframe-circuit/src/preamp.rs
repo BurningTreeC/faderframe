@@ -15,10 +15,9 @@ pub const CONSOLE_BUSES: usize = console_bus::FAMILIES.len();
 /// 0 dBFS is +22 dBu.
 pub const BUS_FULL_SCALE: f64 = 1.227_8 * std::f64::consts::SQRT_2 * 7.943_282;
 
-/// A console bus's drive (the Gain control, 0…1) in dB: −12…+12.
-pub fn bus_drive_db(control: f64) -> f64 {
-    -12.0 + 24.0 * control.clamp(0.0, 1.0)
-}
+/// A console bus's drive range (dB either way; its Gain control is the
+/// drive in dB).
+pub const BUS_DRIVE_DB: f64 = 12.0;
 struct Calibration {
     drive_volts: f64,
     make_up_db: [f64; 33],
@@ -113,7 +112,7 @@ pub struct Preamp {
 
 impl Preamp {
     /// Console bus `family` (see [`console_bus`]): Gain is the drive
-    /// ([`bus_drive_db`]), Master the output trim. Levels are set so that
+    /// (dB, ±[`BUS_DRIVE_DB`]), Master the output trim. Levels are set so that
     /// −18 dBFS leaves the bus's line at +4 dBu, the drive putting more in
     /// and taking it off after.
     fn console_bus(family: usize, rate: f64, drive: f64, master_db: f64) -> Result<Self, Fault> {
@@ -197,11 +196,17 @@ impl Preamp {
         Oversampler::latency_of(OVERSAMPLING)
     }
 
+    /// Gain (0…1; a console bus: its drive in dB) and Master (dB).
     pub fn set_controls(&mut self, gain: f64, master_db: f64) {
-        let gain = if gain.is_finite() {
-            gain.clamp(0.0, 1.0)
+        let (low, high, rest) = if self.bus.is_some() {
+            (-BUS_DRIVE_DB, BUS_DRIVE_DB, 0.0)
         } else {
-            0.5
+            (0.0, 1.0, REFERENCE)
+        };
+        let gain = if gain.is_finite() {
+            gain.clamp(low, high)
+        } else {
+            rest
         };
         let master = if master_db.is_finite() {
             master_db.clamp(-60.0, 12.0)
@@ -216,7 +221,7 @@ impl Preamp {
         if let Some(g) = self.bus {
             // The drive into the bus and off it after: the colour changes,
             // not the level.
-            let drive = 10f64.powf(bus_drive_db(gain) / 20.0);
+            let drive = 10f64.powf(gain / 20.0);
             self.input_scale = BUS_FULL_SCALE * drive / g.abs();
             self.makeup_scale = g.signum() / (BUS_FULL_SCALE * drive);
             self.output_target = 10f64.powf(master / 20.0);

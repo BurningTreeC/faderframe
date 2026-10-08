@@ -16,6 +16,9 @@ use std::sync::Arc;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Preamp(usize),
+    /// A console's mix-bus amplifier (family `i`): preamp model
+    /// `MODELS + i`, its Gain the drive in dB.
+    ConsoleBus(usize),
     Compressor,
     Gain,
     Echo,
@@ -47,13 +50,16 @@ enum Kind {
 }
 
 impl Kind {
-    const ALL: [Kind; 31] = [
+    const ALL: [Kind; 34] = [
         Kind::Preamp(0),
         Kind::Preamp(1),
         Kind::Preamp(2),
         Kind::Preamp(3),
         Kind::Preamp(4),
         Kind::Preamp(5),
+        Kind::ConsoleBus(0),
+        Kind::ConsoleBus(1),
+        Kind::ConsoleBus(2),
         Kind::Eq,
         Kind::ProgramEq,
         Kind::Limiter,
@@ -81,9 +87,21 @@ impl Kind {
         Kind::LatencyProbe,
     ];
 
+    /// The circuit a preamp or console bus solves (`Preamp` model).
+    fn circuit_model(self) -> usize {
+        match self {
+            Kind::ConsoleBus(i) => faderframe_circuit::preamp::MODELS + i,
+            Kind::Preamp(i) => i,
+            _ => 0,
+        }
+    }
+
     fn from_id(id: &str) -> Option<Self> {
         if let Some(i) = builtin::preamp_index(id) {
             return Some(Self::Preamp(i));
+        }
+        if let Some(i) = builtin::console_bus_index(id) {
+            return Some(Self::ConsoleBus(i));
         }
         Some(match id {
             builtin::GAIN => Kind::Gain,
@@ -128,6 +146,13 @@ impl Kind {
             Kind::Preamp(i) => (
                 builtin::PREAMPS[i].0,
                 builtin::PREAMPS[i].1,
+                PluginCategory::Preamp,
+                vec![stereo],
+                0,
+            ),
+            Kind::ConsoleBus(i) => (
+                builtin::CONSOLE_BUSES[i].0,
+                builtin::CONSOLE_BUSES[i].1,
                 PluginCategory::Preamp,
                 vec![stereo],
                 0,
@@ -352,6 +377,7 @@ impl Kind {
         use ParameterUnit::*;
         match self {
             Kind::Preamp(_) => crate::devices::preamp::parameters(),
+            Kind::ConsoleBus(_) => crate::devices::preamp::bus_parameters(),
             Kind::Gain => crate::devices::utility::parameters(),
             Kind::Compressor => crate::devices::compressor::parameters(),
             Kind::Limiter => crate::devices::limiter::parameters(),
@@ -653,7 +679,7 @@ impl PluginInstance for BuiltinInstance {
 
     fn latency_samples(&self) -> u32 {
         match self.kind {
-            Kind::Preamp(_) => {
+            Kind::Preamp(_) | Kind::ConsoleBus(_) => {
                 faderframe_circuit::preamp::Preamp::latency()
                     + crate::devices::preamp::buffer_delay(self.sized_block) as u32
             }
@@ -687,7 +713,7 @@ impl PluginInstance for BuiltinInstance {
 
     fn tail(&self) -> TailLength {
         match self.kind {
-            Kind::Preamp(_) => TailLength::Samples(48_000),
+            Kind::Preamp(_) | Kind::ConsoleBus(_) => TailLength::Samples(48_000),
             // A spring tank's tail and a power stage's recovery.
             Kind::Guitar => TailLength::Samples(96_000),
             Kind::Echo | Kind::Reverb => TailLength::Infinite,
@@ -752,14 +778,16 @@ impl PluginInstance for BuiltinInstance {
                 .ok_or_else(|| PluginError::Failed("no tap".into()))
         };
         let inner: Box<dyn PluginProcessor> = match self.kind {
-            Kind::Preamp(i) => Box::new(crate::devices::preamp::BufferedPreampProcessor::new(
-                i,
-                params,
-                config,
-                self.channels,
-                self.realtime,
-                crate::devices::preamp::buffer_delay(self.sized_block),
-            )?),
+            Kind::Preamp(_) | Kind::ConsoleBus(_) => {
+                Box::new(crate::devices::preamp::BufferedPreampProcessor::new(
+                    self.kind.circuit_model(),
+                    params,
+                    config,
+                    self.channels,
+                    self.realtime,
+                    crate::devices::preamp::buffer_delay(self.sized_block),
+                )?)
+            }
             Kind::Gain => Box::new(crate::devices::utility::UtilityProcessor::new(
                 params,
                 tap()?,

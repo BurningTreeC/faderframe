@@ -117,3 +117,34 @@ pub const PREAMPS: [(&str, &str, [u8; 3]); 6] = [
 pub fn preamp_index(id: &str) -> Option<usize> {
     PREAMPS.iter().position(|p| p.0 == id)
 }
+
+/// Console mix-bus amplifiers, the console summing's bus circuits (in
+/// `faderframe_circuit::circuits::console_bus::FAMILIES` order): the input
+/// stage of a bus or the master. IDs and order are persistent project data.
+pub const CONSOLE_BUSES: [(&str, &str, [u8; 3]); 3] = [
+    (
+        "faderframe.console-bus.american",
+        "American Bus",
+        [52, 60, 72],
+    ),
+    (
+        "faderframe.console-bus.british4k",
+        "British 4K Bus",
+        [78, 82, 84],
+    ),
+    (
+        "faderframe.console-bus.british73",
+        "British 73 Bus",
+        [70, 92, 112],
+    ),
+];
+
+pub fn console_bus_index(id: &str) -> Option<usize> {
+    CONSOLE_BUSES.iter().position(|p| p.0 == id)
+}
+
+/// A track's input-stage device: a microphone preamp or a console bus
+/// amplifier (only in the input stage, never an ordinary insert).
+pub fn is_input_stage(id: &str) -> bool {
+    preamp_index(id).is_some() || console_bus_index(id).is_some()
+}

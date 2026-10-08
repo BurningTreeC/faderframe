@@ -33,6 +33,7 @@ pub mod analysis;
 pub mod capture;
 pub mod clip_fx;
 pub mod conform;
+pub mod console;
 pub mod containers;
 pub mod control;
 mod control_extra;
@@ -241,6 +242,12 @@ pub enum Action {
     SetPreamp {
         track: TrackId,
         model: Option<usize>,
+    },
+    /// Run the mix through a console's circuits (`faderframe_project::console`
+    /// family; None: in the box): one undo step that also places its bus
+    /// amplifiers.
+    SetConsole {
+        family: Option<u8>,
     },
     InsertPlugin {
         track: TrackId,
@@ -2942,6 +2949,8 @@ impl Session {
         // plugin's main gives the plugin's track its routing back.
         let cmd = self.keep_folder_contents(cmd);
         let cmd = self.keep_main_heard(cmd);
+        // Buses added while a console is set get its bus amplifier.
+        let cmd = self.console_buses_for_new_tracks(cmd);
         // Splitting an alias makes it its own; content edits reach the
         // others (one undo step).
         let cmd = self.unlink_split_aliases(cmd);
@@ -3127,6 +3136,7 @@ impl Session {
                 }
             }
             Action::SplitSelectedAtPlayhead => self.split_at_playhead()?,
+            Action::SetConsole { family } => self.set_console(family)?,
             Action::SetPreamp { track, model } => {
                 let slot = if let Some(model) = model {
                     let &(id, name, _) = faderframe_core::builtin::PREAMPS
@@ -3155,7 +3165,7 @@ impl Session {
                 plugin,
             } => {
                 if plugin.format == faderframe_project::PluginFormat::Builtin
-                    && faderframe_core::builtin::preamp_index(&plugin.id).is_some()
+                    && faderframe_core::builtin::is_input_stage(&plugin.id)
                 {
                     return Err(SessionError::Other(
                         "Choose microphone preamps in the dedicated mixer section".into(),

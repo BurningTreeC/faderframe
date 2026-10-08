@@ -1210,3 +1210,72 @@ fn the_master_strip_has_a_mono_check_and_listening_choices() {
             .any(|i| i.label.starts_with("Headphone Render"))
     );
 }
+
+/// With a console, the buses' input stage is its bus amplifier — Drive and
+/// Output in dB on the faceplate, a drag moving the drive up from 0 dB, a
+/// double-click back to it — and the mixer takes the console's look until
+/// the look is turned off.
+#[test]
+fn a_console_shows_its_bus_amplifiers_and_its_look() {
+    let mut s = session();
+    let mut view = MixerView::new(Theme::default());
+    let size = Size::new(1400.0, 900.0);
+    s.dispatch(Action::SetConsole { family: Some(1) }).unwrap();
+    let bus = MixerView::channel_tracks(&s)
+        .iter()
+        .find(|t| t.kind == TrackKind::Bus)
+        .unwrap()
+        .id;
+    view.update_sends(&s);
+    let mut canvas = faderframe_ui_canvas::RecordingPainter::default();
+    view.paint(&mut canvas, size, &s, &Theme::default());
+    assert_ne!(
+        view.theme.console.panel_top,
+        Theme::default().console.panel_top,
+        "the console's look"
+    );
+    let area = view.layout_of(&s, bus, size).unwrap().preamp.unwrap();
+    let knob = Point::new(area.x + area.w * 0.25, area.y + 30.0);
+    assert_eq!(view.hit_test(knob, size, &s), Some(Hit::PreampKnob(bus, 0)));
+    let (mut actions, _) = run(&mut view, down(knob, 1), size, &s);
+    let (a, _) = run(
+        &mut view,
+        ViewEvent::PointerMove {
+            pos: Point::new(knob.x, knob.y - 20.0),
+            modifiers: Modifiers::NONE,
+            dragging: true,
+        },
+        size,
+        &s,
+    );
+    actions.extend(a);
+    let (a, _) = run(
+        &mut view,
+        ViewEvent::PointerUp {
+            pos: knob,
+            button: PointerButton::Primary,
+            modifiers: Modifiers::NONE,
+        },
+        size,
+        &s,
+    );
+    actions.extend(a);
+    for a in actions {
+        s.dispatch(a).unwrap();
+    }
+    let amp = |s: &Session| s.project().track(bus).unwrap().preamp.clone().unwrap();
+    let drive = preamp::value(&amp(&s), 0);
+    assert!(drive > 0.0 && drive <= 12.0, "drive {drive} dB");
+    let (actions, _) = run(&mut view, down(knob, 2), size, &s);
+    for a in actions {
+        s.dispatch(a).unwrap();
+    }
+    assert_eq!(preamp::value(&amp(&s), 0), 0.0, "back to 0 dB");
+    s.dispatch(Action::Edit(Command::SetConsoleLook { look: false }))
+        .unwrap();
+    view.paint(&mut canvas, size, &s, &Theme::default());
+    assert_eq!(
+        view.theme.console.panel_top,
+        Theme::default().console.panel_top
+    );
+}

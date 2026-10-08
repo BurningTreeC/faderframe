@@ -17,7 +17,7 @@ const RATE: f64 = 48_000.0;
 
 fn both(f: usize, hz: f64, dbfs: f64) -> ((f64, f64), (f64, f64)) {
     let tone = Tone::near(RATE, 9600, hz, 10f64.powf(dbfs / 20.0));
-    let mut c = Preamp::new(MODELS + f, RATE, 0.5, 0.0).expect("the bus");
+    let mut c = Preamp::new(MODELS + f, RATE, 0.0, 0.0).expect("the bus");
     // Both settle 0.6 s: the British 73's bias servo and coupling take more
     // than a fifth of a second to come to rest.
     let mc = run(tone, 28_800, |x| c.process(x));

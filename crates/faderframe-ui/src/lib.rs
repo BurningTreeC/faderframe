@@ -13,6 +13,7 @@
 
 mod actions;
 pub mod canvas;
+mod console;
 mod dialogs;
 pub mod dock;
 pub mod gpu;
@@ -245,6 +246,7 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
     actions::install(&state);
     recording::install_actions(&state);
     listen::install_actions(&state);
+    console::install_actions(&state);
     actions::install_window_keys(&state, &window);
     dialogs::install_close_guard(&state, &window);
     dock::realize(&state);

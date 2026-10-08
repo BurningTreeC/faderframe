@@ -150,6 +150,10 @@ enum Drag {
 
 pub struct MixerView {
     theme: Theme,
+    /// The skin as chosen (the mixer's own theme is it, or it with the
+    /// console's look), and the console family whose look is shown.
+    base_theme: Theme,
+    look: Option<u8>,
     scroll_x: f32,
     drag: Option<Drag>,
     hover: Option<Hit>,
@@ -290,6 +294,8 @@ fn parse_db(text: &str) -> Option<f32> {
 impl MixerView {
     pub fn new(theme: Theme) -> Self {
         Self {
+            base_theme: theme.clone(),
+            look: None,
             theme,
             scroll_x: 0.0,
             drag: None,
@@ -1283,6 +1289,24 @@ impl MixerView {
 
     // --- interaction helpers ---------------------------------------------------
 
+    /// The theme to paint with: the skin, with the console's look when
+    /// the project asks for it.
+    fn looked(&self) -> Theme {
+        match self.look {
+            Some(f) => self.base_theme.with_console_family(usize::from(f)),
+            None => self.base_theme.clone(),
+        }
+    }
+
+    /// Take (or leave) the console's look as the project's console changes.
+    pub(crate) fn follow_console(&mut self, model: &Session) {
+        let look = model.console().filter(|c| c.look).map(|c| c.family);
+        if look != self.look {
+            self.look = look;
+            self.theme = self.looked();
+        }
+    }
+
     fn track(model: &Session, id: TrackId) -> Option<&Track> {
         model.project().track(id)
     }
@@ -1292,7 +1316,7 @@ impl MixerView {
             KnobTarget::Preamp(id) => t
                 .preamp
                 .as_ref()
-                .map(|slot| preamp::position(preamp::value(slot, id), id)),
+                .map(|slot| preamp::position(&preamp::face(slot), preamp::value(slot, id), id)),
             KnobTarget::Pan => Some((t.pan + 1.0) * 0.5),
             KnobTarget::Send(i) => t.sends.get(i).map(|s| self.law.db_to_position(s.level_db)),
         }
@@ -1305,7 +1329,7 @@ impl MixerView {
                 track: t.id,
                 plugin: slot.id,
                 parameter: faderframe_core::ParameterId(id),
-                value: Some(preamp::plain(value, id)),
+                value: Some(preamp::plain(&preamp::face(slot), value, id)),
             }),
             KnobTarget::Pan => {
                 // Snap to centre near the middle for convenience.
@@ -1904,6 +1928,10 @@ impl MixerView {
             let mut listen = choices(model.listen_choices());
             listen.push(MenuItem::submenu("Head", choices(model.head_choices())).separated());
             items.push(MenuItem::submenu("Listen", listen).separated());
+            items.push(MenuItem::submenu(
+                "Console",
+                choices(model.console_choices()),
+            ));
         }
         if t.kind != TrackKind::Master {
             let now = model.strip_width(t.id);
@@ -2272,9 +2300,10 @@ impl MixerView {
                 };
                 if clicks >= 2 {
                     let reset = match target {
-                        KnobTarget::Preamp(id) => {
-                            preamp::position(if id == 0 { 0.5 } else { 0.0 }, id)
-                        }
+                        KnobTarget::Preamp(id) => t.preamp.as_ref().map_or(0.5, |slot| {
+                            let f = preamp::face(slot);
+                            preamp::position(&f, f.ranges[(id as usize).min(1)].2, id)
+                        }),
                         KnobTarget::Pan => 0.5,
                         KnobTarget::Send(_) => self.law.unity_position(),
                     };
@@ -2617,14 +2646,12 @@ impl MixerView {
                         },
                     )
                     .unwrap_or_else(|| preamp::value(slot, param));
-                if param == 0 {
-                    format!(
-                        "Gain {:.1}% · Drag or wheel · Double-click to reset",
-                        v * 100.0
-                    )
-                } else {
-                    format!("Master {v:.1} dB · Drag or wheel · Double-click for 0 dB")
-                }
+                let f = preamp::face(slot);
+                format!(
+                    "{} {} · Drag or wheel · Double-click to reset",
+                    f.labels[(param as usize).min(1)],
+                    preamp::shown(&f, v, param)
+                )
             }
             Hit::FaderCap(id) | Hit::FaderTrack(id) => {
                 let t = Self::track(model, id)?;
@@ -2743,10 +2770,12 @@ impl MixerView {
 
 impl CanvasView<Session, Action> for MixerView {
     fn set_theme(&mut self, theme: &Theme) {
-        self.theme = theme.clone();
+        self.base_theme = theme.clone();
+        self.theme = self.looked();
     }
 
     fn paint(&mut self, p: &mut dyn Painter, size: Size, model: &Session, theme: &Theme) {
+        self.follow_console(model);
         self.update_sends(model);
         self.update_strips(model);
         let tracks = Self::channel_tracks(model);

@@ -3340,9 +3340,8 @@ Worker underruns join the existing xrun counter. Live graphs honor processors'
 preferred 128-frame quantum so
 large device callbacks enqueue tracks in smaller chunks. Those chunks share
 one bounded device deadline, retaining time for downstream work. Gain moves
-the circuit control with upstream automatic level compensation, except on
-the Tube 610: its physical Level pot uses fixed calibration at 50%, allowing
-it to attenuate without boosting capacitive leakage near zero. Master is a
+the circuit control and the level with it (the calibration is fixed at 50 %,
+see above). Master is a
 smoothed -60 to +12 dB output trim. Calibration is
 applied before decimation, synchronously with circuit gain changes. Constructor
 work runs off the audio thread; processing, automation, and reset use reserved
@@ -3355,3 +3354,57 @@ solver and FIR history without allocation. Both channels then remain active,
 including during silence, until reset. Tests compare this path bit for bit
 against always processing two independent channels through gain changes,
 stereo transitions, tails, and resets.
+
+### Console summing
+
+`Project::console` (`faderframe_project::console`: family, channel drive,
+whether the mixer takes the console's look; `Command::{SetConsole,
+SetConsoleDrive, SetConsoleLook}`) runs the mix through a console's
+circuits: American (a 2520-style virtual earth into the 2503 output
+transformer), British 4K (two 5534 stages) and British 73 (the 73's class-A
+line amplifier into its transformer), all in `circuits::console_bus`,
+calibrated so −18 dBFS is +4 dBu at the line.
+
+* **Buses, returns and the master** sum through the circuit itself: a
+  built-in device in their input stage (`builtin::CONSOLE_BUSES`, preamp
+  model `MODELS + family` through the preamps' `BufferedPreampProcessor` —
+  reservoir buffering, worker pool, deadlines — its latency compensated).
+  Its Gain is the drive in dB (±12), taken off after the circuit so the
+  colour changes, not the level; Output trims. `Session::set_console`
+  places, replaces (keeping drive and output) or removes them in the same
+  undo step as the setting; a bus whose input stage holds a microphone
+  preamp keeps it; buses added while a console is set get theirs
+  (`console_buses_for_new_tracks`, a hook in `Session::edit`).
+* **Audio and instrument channels** go through the console's line
+  amplifier as a light model (`faderframe_circuit::console::ConsoleStage`,
+  0.3 % of a core per channel against 3.5–6.3 % for the circuits), in
+  front of the strip (`nodes::ConsoleChannel` in `add_strip`, so whichever
+  graph builds a strip builds its stage; pre-fader sends carry it). The
+  channel drive is a parameter slot (`SlotRegistry::console_drive`, no
+  rebuild), ramped across a block.
+
+The model is baked from the bus circuits (`tests/console_bake.rs`, run with
+`FADERFRAME_BAKE_CONSOLE=1 … --ignored`): the small-signal response as a
+high-pass, low-pass, bell and shelf; transfer curves at 25 levels from −24
+to +12 dBFS, each relative to its level (an AC-coupled class-A stage moves
+its operating point so it clips near the peak at any level; relative to the
+level, neighbouring curves keep their knees together, so mixing them moves
+the knee instead of making two), chosen by a peak follower with a 25 ms
+hold; and per-level emphasis bands (a low and a high one-pole band, the
+gain into the curve undone exactly after it, then a correction) where the
+circuit's distortion and compression depend on the frequency differently
+at different levels. `tests/console_match.rs` holds it to the circuit at
+60 Hz, 1 kHz and 5 kHz from the nominal level to +6 dBFS (distortion within
+35 % or within what the circuit has a quarter of a dB either side, gain and
+response within 0.3 dB, distortion rising with the level). Not modelled: the
+British 73's slew distortion at 5 kHz where its curve is still straight
+(about −60 dB).
+
+The mixer takes the family's look (`Theme::with_console_family`: panels,
+knobs, faders, meters and finish of the console section, in FaderFrame's
+own design — graphite and brass, slate with colour-coded caps, pewter and
+walnut) unless the look is turned off; Audio → Console and the master
+strip's menu switch it all. Tests: `session/tests/console.rs` (one step,
+latency to the sample, level kept, colour when driven, families keep the
+bus settings), `the_console_does_not_allocate`, the mixer's
+`a_console_shows_its_bus_amplifiers_and_its_look`.

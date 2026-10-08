@@ -69,6 +69,7 @@ pub enum Impact {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CoalesceKey {
     TrackVolume(TrackId),
+    ConsoleDrive,
     TrackPan(TrackId),
     TrackSurround(TrackId),
     SendLevel(TrackId, SendId),
@@ -308,6 +309,19 @@ pub enum Command {
     /// Enable analogue crosstalk for adjacent mixer channels.
     SetCrosstalk {
         enabled: bool,
+    },
+    /// The console the mix runs through (None: in the box). The session
+    /// places (or removes) the bus amplifiers in the same step.
+    SetConsole {
+        console: Option<crate::console::Console>,
+    },
+    /// How hard the channels drive the console's line amplifiers.
+    SetConsoleDrive {
+        drive_db: f64,
+    },
+    /// Whether the mixer takes the console's look.
+    SetConsoleLook {
+        look: bool,
     },
 
     // --- track structure -------------------------------------------------
@@ -722,6 +736,10 @@ impl Command {
             RemoveTrack { .. } => "Remove Track".into(),
             MoveTrack { .. } => "Move Track".into(),
             SetCrosstalk { .. } => "Analogue Crosstalk".into(),
+            SetConsole { console: Some(c) } => format!("Console: {}", c.name()),
+            SetConsole { console: None } => "Console Off".into(),
+            SetConsoleDrive { .. } => "Console Drive".into(),
+            SetConsoleLook { .. } => "Console Look".into(),
             AddAutomationLane { .. } => "Add Automation Lane".into(),
             RemoveAutomationLane { .. } => "Remove Automation Lane".into(),
             SetAutomationLane { .. } => "Edit Automation".into(),
@@ -783,6 +801,7 @@ impl Command {
             MoveClip { clip, .. } | SetClipContent { clip, .. } => CoalesceKey::Clip(*clip),
             UpdateNote { clip, note } => CoalesceKey::Note(*clip, note.id),
             SetTempo { .. } => CoalesceKey::Tempo,
+            SetConsoleDrive { .. } => CoalesceKey::ConsoleDrive,
             SetVideo { .. } => CoalesceKey::Video,
             SetLoop { .. } => CoalesceKey::Loop,
             SetPunch { .. } => CoalesceKey::Punch,
@@ -811,7 +830,9 @@ impl Command {
             | SetTrackPhaseInvert { .. }
             | SetSendLevel { .. }
             | SetPluginParameter { .. }
-            | SetPluginState { .. } => Impact::Params,
+            | SetPluginState { .. }
+            | SetConsoleDrive { .. } => Impact::Params,
+            SetConsoleLook { .. } => Impact::None,
             RenameTrack { .. }
             | SetTrackBinaural { .. }
             | SetTrackColor { .. }
@@ -865,6 +886,7 @@ impl Command {
             | SetTimeSignature { .. }
             | SetLoop { .. } => Impact::Timeline,
             SetCrosstalk { .. }
+            | SetConsole { .. }
             | MoveTrack { .. }
             | SetTrackRecordArm { .. }
             | SetTrackMonitor { .. }
@@ -1372,7 +1394,7 @@ impl Command {
                 if let Some(s) = &slot
                     && (!t.kind.has_audio()
                         || s.plugin.format != crate::PluginFormat::Builtin
-                        || faderframe_core::builtin::preamp_index(&s.plugin.id).is_none())
+                        || !faderframe_core::builtin::is_input_stage(&s.plugin.id))
                 {
                     return Err(EditError::Invalid("Invalid microphone preamp slot".into()));
                 }
@@ -1504,6 +1526,42 @@ impl Command {
             SetCrosstalk { enabled } => {
                 let old = std::mem::replace(&mut p.crosstalk, enabled);
                 SetCrosstalk { enabled: old }
+            }
+            SetConsole { console } => {
+                let console = console.map(|c| {
+                    crate::console::Console {
+                        drive_db: if c.drive_db.is_finite() {
+                            c.drive_db
+                                .clamp(-crate::console::DRIVE_DB, crate::console::DRIVE_DB)
+                        } else {
+                            0.0
+                        },
+                        ..crate::console::Console::new(c.family)
+                    }
+                    .with_look(c.look)
+                });
+                let old = std::mem::replace(&mut p.console, console);
+                SetConsole { console: old }
+            }
+            SetConsoleDrive { drive_db } => {
+                let c = p
+                    .console
+                    .as_mut()
+                    .ok_or_else(|| EditError::Invalid("no console".into()))?;
+                if !drive_db.is_finite() {
+                    return Err(EditError::Invalid("console drive".into()));
+                }
+                let d = drive_db.clamp(-crate::console::DRIVE_DB, crate::console::DRIVE_DB);
+                let old = std::mem::replace(&mut c.drive_db, d);
+                SetConsoleDrive { drive_db: old }
+            }
+            SetConsoleLook { look } => {
+                let c = p
+                    .console
+                    .as_mut()
+                    .ok_or_else(|| EditError::Invalid("no console".into()))?;
+                let old = std::mem::replace(&mut c.look, look);
+                SetConsoleLook { look: old }
             }
             MoveTrack { track, index } => {
                 let from = p.track_index(track).ok_or(EditError::UnknownTrack(track))?;

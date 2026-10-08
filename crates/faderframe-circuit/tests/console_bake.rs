@@ -30,7 +30,7 @@ const EMPHASIS: (f64, f64) = (150.0, 3000.0);
 
 /// The family's bus circuit at its calibration, the drive at 0 dB.
 fn bus(family: usize) -> Preamp {
-    Preamp::new(MODELS + family, RATE, 0.5, 0.0).expect("the bus builds")
+    Preamp::new(MODELS + family, RATE, 0.0, 0.0).expect("the bus builds")
 }
 
 fn gain(family: usize, hz: f64) -> f64 {

@@ -13,7 +13,7 @@ fn bus(family: usize, drive: f64) -> Preamp {
 }
 
 fn measure(family: usize, hz: f64, dbfs: f64) -> (f64, f64) {
-    let mut p = bus(family, 0.5);
+    let mut p = bus(family, 0.0);
     let tone = Tone::near(RATE, 9600, hz, 10f64.powf(dbfs / 20.0));
     let m = run(tone, 9600, |x| p.process(x));
     (m.gain_db(), m.thd_percent())
@@ -22,7 +22,7 @@ fn measure(family: usize, hz: f64, dbfs: f64) -> (f64, f64) {
 #[test]
 fn buses_pass_at_unity_and_in_phase() {
     for f in 0..CONSOLE_BUSES {
-        let mut p = bus(f, 0.5);
+        let mut p = bus(f, 0.0);
         let tone = Tone::near(RATE, 9600, 1000.0, 0.01);
         let m = run(tone, 9600, |x| p.process(x));
         let g = m.fundamental();

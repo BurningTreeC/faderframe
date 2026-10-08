@@ -2,6 +2,7 @@
 
 mod chain;
 mod clip_player;
+mod console;
 mod crosstalk;
 mod io;
 mod listen;
@@ -13,6 +14,7 @@ mod strip;
 
 pub use chain::{ChainMix, ChainNotes};
 pub use clip_player::{AudioClipPlayer, StretchVoices};
+pub use console::ConsoleChannel;
 pub use crosstalk::Crosstalk;
 pub use io::{
     DeviceInputTap, DeviceOutputSink, FoldDown, HardwareReturn, HardwareSendGain, MonitorGate,

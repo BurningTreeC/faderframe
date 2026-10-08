@@ -61,6 +61,8 @@ pub struct SlotRegistry {
     chains: HashMap<(PluginInstanceId, usize), ChainSlots>,
     /// 1.0 while the mono check is on (listening only).
     monitor_mono: Option<ParamSlot>,
+    /// The console's channel drive (dB).
+    console_drive: Option<ParamSlot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -80,6 +82,7 @@ impl SlotRegistry {
             midi_mute: HashMap::new(),
             chains: HashMap::new(),
             monitor_mono: None,
+            console_drive: None,
         }
     }
 
@@ -143,6 +146,20 @@ impl SlotRegistry {
                 .ok_or(SlotsExhausted("parameters"))?,
         );
         self.monitor_mono = Some(s);
+        Ok(s)
+    }
+
+    /// The console's channel drive (one for the session).
+    pub fn console_drive(&mut self) -> Result<ParamSlot, SlotsExhausted> {
+        if let Some(s) = self.console_drive {
+            return Ok(s);
+        }
+        let s = ParamSlot(
+            self.params
+                .allocate(1)
+                .ok_or(SlotsExhausted("parameters"))?,
+        );
+        self.console_drive = Some(s);
         Ok(s)
     }
 
@@ -295,6 +312,10 @@ impl SlotRegistry {
         suspended: &HashSet<AutomationLaneId>,
     ) -> Result<(), SlotsExhausted> {
         let solo = project.solo_audible();
+        if let Some(c) = &project.console {
+            let slot = self.console_drive()?;
+            table.set(slot, c.drive_db as f32);
+        }
         for t in &project.tracks {
             if t.input.is_midi() {
                 let slot = self.midi_live(t.id)?;

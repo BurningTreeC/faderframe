@@ -2225,6 +2225,69 @@ fn microphone_preamps_do_not_allocate_while_automating_or_resetting() {
     }
 }
 
+/// Console summing: every family's channel stage on a stereo track and its
+/// bus amplifier on the master, inline and on its workers, the drive
+/// turned while playing, a transport reset.
+#[test]
+fn the_console_does_not_allocate() {
+    let _serial = serial();
+    use faderframe_core::{ChannelLayout, builtin};
+    use faderframe_project::{PluginRef, PluginSlot, TrackKind, console::Console};
+    use faderframe_timeline::MusicalTime;
+    for (family, (name, label, _)) in builtin::CONSOLE_BUSES.into_iter().enumerate() {
+        let mut tp = common::TestProject::new(48_000);
+        let t = tp.track(TrackKind::Audio, "Voice", ChannelLayout::Stereo);
+        let wave: Vec<f32> = (0..16_384).map(|i| 0.7 * (i as f32 * 0.05).sin()).collect();
+        let src = tp.source(faderframe_audio_files::AudioData::from_channels(
+            48_000,
+            vec![wave.clone(), wave],
+        ));
+        tp.clip(t, src, MusicalTime::ZERO, 16_384);
+        tp.project.console = Some(Console {
+            drive_db: 6.0,
+            ..Console::new(family as u8)
+        });
+        let plugin = tp.project.ids.allocate();
+        let master = tp.project.master_id().unwrap();
+        tp.project.track_mut(master).unwrap().preamp = Some(PluginSlot {
+            id: plugin,
+            plugin: PluginRef::builtin(name, label),
+            bypass: false,
+            parameters: Vec::new(),
+            state: None,
+            sidechain: None,
+        });
+        for realtime in [false, true] {
+            let mut r =
+                OfflineRenderer::new(&tp.project, &tp.sources, EngineConfig::default(), 128, 2)
+                    .unwrap();
+            r.controller.plugins().set_realtime(realtime);
+            r.controller.rebuild_graph(&tp.project).unwrap();
+            r.controller.update_params(&tp.project).unwrap();
+            let mut buffers = OwnedBuffers::new(2, 2, 128);
+            r.play_from(0).unwrap();
+            let (_, count) = armed(|| {
+                for _ in 0..24 {
+                    r.processor.process_device(&mut buffers);
+                }
+            });
+            assert_eq!(count, 0, "{label}: playing allocates");
+            let mut hotter = tp.project.clone();
+            if let Some(c) = &mut hotter.console {
+                c.drive_db = -9.0;
+            }
+            r.controller.update_params(&hotter).unwrap();
+            r.play_from(0).unwrap();
+            let (_, count) = armed(|| {
+                for _ in 0..24 {
+                    r.processor.process_device(&mut buffers);
+                }
+            });
+            assert_eq!(count, 0, "{label}: the drive or a reset allocates");
+        }
+    }
+}
+
 /// The Guitar Station in a graph, inline and on its stages' workers: a line
 /// of three pedals, a wah's treadle and the amplifier's drive automated, a
 /// footswitch, a stereo signal waking the second channel, a reset.

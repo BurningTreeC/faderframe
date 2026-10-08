@@ -13,7 +13,7 @@ fn main() {
         println!("{hz} Hz");
         for db in -8..=8 {
             let tone = Tone::near(rate, 9600, hz, 10f64.powf(db as f64 / 20.0));
-            let mut c = Preamp::new(MODELS + f, rate, 0.5, 0.0).unwrap();
+            let mut c = Preamp::new(MODELS + f, rate, 0.0, 0.0).unwrap();
             let mc = run(tone, 28_800, |x| c.process(x));
             let mut s = ConsoleStage::new(f, 0.0, rate);
             let ms = run(tone, 28_800, |x| s.process(x));

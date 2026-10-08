@@ -555,6 +555,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
         ]),
     );
     audio.append_submenu(Some("Listen"), &crate::listen::menu());
+    audio.append_submenu(Some("Console"), &crate::console::menu());
     audio.append_section(
         None,
         &section(&[(

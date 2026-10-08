@@ -381,6 +381,7 @@ enum Role {
     Renderer = 17,
     HardwareSend = 18,
     HardwareReturn = 19,
+    Console = 20,
 }
 
 /// Stretcher voices a track's clip player needs: one per pitch-preserving
@@ -1017,7 +1018,7 @@ pub fn build_graph(
                         &plan.misses,
                     )
                 };
-                let strip = add_strip(&mut bb, project, slots, t, None, end, true)?;
+                let strip = add_strip(&mut bb, project, slots, config, t, None, end, true)?;
                 let echo = ring_of(
                     plan.bus_rings,
                     t.id,
@@ -1068,7 +1069,7 @@ pub fn build_graph(
                 };
                 let back = reader(&mut b, &ring, latency, end_layout, Some(gi), &plan.misses);
                 own(&mut owners, back, t.id, None, NodeWork::Ahead);
-                let strip = add_strip(&mut b, project, slots, t, Some(gi), back, false)?;
+                let strip = add_strip(&mut b, project, slots, config, t, Some(gi), back, false)?;
                 tn.post_fx = Some(back);
                 tn.strip = Some(own(&mut owners, strip, t.id, None, NodeWork::Strip));
             }
@@ -1414,7 +1415,7 @@ pub fn build_graph(
             prev = node;
         }
 
-        let strip = add_strip(&mut b, project, slots, t, Some(gi), prev, false)?;
+        let strip = add_strip(&mut b, project, slots, config, t, Some(gi), prev, false)?;
         tn.post_fx = Some(prev);
         tn.strip = Some(own(&mut owners, strip, t.id, None, NodeWork::Strip));
         nodes.insert(t.id, tn);
@@ -1911,16 +1912,48 @@ fn add_container(
 }
 
 /// A track's channel strip, fed from `from` (`quiet`: rendered ahead).
+#[allow(clippy::too_many_arguments)]
 fn add_strip(
     b: &mut GraphBuilder<EngineContext>,
     project: &Project,
     slots: &mut SlotRegistry,
+    config: &PrepareConfig,
     t: &Track,
     group: Option<u32>,
     from: NodeId,
     quiet: bool,
 ) -> Result<NodeId, EngineError> {
     let layout = t.chain_layout();
+    // The console's channel line amplifier, before the strip (wherever
+    // the strip is built, the stage comes with it).
+    let from = match &project.console {
+        Some(c) if faderframe_project::console::has_channel_stage(t.kind) => {
+            let mut spec = NodeSpec::new(format!("{} · Console", t.name))
+                .key(node_key(
+                    t.id,
+                    Role::Console,
+                    u64::from(c.family),
+                    &[layout],
+                ))
+                .audio_in(layout)
+                .audio_out(layout);
+            if let Some(g) = group {
+                spec = spec.group(g);
+            }
+            let node = b.add_node(
+                spec,
+                Box::new(crate::nodes::ConsoleChannel::new(
+                    usize::from(c.family),
+                    layout.channel_count(),
+                    config.sample_rate,
+                    slots.console_drive()?,
+                )),
+            );
+            b.connect_audio(from, 0, node, 0)?;
+            node
+        }
+        _ => from,
+    };
     let dest = destination_layout(project, t);
     let strip_slots = slots.strip(t.id)?;
     let meter = slots.meter(t.id, dest.channel_count())?;

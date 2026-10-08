@@ -648,7 +648,127 @@ pub fn high_contrast() -> Theme {
     })
 }
 
+/// A console family's mixer look (`faderframe_project::console::FAMILIES`
+/// order), in FaderFrame's own design language: the console section's
+/// panels, knobs, faders, meters and finish change, everything else stays
+/// the skin's. Not any real console's livery.
+struct Family {
+    panel: (u32, u32),
+    master_panel: (u32, u32),
+    label: u32,
+    /// Body dark/light, cap top/bottom, pointer, ring track.
+    knob: [u32; 6],
+    /// Send, pan, trim caps.
+    caps: [u32; 3],
+    /// Audio, bus, aux, master fader caps.
+    faders: [u32; 4],
+    scribble: (u32, u32),
+    well: u32,
+    look: ConsoleLook,
+}
+
+fn family(f: usize) -> Family {
+    match f {
+        // Graphite and brass: brushed dark metal, brass pointers, moving
+        // coil meters.
+        0 => Family {
+            panel: (0x36393e, 0x27292d),
+            master_panel: (0x2b2d31, 0x1d1f22),
+            label: 0xe9e1cc,
+            knob: [0x111214, 0x2d2f33, 0x3b3d41, 0x1b1c1f, 0xd9b56b, 0x101113],
+            caps: [0x3a3d42, 0x8c7a52, 0x7d322b],
+            faders: [0x1d1e21, 0x8c7a52, 0x4f6b57, 0x9a3b2f],
+            scribble: (0xe4d9bd, 0x221d14),
+            well: 0x101113,
+            look: ConsoleLook {
+                knob_skirt: Some(c(0x1b1c1f)),
+                knob_ring: false,
+                sheen: 0.25,
+                brushed: 0.55,
+                screws: true,
+                wood: None,
+                meter: MeterKind::Edgewise,
+                engrave: Color::rgba(0.0, 0.0, 0.0, 0.6),
+                flat: false,
+            },
+        },
+        // Slate and colour: light caps, colour-coded sections, bar meters.
+        1 => Family {
+            panel: (0x4b5158, 0x3c4147),
+            master_panel: (0x3c4147, 0x2f3338),
+            label: 0xf1f2ef,
+            knob: [0x1f2225, 0x3d4247, 0xdcddd8, 0xa6a8a4, 0x1b1d1f, 0x1a1c1e],
+            caps: [0x2f6f8f, 0xc9a227, 0xa83a32],
+            faders: [0xdcddd8, 0x2f6f8f, 0x4f8a55, 0xa83a32],
+            scribble: (0xf3f1e8, 0x1d2024),
+            well: 0x16181b,
+            look: ConsoleLook {
+                knob_skirt: None,
+                knob_ring: false,
+                sheen: 0.35,
+                brushed: 0.0,
+                screws: false,
+                wood: None,
+                meter: MeterKind::Bar,
+                engrave: Color::rgba(0.0, 0.0, 0.0, 0.45),
+                flat: false,
+            },
+        },
+        // Pewter and walnut: warm grey-green plates, printed knob scales,
+        // wooden cheeks, moving coil meters.
+        _ => Family {
+            panel: (0x5a5e57, 0x474a44),
+            master_panel: (0x4c3a2c, 0x382a1f),
+            label: 0xf1ead8,
+            knob: [0x1c1a17, 0x3b3833, 0x8e8c86, 0x5f5d58, 0xf3eee0, 0x171512],
+            caps: [0x5f5d58, 0x8e8c86, 0x8d2f27],
+            faders: [0xe8e2d3, 0x6c7a5d, 0x5d7a78, 0x8d2f27],
+            scribble: (0xeee6d0, 0x241f17),
+            well: 0x14130f,
+            look: ConsoleLook {
+                knob_skirt: Some(c(0x2a2925)),
+                knob_ring: false,
+                sheen: 0.3,
+                brushed: 0.2,
+                screws: true,
+                wood: Some((c(0x7a4b2a), c(0x46291a))),
+                meter: MeterKind::Edgewise,
+                engrave: Color::rgba(0.0, 0.0, 0.0, 0.6),
+                flat: false,
+            },
+        },
+    }
+}
+
 impl Theme {
+    /// This skin with console family `f`'s mixer look (see [`Family`]).
+    pub fn with_console_family(&self, f: usize) -> Theme {
+        let s = family(f);
+        let mut t = self.clone();
+        let k = &mut t.console;
+        (k.panel_top, k.panel_bottom) = (c(s.panel.0), c(s.panel.1));
+        (k.master_panel_top, k.master_panel_bottom) = (c(s.master_panel.0), c(s.master_panel.1));
+        k.panel_label = c(s.label);
+        k.panel_edge_light = Color::rgba(1.0, 1.0, 1.0, 0.12);
+        k.panel_edge_dark = Color::rgba(0.0, 0.0, 0.0, 0.55);
+        k.section_line = Color::rgba(0.0, 0.0, 0.0, 0.44);
+        k.well = c(s.well);
+        k.knob.body_dark = c(s.knob[0]);
+        k.knob.body_light = c(s.knob[1]);
+        k.knob.cap_top = c(s.knob[2]);
+        k.knob.cap_bottom = c(s.knob[3]);
+        k.knob.pointer = c(s.knob[4]);
+        k.knob.ring_track = c(s.knob[5]);
+        (k.send_cap, k.pan_cap, k.trim_cap) = (c(s.caps[0]), c(s.caps[1]), c(s.caps[2]));
+        k.fader_cap_audio = c(s.faders[0]);
+        k.fader_cap_bus = c(s.faders[1]);
+        k.fader_cap_aux = c(s.faders[2]);
+        k.fader_cap_master = c(s.faders[3]);
+        (k.scribble_bg, k.scribble_text) = (c(s.scribble.0), c(s.scribble.1));
+        k.look = s.look;
+        t
+    }
+
     /// Every built-in skin, the default first.
     pub fn all() -> Vec<Theme> {
         vec![
@@ -687,6 +807,19 @@ mod tests {
         assert!(all.iter().any(|t| !t.dark), "a light skin");
         assert_eq!(Theme::by_id("vintage").name, "Vintage Console");
         assert_eq!(Theme::by_id("nope").id, "studio");
+        // The console looks change the console section only, each its
+        // own, its labels readable on its panels.
+        let base = Theme::studio();
+        for f in 0..3 {
+            let t = base.with_console_family(f);
+            assert_eq!(t.ui.text, base.ui.text);
+            assert_ne!(t.console.panel_top, base.console.panel_top);
+            let (a, b) = (
+                t.console.panel_label.luminance(),
+                t.console.panel_top.luminance(),
+            );
+            assert!((a - b).abs() > 0.4, "family {f}: label contrast");
+        }
         // Text stands out from the background in every skin.
         for t in &all {
             let (a, b) = (t.ui.text.luminance(), t.ui.background.luminance());
