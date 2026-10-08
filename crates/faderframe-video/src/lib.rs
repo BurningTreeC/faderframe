@@ -15,6 +15,8 @@
 //! - [`mux`]: a movie with the picture copied untouched and new sound.
 //! - [`service`]: decoders on threads and a frame cache, answering at once
 //!   with the best frame there is.
+//! - `zero_copy` (Linux): playback decoded by VA-API into dmabufs the
+//!   display imports as they are.
 //!
 //! Each job decodes only the streams it needs: parsing (`parsebin`) comes
 //! first and only the stream asked for is decoded.
@@ -32,6 +34,8 @@ pub mod qt_timecode;
 pub mod service;
 mod streams;
 pub mod sync_test;
+#[cfg(target_os = "linux")]
+pub mod zero_copy;
 
 pub use decode::{Decoder, Frame, fit};
 pub use index::FrameIndex;

@@ -32,7 +32,7 @@ pub use color::Color;
 pub use event::{Cursor, Key, Modifiers, PointerButton, ViewEvent};
 pub use flow::{Flow, FlowMetrics};
 pub use geometry::{Point, Rect, Size};
-pub use paint::{Image, Paint, Path, PathCmd, Pixels};
+pub use paint::{External, Image, Paint, Path, PathCmd, Pixels};
 pub use painter::{DrawOp, Painter, RecordingPainter};
 pub use text::{Align, FontFamily, FontWeight, TextStyle};
 pub use theme::{

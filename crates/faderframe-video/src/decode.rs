@@ -9,7 +9,16 @@ use gst_video::prelude::*;
 use std::path::Path;
 use std::time::Duration;
 
-/// A decoded frame: rows of RGBA (opaque), `width * 4` bytes each.
+/// A frame in video memory ([`crate::zero_copy`], Linux).
+#[cfg(target_os = "linux")]
+pub type Gpu = crate::zero_copy::GpuFrame;
+/// No frames in video memory here.
+#[cfg(not(target_os = "linux"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Gpu {}
+
+/// A decoded frame: rows of RGBA (opaque), `width * 4` bytes each — or,
+/// from a zero-copy decoder, a dmabuf (`gpu`, `rgba` empty).
 #[derive(Clone, PartialEq, Eq)]
 pub struct Frame {
     pub width: u32,
@@ -17,6 +26,7 @@ pub struct Frame {
     /// Its start in the file's timeline (ns, stream time).
     pub time: i64,
     pub rgba: Vec<u8>,
+    pub gpu: Option<Gpu>,
 }
 
 impl std::fmt::Debug for Frame {
@@ -30,6 +40,15 @@ impl std::fmt::Debug for Frame {
 }
 
 impl Frame {
+    /// The memory it takes (in video memory for a dmabuf frame).
+    pub fn bytes(&self) -> usize {
+        if self.gpu.is_some() {
+            self.width as usize * self.height as usize * 4
+        } else {
+            self.rgba.len()
+        }
+    }
+
     /// The pixel at (`x`, `y`) as RGBA.
     pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
         let i = ((y * self.width + x) * 4) as usize;
@@ -63,7 +82,6 @@ impl Decoder {
     /// Open `path`'s picture, scaled to `width`×`height` (see [`fit`]);
     /// shows the first frame.
     pub fn open(path: &Path, width: u32, height: u32) -> Result<Self> {
-        let p = Pipeline::new(path)?;
         let convert = make("videoconvertscale")?;
         let caps = gst::Caps::builder("video/x-raw")
             .field("format", "RGBA")
@@ -71,6 +89,43 @@ impl Decoder {
             .field("height", height as i32)
             .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
             .build();
+        Self::open_with(path, width, height, convert, caps, false)
+    }
+
+    /// Open `path`'s picture decoded into dmabufs at `width`×`height`
+    /// (VA-API scales and converts; see [`crate::zero_copy`]).
+    #[cfg(target_os = "linux")]
+    pub fn open_dmabuf(path: &Path, width: u32, height: u32) -> Result<Self> {
+        let post = make("vapostproc")?;
+        let caps = crate::zero_copy::caps_for(&post, width, height).ok_or_else(|| {
+            VideoError::Unavailable("no dmabuf format both VA-API and the display know".into())
+        })?;
+        let d = Self::open_with(path, width, height, post, caps, true)?;
+        // A pipeline that negotiates something else is no use.
+        let caps = d
+            .sink
+            .static_pad("sink")
+            .and_then(|p| p.current_caps())
+            .ok_or_else(|| VideoError::Unavailable("nothing negotiated".into()))?;
+        if !caps
+            .features(0)
+            .is_some_and(|f| f.contains("memory:DMABuf"))
+        {
+            return Err(VideoError::Unavailable(format!("negotiated {caps}")));
+        }
+        tracing::debug!("{}: frames in dmabufs: {caps}", path.display());
+        Ok(d)
+    }
+
+    fn open_with(
+        path: &Path,
+        width: u32,
+        height: u32,
+        convert: gst::Element,
+        caps: gst::Caps,
+        video_meta: bool,
+    ) -> Result<Self> {
+        let p = Pipeline::new(path)?;
         let filter = gst::ElementFactory::make("capsfilter")
             .property("caps", &caps)
             .build()
@@ -81,12 +136,23 @@ impl Decoder {
             .drop(false)
             .enable_last_sample(false)
             .build();
+        if video_meta && let Some(pad) = sink.static_pad("sink") {
+            // Planes are described by a video meta (dmabufs need it).
+            pad.add_probe(gst::PadProbeType::QUERY_DOWNSTREAM, |_, info| {
+                if let Some(gst::PadProbeData::Query(q)) = info.data.as_mut()
+                    && let gst::QueryViewMut::Allocation(a) = q.view_mut()
+                {
+                    a.add_allocation_meta::<gst_video::VideoMeta>(None);
+                }
+                gst::PadProbeReturn::Ok
+            });
+        }
         let elements = [convert, filter, sink.clone().upcast()];
         p.pipeline.add_many(&elements)?;
         gst::Element::link_many(&elements)?;
         let next = elements[0]
             .static_pad("sink")
-            .ok_or_else(|| VideoError::Gst("videoconvertscale without a sink".into()))?;
+            .ok_or_else(|| VideoError::Gst("a converter without a sink".into()))?;
         p.parse(move |p, kind, n, pad| {
             (kind == Kind::Picture && n == 0)
                 .then(|| p.decoder_into(pad, next.clone()).ok())
@@ -129,7 +195,6 @@ impl Decoder {
         let caps = sample
             .caps()
             .ok_or_else(|| VideoError::Gst("a frame without caps".into()))?;
-        let info = gst_video::VideoInfo::from_caps(caps)?;
         let buffer = sample
             .buffer()
             .ok_or_else(|| VideoError::Gst("a sample without a frame".into()))?;
@@ -140,6 +205,26 @@ impl Decoder {
                 .map_or(0, crate::ns),
             _ => 0,
         };
+        #[cfg(target_os = "linux")]
+        if caps
+            .features(0)
+            .is_some_and(|f| f.contains("memory:DMABuf"))
+        {
+            let info = gst_video::VideoInfoDmaDrm::from_caps(caps)?;
+            let owned = sample
+                .buffer_owned()
+                .ok_or_else(|| VideoError::Gst("a sample without a frame".into()))?;
+            let gpu = crate::zero_copy::GpuFrame::of(&owned, &info)
+                .ok_or_else(|| VideoError::Gst("a frame that is not in dmabufs".into()))?;
+            return Ok(Frame {
+                width: info.width(),
+                height: info.height(),
+                time,
+                rgba: Vec::new(),
+                gpu: Some(gpu),
+            });
+        }
+        let info = gst_video::VideoInfo::from_caps(caps)?;
         let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info)
             .map_err(|_| VideoError::Gst("an unreadable frame".into()))?;
         let (w, h) = (info.width(), info.height());
@@ -161,6 +246,7 @@ impl Decoder {
             height: h,
             time,
             rgba,
+            gpu: None,
         })
     }
 

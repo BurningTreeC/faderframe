@@ -44,16 +44,30 @@ pub fn make_proxy(
     }
     let p = Pipeline::new(src)?;
     let convert = make("videoconvertscale")?;
-    let caps = gst::Caps::builder("video/x-raw")
-        .field("format", "I420")
-        .field("width", w as i32)
-        .field("height", h as i32)
-        .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
-        .build();
-    let filter = gst::ElementFactory::make("capsfilter")
-        .property("caps", &caps)
-        .build()
-        .map_err(|_| VideoError::Missing("capsfilter".into()))?;
+    // JPEG's own colours (full range, the BT.601 matrix): a picture's
+    // video-range YUV written as it is would come back washed out. Through
+    // RGB, since a YUV-to-YUV conversion keeps the range as it is.
+    let capsfilter = |caps: gst::Caps| {
+        gst::ElementFactory::make("capsfilter")
+            .property("caps", &caps)
+            .build()
+            .map_err(|_| VideoError::Missing("capsfilter".into()))
+    };
+    let rgb = capsfilter(
+        gst::Caps::builder("video/x-raw")
+            .field("format", "RGBx")
+            .field("width", w as i32)
+            .field("height", h as i32)
+            .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
+            .build(),
+    )?;
+    let to_jpeg = make("videoconvert")?;
+    let filter = capsfilter(
+        gst::Caps::builder("video/x-raw")
+            .field("format", "I420")
+            .field("colorimetry", "1:4:0:0")
+            .build(),
+    )?;
     let encode = gst::ElementFactory::make("jpegenc")
         .property("quality", spec.quality.clamp(1, 100) as i32)
         .build()
@@ -63,7 +77,7 @@ pub fn make_proxy(
         .property("location", partial.to_string_lossy().as_ref())
         .build()
         .map_err(|_| VideoError::Missing("filesink".into()))?;
-    let elements = [convert, filter, encode, mux, sink];
+    let elements = [convert, rgb, to_jpeg, filter, encode, mux, sink];
     p.pipeline.add_many(&elements)?;
     gst::Element::link_many(&elements)?;
     let next = elements[0]

@@ -538,7 +538,8 @@ fn video_page(app: &Rc<AppState>) -> gtk::Widget {
     row(&g, 0, "Proxies", &proxy);
     g.attach(
         &note(
-            "Long-GOP and large pictures get an all-intra copy at this height for scrubbing;              stopped, frames are decoded sharp from the original, and exports always use it.",
+            "Long-GOP and large pictures get an all-intra copy at this height for scrubbing; \
+             stopped, frames are decoded sharp from the original, and exports always use it.",
         ),
         1,
         1,
@@ -575,6 +576,21 @@ fn video_page(app: &Rc<AppState>) -> gtk::Widget {
     clear_box.append(&size);
     clear_box.append(&clear);
     row(&g, 3, "Cache", &clear_box);
+    let zero_copy =
+        gtk::CheckButton::with_label("Show frames straight from the decoder (zero-copy)");
+    zero_copy.set_active(prefs.video_zero_copy);
+    zero_copy.set_sensitive(cfg!(target_os = "linux"));
+    row(&g, 4, "Display", &zero_copy);
+    g.attach(
+        &note(
+            "VA-API decodes and scales the picture into video memory the display shows as it is \
+             (Linux); without VA-API, or off, frames come through memory.",
+        ),
+        1,
+        5,
+        1,
+        1,
+    );
 
     let apply = {
         let weak = Rc::downgrade(app);
@@ -600,6 +616,15 @@ fn video_page(app: &Rc<AppState>) -> gtk::Widget {
             let i = d.selected() as usize;
             let h = if i == 0 { 0 } else { PROXY_HEIGHTS[i - 1] };
             apply(&|p| p.video_proxy_height = h);
+        });
+    }
+    {
+        let apply = Rc::clone(&apply);
+        zero_copy.connect_toggled(move |b| {
+            let on = b.is_active();
+            apply(&|p| p.video_zero_copy = on);
+            #[cfg(target_os = "linux")]
+            faderframe_video::zero_copy::set_allowed(on);
         });
     }
     {

@@ -137,7 +137,8 @@ fn index_of(
 
 /// Where `path`'s proxy of `height` is (made or to be made).
 fn proxy_path(path: &Path, height: u32) -> PathBuf {
-    cache_dir().join(format!("{}.proxy{height}.mkv", cache_key(path)))
+    // "-2": full-range JPEG colours (the first proxies were washed out).
+    cache_dir().join(format!("{}.proxy{height}-2.mkv", cache_key(path)))
 }
 
 /// Bytes the cache folder's indexes and proxies take.

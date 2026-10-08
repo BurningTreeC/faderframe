@@ -79,12 +79,18 @@ struct Cache {
     frames: BTreeMap<Slot, Cached>,
     bytes: usize,
     clock: u64,
+    /// Frames in video memory (kept to `MAX_GPU_FRAMES`).
+    gpu: usize,
 }
+
+/// Dmabuf frames kept at most (video memory: a second or two of picture).
+const MAX_GPU_FRAMES: usize = 48;
 
 impl Cache {
     fn put(&mut self, slot: Slot, frame: Arc<Frame>, budget: usize) {
         self.clock += 1;
-        let size = frame.rgba.len();
+        let size = frame.bytes();
+        let gpu = frame.gpu.is_some();
         if let Some(old) = self.frames.insert(
             slot,
             Cached {
@@ -92,17 +98,37 @@ impl Cache {
                 used: self.clock,
             },
         ) {
-            self.bytes -= old.frame.rgba.len();
+            self.forget(&old);
         }
         self.bytes += size;
+        self.gpu += usize::from(gpu);
         while self.bytes > budget && self.frames.len() > 1 {
             let Some((&oldest, _)) = self.frames.iter().min_by_key(|(_, c)| c.used) else {
                 break;
             };
             if let Some(c) = self.frames.remove(&oldest) {
-                self.bytes -= c.frame.rgba.len();
+                self.forget(&c);
             }
         }
+        while self.gpu > MAX_GPU_FRAMES {
+            let Some((&oldest, _)) = self
+                .frames
+                .iter()
+                .filter(|(_, c)| c.frame.gpu.is_some())
+                .min_by_key(|(_, c)| c.used)
+            else {
+                break;
+            };
+            if let Some(c) = self.frames.remove(&oldest) {
+                self.forget(&c);
+            }
+        }
+    }
+
+    /// Account for a frame that left.
+    fn forget(&mut self, c: &Cached) {
+        self.bytes -= c.frame.bytes();
+        self.gpu -= usize::from(c.frame.gpu.is_some());
     }
 
     fn get(&mut self, slot: Slot) -> Option<Arc<Frame>> {
@@ -152,7 +178,7 @@ impl Cache {
             .collect();
         for s in gone {
             if let Some(c) = self.frames.remove(&s) {
-                self.bytes -= c.frame.rgba.len();
+                self.forget(&c);
             }
         }
     }
@@ -194,6 +220,9 @@ struct Shared {
     cache: Mutex<Cache>,
     thumbs: Mutex<Cache>,
     asked: Mutex<Asked>,
+    /// Files whose picture does not decode into dmabufs.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    no_dmabuf: Mutex<std::collections::HashSet<PathBuf>>,
     wake: Condvar,
     stop: AtomicBool,
     budget: usize,
@@ -220,6 +249,7 @@ impl FrameService {
             cache: Mutex::default(),
             thumbs: Mutex::default(),
             asked: Mutex::default(),
+            no_dmabuf: Mutex::default(),
             wake: Condvar::new(),
             stop: AtomicBool::new(false),
             budget,
@@ -384,6 +414,8 @@ struct Open {
     key: Key,
     file: PathBuf,
     size: (u32, u32),
+    /// Decoding into dmabufs.
+    gpu: bool,
     decoder: Decoder,
 }
 
@@ -404,25 +436,38 @@ fn wait<'a>(s: &'a Shared, seen: u64) -> Option<MutexGuard<'a, Asked>> {
     (!s.stop.load(Ordering::Relaxed)).then_some(a)
 }
 
-/// The decoder for `file` at `size`, reusing `open` when it is that one.
+/// The decoder for `file` at `size`, reusing `open` when it is that one;
+/// for playback (`play`) into dmabufs where the display takes them.
 fn decoder_for<'a>(
     open: &'a mut Option<Open>,
     key: Key,
     file: &PathBuf,
     size: (u32, u32),
+    play: bool,
     s: &Shared,
 ) -> Option<&'a mut Decoder> {
+    let gpu = play && zero_copy_for(file, s);
     let same = open
         .as_ref()
-        .is_some_and(|o| o.key == key && &o.file == file && o.size == size);
+        .is_some_and(|o| o.key == key && &o.file == file && o.size == size && o.gpu == gpu);
     if !same {
         *open = None;
-        match Decoder::open(file, size.0, size.1) {
-            Ok(decoder) => {
+        let opened = if gpu {
+            open_dmabuf(file, size, s).map(|d| (d, true))
+        } else {
+            None
+        };
+        let opened = match opened {
+            Some(d) => Ok(d),
+            None => Decoder::open(file, size.0, size.1).map(|d| (d, false)),
+        };
+        match opened {
+            Ok((decoder, gpu)) => {
                 *open = Some(Open {
                     key,
                     file: file.clone(),
                     size,
+                    gpu,
                     decoder,
                 });
             }
@@ -434,6 +479,34 @@ fn decoder_for<'a>(
         }
     }
     open.as_mut().map(|o| &mut o.decoder)
+}
+
+/// Whether `file` plays into dmabufs (zero-copy on, and it has not failed
+/// for this file).
+fn zero_copy_for(file: &PathBuf, s: &Shared) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        crate::zero_copy::enabled() && !lock(&s.no_dmabuf).contains(file)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (file, s);
+        false
+    }
+}
+
+/// A dmabuf decoder of `file`, or `None` (then never again for it).
+fn open_dmabuf(file: &PathBuf, size: (u32, u32), s: &Shared) -> Option<Decoder> {
+    #[cfg(target_os = "linux")]
+    match Decoder::open_dmabuf(file, size.0, size.1) {
+        Ok(d) => return Some(d),
+        Err(e) => {
+            tracing::info!("{}: frames through memory ({e})", file.display());
+            lock(&s.no_dmabuf).insert(file.clone());
+        }
+    }
+    let _ = (file, size, s);
+    None
 }
 
 /// Which file and size playing and scrubbing read: the proxy when there is
@@ -488,7 +561,7 @@ fn play_step(s: &Shared, lane: &mut Lane, key: Key, m: &Media) -> bool {
             let Some(t) = m.index.times.get(want as usize).copied() else {
                 return false;
             };
-            let Some(d) = decoder_for(&mut lane.open, key, &file, dsize, s) else {
+            let Some(d) = decoder_for(&mut lane.open, key, &file, dsize, true, s) else {
                 return false;
             };
             if let Err(e) = d.play_from(t) {
@@ -502,7 +575,7 @@ fn play_step(s: &Shared, lane: &mut Lane, key: Key, m: &Media) -> bool {
     if at > want + AHEAD {
         return false;
     }
-    let Some(d) = decoder_for(&mut lane.open, key, &file, dsize, s) else {
+    let Some(d) = decoder_for(&mut lane.open, key, &file, dsize, true, s) else {
         return false;
     };
     match d.next_frame() {
@@ -602,7 +675,7 @@ fn still_step(s: &Shared, d: &mut Stills, key: Key, m: &Media) {
         if far
             && !have_frame(s, key, k as u32, dsize.0)
             && let Some(&kt) = m.index.times.get(k)
-            && let Some(dec) = decoder_for(&mut d.moving, key, &file, dsize, s)
+            && let Some(dec) = decoder_for(&mut d.moving, key, &file, dsize, false, s)
             && let Ok(Some(f)) = dec.frame_at(kt, false)
         {
             lock(&s.cache).put((key, k as u32, dsize.0), Arc::new(f), s.budget);
@@ -610,7 +683,7 @@ fn still_step(s: &Shared, d: &mut Stills, key: Key, m: &Media) {
         if newer() {
             return;
         }
-        if let Some(dec) = decoder_for(&mut d.moving, key, &file, dsize, s) {
+        if let Some(dec) = decoder_for(&mut d.moving, key, &file, dsize, false, s) {
             match dec.frame_at(t, true) {
                 Ok(Some(f)) => lock(&s.cache).put((key, n, dsize.0), Arc::new(f), s.budget),
                 Ok(None) => {}
@@ -621,7 +694,7 @@ fn still_step(s: &Shared, d: &mut Stills, key: Key, m: &Media) {
     // Sharp when stopped: the original at the full size wanted.
     if dsize != size && !have(size.0) && !newer() {
         let original = m.original.clone();
-        if let Some(dec) = decoder_for(&mut d.sharp, key, &original, size, s) {
+        if let Some(dec) = decoder_for(&mut d.sharp, key, &original, size, false, s) {
             match dec.frame_at(t, true) {
                 Ok(Some(f)) => lock(&s.cache).put((key, n, size.0), Arc::new(f), s.budget),
                 Ok(None) => {}
@@ -655,7 +728,7 @@ fn thumbnailer(s: &Shared) {
                     None => (m.original.clone(), m.index.longest_gop() <= 1),
                 };
                 let size = m.fit((u32::MAX, height));
-                if let Some(d) = decoder_for(&mut open, key, &file, size, s) {
+                if let Some(d) = decoder_for(&mut open, key, &file, size, false, s) {
                     match d.frame_at(t, exact) {
                         Ok(Some(f)) => {
                             lock(&s.thumbs).put(slot, Arc::new(f), s.thumb_budget);

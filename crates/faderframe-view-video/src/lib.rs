@@ -10,8 +10,8 @@
 use faderframe_session::video::{VideoCompare, VideoOp, VideoShown};
 use faderframe_session::{Action, Session};
 use faderframe_ui_canvas::{
-    Align, CanvasView, Color, EventCx, FontFamily, FontWeight, HostRequest, MenuItem, Painter,
-    Pixels, Point, PointerButton, Rect, Size, TextStyle, Theme, ViewEvent,
+    Align, CanvasView, Color, EventCx, External, FontFamily, FontWeight, HostRequest, MenuItem,
+    Painter, Pixels, Point, PointerButton, Rect, Size, TextStyle, Theme, ViewEvent,
 };
 use faderframe_workspace::ViewId;
 
@@ -158,15 +158,33 @@ impl VideoView {
                     let fit = Self::fit(f.width as f32, f.height as f32, Size::new(area.w, area.h));
                     let dst = Rect::new(area.x + fit.x, area.y + fit.y, fit.w, fit.h);
                     let key = (v.source.raw() << 40) ^ ((pic.number as u64) << 12) ^ f.width as u64;
-                    p.pixels(
-                        &Pixels {
-                            key,
-                            width: f.width,
-                            height: f.height,
-                            rgba: &f.rgba,
-                        },
-                        dst,
-                    );
+                    match &f.gpu {
+                        // In video memory: the display takes it as it is
+                        // (or the frames after come through memory).
+                        Some(g) => {
+                            let shown = p.external(
+                                &External {
+                                    key,
+                                    width: f.width,
+                                    height: f.height,
+                                    handle: g,
+                                },
+                                dst,
+                            );
+                            if !shown {
+                                return true;
+                            }
+                        }
+                        None => p.pixels(
+                            &Pixels {
+                                key,
+                                width: f.width,
+                                height: f.height,
+                                rgba: &f.rgba,
+                            },
+                            dst,
+                        ),
+                    }
                     !pic.exact
                 }
                 None => {

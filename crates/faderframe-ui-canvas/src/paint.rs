@@ -81,6 +81,17 @@ pub struct Pixels<'a> {
     pub rgba: &'a [u8],
 }
 
+/// A picture in video memory (a decoded frame in a dmabuf), drawn with
+/// [`crate::Painter::external`]: the backend knows `handle`'s type (and
+/// keeps a clone while it shows it). `key` as for [`Pixels`].
+#[derive(Clone, Copy)]
+pub struct External<'a> {
+    pub key: u64,
+    pub width: u32,
+    pub height: u32,
+    pub handle: &'a (dyn std::any::Any + Send + Sync),
+}
+
 /// A vector path built from lines and cubic Béziers. Arcs are converted to
 /// cubics here, so painter backends only need move/line/cubic/close.
 #[derive(Clone, Debug, Default, PartialEq)]

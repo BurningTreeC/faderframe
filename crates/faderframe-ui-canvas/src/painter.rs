@@ -23,6 +23,12 @@ pub trait Painter {
     /// without it draw nothing.
     fn pixels(&mut self, _pixels: &crate::Pixels<'_>, _dst: Rect) {}
 
+    /// Draw a picture in video memory scaled into `dst`; whether it could
+    /// (backends that cannot take it draw nothing and say so).
+    fn external(&mut self, _image: &crate::External<'_>, _dst: Rect) -> bool {
+        false
+    }
+
     /// Draw what follows translated by `(dx, dy)` and then scaled by
     /// `scale` (a view laid out in its own coordinates), until
     /// [`Painter::pop_transform`].

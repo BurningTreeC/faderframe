@@ -477,3 +477,89 @@ fn cuts_are_found_where_shots_change() {
     assert_eq!(some, vec![frame_ns(60)]);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// Zero-copy playback: VA-API decodes and scales into RGB dmabufs (here
+/// with VA-API: a display taking what its post-processor makes).
+#[cfg(target_os = "linux")]
+#[test]
+fn frames_decode_into_dmabufs() {
+    use faderframe_video::zero_copy;
+    if !(has_element("vah264enc") && has_element("h264parse") && has_element("vapostproc")) {
+        eprintln!("skipped: no VA-API here");
+        return;
+    }
+    faderframe_video::init().unwrap();
+    let formats = zero_copy::postproc_formats();
+    assert!(!formats.is_empty(), "RGB formats out of vapostproc");
+    zero_copy::set_display_formats(formats.clone());
+    let d = dir();
+    let clip = d.join("dmabuf.mp4");
+    make_clip(
+        &clip,
+        "vah264enc key-int-max=25 ! h264parse",
+        "mp4mux",
+        false,
+    );
+    let mut dec = Decoder::open_dmabuf(&clip, 160, 120).unwrap();
+    dec.play_from(0).unwrap();
+    // Frames held (the cache keeps some) never stall the decoder.
+    let mut held = Vec::new();
+    for n in 0..FRAMES {
+        let f = dec.next_frame().unwrap().unwrap();
+        assert_eq!((f.width, f.height), (160, 120));
+        assert!(f.rgba.is_empty());
+        let g = f.gpu.as_ref().expect("a dmabuf frame");
+        assert!(formats.contains(&(g.fourcc, g.modifier)), "{g:?}");
+        assert!(!g.planes.is_empty() && g.planes.iter().all(|p| p.fd >= 0 && p.stride >= 160 * 4));
+        assert_eq!(f.time, frame_ns(n));
+        held.push(f);
+    }
+    assert!(dec.next_frame().unwrap().is_none(), "the end");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A proxy keeps the picture's colours: video-range white, black and a
+/// saturated colour come back as they were (not washed out).
+#[test]
+fn proxies_keep_the_colours() {
+    if !(has_element("vah264enc") && has_element("h264parse")) {
+        eprintln!("skipped: no H.264 encoder (vah264enc) here");
+        return;
+    }
+    let d = dir();
+    let clip = d.join("colours.mp4");
+    let paint = |n: u32| match n % 3 {
+        0 => [250, 250, 250],
+        1 => [6, 6, 6],
+        _ => [230, 30, 30],
+    };
+    make_clip_with(&clip, "vah264enc ! h264parse", "mp4mux", false, paint);
+    let proxy = d.join("colours.proxy.mkv");
+    let cancel = AtomicBool::new(false);
+    make_proxy(
+        &clip,
+        &proxy,
+        (W, H, (1, 1)),
+        ProxySpec {
+            height: 120,
+            quality: 90,
+        },
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let ix = index::index(&proxy, &cancel, |_| {}).unwrap();
+    let mut dec = Decoder::open(&proxy, 160, 120).unwrap();
+    for n in [30, 31, 32] {
+        let f = dec.frame_at(ix.times[n as usize], true).unwrap().unwrap();
+        let p = f.pixel(80, 60);
+        let c = paint(n);
+        for i in 0..3 {
+            assert!(
+                (p[i] as i32 - c[i] as i32).abs() <= 8,
+                "frame {n}: {c:?} came back as {p:?}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}

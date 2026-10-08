@@ -88,6 +88,8 @@ pub struct Preferences {
     pub video_proxy_height: u32,
     /// Where video indexes and proxies go (`None`: the cache folder).
     pub video_cache_dir: Option<String>,
+    /// Video frames shown straight from the decoder (dmabufs, Linux).
+    pub video_zero_copy: bool,
 }
 
 impl Default for Preferences {
@@ -132,6 +134,7 @@ impl Default for Preferences {
             default_template: None,
             video_proxy_height: 540,
             video_cache_dir: None,
+            video_zero_copy: true,
         }
     }
 }

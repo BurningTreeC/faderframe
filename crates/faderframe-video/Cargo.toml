@@ -22,6 +22,11 @@ gst-app.workspace = true
 gst-video.workspace = true
 gst-pbutils.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+gst-allocators.workspace = true
+# DMA_DRM caps (zero-copy frames).
+gst-video = { workspace = true, features = ["v1_24"] }
+
 [dev-dependencies]
 gst.workspace = true
 gst-app.workspace = true

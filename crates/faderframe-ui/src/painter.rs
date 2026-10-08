@@ -159,6 +159,72 @@ fn pixel_texture(p: &faderframe_ui_canvas::Pixels<'_>) -> Option<gdk::Texture> {
     })
 }
 
+thread_local! {
+    /// The textures of the last few dmabuf pictures.
+    static EXTERNAL: RefCell<std::collections::VecDeque<(u64, gdk::Texture)>> =
+        const { RefCell::new(std::collections::VecDeque::new()) };
+}
+
+/// A texture of a dmabuf frame (imported as it is: no copy), or `None`
+/// when this is no frame the painter knows or the display refuses it
+/// (then frames come through memory from now on).
+fn external_texture(e: &faderframe_ui_canvas::External<'_>) -> Option<gdk::Texture> {
+    EXTERNAL.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some((_, t)) = cache.iter().find(|(k, _)| *k == e.key) {
+            return Some(t.clone());
+        }
+        let tex = dmabuf_texture(e)?;
+        cache.push_front((e.key, tex.clone()));
+        cache.truncate(6);
+        Some(tex)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn dmabuf_texture(e: &faderframe_ui_canvas::External<'_>) -> Option<gdk::Texture> {
+    let frame = e
+        .handle
+        .downcast_ref::<faderframe_video::zero_copy::GpuFrame>()?
+        .clone();
+    let display = gdk::Display::default()?;
+    let mut builder = gdk::DmabufTextureBuilder::new()
+        .set_display(&display)
+        .set_width(e.width)
+        .set_height(e.height)
+        .set_fourcc(frame.fourcc)
+        .set_modifier(frame.modifier)
+        .set_n_planes(frame.planes.len() as u32)
+        .set_premultiplied(true);
+    for (i, p) in frame.planes.iter().enumerate() {
+        builder = builder
+            .set_offset(i as u32, p.offset)
+            .set_stride(i as u32, p.stride);
+    }
+    let fds: Vec<_> = frame.planes.iter().map(|p| p.fd).collect();
+    // SAFETY: the descriptors belong to the frame's buffer, which the
+    // closure keeps (a clone of the frame) until GTK drops it once it no
+    // longer uses them.
+    let built = unsafe {
+        for (i, fd) in fds.into_iter().enumerate() {
+            builder = builder.set_fd(i as u32, fd);
+        }
+        builder.build_with_release_func(move || drop(frame))
+    };
+    match built {
+        Ok(t) => Some(t),
+        Err(err) => {
+            faderframe_video::zero_copy::failed(&err.to_string());
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn dmabuf_texture(_e: &faderframe_ui_canvas::External<'_>) -> Option<gdk::Texture> {
+    None
+}
+
 /// Cache key of a shaped text layout.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct TextKey {
@@ -424,6 +490,20 @@ impl Painter for SnapshotPainter<'_> {
         s.push_clip(&grect(dst));
         s.append_scaled_texture(&tex, gsk::ScalingFilter::Linear, &grect(dst));
         s.pop();
+    }
+
+    fn external(&mut self, image: &faderframe_ui_canvas::External<'_>, dst: Rect) -> bool {
+        if dst.is_empty() || image.width == 0 || image.height == 0 {
+            return true;
+        }
+        let Some(tex) = external_texture(image) else {
+            return false;
+        };
+        let s = self.snapshot;
+        s.push_clip(&grect(dst));
+        s.append_scaled_texture(&tex, gsk::ScalingFilter::Linear, &grect(dst));
+        s.pop();
+        true
     }
 
     fn push_transform(&mut self, dx: f32, dy: f32, scale: f32) {

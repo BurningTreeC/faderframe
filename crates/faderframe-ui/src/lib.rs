@@ -206,6 +206,14 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
     }
     session.set_sync_settings(prefs.sync_settings());
     session.set_video_settings(prefs.video_settings());
+    // Video frames go to the display as dmabufs it takes.
+    #[cfg(target_os = "linux")]
+    if let Some(display) = gtk::gdk::Display::default() {
+        let f = display.dmabuf_formats();
+        let formats = (0..f.n_formats()).map(|i| f.format(i)).collect();
+        faderframe_video::zero_copy::set_display_formats(formats);
+        faderframe_video::zero_copy::set_allowed(prefs.video_zero_copy);
+    }
     session.editor.show_edit_toolbar = prefs.show_edit_toolbar;
     // MIDI keyboards and controllers (FADERFRAME_NO_MIDI=1 keeps the
     // system's devices closed, e.g. for scripted runs).
