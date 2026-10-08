@@ -67,6 +67,15 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.16.0" date="2026-10-08">
+      <description>
+        <p>Every output of a plugin on a track of its own, and a steadier GPU painter on Windows.</p>
+        <ul>
+          <li>Create Output Tracks makes a track for every output of a multi-output plugin, the main one too (the Guitar Station's Main and DI, the Drum Sampler's Main and Out 1–8), in one folder; the plugin's own track then only carries the plugin, and removing the Main track gives it its routing back.</li>
+          <li>Windows: the GPU painter's shaders are compiled with DXC, which the packages now carry; on machines without a graphics driver the toolkit draws instead of the GPU painter.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.15.0" date="2026-10-08">
       <description>
         <p>The Linux tarball starts everywhere again.</p>
