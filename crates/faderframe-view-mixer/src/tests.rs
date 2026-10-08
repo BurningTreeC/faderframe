@@ -703,12 +703,66 @@ fn dragging_bottom_names_reorders_tracks_once_and_preserves_contents() {
     assert!(
         !actions
             .iter()
-            .any(|a| matches!(a, Action::Edit(Command::MoveTrack { .. })))
+            .any(|a| matches!(a, Action::PlaceTrack { .. }))
     );
     let (_, req) = run(&mut view, down(from, 2), size, &s);
     assert!(
         req.iter()
             .any(|r| matches!(r, HostRequest::TextInput { .. }))
+    );
+}
+
+/// A drop counts where it is across, whatever its height: released below
+/// the mixer (or above it) it still moves the strip, past the last strip it
+/// goes last, before the first first.
+#[test]
+fn a_strip_lands_by_where_it_is_across_even_off_the_mixer() {
+    let mut s = session();
+    let mut view = MixerView::new(Theme::default());
+    let size = Size::new(1400.0, 900.0);
+    let order =
+        |s: &Session| -> Vec<_> { MixerView::channel_tracks(s).iter().map(|t| t.id).collect() };
+    let start = order(&s);
+    let (a, b) = (start[0], start[1]);
+    let from = view.layout_of(&s, a, size).unwrap().scribble.center();
+    let to_b = view.layout_of(&s, b, size).unwrap().scribble.center();
+    // Released 300 px below the mixer, across from b's middle.
+    for action in press_drag_release(
+        &mut view,
+        &s,
+        size,
+        from,
+        Point::new(to_b.x, size.h + 300.0),
+        Modifiers::NONE,
+    ) {
+        s.dispatch(action).unwrap();
+    }
+    assert_eq!(&order(&s)[..2], &[b, a]);
+    s.dispatch(Action::Undo).unwrap();
+    // Past the right end of the strips: last (of the strips in view).
+    let last_x = (0..start.len())
+        .filter_map(|i| {
+            view.layout_of(&s, start[i], size)
+                .map(|l| l.scribble.right())
+        })
+        .fold(0.0f32, f32::max);
+    for action in press_drag_release(
+        &mut view,
+        &s,
+        size,
+        from,
+        Point::new(last_x + 4000.0, -50.0),
+        Modifiers::NONE,
+    ) {
+        s.dispatch(action).unwrap();
+    }
+    let now = order(&s);
+    let visible = (0..start.len())
+        .filter(|i| view.layout_of(&s, now[*i], size).is_some())
+        .count();
+    assert!(
+        now.iter().position(|t| *t == a).unwrap() + 1 >= visible,
+        "{now:?}"
     );
 }
 
@@ -739,7 +793,7 @@ fn track_drop_uses_visible_order_with_hidden_midi_tracks_and_a_pinned_master() {
     assert!(
         !actions
             .iter()
-            .any(|a| matches!(a, Action::Edit(Command::MoveTrack { .. })))
+            .any(|a| matches!(a, Action::PlaceTrack { .. }))
     );
 }
 

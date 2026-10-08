@@ -143,3 +143,70 @@ fn the_track_menu_offers_folders() {
         ["New Folder with the Track", "Move out of ‘Folder 1’"]
     );
 }
+
+/// Mixer drag and drop: every strip dropped into every gap between the
+/// strips (folders nested two deep, tracks at the top level between them)
+/// shows exactly there afterwards — one undo step each, undone cleanly.
+#[test]
+fn every_strip_lands_where_it_is_dropped() {
+    let mut s = Session::new(
+        faderframe_project::Project::new("Order", 48_000),
+        None,
+        EngineConfig::default(),
+    )
+    .unwrap();
+    let mut add = |s: &mut Session, kind| s.add_track(kind).unwrap();
+    let a = add(&mut s, TrackKind::Audio);
+    let f1 = add(&mut s, TrackKind::Folder);
+    let b = add(&mut s, TrackKind::Audio);
+    let c = add(&mut s, TrackKind::Audio);
+    let f2 = add(&mut s, TrackKind::Folder);
+    let d = add(&mut s, TrackKind::Audio);
+    let e = add(&mut s, TrackKind::Audio);
+    let g = add(&mut s, TrackKind::Bus);
+    let h = add(&mut s, TrackKind::Audio);
+    for (t, f) in [(b, f1), (c, f1), (f2, f1), (d, f2), (e, f2)] {
+        s.dispatch(Action::Edit(Command::SetTrackFolder {
+            track: t,
+            folder: Some(f),
+        }))
+        .unwrap();
+    }
+    // What the mixer shows: folder order without folders and the master.
+    let strips = |s: &Session| -> Vec<TrackId> {
+        s.project()
+            .folder_order()
+            .into_iter()
+            .filter(|t| !matches!(t.kind, TrackKind::Master | TrackKind::Folder))
+            .map(|t| t.id)
+            .collect()
+    };
+    let start = strips(&s);
+    assert_eq!(start, [a, b, c, d, e, g, h]);
+    let before_all = s.project().clone();
+    for &t in &start {
+        let others: Vec<TrackId> = start.iter().copied().filter(|x| *x != t).collect();
+        for gap in 0..=others.len() {
+            let after = gap.checked_sub(1).map(|i| others[i]);
+            let before = others.get(gap).copied();
+            let mut want = others.clone();
+            want.insert(gap, t);
+            let steps = s.history_steps().0.len();
+            s.dispatch(Action::PlaceTrack {
+                track: t,
+                after,
+                before,
+            })
+            .unwrap();
+            assert_eq!(strips(&s), want, "{t:?} into gap {gap}");
+            // One step (none when it was there already), and back.
+            let now = s.history_steps().0.len();
+            assert!(now - steps <= 1);
+            if now > steps {
+                s.dispatch(Action::Undo).unwrap();
+            }
+            assert_eq!(strips(&s), start);
+            assert_eq!(s.project().tracks, before_all.tracks);
+        }
+    }
+}

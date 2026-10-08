@@ -513,6 +513,13 @@ pub enum Action {
         tracks: Vec<TrackId>,
     },
     /// Put tracks into a folder (`None`: out of theirs, a level up).
+    /// Put a track between two strips as the mixer shows them (folder
+    /// order): its folder follows where it lands; one undo step.
+    PlaceTrack {
+        track: TrackId,
+        after: Option<TrackId>,
+        before: Option<TrackId>,
+    },
     MoveToFolder {
         tracks: Vec<TrackId>,
         folder: Option<TrackId>,
@@ -3369,6 +3376,11 @@ impl Session {
                 self.new_folder(&tracks)?;
             }
             Action::MoveToFolder { tracks, folder } => self.move_to_folder(&tracks, folder)?,
+            Action::PlaceTrack {
+                track,
+                after,
+                before,
+            } => self.place_track(track, after, before)?,
             Action::ToggleFolder(folder) => self.toggle_folder(folder),
             Action::SumFolder(folder) => {
                 self.sum_folder(folder)?;

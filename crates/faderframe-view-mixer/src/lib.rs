@@ -2104,35 +2104,40 @@ impl MixerView {
 
     /// Insertion boundary in mixer order, and index after removing the
     /// dragged track from the project (which may also contain MIDI tracks).
+    /// Where a dragged strip lands: the strips either side of the gap
+    /// under the pointer (only across matters, and a pointer beyond the
+    /// strips takes the first or last gap), and the gap's x. None when it
+    /// would stay where it is.
     fn track_drop(
         &self,
         model: &Session,
         size: Size,
         track: TrackId,
         pos: Point,
-    ) -> Option<(usize, f32)> {
-        if self.master_only
-            || pos.y < 0.0
-            || pos.y > size.h
-            || pos.x < self.cheek()
-            || pos.x > self.cheek() + self.viewport_w(size)
-        {
+    ) -> Option<(Option<TrackId>, Option<TrackId>, f32)> {
+        if self.master_only {
             return None;
         }
         let tracks = Self::channel_tracks(model);
-        // Before the first strip whose middle is right of the pointer.
-        let x = pos.x - self.cheek() + self.scroll_x;
-        let boundary = (0..tracks.len())
+        let left = self.cheek();
+        let x = pos.x.clamp(left, left + self.viewport_w(size)) - left + self.scroll_x;
+        // The gap before the first strip whose middle is right of the
+        // pointer.
+        let gap = (0..tracks.len())
             .find(|&i| self.offset(i) + self.width(i) / 2.0 > x)
             .unwrap_or(tracks.len());
-        let project = model.project();
-        let from = project.track_index(track)?;
-        let before = match tracks.get(boundary) {
-            Some(t) => project.track_index(t.id)?,
-            None => project.track_index(tracks.last()?.id)? + 1,
-        };
-        let index = before - usize::from(from < before);
-        Some((index, self.cheek() + self.offset(boundary) - self.scroll_x))
+        let from = tracks.iter().position(|t| t.id == track)?;
+        // Either side of the dragged strip is where it is now.
+        if gap == from || gap == from + 1 {
+            return None;
+        }
+        let after = gap.checked_sub(1).map(|i| tracks[i].id);
+        let before = tracks.get(gap).map(|t| t.id);
+        Some((
+            after,
+            before,
+            self.cheek() + self.offset(gap) - self.scroll_x,
+        ))
     }
 
     fn press(
@@ -2769,7 +2774,7 @@ impl CanvasView<Session, Action> for MixerView {
             moved: true,
             ..
         }) = self.drag
-            && let Some((_, x)) = self.track_drop(model, size, track, pos)
+            && let Some((_, _, x)) = self.track_drop(model, size, track, pos)
         {
             p.fill(Rect::new(x - 1.5, 0.0, 3.0, size.h), theme.ui.accent);
         }
@@ -3018,10 +3023,14 @@ impl CanvasView<Session, Action> for MixerView {
                     Some(Drag::Track {
                         track, moved: true, ..
                     }) => {
-                        if let Some((index, _)) = self.track_drop(model, size, track, up_pos)
-                            && model.project().track_index(track) != Some(index)
+                        if let Some((after, before, _)) =
+                            self.track_drop(model, size, track, up_pos)
                         {
-                            cx.emit(Action::Edit(Command::MoveTrack { track, index }));
+                            cx.emit(Action::PlaceTrack {
+                                track,
+                                after,
+                                before,
+                            });
                         }
                         cx.set_cursor(Cursor::Default);
                         cx.redraw();

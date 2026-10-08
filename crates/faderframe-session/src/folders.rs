@@ -23,6 +23,76 @@ impl Session {
             .all(|f| self.folder_open(f.id))
     }
 
+    /// The commands that put `track` between `after` and `before` (the
+    /// strips either side of a drop in the mixer, which shows tracks in
+    /// folder order): it keeps its folder when a neighbour shares it (and
+    /// goes right after or before that neighbour in the track list), else
+    /// it joins the folder of the strip it lands after (or before, at the
+    /// start) — so it shows exactly where it was dropped. Empty when it
+    /// already is there.
+    pub fn place_track_commands(
+        &self,
+        track: TrackId,
+        after: Option<TrackId>,
+        before: Option<TrackId>,
+    ) -> Vec<Command> {
+        let p = &self.project;
+        let Some(t) = p.track(track) else {
+            return Vec::new();
+        };
+        let (after, before) = (
+            after.filter(|a| *a != track),
+            before.filter(|b| *b != track),
+        );
+        let folder_of = |id: TrackId| p.track(id).and_then(|t| t.folder);
+        // Where it goes: next to a neighbour in its own folder, else into
+        // the left (or right) neighbour's.
+        let (folder, anchor) = match (after, before) {
+            (Some(a), _) if folder_of(a) == t.folder => (t.folder, Some((a, true))),
+            (_, Some(b)) if folder_of(b) == t.folder => (t.folder, Some((b, false))),
+            (Some(a), _) => (folder_of(a), Some((a, true))),
+            (None, Some(b)) => (folder_of(b), Some((b, false))),
+            (None, None) => (t.folder, None),
+        };
+        let Some((anchor, after_it)) = anchor else {
+            return Vec::new();
+        };
+        // The index in the list without the track (what MoveTrack takes).
+        let rest: Vec<TrackId> = p
+            .tracks
+            .iter()
+            .map(|x| x.id)
+            .filter(|x| *x != track)
+            .collect();
+        let Some(at) = rest.iter().position(|x| *x == anchor) else {
+            return Vec::new();
+        };
+        let index = if after_it { at + 1 } else { at };
+        let mut commands = Vec::new();
+        if folder != t.folder {
+            commands.push(Command::SetTrackFolder { track, folder });
+        }
+        if p.track_index(track) != Some(index) {
+            commands.push(Command::MoveTrack { track, index });
+        }
+        commands
+    }
+
+    /// Put `track` between the strips `after` and `before` (see
+    /// [`Self::place_track_commands`]): one undo step.
+    pub(crate) fn place_track(
+        &mut self,
+        track: TrackId,
+        after: Option<TrackId>,
+        before: Option<TrackId>,
+    ) -> Result<()> {
+        let commands = self.place_track_commands(track, after, before);
+        if commands.is_empty() {
+            return Ok(());
+        }
+        self.batch("Move Track", commands)
+    }
+
     /// The tracks a folder holds (all levels).
     pub fn folder_contents(&self, folder: TrackId) -> Vec<TrackId> {
         self.project
