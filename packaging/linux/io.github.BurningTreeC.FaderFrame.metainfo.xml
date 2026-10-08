@@ -67,6 +67,24 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.17.0" date="2026-10-08">
+      <description>
+        <p>Console summing, spectral editing, a MIDI event list, lead sheets, video phases 2 and 3, and much more.</p>
+        <ul>
+          <li>Console summing: the mix through a console's circuits, six families, one for each preamp, chosen in the master's input slot; each bus has its own amplifier, and the mixer takes the console's look.</li>
+          <li>Spectral editing: an audio clip's spectrogram, regions drawn on it (rectangle, time, band, lasso, brush) attenuated, healed, removed or changed in level; the original audio is kept.</li>
+          <li>MIDI event list: every event of a clip a row, every property editable; MIDI files keep program changes, polyphonic pressure and release velocities; MIDI channels set from the menus.</li>
+          <li>Snap to Samples and Snap to Zero Crossings.</li>
+          <li>Lead sheets from a recording (melody, chords and words as MusicXML and PDF) and the tempo through hit points.</li>
+          <li>Video: several tracks with A/B comparison, cut detection, conform to a new cut (EDL, OpenTimelineIO), ADR cue lists, HDR mapped for SDR screens, zero-copy display on Linux, J/K/L shuttle, timecode counters, SDI and HDMI picture outputs, MXF, DV, ProRes and DNxHD.</li>
+          <li>The 76 Compressor, a FET limiting amplifier with its own front panel and fourteen presets; hardware inserts with a round-trip ping.</li>
+          <li>Gain-reduction stripes beside the mixer's meters, for built-in devices and CLAP, VST3, LV2 and AU plugins that report it.</li>
+          <li>Folders as mixer strips; tracks dragged onto folders and reordered in the arranger and the mixer.</li>
+          <li>The Guitar Station's Mic A and Mic B on outputs of their own; MIDI learn for solo, record arm, macros and the Surround Panner.</li>
+          <li>Preamps: Gain is the circuit's real gain on every model, 0 % is silence.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.16.0" date="2026-10-08">
       <description>
         <p>Every output of a plugin on a track of its own, and a steadier GPU painter on Windows.</p>
