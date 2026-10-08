@@ -155,7 +155,7 @@ fn every_strip_lands_where_it_is_dropped() {
         EngineConfig::default(),
     )
     .unwrap();
-    let mut add = |s: &mut Session, kind| s.add_track(kind).unwrap();
+    let add = |s: &mut Session, kind| s.add_track(kind).unwrap();
     let a = add(&mut s, TrackKind::Audio);
     let f1 = add(&mut s, TrackKind::Folder);
     let b = add(&mut s, TrackKind::Audio);
