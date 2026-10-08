@@ -291,8 +291,13 @@ long sessions), Neon and High Contrast:
   Tracks; folders hold tracks and other folders, show them indented under
   them, close by their triangle (or a double-click), give an overview of
   their clips, and their mute and solo reach everything inside. Move tracks
-  into and out of folders from the track menu; removing a folder keeps its
-  tracks; Sum into a New Bus routes the folder's tracks through a bus.
+  into and out of folders from the track menu, or drag a track's header
+  (arranger) or strip (mixer) between others to reorder it and onto a
+  folder to put it in; removing a folder keeps its tracks; Sum into a New
+  Bus routes the folder's tracks through a bus. In the mixer a folder has
+  a narrow strip of its own (its triangle, mute, solo, what it holds), its
+  tracks a band of its colour along their foot, and a closed folder's
+  strips fold away there too.
 * Adding tracks: the "+" under the last track in the arranger and right of
   the last strip in the mixer (each kind of track, or one from a saved
   track preset; an instrument track opens the plugin browser).

@@ -44,6 +44,44 @@ const ADD_W: f32 = 44.0;
 const MASTER_GAP: f32 = 8.0;
 /// Wooden end cheeks (themes with wood).
 const CHEEK_W: f32 = 22.0;
+/// A folder's strip: narrow (its triangle, mute, solo, name).
+const FOLDER_W: f32 = 48.0;
+
+/// Where a dragged strip lands.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum StripDrop {
+    /// Between two strips (as `Action::PlaceTrack` takes them), the line at
+    /// `x`.
+    Between {
+        after: Option<TrackId>,
+        before: Option<TrackId>,
+        x: f32,
+    },
+    /// Onto a folder's strip: into it.
+    Into { folder: TrackId, strip: Rect },
+}
+
+/// A folder's strip, laid out.
+struct FolderLayout {
+    color_bar: Rect,
+    fold: Rect,
+    mute: Rect,
+    solo: Rect,
+    count: Rect,
+    scribble: Rect,
+}
+
+fn folder_layout(rect: Rect) -> FolderLayout {
+    let (x, w) = (rect.x + 5.0, rect.w - 10.0);
+    FolderLayout {
+        color_bar: Rect::new(rect.x + 2.0, rect.y + 2.0, rect.w - 4.0, 7.0),
+        fold: Rect::new(x, rect.y + 16.0, w, 24.0),
+        mute: Rect::new(x, rect.y + 48.0, w, 18.0),
+        solo: Rect::new(x, rect.y + 70.0, w, 18.0),
+        count: Rect::new(rect.x + 2.0, rect.y + 94.0, rect.w - 4.0, 28.0),
+        scribble: Rect::new(rect.x + 2.0, rect.bottom() - 24.0, rect.w - 4.0, 20.0),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Hit {
@@ -71,6 +109,8 @@ pub enum Hit {
     Output(TrackId),
     Level(TrackId),
     Scribble(TrackId),
+    /// A folder's triangle: opens or closes it.
+    Fold(TrackId),
     Meter(TrackId),
     Strip(TrackId),
     /// The rule under the inserts: drag to show more or fewer slots.
@@ -327,14 +367,14 @@ impl MixerView {
         self.theme.console.strip_width + self.theme.console.strip_gap
     }
 
-    /// The channel strips: in folder order (a folder's tracks together);
-    /// folders themselves have none.
+    /// The channel strips: in folder order (a folder's strip, then its
+    /// tracks'), the tracks of closed folders left out.
     fn channel_tracks(model: &Session) -> Vec<&Track> {
         model
             .project()
             .folder_order()
             .into_iter()
-            .filter(|t| !matches!(t.kind, TrackKind::Master | TrackKind::Folder))
+            .filter(|t| t.kind != TrackKind::Master && model.track_shown(t))
             .collect()
     }
 
@@ -377,7 +417,13 @@ impl MixerView {
         let default = self.theme.console.strip_width;
         self.widths = Self::channel_tracks(model)
             .iter()
-            .map(|t| model.strip_width(t.id).unwrap_or(default))
+            .map(|t| {
+                if t.kind == TrackKind::Folder {
+                    FOLDER_W
+                } else {
+                    model.strip_width(t.id).unwrap_or(default)
+                }
+            })
             .collect();
         self.offsets.clear();
         let mut x = 0.0;
@@ -547,6 +593,22 @@ impl MixerView {
             {
                 continue;
             }
+            if t.kind == TrackKind::Folder {
+                let f = folder_layout(rect);
+                let id = t.id;
+                return Some(
+                    [
+                        (f.color_bar, Hit::Color(id)),
+                        (f.fold, Hit::Fold(id)),
+                        (f.mute, Hit::Mute(id)),
+                        (f.solo, Hit::Solo(id)),
+                        (f.scribble, Hit::Scribble(id)),
+                    ]
+                    .into_iter()
+                    .find(|(r, _)| r.contains(pos))
+                    .map_or(Hit::Scribble(id), |(_, h)| h),
+                );
+            }
             let l = self.layout_for(rect, t, model.project());
             let id = t.id;
             if t.kind == TrackKind::Midi {
@@ -698,6 +760,71 @@ impl MixerView {
     }
 
     // --- painting --------------------------------------------------------------
+
+    /// A folder's strip: its colour, its triangle (open or closed), mute
+    /// and solo (they reach what it holds), how many tracks it holds, and
+    /// its name.
+    fn paint_folder_strip(&self, p: &mut dyn Painter, rect: Rect, t: &Track, model: &Session) {
+        let th = &self.theme;
+        let c = &th.console;
+        let f = folder_layout(rect);
+        controls::panel(
+            p,
+            rect,
+            c.panel_top.darken(0.12),
+            c.panel_bottom.darken(0.12),
+            th,
+        );
+        let color = track_color(t.color);
+        p.fill(f.color_bar, color);
+        if model.selection.tracks.contains(&t.id) {
+            p.stroke_rounded(rect.inset(1.0), 2.0, 1.5, c.selected_glow);
+        }
+        // The triangle: right when closed, down when open.
+        let open = model.folder_open(t.id);
+        p.fill_rounded(f.fold, 3.0, &faderframe_ui_canvas::Paint::Solid(c.well));
+        let (cx, cy, r) = (f.fold.center().x, f.fold.center().y, 5.0);
+        let tri = if open {
+            [
+                Point::new(cx - r, cy - r * 0.55),
+                Point::new(cx + r, cy - r * 0.55),
+                Point::new(cx, cy + r * 0.65),
+            ]
+        } else {
+            [
+                Point::new(cx - r * 0.55, cy - r),
+                Point::new(cx - r * 0.55, cy + r),
+                Point::new(cx + r * 0.65, cy),
+            ]
+        };
+        let mut path = faderframe_ui_canvas::Path::new();
+        path.move_to(tri[0]).line_to(tri[1]).line_to(tri[2]).close();
+        p.fill_path(&path, color.lighten(0.2));
+        controls::led_button(p, f.mute, "M", t.mute, c.led.mute, th);
+        controls::led_button(p, f.solo, "S", t.solo, c.led.solo, th);
+        let n = model
+            .folder_contents(t.id)
+            .iter()
+            .filter(|id| {
+                model
+                    .project()
+                    .track(**id)
+                    .is_some_and(|x| x.kind != TrackKind::Folder)
+            })
+            .count();
+        let style = faderframe_ui_canvas::TextStyle::new(th.fonts.tiny, c.panel_label).center();
+        p.text(
+            &n.to_string(),
+            Rect::new(f.count.x, f.count.y, f.count.w, 14.0),
+            &style.weight(faderframe_ui_canvas::FontWeight::Bold),
+        );
+        p.text(
+            if n == 1 { "track" } else { "tracks" },
+            Rect::new(f.count.x, f.count.y + 13.0, f.count.w, 12.0),
+            &style,
+        );
+        controls::scribble(p, f.scribble, &t.name, color, th);
+    }
 
     fn paint_strip(
         &self,
@@ -2123,6 +2250,19 @@ impl MixerView {
         }
     }
 
+    /// A strip's name (a folder's strip has its own layout).
+    fn scribble_rect(&self, model: &Session, id: TrackId, size: Size) -> Option<Rect> {
+        let (rect, t) = self
+            .visible_strips(model, size)
+            .into_iter()
+            .find(|(_, t)| t.id == id)?;
+        Some(if t.kind == TrackKind::Folder {
+            folder_layout(rect).scribble
+        } else {
+            self.layout_for(rect, t, model.project()).scribble
+        })
+    }
+
     fn layout_of(&self, model: &Session, id: TrackId, size: Size) -> Option<StripLayout> {
         self.visible_strips(model, size)
             .into_iter()
@@ -2132,40 +2272,56 @@ impl MixerView {
 
     /// Insertion boundary in mixer order, and index after removing the
     /// dragged track from the project (which may also contain MIDI tracks).
-    /// Where a dragged strip lands: the strips either side of the gap
-    /// under the pointer (only across matters, and a pointer beyond the
-    /// strips takes the first or last gap), and the gap's x. None when it
-    /// would stay where it is.
+    /// Where a dragged strip lands: onto a folder's strip when over its
+    /// middle (not its own folder, nor itself or a folder inside it), else
+    /// between the strips either side of the gap under the pointer (only
+    /// across matters, and a pointer beyond the strips takes the first or
+    /// last gap). None when it would stay where it is.
     fn track_drop(
         &self,
         model: &Session,
         size: Size,
         track: TrackId,
         pos: Point,
-    ) -> Option<(Option<TrackId>, Option<TrackId>, f32)> {
+    ) -> Option<StripDrop> {
         if self.master_only {
             return None;
         }
+        let p = model.project();
+        let moving = p.track(track)?;
         let tracks = Self::channel_tracks(model);
+        // What moves with it: the track and what it holds.
+        let block = |t: &Track| t.id == track || p.in_folder(t, track);
         let left = self.cheek();
         let x = pos.x.clamp(left, left + self.viewport_w(size)) - left + self.scroll_x;
+        if let Some(i) = (0..tracks.len()).find(|&i| {
+            let (a, w) = (self.offset(i), self.width(i));
+            tracks[i].kind == TrackKind::Folder && x >= a + w * 0.2 && x < a + w * 0.8
+        }) && !block(tracks[i])
+            && moving.folder != Some(tracks[i].id)
+        {
+            return Some(StripDrop::Into {
+                folder: tracks[i].id,
+                strip: self.strip_rect(i, size),
+            });
+        }
         // The gap before the first strip whose middle is right of the
         // pointer.
         let gap = (0..tracks.len())
             .find(|&i| self.offset(i) + self.width(i) / 2.0 > x)
             .unwrap_or(tracks.len());
-        let from = tracks.iter().position(|t| t.id == track)?;
-        // Either side of the dragged strip is where it is now.
-        if gap == from || gap == from + 1 {
+        let after = gap.checked_sub(1).map(|i| tracks[i]);
+        let before = tracks.get(gap).copied();
+        // Either side of the dragged strip (or of what it holds) is where
+        // it is now.
+        if after.is_some_and(block) || before.is_some_and(block) {
             return None;
         }
-        let after = gap.checked_sub(1).map(|i| tracks[i].id);
-        let before = tracks.get(gap).map(|t| t.id);
-        Some((
-            after,
-            before,
-            self.cheek() + self.offset(gap) - self.scroll_x,
-        ))
+        Some(StripDrop::Between {
+            after: after.map(|t| t.id),
+            before: before.map(|t| t.id),
+            x: self.cheek() + self.offset(gap) - self.scroll_x,
+        })
     }
 
     fn press(
@@ -2489,10 +2645,10 @@ impl MixerView {
             Hit::Scribble(id) | Hit::Strip(id) => {
                 if clicks >= 2
                     && matches!(hit, Hit::Scribble(_))
-                    && let (Some(t), Some(l)) =
-                        (Self::track(model, id), self.layout_of(model, id, size))
+                    && let (Some(t), Some(at)) =
+                        (Self::track(model, id), self.scribble_rect(model, id, size))
                 {
-                    cx.request(Self::rename_request(t, l.scribble));
+                    cx.request(Self::rename_request(t, at));
                     return true;
                 }
                 let mode = if mods.toggle() {
@@ -2516,6 +2672,7 @@ impl MixerView {
                 }
             }
             Hit::Meter(_) => cx.emit(Action::ResetClipIndicators),
+            Hit::Fold(id) => cx.emit(Action::ToggleFolder(id)),
         }
         true
     }
@@ -2715,6 +2872,11 @@ impl MixerView {
                 }
             }
             Hit::Mute(id) => format!("Mute {}", name(id)),
+            Hit::Fold(id) => format!(
+                "{} {} · Drag a strip onto the folder to put it in",
+                if model.folder_open(id) { "Close" } else { "Open" },
+                name(id)
+            ),
             Hit::Solo(id) => format!("Solo {}", name(id)),
             Hit::Record(id) => format!("Record-arm {}", name(id)),
             Hit::MonoCheck => "Mono check: hear the mix summed to mono (listening only, renders stay as mixed) · Right-click the strip: Listen (headphones)".into(),
@@ -2813,7 +2975,25 @@ impl CanvasView<Session, Action> for MixerView {
         let viewport = Rect::new(cheek, 0.0, self.viewport_w(size), size.h);
         p.push_clip(viewport);
         for i in self.visible_range(tracks.len(), size) {
-            self.paint_strip(p, self.strip_rect(i, size), tracks[i], i + 1, model);
+            let rect = self.strip_rect(i, size);
+            if tracks[i].kind == TrackKind::Folder {
+                self.paint_folder_strip(p, rect, tracks[i], model);
+            } else {
+                // Channels are numbered, folders not.
+                let number = tracks[..=i]
+                    .iter()
+                    .filter(|t| t.kind != TrackKind::Folder)
+                    .count();
+                self.paint_strip(p, rect, tracks[i], number, model);
+            }
+            // What a strip is in: a band of each folder's colour along its
+            // foot, the innermost lowest.
+            for (k, f) in model.project().folder_chain(tracks[i]).iter().enumerate() {
+                p.fill(
+                    Rect::new(rect.x, rect.bottom() - 3.0 - 4.0 * k as f32, rect.w, 3.0),
+                    track_color(f.color).with_alpha(0.85),
+                );
+            }
         }
         if let Some(Drag::Track {
             track,
@@ -2821,7 +3001,18 @@ impl CanvasView<Session, Action> for MixerView {
             moved: true,
             ..
         }) = self.drag
-            && let Some((_, _, x)) = self.track_drop(model, size, track, pos)
+            && let Some(StripDrop::Into { strip, .. }) = self.track_drop(model, size, track, pos)
+        {
+            p.fill(strip, theme.ui.accent.with_alpha(0.18));
+            p.stroke_rounded(strip.inset(1.0), 3.0, 2.0, theme.ui.accent);
+        }
+        if let Some(Drag::Track {
+            track,
+            pos,
+            moved: true,
+            ..
+        }) = self.drag
+            && let Some(StripDrop::Between { x, .. }) = self.track_drop(model, size, track, pos)
         {
             p.fill(Rect::new(x - 1.5, 0.0, 3.0, size.h), theme.ui.accent);
         }
@@ -3070,14 +3261,21 @@ impl CanvasView<Session, Action> for MixerView {
                     Some(Drag::Track {
                         track, moved: true, ..
                     }) => {
-                        if let Some((after, before, _)) =
-                            self.track_drop(model, size, track, up_pos)
-                        {
-                            cx.emit(Action::PlaceTrack {
-                                track,
-                                after,
-                                before,
-                            });
+                        match self.track_drop(model, size, track, up_pos) {
+                            Some(StripDrop::Between { after, before, .. }) => {
+                                cx.emit(Action::PlaceTrack {
+                                    track,
+                                    after,
+                                    before,
+                                });
+                            }
+                            Some(StripDrop::Into { folder, .. }) => {
+                                cx.emit(Action::MoveToFolder {
+                                    tracks: vec![track],
+                                    folder: Some(folder),
+                                });
+                            }
+                            None => {}
                         }
                         cx.set_cursor(Cursor::Default);
                         cx.redraw();

@@ -1338,3 +1338,62 @@ fn the_master_chooses_the_console_and_a_bus_its_amplifier() {
         "the preamps"
     );
 }
+
+/// Folders have strips of their own: narrow, the triangle folding what
+/// they hold away (and back), mute reaching it, and a strip dragged onto a
+/// folder's strip goes into the folder.
+#[test]
+fn folder_strips_fold_mute_and_take_dropped_strips() {
+    let mut s = session();
+    let mut view = MixerView::new(Theme::default());
+    let size = Size::new(1600.0, 900.0);
+    view.update_sends(&s);
+    view.update_strips(&s);
+    let strips = |s: &Session| -> Vec<TrackId> {
+        MixerView::channel_tracks(s).iter().map(|t| t.id).collect()
+    };
+    let i = MixerView::channel_tracks(&s)
+        .iter()
+        .position(|t| t.kind == TrackKind::Folder)
+        .expect("the demo's folder");
+    let folder = strips(&s)[i];
+    let rect = view.strip_rect(i, size);
+    assert_eq!(rect.w, FOLDER_W);
+    let held = s.folder_contents(folder);
+    assert!(held.iter().all(|t| strips(&s).contains(t)), "open: shown");
+    // Fold it: what it holds goes from the mixer.
+    let f = folder_layout(rect);
+    let (a, _) = run(&mut view, down(f.fold.center(), 1), size, &s);
+    assert_eq!(a, vec![Action::ToggleFolder(folder)]);
+    s.dispatch(a[0].clone()).unwrap();
+    assert!(
+        held.iter().all(|t| !strips(&s).contains(t)),
+        "closed: hidden"
+    );
+    assert!(strips(&s).contains(&folder));
+    // Mute on the folder's strip.
+    view.update_strips(&s);
+    let i = strips(&s).iter().position(|t| *t == folder).unwrap();
+    let f = folder_layout(view.strip_rect(i, size));
+    let (a, _) = run(&mut view, down(f.mute.center(), 1), size, &s);
+    for x in a {
+        s.dispatch(x).unwrap();
+    }
+    assert!(s.project().track(folder).unwrap().mute);
+    // The first strip dragged onto the folder's: into it.
+    let first = strips(&s)[0];
+    let from = view.layout_of(&s, first, size).unwrap().scribble.center();
+    let onto = Point::new(view.strip_rect(i, size).center().x, from.y);
+    let actions = press_drag_release(&mut view, &s, size, from, onto, Modifiers::NONE);
+    assert!(
+        actions.contains(&Action::MoveToFolder {
+            tracks: vec![first],
+            folder: Some(folder),
+        }),
+        "{actions:?}"
+    );
+    for x in actions {
+        s.dispatch(x).unwrap();
+    }
+    assert_eq!(s.project().track(first).unwrap().folder, Some(folder));
+}
