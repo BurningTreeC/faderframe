@@ -218,6 +218,22 @@ fn tab_label(app: &Rc<AppState>, view: &ViewId, window: WindowRef) -> gtk::Box {
         }
     });
     b.append(&btn);
+    // Close: the view leaves the layout (View shows it again, in its
+    // place); the arranger stays.
+    if *view != ViewId::arranger() {
+        let close = gtk::Button::from_icon_name("window-close-symbolic");
+        close.add_css_class("flat");
+        close.add_css_class("tab-button");
+        close.set_tooltip_text(Some("Close (View shows it again)"));
+        let weak = Rc::downgrade(app);
+        let id = view.clone();
+        close.connect_clicked(move |_| {
+            if let Some(app) = weak.upgrade() {
+                app.dispatch(Action::Workspace(WorkspaceAction::CloseView(id.clone())));
+            }
+        });
+        b.append(&close);
+    }
     b
 }
 
