@@ -16,6 +16,7 @@ mod loudness;
 pub mod melody;
 pub mod pitch;
 mod spectrum;
+pub mod structure;
 pub mod tempo;
 pub mod vinyl;
 

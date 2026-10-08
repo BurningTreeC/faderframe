@@ -26,6 +26,7 @@ pub mod performance;
 pub mod picture_out;
 pub mod pitch;
 pub mod spectral;
+mod structure;
 pub use performance::{Load, PerformanceReport, PluginPerformance, TrackPerformance};
 pub mod adm;
 pub mod album;
@@ -421,6 +422,11 @@ pub enum Action {
     TempoFromHits(hits::HitRequest),
     /// Ask (in the shell) how to land the hits.
     PromptTempoFromHits,
+    /// Find the song structure of audio clips (a jam recording, or the
+    /// tracks of one) and lay it on the section lane.
+    SongStructure {
+        clips: Vec<ClipId>,
+    },
     /// Set the project's tempo or key from a clip, or warp it to the
     /// tempo (after analysing it).
     FromClip {
@@ -1274,6 +1280,7 @@ pub struct Session {
     transients: transients::TransientCache,
     pitch: pitch::PitchCache,
     clip_analyses: detect::ClipAnalyses,
+    structure_jobs: structure::StructureJobs,
     conversions: to_midi::Conversions,
     lead_sheets: leadsheet::LeadSheets,
     clip_fx: clip_fx::ClipFxState,
@@ -1532,6 +1539,7 @@ impl Session {
             transients: transients::TransientCache::default(),
             pitch: pitch::PitchCache::default(),
             clip_analyses: detect::ClipAnalyses::default(),
+            structure_jobs: structure::StructureJobs::default(),
             conversions: to_midi::Conversions::default(),
             lead_sheets: leadsheet::LeadSheets::default(),
             clip_fx: clip_fx::ClipFxState::default(),
@@ -2490,6 +2498,7 @@ impl Session {
         self.poll_transients();
         self.poll_pitch();
         self.poll_clip_analyses();
+        self.poll_structure();
         self.poll_conversions();
         self.poll_lead_sheets();
         self.poll_clip_fx();
@@ -3410,6 +3419,7 @@ impl Session {
             Action::CaptureMidi => self.capture_midi()?,
             Action::DetectPitch { clips } => self.detect_pitch(&clips)?,
             Action::FromClip { clip, what } => self.from_clip(clip, what)?,
+            Action::SongStructure { clips } => self.song_structure(&clips)?,
             Action::ConvertToMidi { clip, how } => self.convert_to_midi(clip, how)?,
             Action::MakeLeadSheet { of, grid } => self.make_lead_sheet(of, grid)?,
             Action::TempoFromHits(req) => self.tempo_from_hits(&req)?,

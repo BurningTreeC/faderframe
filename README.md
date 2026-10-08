@@ -389,6 +389,10 @@ long sessions), Neon and High Contrast:
   toolbar, beside the grid): free positions land on whole samples, and
   cuts and trims of audio clips move to the nearest zero crossing so they
   do not click.
+* Song structure from a jam (an audio clip's menu, or several clips of a
+  multitrack jam): the recording's parts found — Intro, Verse, Chorus,
+  Bridge, Solo, Outro — and laid on the arranger's section lane, on the
+  bars when the project plays at the jam's tempo.
 * Spectral editing (an audio clip's menu → Spectral Editor): the clip's
   spectrogram, regions drawn on it (rectangle, time range, frequency band,
   lasso, brush) with soft edges, and turned into edits: Attenuate (down to

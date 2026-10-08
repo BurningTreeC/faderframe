@@ -1913,6 +1913,23 @@ pub fn install(app: &Rc<AppState>) {
         named("export-lead-sheet", |a, arg| {
             a.dispatch(Action::ExportLeadSheet(std::path::PathBuf::from(arg)));
         }),
+        // Development aid: `song-structure:<track>[|<track>…]` (their
+        // first clips).
+        named("song-structure", |a, arg| {
+            let clips: Vec<_> = {
+                let s = a.session.borrow();
+                arg.split('|')
+                    .filter_map(|name| {
+                        s.project()
+                            .tracks
+                            .iter()
+                            .find(|t| t.name == name)
+                            .and_then(|t| t.clips.first().copied())
+                    })
+                    .collect()
+            };
+            a.dispatch(Action::SongStructure { clips });
+        }),
         // Development aid: `from-clip:<tempo|warp|key>=<track>` (its first
         // clip).
         named("from-clip", |a, arg| {

@@ -2639,10 +2639,32 @@ impl ArrangerView {
                         grid: faderframe_session::leadsheet::Grid::Auto,
                     },
                 ));
+                // The selected audio clips (a multitrack jam) or this one.
+                let audio: Vec<ClipId> = targets
+                    .iter()
+                    .copied()
+                    .filter(|c| {
+                        model
+                            .project()
+                            .clip(*c)
+                            .is_some_and(|c| c.as_audio().is_some())
+                    })
+                    .collect();
                 items.push(
-                    MenuItem::new("Set Project Tempo from Clip", from(FromClip::SetTempo))
-                        .separated(),
+                    MenuItem::new(
+                        if audio.len() > 1 {
+                            "Find the Song's Structure (Sections) in These Recordings"
+                        } else {
+                            "Find the Song's Structure (Sections)"
+                        },
+                        Action::SongStructure { clips: audio },
+                    )
+                    .separated(),
                 );
+                items.push(MenuItem::new(
+                    "Set Project Tempo from Clip",
+                    from(FromClip::SetTempo),
+                ));
                 items.push(MenuItem::new(
                     "Warp Clip to Project Tempo",
                     from(FromClip::WarpToTempo),

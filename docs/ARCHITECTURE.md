@@ -3575,3 +3575,24 @@ bar is the RMS and the peak one LED (or line) above it. The mixer's meter
 bridge (`BRIDGE_H` over the strips; `paint`/`event`/`tooltip` shift the
 strips below it) shows a moving-coil VU (`controls::vu_arc`) per audio
 strip and the master, two for a wide stereo strip.
+
+### Song structure from a jam
+
+`faderframe_analysis::structure::analyse(mono, rate, quarters_per_bar)`
+cuts a recording into bars by its tempo (`tempo::detect`; the downbeat is
+the beat phase whose bar lines fall where the harmony changes most; two
+seconds a unit without a beat), describes each bar by chroma, the shape of
+20 log band energies and loudness, and finds part boundaries where the
+mean features of the four bars before and the four after differ most
+(means, so a chord cycle inside a verse is not change; z-scored, loudness
+changes added, four-bar phrases preferred, no part under three bars at
+either end; silence is a gap). Parts are compared along the bar
+self-similarity matrix's diagonals; alike ones share a letter, named by
+repetition, loudness and place (the loudest repeated letter Chorus, the
+next Verse, one only opening and closing Intro/Outro, a lone middle part
+Bridge or Solo). `session::structure` (`Action::SongStructure { clips }`,
+the audio clip menu, dev action `song-structure:<track>[|…]`) mixes the
+clips to mono in project time, analyses in a thread and lays the parts on
+the section lane in one "Song Structure" step (replacing the sections they
+overlap, coloured by letter, snapped to the project's bars when it plays at
+the jam's tempo).
