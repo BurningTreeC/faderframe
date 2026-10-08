@@ -70,8 +70,8 @@ pub const OUTPUT_CORE: CoreSpec = CoreSpec {
     knee: 0.08,
     sharpness: 5.0,
 };
-const OUTPUT_PRIMARY_R: f64 = 8.0;
-const OUTPUT_SECONDARY_R: f64 = 30.0;
+pub(crate) const OUTPUT_PRIMARY_R: f64 = 8.0;
+pub(crate) const OUTPUT_SECONDARY_R: f64 = 30.0;
 
 pub fn build(source: f64, load: f64) -> Result<Circuit, Fault> {
     tap(source, load, "line")

@@ -3309,7 +3309,14 @@ Frozen players report the latency baked into their audio, preserving alignment
 with other tracks and sends; bounced clips skip that leading delay instead.
 
 The six models retain upstream impedances, resting controls, and measured
-calibration curves. British 73 includes its separate line driver. Each channel
+calibration curves. British 73 includes its separate line driver. Gain is the
+circuit's gain, as on the hardware: the calibration holds the level at the
+middle of its travel (−18 dBFS in, about −20 dBFS out) and the level follows
+the circuit from there (`preamp::level_change_db`) — the Tube 610's Level pot
+closes to silence, the British 47's switch has its three positions, and the
+British 73's lower half of the travel is its gain switch's input divider (up
+to 35 dB; the circuit is wired as the 70 dB position, its feedback leg
+covering only 10 dB). Master trims after. Each channel
 has independent circuit state and uses fixed 2x oversampling with reported
 latency. A track's channels are solved side by side (`PreampBank`: the
 calling thread and helper threads of a `WorkerPool`, which adopt its

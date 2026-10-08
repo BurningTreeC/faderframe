@@ -164,3 +164,47 @@ fn preamp_cost_by_gain() {
         }
     }
 }
+
+/// Gain is the circuit's gain: the level rises with it on every model, by
+/// what [`level_change_db`] says (the circuit's calibration and the British
+/// 73's input divider), and the middle of the travel is the calibrated
+/// level.
+#[test]
+fn gain_moves_the_level_as_the_circuit_does() {
+    use faderframe_circuit::preamp::{level_change_db, REFERENCE};
+    let rate = 48_000.0;
+    let level = |model: usize, gain: f64| {
+        let mut p = Preamp::new(model, rate, gain, 0.0).unwrap();
+        let n = 24_000;
+        let mut e = 0.0;
+        for i in 0..2 * n {
+            let x = 0.125 * (i as f64 * std::f64::consts::TAU * 1_000.0 / rate).sin();
+            let y = p.process(x);
+            if i >= n {
+                e += y * y;
+            }
+        }
+        10.0 * (e / n as f64).log10()
+    };
+    for model in 0..MODELS {
+        let middle = level(model, REFERENCE);
+        assert!((-23.0..-19.0).contains(&middle), "model {model}: {middle}");
+        let (low, high) = (level(model, 0.1), level(model, 0.9));
+        assert!(
+            high - low > 9.0,
+            "model {model}: the Gain moves the level only {:.1} dB",
+            high - low
+        );
+        for gain in [0.1, 0.3, 0.7] {
+            let measured = level(model, gain) - middle;
+            let said = level_change_db(model, gain);
+            assert!(
+                (measured - said).abs() < 2.0,
+                "model {model} at {gain}: {measured:.1} dB, said {said:.1}"
+            );
+        }
+    }
+    assert_eq!(level_change_db(2, REFERENCE), 0.0);
+    // The British 73 reaches below its circuit's range by its divider.
+    assert!(level(0, 0.0) < level(0, REFERENCE) - 30.0);
+}

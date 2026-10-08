@@ -10,3 +10,5 @@ pub mod tube610;
 pub mod british_47;
 #[rustfmt::skip]
 pub mod german_76;
+#[rustfmt::skip]
+pub mod console_bus;
