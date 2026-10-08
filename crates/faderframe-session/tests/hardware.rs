@@ -129,7 +129,9 @@ fn the_round_trip_is_pinged_and_compensated() {
         run(&mut s, 20);
     }
     assert_eq!(s.engine().graph_stats().max_compensation, trip as u32);
-    // And it plays: the tone through it is heard.
+    // And it plays: the tone through it is heard (its peak: the macOS
+    // runners' dummy device runs in bursts, which the 300 ms RMS reads
+    // low).
     s.dispatch(Action::Transport(TransportAction::Locate(
         MusicalTime::from_quarters(4.0),
     )))
@@ -137,6 +139,6 @@ fn the_round_trip_is_pinged_and_compensated() {
     s.dispatch(Action::Transport(TransportAction::Play))
         .unwrap();
     run(&mut s, 1000);
-    assert!(s.meter(t).left.rms_db > -30.0, "{:?}", s.meter(t));
+    assert!(s.meter(t).left.level_db > -20.0, "{:?}", s.meter(t));
     s.stop_audio();
 }

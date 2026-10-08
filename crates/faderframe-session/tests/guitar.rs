@@ -280,8 +280,10 @@ fn a_mono_track_is_stereo_from_the_guitar_station_on() {
             "left {:.1} dB (ahead {ahead})",
             m.left.level_db
         );
+        // 30 dB under the left, or at the meter's floor (−72) when the
+        // left is quiet at that moment.
         assert!(
-            m.right.level_db < m.left.level_db - 30.0,
+            m.right.level_db < (m.left.level_db - 30.0).max(-71.0),
             "panned left, live (ahead {ahead}): {:.1} / {:.1} dB",
             m.left.level_db,
             m.right.level_db
