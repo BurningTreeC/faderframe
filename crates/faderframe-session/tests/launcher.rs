@@ -207,6 +207,11 @@ fn launched_clips_play_and_are_recorded_into_the_arrangement() {
             scene,
         },
     );
+    // (Render-ahead primes the position first: a busy runner takes a while.)
+    let start = Instant::now();
+    while !s.transport().playing && start.elapsed() < Duration::from_secs(3) {
+        run(&mut s, 50);
+    }
     run(&mut s, 400);
     assert!(s.transport().playing);
     let state = *s.launch_state(drums).unwrap();

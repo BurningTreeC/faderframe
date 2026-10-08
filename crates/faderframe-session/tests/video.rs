@@ -384,11 +384,12 @@ fn the_shuttle_runs_back_and_frames_step() {
     assert_eq!(s.shuttle_speed(), Some(-2.0));
     let start = Instant::now();
     let mut frames = Vec::new();
-    let mut heard = 0;
+    let (mut heard, mut ticks) = (0, 0);
     while start.elapsed() < Duration::from_millis(1000) {
         s.tick(0.01);
         assert!(!s.transport().playing, "snippets, not playback");
         heard += usize::from(s.transport().scrubbing);
+        ticks += 1;
         if let Some(v) = s.video_picture(0, (64, 36)) {
             frames.push(v.frame);
         }
@@ -396,7 +397,12 @@ fn the_shuttle_runs_back_and_frames_step() {
     }
     s.dispatch(Action::Shuttle(ShuttleOp::Stop)).unwrap();
     assert_eq!(s.shuttle_speed(), None);
-    assert!(heard > 10, "snippets heard in {heard} ticks");
+    // Snippets back to back: heard in most ticks (however few a busy
+    // runner gets through).
+    assert!(
+        heard >= 3 && heard * 3 >= ticks,
+        "snippets heard in {heard} of {ticks} ticks"
+    );
     s.tick(0.01);
     let at = s.transport().position as f64 / 48_000.0;
     // Six seconds, back two a second for one: about four (a slow runner

@@ -22,8 +22,12 @@ fn colour(n: u32) -> [u8; 3] {
     ]
 }
 
+/// A folder of its own for each test (tests run side by side in one
+/// process under `cargo test` and remove their folders when done).
 fn dir() -> PathBuf {
-    let d = std::env::temp_dir().join(format!("ff-video-{}", std::process::id()));
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let d = std::env::temp_dir().join(format!("ff-video-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
     d
 }
