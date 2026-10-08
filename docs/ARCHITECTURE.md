@@ -3250,8 +3250,10 @@ DAW does well yet):
     - *Show mode*: songs back to back with click and backing tracks to
       in-ear outputs and program changes to external gear per song (from
       the album).
-17. **Further out**: MIDI 2.0 (UMP: high-resolution controllers; ALSA and
-    CoreMIDI carry it now); screen-reader accessibility (the canvas views
+17. **Further out**: MIDI 2.0 on macOS (CoreMIDI's `MIDIEventList`) and
+    Windows (Windows MIDI Services), and clips that keep MIDI 2.0's
+    resolution (16-bit velocities, 32-bit controllers: today they arrive
+    and leave at it, and clips hold MIDI 1.0's); screen-reader accessibility (the canvas views
     need an accessibility tree — rare among DAWs and meaningful); merging
     project versions (three-way, from `faderframe_project::compare`) for
     collaborators; singing into MIDI live (real-time pitch tracking of an
@@ -3616,3 +3618,48 @@ Previous, PlayStop} }` (foot switches). View `faderframe-view-setlist`
 screen via `UiRequest::FullScreen`): song, time and what is left, the part
 now and next, the lyric line, notes, the list, big buttons; Space, arrows,
 Enter, Esc.
+
+### MIDI 2.0
+
+Packets: `faderframe_midi::ump` (pure: `Ump` = 1–4 words by message type,
+`packets` splits a stream, `Message::{parse, to_ump}` for utility, system,
+MIDI 1.0 and 2.0 channel voice (`Voice2`), SysEx7, flex data (tempo,
+meter, key, text) and UMP stream messages; `scale_up`/`scale_down` = the
+specification's min-centre-max scaling; `Midi1ToMidi2` = the default
+translation with bank select and RPN/NRPN folded in, `Voice2::to_midi1`
+back; `per_note_expression`/`per_note_message` map per-note pitch bend
+(±48 semitones), absolute pitch 7.25 and the registered per-note
+controllers (volume, pan/balance, modulation, expression, brightness) to
+the host's `NoteExpressionKind`s and back).
+
+Devices (Linux): `faderframe-midi-ump` is a MIDI 2.0 client of the ALSA
+sequencer (`snd_seq_set_client_midi_version`, one in and one out port,
+`ports()` lists the other UMP clients — kernel UMP clients for MIDI 2.0
+hardware, programs — with `chosen_ports` taking an endpoint port for its
+groups; a reader thread polls and hands packets on; `UmpWriter` writes
+straight to a port; one handle behind a mutex). `faderframe-midi-io` lists
+them as inputs and outputs ("… (MIDI 2.0)", keys `ump:<client>:<port>`),
+leaves those clients out of midir's MIDI 1.0 lists, files packets sent
+straight to FaderFrame under "Sent to FaderFrame (MIDI 2.0)", and gives
+MIDI 2.0 outputs `Sink::Ump` (events translated to MIDI 2.0, expressions
+as per-note controllers). Elsewhere the client reports "not supported".
+`FADERFRAME_NO_UMP=1` keeps it closed.
+
+Inside, events stay MIDI 1.0 shaped plus per-note expression:
+`MidiInputEvent`/`MidiOutputEvent` carry an optional expression next to
+their bytes; `MidiInputSender::send_ump` turns packets into them (velocity
+and controllers at 7 bits, per-note controllers and a note-on's pitch
+attribute as expression at full resolution); `MidiOutputSink` passes
+expressions on and the engine queues them. Recording and Capture MIDI keep
+per-note expression (`MidiTake::expressions` → `native_expressions`, by
+channel and key, thinned like MPE's).
+
+Clip files: `faderframe_midi::clipfile` (`SMF2CLIP`, big-endian words, a
+Delta Clockstamp before every packet, ticks per quarter in the header,
+Start/End of Clip; gaps over 20 bits as several clockstamps with no-ops) and
+`session::midi2file` (`export_midi2_clip` writes one clip with 16-bit
+velocities, 32-bit controllers, programs with banks, expression, SysEx, the
+project's tempo/meter/key and the clip's name; `import_midi2_clip` reads
+MIDI 1.0 and 2.0 messages into a clip on a new instrument track, poly
+pressure during its note as the note's pressure). Import MIDI takes
+`.midi2`; File → Export MIDI 2.0 Clip….

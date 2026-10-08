@@ -66,6 +66,7 @@ pub mod speech;
 pub mod to_midi;
 pub mod vinyl;
 pub use groups::GroupMenuEntry;
+mod midi2file;
 mod midifile;
 pub mod presets;
 pub mod record;
@@ -82,6 +83,7 @@ pub mod video;
 pub use faderframe_engine::{
     decode_state as decode_plugin_state, encode_state as encode_plugin_state,
 };
+pub use midi2file::is_midi2_clip_file;
 pub use midifile::is_midi_file;
 pub mod warping;
 pub use editing::{

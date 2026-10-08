@@ -800,18 +800,28 @@ impl EngineProcessor {
                             return;
                         }
                         for ev in buf.iter() {
-                            let (bytes, len) = ev.event.to_bytes();
-                            if len == 0 {
-                                // Note expressions have no MIDI form.
-                                continue;
-                            }
                             let due = base
                                 + ((latency + ev.sample_offset as usize) as f64 * ns_per_frame)
                                     as u64;
-                            let Some(m) =
-                                faderframe_midi::MidiOutputEvent::new(port, due, &bytes[..len])
-                            else {
-                                continue;
+                            let m = if let faderframe_midi::MidiEvent::NoteExpression {
+                                channel,
+                                key,
+                                kind,
+                                value,
+                            } = ev.event
+                            {
+                                // For MIDI 2.0 ports (per-note controllers).
+                                faderframe_midi::MidiOutputEvent::expression(
+                                    port, due, channel, key, kind, value,
+                                )
+                            } else {
+                                let (bytes, len) = ev.event.to_bytes();
+                                let Some(m) =
+                                    faderframe_midi::MidiOutputEvent::new(port, due, &bytes[..len])
+                                else {
+                                    continue;
+                                };
+                                m
                             };
                             if q.producer.push(m).is_err() {
                                 dropped.fetch_add(1, Ordering::Relaxed);

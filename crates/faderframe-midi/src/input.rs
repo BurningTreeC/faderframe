@@ -14,7 +14,7 @@
 //! go there, as [`MidiSystemEvent`]s: synchronisation and SysEx recording
 //! happen on the control side with the messages' timestamps.
 
-use crate::MidiEvent;
+use crate::{ExpressionValue, MidiEvent, NoteExpressionKind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -51,13 +51,16 @@ impl MidiClock {
 }
 
 /// One channel message as received from a port (system messages, SysEx and
-/// clock are not passed on).
+/// clock are not passed on), or a per-note expression (MIDI 2.0 per-note
+/// controllers; no bytes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MidiInputEvent {
     pub port: u16,
     pub time_ns: u64,
     pub len: u8,
     pub bytes: [u8; 3],
+    /// Channel, key, kind and value of a per-note expression.
+    pub expression: Option<(u8, u8, NoteExpressionKind, ExpressionValue)>,
 }
 
 impl MidiInputEvent {
@@ -74,12 +77,45 @@ impl MidiInputEvent {
             time_ns,
             len: msg.len() as u8,
             bytes,
+            expression: None,
         })
     }
 
+    /// A per-note expression.
+    pub fn expression(
+        port: u16,
+        time_ns: u64,
+        channel: u8,
+        key: u8,
+        kind: NoteExpressionKind,
+        value: f64,
+    ) -> Self {
+        Self {
+            port,
+            time_ns,
+            len: 0,
+            bytes: [0; 3],
+            expression: Some((channel & 0xF, key & 0x7F, kind, ExpressionValue::new(value))),
+        }
+    }
+
     pub fn event(&self) -> Option<MidiEvent> {
+        if let Some((channel, key, kind, value)) = self.expression {
+            return Some(MidiEvent::NoteExpression {
+                channel,
+                key,
+                kind,
+                value,
+            });
+        }
         MidiEvent::from_bytes(&self.bytes[..self.len as usize])
     }
+}
+
+/// What a port's UMP input holds between packets (a SysEx being received).
+#[derive(Debug, Default)]
+pub struct UmpInput {
+    sysex: Vec<u8>,
 }
 
 /// The audio thread's end of all MIDI inputs.
@@ -186,6 +222,10 @@ impl MidiInputSender {
         let Some(ev) = MidiInputEvent::new(port, now, msg) else {
             return false;
         };
+        self.push(ev)
+    }
+
+    fn push(&self, ev: MidiInputEvent) -> bool {
         // The control copy may be lost when nobody reads it; that is fine.
         let _ = self.control.try_send(ev);
         let pushed = self
@@ -197,6 +237,89 @@ impl MidiInputSender {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
         pushed
+    }
+
+    /// Queue a Universal MIDI Packet from a MIDI 2.0 port: MIDI 1.0 and
+    /// system messages as they are, SysEx7 once complete, MIDI 2.0 channel
+    /// voice messages as their MIDI 1.0 forms — and per-note controllers
+    /// (and a note-on's pitch attribute) as per-note expressions, at full
+    /// resolution. Flex data and stream messages are not for instruments.
+    pub fn send_ump(&self, port: u16, packet: &crate::ump::Ump, state: &mut UmpInput) -> bool {
+        use crate::ump::{Form, Message, Voice2, per_note_expression};
+        match Message::parse(packet) {
+            Message::System { status, data, .. } => {
+                let n = match status {
+                    0xF1 | 0xF3 => 2,
+                    0xF2 => 3,
+                    _ => 1,
+                };
+                self.send(port, &[status, data[0], data[1]][..n])
+            }
+            Message::Midi1 { bytes, .. } => {
+                let n = if matches!(bytes[0] & 0xF0, 0xC0 | 0xD0) {
+                    2
+                } else {
+                    3
+                };
+                self.send(port, &bytes[..n])
+            }
+            Message::Sysex7 {
+                form, bytes, len, ..
+            } => {
+                if matches!(form, Form::Complete | Form::Start) {
+                    state.sysex.clear();
+                    state.sysex.push(0xF0);
+                }
+                if state.sysex.first() != Some(&0xF0) {
+                    return false;
+                }
+                state
+                    .sysex
+                    .extend_from_slice(&bytes[..usize::from(len.min(6))]);
+                if matches!(form, Form::Complete | Form::End) {
+                    state.sysex.push(0xF7);
+                    let sent = self.send(port, &state.sysex);
+                    state.sysex.clear();
+                    return sent;
+                }
+                true
+            }
+            Message::Midi2 { channel, voice, .. } => {
+                let now = self.clock.now_ns();
+                if let Some((key, kind, value)) = per_note_expression(&voice) {
+                    return self.push(MidiInputEvent::expression(
+                        port, now, channel, key, kind, value,
+                    ));
+                }
+                let (messages, n) = voice.to_midi1(channel);
+                let mut ok = true;
+                for m in &messages[..n] {
+                    let len = if matches!(m[0] & 0xF0, 0xC0 | 0xD0) {
+                        2
+                    } else {
+                        3
+                    };
+                    ok &= self.send(port, &m[..len]);
+                }
+                // A note-on's pitch 7.9: the note's tuning from the start.
+                if let Voice2::NoteOn {
+                    note, attribute, ..
+                } = voice
+                    && let Some(pitch) = attribute.pitch()
+                {
+                    ok &= self.push(MidiInputEvent::expression(
+                        port,
+                        now,
+                        channel,
+                        note,
+                        NoteExpressionKind::Tuning,
+                        pitch - f64::from(note),
+                    ));
+                }
+                ok
+            }
+            _ => true,
+        }
     }
 
     /// A fresh audio-thread end (for a new engine); every port keeps

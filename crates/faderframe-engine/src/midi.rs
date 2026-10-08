@@ -517,12 +517,9 @@ impl Processor<EngineContext> for MidiOutputSink {
             return;
         };
         for ev in input.iter() {
-            if matches!(
-                ev.event,
-                MidiEvent::NoteExpression { .. } | MidiEvent::SysEx(_)
-            ) {
-                // No MIDI form (expressions), or sent from the control side
-                // (clip SysEx: `session::sysex`).
+            if matches!(ev.event, MidiEvent::SysEx(_)) {
+                // Sent from the control side (clip SysEx: `session::sysex`).
+                // Note expressions go on: MIDI 2.0 ports send them.
                 continue;
             }
             let e = match self.channel {

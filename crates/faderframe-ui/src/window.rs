@@ -297,6 +297,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             ("Import ADM BWF Master (Bed and Objects)…", "app.import-adm"),
             ("Import MIDI File…", "app.import-midi"),
             ("Export MIDI File…", "app.export-midi"),
+            ("Export MIDI 2.0 Clip…", "app.export-midi2"),
         ]),
     );
     file.append_section(

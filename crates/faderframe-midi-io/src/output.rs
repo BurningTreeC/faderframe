@@ -3,13 +3,17 @@
 //! The engine queues messages with the time they are due (the moment the
 //! audio of the same callback is heard); [`MidiOutputs`] runs a thread that
 //! keeps them in time order and sends each when it is due, to every enabled
-//! output port (ALSA sequencer via `midir`) or a virtual capture port.
+//! output port (ALSA sequencer via `midir`; MIDI 2.0 ports through the
+//! UMP client, with note expressions as per-note controllers) or a virtual
+//! capture port.
 //! SysEx comes from the control thread instead ([`MidiOutputs::send_sysex`]),
 //! scheduled ahead with its due time; scheduled SysEx can be cancelled (the
 //! transport stopped or jumped).
 
-use crate::{CLIENT_NAME, port_identity};
+use crate::{CLIENT_NAME, UmpClient, port_identity, ump_ports};
+use faderframe_midi::ump::Midi1ToMidi2;
 use faderframe_midi::{MidiClock, MidiOutputEvent, MidiOutputQueue, midi_output_queue};
+use faderframe_midi_ump::UmpWriter;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -35,12 +39,18 @@ pub struct MidiOutputPort {
 /// What a virtual output received: (time sent on the [`MidiClock`], bytes).
 pub type Captured = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
 
+/// What a virtual MIDI 2.0 output received: (time sent, packets' words).
+pub type CapturedUmp = Arc<Mutex<Vec<(u64, Vec<u32>)>>>;
+
 enum Sink {
     Device(midir::MidiOutputConnection),
     Capture(Captured),
+    Ump(UmpWriter, Midi1ToMidi2),
+    UmpCapture(CapturedUmp, Midi1ToMidi2),
 }
 
 impl Sink {
+    /// Bytes as they are (SysEx, timecode, surfaces' displays).
     fn send(&mut self, now: u64, bytes: &[u8]) {
         match self {
             Sink::Device(c) => {
@@ -51,14 +61,82 @@ impl Sink {
                     v.push((now, bytes.to_vec()));
                 }
             }
+            Sink::Ump(w, t) => {
+                let mut words = Vec::new();
+                ump_ports::bytes_words(t, bytes, &mut words);
+                w.write(&words);
+            }
+            Sink::UmpCapture(c, t) => {
+                let mut words = Vec::new();
+                ump_ports::bytes_words(t, bytes, &mut words);
+                if let Ok(mut v) = c.lock() {
+                    v.push((now, words));
+                }
+            }
         }
+    }
+
+    /// An event of the engine's (expressions only reach MIDI 2.0 ports).
+    fn send_event(&mut self, now: u64, ev: &MidiOutputEvent) {
+        match self {
+            Sink::Device(_) | Sink::Capture(_) => {
+                if ev.len > 0 {
+                    self.send(now, ev.bytes());
+                }
+            }
+            Sink::Ump(w, t) => {
+                let mut words = Vec::with_capacity(4);
+                ump_ports::event_words(t, ev, &mut words);
+                if !words.is_empty() {
+                    w.write(&words);
+                }
+            }
+            Sink::UmpCapture(c, t) => {
+                let mut words = Vec::with_capacity(4);
+                ump_ports::event_words(t, ev, &mut words);
+                if !words.is_empty()
+                    && let Ok(mut v) = c.lock()
+                {
+                    v.push((now, words));
+                }
+            }
+        }
+    }
+
+    fn is_virtual(&self) -> bool {
+        matches!(self, Sink::Capture(_) | Sink::UmpCapture(..))
     }
 }
 
 type Sinks = Arc<Mutex<HashMap<u16, Sink>>>;
 
-/// A queued message: (due, sequence, port, length, bytes).
-type Pending = (u64, u64, u16, u8, [u8; 3]);
+/// A queued message, ordered by (due, sequence).
+#[derive(Clone, Copy, Debug)]
+struct Pending {
+    due: u64,
+    seq: u64,
+    event: MidiOutputEvent,
+}
+
+impl PartialEq for Pending {
+    fn eq(&self, other: &Self) -> bool {
+        (self.due, self.seq) == (other.due, other.seq)
+    }
+}
+
+impl Eq for Pending {}
+
+impl PartialOrd for Pending {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Pending {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.due, self.seq).cmp(&(other.due, other.seq))
+    }
+}
 
 /// Scheduled SysEx: (due, sequence, port, generation, bytes).
 type PendingSysex = (u64, u64, u16, u64, Vec<u8>);
@@ -75,6 +153,8 @@ pub struct MidiOutputs {
     sinks: Sinks,
     disabled: HashSet<String>,
     lister: Option<midir::MidiOutput>,
+    /// The MIDI 2.0 client (the input hub's).
+    ump: Option<Arc<UmpClient>>,
     clock: MidiClock,
     queues: Sender<rtrb::Consumer<MidiOutputEvent>>,
     sysex: Sender<PendingSysex>,
@@ -112,19 +192,23 @@ fn run(sinks: Sinks, clock: MidiClock, ch: Channels, stop: Arc<AtomicBool>) {
         if let Some(rx) = rx.as_mut() {
             while let Ok(m) = rx.pop() {
                 seq += 1;
-                pending.push(Reverse((m.due_ns, seq, m.port, m.len, m.bytes)));
+                pending.push(Reverse(Pending {
+                    due: m.due_ns,
+                    seq,
+                    event: m,
+                }));
             }
         }
         let now = clock.now_ns();
         if let Ok(mut s) = sinks.lock() {
-            while let Some(Reverse((due, _, port, len, bytes))) = pending.peek().copied() {
+            while let Some(Reverse(p)) = pending.peek().copied() {
                 // Within 200 µs is on time.
-                if due > now + 200_000 {
+                if p.due > now + 200_000 {
                     break;
                 }
                 pending.pop();
-                if let Some(sink) = s.get_mut(&port) {
-                    sink.send(now, &bytes[..len as usize]);
+                if let Some(sink) = s.get_mut(&p.event.port) {
+                    sink.send_event(now, &p.event);
                 }
             }
             while let Some(Reverse((due, _, port, g, _))) = sysex.peek() {
@@ -144,7 +228,7 @@ fn run(sinks: Sinks, clock: MidiClock, ch: Channels, stop: Arc<AtomicBool>) {
         }
         let next = pending
             .peek()
-            .map(|Reverse((due, ..))| *due)
+            .map(|Reverse(p)| p.due)
             .into_iter()
             .chain(sysex.peek().map(|Reverse((due, ..))| *due))
             .min();
@@ -180,6 +264,7 @@ impl MidiOutputs {
             sinks,
             disabled: HashSet::new(),
             lister: None,
+            ump: None,
             clock,
             queues,
             sysex,
@@ -254,6 +339,26 @@ impl MidiOutputs {
         (index, captured)
     }
 
+    /// An output that records the MIDI 2.0 packets it is sent (tests).
+    pub fn virtual_ump_output(&mut self, name: &str) -> (u16, CapturedUmp) {
+        let key = format!("virtual:{name}");
+        let index = self.index_for(&key, name, true);
+        let captured: CapturedUmp = Arc::default();
+        if let Ok(mut s) = self.sinks.lock() {
+            s.insert(
+                index,
+                Sink::UmpCapture(Arc::clone(&captured), Midi1ToMidi2::new()),
+            );
+        }
+        (index, captured)
+    }
+
+    /// Send to MIDI 2.0 ports through `client` (the input hub's), or not.
+    pub fn set_ump(&mut self, client: Option<Arc<UmpClient>>) {
+        self.ump = client;
+        self.refresh();
+    }
+
     pub fn start_system(&mut self) {
         if self.lister.is_none() {
             match midir::MidiOutput::new(CLIENT_NAME) {
@@ -266,8 +371,9 @@ impl MidiOutputs {
 
     pub fn stop_system(&mut self) {
         self.lister = None;
+        self.ump = None;
         if let Ok(mut s) = self.sinks.lock() {
-            s.retain(|_, sink| matches!(sink, Sink::Capture(_)));
+            s.retain(|_, sink| sink.is_virtual());
         }
     }
 
@@ -278,22 +384,40 @@ impl MidiOutputs {
 
     /// Connect new enabled ports, drop vanished or disabled ones.
     pub fn refresh(&mut self) -> bool {
-        let Some(lister) = &self.lister else {
+        if self.lister.is_none() && self.ump.is_none() {
             return false;
-        };
+        }
+        let lister = self.lister.as_ref();
+        let ump_clients: HashSet<u8> = self
+            .ump
+            .as_ref()
+            .map(|c| c.ump_clients().into_iter().collect())
+            .unwrap_or_default();
         let mut present = Vec::new();
-        for p in lister.ports() {
-            let Ok(full) = lister.port_name(&p) else {
+        let ports = lister.map(midir::MidiOutput::ports).unwrap_or_default();
+        for p in ports {
+            let Some(Ok(full)) = lister.map(|l| l.port_name(&p)) else {
                 continue;
             };
-            if full.starts_with(CLIENT_NAME) {
+            if full.starts_with(CLIENT_NAME)
+                || ump_ports::sequencer_client(&full).is_some_and(|c| ump_clients.contains(&c))
+            {
                 continue;
             }
             let (key, name) = port_identity(&full);
             present.push((key, name, p));
         }
+        let ump_present: Vec<faderframe_midi_ump::UmpPort> = self
+            .ump
+            .as_ref()
+            .map(|c| crate::ump_ports(c, |p| p.writable))
+            .unwrap_or_default();
         let mut changed = false;
-        let keys: HashSet<String> = present.iter().map(|(k, _, _)| k.clone()).collect();
+        let keys: HashSet<String> = present
+            .iter()
+            .map(|(k, _, _)| k.clone())
+            .chain(ump_present.iter().map(faderframe_midi_ump::UmpPort::key))
+            .collect();
         let disabled = self.disabled.clone();
         let indices: Vec<(String, u16)> = self
             .known
@@ -332,6 +456,25 @@ impl MidiOutputs {
                     changed = true;
                 }
                 Err(e) => tracing::warn!("MIDI output {name}: {e}"),
+            }
+        }
+        if let Some(client) = self.ump.clone() {
+            for p in ump_present {
+                let key = p.key();
+                let index = self.index_for(&key, &p.display_name(), false);
+                if self.disabled.contains(&key) {
+                    continue;
+                }
+                if let Ok(mut s) = self.sinks.lock()
+                    && !s.contains_key(&index)
+                {
+                    tracing::info!("MIDI 2.0 output connected: {}", p.display_name());
+                    s.insert(
+                        index,
+                        Sink::Ump(client.writer(p.address()), Midi1ToMidi2::new()),
+                    );
+                    changed = true;
+                }
             }
         }
         changed

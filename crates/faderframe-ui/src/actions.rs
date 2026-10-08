@@ -50,6 +50,7 @@ pub fn install(app: &Rc<AppState>) {
         entry(app, "import-adm", crate::dialogs::import_adm),
         entry(app, "import-midi", crate::dialogs::import_midi),
         entry(app, "export-midi", crate::dialogs::export_midi),
+        entry(app, "export-midi2", crate::dialogs::export_midi2),
         entry(app, "cancel-import", |a| {
             a.session.borrow().cancel_imports()
         }),
@@ -2697,6 +2698,9 @@ pub fn install(app: &Rc<AppState>) {
                 at: faderframe_timeline::MusicalTime::ZERO,
                 tempo: empty,
             });
+        }),
+        named("export-midi2-to", |a, arg| {
+            crate::dialogs::export_midi2_to(a, std::path::Path::new(arg));
         }),
         named("export-midi-to", |a, arg| {
             crate::dialogs::export_midi_to(a, std::path::Path::new(arg));

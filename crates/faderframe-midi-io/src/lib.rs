@@ -17,11 +17,54 @@
 mod output;
 mod surface;
 
-pub use output::{Captured, MidiOutputPort, MidiOutputs, OUTPUT_CAPACITY};
+pub use faderframe_midi_ump::UmpClient;
+pub use output::{Captured, CapturedUmp, MidiOutputPort, MidiOutputs, OUTPUT_CAPACITY};
 pub use surface::{SurfacePorts, VirtualSurface};
 
-use faderframe_midi::MidiInputSender;
+mod ump_ports;
+
+use faderframe_midi::{MidiInputSender, UmpInput};
+use faderframe_midi_ump::{UmpPort, chosen_ports};
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+
+/// MIDI 2.0 inputs by sequencer address: their port index and what a SysEx
+/// being received holds.
+type UmpInputs = Arc<Mutex<HashMap<(u8, u8), (u16, UmpInput)>>>;
+
+/// Where packets from programs that send straight to FaderFrame's MIDI 2.0
+/// input (not from a port it connected) are filed.
+const DIRECT: (u8, u8) = (255, 255);
+
+/// The input key and name of those packets.
+pub const UMP_DIRECT_KEY: &str = "ump:FaderFrame MIDI 2.0 In";
+const UMP_DIRECT_NAME: &str = "Sent to FaderFrame (MIDI 2.0)";
+
+/// The MIDI 2.0 ports of other programs and devices, as FaderFrame lists
+/// them (an endpoint port for its groups; FaderFrame's own clients left
+/// out).
+fn ump_ports(client: &UmpClient, wanted: impl Fn(&UmpPort) -> bool) -> Vec<UmpPort> {
+    let ports: Vec<UmpPort> = client
+        .ports()
+        .into_iter()
+        .filter(|p| wanted(p) && !p.client_name.starts_with(CLIENT_NAME))
+        .collect();
+    chosen_ports(&ports)
+}
+
+/// Opens the MIDI 2.0 client (not with `FADERFRAME_NO_UMP=1`).
+pub fn open_ump() -> Option<Arc<UmpClient>> {
+    if std::env::var_os("FADERFRAME_NO_UMP").is_some() {
+        return None;
+    }
+    match UmpClient::open(faderframe_midi_ump::CLIENT_NAME) {
+        Ok(c) => Some(Arc::new(c)),
+        Err(e) => {
+            tracing::info!("MIDI 2.0: {e}");
+            None
+        }
+    }
+}
 
 /// The sequencer client name FaderFrame shows up as.
 pub const CLIENT_NAME: &str = "FaderFrame";
@@ -66,6 +109,7 @@ pub fn port_identity(full: &str) -> (String, String) {
 pub struct VirtualMidiInput {
     port: u16,
     tx: MidiInputSender,
+    ump: Arc<Mutex<UmpInput>>,
 }
 
 impl VirtualMidiInput {
@@ -76,6 +120,20 @@ impl VirtualMidiInput {
     /// Send one channel message (e.g. `[0x90, 60, 100]`).
     pub fn send(&self, msg: &[u8]) -> bool {
         self.tx.send(self.port, msg)
+    }
+
+    /// Send Universal MIDI Packets as a MIDI 2.0 port would (see
+    /// [`MidiInputSender::send_ump`]).
+    pub fn send_ump(&self, words: &[u32]) -> bool {
+        let Ok(mut state) = self.ump.lock() else {
+            return false;
+        };
+        // Every packet is sent, whether one before it was dropped or not.
+        let mut ok = true;
+        for p in faderframe_midi::ump::packets(words) {
+            ok &= self.tx.send_ump(self.port, &p, &mut state);
+        }
+        ok
     }
 
     /// The clock its messages are stamped with.
@@ -99,6 +157,10 @@ pub struct MidiHub {
     /// Enumerates ports (connections need their own clients).
     lister: Option<midir::MidiInput>,
     error: Option<String>,
+    /// The MIDI 2.0 client, its inputs by address, its connections by key.
+    ump: Option<Arc<UmpClient>>,
+    ump_inputs: UmpInputs,
+    ump_connected: HashMap<String, (u8, u8)>,
 }
 
 impl MidiHub {
@@ -113,6 +175,9 @@ impl MidiHub {
             disabled: HashSet::new(),
             lister: None,
             error: None,
+            ump: None,
+            ump_inputs: Arc::default(),
+            ump_connected: HashMap::new(),
         }
     }
 
@@ -122,6 +187,11 @@ impl MidiHub {
     pub fn start_system(&mut self) {
         if self.lister.is_some() {
             return;
+        }
+        if self.ump.is_none()
+            && let Some(client) = open_ump()
+        {
+            self.start_ump(client);
         }
         match midir::MidiInput::new(CLIENT_NAME) {
             Ok(l) => {
@@ -137,10 +207,48 @@ impl MidiHub {
         }
     }
 
+    /// Read MIDI 2.0 ports through `client` (from [`open_ump`]; tests give
+    /// their own).
+    pub fn start_ump(&mut self, client: Arc<UmpClient>) {
+        let (tx, inputs) = (self.tx.clone(), Arc::clone(&self.ump_inputs));
+        let started = client.start_input(move |from, words| {
+            let Some(p) = faderframe_midi::ump::Ump::new(words) else {
+                return;
+            };
+            let Ok(mut m) = inputs.lock() else {
+                return;
+            };
+            let key = if m.contains_key(&from) { from } else { DIRECT };
+            if let Some((index, state)) = m.get_mut(&key) {
+                tx.send_ump(*index, &p, state);
+            }
+        });
+        match started {
+            Ok(()) => {
+                self.ump = Some(client);
+                self.refresh_ump();
+            }
+            Err(e) => tracing::warn!("MIDI 2.0 input: {e}"),
+        }
+    }
+
     /// Disconnect every system input.
     pub fn stop_system(&mut self) {
         self.connections.clear();
         self.lister = None;
+        if let Some(client) = self.ump.take() {
+            for (_, addr) in self.ump_connected.drain() {
+                client.disconnect_input(addr);
+            }
+        }
+        if let Ok(mut m) = self.ump_inputs.lock() {
+            m.clear();
+        }
+    }
+
+    /// The MIDI 2.0 client (for the outputs), when it is open.
+    pub fn ump_client(&self) -> Option<Arc<UmpClient>> {
+        self.ump.clone()
     }
 
     pub fn system_started(&self) -> bool {
@@ -173,6 +281,7 @@ impl MidiHub {
         VirtualMidiInput {
             port,
             tx: self.tx.clone(),
+            ump: Arc::default(),
         }
     }
 
@@ -190,14 +299,22 @@ impl MidiHub {
     /// whether the set of ports or connections changed.
     pub fn refresh(&mut self) -> bool {
         let Some(lister) = &self.lister else {
-            return false;
+            return self.refresh_ump();
         };
+        // MIDI 2.0 clients are read as such, not again as MIDI 1.0.
+        let ump_clients: HashSet<u8> = self
+            .ump
+            .as_ref()
+            .map(|c| c.ump_clients().into_iter().collect())
+            .unwrap_or_default();
         let mut present: Vec<(String, String, midir::MidiInputPort)> = Vec::new();
         for p in lister.ports() {
             let Ok(full) = lister.port_name(&p) else {
                 continue;
             };
-            if full.starts_with(CLIENT_NAME) {
+            if full.starts_with(CLIENT_NAME)
+                || ump_ports::sequencer_client(&full).is_some_and(|c| ump_clients.contains(&c))
+            {
                 continue;
             }
             let (key, name) = port_identity(&full);
@@ -221,6 +338,75 @@ impl MidiHub {
                     changed = true;
                 }
                 Err(e) => tracing::warn!("MIDI input {name}: {e}"),
+            }
+        }
+        changed | self.refresh_ump()
+    }
+
+    /// Connect new enabled MIDI 2.0 inputs, drop vanished or disabled ones.
+    fn refresh_ump(&mut self) -> bool {
+        let Some(client) = self.ump.clone() else {
+            return false;
+        };
+        let present: HashMap<String, UmpPort> = ump_ports(&client, |p| p.readable)
+            .into_iter()
+            .map(|p| (p.key(), p))
+            .collect();
+        let mut changed = false;
+        // What programs send straight to FaderFrame.
+        let direct = self.index_for(UMP_DIRECT_KEY, UMP_DIRECT_NAME, false);
+        let wanted = !self.disabled.contains(UMP_DIRECT_KEY);
+        if let Ok(mut m) = self.ump_inputs.lock()
+            && m.contains_key(&DIRECT) != wanted
+        {
+            if wanted {
+                m.insert(DIRECT, (direct, UmpInput::default()));
+            } else {
+                m.remove(&DIRECT);
+            }
+            changed = true;
+        }
+        // (The address map is never held while calling the client: its
+        // reader thread holds the client while it looks the map up.)
+        let gone: Vec<(String, (u8, u8))> = self
+            .ump_connected
+            .iter()
+            .filter(|(k, addr)| {
+                present.get(*k).map(UmpPort::address) != Some(**addr) || self.disabled.contains(*k)
+            })
+            .map(|(k, a)| (k.clone(), *a))
+            .collect();
+        for (key, addr) in gone {
+            client.disconnect_input(addr);
+            if let Ok(mut m) = self.ump_inputs.lock() {
+                m.remove(&addr);
+            }
+            self.ump_connected.remove(&key);
+            changed = true;
+        }
+        let mut present: Vec<UmpPort> = present.into_values().collect();
+        present.sort_by_key(UmpPort::address);
+        for p in present {
+            let key = p.key();
+            let index = self.index_for(&key, &p.display_name(), false);
+            if self.ump_connected.contains_key(&key) || self.disabled.contains(&key) {
+                continue;
+            }
+            if let Ok(mut m) = self.ump_inputs.lock() {
+                m.insert(p.address(), (index, UmpInput::default()));
+            }
+            match client.connect_input(p.address()) {
+                Ok(()) => {
+                    tracing::info!("MIDI 2.0 input connected: {}", p.display_name());
+                    self.ump_connected.insert(key, p.address());
+                    changed = true;
+                }
+                Err(e) => {
+                    tracing::warn!("MIDI 2.0 input {}: {e}", p.display_name());
+                    if let Ok(mut m) = self.ump_inputs.lock() {
+                        m.remove(&p.address());
+                    }
+                }
             }
         }
         changed
@@ -259,7 +445,12 @@ impl MidiHub {
                 name: k.name.clone(),
                 index: i as u16,
                 enabled: !self.disabled.contains(&k.key),
-                connected: k.is_virtual || self.connections.contains_key(&k.key),
+                connected: k.is_virtual
+                    || self.connections.contains_key(&k.key)
+                    || self.ump_connected.contains_key(&k.key)
+                    || (k.key == UMP_DIRECT_KEY
+                        && self.ump.is_some()
+                        && !self.disabled.contains(&k.key)),
                 is_virtual: k.is_virtual,
             })
             .collect()

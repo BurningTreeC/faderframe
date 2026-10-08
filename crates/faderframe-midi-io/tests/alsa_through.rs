@@ -6,12 +6,22 @@ use faderframe_midi::{MidiEvent, midi_input_queue};
 use faderframe_midi_io::MidiHub;
 use std::time::{Duration, Instant};
 
+/// Both tests use the one Midi Through port: one at a time, also across
+/// test processes (nextest).
+fn turn() -> std::fs::File {
+    let f =
+        std::fs::File::create(std::env::temp_dir().join("faderframe-midi-through.lock")).unwrap();
+    f.lock().unwrap();
+    f
+}
+
 /// The tests share the system's Midi Through port: one at a time.
 static PORT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
 #[ignore = "needs an ALSA sequencer with Midi Through and aseqsend"]
 fn messages_sent_to_midi_through_arrive() {
+    let _turn = turn();
     let _one_at_a_time = PORT.lock().unwrap_or_else(|e| e.into_inner());
     let (tx, mut rx, _feed) = midi_input_queue(64);
     let mut hub = MidiHub::new(tx);
@@ -56,6 +66,7 @@ fn messages_sent_to_midi_through_arrive() {
 #[test]
 #[ignore = "needs an ALSA sequencer with Midi Through"]
 fn output_to_midi_through_comes_back_in() {
+    let _turn = turn();
     let _one_at_a_time = PORT.lock().unwrap_or_else(|e| e.into_inner());
     use faderframe_midi::MidiOutputEvent;
     use faderframe_midi_io::MidiOutputs;

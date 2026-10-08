@@ -389,6 +389,11 @@ long sessions), Neon and High Contrast:
   toolbar, beside the grid): free positions land on whole samples, and
   cuts and trims of audio clips move to the nearest zero crossing so they
   do not click.
+* MIDI 2.0 (Linux): MIDI 2.0 devices and programs as inputs and outputs
+  through the ALSA sequencer; per-note pitch bend and controllers are
+  played, recorded and captured as note expression, and clips' note
+  expression goes out to MIDI 2.0 gear as per-note controllers; MIDI 2.0
+  Clip Files (`.midi2`) are imported and exported (File menu).
 * Setlist and show mode (View → Setlist): a show's songs in order — one
   per section, or ranges of the project — with what follows each (stop,
   the next song after a gap, play on) and the performer's notes; Show Mode

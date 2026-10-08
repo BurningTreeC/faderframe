@@ -20,6 +20,7 @@ faderframe-control = { path = "crates/faderframe-control" }
 faderframe-timeline = { path = "crates/faderframe-timeline" }
 faderframe-midi = { path = "crates/faderframe-midi" }
 faderframe-midi-io = { path = "crates/faderframe-midi-io" }
+faderframe-midi-ump = { path = "crates/faderframe-midi-ump" }
 faderframe-realtime = { path = "crates/faderframe-realtime" }
 faderframe-stretch = { path = "crates/faderframe-stretch" }
 faderframe-audio-graph = { path = "crates/faderframe-audio-graph" }

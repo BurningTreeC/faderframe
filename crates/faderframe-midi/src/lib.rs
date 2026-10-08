@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 mod buffer;
+pub mod clipfile;
 mod event;
 pub mod gm;
 mod input;
@@ -20,12 +21,13 @@ mod output;
 pub mod theory;
 pub mod timecode;
 mod tracker;
+pub mod ump;
 
 pub use buffer::{MidiBuffer, MidiBufferFull};
 pub use event::{ExpressionValue, MidiEvent, NoteExpressionKind, SysexRef, TimedMidiEvent};
 pub use input::{
     MAX_MIDI_PORTS, MidiClock, MidiControlFeed, MidiInputEvent, MidiInputQueue, MidiInputSender,
-    MidiSystemEvent, SystemMessage, midi_input_queue,
+    MidiSystemEvent, SystemMessage, UmpInput, midi_input_queue,
 };
 pub use note_ids::NoteIds;
 pub use output::{MidiOutputEvent, MidiOutputQueue, midi_output_queue};

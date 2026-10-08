@@ -5,9 +5,11 @@
 //! same callback is heard, so external instruments play in time with the
 //! mix. A sender thread waits until each message is due.
 
-use crate::MidiClock;
+use crate::{ExpressionValue, MidiClock, MidiEvent, NoteExpressionKind};
 
-/// One message for an output port (channel or system real-time/common).
+/// One message for an output port (channel or system real-time/common), or
+/// a per-note expression (no bytes: MIDI 2.0 ports send it as a per-note
+/// controller, MIDI 1.0 ports leave it out).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MidiOutputEvent {
     /// Output port index (see the session's output port map).
@@ -16,6 +18,8 @@ pub struct MidiOutputEvent {
     pub due_ns: u64,
     pub len: u8,
     pub bytes: [u8; 3],
+    /// Channel, key, kind and value of a per-note expression.
+    pub expression: Option<(u8, u8, NoteExpressionKind, ExpressionValue)>,
 }
 
 impl MidiOutputEvent {
@@ -30,7 +34,39 @@ impl MidiOutputEvent {
             due_ns,
             len: msg.len() as u8,
             bytes,
+            expression: None,
         })
+    }
+
+    /// A per-note expression.
+    pub fn expression(
+        port: u16,
+        due_ns: u64,
+        channel: u8,
+        key: u8,
+        kind: NoteExpressionKind,
+        value: ExpressionValue,
+    ) -> Self {
+        Self {
+            port,
+            due_ns,
+            len: 0,
+            bytes: [0; 3],
+            expression: Some((channel & 0xF, key & 0x7F, kind, value)),
+        }
+    }
+
+    /// The event it carries (channel messages and expressions).
+    pub fn event(&self) -> Option<MidiEvent> {
+        if let Some((channel, key, kind, value)) = self.expression {
+            return Some(MidiEvent::NoteExpression {
+                channel,
+                key,
+                kind,
+                value,
+            });
+        }
+        MidiEvent::from_bytes(self.bytes())
     }
 
     pub fn bytes(&self) -> &[u8] {

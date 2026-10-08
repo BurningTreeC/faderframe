@@ -99,6 +99,21 @@ impl ExpressionKind {
         }
     }
 
+    /// The kind of a dimension hosted plugins receive (the inverse of
+    /// [`Self::native`]; the values are in the same units).
+    pub fn of_native(kind: faderframe_midi::NoteExpressionKind) -> Self {
+        use faderframe_midi::NoteExpressionKind as N;
+        match kind {
+            N::Tuning => Self::Pitch,
+            N::Pressure => Self::Pressure,
+            N::Brightness => Self::Timbre,
+            N::Volume => Self::Volume,
+            N::Pan => Self::Pan,
+            N::Vibrato => Self::Vibrato,
+            N::Expression => Self::Expression,
+        }
+    }
+
     /// Value before any point (and of notes without expression).
     pub fn rest(self) -> f32 {
         match self {

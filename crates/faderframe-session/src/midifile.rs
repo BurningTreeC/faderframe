@@ -28,7 +28,7 @@ pub fn is_midi_file(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
         matches!(
             e.to_ascii_lowercase().as_str(),
-            "mid" | "midi" | "smf" | "kar"
+            "mid" | "midi" | "smf" | "kar" | "midi2"
         )
     })
 }
@@ -63,6 +63,9 @@ impl Session {
         at: MusicalTime,
         tempo: bool,
     ) -> Result<Vec<TrackId>> {
+        if crate::midi2file::is_midi2_clip_file(path) {
+            return self.import_midi2_clip(path, at, tempo).map(|t| vec![t]);
+        }
         let bytes = std::fs::read(path).map_err(|e| err(format!("{}: {e}", path.display())))?;
         let smf = Smf::parse(&bytes).map_err(err)?;
         let ppq = match smf.header.timing {
@@ -187,42 +190,11 @@ impl Session {
 
         let mut cmds = Vec::new();
         if tempo && at == MusicalTime::ZERO && (!tempos.is_empty() || !meters.is_empty()) {
-            let mut tl = self.project.timeline.clone();
-            tempos.sort_by_key(|(t, _)| *t);
-            while tl.tempo.points().len() > 1 {
-                tl.tempo.remove_point(1);
-            }
-            let first = tempos
-                .first()
-                .filter(|(t, _)| *t == 0)
-                .map_or(120.0, |(_, b)| *b);
-            tl.tempo.set_initial_bpm(first.clamp(10.0, 999.0));
-            for &(t, bpm) in tempos.iter().filter(|(t, _)| *t > 0) {
-                tl.tempo.set_point(TempoPoint {
-                    position: musical(t, ppq),
-                    bpm: bpm.clamp(10.0, 999.0),
-                    curve: TempoCurve::Constant,
-                });
-            }
-            meters.sort_by_key(|(t, _)| *t);
-            let mut meter = faderframe_timeline::TimeSignatureMap::new(
-                meters
-                    .first()
-                    .filter(|(t, _)| *t == 0)
-                    .map_or(TimeSignature::FOUR_FOUR, |(_, s)| *s),
-            );
-            for &(t, signature) in meters.iter().filter(|(t, _)| *t > 0) {
-                let pos = musical(t, ppq);
-                let mut bar = meter.bar_at(pos);
-                if meter.bar_start(bar) != pos {
-                    bar += 1; // changes land on bar lines
-                }
-                meter.set_change(MeterChange { bar, signature });
-            }
-            tl.meter = meter;
-            cmds.push(Command::SetTimeline {
-                timeline: Box::new(tl),
-            });
+            let tempos: Vec<(MusicalTime, f64)> =
+                tempos.iter().map(|&(t, b)| (musical(t, ppq), b)).collect();
+            let meters: Vec<(MusicalTime, TimeSignature)> =
+                meters.iter().map(|&(t, m)| (musical(t, ppq), m)).collect();
+            cmds.push(self.imported_timeline(tempos, meters));
         }
 
         let p = &mut self.project;
@@ -411,6 +383,50 @@ impl Session {
         );
         self.notify(crate::NoticeLevel::Info, text);
         Ok(created)
+    }
+
+    /// The project's timeline with a file's tempo map and time signatures
+    /// (positions from the start; meter changes land on bar lines).
+    pub(crate) fn imported_timeline(
+        &self,
+        mut tempos: Vec<(MusicalTime, f64)>,
+        mut meters: Vec<(MusicalTime, TimeSignature)>,
+    ) -> Command {
+        let mut tl = self.project.timeline.clone();
+        tempos.sort_by_key(|(t, _)| *t);
+        while tl.tempo.points().len() > 1 {
+            tl.tempo.remove_point(1);
+        }
+        let first = tempos
+            .first()
+            .filter(|(t, _)| *t == MusicalTime::ZERO)
+            .map_or(120.0, |(_, b)| *b);
+        tl.tempo.set_initial_bpm(first.clamp(10.0, 999.0));
+        for &(t, bpm) in tempos.iter().filter(|(t, _)| *t > MusicalTime::ZERO) {
+            tl.tempo.set_point(TempoPoint {
+                position: t,
+                bpm: bpm.clamp(10.0, 999.0),
+                curve: TempoCurve::Constant,
+            });
+        }
+        meters.sort_by_key(|(t, _)| *t);
+        let mut meter = faderframe_timeline::TimeSignatureMap::new(
+            meters
+                .first()
+                .filter(|(t, _)| *t == MusicalTime::ZERO)
+                .map_or(TimeSignature::FOUR_FOUR, |(_, s)| *s),
+        );
+        for &(pos, signature) in meters.iter().filter(|(t, _)| *t > MusicalTime::ZERO) {
+            let mut bar = meter.bar_at(pos);
+            if meter.bar_start(bar) != pos {
+                bar += 1; // changes land on bar lines
+            }
+            meter.set_change(MeterChange { bar, signature });
+        }
+        tl.meter = meter;
+        Command::SetTimeline {
+            timeline: Box::new(tl),
+        }
     }
 
     /// Write the MIDI of instrument and MIDI tracks (or only `clips`) as a

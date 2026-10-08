@@ -113,6 +113,84 @@ pub(crate) struct RecNote {
     pub release: Option<u8>,
 }
 
+/// Sorted curves without repeats at a time (the later value wins: initial
+/// values arrive in a burst before the note) and without the points where
+/// the curve runs straight (within half a cent of pitch, `tol` of other
+/// kinds' units).
+fn thin_curves(e: &mut faderframe_project::NoteExpression, tol: f32) {
+    use faderframe_project::{ExpressionKind, ExpressionPoint};
+    for k in ExpressionKind::ALL {
+        let c = e.curve_mut(k);
+        c.sort_by_key(|p| p.time);
+        c.reverse();
+        c.dedup_by_key(|p| p.time);
+        c.reverse();
+        let tol = match k {
+            ExpressionKind::Pitch => 0.01,
+            ExpressionKind::Volume => tol * 60.0,
+            _ => tol,
+        };
+        let mut kept: Vec<ExpressionPoint> = Vec::with_capacity(c.len());
+        for (j, p) in c.iter().enumerate() {
+            let next = c.get(j + 1);
+            let redundant = match (kept.last(), next) {
+                (Some(a), Some(b)) => {
+                    let span = (b.time - a.time).ticks().max(1) as f32;
+                    let f = (p.time - a.time).ticks() as f32 / span;
+                    (a.value + (b.value - a.value) * f - p.value).abs() <= tol
+                }
+                _ => false,
+            };
+            if !redundant {
+                kept.push(*p);
+            }
+        }
+        *c = kept;
+    }
+}
+
+/// A recorded per-note expression: (position, channel, key, kind, value,
+/// pass).
+pub(crate) type RecExpression = (i64, u8, u8, faderframe_project::ExpressionKind, f32, u32);
+
+/// Per-note expression as it came (MIDI 2.0 per-note controllers): each
+/// value goes to the note sounding on its channel and key (or starting
+/// within 20 ms: initial values come just before the note-on).
+pub(crate) fn native_expressions(
+    notes: &[RecNote],
+    ids: &[faderframe_core::NoteId],
+    recorded: &[RecExpression],
+    rate: f64,
+    to_note_time: impl Fn(i64, i64) -> faderframe_timeline::MusicalTime,
+) -> Vec<faderframe_project::NoteExpression> {
+    use faderframe_project::{ExpressionPoint, NoteExpression};
+    let lead = (rate * 0.02) as i64;
+    let mut out = Vec::new();
+    for (n, &id) in notes.iter().zip(ids) {
+        let mut e = NoteExpression::new(id);
+        for &(pos, ch, key, kind, value, pass) in recorded {
+            if ch != n.channel
+                || key != n.key
+                || pass != n.pass
+                || pos < n.start - lead
+                || pos > n.end
+            {
+                continue;
+            }
+            let (lo, hi) = kind.range();
+            e.curve_mut(kind).push(ExpressionPoint {
+                time: to_note_time(pos.max(n.start), n.start),
+                value: value.clamp(lo, hi),
+            });
+        }
+        thin_curves(&mut e, 1.0 / 2048.0);
+        if !e.is_empty() {
+            out.push(e);
+        }
+    }
+    out
+}
+
 /// MPE recording: the member-channel pitch bend, pressure and CC 74 that
 /// arrive while a note sounds (and just before it, for its initial values)
 /// become that note's expression; such controller moves are removed from
@@ -157,37 +235,7 @@ pub(crate) fn mpe_expressions(
                 value,
             });
         }
-        for k in ExpressionKind::ALL {
-            let c = e.curve_mut(k);
-            c.sort_by_key(|p| p.time);
-            // Later values at the same time win (initial values arrive in a
-            // burst before the note).
-            c.reverse();
-            c.dedup_by_key(|p| p.time);
-            c.reverse();
-            // Keep the points where the curve bends.
-            let tol = if k == ExpressionKind::Pitch {
-                0.01
-            } else {
-                0.4 / 127.0
-            };
-            let mut kept: Vec<ExpressionPoint> = Vec::with_capacity(c.len());
-            for (j, p) in c.iter().enumerate() {
-                let next = c.get(j + 1);
-                let redundant = match (kept.last(), next) {
-                    (Some(a), Some(b)) => {
-                        let span = (b.time - a.time).ticks().max(1) as f32;
-                        let f = (p.time - a.time).ticks() as f32 / span;
-                        (a.value + (b.value - a.value) * f - p.value).abs() <= tol
-                    }
-                    _ => false,
-                };
-                if !redundant {
-                    kept.push(*p);
-                }
-            }
-            *c = kept;
-        }
+        thin_curves(&mut e, 0.4 / 127.0);
         if !e.is_empty() {
             out.push(e);
         }
@@ -217,6 +265,8 @@ pub(crate) struct MidiTake {
     pub controllers: Vec<Vec<RecController>>,
     /// SysEx per track: (position, message).
     pub sysex: Vec<Vec<(i64, Vec<u8>)>>,
+    /// Per-note expression per track (MIDI 2.0 inputs).
+    pub expressions: Vec<Vec<RecExpression>>,
     pub last: i64,
 }
 
@@ -234,6 +284,7 @@ impl MidiTake {
             notes: vec![Vec::new(); n],
             controllers: vec![Vec::new(); n],
             sysex: vec![Vec::new(); n],
+            expressions: vec![Vec::new(); n],
             last: i64::MIN,
         }
     }
@@ -268,6 +319,19 @@ impl MidiTake {
                         self.controllers[t].push((pos, c, ch, v, r.pass));
                     }
                 }
+                MidiEvent::NoteExpression {
+                    channel,
+                    key,
+                    kind,
+                    value,
+                } => self.expressions[t].push((
+                    pos,
+                    channel,
+                    key,
+                    faderframe_project::ExpressionKind::of_native(kind),
+                    value.get() as f32,
+                    r.pass,
+                )),
                 MidiEvent::NoteOn { channel, key, .. }
                 | MidiEvent::NoteOff { channel, key, .. } => {
                     let release = match r.event {
@@ -541,6 +605,8 @@ impl Session {
                 .cloned()
                 .collect::<Vec<_>>(),
         );
+        // MIDI 2.0 ports through the hub's UMP client.
+        self.midi.outputs.set_ump(self.midi.hub.ump_client());
         self.midi.outputs.start_system();
         self.midi.clock_outputs = prefs.clock_outputs.iter().cloned().collect();
         self.midi.mtc_outputs = prefs.mtc_outputs.iter().cloned().collect();
@@ -788,6 +854,14 @@ impl Session {
     /// A capture output (tests, monitoring): every message sent to it.
     pub fn add_virtual_midi_output(&mut self, name: &str) -> faderframe_midi_io::Captured {
         let (_, captured) = self.midi.outputs.virtual_output(name);
+        self.midi_ports_changed();
+        captured
+    }
+
+    /// A capture output that speaks MIDI 2.0 (tests): the packets sent to
+    /// it.
+    pub fn add_virtual_ump_output(&mut self, name: &str) -> faderframe_midi_io::CapturedUmp {
+        let (_, captured) = self.midi.outputs.virtual_ump_output(name);
         self.midi_ports_changed();
         captured
     }
@@ -1843,17 +1917,33 @@ impl Session {
             notes.iter().map(|_| self.project.ids.allocate()).collect();
         let to_musical = |s: i64| self.engine.samples_to_musical(&self.project, s.max(0));
         // MPE: member-channel expression goes with the notes.
-        let expressions = match self.project.track(*track).and_then(|t| t.mpe) {
+        let rate = self.engine.sample_rate() as f64;
+        let mut expressions = match self.project.track(*track).and_then(|t| t.mpe) {
             Some(cfg) => mpe_expressions(
                 &notes,
                 &ids,
                 &mut ccs,
                 cfg.bend_range,
-                self.engine.sample_rate() as f64,
+                rate,
                 |pos, start| to_musical(pos) - to_musical(start),
             ),
             None => Vec::new(),
         };
+        // MIDI 2.0: per-note expression as it came.
+        for e in native_expressions(&notes, &ids, &take.expressions[i], rate, |pos, start| {
+            to_musical(pos) - to_musical(start)
+        }) {
+            match expressions.iter_mut().find(|x| x.note == e.note) {
+                Some(x) => {
+                    for k in faderframe_project::ExpressionKind::ALL {
+                        if x.curve(k).is_empty() {
+                            *x.curve_mut(k) = e.curve(k).to_vec();
+                        }
+                    }
+                }
+                None => expressions.push(e),
+            }
+        }
         let meter = &self.project.timeline.meter;
         let first = notes
             .iter()

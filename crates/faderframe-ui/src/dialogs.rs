@@ -56,7 +56,7 @@ fn audio_filters() -> gio::ListStore {
 fn midi_filters() -> gio::ListStore {
     let midi = gtk::FileFilter::new();
     midi.set_name(Some("MIDI files"));
-    for ext in ["mid", "midi", "smf", "kar"] {
+    for ext in ["mid", "midi", "smf", "kar", "midi2"] {
         midi.add_suffix(ext);
     }
     let all = gtk::FileFilter::new();
@@ -146,6 +146,69 @@ pub fn export_midi_to(app: &Rc<AppState>, path: &std::path::Path) {
                 if n == 1 { "" } else { "s" },
                 path.display()
             ),
+        ),
+        Err(e) => app.report(e, true),
+    }
+    app.after_change();
+}
+
+/// File → Export MIDI 2.0 Clip…: the selected MIDI clip as a MIDI 2.0 clip
+/// file.
+pub fn export_midi2(app: &Rc<AppState>) {
+    let Some(win) = app.window.borrow().clone() else {
+        return;
+    };
+    let name = {
+        let s = app.session.borrow();
+        let Some(clip) = s.midi2_export_clip() else {
+            drop(s);
+            app.report(
+                faderframe_session::SessionError::Other(
+                    "select a MIDI clip (or its track) to export it as a MIDI 2.0 clip".into(),
+                ),
+                false,
+            );
+            return;
+        };
+        let name = s.project().clip(clip).map_or("Clip", |c| c.name.as_str());
+        format!("{name}.midi2")
+    };
+    let filter = gtk::FileFilter::new();
+    filter.set_name(Some("MIDI 2.0 clip files"));
+    filter.add_suffix("midi2");
+    let filters = gio::ListStore::new::<gtk::FileFilter>();
+    filters.append(&filter);
+    let dialog = gtk::FileDialog::builder()
+        .title("Export MIDI 2.0 Clip")
+        .modal(true)
+        .initial_name(name)
+        .filters(&filters)
+        .build();
+    let weak = Rc::downgrade(app);
+    dialog.save(Some(&win), gio::Cancellable::NONE, move |res| {
+        let (Ok(file), Some(app)) = (res, weak.upgrade()) else {
+            return;
+        };
+        let Some(path) = file.path() else { return };
+        export_midi2_to(&app, &path);
+    });
+}
+
+/// Write the MIDI 2.0 clip file.
+pub fn export_midi2_to(app: &Rc<AppState>, path: &std::path::Path) {
+    let result = {
+        let s = app.session.borrow();
+        match s.midi2_export_clip() {
+            Some(clip) => s.export_midi2_clip(path, clip),
+            None => Err(faderframe_session::SessionError::Other(
+                "select a MIDI clip to export".into(),
+            )),
+        }
+    };
+    match result {
+        Ok(()) => app.session.borrow_mut().notify(
+            faderframe_session::NoticeLevel::Info,
+            format!("exported the MIDI 2.0 clip to {}", path.display()),
         ),
         Err(e) => app.report(e, true),
     }

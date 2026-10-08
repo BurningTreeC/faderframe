@@ -1,0 +1,18 @@
+[package]
+name = "faderframe-midi-ump"
+description = "MIDI 2.0 devices: a Universal MIDI Packet client of the ALSA sequencer (Linux)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-midi.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+alsa-sys = "0.4"
+libc.workspace = true

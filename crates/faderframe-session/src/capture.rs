@@ -135,6 +135,7 @@ impl Session {
                     | MidiEvent::ChannelPressure { .. }
                     | MidiEvent::ProgramChange { .. }
                     | MidiEvent::PolyPressure { .. }
+                    | MidiEvent::NoteExpression { .. }
             ) {
                 continue;
             }

@@ -912,9 +912,19 @@ name = "faderframe-midi-io"
 version = "0.17.0"
 dependencies = [
  "faderframe-midi",
+ "faderframe-midi-ump",
  "midir",
  "rtrb",
  "tracing",
+]
+
+[[package]]
+name = "faderframe-midi-ump"
+version = "0.17.0"
+dependencies = [
+ "alsa-sys",
+ "faderframe-midi",
+ "libc",
 ]
 
 [[package]]
