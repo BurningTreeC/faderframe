@@ -304,6 +304,11 @@ pub fn install(app: &Rc<AppState>) {
             "show-lead-sheet",
             A::Workspace(W::ShowView(ViewId::lead_sheet())),
         ),
+        dispatch(
+            app,
+            "show-events",
+            A::Workspace(W::ShowView(ViewId::events())),
+        ),
         entry(app, "import-video", crate::video::import),
         entry(app, "conform-lists", crate::video::conform_lists),
         dispatch(

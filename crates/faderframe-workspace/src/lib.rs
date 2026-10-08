@@ -112,6 +112,10 @@ impl ViewId {
     pub fn lead_sheet() -> Self {
         Self::new("lead-sheet")
     }
+
+    pub fn events() -> Self {
+        Self::new("events")
+    }
 }
 
 impl fmt::Debug for ViewId {

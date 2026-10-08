@@ -123,6 +123,110 @@ fn tidy_lanes(m: &mut MidiClip) {
     m.controllers = merged;
 }
 
+/// Change one field of one event of `m` (a clip starting at `start`).
+fn edit_event(
+    m: &mut MidiClip,
+    start: MusicalTime,
+    event: EventRef,
+    field: EventField,
+    value: EventValue,
+) {
+    let number = |v: EventValue| match v {
+        EventValue::Number(n) => Some(n),
+        EventValue::Time(_) => None,
+    };
+    let time = |v: EventValue| match v {
+        EventValue::Time(t) => Some(t),
+        EventValue::Number(_) => None,
+    };
+    match event {
+        EventRef::Note(id) => {
+            let Some(n) = m.notes.iter_mut().find(|n| n.id == id) else {
+                return;
+            };
+            match field {
+                EventField::Position => {
+                    if let Some(t) = time(value) {
+                        n.start = (t - start).max(MusicalTime::ZERO);
+                    }
+                }
+                EventField::Length => {
+                    if let Some(t) = time(value) {
+                        n.length = t.max(MusicalTime::from_ticks(1));
+                    }
+                }
+                EventField::Channel => {
+                    if let Some(c) = number(value) {
+                        n.channel = c.clamp(0, 15) as u8;
+                    }
+                }
+                EventField::Data1 => {
+                    if let Some(k) = number(value) {
+                        n.key = k.clamp(0, 127) as u8;
+                    }
+                }
+                EventField::Data2 => {
+                    if let Some(v) = number(value) {
+                        n.velocity = v.clamp(1, 127) as u8;
+                    }
+                }
+            }
+            m.notes.sort_by_key(|n| (n.start, n.key));
+        }
+        EventRef::Controller {
+            controller,
+            channel,
+            time: at,
+        } => {
+            let Some(lane) = m.lane(controller, channel) else {
+                return;
+            };
+            let Some(i) = point_at(lane, at) else {
+                return;
+            };
+            let mut point = lane.points[i];
+            let (mut to_controller, mut to_channel) = (controller, channel);
+            match field {
+                EventField::Position => {
+                    if let Some(t) = time(value) {
+                        point.time = (t - start).max(MusicalTime::ZERO);
+                    }
+                }
+                EventField::Channel => {
+                    if let Some(c) = number(value) {
+                        to_channel = c.clamp(0, 15) as u8;
+                    }
+                }
+                EventField::Data1 => {
+                    if let (MidiController::Cc { .. }, Some(c)) = (controller, number(value)) {
+                        to_controller = MidiController::Cc {
+                            number: c.clamp(0, 127) as u8,
+                        };
+                    }
+                }
+                EventField::Data2 => {
+                    if let Some(v) = number(value) {
+                        point.value = v.clamp(0, i64::from(to_controller.max())) as u16;
+                    }
+                }
+                EventField::Length => return,
+            }
+            m.lane_mut(controller, channel).points.remove(i);
+            put_point(m, to_controller, to_channel, point);
+            tidy_lanes(m);
+        }
+        EventRef::Sysex(i) => {
+            if field != EventField::Position || i >= m.sysex.len() {
+                return;
+            }
+            if let Some(t) = time(value) {
+                m.sysex[i].time = (t - start).max(MusicalTime::ZERO);
+                m.sysex.sort_by_key(|s| s.time);
+            }
+        }
+    }
+}
+
 impl Session {
     /// The MIDI clip `clip` and its start.
     fn midi_of(&self, clip: ClipId) -> Result<(MusicalTime, MidiClip)> {
@@ -224,108 +328,22 @@ impl Session {
         rows.into_iter().map(|(_, r)| r).collect()
     }
 
-    /// Change one field of one event.
-    pub(crate) fn edit_midi_event(
+    /// Change one field of events (the same value for each), one undo
+    /// step.
+    pub(crate) fn edit_midi_events(
         &mut self,
         clip: ClipId,
-        event: EventRef,
+        events: &[EventRef],
         field: EventField,
         value: EventValue,
     ) -> Result<()> {
         let (start, mut m) = self.midi_of(clip)?;
-        let number = |v: EventValue| match v {
-            EventValue::Number(n) => Some(n),
-            EventValue::Time(_) => None,
-        };
-        let time = |v: EventValue| match v {
-            EventValue::Time(t) => Some(t),
-            EventValue::Number(_) => None,
-        };
-        match event {
-            EventRef::Note(id) => {
-                let Some(n) = m.notes.iter_mut().find(|n| n.id == id) else {
-                    return Ok(());
-                };
-                match field {
-                    EventField::Position => {
-                        if let Some(t) = time(value) {
-                            n.start = (t - start).max(MusicalTime::ZERO);
-                        }
-                    }
-                    EventField::Length => {
-                        if let Some(t) = time(value) {
-                            n.length = t.max(MusicalTime::from_ticks(1));
-                        }
-                    }
-                    EventField::Channel => {
-                        if let Some(c) = number(value) {
-                            n.channel = c.clamp(0, 15) as u8;
-                        }
-                    }
-                    EventField::Data1 => {
-                        if let Some(k) = number(value) {
-                            n.key = k.clamp(0, 127) as u8;
-                        }
-                    }
-                    EventField::Data2 => {
-                        if let Some(v) = number(value) {
-                            n.velocity = v.clamp(1, 127) as u8;
-                        }
-                    }
-                }
-                m.notes.sort_by_key(|n| (n.start, n.key));
-            }
-            EventRef::Controller {
-                controller,
-                channel,
-                time: at,
-            } => {
-                let Some(lane) = m.lane(controller, channel) else {
-                    return Ok(());
-                };
-                let Some(i) = point_at(lane, at) else {
-                    return Ok(());
-                };
-                let mut point = lane.points[i];
-                let (mut to_controller, mut to_channel) = (controller, channel);
-                match field {
-                    EventField::Position => {
-                        if let Some(t) = time(value) {
-                            point.time = (t - start).max(MusicalTime::ZERO);
-                        }
-                    }
-                    EventField::Channel => {
-                        if let Some(c) = number(value) {
-                            to_channel = c.clamp(0, 15) as u8;
-                        }
-                    }
-                    EventField::Data1 => {
-                        if let (MidiController::Cc { .. }, Some(c)) = (controller, number(value)) {
-                            to_controller = MidiController::Cc {
-                                number: c.clamp(0, 127) as u8,
-                            };
-                        }
-                    }
-                    EventField::Data2 => {
-                        if let Some(v) = number(value) {
-                            point.value = v.clamp(0, i64::from(to_controller.max())) as u16;
-                        }
-                    }
-                    EventField::Length => return Ok(()),
-                }
-                m.lane_mut(controller, channel).points.remove(i);
-                put_point(&mut m, to_controller, to_channel, point);
-                tidy_lanes(&mut m);
-            }
-            EventRef::Sysex(i) => {
-                if field != EventField::Position || i >= m.sysex.len() {
-                    return Ok(());
-                }
-                if let Some(t) = time(value) {
-                    m.sysex[i].time = (t - start).max(MusicalTime::ZERO);
-                    m.sysex.sort_by_key(|s| s.time);
-                }
-            }
+        let before = m.clone();
+        for &event in events {
+            edit_event(&mut m, start, event, field, value);
+        }
+        if m == before {
+            return Ok(());
         }
         self.set_midi(clip, start, m, "Edit MIDI Event")
     }

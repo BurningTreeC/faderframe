@@ -47,20 +47,20 @@ fn the_event_list_edits_a_clips_events() {
         (cc.data1, cc.data2, cc.channel),
         (Some(1), Some(64), Some(0))
     );
-    s.dispatch(Action::EditMidiEvent {
+    s.dispatch(Action::EditMidiEvents {
         clip,
-        event: cc.event,
+        events: vec![cc.event],
         field: EventField::Data2,
         value: EventValue::Number(100),
     })
     .unwrap();
-    s.dispatch(Action::EditMidiEvent {
+    s.dispatch(Action::EditMidiEvents {
         clip,
-        event: EventRef::Controller {
+        events: vec![EventRef::Controller {
             controller: MidiController::MOD_WHEEL,
             channel: 0,
             time: MusicalTime::ZERO,
-        },
+        }],
         field: EventField::Channel,
         value: EventValue::Number(3),
     })
@@ -76,9 +76,9 @@ fn the_event_list_edits_a_clips_events() {
         "moved to channel 4"
     );
     // Its controller number: now CC 11 (another lane).
-    s.dispatch(Action::EditMidiEvent {
+    s.dispatch(Action::EditMidiEvents {
         clip,
-        event: cc.event,
+        events: vec![cc.event],
         field: EventField::Data1,
         value: EventValue::Number(11),
     })
@@ -112,9 +112,9 @@ fn the_event_list_edits_a_clips_events() {
         ),
     ] {
         let n = steps(&s);
-        s.dispatch(Action::EditMidiEvent {
+        s.dispatch(Action::EditMidiEvents {
             clip,
-            event: note.event,
+            events: vec![note.event],
             field,
             value,
         })

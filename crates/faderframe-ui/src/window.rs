@@ -484,6 +484,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
         &section(&[
             ("Mixer", "app.view-mixer"),
             ("Piano Roll", "app.view-piano-roll"),
+            ("MIDI Event List", "app.view-events"),
             ("Automation", "app.view-automation"),
             ("Tools (Loudness, Level, Phase, Spectrum)", "app.view-tools"),
             ("Album (Songs, Loudness, Delivery)", "app.view-album"),

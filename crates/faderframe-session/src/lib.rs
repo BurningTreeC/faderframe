@@ -230,6 +230,8 @@ pub enum Action {
     ClearSelection,
     /// Open a MIDI clip in the piano roll (and show the piano roll).
     OpenClipEditor(ClipId),
+    /// Open a MIDI clip in the event list (and show it).
+    OpenEventList(ClipId),
     ResetClipIndicators,
     AddTrack(TrackKind),
     /// Add a track with an explicit format (e.g. a stereo audio track).
@@ -736,10 +738,10 @@ pub enum Action {
         clip: ClipId,
         index: usize,
     },
-    /// The event list: change one field of one event.
-    EditMidiEvent {
+    /// The event list: change one field of events (one value for each).
+    EditMidiEvents {
         clip: ClipId,
-        event: midi_events::EventRef,
+        events: Vec<midi_events::EventRef>,
         field: midi_events::EventField,
         value: midi_events::EventValue,
     },
@@ -3110,6 +3112,18 @@ impl Session {
                 self.selection.clear();
                 self.revision += 1;
             }
+            Action::OpenEventList(clip) => {
+                if self
+                    .project
+                    .clip(clip)
+                    .is_some_and(|c| c.as_midi().is_some())
+                {
+                    self.editor_clip = Some(clip);
+                    self.selection.notes.clear();
+                    self.workspace_action(WorkspaceAction::ShowView(ViewId::events()))?;
+                    self.revision += 1;
+                }
+            }
             Action::OpenClipEditor(clip) => {
                 if self
                     .project
@@ -3651,12 +3665,12 @@ impl Session {
             } => self.set_note_expression(clip, note, kind, from, to, &points)?,
             Action::AddSysex { clip, at, messages } => self.add_sysex(clip, at, messages)?,
             Action::RemoveSysex { clip, index } => self.remove_sysex(clip, index)?,
-            Action::EditMidiEvent {
+            Action::EditMidiEvents {
                 clip,
-                event,
+                events,
                 field,
                 value,
-            } => self.edit_midi_event(clip, event, field, value)?,
+            } => self.edit_midi_events(clip, &events, field, value)?,
             Action::RemoveMidiEvents { clip, events } => self.remove_midi_events(clip, &events)?,
             Action::AddMidiEvent {
                 clip,

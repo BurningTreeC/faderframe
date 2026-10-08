@@ -1187,6 +1187,7 @@ dependencies = [
  "faderframe-view-clipfx",
  "faderframe-view-ddp",
  "faderframe-view-devices",
+ "faderframe-view-events",
  "faderframe-view-history",
  "faderframe-view-launcher",
  "faderframe-view-leadsheet",
@@ -1342,6 +1343,18 @@ dependencies = [
  "faderframe-plugin-host",
  "faderframe-project",
  "faderframe-session",
+ "faderframe-ui-canvas",
+]
+
+[[package]]
+name = "faderframe-view-events"
+version = "0.16.0"
+dependencies = [
+ "faderframe-core",
+ "faderframe-engine",
+ "faderframe-project",
+ "faderframe-session",
+ "faderframe-timeline",
  "faderframe-ui-canvas",
 ]
 

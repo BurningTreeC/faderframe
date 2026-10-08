@@ -2534,6 +2534,10 @@ impl ArrangerView {
                 "Edit in Piano Roll",
                 Action::OpenClipEditor(clip.id),
             ));
+            items.push(MenuItem::new(
+                "Edit in Event List",
+                Action::OpenEventList(clip.id),
+            ));
             // Every note and controller value of the clips onto a channel.
             let midi: Vec<ClipId> = targets
                 .iter()

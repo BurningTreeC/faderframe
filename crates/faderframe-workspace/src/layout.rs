@@ -36,10 +36,12 @@ pub enum ViewKind {
     Adr,
     /// A clip's lead sheet, engraved.
     LeadSheet,
+    /// A MIDI clip's events, one row each.
+    Events,
 }
 
 impl ViewKind {
-    pub const ALL: [ViewKind; 17] = [
+    pub const ALL: [ViewKind; 18] = [
         ViewKind::Arranger,
         ViewKind::Mixer,
         ViewKind::PianoRoll,
@@ -57,14 +59,16 @@ impl ViewKind {
         ViewKind::Video,
         ViewKind::Adr,
         ViewKind::LeadSheet,
+        ViewKind::Events,
     ];
 
     /// The order tabs keep, whichever opened first: the arranger, the
     /// mixer, then as the View menu lists them.
-    pub const TAB_ORDER: [ViewKind; 17] = [
+    pub const TAB_ORDER: [ViewKind; 18] = [
         ViewKind::Arranger,
         ViewKind::Mixer,
         ViewKind::PianoRoll,
+        ViewKind::Events,
         ViewKind::Automation,
         ViewKind::Tools,
         ViewKind::Album,
@@ -114,6 +118,7 @@ impl ViewKind {
             ViewKind::Video => "Video",
             ViewKind::Adr => "ADR Cues",
             ViewKind::LeadSheet => "Lead Sheet",
+            ViewKind::Events => "Event List",
         }
     }
 
@@ -136,6 +141,7 @@ impl ViewKind {
             ViewKind::Video => ViewId::video(),
             ViewKind::Adr => ViewId::adr(),
             ViewKind::LeadSheet => ViewId::lead_sheet(),
+            ViewKind::Events => ViewId::events(),
         }
     }
 }

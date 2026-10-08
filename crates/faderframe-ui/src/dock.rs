@@ -104,6 +104,12 @@ fn create_view(app: &Rc<AppState>, kind: ViewKind) -> ViewHost {
             false,
             true,
         ),
+        ViewKind::Events => ViewHost::new(
+            app,
+            Box::new(faderframe_view_events::EventsView::new(theme)),
+            false,
+            true,
+        ),
         ViewKind::LeadSheet => ViewHost::new(
             app,
             Box::new(faderframe_view_leadsheet::LeadSheetView::new(theme)),
@@ -535,9 +541,10 @@ pub fn realize(app: &Rc<AppState>) {
 /// A dock view: its action's name and its id.
 type DockView = (&'static str, fn() -> ViewId);
 
-pub(crate) const DOCK_VIEWS: [DockView; 16] = [
+pub(crate) const DOCK_VIEWS: [DockView; 17] = [
     ("mixer", ViewId::mixer),
     ("piano-roll", ViewId::piano_roll),
+    ("events", ViewId::events),
     ("automation", ViewId::automation),
     ("tools", ViewId::tools),
     ("album", ViewId::album),
