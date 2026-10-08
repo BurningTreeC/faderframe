@@ -51,6 +51,9 @@ mod imp {
         /// The payload left the window: a native drag carries it to other
         /// windows (this view's own drag is over).
         pub native_drag: Cell<bool>,
+        /// How much later than predicted frames have reached the screen
+        /// (µs, averaged from the frame clock's completed timings).
+        pub presentation_bias: Cell<i64>,
     }
 
     #[glib::object_subclass]
@@ -109,7 +112,7 @@ mod imp {
             snapshot.push_clip(&graphene::Rect::new(0.0, 0.0, size.w, size.h));
             let w: &gtk::Widget = widget.upcast_ref();
             if let Some(view) = self.view.borrow_mut().as_mut() {
-                view.frame_lead(frame_lead(w));
+                view.frame_timing(frame_lead(w, &self.presentation_bias), device_scale(w));
             }
             let mut painter = SnapshotPainter::new(snapshot, w, &self.text_cache, &self.path_cache);
             if paint_stats::enabled() {
@@ -149,12 +152,28 @@ glib::wrapper! {
 
 /// How far ahead (ns) the frame now being drawn is expected on screen: the
 /// frame clock's next predicted presentation (a refresh away when it has
-/// no history yet).
-fn frame_lead(widget: &gtk::Widget) -> i64 {
+/// no history yet), corrected by how much later than predicted earlier
+/// frames actually got there (presentation feedback, where the compositor
+/// reports it; `bias` keeps the running average, µs).
+fn frame_lead(widget: &gtk::Widget, bias: &Cell<i64>) -> i64 {
     let now = glib::monotonic_time();
     let Some(clock) = widget.frame_clock() else {
         return 16_666_667;
     };
+    // The newest frame whose presentation is known.
+    let counter = clock.frame_counter();
+    for n in (counter.saturating_sub(8)..counter).rev() {
+        if let Some(t) = clock.timings(n)
+            && t.is_complete()
+        {
+            let (actual, predicted) = (t.presentation_time(), t.predicted_presentation_time());
+            if actual > 0 && predicted > 0 {
+                let late = (actual - predicted).clamp(-50_000, 100_000);
+                bias.set(bias.get() + (late - bias.get()) / 8);
+            }
+            break;
+        }
+    }
     let (interval, predicted) = clock.refresh_info(now);
     let interval = if interval > 0 { interval } else { 16_667 };
     let at = if predicted > now {
@@ -162,7 +181,15 @@ fn frame_lead(widget: &gtk::Widget) -> i64 {
     } else {
         now + interval
     };
-    (at - now) * 1000
+    (at - now + bias.get()) * 1000
+}
+
+/// Device pixels per logical pixel of `widget`'s surface.
+fn device_scale(widget: &gtk::Widget) -> f32 {
+    widget
+        .native()
+        .and_then(|n| n.surface())
+        .map_or(widget.scale_factor() as f64, |s| s.scale()) as f32
 }
 
 fn modifiers(state: gdk::ModifierType) -> Modifiers {

@@ -25,6 +25,9 @@ pub struct VideoView {
     theme: Theme,
     /// When the frame being drawn reaches the screen (ns from now).
     lead: i64,
+    /// Device pixels per logical pixel (pictures are decoded at device
+    /// size).
+    scale: f32,
     overlay: bool,
     /// Waiting for the exact frame (keep drawing).
     waiting: bool,
@@ -35,6 +38,7 @@ impl VideoView {
         Self {
             theme,
             lead: 16_666_667,
+            scale: 1.0,
             overlay: true,
             waiting: false,
         }
@@ -110,8 +114,9 @@ impl VideoView {
 }
 
 impl CanvasView<Session, Action> for VideoView {
-    fn frame_lead(&mut self, lead_ns: i64) {
+    fn frame_timing(&mut self, lead_ns: i64, scale: f32) {
         self.lead = lead_ns;
+        self.scale = scale.clamp(0.5, 4.0);
     }
 
     fn set_theme(&mut self, theme: &Theme) {
@@ -127,7 +132,11 @@ impl CanvasView<Session, Action> for VideoView {
         // Picture is framed in black, whatever the skin.
         p.fill(area, Color::rgb(0.0, 0.0, 0.0));
         let ui = &theme.ui;
-        let max = (size.w.max(1.0) as u32, size.h.max(1.0) as u32);
+        // At device pixels: sharp on HiDPI screens.
+        let max = (
+            (size.w * self.scale).max(1.0) as u32,
+            (size.h * self.scale).max(1.0) as u32,
+        );
         let shown = model.video_picture(self.lead, max);
         self.waiting = false;
         let small = TextStyle::new(11.0, ui.text_dim).align(Align::Center);
@@ -208,6 +217,26 @@ impl CanvasView<Session, Action> for VideoView {
                 &faderframe_ui_canvas::Paint::Solid(Color::rgba(0.0, 0.0, 0.0, 0.6)),
             );
             p.text(&what, ib, &info);
+        }
+        // The late-frame meter: frames shown while playing and how many
+        // were not the one wanted when they reached the screen.
+        let (shown_n, late) = model.video_frames_late();
+        if self.overlay && shown_n > 0 {
+            let text = format!("late {late} / {shown_n}");
+            let w = text.chars().count() as f32 * 6.2 + 14.0;
+            let r = Rect::new(size.w - w - 8.0, size.h - 24.0, w, 18.0);
+            let ok = late * 100 <= shown_n;
+            p.fill_rounded(
+                r,
+                4.0,
+                &faderframe_ui_canvas::Paint::Solid(Color::rgba(0.0, 0.0, 0.0, 0.6)),
+            );
+            let colour = if ok {
+                Color::rgba(0.6, 0.9, 0.6, 0.9)
+            } else {
+                Color::rgba(1.0, 0.75, 0.3, 0.95)
+            };
+            p.text(&text, r, &TextStyle::new(10.0, colour).align(Align::Center));
         }
         // Jobs (reading, proxies, writing) above the bottom line.
         let jobs = model.video_jobs();

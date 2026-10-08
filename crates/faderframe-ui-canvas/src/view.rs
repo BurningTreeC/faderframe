@@ -188,9 +188,10 @@ pub trait CanvasView<M, A> {
     fn set_theme(&mut self, _theme: &Theme) {}
 
     /// Before each paint: how far ahead (ns) the frame being drawn is
-    /// expected on screen, from the toolkit's frame clock (video shows the
-    /// picture for that moment).
-    fn frame_lead(&mut self, _lead_ns: i64) {}
+    /// expected on screen, from the toolkit's frame clock and its
+    /// presentation feedback (video shows the picture for that moment), and
+    /// the device pixels per logical pixel.
+    fn frame_timing(&mut self, _lead_ns: i64, _scale: f32) {}
 
     /// Should the host keep redrawing every frame (meters, playhead)?
     fn wants_frames(&self, _model: &M) -> bool {

@@ -38,8 +38,28 @@ use std::thread::JoinHandle;
 /// Bytes of decoded frames kept (thumbnails a tenth more).
 const FRAME_BUDGET: usize = 384 << 20;
 
-/// Proxies' height.
-const PROXY_HEIGHT: u32 = 540;
+/// Proxy heights to choose from.
+pub const PROXY_HEIGHTS: [u32; 4] = [360, 540, 720, 1080];
+
+/// How video is cached.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VideoSettings {
+    /// Proxies' height (`None`: no proxies; scrubbing long-GOP files is
+    /// slower then).
+    pub proxy_height: Option<u32>,
+    /// Where indexes and proxies are kept (`None`: the computer's cache
+    /// folder).
+    pub cache_dir: Option<PathBuf>,
+}
+
+impl Default for VideoSettings {
+    fn default() -> Self {
+        Self {
+            proxy_height: Some(540),
+            cache_dir: None,
+        }
+    }
+}
 
 /// Another place for [`cache_dir`] (tests: never the user's cache).
 static CACHE_OVERRIDE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
@@ -115,9 +135,32 @@ fn index_of(
     Ok(ix)
 }
 
-/// Where `path`'s proxy is (made or to be made).
-fn proxy_path(path: &Path) -> PathBuf {
-    cache_dir().join(format!("{}.proxy{PROXY_HEIGHT}.mkv", cache_key(path)))
+/// Where `path`'s proxy of `height` is (made or to be made).
+fn proxy_path(path: &Path, height: u32) -> PathBuf {
+    cache_dir().join(format!("{}.proxy{height}.mkv", cache_key(path)))
+}
+
+/// Bytes the cache folder's indexes and proxies take.
+pub fn video_cache_size() -> u64 {
+    cache_files()
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum()
+}
+
+fn cache_files() -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(cache_dir()) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            name.ends_with(".index.json") || (name.contains(".proxy") && name.ends_with(".mkv"))
+        })
+        .collect()
 }
 
 /// A share done, shared with the shell.
@@ -200,6 +243,7 @@ pub struct VideoSourceState {
 
 #[derive(Default)]
 pub(crate) struct VideoState {
+    settings: VideoSettings,
     service: Option<FrameService>,
     known: HashMap<VideoSourceId, Known>,
     jobs: Vec<Job>,
@@ -340,6 +384,62 @@ impl crate::Session {
                     .and_then(|s| s.error(source.raw()))
             }),
         }
+    }
+
+    /// Start counting frames shown and late again (playback starts).
+    pub(crate) fn reset_video_stats(&self) {
+        self.video.shown.store(0, Ordering::Relaxed);
+        self.video.late.store(0, Ordering::Relaxed);
+    }
+
+    pub fn video_settings(&self) -> &VideoSettings {
+        &self.video.settings
+    }
+
+    /// Change how video is cached: proxies of another height (or none)
+    /// replace the ones in use as they are made; another cache folder
+    /// starts empty.
+    pub fn set_video_settings(&mut self, settings: VideoSettings) {
+        if settings == self.video.settings {
+            return;
+        }
+        set_cache_dir(settings.cache_dir.clone());
+        self.video.settings = settings;
+        self.drop_proxies();
+    }
+
+    /// Stop making proxies and stop using the ones made (they are picked
+    /// up or made again as the settings say).
+    fn drop_proxies(&mut self) {
+        for j in self
+            .video
+            .jobs
+            .iter()
+            .filter(|j| j.label.starts_with("Proxy"))
+        {
+            j.cancel.store(true, Ordering::Relaxed);
+        }
+        for k in self.video.known.values_mut() {
+            k.proxy = None;
+            k.registered = false;
+        }
+        self.revision += 1;
+    }
+
+    /// Delete the cache's indexes and proxies (they are made again as
+    /// needed); the bytes freed.
+    pub fn clear_video_cache(&mut self) -> u64 {
+        self.drop_proxies();
+        let mut freed = 0;
+        for p in cache_files() {
+            let len = std::fs::metadata(&p).map_or(0, |m| m.len());
+            match std::fs::remove_file(&p) {
+                Ok(()) => freed += len,
+                // In use (Windows keeps open files): left for next time.
+                Err(e) => tracing::info!("{}: {e}", p.display()),
+            }
+        }
+        freed
     }
 
     /// Frames shown while playing, and of them not the one wanted.
@@ -559,13 +659,15 @@ impl crate::Session {
                 continue;
             }
             // A proxy that is already there.
-            if known.proxy.is_none() {
-                let p = proxy_path(&path);
+            let proxy_height = self.video.settings.proxy_height;
+            if known.proxy.is_none()
+                && let Some(height) = proxy_height
+            {
+                let p = proxy_path(&path, height);
                 if p.is_file()
                     && let Some(s) = self.project.video.sources.get(&id)
                 {
-                    let size =
-                        faderframe_video::fit(s.width, s.height, s.par, u32::MAX, PROXY_HEIGHT);
+                    let size = faderframe_video::fit(s.width, s.height, s.par, u32::MAX, height);
                     known.proxy = Some((p, size));
                     known.registered = false;
                 }
@@ -593,16 +695,17 @@ impl crate::Session {
             let proxying = self.video.jobs.iter().any(|j| j.label.starts_with("Proxy"));
             if needs
                 && !proxying
+                && let Some(height) = proxy_height
                 && let Some(s) = self.project.video.sources.get(&id).cloned()
             {
-                let out = proxy_path(&path);
+                let out = proxy_path(&path, height);
                 let name = s.name();
                 self.spawn_video(
                     format!("Proxy for {name}"),
                     Some(id),
                     move |share, cancel| {
                         let spec = ProxySpec {
-                            height: PROXY_HEIGHT,
+                            height,
                             ..ProxySpec::default()
                         };
                         let picture = (s.width, s.height, s.par);
@@ -616,7 +719,7 @@ impl crate::Session {
                         )
                         .map_err(|e| e.to_string())?;
                         let size =
-                            faderframe_video::fit(s.width, s.height, s.par, u32::MAX, PROXY_HEIGHT);
+                            faderframe_video::fit(s.width, s.height, s.par, u32::MAX, height);
                         Ok(Done::Proxied {
                             source: id,
                             proxy: out,

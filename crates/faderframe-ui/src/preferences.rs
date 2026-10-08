@@ -519,6 +519,142 @@ fn editing_page(app: &Rc<AppState>) -> gtk::Widget {
     g.upcast()
 }
 
+/// Video: proxies (their size, or none) and the cache of indexes and
+/// proxies (where, how big, clearing it).
+fn video_page(app: &Rc<AppState>) -> gtk::Widget {
+    use faderframe_session::video::{PROXY_HEIGHTS, video_cache_size};
+    let g = form();
+    let prefs = Preferences::load();
+    let mut labels = vec!["No proxies".to_string()];
+    labels.extend(PROXY_HEIGHTS.iter().map(|h| format!("{h}p (MJPEG)")));
+    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let proxy = gtk::DropDown::from_strings(&refs);
+    proxy.set_selected(
+        PROXY_HEIGHTS
+            .iter()
+            .position(|h| *h == prefs.video_proxy_height)
+            .map_or(0, |i| i as u32 + 1),
+    );
+    row(&g, 0, "Proxies", &proxy);
+    g.attach(
+        &note(
+            "Long-GOP and large pictures get an all-intra copy at this height for scrubbing;              stopped, frames are decoded sharp from the original, and exports always use it.",
+        ),
+        1,
+        1,
+        1,
+        1,
+    );
+    let folder = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let path = gtk::Label::new(Some(
+        &faderframe_session::video::cache_dir().display().to_string(),
+    ));
+    path.set_xalign(0.0);
+    path.set_hexpand(true);
+    path.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    path.set_selectable(true);
+    let choose = gtk::Button::with_label("Choose…");
+    let reset = gtk::Button::with_label("Default");
+    reset.set_sensitive(prefs.video_cache_dir.is_some());
+    folder.append(&path);
+    folder.append(&choose);
+    folder.append(&reset);
+    row(&g, 2, "Cache folder", &folder);
+    let size_text = |bytes: u64| {
+        if bytes >= 1_000_000_000 {
+            format!("{:.1} GB of indexes and proxies", bytes as f64 / 1e9)
+        } else {
+            format!("{:.0} MB of indexes and proxies", bytes as f64 / 1e6)
+        }
+    };
+    let clear_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let size = gtk::Label::new(Some(&size_text(video_cache_size())));
+    size.set_xalign(0.0);
+    size.set_hexpand(true);
+    let clear = gtk::Button::with_label("Clear Cache");
+    clear_box.append(&size);
+    clear_box.append(&clear);
+    row(&g, 3, "Cache", &clear_box);
+
+    let apply = {
+        let weak = Rc::downgrade(app);
+        move |change: &dyn Fn(&mut Preferences)| {
+            let mut p = Preferences::load();
+            change(&mut p);
+            if let Err(e) = p.save() {
+                tracing::warn!("could not save the preferences: {e}");
+            }
+            if let Some(app) = weak.upgrade() {
+                let settings = p.video_settings();
+                app.with_session(|s| {
+                    s.set_video_settings(settings);
+                    Ok(())
+                });
+            }
+        }
+    };
+    let apply = Rc::new(apply);
+    {
+        let apply = Rc::clone(&apply);
+        proxy.connect_selected_notify(move |d| {
+            let i = d.selected() as usize;
+            let h = if i == 0 { 0 } else { PROXY_HEIGHTS[i - 1] };
+            apply(&|p| p.video_proxy_height = h);
+        });
+    }
+    {
+        let (apply, path, reset2, size2) =
+            (Rc::clone(&apply), path.clone(), reset.clone(), size.clone());
+        reset.connect_clicked(move |_| {
+            apply(&|p| p.video_cache_dir = None);
+            path.set_text(&faderframe_session::video::cache_dir().display().to_string());
+            reset2.set_sensitive(false);
+            size2.set_text(&size_text(video_cache_size()));
+        });
+    }
+    {
+        let (apply, path, reset, size2) =
+            (Rc::clone(&apply), path.clone(), reset.clone(), size.clone());
+        choose.connect_clicked(move |b| {
+            let dialog = gtk::FileDialog::builder()
+                .title("Video Cache Folder")
+                .modal(true)
+                .build();
+            let window = b.root().and_downcast::<gtk::Window>();
+            let (apply, path, reset, size2) = (
+                Rc::clone(&apply),
+                path.clone(),
+                reset.clone(),
+                size2.clone(),
+            );
+            dialog.select_folder(window.as_ref(), gtk::gio::Cancellable::NONE, move |res| {
+                let Some(dir) = res.ok().and_then(|f| f.path()) else {
+                    return;
+                };
+                let text = dir.display().to_string();
+                apply(&|p| p.video_cache_dir = Some(text.clone()));
+                path.set_text(&text);
+                reset.set_sensitive(true);
+                size2.set_text(&size_text(video_cache_size()));
+            });
+        });
+    }
+    {
+        let (weak, size2) = (Rc::downgrade(app), size.clone());
+        clear.connect_clicked(move |_| {
+            let Some(app) = weak.upgrade() else { return };
+            let mut freed = 0;
+            app.with_session(|s| {
+                freed = s.clear_video_cache();
+                Ok(())
+            });
+            size2.set_text(&size_text(video_cache_size()));
+            tracing::info!("video cache: {freed} bytes freed");
+        });
+    }
+    g.upcast()
+}
+
 fn engine_page(app: &Rc<AppState>) -> gtk::Widget {
     let g = form();
     let s = app.session.borrow();
@@ -657,6 +793,7 @@ pub fn open(app: &Rc<AppState>, page: Option<&str>) {
         "Recording",
     );
     stack.add_titled(&crate::midi_prefs::page(app), Some("midi"), "MIDI");
+    stack.add_titled(&video_page(app), Some("video"), "Video");
     stack.add_titled(&engine_page(app), Some("engine"), "Engine");
     stack.add_titled(&project_page(app), Some("project"), "Project");
     if let Some(p) = page {

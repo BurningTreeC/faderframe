@@ -14,6 +14,14 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
+/// The video cache's folder is the process's: the tests take turns.
+static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn turn() -> std::sync::MutexGuard<'static, ()> {
+    TURN.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// A fresh folder for a test, with the video cache in it (never the
 /// user's).
 fn dir(name: &str) -> PathBuf {
@@ -70,6 +78,7 @@ fn still(s: &mut Session) -> faderframe_session::video::VideoShown {
 
 #[test]
 fn a_movie_is_imported_shown_saved_and_written_out() {
+    let _turn = turn();
     let d = dir("import");
     let file = movie(&d);
     let mut s = Session::new(Project::new("Film", 48_000), None, EngineConfig::default()).unwrap();
@@ -171,6 +180,7 @@ fn a_movie_is_imported_shown_saved_and_written_out() {
 
 #[test]
 fn the_picture_follows_the_engine_while_playing() {
+    let _turn = turn();
     let d = dir("play");
     let file = movie(&d);
     let mut s = Session::new(Project::new("Film", 48_000), None, EngineConfig::default()).unwrap();
@@ -211,5 +221,34 @@ fn the_picture_follows_the_engine_while_playing() {
     assert!(shown > 10, "{shown} frames counted");
     eprintln!("{shown} frames shown, {late} not ready in time");
     s.stop_audio();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The cache: what a movie leaves there (its index), cleared on request,
+/// and moved elsewhere by the settings.
+#[test]
+fn the_video_cache_is_kept_where_set_and_cleared() {
+    let _turn = turn();
+    let d = dir("cache");
+    let file = movie(&d);
+    let mut s = Session::new(Project::new("Film", 48_000), None, EngineConfig::default()).unwrap();
+    s.import_video(file.clone(), false);
+    s.wait_for_video();
+    assert!(
+        faderframe_session::video::video_cache_size() > 0,
+        "an index"
+    );
+    let freed = s.clear_video_cache();
+    assert!(freed > 0);
+    assert_eq!(faderframe_session::video::video_cache_size(), 0);
+    // Another folder: the next index goes there.
+    let other = d.join("elsewhere");
+    s.set_video_settings(faderframe_session::video::VideoSettings {
+        proxy_height: None,
+        cache_dir: Some(other.clone()),
+    });
+    s.import_video(file, false);
+    s.wait_for_video();
+    assert!(std::fs::read_dir(&other).unwrap().count() > 0);
     let _ = std::fs::remove_dir_all(&d);
 }

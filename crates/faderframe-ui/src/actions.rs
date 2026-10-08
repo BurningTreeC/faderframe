@@ -1187,6 +1187,10 @@ pub fn install(app: &Rc<AppState>) {
                 None => tracing::warn!("chain-insert: no container chain {chain} or no '{id}'"),
             }
         }),
+        // Development aid: `preferences-page:<general|audio|video|…>`.
+        named("preferences-page", |a, arg| {
+            crate::preferences::open(a, Some(arg));
+        }),
         // Development aids: `import-video-from:<path>` imports a video with
         // its sound, `video-offset:<ms>` sets the picture offset,
         // `export-movie-to:<path>` writes the movie (container by the

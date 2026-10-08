@@ -84,6 +84,10 @@ pub struct Preferences {
     pub shortcuts: std::collections::BTreeMap<String, Vec<String>>,
     /// The project template New Project starts from (its name).
     pub default_template: Option<String>,
+    /// Video proxies' height (0: no proxies).
+    pub video_proxy_height: u32,
+    /// Where video indexes and proxies go (`None`: the cache folder).
+    pub video_cache_dir: Option<String>,
 }
 
 impl Default for Preferences {
@@ -126,11 +130,21 @@ impl Default for Preferences {
             headphone_correction: None,
             shortcuts: Default::default(),
             default_template: None,
+            video_proxy_height: 540,
+            video_cache_dir: None,
         }
     }
 }
 
 impl Preferences {
+    /// How video is cached, as stored.
+    pub fn video_settings(&self) -> faderframe_session::video::VideoSettings {
+        faderframe_session::video::VideoSettings {
+            proxy_height: (self.video_proxy_height > 0).then_some(self.video_proxy_height),
+            cache_dir: self.video_cache_dir.as_ref().map(std::path::PathBuf::from),
+        }
+    }
+
     /// External synchronisation as stored.
     pub fn sync_settings(&self) -> faderframe_session::SyncSettings {
         faderframe_session::SyncSettings {

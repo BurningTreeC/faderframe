@@ -205,6 +205,7 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
         tracing::warn!("recording settings: {e}");
     }
     session.set_sync_settings(prefs.sync_settings());
+    session.set_video_settings(prefs.video_settings());
     session.editor.show_edit_toolbar = prefs.show_edit_toolbar;
     // MIDI keyboards and controllers (FADERFRAME_NO_MIDI=1 keeps the
     // system's devices closed, e.g. for scripted runs).

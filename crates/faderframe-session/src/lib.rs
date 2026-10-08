@@ -2060,6 +2060,7 @@ impl Session {
         }
         if !was_playing && self.transport.playing {
             self.automation_play_requested();
+            self.reset_video_stats();
         }
         self.poll_launcher(was_playing);
         self.poll_slot_recording();
