@@ -1009,6 +1009,35 @@ covered by `the_stock_devices_do_not_allocate`.
   colour (saturation), mix, an external sidechain (on by default once one
   is routed) with high/low cuts and listen. Editor: the transfer curve
   with the level moving on it (drag to set the threshold) and a history.
+* **76 Compressor** (`devices::fet76`, id `faderframe.76-compressor`): a
+  FET limiting amplifier in the manner of the 1176, written from how the
+  hardware behaves (its owner's manual), not from another plugin. Feedback
+  gain control solved without a sample's delay (Newton on the loop's
+  equation: stable at the 20 µs attack and any ratio), the Input driving a
+  fixed threshold, soft knee, attack 800 µs (1) … 20 µs (7) with an Off
+  position that disconnects the compression (the amplifier still colours),
+  release 1.1 s … 50 ms with a programme-dependent slow stage. The ratio
+  buttons go in in any combination, as pressing them together does
+  (`network`): their taps mix (the ratio lands between theirs; higher
+  buttons set the threshold higher) and every extra button moves the bias —
+  threshold down, attack lagging, release quicker, more FET distortion;
+  with all four the ratio is between 12:1 and 20:1 and louder input comes
+  out quieter; none in: no compression. Meter Off is the power switch.
+  Colour: the FET's even harmonics (with the reduction and the signal
+  across it), the class-A stage and transformer, 2× oversampled; stereo
+  link, sidechain high-pass, mix. Its editor is a panel of its own
+  (`view-devices::fet76`): knurled knobs, lit push-buttons (Shift-click
+  presses several), a backlit VU with standard ballistics (gain reduction,
+  or the output at +4/+8; its bias swings with several buttons in, all four
+  pin it), input and output peak meters either side.
+* **Hardware Insert** (`devices::hardware_insert`): outboard gear in the
+  chain — the graph sends the input to an interface output and takes the
+  return from an input (`NodeSpec::after` orders the return after the send
+  and counts the send's latency in its arrival), the round trip measured by
+  a ping (`EngineController::ping`: an impulse out, the return scanned, on
+  the device level after the render) and kept as the insert's Round Trip,
+  which the graph compensates; the session opens the device with the
+  channels the project wants (`wanted_channels`, `UiRequest::ReopenAudio`).
 * **Limiter** (`devices::limiter`): a lookahead limiter that guarantees
   its ceiling — per channel the minimum needed gain over the lookahead
   window, averaged over an attack window no longer than the lookahead
@@ -1471,7 +1500,14 @@ gives their names. The engine caches buses and names per instance
     `Instantiated`.
 * **The Drum Sampler** has eight stereo extra outputs. Each pad's
   `id::OUTPUT` sends it to one, or to the main output while no track
-  takes that output.
+  takes that output — the engine tells instances which buses are taken
+  (`configure_taken_outputs`, `Project::taken_plugin_buses`), so a bus
+  below a taken one that has no track of its own goes to the main too.
+* **The Guitar Station** has three: DI (the guitar before the rig, at
+  unity), Mic A and Mic B (each microphone on the cabinet, calibrated,
+  before the blend and the pan, at the Output's level — carried as two
+  more lanes of the amplifier's reservoir stage, so they stay in step with
+  the main).
 * **Session** (`session::outputs`):
   * `plugin_output_buses` gives each bus with the track taking it.
   * `Action::CreateOutputTracks { plugin, buses }` is one undo step. It
@@ -1479,11 +1515,16 @@ gives their names. The engine caches buses and names per instance
     track when a name is only a number), with the layout from the bus's
     channels, routed like the plugin's track, in a new folder under it or
     in the folder earlier ones are in.
+  * `Action::RemoveOutputTrack { plugin, bus }` gives an output back:
+    its track goes (its folder too when that empties), one undo step;
+    for the main, the plugin's track gets its routing back
+    (`keep_main_heard`, also when the track is removed by hand).
   * The input choices list other tracks' extra outputs (not ones that
     would loop).
   * Freezing a track whose plugin feeds output tracks is refused. Track
     presets drop a plugin-output input.
-* **UI**: the insert menu (Create Output Tracks, an Outputs submenu),
+* **UI**: the insert menu (Create Output Tracks, an Outputs submenu —
+  a ticked output removes its track),
   the arranger's track menu, the editor header's Outputs menu
   (`app.create-output-tracks`, dev form `insert=<n>`), and the mixer's
   input well (the bus name; Aux/Bus strips taking a bus get the input
@@ -3089,13 +3130,12 @@ DAW does well yet):
     rated in their folders); conform from EDL/OTIO, helped by cut
     detection; SDI output through Blackmagic DeckLink (read its SDK's
     licence first); MXF through an LGPL FFmpeg; colour management and HDR.
-14. **Gaps**: MIDI learn for solo, record arm, modulator macros and the
-    Surround Panner window; hardware inserts (a send and return with the
-    round trip measured by a ping and compensated); the Guitar Station's
-    microphones as outputs of their own (close and room on separate
-    tracks); ARA hosting (Melodyne, SpectraLayers; the ARA SDK is
-    Apache-2.0); Comp76Fx's port (with its author's go-ahead); stem
-    separation (still waiting for permissively licensed weights);
+14. **Gaps**: ~~MIDI learn for solo, record arm, modulator macros and the
+    Surround Panner window~~, ~~hardware inserts~~, ~~the Guitar
+    Station's microphones as outputs of their own~~, ~~a 76-style FET
+    compressor~~ — done; ARA hosting (Melodyne, SpectraLayers; the ARA SDK
+    is Apache-2.0); stem separation (still waiting for permissively
+    licensed weights);
     `rendering_ahead_does_not_allocate_on_the_audio_thread`'s rare timing
     failure under load.
 15. **Ideas from what FaderFrame has**:
