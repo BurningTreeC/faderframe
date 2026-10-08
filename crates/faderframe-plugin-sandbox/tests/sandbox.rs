@@ -610,3 +610,38 @@ fn a_helpers_audio_thread_joins_the_audio_workgroup() {
     }
     faderframe_realtime::set_process_workgroup(None);
 }
+
+/// What a plugin reports it takes off reaches the host through the
+/// helper (each block, in the shared memory): a compressor in the helper
+/// reports what the same one in process does; a plugin that reports
+/// nothing reports nothing through it either.
+#[test]
+fn a_sandboxed_compressor_reports_its_gain_reduction() {
+    use faderframe_plugin_host::devices::compressor::id;
+    let mut a = local(builtin::COMPRESSOR);
+    let mut b = remote(PluginFormat::Builtin, builtin::COMPRESSOR);
+    for inst in [&mut a, &mut b] {
+        inst.set_parameter(ParameterId(id::THRESHOLD), -30.0)
+            .unwrap();
+        inst.set_parameter(ParameterId(id::RATIO), 8.0).unwrap();
+    }
+    let (mut pa, mut pb) = (
+        a.create_processor(&CONFIG).unwrap(),
+        b.create_processor(&CONFIG).unwrap(),
+    );
+    run(pa.as_mut(), 16, &[], &[]);
+    run(pb.as_mut(), 16, &[], &[]);
+    let (ra, rb) = (
+        a.reduction().and_then(|r| r.get()).expect("in process"),
+        b.reduction()
+            .and_then(|r| r.get())
+            .expect("through the helper"),
+    );
+    assert!(ra > 3.0, "{ra} dB");
+    assert_eq!(ra, rb, "the same through the helper");
+    // A device that does not compress: nothing reported.
+    let mut c = remote(PluginFormat::Builtin, builtin::GAIN);
+    let mut pc = c.create_processor(&CONFIG).unwrap();
+    run(pc.as_mut(), 2, &[], &[]);
+    assert_eq!(c.reduction().and_then(|r| r.get()), None);
+}

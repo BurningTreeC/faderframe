@@ -111,7 +111,77 @@ pub struct Lv2Plugin {
     pub presets: Vec<Preset>,
 }
 
+/// How an output control port's value is a gain reduction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReductionScale {
+    /// In dB (either sign: some count down from 0, some up).
+    Db,
+    /// A linear gain (1 = nothing taken off).
+    Gain,
+}
+
+impl ReductionScale {
+    /// What a port's value takes off (dB, positive).
+    pub fn reduction_db(self, v: f32) -> f32 {
+        match self {
+            ReductionScale::Db => v.abs(),
+            ReductionScale::Gain if v > 0.0 => (-20.0 * v.log10()).clamp(0.0, 90.0),
+            ReductionScale::Gain => 90.0,
+        }
+    }
+}
+
+/// Does an output control port named so report gain reduction? (By name or
+/// symbol: "Gain Reduction", "GR", Calf's "compression", LSP's "rlm"…;
+/// a noise reducer's "reduction" is not.)
+fn names_reduction(symbol: &str, name: &str) -> bool {
+    let (s, n) = (symbol.to_ascii_lowercase(), name.to_ascii_lowercase());
+    if n.contains("noise") {
+        return false;
+    }
+    faderframe_plugin_host::names_gain_reduction(name)
+        || matches!(
+            s.as_str(),
+            "gr" | "gr_l"
+                | "gr_r"
+                | "grl"
+                | "grr"
+                | "gain_reduction"
+                | "gainreduction"
+                | "reduction"
+                | "rlm"
+                | "rlm_l"
+                | "rlm_r"
+                | "compression"
+                | "gr_meter"
+        )
+}
+
 impl Lv2Plugin {
+    /// The output control ports that report gain reduction (a compressor's
+    /// meter), and how to read each: a dB unit as dB, a 0…1 range or a
+    /// coefficient unit as a linear gain, else dB.
+    pub fn reduction_ports(&self) -> Vec<(u32, ReductionScale)> {
+        self.ports
+            .iter()
+            .filter(|p| p.kind == PortKind::Control && !p.input && !p.latency)
+            .filter(|p| names_reduction(&p.symbol, &p.name))
+            .map(|p| {
+                let scale = match p.unit.as_deref() {
+                    Some("db") => ReductionScale::Db,
+                    Some("coef") => ReductionScale::Gain,
+                    _ if p.maximum.is_some_and(|m| m <= 1.0 + 1e-6)
+                        && p.minimum.is_some_and(|m| m >= 0.0) =>
+                    {
+                        ReductionScale::Gain
+                    }
+                    _ => ReductionScale::Db,
+                };
+                (p.index, scale)
+            })
+            .collect()
+    }
+
     /// Classed an instrument, or taking notes and making audio from them
     /// alone (no audio input).
     pub fn is_instrument(&self) -> bool {
@@ -735,4 +805,31 @@ pub fn scan(paths: &[PathBuf]) -> Vec<Lv2Plugin> {
         tracing::warn!("LV2 {e}");
     }
     cache.plugins()
+}
+
+#[cfg(test)]
+mod reduction_tests {
+    use super::*;
+
+    #[test]
+    fn gain_reduction_ports_are_found_by_their_names() {
+        for (symbol, name) in [
+            ("gr", "GR"),
+            ("compression", "Gain Reduction"),
+            ("rlm", "Reduction level meter"),
+            ("x", "Gain reduction (dB)"),
+        ] {
+            assert!(names_reduction(symbol, name), "{symbol} / {name}");
+        }
+        for (symbol, name) in [
+            ("nr", "Noise Reduction"),
+            ("out", "Output"),
+            ("lat", "Latency"),
+        ] {
+            assert!(!names_reduction(symbol, name), "{symbol} / {name}");
+        }
+        assert_eq!(ReductionScale::Db.reduction_db(-4.5), 4.5);
+        assert!((ReductionScale::Gain.reduction_db(0.5) - 6.0206).abs() < 1e-3);
+        assert_eq!(ReductionScale::Gain.reduction_db(1.0), 0.0);
+    }
 }

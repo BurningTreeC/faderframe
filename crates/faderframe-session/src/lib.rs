@@ -4235,19 +4235,18 @@ impl Session {
     }
 
     /// The track's compressors in series (its input stage and inserts, not
-    /// bypassed; the built-ins, which say what they take off): their slots
-    /// and the published value that is their gain reduction.
-    fn reducers(&self, track: TrackId) -> Vec<(&PluginSlot, usize)> {
+    /// bypassed): the devices that report a gain reduction to the host (the
+    /// built-in compressors, plugins with CLAP's gain-adjustment metering,
+    /// a VST3 or AU gain-reduction meter, an LV2 gain-reduction port).
+    fn reducers(&self, track: TrackId) -> Vec<(&PluginSlot, f32)> {
         let Some(t) = self.project.track(track) else {
             return Vec::new();
         };
         t.preamp
             .iter()
             .chain(&t.inserts)
-            .filter(|s| !s.bypass && s.plugin.format == faderframe_project::PluginFormat::Builtin)
-            .filter_map(|s| {
-                faderframe_plugin_host::devices::reduction_value(&s.plugin.id).map(|v| (s, v))
-            })
+            .filter(|s| !s.bypass)
+            .filter_map(|s| self.engine.plugin_reduction(s.id).map(|r| (s, r)))
             .collect()
     }
 
@@ -4258,12 +4257,7 @@ impl Session {
         if reducers.is_empty() {
             return None;
         }
-        Some(
-            reducers
-                .iter()
-                .filter_map(|(s, v)| self.plugin_tap(s.id).map(|tap| tap.value(*v).max(0.0)))
-                .sum(),
-        )
+        Some(reducers.iter().map(|(_, r)| r.max(0.0)).sum())
     }
 
     /// The names of the devices [`Self::gain_reduction`] adds up.

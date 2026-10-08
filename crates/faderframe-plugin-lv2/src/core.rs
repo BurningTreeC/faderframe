@@ -33,7 +33,16 @@ pub struct Shared {
     pub ui_open: AtomicBool,
     /// Offline rendering: the `lv2:freeWheeling` port reads 1.
     pub freewheel: AtomicBool,
+    /// Gain-reduction output ports (a compressor's meter) and the cell
+    /// the most they take off goes to after each run.
+    pub reduction: Option<ReductionMeter>,
 }
+
+/// Gain-reduction ports and their cell (see [`Shared::reduction`]).
+pub type ReductionMeter = (
+    Box<[(u32, crate::scan::ReductionScale)]>,
+    Arc<faderframe_plugin_host::Reduction>,
+);
 
 impl Shared {
     pub fn new(plugin: &Lv2Plugin) -> Shared {
@@ -46,6 +55,15 @@ impl Shared {
             latency_changed: AtomicBool::new(false),
             ui_open: AtomicBool::new(false),
             freewheel: AtomicBool::new(false),
+            reduction: {
+                let ports = plugin.reduction_ports();
+                (!ports.is_empty()).then(|| {
+                    (
+                        ports.into_boxed_slice(),
+                        faderframe_plugin_host::Reduction::new(),
+                    )
+                })
+            },
         }
     }
 
@@ -644,6 +662,13 @@ impl Core {
         }
         for &p in &self.control_out {
             self.shared.set(p, self.controls[p as usize]);
+        }
+        if let Some((ports, cell)) = &self.shared.reduction {
+            let most = ports
+                .iter()
+                .map(|&(p, scale)| scale.reduction_db(self.controls[p as usize]))
+                .fold(0.0f32, f32::max);
+            cell.set(most);
         }
         if let Some(p) = self.latency_port {
             let v = self.controls[p as usize];

@@ -75,9 +75,11 @@ const P_OUT: usize = 1;
 const P_GAIN: usize = 2;
 const P_LATENCY: usize = 3;
 const P_CONTROL: usize = 4;
+/// What it "takes off": its gain below unity, as a coefficient.
+const P_GR: usize = 5;
 
 struct Test {
-    ports: [*mut c_void; 5],
+    ports: [*mut c_void; 6],
     map: *const sys::LV2_URID_Map,
     schedule: *const sys::LV2_Worker_Schedule,
     notes: i32,
@@ -97,7 +99,7 @@ unsafe extern "C" fn instantiate(
     features: *const *const LV2_Feature,
 ) -> LV2_Handle {
     let mut t = Box::new(Test {
-        ports: [std::ptr::null_mut(); 5],
+        ports: [std::ptr::null_mut(); 6],
         map: std::ptr::null(),
         schedule: std::ptr::null(),
         notes: 0,
@@ -138,6 +140,9 @@ unsafe extern "C" fn run(h: LV2_Handle, n: u32) {
             *o = i * gain;
         }
         *t.ports[P_LATENCY].cast::<f32>() = 32.0;
+        if !t.ports[P_GR].is_null() {
+            *t.ports[P_GR].cast::<f32>() = gain.min(1.0);
+        }
         let midi = urid(t, c"http://lv2plug.in/ns/ext/midi#MidiEvent");
         let object = urid(t, c"http://lv2plug.in/ns/ext/atom#Object");
         let speed_key = urid(t, c"http://lv2plug.in/ns/ext/time#speed");
@@ -326,7 +331,9 @@ fn model() -> Arc<scan::Lv2Plugin> {
           lv2:portProperty lv2:reportsLatency ] ,
         [ a lv2:InputPort , atom:AtomPort ; atom:bufferType atom:Sequence ; lv2:index 4 ;
           lv2:symbol "control" ; lv2:name "Control" ;
-          atom:supports <http://lv2plug.in/ns/ext/midi#MidiEvent> , <http://lv2plug.in/ns/ext/time#Position> ] .
+          atom:supports <http://lv2plug.in/ns/ext/midi#MidiEvent> , <http://lv2plug.in/ns/ext/time#Position> ] ,
+        [ a lv2:OutputPort , lv2:ControlPort ; lv2:index 5 ; lv2:symbol "gr" ; lv2:name "Gain Reduction" ;
+          <http://lv2plug.in/ns/extensions/units#unit> <http://lv2plug.in/ns/extensions/units#coef> ] .
 "#,
     )
     .unwrap();
@@ -518,4 +525,53 @@ fn a_rate_change_makes_the_plugin_again_with_its_state() {
     let _c = inst.create_processor(&cfg(96_000.0)).unwrap();
     assert!(inst.activation() > first, "another rate restarts it");
     assert_eq!(inst.parameter(ParameterId(2)), Some(1.5));
+}
+
+/// A gain-reduction output port (here a coefficient) reaches the host after
+/// each run, for the mixer's meter: 0.5 is 6 dB taken off, unity nothing.
+#[test]
+fn its_gain_reduction_port_reaches_the_host() {
+    let model = model();
+    assert_eq!(model.reduction_ports(), [(5, scan::ReductionScale::Gain)]);
+    let mut inst = Lv2Instance::with_entry(Arc::clone(&model), entry).unwrap();
+    let mut proc = inst
+        .create_processor(&ProcessConfig {
+            sample_rate: 48_000.0,
+            max_block_size: 64,
+            sidechain: false,
+            double_precision: false,
+        })
+        .unwrap();
+    let cell = inst.reduction().expect("it has a gain-reduction port");
+    let mut inputs = vec![AudioBuffer::new(ChannelLayout::Mono, 64)];
+    inputs[0].set_len(64);
+    let mut outputs = vec![AudioBuffer::new(ChannelLayout::Mono, 64)];
+    outputs[0].set_len(64);
+    let midi = vec![MidiBuffer::with_capacity(8)];
+    let transport = TransportInfo::default();
+    let mut run = |gain: f32| {
+        let events = [ParameterEvent {
+            parameter: ParameterId(2),
+            value: gain,
+            sample_offset: 0,
+        }];
+        let mut io = NodeIo {
+            frames: 64,
+            audio_in: &inputs,
+            audio_out: &mut outputs,
+            events_in: &midi,
+            events_out: &mut [],
+        };
+        let ctx = PluginProcessContext {
+            transport: &transport,
+            param_events: &events,
+            harmony: &faderframe_plugin_host::NO_HARMONY,
+            param_mods: &[],
+            note_mods: &[],
+        };
+        proc.process(&ctx, &mut io);
+        cell.get().expect("reported")
+    };
+    assert!((run(0.5) - 6.0206).abs() < 1e-3);
+    assert_eq!(run(1.5), 0.0);
 }

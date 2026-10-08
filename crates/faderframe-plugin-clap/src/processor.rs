@@ -60,6 +60,11 @@ pub(crate) struct RtState {
     /// Parameters whose voices are addressed by note id, not by key
     /// (sorted).
     by_note_id: Box<[u32]>,
+    /// The plugin's gain-adjustment metering and where its value goes.
+    reduction: Option<(
+        crate::host::PluginGainAdjustment,
+        Arc<faderframe_plugin_host::Reduction>,
+    )>,
 }
 
 /// Most parameters modulated at once.
@@ -101,6 +106,10 @@ impl RtState {
         params_rx: rtrb::Consumer<(u32, f64)>,
         edits_tx: rtrb::Producer<(u8, u32, f64)>,
         by_note_id: Box<[u32]>,
+        reduction: Option<(
+            crate::host::PluginGainAdjustment,
+            Arc<faderframe_plugin_host::Reduction>,
+        )>,
     ) -> Self {
         let (n32, n64) = if double {
             (0, max_frames)
@@ -139,6 +148,7 @@ impl RtState {
             mods: Box::new([(0, 0.0); MAX_MODS]),
             mod_count: 0,
             by_note_id,
+            reduction,
         }
     }
 }
@@ -524,6 +534,11 @@ impl PluginProcessor for ClapProcessor {
                 },
                 _ => out.clear(),
             }
+        }
+        // What it takes off now, for the mixer's meter (an audio-thread
+        // call, after process, as the extension asks).
+        if let Some((metering, cell)) = &st.reduction {
+            cell.set_adjustment(metering.get(&started.plugin_handle()));
         }
         st.proc = Some(RtProc::Started(started));
         match status {

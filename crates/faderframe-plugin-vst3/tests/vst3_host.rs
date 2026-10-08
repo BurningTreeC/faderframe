@@ -655,7 +655,7 @@ impl IEditControllerTrait for TestController {
         let (id, name, steps, flags) = match index {
             0 => (GAIN, "Gain", 0, kCanAutomate),
             1 => (MODE, "Mode", 2, kCanAutomate | kIsList),
-            2 => (METER, "Meter", 0, kIsReadOnly),
+            2 => (METER, "Gain Reduction", 0, kIsReadOnly),
             3 => (
                 PROGRAM,
                 "Program",
@@ -1147,6 +1147,17 @@ fn hosts_a_plugin_with_separate_controller() {
     inst.poll();
     let meter = inst.parameter(ParameterId(METER)).unwrap();
     assert!((meter - 1.5 / 4.0).abs() < 1e-6, "meter {meter}");
+    // Being a gain-reduction meter (read-only, named so), it reaches the
+    // mixer's: a 0…1 meter without a unit is a linear gain.
+    let reduction = inst
+        .reduction()
+        .and_then(|r| r.get())
+        .expect("a gain-reduction meter");
+    let want = -20.0 * (1.5f32 / 4.0).log10();
+    assert!(
+        (reduction - want).abs() < 0.05,
+        "{reduction} dB, want {want}"
+    );
 
     // Stepped parameters are integers in FaderFrame, 0–1 in VST3.
     inst.set_parameter(ParameterId(MODE), 2.0).unwrap();

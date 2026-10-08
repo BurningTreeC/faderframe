@@ -26,6 +26,7 @@ const CONFIG: ProcessConfig = ProcessConfig {
 const DELAY: &str = "aufx:dely:appl";
 const LOWPASS: &str = "aufx:lpas:appl";
 const DLS: &str = "aumu:dls :appl";
+const DYNAMICS: &str = "aufx:dcmp:appl";
 
 struct Rig {
     input: Vec<AudioBuffer>,
@@ -366,4 +367,23 @@ fn extra_output_elements_reach_the_graph() {
     inst.configure_outputs(1);
     let _ = inst.create_processor(&CONFIG).unwrap();
     assert!(inst.activation() > before);
+}
+
+/// Apple's Dynamics Processor reports its "Compression Amount" meter; it
+/// reaches the host after each render, for the mixer's gain-reduction
+/// meter.
+#[test]
+fn the_dynamics_processor_reports_its_gain_reduction() {
+    let mut inst = instantiate(DYNAMICS);
+    let threshold = param(&*inst, "threshold");
+    inst.set_parameter(threshold, -40.0).unwrap();
+    let mut p = inst.create_processor(&CONFIG).unwrap();
+    let cell = inst.reduction().expect("a compression meter");
+    let mut rig = Rig::new();
+    rig.input(|i| 0.5 * (i as f32 * 0.05).sin());
+    for _ in 0..40 {
+        rig.run(p.as_mut(), &[]);
+    }
+    let r = cell.get().expect("reported");
+    assert!(r > 1.0, "{r} dB");
 }

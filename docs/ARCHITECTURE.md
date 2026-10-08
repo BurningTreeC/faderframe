@@ -3441,3 +3441,31 @@ strip's menu switch it all. Tests: `session/tests/console.rs` (one step,
 latency to the sample, level kept, colour when driven, families keep the
 bus settings), `the_console_does_not_allocate`, the mixer's
 `a_console_shows_its_bus_amplifiers_and_its_look`.
+
+### Gain-reduction meters
+
+Every strip with a compressor shows its gain reduction in a stripe left of
+the meter (on the meter's scale, from the top down; several in series
+added). Any `PluginInstance` may report it through `reduction()` — a
+`plugin_host::Reduction` cell (an atomic f32 in dB; NaN = not reported) its
+processor sets after each block on the audio thread:
+
+* built-ins: the compressors' published value (`devices::reduction_value`:
+  Compressor, 76, Limiter, De-esser, Channel Strip), copied by the
+  `Modulated` wrapper;
+* CLAP: the draft `clap.gain-adjustment-metering/0` extension
+  (`host::PluginGainAdjustment`, its `get` called after `process`);
+* VST3: a read-only parameter named as gain reduction
+  (`plugin_host::names_gain_reduction`), caught in the block's output
+  parameter changes and converted by a `ReductionTable` measured from the
+  controller (dB unit, else the dB its text shows, else a 0…1 linear gain);
+* LV2: output control ports named so (`scan::Lv2Plugin::reduction_ports`,
+  `ReductionScale::{Db, Gain}` from `units:db`/`units:coef`/the range);
+* AU: a read-only meter parameter named so (Apple's Dynamics Processor's
+  "Compression Amount"), read with `AudioUnitGetParameter` after render;
+* sandboxed plugins: the helper writes the reduction into the shared
+  memory's `Header::reduction` each block and the proxy hands it on (shm
+  version 5).
+
+`Session::{gain_reduction, gain_reduction_devices}` sum the devices of a
+track's input stage and inserts that report (bypassed ones not).

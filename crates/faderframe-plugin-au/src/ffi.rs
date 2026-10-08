@@ -59,6 +59,7 @@ pub const kAudioUnitProperty_ParameterStringFromValue: u32 = 33;
 
 // Parameter flags and units.
 pub const kAudioUnitParameterFlag_CFNameRelease: u32 = 1 << 4;
+pub const kAudioUnitParameterFlag_MeterReadOnly: u32 = 1 << 15;
 pub const kAudioUnitParameterFlag_ValuesHaveStrings: u32 = 1 << 21;
 pub const kAudioUnitParameterFlag_NonRealTime: u32 = 1 << 24;
 pub const kAudioUnitParameterFlag_HasCFNameString: u32 = 1 << 27;
@@ -70,6 +71,7 @@ pub const kAudioUnitParameterUnit_Seconds: u32 = 4;
 pub const kAudioUnitParameterUnit_SampleFrames: u32 = 5;
 pub const kAudioUnitParameterUnit_Hertz: u32 = 8;
 pub const kAudioUnitParameterUnit_Decibels: u32 = 13;
+pub const kAudioUnitParameterUnit_LinearGain: u32 = 14;
 pub const kAudioUnitParameterUnit_Milliseconds: u32 = 24;
 pub const kAudioUnitParameterUnit_CustomUnit: u32 = 26;
 

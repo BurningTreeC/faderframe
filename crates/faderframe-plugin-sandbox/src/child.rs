@@ -442,6 +442,8 @@ impl Helper {
             Err(e) => return failed(e),
         };
         let latency = inst.latency_samples();
+        // What the plugin reports it takes off, passed on each block.
+        let reduction = inst.reduction();
         let (b, go, done, wg) = (
             Arc::clone(&block),
             Arc::clone(&self.go),
@@ -450,7 +452,7 @@ impl Helper {
         );
         let thread = std::thread::Builder::new()
             .name("faderframe-plugin-audio".into())
-            .spawn(move || audio_loop(processor, b, go, done, wg));
+            .spawn(move || audio_loop(processor, reduction, b, go, done, wg));
         match thread {
             Ok(thread) => {
                 self.audio = Some(Audio { block, thread });
@@ -598,6 +600,7 @@ fn own_window_requests(
 /// The helper's audio thread: one block per wake-up byte.
 fn audio_loop(
     mut processor: Box<dyn PluginProcessor>,
+    reduction: Option<Arc<faderframe_plugin_host::Reduction>>,
     block: Arc<Block>,
     go: Arc<Waiter>,
     done: Arc<Signal>,
@@ -670,6 +673,9 @@ fn audio_loop(
             processor.process(&ctx, &mut node)
         };
         block.write_response(frames, status, &mut io);
+        let reported = reduction.as_ref().and_then(|r| r.get());
+        h.reduction
+            .store(reported.unwrap_or(f32::NAN).to_bits(), Ordering::Relaxed);
         h.done.store(seq, Ordering::Release);
         if !done.signal() {
             break;

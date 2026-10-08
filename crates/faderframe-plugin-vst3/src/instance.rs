@@ -111,6 +111,10 @@ pub struct Vst3Instance {
     mod_bases: Arc<ModBases>,
     /// Parameters modulation may move (continuous, automatable).
     modulatable: Vec<ParamID>,
+    /// The plugin's gain-reduction meter (a read-only parameter): its id,
+    /// its values in dB, and the cell the processor sets.
+    reduction: Option<(ParamID, Arc<faderframe_plugin_host::ReductionTable>)>,
+    reduction_cell: Arc<faderframe_plugin_host::Reduction>,
     /// Changes made while inactive, sent to the processor on activation.
     pending: Vec<(ParamID, ParamValue)>,
     latency: u32,
@@ -193,6 +197,8 @@ impl Vst3Instance {
             bases_tx: None,
             mod_bases: Arc::default(),
             modulatable: Vec::new(),
+            reduction: None,
+            reduction_cell: faderframe_plugin_host::Reduction::new(),
             pending: Vec::new(),
             latency: 0,
             tail: TailLength::None,
@@ -286,6 +292,8 @@ impl Vst3Instance {
         let mut out = Vec::new();
         let mut steps = Vec::new();
         let mut modulatable = Vec::new();
+        // A gain-reduction meter: (id, units).
+        let mut meter = None;
         // The program-change parameter (often hidden): (id, unit, steps).
         let mut program = None;
         // SAFETY: plain queries with valid out pointers.
@@ -297,6 +305,13 @@ impl Vst3Instance {
                 }
                 if info.flags & kIsProgramChange != 0 && program.is_none() {
                     program = Some((info.id, info.unitId, info.stepCount.max(0) as u32));
+                }
+                if info.flags & kIsReadOnly != 0
+                    && meter.is_none()
+                    && (faderframe_plugin_host::names_gain_reduction(&wstr(&info.title))
+                        || faderframe_plugin_host::names_gain_reduction(&wstr(&info.shortTitle)))
+                {
+                    meter = Some((info.id, wstr(&info.units).to_ascii_lowercase()));
                 }
                 if info.flags & kIsHidden != 0
                     || (info.flags & kCanAutomate == 0 && proxies.contains(&info.id))
@@ -334,6 +349,8 @@ impl Vst3Instance {
             }
         }
         self.params = out;
+        self.reduction =
+            meter.map(|(id, units)| (id, Arc::new(reduction_table(&ctrl, id, &units))));
         modulatable.sort_unstable();
         self.modulatable = modulatable;
         self.map = Arc::new(ParamMap::new(steps));
@@ -673,6 +690,12 @@ impl FfInstance for Vst3Instance {
 
     fn parameters(&self) -> &[ParameterInfo] {
         &self.params
+    }
+
+    fn reduction(&self) -> Option<Arc<faderframe_plugin_host::Reduction>> {
+        self.reduction
+            .as_ref()
+            .map(|_| Arc::clone(&self.reduction_cell))
     }
 
     fn modulatable(&self, id: ParameterId) -> bool {
@@ -1021,6 +1044,9 @@ impl FfInstance for Vst3Instance {
                     }),
                     values,
                     bases: Arc::clone(&self.mod_bases),
+                    reduction: self.reduction.as_ref().map(|(id, table)| {
+                        (*id, Arc::clone(table), Arc::clone(&self.reduction_cell))
+                    }),
                 },
                 rx,
                 out_tx,
@@ -1197,4 +1223,46 @@ impl PluginEditor for Vst3Instance {
             closed: false,
         }
     }
+}
+
+/// A gain-reduction meter's values in dB taken off, from the plugin's own
+/// conversion (main thread): its plain value when its unit is dB, else the
+/// dB its text shows, else a plain 0…1 as a linear gain, else the plain
+/// value as dB.
+fn reduction_table(
+    ctrl: &ComPtr<IEditController>,
+    id: ParamID,
+    units: &str,
+) -> faderframe_plugin_host::ReductionTable {
+    let mut t = [0.0f32; 65];
+    // SAFETY: plain queries with valid out pointers.
+    let plain = |n: f64| unsafe { ctrl.normalizedParamToPlain(id, n) };
+    let unit_range = (0.0..=1.0).contains(&plain(0.0)) && (0.0..=1.0).contains(&plain(1.0));
+    for (k, v) in t.iter_mut().enumerate() {
+        let n = k as f64 / 64.0;
+        let p = plain(n);
+        // SAFETY: a plain query into a valid string buffer.
+        let text = unsafe {
+            let mut text: String128 = std::mem::zeroed();
+            (ctrl.getParamStringByValue(id, n, &mut text) == kResultOk).then(|| wstr(&text))
+        };
+        let shown = text
+            .as_deref()
+            .filter(|t| t.to_ascii_lowercase().contains("db"))
+            .and_then(faderframe_plugin_host::leading_number);
+        *v = if units.contains("db") {
+            p.abs() as f32
+        } else if let Some(db) = shown {
+            db.abs()
+        } else if unit_range {
+            if p > 0.0 {
+                (-20.0 * p.log10()).clamp(0.0, 90.0) as f32
+            } else {
+                90.0
+            }
+        } else {
+            p.abs() as f32
+        };
+    }
+    faderframe_plugin_host::ReductionTable(t)
 }

@@ -38,6 +38,8 @@ struct Channel {
     pipes: Arc<Pipes>,
     seq: u32,
     sched_sent: bool,
+    /// The instance's gain-reduction cell, set from the helper's answer.
+    reduction: Arc<faderframe_plugin_host::Reduction>,
 }
 
 fn silence(io: &mut NodeIo<'_>) {
@@ -108,8 +110,14 @@ impl Channel {
                 return fail(io);
             }
         }
-        self.block
-            .read_response(frames, io.audio_out, io.events_out.first_mut())
+        let status = self
+            .block
+            .read_response(frames, io.audio_out, io.events_out.first_mut());
+        match f32::from_bits(h.reduction.load(Ordering::Relaxed)) {
+            v if v.is_nan() => self.reduction.set_unreported(),
+            v => self.reduction.set(v),
+        }
+        status
     }
 }
 
@@ -180,6 +188,8 @@ pub struct RemoteInstance {
     formatted: HashMap<u32, (u64, Option<String>)>,
     /// The dead helper was killed and reaped.
     reaped: bool,
+    /// The gain reduction the plugin reports (through the helper).
+    reduction: Arc<faderframe_plugin_host::Reduction>,
 }
 
 fn failed(e: impl std::fmt::Display) -> PluginError {
@@ -233,6 +243,7 @@ impl RemoteInstance {
             needs_restart: false,
             formatted: HashMap::new(),
             reaped: false,
+            reduction: faderframe_plugin_host::Reduction::unreported(),
         };
         let req = Request::Instantiate {
             format: format.into(),
@@ -475,6 +486,10 @@ impl PluginInstance for RemoteInstance {
         self.note_expressions.clone()
     }
 
+    fn reduction(&self) -> Option<Arc<faderframe_plugin_host::Reduction>> {
+        Some(Arc::clone(&self.reduction))
+    }
+
     fn sandboxed(&self) -> bool {
         true
     }
@@ -615,6 +630,7 @@ impl PluginInstance for RemoteInstance {
                     pipes: Arc::clone(&self.pipes),
                     seq: 0,
                     sched_sent: false,
+                    reduction: Arc::clone(&self.reduction),
                 })),
                 Arc::new(AtomicBool::new(false)),
             ));

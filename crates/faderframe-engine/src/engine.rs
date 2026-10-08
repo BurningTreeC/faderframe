@@ -1124,6 +1124,11 @@ impl EngineController {
         self.plugins.tap(plugin)
     }
 
+    /// The gain reduction a hosted plugin reports now (dB), if it does.
+    pub fn plugin_reduction(&self, plugin: faderframe_core::PluginInstanceId) -> Option<f32> {
+        self.plugins.reduction(plugin)
+    }
+
     /// Host `slot`'s plugin (instantiate it) outside the graph; `false`
     /// when it cannot be loaded.
     pub fn host_plugin(&mut self, slot: &faderframe_project::PluginSlot) -> bool {

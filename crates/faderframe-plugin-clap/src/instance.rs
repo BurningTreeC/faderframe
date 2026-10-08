@@ -36,6 +36,9 @@ pub struct ClapInstance {
     /// Parameter moves from the audio thread (the plugin's editor).
     edits_rx: Option<rtrb::Consumer<(u8, u32, f64)>>,
     gui_open: bool,
+    /// Where the processor puts the gain reduction the plugin reports
+    /// (CLAP's gain-adjustment metering); `None` while it has none.
+    reduction: Option<Arc<faderframe_plugin_host::Reduction>>,
     // Declared last: dropped after the processor has been deactivated.
     instance: PluginInstance<FfHost>,
 }
@@ -86,6 +89,7 @@ impl ClapInstance {
             activations: 0,
             edits_rx: None,
             gui_open: false,
+            reduction: None,
             instance,
         };
         s.query_params();
@@ -335,6 +339,10 @@ impl FfInstance for ClapInstance {
         self.latency
     }
 
+    fn reduction(&self) -> Option<Arc<faderframe_plugin_host::Reduction>> {
+        self.reduction.clone()
+    }
+
     fn activation(&self) -> u64 {
         self.activations
     }
@@ -477,6 +485,14 @@ impl FfInstance for ClapInstance {
                 self.scanned.name,
                 if double { 64 } else { 32 }
             );
+            // Gain-adjustment metering: a cell kept across activations.
+            let metering = self.ext().gain_adjustment.map(|m| {
+                let cell = Arc::clone(
+                    self.reduction
+                        .get_or_insert_with(faderframe_plugin_host::Reduction::new),
+                );
+                (m, cell)
+            });
             let state = RtState::new(
                 stopped,
                 &self.scanned.audio_inputs,
@@ -495,6 +511,7 @@ impl FfInstance for ClapInstance {
                     ids.sort_unstable();
                     ids.into()
                 },
+                metering,
             );
             self.edits_rx = Some(edits_rx);
             self.rt = Some(Arc::new(TryCell::new(state)));

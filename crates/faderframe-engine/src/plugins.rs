@@ -392,6 +392,11 @@ impl PluginHost {
         self.instances.get(&plugin)?.instance.tap()
     }
 
+    /// The gain reduction the plugin reports now (dB), if it reports any.
+    pub fn reduction(&self, plugin: PluginInstanceId) -> Option<f32> {
+        self.instances.get(&plugin)?.instance.reduction()?.get()
+    }
+
     /// The plugin's own editor, if it has one.
     pub fn editor(&mut self, plugin: PluginInstanceId) -> Option<&mut dyn PluginEditor> {
         self.instances.get_mut(&plugin)?.instance.editor()

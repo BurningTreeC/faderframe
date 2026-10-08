@@ -107,6 +107,10 @@ pub struct AuInstance {
     params: Vec<ParameterInfo>,
     /// Parameters with value strings of their own.
     with_strings: Vec<u32>,
+    /// The unit's gain-reduction meter (a read-only parameter): its id and
+    /// whether it is a linear gain (else dB); and the cell it goes to.
+    meter: Option<(u32, bool)>,
+    reduction_cell: Arc<faderframe_plugin_host::Reduction>,
     rt: Option<SharedRt>,
     config: Option<ProcessConfig>,
     latency: u32,
@@ -156,6 +160,8 @@ impl AuInstance {
             unit,
             params: Vec::new(),
             with_strings: Vec::new(),
+            meter: None,
+            reduction_cell: faderframe_plugin_host::Reduction::new(),
             rt: None,
             config: None,
             latency: 0,
@@ -251,6 +257,7 @@ impl AuInstance {
     fn query_params(&mut self) {
         self.params.clear();
         self.with_strings.clear();
+        self.meter = None;
         let mut size = 0u32;
         let mut writable = 0u8;
         // SAFETY: plain property queries; buffers are sized from the info.
@@ -310,7 +317,19 @@ impl AuInstance {
                 }
             }
             if info.flags & kAudioUnitParameterFlag_IsWritable == 0 {
-                continue; // meters
+                // Meters; a gain-reduction one reaches the mixer's.
+                if (info.flags & kAudioUnitParameterFlag_MeterReadOnly != 0
+                    || info.flags & kAudioUnitParameterFlag_IsReadable != 0)
+                    && self.meter.is_none()
+                    && faderframe_plugin_host::names_gain_reduction(&name)
+                {
+                    let gain = info.unit == kAudioUnitParameterUnit_LinearGain
+                        || (info.unit != kAudioUnitParameterUnit_Decibels
+                            && info.minValue >= 0.0
+                            && info.maxValue <= 1.0);
+                    self.meter = Some((id, gain));
+                }
+                continue;
             }
             if info.flags & kAudioUnitParameterFlag_ValuesHaveStrings != 0 {
                 self.with_strings.push(id);
@@ -444,6 +463,10 @@ impl AuInstance {
                 bases_rx,
             },
         );
+        let mut state = state;
+        state.reduction = self
+            .meter
+            .map(|(id, gain)| (id, gain, Arc::clone(&self.reduction_cell)));
         self.bases_tx = Some(bases_tx);
         if inputs > 0 {
             let cb = state.render_callback();
@@ -721,6 +744,10 @@ impl PluginInstance for AuInstance {
 
     fn descriptor(&self) -> &PluginDescriptor {
         &self.descriptor
+    }
+
+    fn reduction(&self) -> Option<Arc<faderframe_plugin_host::Reduction>> {
+        self.meter.map(|_| Arc::clone(&self.reduction_cell))
     }
 
     fn parameters(&self) -> &[ParameterInfo] {

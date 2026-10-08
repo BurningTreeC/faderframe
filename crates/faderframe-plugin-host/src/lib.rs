@@ -319,6 +319,97 @@ pub trait PluginEditor {
 /// instance to come from the thread that created it, so instances stay on
 /// the thread that owns the engine controller (the UI thread, or a render
 /// thread for its own instances).
+/// A plugin's gain reduction now (dB, positive), as its processor last
+/// reported it: written on the audio thread after each block, read by the
+/// mixer's meter on any thread. "Not reported" is a value of its own (a
+/// sandboxed plugin's proxy learns from the helper whether it reports).
+#[derive(Debug, Default)]
+pub struct Reduction(std::sync::atomic::AtomicU32);
+
+impl Reduction {
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+
+    /// A cell that reports nothing until it is set.
+    pub fn unreported() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self(std::sync::atomic::AtomicU32::new(f32::NAN.to_bits())))
+    }
+
+    /// The plugin does not (or no longer) report it.
+    #[inline]
+    pub fn set_unreported(&self) {
+        self.0
+            .store(f32::NAN.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// What the plugin takes off (dB; a gain adjustment below 0 dB counts,
+    /// an expander's boost does not).
+    #[inline]
+    pub fn set(&self, db: f32) {
+        let db = if db.is_finite() { db.max(0.0) } else { 0.0 };
+        self.0
+            .store(db.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// From a gain adjustment as CLAP has it (dB, negative = reduction).
+    #[inline]
+    pub fn set_adjustment(&self, db: f64) {
+        self.set(-db as f32);
+    }
+
+    /// The reduction (dB), or None while nothing is reported.
+    #[inline]
+    pub fn get(&self) -> Option<f32> {
+        let v = f32::from_bits(self.0.load(std::sync::atomic::Ordering::Relaxed));
+        (!v.is_nan()).then_some(v)
+    }
+}
+
+/// Does a plugin's meter named so report gain reduction? ("Gain
+/// Reduction", "GR", "Reduction", "Compression Amount"…; a noise reducer's
+/// "reduction" is not.) VST3, AU and LV2 meters by their names.
+pub fn names_gain_reduction(name: &str) -> bool {
+    let n = name.trim().to_ascii_lowercase();
+    if n.contains("noise") {
+        return false;
+    }
+    n.contains("reduction")
+        || n.contains("compression amount")
+        || n == "gr"
+        || n.starts_with("gr ")
+        || n.ends_with(" gr")
+        || n.contains("gr meter")
+}
+
+/// A gain-reduction meter's normalised values (0…1, as VST3 parameters
+/// travel) in dB taken off: measured from the plugin's own conversion on
+/// the main thread, read on the audio thread.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReductionTable(pub [f32; 65]);
+
+impl ReductionTable {
+    /// The dB at normalised `v` (between the measured points, linearly).
+    #[inline]
+    pub fn db(&self, v: f64) -> f32 {
+        let x = (v.clamp(0.0, 1.0) * 64.0) as f32;
+        let i = (x as usize).min(63);
+        let f = x - i as f32;
+        self.0[i] + (self.0[i + 1] - self.0[i]) * f
+    }
+}
+
+/// The first number in a parameter's text ("-6.2 dB" → −6.2).
+pub fn leading_number(text: &str) -> Option<f32> {
+    let start = text.find(|c: char| c.is_ascii_digit() || c == '-' || c == '+' || c == '.')?;
+    let rest = &text[start..];
+    let end = rest
+        .char_indices()
+        .find(|&(i, c)| !(c.is_ascii_digit() || c == '.' || ((c == '-' || c == '+') && i == 0)))
+        .map_or(rest.len(), |(i, _)| i);
+    rest[..end].parse().ok()
+}
+
 pub trait PluginInstance {
     /// Actual graph output width, supplied off the audio thread before activation.
     fn configure_channels(&mut self, _channels: usize) {}
@@ -412,6 +503,13 @@ pub trait PluginInstance {
     /// What a built-in plugin's own editor reads (live parameters,
     /// analyser audio, meters); `None` for other plugins.
     fn tap(&self) -> Option<std::sync::Arc<tap::AnalysisTap>> {
+        None
+    }
+    /// What the plugin's dynamics take off now, when it reports it to the
+    /// host (CLAP's gain-adjustment metering, a VST3 or AU read-only gain
+    /// reduction meter, an LV2 gain reduction output port): its processor
+    /// writes it after each block. `None` for plugins that do not.
+    fn reduction(&self) -> Option<std::sync::Arc<Reduction>> {
         None
     }
     /// Counts (re)activations. Processors of different activations are not
@@ -537,5 +635,39 @@ impl PluginRegistry {
             .find(|f| f.format() == format)
             .ok_or(PluginError::UnsupportedFormat(format))?
             .instantiate(id)
+    }
+}
+
+#[cfg(test)]
+mod reduction_tests {
+    use super::*;
+
+    #[test]
+    fn meters_that_report_gain_reduction_are_known_by_name() {
+        for n in [
+            "Gain Reduction",
+            "GR",
+            "gr meter",
+            "Compression Amount",
+            "Comp GR",
+            "Reduction",
+        ] {
+            assert!(names_gain_reduction(n), "{n}");
+        }
+        for n in ["Noise Reduction", "Output", "Gain", "Grain"] {
+            assert!(!names_gain_reduction(n), "{n}");
+        }
+        assert_eq!(leading_number("-6.25 dB"), Some(-6.25));
+        assert_eq!(leading_number("GR 3.5 dB"), Some(3.5));
+        assert_eq!(leading_number("off"), None);
+        let t = ReductionTable(std::array::from_fn(|k| k as f32));
+        assert_eq!(t.db(0.5), 32.0);
+        assert_eq!(t.db(1.0), 64.0);
+        let r = Reduction::unreported();
+        assert_eq!(r.get(), None);
+        r.set_adjustment(-4.0);
+        assert_eq!(r.get(), Some(4.0));
+        r.set(-1.0);
+        assert_eq!(r.get(), Some(0.0), "a boost takes nothing off");
     }
 }

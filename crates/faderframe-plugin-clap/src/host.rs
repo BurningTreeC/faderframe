@@ -42,6 +42,7 @@ pub struct PluginExtensions {
     pub timer: Option<PluginTimer>,
     #[cfg(unix)]
     pub posix_fd: Option<PluginPosixFd>,
+    pub gain_adjustment: Option<PluginGainAdjustment>,
 }
 
 /// Thread-safe host state of one instance.
@@ -115,6 +116,7 @@ impl<'a> SharedHandler<'a> for FfShared {
             timer: instance.get_extension(),
             #[cfg(unix)]
             posix_fd: instance.get_extension(),
+            gain_adjustment: instance.get_extension(),
         });
     }
 
@@ -361,6 +363,56 @@ pub fn host_info() -> Result<HostInfo, std::ffi::NulError> {
     )
 }
 
+/// CLAP's (draft) gain-adjustment metering: the plugin reports the gain it
+/// applies (dB; negative = reduction, before make-up), for a host's meter.
+/// `get` is an audio-thread call, made after `process`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(non_camel_case_types)]
+pub struct clap_plugin_gain_adjustment_metering {
+    pub get: Option<unsafe extern "C" fn(plugin: *const std::ffi::c_void) -> f64>,
+}
+
+#[derive(Copy, Clone)]
+pub struct PluginGainAdjustment(
+    clack_host::extensions::prelude::RawExtension<
+        clack_host::extensions::prelude::PluginExtensionSide,
+        clap_plugin_gain_adjustment_metering,
+    >,
+);
+
+// SAFETY: the type is the extension's repr(C) struct (`get` takes the
+// plugin pointer, ABI-identical to `*const clap_plugin`).
+unsafe impl clack_host::extensions::prelude::Extension for PluginGainAdjustment {
+    const IDENTIFIERS: &[&std::ffi::CStr] = &[c"clap.gain-adjustment-metering/0"];
+    type ExtensionSide = clack_host::extensions::prelude::PluginExtensionSide;
+
+    #[inline]
+    unsafe fn from_raw(
+        raw: clack_host::extensions::prelude::RawExtension<Self::ExtensionSide>,
+    ) -> Self {
+        // SAFETY: the caller guarantees the pointer is this extension's.
+        Self(unsafe { raw.cast() })
+    }
+}
+
+impl PluginGainAdjustment {
+    /// The gain adjustment applied to the last sample of the last block
+    /// (dB). Audio thread only.
+    #[inline]
+    pub fn get(
+        &self,
+        plugin: &clack_host::extensions::prelude::PluginAudioProcessorHandle<'_>,
+    ) -> f64 {
+        match plugin.use_extension(&self.0).get {
+            // SAFETY: the plugin's own function for this instance, called on
+            // the audio thread as the extension asks.
+            Some(get) => unsafe { get(plugin.as_raw_ptr().cast()) },
+            None => 0.0,
+        }
+    }
+}
+
 /// Every extension FaderFrame uses, queried once the plugin is initialised.
 pub fn query_extensions(h: &PluginMainThreadHandle<'_>) -> PluginExtensions {
     PluginExtensions {
@@ -373,6 +425,7 @@ pub fn query_extensions(h: &PluginMainThreadHandle<'_>) -> PluginExtensions {
         timer: h.get_extension(),
         #[cfg(unix)]
         posix_fd: h.get_extension(),
+        gain_adjustment: h.get_extension(),
     }
 }
 

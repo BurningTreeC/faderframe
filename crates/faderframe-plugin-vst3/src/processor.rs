@@ -463,6 +463,12 @@ pub(crate) struct Active {
     program: Option<(ParamID, u32)>,
     continuous: i64,
     max_frames: usize,
+    /// The gain-reduction meter (see `ActiveConfig::reduction`).
+    reduction: Option<(
+        ParamID,
+        Arc<faderframe_plugin_host::ReductionTable>,
+        Arc<faderframe_plugin_host::Reduction>,
+    )>,
 }
 
 // SAFETY: `Active` is used by one thread at a time (it lives in a TryCell;
@@ -489,6 +495,12 @@ pub(crate) struct ActiveConfig {
     /// modulated ones are published.
     pub values: Vec<(ParamID, ParamValue)>,
     pub bases: Arc<ModBases>,
+    /// The gain-reduction meter: its parameter, its values in dB, the cell.
+    pub reduction: Option<(
+        ParamID,
+        Arc<faderframe_plugin_host::ReductionTable>,
+        Arc<faderframe_plugin_host::Reduction>,
+    )>,
 }
 
 /// A modulation's share of the range: VST3's normalised offset.
@@ -526,6 +538,7 @@ impl Active {
             program: c.program,
             continuous: 0,
             max_frames: c.max_frames,
+            reduction: c.reduction,
         }
     }
 }
@@ -866,6 +879,12 @@ impl Active {
         for q in self.out_params.changed() {
             if let Some(v) = q.last() {
                 let id = q.id.get();
+                // The gain-reduction meter, for the mixer's.
+                if let Some((meter, table, cell)) = &self.reduction
+                    && *meter == id
+                {
+                    cell.set(table.db(v));
+                }
                 if !self.emu.modulated(id) {
                     self.emu.set(id, v);
                 }

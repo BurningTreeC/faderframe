@@ -43,7 +43,7 @@ pub const MAX_NOTE_MODS: usize = 256;
 /// Bytes of SysEx per block (to the plugin).
 pub const MAX_SYSEX: usize = 16 * 1024;
 const MAGIC: u32 = 0x4646_5348;
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 /// A SysEx event: `value` holds the start of its bytes in `sysex_in`
 /// (low 16 bits) and their count (high 16 bits).
 const SYSEX_KIND: u8 = 9;
@@ -256,6 +256,9 @@ pub struct Header {
     /// audio thread joined (see `workgroup`).
     pub wg_gen: AtomicU32,
     pub wg_joined: AtomicU32,
+    /// The gain reduction the plugin reported for the last block (f32 bits,
+    /// dB; NaN: it does not report one).
+    pub reduction: AtomicU32,
     pub max_frames: u32,
     pub frames: u32,
     /// 0 continue, 1 sleep, 2 error.

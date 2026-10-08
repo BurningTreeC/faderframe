@@ -65,6 +65,9 @@ pub(crate) struct RtState {
     emu: EmulatedMods,
     ranges: Box<[(u32, f32, f32)]>,
     bases_rx: rtrb::Consumer<(u32, f64)>,
+    /// The unit's gain-reduction meter (id, linear gain?), read after each
+    /// render for the mixer's.
+    pub reduction: Option<(u32, bool, Arc<faderframe_plugin_host::Reduction>)>,
 }
 
 /// What the processor needs to modulate (see [`RtState`]'s `emu`).
@@ -146,6 +149,7 @@ impl RtState {
                 r.into_boxed_slice()
             },
             bases_rx: modulation.bases_rx,
+            reduction: None,
         }
     }
 
@@ -491,6 +495,19 @@ impl PluginProcessor for AuProcessor {
             )
         };
         st.sample_time += n as f64;
+        if status == 0
+            && let Some((id, gain, cell)) = &st.reduction
+        {
+            let mut v = 0f32;
+            // SAFETY: an initialised unit, read on the thread that renders it.
+            if unsafe { AudioUnitGetParameter(unit, *id, kAudioUnitScope_Global, 0, &mut v) } == 0 {
+                cell.set(match *gain {
+                    true if v > 0.0 => (-20.0 * v.log10()).clamp(0.0, 90.0),
+                    true => 90.0,
+                    false => v.abs(),
+                });
+            }
+        }
         if status != 0 {
             silence(io);
             return ProcessStatus::Error;

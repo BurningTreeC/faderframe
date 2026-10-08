@@ -468,6 +468,9 @@ pub struct BuiltinInstance {
     descriptor: PluginDescriptor,
     params: ParamValues,
     tap: Option<Arc<AnalysisTap>>,
+    /// A compressor's gain reduction for the host (from its published value
+    /// `.1`, copied after each block).
+    reduction: Option<(Arc<crate::Reduction>, usize)>,
     /// The latency and processor shape last reported (a change asks for a
     /// restart).
     reported: Option<(u32, u64)>,
@@ -569,6 +572,10 @@ impl PluginInstance for BuiltinInstance {
 
     fn tap(&self) -> Option<Arc<AnalysisTap>> {
         self.tap.clone()
+    }
+
+    fn reduction(&self) -> Option<Arc<crate::Reduction>> {
+        self.reduction.as_ref().map(|(r, _)| Arc::clone(r))
     }
 
     fn activation(&self) -> u64 {
@@ -950,6 +957,11 @@ impl PluginInstance for BuiltinInstance {
             inner,
             set: [usize::MAX; MAX_MODULATED],
             count: 0,
+            reduction: self
+                .reduction
+                .as_ref()
+                .zip(self.tap.as_ref())
+                .map(|((r, v), tap)| (Arc::clone(r), Arc::clone(tap), *v)),
         }))
     }
 }
@@ -966,6 +978,9 @@ struct Modulated {
     /// Indices given an offset last block.
     set: [usize; MAX_MODULATED],
     count: usize,
+    /// A compressor's reduction: copied from its published value after
+    /// each block.
+    reduction: Option<(Arc<crate::Reduction>, Arc<AnalysisTap>, usize)>,
 }
 
 impl PluginProcessor for Modulated {
@@ -986,7 +1001,11 @@ impl PluginProcessor for Modulated {
                 }
             }
         }
-        self.inner.process(ctx, io)
+        let status = self.inner.process(ctx, io);
+        if let Some((r, tap, v)) = &self.reduction {
+            r.set(tap.value(*v));
+        }
+        status
     }
 
     fn reset(&mut self) {
@@ -1043,6 +1062,9 @@ impl PluginFactory for BuiltinFactory {
             kind,
             descriptor: kind.descriptor(),
             params,
+            reduction: crate::devices::reduction_value(kind.descriptor().id.as_str())
+                .filter(|_| tap.is_some())
+                .map(|v| (crate::Reduction::new(), v)),
             tap,
             reported: None,
             reshaped: 0,

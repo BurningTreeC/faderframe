@@ -354,6 +354,10 @@ impl PluginInstance for Lv2Instance {
         self.shared.freewheel.store(!realtime, Ordering::Relaxed);
     }
 
+    fn reduction(&self) -> Option<Arc<faderframe_plugin_host::Reduction>> {
+        self.shared.reduction.as_ref().map(|(_, c)| Arc::clone(c))
+    }
+
     fn output_bus_names(&mut self) -> Vec<String> {
         self.model.output_bus_names()
     }

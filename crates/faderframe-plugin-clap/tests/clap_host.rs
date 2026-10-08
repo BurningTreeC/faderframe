@@ -260,6 +260,63 @@ impl PluginAudioProcessorParams for GainProcessor<'_> {
     }
 }
 
+/// The plugin side of CLAP's (draft) gain-adjustment metering: Test Gain
+/// reports its gain as the gain it adjusts by (negative = reduction).
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(non_camel_case_types)]
+struct clap_plugin_gain_adjustment_metering {
+    get: Option<
+        unsafe extern "C" fn(plugin: *const clack_plugin::extensions::prelude::clap_plugin) -> f64,
+    >,
+}
+
+#[derive(Copy, Clone)]
+#[allow(dead_code)]
+struct GainAdjustment(
+    clack_plugin::extensions::prelude::RawExtension<
+        clack_plugin::extensions::prelude::PluginExtensionSide,
+        clap_plugin_gain_adjustment_metering,
+    >,
+);
+
+// SAFETY: the extension's repr(C) struct.
+unsafe impl clack_plugin::extensions::prelude::Extension for GainAdjustment {
+    const IDENTIFIERS: &[&CStr] = &[c"clap.gain-adjustment-metering/0"];
+    type ExtensionSide = clack_plugin::extensions::prelude::PluginExtensionSide;
+
+    unsafe fn from_raw(
+        raw: clack_plugin::extensions::prelude::RawExtension<Self::ExtensionSide>,
+    ) -> Self {
+        // SAFETY: the caller guarantees the pointer is this extension's.
+        Self(unsafe { raw.cast() })
+    }
+}
+
+// SAFETY: the implementation is the extension's struct.
+unsafe impl clack_plugin::extensions::prelude::ExtensionImplementation<TestGain>
+    for GainAdjustment
+{
+    const IMPLEMENTATION: clack_plugin::extensions::prelude::RawExtensionImplementation =
+        clack_plugin::extensions::prelude::RawExtensionImplementation::new(
+            &clap_plugin_gain_adjustment_metering {
+                get: Some(gain_adjustment),
+            },
+        );
+}
+
+unsafe extern "C" fn gain_adjustment(
+    plugin: *const clack_plugin::extensions::prelude::clap_plugin,
+) -> f64 {
+    // SAFETY: called by the host with this plugin's pointer.
+    unsafe {
+        clack_plugin::extensions::prelude::PluginWrapper::<TestGain>::handle(plugin, |p| {
+            Ok(f64::from_bits(p.shared().gain_db.load(Ordering::Relaxed)))
+        })
+    }
+    .unwrap_or(0.0)
+}
+
 impl Plugin for TestGain {
     type AudioProcessor<'a> = GainProcessor<'a>;
     type Shared<'a> = GainShared;
@@ -269,7 +326,8 @@ impl Plugin for TestGain {
         builder
             .register::<PluginParams>()
             .register::<PluginState>()
-            .register::<PluginAudioPorts>();
+            .register::<PluginAudioPorts>()
+            .register::<GainAdjustment>();
     }
 }
 
@@ -654,6 +712,37 @@ fn parameters_state_and_processing() {
         out.iter().all(|v| *v == 0.0),
         "after the instance is gone the node is silent"
     );
+}
+
+/// A plugin that reports its gain adjustment (CLAP's metering extension)
+/// has the reduction read after each block, for the mixer's meter: what
+/// it takes off, nothing for a boost.
+#[test]
+fn the_gain_adjustment_it_reports_reaches_the_host() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let f = factory();
+    let mut inst = f.instantiate("org.faderframe.test-gain").unwrap();
+    let mut proc = inst
+        .create_processor(&ProcessConfig {
+            sample_rate: 48_000.0,
+            max_block_size: 64,
+            sidechain: false,
+            double_precision: false,
+        })
+        .unwrap();
+    let cell = inst.reduction().expect("it reports its gain adjustment");
+    let at = |db: f32| {
+        [ParameterEvent {
+            parameter: ParameterId(0),
+            value: db,
+            sample_offset: 0,
+        }]
+    };
+    run_block(proc.as_mut(), &at(-6.0), 64);
+    let got = cell.get().expect("reported");
+    assert!((got - 6.0).abs() < 1e-4, "{got}");
+    run_block(proc.as_mut(), &at(3.0), 64);
+    assert_eq!(cell.get(), Some(0.0), "a boost takes nothing off");
 }
 
 #[test]
