@@ -1352,6 +1352,7 @@ version = "0.16.0"
 dependencies = [
  "faderframe-core",
  "faderframe-engine",
+ "faderframe-midi",
  "faderframe-project",
  "faderframe-session",
  "faderframe-timeline",

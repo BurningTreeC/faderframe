@@ -458,7 +458,7 @@ fn mpe_note_events(
             MidiEvent::NoteOff {
                 channel,
                 key: n.key,
-                velocity: 0,
+                velocity: n.release.unwrap_or(0),
             },
         ));
     }
@@ -833,7 +833,7 @@ impl TimelineSnapshot {
                             MidiEvent::NoteOff {
                                 channel: n.channel,
                                 key: n.key,
-                                velocity: 0,
+                                velocity: n.release.unwrap_or(0),
                             },
                         ));
                         if let Some(e) = m.expression(n.id) {

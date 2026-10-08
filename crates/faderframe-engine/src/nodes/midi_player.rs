@@ -6,10 +6,12 @@ use faderframe_core::TrackId;
 use faderframe_midi::{MidiBuffer, MidiEvent, NoteTracker, TimedMidiEvent};
 use faderframe_realtime::ParamSlot;
 
-/// Controller slots per channel: 128 CCs, pitch bend, channel pressure.
-const SLOTS: usize = 130;
+/// Controller slots per channel: 128 CCs, pitch bend, channel pressure,
+/// program (chased after the CCs, so a bank select comes first).
+const SLOTS: usize = 131;
 const PB: usize = 128;
 const AT: usize = 129;
+const PC: usize = 130;
 
 fn slot(ev: MidiEvent) -> Option<(usize, usize)> {
     match ev {
@@ -20,6 +22,7 @@ fn slot(ev: MidiEvent) -> Option<(usize, usize)> {
         } => Some(((channel & 15) as usize, (controller & 127) as usize)),
         MidiEvent::PitchBend { channel, .. } => Some(((channel & 15) as usize, PB)),
         MidiEvent::ChannelPressure { channel, .. } => Some(((channel & 15) as usize, AT)),
+        MidiEvent::ProgramChange { channel, .. } => Some(((channel & 15) as usize, PC)),
         _ => None,
     }
 }
@@ -31,7 +34,7 @@ fn slot(ev: MidiEvent) -> Option<(usize, usize)> {
 /// started are released at offset 0, so nothing hangs; controllers are
 /// *chased*: playback starting mid-clip first sends the value each
 /// controller has at that point (a held sustain pedal, a bend, the mod
-/// wheel), and controllers the player moved go back to rest (sustain off,
+/// wheel, the program), and controllers the player moved go back to rest (sustain off,
 /// bend centred) when playback jumps or stops. All state is fixed-size.
 pub struct MidiClipPlayer {
     track: TrackId,

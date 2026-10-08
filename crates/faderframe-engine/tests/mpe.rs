@@ -25,6 +25,7 @@ fn note(id: u64, start: f64, length: f64, key: u8) -> MidiNote {
         velocity: 100,
         channel: 0,
         muted: false,
+        release: None,
     }
 }
 

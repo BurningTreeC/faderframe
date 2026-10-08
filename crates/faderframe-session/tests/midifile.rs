@@ -220,3 +220,158 @@ fn exporting_only_selected_clips_and_nothing_to_export() {
     assert!(demo.export_midi_file(&path, Some(&[drum_clip])).is_err());
     assert!(empty().export_midi_file(&path, None).is_err());
 }
+
+/// Program changes (after their bank select), polyphonic aftertouch and
+/// note-off velocities come in, play from the clip and go out again.
+#[test]
+fn programs_poly_pressure_and_release_velocities_survive_import_and_export() {
+    let cc = |n: u8, v: u8| MidiMessage::Controller {
+        controller: u7::new(n),
+        value: u7::new(v),
+    };
+    let mut smf = Smf::new(Header::new(
+        Format::SingleTrack,
+        Timing::Metrical(u15::new(96)),
+    ));
+    smf.tracks.push(vec![
+        ev(0, midi(0, cc(0, 1))),
+        ev(0, midi(0, cc(32, 0))),
+        ev(
+            0,
+            midi(
+                0,
+                MidiMessage::ProgramChange {
+                    program: u7::new(40),
+                },
+            ),
+        ),
+        ev(
+            0,
+            midi(
+                0,
+                MidiMessage::NoteOn {
+                    key: u7::new(60),
+                    vel: u7::new(100),
+                },
+            ),
+        ),
+        ev(
+            24,
+            midi(
+                0,
+                MidiMessage::Aftertouch {
+                    key: u7::new(60),
+                    vel: u7::new(77),
+                },
+            ),
+        ),
+        ev(
+            72,
+            midi(
+                0,
+                MidiMessage::NoteOff {
+                    key: u7::new(60),
+                    vel: u7::new(55),
+                },
+            ),
+        ),
+        ev(
+            0,
+            midi(
+                0,
+                MidiMessage::NoteOn {
+                    key: u7::new(62),
+                    vel: u7::new(90),
+                },
+            ),
+        ),
+        ev(
+            96,
+            midi(
+                0,
+                MidiMessage::NoteOn {
+                    key: u7::new(62),
+                    vel: u7::new(0),
+                },
+            ),
+        ),
+        ev(0, TrackEventKind::Meta(MetaMessage::EndOfTrack)),
+    ]);
+    let path = dir().join("programs.mid");
+    smf.save(&path).unwrap();
+    let mut s = empty();
+    let tracks = s.import_midi_file(&path, MusicalTime::ZERO, false).unwrap();
+    let clip_of = |s: &Session, t| {
+        let id = s.project().track(t).unwrap().clips[0];
+        s.project().clip(id).unwrap().as_midi().unwrap().clone()
+    };
+    let m = clip_of(&s, tracks[0]);
+    let q = MusicalTime::from_quarters;
+    let program = m.lane(MidiController::Program, 0).unwrap();
+    assert_eq!(
+        (program.points[0].time, program.points[0].value),
+        (q(0.0), 40)
+    );
+    assert_eq!(
+        m.lane(MidiController::Cc { number: 0 }, 0).unwrap().points[0].value,
+        1
+    );
+    let poly = m.lane(MidiController::PolyPressure { key: 60 }, 0).unwrap();
+    assert_eq!((poly.points[0].time, poly.points[0].value), (q(0.25), 77));
+    let note = |k: u8| *m.notes.iter().find(|n| n.key == k).unwrap();
+    assert_eq!(note(60).release, Some(55), "a note-off's velocity");
+    assert_eq!(note(62).release, None, "a note-on of velocity 0 has none");
+    assert!(
+        !s.notices().any(|n| n.text.contains("not imported")),
+        "nothing dropped"
+    );
+
+    // Out again: the bank before the program, poly pressure, the release.
+    let out = dir().join("programs-out.mid");
+    s.export_midi_file(&out, None).unwrap();
+    let bytes = std::fs::read(&out).unwrap();
+    let back = Smf::parse(&bytes).unwrap();
+    let messages: Vec<MidiMessage> = back
+        .tracks
+        .iter()
+        .flatten()
+        .filter_map(|e| match e.kind {
+            TrackEventKind::Midi { message, .. } => Some(message),
+            _ => None,
+        })
+        .collect();
+    let at = |m: &MidiMessage| messages.iter().position(|x| x == m);
+    let program = at(&MidiMessage::ProgramChange {
+        program: u7::new(40),
+    })
+    .expect("the program change");
+    assert!(at(&cc(0, 1)).unwrap() < program && at(&cc(32, 0)).unwrap() < program);
+    assert!(
+        at(&MidiMessage::Aftertouch {
+            key: u7::new(60),
+            vel: u7::new(77),
+        })
+        .is_some()
+    );
+    assert!(
+        at(&MidiMessage::NoteOff {
+            key: u7::new(60),
+            vel: u7::new(55),
+        })
+        .is_some()
+    );
+    // And in once more: the same clip.
+    let mut again = empty();
+    let t = again
+        .import_midi_file(&out, MusicalTime::ZERO, false)
+        .unwrap();
+    let m2 = clip_of(&again, t[0]);
+    assert_eq!(m2.controllers, m.controllers);
+    let strip = |m: &faderframe_project::MidiClip| {
+        m.notes
+            .iter()
+            .map(|n| (n.start, n.length, n.key, n.velocity, n.release))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(strip(&m2), strip(&m));
+}

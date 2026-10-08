@@ -119,6 +119,7 @@ fn midi_clip(s: &mut Session, starts: &[f64]) -> ClipId {
                         velocity: 100,
                         channel: 0,
                         muted: false,
+                        release: None,
                     })
                     .collect(),
                 ..MidiClip::default()

@@ -319,6 +319,7 @@ impl Session {
                     velocity: n.velocity.clamp(1, 127),
                     channel: 0,
                     muted: false,
+                    release: None,
                 }
             })
             .collect();

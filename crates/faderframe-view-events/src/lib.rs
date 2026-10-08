@@ -1,19 +1,22 @@
-//! The MIDI event list: the edited MIDI clip's events in time order —
-//! notes, control changes, pitch bend, channel pressure and SysEx — one row
-//! each, with its position, channel, key or controller number, velocity or
-//! value and length. A double-click on a field types it, a vertical drag on
-//! a number changes it (committed once on release); rows are added from
-//! "+ Add" or a row's menu, deleted with Delete. Note rows share the
-//! session's note selection (the piano roll shows the same notes picked);
-//! the row at the playhead is marked and kept in view while playing.
+//! The MIDI event list: every event of the edited MIDI clip in time order
+//! — notes, control changes, pitch bend, channel pressure, polyphonic key
+//! pressure, program changes, per-note expression points and SysEx — one
+//! row each, every property in a column: position, channel, key or
+//! controller number, velocity or value, length, end, release velocity,
+//! mute, and a SysEx message's bytes. A double-click on a field types it, a
+//! vertical drag on a number changes it (committed once on release), a
+//! click in M mutes a note; rows are added from "+ Add" or a row's menu,
+//! deleted with Delete. Note rows share the session's note selection (the
+//! piano roll shows the same notes picked); the row at the playhead is
+//! marked and kept in view while playing.
 
 #![forbid(unsafe_code)]
 
 use faderframe_core::{ClipId, NoteId};
-use faderframe_project::MidiController;
+use faderframe_project::{ExpressionKind, MidiController};
 use faderframe_session::editing::{format_position, parse_position};
 use faderframe_session::midi_events::{
-    EventField, EventKind, EventRef, EventRow, EventValue, NewEvent,
+    EventField, EventKind, EventRef, EventRow, EventValue, NewEvent, parse_sysex,
 };
 use faderframe_session::{Action, NoteOp, SelectMode, Session, TransportAction};
 use faderframe_timeline::{MusicalTime, TICKS_PER_QUARTER};
@@ -37,23 +40,32 @@ pub enum Column {
     Position,
     Type,
     Channel,
-    /// The key (notes) or controller number (control changes).
+    /// The key (notes, poly pressure, expression points) or controller
+    /// number (control changes).
     Data1,
     /// The velocity or value.
     Data2,
     Length,
-    /// The controller's name, "muted", a SysEx message's bytes.
+    End,
+    /// A note's release velocity.
+    Release,
+    /// A note's mute.
+    Mute,
+    /// The controller's or program's name; a SysEx message's bytes.
     Info,
 }
 
-const COLUMNS: [(Column, &str, f32); 8] = [
+const COLUMNS: [(Column, &str, f32); 11] = [
     (Column::Locate, "", 26.0),
     (Column::Position, "Position", 108.0),
-    (Column::Type, "Type", 104.0),
+    (Column::Type, "Type", 118.0),
     (Column::Channel, "Ch", 36.0),
-    (Column::Data1, "Key / No.", 74.0),
-    (Column::Data2, "Value", 64.0),
+    (Column::Data1, "Key / No.", 70.0),
+    (Column::Data2, "Value", 76.0),
     (Column::Length, "Length", 76.0),
+    (Column::End, "End", 108.0),
+    (Column::Release, "Off Vel.", 60.0),
+    (Column::Mute, "M", 26.0),
     (Column::Info, "", 0.0),
 ];
 
@@ -65,13 +77,20 @@ impl Column {
             Column::Data1 => EventField::Data1,
             Column::Data2 => EventField::Data2,
             Column::Length => EventField::Length,
-            _ => return None,
+            Column::End => EventField::End,
+            Column::Release => EventField::Release,
+            Column::Mute => EventField::Muted,
+            Column::Info => EventField::Bytes,
+            Column::Locate | Column::Type => return None,
         })
     }
 
-    /// Changed by dragging (whole numbers).
+    /// Changed by dragging.
     fn numeric(self) -> bool {
-        matches!(self, Column::Channel | Column::Data1 | Column::Data2)
+        matches!(
+            self,
+            Column::Channel | Column::Data1 | Column::Data2 | Column::Release
+        )
     }
 }
 
@@ -80,6 +99,7 @@ impl Column {
 struct Filter {
     notes: bool,
     controllers: bool,
+    expression: bool,
     sysex: bool,
 }
 
@@ -88,6 +108,7 @@ impl Filter {
         match kind {
             EventKind::Note => self.notes,
             EventKind::Controller(_) => self.controllers,
+            EventKind::Expression(_) => self.expression,
             EventKind::Sysex => self.sysex,
         }
     }
@@ -100,14 +121,15 @@ struct ValueDrag {
     column: Column,
     kind: EventKind,
     y0: f32,
-    base: i64,
-    value: i64,
+    base: f64,
+    value: f64,
 }
 
 /// The header's controls.
 struct Header {
     notes: Rect,
     controllers: Rect,
+    expression: Rect,
     sysex: Rect,
     add: Rect,
 }
@@ -116,8 +138,8 @@ pub struct EventsView {
     theme: Theme,
     scroll: f32,
     hover: Option<usize>,
-    /// Selected controller values and SysEx (note rows follow the
-    /// session's note selection).
+    /// Selected controller values, expression points and SysEx (note rows
+    /// follow the session's note selection).
     selected: Vec<EventRef>,
     /// Where Shift-clicks extend from.
     anchor: Option<usize>,
@@ -140,6 +162,7 @@ impl EventsView {
             filter: Filter {
                 notes: true,
                 controllers: true,
+                expression: true,
                 sysex: true,
             },
             drag: None,
@@ -180,11 +203,13 @@ impl EventsView {
         let h = HEADER_H - 12.0;
         let add = Rect::new(size.w - 12.0 - 58.0, y, 58.0, h);
         let sysex = Rect::new(add.x - 10.0 - 54.0, y, 54.0, h);
-        let controllers = Rect::new(sysex.x - 4.0 - 84.0, y, 84.0, h);
+        let expression = Rect::new(sysex.x - 4.0 - 80.0, y, 80.0, h);
+        let controllers = Rect::new(expression.x - 4.0 - 84.0, y, 84.0, h);
         let notes = Rect::new(controllers.x - 4.0 - 54.0, y, 54.0, h);
         Header {
             notes,
             controllers,
+            expression,
             sysex,
             add,
         }
@@ -298,51 +323,69 @@ impl EventsView {
 
     /// Where a new event goes: at the first selected row, else the playhead
     /// inside the clip, else the clip's start; on that row's channel (else
-    /// the first event's).
+    /// the first event's); and the note a new expression point is for (the
+    /// selected one, else the one sounding there).
     fn new_event_place(
         &self,
         rows: &[EventRow],
         clip: ClipId,
         model: &Session,
-    ) -> (MusicalTime, u8) {
+    ) -> (MusicalTime, u8, Option<(NoteId, u8)>) {
         let picked = rows.iter().find(|r| self.is_selected(r, model));
         let channel = picked
             .or_else(|| rows.iter().find(|r| r.channel.is_some()))
             .and_then(|r| r.channel)
             .unwrap_or(0);
-        if let Some(r) = picked {
-            return (r.at, channel);
-        }
-        let at = model.project().clip(clip).map_or(MusicalTime::ZERO, |c| {
-            let end = c.start + c.as_midi().map_or(MusicalTime::ZERO, |m| m.length);
-            let p = model.playhead();
-            if p >= c.start && p < end { p } else { c.start }
+        let at = match picked {
+            Some(r) => r.at,
+            None => model.project().clip(clip).map_or(MusicalTime::ZERO, |c| {
+                let end = c.start + c.as_midi().map_or(MusicalTime::ZERO, |m| m.length);
+                let p = model.playhead();
+                if p >= c.start && p < end { p } else { c.start }
+            }),
+        };
+        let note_of = |r: &EventRow| match r.event {
+            EventRef::Note(id) | EventRef::Expression { note: id, .. } => {
+                Some((id, r.data1.unwrap_or(60) as u8))
+            }
+            _ => None,
+        };
+        let note = picked.and_then(note_of).or_else(|| {
+            rows.iter()
+                .filter(|r| r.kind == EventKind::Note)
+                .find(|r| r.at <= at && r.length.is_some_and(|l| r.at + l > at))
+                .and_then(note_of)
         });
-        (at, channel)
+        (at, channel, note)
+    }
+
+    /// The dragged value of this cell, if it is being dragged.
+    fn dragged(&self, row: &EventRow, col: Column) -> Option<f64> {
+        self.drag
+            .filter(|d| d.event == row.event && d.column == col)
+            .map(|d| d.value)
     }
 
     /// The text of a cell (with a dragged value in place).
     fn cell_text(&self, row: &EventRow, col: Column, model: &Session) -> String {
-        let dragged = self
-            .drag
-            .filter(|d| d.event == row.event && d.column == col)
-            .map(|d| d.value);
+        let dragged = self.dragged(row, col).map(|v| v.round() as i64);
         let number = |stored: Option<u16>| dragged.or(stored.map(i64::from));
+        let position = |at: MusicalTime| {
+            let p = model.project();
+            let samples = p.timeline.to_samples(at, f64::from(p.sample_rate.max(1)));
+            format_position(p, samples, model.editor.main_counter)
+        };
         match col {
-            Column::Locate => String::new(),
-            Column::Position => {
-                let p = model.project();
-                let samples = p
-                    .timeline
-                    .to_samples(row.at, f64::from(p.sample_rate.max(1)));
-                format_position(p, samples, model.editor.main_counter)
-            }
-            Column::Type => kind_label(row.kind).into(),
+            Column::Locate | Column::Mute => String::new(),
+            Column::Position => position(row.at),
+            Column::Type => kind_label(row.kind),
             Column::Channel => dragged
                 .or(row.channel.map(i64::from))
                 .map_or_else(String::new, |c| (c + 1).to_string()),
             Column::Data1 => match row.kind {
-                EventKind::Note => {
+                EventKind::Note
+                | EventKind::Expression(_)
+                | EventKind::Controller(MidiController::PolyPressure { .. }) => {
                     number(row.data1).map_or_else(String::new, |k| note_name(k.clamp(0, 127) as u8))
                 }
                 EventKind::Controller(MidiController::Cc { .. }) => {
@@ -354,18 +397,32 @@ impl EventsView {
                 EventKind::Controller(MidiController::PitchBend) => {
                     number(row.data2).map_or_else(String::new, |v| bend_text(v - 8192))
                 }
-                EventKind::Sysex => String::new(),
+                EventKind::Controller(MidiController::Program) => {
+                    number(row.data2).map_or_else(String::new, |v| (v + 1).to_string())
+                }
+                EventKind::Expression(kind) => self
+                    .dragged(row, col)
+                    .map(|v| v as f32)
+                    .or(row.amount)
+                    .map_or_else(String::new, |v| kind.format(v)),
+                EventKind::Sysex => format!("{} bytes", row.bytes.len()),
                 _ => number(row.data2).map_or_else(String::new, |v| v.to_string()),
             },
             Column::Length => row.length.map_or_else(String::new, length_text),
+            Column::End => row
+                .length
+                .map_or_else(String::new, |l| position(row.at + l)),
+            Column::Release => match (row.kind, dragged.or(row.release.map(i64::from))) {
+                (EventKind::Note, Some(v)) => v.to_string(),
+                (EventKind::Note, None) => "–".into(),
+                _ => String::new(),
+            },
             Column::Info => match row.kind {
-                EventKind::Note if row.muted => "muted".into(),
                 EventKind::Controller(MidiController::Cc { number }) => {
                     // The name of the number being dragged.
                     let number = self
-                        .drag
-                        .filter(|d| d.event == row.event && d.column == Column::Data1)
-                        .map_or(number, |d| d.value.clamp(0, 127) as u8);
+                        .dragged(row, Column::Data1)
+                        .map_or(number, |v| v.round().clamp(0.0, 127.0) as u8);
                     let label = MidiController::Cc { number }.label();
                     if label.starts_with("CC ") {
                         String::new()
@@ -373,53 +430,83 @@ impl EventsView {
                         label
                     }
                 }
-                EventKind::Sysex => row.bytes.clone(),
+                EventKind::Controller(MidiController::Program) => {
+                    let program = number(row.data2).unwrap_or(0).clamp(0, 127) as u8;
+                    faderframe_midi::gm::program_name(row.channel.unwrap_or(0), program)
+                        .map_or_else(String::new, |n| format!("GM: {n}"))
+                }
+                EventKind::Sysex => hex(&row.bytes),
                 _ => String::new(),
             },
         }
     }
 
     /// The range of a dragged number (stored values).
-    fn range(kind: EventKind, col: Column) -> (i64, i64) {
+    fn range(kind: EventKind, col: Column) -> (f64, f64) {
         match (col, kind) {
-            (Column::Channel, _) => (0, 15),
-            (Column::Data2, EventKind::Note) => (1, 127),
-            (Column::Data2, EventKind::Controller(c)) => (0, i64::from(c.max())),
-            _ => (0, 127),
+            (Column::Channel, _) => (0.0, 15.0),
+            (Column::Data2, EventKind::Note) => (1.0, 127.0),
+            (Column::Data2, EventKind::Controller(c)) => (0.0, f64::from(c.max())),
+            (Column::Data2, EventKind::Expression(k)) => {
+                let (lo, hi) = k.range();
+                (f64::from(lo), f64::from(hi))
+            }
+            _ => (0.0, 127.0),
         }
     }
 
-    /// Steps of a dragged number per [`DRAG_PX`] (pitch bend moves faster).
-    fn drag_step(kind: EventKind, col: Column) -> f32 {
+    /// A dragged number's change per [`DRAG_PX`].
+    fn drag_step(kind: EventKind, col: Column) -> f64 {
         match (col, kind) {
             (Column::Data2, EventKind::Controller(MidiController::PitchBend)) => 64.0,
+            (Column::Data2, EventKind::Expression(k)) => match k {
+                ExpressionKind::Pitch => 0.05,
+                ExpressionKind::Volume => 0.5,
+                _ => 0.01,
+            },
             _ => 1.0,
         }
     }
 
-    fn stored(row: &EventRow, col: Column) -> Option<i64> {
-        match col {
-            Column::Channel => row.channel.map(i64::from),
-            Column::Data1 => row.data1.map(i64::from),
-            Column::Data2 => row.data2.map(i64::from),
+    /// Where a drag starts from.
+    fn stored(row: &EventRow, col: Column) -> Option<f64> {
+        match (col, row.kind) {
+            (Column::Channel, _) => row.channel.map(f64::from),
+            (Column::Data1, _) => row.data1.map(f64::from),
+            (Column::Data2, EventKind::Expression(_)) => row.amount.map(f64::from),
+            (Column::Data2, _) => row.data2.map(f64::from),
+            // A release velocity not set starts from the usual 64.
+            (Column::Release, EventKind::Note) => Some(f64::from(row.release.unwrap_or(64))),
             _ => None,
+        }
+    }
+
+    /// The value a drag ends with.
+    fn drag_value(kind: EventKind, v: f64) -> EventValue {
+        match kind {
+            EventKind::Expression(_) => EventValue::Amount(v as f32),
+            _ => EventValue::Number(v.round() as i64),
         }
     }
 
     /// The field can change for this row.
     pub fn editable(row: &EventRow, col: Column) -> bool {
+        use EventKind as K;
+        use MidiController as C;
         matches!(
             (col, row.kind),
             (Column::Position, _)
-                | (
-                    Column::Channel | Column::Data2,
-                    EventKind::Note | EventKind::Controller(_)
-                )
+                | (Column::Channel, K::Note | K::Controller(_))
                 | (
                     Column::Data1,
-                    EventKind::Note | EventKind::Controller(MidiController::Cc { .. })
+                    K::Note | K::Controller(C::Cc { .. } | C::PolyPressure { .. })
                 )
-                | (Column::Length, EventKind::Note)
+                | (Column::Data2, K::Note | K::Controller(_) | K::Expression(_))
+                | (
+                    Column::Length | Column::End | Column::Release | Column::Mute,
+                    K::Note
+                )
+                | (Column::Info, K::Sysex)
         )
     }
 
@@ -440,31 +527,48 @@ impl EventsView {
         let rate = p.sample_rate;
         let tc = p.timecode.unwrap_or_default();
         let unit = model.editor.main_counter;
-        let initial = self.cell_text(row, col, model);
+        let initial = match col {
+            Column::Release if row.release.is_none() => String::new(),
+            Column::Data2 if matches!(kind, EventKind::Expression(_)) => {
+                row.amount.map_or_else(String::new, |v| format!("{v:.2}"))
+            }
+            _ => self.cell_text(row, col, model),
+        };
         let commit = move |text: &str| -> Option<Action> {
+            let int = |t: &str| t.trim().replace('−', "-").parse::<i64>().ok();
             let value = match col {
-                Column::Position => {
+                Column::Position | Column::End => {
                     EventValue::Time(parse_position(text, unit, &timeline, rate, tc)?)
                 }
                 Column::Length => EventValue::Time(parse_length(text)?),
                 Column::Channel => {
-                    let c: i64 = text.trim().parse().ok()?;
+                    let c = int(text)?;
                     (1..=16).contains(&c).then_some(EventValue::Number(c - 1))?
                 }
                 Column::Data1 => EventValue::Number(match kind {
-                    EventKind::Note => i64::from(parse_key(text)?),
-                    _ => text
-                        .trim()
-                        .parse::<i64>()
-                        .ok()
-                        .filter(|n| (0..=127).contains(n))?,
-                }),
-                Column::Data2 => EventValue::Number(match kind {
-                    EventKind::Controller(MidiController::PitchBend) => {
-                        parse_signed(text)?.clamp(-8192, 8191) + 8192
+                    EventKind::Controller(MidiController::Cc { .. }) => {
+                        int(text).filter(|n| (0..=127).contains(n))?
                     }
-                    _ => text.trim().parse::<i64>().ok()?,
+                    _ => i64::from(parse_key(text)?),
                 }),
+                Column::Data2 => match kind {
+                    EventKind::Controller(MidiController::PitchBend) => {
+                        EventValue::Number(parse_signed(text)?.clamp(-8192, 8191) + 8192)
+                    }
+                    EventKind::Controller(MidiController::Program) => {
+                        let p = int(text)?;
+                        (1..=128)
+                            .contains(&p)
+                            .then_some(EventValue::Number(p - 1))?
+                    }
+                    EventKind::Expression(k) => EventValue::Amount(parse_amount(k, text)?),
+                    _ => EventValue::Number(int(text)?),
+                },
+                Column::Release => match text.trim() {
+                    "" | "-" | "–" | "—" => EventValue::Number(-1),
+                    t => EventValue::Number(int(t).filter(|v| (0..=127).contains(v))?),
+                },
+                Column::Info => EventValue::Bytes(parse_sysex(text)?),
                 _ => return None,
             };
             Some(Action::EditMidiEvents {
@@ -481,8 +585,14 @@ impl EventsView {
         })
     }
 
-    /// "+ Add": a note, a controller, pitch bend, pressure at `at`.
-    fn add_items(clip: ClipId, at: MusicalTime, channel: u8) -> Vec<MenuItem<Action>> {
+    /// "+ Add": every kind of event at `at` (an expression point needs a
+    /// note: the selected one or the one sounding there).
+    fn add_items(
+        clip: ClipId,
+        at: MusicalTime,
+        channel: u8,
+        note: Option<(NoteId, u8)>,
+    ) -> Vec<MenuItem<Action>> {
         let add = |label: &str, what: NewEvent| {
             MenuItem::new(
                 label,
@@ -504,7 +614,7 @@ impl EventsView {
             };
             add(&label, NewEvent::Controller(c))
         };
-        let common = [1u8, 2, 7, 10, 11, 64, 66, 67, 71, 74];
+        let common = [0u8, 32, 1, 2, 7, 10, 11, 64, 66, 67, 71, 74];
         let mut controllers: Vec<MenuItem<Action>> = common.into_iter().map(cc).collect();
         controllers.push(
             MenuItem::submenu(
@@ -520,9 +630,24 @@ impl EventsView {
             )
             .separated(),
         );
+        let key = note.map_or(60, |(_, k)| k);
+        let expression = match note {
+            Some((id, key)) => MenuItem::submenu(
+                format!("Note Expression ({})", note_name(key)),
+                ExpressionKind::ALL
+                    .into_iter()
+                    .map(|kind| add(kind.label(), NewEvent::Expression { note: id, kind }))
+                    .collect(),
+            ),
+            None => MenuItem::disabled("Note Expression (select a note)"),
+        };
         vec![
             add("Note", NewEvent::Note),
             MenuItem::submenu("Control Change", controllers),
+            add(
+                "Program Change",
+                NewEvent::Controller(MidiController::Program),
+            ),
             add(
                 "Pitch Bend",
                 NewEvent::Controller(MidiController::PitchBend),
@@ -531,11 +656,17 @@ impl EventsView {
                 "Channel Pressure",
                 NewEvent::Controller(MidiController::ChannelPressure),
             ),
+            add(
+                &format!("Poly Pressure ({})", note_name(key)),
+                NewEvent::Controller(MidiController::PolyPressure { key }),
+            ),
+            expression,
+            add("SysEx", NewEvent::Sysex).separated(),
         ]
     }
 
-    /// A row's menu: the playhead, the channel, mute, add, delete — for the
-    /// selected rows when it is one of them.
+    /// A row's menu: the playhead, the channel, mute, release velocity,
+    /// add, delete — for the selected rows when it is one of them.
     fn row_menu(
         &mut self,
         at: Point,
@@ -563,7 +694,7 @@ impl EventsView {
         let channelled: Vec<EventRef> = events
             .iter()
             .copied()
-            .filter(|e| !matches!(e, EventRef::Sysex(_)))
+            .filter(|e| matches!(e, EventRef::Note(_) | EventRef::Controller { .. }))
             .collect();
         let shared = {
             let mut chans = rows
@@ -603,15 +734,43 @@ impl EventsView {
                 "Mute / Unmute Notes",
                 Action::NoteOperation {
                     clip,
-                    notes,
+                    notes: notes.clone(),
                     op: NoteOp::ToggleMuted,
                 },
             ));
+            let note_events: Vec<EventRef> = notes.iter().map(|n| EventRef::Note(*n)).collect();
+            let release = |label: String, v: i64| {
+                MenuItem::new(
+                    label,
+                    Action::EditMidiEvents {
+                        clip,
+                        events: note_events.clone(),
+                        field: EventField::Release,
+                        value: EventValue::Number(v),
+                    },
+                )
+            };
+            items.push(MenuItem::submenu(
+                "Release Velocity",
+                std::iter::once(release("None (note-off at 0)".into(), -1))
+                    .chain(
+                        [0i64, 32, 64, 96, 127]
+                            .into_iter()
+                            .map(|v| release(v.to_string(), v)),
+                    )
+                    .collect(),
+            ));
         }
+        let note = match row.event {
+            EventRef::Note(id) | EventRef::Expression { note: id, .. } => {
+                Some((id, row.data1.unwrap_or(60) as u8))
+            }
+            _ => None,
+        };
         items.push(
             MenuItem::submenu(
                 "Add Here",
-                Self::add_items(clip, row.at, row.channel.unwrap_or(0)),
+                Self::add_items(clip, row.at, row.channel.unwrap_or(0), note),
             )
             .separated(),
         );
@@ -697,6 +856,7 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for EventsView {
         );
         self.chip(p, h.notes, "Notes", self.filter.notes);
         self.chip(p, h.controllers, "Controllers", self.filter.controllers);
+        self.chip(p, h.expression, "Expression", self.filter.expression);
         self.chip(p, h.sysex, "SysEx", self.filter.sysex);
         if clip.is_some() {
             p.fill_rounded(h.add, 4.0, &th.ui.accent.with_alpha(0.25).into());
@@ -714,11 +874,13 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for EventsView {
         for (col, label, _) in COLUMNS {
             let r = Self::cell(col, names);
             if !label.is_empty() {
-                p.text(
-                    label,
-                    r.inset_xy(6.0, 0.0),
-                    &TextStyle::new(th.fonts.small, th.ui.text_dim).bold(),
-                );
+                let style = TextStyle::new(th.fonts.small, th.ui.text_dim).bold();
+                let style = if col == Column::Mute {
+                    style.center()
+                } else {
+                    style
+                };
+                p.text(label, r.inset_xy(6.0, 0.0), &style);
             }
             if col != Column::Info {
                 p.vline(
@@ -783,6 +945,27 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for EventsView {
                     &TextStyle::new(th.fonts.small, th.ui.text_faint).center(),
                 );
             }
+            // A note's mute: a small button, lit when muted.
+            if row.kind == EventKind::Note {
+                let m = Self::cell(Column::Mute, r).centered(14.0, 14.0);
+                if row.muted {
+                    p.fill_rounded(m, 3.0, &th.ui.accent.with_alpha(0.8).into());
+                }
+                p.stroke_rounded(m, 3.0, 1.0, th.ui.border);
+                p.text(
+                    "M",
+                    m,
+                    &TextStyle::new(
+                        th.fonts.small,
+                        if row.muted {
+                            th.ui.text
+                        } else {
+                            th.ui.text_faint
+                        },
+                    )
+                    .center(),
+                );
+            }
             let ink = if row.muted {
                 th.ui.text_faint
             } else {
@@ -797,9 +980,12 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for EventsView {
                 let style = match col {
                     Column::Type => TextStyle::new(th.fonts.small, kind_color(row.kind, th)),
                     Column::Info => TextStyle::new(th.fonts.small, th.ui.text_dim),
+                    Column::Release if row.release.is_none() => {
+                        TextStyle::new(th.fonts.small, th.ui.text_faint)
+                    }
                     _ => TextStyle::new(th.fonts.small, ink),
                 };
-                let style = if matches!(col, Column::Position | Column::Length)
+                let style = if matches!(col, Column::Position | Column::Length | Column::End)
                     || (*col == Column::Info && row.kind == EventKind::Sysex)
                 {
                     style.family(FontFamily::Mono)
@@ -829,12 +1015,18 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for EventsView {
                 clicks,
             } => {
                 let h = Self::header(size);
-                for (r, which) in [(h.notes, 0), (h.controllers, 1), (h.sysex, 2)] {
+                for (r, which) in [
+                    (h.notes, 0),
+                    (h.controllers, 1),
+                    (h.expression, 2),
+                    (h.sysex, 3),
+                ] {
                     if r.contains(pos) {
                         let f = &mut self.filter;
                         let on = match which {
                             0 => &mut f.notes,
                             1 => &mut f.controllers,
+                            2 => &mut f.expression,
                             _ => &mut f.sysex,
                         };
                         *on = !*on;
@@ -847,10 +1039,10 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for EventsView {
                 };
                 let rows = self.rows(model);
                 if h.add.contains(pos) {
-                    let (at, channel) = self.new_event_place(&rows, clip, model);
+                    let (at, channel, note) = self.new_event_place(&rows, clip, model);
                     cx.request(HostRequest::ContextMenu {
                         at: Point::new(h.add.x, h.add.y + h.add.h),
-                        items: Self::add_items(clip, at, channel),
+                        items: Self::add_items(clip, at, channel, note),
                     });
                     return true;
                 }
@@ -862,6 +1054,16 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for EventsView {
                 let col = Self::column_at(pos.x);
                 if col == Column::Locate {
                     cx.emit(Action::Transport(TransportAction::Locate(row.at)));
+                }
+                // M: mute or unmute the note at once.
+                if col == Column::Mute && row.kind == EventKind::Note {
+                    cx.emit(Action::EditMidiEvents {
+                        clip,
+                        events: vec![row.event],
+                        field: EventField::Muted,
+                        value: EventValue::Number(i64::from(!row.muted)),
+                    });
+                    return true;
                 }
                 if clicks >= 2 && Self::editable(row, col) {
                     let cell = Self::cell(col, self.row_rect(i, size));
@@ -918,12 +1120,12 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for EventsView {
                 let rows = self.rows(model);
                 let Some(i) = self.row_at(pos, size, rows.len()) else {
                     if Self::list(size).contains(pos) {
-                        let (at, channel) = self.new_event_place(&rows, clip, model);
+                        let (at, channel, note) = self.new_event_place(&rows, clip, model);
                         cx.request(HostRequest::ContextMenu {
                             at: pos,
                             items: vec![MenuItem::submenu(
                                 "Add",
-                                Self::add_items(clip, at, channel),
+                                Self::add_items(clip, at, channel, note),
                             )],
                         });
                         return true;
@@ -936,9 +1138,8 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for EventsView {
             ViewEvent::PointerMove { pos, dragging, .. } => {
                 if let (Some(d), true) = (self.drag.as_mut(), dragging) {
                     let (lo, hi) = Self::range(d.kind, d.column);
-                    let steps = ((d.y0 - pos.y) / DRAG_PX).round();
-                    let v = (d.base as f32 + steps * Self::drag_step(d.kind, d.column)) as i64;
-                    let v = v.clamp(lo, hi);
+                    let steps = f64::from(((d.y0 - pos.y) / DRAG_PX).round());
+                    let v = (d.base + steps * Self::drag_step(d.kind, d.column)).clamp(lo, hi);
                     if v != d.value {
                         d.value = v;
                         cx.redraw();
@@ -955,6 +1156,7 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for EventsView {
                 let col = Self::column_at(pos.x);
                 let cursor = match hover.map(|i| &rows[i]) {
                     Some(r) if col.numeric() && Self::editable(r, col) => Cursor::ResizeVertical,
+                    Some(r) if col == Column::Mute && Self::editable(r, col) => Cursor::Pointer,
                     Some(_) if col == Column::Locate => Cursor::Pointer,
                     _ => Cursor::Default,
                 };
@@ -975,7 +1177,7 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for EventsView {
                         clip,
                         events: vec![d.event],
                         field,
-                        value: EventValue::Number(d.value),
+                        value: Self::drag_value(d.kind, d.value),
                     });
                 }
                 cx.redraw();
@@ -1050,31 +1252,53 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for EventsView {
 
     fn tooltip(&self, pos: Point, size: Size, model: &Session) -> Option<String> {
         let h = Self::header(size);
-        if h.notes.contains(pos) {
-            return Some("Show notes".into());
-        }
-        if h.controllers.contains(pos) {
-            return Some("Show controller values (control change, pitch bend, pressure)".into());
-        }
-        if h.sysex.contains(pos) {
-            return Some("Show SysEx messages".into());
-        }
-        if h.add.contains(pos) {
-            return Some("Add an event at the selected event, else at the playhead".into());
+        for (r, tip) in [
+            (h.notes, "Show notes"),
+            (
+                h.controllers,
+                "Show controller values: control changes, program changes, pitch bend, channel and poly pressure",
+            ),
+            (
+                h.expression,
+                "Show the points of the notes' expression curves",
+            ),
+            (h.sysex, "Show SysEx messages"),
+            (
+                h.add,
+                "Add an event at the selected event, else at the playhead",
+            ),
+        ] {
+            if r.contains(pos) {
+                return Some(tip.into());
+            }
         }
         let rows = self.rows(model);
         let row = &rows[self.row_at(pos, size, rows.len())?];
         let col = Self::column_at(pos.x);
+        let editable = Self::editable(row, col);
         Some(match col {
             Column::Locate => "Move the playhead to this event".into(),
-            Column::Info if row.kind == EventKind::Sysex => row.bytes.clone(),
-            Column::Length if Self::editable(row, col) => {
+            Column::Mute if editable => {
+                if row.muted {
+                    "Muted: click to unmute".into()
+                } else {
+                    "Click to mute the note".into()
+                }
+            }
+            Column::Info if editable => {
+                format!(
+                    "{} · double-click to type its bytes in hex",
+                    hex(&row.bytes)
+                )
+            }
+            Column::Length if editable => {
                 "Length in beats.ticks (960 ticks a beat) or a note value like 1/8 · double-click to type".into()
             }
-            _ if col.numeric() && Self::editable(row, col) => {
-                "Drag up or down, or double-click to type".into()
+            Column::Release if editable => {
+                "Release (note-off) velocity: drag or double-click to type; empty = none".into()
             }
-            _ if Self::editable(row, col) => "Double-click to type".into(),
+            _ if col.numeric() && editable => "Drag up or down, or double-click to type".into(),
+            _ if editable => "Double-click to type".into(),
             _ => return None,
         })
     }
@@ -1109,13 +1333,16 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for EventsView {
     }
 }
 
-fn kind_label(kind: EventKind) -> &'static str {
+fn kind_label(kind: EventKind) -> String {
     match kind {
-        EventKind::Note => "Note",
-        EventKind::Controller(MidiController::Cc { .. }) => "Control Change",
-        EventKind::Controller(MidiController::PitchBend) => "Pitch Bend",
-        EventKind::Controller(MidiController::ChannelPressure) => "Channel Pressure",
-        EventKind::Sysex => "SysEx",
+        EventKind::Note => "Note".into(),
+        EventKind::Controller(MidiController::Cc { .. }) => "Control Change".into(),
+        EventKind::Controller(MidiController::PitchBend) => "Pitch Bend".into(),
+        EventKind::Controller(MidiController::ChannelPressure) => "Channel Pressure".into(),
+        EventKind::Controller(MidiController::PolyPressure { .. }) => "Poly Pressure".into(),
+        EventKind::Controller(MidiController::Program) => "Program Change".into(),
+        EventKind::Expression(k) => format!("Note {}", k.label()),
+        EventKind::Sysex => "SysEx".into(),
     }
 }
 
@@ -1123,8 +1350,17 @@ fn kind_color(kind: EventKind, th: &Theme) -> faderframe_ui_canvas::Color {
     match kind {
         EventKind::Note => th.ui.text,
         EventKind::Controller(_) => th.ui.accent,
-        EventKind::Sysex => th.ui.text_dim,
+        EventKind::Expression(_) | EventKind::Sysex => th.ui.text_dim,
     }
+}
+
+/// Bytes as hex ("F0 7E 7F 06 01 F7").
+fn hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 const NAMES: [&str; 12] = [
@@ -1179,6 +1415,30 @@ fn bend_text(d: i64) -> String {
 fn parse_signed(text: &str) -> Option<i64> {
     let t = text.trim().replace('−', "-");
     t.strip_prefix('+').unwrap_or(&t).parse().ok()
+}
+
+/// A typed expression value in its kind's unit: "+1.5 st", "−3 dB", pan as
+/// "C", "L 30", "R 30" or −1…1, else a plain number.
+pub fn parse_amount(kind: ExpressionKind, text: &str) -> Option<f32> {
+    let t = text.trim().replace('−', "-");
+    if kind == ExpressionKind::Pan {
+        let up = t.to_ascii_uppercase();
+        if up == "C" {
+            return Some(0.0);
+        }
+        for (side, sign) in [("L", -1.0f32), ("R", 1.0)] {
+            if let Some(rest) = up.strip_prefix(side) {
+                let v: f32 = rest.trim().parse().ok()?;
+                return Some((sign * v / 100.0).clamp(-1.0, 1.0));
+            }
+        }
+    }
+    let t = t
+        .trim_end_matches(|c: char| c.is_alphabetic() || c.is_whitespace())
+        .trim();
+    let v: f32 = t.strip_prefix('+').unwrap_or(t).parse().ok()?;
+    let (lo, hi) = kind.range();
+    v.is_finite().then_some(v.clamp(lo, hi))
 }
 
 /// A length as beats.ticks (960 ticks a quarter, like the positions).

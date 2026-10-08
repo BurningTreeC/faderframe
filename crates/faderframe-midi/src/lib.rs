@@ -13,6 +13,7 @@
 
 mod buffer;
 mod event;
+pub mod gm;
 mod input;
 mod note_ids;
 mod output;

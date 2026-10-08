@@ -474,6 +474,7 @@ pub fn demo_project(sample_rate: u32) -> Project {
                 velocity: if start.fract() == 0.0 { 104 } else { 86 },
                 channel: 0,
                 muted: false,
+                release: None,
             });
         }
     }
@@ -506,6 +507,7 @@ pub fn demo_project(sample_rate: u32) -> Project {
             velocity: 92,
             channel: 0,
             muted: false,
+            release: None,
         })
         .collect();
     let chord_clip = Clip {

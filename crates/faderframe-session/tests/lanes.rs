@@ -140,6 +140,7 @@ fn song() -> Session {
             velocity: 100,
             channel: 0,
             muted: false,
+            release: None,
         };
         p.clips.insert(
             id,

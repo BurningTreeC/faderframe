@@ -190,6 +190,11 @@ pub enum StretchSettings {
     Off,
 }
 
+/// Key names for labels ("C4" = MIDI 60).
+const KEY_NAMES: [&str; 12] = [
+    "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+];
+
 /// A MIDI controller whose values a clip can hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
@@ -200,6 +205,10 @@ pub enum MidiController {
     PitchBend,
     /// Channel pressure (aftertouch).
     ChannelPressure,
+    /// Program change 0–127 (a bank comes from CC 0 and 32 before it).
+    Program,
+    /// Polyphonic key pressure on one key.
+    PolyPressure { key: u8 },
 }
 
 impl MidiController {
@@ -245,6 +254,12 @@ impl MidiController {
             },
             MidiController::PitchBend => "Pitch Bend".into(),
             MidiController::ChannelPressure => "Aftertouch".into(),
+            MidiController::Program => "Program".into(),
+            MidiController::PolyPressure { key } => format!(
+                "Poly Pressure {}{}",
+                KEY_NAMES[usize::from(key % 12)],
+                i32::from(key) / 12 - 1
+            ),
         }
     }
 
@@ -262,6 +277,15 @@ impl MidiController {
             },
             MidiController::ChannelPressure => MidiEvent::ChannelPressure {
                 channel,
+                pressure: value.min(127) as u8,
+            },
+            MidiController::Program => MidiEvent::ProgramChange {
+                channel,
+                program: value.min(127) as u8,
+            },
+            MidiController::PolyPressure { key } => MidiEvent::PolyPressure {
+                channel,
+                key: key.min(127),
                 pressure: value.min(127) as u8,
             },
         }
@@ -285,6 +309,18 @@ impl MidiController {
             }
             MidiEvent::ChannelPressure { channel, pressure } => Some((
                 MidiController::ChannelPressure,
+                channel,
+                u16::from(pressure),
+            )),
+            MidiEvent::ProgramChange { channel, program } => {
+                Some((MidiController::Program, channel, u16::from(program)))
+            }
+            MidiEvent::PolyPressure {
+                channel,
+                key,
+                pressure,
+            } => Some((
+                MidiController::PolyPressure { key },
                 channel,
                 u16::from(pressure),
             )),
@@ -533,6 +569,10 @@ pub struct MidiNote {
     /// Kept but silent.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub muted: bool,
+    /// Note-off (release) velocity; `None` sends 0, as a note-on of
+    /// velocity 0 ends a note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<u8>,
 }
 
 impl MidiNote {

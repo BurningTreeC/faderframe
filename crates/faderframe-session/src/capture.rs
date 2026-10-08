@@ -133,6 +133,8 @@ impl Session {
                     | MidiEvent::ControlChange { .. }
                     | MidiEvent::PitchBend { .. }
                     | MidiEvent::ChannelPressure { .. }
+                    | MidiEvent::ProgramChange { .. }
+                    | MidiEvent::PolyPressure { .. }
             ) {
                 continue;
             }

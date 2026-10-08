@@ -217,6 +217,7 @@ fn synth_track(tp: &mut TestProject, velocity: u8) -> (faderframe_core::TrackId,
         velocity,
         channel: 0,
         muted: false,
+        release: None,
     };
     let id = tp.project.ids.allocate();
     tp.project.clips.insert(

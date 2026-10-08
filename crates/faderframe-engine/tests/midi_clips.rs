@@ -47,6 +47,7 @@ fn project(muted: bool, sustain: bool) -> TestProject {
             velocity: 110,
             channel: 0,
             muted,
+            release: None,
         }],
         controllers: Vec::new(),
         expressions: Vec::new(),
@@ -124,4 +125,66 @@ fn a_sustained_note_keeps_ringing_and_is_released_on_stop() {
         .unwrap();
     energy(&mut pedal, 600);
     assert!(energy(&mut pedal, 20) < 1e-6, "released after stop");
+}
+
+/// Program changes (after their bank select), poly pressure and release
+/// velocities play from a clip; starting after the program change sends
+/// it first (chased with the bank).
+#[test]
+fn programs_poly_pressure_and_release_velocities_play() {
+    use faderframe_engine::TimelineSnapshot;
+    use faderframe_midi::MidiEvent;
+    let mut tp = project(false, false);
+    let id = *tp.project.clips.keys().next().unwrap();
+    let ClipContent::Midi(m) = &mut tp.project.clips.get_mut(&id).unwrap().content else {
+        panic!("a MIDI clip");
+    };
+    m.notes[0].release = Some(55);
+    let q = MusicalTime::from_quarters;
+    for (controller, time, value) in [
+        (MidiController::Cc { number: 0 }, q(0.0), 1),
+        (MidiController::Program, q(0.0), 40),
+        (MidiController::PolyPressure { key: 60 }, q(0.125), 77),
+    ] {
+        let mut lane = ControllerLane::new(controller, 0);
+        lane.points = vec![ControllerPoint { time, value }];
+        m.controllers.push(lane);
+    }
+    m.controllers.sort_by_key(|l| (l.controller, l.channel));
+    let track = tp.project.clips[&id].track;
+    let snap = TimelineSnapshot::build(&tp.project, &tp.sources, SR);
+    let events: Vec<MidiEvent> = snap.lane(track).unwrap().midi[0]
+        .events
+        .iter()
+        .map(|(_, e)| *e)
+        .collect();
+    let at = |e: MidiEvent| events.iter().position(|x| *x == e);
+    let program = at(MidiEvent::ProgramChange {
+        channel: 0,
+        program: 40,
+    })
+    .expect("the program change");
+    let bank = at(MidiEvent::ControlChange {
+        channel: 0,
+        controller: 0,
+        value: 1,
+    })
+    .unwrap();
+    assert!(bank < program, "the bank before the program");
+    assert!(
+        at(MidiEvent::PolyPressure {
+            channel: 0,
+            key: 60,
+            pressure: 77,
+        })
+        .is_some()
+    );
+    assert!(
+        at(MidiEvent::NoteOff {
+            channel: 0,
+            key: 60,
+            velocity: 55,
+        })
+        .is_some()
+    );
 }

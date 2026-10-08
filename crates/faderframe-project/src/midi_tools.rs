@@ -505,6 +505,7 @@ fn new_note(
         velocity: velocity.clamp(1, 127) as u8,
         channel: like.channel,
         muted: like.muted,
+        release: None,
     })
 }
 
@@ -862,6 +863,7 @@ pub fn generate(
         velocity: s.velocity,
         channel: 0,
         muted: false,
+        release: None,
     };
     let velocity = i32::from(s.velocity);
     let mut out = Vec::new();
@@ -1203,6 +1205,7 @@ mod tests {
             velocity: 100,
             channel: 0,
             muted: false,
+            release: None,
         }
     }
 

@@ -512,6 +512,7 @@ impl PianoRollView {
                     velocity: pr.velocity,
                     channel: 0,
                     muted: false,
+                    release: None,
                 };
                 if let Some(r) = self.note_rect(&n) {
                     let c = Self::note_color(color, pr.velocity);

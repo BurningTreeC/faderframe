@@ -109,6 +109,8 @@ pub(crate) struct RecNote {
     pub velocity: u8,
     pub channel: u8,
     pub pass: u32,
+    /// The note-off's velocity (none for a note-on of velocity 0).
+    pub release: Option<u8>,
 }
 
 /// MPE recording: the member-channel pitch bend, pressure and CC 74 that
@@ -253,19 +255,25 @@ impl MidiTake {
                 } if velocity > 0 => {
                     // A retrigger closes the previous note first.
                     if let Some((start, vel, pass)) = self.open[t].remove(&(channel, key)) {
-                        self.close(t, start, pos, key, vel, channel, pass);
+                        self.close(t, start, pos, key, vel, channel, pass, None);
                     }
                     self.open[t].insert((channel, key), (pos, velocity, r.pass));
                 }
                 ev @ (MidiEvent::ControlChange { .. }
                 | MidiEvent::PitchBend { .. }
-                | MidiEvent::ChannelPressure { .. }) => {
+                | MidiEvent::ChannelPressure { .. }
+                | MidiEvent::ProgramChange { .. }
+                | MidiEvent::PolyPressure { .. }) => {
                     if let Some((c, ch, v)) = faderframe_project::MidiController::of_event(ev) {
                         self.controllers[t].push((pos, c, ch, v, r.pass));
                     }
                 }
                 MidiEvent::NoteOn { channel, key, .. }
                 | MidiEvent::NoteOff { channel, key, .. } => {
+                    let release = match r.event {
+                        MidiEvent::NoteOff { velocity, .. } => Some(velocity),
+                        _ => None,
+                    };
                     if let Some((start, vel, pass)) = self.open[t].remove(&(channel, key)) {
                         // A loop wrap while held ends the note at the wrap.
                         let end = if pass == r.pass {
@@ -273,7 +281,7 @@ impl MidiTake {
                         } else {
                             self.last.max(start + 1)
                         };
-                        self.close(t, start, end, key, vel, channel, pass);
+                        self.close(t, start, end, key, vel, channel, pass, release);
                     }
                 }
                 _ => {}
@@ -291,6 +299,7 @@ impl MidiTake {
         velocity: u8,
         channel: u8,
         pass: u32,
+        release: Option<u8>,
     ) {
         self.notes[t].push(RecNote {
             start,
@@ -299,6 +308,7 @@ impl MidiTake {
             velocity,
             channel,
             pass,
+            release,
         });
     }
 
@@ -307,7 +317,7 @@ impl MidiTake {
         for t in 0..self.tracks.len() {
             let open: Vec<_> = self.open[t].drain().collect();
             for ((channel, key), (start, vel, pass)) in open {
-                self.close(t, start, at.max(start + 1), key, vel, channel, pass);
+                self.close(t, start, at.max(start + 1), key, vel, channel, pass, None);
             }
         }
     }
@@ -1036,6 +1046,7 @@ impl Session {
                             velocity,
                             channel,
                             muted: false,
+                            release: None,
                         })
                         .collect();
                     if let Err(e) = self.add_notes(st.clip, &notes) {
@@ -1869,6 +1880,7 @@ impl Session {
                     velocity: n.velocity.max(1),
                     channel: n.channel,
                     muted: false,
+                    release: n.release,
                 }
             })
             .collect();
@@ -1967,6 +1979,7 @@ mod mpe_tests {
                 velocity: 90,
                 channel: 1,
                 pass: 0,
+                release: None,
             },
             RecNote {
                 start: ms(200),
@@ -1975,6 +1988,7 @@ mod mpe_tests {
                 velocity: 90,
                 channel: 2,
                 pass: 0,
+                release: None,
             },
         ];
         let ids = [faderframe_core::NoteId(10), faderframe_core::NoteId(11)];

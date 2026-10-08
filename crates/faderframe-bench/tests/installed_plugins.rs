@@ -188,6 +188,7 @@ fn installed_plugins_pass_audio_and_play_notes() {
                         velocity: 110,
                         channel: 0,
                         muted: false,
+                        release: None,
                     })
                     .collect();
                 p.clips.insert(

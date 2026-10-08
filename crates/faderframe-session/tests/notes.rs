@@ -32,6 +32,7 @@ fn setup() -> (Session, ClipId) {
             velocity: 100,
             channel: 0,
             muted: false,
+            release: None,
         })
         .collect();
     s.dispatch(Action::AddNotes { clip, notes }).unwrap();

@@ -3474,17 +3474,28 @@ track's input stage and inserts that report (bypassed ones not).
 
 `faderframe-view-events` (`ViewKind::Events`, View → MIDI Event List, a MIDI
 clip's menu → Edit in Event List = `Action::OpenEventList`) lists the edited
-MIDI clip (else the first selected one) a row per event: notes, control
-changes, pitch bend, channel pressure, SysEx, filtered by kind. A
-double-click types a field (positions in the main counter's unit, keys by
-name or number, lengths as beats.ticks or a note value like `1/8`); a
-vertical drag on a number previews and commits once on release; "+ Add" and
-the rows' menus add events at a row or the playhead, set the channel of the
-selected rows, mute notes; Delete removes. Note rows share the session's
-note selection with the piano roll. The operations are
-`session::midi_events` (`midi_events`, `Action::{EditMidiEvents,
-RemoveMidiEvents, AddMidiEvent}`): a controller value moved to another
-channel or number changes lanes and emptied lanes go. A clip's channel as a
-whole: `Action::SetMidiChannel` (the arranger's MIDI Channel submenu: notes
-and controller lanes); the piano roll's Channel submenu sets the selected
-notes'.
+MIDI clip (else the first selected one) a row per event, every property a
+column: notes (position, channel, key, velocity, length, end, release
+velocity, mute), control changes, program changes (shown 1–128 with their
+General MIDI name, `faderframe_midi::gm`), pitch bend, channel pressure,
+polyphonic key pressure, the points of the notes' expression curves, and
+SysEx (its bytes). Filters by kind. A double-click types a field (positions
+in the main counter's unit, keys by name or number, lengths as beats.ticks
+or a note value like `1/8`, expression values in their unit, SysEx in hex);
+a vertical drag on a number previews and commits once on release; M mutes;
+"+ Add" and the rows' menus add any kind at a row or the playhead, set the
+channel or release velocity of the selected rows, mute notes; Delete
+removes. Note rows share the session's note selection with the piano roll.
+The operations are `session::midi_events` (`midi_events`, `Action::{
+EditMidiEvents, RemoveMidiEvents, AddMidiEvent}`): a controller value moved
+to another channel, number or key changes lanes and emptied lanes go. A
+clip's channel as a whole: `Action::SetMidiChannel` (the arranger's MIDI
+Channel submenu: notes and controller lanes); the piano roll's Channel
+submenu sets the selected notes'.
+
+Nothing MIDI carries is dropped: program changes and polyphonic key
+pressure are controller lanes (`MidiController::{Program, PolyPressure {
+key }}`), a note's release velocity is `MidiNote::release` (`None` sends
+0). MIDI file import and export, recording (`MidiTake`), Capture MIDI and
+playback carry them; the clip player chases programs on locate after the
+CCs, so a bank select goes first.

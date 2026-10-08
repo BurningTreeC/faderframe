@@ -3548,6 +3548,7 @@ impl Session {
                     velocity,
                     channel: 0,
                     muted: false,
+                    release: None,
                 };
                 self.edit(Command::AddNote { clip, note })?;
                 self.selection.select_notes(&[id], SelectMode::Replace);
@@ -3670,7 +3671,7 @@ impl Session {
                 events,
                 field,
                 value,
-            } => self.edit_midi_events(clip, &events, field, value)?,
+            } => self.edit_midi_events(clip, &events, field, &value)?,
             Action::RemoveMidiEvents { clip, events } => self.remove_midi_events(clip, &events)?,
             Action::AddMidiEvent {
                 clip,

@@ -501,6 +501,7 @@ impl Session {
                 velocity,
                 channel: 0,
                 muted: false,
+                release: None,
             })
             .collect();
         self.add_notes(clip, &notes)

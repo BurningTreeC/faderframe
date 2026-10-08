@@ -547,6 +547,7 @@ mod tests {
             velocity: 100,
             channel: 0,
             muted: false,
+            release: None,
         }
     }
 

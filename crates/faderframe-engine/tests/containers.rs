@@ -176,6 +176,7 @@ fn note(tp: &mut TestProject, track: TrackId, key: u8) {
         velocity: 100,
         channel: 0,
         muted: false,
+        release: None,
     };
     let id = tp.project.ids.allocate();
     tp.project.clips.insert(

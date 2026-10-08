@@ -250,6 +250,7 @@ fn a_launched_midi_clip_plays_and_releases_the_arrangements_notes() {
         velocity: 110,
         channel: 0,
         muted: false,
+        release: None,
     };
     // A long note in the arrangement, a short one in the launched clip.
     let held = note(&mut tp, 0.0, 32.0);

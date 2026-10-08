@@ -232,7 +232,6 @@ impl Session {
             .rposition(|t| t.kind.has_clips())
             .map_or(0, |i| i + 1);
         let mut created = Vec::new();
-        let mut programs = 0usize;
         for part in parts {
             let mut notes: Vec<MidiNote> = Vec::new();
             let mut open: HashMap<(u8, u8), Vec<(u64, u8)>> = HashMap::new();
@@ -268,6 +267,14 @@ impl Session {
                     }
                     MidiMessage::NoteOn { key, .. } | MidiMessage::NoteOff { key, .. } => {
                         let k = key.as_int();
+                        // A note-off's own velocity is kept (a note-on of
+                        // velocity 0 has none, and 0 is what none sends).
+                        let release = match message {
+                            MidiMessage::NoteOff { vel, .. } => {
+                                Some(vel.as_int()).filter(|v| *v > 0)
+                            }
+                            _ => None,
+                        };
                         if let Some(stack) = open.get_mut(&(ch, k))
                             && !stack.is_empty()
                         {
@@ -281,6 +288,7 @@ impl Session {
                                 velocity: vel,
                                 channel: ch,
                                 muted: false,
+                                release,
                             });
                         }
                     }
@@ -303,8 +311,20 @@ impl Session {
                             vel.as_int() as u16,
                         );
                     }
-                    MidiMessage::ProgramChange { .. } => programs += 1,
-                    MidiMessage::Aftertouch { .. } => {}
+                    MidiMessage::ProgramChange { program } => {
+                        lane(
+                            MidiController::Program,
+                            ch,
+                            tick,
+                            u16::from(program.as_int()),
+                        );
+                    }
+                    MidiMessage::Aftertouch { key, vel } => lane(
+                        MidiController::PolyPressure { key: key.as_int() },
+                        ch,
+                        tick,
+                        u16::from(vel.as_int()),
+                    ),
                 }
             }
             // Notes still held at the end last until there.
@@ -319,6 +339,7 @@ impl Session {
                         velocity: vel,
                         channel: ch,
                         muted: false,
+                        release: None,
                     });
                 }
             }
@@ -381,16 +402,13 @@ impl Session {
         self.selection
             .select_tracks(&created, crate::SelectMode::Replace);
         let n = created.len();
-        let mut text = format!(
+        let text = format!(
             "imported {n} track{} from {} — choose an instrument for {}",
             if n == 1 { "" } else { "s" },
             path.file_name()
                 .map_or_else(String::new, |f| f.to_string_lossy().to_string()),
             if n == 1 { "it" } else { "each" }
         );
-        if programs > 0 {
-            text.push_str(" (program changes are not imported)");
-        }
         self.notify(crate::NoticeLevel::Info, text);
         Ok(created)
     }
@@ -453,7 +471,7 @@ impl Session {
                             ch,
                             MidiMessage::NoteOff {
                                 key,
-                                vel: u7::new(0),
+                                vel: u7::new(n.release.unwrap_or(0).min(127)),
                             },
                         ),
                     ));
@@ -469,6 +487,13 @@ impl Session {
                                 bend: PitchBend(u14::new(pt.value.min(16383))),
                             },
                             MidiController::ChannelPressure => MidiMessage::ChannelAftertouch {
+                                vel: u7::new(pt.value.min(127) as u8),
+                            },
+                            MidiController::Program => MidiMessage::ProgramChange {
+                                program: u7::new(pt.value.min(127) as u8),
+                            },
+                            MidiController::PolyPressure { key } => MidiMessage::Aftertouch {
+                                key: u7::new(key.min(127)),
                                 vel: u7::new(pt.value.min(127) as u8),
                             },
                         };

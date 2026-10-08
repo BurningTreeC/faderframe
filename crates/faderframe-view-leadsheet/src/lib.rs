@@ -386,6 +386,7 @@ mod tests {
             velocity: 100,
             channel: 0,
             muted: false,
+            release: None,
         })
         .collect();
         let clip = faderframe_core::ClipId(8000);

@@ -18,7 +18,7 @@ use faderframe_ui_canvas::{
 };
 
 /// Controllers offered in the lane menu.
-const LANES: [MidiController; 10] = [
+const LANES: [MidiController; 11] = [
     MidiController::MOD_WHEEL,
     MidiController::PitchBend,
     MidiController::SUSTAIN,
@@ -29,6 +29,7 @@ const LANES: [MidiController; 10] = [
     MidiController::Cc { number: 2 },
     MidiController::Cc { number: 74 },
     MidiController::Cc { number: 71 },
+    MidiController::Program,
 ];
 
 impl PianoRollView {

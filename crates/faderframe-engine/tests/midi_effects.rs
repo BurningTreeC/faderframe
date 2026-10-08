@@ -70,6 +70,7 @@ fn clip(tp: &mut TestProject, track: TrackId, keys: &[u8], quarters: f64) {
             velocity: 100,
             channel: 0,
             muted: false,
+            release: None,
         })
         .collect();
     let id = tp.project.ids.allocate();
