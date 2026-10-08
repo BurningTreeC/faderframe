@@ -1759,6 +1759,44 @@ pub fn install(app: &Rc<AppState>) {
                 a.dispatch(Action::ConvertToMidi { clip, how });
             }
         }),
+        // Development aid: `tempo-from-hits:<markers|cuts|range>[@beats|
+        // eighths|bars][/<slowest>-<fastest>][/near=<bpm>][/move]` (`move`:
+        // audio follows the beats), `tempo-from-hits:dialog` opens the form.
+        named("tempo-from-hits", |a, arg| {
+            use faderframe_session::hits::{HitRequest, HitSource};
+            use faderframe_timeline::hits::HitGrid;
+            if arg.trim() == "dialog" {
+                crate::dialogs::tempo_from_hits(a);
+                return;
+            }
+            let mut parts = arg.split('/');
+            let head = parts.next().unwrap_or("");
+            let (source, grid) = head.split_once('@').unwrap_or((head, "beats"));
+            let mut req = HitRequest {
+                source: match source {
+                    "cuts" => HitSource::Cuts,
+                    "range" => HitSource::Range,
+                    _ => HitSource::Markers,
+                },
+                ..HitRequest::default()
+            };
+            req.settings.grid = match grid {
+                "eighths" => HitGrid::Eighths,
+                "bars" => HitGrid::Bars(4.0),
+                _ => HitGrid::Beats,
+            };
+            for p in parts {
+                if p == "move" {
+                    req.keep_audio = false;
+                } else if let Some(n) = p.strip_prefix("near=") {
+                    req.settings.preferred = n.parse().ok();
+                } else if let Some((lo, hi)) = p.split_once('-') {
+                    req.settings.min_bpm = lo.parse().unwrap_or(req.settings.min_bpm);
+                    req.settings.max_bpm = hi.parse().unwrap_or(req.settings.max_bpm);
+                }
+            }
+            a.dispatch(Action::TempoFromHits(req));
+        }),
         // Development aid: `lead-sheet:<track>[@auto|straight|triplets]`
         // (its first clip) and `export-lead-sheet:<path.pdf|.musicxml>`.
         named("lead-sheet", |a, arg| {

@@ -2373,6 +2373,29 @@ A clip's melody with its chords and words, written out as notation
   the extension); the arranger's clip menu; dev actions
   `lead-sheet:<track>[@straight|triplets]`, `export-lead-sheet:<path>`.
 
+### Tempo through hit points
+
+For scoring to picture (`faderframe_timeline::hits`, pure; `session::hits`;
+the GTK form `dialogs::tempo_from_hits`): markers are the hits — all of
+them, the cuts found in the picture ("Cut n" markers from cut detection)
+or those in the edit range. Between two hits the music plays a whole
+number of steps (beats, eighths or bars, by the project's metre), so each
+stretch has the tempo `60 · steps / seconds`; the solver picks the counts
+by dynamic programming over the counts whose tempo is inside the range,
+each step costing the squared change of tempo in log (so a change counts
+as a share) plus, when asked, the distance from a preferred tempo. The
+stretch before the first hit may take any tempo in the range; hits closer
+to the one before than a step at the fastest tempo are left out and
+named. Applied as one undo step ("Tempo from Hit Points"): the new tempo
+map (a step at each hit), the hit markers moved onto their beats (each
+sounding where it did), the other markers and — by default — the audio
+clips kept where they sound, MIDI following the beats; the picture is
+placed in samples and stays. The form previews the result (hits, tempo
+range, the largest change) as it is set. Menus: a marker's, the markers
+lane's and the tempo lane's; dev action
+`tempo-from-hits:<markers|cuts|range>[@beats|eighths|bars][/lo-hi][/near=bpm][/move]`
+(`dialog` opens the form).
+
 ### MIDI time code out and varispeed
 
 MTC output: outputs with MTC on (`MidiShared::mtc_ports`, rate and the
@@ -3186,9 +3209,9 @@ DAW does well yet):
     - *Comping by lyric*: Whisper's word timings on every take; choose
       the best take word by word, the syllable shown under each note in
       the pitch editor.
-    - *Tempo through hit points*: cut detection on the picture and
-      markers, and a solver for the smoothest tempo curve that lands
-      every hit on a beat.
+    - ~~*Tempo through hit points*~~ — done (see Tempo through hit
+      points): cuts and markers as hits, the steadiest step tempo map that
+      lands each on a beat or a bar line.
     - *A/V calibration by itself*: the flash-and-beep test seen by a
       webcam (GStreamer captures it) and heard by a microphone gives the
       picture offset.

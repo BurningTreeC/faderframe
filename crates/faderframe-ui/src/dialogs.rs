@@ -1627,3 +1627,185 @@ pub fn send_sysex_file(app: &Rc<AppState>, output: String) {
         }
     });
 }
+
+/// Tempo from Hit Points: which markers are hits, what they land on, the
+/// tempo range, whether audio stays where it sounds — the result previewed
+/// as it is chosen, applied as one undo step.
+pub fn tempo_from_hits(app: &Rc<AppState>) {
+    use faderframe_session::hits::{HitRequest, HitSource};
+    use faderframe_timeline::hits::{HitGrid, HitSettings};
+    let Some(main) = app.window.borrow().clone() else {
+        return;
+    };
+    let win = gtk::Window::builder()
+        .application(&app.app)
+        .title("Tempo from Hit Points")
+        .modal(true)
+        .transient_for(&main)
+        .resizable(false)
+        .default_width(440)
+        .build();
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    body.set_margin_top(14);
+    body.set_margin_bottom(14);
+    body.set_margin_start(14);
+    body.set_margin_end(14);
+    let intro = gtk::Label::new(Some(
+        "The steadiest tempo that puts every hit exactly on a beat. Hits are markers: \
+         place them at the hits, or find the cuts in the picture (the video clip's menu).",
+    ));
+    intro.set_wrap(true);
+    intro.set_xalign(0.0);
+    intro.set_max_width_chars(52);
+    body.append(&intro);
+    let grid = gtk::Grid::new();
+    grid.set_row_spacing(6);
+    grid.set_column_spacing(10);
+    let label = |text: &str, row: i32| {
+        let l = gtk::Label::new(Some(text));
+        l.set_halign(gtk::Align::End);
+        grid.attach(&l, 0, row, 1, 1);
+    };
+    let source = gtk::DropDown::from_strings(&[
+        "All markers",
+        "Cuts in the picture",
+        "Markers in the edit range",
+    ]);
+    label("Hits", 0);
+    grid.attach(&source, 1, 0, 1, 1);
+    let on = gtk::DropDown::from_strings(&["Beats", "Eighths", "Bar lines"]);
+    label("Land on", 1);
+    grid.attach(&on, 1, 1, 1, 1);
+    let spin = |v: f64| {
+        let s = gtk::SpinButton::with_range(20.0, 400.0, 1.0);
+        s.set_digits(1);
+        s.set_value(v);
+        s
+    };
+    let slowest = spin(70.0);
+    let fastest = spin(160.0);
+    let preferred = gtk::SpinButton::with_range(0.0, 400.0, 1.0);
+    preferred.set_digits(1);
+    preferred.set_tooltip_text(Some("0: none, only steadiness counts"));
+    label("Slowest (BPM)", 2);
+    grid.attach(&slowest, 1, 2, 1, 1);
+    label("Fastest (BPM)", 3);
+    grid.attach(&fastest, 1, 3, 1, 1);
+    label("Near (BPM)", 4);
+    grid.attach(&preferred, 1, 4, 1, 1);
+    body.append(&grid);
+    let keep =
+        gtk::CheckButton::with_label("Keep audio clips where they sound (MIDI follows the beats)");
+    keep.set_active(true);
+    body.append(&keep);
+    let preview = gtk::Label::new(None);
+    preview.set_wrap(true);
+    preview.set_xalign(0.0);
+    preview.set_max_width_chars(52);
+    preview.add_css_class("dim-label");
+    body.append(&preview);
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    buttons.set_halign(gtk::Align::End);
+    let cancel = gtk::Button::with_label("Cancel");
+    let apply = gtk::Button::with_label("Apply");
+    apply.add_css_class("suggested-action");
+    buttons.append(&cancel);
+    buttons.append(&apply);
+    body.append(&buttons);
+    win.set_child(Some(&body));
+    let request = {
+        let (source, on, slowest, fastest, preferred, keep) = (
+            source.clone(),
+            on.clone(),
+            slowest.clone(),
+            fastest.clone(),
+            preferred.clone(),
+            keep.clone(),
+        );
+        move || HitRequest {
+            source: match source.selected() {
+                1 => HitSource::Cuts,
+                2 => HitSource::Range,
+                _ => HitSource::Markers,
+            },
+            settings: HitSettings {
+                min_bpm: slowest.value().min(fastest.value()),
+                max_bpm: fastest.value().max(slowest.value()),
+                preferred: Some(preferred.value()).filter(|v| *v > 0.0),
+                grid: match on.selected() {
+                    1 => HitGrid::Eighths,
+                    // The bar's length comes from the project's metre.
+                    2 => HitGrid::Bars(4.0),
+                    _ => HitGrid::Beats,
+                },
+            },
+            keep_audio: keep.is_active(),
+        }
+    };
+    let request = Rc::new(request);
+    let refresh = {
+        let (app, preview, apply, request) = (
+            Rc::clone(app),
+            preview.clone(),
+            apply.clone(),
+            Rc::clone(&request),
+        );
+        move || {
+            let r = request();
+            let text = match app.session.borrow().preview_hit_tempo(&r) {
+                Ok(p) => {
+                    apply.set_sensitive(true);
+                    let mut t = format!(
+                        "{} hit{} land on {}: {:.1}–{:.1} BPM, at most {:.1} % from one stretch to the next.",
+                        p.hits,
+                        if p.hits == 1 { "" } else { "s" },
+                        match r.settings.grid {
+                            HitGrid::Bars(_) => "bar lines",
+                            HitGrid::Eighths => "eighths",
+                            HitGrid::Beats => "beats",
+                        },
+                        p.slowest,
+                        p.fastest,
+                        p.largest_change * 100.0
+                    );
+                    if !p.dropped.is_empty() {
+                        t.push_str(&format!(
+                            " Left out (too close to the hit before): {}.",
+                            p.dropped.join(", ")
+                        ));
+                    }
+                    t
+                }
+                Err(e) => {
+                    apply.set_sensitive(false);
+                    e.to_string()
+                }
+            };
+            preview.set_text(&text);
+        }
+    };
+    let refresh = Rc::new(refresh);
+    refresh();
+    {
+        let r = Rc::clone(&refresh);
+        source.connect_selected_notify(move |_| r());
+        let r = Rc::clone(&refresh);
+        on.connect_selected_notify(move |_| r());
+        for s in [&slowest, &fastest, &preferred] {
+            let r = Rc::clone(&refresh);
+            s.connect_value_changed(move |_| r());
+        }
+    }
+    {
+        let win = win.clone();
+        cancel.connect_clicked(move |_| win.close());
+    }
+    {
+        let (win, app) = (win.clone(), Rc::clone(app));
+        apply.connect_clicked(move |_| {
+            app.dispatch(faderframe_session::Action::TempoFromHits(request()));
+            win.close();
+        });
+    }
+    win.present();
+}

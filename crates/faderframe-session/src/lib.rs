@@ -45,6 +45,7 @@ mod freeze;
 pub mod groove;
 mod groups;
 pub mod hardware;
+pub mod hits;
 pub mod iamf;
 pub mod lanes;
 pub mod launcher;
@@ -389,6 +390,11 @@ pub enum Action {
     },
     /// Write the lead sheet as PDF or MusicXML (by the extension).
     ExportLeadSheet(PathBuf),
+    /// The steadiest tempo map that lands the hit markers on beats (one
+    /// undo step).
+    TempoFromHits(hits::HitRequest),
+    /// Ask (in the shell) how to land the hits.
+    PromptTempoFromHits,
     /// Set the project's tempo or key from a clip, or warp it to the
     /// tempo (after analysing it).
     FromClip {
@@ -1263,6 +1269,8 @@ pub enum UiRequest {
     /// The project needs device channels the stream does not have open
     /// (a hardware insert's): start the audio device again.
     ReopenAudio,
+    /// Ask how to land the hit markers on beats (Tempo from Hit Points).
+    TempoFromHits,
     PluginBrowser {
         track: TrackId,
         target: PluginTarget,
@@ -3282,6 +3290,8 @@ impl Session {
             Action::FromClip { clip, what } => self.from_clip(clip, what)?,
             Action::ConvertToMidi { clip, how } => self.convert_to_midi(clip, how)?,
             Action::MakeLeadSheet { clip, grid } => self.make_lead_sheet(clip, grid)?,
+            Action::TempoFromHits(req) => self.tempo_from_hits(&req)?,
+            Action::PromptTempoFromHits => self.ui_requests.push(UiRequest::TempoFromHits),
             Action::ExportLeadSheet(path) => {
                 self.export_lead_sheet(&path)?;
             }

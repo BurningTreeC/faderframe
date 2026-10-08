@@ -929,6 +929,10 @@ impl ArrangerView {
                     "Delete Marker",
                     Action::Edit(Command::RemoveMarker { marker: id }),
                 ));
+                items.push(
+                    MenuItem::new("Tempo from Hit Points…", Action::PromptTempoFromHits)
+                        .separated(),
+                );
                 HostRequest::ContextMenu { at: pos, items }
             }
             GlobalHit::Section(id, _) => {
@@ -1047,10 +1051,14 @@ impl ArrangerView {
             }
             GlobalHit::Empty(GlobalLane::Tempo, t) => HostRequest::ContextMenu {
                 at: pos,
-                items: vec![MenuItem::new(
-                    "Add Tempo Change Here",
-                    Action::AddTempoPoint(self.snap(t, model, Modifiers::NONE)),
-                )],
+                items: vec![
+                    MenuItem::new(
+                        "Add Tempo Change Here",
+                        Action::AddTempoPoint(self.snap(t, model, Modifiers::NONE)),
+                    ),
+                    MenuItem::new("Tempo from Hit Points…", Action::PromptTempoFromHits)
+                        .separated(),
+                ],
             },
             GlobalHit::Empty(GlobalLane::Markers, t) => HostRequest::ContextMenu {
                 at: pos,
@@ -1063,6 +1071,8 @@ impl ArrangerView {
                         "Add Marker at Playhead",
                         Action::AddMarker(model.playhead()),
                     ),
+                    MenuItem::new("Tempo from Hit Points…", Action::PromptTempoFromHits)
+                        .separated(),
                 ],
             },
             GlobalHit::Key(i) => match p.keys.get(i) {

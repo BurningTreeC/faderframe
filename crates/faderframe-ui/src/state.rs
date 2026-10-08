@@ -361,6 +361,9 @@ impl AppState {
         for r in requests {
             match r {
                 faderframe_session::UiRequest::ReopenAudio => self.start_audio(),
+                faderframe_session::UiRequest::TempoFromHits => {
+                    crate::dialogs::tempo_from_hits(self);
+                }
                 faderframe_session::UiRequest::PluginBrowser { track, target } => {
                     crate::plugin_browser::open(self, track, target);
                 }

@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 mod grid;
+pub mod hits;
 mod meter;
 mod tempo;
 mod time;
