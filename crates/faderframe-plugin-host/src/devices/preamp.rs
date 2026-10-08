@@ -14,11 +14,28 @@ pub use buffered::{BUFFER_LATENCY, BufferedPreampProcessor, buffer_delay};
 
 pub const GAIN: u32 = 0;
 pub const MASTER: u32 = 1;
+/// The British 73's line: 0 = 600 ohms (terminated), 1 = a bridging 10 k
+/// input (see `faderframe_circuit::preamp::BRIDGING`).
+pub const LOAD: u32 = 2;
 pub fn parameters() -> Vec<ParameterInfo> {
     vec![
         super::param(GAIN, "Gain", 0.0, 1.0, 0.5, ParameterUnit::Percent),
         super::param(MASTER, "Master", -60.0, 12.0, 0.0, ParameterUnit::Decibels),
     ]
+}
+
+/// Model `model`'s parameters: the British 73 also has its Output Load.
+pub fn parameters_for(model: usize) -> Vec<ParameterInfo> {
+    let mut p = parameters();
+    if model == 0 {
+        p.push(super::stepped(LOAD, "Output Load", 1.0, 0.0));
+    }
+    p
+}
+
+/// Whether model `model` with `params` drives a bridging input.
+pub fn bridging(model: usize, params: &ParamValues) -> bool {
+    model == 0 && params.get(LOAD as usize) >= 0.5
 }
 
 /// A console bus amplifier's: the drive into it (dB; taken off after it,
@@ -57,10 +74,11 @@ impl PreampBank {
         channels: usize,
         gain: f64,
         master: f64,
+        bridging: bool,
     ) -> Result<Self, PluginError> {
         let circuits = (0..channels)
             .map(|_| {
-                Preamp::new(model, config.sample_rate, gain, master)
+                Preamp::with_line(model, config.sample_rate, gain, master, bridging)
                     .map(TryCell::new)
                     .map_err(|e| PluginError::Failed(format!("Microphone preamp: {e}")))
             })
@@ -223,10 +241,11 @@ impl PreampProcessor {
         // track's actual channel count rather than their stereo descriptor.
         let gain = f64::from(params.get(GAIN as usize));
         let master = f64::from(params.get(MASTER as usize));
+        let bridging = bridging(model, &params);
         let block = config.max_block_size.max(1) as usize;
         Ok(Self {
             params,
-            bank: PreampBank::new(model, config, channels, gain, master)?,
+            bank: PreampBank::new(model, config, channels, gain, master, bridging)?,
             gain: vec![0.0; block],
             master: vec![0.0; block],
         })

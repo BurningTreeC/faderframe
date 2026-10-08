@@ -1,9 +1,12 @@
-// Measured upstream; retained in catalogue order.
+// Measured upstream (the British 73 here); in catalogue order.
 const CALIBRATION: [Calibration; 6] = [
-// Neve 73P with transistors: 0.0073 V in, 3.0 % distortion, 1.8 % third.
+// Neve 73P with transistors, its output block driven from the trim into
+// 600 ohms (`tests/british73_calibration.rs`; upstream's was fed from 470 k,
+// which held the block at no gain and took 4 dB off at 20 kHz): 0.0027 V in,
+// 3.0 % distortion, 1.4 % third.
     Calibration {
-        drive_volts: 0.007263,
-        make_up_db: [-43.95, -43.95, -43.96, -43.96, -43.96, -43.96, -43.97, -43.97, -43.98, -44.00, -44.02, -44.04, -44.07, -44.11, -44.16, -44.23, -44.31, -44.43, -44.59, -44.80, -45.08, -45.46, -45.98, -46.65, -47.52, -48.56, -49.73, -50.92, -52.00, -52.87, -53.49, -53.88, -54.07],
+        drive_volts: 0.002730,
+        make_up_db: [-62.43, -62.43, -62.43, -62.44, -62.44, -62.44, -62.45, -62.45, -62.46, -62.48, -62.49, -62.52, -62.55, -62.59, -62.64, -62.71, -62.79, -62.91, -63.06, -63.27, -63.56, -63.94, -64.46, -65.13, -66.00, -67.04, -68.21, -69.40, -70.48, -71.32, -71.89, -72.26, -72.43],
     },
 // API 312 with an op-amp: 0.0159 V in, 3.0 % distortion, 2.2 % third.
     Calibration {

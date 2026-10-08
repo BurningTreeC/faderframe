@@ -3309,7 +3309,15 @@ Frozen players report the latency baked into their audio, preserving alignment
 with other tracks and sends; bounced clips skip that leading delay instead.
 
 The six models retain upstream impedances, resting controls, and measured
-calibration curves. British 73 includes its separate line driver. Gain is the
+calibration curves. British 73 includes its separate line driver, its output
+block driven from the card's output trim (about 2.5 k) as on the drawing, so
+it does its 18 dB of gain and is the stage that runs out first, into the 600
+ohm line it was built for — or, by its Output Load parameter, a bridging 10 k
+input (a little brighter, +1.6 dB at 20 kHz from the estimated leakage, and
+8 dB more swing; the level is matched, `BRIDGING_DB`, and changing it
+restarts the processor). Its calibration is measured on the circuit by
+`tests/british73_calibration.rs` (upstream's fed the block from 470 k, which
+held it at no gain and took 4 dB off at 20 kHz). Gain is the
 circuit's gain, as on the hardware: the calibration holds the level at the
 middle of its travel (−18 dBFS in, about −20 dBFS out) and the level follows
 the circuit from there (`preamp::level_change_db`) — the Tube 610's Level pot

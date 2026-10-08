@@ -228,3 +228,45 @@ fn gain_moves_the_level_as_the_circuit_does() {
         }
     }
 }
+
+/// The British 73's output block, driven from the card's trim as on the
+/// drawing: its top is open (not the 4 dB down at 20 kHz a 470 k feed
+/// made); into a bridging input it is a little brighter, as loud at 1 kHz,
+/// and runs out later.
+#[test]
+fn the_british_73_drives_its_line_like_the_card() {
+    use faderframe_circuit::dsp::measure::{run, Tone};
+    let rate = 48_000.0;
+    let at = |bridging: bool, gain: f64, hz: f64, dbfs: f64| {
+        let mut p = Preamp::with_line(0, rate, gain, 0.0, bridging).unwrap();
+        let tone = Tone::near(rate, 9600, hz, 10f64.powf(dbfs / 20.0));
+        run(tone, 28_800, |x| p.process(x))
+    };
+    for bridging in [false, true] {
+        let reference = at(bridging, 0.5, 1000.0, -40.0).gain_db();
+        let top = at(bridging, 0.5, 20_000.0, -40.0).gain_db() - reference;
+        let ten = at(bridging, 0.5, 10_000.0, -40.0).gain_db() - reference;
+        assert!(
+            ten.abs() < 0.6,
+            "bridging {bridging}: {ten:+.2} dB at 10 kHz"
+        );
+        assert!(
+            (-1.0..2.5).contains(&top),
+            "bridging {bridging}: {top:+.2} dB at 20 kHz"
+        );
+    }
+    // The same level either way.
+    let (a, b) = (at(false, 0.5, 1000.0, -30.0), at(true, 0.5, 1000.0, -30.0));
+    assert!((a.gain_db() - b.gain_db()).abs() < 0.15);
+    // Brighter bridging.
+    let top = |bridging| at(bridging, 0.5, 20_000.0, -40.0).gain_db();
+    assert!(top(true) > top(false) + 0.3);
+    // Driven hard at full gain, the terminated line runs out first.
+    let hot = |bridging| at(bridging, 1.0, 1000.0, -12.0).thd_percent();
+    assert!(
+        hot(false) > 1.5 * hot(true),
+        "{} vs {}",
+        hot(false),
+        hot(true)
+    );
+}

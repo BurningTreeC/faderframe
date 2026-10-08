@@ -379,7 +379,7 @@ impl Kind {
         };
         use ParameterUnit::*;
         match self {
-            Kind::Preamp(_) => crate::devices::preamp::parameters(),
+            Kind::Preamp(i) => crate::devices::preamp::parameters_for(i),
             Kind::ConsoleBus(_) => crate::devices::preamp::bus_parameters(),
             Kind::Gain => crate::devices::utility::parameters(),
             Kind::Compressor => crate::devices::compressor::parameters(),
@@ -629,6 +629,8 @@ impl PluginInstance for BuiltinInstance {
                 let (send, ret, _, trip) = crate::devices::hardware_insert::routing(&self.params);
                 u64::from(send) | (u64::from(ret) << 8) | (u64::from(trip) << 16)
             }
+            // The British 73's line is part of its circuit.
+            Kind::Preamp(i) => u64::from(crate::devices::preamp::bridging(i, &self.params)),
             _ => 0,
         };
         if self.device_block == self.sized_block {

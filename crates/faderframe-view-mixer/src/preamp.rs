@@ -51,6 +51,17 @@ pub(super) fn face(slot: &PluginSlot) -> Face {
     }
 }
 
+/// The British 73's Output Load parameter.
+const LOAD: u32 = 2;
+
+/// Whether a British 73 drives a bridging input.
+fn bridging(slot: &PluginSlot) -> bool {
+    slot.parameters
+        .iter()
+        .find(|p| p.id == ParameterId(LOAD))
+        .is_some_and(|p| p.value >= 0.5)
+}
+
 pub(super) fn value(slot: &PluginSlot, id: u32) -> f64 {
     let rest = face(slot).ranges[(id as usize).min(1)].2;
     slot.parameters
@@ -257,6 +268,36 @@ impl MixerView {
                 .checked(t.preamp.as_ref().is_some_and(|p| p.plugin.id == id))
             })
             .collect();
+        // The British 73's line: terminated (600 ohms) or bridging (10 k).
+        if let Some(slot) = t
+            .preamp
+            .as_ref()
+            .filter(|s| preamp_index(&s.plugin.id) == Some(0))
+        {
+            let bridging = bridging(slot);
+            let load = |label: &str, value: f64, on: bool| {
+                MenuItem::new(
+                    label,
+                    Action::Edit(Command::SetPluginParameter {
+                        track: t.id,
+                        plugin: slot.id,
+                        parameter: ParameterId(LOAD),
+                        value: Some(value),
+                    }),
+                )
+                .checked(on)
+            };
+            items.push(
+                MenuItem::submenu(
+                    "Output Load",
+                    vec![
+                        load("600 Ω (Terminated)", 0.0, !bridging),
+                        load("10 kΩ (Bridging: More Headroom, Open Top)", 1.0, bridging),
+                    ],
+                )
+                .separated(),
+            );
+        }
         if t.preamp.is_some() {
             items.push(
                 MenuItem::new(
@@ -283,7 +324,13 @@ impl MixerView {
             return;
         };
         let f = face(slot);
-        let (name, rgb) = (f.name, f.rgb);
+        let rgb = f.rgb;
+        let bridged = format!("{} · 10 k", f.name);
+        let name = if preamp_index(&slot.plugin.id) == Some(0) && bridging(slot) {
+            bridged.as_str()
+        } else {
+            f.name
+        };
         let base = Color::rgb8(rgb[0], rgb[1], rgb[2]);
         controls::panel(p, area, base.lighten(0.14), base.darken(0.16), th);
         let ink = if f.light {

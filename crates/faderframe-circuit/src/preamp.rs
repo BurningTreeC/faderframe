@@ -47,6 +47,21 @@ fn makeup(table: &[f64; 33], gain: f64, steps: Option<usize>) -> f64 {
 /// Where on its travel the Gain leaves the level as it came in.
 pub const REFERENCE: f64 = 0.5;
 
+/// The British 73's output block is driven from the card's output trim (VR3
+/// at mid travel in series with VR2 near its top, over R67): about 2.5 k
+/// (ESTIMATED from those settings). It does the 18 dB of gain the guide
+/// states, so it is the stage that runs out first.
+pub const LINE_SOURCE: f64 = 2_500.0;
+/// The line the British 73 drives: 600 ohms, what the block was built for
+/// (terminated, the default), or a bridging 10 k input (its estimated
+/// leakage then rings against C26 a little: +1.6 dB at 20 kHz, and 8 dB
+/// more swing before it clips).
+pub const TERMINATED: f64 = 600.0;
+pub const BRIDGING: f64 = 10_000.0;
+/// How much louder the British 73 is into a bridging input (its
+/// calibration is the terminated one's): taken off so the level stays.
+pub const BRIDGING_DB: f64 = 0.93;
+
 /// Model `model`'s circuit (catalogue order).
 fn netlist(model: usize) -> Result<crate::dsp::netlist::Circuit, Fault> {
     match model {
@@ -132,6 +147,8 @@ pub struct Preamp {
     /// A console bus: the circuit's small-signal gain at 1 kHz (its sign
     /// the polarity), measured once.
     bus: Option<f64>,
+    /// The British 73 into a bridging input (else terminated).
+    bridging: bool,
 }
 
 impl Preamp {
@@ -183,6 +200,7 @@ impl Preamp {
             gain: -1.0,
             master: f64::NAN,
             bus: Some(sign * gain.max(1e-6)),
+            bridging: false,
         };
         p.set_controls(drive, master_db);
         p.output_scale = p.output_target;
@@ -192,6 +210,18 @@ impl Preamp {
     /// Constructs and settles off the audio thread. Models follow the catalogue
     /// order: British 73, American 312, British 4K E, Tube 610, British 47, German 76.
     pub fn new(model: usize, rate: f64, gain: f64, master_db: f64) -> Result<Self, Fault> {
+        Self::with_line(model, rate, gain, master_db, false)
+    }
+
+    /// [`Self::new`], the British 73 into a bridging input when `bridging`
+    /// (see [`BRIDGING`]).
+    pub fn with_line(
+        model: usize,
+        rate: f64,
+        gain: f64,
+        master_db: f64,
+        bridging: bool,
+    ) -> Result<Self, Fault> {
         if model >= MODELS {
             return Self::console_bus(model - MODELS, rate, gain, master_db);
         }
@@ -203,7 +233,7 @@ impl Preamp {
         circuit.reset();
         let line = if model == 0 {
             Some(Simulation::new(
-                neve::output(470_000.0, 10_000.0)?,
+                neve::output(LINE_SOURCE, if bridging { BRIDGING } else { TERMINATED })?,
                 rate * OVERSAMPLING as f64,
             ))
         } else {
@@ -224,6 +254,7 @@ impl Preamp {
             gain: -1.0,
             master: f64::NAN,
             bus: None,
+            bridging: bridging && model == 0,
         };
         p.set_controls(gain, master_db);
         p.output_scale = p.output_target;
@@ -274,7 +305,8 @@ impl Preamp {
         // travel. (Following the gain with the makeup instead made it a
         // drive control, and on the 610 boosted the C15 feedthrough when
         // the pot closed.)
-        let db = makeup(&cal.make_up_db, REFERENCE, self.circuit.control_steps(0));
+        let db = makeup(&cal.make_up_db, REFERENCE, self.circuit.control_steps(0))
+            - if self.bridging { BRIDGING_DB } else { 0.0 };
         self.pad_target = pad(self.model, gain);
         // Circuit gain and its calibration must change together. Smoothing
         // their product held the old (sometimes +70 dB) correction while the

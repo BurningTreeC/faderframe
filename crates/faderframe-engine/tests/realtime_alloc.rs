@@ -2151,7 +2151,16 @@ fn microphone_preamps_do_not_allocate_while_automating_or_resetting() {
     use faderframe_core::{ChannelLayout, ParameterId, builtin};
     use faderframe_project::{PluginRef, PluginSlot, TrackKind};
     use faderframe_timeline::MusicalTime;
-    for (name, label, _) in builtin::PREAMPS {
+    // Every model, and the British 73 into a bridging input too.
+    let runs = builtin::PREAMPS
+        .iter()
+        .map(|&(name, label, _)| (name, label, false))
+        .chain(std::iter::once((
+            builtin::PREAMPS[0].0,
+            builtin::PREAMPS[0].1,
+            true,
+        )));
+    for (name, label, bridging) in runs {
         let mut tp = common::TestProject::new(48_000);
         let t = tp.track(TrackKind::Audio, label, ChannelLayout::Stereo);
         // Wake the dormant channel after gain automation, then return to
@@ -2170,7 +2179,14 @@ fn microphone_preamps_do_not_allocate_while_automating_or_resetting() {
             id: plugin,
             plugin: PluginRef::builtin(name, label),
             bypass: false,
-            parameters: Vec::new(),
+            parameters: if bridging {
+                vec![faderframe_project::SavedParameter {
+                    id: ParameterId(2),
+                    value: 1.0,
+                }]
+            } else {
+                Vec::new()
+            },
             state: None,
             sidechain: None,
         });
