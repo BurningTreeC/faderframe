@@ -421,6 +421,7 @@ fn general_page(app: &Rc<AppState>) -> gtk::Widget {
         gpu.connect_toggled(move |b| {
             let mut p = Preferences::load();
             p.gpu_painter = b.is_active();
+            p.gpu_painter_chosen = true;
             if let Err(e) = p.save() {
                 tracing::warn!("cannot save preferences: {e}");
             }

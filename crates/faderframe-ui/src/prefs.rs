@@ -71,6 +71,9 @@ pub struct Preferences {
     pub render_ahead_buses: bool,
     /// Draw dense views (analysers, meters, curves) on the GPU.
     pub gpu_painter: bool,
+    /// The GPU painter was set in Preferences (until then it is on, the
+    /// default, whatever an older file says).
+    pub gpu_painter_chosen: bool,
     /// Listening on headphones: the room of the binaural render ("near",
     /// "mid", "far"); `None`: speakers.
     pub headphones: Option<String>,
@@ -130,7 +133,8 @@ impl Default for Preferences {
             plugin_double_precision: false,
             render_ahead_ms: 200,
             render_ahead_buses: true,
-            gpu_painter: false,
+            gpu_painter: true,
+            gpu_painter_chosen: false,
             headphones: None,
             headphone_head: None,
             headphone_correction: None,
@@ -182,10 +186,16 @@ impl Preferences {
     }
 
     pub fn load() -> Self {
-        std::fs::read_to_string(Self::path())
+        let mut p: Self = std::fs::read_to_string(Self::path())
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Drawing on the GPU is the default; files from before it was
+        // stored false for everyone.
+        if !p.gpu_painter_chosen {
+            p.gpu_painter = true;
+        }
+        p
     }
 
     pub fn save(&self) -> std::io::Result<()> {

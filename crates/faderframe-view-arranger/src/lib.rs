@@ -273,6 +273,9 @@ pub struct ArrangerView {
     scroll_x: f64,
     /// A scrollbar is held: the view does not follow the playhead.
     bar_held: bool,
+    /// The transport's jump count last seen (a jump brings the playhead
+    /// into view).
+    seen_jumps: Option<u32>,
     scroll_y: f32,
     drag: Option<Drag>,
     hover: Option<Hit>,
@@ -348,6 +351,7 @@ impl ArrangerView {
             ppq: 34.0,
             scroll_x: 0.0,
             bar_held: false,
+            seen_jumps: None,
             scroll_y: 0.0,
             drag: None,
             hover: None,
@@ -1838,6 +1842,23 @@ impl ArrangerView {
     }
 
     fn follow(&mut self, model: &Session, size: Size) {
+        // The playhead jumped (Home, a marker, a locate): back to the start
+        // when it went there, else into view when it is out of it (with
+        // Follow Playhead).
+        let jumps = model.transport().jumps;
+        if self.seen_jumps.replace(jumps).is_some_and(|j| j != jumps) && !self.bar_held {
+            let at = model.playhead();
+            let x = self.x_of(at);
+            let lanes_w = size.w - self.header_w();
+            if at <= MusicalTime::ZERO {
+                self.scroll_x = 0.0;
+                return;
+            }
+            if model.editor.follow_playhead && (x > size.w - 30.0 || x < self.header_w()) {
+                self.scroll_x = (at.quarters() * self.ppq as f64 - lanes_w as f64 * 0.1).max(0.0);
+                return;
+            }
+        }
         if !(model.editor.follow_playhead && model.transport().playing) || self.bar_held {
             return;
         }

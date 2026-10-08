@@ -1666,3 +1666,41 @@ fn free_moves_land_on_whole_samples() {
     let rate = f64::from(s.project().sample_rate);
     assert_eq!(tl.to_musical(tl.to_samples(moved, rate), rate), moved);
 }
+
+/// Return to Start: the arranger goes back to the start with the playhead
+/// (Follow Playhead or not).
+#[test]
+fn return_to_start_brings_the_arranger_back_to_the_start() {
+    let mut s = session();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1200.0, 600.0);
+    s.dispatch(Action::Transport(TransportAction::Locate(
+        MusicalTime::from_quarters(64.0),
+    )))
+    .unwrap();
+    s.tick(0.01);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    view.scroll_x = 1000.0;
+    view.paint(&mut p, size, &s, &Theme::default());
+    let scrolled = view.scroll_x;
+    view.paint(&mut p, size, &s, &Theme::default());
+    assert!(scrolled > 500.0);
+    assert_eq!(view.scroll_x, scrolled, "no jump: where it was scrolled");
+    s.dispatch(Action::SetEditFlag(
+        faderframe_session::EditFlag::FollowPlayhead,
+        false,
+    ))
+    .unwrap();
+    s.dispatch(Action::Transport(TransportAction::ReturnToStart))
+        .unwrap();
+    for _ in 0..20 {
+        s.tick(0.01);
+        view.paint(&mut p, size, &s, &Theme::default());
+        if view.scroll_x == 0.0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(view.scroll_x, 0.0, "back at the start");
+}
