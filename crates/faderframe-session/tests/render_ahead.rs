@@ -110,7 +110,9 @@ fn tracks_render_ahead_until_armed() {
             "the device did not keep pace ({got} callbacks for {expected:.1}): late {late} not checked"
         );
     } else {
-        assert!(late <= 4, "late {late} times");
+        // A starved anticipator on a busy runner (the Windows one) was
+        // late 10 times; a stale ring is late about 60.
+        assert!(late <= 20, "late {late} times");
     }
     s.stop_audio();
 }
