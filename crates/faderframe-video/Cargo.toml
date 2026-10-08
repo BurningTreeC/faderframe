@@ -30,3 +30,4 @@ gst-video = { workspace = true, features = ["v1_24"] }
 [dev-dependencies]
 gst.workspace = true
 gst-app.workspace = true
+gst-video.workspace = true

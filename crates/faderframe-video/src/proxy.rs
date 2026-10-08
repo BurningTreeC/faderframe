@@ -34,6 +34,7 @@ pub fn make_proxy(
     dst: &Path,
     picture: (u32, u32, (u32, u32)),
     spec: ProxySpec,
+    colour: crate::colour::Colour,
     cancel: &AtomicBool,
     progress: impl FnMut(f64),
 ) -> Result<()> {
@@ -41,6 +42,10 @@ pub fn make_proxy(
     let partial = dst.with_extension("partial");
     if let Some(dir) = dst.parent() {
         std::fs::create_dir_all(dir)?;
+    }
+    if colour.needs_mapping() {
+        let r = mapped_proxy(src, &partial, (w, h), spec, colour, cancel, progress);
+        return finish(r, &partial, dst);
     }
     let p = Pipeline::new(src)?;
     let convert = make("videoconvertscale")?;
@@ -90,14 +95,125 @@ pub fn make_proxy(
     })?;
     let result = p.run(cancel, progress);
     drop(p);
+    finish(result, &partial, dst)
+}
+
+/// Move a whole proxy in place, or drop what there is of it.
+fn finish(result: Result<()>, partial: &Path, dst: &Path) -> Result<()> {
     match result {
         Ok(()) => {
-            std::fs::rename(&partial, dst)?;
+            std::fs::rename(partial, dst)?;
             Ok(())
         }
         Err(e) => {
-            let _ = std::fs::remove_file(&partial);
+            let _ = std::fs::remove_file(partial);
             Err(e)
         }
     }
+}
+
+/// The proxy of an HDR or wide-gamut picture: decoded and mapped for the
+/// screen here (as it is shown), then written as any proxy.
+fn mapped_proxy(
+    src: &Path,
+    out: &Path,
+    (w, h): (u32, u32),
+    spec: ProxySpec,
+    colour: crate::colour::Colour,
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(f64),
+) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    let duration = crate::probe::probe(src)?.duration_ns.max(1);
+    let mut dec = crate::Decoder::open_colour(src, w, h, colour)?;
+    let caps = gst::Caps::builder("video/x-raw")
+        .field("format", "RGBA")
+        .field("width", w as i32)
+        .field("height", h as i32)
+        .field("framerate", gst::Fraction::new(0, 1))
+        .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
+        .build();
+    let appsrc = gst_app::AppSrc::builder()
+        .caps(&caps)
+        .format(gst::Format::Time)
+        .block(true)
+        .max_bytes((w * h * 4 * 8) as u64)
+        .build();
+    let pipeline = gst::Pipeline::new();
+    let jpeg_caps = gst::Caps::builder("video/x-raw")
+        .field("format", "I420")
+        .field("colorimetry", "1:4:0:0")
+        .build();
+    let filter = gst::ElementFactory::make("capsfilter")
+        .property("caps", &jpeg_caps)
+        .build()
+        .map_err(|_| VideoError::Missing("capsfilter".into()))?;
+    let encode = gst::ElementFactory::make("jpegenc")
+        .property("quality", spec.quality.clamp(1, 100) as i32)
+        .build()
+        .map_err(|_| VideoError::Missing("jpegenc".into()))?;
+    let sink = gst::ElementFactory::make("filesink")
+        .property("location", out.to_string_lossy().as_ref())
+        .build()
+        .map_err(|_| VideoError::Missing("filesink".into()))?;
+    let elements = [
+        appsrc.clone().upcast::<gst::Element>(),
+        make("videoconvert")?,
+        filter,
+        encode,
+        make("matroskamux")?,
+        sink,
+    ];
+    pipeline.add_many(&elements)?;
+    gst::Element::link_many(&elements)?;
+    pipeline.set_state(gst::State::Playing)?;
+    let result = (|| {
+        dec.play_from(0)?;
+        let mut last: Option<crate::Frame> = None;
+        let push = |f: crate::Frame, end: i64| -> Result<()> {
+            let mut buf = gst::Buffer::from_mut_slice(f.rgba);
+            if let Some(b) = buf.get_mut() {
+                b.set_pts(crate::clock(f.time.max(0)));
+                b.set_duration(crate::clock((end - f.time).max(1)));
+            }
+            appsrc
+                .push_buffer(buf)
+                .map_err(|e| VideoError::Gst(format!("proxy frames: {e}")))?;
+            Ok(())
+        };
+        while let Some(f) = dec.next_frame()? {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(VideoError::Cancelled);
+            }
+            progress((f.time as f64 / duration as f64).clamp(0.0, 1.0));
+            if let Some(prev) = last.take() {
+                let end = f.time;
+                push(prev, end)?;
+            }
+            last = Some(f);
+        }
+        if let Some(prev) = last {
+            // The last frame lasts to the end (or a frame's length).
+            let end = (prev.time + 40_000_000).min(duration.max(prev.time + 1));
+            push(prev, end)?;
+        }
+        appsrc
+            .end_of_stream()
+            .map_err(|e| VideoError::Gst(format!("proxy frames: {e}")))?;
+        let bus = pipeline
+            .bus()
+            .ok_or_else(|| VideoError::Gst("a pipeline without a bus".into()))?;
+        match bus.timed_pop_filtered(
+            gst::ClockTime::from_seconds(60),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        ) {
+            Some(m) => match m.view() {
+                gst::MessageView::Error(e) => Err(VideoError::Gst(e.error().to_string())),
+                _ => Ok(()),
+            },
+            None => Err(VideoError::Gst("the proxy did not finish".into())),
+        }
+    })();
+    let _ = pipeline.set_state(gst::State::Null);
+    result
 }

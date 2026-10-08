@@ -142,6 +142,9 @@ opt-level = 3
 
 [profile.dev.package.faderframe-speech]
 opt-level = 3
+# HDR pictures are mapped per pixel as they are decoded.
+[profile.dev.package.faderframe-video]
+opt-level = 3
 
 # The preamps' circuit solver: real time needs it optimised.
 [profile.dev.package.faderframe-circuit]

@@ -178,6 +178,7 @@ fn an_intra_clip_is_probed_indexed_decoded_proxied_and_remuxed() {
             height: 120,
             quality: 80,
         },
+        Default::default(),
         &cancel,
         |s| shares.push(s),
     )
@@ -406,6 +407,7 @@ fn the_service_answers_at_once_and_catches_up() {
             height: 120,
             quality: 80,
         },
+        Default::default(),
         &cancel,
         |_| {},
     )
@@ -544,6 +546,7 @@ fn proxies_keep_the_colours() {
             height: 120,
             quality: 90,
         },
+        Default::default(),
         &cancel,
         |_| {},
     )
@@ -631,5 +634,161 @@ fn prores_and_dnxhr_decode() {
             assert_frame(&f, n);
         }
     }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// HDR: a PQ BT.2020 picture (raw, exact code values) is recognised from
+/// its stream and mapped for an SDR screen — reference white (203 nits)
+/// just under white (room for the highlights), a 1000-nit highlight
+/// rolled off to white, 20 nits a dark grey — where shown as it is it
+/// would be dull.
+#[test]
+fn hdr_pictures_are_mapped_for_sdr_screens() {
+    use faderframe_video::colour::{Gamut, Transfer, nits_to_pq};
+    faderframe_video::init().unwrap();
+    let d = dir();
+    let clip = d.join("pq.mkv");
+    let colorimetry = gst_video::VideoColorimetry::new(
+        gst_video::VideoColorRange::Range0_255,
+        gst_video::VideoColorMatrix::Rgb,
+        gst_video::VideoTransferFunction::Smpte2084,
+        gst_video::VideoColorPrimaries::Bt2020,
+    );
+    let desc = format!(
+        "appsrc name=src format=time caps=video/x-raw,format=RGBA64_LE,width={W},height={H},framerate={FPS}/1,colorimetry={colorimetry} ! matroskamux ! filesink name=out"
+    );
+    let pipeline = gst::parse::launch(&desc)
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+    pipeline
+        .by_name("out")
+        .unwrap()
+        .set_property("location", clip.to_string_lossy().as_ref());
+    let src = pipeline
+        .by_name("src")
+        .unwrap()
+        .downcast::<gst_app::AppSrc>()
+        .unwrap();
+    pipeline.set_state(gst::State::Playing).unwrap();
+    // Thirds: 20 nits, 203 nits, 1000 nits (grey).
+    let code = |nits: f64| ((nits_to_pq(nits) * 65_535.0).round() as u16).to_le_bytes();
+    for n in 0..10u64 {
+        let mut data = Vec::with_capacity((W * H * 8) as usize);
+        for _ in 0..H {
+            for x in 0..W {
+                let c = code([20.0, 203.0, 1000.0][(x * 3 / W) as usize]);
+                for _ in 0..3 {
+                    data.extend_from_slice(&c);
+                }
+                data.extend_from_slice(&u16::MAX.to_le_bytes());
+            }
+        }
+        let mut buf = gst::Buffer::from_mut_slice(data);
+        let b = buf.get_mut().unwrap();
+        b.set_pts(gst::ClockTime::from_mseconds(n * 40));
+        b.set_duration(gst::ClockTime::from_mseconds(40));
+        src.push_buffer(buf).unwrap();
+    }
+    src.end_of_stream().unwrap();
+    let bus = pipeline.bus().unwrap();
+    bus.timed_pop_filtered(
+        gst::ClockTime::from_seconds(30),
+        &[gst::MessageType::Eos, gst::MessageType::Error],
+    )
+    .unwrap();
+    pipeline.set_state(gst::State::Null).unwrap();
+
+    let cancel = AtomicBool::new(false);
+    let ix = index::index(&clip, &cancel, |_| {}).unwrap();
+    assert_eq!(ix.colour.transfer, Transfer::Pq);
+    assert_eq!(ix.colour.gamut, Gamut::Bt2020);
+    assert!(ix.colour.label().unwrap().contains("PQ"));
+    let mut dec = Decoder::open_colour(&clip, W, H, ix.colour).unwrap();
+    let f = dec.frame_at(ix.times[3], true).unwrap().unwrap();
+    let at = |third: u32| f.pixel(W * third / 3 + W / 6, H / 2);
+    let (dark, white, bright) = (at(0), at(1), at(2));
+    assert!((90..=105).contains(&dark[0]), "20 nits: {dark:?}");
+    assert!(
+        (220..=240).contains(&white[0]),
+        "reference white: {white:?}"
+    );
+    assert!(
+        bright[0] >= 252 && bright[1] >= 252,
+        "1000 nits: {bright:?}"
+    );
+    // Shown as it is (no mapping), reference white is dull grey.
+    let mut plain = Decoder::open(&clip, W, H).unwrap();
+    let f = plain.frame_at(ix.times[3], true).unwrap().unwrap();
+    assert!(f.pixel(W / 2, H / 2)[0] < 170);
+    // Its proxy is mapped the same way (and SDR itself).
+    let proxy = d.join("pq.proxy.mkv");
+    make_proxy(
+        &clip,
+        &proxy,
+        (W, H, (1, 1)),
+        ProxySpec {
+            height: 120,
+            quality: 95,
+        },
+        ix.colour,
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let pix = index::index(&proxy, &cancel, |_| {}).unwrap();
+    assert_eq!(pix.len(), 10);
+    assert!(!pix.colour.needs_mapping(), "{:?}", pix.colour);
+    let mut dec = Decoder::open(&proxy, 160, 120).unwrap();
+    let f = dec.frame_at(pix.times[3], true).unwrap().unwrap();
+    let mid = f.pixel(80, 60);
+    assert!(
+        (220..=240).contains(&mid[0]),
+        "proxy's reference white: {mid:?}"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A real HDR10 stream (HEVC Main 10, PQ, BT.2020) is recognised from what
+/// its parser says, and decodes mapped.
+#[test]
+fn hevc_hdr10_is_recognised() {
+    use faderframe_video::colour::{Gamut, Transfer};
+    if !(has_element("vah265enc") && has_element("h265parse")) {
+        eprintln!("skipped: no HEVC encoder (vah265enc) here");
+        return;
+    }
+    faderframe_video::init().unwrap();
+    let d = dir();
+    let clip = d.join("hdr10.mp4");
+    let pipeline = gst::parse::launch(
+        "videotestsrc num-buffers=25 ! video/x-raw,width=320,height=240,framerate=25/1,format=P010_10LE,colorimetry=bt2100-pq ! vah265enc ! h265parse ! mp4mux ! filesink name=out",
+    )
+    .unwrap()
+    .downcast::<gst::Pipeline>()
+    .unwrap();
+    pipeline
+        .by_name("out")
+        .unwrap()
+        .set_property("location", clip.to_string_lossy().as_ref());
+    pipeline.set_state(gst::State::Playing).unwrap();
+    pipeline
+        .bus()
+        .unwrap()
+        .timed_pop_filtered(
+            gst::ClockTime::from_seconds(30),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        )
+        .unwrap();
+    pipeline.set_state(gst::State::Null).unwrap();
+    let cancel = AtomicBool::new(false);
+    let ix = index::index(&clip, &cancel, |_| {}).unwrap();
+    assert_eq!(
+        (ix.colour.transfer, ix.colour.gamut),
+        (Transfer::Pq, Gamut::Bt2020)
+    );
+    let mut dec = Decoder::open_colour(&clip, 160, 120, ix.colour).unwrap();
+    let f = dec.frame_at(ix.times[5], true).unwrap().unwrap();
+    assert_eq!((f.width, f.height), (160, 120));
     let _ = std::fs::remove_dir_all(&d);
 }

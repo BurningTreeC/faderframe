@@ -3,6 +3,8 @@
 //! the clock) nor shows a frame (the shell does).
 //!
 //! - [`probe`]: what a file holds (picture, audio streams, length).
+//! - [`colour`]: what a picture's colours mean; HDR and wide-gamut
+//!   pictures mapped for an SDR screen.
 //! - [`index`]: every frame's time and the keyframes, read from the
 //!   demuxer alone (fast), so variable frame rates, B-frames and edit
 //!   lists come out exact; the file's start timecode.
@@ -24,6 +26,7 @@
 #![forbid(unsafe_code)]
 
 pub mod audio;
+pub mod colour;
 pub mod cuts;
 pub mod decode;
 pub mod index;

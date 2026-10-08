@@ -119,7 +119,8 @@ fn index_of(
     cancel: &AtomicBool,
     share: &Share,
 ) -> std::result::Result<FrameIndex, String> {
-    let file = cache_dir().join(format!("{}.index.json", cache_key(path)));
+    // "v2": with the picture's colours.
+    let file = cache_dir().join(format!("{}.v2.index.json", cache_key(path)));
     if let Some(ix) = std::fs::read(&file)
         .ok()
         .and_then(|b| serde_json::from_slice::<FrameIndex>(&b).ok())
@@ -245,6 +246,9 @@ pub struct VideoSourceState {
     /// Making the proxy: the share done.
     pub proxying: Option<f64>,
     pub error: Option<String>,
+    /// HDR or wide gamut, as its stream says ("HDR (PQ, BT.2020)"):
+    /// mapped for the screen.
+    pub colour: Option<String>,
 }
 
 #[derive(Default)]
@@ -416,6 +420,9 @@ impl crate::Session {
                     .as_ref()
                     .and_then(|s| s.error(source.raw()))
             }),
+            colour: k
+                .and_then(|k| k.index.as_ref())
+                .and_then(|ix| ix.colour.label()),
         }
     }
 
@@ -782,6 +789,13 @@ impl crate::Session {
             {
                 let out = proxy_path(&path, height);
                 let name = s.name();
+                let colour = self
+                    .video
+                    .known
+                    .get(&id)
+                    .and_then(|k| k.index.as_ref())
+                    .map(|ix| ix.colour)
+                    .unwrap_or_default();
                 self.spawn_video(
                     format!("Proxy for {name}"),
                     Some(id),
@@ -796,6 +810,7 @@ impl crate::Session {
                             &out,
                             picture,
                             spec,
+                            colour,
                             cancel,
                             |x| share.set(x),
                         )

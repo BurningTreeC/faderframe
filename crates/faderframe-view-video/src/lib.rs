@@ -227,7 +227,12 @@ impl VideoView {
             .get(&v.source)
             .map(|s| s.name())
             .unwrap_or_default();
-        (label, format!("{name} · frame {}", v.frame))
+        let mapped = model
+            .video_source_state(v.source)
+            .colour
+            .map(|c| format!(" · {c} → SDR"))
+            .unwrap_or_default();
+        (label, format!("{name} · frame {}{mapped}", v.frame))
     }
 }
 

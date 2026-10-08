@@ -441,12 +441,20 @@ fn wait<'a>(s: &'a Shared, seen: u64) -> Option<MutexGuard<'a, Asked>> {
 fn decoder_for<'a>(
     open: &'a mut Option<Open>,
     key: Key,
+    m: &Media,
     file: &PathBuf,
     size: (u32, u32),
     play: bool,
     s: &Shared,
 ) -> Option<&'a mut Decoder> {
-    let gpu = play && zero_copy_for(file, s);
+    // The original as its stream says (HDR mapped for the screen); a
+    // proxy is SDR already.
+    let colour = if *file == m.original {
+        m.index.colour
+    } else {
+        crate::colour::Colour::default()
+    };
+    let gpu = play && !colour.needs_mapping() && zero_copy_for(file, s);
     let same = open
         .as_ref()
         .is_some_and(|o| o.key == key && &o.file == file && o.size == size && o.gpu == gpu);
@@ -459,7 +467,7 @@ fn decoder_for<'a>(
         };
         let opened = match opened {
             Some(d) => Ok(d),
-            None => Decoder::open(file, size.0, size.1).map(|d| (d, false)),
+            None => Decoder::open_colour(file, size.0, size.1, colour).map(|d| (d, false)),
         };
         match opened {
             Ok((decoder, gpu)) => {
@@ -561,7 +569,7 @@ fn play_step(s: &Shared, lane: &mut Lane, key: Key, m: &Media) -> bool {
             let Some(t) = m.index.times.get(want as usize).copied() else {
                 return false;
             };
-            let Some(d) = decoder_for(&mut lane.open, key, &file, dsize, true, s) else {
+            let Some(d) = decoder_for(&mut lane.open, key, m, &file, dsize, true, s) else {
                 return false;
             };
             if let Err(e) = d.play_from(t) {
@@ -575,7 +583,7 @@ fn play_step(s: &Shared, lane: &mut Lane, key: Key, m: &Media) -> bool {
     if at > want + AHEAD {
         return false;
     }
-    let Some(d) = decoder_for(&mut lane.open, key, &file, dsize, true, s) else {
+    let Some(d) = decoder_for(&mut lane.open, key, m, &file, dsize, true, s) else {
         return false;
     };
     match d.next_frame() {
@@ -675,7 +683,7 @@ fn still_step(s: &Shared, d: &mut Stills, key: Key, m: &Media) {
         if far
             && !have_frame(s, key, k as u32, dsize.0)
             && let Some(&kt) = m.index.times.get(k)
-            && let Some(dec) = decoder_for(&mut d.moving, key, &file, dsize, false, s)
+            && let Some(dec) = decoder_for(&mut d.moving, key, m, &file, dsize, false, s)
             && let Ok(Some(f)) = dec.frame_at(kt, false)
         {
             lock(&s.cache).put((key, k as u32, dsize.0), Arc::new(f), s.budget);
@@ -683,7 +691,7 @@ fn still_step(s: &Shared, d: &mut Stills, key: Key, m: &Media) {
         if newer() {
             return;
         }
-        if let Some(dec) = decoder_for(&mut d.moving, key, &file, dsize, false, s) {
+        if let Some(dec) = decoder_for(&mut d.moving, key, m, &file, dsize, false, s) {
             match dec.frame_at(t, true) {
                 Ok(Some(f)) => lock(&s.cache).put((key, n, dsize.0), Arc::new(f), s.budget),
                 Ok(None) => {}
@@ -694,7 +702,7 @@ fn still_step(s: &Shared, d: &mut Stills, key: Key, m: &Media) {
     // Sharp when stopped: the original at the full size wanted.
     if dsize != size && !have(size.0) && !newer() {
         let original = m.original.clone();
-        if let Some(dec) = decoder_for(&mut d.sharp, key, &original, size, false, s) {
+        if let Some(dec) = decoder_for(&mut d.sharp, key, m, &original, size, false, s) {
             match dec.frame_at(t, true) {
                 Ok(Some(f)) => lock(&s.cache).put((key, n, size.0), Arc::new(f), s.budget),
                 Ok(None) => {}
@@ -728,7 +736,7 @@ fn thumbnailer(s: &Shared) {
                     None => (m.original.clone(), m.index.longest_gop() <= 1),
                 };
                 let size = m.fit((u32::MAX, height));
-                if let Some(d) = decoder_for(&mut open, key, &file, size, false, s) {
+                if let Some(d) = decoder_for(&mut open, key, &m, &file, size, false, s) {
                     match d.frame_at(t, exact) {
                         Ok(Some(f)) => {
                             lock(&s.thumbs).put(slot, Arc::new(f), s.thumb_budget);

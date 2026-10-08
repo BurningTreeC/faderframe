@@ -23,6 +23,10 @@ pub struct FrameIndex {
     /// The file's start timecode and its rate, when it carries one (a
     /// QuickTime timecode track).
     pub timecode: Option<(Timecode, FrameRate)>,
+    /// What the picture's colours mean (HDR, wide gamut), as its stream
+    /// says.
+    #[serde(default)]
+    pub colour: crate::colour::Colour,
 }
 
 impl FrameIndex {
@@ -116,12 +120,14 @@ pub fn index(path: &Path, cancel: &AtomicBool, progress: impl FnMut(f64)) -> Res
         frames: Vec<(i64, bool)>,
         end: i64,
         timecode: Option<(Timecode, FrameRate)>,
+        colour: Option<crate::colour::Colour>,
         picture: bool,
     }
     let seen = Arc::new(Mutex::new(Seen {
         frames: Vec::new(),
         end: 0,
         timecode: None,
+        colour: None,
         picture: false,
     }));
     let sink = gst_app::AppSink::builder()
@@ -151,6 +157,11 @@ pub fn index(path: &Path, cancel: &AtomicBool, progress: impl FnMut(f64)) -> Res
                 let Ok(mut s) = s2.lock() else {
                     return Err(gst::FlowError::Error);
                 };
+                if s.colour.is_none()
+                    && let Some(caps) = sample.caps()
+                {
+                    s.colour = Some(crate::colour::Colour::of_caps(caps));
+                }
                 let t = crate::ns(t);
                 let end = t + buffer.duration().map_or(0, crate::ns);
                 s.end = s.end.max(end);
@@ -207,6 +218,7 @@ pub fn index(path: &Path, cancel: &AtomicBool, progress: impl FnMut(f64)) -> Res
         timecode: s
             .timecode
             .or_else(|| crate::qt_timecode::start_timecode(path)),
+        colour: s.colour.unwrap_or_default(),
     };
     // A last frame without a duration lasts as long as the others.
     if let Some(&last) = index.times.last()

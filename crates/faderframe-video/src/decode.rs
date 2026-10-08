@@ -72,6 +72,8 @@ pub fn fit(width: u32, height: u32, par: (u32, u32), max_w: u32, max_h: u32) -> 
 pub struct Decoder {
     p: Pipeline,
     sink: gst_app::AppSink,
+    /// HDR or wide gamut: decoded at 16 bits and mapped for the screen.
+    map: Option<std::sync::Arc<crate::colour::ToneMap>>,
     width: u32,
     height: u32,
     playing: bool,
@@ -80,16 +82,35 @@ pub struct Decoder {
 
 impl Decoder {
     /// Open `path`'s picture, scaled to `width`×`height` (see [`fit`]);
-    /// shows the first frame.
+    /// shows the first frame. Its colours are taken as SDR BT.709 (see
+    /// [`Self::open_colour`]).
     pub fn open(path: &Path, width: u32, height: u32) -> Result<Self> {
+        Self::open_colour(path, width, height, crate::colour::Colour::default())
+    }
+
+    /// [`Self::open`] for a picture whose colours mean `colour`: HDR and
+    /// wide-gamut ones are mapped for an SDR BT.709 screen.
+    pub fn open_colour(
+        path: &Path,
+        width: u32,
+        height: u32,
+        colour: crate::colour::Colour,
+    ) -> Result<Self> {
         let convert = make("videoconvertscale")?;
+        // Mapped: 16 bits a channel, still in the picture's own transfer
+        // and primaries (the converter changes only matrix and range).
+        let map = colour
+            .needs_mapping()
+            .then(|| crate::colour::tone_map(colour));
         let caps = gst::Caps::builder("video/x-raw")
-            .field("format", "RGBA")
+            .field("format", if map.is_some() { "RGBA64_LE" } else { "RGBA" })
             .field("width", width as i32)
             .field("height", height as i32)
             .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
             .build();
-        Self::open_with(path, width, height, convert, caps, false)
+        let mut d = Self::open_with(path, width, height, convert, caps, false)?;
+        d.map = map;
+        Ok(d)
     }
 
     /// Open `path`'s picture decoded into dmabufs at `width`×`height`
@@ -163,6 +184,7 @@ impl Decoder {
         Ok(Self {
             p,
             sink,
+            map: None,
             width,
             height,
             playing: false,
@@ -232,6 +254,17 @@ impl Decoder {
         let data = frame
             .plane_data(0)
             .map_err(|_| VideoError::Gst("an unreadable frame".into()))?;
+        if let Some(map) = &self.map {
+            let mut rgba = Vec::new();
+            map.map(data, stride, w as usize, h as usize, &mut rgba);
+            return Ok(Frame {
+                width: w,
+                height: h,
+                time,
+                rgba,
+                gpu: None,
+            });
+        }
         let row = w as usize * 4;
         let mut rgba = Vec::with_capacity(row * h as usize);
         for y in 0..h as usize {
