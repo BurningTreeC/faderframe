@@ -80,6 +80,7 @@ impl FactoryPreset {
 pub fn factory_presets(plugin_id: &str) -> Vec<FactoryPreset> {
     match plugin_id {
         builtin::COMPRESSOR => dynamics::compressor(),
+        builtin::COMPRESSOR_76 => dynamics::compressor_76(),
         builtin::LIMITER => dynamics::limiter(),
         builtin::GATE => dynamics::gate(),
         builtin::DEESSER => dynamics::deesser(),
@@ -105,6 +106,7 @@ pub fn parameters(plugin_id: &str) -> Vec<ParameterInfo> {
     use crate::devices::*;
     match plugin_id {
         builtin::COMPRESSOR => compressor::parameters(),
+        builtin::COMPRESSOR_76 => fet76::parameters(),
         builtin::LIMITER => limiter::parameters(),
         builtin::GATE => gate::parameters(),
         builtin::DEESSER => deesser::parameters(),

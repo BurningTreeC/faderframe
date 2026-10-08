@@ -664,3 +664,178 @@ pub(super) fn deesser() -> Vec<FactoryPreset> {
         ),
     ]
 }
+
+/// The 76 Compressor's: what the FET limiting amplifier is reached for —
+/// the voice in front, bass and drums with bite, the all-buttons smash,
+/// peaks caught, and its line amplifier alone. Attack and release run 1
+/// (slowest) to 7 (fastest), as on the hardware; Output keeps each level
+/// with the dry signal.
+pub(super) fn compressor_76() -> Vec<FactoryPreset> {
+    use crate::devices::fet76::id::*;
+    // The ratio buttons (bits: 4, 8, 12, 20 to one).
+    const R4: f64 = 1.0;
+    const R8: f64 = 2.0;
+    const R12: f64 = 4.0;
+    const R20: f64 = 8.0;
+    const ALL: f64 = 15.0;
+    vec![
+        // 4:1, a medium attack and a quick release: the voice sits in
+        // front without losing its consonants.
+        preset(
+            "Vocal Upfront",
+            &[
+                (INPUT, 14.0),
+                (OUTPUT, 4.1),
+                (ATTACK, 3.0),
+                (RELEASE, 6.0),
+                (RATIO, R4),
+            ],
+        ),
+        // A slower attack and release, a little less: levelling, not
+        // grabbing.
+        preset(
+            "Vocal Gentle",
+            &[
+                (INPUT, 9.0),
+                (OUTPUT, 6.2),
+                (ATTACK, 2.0),
+                (RELEASE, 3.0),
+                (RATIO, R4),
+            ],
+        ),
+        // 8:1, fast both ways and pushed: the hard, edgy rap and rock voice.
+        preset(
+            "Vocal Grit",
+            &[
+                (INPUT, 22.0),
+                (OUTPUT, 3.9),
+                (ATTACK, 5.0),
+                (RELEASE, 7.0),
+                (RATIO, R8),
+            ],
+        ),
+        // 4:1, slow attack, slow release: the notes even, no distortion
+        // from a release riding the waveform.
+        preset(
+            "Bass Even",
+            &[
+                (INPUT, 12.0),
+                (OUTPUT, 6.0),
+                (ATTACK, 2.0),
+                (RELEASE, 2.0),
+                (RATIO, R4),
+            ],
+        ),
+        // 8:1, fast: the release rides the low notes into grit.
+        preset(
+            "Bass Growl",
+            &[
+                (INPUT, 20.0),
+                (OUTPUT, 4.2),
+                (ATTACK, 6.0),
+                (RELEASE, 7.0),
+                (RATIO, R8),
+            ],
+        ),
+        // The slowest attack lets the beater through, the fast release
+        // brings the body up.
+        preset(
+            "Kick Snap",
+            &[
+                (INPUT, 14.0),
+                (OUTPUT, 3.8),
+                (ATTACK, 1.0),
+                (RELEASE, 7.0),
+                (RATIO, R4),
+            ],
+        ),
+        // 8:1 with a quick release: the crack first, then the ring up.
+        preset(
+            "Snare Crack",
+            &[
+                (INPUT, 16.0),
+                (OUTPUT, 4.9),
+                (ATTACK, 2.0),
+                (RELEASE, 6.0),
+                (RATIO, R8),
+            ],
+        ),
+        // Every button in: the ratio bends, the attack overshoots and the
+        // room explodes — the classic smash.
+        preset(
+            "All Buttons Room",
+            &[
+                (INPUT, 24.0),
+                (OUTPUT, 13.7),
+                (ATTACK, 7.0),
+                (RELEASE, 7.0),
+                (RATIO, ALL),
+            ],
+        ),
+        // The same smash under the dry drums (parallel, inside the unit).
+        preset(
+            "All Buttons Parallel",
+            &[
+                (INPUT, 24.0),
+                (OUTPUT, 5.0),
+                (ATTACK, 7.0),
+                (RELEASE, 7.0),
+                (RATIO, ALL),
+                (MIX, 0.4),
+            ],
+        ),
+        // 4:1 on the drum bus, fast release; the sidechain's high-pass at
+        // 120 Hz keeps the kick from pumping the cymbals.
+        preset(
+            "Drum Bus Crunch",
+            &[
+                (INPUT, 12.0),
+                (OUTPUT, 3.7),
+                (ATTACK, 3.0),
+                (RELEASE, 7.0),
+                (RATIO, R4),
+                (SC_HPF, 2.0),
+            ],
+        ),
+        // 4:1, medium: strums even, the picking still there.
+        preset(
+            "Acoustic Strum",
+            &[
+                (INPUT, 11.0),
+                (OUTPUT, 5.5),
+                (ATTACK, 3.0),
+                (RELEASE, 4.0),
+                (RATIO, R4),
+                (SC_HPF, 1.0),
+            ],
+        ),
+        // 12:1 with a slow release: sustain for leads and clean guitar.
+        preset(
+            "Guitar Sustain",
+            &[
+                (INPUT, 18.0),
+                (OUTPUT, 5.2),
+                (ATTACK, 4.0),
+                (RELEASE, 3.0),
+                (RATIO, R12),
+            ],
+        ),
+        // 20:1, the fastest attack: only the peaks are caught.
+        preset(
+            "Peak Catcher",
+            &[
+                (INPUT, 8.0),
+                (OUTPUT, 4.8),
+                (ATTACK, 7.0),
+                (RELEASE, 5.0),
+                (RATIO, R20),
+            ],
+        ),
+        // Attack off: no compression, the signal through the input and
+        // output transformers and the line amplifier, driven.
+        preset(
+            "Line Amp Colour",
+            &[(INPUT, 10.0), (OUTPUT, -7.0), (ATTACK, 0.0), (RATIO, R4)],
+        ),
+    ]
+}

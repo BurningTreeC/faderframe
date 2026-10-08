@@ -20,7 +20,8 @@ const MIDI_EFFECTS: [&str; 4] = [
 ];
 
 /// Every built-in with factory presets.
-const WITH_PRESETS: [&str; 17] = [
+const WITH_PRESETS: [&str; 18] = [
+    builtin::COMPRESSOR_76,
     builtin::ARPEGGIATOR,
     builtin::CHORD,
     builtin::SCALE,
