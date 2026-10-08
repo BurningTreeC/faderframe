@@ -147,6 +147,10 @@ impl MidiShared {
 #[derive(Debug)]
 pub struct MidiInputBlock {
     events: Vec<(u16, TimedMidiEvent)>,
+    /// Per event: how many frames before the block it was stamped (an
+    /// event older than a block, e.g. a sung note stamped where it was sung:
+    /// played at the block's start, recorded where it belongs).
+    early: Vec<u32>,
     /// Holds the bytes of the chunk's SysEx messages.
     bytes: MidiBuffer,
 }
@@ -158,6 +162,7 @@ impl MidiInputBlock {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             events: Vec::with_capacity(capacity),
+            early: Vec::with_capacity(capacity),
             bytes: MidiBuffer::with_capacities(LIVE_SYSEX, MidiBuffer::DEFAULT_SYSEX_CAPACITY),
         }
     }
@@ -182,19 +187,32 @@ impl MidiInputBlock {
         self.events.iter()
     }
 
+    /// The events with how many frames before the block each was stamped.
+    pub fn iter_early(&self) -> impl Iterator<Item = (&(u16, TimedMidiEvent), u32)> {
+        self.events
+            .iter()
+            .zip(self.early.iter().copied().chain(std::iter::repeat(0)))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
 
     fn clear(&mut self) {
         self.events.clear();
+        self.early.clear();
         self.bytes.clear();
     }
 
     /// Realtime-safe: never grows past the capacity.
     fn push(&mut self, port: u16, ev: TimedMidiEvent) -> bool {
+        self.push_early(port, ev, 0)
+    }
+
+    fn push_early(&mut self, port: u16, ev: TimedMidiEvent, early: u32) -> bool {
         if self.events.len() < self.events.capacity() {
             self.events.push((port, ev));
+            self.early.push(early);
             true
         } else {
             false
@@ -311,9 +329,11 @@ impl MidiInputState {
             let age = now.saturating_sub(raw.time_ns) as f64;
             let at = ((block_ns - age).max(0.0) / block_ns * frames as f64) as usize;
             let offset = at.min(frames - 1) as u32;
+            // Older than a block: played now, recorded where it was.
+            let early = ((age - block_ns).max(0.0) / block_ns * frames as f64) as u32;
             if !self
                 .events
-                .push(raw.port, TimedMidiEvent::new(offset, event))
+                .push_early(raw.port, TimedMidiEvent::new(offset, event), early)
             {
                 dropped.fetch_add(1, Ordering::Relaxed);
             }
@@ -321,10 +341,12 @@ impl MidiInputState {
         // Stable insertion sort by offset (events of several ports
         // interleave; allocation-free, the lists are short).
         let ev = &mut self.events.events;
+        let early = &mut self.events.early;
         for i in 1..ev.len() {
             let mut j = i;
             while j > 0 && ev[j - 1].1.sample_offset > ev[j].1.sample_offset {
                 ev.swap(j - 1, j);
+                early.swap(j - 1, j);
                 j -= 1;
             }
         }
@@ -335,7 +357,7 @@ impl MidiInputState {
     pub(crate) fn chunk(&self, offset: usize, frames: usize, out: &mut MidiInputBlock) {
         out.clear();
         let (a, b) = (offset as u32, (offset + frames) as u32);
-        for &(port, ev) in self.events.iter() {
+        for (&(port, ev), early) in self.events.iter_early() {
             if ev.sample_offset >= a && ev.sample_offset < b {
                 let at = ev.sample_offset - a;
                 match ev.event {
@@ -345,7 +367,7 @@ impl MidiInputState {
                         }
                     }
                     e => {
-                        out.push(port, TimedMidiEvent::new(at, e));
+                        out.push_early(port, TimedMidiEvent::new(at, e), early);
                     }
                 }
             }
@@ -595,8 +617,8 @@ impl MidiRecorder {
             self.pass += 1;
         }
         self.next = Some(pos + frames as i64);
-        for &(port, ev) in block.iter() {
-            let at = pos + ev.sample_offset as i64;
+        for (&(port, ev), early) in block.iter_early() {
+            let at = pos + ev.sample_offset as i64 - i64::from(early);
             if at < self.from
                 || at >= self.to
                 || port == AUDITION_PORT
@@ -627,6 +649,61 @@ mod tests {
 
     fn note(key: u8) -> [u8; 3] {
         [0x90, key, 100]
+    }
+
+    /// A message stamped well before the block (a sung note, heard late):
+    /// played at the block's start, recorded where it was stamped.
+    #[test]
+    fn an_early_stamp_plays_now_and_records_where_it_was() {
+        let (mut st, _tx) = MidiInputState::new();
+        let (sender, queue, _feed) = faderframe_midi::midi_input_queue(16);
+        st.replace_queue(Some(Box::new(queue)));
+        let clock = sender.clock();
+        let rate = 48_000.0;
+        let frames = 256usize;
+        let block_ns = frames as f64 * 1e9 / rate;
+        // Three blocks old: two more than the one block live input waits
+        // (the clock must have run that long).
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let now = clock.now_ns();
+        let stamp = now.saturating_sub((3.0 * block_ns) as u64);
+        assert!(sender.send_at(2, stamp, &note(64)));
+        let dropped = AtomicU64::new(0);
+        st.take(frames, rate, &dropped);
+        let got: Vec<(u32, u32)> = st
+            .events
+            .iter_early()
+            .map(|((_, e), early)| (e.sample_offset, early))
+            .collect();
+        assert_eq!(got.len(), 1);
+        let (offset, early) = got[0];
+        assert_eq!(offset, 0, "played at the block's start");
+        let want = 2 * frames as u32;
+        assert!(early.abs_diff(want) <= 4, "{early} for {want}");
+        // The recorder puts it that much before the block.
+        let (mut rec, mut rx) = midi_recording(
+            vec![MidiRecordTarget {
+                track: faderframe_core::TrackId(1),
+                filter: MidiFilter {
+                    port: None,
+                    channel: None,
+                },
+            }],
+            0,
+            i64::MAX,
+            16,
+        );
+        let mut chunk = MidiInputBlock::with_capacity(8);
+        st.chunk(0, frames, &mut chunk);
+        rec.capture(
+            &chunk,
+            10_000,
+            frames,
+            &AtomicU64::new(0),
+            &ConsumedControls::default(),
+        );
+        let r = rx.pop().unwrap();
+        assert_eq!(r.position, 10_000 - i64::from(early));
     }
 
     #[test]

@@ -208,7 +208,13 @@ impl MidiInputSender {
     /// message or the queue was full (counted in [`Self::dropped`]).
     /// System messages go to the control feed only.
     pub fn send(&self, port: u16, msg: &[u8]) -> bool {
-        let now = self.clock.now_ns();
+        self.send_at(port, self.clock.now_ns(), msg)
+    }
+
+    /// [`Self::send`] stamped with an earlier `time_ns` on the clock (when
+    /// what it reports happened: a sung note, heard a little later).
+    pub fn send_at(&self, port: u16, time_ns: u64, msg: &[u8]) -> bool {
+        let now = time_ns.min(self.clock.now_ns());
         if let Some(message) = SystemMessage::parse(msg) {
             return self
                 .system
@@ -237,6 +243,26 @@ impl MidiInputSender {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
         pushed
+    }
+
+    /// A per-note expression stamped at `time_ns`.
+    pub fn send_expression_at(
+        &self,
+        port: u16,
+        time_ns: u64,
+        channel: u8,
+        key: u8,
+        kind: NoteExpressionKind,
+        value: f64,
+    ) -> bool {
+        self.push(MidiInputEvent::expression(
+            port,
+            time_ns.min(self.clock.now_ns()),
+            channel,
+            key,
+            kind,
+            value,
+        ))
     }
 
     /// Queue a Universal MIDI Packet from a MIDI 2.0 port: MIDI 1.0 and

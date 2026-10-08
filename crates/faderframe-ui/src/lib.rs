@@ -207,6 +207,7 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
         tracing::warn!("recording settings: {e}");
     }
     session.set_sync_settings(prefs.sync_settings());
+    session.set_voice_settings(prefs.voice);
     session.set_video_settings(prefs.video_settings());
     // Video frames go to the display as dmabufs it takes.
     #[cfg(target_os = "linux")]

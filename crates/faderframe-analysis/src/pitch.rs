@@ -22,6 +22,8 @@ pub struct Detector {
     re: Vec<f64>,
     im: Vec<f64>,
     nsdf: Vec<f64>,
+    /// The peaks found (room for every one: no allocation per call).
+    peaks: Vec<(usize, f64)>,
 }
 
 impl Default for Detector {
@@ -36,6 +38,7 @@ impl Detector {
             re: vec![0.0; 2 * FRAMES],
             im: vec![0.0; 2 * FRAMES],
             nsdf: vec![0.0; FRAMES],
+            peaks: Vec::with_capacity(FRAMES / 2 + 1),
         }
     }
 
@@ -79,7 +82,8 @@ impl Detector {
             self.nsdf[t] = if m > 1e-12 { 2.0 * r / m } else { 0.0 };
         }
         // The peaks between the positive zero crossings.
-        let mut peaks: Vec<(usize, f64)> = Vec::new();
+        let mut peaks = std::mem::take(&mut self.peaks);
+        peaks.clear();
         let mut t = 1;
         while t < max_lag && self.nsdf[t] > 0.0 {
             t += 1;
@@ -100,7 +104,9 @@ impl Detector {
             }
         }
         let highest = peaks.iter().map(|p| p.1).fold(0.0, f64::max);
-        let &(k, v) = peaks.iter().find(|p| p.1 >= 0.9 * highest)?;
+        let found = peaks.iter().find(|p| p.1 >= 0.9 * highest).copied();
+        self.peaks = peaks;
+        let (k, v) = found?;
         // A parabola through the peak and its neighbours.
         let (a, b, c) = (self.nsdf[k - 1], v, self.nsdf[(k + 1).min(max_lag)]);
         let d = a - 2.0 * b + c;

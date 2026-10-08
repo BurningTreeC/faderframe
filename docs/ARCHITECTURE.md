@@ -3253,10 +3253,11 @@ DAW does well yet):
 17. **Further out**: MIDI 2.0 on macOS (CoreMIDI's `MIDIEventList`) and
     Windows (Windows MIDI Services), and clips that keep MIDI 2.0's
     resolution (16-bit velocities, 32-bit controllers: today they arrive
-    and leave at it, and clips hold MIDI 1.0's); more views for screen readers (the Album, Launcher, Automation, Tools and Video views, the edit toolbar; a canvas only names itself until it lists its controls); merging
-    project versions (three-way, from `faderframe_project::compare`) for
-    collaborators; singing into MIDI live (real-time pitch tracking of an
-    input driving an instrument).
+    and leave at it, and clips hold MIDI 1.0's); more views for screen
+    readers (Album, Launcher, Automation, Tools and Video, the edit
+    toolbar: they only name themselves so far); merging project versions
+    (three-way, from `faderframe_project::compare`) for collaborators;
+    polyphonic voice ports (several inputs at once; chords from a guitar).
 
 Suggested next: 11 and the auto-align of 16, then reference tracks and
 lead sheets — the first three everyday tools, the last one FaderFrame's
@@ -3705,3 +3706,32 @@ knobs as sliders by a hundredth of their travel, switches as toggles,
 stepped values a step at a time). Check with the system's AT-SPI (the
 scratchpad's `a11y_dump.py` / `a11y_events.py` on `/usr/bin/python3` with
 `gi` Atspi) and the dev action `access-key:<view>=<tab|backtab|enter|up|…>`.
+
+### Singing into MIDI (voice ports)
+
+Every input channel of the audio device has a MIDI input port "Voice · In
+n" (`session::voice`, virtual inputs of the hub, left out of the
+Preferences' input list). A track whose MIDI input names one makes the
+session listen to that channel: the engine copies it into
+`EngineShared::voice` (`engine::voice_tap::VoiceTap`, a `ScopeRing` plus the
+MIDI clock time and ring position of each callback, so a frame's time is
+known), and a thread runs `faderframe_analysis::voice::VoiceTracker` on it
+— low-passed and decimated to ~11 kHz, McLeod pitch over the last 40 ms
+every 5 ms, a level gate; a note starts when the same key (nearest in the
+scale) holds 3 frames, changes after 5 with half a semitone plus 0.3 of
+hysteresis (vibrato and scoops stay on it), ends after 8 unvoiced; bends
+against the key while it sounds; each event dated to when its sound began.
+What it hears goes into the MIDI input queue through the port, stamped
+with that time (`MidiInputSender::send_at`, `send_expression_at`); glides as
+note expression (tuning), pitch bend (±2) or not at all; notes can snap to
+the project's key (`VoiceSettings`, Preferences → MIDI → Voice to MIDI).
+From there it is MIDI: live play by the live rule, MIDI tracks to external
+synths, Capture MIDI (positions from the stamps), recording — the engine
+keeps how much earlier than a block an event was stamped
+(`MidiInputBlock::early`, `iter_early`) and the recorder places it there
+(live play is unchanged: at the block's start). One input listens at a
+time (the first track's in track order). Tests: `voice::tests` (a sung
+phrase placed within 25 ms, vibrato, threshold, scale, octave), engine
+`an_early_stamp_plays_now_and_records_where_it_was`, the tap in
+`live_midi_input_and_midi_recording_do_not_allocate`,
+`session/tests/voice.rs` (the dummy device's tone played and recorded).

@@ -19,6 +19,7 @@ mod spectrum;
 pub mod structure;
 pub mod tempo;
 pub mod vinyl;
+pub mod voice;
 
 pub use dynamics::{Dynamics, DynamicsMeter};
 pub use loudness::{Loudness, LoudnessMeter, integrated_weighted, speaker_weight};

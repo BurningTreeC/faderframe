@@ -97,6 +97,8 @@ pub struct Preferences {
     pub video_fullscreen_monitor: Option<String>,
     /// The picture on a Blackmagic DeckLink output: device and mode.
     pub video_output: Option<(u32, String)>,
+    /// How voice ports hear singing (Preferences → MIDI).
+    pub voice: faderframe_session::voice::VoiceSettings,
 }
 
 impl Default for Preferences {
@@ -145,6 +147,7 @@ impl Default for Preferences {
             video_zero_copy: true,
             video_fullscreen_monitor: None,
             video_output: None,
+            voice: Default::default(),
         }
     }
 }

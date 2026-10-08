@@ -197,6 +197,8 @@ pub struct EngineShared {
     output_latency: AtomicU32,
     /// Auditioning, mapped controls, clock outputs.
     pub midi: Arc<crate::midi::MidiShared>,
+    /// The live input voice-to-MIDI listens to.
+    pub voice: crate::voice_tap::VoiceTap,
     /// Album playback (see [`crate::preview`]).
     pub preview: crate::preview::PreviewShared,
     /// A ping asked for: `1 << 63 | output << 16 | input` (0: none).
@@ -251,6 +253,7 @@ pub fn create_with_epoch(
     let shared = Arc::new(EngineShared {
         epoch,
         midi: Arc::clone(&shared_midi),
+        voice: crate::voice_tap::VoiceTap::default(),
         preview: Default::default(),
         ..EngineShared::default()
     });
@@ -555,6 +558,15 @@ impl EngineProcessor {
             self.shared.transport.publish(&self.transport);
             self.shared.epoch.advance();
             return;
+        }
+        // Voice to MIDI: the input it listens to, stamped.
+        if let Some(c) = self.shared.voice.channel()
+            && let Some(clock) = self.midi.clock()
+        {
+            let input = (usize::from(c) < io.input_channels()).then(|| io.input(usize::from(c)));
+            self.shared
+                .voice
+                .capture(input, clock.now_ns(), self.stream_rate);
         }
         // Varispeed: the engine renders the frames the device's need at
         // the speed (resampled both ways).
@@ -1980,6 +1992,17 @@ impl EngineController {
     /// Auditioning, mapped controls and clock outputs.
     pub fn midi_shared(&self) -> &Arc<crate::midi::MidiShared> {
         &self.shared.midi
+    }
+
+    /// The running stream's input channels (0 without one).
+    pub fn stream_inputs(&self) -> usize {
+        self.shared.stream_inputs.load(Ordering::Relaxed) as usize
+    }
+
+    /// The live input voice-to-MIDI listens to (and the engine's shared
+    /// state it lives in, for the listening thread).
+    pub fn voice_tap(&self) -> Arc<EngineShared> {
+        Arc::clone(&self.shared)
     }
 
     /// MIDI output messages lost because the sender fell behind.

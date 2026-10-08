@@ -43,7 +43,11 @@ impl Ports {
             self.list.remove(&c);
         }
         let mut dots = Vec::new();
-        for p in ports {
+        // Voice ports have their own section (Voice to MIDI).
+        for p in ports
+            .iter()
+            .filter(|p| faderframe_session::voice::voice_channel(&p.key).is_none())
+        {
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
             row.add_css_class("midi-port");
             let dot = gtk::Label::new(Some("●"));
@@ -297,6 +301,95 @@ pub fn sync_status_text(st: &faderframe_session::SyncStatus) -> String {
 }
 
 /// Source, input and MTC start; changes apply at once and are saved.
+/// Voice to MIDI: how the voice ports hear.
+fn voice_section(app: &Rc<AppState>) -> gtk::Grid {
+    use faderframe_session::voice::{VoiceGlide, VoiceSettings};
+    let grid = gtk::Grid::new();
+    grid.set_row_spacing(8);
+    grid.set_column_spacing(12);
+    let label = |t: &str| {
+        let l = gtk::Label::new(Some(t));
+        l.set_xalign(1.0);
+        l.add_css_class("dim-label");
+        l
+    };
+    let now = app.session.borrow().voice_settings();
+    let save = |app: &Rc<AppState>, s: VoiceSettings| {
+        app.session.borrow_mut().set_voice_settings(s);
+        let mut p = crate::prefs::Preferences::load();
+        p.voice = s;
+        if let Err(e) = p.save() {
+            tracing::warn!("cannot save preferences: {e}");
+        }
+    };
+    let threshold = gtk::SpinButton::with_range(-80.0, -10.0, 1.0);
+    threshold.set_value(f64::from(now.threshold_db));
+    threshold.set_tooltip_text(Some(
+        "Quieter input is silence (dBFS): lower it for a soft voice, raise it in a noisy room",
+    ));
+    {
+        let weak = Rc::downgrade(app);
+        threshold.connect_value_changed(move |b| {
+            if let Some(app) = weak.upgrade() {
+                let mut s = app.session.borrow().voice_settings();
+                s.threshold_db = b.value() as f32;
+                save(&app, s);
+            }
+        });
+    }
+    let names: Vec<&str> = VoiceGlide::ALL.iter().map(|g| g.label()).collect();
+    let glide = gtk::DropDown::from_strings(&names);
+    glide.set_selected(
+        VoiceGlide::ALL
+            .iter()
+            .position(|g| *g == now.glide)
+            .unwrap_or(0) as u32,
+    );
+    {
+        let weak = Rc::downgrade(app);
+        glide.connect_selected_notify(move |d| {
+            if let Some(app) = weak.upgrade() {
+                let mut s = app.session.borrow().voice_settings();
+                s.glide = VoiceGlide::ALL
+                    .get(d.selected() as usize)
+                    .copied()
+                    .unwrap_or_default();
+                save(&app, s);
+            }
+        });
+    }
+    let in_key = gtk::CheckButton::with_label("Snap notes to the project's key");
+    in_key.set_active(now.in_key);
+    {
+        let weak = Rc::downgrade(app);
+        in_key.connect_toggled(move |b| {
+            if let Some(app) = weak.upgrade() {
+                let mut s = app.session.borrow().voice_settings();
+                s.in_key = b.is_active();
+                save(&app, s);
+            }
+        });
+    }
+    let hint = gtk::Label::new(Some(
+        "Sing (or play a monophonic instrument) into an audio input and choose “Voice · In n” as an instrument or MIDI track's MIDI input: the track plays and records the notes you sing.",
+    ));
+    hint.set_wrap(true);
+    hint.set_natural_wrap_mode(gtk::NaturalWrapMode::Word);
+    hint.set_xalign(0.0);
+    hint.add_css_class("dim-label");
+    let l = label("Sensitivity (dB)");
+    threshold.update_relation(&[gtk::accessible::Relation::LabelledBy(&[l.upcast_ref()])]);
+    grid.attach(&l, 0, 0, 1, 1);
+    grid.attach(&threshold, 1, 0, 1, 1);
+    let l = label("Pitch");
+    glide.update_relation(&[gtk::accessible::Relation::LabelledBy(&[l.upcast_ref()])]);
+    grid.attach(&l, 0, 1, 1, 1);
+    grid.attach(&glide, 1, 1, 1, 1);
+    grid.attach(&in_key, 1, 2, 1, 1);
+    grid.attach(&hint, 0, 3, 2, 1);
+    grid
+}
+
 fn sync_section(app: &Rc<AppState>) -> SyncWidgets {
     use faderframe_session::{SyncSource, Timecode};
     let grid = gtk::Grid::new();
@@ -481,6 +574,9 @@ pub fn page(app: &Rc<AppState>) -> gtk::Widget {
     hint.set_xalign(0.0);
     hint.add_css_class("dim-label");
     body.append(&hint);
+
+    body.append(&heading("VOICE TO MIDI"));
+    body.append(&voice_section(app));
 
     body.append(&heading("MIDI OUTPUTS"));
     let outputs = gtk::ListBox::new();

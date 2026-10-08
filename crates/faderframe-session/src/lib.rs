@@ -79,6 +79,7 @@ pub mod templates;
 mod transients;
 pub mod versions;
 pub mod video;
+pub mod voice;
 /// A plugin state as projects store it (and back).
 pub use faderframe_engine::{
     decode_state as decode_plugin_state, encode_state as encode_plugin_state,
@@ -1344,6 +1345,8 @@ pub struct Session {
     note_clipboard_expressions: Vec<faderframe_project::NoteExpression>,
     perf: performance::PerformanceMonitor,
     midi: midi::MidiState,
+    /// Voice ports: singing into MIDI.
+    voice: voice::VoiceState,
 }
 
 /// Where a plugin chosen in the browser goes.
@@ -1582,6 +1585,7 @@ impl Session {
             note_clipboard_expressions: Vec::new(),
             perf: Default::default(),
             midi,
+            voice: voice::VoiceState::default(),
         };
         s.rescan_track_presets();
         s.render_sources();
@@ -2225,6 +2229,7 @@ impl Session {
 
     /// Close the stream (the engine processor goes with it).
     pub fn stop_audio(&mut self) {
+        self.stop_voice();
         self.audio = None;
         faderframe_realtime::set_process_workgroup(None);
         if let Some(pool) = &self.pool {
@@ -2355,6 +2360,7 @@ impl Session {
         }
         self.tick_performance();
         self.tick_midi();
+        self.tick_voice();
         self.tick_mtc_out();
         // A manual varispeed waits for the stream.
         if self.manual_speed().is_some() && !self.engine.varispeed() {

@@ -823,6 +823,8 @@ fn live_midi_input_and_midi_recording_do_not_allocate() {
     let (tx, q, _feed) = faderframe_midi::midi_input_queue(256);
     let (oq, mut orx) = faderframe_midi::midi_output_queue(4096, tx.clock());
     r.controller.set_midi_input(q).unwrap();
+    // Voice to MIDI listens to input 1: the tap copies it, stamped.
+    r.controller.voice_tap().voice.set_channel(Some(0));
     // MIDI clock out on port 0 while playing.
     r.controller.set_midi_output(oq).unwrap();
     r.controller

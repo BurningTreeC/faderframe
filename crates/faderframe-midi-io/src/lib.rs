@@ -140,6 +140,24 @@ impl VirtualMidiInput {
     pub fn clock(&self) -> faderframe_midi::MidiClock {
         self.tx.clock()
     }
+
+    /// Send a message stamped at `time_ns` on the clock.
+    pub fn send_at(&self, time_ns: u64, msg: &[u8]) -> bool {
+        self.tx.send_at(self.port, time_ns, msg)
+    }
+
+    /// Send a per-note expression stamped at `time_ns`.
+    pub fn send_expression_at(
+        &self,
+        time_ns: u64,
+        channel: u8,
+        key: u8,
+        kind: faderframe_midi::NoteExpressionKind,
+        value: f64,
+    ) -> bool {
+        self.tx
+            .send_expression_at(self.port, time_ns, channel, key, kind, value)
+    }
 }
 
 struct Known {
