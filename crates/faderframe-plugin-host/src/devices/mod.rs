@@ -14,6 +14,7 @@ pub mod compressor;
 pub mod deesser;
 pub mod delay;
 pub mod drums;
+pub mod fet76;
 pub mod gate;
 pub mod guitar;
 pub mod hardware_insert;

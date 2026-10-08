@@ -1534,6 +1534,21 @@ fn the_stock_devices_do_not_allocate() {
     // its range.
     type Device = (&'static str, Vec<SavedParameter>, bool, u32, (f64, f64));
     let devices: Vec<Device> = vec![
+        // The 76: all four ratio buttons in, the fastest times, the
+        // sidechain filter, half mix; its Input automated.
+        (
+            builtin::COMPRESSOR_76,
+            vec![
+                set(4, 15.0),
+                set(2, 7.0),
+                set(3, 7.0),
+                set(8, 2.0),
+                set(5, 0.5),
+            ],
+            false,
+            0,
+            (0.0, 30.0),
+        ),
         (
             builtin::COMPRESSOR,
             vec![

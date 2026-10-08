@@ -13,6 +13,7 @@ mod deesser;
 mod delay;
 mod drums;
 pub mod eq;
+pub mod fet76;
 mod gate;
 pub mod guitar;
 mod hardware_insert;
@@ -139,6 +140,7 @@ pub fn editor_for(
             note_echo::NoteEchoFace::new(theme),
         ))),
         builtin::PROGRAM_EQ => Some(Box::new(program_eq::ProgramEqView::new(plugin, theme))),
+        builtin::COMPRESSOR_76 => Some(Box::new(fet76::Fet76View::new(plugin, theme))),
         builtin::GUITAR_STATION => Some(Box::new(guitar::GuitarView::new(plugin, theme))),
         builtin::CONTAINER => Some(Box::new(container::ContainerView::new(plugin, theme))),
         _ => None,
@@ -177,6 +179,8 @@ pub fn editor_size(plugin_id: &str) -> Option<(i32, i32)> {
             (program_eq::PANEL_W * 1.2) as i32,
             (program_eq::TOTAL_H * 1.2) as i32 + HEADER_BAR,
         )),
+        // The panel at its size.
+        builtin::COMPRESSOR_76 => Some((fet76::PANEL_W as i32, fet76::TOTAL_H as i32 + HEADER_BAR)),
         // The rig at 0.92 of its size.
         builtin::GUITAR_STATION => Some((
             (guitar::PANEL_W * 0.92) as i32,

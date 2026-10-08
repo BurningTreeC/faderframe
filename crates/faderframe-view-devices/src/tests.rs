@@ -344,3 +344,114 @@ fn a_mapped_control_can_be_unmapped_from_its_menu() {
     s.dispatch(remove.action.clone().unwrap()).unwrap();
     assert!(s.midi_mappings_for(target).is_empty(), "removed");
 }
+
+/// The 76's panel: a ratio button alone lets the others out, Shift-click
+/// presses several in (all four, or none), Meter Off switches it off and
+/// the attack knob turns down to Off.
+#[test]
+fn the_76_buttons_go_in_together_as_on_the_hardware() {
+    use crate::fet76::Fet76View;
+    use faderframe_plugin_host::devices::fet76::{self as fet, id};
+    let (mut s, plugin) = session(builtin::COMPRESSOR_76, "76 Compressor");
+    let size = Size::new(crate::fet76::PANEL_W, crate::fet76::TOTAL_H);
+    let mut view = Fet76View::new(plugin, &Theme::default());
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    assert!(p.balanced_clips());
+    assert!(p.texts().contains(&"COMPRESSOR"));
+    assert!(
+        p.texts().contains(&"OFF"),
+        "the attack's Off and the meter's"
+    );
+    let value =
+        |s: &Session, i: u32| f64::from(s.plugin_tap(plugin).unwrap().params.get(i as usize));
+    // At scale 1 the panel starts 40 below the top.
+    let at = |x: f32, y: f32| Point::new(x, y + 40.0);
+    // Button n of a column (from the top).
+    let button = |x: f32, n: usize| at(x + 33.0, 40.0 + 48.0 * n as f32 + 20.0);
+    let shift = |pos: Point| ViewEvent::PointerDown {
+        pos,
+        button: PointerButton::Primary,
+        modifiers: Modifiers {
+            shift: true,
+            ..Modifiers::NONE
+        },
+        clicks: 1,
+    };
+    let (ratio_x, meter_x) = (548.0, 638.0);
+    // 20 alone.
+    run(
+        &mut view,
+        &mut s,
+        down(button(ratio_x, 0), PointerButton::Primary, 1),
+        size,
+    );
+    assert_eq!(value(&s, id::RATIO), 8.0);
+    // With 4: the outer two.
+    run(&mut view, &mut s, shift(button(ratio_x, 3)), size);
+    assert_eq!(
+        fet::buttons_name(fet::buttons(value(&s, id::RATIO))),
+        "4 + 20"
+    );
+    // All four.
+    run(&mut view, &mut s, shift(button(ratio_x, 1)), size);
+    run(&mut view, &mut s, shift(button(ratio_x, 2)), size);
+    assert_eq!(value(&s, id::RATIO), 15.0);
+    // 8 alone again: the others come out.
+    run(
+        &mut view,
+        &mut s,
+        down(button(ratio_x, 2), PointerButton::Primary, 1),
+        size,
+    );
+    assert_eq!(value(&s, id::RATIO), 2.0);
+    // Let it out too: none in.
+    run(&mut view, &mut s, shift(button(ratio_x, 2)), size);
+    assert_eq!(value(&s, id::RATIO), 0.0);
+    // Meter Off: the power switch.
+    run(
+        &mut view,
+        &mut s,
+        down(button(meter_x, 3), PointerButton::Primary, 1),
+        size,
+    );
+    assert_eq!(value(&s, id::METER), fet::POWER_OFF as f64);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    run(
+        &mut view,
+        &mut s,
+        down(button(meter_x, 0), PointerButton::Primary, 1),
+        size,
+    );
+    assert_eq!(value(&s, id::METER), 0.0);
+    // The attack knob (452, 94) dragged all the way down: Off.
+    run(
+        &mut view,
+        &mut s,
+        down(at(452.0, 94.0), PointerButton::Primary, 1),
+        size,
+    );
+    run(&mut view, &mut s, drag(at(452.0, 400.0)), size);
+    run(
+        &mut view,
+        &mut s,
+        up(at(452.0, 400.0), PointerButton::Primary),
+        size,
+    );
+    assert!(fet::attack_off(value(&s, id::ATTACK)));
+    // The mix slider in the strip: its left end is dry.
+    run(
+        &mut view,
+        &mut s,
+        down(Point::new(104.0, 20.0), PointerButton::Primary, 1),
+        size,
+    );
+    run(
+        &mut view,
+        &mut s,
+        up(Point::new(104.0, 20.0), PointerButton::Primary),
+        size,
+    );
+    assert!(value(&s, id::MIX) < 0.01);
+}

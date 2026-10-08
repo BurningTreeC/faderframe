@@ -66,6 +66,8 @@ pub const CONTAINER: &str = "faderframe.container";
 /// Outboard gear: a send to the interface's outputs and a return from its
 /// inputs, the round trip measured and compensated.
 pub const HARDWARE_INSERT: &str = "faderframe.hardware-insert";
+/// A FET limiting amplifier in the classic 1176's manner.
+pub const COMPRESSOR_76: &str = "faderframe.76-compressor";
 
 /// Built-ins with an editor of their own (others get the generic one).
 pub fn has_editor(id: &str) -> bool {
@@ -93,6 +95,7 @@ pub fn has_editor(id: &str) -> bool {
             | SCALE
             | NOTE_ECHO
             | HARDWARE_INSERT
+            | COMPRESSOR_76
     )
 }
 

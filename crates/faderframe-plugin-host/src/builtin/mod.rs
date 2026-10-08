@@ -42,10 +42,12 @@ enum Kind {
     Container,
     /// Outboard gear (the graph builds its send and return).
     HardwareInsert,
+    /// The 76 Compressor (a FET limiting amplifier).
+    Fet76,
 }
 
 impl Kind {
-    const ALL: [Kind; 30] = [
+    const ALL: [Kind; 31] = [
         Kind::Preamp(0),
         Kind::Preamp(1),
         Kind::Preamp(2),
@@ -68,6 +70,7 @@ impl Kind {
         Kind::Synth,
         Kind::Echo,
         Kind::Compressor,
+        Kind::Fet76,
         Kind::Gain,
         Kind::Arpeggiator,
         Kind::Chord,
@@ -107,6 +110,7 @@ impl Kind {
             builtin::GUITAR_STATION => Kind::Guitar,
             builtin::CONTAINER => Kind::Container,
             builtin::HARDWARE_INSERT => Kind::HardwareInsert,
+            builtin::COMPRESSOR_76 => Kind::Fet76,
             _ => return None,
         })
     }
@@ -261,6 +265,13 @@ impl Kind {
                 vec![stereo],
                 0,
             ),
+            Kind::Fet76 => (
+                builtin::COMPRESSOR_76,
+                "76 Compressor",
+                PluginCategory::Effect,
+                vec![stereo],
+                0,
+            ),
             Kind::HardwareInsert => (
                 builtin::HARDWARE_INSERT,
                 "Hardware Insert",
@@ -369,6 +380,7 @@ impl Kind {
             Kind::ProgramEq => crate::program_eq::parameters(),
             Kind::Container => Vec::new(),
             Kind::HardwareInsert => crate::devices::hardware_insert::parameters(),
+            Kind::Fet76 => crate::devices::fet76::parameters(),
         }
     }
 
@@ -398,6 +410,7 @@ impl Kind {
             Kind::ProgramEq => Some(0),
             // A tap for its live parameters (the engine's send reads them).
             Kind::HardwareInsert => Some(0),
+            Kind::Fet76 => Some(crate::devices::fet76::TAP_VALUES),
             _ => None,
         }
     }
@@ -515,6 +528,7 @@ impl PluginInstance for BuiltinInstance {
             Kind::Echo => crate::devices::delay::format(id, value),
             Kind::Gain => crate::devices::utility::format(id, value),
             Kind::HardwareInsert => crate::devices::hardware_insert::format(id, value),
+            Kind::Fet76 => crate::devices::fet76::format(id, value),
             Kind::Saturator => crate::devices::saturator::format(id, value),
             Kind::Deesser => crate::devices::deesser::format(id, value),
             Kind::Gate => crate::devices::gate::format(id, value),
@@ -659,6 +673,7 @@ impl PluginInstance for BuiltinInstance {
             Kind::Saturator => crate::devices::saturator::latency(&self.params, self.rate),
             Kind::Deesser => crate::devices::deesser::latency(&self.params, self.rate),
             Kind::Gate => crate::devices::gate::latency(&self.params, self.rate),
+            Kind::Fet76 => crate::devices::fet76::latency(&self.params, self.rate),
             _ => 0,
         }
     }
@@ -689,6 +704,8 @@ impl PluginInstance for BuiltinInstance {
             | Kind::Tuner
             | Kind::Container
             | Kind::HardwareInsert => TailLength::None,
+            // The longest release (1.1 s) to come back.
+            Kind::Fet76 => TailLength::Samples(96_000),
             // Notes still due: a held arpeggio's last steps, strums, echoes.
             Kind::Arpeggiator | Kind::Chord | Kind::Scale => TailLength::Samples(48_000 * 2),
             Kind::NoteEcho => TailLength::Samples(48_000 * 40),
@@ -744,6 +761,11 @@ impl PluginInstance for BuiltinInstance {
                 crate::devices::preamp::buffer_delay(self.sized_block),
             )?),
             Kind::Gain => Box::new(crate::devices::utility::UtilityProcessor::new(
+                params,
+                tap()?,
+                config,
+            )),
+            Kind::Fet76 => Box::new(crate::devices::fet76::Fet76Processor::new(
                 params,
                 tap()?,
                 config,
