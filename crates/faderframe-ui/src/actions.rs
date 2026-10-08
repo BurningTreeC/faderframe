@@ -1260,6 +1260,38 @@ pub fn install(app: &Rc<AppState>) {
                 sound: true,
             }));
         }),
+        // Development aid: `counter:<main|sub>=<bars|minsec|timecode|samples|auto>`.
+        named("counter", |a, arg| {
+            use faderframe_session::CounterUnit;
+            let (which, unit) = arg.split_once('=').unwrap_or(("sub", arg));
+            let unit = match unit.trim() {
+                "bars" => Some(CounterUnit::BarsBeats),
+                "minsec" => Some(CounterUnit::MinSecs),
+                "timecode" => Some(CounterUnit::Timecode),
+                "samples" => Some(CounterUnit::Samples),
+                _ => None,
+            };
+            a.dispatch(Action::SetTransportCounter {
+                sub: which.trim() != "main",
+                unit,
+            });
+        }),
+        // Development aid: `timecode:<rate id>@<hh:mm:ss:ff>` (the project's).
+        named("timecode", |a, arg| {
+            use faderframe_core::timecode::{FrameRate, Timecode};
+            let (rate, start) = arg.split_once('@').unwrap_or((arg, "00:00:00:00"));
+            let Some(rate) = FrameRate::from_id(rate.trim()) else {
+                tracing::warn!("timecode: unknown rate '{rate}'");
+                return;
+            };
+            let Some(start) = Timecode::parse(start, rate) else {
+                tracing::warn!("timecode: cannot read '{start}'");
+                return;
+            };
+            a.dispatch(Action::Edit(faderframe_project::Command::SetTimecode {
+                timecode: Some(faderframe_project::video::ProjectTimecode { rate, start }),
+            }));
+        }),
         named("video-offset", |a, arg| match arg.trim().parse::<f64>() {
             Ok(ms) => a.dispatch(Action::Video(
                 faderframe_session::video::VideoOp::SetOffset(ms),

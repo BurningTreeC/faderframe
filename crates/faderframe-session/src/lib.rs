@@ -74,7 +74,7 @@ pub use midifile::is_midi_file;
 pub mod warping;
 pub use editing::{
     ClipEdge, CounterUnit, EditFlag, EditMode, EditRange, EditTool, GridMode, NudgeTarget,
-    NudgeValue, ZoomRequest, parse_position,
+    NudgeValue, ZoomRequest, format_position, format_timecode_length, parse_position,
 };
 pub use faderframe_workspace::{DEFAULT_INSERT_SLOTS, INSERT_SLOTS_RANGE, STRIP_WIDTH_RANGE};
 pub use sync::{MANUAL_SPEED_RANGE, MtcRate, SyncSettings, SyncSource, SyncStatus, Timecode};
@@ -810,6 +810,12 @@ pub enum Action {
     SetNudge(NudgeValue),
     SetEditFlag(EditFlag, bool),
     SetCounterUnit(CounterUnit),
+    /// The transport display's big (`sub: false`) or small counter
+    /// (`None`: automatic, small one only).
+    SetTransportCounter {
+        sub: bool,
+        unit: Option<CounterUnit>,
+    },
     SetTransientSensitivity(f32),
     /// Ask the arranger to zoom.
     Zoom(ZoomRequest),
@@ -948,6 +954,11 @@ pub struct EditorSettings {
     pub warp: bool,
     pub show_edit_toolbar: bool,
     pub counter_unit: CounterUnit,
+    /// The transport display's big and small counters (`None` for the
+    /// small one: timecode when the project has video or a timecode,
+    /// else minutes and seconds).
+    pub main_counter: CounterUnit,
+    pub sub_counter: Option<CounterUnit>,
     /// Transient detection sensitivity, 0–1 (more transients when higher).
     pub transient_sensitivity: f32,
     /// The latest zoom request and its sequence number (views apply each
@@ -980,6 +991,8 @@ impl Default for EditorSettings {
             warp: false,
             show_edit_toolbar: false,
             counter_unit: CounterUnit::BarsBeats,
+            main_counter: CounterUnit::BarsBeats,
+            sub_counter: None,
             transient_sensitivity: 0.5,
             zoom_request: (0, ZoomRequest::Fit),
             lanes: lanes::GlobalLanes::default(),
@@ -3669,6 +3682,14 @@ impl Session {
             }
             Action::SetCounterUnit(u) => {
                 self.editor.counter_unit = u;
+                self.revision += 1;
+            }
+            Action::SetTransportCounter { sub, unit } => {
+                if sub {
+                    self.editor.sub_counter = unit;
+                } else {
+                    self.editor.main_counter = unit.unwrap_or_default();
+                }
                 self.revision += 1;
             }
             Action::Zoom(z) => {

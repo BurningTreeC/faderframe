@@ -764,22 +764,21 @@ impl ArrangerView {
         let unit = model.editor.counter_unit;
         let timeline = p.timeline.clone();
         let rate = p.sample_rate;
+        let tc = p.timecode.unwrap_or_default();
         let id = c.id;
         let initial = match unit {
             faderframe_session::CounterUnit::BarsBeats => p.timeline.format_bbt(c.start),
-            faderframe_session::CounterUnit::MinSecs => {
-                let f = p.timeline.to_samples(c.start, rate as f64);
-                faderframe_timeline::format_seconds(f as f64 / rate.max(1) as f64)
-            }
-            faderframe_session::CounterUnit::Samples => {
-                p.timeline.to_samples(c.start, rate as f64).to_string()
-            }
+            _ => faderframe_session::format_position(
+                p,
+                p.timeline.to_samples(c.start, rate as f64),
+                unit,
+            ),
         };
         HostRequest::TextInput {
             at: Rect::new(at.x, at.y, at.w.max(120.0), 24.0),
             initial,
             commit: Box::new(move |text| {
-                parse_position(text, unit, &timeline, rate)
+                parse_position(text, unit, &timeline, rate, tc)
                     .map(|start| Action::SpotClip { clip: id, start })
             }),
         }

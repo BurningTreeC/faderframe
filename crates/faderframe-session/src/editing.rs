@@ -139,19 +139,57 @@ pub enum CounterUnit {
     #[default]
     BarsBeats,
     MinSecs,
+    /// SMPTE timecode at the project's rate and start.
+    Timecode,
     Samples,
 }
 
 impl CounterUnit {
-    pub const ALL: [CounterUnit; 3] = [Self::BarsBeats, Self::MinSecs, Self::Samples];
+    pub const ALL: [CounterUnit; 4] = [
+        Self::BarsBeats,
+        Self::MinSecs,
+        Self::Timecode,
+        Self::Samples,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::BarsBeats => "Bars|Beats",
             Self::MinSecs => "Min:Sec",
+            Self::Timecode => "Timecode",
             Self::Samples => "Samples",
         }
     }
+}
+
+/// The position `pos` (samples) as `unit` shows it.
+pub fn format_position(
+    project: &faderframe_project::Project,
+    pos: i64,
+    unit: CounterUnit,
+) -> String {
+    let rate = project.sample_rate;
+    let r = rate.max(1) as f64;
+    match unit {
+        CounterUnit::BarsBeats => project
+            .timeline
+            .format_bbt(project.timeline.to_musical(pos, r)),
+        CounterUnit::MinSecs => faderframe_timeline::format_seconds(pos as f64 / r),
+        CounterUnit::Timecode => {
+            let tc = project.timecode.unwrap_or_default();
+            tc.at(pos, rate).display(tc.rate)
+        }
+        CounterUnit::Samples => pos.to_string(),
+    }
+}
+
+/// A duration of `frames` samples as timecode ("00:00:02:12").
+pub fn format_timecode_length(project: &faderframe_project::Project, frames: i64) -> String {
+    let tc = project.timecode.unwrap_or_default();
+    let n = tc
+        .rate
+        .frame_at(frames.max(0) as f64 / project.sample_rate.max(1) as f64);
+    faderframe_core::timecode::Timecode::from_frames(n, tc.rate).display(tc.rate)
 }
 
 /// On/off editing options.
@@ -1154,12 +1192,15 @@ impl Session {
     }
 }
 
-/// A typed position in `unit` ("5.3.480", "1:02.500", "96000"), or `None`.
+/// A typed position in `unit` ("5.3.480", "1:02.500", "01:00:10:12",
+/// "96000"), or `None`. Timecode may leave out leading fields: they fill
+/// from the right ("10:12" = 00:00:10:12).
 pub fn parse_position(
     text: &str,
     unit: CounterUnit,
     timeline: &faderframe_timeline::Timeline,
     rate: u32,
+    tc: faderframe_project::video::ProjectTimecode,
 ) -> Option<MusicalTime> {
     let text = text.trim();
     let r = rate.max(1) as f64;
@@ -1173,6 +1214,18 @@ pub fn parse_position(
             let secs = m * 60.0 + s;
             (secs.is_finite() && secs >= 0.0)
                 .then(|| timeline.to_musical((secs * r).round() as i64, r))
+        }
+        CounterUnit::Timecode => {
+            let mut fields: Vec<&str> = text.split([':', ';', '.', ',']).collect();
+            if fields.len() > 4 || fields.iter().any(|f| f.trim().is_empty()) {
+                return None;
+            }
+            while fields.len() < 4 {
+                fields.insert(0, "0");
+            }
+            let label = faderframe_core::timecode::Timecode::parse(&fields.join(":"), tc.rate)?;
+            let f = tc.position_of(label, rate);
+            (f >= 0).then(|| timeline.to_musical(f, r))
         }
         CounterUnit::Samples => {
             let f: i64 = text.replace(['_', ','], "").parse().ok()?;
@@ -1190,30 +1243,55 @@ mod position_tests {
         let mut tl = faderframe_timeline::Timeline::default();
         tl.tempo.set_initial_bpm(120.0);
         let q = MusicalTime::from_quarters;
+        let tc = faderframe_project::video::ProjectTimecode {
+            rate: faderframe_core::timecode::FrameRate::Fps25,
+            start: faderframe_core::timecode::Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+        };
         assert_eq!(
-            parse_position("3", CounterUnit::BarsBeats, &tl, 48_000),
-            Some(q(8.0))
-        );
-        assert_eq!(
-            parse_position("2.3.480", CounterUnit::BarsBeats, &tl, 48_000),
-            Some(q(6.5))
-        );
-        assert_eq!(
-            parse_position("0.1", CounterUnit::BarsBeats, &tl, 48_000),
-            None
-        );
-        assert_eq!(
-            parse_position("0:01.5", CounterUnit::MinSecs, &tl, 48_000),
-            Some(q(3.0))
-        );
-        assert_eq!(
-            parse_position("2", CounterUnit::MinSecs, &tl, 48_000),
+            parse_position("01:00:02:00", CounterUnit::Timecode, &tl, 48_000, tc),
             Some(q(4.0))
         );
         assert_eq!(
-            parse_position("24_000", CounterUnit::Samples, &tl, 48_000),
+            parse_position("1:0:1:12", CounterUnit::Timecode, &tl, 48_000, tc),
+            Some(q(3.0))
+        );
+        assert_eq!(
+            parse_position("10:00", CounterUnit::Timecode, &tl, 48_000, tc),
+            None,
+            "before the start"
+        );
+        assert_eq!(
+            parse_position("3", CounterUnit::BarsBeats, &tl, 48_000, tc),
+            Some(q(8.0))
+        );
+        assert_eq!(
+            parse_position("2.3.480", CounterUnit::BarsBeats, &tl, 48_000, tc),
+            Some(q(6.5))
+        );
+        assert_eq!(
+            parse_position("0.1", CounterUnit::BarsBeats, &tl, 48_000, tc),
+            None
+        );
+        assert_eq!(
+            parse_position("0:01.5", CounterUnit::MinSecs, &tl, 48_000, tc),
+            Some(q(3.0))
+        );
+        assert_eq!(
+            parse_position("2", CounterUnit::MinSecs, &tl, 48_000, tc),
+            Some(q(4.0))
+        );
+        assert_eq!(
+            parse_position("24_000", CounterUnit::Samples, &tl, 48_000, tc),
             Some(q(1.0))
         );
-        assert_eq!(parse_position("x", CounterUnit::Samples, &tl, 48_000), None);
+        assert_eq!(
+            parse_position("x", CounterUnit::Samples, &tl, 48_000, tc),
+            None
+        );
     }
 }

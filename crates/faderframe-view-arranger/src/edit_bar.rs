@@ -308,6 +308,19 @@ impl EditToolbarView {
                 let frames = p.timeline.to_samples(b, rate) - p.timeline.to_samples(a, rate);
                 format_seconds(frames as f64 / rate)
             }
+            CounterUnit::Timecode => {
+                let a = if length { from } else { MusicalTime::ZERO };
+                let b = if length { from + t } else { t };
+                let (sa, sb) = (
+                    p.timeline.to_samples(a, rate),
+                    p.timeline.to_samples(b, rate),
+                );
+                if length {
+                    faderframe_session::format_timecode_length(p, sb - sa)
+                } else {
+                    faderframe_session::format_position(p, sb, CounterUnit::Timecode)
+                }
+            }
             CounterUnit::Samples => {
                 let (a, b) = if length {
                     (from, from + t)

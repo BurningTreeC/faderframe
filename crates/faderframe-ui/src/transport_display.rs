@@ -1,11 +1,12 @@
-//! The LCD-style position/tempo display in the header bar: position, tempo
-//! (double-click to type, the TAP pad to tap it in), time signature (click
-//! to type, right-click for common meters and meter changes), loop and
-//! record flags.
+//! The LCD-style position/tempo display in the header bar: position (a
+//! big and a small counter in any unit: right-click to choose, a click on
+//! the small one steps it), tempo (double-click to type, the TAP pad to
+//! tap it in), time signature (click to type, right-click for common
+//! meters and meter changes), loop and record flags.
 
 use faderframe_project::Command;
-use faderframe_session::{Action, Session, TransportAction};
-use faderframe_timeline::{TimeSignature, format_seconds};
+use faderframe_session::{Action, CounterUnit, Session, TransportAction, format_position};
+use faderframe_timeline::TimeSignature;
 use faderframe_ui_canvas::{
     Align, CanvasView, Color, EventCx, FontFamily, HostRequest, MenuItem, Paint, Painter, Point,
     PointerButton, Rect, Size, TextStyle, Theme, ViewEvent,
@@ -127,6 +128,67 @@ fn heading(label: String) -> MenuItem<Action> {
     MenuItem::disabled(label).separated()
 }
 
+/// The small counter's unit (automatic: timecode for picture work).
+fn sub_unit(s: &Session) -> CounterUnit {
+    s.editor.sub_counter.unwrap_or({
+        let p = s.project();
+        if p.timecode.is_some() || !p.video.tracks.is_empty() {
+            CounterUnit::Timecode
+        } else {
+            CounterUnit::MinSecs
+        }
+    })
+}
+
+/// The playhead in `unit`.
+fn readout(s: &Session, unit: CounterUnit) -> String {
+    match unit {
+        CounterUnit::BarsBeats => s.project().timeline.format_bbt(s.playhead()),
+        _ => format_position(s.project(), s.transport().position, unit),
+    }
+}
+
+fn counter_menu(s: &Session, at: Point) -> HostRequest<Action> {
+    let e = &s.editor;
+    let mut items = vec![heading("Main Counter".into())];
+    for u in CounterUnit::ALL {
+        items.push(
+            MenuItem::new(
+                u.label(),
+                Action::SetTransportCounter {
+                    sub: false,
+                    unit: Some(u),
+                },
+            )
+            .checked(e.main_counter == u),
+        );
+    }
+    items.push(heading("Sub Counter".into()));
+    items.push(
+        MenuItem::new(
+            "Automatic (Timecode with Picture)",
+            Action::SetTransportCounter {
+                sub: true,
+                unit: None,
+            },
+        )
+        .checked(e.sub_counter.is_none()),
+    );
+    for u in CounterUnit::ALL {
+        items.push(
+            MenuItem::new(
+                u.label(),
+                Action::SetTransportCounter {
+                    sub: true,
+                    unit: Some(u),
+                },
+            )
+            .checked(e.sub_counter == Some(u)),
+        );
+    }
+    HostRequest::ContextMenu { at, items }
+}
+
 fn meter_menu(s: &Session, at: Point) -> HostRequest<Action> {
     let meter = &s.project().timeline.meter;
     let change_bar = current_change_bar(s);
@@ -175,16 +237,26 @@ impl CanvasView<Session, Action> for TransportDisplay {
         let pos = s.playhead();
         let mono = |size: f32, c: Color| TextStyle::new(size, c).family(FontFamily::Mono);
         let small = |c: Color| TextStyle::new(theme.fonts.tiny + 0.5, c).bold();
+        // Long readouts (timecode, samples) shrink to fit.
+        let fit = |text: &str, size: f32, room: usize| {
+            let n = text.chars().count().max(1);
+            if n > room {
+                size * room as f32 / n as f32
+            } else {
+                size
+            }
+        };
+        let main = readout(s, s.editor.main_counter);
         p.text(
-            &project.timeline.format_bbt(pos),
+            &main,
             z.bbt,
-            &mono(theme.fonts.display - 2.0, lcd_text).bold(),
+            &mono(fit(&main, theme.fonts.display - 2.0, 9), lcd_text).bold(),
         );
-        let secs = s.transport().position as f64 / s.sample_rate().max(1) as f64;
+        let sub = readout(s, sub_unit(s));
         p.text(
-            &format_seconds(secs),
+            &sub,
             z.time,
-            &mono(theme.fonts.small, lcd_text.with_alpha(0.75)),
+            &mono(fit(&sub, theme.fonts.small, 14), lcd_text.with_alpha(0.75)),
         );
         let bpm = project.timeline.tempo.bpm_at(pos);
         p.text(
@@ -278,6 +350,23 @@ impl CanvasView<Session, Action> for TransportDisplay {
             cx.redraw();
             return true;
         }
+        let counters = z.bbt.union(&z.time);
+        if counters.contains(pos) {
+            match button {
+                PointerButton::Secondary => cx.request(counter_menu(s, pos)),
+                // The small counter steps through the units.
+                PointerButton::Primary if z.time.contains(pos) => {
+                    let now = sub_unit(s);
+                    let i = CounterUnit::ALL.iter().position(|u| *u == now).unwrap_or(0);
+                    cx.emit(Action::SetTransportCounter {
+                        sub: true,
+                        unit: Some(CounterUnit::ALL[(i + 1) % CounterUnit::ALL.len()]),
+                    });
+                }
+                _ => return false,
+            }
+            return true;
+        }
         let meter_zone = z.meter.union(&z.meter_label);
         if meter_zone.contains(pos) {
             match button {
@@ -343,7 +432,7 @@ impl CanvasView<Session, Action> for TransportDisplay {
         } else if z.flags.contains(pos) {
             "Toggle loop / record mode".into()
         } else {
-            "Bars.Beats.Ticks and time".into()
+            "Position: right-click to choose the counters · click the small one to step it".into()
         })
     }
 
