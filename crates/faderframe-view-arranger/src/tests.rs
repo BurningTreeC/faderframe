@@ -1556,3 +1556,83 @@ fn a_click_on_a_clips_header_does_not_move_the_playhead() {
     a.extend(run(&mut view, up(body), size, &s).0);
     assert!(located(&a), "{a:?}");
 }
+
+/// Track headers drag: between rows they reorder (one `PlaceTrack`), onto
+/// a folder's middle they go into it, and a click only selects.
+#[test]
+fn track_headers_drag_to_reorder_and_into_folders() {
+    let mut s = bare_session();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 900.0);
+    let theme = Theme::default();
+    let mut paint = |view: &mut ArrangerView, s: &Session| {
+        let mut p = RecordingPainter::default();
+        view.paint(&mut p, size, s, &theme);
+    };
+    paint(&mut view, &s);
+    let ids = |s: &Session| -> Vec<TrackId> {
+        ArrangerView::lane_tracks(s).iter().map(|t| t.id).collect()
+    };
+    let start = ids(&s);
+    let (t0, t2, t3) = (start[0], start[2], start[3]);
+    let grab = view.header_layout(&s, t0, size).unwrap().name.center();
+    // Into the lower half of the third row: between it and the fourth.
+    let row = |view: &ArrangerView, s: &Session, id| {
+        let i = ids(s).iter().position(|t| *t == id).unwrap();
+        view.row_rect(i, size)
+    };
+    let target = row(&view, &s, t2);
+    let drop = Point::new(grab.x, target.y + target.h * 0.8);
+    let mut actions = run(&mut view, down(grab), size, &s).0;
+    actions.extend(run(&mut view, mv(Point::new(grab.x, grab.y + 10.0)), size, &s).0);
+    actions.extend(run(&mut view, mv(drop), size, &s).0);
+    actions.extend(run(&mut view, up(drop), size, &s).0);
+    assert!(
+        actions.contains(&Action::PlaceTrack {
+            track: t0,
+            after: Some(t2),
+            before: Some(t3),
+        }),
+        "{actions:?}"
+    );
+    for a in actions {
+        s.dispatch(a).unwrap();
+    }
+    let now = ids(&s);
+    assert_eq!(&now[..3], &[start[1], t2, t0]);
+    // A folder holding the fourth track; the second dragged onto it.
+    s.dispatch(Action::NewFolder { tracks: vec![t3] }).unwrap();
+    paint(&mut view, &s);
+    let folder = ArrangerView::lane_tracks(&s)
+        .iter()
+        .find(|t| t.kind == TrackKind::Folder)
+        .unwrap()
+        .id;
+    let mover = start[1];
+    let grab = view.header_layout(&s, mover, size).unwrap().name.center();
+    let f = row(&view, &s, folder);
+    let onto = Point::new(grab.x, f.y + f.h * 0.5);
+    let mut actions = run(&mut view, down(grab), size, &s).0;
+    actions.extend(run(&mut view, mv(Point::new(grab.x, grab.y + 10.0)), size, &s).0);
+    actions.extend(run(&mut view, mv(onto), size, &s).0);
+    actions.extend(run(&mut view, up(onto), size, &s).0);
+    for a in actions {
+        s.dispatch(a).unwrap();
+    }
+    assert_eq!(s.project().track(mover).unwrap().folder, Some(folder));
+    // A click: selected, nothing moves.
+    let before = ids(&s);
+    let at = view.header_layout(&s, t2, size).unwrap().name.center();
+    let mut actions = run(&mut view, down(at), size, &s).0;
+    actions.extend(run(&mut view, up(at), size, &s).0);
+    assert!(
+        actions
+            .iter()
+            .all(|a| matches!(a, Action::SelectTracks { .. })),
+        "{actions:?}"
+    );
+    for a in actions {
+        s.dispatch(a).unwrap();
+    }
+    assert_eq!(ids(&s), before);
+}

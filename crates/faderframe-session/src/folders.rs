@@ -24,12 +24,14 @@ impl Session {
     }
 
     /// The commands that put `track` between `after` and `before` (the
-    /// strips either side of a drop in the mixer, which shows tracks in
-    /// folder order): it keeps its folder when a neighbour shares it (and
-    /// goes right after or before that neighbour in the track list), else
-    /// it joins the folder of the strip it lands after (or before, at the
-    /// start) — so it shows exactly where it was dropped. Empty when it
-    /// already is there.
+    /// rows or strips either side of a drop, as the editors show tracks:
+    /// folder order): right under a folder's header (`before` in the folder
+    /// `after` is) it goes first into that folder; else it keeps its folder
+    /// when a neighbour shares it (and goes right after or before that
+    /// neighbour in the track list), else it joins the folder of the row it
+    /// lands after (or before, at the start) — so it shows exactly where it
+    /// was dropped. A folder goes with what it holds, never into itself.
+    /// Empty when it already is there.
     pub fn place_track_commands(
         &self,
         track: TrackId,
@@ -48,6 +50,8 @@ impl Session {
         // Where it goes: next to a neighbour in its own folder, else into
         // the left (or right) neighbour's.
         let (folder, anchor) = match (after, before) {
+            // Under a folder's header, before what it holds: first in it.
+            (Some(a), Some(b)) if folder_of(b) == Some(a) => (Some(a), Some((b, false))),
             (Some(a), _) if folder_of(a) == t.folder => (t.folder, Some((a, true))),
             (_, Some(b)) if folder_of(b) == t.folder => (t.folder, Some((b, false))),
             (Some(a), _) => (folder_of(a), Some((a, true))),
@@ -57,6 +61,12 @@ impl Session {
         let Some((anchor, after_it)) = anchor else {
             return Vec::new();
         };
+        // Not into itself or a folder inside it.
+        if let Some(f) = folder
+            && (f == track || p.track(f).is_some_and(|ft| p.in_folder(ft, track)))
+        {
+            return Vec::new();
+        }
         // The index in the list without the track (what MoveTrack takes).
         let rest: Vec<TrackId> = p
             .tracks

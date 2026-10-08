@@ -210,3 +210,95 @@ fn every_strip_lands_where_it_is_dropped() {
         }
     }
 }
+
+/// Arranger drag and drop: rows include the folders (open), and a folder
+/// moves with what it holds. Every track and folder dropped into every gap
+/// between the other rows shows exactly there afterwards — under a
+/// folder's header first in it — each one undo step.
+#[test]
+fn every_row_lands_where_it_is_dropped_folders_included() {
+    let mut s = Session::new(
+        faderframe_project::Project::new("Rows", 48_000),
+        None,
+        EngineConfig::default(),
+    )
+    .unwrap();
+    let add = |s: &mut Session, kind| s.add_track(kind).unwrap();
+    let a = add(&mut s, TrackKind::Audio);
+    let f1 = add(&mut s, TrackKind::Folder);
+    let b = add(&mut s, TrackKind::Audio);
+    let f2 = add(&mut s, TrackKind::Folder);
+    let c = add(&mut s, TrackKind::Audio);
+    let d = add(&mut s, TrackKind::Audio);
+    let e = add(&mut s, TrackKind::Bus);
+    for (t, f) in [(b, f1), (f2, f1), (c, f2)] {
+        s.dispatch(Action::Edit(Command::SetTrackFolder {
+            track: t,
+            folder: Some(f),
+        }))
+        .unwrap();
+    }
+    let rows = |s: &Session| -> Vec<TrackId> {
+        s.project()
+            .folder_order()
+            .into_iter()
+            .filter(|t| t.kind != TrackKind::Master)
+            .map(|t| t.id)
+            .collect()
+    };
+    let start = rows(&s);
+    assert_eq!(start, [a, f1, b, f2, c, d, e]);
+    let before_all = s.project().tracks.clone();
+    for &t in &start {
+        // The block that moves: the track, and what it holds.
+        let block: Vec<TrackId> = start
+            .iter()
+            .copied()
+            .filter(|x| {
+                *x == t
+                    || s.project()
+                        .track(*x)
+                        .is_some_and(|xt| s.project().in_folder(xt, t))
+            })
+            .collect();
+        let others: Vec<TrackId> = start
+            .iter()
+            .copied()
+            .filter(|x| !block.contains(x))
+            .collect();
+        for gap in 0..=others.len() {
+            let after = gap.checked_sub(1).map(|i| others[i]);
+            let before = others.get(gap).copied();
+            let mut want = others.clone();
+            for (k, x) in block.iter().enumerate() {
+                want.insert(gap + k, *x);
+            }
+            let steps = s.history_steps().0.len();
+            s.dispatch(Action::PlaceTrack {
+                track: t,
+                after,
+                before,
+            })
+            .unwrap();
+            assert_eq!(
+                rows(&s),
+                want,
+                "{t:?} into gap {gap} ({after:?} | {before:?})"
+            );
+            let now = s.history_steps().0.len();
+            assert!(now - steps <= 1);
+            if now > steps {
+                s.dispatch(Action::Undo).unwrap();
+            }
+            assert_eq!(s.project().tracks, before_all);
+        }
+    }
+    // A folder never goes into itself or a folder inside it.
+    s.dispatch(Action::PlaceTrack {
+        track: f1,
+        after: Some(f2),
+        before: Some(c),
+    })
+    .unwrap();
+    assert_eq!(s.project().tracks, before_all);
+}

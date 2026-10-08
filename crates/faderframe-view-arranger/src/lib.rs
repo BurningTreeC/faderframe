@@ -127,8 +127,28 @@ pub enum Hit {
     AddTrack,
 }
 
+/// Where a dragged track row lands.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RowDrop {
+    /// Between two rows (as `Action::PlaceTrack` takes them), the line at `y`.
+    Between {
+        after: Option<TrackId>,
+        before: Option<TrackId>,
+        y: f32,
+    },
+    /// Onto a folder: into it.
+    Into { folder: TrackId, row: Rect },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Drag {
+    /// A track's header dragged up or down: to reorder, or onto a folder.
+    Row {
+        track: TrackId,
+        origin_y: f32,
+        moved: bool,
+        pos: Point,
+    },
     /// Moving the playhead; `audible` (the Scrub tool) plays snippets.
     Scrub {
         audible: bool,
@@ -556,6 +576,55 @@ impl ArrangerView {
             })
             .collect();
         HostRequest::ContextMenu { at, items }
+    }
+
+    /// Where a track row dragged to `pos` lands: onto a folder's row when
+    /// over its middle (not its own, nor one inside it), else between the
+    /// rows either side of the nearest gap. None where it would stay put.
+    fn row_drop(&self, model: &Session, size: Size, track: TrackId, pos: Point) -> Option<RowDrop> {
+        let p = model.project();
+        let tracks = Self::lane_tracks(model);
+        let moving = p.track(track)?;
+        // What moves with it: the track and what it holds.
+        let block = |t: &Track| t.id == track || p.in_folder(t, track);
+        let n = tracks.len();
+        if n == 0 {
+            return None;
+        }
+        let rect = |i: usize| self.row_rect(i, size);
+        // The row under the pointer (clamped to the first and last).
+        let y = pos.y;
+        let i = (0..n).find(|&i| y < rect(i).bottom()).unwrap_or(n - 1);
+        let r = rect(i);
+        let t = tracks[i];
+        if t.kind == TrackKind::Folder
+            && !block(t)
+            && (r.y + r.h * 0.3..r.y + r.h * 0.7).contains(&y)
+            && moving.folder != Some(t.id)
+        {
+            return Some(RowDrop::Into {
+                folder: t.id,
+                row: r,
+            });
+        }
+        let gap = if y < r.y + r.h * 0.5 { i } else { i + 1 };
+        let gap = if y < rect(0).y { 0 } else { gap };
+        let after = gap.checked_sub(1).map(|k| tracks[k]);
+        let before = tracks.get(gap).copied();
+        // Next to itself (or inside what it holds): it stays.
+        if after.is_some_and(block) || before.is_some_and(block) {
+            return None;
+        }
+        let line = if gap < n {
+            rect(gap).y
+        } else {
+            rect(n - 1).bottom()
+        };
+        Some(RowDrop::Between {
+            after: after.map(|t| t.id),
+            before: before.map(|t| t.id),
+            y: line,
+        })
     }
 
     fn clamp_scroll(&mut self, model: &Session, size: Size) {
@@ -2832,6 +2901,16 @@ impl ArrangerView {
                             tracks: vec![id],
                             mode,
                         });
+                        // The name and the header's free space carry the
+                        // track: drag it to reorder, or onto a folder.
+                        if matches!(part, HeaderPart::Name | HeaderPart::Body) && !mods.toggle() {
+                            self.drag = Some(Drag::Row {
+                                track: id,
+                                origin_y: pos.y,
+                                moved: false,
+                                pos,
+                            });
+                        }
                     }
                 }
             }
@@ -3014,6 +3093,24 @@ impl ArrangerView {
                     pan: if pan.abs() < 0.01 { 0.0 } else { pan },
                 }));
             }
+            Some(Drag::Row {
+                track,
+                origin_y,
+                moved,
+                ..
+            }) => {
+                let moved = moved || (pos.y - origin_y).abs() > 4.0;
+                self.drag = Some(Drag::Row {
+                    track,
+                    origin_y,
+                    moved,
+                    pos,
+                });
+                if moved {
+                    cx.set_cursor(Cursor::Grabbing);
+                }
+                cx.redraw();
+            }
             Some(Drag::HeaderWidth { start_x, start_w }) => {
                 let (lo, hi) = faderframe_workspace::HEADER_WIDTH_RANGE;
                 let w = (start_w + pos.x - start_x).round().clamp(lo, hi);
@@ -3073,6 +3170,28 @@ impl ArrangerView {
             return;
         }
         match self.drag.take() {
+            Some(Drag::Row {
+                track,
+                moved: true,
+                pos,
+                ..
+            }) => {
+                match self.row_drop(model, size, track, pos) {
+                    Some(RowDrop::Between { after, before, .. }) => {
+                        cx.emit(Action::PlaceTrack {
+                            track,
+                            after,
+                            before,
+                        });
+                    }
+                    Some(RowDrop::Into { folder, .. }) => cx.emit(Action::MoveToFolder {
+                        tracks: vec![track],
+                        folder: Some(folder),
+                    }),
+                    None => {}
+                }
+                cx.set_cursor(Cursor::Default);
+            }
             Some(
                 Drag::Volume { .. }
                 | Drag::Pan { .. }
@@ -3291,6 +3410,41 @@ impl CanvasView<Session, Action> for ArrangerView {
                 Rect::new(0.0, y - 1.0, self.header_w(), 2.0),
                 theme.ui.accent.with_alpha(0.85),
             );
+        }
+        // A dragged track: where it lands, and the rows scroll at the edges.
+        if let Some(Drag::Row {
+            track,
+            moved: true,
+            pos,
+            ..
+        }) = self.drag
+        {
+            let edge = 28.0;
+            let top = self.ruler_h();
+            let step = if pos.y < top + edge {
+                -(top + edge - pos.y).min(edge) * 0.5
+            } else if pos.y > size.h - edge {
+                (pos.y - (size.h - edge)).min(edge) * 0.5
+            } else {
+                0.0
+            };
+            if step != 0.0 {
+                self.scroll_y += step;
+                self.clamp_scroll(model, size);
+            }
+            match self.row_drop(model, size, track, pos) {
+                Some(RowDrop::Between { y, .. }) => {
+                    p.fill(
+                        Rect::new(0.0, y - 1.5, size.w, 3.0),
+                        theme.ui.accent.with_alpha(0.9),
+                    );
+                }
+                Some(RowDrop::Into { row, .. }) => {
+                    p.fill(row, theme.ui.accent.with_alpha(0.16));
+                    p.stroke_rounded(row.inset(1.0), 3.0, 2.0, theme.ui.accent.with_alpha(0.85));
+                }
+                None => {}
+            }
         }
         // The "+" under the last track.
         let add = self.add_track_rect(tracks.len(), size);
@@ -3649,7 +3803,7 @@ impl CanvasView<Session, Action> for ArrangerView {
     }
 
     fn wants_frames(&self, model: &Session) -> bool {
-        model.is_animating()
+        model.is_animating() || matches!(self.drag, Some(Drag::Row { moved: true, .. }))
     }
 
     fn tooltip(&self, pos: Point, size: Size, model: &Session) -> Option<String> {
