@@ -1565,7 +1565,7 @@ fn track_headers_drag_to_reorder_and_into_folders() {
     let mut view = ArrangerView::new(Theme::default());
     let size = Size::new(1400.0, 900.0);
     let theme = Theme::default();
-    let mut paint = |view: &mut ArrangerView, s: &Session| {
+    let paint = |view: &mut ArrangerView, s: &Session| {
         let mut p = RecordingPainter::default();
         view.paint(&mut p, size, s, &theme);
     };
