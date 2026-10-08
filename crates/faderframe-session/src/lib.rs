@@ -44,6 +44,7 @@ mod folders;
 mod freeze;
 pub mod groove;
 mod groups;
+pub mod hardware;
 pub mod iamf;
 pub mod lanes;
 pub mod launcher;
@@ -462,6 +463,11 @@ pub enum Action {
     Shuttle(shuttle::ShuttleOp),
     /// Conform the session to a new picture cut.
     Conform(conform::ConformOp),
+    /// Measure a hardware insert's round trip (a ping).
+    PingHardwareInsert {
+        track: TrackId,
+        plugin: faderframe_core::PluginInstanceId,
+    },
     /// ADR: the cue list, beeps, cue runs, take ratings.
     Adr(adr::AdrOp),
     /// Show a view full screen in a window of its own (again: leave).
@@ -1118,6 +1124,10 @@ pub struct Session {
     adr_run: Option<adr::AdrRun>,
     /// The picture on an output of its own.
     picture_out: Option<picture_out::PictureOut>,
+    /// A hardware insert's round trip being measured.
+    hardware_ping: Option<hardware::Ping>,
+    /// The channels (inputs, outputs) the device was last reopened for.
+    reopened_for: Option<(u16, u16)>,
     metrics: MetricsSnapshot,
     last_metrics: Instant,
     path: Option<PathBuf>,
@@ -1228,6 +1238,9 @@ pub enum PluginTarget {
 /// Things views ask the toolkit shell to show (polled every frame).
 #[derive(Clone, Debug, PartialEq)]
 pub enum UiRequest {
+    /// The project needs device channels the stream does not have open
+    /// (a hardware insert's): start the audio device again.
+    ReopenAudio,
     PluginBrowser {
         track: TrackId,
         target: PluginTarget,
@@ -1378,6 +1391,8 @@ impl Session {
             shuttle: None,
             adr_run: None,
             picture_out: None,
+            hardware_ping: None,
+            reopened_for: None,
             metrics: MetricsSnapshot::default(),
             last_metrics: Instant::now(),
             path: None,
@@ -1824,9 +1839,12 @@ impl Session {
                 continue;
             };
             processor.set_worker_pool(self.worker_pool(prefs.threads));
+            let (inputs, outputs) = self.wanted_channels();
             let config = StreamConfig {
                 sample_rate: prefs.sample_rate,
                 buffer_size: prefs.buffer_size,
+                input_channels: inputs,
+                output_channels: outputs,
                 ..StreamConfig::default()
             };
             match backend.open_stream(config, Box::new(processor)) {
@@ -2037,6 +2055,19 @@ impl Session {
     /// absolute.
     pub(crate) fn render_copy(&mut self) -> Project {
         self.capture_plugin_states();
+        // Renders have no interface: outboard gear is passed by.
+        let outboard = self
+            .project
+            .tracks
+            .iter()
+            .flat_map(|t| t.slots())
+            .any(|s| s.plugin.id == faderframe_core::builtin::HARDWARE_INSERT && !s.bypass);
+        if outboard {
+            self.notify(
+                NoticeLevel::Warning,
+                "Renders pass hardware inserts by (the gear plays only in real time): record its return to a track first",
+            );
+        }
         let mut project = self.project.clone();
         let dir = self.project_dir();
         for s in project.sources.values_mut() {
@@ -2092,6 +2123,8 @@ impl Session {
         }
         self.tick_shuttle(!was_playing && self.transport.playing);
         self.tick_adr();
+        self.tick_hardware_ping();
+        self.check_channels();
         self.publish_picture_map();
         if !was_playing && self.transport.playing {
             self.automation_play_requested();
@@ -3279,6 +3312,9 @@ impl Session {
             Action::Video(op) => self.video_op(op)?,
             Action::Shuttle(op) => self.shuttle_op(op)?,
             Action::Conform(op) => self.conform_op(op)?,
+            Action::PingHardwareInsert { track, plugin } => {
+                self.ping_hardware_insert(track, plugin)?
+            }
             Action::Adr(op) => self.adr_op(op)?,
             Action::FullScreen(view) => self.ui_requests.push(UiRequest::FullScreen(view)),
             Action::ShowTemplates => self.ui_requests.push(UiRequest::Templates),

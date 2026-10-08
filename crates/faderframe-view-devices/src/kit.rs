@@ -276,6 +276,16 @@ impl Edit<'_, '_> {
         }
     }
 
+    /// Measure a hardware insert's round trip (its ping).
+    pub fn ping(&mut self) {
+        if let Some((track, _)) = self.model.plugin_owner(self.device.plugin) {
+            self.cx.emit(Action::PingHardwareInsert {
+                track,
+                plugin: self.device.plugin,
+            });
+        }
+    }
+
     /// Let go of the key [`Self::audition`] played.
     pub fn release(&mut self) {
         self.cx.emit(Action::AuditionOff);

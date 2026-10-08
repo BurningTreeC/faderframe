@@ -97,10 +97,16 @@ impl BackendChoice {
         let tone = std::env::var("FADERFRAME_DUMMY_TONE")
             .ok()
             .and_then(|v| v.parse::<f32>().ok());
+        // FADERFRAME_DUMMY_LOOPBACK=<frames>: its outputs come back on its
+        // inputs (trying hardware inserts without hardware).
+        let loopback = std::env::var("FADERFRAME_DUMMY_LOOPBACK")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok());
         let dummy = move || {
-            Box::new(match tone {
-                Some(hz) => faderframe_audio::dummy::DummyBackend::with_input_pluck(hz),
-                None => faderframe_audio::dummy::DummyBackend::default(),
+            Box::new(match (tone, loopback) {
+                (Some(hz), _) => faderframe_audio::dummy::DummyBackend::with_input_pluck(hz),
+                (None, Some(d)) => faderframe_audio::dummy::DummyBackend::with_loopback(d),
+                (None, None) => faderframe_audio::dummy::DummyBackend::default(),
             }) as Box<dyn AudioBackend>
         };
         #[cfg(target_os = "linux")]
@@ -354,6 +360,7 @@ impl AppState {
             .unwrap_or_default();
         for r in requests {
             match r {
+                faderframe_session::UiRequest::ReopenAudio => self.start_audio(),
                 faderframe_session::UiRequest::PluginBrowser { track, target } => {
                     crate::plugin_browser::open(self, track, target);
                 }

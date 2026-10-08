@@ -406,3 +406,53 @@ fn audio_summing_order_does_not_depend_on_upstream_chain_depth() {
     assert!(shallow.iter().all(|&x| x == 1.0));
     assert_eq!(shallow, render(true));
 }
+
+/// A hardware insert: the chain into a send (device output), the return
+/// (device input) declared `after` it with the round trip as latency, and
+/// the dry signal meeting the return: the dry path is held back by the
+/// round trip plus what came before the send, whatever the node order.
+#[test]
+fn a_return_counts_its_latency_from_its_send() {
+    let mut b = GraphBuilder::<Ctx>::new();
+    let src = source(&mut b, "Track", 0.0);
+    let pre = b.add_node(
+        NodeSpec::new("Plugin before")
+            .audio_in(Mono)
+            .audio_out(Mono),
+        Box::new(LatencyProbe::new(100)),
+    );
+    let send = b.add_node(
+        NodeSpec::new("Send")
+            .audio_in(Mono)
+            .role(NodeRole::DeviceOutput { first_channel: 2 }),
+        Box::new(Passthrough),
+    );
+    let ret = b.add_node(
+        NodeSpec::new("Return")
+            .audio_out(Mono)
+            .role(NodeRole::DeviceInput { first_channel: 2 })
+            .after(send),
+        Box::new(LatencyProbe::new(64)),
+    );
+    let mix = b.add_node(
+        NodeSpec::new("Mix")
+            .audio_in(Mono)
+            .audio_in(Mono)
+            .audio_out(Mono),
+        Box::new(Passthrough),
+    );
+    b.connect_audio(src, 0, pre, 0).unwrap();
+    b.connect_audio(pre, 0, send, 0).unwrap();
+    b.connect_audio(pre, 0, mix, 0).unwrap();
+    b.connect_audio(ret, 0, mix, 1).unwrap();
+    let g = b.compile(&config(64)).unwrap();
+    assert_eq!(
+        g.output_latency(ret),
+        Some(164),
+        "the send's 100 and the round trip"
+    );
+    let comp = g.compensation_into(mix);
+    let of = |id| comp.iter().find(|(n, _)| *n == id).unwrap().1;
+    assert_eq!(of(pre), 64, "the dry path waits for the return");
+    assert_eq!(of(ret), 0);
+}

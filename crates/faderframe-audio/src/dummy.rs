@@ -10,7 +10,7 @@
 //! sleeps inside the processing callback itself.
 
 use crate::{
-    AudioBackend, AudioCallback, AudioError, AudioStream, DeviceInfo, OwnedBuffers,
+    AudioBackend, AudioCallback, AudioError, AudioStream, DeviceBuffers, DeviceInfo, OwnedBuffers,
     STANDARD_SAMPLE_RATES, StreamConfig, StreamInfo, StreamMonitor, StreamStatus, validate_format,
 };
 use std::sync::Arc;
@@ -30,6 +30,10 @@ pub struct DummyBackend {
     input_tone: Option<f32>,
     /// Shape the tone into plucked notes (twice a second).
     pluck: bool,
+    /// A cable from every output to the input of the same number, `n`
+    /// frames longer than the device's own buffer (hardware inserts
+    /// without hardware).
+    loopback: Option<u32>,
 }
 
 impl DummyBackend {
@@ -37,7 +41,17 @@ impl DummyBackend {
     pub fn with_input_tone(hz: f32) -> Self {
         Self {
             input_tone: Some(hz),
-            pluck: false,
+            ..Self::default()
+        }
+    }
+
+    /// Outputs come back on the inputs of the same number (a patch cable
+    /// on every channel), `delay` frames after the next callback's start:
+    /// a round trip of one buffer plus `delay`.
+    pub fn with_loopback(delay: u32) -> Self {
+        Self {
+            loopback: Some(delay),
+            ..Self::default()
         }
     }
 
@@ -47,6 +61,7 @@ impl DummyBackend {
         Self {
             input_tone: Some(hz),
             pluck: true,
+            ..Self::default()
         }
     }
 }
@@ -98,6 +113,7 @@ impl AudioBackend for DummyBackend {
         let monitor = StreamMonitor::new(sample_rate, buffer_size);
         let tone = self.input_tone;
         let pluck = self.pluck;
+        let loopback = self.loopback;
         let stop = Arc::new(AtomicBool::new(false));
         let requested = Arc::new(AtomicU32::new(buffer_size));
 
@@ -119,6 +135,17 @@ impl AudioBackend for DummyBackend {
                     let mut next = Instant::now();
                     let mut phase = 0.0f64;
                     let mut t = 0u64;
+                    // The loopback's cable: a ring per channel, made once
+                    // (long enough for any buffer and the delay).
+                    // Output at stream frame n is input at n + buffer +
+                    // delay: the write head that far ahead of the read
+                    // head (for the buffer size the stream starts with).
+                    let cable = loopback.map(|d| d as usize);
+                    let ahead = cable.map_or(0, |d| d + info.buffer_size as usize);
+                    let ring_len = ahead + 16_384;
+                    let mut rings = vec![vec![0.0f32; ring_len]; ins.min(outs)];
+                    let mut write = ahead;
+                    let mut read = 0usize;
                     while !stop.load(Ordering::Relaxed) {
                         let want = requested.load(Ordering::Relaxed);
                         if want != info.buffer_size {
@@ -152,7 +179,25 @@ impl AudioBackend for DummyBackend {
                             }
                             t += info.buffer_size as u64;
                         }
+                        if cable.is_some() {
+                            let n = info.buffer_size as usize;
+                            for (c, ring) in rings.iter_mut().enumerate() {
+                                for (i, s) in bufs.input_mut(c).iter_mut().enumerate() {
+                                    *s = ring[(read + i) % ring_len];
+                                }
+                            }
+                            read = (read + n) % ring_len.max(1);
+                        }
                         callback.process(&mut bufs);
+                        if cable.is_some() {
+                            let n = info.buffer_size as usize;
+                            for (c, ring) in rings.iter_mut().enumerate() {
+                                for (i, s) in bufs.output(c).iter().enumerate().take(n) {
+                                    ring[(write + i) % ring_len] = *s;
+                                }
+                            }
+                            write = (write + n) % ring_len.max(1);
+                        }
                         monitor.record_callback();
                         next += period;
                         let now = Instant::now();

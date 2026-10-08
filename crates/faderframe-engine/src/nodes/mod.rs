@@ -14,7 +14,9 @@ mod strip;
 pub use chain::{ChainMix, ChainNotes};
 pub use clip_player::{AudioClipPlayer, StretchVoices};
 pub use crosstalk::Crosstalk;
-pub use io::{DeviceInputTap, DeviceOutputSink, FoldDown, MonitorGate};
+pub use io::{
+    DeviceInputTap, DeviceOutputSink, FoldDown, HardwareReturn, HardwareSendGain, MonitorGate,
+};
 pub use listen::ListenOut;
 pub use midi_player::MidiClipPlayer;
 pub use plugin::PluginNode;

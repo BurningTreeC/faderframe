@@ -18,6 +18,53 @@ impl Processor<EngineContext> for DeviceOutputSink {
     fn process(&mut self, _cx: &ProcessContext<'_, EngineContext>, _io: &mut NodeIo<'_>) {}
 }
 
+/// A hardware insert's send: its input at the device's Send level, on to
+/// the device output node after it.
+pub struct HardwareSendGain {
+    params: faderframe_plugin_host::ParamValues,
+    current: f32,
+}
+
+impl HardwareSendGain {
+    pub fn new(params: faderframe_plugin_host::ParamValues) -> Self {
+        let current = faderframe_plugin_host::devices::hardware_insert::routing(&params).2;
+        Self { params, current }
+    }
+}
+
+impl Processor<EngineContext> for HardwareSendGain {
+    fn process(&mut self, _cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
+        let (Some(input), Some(out)) = (io.audio_in.first(), io.audio_out.first_mut()) else {
+            return;
+        };
+        out.copy_from(input);
+        let target = faderframe_plugin_host::devices::hardware_insert::routing(&self.params).2;
+        let step = (target - self.current) / io.frames.max(1) as f32;
+        for c in 0..out.num_channels() {
+            let mut g = self.current;
+            for s in out.channel_mut(c).iter_mut() {
+                g += step;
+                *s *= g;
+            }
+        }
+        self.current = target;
+    }
+}
+
+/// A hardware insert's return: a device input (filled by the engine) whose
+/// latency is the round trip, counted from its send (`NodeSpec::after`).
+pub struct HardwareReturn {
+    pub latency: u32,
+}
+
+impl Processor<EngineContext> for HardwareReturn {
+    fn process(&mut self, _cx: &ProcessContext<'_, EngineContext>, _io: &mut NodeIo<'_>) {}
+
+    fn latency(&self) -> u32 {
+        self.latency
+    }
+}
+
 /// Passes live input to the track according to its monitoring mode.
 ///
 /// `Auto` is tape-style: monitor while armed, except during playback that is

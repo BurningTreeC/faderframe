@@ -63,6 +63,9 @@ pub fn widens_mono(id: &str) -> bool {
 
 /// Parallel chains of devices, mixed (see `faderframe_project::container`).
 pub const CONTAINER: &str = "faderframe.container";
+/// Outboard gear: a send to the interface's outputs and a return from its
+/// inputs, the round trip measured and compensated.
+pub const HARDWARE_INSERT: &str = "faderframe.hardware-insert";
 
 /// Built-ins with an editor of their own (others get the generic one).
 pub fn has_editor(id: &str) -> bool {
@@ -89,6 +92,7 @@ pub fn has_editor(id: &str) -> bool {
             | CHORD
             | SCALE
             | NOTE_ECHO
+            | HARDWARE_INSERT
     )
 }
 

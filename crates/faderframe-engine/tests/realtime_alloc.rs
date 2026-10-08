@@ -2520,3 +2520,71 @@ fn surround_strips_do_not_allocate() {
     }
     assert_eq!(total, 0, "allocations/frees on the audio thread");
 }
+
+/// A hardware insert on a live (four-channel) device — its send, return
+/// and mix — and a ping, on the audio thread.
+#[test]
+fn the_hardware_insert_and_its_ping_do_not_allocate() {
+    let _serial = serial();
+    use faderframe_audio::{AudioCallback, StreamInfo};
+    use faderframe_core::{ChannelLayout, ParameterId, builtin};
+    use faderframe_project::{Impact, PluginRef, PluginSlot, SavedParameter, TrackKind};
+    use faderframe_transport::TransportCommand;
+
+    const SR: u32 = 48_000;
+    let mut tp = common::TestProject::new(SR);
+    let t = tp.track(TrackKind::Audio, "Vox", ChannelLayout::Stereo);
+    let src = tp.dc(2, 0.25, 100_000);
+    tp.clip(t, src, faderframe_timeline::MusicalTime::ZERO, 100_000);
+    let slot = PluginSlot {
+        id: tp.project.ids.allocate(),
+        plugin: PluginRef::builtin(builtin::HARDWARE_INSERT, "Hardware Insert"),
+        bypass: false,
+        parameters: vec![
+            SavedParameter {
+                id: ParameterId(4),
+                value: 0.5,
+            },
+            SavedParameter {
+                id: ParameterId(6),
+                value: 300.0,
+            },
+        ],
+        state: None,
+        sidechain: None,
+    };
+    tp.project.track_mut(t).unwrap().inserts.push(slot);
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let (mut c, mut p) = faderframe_engine::create(config);
+    AudioCallback::prepare(
+        &mut p,
+        &StreamInfo {
+            backend: "test",
+            device: "four".into(),
+            sample_rate: SR,
+            buffer_size: 256,
+            input_channels: 4,
+            output_channels: 4,
+            input_latency: 0,
+            output_latency: 0,
+        },
+    );
+    c.sync(&tp.project, &tp.sources, Impact::Graph).unwrap();
+    c.transport(TransportCommand::Locate(0)).unwrap();
+    c.transport(TransportCommand::Play).unwrap();
+    let mut bufs = OwnedBuffers::new(4, 4, 256);
+    for _ in 0..8 {
+        p.process_device(&mut bufs);
+        c.collect_garbage();
+    }
+    c.ping(2, 2);
+    let (_, allocs) = armed(|| {
+        for _ in 0..200 {
+            p.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations with a hardware insert and a ping");
+}

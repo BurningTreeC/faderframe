@@ -27,8 +27,8 @@ use crate::context::EngineContext;
 use crate::midi::{MidiFilter, MidiInputNode, MidiOutputSink, MidiShared, NO_PORT};
 use crate::nodes::{
     AudioClipPlayer, ChannelStrip, Crosstalk, DeviceInputTap, DeviceOutputSink, FoldDown,
-    ListenOut, MidiClipPlayer, MonitorGate, ObjectRenderer, PluginNode, SendNode, StretchVoices,
-    StripEcho,
+    HardwareReturn, HardwareSendGain, ListenOut, MidiClipPlayer, MonitorGate, ObjectRenderer,
+    PluginNode, SendNode, StretchVoices, StripEcho,
 };
 use crate::plugins::PluginHost;
 use crate::slots::SlotRegistry;
@@ -134,7 +134,7 @@ pub fn ahead_eligible(
 /// Does `t` play from the timeline alone (whatever its kind)? Not armed,
 /// no input monitoring, live MIDI or external MIDI output, no sidechain
 /// inputs, no pre-FX sends, modulators that can run ahead, no launcher
-/// clips.
+/// clips, no hardware inserts.
 fn plays_from_timeline(project: &Project, t: &Track, live: &HashSet<TrackId>) -> bool {
     let monitored =
         matches!(t.input, InputRouting::Hardware { .. }) && t.monitor != MonitorMode::Off;
@@ -156,6 +156,10 @@ fn plays_from_timeline(project: &Project, t: &Track, live: &HashSet<TrackId>) ->
             .all(|s| project.plugin_output_tracks(s.id).is_empty())
         // Launched clips are played as they are launched.
         && !project.launcher.slots.keys().any(|k| k.track == t.id)
+        // Outboard gear plays through the interface, on the audio thread.
+        && t.slots()
+            .iter()
+            .all(|s| s.plugin.id != faderframe_core::builtin::HARDWARE_INSERT)
 }
 
 fn is_bus(kind: TrackKind) -> bool {
@@ -375,6 +379,8 @@ enum Role {
     ChainNotes = 15,
     StripEcho = 16,
     Renderer = 17,
+    HardwareSend = 18,
+    HardwareReturn = 19,
 }
 
 /// Stretcher voices a track's clip player needs: one per pitch-preserving
@@ -656,6 +662,127 @@ impl PluginCx<'_> {
             }
         }
     }
+}
+
+/// A hardware insert on the live graph: send level → device output from
+/// its Send Channel; device input from its Return Channel (latency: the
+/// round trip after the send) into the device's second input, the chain
+/// into its first. `None` when it is not one, is bypassed or this graph
+/// has no interface (it is then an ordinary insert passing the dry
+/// signal).
+#[allow(clippy::too_many_arguments)]
+fn add_hardware_insert(
+    b: &mut GraphBuilder<EngineContext>,
+    pcx: &mut PluginCx<'_>,
+    owners: &mut Vec<(NodeId, NodeOwner)>,
+    t: &Track,
+    slot: &PluginSlot,
+    prev: NodeId,
+    layout: ChannelLayout,
+    gi: u32,
+) -> Result<Option<NodeId>, EngineError> {
+    if slot.plugin.format != faderframe_project::PluginFormat::Builtin
+        || slot.plugin.id != faderframe_core::builtin::HARDWARE_INSERT
+        || slot.bypass
+        || !pcx.realtime
+    {
+        return Ok(None);
+    }
+    let Some(params) = pcx
+        .plugins
+        .instance(slot)
+        .ok()
+        .and_then(|i| i.tap())
+        .map(|tap| tap.params.clone())
+    else {
+        return Ok(None);
+    };
+    let (send_ch, ret_ch, _, trip) =
+        faderframe_plugin_host::devices::hardware_insert::routing(&params);
+    let label = format!("{} · {}", t.name, slot.plugin.name);
+    let id = slot.id.raw();
+    let level = b.add_node(
+        NodeSpec::new(format!("{label} · Send"))
+            .key(node_key(t.id, Role::HardwareSend, id, &[layout]))
+            .group(gi)
+            .audio_in(layout)
+            .audio_out(layout),
+        Box::new(HardwareSendGain::new(params)),
+    );
+    owners.push((
+        level,
+        NodeOwner {
+            track: t.id,
+            plugin: Some(slot.id),
+            work: NodeWork::Insert,
+        },
+    ));
+    let send = b.add_node(
+        NodeSpec::new(format!("{label} · Hardware Out"))
+            .key(node_key(
+                t.id,
+                Role::DeviceOut,
+                id ^ (u64::from(send_ch) << 48),
+                &[layout],
+            ))
+            .role(NodeRole::DeviceOutput {
+                first_channel: send_ch,
+            })
+            .group(gi)
+            .audio_in(layout),
+        Box::new(DeviceOutputSink),
+    );
+    owners.push((
+        send,
+        NodeOwner {
+            track: t.id,
+            plugin: Some(slot.id),
+            work: NodeWork::HardwareOut,
+        },
+    ));
+    b.connect_audio(prev, 0, level, 0)?;
+    b.connect_audio(level, 0, send, 0)?;
+    let ret = b.add_node(
+        NodeSpec::new(format!("{label} · Hardware In"))
+            .key(node_key(
+                t.id,
+                Role::HardwareReturn,
+                id ^ (u64::from(ret_ch) << 48) ^ (u64::from(trip) << 24),
+                &[layout],
+            ))
+            .role(NodeRole::DeviceInput {
+                first_channel: ret_ch,
+            })
+            .after(send)
+            .group(gi)
+            .audio_out(layout),
+        Box::new(HardwareReturn { latency: trip }),
+    );
+    owners.push((
+        ret,
+        NodeOwner {
+            track: t.id,
+            plugin: Some(slot.id),
+            work: NodeWork::HardwareIn,
+        },
+    ));
+    let spec = NodeSpec::new(label)
+        .group(gi)
+        .audio_in(layout)
+        .audio_in(layout)
+        .audio_out(layout);
+    let (node, _) = pcx.node(b, slot, t, spec, Role::Insert);
+    owners.push((
+        node,
+        NodeOwner {
+            track: t.id,
+            plugin: Some(slot.id),
+            work: NodeWork::Insert,
+        },
+    ));
+    b.connect_audio(prev, 0, node, 0)?;
+    b.connect_audio(ret, 0, node, 1)?;
+    Ok(Some(node))
 }
 
 /// What a `layout` going to a device with `outputs` channels from
@@ -1221,6 +1348,15 @@ pub fn build_graph(
             if let Some((_, n)) = fx.iter().find(|(id, _)| *id == slot.id) {
                 events = vec![*n];
                 raw = false;
+                continue;
+            }
+            // Outboard gear (live only: renders have no interface and pass
+            // it by): the chain to the interface, its return into the
+            // device's second input, the round trip the return's latency.
+            if let Some(node) =
+                add_hardware_insert(&mut b, &mut pcx, &mut owners, t, slot, prev, layout, gi)?
+            {
+                prev = node;
                 continue;
             }
             // Inserts that take notes (a synth placed as an insert, MIDI-

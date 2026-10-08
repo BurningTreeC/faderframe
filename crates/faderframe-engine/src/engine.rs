@@ -197,6 +197,25 @@ pub struct EngineShared {
     pub midi: Arc<crate::midi::MidiShared>,
     /// Album playback (see [`crate::preview`]).
     pub preview: crate::preview::PreviewShared,
+    /// A ping asked for: `1 << 63 | output << 16 | input` (0: none).
+    ping_request: AtomicU64,
+    /// Its answer: the round trip (frames), `PING_PENDING` or
+    /// `PING_LOST`.
+    ping_result: std::sync::atomic::AtomicI64,
+}
+
+/// No answer yet.
+const PING_PENDING: i64 = -1;
+/// Nothing came back within a second.
+const PING_LOST: i64 = -2;
+
+/// A ping on its way (audio thread).
+#[derive(Clone, Copy, Debug)]
+struct PingRun {
+    output: usize,
+    input: usize,
+    /// Frames since the impulse went out (`None`: not sent yet).
+    elapsed: Option<u64>,
 }
 
 /// Create a connected controller/processor pair.
@@ -282,6 +301,7 @@ pub fn create_with_epoch(
         ahead: None,
         preview: None,
         varispeed: None,
+        ping: None,
     };
     let controller = EngineController {
         config,
@@ -368,6 +388,7 @@ pub struct EngineProcessor {
     /// Album playback's file.
     preview: Option<Box<crate::preview::Preview>>,
     varispeed: Option<Box<crate::varispeed::Varispeed>>,
+    ping: Option<PingRun>,
 }
 
 impl EngineProcessor {
@@ -538,6 +559,58 @@ impl EngineProcessor {
             }
             None => self.render(io, started),
         }
+        self.ping(io);
+    }
+
+    /// A round-trip ping (hardware inserts): an impulse onto an output
+    /// after the graph's, then the input watched for it, the frames counted
+    /// from the output sample to the input one.
+    fn ping(&mut self, io: &mut dyn DeviceBuffers) {
+        if self.ping.is_none() {
+            let r = self.shared.ping_request.swap(0, Ordering::Relaxed);
+            if r != 0 {
+                self.ping = Some(PingRun {
+                    output: ((r >> 16) & 0xffff) as usize,
+                    input: (r & 0xffff) as usize,
+                    elapsed: None,
+                });
+            }
+        }
+        let Some(mut run) = self.ping else {
+            return;
+        };
+        let frames = io.frames();
+        match run.elapsed {
+            None => {
+                if run.output >= io.output_channels() || run.input >= io.input_channels() {
+                    self.shared.ping_result.store(PING_LOST, Ordering::Relaxed);
+                    self.ping = None;
+                    return;
+                }
+                if let Some(s) = io.output(run.output).first_mut() {
+                    *s += 0.5;
+                }
+                run.elapsed = Some(frames as u64);
+            }
+            Some(elapsed) => {
+                let found = io.input(run.input).iter().position(|s| s.abs() > 0.1);
+                if let Some(f) = found {
+                    self.shared
+                        .ping_result
+                        .store((elapsed + f as u64) as i64, Ordering::Relaxed);
+                    self.ping = None;
+                    return;
+                }
+                let elapsed = elapsed + frames as u64;
+                if elapsed > u64::from(self.stream_rate.max(1)) {
+                    self.shared.ping_result.store(PING_LOST, Ordering::Relaxed);
+                    self.ping = None;
+                    return;
+                }
+                run.elapsed = Some(elapsed);
+            }
+        }
+        self.ping = Some(run);
     }
 
     /// One callback's processing (the device's frames, or the engine's
@@ -1162,6 +1235,30 @@ impl EngineController {
         // At the varispeed's speed.
         let rate = self.stream_sample_rate() as f64 * self.speed();
         Some((pos + ((t_ns as f64 - cb as f64) * rate / 1e9) as i64, jumps))
+    }
+
+    /// Measure the round trip from device output `output` to input
+    /// `input` (both from 0): an impulse goes out, its arrival is counted
+    /// in frames; see [`Self::ping_result`]. Ping while stopped.
+    pub fn ping(&self, output: u16, input: u16) {
+        self.shared
+            .ping_result
+            .store(PING_PENDING, Ordering::Relaxed);
+        self.shared.ping_request.store(
+            (1 << 63) | (u64::from(output) << 16) | u64::from(input),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The last ping's answer: `None` while waiting, `Some(Ok(frames))`,
+    /// or `Some(Err(()))` when nothing came back within a second.
+    pub fn ping_result(&self) -> Option<Result<u32, ()>> {
+        match self.shared.ping_result.load(Ordering::Relaxed) {
+            PING_PENDING => None,
+            PING_LOST => Some(Err(())),
+            v if v >= 0 => Some(Ok(v as u32)),
+            _ => None,
+        }
     }
 
     /// A handle that tells where the engine is from any thread (picture

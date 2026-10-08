@@ -396,9 +396,17 @@ pub(crate) fn compile<C>(
     if nodes.len() >= u32::MAX as usize {
         return Err(GraphError::Limit("too many nodes"));
     }
+    // Edges, and the nodes that follow another without one.
     let pairs: Vec<(usize, usize)> = edges
         .iter()
         .map(|e| (e.from.0 as usize, e.to.0 as usize))
+        .chain(
+            nodes
+                .iter()
+                .enumerate()
+                .filter_map(|(i, n)| n.spec.after.map(|a| (a.0 as usize, i))),
+        )
+        .filter(|(a, _)| *a < nodes.len())
         .collect();
     let order = topological_order(nodes.len(), &pairs).map_err(|err| {
         GraphError::Cycle(
@@ -420,6 +428,8 @@ pub(crate) fn compile<C>(
         bufs: NodeBuffers,
         work: NodeWork<C>,
         latency: u32,
+        /// The node it follows without an edge (topological position).
+        after: Option<usize>,
     }
     let mut slots: Vec<Option<NodeDesc<C>>> = nodes.into_iter().map(Some).collect();
     let max_block = config.max_block_size.max(1);
@@ -471,6 +481,7 @@ pub(crate) fn compile<C>(
                 cycle_ns: 0,
             },
             latency,
+            after: spec.after.map(|a| position[a.0 as usize] as usize),
         });
         labels.push(spec.label);
         groups_of.push(spec.group);
@@ -543,6 +554,7 @@ pub(crate) fn compile<C>(
                     .iter()
                     .map(|s| done[s.from_node as usize].info.output_latency),
             )
+            .chain(node.after.map(|a| done[a].info.output_latency))
             .max()
             .unwrap_or(0);
         for s in &mut node.work.audio_sources {

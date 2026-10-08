@@ -15,6 +15,7 @@ mod drums;
 pub mod eq;
 mod gate;
 pub mod guitar;
+mod hardware_insert;
 mod keys;
 mod kit;
 mod limiter;
@@ -92,6 +93,11 @@ pub fn editor_for(
             theme,
             utility::UtilityFace::new(theme),
         ))),
+        builtin::HARDWARE_INSERT => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            hardware_insert::HardwareInsertFace::new(theme),
+        ))),
         builtin::SATURATOR => Some(Box::new(kit::DeviceView::new(
             plugin,
             theme,
@@ -157,6 +163,7 @@ pub fn editor_size(plugin_id: &str) -> Option<(i32, i32)> {
         builtin::REVERB => Some((1120, 520 + HEADER_BAR)),
         builtin::ECHO => Some((1120, 520 + HEADER_BAR)),
         builtin::GAIN => Some((900, 500 + HEADER_BAR)),
+        builtin::HARDWARE_INSERT => Some((820, 440 + HEADER_BAR)),
         builtin::SATURATOR => Some((960, 520 + HEADER_BAR)),
         builtin::DEESSER => Some((1000, 520 + HEADER_BAR)),
         builtin::GATE => Some((1000, 520 + HEADER_BAR)),

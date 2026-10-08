@@ -48,6 +48,10 @@ pub struct NodeSpec {
     /// Accounting group (e.g. the track the node belongs to): processing
     /// time is also summed per group and callback ([`crate::NodeTimings`]).
     pub group: Option<u32>,
+    /// A node this one's signal comes out of without an edge — a hardware
+    /// insert's return, `after` its send: ordered after it, and its
+    /// latency counts from what arrives there.
+    pub after: Option<NodeId>,
 }
 
 impl NodeSpec {
@@ -65,6 +69,12 @@ impl NodeSpec {
 
     pub fn group(mut self, group: u32) -> Self {
         self.group = Some(group);
+        self
+    }
+
+    /// See [`NodeSpec::after`].
+    pub fn after(mut self, node: NodeId) -> Self {
+        self.after = Some(node);
         self
     }
 

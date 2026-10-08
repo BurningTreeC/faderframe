@@ -40,10 +40,12 @@ enum Kind {
     NoteEcho,
     /// Parallel chains: the graph builds them; the instance does nothing.
     Container,
+    /// Outboard gear (the graph builds its send and return).
+    HardwareInsert,
 }
 
 impl Kind {
-    const ALL: [Kind; 29] = [
+    const ALL: [Kind; 30] = [
         Kind::Preamp(0),
         Kind::Preamp(1),
         Kind::Preamp(2),
@@ -72,6 +74,7 @@ impl Kind {
         Kind::Scale,
         Kind::NoteEcho,
         Kind::Container,
+        Kind::HardwareInsert,
         Kind::LatencyProbe,
     ];
 
@@ -103,6 +106,7 @@ impl Kind {
             builtin::CHANNEL_STRIP => Kind::ChannelStrip,
             builtin::GUITAR_STATION => Kind::Guitar,
             builtin::CONTAINER => Kind::Container,
+            builtin::HARDWARE_INSERT => Kind::HardwareInsert,
             _ => return None,
         })
     }
@@ -257,6 +261,13 @@ impl Kind {
                 vec![stereo],
                 0,
             ),
+            Kind::HardwareInsert => (
+                builtin::HARDWARE_INSERT,
+                "Hardware Insert",
+                PluginCategory::Utility,
+                vec![stereo, sidechain],
+                0,
+            ),
             Kind::Sampler => (
                 builtin::SAMPLER,
                 "Sampler",
@@ -356,6 +367,7 @@ impl Kind {
             Kind::Eq => crate::eq::parameters(),
             Kind::ProgramEq => crate::program_eq::parameters(),
             Kind::Container => Vec::new(),
+            Kind::HardwareInsert => crate::devices::hardware_insert::parameters(),
         }
     }
 
@@ -383,6 +395,8 @@ impl Kind {
             Kind::ChannelStrip => Some(crate::devices::channel_strip::TAP_VALUES),
             Kind::Guitar => Some(crate::devices::guitar::TAP_VALUES),
             Kind::ProgramEq => Some(0),
+            // A tap for its live parameters (the engine's send reads them).
+            Kind::HardwareInsert => Some(0),
             _ => None,
         }
     }
@@ -492,6 +506,7 @@ impl PluginInstance for BuiltinInstance {
             Kind::Reverb => crate::devices::reverb::format(id, value),
             Kind::Echo => crate::devices::delay::format(id, value),
             Kind::Gain => crate::devices::utility::format(id, value),
+            Kind::HardwareInsert => crate::devices::hardware_insert::format(id, value),
             Kind::Saturator => crate::devices::saturator::format(id, value),
             Kind::Deesser => crate::devices::deesser::format(id, value),
             Kind::Gate => crate::devices::gate::format(id, value),
@@ -557,6 +572,12 @@ impl PluginInstance for BuiltinInstance {
                     >= 0.5,
             ),
             Kind::Drums => u64::from(crate::devices::drums::keeps_length(&self.params)),
+            // Its channels and round trip are the graph's (send, return and
+            // the return's latency): built again when they change.
+            Kind::HardwareInsert => {
+                let (send, ret, _, trip) = crate::devices::hardware_insert::routing(&self.params);
+                u64::from(send) | (u64::from(ret) << 8) | (u64::from(trip) << 16)
+            }
             _ => 0,
         };
         if self.device_block == self.sized_block {
@@ -658,7 +679,8 @@ impl PluginInstance for BuiltinInstance {
             | Kind::Deesser
             | Kind::Saturator
             | Kind::Tuner
-            | Kind::Container => TailLength::None,
+            | Kind::Container
+            | Kind::HardwareInsert => TailLength::None,
             // Notes still due: a held arpeggio's last steps, strums, echoes.
             Kind::Arpeggiator | Kind::Chord | Kind::Scale => TailLength::Samples(48_000 * 2),
             Kind::NoteEcho => TailLength::Samples(48_000 * 40),
@@ -837,6 +859,9 @@ impl PluginInstance for BuiltinInstance {
             Kind::LatencyProbe => Box::new(latency::LatencyProcessor::new(self.latency_samples())),
             // Never in a graph (it is built from the chains): passes audio.
             Kind::Container => Box::new(latency::LatencyProcessor::new(0)),
+            Kind::HardwareInsert => Box::new(
+                crate::devices::hardware_insert::HardwareInsertProcessor::new(params, config),
+            ),
             Kind::Eq => {
                 let tap = self
                     .tap

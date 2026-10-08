@@ -16,6 +16,7 @@ pub mod delay;
 pub mod drums;
 pub mod gate;
 pub mod guitar;
+pub mod hardware_insert;
 pub mod keep_length;
 pub mod limiter;
 pub(crate) mod midi_fx;
