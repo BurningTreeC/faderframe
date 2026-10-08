@@ -312,7 +312,9 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
     );
     file.append_section(None, &section(&[("Preferences…", "app.preferences")]));
     file.append_section(None, &section(&[("Quit", "app.quit")]));
-    menu.append_submenu(Some("_File"), &file);
+    // No mnemonics on the menu bar: Alt is the edit modes' and tools'
+    // (Alt+1 … Alt+0, Alt+S), and a held Alt must not arm the menus.
+    menu.append_submenu(Some("File"), &file);
 
     let edit = gio::Menu::new();
     edit.append_section(
@@ -400,7 +402,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             ("Follow Playhead", "app.toggle-follow"),
         ]),
     );
-    menu.append_submenu(Some("_Edit"), &edit);
+    menu.append_submenu(Some("Edit"), &edit);
 
     let track = gio::Menu::new();
     track.append_section(
@@ -435,7 +437,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             ),
         ]),
     );
-    menu.append_submenu(Some("_Track"), &track);
+    menu.append_submenu(Some("Track"), &track);
 
     let transport = gio::Menu::new();
     transport.append_section(
@@ -474,7 +476,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
     transport.append_submenu(Some("Shuttle"), &shuttle);
     transport.append_section(None, &crate::recording::menu());
     transport.append_section(None, &section(&[("Panic (All Notes Off)", "app.panic")]));
-    menu.append_submenu(Some("T_ransport"), &transport);
+    menu.append_submenu(Some("Transport"), &transport);
 
     let view = gio::Menu::new();
     view.append_section(
@@ -542,7 +544,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
         themes.append_item(&item);
     }
     view.append_submenu(Some("Theme"), &themes);
-    menu.append_submenu(Some("_View"), &view);
+    menu.append_submenu(Some("View"), &view);
 
     let audio = gio::Menu::new();
     audio.append_section(
@@ -560,11 +562,11 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             "app.download-speech-model",
         )]),
     );
-    menu.append_submenu(Some("_Audio"), &audio);
+    menu.append_submenu(Some("Audio"), &audio);
 
     let help = gio::Menu::new();
     help.append(Some("About FaderFrame"), Some("app.about"));
-    menu.append_submenu(Some("_Help"), &help);
+    menu.append_submenu(Some("Help"), &help);
     menu
 }
 

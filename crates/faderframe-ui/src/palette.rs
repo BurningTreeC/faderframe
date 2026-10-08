@@ -57,6 +57,19 @@ pub(crate) const DEFAULT_SHORTCUTS: &[(&str, &[&str])] = &[
     ("app.workspace-3", &["<Control>3"]),
     ("app.workspace-4", &["<Control>4"]),
     ("app.workspace-5", &["<Control>5"]),
+    // Edit modes and tools (wherever the keyboard is: not only in the
+    // arranger).
+    ("app.edit-mode::shuffle", &["<Alt>1"]),
+    ("app.edit-mode::slip", &["<Alt>2"]),
+    ("app.edit-mode::spot", &["<Alt>3"]),
+    ("app.edit-mode::grid", &["<Alt>4"]),
+    ("app.edit-tool::zoom", &["<Alt>5"]),
+    ("app.edit-tool::trim", &["<Alt>6"]),
+    ("app.edit-tool::select", &["<Alt>7"]),
+    ("app.edit-tool::grab", &["<Alt>8"]),
+    ("app.edit-tool::scrub", &["<Alt>9"]),
+    ("app.edit-tool::pencil", &["<Alt>0"]),
+    ("app.edit-tool::smart", &["<Alt>s"]),
 ];
 
 /// The fixed single-key shortcuts, for the editor's note.
