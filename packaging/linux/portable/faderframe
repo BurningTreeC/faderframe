@@ -16,14 +16,13 @@ if [ -f "$loaders/loaders.cache.in" ]; then
     sed "s|@ROOT@|$here|g" "$loaders/loaders.cache.in" >"$cache" &&
         export GDK_PIXBUF_MODULE_FILE="$cache"
 fi
-# Video: the system's GStreamer (its plugins and codecs match it), or the
-# bundled one where the system has none.
-if ! /sbin/ldconfig -p 2>/dev/null | grep -q 'libgstreamer-1\.0\.so\.0 '; then
-    export LD_LIBRARY_PATH="$here/lib/gstreamer:$LD_LIBRARY_PATH"
-    export GST_PLUGIN_SYSTEM_PATH_1_0="$here/lib/gstreamer-1.0"
-    export GST_PLUGIN_SCANNER_1_0="$here/libexec/gst-plugin-scanner"
-    export GST_REGISTRY_1_0="${XDG_CACHE_HOME:-$HOME/.cache}/faderframe/gstreamer-registry.bin"
-fi
+# Video: the bundled GStreamer and its plugins, always. They are built
+# against the bundled GLib; a system's GStreamer may need a newer GLib than
+# the bundled one (Arch's 1.28: g_sort_array, GLib 2.82) and cannot load.
+export LD_LIBRARY_PATH="$here/lib/gstreamer:$LD_LIBRARY_PATH"
+export GST_PLUGIN_SYSTEM_PATH_1_0="$here/lib/gstreamer-1.0"
+export GST_PLUGIN_SCANNER_1_0="$here/libexec/gst-plugin-scanner"
+export GST_REGISTRY_1_0="${XDG_CACHE_HOME:-$HOME/.cache}/faderframe/gstreamer-registry.bin"
 # Portable: the graphics driver's shader cache stays in the folder too.
 if [ -d "$here/FaderFrame Data" ]; then
     export MESA_SHADER_CACHE_DIR="$here/FaderFrame Data/Cache/mesa"

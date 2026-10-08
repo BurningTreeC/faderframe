@@ -14,10 +14,13 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
+/// A fresh folder for a test, with the video cache in it (never the
+/// user's).
 fn dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("ff-session-video-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
+    faderframe_session::video::set_cache_dir(Some(d.join("cache")));
     d
 }
 

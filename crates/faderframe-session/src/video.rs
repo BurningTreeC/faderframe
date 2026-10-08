@@ -41,10 +41,25 @@ const FRAME_BUDGET: usize = 384 << 20;
 /// Proxies' height.
 const PROXY_HEIGHT: u32 = 540;
 
+/// Another place for [`cache_dir`] (tests: never the user's cache).
+static CACHE_OVERRIDE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+/// Keep indexes and proxies in `dir` instead (`None`: the usual place).
+pub fn set_cache_dir(dir: Option<PathBuf>) {
+    *CACHE_OVERRIDE.write().unwrap_or_else(|p| p.into_inner()) = dir;
+}
+
 /// Where indexes and proxies are kept (deletable): the computer's own
 /// cache folder, also in portable mode -- proxies take gigabytes per hour
 /// of picture, and a portable folder may be on a stick.
 pub fn cache_dir() -> PathBuf {
+    if let Some(dir) = CACHE_OVERRIDE
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+    {
+        return dir;
+    }
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())

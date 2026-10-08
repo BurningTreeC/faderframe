@@ -8,7 +8,7 @@
 #                             --uninstall removes it again
 #     bin/faderframe          the program
 #     lib/                    GTK 4 and the libraries it needs, image loaders
-#     lib/gstreamer/          GStreamer, used only where the system has none
+#     lib/gstreamer/          GStreamer (kept apart from the rest of lib/)
 #     lib/gstreamer-1.0/      its plugins video uses (with libexec/'s scanner)
 #     share/                  GTK's settings schemas and icon themes, the
 #                             desktop entry, AppStream data, MIME type, icon
@@ -78,12 +78,11 @@ if [ -z "$query" ]; then
 fi
 "$query" "$loaders"/loaders/*.so |
     sed "s|$root/$out|@ROOT@|g" >"$loaders/loaders.cache.in"
-# GStreamer for systems without one (the launcher uses the system's when
-# there is one: its plugins and codecs match it): the plugins video uses
-# (demuxers and muxers, JPEG, conversion, Opus, the H.264/H.265 parsers,
-# VA hardware decoding -- libva and its drivers are the system's) and the
-# plugin scanner; GStreamer's own libraries are moved to lib/gstreamer
-# below.
+# GStreamer, always the bundled one (a system's may need a newer GLib than
+# the bundled one): the plugins video uses (demuxers and muxers, JPEG,
+# conversion, Opus, the H.264/H.265 parsers, VA hardware decoding -- libva
+# and its drivers are the system's) and the plugin scanner; GStreamer's
+# own libraries are moved to lib/gstreamer below.
 gst_dir=$(pkg-config --variable=pluginsdir gstreamer-1.0)
 gst_scanner=$(pkg-config --variable=pluginscannerdir gstreamer-1.0)/gst-plugin-scanner
 mkdir -p "$out/lib/gstreamer-1.0" "$out/libexec"
@@ -102,8 +101,8 @@ if [ -x "$gst_scanner" ]; then
     cp -L "$gst_scanner" "$out/libexec/"
     copy_deps "$gst_scanner"
 fi
-# GStreamer's own libraries apart: on the library path only where the
-# system has no GStreamer.
+# GStreamer's own libraries apart (the launcher puts them on the library
+# path).
 mkdir -p "$out/lib/gstreamer"
 for lib in "$out"/lib/libgst*.so* "$out"/lib/liborc-*.so*; do
     mv "$lib" "$out/lib/gstreamer/"

@@ -712,16 +712,18 @@ of them for a `v*` tag and attaches them to the GitHub release.
 
 | Platform | Package | How |
 |---|---|---|
-| Linux | portable tarball (GTK bundled, GStreamer too for systems without one; runs in place, `install.sh` installs it) | `cargo build --release && packaging/linux/tarball.sh` |
+| Linux | portable tarball (GTK and GStreamer bundled; runs in place, `install.sh` installs it) | `cargo build --release && packaging/linux/tarball.sh` |
 | Linux | Flatpak (GNOME 51 runtime) | `flatpak-builder --user --install build-dir packaging/flatpak/io.github.BurningTreeC.FaderFrame.yml` |
 | Linux | system install from source (binary, desktop entry, AppStream, MIME type, icon) | `cargo build --release && sudo packaging/linux/install.sh /usr/local` |
 | macOS | `FaderFrame.app` in a DMG (GTK and GStreamer bundled, ad-hoc signed) | `brew install gtk4 adwaita-icon-theme librsvg pkgconf gstreamer && packaging/macos/bundle.sh` |
 | Windows | installer (Inno Setup) and portable zip (GTK and GStreamer bundled) | in MSYS2 UCRT64: `packaging/windows/bundle.sh` |
 
-Video needs nothing installed with a package: the macOS and Windows
-packages carry GStreamer with the plugins video uses; the Linux tarball
-uses the system's GStreamer (with its codecs) and its own where there is
-none; the Flatpak takes it from the GNOME runtime. No FFmpeg is bundled.
+Video needs nothing installed with a package: the Linux tarball, the
+macOS and the Windows packages carry GStreamer with the plugins video
+uses (a system's GStreamer cannot be mixed with the bundled GTK
+libraries); the Flatpak takes it from the GNOME runtime. No FFmpeg is
+bundled, so decoding H.264 and H.265 goes through the hardware (VA-API on
+Linux, through your graphics driver).
 
 The macOS app is signed ad hoc, not notarised, so Gatekeeper stops it the
 first time. On macOS 15 and later, try to open it once, then allow it in
