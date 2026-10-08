@@ -19,7 +19,8 @@ thiserror.workspace = true
 tracing.workspace = true
 gst.workspace = true
 gst-app.workspace = true
-gst-video.workspace = true
+# PQ and HLG transfer functions.
+gst-video = { workspace = true, features = ["v1_18"] }
 gst-pbutils.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
