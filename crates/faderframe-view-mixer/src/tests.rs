@@ -1397,3 +1397,50 @@ fn folder_strips_fold_mute_and_take_dropped_strips() {
     }
     assert_eq!(s.project().track(first).unwrap().folder, Some(folder));
 }
+
+/// A track with a compressor shows its gain reduction in a stripe left of
+/// its meter (the stripe only where something compresses; a click there
+/// does not move the fader).
+#[test]
+fn a_compressing_track_shows_its_gain_reduction() {
+    let mut s = session();
+    let mut view = MixerView::new(Theme::default());
+    let size = Size::new(1600.0, 900.0);
+    view.update_sends(&s);
+    view.update_strips(&s);
+    // The demo's Bass has a compressor; a track without dynamics has none.
+    let bass = MixerView::channel_tracks(&s)
+        .iter()
+        .find(|t| t.name == "Bass")
+        .unwrap()
+        .id;
+    assert!(s.gain_reduction(bass).is_some());
+    let plain = s.add_track(TrackKind::Audio).unwrap();
+    assert!(s.gain_reduction(plain).is_none());
+    assert_eq!(s.gain_reduction_devices(bass), ["FaderFrame Compressor"]);
+    // Bypassed, it is not counted.
+    let comp = s
+        .project()
+        .track(bass)
+        .unwrap()
+        .inserts
+        .iter()
+        .find(|x| x.plugin.id == faderframe_core::builtin::COMPRESSOR)
+        .unwrap()
+        .id;
+    let l = view.layout_of(&s, bass, size).unwrap();
+    let stripe = reduction_rect(&l);
+    assert_eq!(
+        view.hit_test(stripe.center(), size, &s),
+        Some(Hit::Reduction(bass))
+    );
+    let (a, _) = run(&mut view, down(stripe.center(), 1), size, &s);
+    assert!(a.is_empty(), "{a:?}");
+    s.dispatch(Action::Edit(Command::SetPluginBypass {
+        track: bass,
+        plugin: comp,
+        bypass: true,
+    }))
+    .unwrap();
+    assert!(s.gain_reduction(bass).is_none());
+}

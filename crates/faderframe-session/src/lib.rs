@@ -4234,6 +4234,46 @@ impl Session {
         self.engine.plugin_tap(plugin)
     }
 
+    /// The track's compressors in series (its input stage and inserts, not
+    /// bypassed; the built-ins, which say what they take off): their slots
+    /// and the published value that is their gain reduction.
+    fn reducers(&self, track: TrackId) -> Vec<(&PluginSlot, usize)> {
+        let Some(t) = self.project.track(track) else {
+            return Vec::new();
+        };
+        t.preamp
+            .iter()
+            .chain(&t.inserts)
+            .filter(|s| !s.bypass && s.plugin.format == faderframe_project::PluginFormat::Builtin)
+            .filter_map(|s| {
+                faderframe_plugin_host::devices::reduction_value(&s.plugin.id).map(|v| (s, v))
+            })
+            .collect()
+    }
+
+    /// What the track's compression takes off now (dB, its compressors'
+    /// reductions added: they are in series), or None when it has none.
+    pub fn gain_reduction(&self, track: TrackId) -> Option<f32> {
+        let reducers = self.reducers(track);
+        if reducers.is_empty() {
+            return None;
+        }
+        Some(
+            reducers
+                .iter()
+                .filter_map(|(s, v)| self.plugin_tap(s.id).map(|tap| tap.value(*v).max(0.0)))
+                .sum(),
+        )
+    }
+
+    /// The names of the devices [`Self::gain_reduction`] adds up.
+    pub fn gain_reduction_devices(&self, track: TrackId) -> Vec<String> {
+        self.reducers(track)
+            .iter()
+            .map(|(s, _)| s.plugin.name.clone())
+            .collect()
+    }
+
     /// An album song's insert and its song.
     pub fn song_insert(
         &self,

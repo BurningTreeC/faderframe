@@ -47,6 +47,19 @@ const CHEEK_W: f32 = 22.0;
 /// A folder's strip: narrow (its triangle, mute, solo, name).
 const FOLDER_W: f32 = 48.0;
 
+/// The gain-reduction stripe: left of the meter, as tall as its scale.
+fn reduction_rect(l: &StripLayout) -> Rect {
+    Rect::new(
+        l.meter.x - 5.0,
+        l.meter.y + 8.0,
+        3.0,
+        (l.meter.h - 10.0).max(0.0),
+    )
+}
+
+/// How fast the gain-reduction stripe falls back (per painted frame).
+const REDUCTION_FALL: f32 = 0.88;
+
 /// Where a dragged strip lands.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum StripDrop {
@@ -112,6 +125,8 @@ pub enum Hit {
     /// A folder's triangle: opens or closes it.
     Fold(TrackId),
     Meter(TrackId),
+    /// The gain-reduction stripe left of the meter (shows, does nothing).
+    Reduction(TrackId),
     Strip(TrackId),
     /// The rule under the inserts: drag to show more or fewer slots.
     InsertsGrip(TrackId),
@@ -194,6 +209,9 @@ pub struct MixerView {
     /// console's look), and the console family whose look is shown.
     base_theme: Theme,
     look: Option<u8>,
+    /// Each strip's gain reduction as shown (falling back by
+    /// `REDUCTION_FALL` a frame).
+    reduction: std::collections::HashMap<TrackId, f32>,
     scroll_x: f32,
     drag: Option<Drag>,
     hover: Option<Hit>,
@@ -336,6 +354,7 @@ impl MixerView {
         Self {
             base_theme: theme.clone(),
             look: None,
+            reduction: std::collections::HashMap::new(),
             theme,
             scroll_x: 0.0,
             drag: None,
@@ -627,9 +646,13 @@ impl MixerView {
             let pans =
                 audio.filter(|_| !matches!(t.layout, faderframe_core::ChannelLayout::Surround(_)));
             let color = Rect::new(l.color_bar.x, l.color_bar.y, l.color_bar.w, 7.0);
-            let checks: [(Option<Rect>, Hit); 14] = [
+            let checks: [(Option<Rect>, Hit); 15] = [
                 (Some(color), Hit::Color(id)),
                 (Some(geo.cap_rect(pos_now).inset(-2.0)), Hit::FaderCap(id)),
+                (
+                    model.gain_reduction(id).map(|_| reduction_rect(&l)),
+                    Hit::Reduction(id),
+                ),
                 (Some(l.fader), Hit::FaderTrack(id)),
                 (audio.map(|_| l.meter), Hit::Meter(id)),
                 (pans.map(|_| l.pan_readout), Hit::PanValue(id)),
@@ -1113,6 +1136,25 @@ impl MixerView {
             controls::meter(p, l.meter, &levels, th);
         } else {
             controls::meter(p, l.meter, &[level(&m.left), level(&m.right)], th);
+        }
+        // The track's compression, from the top down on the meter's own
+        // scale (6 dB taken off reaches the meter's −6).
+        if model.gain_reduction(t.id).is_some() {
+            let r = reduction_rect(&l);
+            let shown = self.reduction.get(&t.id).copied().unwrap_or(0.0);
+            p.fill_rounded(
+                r,
+                1.0,
+                &faderframe_ui_canvas::Paint::Solid(c.meter.background),
+            );
+            if shown > 0.05 {
+                let depth = r.h * (1.0 - controls::meter_scale(-shown));
+                p.fill_rounded(
+                    Rect::new(r.x, r.y, r.w, depth.clamp(1.0, r.h)),
+                    1.0,
+                    &faderframe_ui_canvas::Paint::Solid(c.meter.orange),
+                );
+            }
         }
 
         let out = match t.output {
@@ -2673,6 +2715,7 @@ impl MixerView {
             }
             Hit::Meter(_) => cx.emit(Action::ResetClipIndicators),
             Hit::Fold(id) => cx.emit(Action::ToggleFolder(id)),
+            Hit::Reduction(_) => {}
         }
         true
     }
@@ -2872,6 +2915,14 @@ impl MixerView {
                 }
             }
             Hit::Mute(id) => format!("Mute {}", name(id)),
+            Hit::Reduction(id) => {
+                let devices = model.gain_reduction_devices(id);
+                format!(
+                    "Gain reduction: {:.1} dB ({})",
+                    model.gain_reduction(id).unwrap_or(0.0),
+                    devices.join(" + ")
+                )
+            }
             Hit::Fold(id) => format!(
                 "{} {} · Drag a strip onto the folder to put it in",
                 if model.folder_open(id) { "Close" } else { "Open" },
@@ -2956,6 +3007,18 @@ impl CanvasView<Session, Action> for MixerView {
 
     fn paint(&mut self, p: &mut dyn Painter, size: Size, model: &Session, theme: &Theme) {
         self.follow_console(model);
+        // The gain reduction shown: up at once, back slowly.
+        let mut shown = std::mem::take(&mut self.reduction);
+        for t in Self::channel_tracks(model)
+            .into_iter()
+            .chain(model.project().master())
+        {
+            if let Some(now) = model.gain_reduction(t.id) {
+                let was = shown.get(&t.id).copied().unwrap_or(0.0);
+                self.reduction.insert(t.id, now.max(was * REDUCTION_FALL));
+            }
+        }
+        shown.clear();
         self.update_sends(model);
         self.update_strips(model);
         let tracks = Self::channel_tracks(model);

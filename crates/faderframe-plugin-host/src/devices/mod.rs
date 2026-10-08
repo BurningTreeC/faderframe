@@ -39,6 +39,21 @@ pub mod utility;
 use crate::{ParameterInfo, ParameterUnit};
 use faderframe_core::ParameterId;
 
+/// The published value that is a built-in's gain reduction now (dB,
+/// positive) — the ones that compress (not the gates: a closed gate is not
+/// compression) — for a mixer's gain-reduction meter.
+pub fn reduction_value(id: &str) -> Option<usize> {
+    use faderframe_core::builtin as b;
+    match id {
+        b::COMPRESSOR => Some(compressor::value::REDUCTION),
+        b::COMPRESSOR_76 => Some(fet76::value::GR),
+        b::LIMITER => Some(limiter::value::REDUCTION),
+        b::DEESSER => Some(deesser::value::REDUCTION),
+        b::CHANNEL_STRIP => Some(channel_strip::value::COMP_GR),
+        _ => None,
+    }
+}
+
 /// A parameter of a device.
 pub(crate) fn param(
     id: u32,
