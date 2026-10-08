@@ -204,9 +204,11 @@ long sessions), Neon and High Contrast:
   faders with a console fader law, segmented peak meters, routing menus,
   any number of sends per channel (rows grow, ◂ ▸ pages through banks),
   scribble strips, pinned master section; click a pan or level readout to
-  type a value. Console summing (Audio → Console): American, British 4K or
-  British 73 — the buses and the master sum through the console's bus
-  amplifier circuit (latency compensated), every channel through a light
+  type a value. Console summing (Audio → Console, or the master's input slot): American,
+  British 4K, British 73, Tube 610, British 47 or German 76 — the buses and
+  the master sum through the console's bus amplifier circuit (latency
+  compensated; each bus may follow the console, run through another
+  console's or stay in the box), every channel through a light
   model of its line amplifier matched to that circuit, a channel drive, and
   the mixer in the console's look (or your theme). The inserts section shows five slots by default; drag the
   grip on the rule below it for more or fewer (saved with the layout).

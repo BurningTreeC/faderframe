@@ -24,8 +24,13 @@ pub struct ConsoleModel {
     /// The high-pass (coupling and transformer): corner and Q; 0 = none.
     pub hp_hz: f64,
     pub hp_q: f64,
+    /// A first-order high-pass after it (a valve stage's further coupling);
+    /// 0 = none.
+    pub hp1_hz: f64,
     /// The low-pass (bandwidth); 0 = none.
     pub lp_hz: f64,
+    /// Its Q when second order (an LC filter's); 0 = first order.
+    pub lp_q: f64,
     /// A bell the response leaves after them: centre, gain (dB), Q.
     pub bell: (f64, f64, f64),
     /// A high shelf for the top octave: corner and gain (dB).
@@ -216,22 +221,94 @@ impl Biquad {
 /// A one-pole low-pass.
 #[derive(Clone, Copy, Debug, Default)]
 struct OnePole {
-    k: f64,
+    b: [f64; 2],
+    p: f64,
     z: f64,
 }
 
 impl OnePole {
+    /// An analog one-pole low-pass at `hz`, matched: the pole where the
+    /// analog one maps, the zero placed so the magnitude is the analog
+    /// one's at DC and at 0.4 of the rate (19.2 kHz at 48 kHz) — right up
+    /// to the top of the band, even for a corner above Nyquist (a valve
+    /// stage's roll-off near 30 kHz still takes a dB at 20 kHz).
     fn new(hz: f64, rate: f64) -> Self {
+        let w = std::f64::consts::TAU * hz / rate;
+        let p = (-w).exp();
+        let wm = 0.8 * std::f64::consts::PI;
+        // |H|² the analog has there, times the pole's |1 − p e^{−jw}|².
+        let target = 1.0 / (1.0 + (wm / w).powi(2)) * (1.0 - 2.0 * p * wm.cos() + p * p);
+        // b0 + b1 = 1 − p (unity at DC); b0² + b1² + 2 b0 b1 cos wm = target.
+        let sum = 1.0 - p;
+        let product = ((sum * sum - target) / (2.0 * (1.0 - wm.cos()))).min(sum * sum / 4.0);
+        let root = (sum * sum / 4.0 - product).max(0.0).sqrt();
         Self {
-            k: 1.0 - (-std::f64::consts::TAU * hz / rate).exp(),
+            b: [0.5 * sum + root, 0.5 * sum - root],
+            p,
             z: 0.0,
         }
     }
 
     #[inline]
     fn process(&mut self, x: f64) -> f64 {
-        self.z += self.k * (x - self.z);
-        self.z
+        // Transposed direct form: y = b0·x + z, z = b1·x + p·y.
+        let y = self.b[0] * x + self.z;
+        self.z = self.b[1] * x + self.p * y;
+        y
+    }
+}
+
+/// An analog second-order low-pass (`f0`, `q`), matched: the poles where
+/// the analog ones map (impulse invariance), the zeros so the magnitude is
+/// the analog one's at DC, at the corner (a quarter of the rate when the
+/// corner is near or above Nyquist) and at Nyquist (after
+/// Vicanek, "Matched Second Order Digital Filters", 2016) — right to the
+/// top of the band, corners above Nyquist included, where the bilinear
+/// transform would bend it.
+fn matched_low_pass(hz: f64, q: f64, rate: f64) -> Biquad {
+    let w0 = std::f64::consts::TAU * hz / rate;
+    let zeta = 0.5 / q.max(0.05);
+    let decay = (-zeta * w0).exp();
+    let a1 = if zeta <= 1.0 {
+        -2.0 * decay * ((1.0 - zeta * zeta).sqrt() * w0).cos()
+    } else {
+        -2.0 * decay * ((zeta * zeta - 1.0).sqrt() * w0).cosh()
+    };
+    let a2 = decay * decay;
+    // The analog magnitude squared at a frequency (Hz).
+    let analog = |f: f64| {
+        let x = f / hz;
+        1.0 / ((1.0 - x * x).powi(2) + (x / q).powi(2))
+    };
+    // What the numerator's magnitude squared must be there: the analog's
+    // times the denominator's.
+    let denominator = |w: f64| {
+        let (c, c2) = (w.cos(), (2.0 * w).cos());
+        let (sn, s2) = (w.sin(), (2.0 * w).sin());
+        (1.0 + a1 * c + a2 * c2).powi(2) + (a1 * sn + a2 * s2).powi(2)
+    };
+    let dc = analog(0.0) * denominator(0.0);
+    let nyquist = analog(rate / 2.0) * denominator(std::f64::consts::PI);
+    let wm = if w0 < 0.9 * std::f64::consts::PI {
+        w0
+    } else {
+        0.5 * std::f64::consts::PI
+    };
+    let middle = analog(wm * rate / std::f64::consts::TAU) * denominator(wm);
+    // B(z) = b0 + b1 z⁻¹ + b2 z⁻²: |B(1)| = p + b1, |B(−1)| = p − b1 with
+    // p = b0 + b2; with m = b0 − b2, |B|² at w is
+    // b1² + p² (1 + cos 2w) / 2 + 2 b1 p cos w + m² (1 − cos 2w) / 2.
+    let (r0, r1) = (dc.sqrt(), nyquist.sqrt());
+    let p = 0.5 * (r0 + r1);
+    let b1 = 0.5 * (r0 - r1);
+    let (c, c2) = (wm.cos(), (2.0 * wm).cos());
+    let m = (2.0 * (middle - b1 * b1 - 2.0 * b1 * p * c - 0.5 * p * p * (1.0 + c2)) / (1.0 - c2))
+        .max(0.0)
+        .sqrt();
+    Biquad {
+        b: [0.5 * (p + m), b1, 0.5 * (p - m)],
+        a: [a1, a2],
+        z: [0.0; 2],
     }
 }
 
@@ -289,6 +366,9 @@ pub struct ConsoleStage {
     bell: Biquad,
     shelf: Biquad,
     lp: Option<OnePole>,
+    lp2: Option<Biquad>,
+    /// The further high-pass, as the low-pass it takes away.
+    hp1: Option<OnePole>,
     /// The emphasis bands' gains per level (see [`ConsoleModel::bands`]).
     bands: [[f64; 4]; LEVEL_COUNT],
     /// The bands into the curve, undone after it, and the corrections
@@ -332,7 +412,12 @@ impl ConsoleStage {
         } else {
             Biquad::identity()
         };
-        let lp = (m.lp_hz > 0.0 && m.lp_hz < nyquist).then(|| OnePole::new(m.lp_hz, rate));
+        let second = m.lp_q > 0.0;
+        let lp = (m.lp_hz > 0.0 && m.lp_hz < 100.0 * rate && !second)
+            .then(|| OnePole::new(m.lp_hz, rate));
+        let lp2 = (m.lp_hz > 0.0 && m.lp_hz < 100.0 * rate && second)
+            .then(|| matched_low_pass(m.lp_hz, m.lp_q, rate));
+        let hp1 = (m.hp1_hz > 0.0).then(|| OnePole::new(m.hp1_hz, rate));
         let (fl, fh) = m.emphasis;
         let band = || {
             [
@@ -347,6 +432,8 @@ impl ConsoleStage {
             bell,
             shelf,
             lp,
+            lp2,
+            hp1,
             bands: std::array::from_fn(|i| std::array::from_fn(|k| f64::from(m.bands[i][k]))),
             pre: band(),
             undo: band(),
@@ -431,6 +518,14 @@ impl ConsoleStage {
             Some(lp) => lp.process(x),
             None => x,
         };
+        let x = match &mut self.lp2 {
+            Some(lp) => lp.process(x),
+            None => x,
+        };
+        let x = match &mut self.hp1 {
+            Some(hp) => x - hp.process(x),
+            None => x,
+        };
         let x = x * self.drive;
         let coming = self.input.follow(x.abs());
         if self.gains_in == 0 {
@@ -465,8 +560,11 @@ impl ConsoleStage {
         {
             b.s = 0.0;
         }
-        if let Some(lp) = &mut self.lp {
-            lp.z = 0.0;
+        for p in [&mut self.lp, &mut self.hp1].into_iter().flatten() {
+            p.z = 0.0;
+        }
+        if let Some(b) = &mut self.lp2 {
+            b.reset();
         }
         self.input.level = 0.0;
         self.level.level = 0.0;
@@ -479,6 +577,9 @@ impl ConsoleStage {
         self.hp.flush();
         self.bell.flush();
         self.shelf.flush();
+        if let Some(b) = &mut self.lp2 {
+            b.flush();
+        }
         for b in self
             .pre
             .iter_mut()
@@ -491,6 +592,56 @@ impl ConsoleStage {
         }
         if self.dc.1.abs() < 1e-20 {
             self.dc.1 = 0.0;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The matched low-pass keeps the analog magnitude up to near Nyquist
+    /// (where the bilinear transform would fall to nothing), corners above
+    /// Nyquist included.
+    #[test]
+    fn the_matched_low_pass_follows_the_analog_one() {
+        for rate in [44_100.0, 48_000.0, 96_000.0] {
+            for (f0, q) in [
+                (15_000.0, 0.8),
+                (22_000.0, 0.707),
+                (30_000.0, 1.0),
+                (8_000.0, 0.6),
+            ] {
+                let b = matched_low_pass(f0, q, rate);
+                for f in [100.0, 1_000.0, 5_000.0, 10_000.0, 16_000.0, 20_000.0] {
+                    let w = std::f64::consts::TAU * f / rate;
+                    let z = |k: f64| (k * w).cos();
+                    let s = |k: f64| (k * w).sin();
+                    let num = ((b.b[0] + b.b[1] * z(1.0) + b.b[2] * z(2.0)).powi(2)
+                        + (b.b[1] * s(1.0) + b.b[2] * s(2.0)).powi(2))
+                    .sqrt();
+                    let den = ((1.0 + b.a[0] * z(1.0) + b.a[1] * z(2.0)).powi(2)
+                        + (b.a[0] * s(1.0) + b.a[1] * s(2.0)).powi(2))
+                    .sqrt();
+                    let digital = 20.0 * (num / den).log10();
+                    let x = f / f0;
+                    let analog = -10.0 * ((1.0 - x * x).powi(2) + (x / q).powi(2)).log10();
+                    // Exact at DC, the corner and Nyquist; within 0.4 dB
+                    // to 0.8 of Nyquist, a dB or so in the last of it.
+                    // 0.4 dB or 8 % of the attenuation (0.6 for a corner
+                    // at Nyquist), 1.5 dB in the band's last fifth.
+                    let near = if f0 < 0.45 * rate { 0.4 } else { 0.6 };
+                    let limit = if f < 0.4 * rate {
+                        f64::max(near, 0.08 * analog.abs())
+                    } else {
+                        1.5
+                    };
+                    assert!(
+                        (digital - analog).abs() < limit,
+                        "{f0} Hz q {q} at {rate}: {f} Hz {digital:.2} vs {analog:.2} dB"
+                    );
+                }
+            }
         }
     }
 }

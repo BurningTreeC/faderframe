@@ -1,10 +1,10 @@
 //! How long each preamp circuit takes for a second of audio at 48 kHz
 //! (a full-scale 100 Hz sine; release build).
-use faderframe_circuit::preamp::Preamp;
+use faderframe_circuit::preamp::{Preamp, CONSOLE_BUSES, MODELS};
 use std::time::Instant;
 
 fn main() {
-    for model in 0..9 {
+    for model in 0..MODELS + CONSOLE_BUSES {
         let mut p = Preamp::new(model, 48_000.0, if model == 3 { 0.5 } else { 0.0 }, 0.0).unwrap();
         let t = Instant::now();
         let mut acc = 0.0;
@@ -17,7 +17,7 @@ fn main() {
             ms / 10.0
         );
     }
-    for f in 0..3 {
+    for f in 0..CONSOLE_BUSES {
         let mut s = faderframe_circuit::console::ConsoleStage::new(f, 6.0, 48_000.0);
         let t = Instant::now();
         let mut acc = 0.0;

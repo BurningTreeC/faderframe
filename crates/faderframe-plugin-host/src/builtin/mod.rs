@@ -50,7 +50,7 @@ enum Kind {
 }
 
 impl Kind {
-    const ALL: [Kind; 34] = [
+    const ALL: [Kind; 37] = [
         Kind::Preamp(0),
         Kind::Preamp(1),
         Kind::Preamp(2),
@@ -60,6 +60,9 @@ impl Kind {
         Kind::ConsoleBus(0),
         Kind::ConsoleBus(1),
         Kind::ConsoleBus(2),
+        Kind::ConsoleBus(3),
+        Kind::ConsoleBus(4),
+        Kind::ConsoleBus(5),
         Kind::Eq,
         Kind::ProgramEq,
         Kind::Limiter,

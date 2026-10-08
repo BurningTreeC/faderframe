@@ -28,12 +28,48 @@
 //! the API bus's 5 k feedback makes the op-amp's half and the 2503's 1:2
 //! give unity, as a program amplifier into that transformer would be
 //! strapped), the stability capacitors across the feedback, the loads.
+//!
+//! ## The valve consoles
+//!
+//! Valve desks summed passively — the channels through a resistive network
+//! at the system's impedance (50, 200 or 600 ohms), losing tens of dB — and
+//! made the loss up with a booster: an amplifier of the same kind as their
+//! microphone amplifiers, at a fixed gain. So the Tube 610 bus is the 610
+//! module itself (its Level at mid, into its UTC input from a 50 ohm
+//! network), the British 47's is the REDD.47 at its lowest gain (34 dB, the
+//! line amplifier of the desks it was built for, from 200 ohms), the German
+//! 76's is the V76 on its 34 dB step from 200 ohms, as broadcast desks used
+//! it to sum. The network's loss is not drawn: the level into the booster
+//! is set so the line carries +4 dBu at −18 dBFS, as for the others.
+//! Estimated: the gain positions (a booster's usual) and the network
+//! impedances.
 
-use crate::circuits::{american312, console_e, neve};
+use crate::circuits::{american312, british_47, console_e, german_76, neve, tube610};
 use crate::dsp::netlist::{Circuit, Fault, Netlist};
 
 /// The families, in catalogue order (persistent).
-pub const FAMILIES: [&str; 3] = ["American", "British 4K", "British 73"];
+pub const FAMILIES: [&str; 6] = [
+    "American",
+    "British 4K",
+    "British 73",
+    "Tube 610",
+    "British 47",
+    "German 76",
+];
+
+/// The gain control a valve family's booster is set to (`None`: the bus
+/// has no control).
+pub fn control(family: usize) -> Option<f64> {
+    match family {
+        // The Level pot at mid.
+        3 => Some(0.5),
+        // The first of three switch positions: 34 dB.
+        4 => Some(1.0 / 6.0),
+        // The fifth of twelve steps: 34 dB.
+        5 => Some(4.5 / 12.0),
+        _ => None,
+    }
+}
 
 /// The summing resistor: each channel's, and the one drawn for them all.
 const SUMMING: f64 = 10_000.0;
@@ -43,7 +79,10 @@ pub fn build(family: usize, load: f64) -> Result<Circuit, Fault> {
     match family {
         0 => american(load),
         1 => british_4k(load),
-        _ => british_73(load),
+        2 => british_73(load),
+        3 => tube610::build(50.0, load),
+        4 => british_47::build(200.0, load),
+        _ => german_76::build(200.0, load),
     }
 }
 

@@ -121,7 +121,7 @@ pub fn preamp_index(id: &str) -> Option<usize> {
 /// Console mix-bus amplifiers, the console summing's bus circuits (in
 /// `faderframe_circuit::circuits::console_bus::FAMILIES` order): the input
 /// stage of a bus or the master. IDs and order are persistent project data.
-pub const CONSOLE_BUSES: [(&str, &str, [u8; 3]); 3] = [
+pub const CONSOLE_BUSES: [(&str, &str, [u8; 3]); 6] = [
     (
         "faderframe.console-bus.american",
         "American Bus",
@@ -136,6 +136,21 @@ pub const CONSOLE_BUSES: [(&str, &str, [u8; 3]); 3] = [
         "faderframe.console-bus.british73",
         "British 73 Bus",
         [70, 92, 112],
+    ),
+    (
+        "faderframe.console-bus.tube610",
+        "Tube 610 Bus",
+        [92, 74, 58],
+    ),
+    (
+        "faderframe.console-bus.british47",
+        "British 47 Bus",
+        [96, 110, 100],
+    ),
+    (
+        "faderframe.console-bus.german76",
+        "German 76 Bus",
+        [150, 152, 146],
     ),
 ];
 

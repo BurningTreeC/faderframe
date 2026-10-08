@@ -10,10 +10,24 @@ use serde::{Deserialize, Serialize};
 
 /// The families, in `faderframe_core::builtin::CONSOLE_BUSES` order (stable:
 /// it is project data).
-pub const FAMILIES: [&str; 3] = ["American", "British 4K", "British 73"];
+pub const FAMILIES: [&str; 6] = [
+    "American",
+    "British 4K",
+    "British 73",
+    "Tube 610",
+    "British 47",
+    "German 76",
+];
 
 /// The families' ids (menus, scripts), in [`FAMILIES`] order.
-pub const IDS: [&str; 3] = ["american", "british-4k", "british-73"];
+pub const IDS: [&str; 6] = [
+    "american",
+    "british-4k",
+    "british-73",
+    "tube-610",
+    "british-47",
+    "german-76",
+];
 
 /// The family with id `id`.
 pub fn family_of(id: &str) -> Option<u8> {

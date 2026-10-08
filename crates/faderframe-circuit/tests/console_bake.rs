@@ -25,8 +25,6 @@ const WINDOW: usize = 9600;
 /// How long a tone runs before the window: the British 73's bias servo
 /// and coupling settle over more than a fifth of a second.
 const SETTLE: usize = 3 * WINDOW;
-/// Where the stage's emphasis bands turn (Hz).
-const EMPHASIS: (f64, f64) = (150.0, 3000.0);
 
 /// The family's bus circuit at its calibration, the drive at 0 dB.
 fn bus(family: usize) -> Preamp {
@@ -60,11 +58,54 @@ fn hp_db(f: f64, fc: f64, q: f64) -> f64 {
     20.0 * (x * x / ((1.0 - x * x).powi(2) + (x / q).powi(2)).sqrt()).log10()
 }
 
-fn lp_db(f: f64, fc: f64) -> f64 {
+/// A low-pass: first order (`q` 0) or second (an LC filter's).
+fn lp_db(f: f64, fc: f64, q: f64) -> f64 {
     if fc <= 0.0 {
         return 0.0;
     }
-    -10.0 * (1.0 + (f / fc).powi(2)).log10()
+    let x = f / fc;
+    if q <= 0.0 {
+        -10.0 * (1.0 + x * x).log10()
+    } else {
+        -10.0 * ((1.0 - x * x).powi(2) + (x / q).powi(2)).log10()
+    }
+}
+
+/// A first-order high-pass.
+fn hp1_db(f: f64, fc: f64) -> f64 {
+    if fc <= 0.0 {
+        return 0.0;
+    }
+    let x = f / fc;
+    10.0 * (x * x / (1.0 + x * x)).log10()
+}
+
+/// Band gains per level (low in, high in, low after, high after).
+type Bands = [[f64; 4]; LEVEL_COUNT];
+
+/// The response model's parameters.
+#[derive(Clone, Copy)]
+struct Response {
+    hp: f64,
+    hp_q: f64,
+    hp1: f64,
+    lp: f64,
+    lp_q: f64,
+    shelf: (f64, f64),
+}
+
+/// The stage's DC blocker at the end (5 Hz, first order): part of what
+/// the fitted response must leave room for.
+const DC_BLOCKER: f64 = 5.0;
+
+impl Response {
+    fn db(&self, f: f64) -> f64 {
+        hp1_db(f, DC_BLOCKER)
+            + hp_db(f, self.hp, self.hp_q)
+            + hp1_db(f, self.hp1)
+            + lp_db(f, self.lp, self.lp_q)
+            + shelf_db(f, self.shelf.0, self.shelf.1)
+    }
 }
 
 /// A first-order high shelf's magnitude (dB) at `f`: `db` above `fc`.
@@ -90,52 +131,76 @@ fn bake(family: usize) -> String {
         .iter()
         .map(|&f| (f, gain(family, f) - reference))
         .collect();
-    let err = |fh: f64, q: f64, fl: f64, sh: (f64, f64)| -> f64 {
+    let err = |r: &Response| -> f64 {
         resp.iter()
-            .filter(|(f, _)| *f <= 300.0 || *f >= 2000.0)
-            .map(|(f, db)| {
-                (db - hp_db(*f, fh, q) - lp_db(*f, fl) - shelf_db(*f, sh.0, sh.1)).powi(2)
-            })
+            .filter(|(f, _)| (20.0..=300.0).contains(f) || *f >= 2000.0)
+            .map(|(f, db)| (db - r.db(*f)).powi(2))
             .sum()
     };
-    let none = (10_000.0, 0.0);
-    let mut best = (0.0, 0.707, 0.0, err(0.0, 0.707, 0.0, none));
-    for q in [0.5, 0.707, 1.0] {
-        for fh in std::iter::once(0.0).chain(grid(0.5, 80.0, 120)) {
-            let e = err(fh, q, 0.0, none);
-            if e < best.3 {
-                best = (fh, q, 0.0, e);
+    let mut r = Response {
+        hp: 0.0,
+        hp_q: 0.707,
+        hp1: 0.0,
+        lp: 0.0,
+        lp_q: 0.0,
+        shelf: (10_000.0, 0.0),
+    };
+    let mut best = err(&r);
+    // The lows: a second-order high-pass and a further first-order one.
+    let start = r;
+    for hp_q in [0.5, 0.6, 0.707, 0.8, 0.9, 1.0, 1.1, 1.2, 1.35, 1.5] {
+        for hp in std::iter::once(0.0).chain(grid(0.5, 80.0, 80)) {
+            for hp1 in std::iter::once(0.0).chain(grid(0.5, 80.0, 40)) {
+                let c = Response {
+                    hp,
+                    hp_q,
+                    hp1,
+                    ..start
+                };
+                let e = err(&c);
+                if e < best {
+                    (r, best) = (c, e);
+                }
             }
         }
     }
-    for fl in grid(4000.0, 400_000.0, 160) {
-        let e = err(best.0, best.1, fl, none);
-        if e < best.3 {
-            best = (best.0, best.1, fl, e);
+    // The top: first order, or second (an LC filter's).
+    let lows = r;
+    for lp_q in [0.0, 0.5, 0.6, 0.707, 0.8, 0.9, 1.0, 1.2] {
+        for lp in grid(4000.0, 400_000.0, 160) {
+            let c = Response { lp, lp_q, ..lows };
+            let e = err(&c);
+            if e < best {
+                (r, best) = (c, e);
+            }
         }
     }
     // A rise in the top octave (the British 73's iron and C26): a shelf.
-    let mut shelf = (none, best.3);
+    let top = r;
     for fc in grid(4000.0, 16_000.0, 50) {
         for tenth in -30..=30 {
-            let sh = (fc, f64::from(tenth) * 0.1);
-            let e = err(best.0, best.1, best.2, sh);
-            if e < shelf.1 {
-                shelf = (sh, e);
+            let c = Response {
+                shelf: (fc, f64::from(tenth) * 0.1),
+                ..top
+            };
+            let e = err(&c);
+            if e < best {
+                (r, best) = (c, e);
             }
         }
     }
-    let (hp_hz, hp_q, lp_hz, _) = best;
-    let shelf = shelf.0;
+    let Response {
+        hp: hp_hz,
+        hp_q,
+        hp1: hp1_hz,
+        lp: lp_hz,
+        lp_q,
+        shelf,
+    } = r;
     let residual = resp
         .iter()
         .filter(|(f, _)| (50.0..=10_000.0).contains(f))
-        .map(|(f, db)| {
-            (
-                *f,
-                db - hp_db(*f, hp_hz, hp_q) - lp_db(*f, lp_hz) - shelf_db(*f, shelf.0, shelf.1),
-            )
-        })
+        .map(|(f, db)| (*f, db - r.db(*f)))
         .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
         .unwrap_or((1000.0, 0.0));
     let bell = if residual.1.abs() > 0.2 {
@@ -195,16 +260,81 @@ fn bake(family: usize) -> String {
             std::array::from_fn(|k| tables[l][k] as f32)
         })));
     const UNITY: [[f32; 4]; LEVEL_COUNT] = [[1.0; 4]; LEVEL_COUNT];
-    let model = ConsoleModel {
+    // The top of the band as the stage plays it here (its digital
+    // low-pass leaves a few tenths of a dB near Nyquist): the corner (and a
+    // second order's Q) nudged so 10 to 20 kHz land on the circuit's.
+    let (lp_hz, lp_q) = if lp_hz > 0.0 {
+        let small = 10f64.powf(-30.0 / 20.0);
+        let played = |lp: f64, lq: f64, hz: f64| {
+            let m = ConsoleModel {
+                name: FAMILIES[family],
+                hp_hz,
+                hp_q,
+                hp1_hz,
+                lp_hz: lp,
+                lp_q: lq,
+                bell,
+                shelf,
+                emphasis: (150.0, 3000.0),
+                bands: &UNITY,
+                tables: leaked,
+            };
+            let mut st = ConsoleStage::with_model(m, 0.0, RATE);
+            let tone = Tone::near(RATE, WINDOW, hz, small);
+            run(tone, SETTLE, |x| st.process(x)).gain_db()
+        };
+        let top: Vec<(f64, f64)> = resp
+            .iter()
+            .filter(|(f, _)| *f >= 10_000.0)
+            .copied()
+            .collect();
+        let qs: Vec<f64> = if lp_q > 0.0 {
+            (-3..=3)
+                .map(|k| (lp_q + 0.08 * f64::from(k)).max(0.4))
+                .collect()
+        } else {
+            vec![0.0]
+        };
+        qs.iter()
+            .flat_map(|&lq| grid(0.8 * lp_hz, 1.25 * lp_hz, 24).map(move |lp| (lp, lq)))
+            .map(|(lp, lq)| {
+                let at_1k = played(lp, lq, 1000.0);
+                let e: f64 = top
+                    .iter()
+                    .map(|(f, db)| (played(lp, lq, *f) - at_1k - db).powi(2))
+                    .sum();
+                ((lp, lq), e)
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map_or((lp_hz, lp_q), |(p, _)| p)
+    } else {
+        (lp_hz, lp_q)
+    };
+    let model_at = |emphasis: (f64, f64)| ConsoleModel {
         name: FAMILIES[family],
         hp_hz,
         hp_q,
+        hp1_hz,
         lp_hz,
+        lp_q,
         bell,
         shelf,
-        emphasis: EMPHASIS,
+        emphasis,
         bands: &UNITY,
         tables: leaked,
+    };
+    let circuit_at = |hz: f64, a: f64| {
+        let mut p = bus(family);
+        let tone = Tone::near(RATE, WINDOW, hz, a);
+        let c = run(tone, SETTLE, |x| p.process(x));
+        (c.gain_db(), c.thd_percent())
+    };
+    let stage_at = |m: ConsoleModel, bands: &[[f64; 4]; LEVEL_COUNT], hz: f64, a: f64| {
+        let mut st = ConsoleStage::with_model(m, 0.0, RATE);
+        st.set_bands(bands);
+        let tone = Tone::near(RATE, WINDOW, hz, a);
+        let m = run(tone, SETTLE, |x| st.process(x));
+        (m.gain_db(), m.thd_percent())
     };
     // The bands, level by level: the gain into the curve so the stage's
     // distortion at 60 Hz (the low band) and 5 kHz (the high band) is the
@@ -214,69 +344,112 @@ fn bake(family: usize) -> String {
     // other levels take the nearest fitted level's way in, uncorrected —
     // a circuit's distortion at levels where its curve is straight (the
     // British 73's slew at 5 kHz) is not the curve's to make.
-    let stage = |bands: &[[f64; 4]; LEVEL_COUNT], hz: f64, a: f64| {
-        let mut st = ConsoleStage::with_model(model, 0.0, RATE);
-        st.set_bands(bands);
-        let tone = Tone::near(RATE, WINDOW, hz, a);
-        let m = run(tone, SETTLE, |x| st.process(x));
-        (m.gain_db(), m.thd_percent())
-    };
-    let mut bands = [[1.0f64; 4]; LEVEL_COUNT];
-    for (band, hz) in [(0usize, 60.0), (1, 5000.0)] {
-        let mut fitted = [false; LEVEL_COUNT];
-        for i in 0..LEVEL_COUNT {
-            let a = LEVELS[i];
-            let mut p = bus(family);
-            let tone = Tone::near(RATE, WINDOW, hz, a);
-            let c = run(tone, SETTLE, |x| p.process(x));
-            let (cg, ct) = (c.gain_db(), c.thd_percent());
-            if ct < 0.1 {
-                continue;
+    let targets: Vec<Vec<(f64, f64)>> = [60.0, 5000.0]
+        .iter()
+        .map(|&hz| LEVELS.iter().map(|&a| circuit_at(hz, a)).collect())
+        .collect();
+    let fit = |emphasis: (f64, f64)| -> [[f64; 4]; LEVEL_COUNT] {
+        let model = model_at(emphasis);
+        let stage =
+            |bands: &[[f64; 4]; LEVEL_COUNT], hz: f64, a: f64| stage_at(model, bands, hz, a);
+        let mut bands = [[1.0f64; 4]; LEVEL_COUNT];
+        for (band, hz) in [(0usize, 60.0), (1, 5000.0)] {
+            let mut fitted = [false; LEVEL_COUNT];
+            for i in 0..LEVEL_COUNT {
+                let a = LEVELS[i];
+                let (cg, ct) = targets[band][i];
+                if ct < 0.2 {
+                    continue;
+                }
+                let set = |bands: &mut [[f64; 4]; LEVEL_COUNT], db: f64| {
+                    bands[i][band] = 10f64.powf(db / 20.0);
+                    bands[i][band + 2] = 1.0;
+                };
+                let (mut lo, mut hi) = (-12.0, 12.0);
+                for _ in 0..12 {
+                    let mid = 0.5 * (lo + hi);
+                    set(&mut bands, mid);
+                    if stage(&bands, hz, a).1 < ct {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                let db = 0.5 * (lo + hi);
+                if db.abs() > 11.9 {
+                    set(&mut bands, 0.0);
+                    continue;
+                }
+                set(&mut bands, db);
+                for _ in 0..4 {
+                    let sg = stage(&bands, hz, a).0;
+                    bands[i][band + 2] *= 10f64.powf((cg - sg) / 20.0);
+                }
+                fitted[i] = true;
             }
-            let set = |bands: &mut [[f64; 4]; LEVEL_COUNT], db: f64| {
-                bands[i][band] = 10f64.powf(db / 20.0);
-                bands[i][band + 2] = 1.0;
-            };
-            let (mut lo, mut hi) = (-6.0, 6.0);
-            for _ in 0..12 {
-                let mid = 0.5 * (lo + hi);
-                set(&mut bands, mid);
-                if stage(&bands, hz, a).1 < ct {
-                    lo = mid;
-                } else {
-                    hi = mid;
+            // Unfitted levels take the nearest fitted level's way in.
+            for i in 0..LEVEL_COUNT {
+                if !fitted[i] {
+                    let near = (0..LEVEL_COUNT)
+                        .filter(|j| fitted[*j])
+                        .min_by_key(|j| j.abs_diff(i));
+                    bands[i][band] = near.map_or(1.0, |j| bands[j][band]);
+                    bands[i][band + 2] = 1.0;
                 }
             }
-            let db = 0.5 * (lo + hi);
-            if db.abs() > 5.9 {
-                set(&mut bands, 0.0);
-                continue;
-            }
-            set(&mut bands, db);
-            for _ in 0..4 {
-                let sg = stage(&bands, hz, a).0;
-                bands[i][band + 2] *= 10f64.powf((cg - sg) / 20.0);
-            }
-            fitted[i] = true;
         }
-        // Unfitted levels take the nearest fitted level's way in.
-        for i in 0..LEVEL_COUNT {
-            if !fitted[i] {
-                let near = (0..LEVEL_COUNT)
-                    .filter(|j| fitted[*j])
-                    .min_by_key(|j| j.abs_diff(i));
-                bands[i][band] = near.map_or(1.0, |j| bands[j][band]);
-                bands[i][band + 2] = 1.0;
+        bands
+    };
+    // Where the bands turn: each family's own, the pair whose fit lands
+    // the stage nearest the circuit between the bands' own frequencies too
+    // (a transformer makes the lows differ only below 100 Hz on the valve
+    // consoles; the British 73's class A from higher up).
+    let checks: Vec<(f64, f64)> = [60.0, 200.0, 1000.0, 5000.0]
+        .iter()
+        .flat_map(|&hz| [-3.0, 0.0, 3.0, 6.0].map(|db| (hz, db)))
+        .collect();
+    let check_targets: Vec<(f64, f64)> = checks
+        .iter()
+        .map(|&(hz, db)| circuit_at(hz, 10f64.powf(db / 20.0)))
+        .collect();
+    let cost = |emphasis: (f64, f64), bands: &[[f64; 4]; LEVEL_COUNT]| -> f64 {
+        checks
+            .iter()
+            .zip(&check_targets)
+            .filter(|(_, (_, ct))| *ct < 20.0)
+            .map(|(&(hz, db), &(cg, ct))| {
+                let (sg, st) = stage_at(model_at(emphasis), bands, hz, 10f64.powf(db / 20.0));
+                let thd = if ct > 0.05 {
+                    (st.max(1e-6) / ct).ln().powi(2)
+                } else {
+                    0.0
+                };
+                thd + ((sg - cg) / 0.3).powi(2) * 0.25
+            })
+            .sum()
+    };
+    let mut best: Option<(f64, (f64, f64), Bands)> = None;
+    for fl in [60.0, 90.0, 150.0] {
+        for fh in [2000.0, 3000.0, 5000.0] {
+            let b = fit((fl, fh));
+            let c = cost((fl, fh), &b);
+            if best.as_ref().is_none_or(|(bc, _, _)| c < *bc) {
+                best = Some((c, (fl, fh), b));
             }
         }
     }
+    let Some((_, emphasis, bands)) = best else {
+        unreachable!("nine pairs tried")
+    };
     eprintln!(
-        "{}: hp {hp_hz:.2} Hz q {hp_q}, lp {lp_hz:.0} Hz, bell {:.0} Hz {:+.2} dB, shelf {:.0} Hz {:+.1} dB, table ends {:.3} / {:.3}",
+        "{}: hp {hp_hz:.2} Hz q {hp_q} + {hp1_hz:.2} Hz, lp {lp_hz:.0} Hz q {lp_q}, bell {:.0} Hz {:+.2} dB, shelf {:.0} Hz {:+.1} dB, bands at {:.0} / {:.0} Hz, table ends {:.3} / {:.3}",
         FAMILIES[family],
         bell.0,
         bell.1,
         shelf.0,
         shelf.1,
+        emphasis.0,
+        emphasis.1,
         table[0],
         table[TABLE_POINTS - 1]
     );
@@ -324,20 +497,22 @@ fn bake(family: usize) -> String {
         })
         .collect();
     format!(
-        "const {name}: [[f32; TABLE_POINTS]; LEVEL_COUNT] = [\n{}\n];\n\nconst {name}_BANDS: [[f32; 4]; LEVEL_COUNT] = [\n{}\n];\n\n@@ConsoleModel {{ name: \"{}\", hp_hz: {}, hp_q: {}, lp_hz: {}, bell: ({}, {}, {}), shelf: ({}, {}), emphasis: ({}, {}), bands: &{name}_BANDS, tables: &{name} }},\n",
+        "const {name}: [[f32; TABLE_POINTS]; LEVEL_COUNT] = [\n{}\n];\n\nconst {name}_BANDS: [[f32; 4]; LEVEL_COUNT] = [\n{}\n];\n\n@@ConsoleModel {{ name: \"{}\", hp_hz: {}, hp_q: {}, hp1_hz: {}, lp_hz: {}, lp_q: {}, bell: ({}, {}, {}), shelf: ({}, {}), emphasis: ({}, {}), bands: &{name}_BANDS, tables: &{name} }},\n",
         blocks.join("\n"),
         band_rows.join("\n"),
         FAMILIES[family],
         f(hp_hz),
         f(hp_q),
+        f(hp1_hz),
         f(lp_hz),
+        f(lp_q),
         f(bell.0),
         f(bell.1),
         f(bell.2),
         f(shelf.0),
         f(shelf.1),
-        f(EMPHASIS.0),
-        f(EMPHASIS.1),
+        f(emphasis.0),
+        f(emphasis.1),
     )
 }
 
@@ -356,7 +531,7 @@ fn bake_console_models() {
         "// Generated by `FADERFRAME_BAKE_CONSOLE=1 cargo test -p faderframe-circuit\n// --release --test console_bake -- --ignored`: each family measured on its\n// console bus circuit at its calibration. Do not edit.\n\n",
     );
     let mut models = String::from(
-        "/// The channels' console models, in the families' order.\npub const MODELS: [ConsoleModel; 3] = [\n",
+        "/// The channels' console models, in the families' order.\npub const MODELS: [ConsoleModel; 6] = [\n",
     );
     for p in &parts {
         let (table, model) = p.split_once("@@").unwrap_or((p.as_str(), ""));

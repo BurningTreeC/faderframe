@@ -721,6 +721,81 @@ fn family(f: usize) -> Family {
                 flat: false,
             },
         },
+        // Taupe and Bakelite: warm plates, dark brown knobs with printed
+        // scales, mahogany cheeks, a plasma column.
+        3 => Family {
+            panel: (0x6e675c, 0x575148),
+            master_panel: (0x4a3628, 0x35261c),
+            label: 0xf4ecd8,
+            knob: [0x1a120d, 0x3a2a20, 0x5a3e2c, 0x2e2018, 0xeee2c4, 0x140e0a],
+            caps: [0x4a3424, 0x8a6a48, 0x8e3a28],
+            faders: [0xece2cc, 0x7a5a3c, 0x5e7058, 0x8e3a28],
+            scribble: (0xf0e6cc, 0x2a1f14),
+            well: 0x16110c,
+            // Mahogany.
+            wood: (0x7a3b26, 0x3f1c12),
+            look: ConsoleLook {
+                knob_skirt: Some(c(0x2c2620)),
+                knob_ring: false,
+                sheen: 0.3,
+                brushed: 0.0,
+                screws: true,
+                wood: Some((c(0x7a3b26), c(0x3f1c12))),
+                meter: MeterKind::Plasma,
+                engrave: Color::rgba(0.0, 0.0, 0.0, 0.6),
+                flat: false,
+            },
+        },
+        // Hammertone green-grey: textured plates, black knobs, oak cheeks
+        // with the skin's, an LED ladder.
+        4 => Family {
+            panel: (0x55605a, 0x434c47),
+            master_panel: (0x3f4843, 0x2f3632),
+            label: 0xeef1ea,
+            knob: [0x121413, 0x2e3330, 0x343936, 0x161917, 0xe8ecdf, 0x0f1110],
+            caps: [0x2e3330, 0x7d8a72, 0x8a3a30],
+            faders: [0xe4e8dc, 0x5e7a68, 0x6a7f86, 0x8a3a30],
+            scribble: (0xeef0e4, 0x1c211e),
+            well: 0x101211,
+            // Oak.
+            wood: (0x9a7444, 0x5a4022),
+            look: ConsoleLook {
+                knob_skirt: None,
+                knob_ring: false,
+                sheen: 0.2,
+                brushed: 0.35,
+                screws: true,
+                wood: None,
+                meter: MeterKind::Ladder,
+                engrave: Color::rgba(0.0, 0.0, 0.0, 0.55),
+                flat: false,
+            },
+        },
+        // Light enamel grey: broadcast-plain plates, dark legends, black
+        // knobs, beech cheeks with the skin's, a bar.
+        5 => Family {
+            panel: (0x9ea19b, 0x878a84),
+            master_panel: (0x7c7f7a, 0x666964),
+            label: 0x171816,
+            knob: [0x0f1010, 0x2a2c2b, 0x2e302f, 0x121313, 0xf0f0ea, 0x0c0d0d],
+            caps: [0x2e302f, 0x5d6a74, 0x9a3a2c],
+            faders: [0x242625, 0x4f6878, 0x5d7a5e, 0x9a3a2c],
+            scribble: (0xf4f4ee, 0x1a1b19),
+            well: 0x1a1b1a,
+            // Beech.
+            wood: (0xb98b5c, 0x7a5636),
+            look: ConsoleLook {
+                knob_skirt: None,
+                knob_ring: false,
+                sheen: 0.45,
+                brushed: 0.0,
+                screws: true,
+                wood: None,
+                meter: MeterKind::Bar,
+                engrave: Color::rgba(1.0, 1.0, 1.0, 0.25),
+                flat: false,
+            },
+        },
         // Pewter and walnut: warm grey-green plates, printed knob scales,
         // wooden cheeks, moving coil meters.
         _ => Family {
@@ -823,7 +898,7 @@ mod tests {
         // The console looks change the console section only, each its
         // own, its labels readable on its panels.
         let base = Theme::studio();
-        for f in 0..3 {
+        for f in 0..6 {
             let t = base.with_console_family(f);
             assert_eq!(t.ui.text, base.ui.text);
             assert_ne!(t.console.panel_top, base.console.panel_top);

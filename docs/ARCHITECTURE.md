@@ -3363,10 +3363,17 @@ stereo transitions, tails, and resets.
 `Project::console` (`faderframe_project::console`: family, channel drive,
 whether the mixer takes the console's look; `Command::{SetConsole,
 SetConsoleDrive, SetConsoleLook}`) runs the mix through a console's
-circuits: American (a 2520-style virtual earth into the 2503 output
-transformer), British 4K (two 5534 stages) and British 73 (the 73's class-A
-line amplifier into its transformer), all in `circuits::console_bus`,
-calibrated so −18 dBFS is +4 dBu at the line.
+circuits, one family for each preamp: American (a 2520-style virtual earth
+into the 2503 output transformer), British 4K (two 5534 stages), British 73
+(the 73's class-A line amplifier into its transformer), and the valve desks,
+which summed passively and made the loss up with a booster of their own kind
+at a fixed gain — Tube 610 (the 610 module, Level at mid), British 47 (the
+REDD.47 at 34 dB) and German 76 (the V76 on its 34 dB step, with its 40 Hz
+high-pass and 15 kHz low-pass) — all in `circuits::console_bus`
+(`control(family)` = the booster's gain position), calibrated so −18 dBFS is
++4 dBu at the line (the small-signal gain measured at a millivolt). The bus
+circuits cost 4–8 % of a core per channel (solid state) and 16–34 % (valves,
+the German 76 the most) on a hot signal.
 
 * **Buses, returns and the master** sum through the circuit itself: a
   built-in device in their input stage (`builtin::CONSOLE_BUSES`, preamp
@@ -3394,7 +3401,10 @@ calibrated so −18 dBFS is +4 dBu at the line.
 
 The model is baked from the bus circuits (`tests/console_bake.rs`, run with
 `FADERFRAME_BAKE_CONSOLE=1 … --ignored`): the small-signal response as a
-high-pass, low-pass, bell and shelf; transfer curves at 25 levels from −24
+high-pass (second order and a further first), low-pass (first order or an
+LC's second, matched to the analog magnitude up to Nyquist, its corner and
+Q nudged on the digital stage at 48 kHz), bell and shelf, the stage's 5 Hz
+DC blocker allowed for; transfer curves at 25 levels from −24
 to +12 dBFS, each relative to its level (an AC-coupled class-A stage moves
 its operating point so it clips near the peak at any level; relative to the
 level, neighbouring curves keep their knees together, so mixing them moves
@@ -3402,17 +3412,23 @@ the knee instead of making two), chosen by a peak follower with a 25 ms
 hold; and per-level emphasis bands (a low and a high one-pole band, the
 gain into the curve undone exactly after it, then a correction) where the
 circuit's distortion and compression depend on the frequency differently
-at different levels. `tests/console_match.rs` holds it to the circuit at
+at different levels, their corners each family's own (chosen from nine
+pairs against checks at 60 Hz, 200 Hz, 1 kHz and 5 kHz). `tests/console_match.rs` holds it to the circuit at
 60 Hz, 1 kHz and 5 kHz from the nominal level to +6 dBFS (distortion within
 35 % or within what the circuit has a quarter of a dB either side, gain and
-response within 0.3 dB, distortion rising with the level). Not modelled: the
+response within 0.3 dB, distortion rising with the level; the gain not
+judged past 20 % THD). The valve families' feedback makes their distortion
+depend on the frequency more than the model follows: within a factor of
+2.5 or 0.1 %, and their response within 0.4 dB at 20 kHz. Not modelled: the
 British 73's slew distortion at 5 kHz where its curve is still straight
 (about −60 dB).
 
 The mixer takes the family's look (`Theme::with_console_family`: panels,
 knobs, faders, meters and finish of the console section, in FaderFrame's
 own design — graphite and brass, slate with colour-coded caps, pewter and
-walnut) unless the look is turned off; Audio → Console and the master
+teak, taupe and Bakelite with mahogany, hammertone with oak, light enamel
+grey with beech; a skin with wooden cheeks keeps them in the family's wood)
+unless the look is turned off; Audio → Console and the master
 strip's menu switch it all. Tests: `session/tests/console.rs` (one step,
 latency to the sample, level kept, colour when driven, families keep the
 bus settings), `the_console_does_not_allocate`, the mixer's

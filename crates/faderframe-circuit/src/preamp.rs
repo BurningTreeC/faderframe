@@ -140,15 +140,30 @@ impl Preamp {
     /// −18 dBFS leaves the bus's line at +4 dBu, the drive putting more in
     /// and taking it off after.
     fn console_bus(family: usize, rate: f64, drive: f64, master_db: f64) -> Result<Self, Fault> {
-        let net = console_bus::build(family.min(CONSOLE_BUSES - 1), 10_000.0)?;
+        let family = family.min(CONSOLE_BUSES - 1);
+        let net = console_bus::build(family, 10_000.0)?;
         let inner = rate.max(1.0) * OVERSAMPLING as f64;
         let mut circuit = Simulation::new(net, inner);
+        if let Some(c) = console_bus::control(family) {
+            circuit.set_control(0, c);
+        }
         circuit.reset();
-        // The gain at 1 kHz, a little under a volt in: the bus at rest.
-        let tone = crate::dsp::measure::Tone::near(inner, 1920, 1000.0, 0.1);
-        let m = crate::dsp::measure::run(tone, 9600, |x| circuit.process(x));
-        let f = m.fundamental();
-        let gain = f.magnitude() / tone.amplitude;
+        // The gain at 1 kHz at a small level (a valve booster's 34 dB and
+        // more turn a tenth of a volt in into its nonlinear range): a
+        // millivolt, less if that comes out over 0.3 V.
+        let mut amplitude = 1e-3;
+        let (mut gain, mut f) = (1.0, crate::dsp::complex::C::ZERO);
+        for _ in 0..2 {
+            circuit.reset();
+            let tone = crate::dsp::measure::Tone::near(inner, 1920, 1000.0, amplitude);
+            let m = crate::dsp::measure::run(tone, 9600, |x| circuit.process(x));
+            f = m.fundamental();
+            gain = f.magnitude() / tone.amplitude;
+            if gain * amplitude <= 0.3 {
+                break;
+            }
+            amplitude = 0.1 / gain.max(1e-9);
+        }
         // Its polarity: the window starts on a whole number of periods, so
         // the input's own bin is (0, −A); in phase the output's is too.
         let sign = if f.im <= 0.0 { 1.0 } else { -1.0 };
