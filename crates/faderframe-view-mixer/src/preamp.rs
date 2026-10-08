@@ -25,10 +25,13 @@ pub(super) struct Face {
 pub(super) fn face(slot: &PluginSlot) -> Face {
     if let Some(i) = console_bus_index(&slot.plugin.id) {
         let (_, name, rgb) = CONSOLE_BUSES[i];
+        // Dark ink on a light plate (the German 76's enamel grey).
+        let luma =
+            0.2126 * f32::from(rgb[0]) + 0.7152 * f32::from(rgb[1]) + 0.0722 * f32::from(rgb[2]);
         return Face {
             name,
             rgb,
-            light: false,
+            light: luma > 128.0,
             labels: ["Drive", "Output"],
             ranges: [(-12.0, 12.0, 0.0), (-24.0, 12.0, 0.0)],
             percent: false,
