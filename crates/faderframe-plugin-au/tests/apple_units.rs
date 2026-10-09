@@ -378,7 +378,10 @@ fn the_dynamics_processor_reports_its_gain_reduction() {
     let threshold = param(&*inst, "threshold");
     inst.set_parameter(threshold, -40.0).unwrap();
     let mut p = inst.create_processor(&CONFIG).unwrap();
-    let cell = inst.reduction().expect("a compression meter");
+    let cell = inst.reduction().unwrap_or_else(|| {
+        let names: Vec<&str> = inst.parameters().iter().map(|p| p.name.as_str()).collect();
+        panic!("a compression meter (controls: {names:?})")
+    });
     let mut rig = Rig::new();
     rig.input(|i| 0.5 * (i as f32 * 0.05).sin());
     for _ in 0..40 {

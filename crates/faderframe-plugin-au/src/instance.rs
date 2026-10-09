@@ -288,7 +288,14 @@ impl AuInstance {
             ids.truncate(size as usize / 4);
             ids
         };
-        for id in ids {
+        // Meters a unit leaves out of its list (Apple's dynamics units keep
+        // theirs from id 1000 on), asked for by id.
+        let probe: Vec<u32> = (1000..1004).filter(|i| !ids.contains(i)).collect();
+        for id in ids.iter().copied().chain(probe.iter().copied()) {
+            let probed = probe.contains(&id);
+            if probed && self.meter.is_some() {
+                break;
+            }
             // SAFETY: an all-zero AudioUnitParameterInfo is valid (null
             // strings); the element of ParameterInfo is the parameter id.
             let zero: AudioUnitParameterInfo = unsafe { std::mem::zeroed() };
@@ -300,35 +307,16 @@ impl AuInstance {
             ) else {
                 continue;
             };
-            let has_cf = info.flags & kAudioUnitParameterFlag_HasCFNameString != 0;
-            let name = if has_cf && !info.cfNameString.is_null() {
-                cf_string(info.cfNameString)
-            } else {
-                // SAFETY: a NUL-terminated C string within the array.
-                let raw = unsafe { CStr::from_ptr(info.name.as_ptr()) };
-                raw.to_string_lossy().into_owned()
-            };
-            if info.flags & kAudioUnitParameterFlag_CFNameRelease != 0 {
-                if has_cf {
-                    release(info.cfNameString);
-                }
-                if info.unit == kAudioUnitParameterUnit_CustomUnit {
-                    release(info.unitName);
-                }
-            }
-            if info.flags & kAudioUnitParameterFlag_IsWritable == 0 {
+            let name = info_name(&info);
+            if is_meter(&info) {
                 // Meters; a gain-reduction one reaches the mixer's.
-                if (info.flags & kAudioUnitParameterFlag_MeterReadOnly != 0
-                    || info.flags & kAudioUnitParameterFlag_IsReadable != 0)
-                    && self.meter.is_none()
-                    && faderframe_plugin_host::names_gain_reduction(&name)
-                {
-                    let gain = info.unit == kAudioUnitParameterUnit_LinearGain
-                        || (info.unit != kAudioUnitParameterUnit_Decibels
-                            && info.minValue >= 0.0
-                            && info.maxValue <= 1.0);
-                    self.meter = Some((id, gain));
+                if self.meter.is_none() && faderframe_plugin_host::names_gain_reduction(&name) {
+                    self.meter = Some((id, meter_is_gain(&info)));
                 }
+                continue;
+            }
+            if probed {
+                // Not listed: not offered as a control.
                 continue;
             }
             if info.flags & kAudioUnitParameterFlag_ValuesHaveStrings != 0 {
@@ -1103,4 +1091,41 @@ impl PluginEditor for AuInstance {
 /// Whether editors can be shown at all (CoreAudioKit is present).
 pub fn has_generic_editor() -> bool {
     view::has_generic()
+}
+
+/// A parameter's name (released as the unit asks).
+fn info_name(info: &AudioUnitParameterInfo) -> String {
+    let has_cf = info.flags & kAudioUnitParameterFlag_HasCFNameString != 0;
+    let name = if has_cf && !info.cfNameString.is_null() {
+        cf_string(info.cfNameString)
+    } else {
+        // SAFETY: a NUL-terminated C string within the array.
+        let raw = unsafe { CStr::from_ptr(info.name.as_ptr()) };
+        raw.to_string_lossy().into_owned()
+    };
+    if info.flags & kAudioUnitParameterFlag_CFNameRelease != 0 {
+        if has_cf {
+            release(info.cfNameString);
+        }
+        if info.unit == kAudioUnitParameterUnit_CustomUnit {
+            release(info.unitName);
+        }
+    }
+    name
+}
+
+/// A meter, not a control: flagged as one (some units flag their meters
+/// writable too), or readable but not writable.
+fn is_meter(info: &AudioUnitParameterInfo) -> bool {
+    info.flags & kAudioUnitParameterFlag_MeterReadOnly != 0
+        || (info.flags & kAudioUnitParameterFlag_IsWritable == 0
+            && info.flags & kAudioUnitParameterFlag_IsReadable != 0)
+}
+
+/// A meter reading linear gain (else dB).
+fn meter_is_gain(info: &AudioUnitParameterInfo) -> bool {
+    info.unit == kAudioUnitParameterUnit_LinearGain
+        || (info.unit != kAudioUnitParameterUnit_Decibels
+            && info.minValue >= 0.0
+            && info.maxValue <= 1.0)
 }
