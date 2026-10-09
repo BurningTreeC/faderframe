@@ -823,8 +823,6 @@ fn live_midi_input_and_midi_recording_do_not_allocate() {
     let (tx, q, _feed) = faderframe_midi::midi_input_queue(256);
     let (oq, mut orx) = faderframe_midi::midi_output_queue(4096, tx.clock());
     r.controller.set_midi_input(q).unwrap();
-    // Voice to MIDI listens to input 1: the tap copies it, stamped.
-    r.controller.voice_tap().voice.set_channel(Some(0));
     // MIDI clock out on port 0 while playing.
     r.controller.set_midi_output(oq).unwrap();
     r.controller
@@ -889,6 +887,83 @@ fn live_midi_input_and_midi_recording_do_not_allocate() {
     assert!(clock > 0, "clock went out");
     let recorded = std::iter::from_fn(|| rx.pop().ok()).count();
     assert!(recorded >= 24 * 3 - 1, "{recorded}");
+}
+
+/// Voice to MIDI on the audio thread: notes, glides and their copies for
+/// the control side, all allocation-free.
+#[test]
+fn voice_to_midi_does_not_allocate() {
+    let _serial = serial();
+    use faderframe_analysis::voice::{Responsiveness, VoiceConfig};
+    use faderframe_engine::voice::{Glide, VoiceRun};
+    use std::collections::HashSet;
+
+    const SR: u32 = 48_000;
+    let project = demo_project(SR);
+    let sources = render_generated_sources(&project, SR);
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&project, &sources, config, 256, 2).unwrap();
+    let synth = project
+        .tracks
+        .iter()
+        .find(|t| t.kind == faderframe_project::TrackKind::Instrument)
+        .unwrap()
+        .id;
+    let (_tx, q, _feed) = faderframe_midi::midi_input_queue(256);
+    r.controller.set_midi_input(q).unwrap();
+    r.controller.set_midi_live(HashSet::from([synth]));
+    let (run, mut heard) = VoiceRun::new(
+        0,
+        0,
+        SR,
+        VoiceConfig::default().with(Responsiveness::Fast),
+        Glide::Expression,
+    );
+    r.controller.set_voice(Some(run)).unwrap();
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    let mut phase = 0.0f64;
+    let mut sing = |bufs: &mut OwnedBuffers, block: usize| {
+        // 150 ms notes a fifth apart with vibrato, 50 ms gaps.
+        let x = bufs.input_mut(0);
+        for (i, v) in x.iter_mut().enumerate() {
+            let t = (block * 256 + i) as f64 / f64::from(SR);
+            let note = (t / 0.2) as usize;
+            let within = t - note as f64 * 0.2;
+            if within > 0.15 {
+                *v = 0.0;
+                continue;
+            }
+            let key = if note.is_multiple_of(2) { 57.0 } else { 64.0 };
+            let f = 440.0
+                * 2f64
+                    .powf((key - 69.0 + 0.3 * (2.0 * std::f64::consts::PI * 5.5 * t).sin()) / 12.0);
+            phase = (phase + f / f64::from(SR)).fract();
+            *v = (0.3 * (2.0 * std::f64::consts::PI * phase).sin()) as f32;
+        }
+    };
+    for b in 0..8 {
+        sing(&mut bufs, b);
+        r.processor.process_device(&mut bufs);
+    }
+    let mut total = 0;
+    for b in 8..400 {
+        sing(&mut bufs, b);
+        let (_, n) = armed(|| r.processor.process_device(&mut bufs));
+        total += n;
+    }
+    assert_eq!(total, 0, "allocations/frees listening to a voice");
+    let got: Vec<_> = std::iter::from_fn(|| heard.pop().ok()).collect();
+    let ons = got
+        .iter()
+        .filter(|e| matches!(e.event(), Some(faderframe_midi::MidiEvent::NoteOn { .. })))
+        .count();
+    let glides = got.iter().filter(|e| e.expression.is_some()).count();
+    assert!(ons >= 8, "notes heard: {ons}");
+    assert!(glides > 0, "glides heard");
 }
 
 #[test]

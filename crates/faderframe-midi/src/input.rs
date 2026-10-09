@@ -245,26 +245,6 @@ impl MidiInputSender {
         pushed
     }
 
-    /// A per-note expression stamped at `time_ns`.
-    pub fn send_expression_at(
-        &self,
-        port: u16,
-        time_ns: u64,
-        channel: u8,
-        key: u8,
-        kind: NoteExpressionKind,
-        value: f64,
-    ) -> bool {
-        self.push(MidiInputEvent::expression(
-            port,
-            time_ns.min(self.clock.now_ns()),
-            channel,
-            key,
-            kind,
-            value,
-        ))
-    }
-
     /// Queue a Universal MIDI Packet from a MIDI 2.0 port: MIDI 1.0 and
     /// system messages as they are, SysEx7 once complete, MIDI 2.0 channel
     /// voice messages as their MIDI 1.0 forms — and per-note controllers

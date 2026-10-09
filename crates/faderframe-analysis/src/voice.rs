@@ -1,33 +1,88 @@
 //! Singing into MIDI live: a causal pitch tracker that turns a monophonic
 //! input (a voice, a whistle, a monophonic instrument) into notes as it
-//! comes in.
+//! comes in, fast enough to play an instrument with.
 //!
-//! The input is low-passed and decimated to about 11 kHz; every 5 ms the
-//! last 40 ms are run through McLeod's method ([`crate::pitch`]) and the
-//! level measured. A frame is voiced when its pitch is clear and it is loud
-//! enough; a note starts when the same key (the nearest one the scale
-//! allows) holds for [`VoiceConfig::onset_frames`], changes when another
-//! one holds for [`VoiceConfig::change_frames`] (with half a semitone of
-//! hysteresis, so vibrato and scoops stay on the note), and ends after
+//! The input is low-passed and decimated to about 11 kHz; every 2 ms the
+//! newest audio is run through McLeod's method ([`crate::pitch`]) over the
+//! shortest window that holds enough periods to be sure — 12 ms first
+//! (most voices), 22 or 40 ms only for low ones, and while a note sounds,
+//! two and a half of its periods — and the level measured. A frame is
+//! voiced when its pitch is clear and it is loud enough; a note starts when
+//! the same key (the nearest the scale allows) holds for
+//! [`VoiceConfig::onset_frames`] (one frame when it is very clear and the
+//! tracker is set to [`Responsiveness::Fast`]), changes when another holds
+//! for [`VoiceConfig::change_frames`] (with half a semitone of hysteresis,
+//! so vibrato and scoops stay on the note), and ends after
 //! [`VoiceConfig::release_frames`] unvoiced. While a note sounds, its pitch
-//! against the key comes out as [`VoiceEvent::Bend`] (for glides). Each
-//! event says when the sound it reports began (`at`, frames from the start
-//! of the input it came with, earlier than the analysis by the window and
-//! the holds), so a recording can put notes where they were sung.
+//! against the key comes out as [`VoiceEvent::Bend`] (for glides).
+//!
+//! Each event comes with two places: where in the input it was decided
+//! (`now`: play it there) and where the sound it reports began (`at`,
+//! earlier by half the window and the holds: record it there).
+//! Allocation-free after [`VoiceTracker::new`], so it runs on the audio
+//! thread.
 
 use crate::pitch::{Detector, note_at};
 
 /// The analysis rate the input is decimated to (about).
 const ANALYSIS_RATE: f64 = 11_025.0;
-const HOP_SECONDS: f64 = 0.005;
-const WINDOW_SECONDS: f64 = 0.040;
-/// How clear a voiced frame's pitch is.
+/// One analysis frame.
+pub const HOP_SECONDS: f64 = 0.001;
+/// The windows tried, shortest first (seconds).
+const WINDOWS: [f64; 3] = [0.012, 0.022, 0.040];
+/// Periods a window must hold for its pitch to be taken.
+const PERIODS: f64 = 2.3;
+/// How clear a voiced frame's pitch is (fast: a note's first periods,
+/// still swelling, are heard sooner at the cost of more doubt).
 const CLARITY: f64 = 0.78;
+const FAST_CLARITY: f64 = 0.6;
+/// Bends at most this often (frames), unless the pitch jumps.
+const BEND_FRAMES: u32 = 4;
 /// The voice's range (Hz).
 const LOWEST_HZ: f64 = 60.0;
 const HIGHEST_HZ: f64 = 1_600.0;
 /// Half a semitone, and this much more, before another key is heard.
 const HYSTERESIS: f64 = 0.3;
+
+/// How quickly notes follow the voice (and how much they risk a wrong
+/// note for it).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Responsiveness {
+    /// A clear frame starts a note (a few ms; for playing).
+    Fast,
+    /// A few frames hold first.
+    #[default]
+    Balanced,
+    /// Notes hold longer before they start or change (for recording
+    /// clean takes).
+    Stable,
+}
+
+impl Responsiveness {
+    pub const ALL: [Responsiveness; 3] = [
+        Responsiveness::Fast,
+        Responsiveness::Balanced,
+        Responsiveness::Stable,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Responsiveness::Fast => "Fast",
+            Responsiveness::Balanced => "Balanced",
+            Responsiveness::Stable => "Stable",
+        }
+    }
+
+    /// (onset, change, release) in analysis frames (1 ms), and the clarity
+    /// a voiced frame needs.
+    pub fn frames(self) -> (u32, u32, u32, f64) {
+        match self {
+            Responsiveness::Fast => (2, 6, 20, FAST_CLARITY),
+            Responsiveness::Balanced => (4, 12, 30, CLARITY),
+            Responsiveness::Stable => (14, 22, 40, CLARITY),
+        }
+    }
+}
 
 /// How the tracker hears.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -37,16 +92,31 @@ pub struct VoiceConfig {
     /// The lowest and highest keys played.
     pub low: u8,
     pub high: u8,
-    /// Analysis frames (5 ms) a key holds before its note starts.
+    /// Analysis frames (1 ms) a key holds before its note starts.
     pub onset_frames: u32,
     /// Frames another key holds before the note changes.
     pub change_frames: u32,
     /// Unvoiced frames that end a note.
     pub release_frames: u32,
+    /// How clear (0–1) a frame's pitch must be to count as voiced.
+    pub clarity: f64,
     /// Pitch classes notes are snapped to (bit 0 = C … bit 11 = B).
     pub scale: u16,
     /// A4 (Hz).
     pub reference: f64,
+}
+
+impl VoiceConfig {
+    /// The holds of a responsiveness.
+    pub fn with(mut self, r: Responsiveness) -> Self {
+        (
+            self.onset_frames,
+            self.change_frames,
+            self.release_frames,
+            self.clarity,
+        ) = r.frames();
+        self
+    }
 }
 
 impl Default for VoiceConfig {
@@ -55,12 +125,14 @@ impl Default for VoiceConfig {
             threshold_db: -45.0,
             low: 28,
             high: 96,
-            onset_frames: 3,
-            change_frames: 5,
-            release_frames: 8,
+            onset_frames: 0,
+            change_frames: 0,
+            release_frames: 0,
+            clarity: CLARITY,
             scale: 0xFFF,
             reference: 440.0,
         }
+        .with(Responsiveness::Balanced)
     }
 }
 
@@ -119,6 +191,14 @@ impl Biquad {
     }
 }
 
+/// A pitch heard in one frame: the fractional key and the window it came
+/// from (analysis samples).
+#[derive(Clone, Copy, Debug)]
+struct Heard {
+    pitch: f64,
+    window: usize,
+}
+
 /// The live tracker (see the module docs).
 pub struct VoiceTracker {
     config: VoiceConfig,
@@ -127,27 +207,32 @@ pub struct VoiceTracker {
     phase: usize,
     filters: [Biquad; 2],
     analysis_rate: f64,
-    /// The last window of decimated input (a ring) and its contiguous copy.
+    /// The newest audio (decimated, a ring as long as the longest window)
+    /// and room for a window's contiguous copy.
     ring: Vec<f32>,
     write: usize,
     filled: usize,
     window: Vec<f32>,
+    windows: [usize; 3],
     hop: usize,
     since_hop: usize,
     detector: Detector,
     sounding: Option<u8>,
-    /// A key being heard (not the sounding one) and for how many frames,
-    /// and the loudest level meanwhile.
-    candidate: Option<(u8, u32, f32)>,
+    /// A key being heard (not the sounding one): the key, frames, the
+    /// loudest level meanwhile and the window of its first frame.
+    candidate: Option<(u8, u32, f32, usize)>,
     unvoiced: u32,
     last_bend: f32,
+    /// Frames since the last bend.
+    since_bend: u32,
 }
 
 impl VoiceTracker {
     pub fn new(rate: f64, config: VoiceConfig) -> Self {
         let decimate = ((rate / ANALYSIS_RATE).floor() as usize).max(1);
         let analysis_rate = rate / decimate as f64;
-        let window_len = (WINDOW_SECONDS * analysis_rate).round() as usize;
+        let windows = WINDOWS.map(|s| (s * analysis_rate).round() as usize);
+        let longest = windows[2];
         // Two sections: a fourth-order Butterworth well below the new
         // Nyquist.
         let cutoff = (analysis_rate * 0.42).min(rate * 0.45);
@@ -160,10 +245,11 @@ impl VoiceTracker {
                 Biquad::lowpass(cutoff, rate, 1.306_563),
             ],
             analysis_rate,
-            ring: vec![0.0; window_len],
+            ring: vec![0.0; longest],
             write: 0,
             filled: 0,
-            window: vec![0.0; window_len],
+            window: vec![0.0; longest],
+            windows,
             hop: ((HOP_SECONDS * analysis_rate).round() as usize).max(1),
             since_hop: 0,
             detector: Detector::new(),
@@ -171,6 +257,7 @@ impl VoiceTracker {
             candidate: None,
             unvoiced: 0,
             last_bend: 0.0,
+            since_bend: 0,
         }
     }
 
@@ -187,12 +274,6 @@ impl VoiceTracker {
         self.sounding
     }
 
-    /// How long before an analysis frame the sound it hears began: half
-    /// the window (input frames).
-    fn heard_delay(&self) -> usize {
-        self.window.len() / 2 * self.decimate
-    }
-
     /// Input frames per analysis frame step.
     fn hop_frames(&self) -> usize {
         self.hop * self.decimate
@@ -205,9 +286,10 @@ impl VoiceTracker {
         self.sounding.take().map(|key| VoiceEvent::NoteOff { key })
     }
 
-    /// Feed `x`; `emit(at, event)` for what it heard, `at` in frames from
-    /// the start of `x` where the sound began (negative: before it).
-    pub fn process(&mut self, x: &[f32], mut emit: impl FnMut(isize, VoiceEvent)) {
+    /// Feed `x`; `emit(now, at, event)` for what it heard: `now` the frame
+    /// of `x` where it was decided, `at` where the sound began (frames from
+    /// the start of `x`; negative: before it).
+    pub fn process(&mut self, x: &[f32], mut emit: impl FnMut(isize, isize, VoiceEvent)) {
         for (i, &v) in x.iter().enumerate() {
             let mut s = f64::from(v);
             for f in &mut self.filters {
@@ -222,44 +304,97 @@ impl VoiceTracker {
             self.write = (self.write + 1) % self.ring.len();
             self.filled = (self.filled + 1).min(self.ring.len());
             self.since_hop += 1;
-            if self.since_hop >= self.hop && self.filled == self.ring.len() {
+            if self.since_hop >= self.hop && self.filled >= self.windows[0] {
                 self.since_hop = 0;
                 self.analyse(i as isize, &mut emit);
             }
         }
     }
 
+    /// The newest `n` analysis samples into the window buffer.
+    fn take_window(&mut self, n: usize) -> &[f32] {
+        let len = self.ring.len();
+        for k in 0..n {
+            self.window[k] = self.ring[(self.write + len - n + k) % len];
+        }
+        &self.window[..n]
+    }
+
+    /// The pitch of the newest `n` samples, when clear, in range and of a
+    /// period the window holds enough of.
+    fn pitch_over(&mut self, n: usize) -> Option<Heard> {
+        let rate = self.analysis_rate;
+        let c = self.config;
+        let w: &[f32] = {
+            let len = self.ring.len();
+            for k in 0..n {
+                self.window[k] = self.ring[(self.write + len - n + k) % len];
+            }
+            &self.window[..n]
+        };
+        let p = self.detector.detect(w, rate)?;
+        let periods = n as f64 * p.freq / rate;
+        let pitch = note_at(p.freq, c.reference);
+        (p.clarity >= c.clarity
+            && (LOWEST_HZ..=HIGHEST_HZ).contains(&p.freq)
+            && periods >= PERIODS
+            && (f64::from(c.low) - 0.5..=f64::from(c.high) + 0.5).contains(&pitch))
+        .then_some(Heard { pitch, window: n })
+    }
+
+    /// What one frame hears: while a note sounds, over two and a half of
+    /// its periods; else the shortest window that is sure.
+    fn hear(&mut self) -> Option<Heard> {
+        let filled = self.filled;
+        if let Some(k) = self.sounding {
+            let f = self.config.reference * 2f64.powf((f64::from(k) - 69.0) / 12.0);
+            let n = ((2.6 * self.analysis_rate / f).ceil() as usize)
+                .clamp(self.windows[0], self.windows[2])
+                .min(filled);
+            if let Some(h) = self.pitch_over(n) {
+                return Some(h);
+            }
+        }
+        for i in 0..self.windows.len() {
+            let n = self.windows[i];
+            if n > filled {
+                break;
+            }
+            if let Some(h) = self.pitch_over(n) {
+                return Some(h);
+            }
+        }
+        None
+    }
+
     /// One analysis frame ending at input frame `now` (of the current
     /// slice).
-    fn analyse(&mut self, now: isize, emit: &mut impl FnMut(isize, VoiceEvent)) {
-        let n = self.ring.len();
-        for k in 0..n {
-            self.window[k] = self.ring[(self.write + k) % n];
-        }
-        // The level over the newest 10 ms.
-        let recent = (self.hop * 2).min(n);
-        let power = self.window[n - recent..]
+    fn analyse(&mut self, now: isize, emit: &mut impl FnMut(isize, isize, VoiceEvent)) {
+        // The level over the newest 6 ms.
+        let recent = (self.hop * 6).min(self.filled);
+        let power = self
+            .take_window(recent)
             .iter()
             .map(|v| f64::from(*v).powi(2))
             .sum::<f64>()
-            / recent as f64;
+            / recent.max(1) as f64;
         let level_db = (10.0 * power.max(1e-12).log10()) as f32;
         let c = self.config;
-        let heard = (level_db >= c.threshold_db)
-            .then(|| self.detector.detect(&self.window, self.analysis_rate))
-            .flatten()
-            .filter(|p| p.clarity >= CLARITY && (LOWEST_HZ..=HIGHEST_HZ).contains(&p.freq))
-            .map(|p| note_at(p.freq, c.reference))
-            .filter(|m| (f64::from(c.low) - 0.5..=f64::from(c.high) + 0.5).contains(m));
-        let delay = self.heard_delay() as isize;
-        let Some(pitch) = heard else {
+        let heard = if level_db >= c.threshold_db {
+            self.hear()
+        } else {
+            None
+        };
+        let hop = self.hop_frames() as isize;
+        let half = |window: usize| (window / 2 * self.decimate) as isize;
+        let Some(h) = heard else {
             self.candidate = None;
             self.unvoiced += 1;
             if self.unvoiced >= c.release_frames
                 && let Some(key) = self.sounding.take()
             {
-                let back = delay + (self.unvoiced as isize - 1) * self.hop_frames() as isize;
-                emit(now - back, VoiceEvent::NoteOff { key });
+                let back = (self.unvoiced as isize - 1) * hop;
+                emit(now, now - back, VoiceEvent::NoteOff { key });
             }
             return;
         };
@@ -267,23 +402,26 @@ impl VoiceTracker {
         // The key heard: the sounding one while within its hysteresis,
         // else the nearest the scale allows.
         let key = match self.sounding {
-            Some(s) if (pitch - f64::from(s)).abs() < 0.5 + HYSTERESIS => s,
-            _ => nearest_in_scale(pitch, c.scale, c.low, c.high),
+            Some(s) if (h.pitch - f64::from(s)).abs() < 0.5 + HYSTERESIS => s,
+            _ => nearest_in_scale(h.pitch, c.scale, c.low, c.high),
         };
         if self.sounding == Some(key) {
             self.candidate = None;
-            let semitones = (pitch - f64::from(key)) as f32;
-            if (semitones - self.last_bend).abs() >= 0.02 {
+            self.since_bend += 1;
+            let semitones = (h.pitch - f64::from(key)) as f32;
+            let moved = (semitones - self.last_bend).abs();
+            if moved >= 0.1 || (moved >= 0.02 && self.since_bend >= BEND_FRAMES) {
                 self.last_bend = semitones;
-                emit(now - delay, VoiceEvent::Bend { semitones });
+                self.since_bend = 0;
+                emit(now, now - half(h.window), VoiceEvent::Bend { semitones });
             }
             return;
         }
-        let (count, loudest) = match self.candidate {
-            Some((k, n, l)) if k == key => (n + 1, l.max(level_db)),
-            _ => (1, level_db),
+        let (count, loudest, first_window) = match self.candidate {
+            Some((k, n, l, w)) if k == key => (n + 1, l.max(level_db), w),
+            _ => (1, level_db, h.window),
         };
-        self.candidate = Some((key, count, loudest));
+        self.candidate = Some((key, count, loudest, first_window));
         let needed = if self.sounding.is_some() {
             c.change_frames
         } else {
@@ -292,19 +430,19 @@ impl VoiceTracker {
         if count < needed {
             return;
         }
-        let back = delay + (count as isize - 1) * self.hop_frames() as isize;
+        let at = now - half(first_window) - (count as isize - 1) * hop;
         if let Some(old) = self.sounding.take() {
-            emit(now - back, VoiceEvent::NoteOff { key: old });
+            emit(now, at, VoiceEvent::NoteOff { key: old });
         }
         let velocity = velocity_of(loudest, c.threshold_db);
-        emit(now - back, VoiceEvent::NoteOn { key, velocity });
+        emit(now, at, VoiceEvent::NoteOn { key, velocity });
         self.sounding = Some(key);
         self.candidate = None;
         self.last_bend = 0.0;
-        let semitones = (pitch - f64::from(key)) as f32;
+        let semitones = (h.pitch - f64::from(key)) as f32;
         if semitones.abs() >= 0.02 {
             self.last_bend = semitones;
-            emit(now - back, VoiceEvent::Bend { semitones });
+            emit(now, at, VoiceEvent::Bend { semitones });
         }
     }
 }
@@ -342,7 +480,7 @@ mod tests {
     const RATE: f64 = 48_000.0;
 
     /// A sung phrase: (start s, end s, key, vibrato cents); a glottal-ish
-    /// saw with a falling spectrum, attack and release ramps.
+    /// saw with a falling spectrum, a 5 ms attack and release.
     fn phrase(notes: &[(f64, f64, f64, f64)], total: f64, gain: f32) -> Vec<f32> {
         let n = (total * RATE) as usize;
         let mut out = vec![0.0f32; n];
@@ -358,31 +496,35 @@ mod tests {
                 for h in 1..12 {
                     v += (2.0 * std::f64::consts::PI * phase * h as f64).sin() / (h * h) as f64;
                 }
-                let env = (t / 0.02).min(1.0) * ((b - a - t) / 0.02).clamp(0.0, 1.0);
+                let env = (t / 0.005).min(1.0) * ((b - a - t) / 0.005).clamp(0.0, 1.0);
                 *o += (v * env) as f32 * gain;
             }
         }
         out
     }
 
-    /// Run in blocks; events with their absolute frame.
-    fn track(x: &[f32], config: VoiceConfig) -> Vec<(i64, VoiceEvent)> {
+    /// Run in blocks; events with the absolute frames they were decided
+    /// at and placed at.
+    fn track(x: &[f32], config: VoiceConfig) -> Vec<(i64, i64, VoiceEvent)> {
         let mut t = VoiceTracker::new(RATE, config);
         let mut out = Vec::new();
         for (b, chunk) in x.chunks(256).enumerate() {
             let base = (b * 256) as i64;
-            t.process(chunk, |at, e| out.push((base + at as i64, e)));
+            t.process(chunk, |now, at, e| {
+                out.push((base + now as i64, base + at as i64, e));
+            });
         }
         if let Some(e) = t.reset() {
-            out.push((x.len() as i64, e));
+            out.push((x.len() as i64, x.len() as i64, e));
         }
         out
     }
 
-    fn notes(events: &[(i64, VoiceEvent)]) -> Vec<(u8, f64, f64)> {
+    /// The notes: (key, start, end) by where they were placed (s).
+    fn notes(events: &[(i64, i64, VoiceEvent)]) -> Vec<(u8, f64, f64)> {
         let mut out = Vec::new();
         let mut open: Option<(u8, i64)> = None;
-        for &(at, e) in events {
+        for &(_, at, e) in events {
             match e {
                 VoiceEvent::NoteOn { key, .. } => open = Some((key, at)),
                 VoiceEvent::NoteOff { key } => {
@@ -397,6 +539,18 @@ mod tests {
         out
     }
 
+    /// How long after a note's start its note-on was decided (ms).
+    fn onset_ms(key: f64, r: Responsiveness) -> f64 {
+        let x = phrase(&[(0.1, 0.5, key, 0.0)], 0.7, 0.3);
+        let ev = track(&x, VoiceConfig::default().with(r));
+        let on = ev
+            .iter()
+            .find(|e| matches!(e.2, VoiceEvent::NoteOn { .. }))
+            .unwrap_or_else(|| panic!("no note at {key}"));
+        assert!(matches!(on.2, VoiceEvent::NoteOn { key: k, .. } if f64::from(k) == key));
+        (on.0 as f64 / RATE - 0.1) * 1000.0
+    }
+
     #[test]
     fn a_sung_phrase_becomes_its_notes_where_they_were_sung() {
         let x = phrase(
@@ -408,28 +562,63 @@ mod tests {
             2.0,
             0.3,
         );
-        let ev = track(&x, VoiceConfig::default());
-        let got = notes(&ev);
-        assert_eq!(
-            got.iter().map(|n| n.0).collect::<Vec<_>>(),
-            [57, 60, 64],
-            "{got:?}"
-        );
-        // Placed where sung (within 25 ms), legato into the second.
-        for ((_, s, e), (a, b)) in got.iter().zip([(0.10, 0.50), (0.50, 0.90), (1.20, 1.60)]) {
-            assert!((s - a).abs() < 0.025, "start {s} for {a}");
-            assert!((e - b).abs() < 0.04, "end {e} for {b}");
+        for r in Responsiveness::ALL {
+            let ev = track(&x, VoiceConfig::default().with(r));
+            let got = notes(&ev);
+            assert_eq!(
+                got.iter().map(|n| n.0).collect::<Vec<_>>(),
+                [57, 60, 64],
+                "{r:?}: {got:?}"
+            );
+            // Placed where sung (within 15 ms), legato into the second.
+            for ((_, s, e), (a, b)) in got.iter().zip([(0.10, 0.50), (0.50, 0.90), (1.20, 1.60)]) {
+                assert!((s - a).abs() < 0.015, "{r:?}: start {s} for {a}");
+                assert!((e - b).abs() < 0.03, "{r:?}: end {e} for {b}");
+            }
+            // Vibrato stays on the note, as bends of about a quarter tone.
+            let bends: Vec<f32> = ev
+                .iter()
+                .filter_map(|(_, _, e)| match e {
+                    VoiceEvent::Bend { semitones } => Some(*semitones),
+                    _ => None,
+                })
+                .collect();
+            // (Up to the hysteresis just before a legato change, where the
+            // pitch already moves to the next note.)
+            assert!(bends.iter().all(|b| b.abs() <= 0.81), "{r:?}: {bends:?}");
+            let mut sizes: Vec<f32> = bends.iter().map(|b| b.abs()).collect();
+            sizes.sort_by(f32::total_cmp);
+            let typical = sizes[sizes.len() * 9 / 10];
+            assert!(typical < 0.35, "{r:?}: 90 % of bends under {typical}");
+            assert!(bends.iter().any(|b| b.abs() > 0.1), "vibrato heard");
         }
-        // Vibrato stays on the note, as bends of about a quarter tone.
-        let bends: Vec<f32> = ev
-            .iter()
-            .filter_map(|(_, e)| match e {
-                VoiceEvent::Bend { semitones } => Some(*semitones),
-                _ => None,
-            })
-            .collect();
-        assert!(bends.iter().all(|b| b.abs() < 0.5), "{bends:?}");
-        assert!(bends.iter().any(|b| b.abs() > 0.1), "vibrato heard");
+    }
+
+    /// The point: notes start a few milliseconds after they are sung.
+    #[test]
+    fn notes_start_within_milliseconds() {
+        let mut table = Vec::new();
+        for key in [45.0, 57.0, 69.0, 76.0] {
+            for r in Responsiveness::ALL {
+                table.push((key, r, onset_ms(key, r)));
+            }
+        }
+        for (key, r, ms) in &table {
+            eprintln!("key {key} {r:?}: {ms:.1} ms");
+        }
+        let at = |key: f64, r: Responsiveness| {
+            table
+                .iter()
+                .find(|(k, q, _)| *k == key && *q == r)
+                .map_or(f64::MAX, |t| t.2)
+        };
+        // About two and a half periods (the least a pitch can be heard
+        // in) and a frame or two: A4 in 8 ms, A3 in 14, A2 in 26.
+        for (key, fast, balanced) in [(76.0, 6.5, 9.0), (69.0, 8.0, 11.0), (57.0, 14.0, 17.0)] {
+            assert!(at(key, Responsiveness::Fast) <= fast, "{key}");
+            assert!(at(key, Responsiveness::Balanced) <= balanced, "{key}");
+        }
+        assert!(at(45.0, Responsiveness::Fast) <= 26.0);
     }
 
     #[test]
@@ -456,12 +645,17 @@ mod tests {
         let x: Vec<f32> = (0..n)
             .map(|j| {
                 let t = j as f64 / RATE;
-                let f = 196.0;
-                let w = 2.0 * std::f64::consts::PI * f * t;
+                let w = 2.0 * std::f64::consts::PI * 196.0 * t;
                 (0.15 * w.sin() + 0.3 * (2.0 * w).sin() + 0.1 * (3.0 * w).sin()) as f32
             })
             .collect();
-        let got = notes(&track(&x, VoiceConfig::default()));
-        assert_eq!(got.iter().map(|n| n.0).collect::<Vec<_>>(), [55], "{got:?}");
+        for r in Responsiveness::ALL {
+            let got = notes(&track(&x, VoiceConfig::default().with(r)));
+            assert_eq!(
+                got.iter().map(|n| n.0).collect::<Vec<_>>(),
+                [55],
+                "{r:?}: {got:?}"
+            );
+        }
     }
 }

@@ -78,6 +78,9 @@ enum Message {
     MidiOutput(Box<faderframe_midi::MidiOutputQueue>),
     BeginMidiRecord(Box<crate::midi::MidiRecorder>),
     EndMidiRecord,
+    /// Listen to a voice, or no more.
+    Voice(Option<Box<crate::voice::VoiceRun>>),
+    VoiceConfig(faderframe_analysis::voice::VoiceConfig, crate::voice::Glide),
     /// Play this file instead of the project (album playback), or no more.
     Preview(Option<Box<crate::preview::Preview>>),
     /// Locate so that `position` is where playback would be at `at_ns` (on
@@ -108,6 +111,7 @@ enum Garbage {
     MidiRecorder(#[allow(dead_code)] Box<crate::midi::MidiRecorder>),
     Preview(#[allow(dead_code)] Box<crate::preview::Preview>),
     Varispeed(#[allow(dead_code)] Box<crate::varispeed::Varispeed>),
+    Voice(#[allow(dead_code)] Box<crate::voice::VoiceRun>),
 }
 
 /// When a callback started (MIDI clock) and the transport position then,
@@ -198,7 +202,7 @@ pub struct EngineShared {
     /// Auditioning, mapped controls, clock outputs.
     pub midi: Arc<crate::midi::MidiShared>,
     /// The live input voice-to-MIDI listens to.
-    pub voice: crate::voice_tap::VoiceTap,
+
     /// Album playback (see [`crate::preview`]).
     pub preview: crate::preview::PreviewShared,
     /// A ping asked for: `1 << 63 | output << 16 | input` (0: none).
@@ -253,7 +257,7 @@ pub fn create_with_epoch(
     let shared = Arc::new(EngineShared {
         epoch,
         midi: Arc::clone(&shared_midi),
-        voice: crate::voice_tap::VoiceTap::default(),
+
         preview: Default::default(),
         ..EngineShared::default()
     });
@@ -298,6 +302,7 @@ pub fn create_with_epoch(
         click: Click::default(),
         midi: midi_input,
         midi_recorder: None,
+        voice: None,
         midi_out: None,
         clock: crate::midi::ClockGen::default(),
         clock_due: 0,
@@ -379,6 +384,8 @@ pub struct EngineProcessor {
     click: Click,
     midi: crate::midi::MidiInputState,
     midi_recorder: Option<Box<crate::midi::MidiRecorder>>,
+    /// Voice to MIDI: the tracker, on this thread.
+    voice: Option<Box<crate::voice::VoiceRun>>,
     midi_out: Option<Box<faderframe_midi::MidiOutputQueue>>,
     clock: crate::midi::ClockGen,
     /// The last MIDI clock and MTC messages' due times: callbacks run late
@@ -487,6 +494,18 @@ impl EngineProcessor {
                         self.retire(Garbage::MidiRecorder(old));
                     }
                 }
+                Message::Voice(run) => {
+                    let old = std::mem::replace(&mut self.voice, run);
+                    if let Some(mut old) = old {
+                        old.release(&mut self.midi);
+                        self.retire(Garbage::Voice(old));
+                    }
+                }
+                Message::VoiceConfig(config, glide) => {
+                    if let Some(v) = self.voice.as_deref_mut() {
+                        v.set(config, glide);
+                    }
+                }
                 Message::EndMidiRecord => {
                     if let Some(old) = self.midi_recorder.take() {
                         self.retire(Garbage::MidiRecorder(old));
@@ -558,15 +577,6 @@ impl EngineProcessor {
             self.shared.transport.publish(&self.transport);
             self.shared.epoch.advance();
             return;
-        }
-        // Voice to MIDI: the input it listens to, stamped.
-        if let Some(c) = self.shared.voice.channel()
-            && let Some(clock) = self.midi.clock()
-        {
-            let input = (usize::from(c) < io.input_channels()).then(|| io.input(usize::from(c)));
-            self.shared
-                .voice
-                .capture(input, clock.now_ns(), self.stream_rate);
         }
         // Varispeed: the engine renders the frames the device's need at
         // the speed (resampled both ways).
@@ -669,6 +679,19 @@ impl EngineProcessor {
         }
         self.ctx.ahead_seq = self.ahead.as_deref().map_or(0, |l| l.seq());
         self.midi.take(frames, rate, &self.shared.midi_dropped);
+        // Voice to MIDI: what the input sings joins this callback's MIDI.
+        if let Some(v) = self.voice.as_deref_mut()
+            && v.rate() == self.stream_rate
+            && v.channel() < io.input_channels()
+            && let Some(clock) = self.midi.clock()
+        {
+            v.listen(
+                io.input(v.channel()),
+                &mut self.midi,
+                clock.now_ns(),
+                &self.shared.midi_dropped,
+            );
+        }
         let callback_ns = self.midi_out.as_ref().map_or(0, |q| q.clock.now_ns());
 
         if let Some(clock) = self.midi.clock() {
@@ -1999,10 +2022,24 @@ impl EngineController {
         self.shared.stream_inputs.load(Ordering::Relaxed) as usize
     }
 
-    /// The live input voice-to-MIDI listens to (and the engine's shared
-    /// state it lives in, for the listening thread).
-    pub fn voice_tap(&self) -> Arc<EngineShared> {
-        Arc::clone(&self.shared)
+    /// The running stream's sample rate (0 without one).
+    pub fn stream_rate(&self) -> u32 {
+        self.shared.stream_sample_rate.load(Ordering::Relaxed)
+    }
+
+    /// Listen to a voice on the audio thread (its notes join the live
+    /// MIDI), or stop (see [`crate::voice`]).
+    pub fn set_voice(&mut self, run: Option<crate::voice::VoiceRun>) -> Result<(), EngineError> {
+        self.send(Message::Voice(run.map(Box::new)))
+    }
+
+    /// How the voice is heard.
+    pub fn set_voice_config(
+        &mut self,
+        config: faderframe_analysis::voice::VoiceConfig,
+        glide: crate::voice::Glide,
+    ) -> Result<(), EngineError> {
+        self.send(Message::VoiceConfig(config, glide))
     }
 
     /// MIDI output messages lost because the sender fell behind.

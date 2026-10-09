@@ -303,7 +303,7 @@ pub fn sync_status_text(st: &faderframe_session::SyncStatus) -> String {
 /// Source, input and MTC start; changes apply at once and are saved.
 /// Voice to MIDI: how the voice ports hear.
 fn voice_section(app: &Rc<AppState>) -> gtk::Grid {
-    use faderframe_session::voice::{VoiceGlide, VoiceSettings};
+    use faderframe_session::voice::{VoiceGlide, VoiceSettings, VoiceSpeed};
     let grid = gtk::Grid::new();
     grid.set_row_spacing(8);
     grid.set_column_spacing(12);
@@ -358,6 +358,30 @@ fn voice_section(app: &Rc<AppState>) -> gtk::Grid {
             }
         });
     }
+    let names: Vec<&str> = VoiceSpeed::ALL.iter().map(|g| g.label()).collect();
+    let speed = gtk::DropDown::from_strings(&names);
+    speed.set_tooltip_text(Some(
+        "How soon a sung note sounds: Fast a couple of its periods after it begins (a few milliseconds; for playing), Stable a little later and surer (for recording clean takes)",
+    ));
+    speed.set_selected(
+        VoiceSpeed::ALL
+            .iter()
+            .position(|g| *g == now.speed)
+            .unwrap_or(1) as u32,
+    );
+    {
+        let weak = Rc::downgrade(app);
+        speed.connect_selected_notify(move |d| {
+            if let Some(app) = weak.upgrade() {
+                let mut s = app.session.borrow().voice_settings();
+                s.speed = VoiceSpeed::ALL
+                    .get(d.selected() as usize)
+                    .copied()
+                    .unwrap_or_default();
+                save(&app, s);
+            }
+        });
+    }
     let in_key = gtk::CheckButton::with_label("Snap notes to the project's key");
     in_key.set_active(now.in_key);
     {
@@ -371,7 +395,7 @@ fn voice_section(app: &Rc<AppState>) -> gtk::Grid {
         });
     }
     let hint = gtk::Label::new(Some(
-        "Sing (or play a monophonic instrument) into an audio input and choose “Voice · In n” as an instrument or MIDI track's MIDI input: the track plays and records the notes you sing.",
+        "Sing (or play a monophonic instrument) into an audio input and choose “Voice · In n” as an instrument or MIDI track's MIDI input: the track plays and records the notes you sing. For the least delay, use a small audio buffer (Preferences → Audio).",
     ));
     hint.set_wrap(true);
     hint.set_natural_wrap_mode(gtk::NaturalWrapMode::Word);
@@ -385,8 +409,12 @@ fn voice_section(app: &Rc<AppState>) -> gtk::Grid {
     glide.update_relation(&[gtk::accessible::Relation::LabelledBy(&[l.upcast_ref()])]);
     grid.attach(&l, 0, 1, 1, 1);
     grid.attach(&glide, 1, 1, 1, 1);
-    grid.attach(&in_key, 1, 2, 1, 1);
-    grid.attach(&hint, 0, 3, 2, 1);
+    let l = label("Response");
+    speed.update_relation(&[gtk::accessible::Relation::LabelledBy(&[l.upcast_ref()])]);
+    grid.attach(&l, 0, 2, 1, 1);
+    grid.attach(&speed, 1, 2, 1, 1);
+    grid.attach(&in_key, 1, 3, 1, 1);
+    grid.attach(&hint, 0, 4, 2, 1);
     grid
 }
 

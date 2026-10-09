@@ -391,7 +391,8 @@ long sessions), Neon and High Contrast:
   do not click.
 * Singing into MIDI live: choose "Voice · In n" as an instrument or MIDI
   track's MIDI input and sing (or play a monophonic instrument) into that
-  audio input — the track plays the notes as you sing, with glides as note
+  audio input — the track plays the notes as you sing, a few milliseconds
+  after each begins (tracked on the audio thread), with glides as note
   expression or pitch bend if wanted, snapped to the project's key if
   wanted, and records them where they were sung.
 * Screen readers and the keyboard: the mixer, arranger, piano roll, event

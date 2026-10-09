@@ -1240,11 +1240,14 @@ impl Session {
         self.tick_sync(&system, clock_now);
         self.record_sysex(&system);
         self.tick_sysex(clock_now);
+        // What devices sent, and what the engine heard sung.
+        let sung = self.voice.take_feed();
         let events: Vec<MidiInputEvent> = self
             .midi
             .feed
             .drain()
             .into_iter()
+            .chain(sung)
             .filter(|e| e.port != faderframe_engine::midi::AUDITION_PORT)
             .collect();
         self.feed_capture(&events);

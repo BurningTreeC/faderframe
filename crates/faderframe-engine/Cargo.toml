@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 base64.workspace = true
+faderframe-analysis.workspace = true
 faderframe-core.workspace = true
 faderframe-binaural.workspace = true
 faderframe-timeline.workspace = true

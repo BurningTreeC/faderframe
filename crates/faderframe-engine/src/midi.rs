@@ -301,6 +301,21 @@ impl MidiInputState {
         }
     }
 
+    /// Add an event the engine made itself (a sung note) to this
+    /// callback's live MIDI, in order: at `offset`, its sound `early`
+    /// frames before (allocation-free; `false` when there is no room).
+    pub(crate) fn inject(&mut self, port: u16, offset: u32, early: u32, event: MidiEvent) -> bool {
+        let b = &mut self.events;
+        if b.events.len() >= b.events.capacity() {
+            return false;
+        }
+        let i = b.events.partition_point(|(_, e)| e.sample_offset <= offset);
+        b.events
+            .insert(i, (port, TimedMidiEvent::new(offset, event)));
+        b.early.insert(i, early);
+        true
+    }
+
     /// Install a queue; returns the previous one (to retire).
     pub(crate) fn replace_queue(
         &mut self,

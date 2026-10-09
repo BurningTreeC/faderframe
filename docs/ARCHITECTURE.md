@@ -3712,26 +3712,38 @@ scratchpad's `a11y_dump.py` / `a11y_events.py` on `/usr/bin/python3` with
 Every input channel of the audio device has a MIDI input port "Voice · In
 n" (`session::voice`, virtual inputs of the hub, left out of the
 Preferences' input list). A track whose MIDI input names one makes the
-session listen to that channel: the engine copies it into
-`EngineShared::voice` (`engine::voice_tap::VoiceTap`, a `ScopeRing` plus the
-MIDI clock time and ring position of each callback, so a frame's time is
-known), and a thread runs `faderframe_analysis::voice::VoiceTracker` on it
-— low-passed and decimated to ~11 kHz, McLeod pitch over the last 40 ms
-every 5 ms, a level gate; a note starts when the same key (nearest in the
-scale) holds 3 frames, changes after 5 with half a semitone plus 0.3 of
-hysteresis (vibrato and scoops stay on it), ends after 8 unvoiced; bends
-against the key while it sounds; each event dated to when its sound began.
-What it hears goes into the MIDI input queue through the port, stamped
-with that time (`MidiInputSender::send_at`, `send_expression_at`); glides as
-note expression (tuning), pitch bend (±2) or not at all; notes can snap to
-the project's key (`VoiceSettings`, Preferences → MIDI → Voice to MIDI).
-From there it is MIDI: live play by the live rule, MIDI tracks to external
-synths, Capture MIDI (positions from the stamps), recording — the engine
-keeps how much earlier than a block an event was stamped
-(`MidiInputBlock::early`, `iter_early`) and the recorder places it there
-(live play is unchanged: at the block's start). One input listens at a
-time (the first track's in track order). Tests: `voice::tests` (a sung
-phrase placed within 25 ms, vibrato, threshold, scale, octave), engine
-`an_early_stamp_plays_now_and_records_where_it_was`, the tap in
-`live_midi_input_and_midi_recording_do_not_allocate`,
+session hand the engine a listener (`engine::voice::VoiceRun`: a
+`faderframe_analysis::voice::VoiceTracker` for that channel at the device
+rate, built on the control thread, `Message::Voice`, retired as garbage;
+settings by `Message::VoiceConfig`). In `render`, right after the queued
+live MIDI is taken, the tracker hears the callback's input and its notes
+are injected into that callback's live MIDI (`MidiInputState::inject`, in
+order) on the voice port at the frame each was decided — the instrument
+plays them in the callback they were heard, with nothing but the input and
+output buffers and the detection itself between voice and sound (6 ms for
+A4, 11 ms for A3 at Fast; `engine/tests/voice.rs` measures it). Each
+injected event's `early` is how much earlier its sound began, so the
+recorder (`MidiInputBlock::iter_early`) places it where it was sung, as it
+places hardware MIDI; a copy of each goes to the session through a ring
+(stamped with when it was sung) for Capture MIDI and the activity lights
+(`VoiceState::take_feed`, joined with the devices' messages in
+`tick_midi`).
+
+The tracker: low-passed and decimated to ~11 kHz; every 1 ms McLeod pitch
+over the shortest window holding 2.3 periods — 12 ms first, 22 or 40 ms
+for low voices, and while a note sounds 2.6 of its periods; a level gate;
+`Responsiveness` sets the holds and the clarity a voiced frame needs (Fast
+2 frames at 0.6, Balanced 4 at 0.78, Stable 14), change after 6/12/22
+frames with half a semitone plus 0.3 of hysteresis (vibrato and scoops stay
+on the note), release after 20/30/40 unvoiced; bends at most every 4 frames
+unless the pitch jumps; each event with where it was decided (`now`) and
+where its sound began (`at`). Allocation-free after `new` (the detector
+keeps its peak list). Glides as note expression (tuning), pitch bend (±2)
+or not at all; notes can snap to the project's key (`VoiceSettings`:
+sensitivity, glide, response, in key — Preferences → MIDI → Voice to MIDI).
+One input listens at a time (the first track's in track order). Tests:
+`voice::tests` (a sung phrase placed within 15 ms at every response,
+onset latencies by key, threshold, scale, octave), engine
+`an_early_stamp_plays_now_and_records_where_it_was`, `tests/voice.rs`
+(voice to sound), `voice_to_midi_does_not_allocate`,
 `session/tests/voice.rs` (the dummy device's tone played and recorded).
