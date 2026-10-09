@@ -78,8 +78,15 @@ enum Message {
     MidiOutput(Box<faderframe_midi::MidiOutputQueue>),
     BeginMidiRecord(Box<crate::midi::MidiRecorder>),
     EndMidiRecord,
-    /// Listen to a voice, or no more.
+    /// Listen to this voice only, or to none.
     Voice(Option<Box<crate::voice::VoiceRun>>),
+    /// Listen to one more voice (replacing one on the same input and port).
+    VoiceAdd(Box<crate::voice::VoiceRun>),
+    /// No more listening to an input on a port.
+    VoiceRemove {
+        input: u16,
+        port: u16,
+    },
     VoiceConfig(faderframe_analysis::voice::VoiceConfig, crate::voice::Glide),
     /// Play this file instead of the project (album playback), or no more.
     Preview(Option<Box<crate::preview::Preview>>),
@@ -201,8 +208,6 @@ pub struct EngineShared {
     output_latency: AtomicU32,
     /// Auditioning, mapped controls, clock outputs.
     pub midi: Arc<crate::midi::MidiShared>,
-    /// The live input voice-to-MIDI listens to.
-
     /// Album playback (see [`crate::preview`]).
     pub preview: crate::preview::PreviewShared,
     /// A ping asked for: `1 << 63 | output << 16 | input` (0: none).
@@ -302,7 +307,7 @@ pub fn create_with_epoch(
         click: Click::default(),
         midi: midi_input,
         midi_recorder: None,
-        voice: None,
+        voices: Vec::with_capacity(crate::voice::MAX_VOICES),
         midi_out: None,
         clock: crate::midi::ClockGen::default(),
         clock_due: 0,
@@ -384,8 +389,11 @@ pub struct EngineProcessor {
     click: Click,
     midi: crate::midi::MidiInputState,
     midi_recorder: Option<Box<crate::midi::MidiRecorder>>,
-    /// Voice to MIDI: the tracker, on this thread.
-    voice: Option<Box<crate::voice::VoiceRun>>,
+    /// Voice to MIDI: the listeners, on this thread (room for
+    /// `MAX_VOICES`, made on the control side). Boxed as they arrive and
+    /// leave: unboxing here would free the box on the audio thread.
+    #[allow(clippy::vec_box)]
+    voices: Vec<Box<crate::voice::VoiceRun>>,
     midi_out: Option<Box<faderframe_midi::MidiOutputQueue>>,
     clock: crate::midi::ClockGen,
     /// The last MIDI clock and MTC messages' due times: callbacks run late
@@ -495,14 +503,44 @@ impl EngineProcessor {
                     }
                 }
                 Message::Voice(run) => {
-                    let old = std::mem::replace(&mut self.voice, run);
-                    if let Some(mut old) = old {
+                    while let Some(mut old) = self.voices.pop() {
+                        old.release(&mut self.midi);
+                        self.retire(Garbage::Voice(old));
+                    }
+                    if let Some(run) = run {
+                        self.voices.push(run);
+                    }
+                }
+                Message::VoiceAdd(run) => {
+                    if let Some(i) = self
+                        .voices
+                        .iter()
+                        .position(|v| v.input() == run.input() && v.port() == run.port())
+                    {
+                        let mut old = self.voices.swap_remove(i);
+                        old.release(&mut self.midi);
+                        self.retire(Garbage::Voice(old));
+                    }
+                    if self.voices.len() < self.voices.capacity() {
+                        self.voices.push(run);
+                    } else {
+                        // No room (never grown here): not listened to.
+                        self.retire(Garbage::Voice(run));
+                    }
+                }
+                Message::VoiceRemove { input, port } => {
+                    if let Some(i) = self
+                        .voices
+                        .iter()
+                        .position(|v| v.input() == input && v.port() == port)
+                    {
+                        let mut old = self.voices.swap_remove(i);
                         old.release(&mut self.midi);
                         self.retire(Garbage::Voice(old));
                     }
                 }
                 Message::VoiceConfig(config, glide) => {
-                    if let Some(v) = self.voice.as_deref_mut() {
+                    for v in &mut self.voices {
                         v.set(config, glide, &mut self.midi);
                     }
                 }
@@ -678,24 +716,26 @@ impl EngineProcessor {
             link.poll(&mut self.transport, frames);
         }
         self.ctx.ahead_seq = self.ahead.as_deref().map_or(0, |l| l.seq());
-        if let Some(v) = self.voice.as_deref_mut()
-            && (v.rate() != self.stream_rate || v.channel() >= io.input_channels())
-        {
-            v.release(&mut self.midi);
+        let inputs = io.input_channels();
+        for v in &mut self.voices {
+            if v.rate() != self.stream_rate || usize::from(v.input()) >= inputs {
+                v.release(&mut self.midi);
+            }
         }
         self.midi.take(frames, rate, &self.shared.midi_dropped);
-        // Voice to MIDI: what the input sings joins this callback's MIDI.
-        if let Some(v) = self.voice.as_deref_mut()
-            && v.rate() == self.stream_rate
-            && v.channel() < io.input_channels()
-            && let Some(clock) = self.midi.clock()
-        {
-            v.listen(
-                io.input(v.channel()),
-                &mut self.midi,
-                clock.now_ns(),
-                &self.shared.midi_dropped,
-            );
+        // Voice to MIDI: what the inputs sing joins this callback's MIDI.
+        if let Some(clock) = self.midi.clock() {
+            let now = clock.now_ns();
+            for v in &mut self.voices {
+                if v.rate() == self.stream_rate && usize::from(v.input()) < inputs {
+                    v.listen(
+                        io.input(usize::from(v.input())),
+                        &mut self.midi,
+                        now,
+                        &self.shared.midi_dropped,
+                    );
+                }
+            }
         }
         let callback_ns = self.midi_out.as_ref().map_or(0, |q| q.clock.now_ns());
 
@@ -2032,13 +2072,25 @@ impl EngineController {
         self.shared.stream_sample_rate.load(Ordering::Relaxed)
     }
 
-    /// Listen to a voice on the audio thread (its notes join the live
-    /// MIDI), or stop (see [`crate::voice`]).
+    /// Listen to this voice only on the audio thread (its notes join the
+    /// live MIDI), or to none (see [`crate::voice`]).
     pub fn set_voice(&mut self, run: Option<crate::voice::VoiceRun>) -> Result<(), EngineError> {
         self.send(Message::Voice(run.map(Box::new)))
     }
 
-    /// How the voice is heard.
+    /// Listen to one more voice, beside those listened to (one on the same
+    /// input and port is replaced; past [`crate::voice::MAX_VOICES`] it is
+    /// not listened to).
+    pub fn add_voice(&mut self, run: crate::voice::VoiceRun) -> Result<(), EngineError> {
+        self.send(Message::VoiceAdd(Box::new(run)))
+    }
+
+    /// Stop listening to `input` for `port` (its notes end).
+    pub fn remove_voice(&mut self, input: u16, port: u16) -> Result<(), EngineError> {
+        self.send(Message::VoiceRemove { input, port })
+    }
+
+    /// How every voice is heard.
     pub fn set_voice_config(
         &mut self,
         config: faderframe_analysis::voice::VoiceConfig,

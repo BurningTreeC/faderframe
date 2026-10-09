@@ -2126,11 +2126,12 @@ pub fn install(app: &Rc<AppState>) {
         // Development aid: `access-key:<view id>=<tab|backtab|enter|up|down|
         // left|right|escape>[/…]` — the keyboard on a view's accessible
         // controls (as Tab, Enter and the arrows reach them).
-        // Development aid: `voice-input:<track>=<n|off>` — the track takes
-        // MIDI from input n's voice port (singing into MIDI).
+        // Development aid: `voice-input:<track>=<n|all|off>` — the track
+        // takes MIDI from input n's voice port, or from every input's (each
+        // on its own channel; singing into MIDI).
         named("voice-input", |a, arg| {
             let Some((name, n)) = arg.split_once('=') else {
-                return tracing::warn!("voice-input: '{arg}' is not <track>=<n|off>");
+                return tracing::warn!("voice-input: '{arg}' is not <track>=<n|all|off>");
             };
             let track = a
                 .session
@@ -2143,11 +2144,14 @@ pub fn install(app: &Rc<AppState>) {
             let Some(track) = track else {
                 return tracing::warn!("voice-input: no track '{name}'");
             };
-            let port = n
-                .parse::<u16>()
-                .ok()
-                .and_then(|n| n.checked_sub(1))
-                .map(faderframe_session::voice::voice_port_key);
+            let port = if n == "all" {
+                Some(faderframe_session::voice::voice_all_port_key())
+            } else {
+                n.parse::<u16>()
+                    .ok()
+                    .and_then(|n| n.checked_sub(1))
+                    .map(faderframe_session::voice::voice_port_key)
+            };
             a.dispatch(Action::Edit(faderframe_project::Command::SetTrackInput {
                 track,
                 input: faderframe_project::InputRouting::Midi {

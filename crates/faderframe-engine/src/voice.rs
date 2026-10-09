@@ -1,14 +1,15 @@
 //! Singing into MIDI on the audio thread (the session's voice ports).
 //!
-//! The mono or polyphonic tracker listens to one input
-//! channel of the device inside the callback and its notes join the live
-//! MIDI of that very callback, on the voice port and at the frame each was
-//! decided, so the instrument plays them at once: only the input and output
-//! buffers and the pitch analysis stand
-//! between the voice and the sound. Each event also keeps how much earlier
-//! its sound began (the block's `early`): a recording puts it there. A copy
-//! of each goes to the control side (Capture MIDI, activity), stamped with
-//! when it was sung.
+//! Each listener's mono or polyphonic tracker listens to one input channel
+//! of the device inside the callback and its notes join the live MIDI of
+//! that very callback, on its voice port, on its MIDI channel and at the
+//! frame each was decided, so the instrument plays them at once: only the
+//! input and output buffers and the pitch analysis stand between the voice
+//! and the sound. Several listeners run side by side (one per input a
+//! track takes, see [`crate::EngineController::add_voice`]). Each event
+//! also keeps how much earlier its sound began (the block's `early`): a
+//! recording puts it there. A copy of each goes to the control side
+//! (Capture MIDI, activity), stamped with when it was sung.
 
 use crate::midi::MidiInputState;
 use faderframe_analysis::polyvoice::PolyTracker;
@@ -27,12 +28,17 @@ pub enum Glide {
     PitchBend,
 }
 
-/// The listening: a tracker, the channel it hears, the port its notes come
-/// from.
+/// Listeners the engine runs at once, at most.
+pub const MAX_VOICES: usize = 64;
+
+/// The listening: a tracker, the input channel it hears, the port and the
+/// MIDI channel its notes come on.
 pub struct VoiceRun {
     tracker: Tracker,
-    channel: u16,
+    input: u16,
     port: u16,
+    /// The MIDI channel (0-based) its notes are on.
+    midi_channel: u8,
     glide: Glide,
     /// The device rate the tracker was made for (it waits for it).
     rate: u32,
@@ -120,8 +126,9 @@ impl VoiceRun {
         (
             Self {
                 tracker,
-                channel,
+                input: channel,
                 port,
+                midi_channel: 0,
                 glide,
                 rate,
                 feed,
@@ -138,8 +145,21 @@ impl VoiceRun {
         self.glide = glide;
     }
 
-    pub(crate) fn channel(&self) -> usize {
-        usize::from(self.channel)
+    /// Its notes on MIDI channel `channel` (0-based; the first by
+    /// default).
+    pub fn on_channel(mut self, channel: u8) -> Self {
+        self.midi_channel = channel.min(15);
+        self
+    }
+
+    /// The input channel it hears (0-based).
+    pub fn input(&self) -> u16 {
+        self.input
+    }
+
+    /// The port its notes come from.
+    pub fn port(&self) -> u16 {
+        self.port
     }
 
     pub(crate) fn rate(&self) -> u32 {
@@ -160,7 +180,7 @@ impl VoiceRun {
             return;
         }
         let ns_per_frame = 1e9 / f64::from(self.rate.max(1));
-        let (port, glide) = (self.port, self.glide);
+        let (port, glide, channel) = (self.port, self.glide, self.midi_channel);
         let polyphonic = matches!(self.tracker, Tracker::Poly(_));
         let feed = &mut self.feed;
         let mut put = |now: isize, at: isize, e: MidiEvent| {
@@ -202,7 +222,7 @@ impl VoiceRun {
                         now,
                         at,
                         MidiEvent::PitchBend {
-                            channel: 0,
+                            channel,
                             value: MidiEvent::PITCH_BEND_CENTRE,
                         },
                     );
@@ -211,7 +231,7 @@ impl VoiceRun {
                     now,
                     at,
                     MidiEvent::NoteOn {
-                        channel: 0,
+                        channel,
                         key,
                         velocity: velocity.clamp(1, 127),
                     },
@@ -222,7 +242,7 @@ impl VoiceRun {
                     now,
                     at,
                     MidiEvent::NoteOff {
-                        channel: 0,
+                        channel,
                         key,
                         velocity: 0,
                     },
@@ -233,7 +253,7 @@ impl VoiceRun {
                     now,
                     at,
                     MidiEvent::NoteExpression {
-                        channel: 0,
+                        channel,
                         key,
                         kind: NoteExpressionKind::Tuning,
                         value: ExpressionValue::new(f64::from(semitones)),
@@ -243,14 +263,7 @@ impl VoiceRun {
                     let v = (f64::from(MidiEvent::PITCH_BEND_CENTRE)
                         + f64::from(semitones) / 2.0 * 8192.0)
                         .clamp(0.0, 16383.0) as u16;
-                    put(
-                        now,
-                        at,
-                        MidiEvent::PitchBend {
-                            channel: 0,
-                            value: v,
-                        },
-                    );
+                    put(now, at, MidiEvent::PitchBend { channel, value: v });
                 }
                 _ => {}
             },
@@ -260,6 +273,7 @@ impl VoiceRun {
     /// End every sounding note (the listening stops or the input went away).
     pub(crate) fn release(&mut self, midi: &mut MidiInputState) {
         let mut released = false;
+        let channel = self.midi_channel;
         let time = midi.clock().map(|clock| clock.now_ns());
         let mut put = |event: MidiEvent| {
             midi.defer(self.port, event);
@@ -274,7 +288,7 @@ impl VoiceRun {
             if let VoiceEvent::NoteOff { key } = e {
                 released = true;
                 put(MidiEvent::NoteOff {
-                    channel: 0,
+                    channel,
                     key,
                     velocity: 0,
                 });
@@ -282,7 +296,7 @@ impl VoiceRun {
         });
         if released && self.glide == Glide::PitchBend && matches!(self.tracker, Tracker::Mono(_)) {
             put(MidiEvent::PitchBend {
-                channel: 0,
+                channel,
                 value: MidiEvent::PITCH_BEND_CENTRE,
             });
         }

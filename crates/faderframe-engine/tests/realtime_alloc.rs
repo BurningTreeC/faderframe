@@ -1006,6 +1006,23 @@ fn voice_allocations(polyphonic: bool) {
         let (_, n) = armed(|| r.processor.process_device(&mut bufs));
         assert_eq!(n, 0, "allocations/frees changing the response");
     }
+    // A second singer joins on input 2 and leaves again.
+    let (second, _heard_second) = make(
+        1,
+        1,
+        SR,
+        VoiceConfig::default().with(Responsiveness::Fast),
+        Glide::Expression,
+    );
+    r.controller.add_voice(second.on_channel(1)).unwrap();
+    for b in 400..440 {
+        sing(&mut bufs, b);
+        let (_, n) = armed(|| r.processor.process_device(&mut bufs));
+        assert_eq!(n, 0, "allocations/frees with a second listener");
+    }
+    r.controller.remove_voice(1, 1).unwrap();
+    let (_, n) = armed(|| r.processor.process_device(&mut bufs));
+    assert_eq!(n, 0, "allocations/frees removing a listener");
     r.controller.set_voice(None).unwrap();
     let (_, n) = armed(|| r.processor.process_device(&mut bufs));
     assert_eq!(n, 0, "allocations/frees releasing the listener");

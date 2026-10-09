@@ -1,17 +1,20 @@
 //! Singing into MIDI live: voice ports.
 //!
 //! Every input channel of the audio device has a MIDI input port, "Voice ·
-//! In n". A track that takes MIDI from one (its input routing names the
-//! port) turns that input into notes: the engine runs the live pitch tracker
-//! ([`faderframe_analysis::voice`] or [`faderframe_analysis::polyvoice`])
-//! on the channel inside its callback. The notes join that callback's live MIDI on the port
-//! ([`faderframe_engine::voice`]) — played at once, recorded where they
-//! were sung. A copy of each comes back here for Capture MIDI and the
-//! activity lights. From there it is MIDI like any keyboard's: it plays the
-//! live instrument tracks, records, reaches external synths. Glides go out
-//! as note expression (per key, for hosted instruments), as pitch bend (±2
-//! semitones, monophonic only), or not at all; notes can snap to the
-//! project's key. One input listens at a time (the first track's, in track order).
+//! In n", and one port takes them all, "Voice · All Inputs" (input n on
+//! MIDI channel n + 1, as an MPE lower zone has its members: one singer,
+//! string or player per channel, up to 15). A track that takes MIDI from
+//! one (its input routing names the port) turns those inputs into notes:
+//! the engine runs a live pitch tracker ([`faderframe_analysis::voice`] or
+//! [`faderframe_analysis::polyvoice`]) on each input inside its callback,
+//! every input any track takes at once. The notes join that callback's
+//! live MIDI on the port ([`faderframe_engine::voice`]) — played at once,
+//! recorded where they were sung. A copy of each comes back here for
+//! Capture MIDI and the activity lights. From there it is MIDI like any
+//! keyboard's: it plays the live instrument tracks, records, reaches
+//! external synths. Glides go out as note expression (per key, for hosted
+//! instruments), as pitch bend (±2 semitones on the input's channel,
+//! monophonic only), or not at all; notes can snap to the project's key.
 
 use crate::Session;
 use faderframe_analysis::voice::{Responsiveness, VoiceConfig};
@@ -22,6 +25,10 @@ use faderframe_project::InputRouting;
 
 /// Port names: this and the 1-based input channel.
 pub const VOICE_PORT: &str = "Voice · In ";
+/// The port of every input, each on a channel of its own.
+pub const VOICE_ALL_PORT: &str = "Voice · All Inputs";
+/// Inputs the all-inputs port carries (MIDI channels 2–16).
+pub const ALL_INPUTS: u16 = 15;
 
 /// How sung pitch moves between notes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -128,14 +135,33 @@ impl VoiceSettings {
     }
 }
 
+/// One input listened to for one port.
+struct Listener {
+    /// What it hears and sends: input channel (0-based), engine port, MIDI
+    /// channel (0-based).
+    hears: Hears,
+    /// The engine's copies of what it heard.
+    feed: rtrb::Consumer<MidiInputEvent>,
+}
+
+/// An input channel, the port its notes come from and their MIDI channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Hears {
+    input: u16,
+    port: u16,
+    channel: u8,
+}
+
 #[derive(Default)]
 pub(crate) struct VoiceState {
-    /// The ports made so far, by input channel (0-based).
+    /// The ports made so far, by input channel (0-based), and the port of
+    /// every input.
     ports: Vec<VirtualMidiInput>,
-    /// The input listened to and the device rate it was set up for.
-    listening: Option<(u16, u32, bool)>,
-    /// The engine's copies of what it heard.
-    feed: Option<rtrb::Consumer<MidiInputEvent>>,
+    all: Option<VirtualMidiInput>,
+    /// The inputs listened to, and the device rate and mode their
+    /// listeners were made for.
+    listeners: Vec<Listener>,
+    made_for: Option<(u32, bool)>,
     /// Keep replaced listeners until their final releases have arrived.
     retiring: Vec<rtrb::Consumer<MidiInputEvent>>,
     pub(crate) settings: VoiceSettings,
@@ -156,12 +182,17 @@ impl VoiceState {
             }
             !finished
         });
-        if let Some(rx) = self.feed.as_mut() {
-            while let Ok(e) = rx.pop() {
+        for l in &mut self.listeners {
+            while let Ok(e) = l.feed.pop() {
                 out.push(e);
             }
         }
         out
+    }
+
+    /// Stop keeping a listener: its feed drains its last note-offs.
+    fn retire(&mut self, l: Listener) {
+        self.retiring.push(l.feed);
     }
 }
 
@@ -180,6 +211,11 @@ pub fn voice_port_key(channel: u16) -> String {
     format!("virtual:{VOICE_PORT}{}", channel + 1)
 }
 
+/// The key of the port of every input.
+pub fn voice_all_port_key() -> String {
+    format!("virtual:{VOICE_ALL_PORT}")
+}
+
 impl Session {
     pub fn voice_settings(&self) -> VoiceSettings {
         self.voice.settings
@@ -190,9 +226,12 @@ impl Session {
         self.tick_voice();
     }
 
-    /// The input channel a voice port listens to now.
-    pub fn voice_listening(&self) -> Option<u16> {
-        self.voice.listening.map(|l| l.0)
+    /// The input channels listened to now (0-based, in order).
+    pub fn voice_listening(&self) -> Vec<u16> {
+        let mut inputs: Vec<u16> = self.voice.listeners.iter().map(|l| l.hears.input).collect();
+        inputs.sort_unstable();
+        inputs.dedup();
+        inputs
     }
 
     /// The key scale notes snap to (all twelve when not in key).
@@ -212,7 +251,7 @@ impl Session {
     pub(crate) fn tick_voice(&mut self) {
         let inputs = self.engine.stream_inputs().min(64) as u16;
         let rate = self.engine.stream_rate();
-        let made = (self.voice.ports.len() as u16) < inputs;
+        let mut made = (self.voice.ports.len() as u16) < inputs;
         while (self.voice.ports.len() as u16) < inputs {
             let n = self.voice.ports.len() as u16;
             self.voice.ports.push(
@@ -221,53 +260,82 @@ impl Session {
                     .virtual_input(&format!("{VOICE_PORT}{}", n + 1)),
             );
         }
+        if inputs > 0 && self.voice.all.is_none() {
+            self.voice.all = Some(self.midi.hub.virtual_input(VOICE_ALL_PORT));
+            made = true;
+        }
         if made {
             // The engine's port map takes the new ports.
             self.midi_ports_changed();
             self.revision += 1;
         }
-        // The first track (in order) taking a voice port.
-        let wanted = self
-            .project
-            .folder_order()
-            .into_iter()
-            .find_map(|t| match &t.input {
-                InputRouting::Midi { port: Some(p), .. } => {
-                    voice_channel(p).filter(|c| *c < inputs)
-                }
-                _ => None,
-            })
-            .filter(|_| rate > 0)
-            .map(|c| (c, rate, self.voice.settings.polyphonic));
+        let wanted = if rate > 0 {
+            self.voice_wanted(inputs)
+        } else {
+            Vec::new()
+        };
+        let mode = (rate, self.voice.settings.polyphonic);
         let scale = self.voice_scale();
-        if self.voice.listening != wanted {
-            let mut feed = None;
-            let run = wanted.and_then(|(c, rate, polyphonic)| {
-                let port = self.voice.ports.get(usize::from(c))?.port();
-                let s = self.voice.settings;
-                let make = if polyphonic {
-                    VoiceRun::new_polyphonic
-                } else {
-                    VoiceRun::new
-                };
-                let (run, rx) = make(c, port, rate, s.config(scale), s.glide.engine());
-                feed = Some(rx);
-                Some(run)
-            });
-            let on = run.is_some();
-            if let Err(e) = self.engine.set_voice(run) {
+        // Another device rate or mode: every listener anew.
+        if self.voice.made_for.is_some_and(|m| m != mode) && !self.voice.listeners.is_empty() {
+            if let Err(e) = self.engine.set_voice(None) {
                 tracing::warn!("voice to MIDI: {e}");
                 return;
             }
-            if let Some(old) = self.voice.feed.take() {
-                self.voice.retiring.push(old);
+            for l in std::mem::take(&mut self.voice.listeners) {
+                self.voice.retire(l);
             }
-            self.voice.feed = feed;
-            self.voice.listening = wanted.filter(|_| on);
-            self.voice.told = on.then_some((self.voice.settings, scale));
         }
+        // Inputs no track takes any more.
+        let mut i = 0;
+        while i < self.voice.listeners.len() {
+            let h = self.voice.listeners[i].hears;
+            if wanted.contains(&h) {
+                i += 1;
+                continue;
+            }
+            if let Err(e) = self.engine.remove_voice(h.input, h.port) {
+                tracing::warn!("voice to MIDI: {e}");
+                return;
+            }
+            let l = self.voice.listeners.swap_remove(i);
+            self.voice.retire(l);
+        }
+        // Inputs a track takes now.
+        let s = self.voice.settings;
+        for h in wanted {
+            if self.voice.listeners.iter().any(|l| l.hears == h) {
+                continue;
+            }
+            if self.voice.listeners.len() >= faderframe_engine::voice::MAX_VOICES {
+                tracing::warn!("voice to MIDI: more inputs than can be listened to");
+                break;
+            }
+            let make = if s.polyphonic {
+                VoiceRun::new_polyphonic
+            } else {
+                VoiceRun::new
+            };
+            let (run, feed) = make(h.input, h.port, rate, s.config(scale), s.glide.engine());
+            if let Err(e) = self.engine.add_voice(run.on_channel(h.channel)) {
+                tracing::warn!("voice to MIDI: {e}");
+                return;
+            }
+            self.voice.listeners.push(Listener { hears: h, feed });
+            // The new one hears as told now; the others may still be on
+            // what they were told.
+            if self.voice.told.is_none() {
+                self.voice.told = Some((s, scale));
+            }
+        }
+        if self.voice.listeners.is_empty() {
+            self.voice.made_for = None;
+            self.voice.told = None;
+            return;
+        }
+        self.voice.made_for = Some(mode);
         let now = (self.voice.settings, scale);
-        if self.voice.listening.is_some() && self.voice.told != Some(now) {
+        if self.voice.told != Some(now) {
             if let Err(e) = self
                 .engine
                 .set_voice_config(now.0.config(now.1), now.0.glide.engine())
@@ -279,12 +347,45 @@ impl Session {
         }
     }
 
-    pub(crate) fn stop_voice(&mut self) {
-        if self.voice.listening.is_some() && self.engine.set_voice(None).is_ok() {
-            self.voice.listening = None;
-            if let Some(old) = self.voice.feed.take() {
-                self.voice.retiring.push(old);
+    /// What the tracks ask to hear: every input a track's MIDI input port
+    /// names (each in order once).
+    fn voice_wanted(&self, inputs: u16) -> Vec<Hears> {
+        let all_key = voice_all_port_key();
+        let mut wanted = Vec::new();
+        for t in self.project.folder_order() {
+            let InputRouting::Midi { port: Some(p), .. } = &t.input else {
+                continue;
+            };
+            if *p == all_key {
+                let Some(all) = &self.voice.all else { continue };
+                for c in 0..inputs.min(ALL_INPUTS) {
+                    wanted.push(Hears {
+                        input: c,
+                        port: all.port(),
+                        channel: (c + 1) as u8,
+                    });
+                }
+            } else if let Some(c) = voice_channel(p).filter(|c| *c < inputs)
+                && let Some(port) = self.voice.ports.get(usize::from(c))
+            {
+                wanted.push(Hears {
+                    input: c,
+                    port: port.port(),
+                    channel: 0,
+                });
             }
+        }
+        wanted.sort_unstable();
+        wanted.dedup();
+        wanted
+    }
+
+    pub(crate) fn stop_voice(&mut self) {
+        if !self.voice.listeners.is_empty() && self.engine.set_voice(None).is_ok() {
+            for l in std::mem::take(&mut self.voice.listeners) {
+                self.voice.retire(l);
+            }
+            self.voice.made_for = None;
             self.voice.told = None;
         }
     }
@@ -300,6 +401,8 @@ mod tests {
         assert_eq!(voice_channel("virtual:Voice · In 2"), Some(1));
         assert_eq!(voice_channel("virtual:FaderFrame Keyboard"), None);
         assert_eq!(voice_channel("MPK mini 3:MPK mini 3 MIDI 1"), None);
+        assert_eq!(voice_all_port_key(), "virtual:Voice · All Inputs");
+        assert_eq!(voice_channel(&voice_all_port_key()), None);
     }
 
     #[test]

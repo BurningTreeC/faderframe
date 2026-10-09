@@ -401,7 +401,11 @@ long sessions), Neon and High Contrast:
   wanted, and records them where they were sung. Preferences → MIDI →
   Voice to MIDI → Polyphonic enables chords from one input, with independent
   glides through note expression. Chord detection takes longer; simultaneous
-  octave doublings can merge. Monophonic mode remains the default.
+  octave doublings can merge. Monophonic mode remains the default. Every
+  input a track takes is heard at once, so several singers or players can
+  each have a track; "Voice · All Inputs" brings every input to one track,
+  each on its own MIDI channel (a choir, or a hexaphonic guitar pickup with
+  every string's bends apart).
 * Screen readers and the keyboard: the mixer, arranger, piano roll, event
   list, setlist, history, transport display and the device editors list
   their controls to screen readers (Orca and other AT-SPI readers on

@@ -3256,8 +3256,7 @@ DAW does well yet):
     and leave at it, and clips hold MIDI 1.0's); more views for screen
     readers (Album, Launcher, Automation, Tools and Video, the edit
     toolbar: they only name themselves so far); merging project versions
-    (three-way, from `faderframe_project::compare`) for collaborators;
-    several voice inputs at once (chords from one input are supported).
+    (three-way, from `faderframe_project::compare`) for collaborators.
 
 Suggested next: 11 and the auto-align of 16, then reference tracks and
 lead sheets — the first three everyday tools, the last one FaderFrame's
@@ -3716,9 +3715,9 @@ scratchpad's `a11y_dump.py` / `a11y_events.py` on `/usr/bin/python3` with
 ### Singing into MIDI (voice ports)
 
 Every input channel of the audio device has a MIDI input port "Voice · In
-n" (`session::voice`, virtual inputs of the hub, left out of the
-Preferences' input list). A track whose MIDI input names one makes the
-session hand the engine a listener (`engine::voice::VoiceRun`: a
+n", and "Voice · All Inputs" takes them all (`session::voice`, virtual
+inputs of the hub, left out of the Preferences' input list). A track whose
+MIDI input names one makes the session hand the engine a listener (`engine::voice::VoiceRun`: a
 `faderframe_analysis::voice::VoiceTracker` for that channel at the device
 rate, built on the control thread, `Message::Voice`, retired as garbage;
 settings by `Message::VoiceConfig`). In `render`, right after the queued
@@ -3762,12 +3761,32 @@ retired listeners' feeds through their final note-offs, preserving Capture
 MIDI. Missing inputs, changed device rates, and changed glide modes also
 release the listener; resets discard old analysis audio.
 
-One input listens at a time (the first track's in track order). Tests:
-`voice::tests` (a sung phrase placed within 15 ms at every response,
-onset latencies by key, threshold, scale, octave), engine
+Every input a track takes is listened to at once. The engine keeps up to
+`voice::MAX_VOICES` (64) listeners in a vector made with that room
+(`Message::VoiceAdd` replaces one on the same input and port,
+`VoiceRemove { input, port }` releases and retires one, `Voice` clears
+them all and is what `set_voice` sends; `VoiceConfig` reaches every one).
+Each listener has its input, its port and its MIDI channel
+(`VoiceRun::on_channel`). The session (`tick_voice`, `voice_wanted`)
+reconciles what the tracks' MIDI inputs name with what it listens to: a
+listener per "Voice · In n" a track takes (on channel 1), and for the port
+"Voice · All Inputs" one per input up to 15, input n on MIDI channel
+n + 1 — an MPE lower zone's members, so one track takes a choir or a
+hexaphonic pickup with each singer's or string's glides on its own
+channel. Listeners that stay keep their trackers (a note goes on while
+another input starts or stops); another device rate or mode makes them
+all anew. Each listener's feed is drained into `tick_midi`; a removed
+one's feed drains to its last note-off. Tests: `voice::tests` (a sung
+phrase placed within 15 ms at every response, onset latencies by key,
+threshold, scale, octave), engine
 `an_early_stamp_plays_now_and_records_where_it_was`, `tests/voice.rs`
-(voice to sound), `voice_to_midi_does_not_allocate`,
-`session/tests/voice.rs` (the dummy device's tone played and recorded).
+(voice to sound; `two_inputs_are_listened_to_at_once`: two ports and
+channels, one leaves), `voice_to_midi_does_not_allocate` (a second
+listener added and removed), `session/tests/voice.rs` (the dummy
+device's tone played and recorded; `two_inputs_sing_into_two_tracks_at_once`
+and `the_all_inputs_port_puts_each_input_on_its_own_channel` on
+`DummyBackend::with_input_spread`, whose input n sings 4n semitones above
+A3 from a second in).
 Polyphonic tests cover plucks, strummed chords at all three responses,
 arpeggios, retriggers, noise, thresholds, scale snapping, reset, block-size
 invariance and device rates from 44.1 to 192 kHz. The engine test plays and

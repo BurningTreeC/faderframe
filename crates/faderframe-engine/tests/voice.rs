@@ -242,3 +242,80 @@ fn chord_in_engine(glide: Glide, disconnect_input: bool) {
     );
     assert_eq!(rd.controller.midi_counters(), (0, 0));
 }
+
+/// Two singers on two inputs: two listeners side by side, each on its
+/// own port and MIDI channel; one stops, the other sings on.
+#[test]
+fn two_inputs_are_listened_to_at_once() {
+    use faderframe_midi::MidiEvent;
+
+    let mut tp = TestProject::new(SR);
+    let t = tp.track(TrackKind::Instrument, "Choir", ChannelLayout::Stereo);
+    tp.project.track_mut(t).unwrap().input = InputRouting::all_midi();
+    let mut rd = OfflineRenderer::new(
+        &tp.project,
+        &tp.sources,
+        EngineConfig {
+            sample_rate: SR,
+            ..EngineConfig::default()
+        },
+        BLOCK,
+        2,
+    )
+    .unwrap();
+    let (_tx, q, _feed) = midi_input_queue(64);
+    rd.controller.set_midi_input(q).unwrap();
+    let (a, mut heard_a) = VoiceRun::new(0, 3, SR, VoiceConfig::default(), Glide::Off);
+    let (b, mut heard_b) = VoiceRun::new(1, 4, SR, VoiceConfig::default(), Glide::Off);
+    rd.controller.add_voice(a.on_channel(1)).unwrap();
+    rd.controller.add_voice(b.on_channel(2)).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, BLOCK);
+    let mut phases = [0.0f64; 2];
+    let mut sing = |bufs: &mut OwnedBuffers, blocks: usize| {
+        for _ in 0..blocks {
+            // A3 on input 1, E4 on input 2.
+            for (c, key) in [57.0f64, 64.0].iter().enumerate() {
+                let f = 440.0 * 2f64.powf((key - 69.0) / 12.0);
+                for v in bufs.input_mut(c).iter_mut() {
+                    phases[c] = (phases[c] + f / f64::from(SR)).fract();
+                    *v = (0.3 * (std::f64::consts::TAU * phases[c]).sin()) as f32;
+                }
+            }
+            rd.processor.process_device(bufs);
+        }
+    };
+    sing(&mut bufs, 150);
+    let ons = |rx: &mut rtrb::Consumer<faderframe_midi::MidiInputEvent>| {
+        std::iter::from_fn(|| rx.pop().ok())
+            .filter_map(|e| match e.event() {
+                Some(MidiEvent::NoteOn { channel, key, .. }) => Some((e.port, channel, key)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ons(&mut heard_a),
+        [(3, 1, 57)],
+        "input 1 on port 3, channel 2"
+    );
+    assert_eq!(
+        ons(&mut heard_b),
+        [(4, 2, 64)],
+        "input 2 on port 4, channel 3"
+    );
+    // The second singer leaves: its note ends, the first sings on.
+    rd.controller.remove_voice(1, 4).unwrap();
+    sing(&mut bufs, 20);
+    let offs: Vec<_> = std::iter::from_fn(|| heard_b.pop().ok())
+        .filter_map(|e| match e.event() {
+            Some(MidiEvent::NoteOff { channel, key, .. }) => Some((channel, key)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(offs, [(2, 64)]);
+    assert!(
+        std::iter::from_fn(|| heard_a.pop().ok())
+            .all(|e| !matches!(e.event(), Some(MidiEvent::NoteOff { .. }))),
+        "the first singer's note goes on"
+    );
+}

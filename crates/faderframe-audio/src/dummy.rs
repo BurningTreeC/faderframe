@@ -30,6 +30,8 @@ pub struct DummyBackend {
     input_tone: Option<f32>,
     /// Shape the tone into plucked notes (twice a second).
     pluck: bool,
+    /// Input n's tone this many semitones above input n − 1's.
+    spread: f32,
     /// A cable from every output to the input of the same number, `n`
     /// frames longer than the device's own buffer (hardware inserts
     /// without hardware).
@@ -41,6 +43,17 @@ impl DummyBackend {
     pub fn with_input_tone(hz: f32) -> Self {
         Self {
             input_tone: Some(hz),
+            ..Self::default()
+        }
+    }
+
+    /// Input n carries a steady sine `n × semitones` above `hz` (several
+    /// singers, one on each input), from one second into the stream (a
+    /// test can listen and start recording before the first note).
+    pub fn with_input_spread(hz: f32, semitones: f32) -> Self {
+        Self {
+            input_tone: Some(hz),
+            spread: semitones,
             ..Self::default()
         }
     }
@@ -113,6 +126,7 @@ impl AudioBackend for DummyBackend {
         let monitor = StreamMonitor::new(sample_rate, buffer_size);
         let tone = self.input_tone;
         let pluck = self.pluck;
+        let spread = self.spread;
         let loopback = self.loopback;
         let stop = Arc::new(AtomicBool::new(false));
         let requested = Arc::new(AtomicU32::new(buffer_size));
@@ -134,6 +148,9 @@ impl AudioBackend for DummyBackend {
                     monitor.set_running(true);
                     let mut next = Instant::now();
                     let mut phase = 0.0f64;
+                    // Spread tones: a phase per input, and frames so far.
+                    let mut phases = vec![0.0f64; ins];
+                    let mut spread_frames = 0u64;
                     let mut t = 0u64;
                     // The loopback's cable: a ring per channel, made once
                     // (long enough for any buffer and the delay).
@@ -158,7 +175,23 @@ impl AudioBackend for DummyBackend {
                             info.buffer_size as f64 / info.sample_rate as f64,
                         );
                         bufs.set_frames(info.buffer_size as usize);
-                        if let Some(hz) = tone {
+                        if let Some(hz) = tone.filter(|_| spread != 0.0) {
+                            let sr = info.sample_rate as f64;
+                            let begin = info.sample_rate as u64;
+                            for (c, ph) in phases.iter_mut().enumerate() {
+                                let f = hz as f64 * 2f64.powf(c as f64 * spread as f64 / 12.0);
+                                let inc = std::f64::consts::TAU * f / sr;
+                                for (i, s) in bufs.input_mut(c).iter_mut().enumerate() {
+                                    if spread_frames + (i as u64) < begin {
+                                        *s = 0.0;
+                                        continue;
+                                    }
+                                    *s = (ph.sin() * 0.5) as f32;
+                                    *ph = (*ph + inc) % std::f64::consts::TAU;
+                                }
+                            }
+                            spread_frames += info.buffer_size as u64;
+                        } else if let Some(hz) = tone {
                             let sr = info.sample_rate as f64;
                             let inc = std::f64::consts::TAU * hz as f64 / sr;
                             let start = phase;

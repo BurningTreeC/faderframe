@@ -7,7 +7,7 @@ use faderframe_audio::dummy::DummyBackend;
 use faderframe_core::{TrackId, builtin};
 use faderframe_engine::EngineConfig;
 use faderframe_project::{ClipContent, Command, InputRouting, PluginRef, Project, TrackKind};
-use faderframe_session::voice::voice_port_key;
+use faderframe_session::voice::{voice_all_port_key, voice_port_key};
 use faderframe_session::{Action, AudioPreferences, Session, TransportAction};
 use std::time::{Duration, Instant};
 
@@ -66,7 +66,10 @@ fn a_sung_note_plays_and_records_on_the_instrument() {
         on: true,
     }))
     .unwrap();
-    assert_eq!(s.voice_listening(), None, "no track takes the voice yet");
+    assert!(
+        s.voice_listening().is_empty(),
+        "no track takes the voice yet"
+    );
     s.dispatch(Action::Transport(TransportAction::ToggleRecord))
         .unwrap();
     s.dispatch(Action::Transport(TransportAction::Play))
@@ -75,7 +78,7 @@ fn a_sung_note_plays_and_records_on_the_instrument() {
     // The steady tone starts its note as soon as the track listens.
     sing_into(&mut s, t, true);
     run(&mut s, Duration::from_millis(400));
-    assert_eq!(s.voice_listening(), Some(0), "listening to input 1");
+    assert_eq!(s.voice_listening(), [0], "listening to input 1");
     assert!(
         s.live_midi_notes(t).iter().any(|n| n.key == 57),
         "A3 sounds: {:?}",
@@ -94,7 +97,7 @@ fn a_sung_note_plays_and_records_on_the_instrument() {
     // Taking the port away stops the listening.
     sing_into(&mut s, t, false);
     run(&mut s, Duration::from_millis(50));
-    assert_eq!(s.voice_listening(), None);
+    assert!(s.voice_listening().is_empty());
     s.stop_audio();
 }
 
@@ -109,7 +112,7 @@ fn changing_polyphonic_mode_releases_and_restarts_the_listener() {
     settings.polyphonic = true;
     s.set_voice_settings(settings);
     run(&mut s, Duration::from_millis(250));
-    assert_eq!(s.voice_listening(), Some(0));
+    assert_eq!(s.voice_listening(), [0]);
     // The dummy's pure sine has no harmonic evidence for chord mode.
     // Its old mono note must still release, including the capture feed.
     assert_eq!(s.held_midi_keys(), 0, "the retired feed releases A3");
@@ -117,6 +120,114 @@ fn changing_polyphonic_mode_releases_and_restarts_the_listener() {
     settings.polyphonic = false;
     s.set_voice_settings(settings);
     run(&mut s, Duration::from_millis(150));
+    assert_eq!(s.held_midi_keys(), 1u128 << 57);
+    s.stop_audio();
+}
+
+/// A track per port, recording, on a device whose input n sings A3 +
+/// 4n semitones (A3, C♯4, F4, A4, …) from a second in, after the
+/// recording began.
+fn choir(ports: &[String]) -> (Session, Vec<TrackId>) {
+    let mut s = Session::new(Project::new("Choir", 48_000), None, EngineConfig::default()).unwrap();
+    let mut ts = Vec::new();
+    for port in ports {
+        let t = s.add_track(TrackKind::Instrument).unwrap();
+        s.dispatch(Action::SetInstrumentPlugin {
+            track: t,
+            plugin: Some(PluginRef::builtin(builtin::SYNTH, "Synth")),
+        })
+        .unwrap();
+        s.dispatch(Action::Edit(Command::SetTrackRecordArm {
+            track: t,
+            on: true,
+        }))
+        .unwrap();
+        take_from(&mut s, t, port.clone());
+        ts.push(t);
+    }
+    s.start_audio(
+        vec![Box::new(DummyBackend::with_input_spread(220.0, 4.0))],
+        &AudioPreferences::default(),
+    )
+    .unwrap();
+    run(&mut s, Duration::from_millis(100));
+    s.dispatch(Action::Transport(TransportAction::ToggleRecord))
+        .unwrap();
+    s.dispatch(Action::Transport(TransportAction::Play))
+        .unwrap();
+    // The voices begin.
+    run(&mut s, Duration::from_millis(1300));
+    (s, ts)
+}
+
+fn take_from(s: &mut Session, t: TrackId, port: String) {
+    s.dispatch(Action::Edit(Command::SetTrackInput {
+        track: t,
+        input: InputRouting::Midi {
+            port: Some(port),
+            channel: None,
+        },
+    }))
+    .unwrap();
+}
+
+/// The notes of a track's recorded clip: (key, channel).
+fn recorded(s: &Session, t: TrackId) -> Vec<(u8, u8)> {
+    let clips: Vec<_> = s.project().clips_of(t).into_iter().cloned().collect();
+    assert_eq!(clips.len(), 1, "{clips:?}");
+    let ClipContent::Midi(m) = &clips[0].content else {
+        panic!("a MIDI clip");
+    };
+    let mut notes: Vec<(u8, u8)> = m.notes.iter().map(|n| (n.key, n.channel)).collect();
+    notes.sort_unstable();
+    notes.dedup();
+    notes
+}
+
+#[test]
+fn two_inputs_sing_into_two_tracks_at_once() {
+    let (mut s, ts) = choir(&[voice_port_key(0), voice_port_key(1)]);
+    assert_eq!(s.voice_listening(), [0, 1]);
+    assert_eq!(
+        s.held_midi_keys(),
+        1u128 << 57 | 1u128 << 61,
+        "A3 and C♯4 sound together"
+    );
+    // One stops listening; the other sings on.
+    take_from(&mut s, ts[1], "virtual:FaderFrame Keyboard".into());
+    run(&mut s, Duration::from_millis(150));
+    assert_eq!(s.voice_listening(), [0]);
+    assert_eq!(s.held_midi_keys(), 1u128 << 57, "C♯4 ended");
+    s.dispatch(Action::Transport(TransportAction::Stop))
+        .unwrap();
+    s.wait_for_recordings();
+    // Each track recorded its own input.
+    assert_eq!(recorded(&s, ts[0]), [(57, 0)]);
+    assert_eq!(recorded(&s, ts[1]), [(61, 0)]);
+    s.stop_audio();
+}
+
+#[test]
+fn the_all_inputs_port_puts_each_input_on_its_own_channel() {
+    let (mut s, ts) = choir(&[voice_all_port_key()]);
+    // The dummy device has eight inputs.
+    assert_eq!(s.voice_listening(), (0..8).collect::<Vec<u16>>());
+    let keys: Vec<u8> = (0..8).map(|n| 57 + 4 * n).collect();
+    assert_eq!(
+        s.held_midi_keys(),
+        keys.iter().fold(0u128, |m, k| m | 1u128 << k),
+        "every input sounds"
+    );
+    s.dispatch(Action::Transport(TransportAction::Stop))
+        .unwrap();
+    s.wait_for_recordings();
+    // Input n on MIDI channel n + 1 (0-based: n + 1, the first left free).
+    let want: Vec<(u8, u8)> = keys.iter().zip(1u8..).map(|(k, c)| (*k, c)).collect();
+    assert_eq!(recorded(&s, ts[0]), want);
+    // Taking the port away ends every note.
+    take_from(&mut s, ts[0], voice_port_key(0));
+    run(&mut s, Duration::from_millis(150));
+    assert_eq!(s.voice_listening(), [0]);
     assert_eq!(s.held_midi_keys(), 1u128 << 57);
     s.stop_audio();
 }

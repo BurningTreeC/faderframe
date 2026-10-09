@@ -409,7 +409,7 @@ fn voice_section(app: &Rc<AppState>) -> gtk::Grid {
         });
     }
     let hint = gtk::Label::new(Some(
-        "Sing or play into an audio input and choose “Voice · In n” as an instrument or MIDI track's MIDI input. Enable Polyphonic for chords. The track plays and records the detected notes. For the least delay, use a small audio buffer (Preferences → Audio).",
+        "Sing or play into an audio input and choose “Voice · In n” as an instrument or MIDI track's MIDI input; every input a track takes is heard at once, so several singers or players can each have a track. “Voice · All Inputs” brings every input to one track, input n on MIDI channel n + 1 (an MPE layout: a hexaphonic guitar pickup, one string per input). Enable Polyphonic for chords. The track plays and records the detected notes. For the least delay, use a small audio buffer (Preferences → Audio).",
     ));
     hint.set_wrap(true);
     hint.set_natural_wrap_mode(gtk::NaturalWrapMode::Word);
