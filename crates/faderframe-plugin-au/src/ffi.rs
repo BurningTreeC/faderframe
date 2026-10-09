@@ -75,6 +75,9 @@ pub const kAudioUnitParameterUnit_LinearGain: u32 = 14;
 pub const kAudioUnitParameterUnit_Milliseconds: u32 = 24;
 pub const kAudioUnitParameterUnit_CustomUnit: u32 = 26;
 
+// AUDynamicsProcessor: global, dB, read-only (AudioUnitParameters.h).
+pub const kDynamicsProcessorParam_CompressionAmount: u32 = 1000;
+
 // Stream formats.
 pub const kAudioFormatLinearPCM: u32 = fourcc(b"lpcm");
 /// Float | Packed | NonInterleaved (native endian).

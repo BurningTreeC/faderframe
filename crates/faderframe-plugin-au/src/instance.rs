@@ -161,7 +161,7 @@ impl AuInstance {
             params: Vec::new(),
             with_strings: Vec::new(),
             meter: None,
-            reduction_cell: faderframe_plugin_host::Reduction::new(),
+            reduction_cell: faderframe_plugin_host::Reduction::unreported(),
             rt: None,
             config: None,
             latency: 0,
@@ -254,10 +254,25 @@ impl AuInstance {
         }
     }
 
+    /// Apple's documented meter need not have ParameterInfo or appear in
+    /// ParameterList. Probe its value, only on the component that defines
+    /// this id; arbitrary units can use id 1000 for an ordinary control.
+    fn query_builtin_meter(&mut self) {
+        if self.meter.is_none()
+            && self.scanned.id == "aufx:dcmp:appl"
+            && self
+                .unit_value(kDynamicsProcessorParam_CompressionAmount)
+                .is_some()
+        {
+            self.meter = Some((kDynamicsProcessorParam_CompressionAmount, false));
+        }
+    }
+
     fn query_params(&mut self) {
         self.params.clear();
         self.with_strings.clear();
         self.meter = None;
+        self.query_builtin_meter();
         let mut size = 0u32;
         let mut writable = 0u8;
         // SAFETY: plain property queries; buffers are sized from the info.
@@ -288,14 +303,7 @@ impl AuInstance {
             ids.truncate(size as usize / 4);
             ids
         };
-        // Meters a unit leaves out of its list (Apple's dynamics units keep
-        // theirs from id 1000 on), asked for by id.
-        let probe: Vec<u32> = (1000..1004).filter(|i| !ids.contains(i)).collect();
-        for id in ids.iter().copied().chain(probe.iter().copied()) {
-            let probed = probe.contains(&id);
-            if probed && self.meter.is_some() {
-                break;
-            }
+        for id in ids {
             // SAFETY: an all-zero AudioUnitParameterInfo is valid (null
             // strings); the element of ParameterInfo is the parameter id.
             let zero: AudioUnitParameterInfo = unsafe { std::mem::zeroed() };
@@ -308,15 +316,11 @@ impl AuInstance {
                 continue;
             };
             let name = info_name(&info);
-            if is_meter(&info) {
+            if is_meter(&info) || self.meter.is_some_and(|(meter, _)| meter == id) {
                 // Meters; a gain-reduction one reaches the mixer's.
                 if self.meter.is_none() && faderframe_plugin_host::names_gain_reduction(&name) {
                     self.meter = Some((id, meter_is_gain(&info)));
                 }
-                continue;
-            }
-            if probed {
-                // Not listed: not offered as a control.
                 continue;
             }
             if info.flags & kAudioUnitParameterFlag_ValuesHaveStrings != 0 {
@@ -452,9 +456,6 @@ impl AuInstance {
             },
         );
         let mut state = state;
-        state.reduction = self
-            .meter
-            .map(|(id, gain)| (id, gain, Arc::clone(&self.reduction_cell)));
         self.bases_tx = Some(bases_tx);
         if inputs > 0 {
             let cb = state.render_callback();
@@ -483,6 +484,12 @@ impl AuInstance {
                 status,
             ));
         }
+        // Some meters become readable only once the unit is initialised.
+        self.query_builtin_meter();
+        self.reduction_cell.set_unreported();
+        state.reduction = self
+            .meter
+            .map(|(id, gain)| (id, gain, Arc::clone(&self.reduction_cell)));
         self.rt = Some(Arc::new(TryCell::new(state)));
         self.config = Some(*config);
         let seconds = |s: f64| (s.max(0.0) * config.sample_rate).round();

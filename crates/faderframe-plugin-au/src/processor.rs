@@ -495,17 +495,21 @@ impl PluginProcessor for AuProcessor {
             )
         };
         st.sample_time += n as f64;
-        if status == 0
-            && let Some((id, gain, cell)) = &st.reduction
-        {
+        if let Some((id, gain, cell)) = &st.reduction {
             let mut v = 0f32;
             // SAFETY: an initialised unit, read on the thread that renders it.
-            if unsafe { AudioUnitGetParameter(unit, *id, kAudioUnitScope_Global, 0, &mut v) } == 0 {
+            if status == 0
+                && unsafe { AudioUnitGetParameter(unit, *id, kAudioUnitScope_Global, 0, &mut v) }
+                    == 0
+                && v.is_finite()
+            {
                 cell.set(match *gain {
                     true if v > 0.0 => (-20.0 * v.log10()).clamp(0.0, 90.0),
                     true => 90.0,
                     false => v.abs(),
                 });
+            } else {
+                cell.set_unreported();
             }
         }
         if status != 0 {

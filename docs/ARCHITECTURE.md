@@ -3463,8 +3463,14 @@ processor sets after each block on the audio thread:
   controller (dB unit, else the dB its text shows, else a 0…1 linear gain);
 * LV2: output control ports named so (`scan::Lv2Plugin::reduction_ports`,
   `ReductionScale::{Db, Gain}` from `units:db`/`units:coef`/the range);
-* AU: a read-only meter parameter named so (Apple's Dynamics Processor's
-  "Compression Amount"), read with `AudioUnitGetParameter` after render;
+* AU: a read-only or meter-flagged parameter named so, read with
+  `AudioUnitGetParameter` after render. Apple's Dynamics Processor also
+  gets a direct probe of its documented `CompressionAmount` parameter
+  (global id 1000, dB), retried after initialization: discovery does not
+  require this built-in meter's parameter metadata. The probe is specific
+  to `aufx:dcmp:appl`; third-party ids come from their parameter lists.
+  Activation clears old readings, and failed or non-finite reads mark
+  the meter unreported;
 * sandboxed plugins: the helper writes the reduction into the shared
   memory's `Header::reduction` each block and the proxy hands it on (shm
   version 5).

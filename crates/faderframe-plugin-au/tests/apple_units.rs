@@ -378,10 +378,16 @@ fn the_dynamics_processor_reports_its_gain_reduction() {
     let threshold = param(&*inst, "threshold");
     inst.set_parameter(threshold, -40.0).unwrap();
     let mut p = inst.create_processor(&CONFIG).unwrap();
+    let compression = inst.parameter(ParameterId(1000));
     let cell = inst.reduction().unwrap_or_else(|| {
         let names: Vec<&str> = inst.parameters().iter().map(|p| p.name.as_str()).collect();
-        panic!("a compression meter (controls: {names:?})")
+        panic!("a compression meter (direct read: {compression:?}, controls: {names:?})")
     });
+    assert!(cell.get().is_none(), "no reading before rendering");
+    assert!(
+        inst.parameters().iter().all(|p| p.id != ParameterId(1000)),
+        "the read-only compression meter is not an editable control"
+    );
     let mut rig = Rig::new();
     rig.input(|i| 0.5 * (i as f32 * 0.05).sin());
     for _ in 0..40 {
@@ -389,4 +395,38 @@ fn the_dynamics_processor_reports_its_gain_reduction() {
     }
     let r = cell.get().expect("reported");
     assert!(r > 1.0, "{r} dB");
+
+    // Restoring state re-queries the parameters; reactivation must attach
+    // the meter to the new processor and keep the cell held by the mixer.
+    let state = inst.save_state().unwrap();
+    inst.load_state(&state).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&cell, &inst.reduction().unwrap()));
+    let config = ProcessConfig {
+        sample_rate: 44_100.0,
+        ..CONFIG
+    };
+    p = inst.create_processor(&config).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&cell, &inst.reduction().unwrap()));
+    assert!(cell.get().is_none(), "reactivation clears the old reading");
+    for _ in 0..40 {
+        rig.run(p.as_mut(), &[]);
+    }
+    assert!(cell.get().unwrap() > 1.0, "the new processor reports");
+
+    inst.set_parameter(threshold, 0.0).unwrap();
+    for _ in 0..200 {
+        rig.run(p.as_mut(), &[]);
+    }
+    let r = cell.get().expect("still reporting");
+    assert!(r < 1.0, "compression releases: {r} dB");
+}
+
+#[test]
+fn ordinary_apple_effects_do_not_report_gain_reduction() {
+    for id in [DELAY, LOWPASS] {
+        let mut inst = instantiate(id);
+        assert!(inst.reduction().is_none(), "{id}");
+        let _p = inst.create_processor(&CONFIG).unwrap();
+        assert!(inst.reduction().is_none(), "{id} after activation");
+    }
 }
