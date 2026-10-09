@@ -90,8 +90,23 @@ struct Slot {
     fd: OwnedFd,
     /// Not shown by the toolkit (any more).
     free: Arc<AtomicBool>,
-    /// The frame at which it was first seen free (the fallback's grace).
-    freed_at: Option<u64>,
+    /// Keep a pending fence alive until it signals. Exporting a new
+    /// aggregate fence on every poll can keep returning a pending fence.
+    readers: Option<OwnedFd>,
+}
+
+impl Slot {
+    fn readers_done(&mut self) -> std::io::Result<bool> {
+        let fence = match self.readers.as_ref() {
+            Some(fence) => fence,
+            None => self.readers.insert(reader_fence(self.fd.as_raw_fd())?),
+        };
+        let ready = fence_ready(fence.as_raw_fd())?;
+        if ready {
+            self.readers = None;
+        }
+        Ok(ready)
+    }
 }
 
 /// Exports frames as dmabufs from a device opened by [`open_device`].
@@ -100,17 +115,11 @@ pub(crate) struct Exporter {
     fd_ext: ash::khr::external_memory_fd::Device,
     memory: vk::PhysicalDeviceMemoryProperties,
     slots: Vec<Slot>,
-    /// Frames handed out so far.
-    frame: u64,
     /// The kernel exports the readers' fences of a dmabuf
-    /// (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`, Linux 6.0); without, a released
-    /// buffer waits [`GRACE`] frames instead.
+    /// (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`, Linux 6.0). If this cannot be
+    /// checked, frames use the readback path instead of reusing buffers.
     sync_files: bool,
 }
-
-/// Frames a released buffer is left alone where its readers cannot be
-/// waited for.
-const GRACE: u64 = 2;
 
 /// A frame in a dmabuf: one plane, `fd` valid until `release` is dropped
 /// (the toolkit drops it when it no longer shows the frame).
@@ -159,7 +168,6 @@ impl Exporter {
             fd_ext,
             memory,
             slots: Vec::new(),
-            frame: 0,
             sync_files: true,
         })
     }
@@ -174,24 +182,35 @@ impl Exporter {
         height: u32,
         stride: u32,
     ) -> Option<(&wgpu::Buffer, DmabufFrame)> {
-        self.frame += 1;
-        let frame = self.frame;
+        if !self.sync_files {
+            return None;
+        }
         // Buffers of another size go once they are free.
         self.slots.retain(|s| {
             (s.width == width && s.height == height) || !s.free.load(Ordering::Acquire)
         });
-        for s in &mut self.slots {
-            if s.free.load(Ordering::Acquire) {
-                s.freed_at.get_or_insert(frame);
+        let mut available = None;
+        for (i, s) in self.slots.iter_mut().enumerate() {
+            if s.width != width || s.height != height || !s.free.load(Ordering::Acquire) {
+                continue;
+            }
+            // Dropping the toolkit's texture is not a fence. Never write
+            // into a buffer whose GPU readers are still using it, even
+            // after a timeout or an arbitrary number of UI frames.
+            match s.readers_done() {
+                Ok(true) => {
+                    available = Some(i);
+                    break;
+                }
+                Ok(false) => continue,
+                Err(e) => {
+                    self.sync_files = false;
+                    tracing::warn!("cannot check dmabuf readers ({e}); reading frames back");
+                    return None;
+                }
             }
         }
-        let sync_files = self.sync_files;
-        let index = match self.slots.iter().position(|s| {
-            s.width == width
-                && s.height == height
-                && s.free.load(Ordering::Acquire)
-                && (sync_files || s.freed_at.is_some_and(|f| frame - f >= GRACE))
-        }) {
+        let index = match available {
             Some(i) => i,
             None if self.slots.len() < POOL => {
                 let slot = self.make(device, width, height, stride)?;
@@ -200,21 +219,7 @@ impl Exporter {
             }
             None => return None,
         };
-        // The toolkit let go of it, but its GPU may still be reading it:
-        // Vulkan does not wait for that by itself (no implicit sync for
-        // exported memory), and a buffer written while still on screen
-        // showed tiles of two frames (striped meters).
-        if self.sync_files && !wait_for_readers(self.slots[index].fd.as_raw_fd(), 50) {
-            self.sync_files = false;
-            tracing::info!(
-                "dmabuf frames: the kernel exports no reader fences; released buffers wait {GRACE} frames"
-            );
-            if self.slots[index].freed_at.is_none_or(|f| frame - f < GRACE) {
-                return None;
-            }
-        }
         let s = &mut self.slots[index];
-        s.freed_at = None;
         s.free.store(false, Ordering::Release);
         let frame = DmabufFrame {
             width,
@@ -345,17 +350,15 @@ impl Exporter {
             buffer,
             fd,
             free: Arc::new(AtomicBool::new(true)),
-            freed_at: None,
+            readers: None,
         })
     }
 }
 
-/// Wait, at most `limit_ms`, until whatever still reads or writes the
-/// dmabuf `fd` (the toolkit's renderer, through the kernel's implicit
-/// fences) is done. `false` when the kernel cannot say
-/// (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE` is Linux 6.0+); a wait that ran out
-/// counts as done.
-fn wait_for_readers(fd: RawFd, limit_ms: i32) -> bool {
+/// Check the kernel's reader/writer fences without stalling the UI.
+/// A pending fence keeps the buffer out of the pool; an unsupported ioctl
+/// or failed poll disables reuse, never grants permission to overwrite.
+fn reader_fence(fd: RawFd) -> std::io::Result<OwnedFd> {
     #[repr(C)]
     struct ExportSyncFile {
         flags: u32,
@@ -371,17 +374,69 @@ fn wait_for_readers(fd: RawFd, limit_ms: i32) -> bool {
     };
     // SAFETY: `fd` is a dmabuf this exporter owns; the kernel writes `arg`.
     let r = unsafe { libc::ioctl(fd, EXPORT_SYNC_FILE as _, &mut arg) };
-    if r != 0 || arg.fd < 0 {
-        return false;
+    if r != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if arg.fd < 0 {
+        return Err(std::io::Error::other("no dmabuf sync file returned"));
     }
     // SAFETY: the kernel handed over a new sync-file descriptor.
-    let sync = unsafe { OwnedFd::from_raw_fd(arg.fd) };
+    Ok(unsafe { OwnedFd::from_raw_fd(arg.fd) })
+}
+
+fn fence_ready(fd: RawFd) -> std::io::Result<bool> {
     let mut poll = libc::pollfd {
-        fd: sync.as_raw_fd(),
+        fd,
         events: libc::POLLIN,
         revents: 0,
     };
     // SAFETY: one valid pollfd.
-    let _ = unsafe { libc::poll(&mut poll, 1, limit_ms) };
-    true
+    let result = unsafe { libc::poll(&mut poll, 1, 0) };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.kind() == std::io::ErrorKind::Interrupted {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    if poll.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+        return Err(std::io::Error::other("dmabuf fence poll failed"));
+    }
+    Ok(result > 0 && poll.revents & libc::POLLIN != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn pending_fence_must_signal_before_a_buffer_can_be_reused() -> std::io::Result<()> {
+        let (mut reader, mut writer) = UnixStream::pair()?;
+        for _ in 0..8 {
+            assert!(
+                !fence_ready(reader.as_raw_fd())?,
+                "a timeout is not completion"
+            );
+        }
+        writer.write_all(&[1])?;
+        assert!(fence_ready(reader.as_raw_fd())?);
+        reader.read_exact(&mut [0])?;
+        assert!(!fence_ready(reader.as_raw_fd())?);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_fences_and_unsupported_exports_do_not_allow_reuse() -> std::io::Result<()> {
+        let (reader, writer) = UnixStream::pair()?;
+        assert!(reader_fence(reader.as_raw_fd()).is_err(), "not a dmabuf");
+        drop(writer);
+        assert!(
+            fence_ready(reader.as_raw_fd()).is_err(),
+            "hangup is not completion"
+        );
+        Ok(())
+    }
 }

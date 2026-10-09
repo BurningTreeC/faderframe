@@ -67,6 +67,16 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.19.0" date="2026-10-10">
+      <description>
+        <p>More flexible voice-to-MIDI input, safer GPU meter updates and newer GTK in the Linux tarball.</p>
+        <ul>
+          <li>Voice-to-MIDI inputs can listen to several inputs at once, with a separate port for each.</li>
+          <li>GPU meter frames are reused only after the display has finished reading them, preventing stale or mixed frame regions.</li>
+          <li>The Linux tarball is built with GTK 4.22 and requires glibc 2.43 or newer; use the Flatpak on older distributions.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.18.0" date="2026-10-09">
       <description>
         <p>Singing and playing into MIDI, polyphonic pitch editing, MIDI 2.0, screen readers, a setlist with a show mode, and new meters.</p>

@@ -263,11 +263,23 @@ fn frames_go_out_as_dmabufs() {
         ),
         "every buffer shown: read back"
     );
-    // Released, a buffer is used again.
+    // A release permits reuse only once the kernel's reader fence is
+    // ready. Until then the pool is full and frames must be read back.
     let fd = frame.fd;
     drop(frame);
-    let Output::Dmabuf(again) = r.render_to(70, 70, 1.0, true, paint).unwrap() else {
-        panic!("no dmabuf after a release");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let again = loop {
+        match r.render_to(70, 70, 1.0, true, paint).unwrap() {
+            Output::Dmabuf(frame) => break frame,
+            Output::Pixels(frame) => {
+                assert_eq!(frame.pixels.as_ref(), pixels.pixels.as_ref());
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "reader fence did not complete"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
     };
     assert_eq!(again.fd, fd);
     drop((second, third, fourth, again));

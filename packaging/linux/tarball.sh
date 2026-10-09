@@ -18,7 +18,7 @@
 # The system provides the C library, graphics drivers, the display server
 # and audio server client libraries and fonts; everything else GTK needs is
 # bundled, so the tarball runs on distributions at least as new as the one
-# it was built on (CI: Ubuntu 24.04), whatever GTK they have.
+# it was built on (CI: Ubuntu 26.04), whatever GTK they have.
 #
 #   cargo build --release -p faderframe-app
 #   packaging/linux/tarball.sh            (FADERFRAME_BIN=<path> for another build)

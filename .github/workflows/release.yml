@@ -34,8 +34,9 @@ jobs:
 
   linux-tarball:
     name: Linux tarball
-    # The oldest GTK 4.14 distribution: the tarball runs on anything newer.
-    runs-on: ubuntu-24.04
+    # Bundle GTK 4.22's renderer fixes; the tarball needs Ubuntu 26.04-era
+    # system libraries (including glibc 2.43).
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v5
       - name: System dependencies
@@ -47,12 +48,14 @@ jobs:
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
             meson ninja-build nasm curl xz-utils
+      - name: GTK version
+        run: pkg-config --modversion gtk4
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
         run: cargo build --release -p faderframe-app
       - name: LGPL FFmpeg decoders (ProRes, DNxHD, …)
-        # GStreamer 1.24's libav plugin takes FFmpeg 6.1.
-        run: FFMPEG_VERSION=6.1.2 packaging/linux/lgpl_libav.sh "$RUNNER_TEMP/libav"
+        # GStreamer 1.28 supports the script's default FFmpeg 7.1.
+        run: packaging/linux/lgpl_libav.sh "$RUNNER_TEMP/libav"
       - name: Portable tarball
         run: FADERFRAME_LIBAV="$RUNNER_TEMP/libav" packaging/linux/tarball.sh
       - uses: actions/upload-artifact@v4
@@ -74,7 +77,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: System dependencies
-        run: brew install gtk4 adwaita-icon-theme librsvg pkgconf gstreamer
+        run: |
+          brew update
+          brew install gtk4 adwaita-icon-theme librsvg pkgconf gstreamer
+          # Also upgrade GTK if the runner already had it installed.
+          brew upgrade gtk4
+      - name: GTK version
+        run: pkg-config --modversion gtk4
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
         run: cargo build --release -p faderframe-app
@@ -96,6 +105,7 @@ jobs:
       - uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
+          # Upgrade MSYS2 packages before installing the latest GTK.
           update: true
           install: >-
             mingw-w64-ucrt-x86_64-gtk4
@@ -112,6 +122,8 @@ jobs:
             mingw-w64-ucrt-x86_64-python
             zip
             unzip
+      - name: GTK version
+        run: pkg-config --modversion gtk4
       - name: Inno Setup
         shell: pwsh
         run: |
