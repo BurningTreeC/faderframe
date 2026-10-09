@@ -88,3 +88,157 @@ fn a_sung_note_sounds_within_milliseconds() {
         assert!(b <= balanced, "{key}: balanced {b}");
     }
 }
+
+#[test]
+fn a_chord_plays_records_and_releases_when_listening_stops() {
+    chord_in_engine(Glide::Expression, false);
+}
+
+#[test]
+fn polyphonic_pitch_bend_is_suppressed_and_missing_input_releases() {
+    chord_in_engine(Glide::PitchBend, true);
+}
+
+fn chord_in_engine(glide: Glide, disconnect_input: bool) {
+    use faderframe_engine::midi::{MidiFilter, MidiRecordTarget};
+    use faderframe_midi::MidiEvent;
+    use faderframe_transport::TransportCommand;
+
+    let mut tp = TestProject::new(SR);
+    let t = tp.track(TrackKind::Instrument, "Chords", ChannelLayout::Stereo);
+    let id = tp.project.ids.allocate();
+    let track = tp.project.track_mut(t).unwrap();
+    track.instrument = Some(PluginSlot {
+        id,
+        plugin: PluginRef::builtin(builtin::SYNTH, "Synth"),
+        bypass: false,
+        parameters: Vec::new(),
+        state: None,
+        sidechain: None,
+    });
+    track.input = InputRouting::all_midi();
+    let mut rd = OfflineRenderer::new(
+        &tp.project,
+        &tp.sources,
+        EngineConfig {
+            sample_rate: SR,
+            ..EngineConfig::default()
+        },
+        BLOCK,
+        2,
+    )
+    .unwrap();
+    let (_tx, q, _feed) = midi_input_queue(64);
+    rd.controller.set_midi_input(q).unwrap();
+    rd.controller.set_midi_live(HashSet::from([t]));
+    rd.controller
+        .sync(&tp.project, &tp.sources, Impact::Params)
+        .unwrap();
+    let (run, mut heard) = VoiceRun::new_polyphonic(0, 7, SR, VoiceConfig::default(), glide);
+    rd.controller.set_voice(Some(run)).unwrap();
+    let mut recorded = rd
+        .controller
+        .begin_midi_recording(
+            vec![MidiRecordTarget {
+                track: t,
+                filter: MidiFilter {
+                    port: Some(7),
+                    channel: Some(0),
+                },
+            }],
+            0,
+            i64::MAX,
+        )
+        .unwrap();
+    rd.controller
+        .transport(TransportCommand::SetRecording(true))
+        .unwrap();
+    rd.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(1, 2, BLOCK);
+    let mut peak = 0.0f32;
+    for b in 0..600 {
+        for (i, v) in bufs.input_mut(0).iter_mut().enumerate() {
+            let n = b * BLOCK + i;
+            let time = n.saturating_sub(ONSET) as f64 / f64::from(SR);
+            // A slightly detuned triad so expression is exercised for each key.
+            *v = if n < ONSET {
+                0.0
+            } else {
+                [48.15, 51.85, 55.2]
+                    .iter()
+                    .map(|k| {
+                        let f = 440.0 * 2f64.powf((k - 69.0) / 12.0);
+                        (1..=10)
+                            .map(|h| (std::f64::consts::TAU * f * h as f64 * time).sin() / h as f64)
+                            .sum::<f64>()
+                            * 0.12
+                            * (time / 0.005).min(1.0)
+                    })
+                    .sum::<f64>() as f32
+            };
+        }
+        rd.processor.process_device(&mut bufs);
+        peak = bufs.output_ref(0).iter().fold(peak, |p, v| p.max(v.abs()));
+    }
+    assert!(peak > 0.01, "the chord reaches the synth");
+    let events: Vec<_> = std::iter::from_fn(|| recorded.pop().ok()).collect();
+    let mut keys = Vec::new();
+    for e in &events {
+        if let MidiEvent::NoteOn { key, .. } = e.event {
+            keys.push(key);
+            assert!(
+                (e.position - ONSET as i64).abs() < (SR / 20) as i64,
+                "note {key} recorded at {} rather than its onset",
+                e.position
+            );
+        }
+    }
+    keys.sort_unstable();
+    assert_eq!(keys, [48, 52, 55]);
+    let copies: Vec<_> = std::iter::from_fn(|| heard.pop().ok()).collect();
+    assert!(
+        !copies
+            .iter()
+            .any(|e| matches!(e.event(), Some(MidiEvent::PitchBend { .. })))
+    );
+    if glide == Glide::Expression {
+        for key in keys {
+            assert!(
+                copies.iter().any(|e| e.port == 7
+                    && matches!(e.event(),
+            Some(MidiEvent::NoteExpression { key: k, .. }) if k == key)),
+                "per-note tuning for {key}"
+            );
+        }
+    }
+
+    // The stop is consumed in a zero-frame control pump. Releases must
+    // survive until a real callback and reach both capture and the synth.
+    if disconnect_input {
+        bufs = OwnedBuffers::new(0, 2, BLOCK);
+    } else {
+        rd.controller.set_voice(None).unwrap();
+    }
+    let mut idle = OwnedBuffers::new(if disconnect_input { 0 } else { 1 }, 2, 0);
+    rd.processor.process_device(&mut idle);
+    rd.processor.process_device(&mut bufs);
+    let mut released: Vec<_> = std::iter::from_fn(|| recorded.pop().ok())
+        .filter_map(|e| {
+            if let MidiEvent::NoteOff { key, .. } = e.event {
+                Some(key)
+            } else {
+                None
+            }
+        })
+        .collect();
+    released.sort_unstable();
+    assert_eq!(released, [48, 52, 55]);
+    for _ in 0..1600 {
+        rd.processor.process_device(&mut bufs);
+    }
+    assert!(
+        bufs.output_ref(0).iter().all(|v| v.abs() < 1e-4),
+        "no stuck notes"
+    );
+    assert_eq!(rd.controller.midi_counters(), (0, 0));
+}

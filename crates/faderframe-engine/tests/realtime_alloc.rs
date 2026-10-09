@@ -893,6 +893,16 @@ fn live_midi_input_and_midi_recording_do_not_allocate() {
 /// the control side, all allocation-free.
 #[test]
 fn voice_to_midi_does_not_allocate() {
+    voice_allocations(false);
+}
+
+#[test]
+fn polyphonic_voice_to_midi_does_not_allocate() {
+    voice_allocations(true);
+}
+
+#[allow(clippy::unwrap_used)]
+fn voice_allocations(polyphonic: bool) {
     let _serial = serial();
     use faderframe_analysis::voice::{Responsiveness, VoiceConfig};
     use faderframe_engine::voice::{Glide, VoiceRun};
@@ -915,7 +925,12 @@ fn voice_to_midi_does_not_allocate() {
     let (_tx, q, _feed) = faderframe_midi::midi_input_queue(256);
     r.controller.set_midi_input(q).unwrap();
     r.controller.set_midi_live(HashSet::from([synth]));
-    let (run, mut heard) = VoiceRun::new(
+    let make = if polyphonic {
+        VoiceRun::new_polyphonic
+    } else {
+        VoiceRun::new
+    };
+    let (run, mut heard) = make(
         0,
         0,
         SR,
@@ -926,6 +941,7 @@ fn voice_to_midi_does_not_allocate() {
     r.play_from(0).unwrap();
     let mut bufs = OwnedBuffers::new(2, 2, 256);
     let mut phase = 0.0f64;
+    let mut chord_phase = [0.0f64; 3];
     let mut sing = |bufs: &mut OwnedBuffers, block: usize| {
         // 150 ms notes a fifth apart with vibrato, 50 ms gaps.
         let x = bufs.input_mut(0);
@@ -942,7 +958,26 @@ fn voice_to_midi_does_not_allocate() {
                 * 2f64
                     .powf((key - 69.0 + 0.3 * (2.0 * std::f64::consts::PI * 5.5 * t).sin()) / 12.0);
             phase = (phase + f / f64::from(SR)).fract();
-            *v = (0.3 * (2.0 * std::f64::consts::PI * phase).sin()) as f32;
+            *v = if polyphonic {
+                [0.0, 4.0, 7.0]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(j, semitones)| {
+                        chord_phase[j] = (chord_phase[j]
+                            + f * 2f64.powf(semitones / 12.0) / f64::from(SR))
+                        .fract();
+                        let phase = chord_phase[j];
+                        (1..=8)
+                            .map(|h| {
+                                (std::f64::consts::TAU * phase * f64::from(h)).sin() / f64::from(h)
+                            })
+                            .sum::<f64>()
+                            * 0.08
+                    })
+                    .sum::<f64>() as f32
+            } else {
+                (0.3 * (2.0 * std::f64::consts::PI * phase).sin()) as f32
+            };
         }
     };
     for b in 0..8 {
@@ -964,6 +999,16 @@ fn voice_to_midi_does_not_allocate() {
     let glides = got.iter().filter(|e| e.expression.is_some()).count();
     assert!(ons >= 8, "notes heard: {ons}");
     assert!(glides > 0, "glides heard");
+    for speed in Responsiveness::ALL {
+        r.controller
+            .set_voice_config(VoiceConfig::default().with(speed), Glide::Off)
+            .unwrap();
+        let (_, n) = armed(|| r.processor.process_device(&mut bufs));
+        assert_eq!(n, 0, "allocations/frees changing the response");
+    }
+    r.controller.set_voice(None).unwrap();
+    let (_, n) = armed(|| r.processor.process_device(&mut bufs));
+    assert_eq!(n, 0, "allocations/frees releasing the listener");
 }
 
 #[test]

@@ -254,6 +254,9 @@ pub(crate) struct MidiInputState {
     queue: Option<Box<MidiInputQueue>>,
     /// Offsets relative to the device callback.
     events: MidiInputBlock,
+    /// Releases made while installing listeners, before `take` clears the
+    /// previous callback. Zero-frame control pumps must keep these too.
+    deferred: MidiInputBlock,
     /// Live SysEx from the control side, and room to put one together.
     sysex: rtrb::Consumer<u8>,
     scratch: Vec<u8>,
@@ -266,6 +269,7 @@ impl MidiInputState {
             Self {
                 queue: None,
                 events: MidiInputBlock::with_capacity(MIDI_INPUT_CAPACITY),
+                deferred: MidiInputBlock::with_capacity(MIDI_INPUT_CAPACITY),
                 sysex: rx,
                 scratch: Vec::with_capacity(MidiBuffer::DEFAULT_SYSEX_CAPACITY),
             },
@@ -316,6 +320,11 @@ impl MidiInputState {
         true
     }
 
+    pub(crate) fn defer(&mut self, port: u16, event: MidiEvent) {
+        self.deferred
+            .push_early(port, TimedMidiEvent::new(0, event), 0);
+    }
+
     /// Install a queue; returns the previous one (to retire).
     pub(crate) fn replace_queue(
         &mut self,
@@ -335,6 +344,7 @@ impl MidiInputState {
         if frames == 0 {
             return;
         }
+        std::mem::swap(&mut self.events, &mut self.deferred);
         self.take_sysex(dropped);
         let Some(q) = &mut self.queue else { return };
         let now = q.clock.now_ns();

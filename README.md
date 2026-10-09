@@ -398,7 +398,10 @@ long sessions), Neon and High Contrast:
   audio input — the track plays the notes as you sing, a few milliseconds
   after each begins (tracked on the audio thread), with glides as note
   expression or pitch bend if wanted, snapped to the project's key if
-  wanted, and records them where they were sung.
+  wanted, and records them where they were sung. Preferences → MIDI →
+  Voice to MIDI → Polyphonic enables chords from one input, with independent
+  glides through note expression. Chord detection takes longer; simultaneous
+  octave doublings can merge. Monophonic mode remains the default.
 * Screen readers and the keyboard: the mixer, arranger, piano roll, event
   list, setlist, history, transport display and the device editors list
   their controls to screen readers (Orca and other AT-SPI readers on

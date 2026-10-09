@@ -339,6 +339,7 @@ fn voice_section(app: &Rc<AppState>) -> gtk::Grid {
     }
     let names: Vec<&str> = VoiceGlide::ALL.iter().map(|g| g.label()).collect();
     let glide = gtk::DropDown::from_strings(&names);
+    glide.set_tooltip_text(Some("For chords, use note expression for independent glides. Channel pitch bend applies only in monophonic mode."));
     glide.set_selected(
         VoiceGlide::ALL
             .iter()
@@ -361,7 +362,7 @@ fn voice_section(app: &Rc<AppState>) -> gtk::Grid {
     let names: Vec<&str> = VoiceSpeed::ALL.iter().map(|g| g.label()).collect();
     let speed = gtk::DropDown::from_strings(&names);
     speed.set_tooltip_text(Some(
-        "How soon a sung note sounds: Fast a couple of its periods after it begins (a few milliseconds; for playing), Stable a little later and surer (for recording clean takes)",
+        "How soon notes sound: monophonic Fast follows within a few periods. Polyphonic needs a longer window (96–160 ms) to distinguish chord notes; Stable takes longer and resolves low notes more reliably",
     ));
     speed.set_selected(
         VoiceSpeed::ALL
@@ -394,8 +395,21 @@ fn voice_section(app: &Rc<AppState>) -> gtk::Grid {
             }
         });
     }
+    let polyphonic = gtk::CheckButton::with_label("Polyphonic (chords)");
+    polyphonic.set_active(now.polyphonic);
+    polyphonic.set_tooltip_text(Some("Follow several notes from one audio input. Chord detection takes longer than a single melodic line; octave doublings may merge."));
+    {
+        let weak = Rc::downgrade(app);
+        polyphonic.connect_toggled(move |b| {
+            if let Some(app) = weak.upgrade() {
+                let mut s = app.session.borrow().voice_settings();
+                s.polyphonic = b.is_active();
+                save(&app, s);
+            }
+        });
+    }
     let hint = gtk::Label::new(Some(
-        "Sing (or play a monophonic instrument) into an audio input and choose “Voice · In n” as an instrument or MIDI track's MIDI input: the track plays and records the notes you sing. For the least delay, use a small audio buffer (Preferences → Audio).",
+        "Sing or play into an audio input and choose “Voice · In n” as an instrument or MIDI track's MIDI input. Enable Polyphonic for chords. The track plays and records the detected notes. For the least delay, use a small audio buffer (Preferences → Audio).",
     ));
     hint.set_wrap(true);
     hint.set_natural_wrap_mode(gtk::NaturalWrapMode::Word);
@@ -414,7 +428,8 @@ fn voice_section(app: &Rc<AppState>) -> gtk::Grid {
     grid.attach(&l, 0, 2, 1, 1);
     grid.attach(&speed, 1, 2, 1, 1);
     grid.attach(&in_key, 1, 3, 1, 1);
-    grid.attach(&hint, 0, 4, 2, 1);
+    grid.attach(&polyphonic, 1, 4, 1, 1);
+    grid.attach(&hint, 0, 5, 2, 1);
     grid
 }
 

@@ -503,7 +503,7 @@ impl EngineProcessor {
                 }
                 Message::VoiceConfig(config, glide) => {
                     if let Some(v) = self.voice.as_deref_mut() {
-                        v.set(config, glide);
+                        v.set(config, glide, &mut self.midi);
                     }
                 }
                 Message::EndMidiRecord => {
@@ -678,6 +678,11 @@ impl EngineProcessor {
             link.poll(&mut self.transport, frames);
         }
         self.ctx.ahead_seq = self.ahead.as_deref().map_or(0, |l| l.seq());
+        if let Some(v) = self.voice.as_deref_mut()
+            && (v.rate() != self.stream_rate || v.channel() >= io.input_channels())
+        {
+            v.release(&mut self.midi);
+        }
         self.midi.take(frames, rate, &self.shared.midi_dropped);
         // Voice to MIDI: what the input sings joins this callback's MIDI.
         if let Some(v) = self.voice.as_deref_mut()

@@ -3257,7 +3257,7 @@ DAW does well yet):
     readers (Album, Launcher, Automation, Tools and Video, the edit
     toolbar: they only name themselves so far); merging project versions
     (three-way, from `faderframe_project::compare`) for collaborators;
-    polyphonic voice ports (several inputs at once; chords from a guitar).
+    several voice inputs at once (chords from one input are supported).
 
 Suggested next: 11 and the auto-align of 16, then reference tracks and
 lead sheets — the first three everyday tools, the last one FaderFrame's
@@ -3747,12 +3747,34 @@ where its sound began (`at`). Allocation-free after `new` (the detector
 keeps its peak list). Glides as note expression (tuning), pitch bend (±2)
 or not at all; notes can snap to the project's key (`VoiceSettings`:
 sensitivity, glide, response, in key — Preferences → MIDI → Voice to MIDI).
+Polyphonic mode is opt-in (`VoiceSettings::polyphonic`): `PolyTracker`
+uses a 96/128/160 ms Hann window at Fast/Balanced/Stable, analysed every
+4 ms. Harmonic candidates share spectral energy; up to six notes are
+followed independently, with per-key tuning in `VoiceEvent::Bend`. The
+longer windows resolve nearby low fundamentals. Ambiguous simultaneous
+octave doublings can merge, and pure sine tones lack the required
+harmonics. Note expression glides each key; channel pitch bend is only
+used in monophonic mode, since it would bend every note together.
+Changing mono/poly constructs a new listener on the control thread.
+Releases from the old listener are deferred in `MidiInputState` until the
+next nonempty callback, so `take` cannot erase them. The session drains
+retired listeners' feeds through their final note-offs, preserving Capture
+MIDI. Missing inputs, changed device rates, and changed glide modes also
+release the listener; resets discard old analysis audio.
+
 One input listens at a time (the first track's in track order). Tests:
 `voice::tests` (a sung phrase placed within 15 ms at every response,
 onset latencies by key, threshold, scale, octave), engine
 `an_early_stamp_plays_now_and_records_where_it_was`, `tests/voice.rs`
 (voice to sound), `voice_to_midi_does_not_allocate`,
 `session/tests/voice.rs` (the dummy device's tone played and recorded).
+Polyphonic tests cover plucks, strummed chords at all three responses,
+arpeggios, retriggers, noise, thresholds, scale snapping, reset, block-size
+invariance and device rates from 44.1 to 192 kHz. The engine test plays and
+records a detuned triad, checks each key's expression, and verifies release
+through a zero-frame control pump; the counting allocator covers chords,
+settings changes and listener retirement. Manual timing:
+`cargo test --release -p faderframe-analysis polyvoice::tests::callback_cost -- --ignored --exact --nocapture`.
 
 ### Polyphonic pitch editing
 

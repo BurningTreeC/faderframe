@@ -15,6 +15,7 @@ mod dynamics;
 mod loudness;
 pub mod melody;
 pub mod pitch;
+pub mod polyvoice;
 mod spectrum;
 pub mod structure;
 pub mod tempo;

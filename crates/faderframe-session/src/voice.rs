@@ -3,15 +3,15 @@
 //! Every input channel of the audio device has a MIDI input port, "Voice ·
 //! In n". A track that takes MIDI from one (its input routing names the
 //! port) turns that input into notes: the engine runs the live pitch tracker
-//! ([`faderframe_analysis::voice`]) on the channel inside its callback and
-//! the notes join that callback's live MIDI on the port
+//! ([`faderframe_analysis::voice`] or [`faderframe_analysis::polyvoice`])
+//! on the channel inside its callback. The notes join that callback's live MIDI on the port
 //! ([`faderframe_engine::voice`]) — played at once, recorded where they
 //! were sung. A copy of each comes back here for Capture MIDI and the
 //! activity lights. From there it is MIDI like any keyboard's: it plays the
 //! live instrument tracks, records, reaches external synths. Glides go out
-//! as note expression (exact, for hosted instruments), as pitch bend (±2
-//! semitones), or not at all; notes can snap to the project's key. One
-//! input listens at a time (the first track's, in track order).
+//! as note expression (per key, for hosted instruments), as pitch bend (±2
+//! semitones, monophonic only), or not at all; notes can snap to the
+//! project's key. One input listens at a time (the first track's, in track order).
 
 use crate::Session;
 use faderframe_analysis::voice::{Responsiveness, VoiceConfig};
@@ -47,7 +47,7 @@ impl VoiceGlide {
         match self {
             VoiceGlide::Off => "Steady notes",
             VoiceGlide::Expression => "Glide (note expression)",
-            VoiceGlide::PitchBend => "Glide (pitch bend ±2)",
+            VoiceGlide::PitchBend => "Glide (pitch bend ±2, monophonic)",
         }
     }
 
@@ -96,6 +96,8 @@ impl VoiceSpeed {
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct VoiceSettings {
+    /// Listen for chords rather than one melodic line.
+    pub polyphonic: bool,
     /// Quieter than this (dBFS) is silence.
     pub threshold_db: f32,
     pub glide: VoiceGlide,
@@ -107,6 +109,7 @@ pub struct VoiceSettings {
 impl Default for VoiceSettings {
     fn default() -> Self {
         Self {
+            polyphonic: false,
             threshold_db: -45.0,
             glide: VoiceGlide::Off,
             in_key: false,
@@ -130,9 +133,11 @@ pub(crate) struct VoiceState {
     /// The ports made so far, by input channel (0-based).
     ports: Vec<VirtualMidiInput>,
     /// The input listened to and the device rate it was set up for.
-    listening: Option<(u16, u32)>,
+    listening: Option<(u16, u32, bool)>,
     /// The engine's copies of what it heard.
     feed: Option<rtrb::Consumer<MidiInputEvent>>,
+    /// Keep replaced listeners until their final releases have arrived.
+    retiring: Vec<rtrb::Consumer<MidiInputEvent>>,
     pub(crate) settings: VoiceSettings,
     /// What the engine was last told: settings and scale.
     told: Option<(VoiceSettings, u16)>,
@@ -142,6 +147,15 @@ impl VoiceState {
     /// What the engine heard since the last call (for the MIDI tick).
     pub(crate) fn take_feed(&mut self) -> Vec<MidiInputEvent> {
         let mut out = Vec::new();
+        self.retiring.retain_mut(|rx| {
+            // Observe abandonment before draining: a producer can publish
+            // its last note-off immediately before it is dropped.
+            let finished = rx.is_abandoned();
+            while let Ok(e) = rx.pop() {
+                out.push(e);
+            }
+            !finished
+        });
         if let Some(rx) = self.feed.as_mut() {
             while let Ok(e) = rx.pop() {
                 out.push(e);
@@ -224,18 +238,20 @@ impl Session {
                 _ => None,
             })
             .filter(|_| rate > 0)
-            .map(|c| (c, rate));
+            .map(|c| (c, rate, self.voice.settings.polyphonic));
         let scale = self.voice_scale();
         if self.voice.listening != wanted {
-            self.voice.listening = None;
-            self.voice.feed = None;
-            self.voice.told = None;
-            let run = wanted.and_then(|(c, rate)| {
+            let mut feed = None;
+            let run = wanted.and_then(|(c, rate, polyphonic)| {
                 let port = self.voice.ports.get(usize::from(c))?.port();
                 let s = self.voice.settings;
-                let (run, rx) = VoiceRun::new(c, port, rate, s.config(scale), s.glide.engine());
-                self.voice.feed = Some(rx);
-                self.voice.told = Some((s, scale));
+                let make = if polyphonic {
+                    VoiceRun::new_polyphonic
+                } else {
+                    VoiceRun::new
+                };
+                let (run, rx) = make(c, port, rate, s.config(scale), s.glide.engine());
+                feed = Some(rx);
                 Some(run)
             });
             let on = run.is_some();
@@ -243,9 +259,12 @@ impl Session {
                 tracing::warn!("voice to MIDI: {e}");
                 return;
             }
-            if on {
-                self.voice.listening = wanted;
+            if let Some(old) = self.voice.feed.take() {
+                self.voice.retiring.push(old);
             }
+            self.voice.feed = feed;
+            self.voice.listening = wanted.filter(|_| on);
+            self.voice.told = on.then_some((self.voice.settings, scale));
         }
         let now = (self.voice.settings, scale);
         if self.voice.listening.is_some() && self.voice.told != Some(now) {
@@ -254,15 +273,18 @@ impl Session {
                 .set_voice_config(now.0.config(now.1), now.0.glide.engine())
             {
                 tracing::warn!("voice to MIDI: {e}");
+            } else {
+                self.voice.told = Some(now);
             }
-            self.voice.told = Some(now);
         }
     }
 
     pub(crate) fn stop_voice(&mut self) {
-        if self.voice.listening.take().is_some() {
-            let _ = self.engine.set_voice(None);
-            self.voice.feed = None;
+        if self.voice.listening.is_some() && self.engine.set_voice(None).is_ok() {
+            self.voice.listening = None;
+            if let Some(old) = self.voice.feed.take() {
+                self.voice.retiring.push(old);
+            }
             self.voice.told = None;
         }
     }
@@ -278,5 +300,39 @@ mod tests {
         assert_eq!(voice_channel("virtual:Voice · In 2"), Some(1));
         assert_eq!(voice_channel("virtual:FaderFrame Keyboard"), None);
         assert_eq!(voice_channel("MPK mini 3:MPK mini 3 MIDI 1"), None);
+    }
+
+    #[test]
+    fn old_voice_preferences_keep_monophonic_mode() {
+        let old: VoiceSettings = serde_json::from_str(
+            r#"{"threshold_db":-36.0,"glide":"expression","in_key":true,"speed":"fast"}"#,
+        )
+        .expect("old preferences");
+        assert!(!old.polyphonic);
+        let poly = VoiceSettings {
+            polyphonic: true,
+            ..old
+        };
+        let json = serde_json::to_string(&poly).expect("serialize settings");
+        assert_eq!(
+            serde_json::from_str::<VoiceSettings>(&json).expect("new preferences"),
+            poly
+        );
+    }
+
+    #[test]
+    fn retired_listener_delivers_its_final_release() {
+        let (mut tx, rx) = rtrb::RingBuffer::new(8);
+        let mut state = VoiceState {
+            retiring: vec![rx],
+            ..VoiceState::default()
+        };
+        assert!(state.take_feed().is_empty());
+        assert_eq!(state.retiring.len(), 1);
+        tx.push(MidiInputEvent::new(7, 100, &[0x80, 60, 0]).expect("note off"))
+            .expect("room");
+        drop(tx);
+        assert_eq!(state.take_feed().len(), 1);
+        assert!(state.retiring.is_empty());
     }
 }

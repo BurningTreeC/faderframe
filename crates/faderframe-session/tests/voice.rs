@@ -97,3 +97,26 @@ fn a_sung_note_plays_and_records_on_the_instrument() {
     assert_eq!(s.voice_listening(), None);
     s.stop_audio();
 }
+
+#[test]
+fn changing_polyphonic_mode_releases_and_restarts_the_listener() {
+    let (mut s, t) = singer();
+    sing_into(&mut s, t, true);
+    run(&mut s, Duration::from_millis(200));
+    assert_eq!(s.held_midi_keys(), 1u128 << 57);
+
+    let mut settings = s.voice_settings();
+    settings.polyphonic = true;
+    s.set_voice_settings(settings);
+    run(&mut s, Duration::from_millis(250));
+    assert_eq!(s.voice_listening(), Some(0));
+    // The dummy's pure sine has no harmonic evidence for chord mode.
+    // Its old mono note must still release, including the capture feed.
+    assert_eq!(s.held_midi_keys(), 0, "the retired feed releases A3");
+
+    settings.polyphonic = false;
+    s.set_voice_settings(settings);
+    run(&mut s, Duration::from_millis(150));
+    assert_eq!(s.held_midi_keys(), 1u128 << 57);
+    s.stop_audio();
+}

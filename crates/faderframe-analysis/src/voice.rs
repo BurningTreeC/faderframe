@@ -87,6 +87,9 @@ impl Responsiveness {
 /// How the tracker hears.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VoiceConfig {
+    /// The responsiveness the holds came from (the polyphonic tracker's
+    /// window follows it).
+    pub responsiveness: Responsiveness,
     /// Quieter than this (dBFS) is silence.
     pub threshold_db: f32,
     /// The lowest and highest keys played.
@@ -109,6 +112,7 @@ pub struct VoiceConfig {
 impl VoiceConfig {
     /// The holds of a responsiveness.
     pub fn with(mut self, r: Responsiveness) -> Self {
+        self.responsiveness = r;
         (
             self.onset_frames,
             self.change_frames,
@@ -122,6 +126,7 @@ impl VoiceConfig {
 impl Default for VoiceConfig {
     fn default() -> Self {
         Self {
+            responsiveness: Responsiveness::Balanced,
             threshold_db: -45.0,
             low: 28,
             high: 96,
@@ -146,8 +151,9 @@ pub enum VoiceEvent {
     NoteOff {
         key: u8,
     },
-    /// The sounding note's pitch against its key (semitones).
+    /// A sounding note's pitch against its key (semitones).
     Bend {
+        key: u8,
         semitones: f32,
     },
 }
@@ -155,7 +161,7 @@ pub enum VoiceEvent {
 /// A second-order low-pass section (Butterworth, direct form II
 /// transposed).
 #[derive(Clone, Copy, Debug, Default)]
-struct Biquad {
+pub(crate) struct Biquad {
     b0: f64,
     b1: f64,
     b2: f64,
@@ -166,7 +172,12 @@ struct Biquad {
 }
 
 impl Biquad {
-    fn lowpass(cutoff: f64, rate: f64, q: f64) -> Self {
+    pub(crate) fn reset(&mut self) {
+        self.z1 = 0.0;
+        self.z2 = 0.0;
+    }
+
+    pub(crate) fn lowpass(cutoff: f64, rate: f64, q: f64) -> Self {
         let w = 2.0 * std::f64::consts::PI * cutoff / rate;
         let (sin, cos) = w.sin_cos();
         let alpha = sin / (2.0 * q);
@@ -183,7 +194,7 @@ impl Biquad {
     }
 
     #[inline]
-    fn run(&mut self, x: f64) -> f64 {
+    pub(crate) fn run(&mut self, x: f64) -> f64 {
         let y = self.b0 * x + self.z1;
         self.z1 = self.b1 * x - self.a1 * y + self.z2;
         self.z2 = self.b2 * x - self.a2 * y;
@@ -283,6 +294,12 @@ impl VoiceTracker {
     pub fn reset(&mut self) -> Option<VoiceEvent> {
         self.candidate = None;
         self.unvoiced = 0;
+        self.filled = 0;
+        self.since_hop = 0;
+        self.phase = 0;
+        for filter in &mut self.filters {
+            filter.reset();
+        }
         self.sounding.take().map(|key| VoiceEvent::NoteOff { key })
     }
 
@@ -413,7 +430,11 @@ impl VoiceTracker {
             if moved >= 0.1 || (moved >= 0.02 && self.since_bend >= BEND_FRAMES) {
                 self.last_bend = semitones;
                 self.since_bend = 0;
-                emit(now, now - half(h.window), VoiceEvent::Bend { semitones });
+                emit(
+                    now,
+                    now - half(h.window),
+                    VoiceEvent::Bend { key, semitones },
+                );
             }
             return;
         }
@@ -442,13 +463,13 @@ impl VoiceTracker {
         let semitones = (h.pitch - f64::from(key)) as f32;
         if semitones.abs() >= 0.02 {
             self.last_bend = semitones;
-            emit(now, at, VoiceEvent::Bend { semitones });
+            emit(now, at, VoiceEvent::Bend { key, semitones });
         }
     }
 }
 
 /// The nearest key to `pitch` whose pitch class the scale has, in range.
-fn nearest_in_scale(pitch: f64, scale: u16, low: u8, high: u8) -> u8 {
+pub(crate) fn nearest_in_scale(pitch: f64, scale: u16, low: u8, high: u8) -> u8 {
     let scale = if scale & 0xFFF == 0 { 0xFFF } else { scale };
     let base = pitch.round() as i32;
     let mut best = base;
@@ -468,7 +489,7 @@ fn nearest_in_scale(pitch: f64, scale: u16, low: u8, high: u8) -> u8 {
 
 /// Velocity from the loudest level of a note's start: the threshold soft,
 /// 40 dB above it full.
-fn velocity_of(level_db: f32, threshold_db: f32) -> u8 {
+pub(crate) fn velocity_of(level_db: f32, threshold_db: f32) -> u8 {
     let t = ((level_db - threshold_db) / 40.0).clamp(0.0, 1.0);
     (30.0 + t * 97.0).round() as u8
 }
@@ -579,7 +600,7 @@ mod tests {
             let bends: Vec<f32> = ev
                 .iter()
                 .filter_map(|(_, _, e)| match e {
-                    VoiceEvent::Bend { semitones } => Some(*semitones),
+                    VoiceEvent::Bend { semitones, .. } => Some(*semitones),
                     _ => None,
                 })
                 .collect();
