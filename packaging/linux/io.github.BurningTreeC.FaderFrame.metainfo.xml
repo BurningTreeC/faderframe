@@ -67,6 +67,22 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.18.0" date="2026-10-09">
+      <description>
+        <p>Singing and playing into MIDI, polyphonic pitch editing, MIDI 2.0, screen readers, a setlist with a show mode, and new meters.</p>
+        <ul>
+          <li>Voice to MIDI: every audio input is a MIDI input; a track that takes one plays and records the notes sung or played into it, tracked on the audio thread within milliseconds, with glides and the project's key if wanted. Polyphonic (chords from one input) is an option.</li>
+          <li>Polyphonic pitch editing, on by default in the Pitch editor: every note of a recording, chords too, moved, corrected, straightened, made louder or quieter or taken out on its own.</li>
+          <li>MIDI 2.0: devices through the ALSA sequencer, per-note expression in and out, MIDI 2.0 clip files.</li>
+          <li>Screen readers and the keyboard: the mixer, arranger, piano roll, event list, setlist, history, transport display and device editors list their controls to Orca and other readers.</li>
+          <li>Setlist and show mode: songs from the sections, a stage screen with countdowns, MIDI-learnable show controls.</li>
+          <li>Song structure from a jam: parts found, labelled and named as sections.</li>
+          <li>Meter styles: peak, peak + RMS, VU, PPM and the K-System per track, and a VU meter bridge over the mixer.</li>
+          <li>The GPU painter draws analysers, meters and curves by default; Home brings the arranger back to the start.</li>
+          <li>Audio Units: Apple's Dynamics Processor reports its gain reduction to the mixer.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.17.0" date="2026-10-08">
       <description>
         <p>Console summing, spectral editing, a MIDI event list, lead sheets, video phases 2 and 3, and much more.</p>
