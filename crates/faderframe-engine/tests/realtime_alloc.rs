@@ -1015,6 +1015,8 @@ fn warped_playback_does_not_allocate() {
             drift: 0.5,
             formant,
             curve: vec![12; ((end - start) / 240) as usize],
+            gain_db: 0.0,
+            muted: false,
         };
         a.pitch = Some(PitchEdit {
             hop: 240,
@@ -1023,6 +1025,7 @@ fn warped_playback_does_not_allocate() {
                 note(from + span / 2, from + span, 45.0, -2.0, -12.0),
             ],
             keep_formants: name == "Pad",
+            polyphonic: None,
         });
     }
     let sources = render_generated_sources(&project, SR);

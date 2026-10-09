@@ -1052,6 +1052,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "faderframe-polypitch"
+version = "0.17.0"
+
+[[package]]
 name = "faderframe-project"
 version = "0.17.0"
 dependencies = [
@@ -1101,6 +1105,7 @@ dependencies = [
  "faderframe-plugin-host",
  "faderframe-plugin-lv2",
  "faderframe-plugin-vst3",
+ "faderframe-polypitch",
  "faderframe-project",
  "faderframe-realtime",
  "faderframe-spectral",

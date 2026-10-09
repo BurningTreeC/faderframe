@@ -33,12 +33,33 @@ fn yes() -> bool {
 pub struct PitchEdit {
     /// Source frames between curve values.
     pub hop: u32,
-    /// Sorted by start, not overlapping.
+    /// Sorted by start; not overlapping, but in a polyphonic edit.
     pub notes: Vec<PitchNote>,
     /// Keep the formants where the pitch moves (a voice keeps its size;
     /// off, they move with the pitch).
     #[serde(default = "yes")]
     pub keep_formants: bool,
+    /// Polyphonic (`None`: melodic, played live by PSOLA).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub polyphonic: Option<Polyphonic>,
+}
+
+/// A polyphonic edit: its notes may sound together and are moved in the
+/// spectrum, each on its own (`faderframe_polypitch`). The clip plays a
+/// render of `original` made from the notes as [`PitchEdit::sound_key`]
+/// named them then (`rendered`; 0: nothing moved, the clip plays
+/// `original` itself). Undo and redo carry the source and the key along
+/// with the notes, so they always agree; a session renders again where
+/// they do not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Polyphonic {
+    pub original: faderframe_core::AudioSourceId,
+    #[serde(default)]
+    pub rendered: u64,
+}
+
+fn is_zero(v: &f32) -> bool {
+    *v == 0.0
 }
 
 /// One note of a [`PitchEdit`].
@@ -62,12 +83,22 @@ pub struct PitchNote {
     /// `pitch` ([`UNVOICED`] where none was heard).
     #[serde(default)]
     pub curve: Vec<i16>,
+    /// Its level change (dB; polyphonic edits).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub gain_db: f32,
+    /// Taken out (polyphonic edits).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub muted: bool,
 }
 
 impl PitchNote {
     /// Has it been edited?
     pub fn edited(&self) -> bool {
-        self.shift != 0.0 || self.drift != 0.0 || self.formant != 0.0
+        self.shift != 0.0
+            || self.drift != 0.0
+            || self.formant != 0.0
+            || self.gain_db != 0.0
+            || self.muted
     }
 
     /// The pitch sung at source frame `at` (inside the note), `None`
@@ -116,6 +147,41 @@ impl PitchNote {
 impl PitchEdit {
     pub fn edited(&self) -> bool {
         self.notes.iter().any(PitchNote::edited)
+    }
+
+    /// Played live by the engine (PSOLA): a melodic edit with something
+    /// moved. A polyphonic one plays its render.
+    pub fn plays_live(&self) -> bool {
+        self.polyphonic.is_none() && self.edited()
+    }
+
+    /// What the notes do to the sound, as a key: equal keys, equal renders
+    /// (0: nothing changes).
+    pub fn sound_key(&self) -> u64 {
+        if !self.edited() {
+            return 0;
+        }
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |v: u64| {
+            for b in v.to_le_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        eat(u64::from(self.hop));
+        for n in &self.notes {
+            eat(n.start as u64);
+            eat(n.end as u64);
+            eat(u64::from(n.pitch.to_bits()));
+            eat(u64::from(n.shift.to_bits()));
+            eat(u64::from(n.drift.to_bits()));
+            eat(u64::from(n.gain_db.to_bits()));
+            eat(u64::from(n.muted));
+            for c in &n.curve {
+                eat(*c as u64);
+            }
+        }
+        h.max(1)
     }
 
     /// The note playing at source frame `at`.
@@ -276,6 +342,8 @@ pub fn join(notes: &[PitchNote], hop: u32) -> Option<PitchNote> {
         drift: longest.drift,
         formant: longest.formant,
         curve: Vec::new(),
+        gain_db: longest.gain_db,
+        muted: longest.muted,
     };
     let hop = i64::from(hop.max(1));
     for n in notes {
@@ -318,6 +386,8 @@ mod tests {
             curve: (0..n)
                 .map(|k| if k % 2 == 0 { wobble } else { -wobble })
                 .collect(),
+            gain_db: 0.0,
+            muted: false,
         }
     }
 
@@ -353,6 +423,7 @@ mod tests {
                 note(200_000, 24_000, 65.0, 0),
             ],
             keep_formants: true,
+            polyphonic: None,
         };
         e.notes[0].shift = 1.0;
         e.notes[1].shift = -1.0;

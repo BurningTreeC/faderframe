@@ -214,6 +214,8 @@ pub enum EditFlag {
     SnapToSamples,
     /// Cuts and trims of audio clips move to the nearest zero crossing.
     SnapToZeroCrossings,
+    /// The Pitch editor finds every note, chords too.
+    PolyphonicPitch,
 }
 
 /// How far a cut looks for a zero crossing, each side (seconds).

@@ -389,6 +389,10 @@ long sessions), Neon and High Contrast:
   toolbar, beside the grid): free positions land on whole samples, and
   cuts and trims of audio clips move to the nearest zero crossing so they
   do not click.
+* Polyphonic pitch editing (the Pitch editor's Polyphonic option, on by
+  default): every note of a recording is found, chords too, and each is
+  moved, corrected to the key, straightened, made louder or quieter or
+  taken out on its own, the rest of the sound left as it is.
 * Singing into MIDI live: choose "Voice · In n" as an instrument or MIDI
   track's MIDI input and sing (or play a monophonic instrument) into that
   audio input — the track plays the notes as you sing, a few milliseconds

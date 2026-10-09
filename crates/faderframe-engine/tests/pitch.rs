@@ -81,6 +81,8 @@ fn steady(start: i64, end: i64, pitch: f32) -> PitchNote {
         drift: 0.0,
         formant: 0.0,
         curve: vec![0; ((end - start) / i64::from(HOP)) as usize],
+        gain_db: 0.0,
+        muted: false,
     }
 }
 
@@ -92,6 +94,7 @@ fn a_moved_note_sounds_at_its_new_pitch_and_its_neighbour_stays() {
         hop: HOP,
         notes: vec![steady(0, 48_000, 57.0), steady(48_000, 96_000, 64.0)],
         keep_formants: true,
+        polyphonic: None,
     };
     // Analysed, nothing moved: played as recorded (no stretcher).
     set_pitch(&mut tp, clip, edit.clone());
@@ -131,6 +134,7 @@ fn straightening_takes_out_the_wandering() {
             hop: HOP,
             notes: vec![n],
             keep_formants: false,
+            polyphonic: None,
         },
     );
     let out = render(&tp, 96_000);
@@ -210,6 +214,7 @@ fn formants_stay_unless_moved() {
                 hop: HOP,
                 notes: vec![n],
                 keep_formants: keep,
+                polyphonic: None,
             },
         );
         let out = render(&tp, 48_000);
@@ -245,6 +250,7 @@ fn playing_from_mid_note_starts_at_once_and_warping_comes_along() {
             hop: HOP,
             notes: vec![n],
             keep_formants: true,
+            polyphonic: None,
         },
     );
     // From the middle of the note: moved from the first frames on.

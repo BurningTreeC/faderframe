@@ -674,6 +674,7 @@ pub fn install(app: &Rc<AppState>) {
                 "follow" => (F::FollowPlayhead, e.follow_playhead),
                 "samples" => (F::SnapToSamples, e.snap_samples),
                 "zero-crossings" => (F::SnapToZeroCrossings, e.zero_crossings),
+                "polyphonic-pitch" => (F::PolyphonicPitch, e.pitch_polyphonic),
                 _ => return tracing::warn!("edit-flag: unknown '{arg}'"),
             };
             a.dispatch(Action::SetEditFlag(flag, !on));
@@ -1994,6 +1995,17 @@ pub fn install(app: &Rc<AppState>) {
                 None if arg == "move-formants" => PitchOp::KeepFormants(false),
                 Some(("move", v)) => match pair(v) {
                     Some((n, by)) => PitchOp::Move { notes: vec![n], by },
+                    None => return,
+                },
+                Some(("mute", v)) => match v.parse::<usize>() {
+                    Ok(n) => PitchOp::Mute {
+                        notes: vec![n],
+                        on: true,
+                    },
+                    Err(_) => return,
+                },
+                Some(("gain", v)) => match pair(v) {
+                    Some((n, db)) => PitchOp::Gain { notes: vec![n], db },
                     None => return,
                 },
                 Some(("formant", v)) => match pair(v) {

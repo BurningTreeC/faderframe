@@ -407,7 +407,7 @@ pub fn stretch_voices(project: &Project, track: &faderframe_project::Track) -> S
         let ClipContent::Audio(a) = &c.content else {
             continue;
         };
-        let pitched = a.pitch.as_ref().is_some_and(|e| e.edited());
+        let pitched = a.pitch.as_ref().is_some_and(|e| e.plays_live());
         let warped = a
             .warp
             .as_ref()

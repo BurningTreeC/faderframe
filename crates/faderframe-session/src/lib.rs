@@ -25,6 +25,7 @@ pub mod notes;
 pub mod performance;
 pub mod picture_out;
 pub mod pitch;
+mod polypitch;
 pub mod setlist;
 pub mod spectral;
 mod structure;
@@ -1083,6 +1084,9 @@ pub struct EditorSettings {
     pub snap_samples: bool,
     /// Cuts and trims of audio clips move to the nearest zero crossing.
     pub zero_crossings: bool,
+    /// The Pitch editor finds every note, chords too (off: one line of
+    /// notes, played live with formants kept).
+    pub pitch_polyphonic: bool,
     pub counter_unit: CounterUnit,
     /// The transport display's big and small counters (`None` for the
     /// small one: timecode when the project has video or a timecode,
@@ -1122,6 +1126,7 @@ impl Default for EditorSettings {
             show_edit_toolbar: false,
             snap_samples: true,
             zero_crossings: false,
+            pitch_polyphonic: true,
             counter_unit: CounterUnit::BarsBeats,
             main_counter: CounterUnit::BarsBeats,
             sub_counter: None,
@@ -1290,6 +1295,8 @@ pub struct Session {
     play_started_at: Option<i64>,
     transients: transients::TransientCache,
     pitch: pitch::PitchCache,
+    /// Polyphonic pitch edits: detections and renders.
+    poly: polypitch::PolyState,
     clip_analyses: detect::ClipAnalyses,
     structure_jobs: structure::StructureJobs,
     show: setlist::ShowState,
@@ -1552,6 +1559,7 @@ impl Session {
             play_started_at: None,
             transients: transients::TransientCache::default(),
             pitch: pitch::PitchCache::default(),
+            poly: polypitch::PolyState::default(),
             clip_analyses: detect::ClipAnalyses::default(),
             structure_jobs: structure::StructureJobs::default(),
             show: setlist::ShowState::default(),
@@ -2515,6 +2523,7 @@ impl Session {
     fn poll_jobs(&mut self) {
         self.poll_transients();
         self.poll_pitch();
+        self.poll_polyphonic();
         self.poll_clip_analyses();
         self.poll_structure();
         self.tick_show();
@@ -3965,6 +3974,7 @@ impl Session {
                     EditFlag::EditToolbar => e.show_edit_toolbar = on,
                     EditFlag::SnapToSamples => e.snap_samples = on,
                     EditFlag::SnapToZeroCrossings => e.zero_crossings = on,
+                    EditFlag::PolyphonicPitch => e.pitch_polyphonic = on,
                 }
                 if matches!(
                     flag,

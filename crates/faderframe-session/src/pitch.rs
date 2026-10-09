@@ -50,6 +50,13 @@ pub enum PitchOp {
     Reset { notes: Vec<usize> },
     /// Keep the formants where the pitch moves.
     KeepFormants(bool),
+    /// Set notes' level change (dB; polyphonic edits).
+    Gain { notes: Vec<usize>, db: f32 },
+    /// Take notes out (or back in; polyphonic edits).
+    Mute { notes: Vec<usize>, on: bool },
+    /// Forget notes found where none was played: they leave the edit, the
+    /// sound stays as it is.
+    Forget { notes: Vec<usize> },
     /// Forget the analysis and its edits.
     Remove,
 }
@@ -166,6 +173,8 @@ pub fn edit_from(
                 drift: 0.0,
                 formant: 0.0,
                 curve,
+                gain_db: 0.0,
+                muted: false,
             })
         })
         .collect();
@@ -173,6 +182,7 @@ pub fn edit_from(
         hop,
         notes,
         keep_formants: true,
+        polyphonic: None,
     }
 }
 
@@ -199,8 +209,12 @@ fn chosen(notes: &[usize], count: usize) -> Vec<usize> {
 
 impl Session {
     /// Find the notes of `clips` (audio clips; at once when their sources
-    /// are analysed, else when the analyses finish).
+    /// are analysed, else when the analyses finish): every note, chords
+    /// too, with the editor's Polyphonic option (the default).
     pub fn detect_pitch(&mut self, clips: &[ClipId]) -> Result<()> {
+        if self.editor.pitch_polyphonic {
+            return self.detect_polyphonic(clips);
+        }
         let mut ready = Vec::new();
         for &id in clips {
             let Some(ClipContent::Audio(a)) = self.project.clip(id).map(|c| &c.content) else {
@@ -408,14 +422,40 @@ impl Session {
                 for i in chosen(&notes, count) {
                     let n = &mut e.notes[i];
                     (n.shift, n.drift, n.formant) = (0.0, 0.0, 0.0);
+                    (n.gain_db, n.muted) = (0.0, false);
                 }
                 "Reset Pitch"
+            }
+            PitchOp::Gain { notes, db } => {
+                for i in chosen(&notes, count) {
+                    e.notes[i].gain_db = db.clamp(-48.0, 12.0);
+                }
+                "Note Level"
+            }
+            PitchOp::Forget { notes } => {
+                let gone = chosen(&notes, count);
+                let mut i = 0;
+                e.notes.retain(|_| {
+                    i += 1;
+                    !gone.contains(&(i - 1))
+                });
+                "Forget Notes"
+            }
+            PitchOp::Mute { notes, on } => {
+                for i in chosen(&notes, count) {
+                    e.notes[i].muted = on;
+                }
+                if on { "Mute Notes" } else { "Unmute Notes" }
             }
             PitchOp::KeepFormants(keep) => {
                 e.keep_formants = keep;
                 "Formants"
             }
             PitchOp::Remove => {
+                // A polyphonic edit's clip plays its original again.
+                if let Some(p) = e.polyphonic {
+                    a.source = p.original;
+                }
                 return self.set_audio("Remove Pitch Edit", &c, c.start, a);
             }
         };

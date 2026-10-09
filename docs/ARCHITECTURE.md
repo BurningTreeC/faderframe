@@ -3747,3 +3747,46 @@ onset latencies by key, threshold, scale, octave), engine
 `an_early_stamp_plays_now_and_records_where_it_was`, `tests/voice.rs`
 (voice to sound), `voice_to_midi_does_not_allocate`,
 `session/tests/voice.rs` (the dummy device's tone played and recorded).
+
+### Polyphonic pitch editing
+
+The Pitch editor's Polyphonic option (on by default; `EditFlag::PolyphonicPitch`,
+`EditorSettings::pitch_polyphonic`; off: the melodic editor, a single line
+played live by PSOLA with its formants) finds every note, chords too, and
+moves each on its own.
+
+Detection (`session::polypitch`): the clip's original audio through the
+transcription model (`to_midi::harmony`, every note), overtone notes of
+louder ones dropped (`drop_overtones`: on the 2nd–12th harmonic, sounding
+mostly with it, under 60 % of its velocity), each note followed to its pitch
+every 5 ms (`faderframe_polypitch::pitch_tracks`: a weighted harmonic sum
+within ±70 cents, then the exact peaks of its own unshared harmonics) — a
+`PitchEdit` whose notes may overlap, marked `Polyphonic { original,
+rendered }`, in one "Detect Pitch" step. Notes also carry `gain_db` and
+`muted`; `PitchOp::{Gain, Mute, Forget}`.
+
+The sound (`faderframe_polypitch::render`, pure): an STFT; in each frame
+every sounding note's harmonic peaks are found near the multiples of its
+pitch, a peak two notes share is split by their levels, each peak's bins
+(halfway to the next peak, at most four) move by its note's ratio — whole
+bins, with the phase turned on by the frequency change so the partial lands
+on its new frequency exactly (Laroche–Dolson peak shifting) — and take its
+gain; bins no note owns (noise, attacks) stay. The window is 85 ms where
+notes sound together (their partials apart) and about 4.5 periods (at least
+20 ms) for a note alone (vibrato followed); only the spans of changed notes
+are processed, crossfaded into the original, the rest bit for bit.
+
+Playback: the engine plays a polyphonic clip's source like any other
+(`PitchEdit::plays_live` keeps PSOLA to melodic edits). The session renders
+once an edit has settled (300 ms, no gesture open) on a worker and puts the
+new source and the notes' `sound_key` into the clip without an undo step
+(`apply_unrecorded`): the edit that caused it is the undo step, and since a
+clip's content carries notes, source and key together, undo and redo bring
+back matching audio; wherever key and render disagree the session renders
+again (`poll_polyphonic`). Polyphonic editing refuses clips with spectral
+edits or clip effects (melodic works on them). Tests: `faderframe-polypitch`
+(a chord's note moved — its partials 46–64 dB down where they were and
+arriving within a dB, the others ±0.01 dB; a note removed; each note followed
+to a cent; vibrato straightened; untouched audio bit for bit) and
+`session/tests/polypitch.rs` (a recorded chord found, moved, undone, redone,
+muted, removed).

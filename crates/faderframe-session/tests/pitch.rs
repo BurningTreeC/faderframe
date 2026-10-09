@@ -48,6 +48,13 @@ fn session(notes: &[(f64, f64)]) -> (Session, ClipId) {
     })
     .unwrap();
     s.wait_for_imports();
+    // These are the melodic editor's tests (a sung line, played live with
+    // its formants): Polyphonic is the default.
+    s.dispatch(Action::SetEditFlag(
+        faderframe_session::EditFlag::PolyphonicPitch,
+        false,
+    ))
+    .unwrap();
     let clip = *s.project().clips.keys().next().unwrap();
     (s, clip)
 }

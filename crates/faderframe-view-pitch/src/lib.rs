@@ -34,6 +34,8 @@ const MAX_ROW: f32 = 40.0;
 /// A toolbar control.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Item {
+    /// Every note, chords too (on), or one line of notes.
+    Polyphonic,
     Detect,
     Correct,
     Amount,
@@ -255,8 +257,15 @@ impl PitchView {
     pub fn toolbar(&self, size: Size, model: &Session) -> Vec<(Item, Rect, String, bool)> {
         let s = shown(model);
         let edit = s.as_ref().and_then(Shown::edit);
-        let detecting = model.detecting_pitch();
+        let detecting = model.detecting_pitch() || model.detecting_polyphonic();
+        let poly = edit.map_or(model.editor.pitch_polyphonic, |e| e.polyphonic.is_some());
         let mut items = vec![(
+            Item::Polyphonic,
+            "Polyphonic".to_string(),
+            model.editor.pitch_polyphonic,
+            84.0,
+        )];
+        items.push((
             Item::Detect,
             if detecting {
                 "Finding Notes…".to_string()
@@ -267,11 +276,21 @@ impl PitchView {
             },
             false,
             98.0,
-        )];
+        ));
         if edit.is_some() {
             let keep = edit.is_some_and(|e| e.keep_formants);
+            let formants = (
+                Item::Formants,
+                if keep {
+                    "Formants Kept".into()
+                } else {
+                    "Formants Move".into()
+                },
+                keep,
+                104.0,
+            );
+            items.extend([(Item::Correct, "Correct".to_string(), false, 64.0)]);
             items.extend([
-                (Item::Correct, "Correct".to_string(), false, 64.0),
                 (
                     Item::Amount,
                     format!("Pitch {:.0}%", self.amount * 100.0),
@@ -284,16 +303,12 @@ impl PitchView {
                     false,
                     106.0,
                 ),
-                (
-                    Item::Formants,
-                    if keep {
-                        "Formants Kept".into()
-                    } else {
-                        "Formants Move".into()
-                    },
-                    keep,
-                    104.0,
-                ),
+            ]);
+            // (A polyphonic edit moves partials: formants go with them.)
+            if !poly {
+                items.push(formants);
+            }
+            items.extend([
                 (Item::Reset, "Reset".into(), false, 52.0),
                 (Item::Remove, "Remove".into(), false, 62.0),
             ]);
@@ -303,7 +318,7 @@ impl PitchView {
             .into_iter()
             .map(|(item, label, on, w)| {
                 let r = Rect::new(x, 5.0, w, TOOLBAR_H - 10.0);
-                x += w + if matches!(item, Item::Detect | Item::Drift) {
+                x += w + if matches!(item, Item::Detect | Item::Drift | Item::Polyphonic) {
                     14.0
                 } else {
                     4.0
@@ -328,13 +343,41 @@ impl PitchView {
         let Some(e) = s.edit() else {
             return s.clip.name.clone();
         };
+        if let Some(done) = model.pitch_rendering(s.id) {
+            return format!("{} · rendering {:.0}%", s.clip.name, done * 100.0);
+        }
         let picked: Vec<&PitchNote> = self
             .selected
             .iter()
             .filter_map(|i| e.notes.get(*i))
             .collect();
         match picked.as_slice() {
-            [] => format!("{} · {} notes", s.clip.name, e.notes.len()),
+            [] => format!(
+                "{} · {} notes{}",
+                s.clip.name,
+                e.notes.len(),
+                if e.polyphonic.is_some() {
+                    " (polyphonic)"
+                } else {
+                    ""
+                }
+            ),
+            [n] if e.polyphonic.is_some() => {
+                let heard = n.heard();
+                let cents = ((heard - heard.round()) * 100.0).round() as i32;
+                format!(
+                    "{} {:+}¢ · moved {:+.2} · straightened {:.0}% · {}",
+                    note_name(heard.round() as i32),
+                    cents,
+                    n.shift,
+                    n.drift * 100.0,
+                    if n.muted {
+                        "muted".to_string()
+                    } else {
+                        format!("{:+.1} dB", n.gain_db)
+                    }
+                )
+            }
             [n] => {
                 let heard = n.heard();
                 let cents = ((heard - heard.round()) * 100.0).round() as i32;
@@ -368,8 +411,15 @@ impl PitchView {
             return;
         };
         let op = match item {
+            Item::Polyphonic => {
+                cx.emit(Action::SetEditFlag(
+                    faderframe_session::EditFlag::PolyphonicPitch,
+                    !model.editor.pitch_polyphonic,
+                ));
+                return;
+            }
             Item::Detect => {
-                if !model.detecting_pitch() {
+                if !model.detecting_pitch() && !model.detecting_polyphonic() {
                     cx.emit(Action::DetectPitch { clips: vec![s.id] });
                 }
                 return;
@@ -403,6 +453,11 @@ impl PitchView {
             .edit()
             .and_then(|e| e.notes.get(note))
             .map_or(0.0, |n| n.formant);
+        let poly = s.edit().is_some_and(|e| e.polyphonic.is_some());
+        let (muted, gain) = s
+            .edit()
+            .and_then(|e| e.notes.get(note))
+            .map_or((false, 0.0), |n| (n.muted, n.gain_db));
         let mut items = vec![
             MenuItem::new(
                 "Correct to the Key",
@@ -421,26 +476,61 @@ impl PitchView {
                     formant: None,
                 }),
             ),
-            MenuItem::new(
-                "Formants Up a Semitone",
-                op(PitchOp::Set {
-                    notes: notes.clone(),
-                    shift: None,
-                    drift: None,
-                    formant: Some(formant + 1.0),
-                }),
-            )
-            .separated(),
-            MenuItem::new(
-                "Formants Down a Semitone",
-                op(PitchOp::Set {
-                    notes: notes.clone(),
-                    shift: None,
-                    drift: None,
-                    formant: Some(formant - 1.0),
-                }),
-            ),
         ];
+        if poly {
+            items.extend([
+                MenuItem::new(
+                    if muted { "Unmute (M)" } else { "Mute (M)" },
+                    op(PitchOp::Mute {
+                        notes: notes.clone(),
+                        on: !muted,
+                    }),
+                )
+                .separated(),
+                MenuItem::new(
+                    "Louder (+3 dB)",
+                    op(PitchOp::Gain {
+                        notes: notes.clone(),
+                        db: gain + 3.0,
+                    }),
+                ),
+                MenuItem::new(
+                    "Quieter (−3 dB)",
+                    op(PitchOp::Gain {
+                        notes: notes.clone(),
+                        db: gain - 3.0,
+                    }),
+                ),
+                MenuItem::new(
+                    "Forget (not played: Del)",
+                    op(PitchOp::Forget {
+                        notes: notes.clone(),
+                    }),
+                ),
+            ]);
+        } else {
+            items.extend([
+                MenuItem::new(
+                    "Formants Up a Semitone",
+                    op(PitchOp::Set {
+                        notes: notes.clone(),
+                        shift: None,
+                        drift: None,
+                        formant: Some(formant + 1.0),
+                    }),
+                )
+                .separated(),
+                MenuItem::new(
+                    "Formants Down a Semitone",
+                    op(PitchOp::Set {
+                        notes: notes.clone(),
+                        shift: None,
+                        drift: None,
+                        formant: Some(formant - 1.0),
+                    }),
+                ),
+            ]);
+        }
         if notes.len() > 1 {
             items.push(
                 MenuItem::new(
@@ -574,7 +664,10 @@ impl PitchView {
             } else {
                 color
             };
-            p.fill_rounded(r, 4.0, &Paint::Solid(fill.with_alpha(0.55)));
+            // Taken out: only its outline.
+            if !n.muted {
+                p.fill_rounded(r, 4.0, &Paint::Solid(fill.with_alpha(0.55)));
+            }
             p.stroke_rounded(
                 r,
                 4.0,
@@ -624,11 +717,16 @@ impl PitchView {
             if r.w > 34.0 && self.row_h >= 10.0 {
                 let heard = n.heard();
                 let cents = ((heard - heard.round()) * 100.0).round() as i32;
-                let label = if cents == 0 {
+                let mut label = if cents == 0 {
                     note_name(heard.round() as i32)
                 } else {
                     format!("{} {cents:+}", note_name(heard.round() as i32))
                 };
+                if n.muted {
+                    label.push_str(" · muted");
+                } else if n.gain_db != 0.0 {
+                    label.push_str(&format!(" · {:+.0} dB", n.gain_db));
+                }
                 p.text(
                     &label,
                     Rect::new(r.x + 4.0, r.y - 13.0, r.w.max(60.0), 12.0),
@@ -1037,13 +1135,35 @@ impl PitchView {
                     by: if key == Key::Up { step } else { -step },
                 }
             }
-            Key::Delete | Key::Backspace if !self.selected.is_empty() => PitchOp::Reset {
-                notes: self.selected.clone(),
-            },
+            // Polyphonic: Delete forgets a note found where none was
+            // played, R resets; melodic: Delete resets.
+            Key::Delete | Key::Backspace
+                if !self.selected.is_empty()
+                    && s.edit().is_some_and(|e| e.polyphonic.is_some()) =>
+            {
+                PitchOp::Forget {
+                    notes: std::mem::take(&mut self.selected),
+                }
+            }
+            Key::Delete | Key::Backspace | Key::Char('r') if !self.selected.is_empty() => {
+                PitchOp::Reset {
+                    notes: self.selected.clone(),
+                }
+            }
             Key::Char('a') if modifiers.toggle() => {
                 self.selected = (0..count).collect();
                 cx.redraw();
                 return true;
+            }
+            Key::Char('m') if !self.selected.is_empty() => {
+                let muted = s
+                    .edit()
+                    .and_then(|e| e.notes.get(self.selected[0]))
+                    .is_some_and(|n| n.muted);
+                PitchOp::Mute {
+                    notes: self.selected.clone(),
+                    on: !muted,
+                }
             }
             Key::Char('j') if self.selected.len() > 1 => {
                 let notes = std::mem::take(&mut self.selected);
@@ -1200,14 +1320,20 @@ impl CanvasView<Session, Action> for PitchView {
     }
 
     fn wants_frames(&self, model: &Session) -> bool {
-        model.transport().playing || model.detecting_pitch()
+        model.transport().playing
+            || model.detecting_pitch()
+            || model.detecting_polyphonic()
+            || shown(model).is_some_and(|s| model.pitch_rendering(s.id).is_some())
     }
 
     fn tooltip(&self, pos: Point, size: Size, model: &Session) -> Option<String> {
         if pos.y < TOOLBAR_H {
             return Some(
                 match self.item_at(pos, size, model)? {
-                    Item::Detect => "Find the clip's notes (a single voice or instrument)",
+                    Item::Polyphonic => {
+                        "On: every note, chords too, each moved on its own (rendered); off: one line of notes (a voice), played live with its formants kept"
+                    }
+                    Item::Detect => "Find the clip's notes (Polyphonic: every note, chords too)",
                     Item::Correct => {
                         "Bring the selected notes (or all) to the key's notes and straighten them"
                     }
@@ -1296,11 +1422,14 @@ mod tests {
             drift: 0.0,
             formant: 0.0,
             curve: vec![0; 90],
+            gain_db: 0.0,
+            muted: false,
         };
         a.pitch = Some(PitchEdit {
             hop: 240,
             notes: vec![note(0, 57.0), note(1, 60.0), note(2, 64.0)],
             keep_formants: true,
+            polyphonic: None,
         });
         s.dispatch(Action::Edit(Command::SetClipContent {
             clip: pad,

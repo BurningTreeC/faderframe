@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 faderframe-analysis.workspace = true
+faderframe-polypitch.workspace = true
 faderframe-transcribe.workspace = true
 faderframe-speech.workspace = true
 faderframe-spectral.workspace = true

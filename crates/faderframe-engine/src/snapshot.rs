@@ -748,7 +748,7 @@ impl TimelineSnapshot {
                     .region(start, sources, sr, project_rate);
                     let Some(r) = region else { continue };
                     let lane = lane_for(&mut lanes, &mut launch_lanes, clip.track, slot);
-                    let pitched = a.pitch.as_ref().is_some_and(|e| e.edited());
+                    let pitched = a.pitch.as_ref().is_some_and(|e| e.plays_live());
                     match a.warp.as_ref() {
                         Some(w) if !a.reversed && !w.is_identity(a.source_offset, a.length) => {
                             lane.warped.push(warped_region(
@@ -1046,7 +1046,7 @@ fn warped_region(
     let pitch = a
         .pitch
         .as_ref()
-        .filter(|e| e.edited())
+        .filter(|e| e.plays_live())
         .map(|e| pitch_curve(e, a, src, project_rate));
     let mode = match w.algorithm {
         _ if pitch.is_some() => WarpMode::Psola,
