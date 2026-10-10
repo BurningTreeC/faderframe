@@ -21,8 +21,8 @@ Install (menu entry, `faderframe` command, .ffproj files open with it):
 
 Audio: PipeWire is used directly; JACK and ALSA work too
 (Preferences → Audio). FaderFrame bundles GTK 4 and its libraries; it needs
-a distribution with Ubuntu 26.04-era system libraries, including glibc
-2.43 or newer. Use the Flatpak package on older distributions.
+glibc 2.41 or newer, including Debian 13. The Flatpak package carries its
+complete runtime for older distributions.
 
 Video: the GStreamer in this folder, with the plugins video needs and
 hardware decoding of H.264 and H.265 through VA-API (your graphics

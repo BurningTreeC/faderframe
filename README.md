@@ -794,10 +794,10 @@ of them for a `v*` tag and attaches them to the GitHub release.
 | macOS | `FaderFrame.app` in a DMG (GTK and GStreamer bundled, ad-hoc signed) | `brew install gtk4 adwaita-icon-theme librsvg pkgconf gstreamer && packaging/macos/bundle.sh` |
 | Windows | installer (Inno Setup) and portable zip (GTK and GStreamer bundled) | in MSYS2 UCRT64: `packaging/windows/bundle.sh` |
 
-The release tarball is built on Ubuntu 26.04 and bundles GTK 4.22. It
-requires Ubuntu 26.04-era system libraries, including glibc 2.43 or newer;
-use the Flatpak on older distributions. Source builds use the requirements
-listed above.
+The release tarball is built on Debian 13 and bundles GTK 4.22. Every ELF in
+the package is checked to require no newer than glibc 2.41, so it runs on
+Debian 13 and newer distributions. The Flatpak carries its complete runtime
+for older distributions. Source builds use the requirements listed above.
 
 Video needs nothing installed with a package: the Linux tarball, the
 macOS and the Windows packages carry GStreamer with the plugins video

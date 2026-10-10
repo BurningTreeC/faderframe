@@ -16,6 +16,7 @@ binaries, followed by the full text of every distinct license.
 | Cairo | LGPL-2.1-only OR MPL-1.1 | https://gitlab.freedesktop.org/cairo/cairo | used by GTK (dynamically linked) |
 | Graphene | MIT | https://github.com/ebassi/graphene | geometry types (dynamically linked) |
 | HarfBuzz | MIT-like (Old MIT) | https://github.com/harfbuzz/harfbuzz | text shaping via Pango |
+| Wayland | MIT | https://gitlab.freedesktop.org/wayland/wayland | client library bundled in the Linux tarball |
 | GStreamer (core; base, good and bad plugins) | LGPL-2.1-or-later | https://gitlab.freedesktop.org/gstreamer/gstreamer | video: demuxing, decoding, encoding, muxing (dynamically linked; plugins loaded at run time) |
 | FFmpeg (decoders only, built LGPL) and GStreamer's libav plugin | LGPL-2.1-or-later | https://ffmpeg.org | Linux tarball: ProRes, DNxHD and other post-production decoders (packaging/linux/lgpl_libav.sh; plugin loaded at run time) |
 | libdv | LGPL-2.1-or-later | https://libdv.sourceforge.net | DV decoding (GStreamer's dv plugin, loaded at run time) |

@@ -15,10 +15,9 @@
 #     FaderFrame Data/        portable mode: settings, caches, presets and
 #                             recordings of unsaved projects stay in here
 #
-# The system provides the C library, graphics drivers, the display server
-# and audio server client libraries and fonts; everything else GTK needs is
-# bundled, so the tarball runs on distributions at least as new as the one
-# it was built on (CI: Ubuntu 26.04), whatever GTK they have.
+# The system provides the C library, graphics drivers, the display and audio
+# servers and fonts; everything else GTK needs is bundled. CI builds on
+# Debian 13 and checks that no ELF requires a glibc newer than 2.41.
 #
 #   cargo build --release -p faderframe-app
 #   packaging/linux/tarball.sh            (FADERFRAME_BIN=<path> for another build)
@@ -39,9 +38,10 @@ cp "$bin" "$out/bin/faderframe"
 strip --strip-debug "$out/bin/faderframe" 2>/dev/null || true
 
 # Libraries the system must provide (C runtime, graphics, display and audio
-# servers, D-Bus/udev, fonts, compression).
+# servers, D-Bus/udev, fonts, compression). The Wayland client library is
+# deliberately bundled because GTK 4.22 requires a newer one than Debian 13.
 # (Names ending in "\." are exact; the others are families.)
-system='^(ld-linux|linux-vdso|libc\.|libm\.|libdl\.|libpthread\.|librt\.|libresolv\.|libutil\.|libgcc_s\.|libstdc\+\+\.|libGL|libEGL|libOpenGL|libgbm\.|libdrm|libvulkan\.|libwayland-|libX|libxcb|libxkbcommon|libasound\.|libjack|libpipewire|libpulse|libdbus|libsystemd\.|libudev\.|libcap\.|libfontconfig\.|libfreetype\.|libexpat\.|libz\.|libbz2\.|liblzma\.|libzstd\.|libgcrypt\.|libgpg-error\.|libva\.|libva-)'
+system='^(ld-linux|linux-vdso|libc\.|libm\.|libdl\.|libpthread\.|librt\.|libresolv\.|libutil\.|libgcc_s\.|libstdc\+\+\.|libGL|libEGL|libOpenGL|libgbm\.|libdrm|libvulkan\.|libX|libxcb|libxkbcommon|libasound\.|libjack|libpipewire|libpulse|libdbus|libsystemd\.|libudev\.|libcap\.|libfontconfig\.|libfreetype\.|libexpat\.|libz\.|libbz2\.|liblzma\.|libzstd\.|libgcrypt\.|libgpg-error\.|libva\.|libva-)'
 copy_deps() {
     ldd "$1" | awk '$3 ~ /^\// { print $3 }' | sort -u | while read -r lib; do
         base=$(basename "$lib")
@@ -142,6 +142,10 @@ install -m755 packaging/linux/portable/install.sh "$out/install.sh"
 install -m644 packaging/linux/portable/README.txt "$out/README.txt"
 cp LICENSE THIRD_PARTY_LICENSES.md AOM-PATENT-LICENSE.txt "$out/"
 mkdir -p "$out/FaderFrame Data"
+
+if [ -n "${FADERFRAME_MAX_GLIBC:-}" ]; then
+    packaging/linux/check-glibc.sh "$out" "$FADERFRAME_MAX_GLIBC"
+fi
 
 tarball=dist/$name.tar.xz
 rm -f "$tarball"

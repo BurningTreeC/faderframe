@@ -34,30 +34,56 @@ jobs:
 
   linux-tarball:
     name: Linux tarball
-    # Bundle GTK 4.22's renderer fixes; the tarball needs Ubuntu 26.04-era
-    # system libraries (including glibc 2.43).
-    runs-on: ubuntu-26.04
+    # Build against Debian 13's glibc, then bundle GTK 4.22 and Wayland 1.24.
+    # This keeps the recent renderer fixes without raising the host baseline.
+    runs-on: ubuntu-24.04
+    container: debian:13
+    env:
+      GTK_PREFIX: /opt/faderframe-gtk
+      PKG_CONFIG_PATH: /opt/faderframe-gtk/lib/pkgconfig
+      LD_LIBRARY_PATH: /opt/faderframe-gtk/lib
     steps:
-      - uses: actions/checkout@v5
       - name: System dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libgtk-4-dev pkg-config libjack-jackd2-dev libasound2-dev \
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates git build-essential pkg-config libjack-jackd2-dev libasound2-dev \
             libpipewire-0.3-dev libclang-dev librsvg2-common adwaita-icon-theme \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
-            meson ninja-build nasm curl xz-utils
+            libglib2.0-dev libglib2.0-bin libpango1.0-dev \
+            libharfbuzz-dev libcairo2-dev libfribidi-dev libgdk-pixbuf-2.0-dev \
+            libgraphene-1.0-dev libepoxy-dev libjpeg-dev libpng-dev libtiff-dev \
+            libfontconfig1-dev libx11-dev libxext-dev libxrender-dev libxi-dev \
+            libxrandr-dev libxcursor-dev libxdamage-dev libxfixes-dev libxinerama-dev \
+            libxkbcommon-dev libwayland-dev wayland-protocols libvulkan-dev libdrm-dev \
+            libegl-dev libgl-dev libgles-dev iso-codes gettext sassc glslc \
+            meson ninja-build nasm curl xz-utils file binutils python3
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v4
+        with:
+          path: /opt/faderframe-gtk
+          key: linux-debian13-gtk-4.22.4-wayland-1.24.0-${{ hashFiles('packaging/linux/build-gtk.sh') }}
+      - name: GTK 4.22 SDK
+        run: packaging/linux/build-gtk.sh "$GTK_PREFIX"
       - name: GTK version
-        run: pkg-config --modversion gtk4
+        run: |
+          pkg-config --modversion gtk4 gstreamer-1.0
+          pkg-config --atleast-version=4.22 gtk4
+          test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.41"
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
         run: cargo build --release -p faderframe-app
       - name: LGPL FFmpeg decoders (ProRes, DNxHD, …)
-        # GStreamer 1.28 supports the script's default FFmpeg 7.1.
+        # GStreamer 1.26 supports the script's default FFmpeg 7.1.
         run: packaging/linux/lgpl_libav.sh "$RUNNER_TEMP/libav"
       - name: Portable tarball
-        run: FADERFRAME_LIBAV="$RUNNER_TEMP/libav" packaging/linux/tarball.sh
+        run: |
+          FADERFRAME_LIBAV="$RUNNER_TEMP/libav" FADERFRAME_MAX_GLIBC=2.41 \
+            packaging/linux/tarball.sh
+          package=$(find dist -mindepth 1 -maxdepth 1 -type d -name 'faderframe-*-linux-*' -print -quit)
+          test -n "$package"
+          "$package/faderframe" --version
       - uses: actions/upload-artifact@v4
         with:
           name: linux-tarball
