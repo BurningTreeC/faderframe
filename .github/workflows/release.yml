@@ -74,19 +74,25 @@ jobs:
           - runner: macos-15-intel
             arch: x86_64
     runs-on: ${{ matrix.runner }}
+    env:
+      # Use the runner image's package metadata and existing libraries.
+      # Updating Homebrew selects newer formulae without Intel bottles,
+      # rebuilding GTK/GStreamer and their toolchains from source for hours.
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_UPGRADE: "1"
+      HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
     steps:
       - uses: actions/checkout@v5
       - name: System dependencies
-        run: |
-          brew update
-          # Intel may build netpbm from SVN. Install the client before
-          # Homebrew prefetches GTK/GStreamer's dependency sources.
-          brew install subversion
-          brew install gtk4 adwaita-icon-theme librsvg pkgconf gstreamer
-          # Also upgrade GTK if the runner already had it installed.
-          brew upgrade gtk4
+        # Bottled dependencies took about two minutes on macos-15-intel.
+        # Bound this step if a future runner image loses usable bottles.
+        timeout-minutes: 15
+        run: brew install gtk4 adwaita-icon-theme librsvg pkgconf gstreamer
       - name: GTK version
-        run: pkg-config --modversion gtk4
+        run: |
+          pkg-config --modversion gtk4 gstreamer-1.0
+          # Keep the recent renderer fixes without upgrading every library.
+          pkg-config --atleast-version=4.22 gtk4
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
         run: cargo build --release -p faderframe-app

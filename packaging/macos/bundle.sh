@@ -3,7 +3,6 @@
 # from a release build, with Homebrew's GTK 4 and its dependencies copied
 # into the bundle (bundle_dylibs.py rewrites the library paths).
 #
-#   brew install subversion  # before fetching any SVN-based dependencies
 #   brew install gtk4 adwaita-icon-theme librsvg pkgconf gstreamer
 #   cargo build --release -p faderframe-app
 #   packaging/macos/bundle.sh

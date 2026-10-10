@@ -27,19 +27,21 @@ jobs:
           - runner: macos-15-intel
             arch: Intel
     runs-on: ${{ matrix.runner }}
+    env:
+      # Keep the runner's recent, bottled dependencies. Updating Homebrew
+      # selects newer formulae without Intel bottles and builds from source.
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_UPGRADE: "1"
+      HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
     steps:
       - uses: actions/checkout@v5
       - name: System dependencies
-        run: |
-          brew update
-          # Intel may build netpbm from SVN. Install the client before
-          # Homebrew prefetches GTK/GStreamer's dependency sources.
-          brew install subversion
-          brew install gtk4 pkgconf gstreamer
-          # Also upgrade GTK if the runner already had it installed.
-          brew upgrade gtk4
+        timeout-minutes: 15
+        run: brew install gtk4 pkgconf gstreamer
       - name: GTK version
-        run: pkg-config --modversion gtk4
+        run: |
+          pkg-config --modversion gtk4 gstreamer-1.0
+          pkg-config --atleast-version=4.22 gtk4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build application
