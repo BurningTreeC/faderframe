@@ -79,6 +79,9 @@ jobs:
       - name: System dependencies
         run: |
           brew update
+          # Intel may build netpbm from SVN. Install the client before
+          # Homebrew prefetches GTK/GStreamer's dependency sources.
+          brew install subversion
           brew install gtk4 adwaita-icon-theme librsvg pkgconf gstreamer
           # Also upgrade GTK if the runner already had it installed.
           brew upgrade gtk4

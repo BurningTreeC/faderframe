@@ -26,6 +26,8 @@ pub struct Preferences {
     pub theme: String,
     pub snap: bool,
     pub follow_playhead: bool,
+    /// Which global lanes the arranger shows, across projects and restarts.
+    pub global_lanes: faderframe_session::lanes::GlobalLanes,
     /// "takes" or "replace".
     pub record_mode: String,
     /// "takes", "last-pass" or "new-tracks".
@@ -114,6 +116,7 @@ impl Default for Preferences {
             theme: "studio".into(),
             snap: true,
             follow_playhead: true,
+            global_lanes: Default::default(),
             record_mode: RecordMode::default().id().into(),
             loop_record_mode: LoopRecordMode::default().id().into(),
             metronome: MetronomeMode::Recording.id().into(),
@@ -252,5 +255,29 @@ impl Preferences {
             BackendChoice::Dummy => "dummy",
         }
         .into();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use faderframe_session::lanes::{GlobalLane, GlobalLanes};
+
+    #[test]
+    fn lane_preferences_round_trip_and_accept_older_files() {
+        let old: Preferences = serde_json::from_str(r#"{"snap":false}"#).unwrap();
+        assert!(!old.snap);
+        assert_eq!(old.global_lanes, GlobalLanes::default());
+        let mut prefs = old;
+        for lane in GlobalLane::ALL {
+            prefs.global_lanes.set(lane, false);
+            let saved = serde_json::to_string(&prefs).unwrap();
+            let restored: Preferences = serde_json::from_str(&saved).unwrap();
+            assert_eq!(restored, prefs);
+        }
+        let partial: Preferences =
+            serde_json::from_str(r#"{"global_lanes":{"tempo":false}}"#).unwrap();
+        assert!(!partial.global_lanes.tempo);
+        assert!(partial.global_lanes.markers);
     }
 }

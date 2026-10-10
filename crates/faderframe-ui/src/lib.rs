@@ -201,6 +201,7 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
     let (mut session, error) = build_session(&options, &prefs);
     session.editor.snap = prefs.snap;
     session.editor.follow_playhead = prefs.follow_playhead;
+    session.editor.lanes = prefs.global_lanes;
     if let Err(e) = session.dispatch(faderframe_session::Action::SetRecordSettings(
         prefs.record_settings(),
     )) {

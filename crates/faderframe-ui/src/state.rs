@@ -253,9 +253,18 @@ impl AppState {
 
     /// Apply an action from any view or menu.
     pub fn dispatch(self: &Rc<Self>, action: Action) {
+        let lanes_before = self.session.borrow().editor.lanes;
         let result = self.session.borrow_mut().dispatch(action);
         if let Err(e) = result {
             self.report(e, false);
+        }
+        let lanes = self.session.borrow().editor.lanes;
+        if lanes != lanes_before {
+            let mut prefs = crate::prefs::Preferences::load();
+            prefs.global_lanes = lanes;
+            if let Err(e) = prefs.save() {
+                tracing::warn!("cannot save lane preferences: {e}");
+            }
         }
         self.after_change();
     }

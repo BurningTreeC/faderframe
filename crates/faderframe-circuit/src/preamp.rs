@@ -15,8 +15,7 @@ pub const CONSOLE_BUSES: usize = console_bus::FAMILIES.len();
 /// 0 dBFS is +22 dBu.
 pub const BUS_FULL_SCALE: f64 = 1.227_8 * std::f64::consts::SQRT_2 * 7.943_282;
 
-/// A console bus's drive range (dB either way; its Gain control is the
-/// drive in dB).
+/// A console bus's separate colour drive range (dB either way).
 pub const BUS_DRIVE_DB: f64 = 12.0;
 struct Calibration {
     drive_volts: f64,
@@ -102,15 +101,16 @@ fn closing(model: usize) -> f64 {
     }
 }
 
-/// What reaches the circuit (linear): the divider and the closing.
+/// Half of the closing taper is applied at each end of the circuit. The
+/// combined square law stays the same, while the output also silences the
+/// energy stored in capacitors and transformer cores when Gain closes.
+fn closing_gain(model: usize, gain: f64) -> f64 {
+    (gain / closing(model)).clamp(0.0, 1.0)
+}
+
+/// What reaches the circuit (linear): the divider and the input closing.
 fn pad(model: usize, gain: f64) -> f64 {
-    let end = closing(model);
-    let closing = if gain < end {
-        (gain.max(0.0) / end).powi(2)
-    } else {
-        1.0
-    };
-    10f64.powf(divider_db(model, gain) / 20.0) * closing
+    10f64.powf(divider_db(model, gain) / 20.0) * closing_gain(model, gain)
 }
 
 /// How much louder (dB) model `model` is with its Gain at `gain` than at
@@ -126,7 +126,7 @@ pub fn level_change_db(model: usize, gain: f64) -> f64 {
         REFERENCE
     };
     makeup(table, REFERENCE, steps) - makeup(table, gain, steps)
-        + (20.0 * pad(model, gain).log10()).max(-200.0)
+        + (20.0 * (pad(model, gain) * closing_gain(model, gain)).log10()).max(-200.0)
 }
 
 pub struct Preamp {
@@ -135,9 +135,13 @@ pub struct Preamp {
     over: Oversampler,
     model: usize,
     input_scale: f64,
-    /// The input divider (linear), smoothed toward its target.
+    /// The input divider (or a bus's colour drive), smoothed toward its target.
     pad: f64,
     pad_target: f64,
+    /// A bus's calibrated Gain: 0 is silent, 0.5 unity, 1 +12 dB.
+    bus_gain: f64,
+    level: f64,
+    level_target: f64,
     makeup_scale: f64,
     output_scale: f64,
     output_target: f64,
@@ -152,8 +156,10 @@ pub struct Preamp {
 }
 
 impl Preamp {
-    /// Console bus `family` (see [`console_bus`]): Gain is the drive
-    /// (dB, ±[`BUS_DRIVE_DB`]), Master the output trim. Levels are set so that
+    /// Console bus `family` (see [`console_bus`]): the legacy first control
+    /// is colour drive (dB, ±[`BUS_DRIVE_DB`]), Master the output trim.
+    /// [`Self::set_bus_gain`] sets its independent calibrated Gain.
+    /// Levels are set so that
     /// −18 dBFS leaves the bus's line at +4 dBu, the drive putting more in
     /// and taking it off after.
     fn console_bus(family: usize, rate: f64, drive: f64, master_db: f64) -> Result<Self, Fault> {
@@ -193,6 +199,9 @@ impl Preamp {
             input_scale: 1.0,
             pad: 1.0,
             pad_target: 1.0,
+            bus_gain: REFERENCE,
+            level: 1.0,
+            level_target: 1.0,
             makeup_scale: 1.0,
             output_scale: 0.0,
             output_target: 0.0,
@@ -204,6 +213,7 @@ impl Preamp {
         };
         p.set_controls(drive, master_db);
         p.output_scale = p.output_target;
+        p.pad = p.pad_target;
         Ok(p)
     }
 
@@ -247,6 +257,9 @@ impl Preamp {
             input_scale: CALIBRATION[model].drive_volts / 10f64.powf(-18.0 / 20.0),
             pad: 1.0,
             pad_target: 1.0,
+            bus_gain: REFERENCE,
+            level: 1.0,
+            level_target: 1.0,
             makeup_scale: 1.0,
             output_scale: 0.0,
             output_target: 0.0,
@@ -292,9 +305,11 @@ impl Preamp {
             // The drive into the bus and off it after: the colour changes,
             // not the level.
             let drive = 10f64.powf(gain / 20.0);
-            self.input_scale = BUS_FULL_SCALE * drive / g.abs();
-            self.makeup_scale = g.signum() / (BUS_FULL_SCALE * drive);
-            self.output_target = 10f64.powf(master / 20.0);
+            self.pad_target = drive;
+            self.input_scale = BUS_FULL_SCALE / g.abs();
+            self.makeup_scale = g.signum() / BUS_FULL_SCALE;
+            self.output_target =
+                10f64.powf(master / 20.0) * closing_gain(self.model, self.bus_gain);
             return;
         }
         self.circuit.set_control(0, gain);
@@ -311,21 +326,46 @@ impl Preamp {
         // Circuit gain and its calibration must change together. Smoothing
         // their product held the old (sometimes +70 dB) correction while the
         // new circuit gain was already active. Only the independent Master
-        // trim is smoothed; calibration occurs before the decimator so its
-        // filter history always contains correctly scaled samples.
+        // trim and the closing taper are smoothed; calibration occurs before
+        // the decimator so its filter history contains correctly scaled samples.
         self.makeup_scale = 10f64.powf(db / 20.0) / self.input_scale;
-        self.output_target = 10f64.powf(master / 20.0);
+        self.output_target = 10f64.powf(master / 20.0) * closing_gain(self.model, gain);
+    }
+
+    /// Calibrated console bus Gain (0…1): silence, unity at 50 %, +12 dB
+    /// at full travel. The square taper is split across the circuit at the
+    /// bottom so closing it also silences its stored energy. Microphone
+    /// models use their own gain control and ignore this setting.
+    pub fn set_bus_gain(&mut self, gain: f64) {
+        if self.bus.is_none() {
+            return;
+        }
+        let gain = if gain.is_finite() {
+            gain.clamp(0.0, 1.0)
+        } else {
+            REFERENCE
+        };
+        if gain == self.bus_gain {
+            return;
+        }
+        self.bus_gain = gain;
+        self.level_target = gain * gain.max(closing(self.model)) / REFERENCE.powi(2);
+        self.output_target = 10f64.powf(self.master / 20.0) * closing_gain(self.model, gain);
     }
 
     pub fn process(&mut self, input: f64) -> f64 {
         let input = if input.is_finite() { input } else { 0.0 };
         let circuit = &mut self.circuit;
         let line = &mut self.line;
-        let makeup = self.makeup_scale;
         self.pad += self.smoothing * (self.pad_target - self.pad);
+        self.level += self.smoothing * (self.level_target - self.level);
+        // Drive and its inverse follow the same smoothed value. Applying a
+        // new inverse immediately to the circuit's old history caused bursts
+        // as large as 24 dB when turning Drive down.
+        let makeup = self.makeup_scale / if self.bus.is_some() { self.pad } else { 1.0 };
         let out = self
             .over
-            .process(input * self.input_scale * self.pad, &mut |x| {
+            .process(input * self.input_scale * self.pad * self.level, &mut |x| {
                 let y = circuit.process(x);
                 let y = match line {
                     Some(sim) => sim.process(y),
@@ -334,6 +374,9 @@ impl Preamp {
                 y * makeup
             });
         self.output_scale += self.smoothing * (self.output_target - self.output_scale);
+        if self.output_target == 0.0 && self.output_scale < 1e-9 {
+            self.output_scale = 0.0;
+        }
         let out = out * self.output_scale;
         if out.is_finite() {
             out
@@ -350,6 +393,7 @@ impl Preamp {
         self.over.reset();
         self.output_scale = self.output_target;
         self.pad = self.pad_target;
+        self.level = self.level_target;
     }
 
     /// When the current audio is due (live use): past it, samples that do
@@ -387,6 +431,7 @@ impl Preamp {
         assert_eq!(self.model, source.model);
         debug_assert_eq!(self.gain, source.gain);
         debug_assert_eq!(self.master, source.master);
+        debug_assert_eq!(self.bus_gain, source.bus_gain);
         self.circuit.copy_runtime_state_from(&source.circuit);
         if let (Some(dst), Some(src)) = (&mut self.line, &source.line) {
             dst.copy_runtime_state_from(src);
@@ -394,5 +439,6 @@ impl Preamp {
         self.over.copy_runtime_state_from(&source.over);
         self.output_scale = source.output_scale;
         self.pad = source.pad;
+        self.level = source.level;
     }
 }

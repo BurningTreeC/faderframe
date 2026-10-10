@@ -28,6 +28,66 @@ fn render(tp: &TestProject, block: usize) -> Vec<Vec<f32>> {
     )
     .unwrap()
 }
+
+#[test]
+fn every_console_bus_passes_audio_and_gain_zero_mutes_the_sum() {
+    use faderframe_core::ParameterId;
+    use faderframe_project::SavedParameter;
+
+    let mut tp = TestProject::new(48_000);
+    let master = tp.master();
+    let track = tp.track(TrackKind::Audio, "Input", ChannelLayout::Stereo);
+    let tone: Vec<_> = (0..8192).map(|n| (n as f32 * 0.13).sin() * 0.05).collect();
+    let src = tp.source(AudioData::from_channels(48_000, vec![tone.clone(), tone]));
+    tp.clip(track, src, MusicalTime::ZERO, 8192);
+    for (family, &(id, name, _)) in builtin::CONSOLE_BUSES.iter().enumerate() {
+        tp.project.console = Some(faderframe_project::console::Console::new(family as u8));
+        let slot = PluginSlot {
+            id: tp.project.ids.allocate(),
+            plugin: PluginRef::builtin(id, name),
+            bypass: false,
+            parameters: vec![],
+            state: None,
+            sidechain: None,
+        };
+        tp.project.track_mut(master).unwrap().preamp = Some(slot);
+        let unity = render(&tp, 128);
+        assert!(
+            unity.iter().flatten().any(|x| x.abs() > 0.01),
+            "{name}: no audio"
+        );
+        let parameters = &mut tp
+            .project
+            .track_mut(master)
+            .unwrap()
+            .preamp
+            .as_mut()
+            .unwrap()
+            .parameters;
+        parameters.push(SavedParameter {
+            id: ParameterId(2),
+            value: 0.0,
+        });
+        let silent = render(&tp, 128);
+        assert!(
+            silent.iter().flatten().all(|&x| x == 0.0),
+            "{name}: closed Gain leaks"
+        );
+        tp.project
+            .track_mut(master)
+            .unwrap()
+            .preamp
+            .as_mut()
+            .unwrap()
+            .parameters[0]
+            .value = 0.5;
+        assert_eq!(
+            render(&tp, 511),
+            unity,
+            "{name}: explicit unity differs from legacy defaults"
+        );
+    }
+}
 #[test]
 fn audio_preamp_is_before_inserts_and_all_channels_are_processed_independently() {
     let mut tp = TestProject::new(48_000);

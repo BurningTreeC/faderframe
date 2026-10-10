@@ -1,6 +1,6 @@
 //! Dedicated channel input faceplates, drawn by the native canvas: a
 //! microphone preamp (Gain, Master) or, on a bus or the master, a console's
-//! bus amplifier (Drive, Output).
+//! bus amplifier (Gain, Output).
 use super::*;
 use faderframe_core::ParameterId;
 use faderframe_core::builtin::{CONSOLE_BUSES, PREAMPS, console_bus_index, preamp_index};
@@ -14,12 +14,23 @@ pub(super) struct Face {
     /// Dark ink on a light plate.
     pub light: bool,
     pub labels: [&'static str; 2],
+    /// Persisted parameter IDs of the two visible knobs.
+    pub ids: [u32; 2],
     /// Per knob: low, high, at rest (the parameter's units).
     pub ranges: [(f64, f64, f64); 2],
     /// The first knob in percent (else dB).
     pub percent: bool,
     /// The first knob's cap red (the British 73's gain).
     pub red: bool,
+}
+
+impl Face {
+    pub fn index(&self, id: u32) -> usize {
+        self.ids
+            .iter()
+            .position(|&parameter| parameter == id)
+            .unwrap_or(0)
+    }
 }
 
 pub(super) fn face(slot: &PluginSlot) -> Face {
@@ -32,9 +43,10 @@ pub(super) fn face(slot: &PluginSlot) -> Face {
             name,
             rgb,
             light: luma > 128.0,
-            labels: ["Drive", "Output"],
-            ranges: [(-12.0, 12.0, 0.0), (-24.0, 12.0, 0.0)],
-            percent: false,
+            labels: ["Gain", "Output"],
+            ids: [2, 1],
+            ranges: [(0.0, 1.0, 0.5), (-24.0, 12.0, 0.0)],
+            percent: true,
             red: false,
         };
     }
@@ -45,6 +57,7 @@ pub(super) fn face(slot: &PluginSlot) -> Face {
         rgb,
         light: i >= 4,
         labels: ["Gain", "Master"],
+        ids: [0, 1],
         ranges: [(0.0, 1.0, 0.5), (-60.0, 12.0, 0.0)],
         percent: true,
         red: i == 0,
@@ -63,23 +76,28 @@ fn bridging(slot: &PluginSlot) -> bool {
 }
 
 pub(super) fn value(slot: &PluginSlot, id: u32) -> f64 {
-    let rest = face(slot).ranges[(id as usize).min(1)].2;
+    let face = face(slot);
+    let rest = if id == 0 && console_bus_index(&slot.plugin.id).is_some() {
+        0.0 // The legacy colour Drive, available in the bus menu.
+    } else {
+        face.ranges[face.index(id)].2
+    };
     slot.parameters
         .iter()
         .find(|p| p.id == ParameterId(id))
         .map_or(rest, |p| p.value)
 }
 pub(super) fn position(face: &Face, value: f64, id: u32) -> f32 {
-    let (lo, hi, _) = face.ranges[(id as usize).min(1)];
+    let (lo, hi, _) = face.ranges[face.index(id)];
     ((value - lo) / (hi - lo)).clamp(0.0, 1.0) as f32
 }
 pub(super) fn plain(face: &Face, position: f32, id: u32) -> f64 {
-    let (lo, hi, _) = face.ranges[(id as usize).min(1)];
+    let (lo, hi, _) = face.ranges[face.index(id)];
     lo + f64::from(position.clamp(0.0, 1.0)) * (hi - lo)
 }
 /// The knob's value as text.
 pub(super) fn shown(face: &Face, value: f64, id: u32) -> String {
-    if id == 0 && face.percent {
+    if id == face.ids[0] && face.percent {
         format!("{:.1}%", value * 100.0)
     } else {
         format!("{value:+.1} dB")
@@ -110,7 +128,7 @@ impl MixerView {
         if t.preamp.is_some() && area.h >= 80.0 {
             for (id, rect) in knobs(area).into_iter().enumerate() {
                 if rect.contains(pos) {
-                    return Some(Hit::PreampKnob(t.id, id as u32));
+                    return Some(Hit::PreampKnob(t.id, face(t.preamp.as_ref()?).ids[id]));
                 }
             }
             if buttons(area)[1].contains(pos) {
@@ -124,15 +142,15 @@ impl MixerView {
     /// preamps.
     pub(super) fn stage_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
         match t.kind {
-            TrackKind::Master => Self::console_menu(model, at),
+            TrackKind::Master => Self::console_menu(model, t, at),
             TrackKind::Bus | TrackKind::Aux => Self::bus_amp_menu(model, t, at),
             _ => Self::preamp_menu(t, at),
         }
     }
 
     /// The console for the whole mix (the master's input stage).
-    fn console_menu(model: &Session, at: Point) -> HostRequest<Action> {
-        let items = model
+    fn console_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
+        let mut items: Vec<_> = model
             .console_choices()
             .into_iter()
             .map(|c| {
@@ -144,7 +162,34 @@ impl MixerView {
                 }
             })
             .collect();
+        if let Some(slot) = t
+            .preamp
+            .as_ref()
+            .filter(|s| console_bus_index(&s.plugin.id).is_some())
+        {
+            items.push(Self::bus_drive_menu(t.id, slot));
+        }
         HostRequest::ContextMenu { at, items }
+    }
+
+    fn bus_drive_menu(track: TrackId, slot: &PluginSlot) -> MenuItem<Action> {
+        let now = value(slot, 0);
+        let drive = [-12.0, -6.0, -3.0, 0.0, 3.0, 6.0, 9.0, 12.0]
+            .into_iter()
+            .map(|db| {
+                MenuItem::new(
+                    format!("{db:+} dB"),
+                    Action::Edit(Command::SetPluginParameter {
+                        track,
+                        plugin: slot.id,
+                        parameter: ParameterId(0),
+                        value: Some(db),
+                    }),
+                )
+                .checked((now - db).abs() < 0.05)
+            })
+            .collect();
+        MenuItem::submenu("Drive", drive).separated()
     }
 
     /// A bus's own amplifier: following the console, through another
@@ -194,23 +239,7 @@ impl MixerView {
             families,
         ));
         if let Some(slot) = t.preamp.as_ref().filter(|_| amp.is_some()) {
-            let now = value(slot, 0);
-            let drive: Vec<_> = [-6.0, -3.0, 0.0, 3.0, 6.0, 9.0, 12.0]
-                .into_iter()
-                .map(|db| {
-                    MenuItem::new(
-                        format!("{db:+} dB"),
-                        Action::Edit(Command::SetPluginParameter {
-                            track,
-                            plugin: slot.id,
-                            parameter: ParameterId(0),
-                            value: Some(db),
-                        }),
-                    )
-                    .checked((now - db).abs() < 0.05)
-                })
-                .collect();
-            items.push(MenuItem::submenu("Drive", drive).separated());
+            items.push(Self::bus_drive_menu(track, slot));
             items.push(
                 MenuItem::new(
                     "Bypass",
@@ -347,23 +376,24 @@ impl MixerView {
         if area.h < 80.0 {
             return;
         }
-        for (id, rect) in knobs(area).into_iter().enumerate() {
+        for (index, rect) in knobs(area).into_iter().enumerate() {
+            let id = f.ids[index];
             let v = model
                 .display_value(
                     t.id,
                     faderframe_automation::AutomationTarget::PluginParameter {
                         plugin: slot.id,
-                        parameter: ParameterId(id as u32),
+                        parameter: ParameterId(id),
                     },
                 )
-                .unwrap_or_else(|| value(slot, id as u32));
+                .unwrap_or_else(|| value(slot, id));
             controls::knob(
                 p,
                 rect,
-                position(&f, v, id as u32),
+                position(&f, v, id),
                 false,
                 KnobLook {
-                    cap: if f.red && id == 0 {
+                    cap: if f.red && index == 0 {
                         Color::rgb8(154, 46, 41)
                     } else {
                         Color::rgb8(40, 42, 42)
@@ -373,7 +403,7 @@ impl MixerView {
                 th,
             );
             p.text(
-                f.labels[id.min(1)],
+                f.labels[index],
                 Rect::new(rect.x - 4.0, rect.bottom(), rect.w + 8.0, 13.0),
                 &label,
             );

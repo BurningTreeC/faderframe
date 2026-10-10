@@ -30,9 +30,9 @@ impl Segments for CircuitWorker {
         timing: &Timing,
         publish: &mut dyn FnMut(&[&mut [f32]], usize),
     ) {
-        // The audio, then the two control lanes (gain, master).
+        // The audio, then gain/drive, master and calibrated bus Gain.
         let count = self.bank.len();
-        if channels.len() < count + 2 {
+        if channels.len() < count + 3 {
             return;
         }
         let frames = channels.first().map_or(0, |c| c.len());
@@ -50,14 +50,14 @@ impl Segments for CircuitWorker {
             let (audio, lanes) = channels.split_at_mut(count);
             let active = self.bank.active(audio);
             self.bank
-                .process(audio, active, 0..first, lanes[0], lanes[1]);
+                .process(audio, active, 0..first, lanes[0], lanes[1], lanes[2]);
             active
         };
         if first < frames {
             publish(channels, first);
             let (audio, lanes) = channels.split_at_mut(count);
             self.bank
-                .process(audio, active, first..frames, lanes[0], lanes[1]);
+                .process(audio, active, first..frames, lanes[0], lanes[1], lanes[2]);
         }
     }
 
@@ -68,7 +68,7 @@ impl Segments for CircuitWorker {
 
 enum Processing {
     Inline {
-        dsp: PreampProcessor,
+        dsp: Box<PreampProcessor>,
         delay: Vec<Vec<f32>>,
         cursor: usize,
     },
@@ -80,11 +80,12 @@ pub struct BufferedPreampProcessor {
     processing: Processing,
     reported_underruns: u64,
     deadline: Option<std::time::Instant>,
-    // Two additional reservoir lanes carry sample-accurate controls alongside
+    // Three additional reservoir lanes carry sample-accurate controls alongside
     // audio. This preserves the host callback size (and structural wait budget)
     // without large event packets or allocations on either realtime thread.
     gain_lane: Vec<f32>,
     master_lane: Vec<f32>,
+    bus_gain_lane: Vec<f32>,
 }
 
 impl BufferedPreampProcessor {
@@ -100,12 +101,12 @@ impl BufferedPreampProcessor {
     ) -> Result<Self, PluginError> {
         let delay = delay.max(BUFFER_LATENCY);
         let dsp = PreampProcessor::new(model, params.clone(), config, channels)?;
-        let processing = if realtime && (1..=reservoir::MAX_CHANNELS - 2).contains(&channels) {
+        let processing = if realtime && (1..=reservoir::MAX_CHANNELS - 3).contains(&channels) {
             Processing::Worker(Box::new(
                 Reservoir::try_new(
                     reservoir::Config {
                         delay,
-                        channels: channels + 2,
+                        channels: channels + 3,
                         max_block: config.max_block_size as usize,
                         sample_rate: config.sample_rate,
                         offline: false,
@@ -119,7 +120,7 @@ impl BufferedPreampProcessor {
             ))
         } else {
             Processing::Inline {
-                dsp,
+                dsp: Box::new(dsp),
                 delay: vec![vec![0.0; delay]; channels],
                 cursor: 0,
             }
@@ -131,6 +132,7 @@ impl BufferedPreampProcessor {
             deadline: None,
             gain_lane: vec![0.0; config.max_block_size as usize],
             master_lane: vec![0.0; config.max_block_size as usize],
+            bus_gain_lane: vec![0.0; config.max_block_size as usize],
         })
     }
 }
@@ -172,26 +174,17 @@ impl PluginProcessor for BufferedPreampProcessor {
                 let Some(out) = io.audio_out.first_mut() else {
                     return ProcessStatus::Continue;
                 };
-                let mut events = ctx.param_events.iter().peekable();
-                let mut gain = self.params.get(GAIN as usize);
-                let mut master = self.params.get(MASTER as usize);
                 let count = out.num_channels();
-                if io.frames > self.gain_lane.len() || count + 2 != worker.config().channels {
+                if io.frames > self.gain_lane.len() || count + 3 != worker.config().channels {
                     return ProcessStatus::Error;
                 }
-                for i in 0..io.frames {
-                    while let Some(e) = events.peek() {
-                        if e.sample_offset as usize > i {
-                            break;
-                        }
-                        self.params.apply_event(e.parameter, e.value);
-                        gain = self.params.get(GAIN as usize);
-                        master = self.params.get(MASTER as usize);
-                        events.next();
-                    }
-                    self.gain_lane[i] = gain;
-                    self.master_lane[i] = master;
-                }
+                control_lanes(
+                    &mut self.params,
+                    ctx.param_events,
+                    &mut self.gain_lane[..io.frames],
+                    &mut self.master_lane[..io.frames],
+                    &mut self.bus_gain_lane[..io.frames],
+                );
                 let mut slices: [&mut [f32]; reservoir::MAX_CHANNELS] =
                     std::array::from_fn(|_| &mut [][..]);
                 for (slice, channel) in slices.iter_mut().zip(out.channels_mut()) {
@@ -199,7 +192,8 @@ impl PluginProcessor for BufferedPreampProcessor {
                 }
                 slices[count] = &mut self.gain_lane[..io.frames];
                 slices[count + 1] = &mut self.master_lane[..io.frames];
-                worker.process_with_deadline(&mut slices[..count + 2], (), self.deadline);
+                slices[count + 2] = &mut self.bus_gain_lane[..io.frames];
+                worker.process_with_deadline(&mut slices[..count + 3], (), self.deadline);
                 ProcessStatus::Continue
             }
         }
@@ -240,14 +234,25 @@ mod tests {
 
     #[test]
     fn worker_matches_inline_with_exact_delay_automation_channels_and_resets() {
+        // The engine and worker both flush denormals in real use.
+        let _denormals = faderframe_realtime::ScopedFlushDenormals::new();
         let config = ProcessConfig {
             sample_rate: 48_000.0,
             max_block_size: 511,
             sidechain: false,
             double_precision: false,
         };
-        for model in 0..faderframe_circuit::preamp::MODELS {
+        for model in
+            0..faderframe_circuit::preamp::MODELS + faderframe_circuit::preamp::CONSOLE_BUSES
+        {
             for count in [1, 2, 4] {
+                let parameters = || {
+                    if model < faderframe_circuit::preamp::MODELS {
+                        parameters_for(model)
+                    } else {
+                        bus_parameters()
+                    }
+                };
                 let params = ParamValues::new(parameters());
                 let dsp = PreampProcessor::new(model, params.clone(), &config, count).unwrap();
                 let mut worker = BufferedPreampProcessor {
@@ -256,7 +261,7 @@ mod tests {
                         Reservoir::try_new(
                             reservoir::Config {
                                 delay: BUFFER_LATENCY,
-                                channels: count + 2,
+                                channels: count + 3,
                                 max_block: config.max_block_size as usize,
                                 sample_rate: config.sample_rate,
                                 // Deterministic parity: scheduling cannot drop audio.
@@ -273,6 +278,7 @@ mod tests {
                     deadline: None,
                     gain_lane: vec![0.0; config.max_block_size as usize],
                     master_lane: vec![0.0; config.max_block_size as usize],
+                    bus_gain_lane: vec![0.0; config.max_block_size as usize],
                 };
                 let mut inline = BufferedPreampProcessor::new(
                     model,
@@ -325,6 +331,11 @@ mod tests {
                                         sample_offset: i as u32,
                                         parameter: ParameterId(MASTER),
                                         value: -6.0,
+                                    },
+                                    ParameterEvent {
+                                        sample_offset: i as u32,
+                                        parameter: ParameterId(BUS_GAIN),
+                                        value: if (at + i) % 2 == 0 { 0.0 } else { 0.8 },
                                     },
                                 ]
                             })

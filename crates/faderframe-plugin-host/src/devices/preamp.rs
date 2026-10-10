@@ -17,6 +17,8 @@ pub const MASTER: u32 = 1;
 /// The British 73's line: 0 = 600 ohms (terminated), 1 = a bridging 10 k
 /// input (see `faderframe_circuit::preamp::BRIDGING`).
 pub const LOAD: u32 = 2;
+/// Console bus Gain; separate from the persisted colour Drive at ID 0.
+pub const BUS_GAIN: u32 = 2;
 pub fn parameters() -> Vec<ParameterInfo> {
     vec![
         super::param(GAIN, "Gain", 0.0, 1.0, 0.5, ParameterUnit::Percent),
@@ -38,13 +40,15 @@ pub fn bridging(model: usize, params: &ParamValues) -> bool {
     model == 0 && params.get(LOAD as usize) >= 0.5
 }
 
-/// A console bus amplifier's: the drive into it (dB; taken off after it,
-/// so it changes the colour, not the level) and its output.
+/// A console bus amplifier's colour Drive, output trim and calibrated Gain.
+/// Drive keeps its original ID and units so existing projects and automation
+/// sound the same with the new Gain at its default unity setting.
 pub fn bus_parameters() -> Vec<ParameterInfo> {
     let drive = faderframe_circuit::preamp::BUS_DRIVE_DB;
     vec![
         super::param(GAIN, "Drive", -drive, drive, 0.0, ParameterUnit::Decibels),
         super::param(MASTER, "Output", -24.0, 12.0, 0.0, ParameterUnit::Decibels),
+        super::param(BUS_GAIN, "Gain", 0.0, 1.0, 0.5, ParameterUnit::Percent),
     ]
 }
 
@@ -119,7 +123,7 @@ impl PreampBank {
     }
 
     /// Frames `range` of `channels` in place, frame `i` with the controls
-    /// `gain[i]` and `master[i]`; `active` from [`Self::active`].
+    /// `gain[i]`, `master[i]` and `bus_gain[i]`; `active` from [`Self::active`].
     pub(crate) fn process(
         &mut self,
         channels: &mut [&mut [f32]],
@@ -127,6 +131,7 @@ impl PreampBank {
         range: Range<usize>,
         gain: &[f32],
         master: &[f32],
+        bus_gain: &[f32],
     ) {
         let count = self.circuits.len().min(channels.len());
         let active = active.min(count);
@@ -136,9 +141,11 @@ impl PreampBank {
             let circuit = circuit.get_mut();
             for i in range.clone() {
                 circuit.set_controls(f64::from(gain[i]), f64::from(master[i]));
+                circuit.set_bus_gain(f64::from(bus_gain[i]));
             }
         }
         let (gain, master) = (&gain[range.clone()], &master[range.clone()]);
+        let bus_gain = &bus_gain[range.clone()];
         match &self.helpers {
             Some(helpers) if active > 1 => {
                 for start in (0..active).step_by(BATCH) {
@@ -154,6 +161,7 @@ impl PreampBank {
                         next: AtomicUsize::new(0),
                         gain,
                         master,
+                        bus_gain,
                     };
                     helpers.run(&job, n - 1);
                 }
@@ -165,7 +173,13 @@ impl PreampBank {
                     .zip(channels.iter_mut())
                     .take(active)
                 {
-                    solve(circuit.get_mut(), &mut channel[range.clone()], gain, master);
+                    solve(
+                        circuit.get_mut(),
+                        &mut channel[range.clone()],
+                        gain,
+                        master,
+                        bus_gain,
+                    );
                 }
             }
         }
@@ -196,6 +210,7 @@ struct Solve<'a, 'b> {
     next: AtomicUsize,
     gain: &'a [f32],
     master: &'a [f32],
+    bus_gain: &'a [f32],
 }
 
 impl PoolJob for Solve<'_, '_> {
@@ -209,15 +224,22 @@ impl PoolJob for Solve<'_, '_> {
             if let (Some(mut circuit), Some(mut samples)) = (circuit.try_lock(), samples.try_lock())
                 && let Some(samples) = samples.as_deref_mut()
             {
-                solve(&mut circuit, samples, self.gain, self.master);
+                solve(&mut circuit, samples, self.gain, self.master, self.bus_gain);
             }
         }
     }
 }
 
-fn solve(circuit: &mut Preamp, samples: &mut [f32], gain: &[f32], master: &[f32]) {
-    for ((x, g), m) in samples.iter_mut().zip(gain).zip(master) {
+fn solve(
+    circuit: &mut Preamp,
+    samples: &mut [f32],
+    gain: &[f32],
+    master: &[f32],
+    bus_gain: &[f32],
+) {
+    for (((x, g), m), b) in samples.iter_mut().zip(gain).zip(master).zip(bus_gain) {
         circuit.set_controls(f64::from(*g), f64::from(*m));
+        circuit.set_bus_gain(f64::from(*b));
         *x = circuit.process(f64::from(*x)) as f32;
     }
 }
@@ -228,6 +250,7 @@ pub struct PreampProcessor {
     /// Each frame's controls (the parameters as their events set them).
     gain: Vec<f32>,
     master: Vec<f32>,
+    bus_gain: Vec<f32>,
 }
 
 impl PreampProcessor {
@@ -243,28 +266,44 @@ impl PreampProcessor {
         let master = f64::from(params.get(MASTER as usize));
         let bridging = bridging(model, &params);
         let block = config.max_block_size.max(1) as usize;
+        let mut bank = PreampBank::new(model, config, channels, gain, master, bridging)?;
+        if model >= faderframe_circuit::preamp::MODELS {
+            for circuit in &mut bank.circuits {
+                let circuit = circuit.get_mut();
+                circuit.set_bus_gain(f64::from(params.get(BUS_GAIN as usize)));
+                circuit.reset();
+            }
+        }
         Ok(Self {
             params,
-            bank: PreampBank::new(model, config, channels, gain, master, bridging)?,
+            bank,
             gain: vec![0.0; block],
             master: vec![0.0; block],
+            bus_gain: vec![0.0; block],
         })
     }
 }
 
-/// Each frame's gain and master from `params` and the call's events.
+/// Each frame's controls from `params` and the call's events.
 fn control_lanes(
     params: &mut ParamValues,
     events: &[faderframe_automation::ParameterEvent],
     gain: &mut [f32],
     master: &mut [f32],
+    bus_gain: &mut [f32],
 ) {
     let mut events = events.iter().peekable();
     // Read the shared atomics at events only, so a concurrent GUI edit
     // cannot give channels different controls within a block.
     let mut g = params.get(GAIN as usize);
     let mut m = params.get(MASTER as usize);
-    for (i, (gain, master)) in gain.iter_mut().zip(master.iter_mut()).enumerate() {
+    let mut b = params.get(BUS_GAIN as usize);
+    for (i, ((gain, master), bus_gain)) in gain
+        .iter_mut()
+        .zip(master.iter_mut())
+        .zip(bus_gain.iter_mut())
+        .enumerate()
+    {
         while let Some(e) = events.peek() {
             if e.sample_offset as usize > i {
                 break;
@@ -272,10 +311,12 @@ fn control_lanes(
             params.apply_event(e.parameter, e.value);
             g = params.get(GAIN as usize);
             m = params.get(MASTER as usize);
+            b = params.get(BUS_GAIN as usize);
             events.next();
         }
         *gain = g;
         *master = m;
+        *bus_gain = b;
     }
 }
 
@@ -296,6 +337,7 @@ impl PluginProcessor for PreampProcessor {
             ctx.param_events,
             &mut self.gain[..frames],
             &mut self.master[..frames],
+            &mut self.bus_gain[..frames],
         );
         let mut slices: [&mut [f32]; BATCH] = std::array::from_fn(|_| &mut [][..]);
         let mut count = 0;
@@ -305,8 +347,14 @@ impl PluginProcessor for PreampProcessor {
         }
         let channels = &mut slices[..count];
         let active = self.bank.active(channels);
-        self.bank
-            .process(channels, active, 0..frames, &self.gain, &self.master);
+        self.bank.process(
+            channels,
+            active,
+            0..frames,
+            &self.gain,
+            &self.master,
+            &self.bus_gain,
+        );
         ProcessStatus::Continue
     }
     fn reset(&mut self) {

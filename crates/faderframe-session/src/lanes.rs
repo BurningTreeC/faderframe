@@ -49,7 +49,8 @@ impl GlobalLane {
 }
 
 /// Which global lanes the arranger shows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct GlobalLanes {
     pub video: bool,
     pub markers: bool,

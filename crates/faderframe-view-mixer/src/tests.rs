@@ -1211,9 +1211,9 @@ fn the_master_strip_has_a_mono_check_and_listening_choices() {
     );
 }
 
-/// With a console, the buses' input stage is its bus amplifier — Drive and
-/// Output in dB on the faceplate, a drag moving the drive up from 0 dB, a
-/// double-click back to it — and the mixer takes the console's look until
+/// With a console, the buses' input stage is its bus amplifier — Gain in
+/// percent and Output in dB, a drag moving Gain up from 50 %, a
+/// double-click back to unity — and the mixer takes the console's look until
 /// the look is turned off.
 #[test]
 fn a_console_shows_its_bus_amplifiers_and_its_look() {
@@ -1236,7 +1236,12 @@ fn a_console_shows_its_bus_amplifiers_and_its_look() {
     );
     let area = view.layout_of(&s, bus, size).unwrap().preamp.unwrap();
     let knob = Point::new(area.x + area.w * 0.25, area.y + 30.0);
-    assert_eq!(view.hit_test(knob, size, &s), Some(Hit::PreampKnob(bus, 0)));
+    assert_eq!(view.hit_test(knob, size, &s), Some(Hit::PreampKnob(bus, 2)));
+    assert!(
+        view.tooltip(knob, size, &s)
+            .unwrap()
+            .starts_with("Gain 50.0%")
+    );
     let (mut actions, _) = run(&mut view, down(knob, 1), size, &s);
     let (a, _) = run(
         &mut view,
@@ -1264,13 +1269,26 @@ fn a_console_shows_its_bus_amplifiers_and_its_look() {
         s.dispatch(a).unwrap();
     }
     let amp = |s: &Session| s.project().track(bus).unwrap().preamp.clone().unwrap();
-    let drive = preamp::value(&amp(&s), 0);
-    assert!(drive > 0.0 && drive <= 12.0, "drive {drive} dB");
+    let gain = preamp::value(&amp(&s), 2);
+    assert!(gain > 0.5 && gain <= 1.0, "gain {gain}");
+    assert_eq!(preamp::value(&amp(&s), 0), 0.0, "colour drive stays");
     let (actions, _) = run(&mut view, down(knob, 2), size, &s);
     for a in actions {
         s.dispatch(a).unwrap();
     }
-    assert_eq!(preamp::value(&amp(&s), 0), 0.0, "back to 0 dB");
+    assert_eq!(preamp::value(&amp(&s), 2), 0.5, "back to unity");
+    let actions = press_drag_release(
+        &mut view,
+        &s,
+        size,
+        knob,
+        Point::new(knob.x, knob.y + 200.0),
+        Modifiers::NONE,
+    );
+    for action in actions {
+        s.dispatch(action).unwrap();
+    }
+    assert_eq!(preamp::value(&amp(&s), 2), 0.0, "Gain reaches silence");
     s.dispatch(Action::Edit(Command::SetConsoleLook { look: false }))
         .unwrap();
     view.paint(&mut canvas, size, &s, &Theme::default());
@@ -1309,6 +1327,10 @@ fn the_master_chooses_the_console_and_a_bus_its_amplifier() {
     let menu = labels(&req);
     assert!(menu.iter().any(|l| l == "British 73"), "{menu:?}");
     assert!(menu.iter().any(|l| l.starts_with("Off")), "{menu:?}");
+    assert!(
+        menu.iter().any(|l| l == "Drive"),
+        "master colour drive remains available"
+    );
     let bus = MixerView::channel_tracks(&s)
         .iter()
         .find(|t| t.kind == TrackKind::Bus)

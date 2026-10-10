@@ -2513,7 +2513,7 @@ impl MixerView {
                     let reset = match target {
                         KnobTarget::Preamp(id) => t.preamp.as_ref().map_or(0.5, |slot| {
                             let f = preamp::face(slot);
-                            preamp::position(&f, f.ranges[(id as usize).min(1)].2, id)
+                            preamp::position(&f, f.ranges[f.index(id)].2, id)
                         }),
                         KnobTarget::Pan => 0.5,
                         KnobTarget::Send(_) => self.law.unity_position(),
@@ -2878,7 +2878,7 @@ impl MixerView {
                 let f = preamp::face(slot);
                 format!(
                     "{} {} · Drag or wheel · Double-click to reset",
-                    f.labels[(param as usize).min(1)],
+                    f.labels[f.index(param)],
                     preamp::shown(&f, v, param)
                 )
             }

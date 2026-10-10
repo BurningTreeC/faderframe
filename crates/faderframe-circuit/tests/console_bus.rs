@@ -42,6 +42,62 @@ fn buses_pass_at_unity_and_in_phase() {
 }
 
 #[test]
+fn drive_changes_do_not_burst_and_reset_keeps_the_calibration() {
+    for family in 0..CONSOLE_BUSES {
+        for rate in [44_100.0, 48_000.0, 96_000.0] {
+            let mut p = Preamp::new(MODELS + family, rate, 12.0, 0.0).unwrap();
+            for drive in [12.0, -12.0, 0.0] {
+                p.set_controls(drive, 0.0);
+                let tone = Tone::near(rate, 9600, 1000.0, 0.01);
+                let m = run(tone, 9600, |x| {
+                    let y = p.process(x);
+                    assert!(
+                        y.abs() < 0.02,
+                        "family {family}, {rate} Hz, {drive} dB: burst {y}"
+                    );
+                    y
+                });
+                assert!(
+                    m.gain_db().abs() < 0.2,
+                    "family {family}, {rate} Hz: {} dB",
+                    m.gain_db()
+                );
+            }
+            p.reset();
+            let tone = Tone::near(rate, 9600, 1000.0, 0.01);
+            let m = run(tone, 9600, |x| p.process(x));
+            assert!(m.gain_db().abs() < 0.2);
+        }
+    }
+}
+
+#[test]
+fn every_bus_gain_is_calibrated_from_silence_through_unity() {
+    for family in 0..CONSOLE_BUSES {
+        for rate in [44_100.0, 48_000.0, 96_000.0] {
+            let mut p = Preamp::new(MODELS + family, rate, 0.0, 0.0).unwrap();
+            for gain in [0.5, 1.0, 0.25, 0.1, 0.02, 0.0, 0.5] {
+                p.set_bus_gain(gain);
+                let tone = Tone::near(rate, 9600, 1000.0, 0.005);
+                let m = run(tone, (rate * 0.3) as usize, |x| p.process(x));
+                if gain == 0.0 {
+                    for _ in 0..128 {
+                        assert_eq!(p.process(0.1), 0.0, "family {family}, {rate} Hz");
+                    }
+                } else {
+                    let expected_db = 40.0 * (gain / 0.5).log10();
+                    assert!(
+                        (m.gain_db() - expected_db).abs() < 0.25,
+                        "family {family}, {rate} Hz, Gain {gain}: {} dB, expected {expected_db}",
+                        m.gain_db()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn nominal_is_clean_and_full_scale_is_near_the_rails() {
     for f in 0..CONSOLE_BUSES {
         let (_, nominal) = measure(f, 1000.0, -18.0);

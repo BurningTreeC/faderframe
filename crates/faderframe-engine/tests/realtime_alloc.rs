@@ -2385,7 +2385,7 @@ fn microphone_preamps_do_not_allocate_while_automating_or_resetting() {
 
 /// Console summing: every family's channel stage on a stereo track and its
 /// bus amplifier on the master, inline and on its workers, the drive
-/// turned while playing, a transport reset.
+/// and calibrated Gain turned while playing, a transport reset.
 #[test]
 fn the_console_does_not_allocate() {
     let _serial = serial();
@@ -2434,6 +2434,22 @@ fn the_console_does_not_allocate() {
             if let Some(c) = &mut hotter.console {
                 c.drive_db = -9.0;
             }
+            hotter
+                .track_mut(master)
+                .unwrap()
+                .preamp
+                .as_mut()
+                .unwrap()
+                .parameters = vec![
+                faderframe_project::SavedParameter {
+                    id: faderframe_core::ParameterId(0),
+                    value: -12.0,
+                },
+                faderframe_project::SavedParameter {
+                    id: faderframe_core::ParameterId(2),
+                    value: 0.0,
+                },
+            ];
             r.controller.update_params(&hotter).unwrap();
             r.play_from(0).unwrap();
             let (_, count) = armed(|| {
@@ -2441,7 +2457,7 @@ fn the_console_does_not_allocate() {
                     r.processor.process_device(&mut buffers);
                 }
             });
-            assert_eq!(count, 0, "{label}: the drive or a reset allocates");
+            assert_eq!(count, 0, "{label}: drive, Gain or a reset allocates");
         }
     }
 }

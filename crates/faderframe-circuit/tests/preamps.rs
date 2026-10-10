@@ -2,6 +2,45 @@ use faderframe_circuit::preamp::{Preamp, MODELS};
 use std::time::Instant;
 
 #[test]
+fn zero_gain_silences_a_running_circuit_and_reopens_after_reset() {
+    for model in 0..MODELS {
+        for rate in [44_100.0, 48_000.0, 96_000.0] {
+            let mut p = Preamp::new(model, rate, 1.0, 0.0).unwrap();
+            let frames = (rate * 0.3) as usize;
+            let signal =
+                |i: usize| 0.125 * (i as f64 * std::f64::consts::TAU * 1000.0 / rate).sin();
+            for i in 0..frames {
+                p.process(signal(i));
+            }
+            p.set_controls(0.0, 0.0);
+            for i in 0..frames {
+                let y = p.process(signal(i));
+                if i > (rate * 0.25) as usize {
+                    assert_eq!(y, 0.0, "model {model} at {rate} Hz: closed Gain leaks");
+                }
+            }
+            p.reset();
+            for i in 0..256 {
+                assert_eq!(p.process(signal(i)), 0.0);
+            }
+            p.set_controls(0.5, 0.0);
+            let mut energy = 0.0;
+            for i in 0..frames {
+                let y = p.process(signal(i));
+                if i >= frames / 2 {
+                    energy += y * y;
+                }
+            }
+            let rms = (energy / (frames / 2) as f64).sqrt();
+            assert!(
+                (0.06..0.12).contains(&rms),
+                "model {model} at {rate} Hz: reopened RMS {rms}"
+            );
+        }
+    }
+}
+
+#[test]
 fn all_models_pass_audio_and_master_is_an_output_trim() {
     for model in 0..MODELS {
         let mut unity = Preamp::new(model, 48_000.0, 0.5, 0.0).unwrap();
