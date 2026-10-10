@@ -121,6 +121,117 @@ fn frame_ns(n: u32) -> i64 {
     n as i64 * 1_000_000_000 / FPS as i64
 }
 
+/// AVI can omit presentation timestamps on B-frames. Every frame still
+/// needs an index slot, including when playback uses a proxy. An MP4
+/// with the same codec checks that its presentation timing stays intact.
+#[test]
+fn avi_and_mp4_playback_keep_up_with_the_transport() {
+    use faderframe_video::{FrameService, Media, Want};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let d = dir();
+    for (name, needs, encoder, mux) in [
+        ("mjpeg.avi", "jpegenc", "jpegenc", "avimux"),
+        (
+            "mpeg4.avi",
+            "avenc_mpeg4",
+            "avenc_mpeg4 bitrate=4000000",
+            "avimux",
+        ),
+        (
+            "mpeg4-bframes.avi",
+            "avenc_mpeg4",
+            "avenc_mpeg4 bitrate=4000000 max-bframes=2 gop-size=50",
+            "avimux",
+        ),
+        (
+            "mpeg4-bframes.mp4",
+            "avenc_mpeg4",
+            "avenc_mpeg4 bitrate=4000000 max-bframes=2 gop-size=50 ! mpeg4videoparse",
+            "qtmux",
+        ),
+    ] {
+        if !has_element(needs) {
+            eprintln!("skipped {name}: no {needs}");
+            continue;
+        }
+        let clip = d.join(name);
+        make_clip(&clip, encoder, mux, true);
+        let ix = Arc::new(index::index(&clip, &AtomicBool::new(false), |_| {}).unwrap());
+        assert_eq!(ix.len(), FRAMES as usize, "{name}: every frame indexed");
+        if name.ends_with(".avi") {
+            for n in 0..FRAMES {
+                assert_eq!(ix.times[n as usize], frame_ns(n), "{name}: frame {n}");
+            }
+        }
+        let proxy = d.join(format!("{name}.proxy.mkv"));
+        make_proxy(
+            &clip,
+            &proxy,
+            (W, H, (1, 1)),
+            ProxySpec {
+                height: 120,
+                quality: 95,
+            },
+            Default::default(),
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        for proxy in [None, Some((proxy, (160, 120)))] {
+            let proxied = proxy.is_some();
+            let service = FrameService::new(64 << 20);
+            service.set_media(
+                1,
+                Media {
+                    original: clip.clone(),
+                    index: ix.clone(),
+                    size: (W, H),
+                    par: (1, 1),
+                    proxy,
+                },
+            );
+            // Preroll at the stopped playhead before the transport starts.
+            let ready_by = Instant::now() + Duration::from_secs(5);
+            while !service
+                .picture(1, 0, (W, H), Want::Play)
+                .is_some_and(|p| p.exact)
+            {
+                assert!(Instant::now() < ready_by, "{name}: no first frame");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let start = Instant::now();
+            let mut decoded = std::collections::BTreeSet::new();
+            let mut worst_lag = 0;
+            while start.elapsed() < Duration::from_secs(2) {
+                let at = start.elapsed();
+                let time = at.as_nanos() as i64;
+                let n = ix.frame_at(time).unwrap();
+                if let Some(p) = service.picture(1, time, (W, H), Want::Play) {
+                    assert_frame(&p.frame, p.number as u32);
+                    if at > Duration::from_millis(500) {
+                        decoded.insert(p.number);
+                        worst_lag = worst_lag.max(n.saturating_sub(p.number));
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            eprintln!(
+                "{name}, proxy={proxied}: {} distinct frames, worst lag {worst_lag}",
+                decoded.len()
+            );
+            assert!(
+                decoded.len() >= 20,
+                "{name}: only {} frames in 1.5 s",
+                decoded.len()
+            );
+            assert!(worst_lag <= 5, "{name}: {worst_lag} frames late");
+        }
+    }
+    let _ = std::fs::remove_dir_all(d);
+}
+
 #[test]
 fn an_intra_clip_is_probed_indexed_decoded_proxied_and_remuxed() {
     let d = dir();

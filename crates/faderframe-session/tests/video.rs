@@ -225,24 +225,53 @@ fn a_movie_is_imported_shown_saved_and_written_out() {
 
 #[test]
 fn the_picture_follows_the_engine_while_playing() {
+    picture_follows_the_engine(false);
+}
+
+#[test]
+fn the_picture_follows_the_engine_while_recording() {
+    picture_follows_the_engine(true);
+}
+
+fn picture_follows_the_engine(recording: bool) {
     let _turn = turn();
     let d = dir("play");
     let file = movie(&d);
     let mut s = Session::new(Project::new("Film", 48_000), None, EngineConfig::default()).unwrap();
     s.import_video(file, false);
     s.wait_for_video();
+    let record_track = recording.then(|| {
+        let track = s.add_track(TrackKind::Audio).unwrap();
+        s.edit(faderframe_project::Command::SetTrackInput {
+            track,
+            input: faderframe_project::InputRouting::Hardware { first_channel: 0 },
+        })
+        .unwrap();
+        s.edit(faderframe_project::Command::SetTrackRecordArm { track, on: true })
+            .unwrap();
+        track
+    });
+    let _ = still(&mut s);
     s.start_audio(
-        vec![Box::new(DummyBackend::default())],
+        vec![Box::new(DummyBackend::with_input_tone(440.0))],
         &AudioPreferences::default(),
     )
     .unwrap();
-    s.dispatch(Action::Transport(TransportAction::Play))
-        .unwrap();
+    s.dispatch(Action::Transport(if recording {
+        TransportAction::ToggleRecord
+    } else {
+        TransportAction::Play
+    }))
+    .unwrap();
     let start = Instant::now();
     let mut frames = Vec::new();
+    let mut decoded = std::collections::BTreeSet::new();
     while start.elapsed() < Duration::from_millis(1500) {
         s.tick(0.01);
         if let Some(v) = s.video_picture(0, (640, 360)) {
+            if let Some(p) = &v.picture {
+                decoded.insert(p.number);
+            }
             frames.push((start.elapsed(), v.frame, v.position));
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -262,9 +291,19 @@ fn the_picture_follows_the_engine_while_playing() {
     let rate = (f1 - f0) as f64 / (t1 - t0).as_secs_f64();
     assert!((15.0..35.0).contains(&rate), "{rate} frames a second");
     assert!(frames.windows(2).all(|w| w[1].1 >= w[0].1), "never back");
+    // The desired frame number advancing alone does not mean the Video
+    // Dock received new pictures. Count what was actually decoded too.
+    assert!(decoded.len() > 15, "only {} decoded frames", decoded.len());
     let (shown, late) = s.video_frames_late();
     assert!(shown > 10, "{shown} frames counted");
     eprintln!("{shown} frames shown, {late} not ready in time");
+    if let Some(track) = record_track {
+        s.wait_for_recordings();
+        assert!(
+            !s.project().track(track).unwrap().clips.is_empty(),
+            "a recorded take"
+        );
+    }
     s.stop_audio();
     let _ = std::fs::remove_dir_all(&d);
 }

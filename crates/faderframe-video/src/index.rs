@@ -146,7 +146,11 @@ pub fn index(path: &Path, cancel: &AtomicBool, progress: impl FnMut(f64)) -> Res
                 let Some(segment) = segment.downcast_ref::<gst::ClockTime>() else {
                     return Ok(gst::FlowSuccess::Ok);
                 };
-                let Some(pts) = buffer.pts() else {
+                // AVI's parsed MPEG-4 B-frames may carry only a decode
+                // timestamp. Keep their time slots: dropping them makes
+                // playback walk decoded frames through a sparse index,
+                // showing the picture much more slowly than the audio.
+                let Some(pts) = buffer.pts().or_else(|| buffer.dts()) else {
                     return Ok(gst::FlowSuccess::Ok);
                 };
                 // Outside the segment (cut by an edit list): never shown.

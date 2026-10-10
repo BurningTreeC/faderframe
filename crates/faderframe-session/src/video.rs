@@ -119,8 +119,9 @@ fn index_of(
     cancel: &AtomicBool,
     share: &Share,
 ) -> std::result::Result<FrameIndex, String> {
-    // "v2": with the picture's colours.
-    let file = cache_dir().join(format!("{}.v2.index.json", cache_key(path)));
+    // "v3": keep AVI frames that carry DTS but no PTS. Older indexes
+    // omitted them and made playback advance through too few frames.
+    let file = cache_dir().join(format!("{}.v3.index.json", cache_key(path)));
     if let Some(ix) = std::fs::read(&file)
         .ok()
         .and_then(|b| serde_json::from_slice::<FrameIndex>(&b).ok())
