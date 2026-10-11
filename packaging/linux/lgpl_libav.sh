@@ -18,6 +18,7 @@ set -eu
 prefix=$(realpath -m "$1")
 ffmpeg_version=${FFMPEG_VERSION:-7.1.2}
 gst_version=${GST_VERSION:-$(pkg-config --modversion gstreamer-1.0)}
+gst_version=$(printf '%s\n' "$gst_version" | cut -d. -f1-3)
 work=${WORK:-$(mktemp -d)}
 jobs=${JOBS:-$(nproc)}
 mkdir -p "$work" "$prefix"
