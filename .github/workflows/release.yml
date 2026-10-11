@@ -58,7 +58,7 @@ jobs:
             libxrandr-dev libxcursor-dev libxdamage-dev libxfixes-dev libxinerama-dev \
             libxkbcommon-dev libwayland-dev wayland-protocols libvulkan-dev libdrm-dev \
             libegl-dev libgl-dev libgles-dev iso-codes gettext sassc glslc \
-            meson ninja-build nasm curl xz-utils file binutils python3
+            meson ninja-build nasm flex bison curl xz-utils file binutils python3
       - uses: actions/checkout@v5
       - uses: actions/cache@v4
         with:
