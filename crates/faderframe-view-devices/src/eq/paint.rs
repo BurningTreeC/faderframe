@@ -952,6 +952,20 @@ impl EqView {
         }
     }
 
+    /// The key of the piano under `pos` in the axis strip, as it is
+    /// painted: a black key over the upper part of its column, below it the
+    /// white keys either side meeting at its middle.
+    pub(super) fn piano_key_at(&self, l: &Layout, model: &Session, pos: Point) -> i32 {
+        let axis = self.axis(model);
+        let n = note_of(axis.f(&l.graph, pos.x)).round() as i32;
+        if is_black(n) && pos.y >= l.axis.y + l.axis.h * BLACK_KEY_W {
+            let middle = axis.x(&l.graph, freq_of(f64::from(n)));
+            if pos.x < middle { n - 1 } else { n + 1 }
+        } else {
+            n
+        }
+    }
+
     fn paint_piano(
         &self,
         p: &mut dyn Painter,
@@ -973,10 +987,15 @@ impl EqView {
         p.push_clip(*a);
         let lo = note_of(axis.lo).floor() as i32 - 1;
         let hi = note_of(axis.hi).ceil() as i32 + 1;
-        let hover_note = self
-            .pointer
-            .filter(|pos| g.contains(*pos) || a.contains(*pos))
-            .map(|pos| note_of(axis.f(g, pos.x)).round() as i32);
+        // The key a double-click there would put a band on.
+        let hover_note = self.pointer.and_then(|pos| {
+            if a.contains(pos) {
+                Some(self.piano_key_at(l, model, pos))
+            } else {
+                g.contains(pos)
+                    .then(|| note_of(axis.f(g, pos.x)).round() as i32)
+            }
+        });
         let column = |n: i32| {
             (
                 axis.x(g, freq_of(f64::from(n) - 0.5)),

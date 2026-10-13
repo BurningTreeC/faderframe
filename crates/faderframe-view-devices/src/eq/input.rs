@@ -381,6 +381,14 @@ impl EqView {
                     from: note,
                 });
             }
+            // A double-click on a key: a band on its note (a bell at 0 dB,
+            // selected, to be shaped; Alt: dynamic, Alt+Shift: spectral).
+            Hit::Piano(at) if primary && clicks >= 2 => {
+                let note = self.piano_key_at(&l, model, at);
+                let shape = new_shape(BandType::Bell, freq_of(f64::from(note)), 0.0);
+                let dynamic = mods.alt.then_some(-6.0);
+                self.add_band(model, cx, shape, dynamic, mods.alt && mods.shift, false);
+            }
             Hit::Piano(_) => {}
             _ => return false,
         }
@@ -1975,6 +1983,7 @@ impl EqView {
                 Hit::Graph(_) => "Click or double-click to add a band (Alt: dynamic, Alt+Shift: spectral) · drag: select · drag the curve: shelves at its ends",
                 Hit::Axis(_) => "Drag up and down to zoom, sideways to scroll; double-click for the whole range",
                 Hit::PianoDot(_) => "Click to put the band on a note, drag to move it by semitones",
+                Hit::Piano(_) => "Double-click a key to add a band on its note (Alt: dynamic, Alt+Shift: spectral)",
                 _ => return None,
             }
             .into(),

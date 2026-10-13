@@ -669,6 +669,66 @@ fn the_piano_puts_bands_on_notes() {
     );
 }
 
+/// A double-click on a key of the piano adds a band on that key's note —
+/// below a black key, on the white key either side of its middle, as
+/// painted.
+#[test]
+fn a_double_click_on_the_piano_adds_a_band_on_its_note() {
+    let (mut s, plugin) = session();
+    let mut view = EqView::new(plugin, &Theme::default());
+    s.dispatch(view.view_action(key::PIANO, 1.0)).unwrap();
+    let l = view.layout(SIZE, &s);
+    let axis = view.axis(&s);
+    let x_of = |note: f64| axis.x(&l.graph, geometry::freq_of(note));
+    let top = l.axis.y + 2.0;
+    let front = l.axis.bottom() - 2.0;
+    // A4 (69) at the top of its key.
+    let used = |s: &Session| (0..24).filter(|b| band(s, plugin, *b).used).count();
+    click(
+        &mut view,
+        &mut s,
+        Point::new(x_of(69.0), top),
+        2,
+        Modifiers::NONE,
+    );
+    assert_eq!(used(&s), 1);
+    let b = band(&s, plugin, 0);
+    assert!((b.freq - 440.0).abs() < 1e-6, "{}", b.freq);
+    assert_eq!(b.kind, BandType::Bell);
+    assert!(b.gain.abs() < 1e-9);
+    // A single click on a key does nothing.
+    click(
+        &mut view,
+        &mut s,
+        Point::new(x_of(72.0), top),
+        1,
+        Modifiers::NONE,
+    );
+    assert_eq!(used(&s), 1);
+    // Below C#5 (73), left of its middle: C5 (72); right of it: D5 (74).
+    for (x, note) in [(x_of(73.0) - 2.0, 72.0), (x_of(73.0) + 2.0, 74.0)] {
+        click(&mut view, &mut s, Point::new(x, front), 2, Modifiers::NONE);
+        let f = (0..24)
+            .map(|b| band(&s, plugin, b))
+            .filter(|b| b.used)
+            .map(|b| b.freq)
+            .find(|f| (geometry::note_of(*f) - note).abs() < 1e-6);
+        assert!(f.is_some(), "a band on note {note}");
+    }
+    // At the top of C#5: C#5 itself.
+    click(
+        &mut view,
+        &mut s,
+        Point::new(x_of(73.0), top),
+        2,
+        Modifiers::NONE,
+    );
+    assert!((0..24).any(|b| {
+        let b = band(&s, plugin, b);
+        b.used && (geometry::note_of(b.freq) - 73.0).abs() < 1e-6
+    }));
+}
+
 #[test]
 fn the_instance_list_shows_every_eq_and_picks_the_external_one() {
     let (mut s, plugin) = session();

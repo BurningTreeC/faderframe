@@ -24,8 +24,9 @@
 //! * Next to a band its values can be dragged, scrolled or typed, it can be
 //!   heard on its own (hold the solo button or the middle button), bypassed
 //!   or deleted.
-//! * The piano display quantizes band frequencies to notes; the frequency
-//!   scale zooms (drag up and down) and scrolls (drag sideways).
+//! * The piano display quantizes band frequencies to notes (a double-click
+//!   on a key adds a band on its note); the frequency scale zooms (drag up
+//!   and down) and scrolls (drag sideways).
 //! * Every change is a parameter edit of the plugin slot, so it is
 //!   undoable and automatable like any other.
 
