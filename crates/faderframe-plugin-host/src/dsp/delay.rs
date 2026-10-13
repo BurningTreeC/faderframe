@@ -9,6 +9,10 @@ pub struct DelayLine {
     mask: usize,
     /// Where the next sample goes.
     pos: usize,
+    /// Samples pushed since the last reset (up to the buffer's length):
+    /// older ones read as silence, so a reset clears nothing (a 5 s line
+    /// at 192 kHz is 8 MB — a panic resets every line at once).
+    fresh: usize,
 }
 
 impl DelayLine {
@@ -18,6 +22,7 @@ impl DelayLine {
             buf: vec![0.0; len],
             mask: len - 1,
             pos: 0,
+            fresh: len,
         }
     }
 
@@ -30,12 +35,17 @@ impl DelayLine {
     pub fn push(&mut self, x: f64) {
         self.buf[self.pos] = x;
         self.pos = (self.pos + 1) & self.mask;
+        self.fresh = (self.fresh + 1).min(self.buf.len());
     }
 
     /// The sample `n` samples ago (`n = 0`: the last one pushed, `n ≥ 1`
     /// further back).
     #[inline]
     pub fn tap(&self, n: usize) -> f64 {
+        if n >= self.fresh {
+            // From before the last reset.
+            return 0.0;
+        }
         self.buf[(self.pos.wrapping_sub(1 + n)) & self.mask]
     }
 
@@ -56,8 +66,10 @@ impl DelayLine {
         ((c3 * t + c2) * t + c1) * t + y1
     }
 
+    /// Forget what was pushed (at once: nothing is cleared — what is older
+    /// than the next push reads as silence).
     pub fn reset(&mut self) {
-        self.buf.fill(0.0);
+        self.fresh = 0;
     }
 }
 
@@ -78,5 +90,27 @@ mod tests {
             (d.read(10.5) - 38.5).abs() < 1e-9,
             "a ramp interpolates exactly"
         );
+    }
+
+    #[test]
+    fn a_reset_line_reads_silence_until_it_is_written_again() {
+        let mut d = DelayLine::new(100);
+        for n in 0..300 {
+            d.push(1.0 + n as f64);
+        }
+        d.reset();
+        for n in 0..d.capacity() {
+            assert_eq!(d.tap(n), 0.0, "{n} back");
+        }
+        for _ in 0..3 {
+            d.push(5.0);
+        }
+        assert_eq!((d.tap(0), d.tap(2), d.tap(3)), (5.0, 5.0, 0.0));
+        assert_eq!(d.read(50.0), 0.0);
+        // Once round the buffer, the old samples are overwritten.
+        for _ in 0..200 {
+            d.push(2.0);
+        }
+        assert_eq!(d.tap(d.capacity() - 1), 2.0);
     }
 }

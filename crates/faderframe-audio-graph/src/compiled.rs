@@ -103,7 +103,9 @@ pub struct GraphStats {
     pub levels: usize,
     /// Largest number of nodes sharing a level (upper bound on parallelism).
     pub max_width: usize,
-    /// Highest latency arriving at a device output.
+    /// The latency arriving at the device outputs: every output the
+    /// listener hears (audio and MIDI outputs, not a hardware insert's
+    /// send) is aligned to the latest of them.
     pub output_latency: u32,
     pub compensated_edges: usize,
     pub max_compensation: u32,
@@ -118,6 +120,8 @@ struct AudioSource {
     from_node: u32,
     from_port: u16,
     delay: Option<AudioDelay>,
+    /// Summed as it arrives: neither delayed nor counted in the arrival.
+    early: bool,
 }
 
 struct EventSource {
@@ -132,6 +136,8 @@ struct NodeInfo {
     id: NodeId,
     key: Option<NodeKey>,
     role: NodeRole,
+    /// Latency of what arrives at its inputs (after compensation).
+    arrival: u32,
     output_latency: u32,
     /// (upstream node, compensation) per audio edge, for diagnostics.
     compensation: Vec<(u32, u32)>,
@@ -153,6 +159,24 @@ struct NodeWork<C> {
     event_sources: Vec<EventSource>,
     /// Time used in the current callback.
     cycle_ns: u64,
+}
+
+impl<C> NodeWork<C> {
+    /// The processor and the delay lines compensating its inputs (old
+    /// audio and events waiting there would come out after a panic).
+    fn reset(&mut self) {
+        self.processor.reset();
+        for s in &mut self.audio_sources {
+            if let Some(d) = &mut s.delay {
+                d.reset();
+            }
+        }
+        for s in &mut self.event_sources {
+            if let Some(d) = &mut s.delay {
+                d.reset();
+            }
+        }
+    }
 }
 
 /// A scheduling unit: a chain of nodes run in order on one thread.
@@ -280,7 +304,8 @@ impl Schedule {
             *t += 1;
         }
         *self.finished.get_mut() = 0;
-        *self.seats.get_mut() = seats;
+        // The caller always works; helpers take the other seats.
+        *self.seats.get_mut() = seats.saturating_sub(1);
     }
 
     /// A ready job to the queue of the seat that ran it (else `seat`'s).
@@ -453,6 +478,7 @@ pub(crate) fn compile<C>(
                 id: NodeId(n as u32),
                 key: spec.key,
                 role: spec.role,
+                arrival: 0,
                 output_latency: 0,
                 compensation: Vec::new(),
             },
@@ -523,6 +549,7 @@ pub(crate) fn compile<C>(
                 from_node: from,
                 from_port: e.from_port,
                 delay: None,
+                early: e.early,
             }),
             EdgeKind::Events => compiled[to].work.event_sources.push(EventSource {
                 to_port: e.to_port,
@@ -547,6 +574,7 @@ pub(crate) fn compile<C>(
             .work
             .audio_sources
             .iter()
+            .filter(|s| !s.early)
             .map(|s| done[s.from_node as usize].info.output_latency)
             .chain(
                 node.work
@@ -559,7 +587,11 @@ pub(crate) fn compile<C>(
             .unwrap_or(0);
         for s in &mut node.work.audio_sources {
             let src = &done[s.from_node as usize];
-            let comp = arrival - src.info.output_latency;
+            let comp = if s.early {
+                0
+            } else {
+                arrival - src.info.output_latency
+            };
             if comp > 0 {
                 let channels = src.bufs.audio_out[s.from_port as usize].num_channels();
                 s.delay = Some(AudioDelay::new(channels, comp as usize, max_block));
@@ -576,11 +608,162 @@ pub(crate) fn compile<C>(
                 stats.max_compensation = stats.max_compensation.max(comp);
             }
         }
+        node.info.arrival = arrival;
         node.info.output_latency = arrival + node.latency;
-        if matches!(node.info.role, NodeRole::DeviceOutput { .. }) {
-            stats.output_latency = stats.output_latency.max(arrival);
+        node.work.processor.set_input_latency(arrival);
+    }
+
+    // Every output the listener hears at the same time: device outputs
+    // (and MIDI outputs, for outboard instruments) wait for the latest
+    // one. Outputs are sinks, so delaying them moves nothing else — except
+    // a hardware insert's send, which its return follows (`after`) and
+    // times itself from: it keeps its own timing.
+    let mut followed = vec![false; compiled.len()];
+    for b in &compiled {
+        if let Some(a) = b.after {
+            followed[a] = true;
         }
     }
+    let heard = |i: usize, b: &Building<C>| {
+        !followed[i]
+            && matches!(
+                b.info.role,
+                NodeRole::DeviceOutput { .. } | NodeRole::EventOutput { .. }
+            )
+    };
+    let out_max = compiled
+        .iter()
+        .enumerate()
+        .filter(|(i, b)| heard(*i, b))
+        .map(|(_, b)| b.info.arrival)
+        .max()
+        .unwrap_or(0);
+    for i in 0..compiled.len() {
+        if !heard(i, &compiled[i]) || compiled[i].info.arrival >= out_max {
+            continue;
+        }
+        let extra = out_max - compiled[i].info.arrival;
+        let (done, rest) = compiled.split_at_mut(i);
+        let node = &mut rest[0];
+        for (k, s) in node.work.audio_sources.iter_mut().enumerate() {
+            if s.early {
+                continue;
+            }
+            let comp = out_max - done[s.from_node as usize].info.output_latency;
+            let channels =
+                done[s.from_node as usize].bufs.audio_out[s.from_port as usize].num_channels();
+            if s.delay.is_none() {
+                stats.compensated_edges += 1;
+            }
+            s.delay = Some(AudioDelay::new(channels, comp as usize, max_block));
+            stats.max_compensation = stats.max_compensation.max(comp);
+            if let Some(c) = node.info.compensation.get_mut(k) {
+                c.1 = comp;
+            }
+        }
+        for s in &mut node.work.event_sources {
+            let comp = out_max - done[s.from_node as usize].info.output_latency;
+            if s.delay.is_none() {
+                stats.compensated_edges += 1;
+            }
+            s.delay = Some(EventDelay::new(comp as usize, config.event_capacity));
+            stats.max_compensation = stats.max_compensation.max(comp);
+        }
+        node.info.arrival += extra;
+        node.info.output_latency += extra;
+        node.work.processor.set_input_latency(node.info.arrival);
+    }
+    stats.output_latency = out_max;
+    /// Early audio (low-latency monitoring, [`GraphBuilder::connect_audio_early`])
+    /// passes every summing point after it without waiting: where it joins
+    /// other audio, *that* audio is held back instead, by what the paths
+    /// after would have held the joined signal back — so the early audio is
+    /// never delayed again, and everything else still meets everything else
+    /// on the same sample.
+    ///
+    /// Nodes downstream of an early edge "carry" it. Walking them from the
+    /// outputs back, a carrying node's `extra` is the least, over its
+    /// consumers, of the edge's compensation plus the consumer's own `extra`;
+    /// that edge's compensation becomes nothing, and the non-carrying audio
+    /// joining the carrying path gets the `extra` on its edge. A carrying
+    /// node's arrival (what its automation reads) is that of the held-back
+    /// audio.
+    fn clear_the_way<P>(
+        compiled: &mut [Building<P>],
+        max_block: usize,
+        event_capacity: usize,
+        stats: &mut GraphStats,
+    ) {
+        let n = compiled.len();
+        let mut carrying = vec![false; n];
+        for i in 0..n {
+            let b = &compiled[i];
+            carrying[i] = b
+                .work
+                .audio_sources
+                .iter()
+                .any(|s| s.early || carrying[s.from_node as usize]);
+        }
+        if !carrying.iter().any(|c| *c) {
+            return;
+        }
+        // Consumers by their (non-early) audio edges.
+        let mut consumers: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (i, b) in compiled.iter().enumerate() {
+            for s in b.work.audio_sources.iter().filter(|s| !s.early) {
+                consumers[s.from_node as usize].push(i);
+            }
+        }
+        let mut extra = vec![0u32; n];
+        for i in (0..n).rev() {
+            if !carrying[i] {
+                continue;
+            }
+            let out = compiled[i].info.output_latency;
+            extra[i] = consumers[i]
+                .iter()
+                .map(|&c| compiled[c].info.arrival.saturating_sub(out) + extra[c])
+                .min()
+                .unwrap_or(0);
+        }
+        for i in 0..n {
+            if !carrying[i] {
+                continue;
+            }
+            let (done, rest) = compiled.split_at_mut(i);
+            let node = &mut rest[0];
+            let arrival = node.info.arrival;
+            let comp_of = |from: usize| -> u32 {
+                let f = &done[from];
+                let c = arrival.saturating_sub(f.info.output_latency) + extra[i];
+                c.saturating_sub(extra[from])
+            };
+            for (k, s) in node.work.audio_sources.iter_mut().enumerate() {
+                if s.early {
+                    continue;
+                }
+                let comp = comp_of(s.from_node as usize);
+                let channels =
+                    done[s.from_node as usize].bufs.audio_out[s.from_port as usize].num_channels();
+                if comp > 0 && s.delay.is_none() {
+                    stats.compensated_edges += 1;
+                }
+                s.delay = (comp > 0).then(|| AudioDelay::new(channels, comp as usize, max_block));
+                stats.max_compensation = stats.max_compensation.max(comp);
+                if let Some(c) = node.info.compensation.get_mut(k) {
+                    c.1 = comp;
+                }
+            }
+            for s in &mut node.work.event_sources {
+                let comp = comp_of(s.from_node as usize);
+                s.delay = (comp > 0).then(|| EventDelay::new(comp as usize, event_capacity));
+            }
+            node.info.arrival += extra[i];
+            node.info.output_latency += extra[i];
+            node.work.processor.set_input_latency(node.info.arrival);
+        }
+    }
+    clear_the_way(&mut compiled, max_block, config.event_capacity, &mut stats);
 
     // Dependencies.
     let n = compiled.len();
@@ -833,12 +1016,14 @@ struct Exec<'a, 'c, C> {
 impl<C: Sync> PoolJob for Exec<'_, '_, C> {
     fn work(&self) {
         let s = &self.graph.schedule;
-        // Threads beyond the graph's useful width leave at once.
-        if !take_seat(&s.seats) {
+        let seat = faderframe_realtime::worker_seat();
+        // Helpers beyond the graph's useful width leave at once; the caller
+        // (seat 0) always works — helpers still spinning from the last run
+        // must not take all the seats and leave it only waiting.
+        if seat != 0 && !take_seat(&s.seats) {
             return;
         }
         let total = s.jobs.len();
-        let seat = faderframe_realtime::worker_seat();
         let mut next: Option<u32> = None;
         loop {
             let j = match next.take().or_else(|| s.pop(seat)) {
@@ -854,8 +1039,12 @@ impl<C: Sync> PoolJob for Exec<'_, '_, C> {
             let Some(job) = s.jobs.get(j as usize) else {
                 continue;
             };
-            self.graph
-                .run_job(j as usize, self.cx, self.frames, self.measure);
+            // A panicking node counts as done: its dependents still run
+            // and the cycle ends (no thread waits for it for ever).
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.graph
+                    .run_job(j as usize, self.cx, self.frames, self.measure)
+            }));
             s.owner[j as usize].store(seat as u32, Ordering::Relaxed);
             // Continue with the most expensive released dependent (it reads
             // what this thread just wrote), queue the others.
@@ -932,6 +1121,11 @@ impl<C> CompiledGraph<C> {
     /// Total latency at a node's outputs (its own plus upstream).
     pub fn output_latency(&self, id: NodeId) -> Option<u32> {
         self.index_of(id).map(|i| self.info[i].output_latency)
+    }
+
+    /// Latency of what arrives at a node's inputs (after compensation).
+    pub fn input_latency(&self, id: NodeId) -> Option<u32> {
+        self.index_of(id).map(|i| self.info[i].arrival)
     }
 
     /// Delay-compensation applied on each edge into `id`
@@ -1213,6 +1407,10 @@ impl<C> CompiledGraph<C> {
                     (self.work.get_mut(idx as usize), old.work.get_mut(old_idx))
                 {
                     std::mem::swap(&mut new.processor, &mut prev.processor);
+                    // Its place in this graph may sit later (or earlier).
+                    if let Some(info) = self.info.get(idx as usize) {
+                        new.processor.set_input_latency(info.arrival);
+                    }
                     adopted += 1;
                 }
             }
@@ -1220,11 +1418,54 @@ impl<C> CompiledGraph<C> {
         adopted
     }
 
+    /// Whether a node both graphs have (by key) sits at another latency in
+    /// this one — its input arrives later or earlier, or it adds another
+    /// delay: the audio through it would jump when this graph takes over
+    /// (realtime-safe: a merge over the sorted keys, no allocation). Nodes
+    /// only one graph has do not count (nothing of theirs carries on).
+    pub fn timing_changed_from(&self, old: &CompiledGraph<C>) -> bool {
+        let timing = |g: &CompiledGraph<C>, i: u32| {
+            let info = &g.info[i as usize];
+            (info.arrival, info.output_latency)
+        };
+        let (mut a, mut b) = (self.key_index.iter(), old.key_index.iter());
+        let (mut x, mut y) = (a.next(), b.next());
+        while let (Some(&(ka, ia)), Some(&(kb, ib))) = (x, y) {
+            match ka.cmp(&kb) {
+                std::cmp::Ordering::Less => x = a.next(),
+                std::cmp::Ordering::Greater => y = b.next(),
+                std::cmp::Ordering::Equal => {
+                    if timing(self, ia) != timing(old, ib) {
+                        return true;
+                    }
+                    x = a.next();
+                    y = b.next();
+                }
+            }
+        }
+        false
+    }
+
     /// Reset every processor (audio thread), e.g. for an "all notes off /
     /// panic" request.
     pub fn reset_all(&mut self) {
         for w in self.work.iter_mut() {
-            w.processor.reset();
+            w.reset();
         }
+    }
+
+    /// Reset nodes from index `from` on, until `until` (at least one):
+    /// the next index, or `None` when every node is reset. Spreads a
+    /// panic's resets (megabytes of delay lines) over callbacks.
+    pub fn reset_nodes(&mut self, from: usize, until: std::time::Instant) -> Option<usize> {
+        let mut i = from;
+        while let Some(w) = self.work.get_mut(i) {
+            w.reset();
+            i += 1;
+            if std::time::Instant::now() >= until {
+                break;
+            }
+        }
+        (i < self.work.len()).then_some(i)
     }
 }

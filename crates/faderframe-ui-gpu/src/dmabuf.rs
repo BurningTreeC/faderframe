@@ -20,7 +20,7 @@ pub const FOURCC_AB24: u32 = u32::from_le_bytes(*b"AB24");
 /// DRM `FORMAT_MOD_LINEAR`.
 pub const MODIFIER_LINEAR: u64 = 0;
 /// Buffers kept for frames the toolkit may still show.
-const POOL: usize = 4;
+pub const POOL: usize = 8;
 
 /// The device extensions dmabuf export needs.
 fn extensions() -> [&'static std::ffi::CStr; 2] {

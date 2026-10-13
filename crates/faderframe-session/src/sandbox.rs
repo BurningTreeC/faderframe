@@ -5,7 +5,8 @@
 //! one notice and can start it again ([`Action::ReloadPlugin`]): its
 //! instance is dropped and created anew from its slot. So that a reload
 //! after a crash restores recent settings, the state of sandboxed plugins
-//! that report changes is taken into their slots every few seconds.
+//! that report changes is taken into their slots every few seconds — asked
+//! for and collected at a later tick, so the UI never waits on a helper.
 //!
 //! [`Action::ReloadPlugin`]: crate::Action::ReloadPlugin
 
@@ -23,6 +24,8 @@ pub(crate) struct PluginCare {
     noticed: HashSet<PluginInstanceId>,
     /// Sandboxed plugins with state not yet in their slots.
     dirty: HashSet<PluginInstanceId>,
+    /// Asked for their state, not answered yet.
+    asked: HashSet<PluginInstanceId>,
     last_capture: Instant,
 }
 
@@ -31,6 +34,7 @@ impl Default for PluginCare {
         Self {
             noticed: HashSet::new(),
             dirty: HashSet::new(),
+            asked: HashSet::new(),
             last_capture: Instant::now(),
         }
     }
@@ -71,11 +75,27 @@ impl Session {
         {
             let dirty: Vec<_> = self.plugin_care.dirty.drain().collect();
             for id in dirty {
-                if !self.engine.plugin_failed(id) {
+                if self.engine.plugin_failed(id) {
+                    continue;
+                }
+                if self.engine.request_plugin_state(id) {
+                    self.plugin_care.asked.insert(id);
+                } else {
                     self.capture_plugin_state(id);
                 }
             }
             self.plugin_care.last_capture = Instant::now();
+        }
+        if !self.plugin_care.asked.is_empty() {
+            let asked: Vec<_> = self.plugin_care.asked.iter().copied().collect();
+            for id in asked {
+                if let Some(state) = self.engine.take_plugin_state(id) {
+                    self.plugin_care.asked.remove(&id);
+                    self.store_plugin_state(id, state);
+                } else if self.engine.plugin_failed(id) || self.plugin_owner(id).is_none() {
+                    self.plugin_care.asked.remove(&id);
+                }
+            }
         }
     }
 
@@ -100,6 +120,7 @@ impl Session {
             if self.engine.reload_plugin(id) {
                 self.plugin_care.noticed.remove(&id);
                 self.plugin_care.dirty.remove(&id);
+                self.plugin_care.asked.remove(&id);
                 reloaded.push(id);
             }
         }

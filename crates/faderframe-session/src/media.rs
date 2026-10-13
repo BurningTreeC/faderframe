@@ -202,6 +202,11 @@ impl DiskLoader {
         let mut scratch = Vec::new();
         let mut tick = 0u64;
         while !shared.stop.load(Ordering::Relaxed) {
+            // Ahead of everything but the audio path (`priority`): pages
+            // arrive in time however busy the rest of the system is.
+            faderframe_realtime::priority::follow_audio(
+                faderframe_realtime::priority::Helper::Feeder,
+            );
             // Every engine of a session shares one epoch (see
             // `faderframe_engine::create_with_epoch`), so retired pages stay
             // valid across engine replacement.
@@ -239,7 +244,15 @@ impl DiskLoader {
             if !plan.is_empty() {
                 let pos = engine.transport.snapshot().position;
                 let ahead = (AHEAD_SECONDS * rate as f64) as i64;
-                let mut windows = vec![(pos - PAGE_FRAMES as i64, pos + ahead)];
+                let mut windows = Vec::with_capacity(3);
+                // A locate on its way first (rendering ahead defers it in
+                // the transport): its pages before anything else.
+                if let Some(to) = engine.recent_locate(Duration::from_secs(2))
+                    && (to - pos).abs() > PAGE_FRAMES as i64
+                {
+                    windows.push((to - PAGE_FRAMES as i64, to + ahead));
+                }
+                windows.push((pos - PAGE_FRAMES as i64, pos + ahead));
                 if let Some((a, _)) = loop_range {
                     windows.push((a, a + ahead));
                 }

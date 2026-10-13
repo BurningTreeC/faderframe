@@ -1,17 +1,20 @@
 use super::strip::{MatrixMix, surround_at};
 use super::{AUTOMATION_STEP, automation_at, ramp_step};
 use crate::context::EngineContext;
+use crate::slots::{MixSlots, StripSlots};
 use faderframe_audio_graph::{NodeIo, ProcessContext, Processor};
-use faderframe_core::{ChannelLayout, SendId, TrackId, db_to_gain};
+use faderframe_core::{ChannelLayout, SendId, SurroundPan, TrackId, db_to_gain};
 use faderframe_realtime::ParamSlot;
 
 /// An aux/bus send: level-controlled copy of a tap point, converted to the
 /// destination layout by the graph's channel rules — or, into or out of a
 /// surround bed, through the panner's matrix: a mono or stereo track's
-/// send taken before its panner follows the panner into the bed, others
-/// are placed by their speakers (a bed folded into a stereo reverb). An
-/// automated level (and panner) is evaluated every [`AUTOMATION_STEP`]
-/// frames and ramped in between.
+/// send taken before its panner follows the panner (and, a stereo source
+/// balanced into the bed, its balance) into the bed; a bed into stereo or
+/// mono folds by the project's downmix, into another bed by its speakers'
+/// places (a bed folded into a stereo reverb). An automated level (and
+/// panner) is evaluated every [`AUTOMATION_STEP`] frames and ramped in
+/// between.
 pub struct SendNode {
     track: TrackId,
     send: SendId,
@@ -20,8 +23,12 @@ pub struct SendNode {
     /// Rendered ahead: shows nothing (a [`super::StripEcho`] does).
     quiet: bool,
     mix: Option<MatrixMix>,
-    /// The track's surround panner slots, when the send follows it.
-    follow: Option<[ParamSlot; 6]>,
+    /// The track's strip slots, when the send follows its panner.
+    follow: Option<StripSlots>,
+    /// The project's downmix (a bed folded into the destination).
+    shared: Option<MixSlots>,
+    /// How late its input is (its automation is read that much earlier).
+    input_latency: u32,
 }
 
 impl SendNode {
@@ -34,21 +41,35 @@ impl SendNode {
             quiet: false,
             mix: None,
             follow: None,
+            shared: None,
+            input_latency: 0,
         }
     }
 
     /// From a tap of layout `input` into a destination of `output`;
-    /// `follow`: the panner slots of the track it follows into a bed.
+    /// `follow`: the strip slots of the track whose panner it follows into
+    /// a bed; `shared`: the project's downmix.
     pub fn with_layouts(
         self,
         input: ChannelLayout,
         output: ChannelLayout,
-        follow: Option<[ParamSlot; 6]>,
+        follow: Option<StripSlots>,
+        shared: MixSlots,
     ) -> Self {
         let mix = MatrixMix::new(input, output);
         Self {
             follow: follow.filter(|_| mix.is_some()),
+            shared: Some(shared),
             mix,
+            ..self
+        }
+    }
+
+    /// With decorrelation filters for the diffuse spread of the panner it
+    /// follows.
+    pub fn with_diffuser(self, rate: f64) -> Self {
+        Self {
+            mix: self.mix.map(|m| m.with_diffuser(rate)),
             ..self
         }
     }
@@ -63,6 +84,10 @@ impl SendNode {
 }
 
 impl Processor<EngineContext> for SendNode {
+    fn set_input_latency(&mut self, frames: u32) {
+        self.input_latency = frames;
+    }
+
     fn process(&mut self, cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
         let static_level = cx.data.params.get(self.level);
         let auto = cx.data.timeline.automation(self.track);
@@ -70,6 +95,10 @@ impl Processor<EngineContext> for SendNode {
         let pan_lanes = auto
             .map(|a| &a.surround)
             .filter(|l| self.follow.is_some() && l.iter().any(Option::is_some));
+        let balance_lane = auto
+            .and_then(|a| a.pan.as_ref())
+            .filter(|_| self.follow.is_some());
+        let downmix = self.shared.map(|s| s.downmix(&cx.data.params));
         let (Some(input), Some(out)) = (io.audio_in.first(), io.audio_out.first_mut()) else {
             return;
         };
@@ -79,7 +108,7 @@ impl Processor<EngineContext> for SendNode {
             out.copy_from(input);
         }
         let n = io.frames;
-        let step = if lane.is_some() || pan_lanes.is_some() {
+        let step = if lane.is_some() || pan_lanes.is_some() || balance_lane.is_some() {
             AUTOMATION_STEP
         } else {
             n.max(1)
@@ -88,14 +117,21 @@ impl Processor<EngineContext> for SendNode {
         while off < n {
             let m = step.min(n - off);
             let target = lane
-                .and_then(|l| l.value_at(automation_at(cx, off + m)))
+                .and_then(|l| l.value_at(automation_at(cx, self.input_latency, off + m)))
                 .map_or(static_level, |db| db_to_gain(db as f32));
             if let Some(mix) = self.mix.as_mut() {
                 // Through the matrix (its pairs ramp the level too).
-                if let Some(slots) = &self.follow {
-                    let at = automation_at(cx, off + m);
-                    mix.pan(&surround_at(slots, &cx.data.params, pan_lanes, at));
-                }
+                let at = automation_at(cx, self.input_latency, off + m);
+                let (pan, balance) = match &self.follow {
+                    Some(slots) => (
+                        surround_at(&slots.surround, &cx.data.params, pan_lanes, at),
+                        balance_lane
+                            .and_then(|l| l.value_at(at))
+                            .map_or(cx.data.params.get(slots.pan), |v| v as f32),
+                    ),
+                    None => (SurroundPan::default(), 0.0),
+                };
+                mix.pan(&pan, balance, downmix.unwrap_or_default());
                 mix.mix(input, out, off, m, target);
                 self.current = target;
                 off += m;

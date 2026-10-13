@@ -5,7 +5,6 @@
 
 use crate::{Action, InputChoice, Result, Session, SessionError};
 use faderframe_binaural::{BUILTIN_HEADS, Correction, Head};
-use faderframe_project::Impact;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -58,7 +57,7 @@ impl Session {
         }
         self.engine.set_head(head);
         if self.engine.binaural().is_some() {
-            self.sync(Impact::Graph)?;
+            self.engine.relisten(&self.project);
         }
         self.revision += 1;
         Ok(())
@@ -91,7 +90,7 @@ impl Session {
             .set_headphone_correction(correction.map(Arc::new));
         self.correction_path = path.map(Path::to_path_buf);
         if self.engine.binaural().is_some() {
-            self.sync(Impact::Graph)?;
+            self.engine.relisten(&self.project);
         }
         self.revision += 1;
         Ok(())

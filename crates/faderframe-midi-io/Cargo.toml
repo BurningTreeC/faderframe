@@ -11,6 +11,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+faderframe-realtime.workspace = true
 faderframe-midi.workspace = true
 faderframe-midi-ump.workspace = true
 midir.workspace = true

@@ -125,6 +125,9 @@ struct Shared {
     sched_extra: AtomicU64,
     sched_failures: AtomicU64,
     runs: AtomicU64,
+    /// The audio thread's priority generation last seen
+    /// (`crate::priority`): a change re-reads the caller's scheduling.
+    priority_seen: AtomicU64,
     /// The audio workgroup to join (macOS), and its changes.
     workgroup: Mutex<Option<Workgroup>>,
     workgroup_changes: AtomicU32,
@@ -187,7 +190,7 @@ pub fn apply_thread_scheduling(packed: u64, extra: u64) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-mod sched {
+pub(crate) mod sched {
     /// This thread's policy and priority, packed (0 = unknown).
     pub fn current() -> (u64, u64) {
         let mut policy = 0;
@@ -198,13 +201,16 @@ mod sched {
         if r != 0 {
             return (0, 0);
         }
-        (
-            (((policy as u32 as u64) << 32) | param.sched_priority as u32 as u64) + 1,
-            0,
-        )
+        (pack(policy, param.sched_priority), 0)
     }
 
-    /// Apply a packed policy/priority to this thread.
+    /// A policy and priority, packed as [`current`] packs them.
+    pub fn pack(policy: i32, priority: i32) -> u64 {
+        (((policy as u32 as u64) << 32) | priority as u32 as u64) + 1
+    }
+
+    /// Apply a packed policy/priority to this thread (a realtime one
+    /// through RealtimeKit where the process may not take it itself).
     pub fn apply(packed: u64, _: u64) -> bool {
         let v = packed - 1;
         let policy = (v >> 32) as i32;
@@ -212,18 +218,23 @@ mod sched {
             sched_priority: v as u32 as i32,
         };
         // SAFETY: sets the calling thread's scheduling with a valid param.
-        unsafe { libc::pthread_setschedparam(libc::pthread_self(), policy, &param) == 0 }
+        let done =
+            unsafe { libc::pthread_setschedparam(libc::pthread_self(), policy, &param) == 0 };
+        done || (is_realtime(packed) && crate::rtkit::make_thread_realtime(param.sched_priority))
     }
 
-    /// Whether packed scheduling is a realtime policy.
+    /// Whether packed scheduling is a realtime policy (whatever its flags:
+    /// PipeWire's data loop is `SCHED_FIFO | SCHED_RESET_ON_FORK`).
     pub fn is_realtime(packed: u64) -> bool {
-        let policy = packed.checked_sub(1).map(|v| (v >> 32) as i32);
+        let policy = packed
+            .checked_sub(1)
+            .map(|v| (v >> 32) as i32 & !libc::SCHED_RESET_ON_FORK);
         matches!(policy, Some(libc::SCHED_FIFO | libc::SCHED_RR))
     }
 }
 
 #[cfg(target_os = "macos")]
-mod sched {
+pub(crate) mod sched {
     //! Mach time-constraint scheduling: CoreAudio's IO thread has a policy
     //! (period, computation, constraint in absolute-time units); workers
     //! copy it.
@@ -307,7 +318,7 @@ mod sched {
 }
 
 #[cfg(windows)]
-mod sched {
+pub(crate) mod sched {
     //! MMCSS: the WASAPI thread runs in the "Pro Audio" task (cpal puts it
     //! there); workers join the same task at high priority.
     use windows_sys::Win32::System::Threading::{
@@ -348,7 +359,7 @@ mod sched {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-mod sched {
+pub(crate) mod sched {
     pub fn current() -> (u64, u64) {
         (0, 0)
     }
@@ -363,6 +374,9 @@ mod sched {
 fn worker(shared: Arc<Shared>, on_start: Option<fn()>, index: usize) {
     SEAT.with(|s| s.set(index + 1));
     flush_denormals_on_this_thread();
+    // The stack deep processing reaches, mapped now (not page by page
+    // while the audio thread waits for this worker).
+    crate::memory::prefault_stack(256 * 1024);
     if let Some(f) = on_start {
         f();
     }
@@ -392,6 +406,13 @@ fn worker(shared: Arc<Shared>, on_start: Option<fn()>, index: usize) {
                 break;
             }
             spins = spins.wrapping_add(1);
+            // Under a realtime time limit, block briefly now and then (cycles
+            // so close together that it never stops spinning would have the
+            // kernel demote it); the caller takes the jobs meanwhile.
+            if spins.is_multiple_of(64) && crate::priority::must_breathe() {
+                crate::priority::breathe();
+                continue;
+            }
             if spins.is_multiple_of(64) && idle_since.elapsed().as_nanos() as u64 > shared.spin_ns {
                 shared.sleeping.fetch_add(1, Ordering::SeqCst);
                 if shared.generation.load(Ordering::SeqCst) == seen {
@@ -437,7 +458,12 @@ fn worker(shared: Arc<Shared>, on_start: Option<fn()>, index: usize) {
             // drops to zero, and it only reads `active` after clearing the
             // pointer.
             let job = unsafe { &*(p as *const JobRef<'_>) };
-            job.0.work();
+            // A plugin may have cleared the FP control flags: set again
+            // (one register write).
+            flush_denormals_on_this_thread();
+            // A panic must not leave `active` raised: the caller would
+            // wait for this worker for ever.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.0.work()));
         }
         shared.active.fetch_sub(1, Ordering::Release);
     }
@@ -458,6 +484,7 @@ impl WorkerPool {
             sched_extra: AtomicU64::new(0),
             sched_failures: AtomicU64::new(0),
             runs: AtomicU64::new(0),
+            priority_seen: AtomicU64::new(u64::MAX),
             workgroup: Mutex::new(None),
             workgroup_changes: AtomicU32::new(0),
             members: AtomicU32::new(0),
@@ -517,8 +544,15 @@ impl WorkerPool {
     /// to the rest of the system.
     pub fn useful_helpers(&self) -> usize {
         let realtime = sched::is_realtime(self.shared.sched.load(Ordering::Relaxed));
-        if realtime && self.priority_failures() == 0 {
-            self.handles.len()
+        if realtime {
+            // Workers that could not take the caller's realtime priority
+            // can be preempted by anything while the caller waits for the
+            // job they hold: then none (the caller alone is on time).
+            if self.priority_failures() == 0 {
+                self.handles.len()
+            } else {
+                0
+            }
         } else {
             self.handles
                 .len()
@@ -550,12 +584,20 @@ impl WorkerPool {
             return;
         }
         // The caller's scheduling, re-read now and then (it may change when
-        // the audio server restarts its thread).
-        if self
+        // the audio server restarts its thread), and at once when the audio
+        // thread's priority changed (helpers that run pools follow it).
+        let generation = crate::priority::generation();
+        let changed = self
             .shared
-            .runs
-            .fetch_add(1, Ordering::Relaxed)
-            .is_multiple_of(4096)
+            .priority_seen
+            .swap(generation, Ordering::Relaxed)
+            != generation;
+        if changed
+            || self
+                .shared
+                .runs
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(4096)
         {
             let (packed, extra) = sched::current();
             self.shared.sched_extra.store(extra, Ordering::Relaxed);

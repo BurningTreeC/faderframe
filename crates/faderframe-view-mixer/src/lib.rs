@@ -98,6 +98,41 @@ fn folder_layout(rect: Rect) -> FolderLayout {
     }
 }
 
+/// The bed `t` is placed into by the surround panner (its strip shows the
+/// room); `None` also for a stereo track balanced into a bed (its strip
+/// shows the balance knob).
+fn room_panned(model: &Session, t: &Track) -> Option<faderframe_core::SurroundFormat> {
+    model
+        .project()
+        .surround_panned(t)
+        .filter(|_| !model.project().balanced_into_bed(t))
+}
+
+/// Whether a strip's pan knob is a stereo balance.
+fn is_balance(model: &Session, t: &Track) -> bool {
+    model.project().pans_stereo(t) || model.project().balanced_into_bed(t)
+}
+
+/// Dual pan's two knobs (left and right input channel) side by side in
+/// the pan area, each over its readout: `[(knob, readout); 2]`.
+pub fn dual_pan_rects(l: &StripLayout) -> [(Rect, Rect); 2] {
+    let area_x = l.pan_readout.x - 6.0;
+    let half = (l.pan_readout.w + 12.0) / 2.0;
+    let size = l.pan_knob.h.min(half - 4.0).max(10.0);
+    std::array::from_fn(|i| {
+        let x = area_x + half * i as f32;
+        (
+            Rect::new(
+                x + (half - size) / 2.0,
+                l.pan_knob.y + (l.pan_knob.h - size) / 2.0,
+                size,
+                size,
+            ),
+            Rect::new(x + 1.0, l.pan_readout.y, half - 2.0, l.pan_readout.h),
+        )
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Hit {
     PreampChoose(TrackId),
@@ -108,6 +143,10 @@ pub enum Hit {
     Pan(TrackId),
     /// The pan value under the knob (click to type).
     PanValue(TrackId),
+    /// Dual pan: one input channel's knob (`true`: the right channel).
+    DualPan(TrackId, bool),
+    /// Dual pan: the value under one knob (click to type).
+    DualPanValue(TrackId, bool),
     /// A send slot; the index is into the track's sends (bank applied).
     Send(TrackId, usize),
     /// Page the send slots by this many banks.
@@ -148,6 +187,8 @@ pub enum Hit {
 enum KnobTarget {
     Preamp(u32),
     Pan,
+    /// Dual pan: one input channel's position (`true`: the right).
+    DualPan(bool),
     Send(usize),
 }
 
@@ -648,6 +689,19 @@ impl MixerView {
             let pans =
                 audio.filter(|_| !matches!(t.layout, faderframe_core::ChannelLayout::Surround(_)));
             let color = Rect::new(l.color_bar.x, l.color_bar.y, l.color_bar.w, 7.0);
+            // Dual pan: two knobs, each over its value (and no single one).
+            let dual = pans.is_some() && model.project().dual_panned(t);
+            let pans = pans.filter(|_| !dual);
+            if dual {
+                for (i, (knob, value)) in dual_pan_rects(&l).into_iter().enumerate() {
+                    if knob.contains(pos) {
+                        return Some(Hit::DualPan(id, i == 1));
+                    }
+                    if value.contains(pos) {
+                        return Some(Hit::DualPanValue(id, i == 1));
+                    }
+                }
+            }
             let checks: [(Option<Rect>, Hit); 15] = [
                 (Some(color), Hit::Color(id)),
                 (Some(geo.cap_rect(pos_now).inset(-2.0)), Hit::FaderCap(id)),
@@ -1004,7 +1058,7 @@ impl MixerView {
         }
 
         let vca = t.kind == TrackKind::Vca;
-        let bed = model.project().surround_panned(t);
+        let bed = room_panned(model, t);
         if vca {
             controls::engraved(p, "VCA", l.pan_knob, th, Align::Center);
         } else if let faderframe_core::ChannelLayout::Surround(f) = t.layout {
@@ -1032,6 +1086,25 @@ impl MixerView {
                 &faderframe_view_surround::room::format_place(&pan),
                 th,
             );
+        } else if model.project().dual_panned(t) {
+            // Dual pan: the left and the right input channel, each placed
+            // on its own.
+            let dual = model.shown_dual_pan(t);
+            for (i, (knob, value)) in dual_pan_rects(&l).into_iter().enumerate() {
+                let pan = dual.side(i == 1);
+                controls::knob(
+                    p,
+                    knob,
+                    (pan + 1.0) * 0.5,
+                    true,
+                    KnobLook {
+                        cap: c.pan_cap,
+                        ring: c.panel_label,
+                    },
+                    th,
+                );
+                controls::readout(p, value, &format_pan(pan), th);
+            }
         } else {
             controls::knob(
                 p,
@@ -1057,13 +1130,23 @@ impl MixerView {
             p.circle(at, 2.3, th.ui.text);
         };
         if pan_mod != 0.0 && bed.is_none() {
-            let now = ((model.shown_pan(t) + pan_mod).clamp(-1.0, 1.0) + 1.0) * 0.5;
-            let a = controls::knob_angle(now);
-            let (o, r) = (
-                l.pan_knob.center(),
-                l.pan_knob.w.min(l.pan_knob.h) * 0.5 - 1.6,
-            );
-            dot(p, Point::new(o.x + r * a.cos(), o.y + r * a.sin()));
+            // A dual-panned image moves as a whole.
+            let knobs: Vec<(Rect, f32)> = if model.project().dual_panned(t) {
+                let dual = model.shown_dual_pan(t);
+                dual_pan_rects(&l)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (knob, _))| (knob, dual.side(i == 1)))
+                    .collect()
+            } else {
+                vec![(l.pan_knob, model.shown_pan(t))]
+            };
+            for (knob, pan) in knobs {
+                let now = ((pan + pan_mod).clamp(-1.0, 1.0) + 1.0) * 0.5;
+                let a = controls::knob_angle(now);
+                let (o, r) = (knob.center(), knob.w.min(knob.h) * 0.5 - 1.6);
+                dot(p, Point::new(o.x + r * a.cos(), o.y + r * a.sin()));
+            }
         }
 
         controls::led_button(p, l.mute, "M", model.shown_mute(t), c.led.mute, th);
@@ -1491,6 +1574,7 @@ impl MixerView {
                 .as_ref()
                 .map(|slot| preamp::position(&preamp::face(slot), preamp::value(slot, id), id)),
             KnobTarget::Pan => Some((t.pan + 1.0) * 0.5),
+            KnobTarget::DualPan(right) => Some((t.dual_pan.side(right) + 1.0) * 0.5),
             KnobTarget::Send(i) => t.sends.get(i).map(|s| self.law.db_to_position(s.level_db)),
         }
     }
@@ -1509,6 +1593,14 @@ impl MixerView {
                 let pan = value * 2.0 - 1.0;
                 let pan = if pan.abs() < 0.01 { 0.0 } else { pan };
                 Some(Command::SetTrackPan { track: t.id, pan })
+            }
+            KnobTarget::DualPan(right) => {
+                let pan = value * 2.0 - 1.0;
+                let pan = if pan.abs() < 0.01 { 0.0 } else { pan };
+                Some(Command::SetTrackDualPan {
+                    track: t.id,
+                    pan: t.dual_pan.with_side(right, pan),
+                })
             }
             KnobTarget::Send(i) => t.sends.get(i).map(|s| Command::SetSendLevel {
                 track: t.id,
@@ -2072,6 +2164,14 @@ impl MixerView {
         if !formats.is_empty() {
             items.push(MenuItem::submenu("Channel Format", formats).separated());
         }
+        let modes: Vec<MenuItem<Action>> = model
+            .pan_mode_choices(t.id)
+            .into_iter()
+            .map(|c| MenuItem::new(c.label, c.action).checked(c.checked))
+            .collect();
+        if !modes.is_empty() {
+            items.push(MenuItem::submenu("Pan Mode", modes));
+        }
         if model.project().surround_panned(t).is_some() {
             items.push(MenuItem::new(
                 "Surround Panner…",
@@ -2288,6 +2388,41 @@ impl MixerView {
         }
     }
 
+    /// Type one side of a dual pan.
+    fn dual_pan_request(model: &Session, t: &Track, right: bool, at: Rect) -> HostRequest<Action> {
+        let id = t.id;
+        let dual = model.shown_dual_pan(t);
+        HostRequest::TextInput {
+            at,
+            initial: format_pan(dual.side(right)),
+            commit: Box::new(move |text| {
+                parse_pan(text).map(|pan| {
+                    Action::Edit(Command::SetTrackDualPan {
+                        track: id,
+                        pan: dual.with_side(right, pan),
+                    })
+                })
+            }),
+        }
+    }
+
+    /// MIDI learn for a pan control, and the pan mode of a stereo source.
+    fn pan_menu(
+        model: &Session,
+        t: &Track,
+        target: faderframe_automation::AutomationTarget,
+        at: Point,
+    ) -> HostRequest<Action> {
+        let mut request = Self::learn_menu(model, t, target, at);
+        if let HostRequest::ContextMenu { items, .. } = &mut request {
+            for (i, c) in model.pan_mode_choices(t.id).into_iter().enumerate() {
+                let item = MenuItem::new(c.label, c.action).checked(c.checked);
+                items.push(if i == 0 { item.separated() } else { item });
+            }
+        }
+        request
+    }
+
     fn pan_request(model: &Session, t: &Track, at: Rect) -> HostRequest<Action> {
         let id = t.id;
         HostRequest::TextInput {
@@ -2474,8 +2609,7 @@ impl MixerView {
                 cx.redraw();
             }
             Hit::Pan(id)
-                if Self::track(model, id)
-                    .is_some_and(|t| model.project().surround_panned(t).is_some()) =>
+                if Self::track(model, id).is_some_and(|t| room_panned(model, t).is_some()) =>
             {
                 if clicks >= 2 {
                     cx.emit(Action::ShowSurroundPanner(id));
@@ -2494,13 +2628,14 @@ impl MixerView {
                 });
                 cx.set_cursor(Cursor::Grabbing);
             }
-            Hit::Pan(id) | Hit::Send(id, _) | Hit::PreampKnob(id, _) => {
+            Hit::Pan(id) | Hit::DualPan(id, _) | Hit::Send(id, _) | Hit::PreampKnob(id, _) => {
                 let Some(t) = Self::track(model, id) else {
                     return false;
                 };
                 let target = match hit {
                     Hit::PreampKnob(_, id) => KnobTarget::Preamp(id),
                     Hit::Send(_, i) => KnobTarget::Send(i),
+                    Hit::DualPan(_, right) => KnobTarget::DualPan(right),
                     _ => KnobTarget::Pan,
                 };
                 let Some(value) = self.knob_value(t, target) else {
@@ -2516,6 +2651,14 @@ impl MixerView {
                             preamp::position(&f, f.ranges[f.index(id)].2, id)
                         }),
                         KnobTarget::Pan => 0.5,
+                        // Back to where the channel came from.
+                        KnobTarget::DualPan(right) => {
+                            if right {
+                                1.0
+                            } else {
+                                0.0
+                            }
+                        }
                         KnobTarget::Send(_) => self.law.unity_position(),
                     };
                     if let Some(cmd) = self.knob_command(t, target, reset) {
@@ -2525,7 +2668,7 @@ impl MixerView {
                 }
                 cx.emit(Action::BeginGesture(match target {
                     KnobTarget::Preamp(_) => "Preamp".into(),
-                    KnobTarget::Pan => "Pan".into(),
+                    KnobTarget::Pan | KnobTarget::DualPan(_) => "Pan".into(),
                     KnobTarget::Send(_) => "Send Level".into(),
                 }));
                 self.drag = Some(Drag::Knob {
@@ -2684,11 +2827,19 @@ impl MixerView {
                 if let (Some(t), Some(l)) =
                     (Self::track(model, id), self.layout_of(model, id, size))
                 {
-                    if model.project().surround_panned(t).is_some() {
+                    if room_panned(model, t).is_some() {
                         cx.emit(Action::ShowSurroundPanner(id));
                     } else {
                         cx.request(Self::pan_request(model, t, l.pan_readout));
                     }
+                }
+            }
+            Hit::DualPanValue(id, right) => {
+                if let (Some(t), Some(l)) =
+                    (Self::track(model, id), self.layout_of(model, id, size))
+                {
+                    let at = dual_pan_rects(&l)[usize::from(right)].1;
+                    cx.request(Self::dual_pan_request(model, t, right, at));
                 }
             }
             Hit::Scribble(id) | Hit::Strip(id) => {
@@ -2790,29 +2941,38 @@ impl MixerView {
             }),
             // Panned into a surround bed: the room's parameters, each its
             // own submenu.
-            Hit::Pan(id) => {
-                Self::track(model, id).map(|t| match model.project().surround_panned(t) {
-                    Some(format) => {
-                        let items = faderframe_core::SurroundParam::ALL
-                            .into_iter()
-                            .filter(|p| p.applies(t.layout, format))
-                            .map(|p| {
-                                Self::learn_submenu(
-                                    model,
-                                    t,
-                                    faderframe_automation::AutomationTarget::Surround(p),
-                                    p.name(),
-                                )
-                            })
-                            .collect();
-                        HostRequest::ContextMenu { at: pos, items }
-                    }
-                    None => Self::learn_menu(
-                        model,
-                        t,
-                        faderframe_automation::AutomationTarget::TrackPan,
-                        pos,
-                    ),
+            Hit::Pan(id) => Self::track(model, id).map(|t| match room_panned(model, t) {
+                Some(format) => {
+                    let pan = model.project().effective_surround(t);
+                    let items = faderframe_core::SurroundParam::ALL
+                        .into_iter()
+                        .filter(|p| p.applies(t.layout, format, &pan))
+                        .map(|p| {
+                            Self::learn_submenu(
+                                model,
+                                t,
+                                faderframe_automation::AutomationTarget::Surround(p),
+                                p.name(),
+                            )
+                        })
+                        .collect();
+                    HostRequest::ContextMenu { at: pos, items }
+                }
+                None => Self::pan_menu(
+                    model,
+                    t,
+                    faderframe_automation::AutomationTarget::TrackPan,
+                    pos,
+                ),
+            }),
+            Hit::DualPan(id, right) | Hit::DualPanValue(id, right) => {
+                Self::track(model, id).map(|t| {
+                    let target = if right {
+                        faderframe_automation::AutomationTarget::DualPanRight
+                    } else {
+                        faderframe_automation::AutomationTarget::DualPanLeft
+                    };
+                    Self::pan_menu(model, t, target, pos)
                 })
             }
             Hit::Mute(id) => Self::track(model, id).map(|t| {
@@ -2892,17 +3052,42 @@ impl MixerView {
             }
             Hit::Pan(id) => {
                 let t = Self::track(model, id)?;
-                match model.project().surround_panned(t) {
+                match room_panned(model, t) {
                     Some(f) => format!(
                         "Surround {} ({}) · Drag to move (Shift/Ctrl: fine) · Double-click: the panner",
                         faderframe_view_surround::room::format_place(&model.shown_surround(t)),
                         f.name()
+                    ),
+                    None if model.project().balanced_into_bed(t) => format!(
+                        "Balance {} into the bed's L and R · Double-click to centre",
+                        format_pan(model.shown_pan(t))
+                    ),
+                    None if model.project().pans_stereo(t) => format!(
+                        "Balance {} · Double-click to centre · Right-click: dual pan",
+                        format_pan(model.shown_pan(t))
                     ),
                     None => format!(
                         "Pan {} · Double-click to centre",
                         format_pan(model.shown_pan(t))
                     ),
                 }
+            }
+            Hit::DualPan(id, right) => {
+                let t = Self::track(model, id)?;
+                format!(
+                    "{} channel at {} · Double-click: hard {} · Right-click: balance",
+                    if right { "Right" } else { "Left" },
+                    format_pan(model.shown_dual_pan(t).side(right)),
+                    if right { "right" } else { "left" }
+                )
+            }
+            Hit::DualPanValue(id, right) => {
+                let t = Self::track(model, id)?;
+                format!(
+                    "{} channel at {} · Click to type (C, L30, R45 or −100…100)",
+                    if right { "Right" } else { "Left" },
+                    format_pan(model.shown_dual_pan(t).side(right))
+                )
             }
             Hit::Send(id, i) => match Self::track(model, id)?.sends.get(i) {
                 Some(s) => format!(
@@ -2985,7 +3170,7 @@ impl MixerView {
             Hit::Level(_) => "Click to type a level".into(),
             Hit::PanValue(id) => {
                 let t = Self::track(model, id)?;
-                if model.project().surround_panned(t).is_some() {
+                if room_panned(model, t).is_some() {
                     "Click to open the surround panner".into()
                 } else {
                     format!(
@@ -3360,12 +3545,26 @@ impl MixerView {
                         from,
                         size,
                     }) => {
-                        // Fine: a quarter as far.
-                        let k = if modifiers.fine() { 0.5 } else { 2.0 } / size;
-                        let pan = faderframe_core::SurroundPan {
-                            x: (from.x + (pos.x - start.x) * k).clamp(-1.0, 1.0),
-                            y: (from.y - (pos.y - start.y) * k).clamp(-1.0, 1.0),
-                            ..from
+                        let object =
+                            Self::track(model, track).is_some_and(|t| model.project().is_object(t));
+                        let pan = if faderframe_view_surround::room::by_direction(&from, object) {
+                            // VBAP: across moves round (a dual pan's pair
+                            // together), half the room's width a half turn;
+                            // fine: a quarter as far.
+                            use faderframe_core::SurroundParam as P;
+                            let k = if modifiers.fine() { 90.0 } else { 360.0 } / size;
+                            let by = -(pos.x - start.x) * k;
+                            let pan = P::Azimuth.set(from, from.azimuth + by);
+                            let pan = P::LeftAzimuth.set(pan, from.left + by);
+                            P::RightAzimuth.set(pan, from.right + by)
+                        } else {
+                            // Fine: a quarter as far.
+                            let k = if modifiers.fine() { 0.5 } else { 2.0 } / size;
+                            faderframe_core::SurroundPan {
+                                x: (from.x + (pos.x - start.x) * k).clamp(-1.0, 1.0),
+                                y: (from.y - (pos.y - start.y) * k).clamp(-1.0, 1.0),
+                                ..from
+                            }
                         };
                         cx.emit(Action::Edit(Command::SetTrackSurround { track, pan }));
                     }
@@ -3448,6 +3647,7 @@ impl MixerView {
                         Some(
                             Hit::FaderTrack(_)
                             | Hit::Pan(_)
+                            | Hit::DualPan(..)
                             | Hit::PreampKnob(..)
                             | Hit::Send(..)
                             | Hit::InsertsGrip(_),
@@ -3554,25 +3754,42 @@ impl MixerView {
                         }
                         true
                     }
-                    // Into a bed the wheel moves the track left and right.
+                    // Into a bed the wheel moves the track left and right
+                    // (VBAP: turns it, a dual pan's pair together).
                     Some(Hit::Pan(id))
                         if dx == 0.0
                             && Self::track(model, id)
-                                .is_some_and(|t| model.project().surround_panned(t).is_some()) =>
+                                .is_some_and(|t| room_panned(model, t).is_some()) =>
                     {
                         if let Some(t) = Self::track(model, id) {
-                            let step = if modifiers.fine() { 0.01 } else { 0.05 };
+                            use faderframe_core::SurroundParam as P;
                             let from = model.shown_surround(t);
-                            let pan =
-                                faderframe_core::SurroundParam::X.set(from, from.x - steps * step);
+                            let pan = if faderframe_view_surround::room::by_direction(
+                                &from,
+                                model.project().is_object(t),
+                            ) {
+                                let by = if modifiers.fine() { 1.0 } else { 5.0 } * steps;
+                                let pan = P::Azimuth.set(from, from.azimuth + by);
+                                let pan = P::LeftAzimuth.set(pan, from.left + by);
+                                P::RightAzimuth.set(pan, from.right + by)
+                            } else {
+                                let step = if modifiers.fine() { 0.01 } else { 0.05 };
+                                P::X.set(from, from.x - steps * step)
+                            };
                             cx.emit(Action::Edit(Command::SetTrackSurround { track: id, pan }));
                         }
                         true
                     }
-                    Some(Hit::Pan(id) | Hit::Send(id, _) | Hit::PreampKnob(id, _)) if dx == 0.0 => {
+                    Some(
+                        Hit::Pan(id)
+                        | Hit::DualPan(id, _)
+                        | Hit::Send(id, _)
+                        | Hit::PreampKnob(id, _),
+                    ) if dx == 0.0 => {
                         let target = match self.hit_test(pos, size, model) {
                             Some(Hit::PreampKnob(_, id)) => KnobTarget::Preamp(id),
                             Some(Hit::Send(_, i)) => KnobTarget::Send(i),
+                            Some(Hit::DualPan(_, right)) => KnobTarget::DualPan(right),
                             _ => KnobTarget::Pan,
                         };
                         if let Some(t) = Self::track(model, id)

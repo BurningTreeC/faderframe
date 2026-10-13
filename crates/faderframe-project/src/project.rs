@@ -107,6 +107,26 @@ pub struct Project {
     /// Subtle analogue leakage between adjacent mixer audio/instrument channels.
     #[serde(default)]
     pub crosstalk: bool,
+    /// How mono pan (and each channel of dual pan) spreads a source over a
+    /// stereo destination. Balance never follows it.
+    #[serde(
+        default,
+        skip_serializing_if = "faderframe_core::pan::PanLaw::is_default"
+    )]
+    pub pan_law: faderframe_core::PanLaw,
+    /// How surround beds fold into stereo and mono. Files from before the
+    /// setting fold every speaker where it stands
+    /// ([`faderframe_core::surround::Downmix::BY_PLACE`]); new projects use
+    /// the −3 dB coefficients.
+    #[serde(
+        default = "faderframe_core::surround::Downmix::older",
+        skip_serializing_if = "faderframe_core::surround::Downmix::is_older"
+    )]
+    pub downmix: faderframe_core::surround::Downmix,
+    /// Speaker layouts the user defined, offered as channel formats
+    /// (tracks carry their own copy of the layout they use).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speaker_layouts: Vec<faderframe_core::surround::LayoutDef>,
     /// The console the mix runs through (None: in the box).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub console: Option<crate::console::Console>,
@@ -183,6 +203,9 @@ impl Project {
             punch_range: None,
             punch_enabled: false,
             crosstalk: false,
+            pan_law: faderframe_core::PanLaw::default(),
+            downmix: faderframe_core::surround::Downmix::STANDARD,
+            speaker_layouts: Vec::new(),
             console: None,
             tracks: vec![master],
             clips: BTreeMap::new(),
@@ -372,6 +395,45 @@ impl Project {
             Some(dst) if dst.kind.has_audio() => dst.layout,
             _ => track.layout,
         }
+    }
+
+    /// Whether `track`'s strip places a stereo source into a stereo
+    /// destination: where its pan mode (balance or dual pan) applies.
+    pub fn pans_stereo(&self, track: &Track) -> bool {
+        track.kind.has_audio()
+            && track.chain_layout().channel_count() == 2
+            && self.destination_layout(track).channel_count() == 2
+    }
+
+    /// Whether `track` is dual-panned: in that mode, a stereo source into
+    /// a stereo destination.
+    pub fn dual_panned(&self, track: &Track) -> bool {
+        track.pan_mode == faderframe_core::PanMode::Dual && self.pans_stereo(track)
+    }
+
+    /// How `track` is placed into a bed as the engine places it: objects
+    /// always by the room panner, as an image (their ADM metadata is the
+    /// room position); a mono source has no stereo mode.
+    pub fn effective_surround(&self, track: &Track) -> faderframe_core::SurroundPan {
+        let mut pan = track.surround;
+        if self.is_object(track) {
+            pan.panner = faderframe_core::surround::SurroundPanner::Room;
+            pan.stereo = faderframe_core::surround::StereoSource::Image;
+            pan.diffuse = false;
+        }
+        if track.layout.channel_count() != 2 {
+            pan.stereo = faderframe_core::surround::StereoSource::Image;
+        }
+        pan
+    }
+
+    /// Whether `track` is a stereo source balanced into the bed it feeds
+    /// (its strip's balance then applies there).
+    pub fn balanced_into_bed(&self, track: &Track) -> bool {
+        self.surround_panned(track).is_some()
+            && track.layout.channel_count() == 2
+            && self.effective_surround(track).stereo
+                == faderframe_core::surround::StereoSource::Balance
     }
 
     /// The surround bed `track` is panned into, if any: a mono or stereo

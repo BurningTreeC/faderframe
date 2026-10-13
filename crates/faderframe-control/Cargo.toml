@@ -1,6 +1,6 @@
 [package]
 name = "faderframe-control"
-description = "Control surfaces: Mackie Control and HUI over MIDI, OSC over UDP (protocols only, no I/O)"
+description = "Control surfaces: Mackie Control and HUI over MIDI, OSC over UDP, controllers' DAW modes (protocols only, no I/O)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,3 +11,4 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+serde.workspace = true

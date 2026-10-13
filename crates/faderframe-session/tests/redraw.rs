@@ -47,6 +47,10 @@ fn redrawing_copies_the_source_for_that_clip_only_and_undoes() {
         samples: drawn.to_vec(),
     })
     .unwrap();
+    // Written in the background; the stroke is shown meanwhile.
+    assert_eq!(s.pending_redraws(clip.id).len(), 1);
+    s.wait_for_redraws();
+    assert!(s.pending_redraws(clip.id).is_empty());
     // Load the new file.
     s.tick(0.016);
     let new = s
@@ -77,4 +81,39 @@ fn redrawing_copies_the_source_for_that_clip_only_and_undoes() {
         audio.source
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Strokes drawn while the first is still being written queue up: each
+/// copies the audio the clip has when it starts, so both are in the end.
+#[test]
+fn quick_strokes_add_up() {
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let clip = s
+        .project()
+        .clips
+        .values()
+        .find(|c| c.name == "Pluck Arp")
+        .unwrap()
+        .id;
+    for (start, v) in [(500, 0.5f32), (2000, -0.5)] {
+        s.dispatch(Action::RedrawAudio {
+            clip,
+            channel: None,
+            start,
+            samples: vec![v; 4],
+        })
+        .unwrap();
+    }
+    assert_eq!(s.pending_redraws(clip).len(), 2);
+    s.wait_for_redraws();
+    s.tick(0.016);
+    let source = s.project().clip(clip).unwrap().as_audio().unwrap().source;
+    assert_eq!(s.source_frames(source, 500, 4).unwrap()[0], vec![0.5; 4]);
+    assert_eq!(s.source_frames(source, 2000, 4).unwrap()[0], vec![-0.5; 4]);
+    // Two steps: undo takes the second stroke back only.
+    s.dispatch(Action::Undo).unwrap();
+    s.tick(0.016);
+    let source = s.project().clip(clip).unwrap().as_audio().unwrap().source;
+    assert_eq!(s.source_frames(source, 500, 4).unwrap()[0], vec![0.5; 4]);
+    assert_ne!(s.source_frames(source, 2000, 4).unwrap()[0], vec![-0.5; 4]);
 }

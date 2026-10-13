@@ -368,3 +368,89 @@ fn a_short_cycle_change_does_not_restart_the_buffered_devices() {
         assert!(!inst.poll().restart, "{id}: once");
     }
 }
+
+/// Graph rebuilds get the processor already made: the graph that adopts
+/// the running one keeps its echo; a graph using the one handed out again
+/// starts clean, as with a new processor; another configuration makes a
+/// new one.
+#[test]
+fn rebuilds_share_the_processor_made_and_start_it_clean() {
+    let mut inst = BuiltinFactory.instantiate(builtin::ECHO).unwrap();
+    inst.set_parameter(ParameterId(0), 10.0).unwrap(); // 480 samples
+    inst.set_parameter(ParameterId(4), 0.0).unwrap();
+    let mut running = inst.create_processor(&config()).unwrap();
+    let mut rig = Rig::new();
+    rig.ins[0].channel_mut(0)[0] = 1.0;
+    rig.ins[0].channel_mut(1)[0] = 1.0;
+    rig.run(running.as_mut());
+    rig.ins[0].clear();
+    // A rebuild: the same processor again (fresh), not run yet.
+    let started = std::time::Instant::now();
+    let mut handed = inst.create_processor(&config()).unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_millis(1));
+    // The running graph keeps playing (adopted): the echo comes.
+    let heard = |p: &mut Box<dyn PluginProcessor>, rig: &mut Rig| {
+        (0..5)
+            .map(|_| {
+                rig.run(p.as_mut());
+                rig.outs[0]
+                    .channel(0)
+                    .iter()
+                    .fold(0f32, |m, s| m.max(s.abs()))
+            })
+            .fold(0f32, f32::max)
+    };
+    let mut probe = Rig::new();
+    let echo = {
+        let mut rig2 = Rig::new();
+        rig2.ins[0].channel_mut(0)[0] = 1.0;
+        let mut other = BuiltinFactory.instantiate(builtin::ECHO).unwrap();
+        other.set_parameter(ParameterId(0), 10.0).unwrap();
+        other.set_parameter(ParameterId(4), 0.0).unwrap();
+        let mut p = other.create_processor(&config()).unwrap();
+        rig2.run(p.as_mut());
+        rig2.ins[0].clear();
+        heard(&mut p, &mut rig2)
+    };
+    assert!(echo > 0.1, "an echo to hear ({echo})");
+    // Not adopted: the handed-out one runs first and starts clean, so the
+    // shared state has no echo left for anyone.
+    assert_eq!(heard(&mut handed, &mut probe), 0.0);
+    assert_eq!(heard(&mut running, &mut rig), 0.0);
+    // Another rate: a processor of its own.
+    let other = ProcessConfig {
+        sample_rate: 44_100.0,
+        ..config()
+    };
+    let mut new = inst.create_processor(&other).unwrap();
+    let mut rig3 = Rig::new();
+    rig3.ins[0].channel_mut(0)[0] = 1.0;
+    rig3.run(new.as_mut());
+    rig3.ins[0].clear();
+    assert!(heard(&mut new, &mut rig3) > 0.1);
+}
+
+/// The running graph adopts its own processor back: its echo carries on.
+#[test]
+fn an_adopted_processor_keeps_its_tail() {
+    let mut inst = BuiltinFactory.instantiate(builtin::ECHO).unwrap();
+    inst.set_parameter(ParameterId(0), 10.0).unwrap();
+    inst.set_parameter(ParameterId(4), 0.0).unwrap();
+    let mut running = inst.create_processor(&config()).unwrap();
+    let mut rig = Rig::new();
+    rig.ins[0].channel_mut(0)[0] = 1.0;
+    rig.run(running.as_mut());
+    rig.ins[0].clear();
+    // A rebuild hands out the same processor; the new graph adopts the
+    // running one and drops the one handed out unused.
+    drop(inst.create_processor(&config()).unwrap());
+    let mut peak = 0f32;
+    for _ in 0..5 {
+        rig.run(running.as_mut());
+        peak = rig.outs[0]
+            .channel(0)
+            .iter()
+            .fold(peak, |m, s| m.max(s.abs()));
+    }
+    assert!(peak > 0.1, "the echo carries on ({peak})");
+}

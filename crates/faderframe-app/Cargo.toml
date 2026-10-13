@@ -24,6 +24,11 @@ faderframe-ui.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 faderframe-audio.workspace = true
+faderframe-realtime.workspace = true
+faderframe-plugin-check.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
 
 [[bin]]
 name = "faderframe"

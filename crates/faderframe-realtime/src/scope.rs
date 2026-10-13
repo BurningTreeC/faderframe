@@ -91,7 +91,20 @@ impl ScopeRing {
     /// the new position and how many frames were lost (overwritten before
     /// they were read).
     pub fn read_since(&self, from: u64, left: &mut Vec<f32>, right: &mut Vec<f32>) -> (u64, u64) {
-        let end = self.written();
+        self.read_between(from, u64::MAX, left, right)
+    }
+
+    /// [`Self::read_since`] up to frame `until` (not past what is
+    /// written): frames are read when they are heard, `until` = written
+    /// less the latency still ahead of them.
+    pub fn read_between(
+        &self,
+        from: u64,
+        until: u64,
+        left: &mut Vec<f32>,
+        right: &mut Vec<f32>,
+    ) -> (u64, u64) {
+        let end = self.written().min(until);
         let cap = self.capacity() as u64;
         // Keep a block of headroom: the writer may be overwriting the
         // oldest frames right now.

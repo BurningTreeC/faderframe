@@ -21,6 +21,8 @@ type LinkField = fn(&mut GroupLink) -> &mut bool;
 pub(crate) enum FollowKey {
     Volume(TrackId),
     Pan(TrackId),
+    /// One side of a dual pan (`true`: the right input channel).
+    DualPan(TrackId, bool),
     Send(faderframe_core::SendId),
 }
 
@@ -125,6 +127,44 @@ impl Session {
                         Command::SetTrackPan {
                             track: id,
                             pan: (from + pan - base).clamp(-1.0, 1.0),
+                        }
+                    })
+                    .collect()
+            }
+            Command::SetTrackPanMode { track, mode } => {
+                let p = &self.project;
+                self.followers(track, None, |t| p.pans_stereo(t))
+                    .into_iter()
+                    .map(|t| Command::SetTrackPanMode { track: t.id, mode })
+                    .collect()
+            }
+            Command::SetTrackDualPan { track, pan } => {
+                // Each side moves by as much as this track's did.
+                let Some(old) = self.project.track(track).map(|t| t.dual_pan) else {
+                    return Vec::new();
+                };
+                let pan = pan.clamped();
+                let base = faderframe_core::DualPan {
+                    left: self.follow_base(FollowKey::DualPan(track, false), old.left),
+                    right: self.follow_base(FollowKey::DualPan(track, true), old.right),
+                };
+                let p = &self.project;
+                let others: Vec<(TrackId, faderframe_core::DualPan)> = self
+                    .followers(track, None, |t| p.dual_panned(t))
+                    .into_iter()
+                    .map(|t| (t.id, t.dual_pan))
+                    .collect();
+                others
+                    .into_iter()
+                    .map(|(id, v)| {
+                        let left = self.follow_base(FollowKey::DualPan(id, false), v.left);
+                        let right = self.follow_base(FollowKey::DualPan(id, true), v.right);
+                        Command::SetTrackDualPan {
+                            track: id,
+                            pan: faderframe_core::DualPan {
+                                left: (left + pan.left - base.left).clamp(-1.0, 1.0),
+                                right: (right + pan.right - base.right).clamp(-1.0, 1.0),
+                            },
                         }
                     })
                     .collect()

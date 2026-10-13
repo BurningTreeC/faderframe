@@ -13,6 +13,11 @@ const PB: usize = 128;
 const AT: usize = 129;
 const PC: usize = 130;
 
+/// A chased controller's key in [`crate::snapshot::ChasePoints`].
+pub(crate) fn chase_key(ev: MidiEvent) -> Option<u16> {
+    slot(ev).map(|(ch, i)| (ch * SLOTS + i) as u16)
+}
+
 fn slot(ev: MidiEvent) -> Option<(usize, usize)> {
     match ev {
         MidiEvent::ControlChange {
@@ -138,10 +143,14 @@ impl MidiClipPlayer {
         }
         let upto = lane.midi.partition_point(|r| r.start <= pos);
         for region in lane.midi[..upto].iter().filter(|r| r.end > pos) {
-            for &(time, ev) in &region.events {
-                if time >= pos {
-                    break;
-                }
+            // From the chase point before `pos` (not the region's start).
+            let to = region.events.partition_point(|(time, _)| *time < pos);
+            let chase = &mut self.chase;
+            let from = region.chase.load(to, |key, ev| {
+                let key = usize::from(key);
+                chase[key / SLOTS][key % SLOTS] = Some(ev);
+            });
+            for &(_, ev) in &region.events[from..to] {
                 if let Some((ch, i)) = slot(ev) {
                     self.chase[ch][i] = Some(ev);
                 }
@@ -270,5 +279,77 @@ impl Processor<EngineContext> for MidiClipPlayer {
             slots.fill(None);
         }
         self.was_playing = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::{CHASE_EVERY, ChasePoints};
+
+    /// Starting anywhere, the values from the chase point before and the
+    /// events after it are the values a scan from the region's start finds.
+    #[test]
+    fn chase_points_give_what_a_scan_from_the_start_gives() {
+        let mut events = Vec::new();
+        let mut t = 0i64;
+        for i in 0..(CHASE_EVERY * 7 + 123) {
+            t += (i % 3) as i64;
+            let ev = match i % 5 {
+                0 => MidiEvent::ControlChange {
+                    channel: (i % 2) as u8,
+                    controller: 1,
+                    value: (i % 128) as u8,
+                },
+                1 => MidiEvent::NoteOn {
+                    channel: 0,
+                    key: 60,
+                    velocity: 100,
+                },
+                2 => MidiEvent::PitchBend {
+                    channel: 3,
+                    value: (i * 7 % 16384) as u16,
+                },
+                // A controller set once, early: points far on still know it.
+                3 if i == 3 => MidiEvent::ControlChange {
+                    channel: 9,
+                    controller: 64,
+                    value: 127,
+                },
+                3 => MidiEvent::ProgramChange {
+                    channel: 1,
+                    program: (i % 128) as u8,
+                },
+                _ => MidiEvent::NoteOff {
+                    channel: 0,
+                    key: 60,
+                    velocity: 0,
+                },
+            };
+            events.push((t, ev));
+        }
+        let points = ChasePoints::new(&events, chase_key);
+        for upto in (0..=events.len()).step_by(37).chain([events.len()]) {
+            let mut scanned = std::collections::HashMap::new();
+            for &(_, ev) in &events[..upto] {
+                if let Some(k) = chase_key(ev) {
+                    scanned.insert(k, ev);
+                }
+            }
+            let mut chased = std::collections::HashMap::new();
+            let from = points.load(upto, |k, ev| {
+                chased.insert(k, ev);
+            });
+            assert!(
+                from <= upto && upto - from <= CHASE_EVERY,
+                "{from} for {upto}"
+            );
+            for &(_, ev) in &events[from..upto] {
+                if let Some(k) = chase_key(ev) {
+                    chased.insert(k, ev);
+                }
+            }
+            assert_eq!(chased, scanned, "up to event {upto}");
+        }
     }
 }

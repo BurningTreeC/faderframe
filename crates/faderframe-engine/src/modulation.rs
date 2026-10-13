@@ -40,24 +40,47 @@ pub const MAX_NOTE_MODS: usize = 256;
 /// Voices a plugin node follows for per-note modulation.
 pub const MAX_NOTE_VOICES: usize = 32;
 
+/// Blocks of modulation a [`ModBus`] remembers: a node behind that many
+/// blocks of latency still reads what its audio was modulated with.
+pub const MOD_HISTORY: usize = 1024;
+
 /// The outputs of a track's modulators this block (bipolar ones −1..1,
 /// unipolar ones 0..1; 0 when off), in the order of the track's
 /// [`TrackModulation::modulators`]. Written by its [`ModNode`], read by the
 /// plugin nodes and the strip after it, and by the UI.
+///
+/// It remembers the last [`MOD_HISTORY`] blocks, each stamped with the
+/// frame its audio came in at (the graph's frame counter less the
+/// modulators' input latency): a plugin or strip `L` frames behind reads
+/// the block its audio passed the modulators in ([`Self::slot_at`]), not
+/// the newest — plugin delay compensation for modulation. Atomics only:
+/// written by one node, read by the nodes after it in the same callback.
 #[derive(Debug)]
 pub struct ModBus {
     outputs: [AtomicF32; MAX_MODULATORS],
+    stamps: Box<[std::sync::atomic::AtomicI64]>,
+    values: Box<[AtomicF32]>,
+    /// Blocks recorded so far (the next one goes to `written % MOD_HISTORY`).
+    written: std::sync::atomic::AtomicUsize,
 }
 
 impl Default for ModBus {
     fn default() -> Self {
         Self {
             outputs: std::array::from_fn(|_| AtomicF32::new(0.0)),
+            stamps: (0..MOD_HISTORY)
+                .map(|_| std::sync::atomic::AtomicI64::new(0))
+                .collect(),
+            values: (0..MOD_HISTORY * MAX_MODULATORS)
+                .map(|_| AtomicF32::new(0.0))
+                .collect(),
+            written: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
 
 impl ModBus {
+    /// The newest output of modulator `i` (what the UI shows).
     #[inline]
     pub fn get(&self, i: usize) -> f32 {
         self.outputs
@@ -69,6 +92,61 @@ impl ModBus {
     fn set(&self, i: usize, v: f32) {
         if let Some(o) = self.outputs.get(i) {
             o.store(v, Ordering::Relaxed);
+        }
+    }
+
+    /// Record a block: its modulators' outputs, stamped `frame` (the frame
+    /// its audio came in at). A stamp older than the newest (the modulators
+    /// moved to another graph) starts the history again.
+    fn record(&self, frame: i64, outputs: &[f32; MAX_MODULATORS]) {
+        let mut w = self.written.load(Ordering::Relaxed);
+        if w > 0 && self.stamps[(w - 1) % MOD_HISTORY].load(Ordering::Relaxed) > frame {
+            w = 0;
+        }
+        let k = w % MOD_HISTORY;
+        self.stamps[k].store(frame, Ordering::Relaxed);
+        for (i, v) in outputs.iter().enumerate() {
+            self.values[k * MAX_MODULATORS + i].store(*v, Ordering::Relaxed);
+            self.set(i, *v);
+        }
+        self.written.store(w + 1, Ordering::Release);
+    }
+
+    /// The recorded block that holds `frame` (the newest stamped at or
+    /// before it; the oldest kept if all are later) — `None` before any.
+    pub fn slot_at(&self, frame: i64) -> Option<usize> {
+        let w = self.written.load(Ordering::Acquire);
+        if w == 0 {
+            return None;
+        }
+        let stamp = |abs: usize| self.stamps[abs % MOD_HISTORY].load(Ordering::Relaxed);
+        let (mut lo, mut hi) = (w - w.min(MOD_HISTORY), w - 1);
+        if stamp(hi) <= frame {
+            return Some(hi % MOD_HISTORY);
+        }
+        if stamp(lo) > frame {
+            return Some(lo % MOD_HISTORY);
+        }
+        // The last stamped at or before `frame`: stamp(lo) <= frame < stamp(hi).
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if stamp(mid) <= frame {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        Some(lo % MOD_HISTORY)
+    }
+
+    /// Modulator `i`'s output in a recorded block (`None`: the newest).
+    #[inline]
+    pub fn get_in(&self, slot: Option<usize>, i: usize) -> f32 {
+        match slot {
+            Some(k) if i < MAX_MODULATORS => {
+                self.values[k * MAX_MODULATORS + i].load(Ordering::Relaxed)
+            }
+            _ => self.get(i),
         }
     }
 }
@@ -130,9 +208,15 @@ impl TrackModulation {
 
     /// This block's offsets of the fader (in travel) and the pan.
     pub fn strip(&self) -> (f32, f32) {
+        self.strip_at(None)
+    }
+
+    /// The offsets of the fader and the pan for audio that came in at
+    /// `frame` ([`ModBus::slot_at`]; `None`: the newest).
+    pub fn strip_at(&self, slot: Option<usize>) -> (f32, f32) {
         let (mut volume, mut pan) = (0.0, 0.0);
         for r in self.routes.iter().filter(|r| !self.per_note(r)) {
-            let m = r.depth * r.range * self.bus.get(r.modulator);
+            let m = r.depth * r.range * self.bus.get_in(slot, r.modulator);
             match r.target {
                 ModTarget::Volume => volume += m,
                 ModTarget::Pan => pan += m,
@@ -145,6 +229,17 @@ impl TrackModulation {
     /// This block's modulation of `plugin`'s parameters into `out`
     /// (cleared first; never grows it past [`MAX_PARAM_MODS`]).
     pub fn plugin_mods(&self, plugin: PluginInstanceId, out: &mut Vec<ParamMod>) {
+        self.plugin_mods_at(plugin, out, None);
+    }
+
+    /// [`Self::plugin_mods`] for audio in a recorded block (a plugin behind
+    /// latency; `None`: the newest).
+    pub fn plugin_mods_at(
+        &self,
+        plugin: PluginInstanceId,
+        out: &mut Vec<ParamMod>,
+        slot: Option<usize>,
+    ) {
         out.clear();
         for r in self.routes.iter().filter(|r| !self.per_note(r)) {
             let ModTarget::Plugin {
@@ -157,7 +252,7 @@ impl TrackModulation {
             if p != plugin {
                 continue;
             }
-            let share = r.depth * self.bus.get(r.modulator);
+            let share = r.depth * self.bus.get_in(slot, r.modulator);
             if let Some(last) = out.last_mut()
                 && last.parameter == parameter
             {
@@ -319,6 +414,9 @@ pub struct ModNode {
     keys: Vec<TrackId>,
     sample_rate: f64,
     states: [ModState; MAX_MODULATORS],
+    /// How late its input is: blocks are stamped with the frame their
+    /// audio came in at.
+    input_latency: u32,
 }
 
 impl ModNode {
@@ -328,6 +426,7 @@ impl ModNode {
             keys,
             sample_rate,
             states: [ModState::default(); MAX_MODULATORS],
+            input_latency: 0,
         }
     }
 
@@ -429,6 +528,10 @@ fn follow(
 }
 
 impl Processor<EngineContext> for ModNode {
+    fn set_input_latency(&mut self, frames: u32) {
+        self.input_latency = frames;
+    }
+
     fn process(&mut self, cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
         if let Some(out) = io.audio_out.first_mut() {
             match io.audio_in.first() {
@@ -441,9 +544,12 @@ impl Processor<EngineContext> for ModNode {
         };
         let t = &cx.data.transport;
         let (n, sr) = (io.frames, self.sample_rate);
+        let mut outputs = [0.0f32; MAX_MODULATORS];
         for (i, m) in tm.modulators.iter().take(MAX_MODULATORS).enumerate() {
-            // Per-note sources: the plugin nodes that get the notes.
+            // Per-note sources: the plugin nodes that get the notes (they
+            // show it on the bus).
             if m.source.per_note() {
+                outputs[i] = tm.bus.get(i);
                 continue;
             }
             self.claim(i, m.id);
@@ -480,8 +586,12 @@ impl Processor<EngineContext> for ModNode {
                 ModSource::Macro { value } => value.clamp(0.0, 1.0),
                 _ => 0.0,
             };
-            tm.bus.set(i, if m.enabled { v } else { 0.0 });
+            outputs[i] = if m.enabled { v } else { 0.0 };
         }
+        tm.bus.record(
+            cx.data.history.chunk_start() - i64::from(self.input_latency),
+            &outputs,
+        );
     }
 
     fn reset(&mut self) {

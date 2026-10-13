@@ -27,6 +27,7 @@ pub mod picture_out;
 pub mod pitch;
 mod polypitch;
 pub mod setlist;
+mod speakers;
 pub mod spectral;
 mod structure;
 pub use performance::{Load, PerformanceReport, PluginPerformance, TrackPerformance};
@@ -57,6 +58,7 @@ pub mod lanes;
 pub mod launcher;
 pub mod leadsheet;
 pub mod listening;
+pub mod metronome;
 pub mod outputs;
 mod programs;
 mod redraw;
@@ -124,6 +126,7 @@ use faderframe_workspace::{
     DockAreaId, LayoutError, ViewId, WindowGeometry, WindowId, WorkspaceSet,
 };
 pub use media::{ImportJob, ImportTarget};
+pub use metronome::{MetronomeSettings, MetronomeSound};
 pub use midi::{
     KEYBOARD_PORT, LiveNote, MidiOutputStatus, MidiPortStatus, MidiPreferences, StepInput,
 };
@@ -380,6 +383,21 @@ pub enum Action {
     ImportAdm(std::path::PathBuf),
     /// The mono check (listening only).
     SetMonoCheck(bool),
+    /// Bass management of the speaker monitoring (listening only).
+    SetBassManagement(faderframe_core::surround::BassManagement),
+    /// Low-latency monitoring on or off (see
+    /// [`Session::set_low_latency_monitoring`]).
+    SetLowLatencyMonitoring(bool),
+    /// The latency an effect on a monitored path keeps (ms).
+    SetLowLatencyLimit(f32),
+    /// Keep a speaker layout in the project's library (`replace`: the
+    /// name of the one it replaces; tracks using that one move to it).
+    SaveSpeakerLayout {
+        replace: Option<String>,
+        layout: faderframe_core::surround::LayoutDef,
+    },
+    /// Take a speaker layout no track uses out of the library.
+    RemoveSpeakerLayout(String),
     /// Listen on headphones (binaural, with a room) or speakers (`None`).
     SetHeadphones(Option<faderframe_binaural::Room>),
     /// Listen through a head (a built-in id, or `sofa:<path>`).
@@ -1087,6 +1105,8 @@ pub struct EditorSettings {
     /// The Pitch editor finds every note, chords too (off: one line of
     /// notes, played live with formants kept).
     pub pitch_polyphonic: bool,
+    /// Stop puts the playhead at the start of the project.
+    pub stop_to_start: bool,
     pub counter_unit: CounterUnit,
     /// The transport display's big and small counters (`None` for the
     /// small one: timecode when the project has video or a timecode,
@@ -1127,6 +1147,7 @@ impl Default for EditorSettings {
             snap_samples: true,
             zero_crossings: false,
             pitch_polyphonic: true,
+            stop_to_start: false,
             counter_unit: CounterUnit::BarsBeats,
             main_counter: CounterUnit::BarsBeats,
             sub_counter: None,
@@ -1216,9 +1237,24 @@ pub struct RecordingView {
 struct ActiveAudio {
     stream: Box<dyn AudioStream>,
     backend: &'static str,
+    /// The CPUs kept out of deep sleep while the stream runs (where the
+    /// system lets us).
+    _wake: Option<faderframe_realtime::priority::CpuWakeLatency>,
 }
 
 /// See the crate documentation.
+/// Effects with at most this latency stay on a monitored path (ms).
+pub const DEFAULT_LOW_LATENCY_LIMIT_MS: f32 = 3.0;
+
+/// A playhead presented (see `Session::presented`).
+#[derive(Clone, Copy, Debug)]
+struct Presented {
+    pos: f64,
+    at: Instant,
+    /// The run of playback it moved in (`None`: standing).
+    run: Option<i64>,
+}
+
 pub struct Session {
     project: Project,
     history: History,
@@ -1234,6 +1270,10 @@ pub struct Session {
     pub editor: EditorSettings,
     editor_clip: Option<ClipId>,
     meters: HashMap<TrackId, MeterDisplay>,
+    /// Meter readings on their way to being shown: each track's when its
+    /// audio is heard (see `Session::tick_meters`).
+    meter_queue:
+        HashMap<TrackId, std::collections::VecDeque<(Instant, faderframe_engine::TrackMeter)>>,
     /// Quasi-peak metering as applied to the engine (its range, on).
     ppm_meters: HashMap<TrackId, (Option<faderframe_realtime::MeterRange>, bool)>,
     transport: TransportSnapshot,
@@ -1241,6 +1281,16 @@ pub struct Session {
     /// later, e.g. once render-ahead has primed it): the target, the
     /// engine's jumps when it was asked, and when.
     shown_position: Option<(i64, u32, Instant)>,
+    /// The playhead last presented (see [`Session::transport`]): its
+    /// position, when, and the run of playback it was in.
+    presented: std::cell::Cell<Option<Presented>>,
+    /// Low-latency monitoring keeps effects with at most this latency on a
+    /// live input's path (ms).
+    low_latency_limit_ms: f32,
+    /// How the metronome sounds, and the rate its sounds were made at (0:
+    /// to be made).
+    metronome: metronome::MetronomeSettings,
+    metronome_rate: u32,
     /// J/K/L shuttle in motion.
     shuttle: Option<shuttle::Shuttle>,
     /// An ADR cue playing (or recording).
@@ -1256,6 +1306,10 @@ pub struct Session {
     path: Option<PathBuf>,
     saved_revision: u64,
     revision: u64,
+    /// Bumped when only what views show changed (keys held on a MIDI
+    /// input, the launcher's clips playing): views repaint, nothing else
+    /// in the shell follows.
+    display_revision: u64,
     layout_revision: u64,
     notices: VecDeque<Notice>,
     // Media. Declared after `audio` so the stream (the page reader) is
@@ -1304,6 +1358,10 @@ pub struct Session {
     lead_sheets: leadsheet::LeadSheets,
     clip_fx: clip_fx::ClipFxState,
     spectral: spectral::SpectralState,
+    redraw: redraw::RedrawState,
+    /// Threads of the audio path that could not take their priority
+    /// (`faderframe_realtime::priority`), as last reported.
+    priority_failures: u64,
     speech: speech::SpeechState,
     launcher: launcher::LauncherState,
     control: control::ControlState,
@@ -1313,6 +1371,8 @@ pub struct Session {
     bounces: Vec<freeze::PendingBounce>,
     /// The mono check is on (listening only).
     mono_check: bool,
+    /// Bass management of the speakers (listening only).
+    bass: faderframe_core::surround::BassManagement,
     /// The headphone correction's file.
     correction_path: Option<std::path::PathBuf>,
     /// ADM BWF files being read.
@@ -1495,6 +1555,9 @@ impl Session {
         let epoch = Epoch::new();
         let (mut engine, processor) =
             faderframe_engine::create_with_epoch(config, Arc::clone(&epoch));
+        // Samplers' samples load beside the UI (opening a project does not
+        // wait for them).
+        engine.plugins().set_background_loading(true);
         let (midi, midi_queue) = midi::MidiState::new();
         engine.set_midi_input(midi_queue)?;
         engine.set_midi_output(midi.renew_output_queue())?;
@@ -1519,9 +1582,14 @@ impl Session {
             editor: EditorSettings::default(),
             editor_clip: None,
             meters: HashMap::new(),
+            meter_queue: HashMap::new(),
             ppm_meters: HashMap::new(),
             transport: TransportSnapshot::default(),
             shown_position: None,
+            presented: std::cell::Cell::new(None),
+            low_latency_limit_ms: DEFAULT_LOW_LATENCY_LIMIT_MS,
+            metronome: metronome::MetronomeSettings::default(),
+            metronome_rate: 0,
             shuttle: None,
             adr_run: None,
             picture_out: None,
@@ -1532,6 +1600,7 @@ impl Session {
             path: None,
             saved_revision: 0,
             revision: 0,
+            display_revision: 0,
             layout_revision: 0,
             notices: VecDeque::new(),
             epoch,
@@ -1567,6 +1636,8 @@ impl Session {
             lead_sheets: leadsheet::LeadSheets::default(),
             clip_fx: clip_fx::ClipFxState::default(),
             spectral: spectral::SpectralState::default(),
+            redraw: redraw::RedrawState::default(),
+            priority_failures: 0,
             speech: speech::SpeechState::default(),
             launcher: launcher::LauncherState::default(),
             control: control::ControlState::default(),
@@ -1574,6 +1645,7 @@ impl Session {
             gesture_base: HashMap::new(),
             bounces: Vec::new(),
             mono_check: false,
+            bass: faderframe_core::surround::BassManagement::default(),
             correction_path: None,
             adm_imports: Vec::new(),
             samplings: Vec::new(),
@@ -1716,13 +1788,100 @@ impl Session {
         self.shown_position = Some((position, self.transport.jumps, Instant::now()));
     }
 
+    /// The transport as the user should see it now: playing, recording,
+    /// looping as the engine is; the position the one being *heard* —
+    /// the engine processes the graph's output latency (plugin delay
+    /// compensation) and the device's buffers ahead of the speakers. A
+    /// locate or stop shows where it went at once and waits there until
+    /// its audio arrives; between the engine's callbacks the position
+    /// moves on at the playback rate (computed when asked, so a view
+    /// painting gets its frame's position).
     pub fn transport(&self) -> TransportSnapshot {
-        self.transport
+        let mut t = self.transport;
+        if self.shown_position.is_none()
+            && let Some(p) = self.presented(Instant::now())
+        {
+            t.position = p;
+        }
+        t
     }
 
+    /// Read the meters and show each reading when its audio is heard: a
+    /// track's meter measures its strip as it is processed, which reaches
+    /// the speakers the graph's latency after that point (buses, the
+    /// master's devices, compensation — `EngineController::meter_delay`)
+    /// and the device's later. The ballistics run on the readings as they
+    /// are shown; peaks and overs are kept, just later.
+    fn tick_meters(&mut self, dt: f32) {
+        /// Readings kept per track (seconds of them at the tick rate).
+        const MAX_QUEUED: usize = 1024;
+        let now = Instant::now();
+        let rate = f64::from(self.engine.sample_rate().max(1));
+        let device = f64::from(self.engine.device_latency());
+        for t in &self.project.tracks {
+            let frames = f64::from(self.engine.meter_delay(t.id)) + device;
+            let due = now + std::time::Duration::from_secs_f64(frames / rate);
+            let queue = self.meter_queue.entry(t.id).or_default();
+            if let Some(m) = self.engine.take_meter(t.id) {
+                if queue.len() >= MAX_QUEUED {
+                    queue.pop_front();
+                }
+                queue.push_back((due, m));
+            }
+            let ready = queue.iter().take_while(|(at, _)| *at <= now).count();
+            if ready > 0 {
+                let shown = self.meters.entry(t.id).or_default();
+                let step = dt / ready as f32;
+                for (_, m) in queue.drain(..ready) {
+                    shown.update(&m, step);
+                }
+            }
+        }
+    }
+
+    /// The playhead heard now (see [`Self::transport`]).
     pub fn playhead(&self) -> MusicalTime {
         self.engine
-            .samples_to_musical(&self.project, self.transport.position)
+            .samples_to_musical(&self.project, self.transport().position)
+    }
+
+    /// The timeline position being processed (ahead of what is heard by
+    /// the output latency) — for timing work against the engine, not for
+    /// showing.
+    pub fn processing_position(&self) -> i64 {
+        self.engine.transport_snapshot().position
+    }
+
+    /// The heard position at `now`, steadied: callbacks are stamped when
+    /// they start, which jitters, so the playhead moves at the playback
+    /// rate and eases onto the measured position (within ~0.2 s) instead of
+    /// stepping with each callback; a loop wrap, locate, start or stop (a
+    /// new run, or a measured position far off) is taken as it is. `None`
+    /// without a running stream.
+    fn presented(&self, now: Instant) -> Option<i64> {
+        self.audio.as_ref()?;
+        let h = self.engine.heard_at(now)?;
+        let measured = h.jumped.unwrap_or(h.position) as f64;
+        let steady = h.jumped.is_none() && h.playing;
+        let pos = match self.presented.get() {
+            Some(last) if steady && last.run == Some(h.run) => {
+                let dt = now.saturating_duration_since(last.at).as_secs_f64();
+                let predicted = last.pos + dt * h.per_second;
+                let error = measured - predicted;
+                if error.abs() > h.per_second * 0.05 {
+                    measured
+                } else {
+                    predicted + error * (dt / 0.2).min(1.0)
+                }
+            }
+            _ => measured,
+        };
+        self.presented.set(Some(Presented {
+            pos,
+            at: now,
+            run: steady.then_some(h.run),
+        }));
+        Some(pos.round() as i64)
     }
 
     pub fn metrics(&self) -> &MetricsSnapshot {
@@ -1745,6 +1904,17 @@ impl Session {
     /// Bumped on every model change (views may cache against it).
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Bumped when only what views show changed (see the field): the
+    /// shell repaints them.
+    pub fn display_revision(&self) -> u64 {
+        self.display_revision
+    }
+
+    /// Something views show changed, not the model.
+    pub(crate) fn shown_changed(&mut self) {
+        self.display_revision += 1;
     }
 
     /// Bumped when the dock layout must be rebuilt by the shell.
@@ -1919,9 +2089,22 @@ impl Session {
         self.capture_plugin_states();
         let position = self.transport.position;
         self.engine_config.sample_rate = self.engine.sample_rate();
+        // Listening carries over (the new engine has its own link), and
+        // low-latency monitoring.
+        let listen = self.engine.listening().clone();
+        let low_latency = self.engine.low_latency_monitoring();
         let (engine, processor) =
             faderframe_engine::create_with_epoch(self.engine_config, Arc::clone(&self.epoch));
         self.engine = engine;
+        self.engine.plugins().set_background_loading(true);
+        self.engine.set_head(listen.head);
+        self.engine.set_headphone_correction(listen.correction);
+        self.engine.set_binaural(listen.binaural);
+        self.engine.set_mono_check(self.mono_check)?;
+        self.engine.set_bass_management(self.bass)?;
+        self.engine.set_low_latency_monitoring(low_latency);
+        self.apply_low_latency_limit();
+        self.reapply_metronome();
         // A new meter bank: quasi-peak metering applied again.
         self.ppm_meters.clear();
         self.engine.set_midi_input(self.midi.renew_queue())?;
@@ -2017,6 +2200,7 @@ impl Session {
                     self.audio = Some(ActiveAudio {
                         stream,
                         backend: backend.id(),
+                        _wake: faderframe_realtime::priority::CpuWakeLatency::hold(),
                     });
                     self.set_engine_rate(info.sample_rate)?;
                     self.notify(NoticeLevel::Info, format!("audio: {info}"));
@@ -2091,6 +2275,95 @@ impl Session {
         self.mono_check
     }
 
+    /// Bass management of the speakers (listening only: renders stay as
+    /// mixed). Heard at once; applies where the master's speakers have an
+    /// LFE channel ([`Self::bass_management_applies`]).
+    pub fn set_bass_management(
+        &mut self,
+        bass: faderframe_core::surround::BassManagement,
+    ) -> Result<()> {
+        let bass = bass.clamped();
+        self.engine.set_bass_management(bass)?;
+        self.bass = bass;
+        self.revision += 1;
+        Ok(())
+    }
+
+    pub fn bass_management(&self) -> faderframe_core::surround::BassManagement {
+        self.bass
+    }
+
+    /// Low-latency monitoring: tracks heard live (a monitored hardware
+    /// input, or played from a MIDI keyboard) skip plugin delay
+    /// compensation — their effects with latency are bypassed and they are
+    /// summed as they come, so the player hears themselves at once rather
+    /// than after the slowest plugin elsewhere. Playback of every other
+    /// track stays aligned; takes are placed as always; renders never
+    /// monitor this way.
+    pub fn set_low_latency_monitoring(&mut self, on: bool) -> Result<()> {
+        if self.engine.low_latency_monitoring() == on {
+            return Ok(());
+        }
+        self.apply_low_latency_limit();
+        self.engine.set_low_latency_monitoring(on);
+        self.sync(Impact::Graph)?;
+        self.revision += 1;
+        Ok(())
+    }
+
+    pub fn low_latency_monitoring(&self) -> bool {
+        self.engine.low_latency_monitoring()
+    }
+
+    /// Effects on a live input's path — the track heard live and the buses,
+    /// returns and master after it — with more latency than `ms` are
+    /// bypassed while monitoring low-latency (at most 50 ms).
+    pub fn set_low_latency_limit(&mut self, ms: f32) -> Result<()> {
+        let ms = if ms.is_finite() {
+            ms.clamp(0.0, 50.0)
+        } else {
+            0.0
+        };
+        if ms == self.low_latency_limit_ms {
+            return Ok(());
+        }
+        self.low_latency_limit_ms = ms;
+        self.apply_low_latency_limit();
+        if self.engine.low_latency_monitoring() {
+            self.sync(Impact::Graph)?;
+        }
+        self.revision += 1;
+        Ok(())
+    }
+
+    pub fn low_latency_limit(&self) -> f32 {
+        self.low_latency_limit_ms
+    }
+
+    /// The limit in frames at the engine's rate.
+    fn apply_low_latency_limit(&mut self) {
+        let frames =
+            f64::from(self.low_latency_limit_ms) * f64::from(self.engine.sample_rate()) / 1000.0;
+        self.engine.set_low_latency_limit(frames.round() as u32);
+    }
+
+    /// The tracks low-latency monitoring applies to now (heard live), and
+    /// the effects it bypasses on them.
+    pub fn low_latency_tracks(&self) -> (Vec<TrackId>, Vec<faderframe_core::PluginInstanceId>) {
+        let mut tracks: Vec<TrackId> = self.engine.low_latency_tracks().iter().copied().collect();
+        tracks.sort_by_key(|t| self.project.track_index(*t));
+        (tracks, self.engine.bypassed_for_monitoring().to_vec())
+    }
+
+    /// Whether the master's speakers have a subwoofer channel to manage.
+    pub fn bass_management_applies(&self) -> bool {
+        self.project.master().is_some_and(|m| {
+            faderframe_core::surround::BassManagement::applies_to(
+                self.project.destination_layout(m),
+            )
+        })
+    }
+
     /// Listen on headphones: the master rendered binaurally with `room`
     /// (`None`: speakers). Listening only.
     pub fn set_headphones(&mut self, room: Option<faderframe_binaural::Room>) -> Result<()> {
@@ -2098,7 +2371,8 @@ impl Session {
             return Ok(());
         }
         self.engine.set_binaural(room);
-        self.sync(Impact::Graph)?;
+        // Crossfaded into the running engine, no rebuild.
+        self.engine.relisten(&self.project);
         self.revision += 1;
         Ok(())
     }
@@ -2256,6 +2530,20 @@ impl Session {
 
     /// Poll the engine (call once per UI frame). `dt` is in seconds.
     pub fn tick(&mut self, dt: f32) {
+        let failures = faderframe_realtime::priority::priority_failures();
+        if failures > self.priority_failures {
+            if self.priority_failures == 0 {
+                self.notify(
+                    NoticeLevel::Warning,
+                    "Some audio threads could not get realtime priority: other programs can \
+                     interrupt them (dropouts under load). Allow realtime scheduling for your \
+                     user (the realtime or audio group: RLIMIT_RTPRIO), or install RealtimeKit \
+                     (rtkit), which grants it on request",
+                );
+            }
+            self.priority_failures = failures;
+        }
+        self.tick_metronome();
         self.poll_jobs();
         self.poll_bounces();
         self.poll_adm_imports();
@@ -2357,11 +2645,7 @@ impl Session {
                 self.ppm_meters.insert(t.id, (range, wanted));
             }
         }
-        for t in &self.project.tracks {
-            if let Some(m) = self.engine.take_meter(t.id) {
-                self.meters.entry(t.id).or_default().update(&m, dt);
-            }
-        }
+        self.tick_meters(dt);
         if self.last_metrics.elapsed().as_millis() >= 250 {
             self.metrics = self.engine.metrics();
             self.last_metrics = Instant::now();
@@ -2531,6 +2815,7 @@ impl Session {
         self.poll_lead_sheets();
         self.poll_clip_fx();
         self.poll_spectral();
+        self.poll_redraws();
         self.poll_speech();
         let mut i = 0;
         while i < self.peak_jobs.len() {
@@ -2830,6 +3115,7 @@ impl Session {
         self.saved_revision = self.history.revision();
         self.selection.clear();
         self.meters.clear();
+        self.meter_queue.clear();
         self.ppm_meters.clear();
         self.sources.clear();
         self.peaks.clear();
@@ -2918,6 +3204,9 @@ impl Session {
         }
         let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
         let project_media = dir.join(MEDIA_FOLDER);
+        // Redrawn audio in the clips first (its files are in the media
+        // folder that may move).
+        self.wait_for_redraws();
         if self.unsaved_media {
             self.consolidate_media(&project_media);
         }
@@ -3474,6 +3763,13 @@ impl Session {
             Action::ClipEffects { clip, op } => self.edit_clip_fx(clip, op)?,
             Action::ImportAdm(path) => self.start_adm_import(path),
             Action::SetMonoCheck(on) => self.set_mono_check(on)?,
+            Action::SetBassManagement(b) => self.set_bass_management(b)?,
+            Action::SetLowLatencyMonitoring(on) => self.set_low_latency_monitoring(on)?,
+            Action::SetLowLatencyLimit(ms) => self.set_low_latency_limit(ms)?,
+            Action::SaveSpeakerLayout { replace, layout } => {
+                self.save_speaker_layout(replace.as_deref(), layout)?;
+            }
+            Action::RemoveSpeakerLayout(name) => self.remove_speaker_layout(&name)?,
             Action::SetHeadphones(room) => self.set_headphones(room)?,
             Action::SetHead(id) => self.set_head(&id)?,
             Action::SetHeadphoneCorrection(path) => {
@@ -3975,6 +4271,7 @@ impl Session {
                     EditFlag::SnapToSamples => e.snap_samples = on,
                     EditFlag::SnapToZeroCrossings => e.zero_crossings = on,
                     EditFlag::PolyphonicPitch => e.pitch_polyphonic = on,
+                    EditFlag::StopToStart => e.stop_to_start = on,
                 }
                 if matches!(
                     flag,
@@ -4114,7 +4411,7 @@ impl Session {
                     self.engine.transport(TransportCommand::Stop)?;
                     self.stop_recording()?;
                     self.automation_stop_sent();
-                    self.return_to_play_start()?;
+                    self.after_stop()?;
                 } else if self.recording.is_some() {
                     self.stop_recording()?;
                 } else {
@@ -4126,7 +4423,7 @@ impl Session {
                     self.engine.transport(TransportCommand::Stop)?;
                     self.stop_recording()?;
                     self.automation_stop_sent();
-                    self.return_to_play_start()?;
+                    self.after_stop()?;
                 } else {
                     self.play()?;
                 }
@@ -4400,6 +4697,22 @@ impl Session {
                 },
             ],
         )
+    }
+
+    /// Whether samplers are still loading samples their state names (in
+    /// the background, after opening a project).
+    pub fn samples_loading(&mut self) -> bool {
+        self.engine.plugins().loading()
+    }
+
+    /// Wait until samplers have their samples (tests, scripted runs).
+    pub fn wait_for_samples(&mut self) {
+        let start = std::time::Instant::now();
+        // The tick polls the plugins (and acts on what they ask for).
+        while self.samples_loading() && start.elapsed() < std::time::Duration::from_secs(60) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            self.tick(0.002);
+        }
     }
 
     /// A built-in plugin's tap: its live parameters (automation included),
@@ -4772,6 +5085,16 @@ impl Session {
     /// into its slot.
     pub(crate) fn capture_plugin_state(&mut self, id: faderframe_core::PluginInstanceId) {
         let state = self.engine.plugin_state(id);
+        self.store_plugin_state(id, state);
+    }
+
+    /// Put a state taken from a plugin (and the values its own editor
+    /// set) into its slot.
+    pub(crate) fn store_plugin_state(
+        &mut self,
+        id: faderframe_core::PluginInstanceId,
+        state: Option<String>,
+    ) {
         let project = &mut self.project;
         let slots = project.tracks.iter_mut().flat_map(|t| t.slots_mut()).chain(
             project
@@ -4876,6 +5199,27 @@ impl Session {
         out
     }
 
+    /// How a track's stereo source can be panned (balance or dual pan);
+    /// empty unless a stereo source feeds a stereo destination. Switching
+    /// keeps both settings and their automation.
+    pub fn pan_mode_choices(&self, track: TrackId) -> Vec<InputChoice> {
+        let Some(t) = self.project.track(track) else {
+            return Vec::new();
+        };
+        if !self.project.pans_stereo(t) {
+            return Vec::new();
+        }
+        faderframe_core::PanMode::ALL
+            .into_iter()
+            .map(|mode| InputChoice {
+                label: mode.label().into(),
+                action: Action::Edit(Command::SetTrackPanMode { track, mode }),
+                checked: t.pan_mode == mode,
+                group_start: false,
+            })
+            .collect()
+    }
+
     /// The channel formats a track can have (audio tracks, buses, auxes and
     /// the master): mono, stereo and each surround bed. Tracks feeding a
     /// bed are panned into it, a bed feeding a smaller format is folded.
@@ -4905,6 +5249,27 @@ impl Session {
             push(
                 format!("{} ({} channels)", f.name(), f.channels()),
                 ChannelLayout::Surround(*f),
+                i == 0,
+            );
+        }
+        // The project's own layouts (and one the track has from
+        // elsewhere, a preset's).
+        let mut custom: Vec<SurroundFormat> = self
+            .project
+            .speaker_layouts
+            .iter()
+            .filter_map(|d| d.intern().ok())
+            .collect();
+        if let ChannelLayout::Surround(f) = t.layout
+            && f.custom().is_some()
+            && !custom.contains(&f)
+        {
+            custom.push(f);
+        }
+        for (i, f) in custom.into_iter().enumerate() {
+            push(
+                format!("{} ({} channels)", f.name(), f.channels()),
+                ChannelLayout::Surround(f),
                 i == 0,
             );
         }
@@ -5378,6 +5743,19 @@ impl Session {
 
     /// "Insertion follows playback" off: stopping returns to where
     /// playback started.
+    /// Where the playhead goes when playback stops: the start of the
+    /// project ([`EditFlag::StopToStart`]), where playback started, or it
+    /// stays ([`EditFlag::InsertionFollowsPlayback`]).
+    fn after_stop(&mut self) -> Result<()> {
+        if self.editor.stop_to_start {
+            self.play_started_at = None;
+            self.engine.transport(TransportCommand::Locate(0))?;
+            self.show_position(0);
+            return Ok(());
+        }
+        self.return_to_play_start()
+    }
+
     fn return_to_play_start(&mut self) -> Result<()> {
         if let Some(pos) = self.play_started_at.take()
             && !self.editor.insertion_follows_playback

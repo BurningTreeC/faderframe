@@ -29,7 +29,20 @@ pub struct AudioClipPlayer {
     psola: Vec<PsolaVoice>,
     /// Blocks processed (voices free up when their clip stopped playing).
     cycle: u64,
+    /// Voices primed in this callback, and until when more may be (a
+    /// prime runs the stretcher's whole latency, about a millisecond: at
+    /// a loop start every warped clip would prime at once). One always
+    /// may; the others play their block silent and prime in the next.
+    primes: u32,
+    prime_until: Option<std::time::Instant>,
+    /// In the live graph (realtime): offline renders and tracks rendered
+    /// ahead prime every voice at once (exact, no deadline).
+    live: bool,
 }
+
+/// Share of a callback's duration the voices of one clip player may spend
+/// priming.
+const PRIME_SHARE: f64 = 0.25;
 
 /// Voices a track's clip player gets.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -185,8 +198,17 @@ impl AudioClipPlayer {
             voices: Vec::new(),
             psola: Vec::new(),
             cycle: 0,
+            primes: 0,
+            prime_until: None,
+            live: false,
             latency: 0,
         }
+    }
+
+    /// In the live graph: voices prime within a share of each callback.
+    pub fn live(mut self, live: bool) -> Self {
+        self.live = live;
+        self
     }
 
     /// Report delay already baked into frozen audio; do not delay it again.
@@ -222,6 +244,9 @@ impl AudioClipPlayer {
             voices,
             psola,
             cycle: 0,
+            primes: 0,
+            prime_until: None,
+            live: false,
             latency: 0,
         }
     }
@@ -420,10 +445,21 @@ impl AudioClipPlayer {
                 continue;
             };
             let cycle = self.cycle;
+            let may_prime = self.primes == 0
+                || self
+                    .prime_until
+                    .is_none_or(|until| std::time::Instant::now() < until);
             let v = &mut self.voices[vi];
             let rel_a = a - w.region.start;
             if v.bound != Some((w.key, a)) {
+                if !may_prime {
+                    // Over this callback's budget: silent now, primed (at
+                    // where it then is) in the next.
+                    v.last_cycle = cycle;
+                    continue;
+                }
                 v.prime(w, rel_a);
+                self.primes += 1;
             }
             let n = (b - a) as usize;
             let li = v.stretcher.input_latency() as f64;
@@ -455,6 +491,13 @@ impl Processor<EngineContext> for AudioClipPlayer {
         };
         out.clear();
         self.cycle += 1;
+        self.primes = 0;
+        self.prime_until = self.live.then(|| {
+            std::time::Instant::now()
+                + std::time::Duration::from_secs_f64(
+                    io.frames as f64 / cx.sample_rate.max(1.0) * PRIME_SHARE,
+                )
+        });
         let t = &cx.data.transport;
         if !t.playing {
             return;

@@ -1030,8 +1030,38 @@ impl ArrangerView {
         p: &mut dyn Painter,
         model: &Session,
         clip: ClipId,
-        _content: Rect,
+        content: Rect,
+        span: &crate::WaveSpan,
     ) {
+        // Strokes released and still being written into a copy.
+        let pending = model.pending_redraws(clip);
+        if !pending.is_empty()
+            && span.warp.is_none()
+            && let Some(peaks) = model.peaks(span.source)
+        {
+            let map = crate::FrameMap::of(span, model);
+            let lanes = Self::wave_lanes(content, peaks.channels());
+            let color = self.theme.ui.accent;
+            for (channel, start, values) in pending {
+                let Some((lane, _)) = lanes.get(channel.unwrap_or(0)) else {
+                    continue;
+                };
+                let (half, mid) = (lane.h * 0.46, lane.center().y);
+                let mut path = faderframe_ui_canvas::Path::new();
+                for (i, v) in values.iter().enumerate() {
+                    let pt = Point::new(
+                        self.x_of_sample(model, map.sample_of(start + i as i64)),
+                        mid - (v * map.gain).clamp(-1.0, 1.0) * half,
+                    );
+                    if i == 0 {
+                        path.move_to(pt);
+                    } else {
+                        path.line_to(pt);
+                    }
+                }
+                p.stroke_path(&path, 1.6, color);
+            }
+        }
         let Some(EditDrag::Redraw {
             clip: c,
             map,

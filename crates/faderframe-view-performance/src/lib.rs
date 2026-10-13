@@ -443,10 +443,15 @@ impl PerformanceView {
         );
         let format = if report.sample_rate > 0 && report.buffer_size > 0 {
             format!(
-                "{} Hz · {} frames · {:.2} ms per buffer",
+                "{} Hz · {} frames · {:.2} ms per buffer · compensation {} · heard {} later",
                 report.sample_rate,
                 report.buffer_size,
-                report.buffer_size as f64 * 1000.0 / report.sample_rate as f64
+                report.buffer_size as f64 * 1000.0 / report.sample_rate as f64,
+                frames_and_ms(report.output_latency, report.sample_rate),
+                frames_and_ms(
+                    report.output_latency + report.device_latency,
+                    report.sample_rate
+                ),
             )
         } else {
             "no audio stream".into()
@@ -533,11 +538,18 @@ impl PerformanceView {
             l4,
             &if report.threads > 1 {
                 format!(
-                    "{} threads · {} jobs · {:.1} busy at once",
-                    report.threads, report.graph_jobs, report.parallelism
+                    "{} threads · {} jobs · {:.1} busy at once{}",
+                    report.threads,
+                    report.graph_jobs,
+                    report.parallelism,
+                    low_latency_note(report)
                 )
             } else {
-                format!("1 thread · {} jobs", report.graph_jobs)
+                format!(
+                    "1 thread · {} jobs{}",
+                    report.graph_jobs,
+                    low_latency_note(report)
+                )
             },
             t.ui.text_faint,
         );
@@ -812,6 +824,14 @@ impl PerformanceView {
                         1 => "1 plugin".to_string(),
                         n => format!("{n} plugins"),
                     };
+                    // Its path's latency, or the compensation it waits for.
+                    let plugins = if tr.latency > 0 {
+                        format!("{plugins} · {} smp", tr.latency)
+                    } else if tr.waits > 0 {
+                        format!("{plugins} · waits {}", tr.waits)
+                    } else {
+                        plugins
+                    };
                     self.paint_numbers(p, &cols, tr.load, scale, &plugins, t.ui.text_faint, false);
                 }
                 Row::Plugin(ti, pi) => {
@@ -860,6 +880,8 @@ impl PerformanceView {
                         ("failed".to_string(), pt.load_critical)
                     } else if pl.bypassed {
                         ("bypassed".to_string(), t.ui.text_faint)
+                    } else if pl.monitoring {
+                        ("bypassed while monitoring".to_string(), pt.graph_peak)
                     } else if pl.latency > 0 {
                         (format!("{} smp latency", pl.latency), pt.graph_peak)
                     } else {
@@ -1135,4 +1157,24 @@ pub fn visible_rows(
             Row::Mixing(_) => None,
         })
         .collect()
+}
+
+/// `n smp (x.x ms)` at `rate`.
+fn frames_and_ms(frames: u32, rate: u32) -> String {
+    if rate == 0 {
+        return format!("{frames} smp");
+    }
+    format!(
+        "{frames} smp ({:.1} ms)",
+        f64::from(frames) * 1000.0 / f64::from(rate)
+    )
+}
+
+/// "· low-latency monitoring: n tracks" while it applies to any.
+fn low_latency_note(report: &PerformanceReport) -> String {
+    match report.low_latency_tracks {
+        0 => String::new(),
+        1 => " · low-latency monitoring: 1 track".to_string(),
+        n => format!(" · low-latency monitoring: {n} tracks"),
+    }
 }

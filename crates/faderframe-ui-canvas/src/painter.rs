@@ -1,5 +1,21 @@
 use crate::{Color, Image, Paint, Path, Point, Rect, TextStyle};
 
+/// Draw `draw` (everything inside `rect`) through a picture the painter
+/// keeps under `key`, shown again while the key is the same: a layer that
+/// rarely changes under one that does (a waveform under the playhead) is
+/// then not drawn again when the frame is. `key` must stand for all the
+/// drawing depends on (its size, colours, data and zoom).
+pub fn kept(p: &mut dyn Painter, key: u64, rect: Rect, draw: impl FnOnce(&mut dyn Painter)) {
+    if p.show_kept(key, rect) {
+        return;
+    }
+    let keeping = p.begin_keep(key, rect);
+    draw(p);
+    if keeping {
+        p.end_keep();
+    }
+}
+
 /// Drawing backend used by every custom view.
 ///
 /// Coordinates are logical pixels; the backend maps them to device pixels
@@ -51,6 +67,21 @@ pub trait Painter {
     fn scale_factor(&self) -> f32 {
         1.0
     }
+
+    /// Show the picture kept under `key` in `rect`: `true` when there is
+    /// one (see [`kept`]). Painters that keep nothing say `false`.
+    fn show_kept(&mut self, _key: u64, _rect: Rect) -> bool {
+        false
+    }
+
+    /// Draw what follows, until [`Painter::end_keep`], as a picture kept
+    /// under `key` and shown in `rect` (`false`: nothing is kept this
+    /// time — what follows is drawn as usual and `end_keep` not called).
+    fn begin_keep(&mut self, _key: u64, _rect: Rect) -> bool {
+        false
+    }
+
+    fn end_keep(&mut self) {}
 
     // --- convenience ------------------------------------------------------
 

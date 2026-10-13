@@ -36,6 +36,7 @@ faderframe-audio-jack = { path = "crates/faderframe-audio-jack" }
 faderframe-audio-pipewire = { path = "crates/faderframe-audio-pipewire" }
 faderframe-audio-files = { path = "crates/faderframe-audio-files" }
 faderframe-plugin-host = { path = "crates/faderframe-plugin-host" }
+faderframe-plugin-check = { path = "crates/faderframe-plugin-check" }
 faderframe-plugin-clap = { path = "crates/faderframe-plugin-clap" }
 faderframe-plugin-vst3 = { path = "crates/faderframe-plugin-vst3" }
 faderframe-plugin-sandbox = { path = "crates/faderframe-plugin-sandbox" }

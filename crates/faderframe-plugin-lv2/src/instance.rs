@@ -450,6 +450,7 @@ impl PluginInstance for Lv2Instance {
     }
 
     fn poll(&mut self) -> PluginPoll {
+        crate::features::flush_audio_log();
         self.pump_ui();
         let restart = self.shared.latency_changed.swap(false, Ordering::Relaxed);
         if restart {

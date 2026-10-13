@@ -147,10 +147,15 @@ impl Session {
         self.analysis.pos = self.engine.scope().written();
     }
 
-    /// Feed the audio that arrived since the last tick (from `tick`).
+    /// Feed the audio heard since the last tick (from `tick`): the scope
+    /// takes the analysed track's audio as it is processed; it is heard
+    /// the latency still ahead of it later (the graph's after its strip,
+    /// and the device's), so it is read that far behind.
     pub(crate) fn poll_analysis(&mut self, dt: f32) {
         let rate = self.engine.sample_rate();
         let source = self.analysis_source();
+        let ahead = source.map_or(0, |t| u64::from(self.engine.meter_delay(t)))
+            + u64::from(self.engine.device_latency());
         let a = &mut self.analysis;
         if a.analyzer.sample_rate() != rate {
             a.analyzer = Analyzer::new(rate);
@@ -167,8 +172,12 @@ impl Session {
         // newest ones may still be the previous source's.
         match source.and_then(|t| scope.run_of(t.raw())) {
             Some(since) => {
-                let (pos, _lost) = scope.read_since(a.pos.max(since), &mut a.left, &mut a.right);
-                a.pos = pos;
+                let until = scope.written().saturating_sub(ahead);
+                let from = a.pos.max(since);
+                if from < until {
+                    let (pos, _lost) = scope.read_between(from, until, &mut a.left, &mut a.right);
+                    a.pos = pos;
+                }
             }
             None => a.pos = scope.written(),
         }

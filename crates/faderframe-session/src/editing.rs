@@ -216,6 +216,10 @@ pub enum EditFlag {
     SnapToZeroCrossings,
     /// The Pitch editor finds every note, chords too.
     PolyphonicPitch,
+    /// Stop puts the playhead at the start of the project (off: back to
+    /// where playback started, or where it stopped with
+    /// [`EditFlag::InsertionFollowsPlayback`]).
+    StopToStart,
 }
 
 /// How far a cut looks for a zero crossing, each side (seconds).

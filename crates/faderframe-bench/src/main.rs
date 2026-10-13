@@ -11,6 +11,18 @@
 //! `--plugin clap:<id>` / `vst3:<id>` / `lv2:<uri>` an installed plugin (from the
 //! application's scan caches) to every track, to measure plugin load.
 //!
+//! `--pan mono|balance|dual` sets how the tracks are panned (mono tracks,
+//! stereo balance — the default — or stereo dual pan) and
+//! `--pan-automation` sweeps their pan lanes (steps and slopes), to compare
+//! the panners' cost. `--bed 5.1|7.1|7.1.4` makes the master and the buses
+//! that surround format (the tracks are panned into them by
+//! `--panner room|vbap`: mono tracks as points, stereo ones (`balance`) as
+//! images, `dual` each channel at its own direction) and `--headphones`
+//! listens to the master binaurally. `--latency N` puts N frames of plugin
+//! latency first on every other track (plugin delay compensation: the
+//! others are delayed to meet them; automation behind it is read back
+//! through the play history).
+//!
 //! Example: `cargo run -p faderframe-bench --release -- --tracks 128 --block 64 --rate 96000`
 
 #![forbid(unsafe_code)]
@@ -55,6 +67,28 @@ struct Args {
     ahead: Option<u64>,
     /// Render buses ahead too.
     ahead_buses: bool,
+    /// How the tracks are panned.
+    pan: PanBench,
+    /// Pan lanes sweeping every track.
+    pan_automation: bool,
+    /// The master and buses are this bed.
+    bed: Option<faderframe_core::SurroundFormat>,
+    /// How tracks are placed into the bed.
+    panner: faderframe_core::surround::SurroundPanner,
+    /// The master heard binaurally.
+    headphones: bool,
+    /// Plugin latency first on every other track (frames; 0: none).
+    latency: u32,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PanBench {
+    /// Mono tracks: mono pan by the pan law.
+    Mono,
+    /// Stereo tracks balanced.
+    Balance,
+    /// Stereo tracks dual-panned.
+    Dual,
 }
 
 fn parse() -> Result<Args, String> {
@@ -76,6 +110,12 @@ fn parse() -> Result<Args, String> {
         paced: false,
         ahead: None,
         ahead_buses: false,
+        pan: PanBench::Balance,
+        pan_automation: false,
+        bed: None,
+        panner: faderframe_core::surround::SurroundPanner::Room,
+        headphones: false,
+        latency: 0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -111,6 +151,33 @@ fn parse() -> Result<Args, String> {
             }
             "--fx" => a.fx = num("--fx")?.parse().map_err(|_| "bad --fx")?,
             "--paced" => a.paced = true,
+            "--pan" => {
+                a.pan = match num("--pan")?.as_str() {
+                    "mono" => PanBench::Mono,
+                    "balance" => PanBench::Balance,
+                    "dual" => PanBench::Dual,
+                    _ => return Err("--pan needs mono, balance or dual".into()),
+                }
+            }
+            "--pan-automation" => a.pan_automation = true,
+            "--bed" => {
+                let v = num("--bed")?;
+                a.bed = Some(
+                    faderframe_core::SurroundFormat::ALL
+                        .into_iter()
+                        .find(|f| f.name() == v)
+                        .ok_or("--bed needs a format like 5.1, 7.1 or 7.1.4")?,
+                );
+            }
+            "--panner" => {
+                a.panner = match num("--panner")?.as_str() {
+                    "room" => faderframe_core::surround::SurroundPanner::Room,
+                    "vbap" => faderframe_core::surround::SurroundPanner::Vbap,
+                    _ => return Err("--panner needs room or vbap".into()),
+                }
+            }
+            "--headphones" => a.headphones = true,
+            "--latency" => a.latency = num("--latency")?.parse().map_err(|_| "bad --latency")?,
             "--ahead-buses" => a.ahead_buses = true,
             "--ahead" => {
                 a.ahead = Some(num("--ahead")?.parse().map_err(|_| "bad --ahead")?);
@@ -135,7 +202,7 @@ fn parse() -> Result<Args, String> {
             }
             "-h" | "--help" => {
                 println!(
-                    "faderframe-bench [--tracks N] [--block FRAMES] [--rate HZ] [--seconds S] [--buses N] [--no-inserts] [--no-sends] [--measure-nodes] [--threads N] [--fx N] [--plugin clap:<id>|vst3:<id>|lv2:<uri>] [--paced] [--ahead MS] [--ahead-buses] [--crosstalk] [--preamp 0..5] [--mono-source]"
+                    "faderframe-bench [--tracks N] [--block FRAMES] [--rate HZ] [--seconds S] [--buses N] [--no-inserts] [--no-sends] [--measure-nodes] [--threads N] [--fx N] [--plugin clap:<id>|vst3:<id>|lv2:<uri>] [--paced] [--ahead MS] [--ahead-buses] [--crosstalk] [--preamp 0..5] [--mono-source] [--pan mono|balance|dual] [--pan-automation] [--bed 5.1|7.1|7.1.4] [--panner room|vbap] [--headphones] [--latency FRAMES]"
                 );
                 std::process::exit(0);
             }
@@ -146,9 +213,107 @@ fn parse() -> Result<Args, String> {
     Ok(a)
 }
 
+/// The track panned as `--pan` asks, with sweeping lanes for
+/// `--pan-automation` (a step and a slope every quarter).
+fn pan_track(p: &mut Project, t: &mut Track, args: &Args, i: usize) {
+    use faderframe_automation::{
+        AutomationCurve, AutomationLane, AutomationMode, AutomationPoint, AutomationTarget,
+        CurveShape,
+    };
+    use faderframe_core::SurroundParam as P;
+    use faderframe_core::surround::{StereoSource, SurroundPanner};
+    if args.bed.is_some() {
+        let azimuth = 180.0 * ((i as f32 * 0.37).sin());
+        t.surround = faderframe_core::SurroundPan {
+            panner: args.panner,
+            azimuth,
+            x: (i as f32 * 0.37).sin(),
+            stereo: match args.pan {
+                PanBench::Dual => StereoSource::Dual,
+                PanBench::Balance => StereoSource::Image,
+                PanBench::Mono => StereoSource::Image,
+            },
+            left: azimuth + 40.0,
+            right: azimuth - 40.0,
+            ..faderframe_core::SurroundPan::default()
+        }
+        .clamped();
+        if args.pan == PanBench::Mono {
+            t.layout = ChannelLayout::Mono;
+        }
+    }
+    let surround_targets: &[AutomationTarget] = match (args.pan, args.panner) {
+        (PanBench::Dual, SurroundPanner::Vbap) => &[
+            AutomationTarget::Surround(P::LeftAzimuth),
+            AutomationTarget::Surround(P::RightAzimuth),
+        ],
+        (_, SurroundPanner::Vbap) => &[AutomationTarget::Surround(P::Azimuth)],
+        (_, SurroundPanner::Room) => &[AutomationTarget::Surround(P::X)],
+    };
+    let targets: &[AutomationTarget] = match args.pan {
+        _ if args.bed.is_some() => surround_targets,
+        PanBench::Mono => {
+            t.layout = ChannelLayout::Mono;
+            &[AutomationTarget::TrackPan]
+        }
+        PanBench::Balance => &[AutomationTarget::TrackPan],
+        PanBench::Dual => {
+            t.pan_mode = faderframe_core::PanMode::Dual;
+            let width = 0.3 + 0.7 * ((i as f32 * 0.53).cos() * 0.5 + 0.5);
+            t.dual_pan = faderframe_core::DualPan {
+                left: (t.pan - width).clamp(-1.0, 1.0),
+                right: (t.pan + width).clamp(-1.0, 1.0),
+            };
+            &[
+                AutomationTarget::DualPanLeft,
+                AutomationTarget::DualPanRight,
+            ]
+        }
+    };
+    if !args.pan_automation {
+        return;
+    }
+    let quarters = (args.seconds * 2.0).ceil() as usize + 1; // 120 BPM
+    for (k, &target) in targets.iter().enumerate() {
+        let flip = if k == 0 { 1.0 } else { -1.0 };
+        let curve = AutomationCurve::from_points(
+            (0..=quarters)
+                .map(|q| AutomationPoint {
+                    time: MusicalTime::from_quarters(q as f64),
+                    value: flip
+                        * (((q + i) as f64 * 0.9).sin())
+                        * match target {
+                            AutomationTarget::Surround(p) if p.wraps() => 180.0,
+                            _ => 1.0,
+                        },
+                    shape: if q % 2 == 0 {
+                        CurveShape::Step
+                    } else {
+                        CurveShape::Linear
+                    },
+                })
+                .collect(),
+        );
+        t.automation.lanes.push(AutomationLane {
+            id: p.ids.allocate(),
+            target,
+            curve,
+            mode: AutomationMode::Read,
+            visible: false,
+        });
+    }
+}
+
 fn build(args: &Args) -> Project {
     let mut p = Project::new("bench", args.rate);
     p.crosstalk = args.crosstalk;
+    let bed = args.bed.map(ChannelLayout::Surround);
+    if let Some(bed) = bed
+        && let Some(master) = p.master_id()
+        && let Some(m) = p.track_mut(master)
+    {
+        m.layout = bed;
+    }
     let bars = ((args.seconds * 2.0 / 4.0).ceil() as u32).max(1); // 120 BPM
     let drum: faderframe_core::AudioSourceId = p.ids.allocate();
     p.sources.insert(
@@ -183,7 +348,7 @@ fn build(args: &Args) -> Project {
             format!("Bus {b}"),
             TrackColor::palette(b),
         )
-        .with_layout(ChannelLayout::Stereo);
+        .with_layout(bed.unwrap_or(ChannelLayout::Stereo));
         if args.inserts {
             t.inserts.push(PluginSlot {
                 id: p.ids.allocate(),
@@ -229,6 +394,7 @@ fn build(args: &Args) -> Project {
             });
         }
         t.pan = ((i as f32 * 0.37).sin()).clamp(-1.0, 1.0);
+        pan_track(&mut p, &mut t, args, i);
         if let Some(bus) = buses.get(i % buses.len().max(1)) {
             t.output = OutputRouting::Track { track: *bus };
         }
@@ -239,6 +405,19 @@ fn build(args: &Args) -> Project {
                 level_db: -18.0,
                 tap: SendTap::PostFader,
                 enabled: true,
+            });
+        }
+        if args.latency > 0 && i % 2 == 0 {
+            t.inserts.push(PluginSlot {
+                id: p.ids.allocate(),
+                plugin: PluginRef::builtin(builtin::LATENCY_PROBE, "Latency"),
+                bypass: false,
+                parameters: vec![faderframe_project::SavedParameter {
+                    id: faderframe_core::ParameterId(0),
+                    value: f64::from(args.latency),
+                }],
+                state: None,
+                sidechain: None,
             });
         }
         if args.inserts {
@@ -341,7 +520,8 @@ fn main() {
         measure_nodes: args.measure,
         ..EngineConfig::default()
     };
-    let mut r = match OfflineRenderer::new(&project, &sources, config, args.block, 2) {
+    let outputs = args.bed.map_or(2, |f| f.channels());
+    let mut r = match OfflineRenderer::new(&project, &sources, config, args.block, outputs) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("faderframe-bench: {e}");
@@ -368,8 +548,13 @@ fn main() {
     if !failed.is_empty() {
         eprintln!("faderframe-bench: plugins failed to load: {failed:?}");
     }
+    if args.headphones {
+        r.controller
+            .set_binaural(Some(faderframe_binaural::Room::Mid));
+        r.controller.relisten(&project);
+    }
     let budget_ns = args.block as f64 * 1e9 / args.rate as f64;
-    let mut bufs = OwnedBuffers::new(2, 2, args.block);
+    let mut bufs = OwnedBuffers::new(2, outputs, args.block);
     if let Some(ms) = args.ahead {
         // The anticipator gets the cores the audio thread's pool leaves.
         let helpers = faderframe_realtime::physical_cores()

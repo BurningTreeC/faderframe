@@ -34,3 +34,6 @@ tracing.workspace = true
 [dev-dependencies]
 faderframe-guitar.workspace = true
 faderframe-analysis.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc.workspace = true

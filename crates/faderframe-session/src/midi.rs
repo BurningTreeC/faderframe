@@ -663,9 +663,10 @@ impl Session {
     /// outputs (and give back the ones they no longer use).
     pub(crate) fn apply_surface_ports(&mut self) {
         let prefs = self.midi_preferences();
-        let (ins, outs) = self.surface_ports();
+        let (ins, outs, shared) = self.surface_ports();
         self.midi.surface_inputs = ins;
         self.midi.surface_outputs = outs;
+        self.midi.hub.set_claims(shared);
         let mut inputs = prefs.disabled_inputs;
         inputs.extend(self.midi.surface_inputs.iter().cloned());
         self.midi.hub.set_disabled(inputs);
@@ -1271,7 +1272,12 @@ impl Session {
                 }
             }
             self.handle_midi_controls(&events);
-            self.revision += 1;
+            // Keys held (shown); learning shows the control it heard.
+            if self.midi.learn.is_some() {
+                self.revision += 1;
+            } else {
+                self.shown_changed();
+            }
         }
         if let Some(t) = self.midi.gesture
             && now.duration_since(t) >= GESTURE_QUIET
@@ -1690,6 +1696,16 @@ impl Session {
                 track,
                 pan: p.set(self.project.track(track)?.surround, v as f32),
             },
+            AutomationTarget::DualPanLeft | AutomationTarget::DualPanRight => {
+                Command::SetTrackDualPan {
+                    track,
+                    pan: self
+                        .project
+                        .track(track)?
+                        .dual_pan
+                        .with_side(target == AutomationTarget::DualPanRight, v as f32),
+                }
+            }
             AutomationTarget::TrackMute => Command::SetTrackMute {
                 track,
                 on: v >= 0.5,

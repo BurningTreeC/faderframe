@@ -3,7 +3,7 @@
 //! and its output port written at once, not through the engine's timed
 //! queue (LEDs, faders and displays follow the session, not the audio).
 
-use crate::{CLIENT_NAME, Captured, port_identity};
+use crate::{CLIENT_NAME, Captured};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 enum Out {
@@ -82,14 +82,16 @@ impl SurfacePorts {
         } else {
             let mut input = midir::MidiInput::new(CLIENT_NAME).map_err(|e| e.to_string())?;
             input.ignore(midir::Ignore::All);
-            let port = input
-                .ports()
+            let ports = input.ports();
+            let names: Vec<String> = ports
+                .iter()
+                .map(|p| input.port_name(p).unwrap_or_default())
+                .collect();
+            let port = crate::port_identities(names.iter().map(String::as_str))
                 .into_iter()
-                .find(|p| {
-                    input
-                        .port_name(p)
-                        .is_ok_and(|full| port_identity(&full).0 == input_key)
-                })
+                .zip(ports)
+                .find(|((key, _), _)| key == input_key)
+                .map(|(_, p)| p)
                 .ok_or_else(|| format!("no MIDI input '{input_key}'"))?;
             let conn = input
                 .connect(
@@ -105,13 +107,16 @@ impl SurfacePorts {
             None
         } else {
             let out = midir::MidiOutput::new(CLIENT_NAME).map_err(|e| e.to_string())?;
-            let port = out
-                .ports()
+            let ports = out.ports();
+            let names: Vec<String> = ports
+                .iter()
+                .map(|p| out.port_name(p).unwrap_or_default())
+                .collect();
+            let port = crate::port_identities(names.iter().map(String::as_str))
                 .into_iter()
-                .find(|p| {
-                    out.port_name(p)
-                        .is_ok_and(|full| port_identity(&full).0 == output_key)
-                })
+                .zip(ports)
+                .find(|((key, _), _)| key == output_key)
+                .map(|(_, p)| p)
                 .ok_or_else(|| format!("no MIDI output '{output_key}'"))?;
             let conn = out
                 .connect(&port, &format!("{CLIENT_NAME} surface out: {output_key}"))

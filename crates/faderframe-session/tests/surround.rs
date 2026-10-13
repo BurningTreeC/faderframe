@@ -82,9 +82,11 @@ fn a_51_mix_renders_with_its_speakers_or_folded_down() {
     let folded = render(&mut s, RenderChannels::Stereo, "stereo.wav");
     assert_eq!(folded.channels.len(), 2);
     assert_eq!(folded.channel_mask, None);
+    // By the project's downmix: a new project's −3 dB surrounds.
     assert!(
-        (folded.channels[0][at] - 0.5).abs() < 1e-4,
-        "Ls folds to the left"
+        (folded.channels[0][at] - 0.5 * std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-4,
+        "Ls folds to the left at −3 dB: {}",
+        folded.channels[0][at]
     );
     assert!(folded.channels[1][at].abs() < 1e-6);
     // Listening on headphones in mono changes no render…

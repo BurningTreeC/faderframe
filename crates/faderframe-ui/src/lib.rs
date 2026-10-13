@@ -23,11 +23,14 @@ mod gpu_win32;
 mod icons;
 mod learn;
 mod listen;
+mod metronome_prefs;
 mod midi_prefs;
+mod monitoring;
 pub mod painter;
 mod palette;
 mod paths;
 mod plugin_browser;
+mod plugin_check;
 mod plugin_window;
 pub mod plugins;
 mod preferences;
@@ -36,6 +39,7 @@ mod recent;
 mod recording;
 mod render;
 mod screenshot;
+mod speaker_layouts;
 pub mod state;
 mod style;
 mod surface_prefs;
@@ -102,13 +106,19 @@ fn start_choice(
     }
 }
 
-fn build_session(options: &RunOptions, prefs: &prefs::Preferences) -> (Session, Option<String>) {
+/// The session to start with, the start-up error, and a project to open
+/// once the window shows (opening waits for plugins and media; the window
+/// does not).
+fn build_session(
+    options: &RunOptions,
+    prefs: &prefs::Preferences,
+) -> (Session, Option<String>, Option<std::path::PathBuf>) {
     let config = EngineConfig {
         sample_rate: options.sample_rate.unwrap_or(48_000),
         ..EngineConfig::default()
     };
     let (start, gone) = start_choice(options, prefs);
-    let mut error = None;
+    let error = None;
     match &start {
         Start::Open(p) => tracing::info!("start-up: opening {}", p.display()),
         Start::New => tracing::info!("start-up: a new project"),
@@ -151,6 +161,15 @@ fn build_session(options: &RunOptions, prefs: &prefs::Preferences) -> (Session, 
         tracing::warn!("render ahead: {e}");
     }
     listen::apply_preferences(&mut session, prefs);
+    if let Err(e) = session.set_bass_management(prefs.bass_management) {
+        tracing::warn!("bass management: {e}");
+    }
+    if let Err(e) = session.set_low_latency_limit(prefs.low_latency_limit_ms) {
+        tracing::warn!("low-latency limit: {e}");
+    }
+    if let Err(e) = session.set_low_latency_monitoring(prefs.low_latency_monitoring) {
+        tracing::warn!("low-latency monitoring: {e}");
+    }
     let room = prefs
         .headphones
         .as_deref()
@@ -168,11 +187,10 @@ fn build_session(options: &RunOptions, prefs: &prefs::Preferences) -> (Session, 
         );
         recent::forget_path(&p);
     }
-    if let Start::Open(path) = &start
-        && let Err(e) = session.open(path)
-    {
-        error = Some(format!("Cannot open {}: {e}", path.display()));
-    }
+    let open = match &start {
+        Start::Open(path) => Some(path.clone()),
+        _ => None,
+    };
     if !options.import.is_empty() {
         session.import_audio(
             options.import.clone(),
@@ -182,7 +200,51 @@ fn build_session(options: &RunOptions, prefs: &prefs::Preferences) -> (Session, 
             },
         );
     }
-    (session, error)
+    (session, error, open)
+}
+
+/// Open the start-up project after the window's first frame (a notice
+/// says what is coming), then go on with `then`.
+fn open_after_first_frame(
+    state: &Rc<AppState>,
+    window: &gtk::ApplicationWindow,
+    path: std::path::PathBuf,
+    then: impl FnOnce() + 'static,
+) {
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    state.session.borrow_mut().notify(
+        faderframe_session::NoticeLevel::Info,
+        format!("Opening {name}…"),
+    );
+    state.after_change();
+    let weak = Rc::downgrade(state);
+    let once = std::cell::Cell::new(Some((path, then)));
+    window.add_tick_callback(move |_, _| {
+        // The frame this tick starts paints first: the idle comes after.
+        if let Some((path, then)) = once.take() {
+            let weak = weak.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(state) = weak.upgrade() {
+                    let opened = state.session.borrow_mut().open(&path);
+                    if let Err(e) = opened {
+                        state.report(
+                            faderframe_session::SessionError::Other(format!(
+                                "Cannot open {}: {e}",
+                                path.display()
+                            )),
+                            true,
+                        );
+                    }
+                    state.after_change();
+                }
+                then();
+            });
+        }
+        glib::ControlFlow::Break
+    });
 }
 
 fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
@@ -198,14 +260,18 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
     if swept > 0 {
         tracing::info!("removed {swept} stale scratch media folder(s)");
     }
-    let (mut session, error) = build_session(&options, &prefs);
+    let (mut session, error, open) = build_session(&options, &prefs);
     session.editor.snap = prefs.snap;
     session.editor.follow_playhead = prefs.follow_playhead;
+    session.editor.stop_to_start = prefs.stop_to_start;
     session.editor.lanes = prefs.global_lanes;
     if let Err(e) = session.dispatch(faderframe_session::Action::SetRecordSettings(
         prefs.record_settings(),
     )) {
         tracing::warn!("recording settings: {e}");
+    }
+    if let Err(e) = session.set_metronome(prefs.metronome_sound.clone()) {
+        tracing::warn!("metronome: {e}");
     }
     session.set_sync_settings(prefs.sync_settings());
     session.set_voice_settings(prefs.voice);
@@ -249,6 +315,7 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
     actions::install(&state);
     recording::install_actions(&state);
     listen::install_actions(&state);
+    monitoring::install_actions(&state);
     console::install_actions(&state);
     actions::install_window_keys(&state, &window);
     dialogs::install_close_guard(&state, &window);
@@ -264,20 +331,44 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
         state.report(faderframe_session::SessionError::Other(e), true);
     }
     // Smoke-testing aid: FADERFRAME_STARTUP_ACTIONS="play,wait:2000,stop"
-    // activates application actions shortly after start-up, in order;
-    // `wait:<ms>` pauses between them.
-    if let Ok(list) = std::env::var("FADERFRAME_STARTUP_ACTIONS") {
-        let steps: Vec<String> = list
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .collect();
-        run_startup_actions(app.clone(), steps, 0, 700);
+    // activates application actions shortly after start-up (after the
+    // start-up project opened), in order; `wait:<ms>` pauses between them.
+    let scripted = {
+        let app = app.clone();
+        move || {
+            if let Ok(list) = std::env::var("FADERFRAME_STARTUP_ACTIONS") {
+                let steps: Vec<String> = list
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect();
+                run_startup_actions(app, steps, 0, 700);
+            }
+        }
+    };
+    match open {
+        Some(path) => open_after_first_frame(&state, &window, path, scripted),
+        None => scripted(),
     }
+    // The session's tick runs with the window's frames (in their update
+    // phase, right before layout and paint: a frame shows that moment's
+    // playhead and meters, one tick per frame at the display's rate), and
+    // on a timer while no frames come (the window hidden).
+    let weak = Rc::downgrade(&state);
+    window.add_tick_callback(move |_, _| match weak.upgrade() {
+        Some(s) => {
+            s.tick();
+            glib::ControlFlow::Continue
+        }
+        None => glib::ControlFlow::Break,
+    });
     let weak = Rc::downgrade(&state);
     glib::timeout_add_local(Duration::from_millis(16), move || match weak.upgrade() {
         Some(s) => {
+            if s.ticked_within(Duration::from_millis(40)) {
+                return glib::ControlFlow::Continue;
+            }
             s.tick();
             glib::ControlFlow::Continue
         }

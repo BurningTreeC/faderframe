@@ -52,6 +52,10 @@ fn layout_for(layout: ChannelLayout) -> Layout {
             SurroundFormat::S514 => Layout::S514,
             SurroundFormat::S712 => Layout::S712,
             SurroundFormat::S714 => Layout::S714,
+            // A custom layout: the IAMF layout its speakers' labels match
+            // into (`start` refuses one they do not fit).
+            SurroundFormat::Custom(_) if f.has_heights() => Layout::S714,
+            SurroundFormat::Custom(_) => Layout::S71,
         },
         _ => Layout::Stereo,
     }
@@ -147,6 +151,26 @@ pub fn start(
     let mut project = project;
     project.loop_enabled = false;
     let plan = plan(&project);
+    // A custom layout delivers only when every speaker has its place in
+    // the IAMF layout (by label).
+    if let Some(ChannelLayout::Surround(f)) = project.master().map(|m| m.layout)
+        && f.custom().is_some()
+    {
+        let lost: Vec<&str> = f
+            .speakers()
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| !s.lfe && !plan.channels.contains(&Some(*i)))
+            .map(|(_, s)| s.label)
+            .collect();
+        if !lost.is_empty() {
+            return Err(RenderError::Iamf(format!(
+                "IAMF has no place for {} of {}: fold the master into a standard layout first",
+                lost.join(", "),
+                f.name()
+            )));
+        }
+    }
     let rate = codec.rate_for(settings.sample_rate);
     let (a, b) = crate::render::resolve_range(&project, settings.range)?;
     let sr = f64::from(rate);

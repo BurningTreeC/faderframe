@@ -163,6 +163,9 @@ fn run(
     let mut zeros: Vec<f32> = Vec::new();
     let mut result: std::io::Result<()> = Ok(());
     loop {
+        // Ahead of everything but the audio path (the capture rings hold
+        // seconds; a writer starved by other work would overrun them).
+        faderframe_realtime::priority::follow_audio(faderframe_realtime::priority::Helper::Feeder);
         let mut worked = false;
         while let Ok(h) = streams.headers.pop() {
             worked = true;
@@ -745,6 +748,10 @@ impl Session {
             Some(_) => (from, i64::MAX),
             None => self.punch_window().unwrap_or((from, i64::MAX)),
         };
+        // What the player hears comes the graph's output latency (plugin
+        // delay compensation) after it is processed: they play along with
+        // that, so every take moves back by it too.
+        let graph = i64::from(self.engine.graph_latency());
         // MIDI: input is placed one buffer late (constant latency) and heard
         // after the output latency; the take moves back by both.
         let midi = if midi_targets.is_empty() {
@@ -752,6 +759,7 @@ impl Session {
         } else {
             let shift = info.buffer_size as i64
                 + info.output_latency as i64
+                + graph
                 + self.record.latency_offset
                 + i64::from(self.engine.varispeed_delay());
             let tracks: Vec<TrackId> = midi_targets.iter().map(|t| t.track).collect();
@@ -771,6 +779,7 @@ impl Session {
                 tracks: midi_tracks,
                 latency: info.input_latency as i64
                     + info.output_latency as i64
+                    + graph
                     + 2 * i64::from(self.engine.varispeed_delay())
                     + self.record.latency_offset,
                 seen: false,
@@ -804,6 +813,7 @@ impl Session {
         let tracks = targets.iter().map(|t| t.track).chain(midi_tracks).collect();
         let latency = info.input_latency as i64
                 + info.output_latency as i64
+                + graph
                 + self.record.latency_offset
                 // Varispeed's resampler, in and out.
                 + 2 * i64::from(self.engine.varispeed_delay());

@@ -51,6 +51,23 @@ mod imp {
 
     thread_local! {
         static GPU: RefCell<State> = const { RefCell::new(State::Untried) };
+        /// Views rendering ahead: the last texture shown (and its size),
+        /// shown again until a newer frame is finished.
+        static LAST: RefCell<std::collections::HashMap<u64, Last>> =
+            RefCell::new(std::collections::HashMap::new());
+    }
+
+    /// A view's last texture: the view (it may go), the texture, its size.
+    type Last = (glib::WeakRef<gtk::Widget>, gdk::Texture, (u32, u32));
+
+    fn view_key(widget: &gtk::Widget) -> u64 {
+        widget.as_ptr() as usize as u64
+    }
+
+    /// Whether the view shows a frame behind the newest (it rendered ahead
+    /// and stopped animating): one more paint brings it up to date.
+    pub fn behind(widget: &gtk::Widget) -> bool {
+        LAST.with(|l| l.borrow().contains_key(&view_key(widget)))
     }
 
     /// Paint `width × height` logical pixels (`scale` device pixels each)
@@ -62,6 +79,7 @@ mod imp {
         width: f32,
         height: f32,
         scale: f32,
+        animating: bool,
         paint: impl FnOnce(&mut dyn Painter),
     ) -> bool {
         GPU.with(|g| {
@@ -130,7 +148,48 @@ mod imp {
             let handover = *dmabuf || share.is_some();
             #[cfg(not(windows))]
             let handover = *dmabuf;
-            match r.render_to(pw, ph, scale, handover, paint) {
+            // An animating view whose last frame went out as a dmabuf of this
+            // size renders ahead (the UI thread does not wait for the GPU);
+            // any other paint waits for its frame.
+            let key = view_key(widget);
+            let ahead = animating
+                && *dmabuf
+                && LAST.with(|l| l.borrow().get(&key).is_some_and(|e| e.2 == (pw, ph)));
+            let output = if ahead {
+                r.render_ahead(key, pw, ph, scale, paint)
+            } else {
+                r.settle(key);
+                LAST.with(|l| {
+                    let mut l = l.borrow_mut();
+                    l.remove(&key);
+                    // Views gone while animating.
+                    l.retain(|_, e| e.0.upgrade().is_some());
+                });
+                r.render_to(pw, ph, scale, handover, paint)
+            };
+            #[cfg(target_os = "linux")]
+            let keep = |texture: &gdk::Texture| {
+                if animating {
+                    LAST.with(|l| {
+                        l.borrow_mut()
+                            .insert(key, (widget.downgrade(), texture.clone(), (pw, ph)))
+                    });
+                }
+            };
+            match output {
+                Ok(faderframe_ui_gpu::Output::Pending) => {
+                    let last = LAST.with(|l| l.borrow().get(&key).map(|e| e.1.clone()));
+                    match last {
+                        Some(texture) => {
+                            snapshot.append_texture(
+                                &texture,
+                                &graphene::Rect::new(0.0, 0.0, width, height),
+                            );
+                            true
+                        }
+                        None => false,
+                    }
+                }
                 Ok(faderframe_ui_gpu::Output::Pixels(frame)) => {
                     let stride = frame.stride();
                     let texture = gdk::MemoryTexture::new(
@@ -151,6 +210,7 @@ mod imp {
                             &texture,
                             &graphene::Rect::new(0.0, 0.0, width, height),
                         );
+                        keep(&texture);
                         true
                     }
                     Err(e) => {
@@ -229,7 +289,7 @@ fn shared_texture(
 }
 
 #[cfg(feature = "gpu-painter")]
-pub use imp::paint;
+pub use imp::{behind, paint};
 
 /// Whether the display imports linear RGBA dmabufs (what the GPU painter
 /// hands over); `FADERFRAME_GPU_DMABUF=0` turns the hand-over off.
@@ -286,7 +346,13 @@ pub fn paint(
     _width: f32,
     _height: f32,
     _scale: f32,
+    _animating: bool,
     _paint: impl FnOnce(&mut dyn Painter),
 ) -> bool {
+    false
+}
+
+#[cfg(not(feature = "gpu-painter"))]
+pub fn behind(_widget: &gtk::Widget) -> bool {
     false
 }

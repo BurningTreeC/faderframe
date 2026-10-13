@@ -199,7 +199,8 @@ fn the_plus_offers_the_missing_parameters() {
     let HostRequest::ContextMenu { items, .. } = &req[0] else {
         panic!("a menu")
     };
-    assert!(items.iter().any(|m| m.label == "Pan"));
+    // The drums are stereo: their pan control is a balance.
+    assert!(items.iter().any(|m| m.label == "Balance"));
     assert!(
         !items.iter().any(|m| m.label == "Volume"),
         "already has a lane"

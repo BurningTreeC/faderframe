@@ -450,3 +450,255 @@ fn a_hui_keypad_and_its_other_zones() {
     // Nobody answers the pings: off line after a few seconds.
     assert_eq!(s.control_surface_online(), vec![None]);
 }
+
+/// A dual-panned track on the pan page: the pot moves the image as a
+/// whole (stopping at the side, keeping its width); with Shift held only
+/// the left side, with Option only the right.
+#[test]
+fn a_pan_pot_moves_a_dual_panned_image() {
+    use faderframe_core::{DualPan, PanMode};
+    use faderframe_project::Command;
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let drums = track(&s, "Drums");
+    s.dispatch(Action::Edit(Command::SetTrackPanMode {
+        track: drums,
+        mode: PanMode::Dual,
+    }))
+    .unwrap();
+    s.dispatch(Action::Edit(Command::SetTrackDualPan {
+        track: drums,
+        pan: DualPan {
+            left: -0.6,
+            right: 0.2,
+        },
+    }))
+    .unwrap();
+    let surface = s.add_virtual_surface(SurfaceKind::Mackie);
+    s.tick(0.01);
+    surface.take();
+    let dual = |s: &Session| s.project().track(drums).unwrap().dual_pan;
+    // Five ticks right: both sides move alike.
+    surface.send(&[0xB0, 0x10, 0x05]);
+    s.tick(0.01);
+    let d = dual(&s);
+    assert!(d.left > -0.6 && d.right > 0.2, "{d:?}");
+    assert!(((d.right - d.left) - 0.8).abs() < 1e-5, "width kept: {d:?}");
+    // Shift held: the left side alone.
+    let before = dual(&s);
+    surface.send(&[0x90, 0x46, 0x7F]);
+    surface.send(&[0xB0, 0x10, 0x45]);
+    s.tick(0.01);
+    surface.send(&[0x90, 0x46, 0x00]);
+    let d = dual(&s);
+    assert!(d.left < before.left && d.right == before.right, "{d:?}");
+    // Option held: the right alone.
+    let before = d;
+    surface.send(&[0x90, 0x47, 0x7F]);
+    surface.send(&[0xB0, 0x10, 0x03]);
+    s.tick(0.01);
+    surface.send(&[0x90, 0x47, 0x00]);
+    let d = dual(&s);
+    assert!(d.right > before.right && d.left == before.left, "{d:?}");
+    // Against the right side the image stops, as wide as it was.
+    s.dispatch(Action::Edit(Command::SetTrackDualPan {
+        track: drums,
+        pan: DualPan {
+            left: 0.4,
+            right: 0.95,
+        },
+    }))
+    .unwrap();
+    for _ in 0..10 {
+        surface.send(&[0xB0, 0x10, 0x0F]);
+        s.tick(0.01);
+    }
+    let d = dual(&s);
+    assert!(
+        (d.right - 1.0).abs() < 1e-5 && (d.left - 0.45).abs() < 1e-5,
+        "{d:?}"
+    );
+}
+
+/// A KeyLab Essential mk3 in its DAW program: connected on its first
+/// update, its transport plays, its absolute knob sets the pan where it
+/// is, its fader the volume; Redo redoes.
+#[test]
+fn a_keylab_essential_mk3_runs_the_transport_and_the_strips() {
+    use faderframe_control::controllers::Controller;
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let surface = s.add_virtual_surface(SurfaceKind::Controller(Controller::KeyLabEssentialMk3));
+    s.tick(0.01);
+    let sent = surface.take();
+    assert_eq!(
+        sent[0],
+        [
+            0xF0, 0x00, 0x20, 0x6B, 0x7F, 0x42, 0x02, 0x0F, 0x40, 0x5A, 0x01, 0xF7
+        ],
+        "the DAW connection"
+    );
+    let bass = track(&s, "Bass");
+    // Knob 2 hard left (absolute 0): pan −1; fader 2 at the top.
+    surface.send(&[0xB0, 97, 0]);
+    surface.send(&[0xB0, 106, 127]);
+    s.tick(0.01);
+    let t = s.project().track(bass).unwrap();
+    assert!((t.pan + 1.0).abs() < 1e-6, "{}", t.pan);
+    let top = FaderLaw::console().position_to_db(1.0);
+    assert!((t.volume_db - top).abs() < 0.01, "{}", t.volume_db);
+    // Undo the fader and the knob, then Redo.
+    s.dispatch(Action::Undo).unwrap();
+    let undone = s.project().track(bass).unwrap().volume_db;
+    surface.send(&[0xB0, 43, 127]);
+    surface.send(&[0xB0, 43, 0]);
+    s.tick(0.01);
+    assert_ne!(s.project().track(bass).unwrap().volume_db, undone, "redone");
+    // Play.
+    surface.send(&[0xB0, 21, 127]);
+    surface.send(&[0xB0, 21, 0]);
+    s.tick(0.01);
+    assert!(s.transport().playing || s.engine().transport_snapshot().playing);
+}
+
+/// An X-Touch One shows the selected track on its one strip and moves it.
+#[test]
+fn an_x_touch_one_follows_the_selection() {
+    use faderframe_control::controllers::Controller;
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let surface = s.add_virtual_surface(SurfaceKind::Controller(Controller::XTouchOne));
+    let bass = track(&s, "Bass");
+    s.dispatch(Action::SelectTracks {
+        tracks: vec![bass],
+        mode: faderframe_session::SelectMode::Replace,
+    })
+    .unwrap();
+    s.tick(0.01);
+    let names = lcd_names(&surface.take()).unwrap();
+    assert!(names.starts_with("Bass"), "{names}");
+    // Its fader (pitch bend channel 1) moves the selected track.
+    surface.send(&[0x90, 0x68, 0x7F]);
+    surface.send(&[0xE0, 0x00, 0x20]);
+    s.tick(0.01);
+    surface.send(&[0x90, 0x68, 0x00]);
+    s.tick(0.01);
+    let law = FaderLaw::console();
+    let db = s.project().track(bass).unwrap().volume_db;
+    assert!(
+        (db - law.position_to_db(4096.0 / 16383.0)).abs() < 0.01,
+        "{db}"
+    );
+}
+
+/// Find Controllers sets up a known keyboard on its DAW port (none here:
+/// no hardware; the catalogue's own detection is tested in the crate).
+#[test]
+fn finding_controllers_without_any_finds_none() {
+    let s = Session::demo(EngineConfig::default()).unwrap();
+    assert!(s.detect_control_surfaces().is_empty());
+}
+
+/// The FaderPort (2018): its fader on the selected track; Marker mode's
+/// Next goes to the next marker; Bypass bypasses the track's devices and
+/// again brings them back; Shift + Mute unmutes every track.
+#[test]
+fn a_faderport_with_one_fader_navigates_by_its_modes() {
+    use faderframe_control::controllers::Controller;
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let surface = s.add_virtual_surface(SurfaceKind::Controller(Controller::FaderPort));
+    // A track with devices (for Bypass).
+    let drums = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| !t.inserts.is_empty())
+        .unwrap()
+        .id;
+    s.dispatch(Action::SelectTracks {
+        tracks: vec![drums],
+        mode: faderframe_session::SelectMode::Replace,
+    })
+    .unwrap();
+    s.tick(0.01);
+    assert!(
+        surface.take().contains(&vec![0xA0, 0x00, 0x00]),
+        "kept alive"
+    );
+    // The fader moves the selected track.
+    surface.send(&[0x90, 0x68, 0x7F]);
+    surface.send(&[0xE0, 0x00, 0x30]);
+    s.tick(0.01);
+    surface.send(&[0x90, 0x68, 0x00]);
+    s.tick(0.01);
+    let law = FaderLaw::console();
+    let db = s.project().track(drums).unwrap().volume_db;
+    assert!(
+        (db - law.position_to_db(6144.0 / 16383.0)).abs() < 0.01,
+        "{db}"
+    );
+    // Marker mode, Next: the first marker after the playhead.
+    let first = s
+        .project()
+        .markers
+        .iter()
+        .map(|m| m.position)
+        .min()
+        .expect("the demo has markers");
+    surface.send(&[0x90, 0x3D, 0x7F]);
+    surface.send(&[0x90, 0x2F, 0x7F]);
+    s.tick(0.01);
+    assert!(
+        (s.playhead().quarters() - first.quarters()).abs() < 1e-3,
+        "{} vs {}",
+        s.playhead().quarters(),
+        first.quarters()
+    );
+    // Bypass: every device of the track off, then on again.
+    let devices = s.project().track(drums).unwrap().inserts.len();
+    assert!(devices > 0);
+    surface.send(&[0x90, 0x03, 0x7F]);
+    s.tick(0.01);
+    assert!(
+        s.project()
+            .track(drums)
+            .unwrap()
+            .inserts
+            .iter()
+            .all(|i| i.bypass)
+    );
+    surface.send(&[0x90, 0x03, 0x7F]);
+    s.tick(0.01);
+    assert!(
+        s.project()
+            .track(drums)
+            .unwrap()
+            .inserts
+            .iter()
+            .all(|i| !i.bypass)
+    );
+    // Mute, then Shift + Mute: every mute off.
+    surface.send(&[0x90, 0x10, 0x7F]);
+    s.tick(0.01);
+    assert!(s.project().track(drums).unwrap().mute);
+    surface.send(&[0x90, 0x46, 0x7F]);
+    surface.send(&[0x90, 0x10, 0x7F]);
+    surface.send(&[0x90, 0x46, 0x00]);
+    s.tick(0.01);
+    assert!(s.project().tracks.iter().all(|t| !t.mute));
+}
+
+/// The FaderPort (2018)'s F1–F4 (Shift + Master/Click/Section/Marker)
+/// switch workspaces, as the session's function keys do.
+#[test]
+fn a_faderports_function_keys_switch_workspaces() {
+    use faderframe_control::controllers::Controller;
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let surface = s.add_virtual_surface(SurfaceKind::Controller(Controller::FaderPort));
+    s.tick(0.01);
+    let before = s.playhead();
+    let layout = s.layout_revision();
+    surface.send(&[0x90, 0x46, 0x7F]);
+    surface.send(&[0x90, 0x3B, 0x7F]);
+    surface.send(&[0x90, 0x46, 0x00]);
+    s.tick(0.01);
+    assert_ne!(s.layout_revision(), layout, "a workspace switch");
+    assert_eq!(s.playhead(), before, "no marker jump");
+}

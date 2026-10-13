@@ -1,6 +1,7 @@
 //! Preferences → MIDI → Control Surfaces: Mackie Control, its extender,
-//! HUI (their MIDI ports) and OSC (UDP ports). Changes apply at once and
-//! are saved.
+//! HUI (their MIDI ports), OSC (UDP ports), the grids, and keyboards and
+//! surfaces known by name in their DAW modes (Find Controllers sets up
+//! those connected). Changes apply at once and are saved.
 
 use crate::prefs::Preferences;
 use crate::state::AppState;
@@ -124,6 +125,7 @@ fn rebuild(section: &Rc<Section>, app: &Rc<AppState>) {
                 change(i, &|s| s.kind = k, true);
             });
         }
+        kind.set_tooltip_text(s.kind.setup());
         row.append(&kind);
         if s.kind.is_midi() {
             let label = |t: &str| {
@@ -294,7 +296,7 @@ pub fn section(app: &Rc<AppState>) -> gtk::Box {
     section.list.add_css_class("boxed-list");
     root.append(&section.list);
     let add = gtk::Button::with_label("Add Control Surface");
-    add.set_halign(gtk::Align::Start);
+
     {
         let weak_app = Rc::downgrade(app);
         let weak = Rc::downgrade(&section);
@@ -308,9 +310,34 @@ pub fn section(app: &Rc<AppState>) -> gtk::Box {
             rebuild(&section, &app);
         });
     }
-    root.append(&add);
+    let find = gtk::Button::with_label("Find Controllers");
+    find.set_tooltip_text(Some(
+        "Set up the keyboards and surfaces FaderFrame knows that are connected (on their DAW ports)",
+    ));
+    {
+        let weak_app = Rc::downgrade(app);
+        let weak = Rc::downgrade(&section);
+        find.connect_clicked(move |b| {
+            let (Some(app), Some(section)) = (weak_app.upgrade(), weak.upgrade()) else {
+                return;
+            };
+            let found = app.session.borrow().detect_control_surfaces();
+            if found.is_empty() {
+                b.set_tooltip_text(Some("None found (connected and switched on?)"));
+                return;
+            }
+            let mut all = app.session.borrow().control_surfaces().to_vec();
+            all.extend(found);
+            apply(&app, all);
+            rebuild(&section, &app);
+        });
+    }
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    buttons.append(&add);
+    buttons.append(&find);
+    root.append(&buttons);
     let hint = gtk::Label::new(Some(
-        "Mackie Control (an extender shows the next strips) and HUI: choose the surface's MIDI ports — they then serve only the surface. OSC: FaderFrame listens on one UDP port and answers on the reply port (e.g. TouchOSC sending to 8000, listening on 9000). Launchpad, APC mini and Push 2: their pads play the clip launcher (Launchpads in programmer mode on their MIDI port, Push 2 in user mode on its user port).",
+        "Mackie Control (an extender shows the next strips) and HUI: choose the surface's MIDI ports — they then serve only the surface. OSC: FaderFrame listens on one UDP port and answers on the reply port (e.g. TouchOSC sending to 8000, listening on 9000). Launchpad, APC mini and Push 2: their pads play the clip launcher (Launchpads in programmer mode on their MIDI port, Push 2 in user mode on its user port). Keyboards and surfaces by name (Arturia, Novation, Korg, NI, M-Audio, Akai, Behringer, PreSonus, iCON): Find Controllers picks their DAW ports; what to do on the device shows on the name. Keyboards whose DAW controls share the keys' port keep playing.",
     ));
     hint.set_wrap(true);
     hint.set_natural_wrap_mode(gtk::NaturalWrapMode::Word);

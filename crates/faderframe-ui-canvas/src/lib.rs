@@ -35,7 +35,7 @@ pub use event::{Cursor, Key, Modifiers, PointerButton, ViewEvent};
 pub use flow::{Flow, FlowMetrics};
 pub use geometry::{Point, Rect, Size};
 pub use paint::{External, Image, Paint, Path, PathCmd, Pixels};
-pub use painter::{DrawOp, Painter, RecordingPainter};
+pub use painter::{DrawOp, Painter, RecordingPainter, kept};
 pub use text::{Align, FontFamily, FontWeight, TextStyle};
 pub use theme::{
     Accent, ArrangerTheme, ConsoleLook, ConsoleTheme, DeviceTheme, FaderStyle, KnobStyle, LedStyle,

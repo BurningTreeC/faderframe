@@ -23,6 +23,7 @@ mod build;
 mod click;
 mod context;
 mod engine;
+pub mod history;
 pub mod launch;
 pub mod midi;
 pub mod modulation;
@@ -37,11 +38,13 @@ pub mod varispeed;
 pub mod voice;
 
 pub use build::{AheadPlan, BuiltGraph, MidiRouting, NodeOwner, NodeWork, build_graph};
-pub use click::{MetronomeMode, MetronomeShared};
+pub use click::{
+    ClickKind, ClickSound, ClickSounds, MAX_CLICK_SECONDS, MetronomeMode, MetronomeShared,
+};
 pub use context::EngineContext;
 pub use engine::{
     EngineClock, EngineConfig, EngineController, EngineProcessor, EngineShared, GraphProfile,
-    METER_MAX, TrackMeter, create, create_with_epoch,
+    Heard, METER_MAX, TrackMeter, create, create_with_epoch,
 };
 pub use plugins::{ActivatedPlugin, OutputBus, PluginHost, decode_state, encode_state};
 pub use record::{RecordBlock, RecordStreams, RecordTarget};

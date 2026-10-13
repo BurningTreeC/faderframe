@@ -18,6 +18,8 @@ const MUTE: u64 = 4;
 const SOLO: u64 = 5;
 const ARM: u64 = 6;
 const INSERT: u64 = 7;
+const PAN_LEFT: u64 = 8;
+const PAN_RIGHT: u64 = 9;
 
 /// The fader's floor and top as a screen reader reports them.
 const FLOOR_DB: f64 = -80.0;
@@ -69,8 +71,36 @@ impl MixerView {
                 .on_step(volume(id, base + 0.5), volume(id, base - 0.5)),
         );
         let surround = matches!(t.layout, faderframe_core::ChannelLayout::Surround(_))
-            || model.project().surround_panned(t).is_some();
-        if t.kind != TrackKind::Vca && !surround && t.kind != TrackKind::Midi {
+            || crate::room_panned(model, t).is_some();
+        if t.kind != TrackKind::Vca
+            && !surround
+            && t.kind != TrackKind::Midi
+            && model.project().dual_panned(t)
+        {
+            // Dual pan: a slider per input channel.
+            let dual = model.shown_dual_pan(t);
+            for (i, (knob, _)) in crate::dual_pan_rects(&l).into_iter().enumerate() {
+                let right = i == 1;
+                let pan = dual.side(right);
+                let set = |p: f32| {
+                    Action::Edit(Command::SetTrackDualPan {
+                        track: id,
+                        pan: dual.with_side(right, p.clamp(-1.0, 1.0)),
+                    })
+                };
+                let (kind, name) = if right {
+                    (PAN_RIGHT, "Right Pan")
+                } else {
+                    (PAN_LEFT, "Left Pan")
+                };
+                strip = strip.child(
+                    AccessNode::new(access_id(&[kind, id.0]), AccessRole::Slider, name)
+                        .at(knob)
+                        .value(f64::from(pan), -1.0, 1.0, format_pan(pan))
+                        .on_step(set(pan + 0.05), set(pan - 0.05)),
+                );
+            }
+        } else if t.kind != TrackKind::Vca && !surround && t.kind != TrackKind::Midi {
             let pan = model.shown_pan(t);
             let set = |p: f32| {
                 Action::Edit(Command::SetTrackPan {
@@ -79,10 +109,18 @@ impl MixerView {
                 })
             };
             strip = strip.child(
-                AccessNode::new(access_id(&[PAN, id.0]), AccessRole::Slider, "Pan")
-                    .at(l.pan_knob)
-                    .value(f64::from(pan), -1.0, 1.0, format_pan(pan))
-                    .on_step(set(pan + 0.05), set(pan - 0.05)),
+                AccessNode::new(
+                    access_id(&[PAN, id.0]),
+                    AccessRole::Slider,
+                    if crate::is_balance(model, t) {
+                        "Balance"
+                    } else {
+                        "Pan"
+                    },
+                )
+                .at(l.pan_knob)
+                .value(f64::from(pan), -1.0, 1.0, format_pan(pan))
+                .on_step(set(pan + 0.05), set(pan - 0.05)),
             );
         }
         let mute = model.shown_mute(t);
@@ -181,10 +219,13 @@ mod tests {
         let names: Vec<&str> = nodes.iter().map(|n| n.label.as_str()).collect();
         assert!(names.iter().any(|n| n.starts_with("Drums")), "{names:?}");
         assert!(names.last().unwrap().ends_with("master"), "{names:?}");
-        // The first strip: volume, pan, mute, solo, arm.
+        // The first strip (stereo drums): volume, balance, mute, solo, arm.
         let first = &nodes[0];
         let kinds: Vec<&str> = first.children.iter().map(|c| c.label.as_str()).collect();
-        assert_eq!(&kinds[..5], ["Volume", "Pan", "Mute", "Solo", "Record arm"]);
+        assert_eq!(
+            &kinds[..5],
+            ["Volume", "Balance", "Mute", "Solo", "Record arm"]
+        );
         // Up on the fader raises it half a dB.
         let fader = &first.children[0];
         let before = fader.value.as_ref().unwrap().now;

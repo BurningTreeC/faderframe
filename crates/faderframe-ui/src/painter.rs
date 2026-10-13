@@ -237,10 +237,18 @@ struct TextKey {
     align: u8,
 }
 
-/// Shaped pango layouts reused across frames (most labels never change).
+/// A label's text node (none for nothing to draw), its height and the
+/// frame it was last drawn in.
+type TextNode = (Option<gsk::RenderNode>, i32, u64);
+
+/// Shaped pango layouts reused across frames (most labels never change),
+/// and the text nodes made from them: a label drawn again is its node
+/// again (under a translation), so neither pango nor GTK lays it out or
+/// measures its glyphs anew, and GTK's frame diff sees the same node.
 #[derive(Default)]
 pub struct TextCache {
     layouts: HashMap<TextKey, (pango::Layout, u64)>,
+    nodes: HashMap<(TextKey, [u32; 4]), TextNode>,
     frame: u64,
 }
 
@@ -253,10 +261,15 @@ impl TextCache {
             let keep_from = self.frame.saturating_sub(2);
             self.layouts.retain(|_, (_, used)| *used >= keep_from);
         }
+        if self.nodes.len() > Self::MAX {
+            let keep_from = self.frame.saturating_sub(2);
+            self.nodes.retain(|_, (_, _, used)| *used >= keep_from);
+        }
     }
 
     pub fn clear(&mut self) {
         self.layouts.clear();
+        self.nodes.clear();
     }
 }
 
@@ -290,7 +303,101 @@ pub struct SnapshotPainter<'a> {
     widget: &'a gtk::Widget,
     cache: &'a RefCell<TextCache>,
     paths: &'a RefCell<PathCache>,
+    kept: Option<&'a RefCell<KeptCache>>,
+    /// Pictures being drawn to keep (innermost last): drawing goes there.
+    layers: Vec<Layer>,
     scale: f32,
+}
+
+/// A picture being drawn to keep: its own snapshot (in its own
+/// coordinates), the key and where it shows (on device pixels).
+struct Layer {
+    snapshot: gtk::Snapshot,
+    key: u64,
+    rect: Rect,
+}
+
+/// Pictures views keep ([`faderframe_ui_canvas::kept`]): layers drawn
+/// once into textures and shown again while their key holds, so a frame
+/// that changes around them (the playhead over a waveform) renders a
+/// texture there instead of filling paths again with cairo.
+#[derive(Default)]
+pub struct KeptCache {
+    pictures: HashMap<u64, Kept>,
+    frame: u64,
+    bytes: usize,
+    /// Pictures made this frame (each is a render and a download).
+    made: usize,
+}
+
+struct Kept {
+    texture: gdk::Texture,
+    /// Device pixels per logical pixel it was made at, and its size.
+    scale: u32,
+    size: (i32, i32),
+    used: u64,
+}
+
+impl KeptCache {
+    /// Pictures made per frame at most: the rest draw as usual (a zoom
+    /// gesture changes every key every frame).
+    const PER_FRAME: usize = 6;
+    const MAX_BYTES: usize = 192 << 20;
+    /// Frames a picture not shown is kept (scrolled away and back).
+    const KEEP_FRAMES: u64 = 600;
+
+    pub fn begin_frame(&mut self) {
+        self.frame += 1;
+        self.made = 0;
+        let frame = self.frame;
+        if self.bytes > Self::MAX_BYTES || frame.is_multiple_of(60) {
+            let mut bytes = self.bytes;
+            self.pictures.retain(|_, k| {
+                let keep = frame - k.used <= Self::KEEP_FRAMES;
+                if !keep {
+                    bytes -= k.texture.width() as usize * k.texture.height() as usize * 4;
+                }
+                keep
+            });
+            // Still too many: the longest unseen go.
+            if bytes > Self::MAX_BYTES {
+                let mut by_age: Vec<(u64, u64)> = self
+                    .pictures
+                    .iter()
+                    .map(|(key, k)| (k.used, *key))
+                    .collect();
+                by_age.sort_unstable();
+                for (_, key) in by_age {
+                    if bytes <= Self::MAX_BYTES / 2 {
+                        break;
+                    }
+                    if let Some(k) = self.pictures.remove(&key) {
+                        bytes -= k.texture.width() as usize * k.texture.height() as usize * 4;
+                    }
+                }
+            }
+            self.bytes = bytes;
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.pictures.clear();
+        self.bytes = 0;
+    }
+}
+
+/// `rect` on whole device pixels: its corner on the pixel it is in, its
+/// size rounded up — the size by the size alone, so pictures of the same
+/// size anywhere (meters, tiles) are the same picture.
+fn on_device_pixels(rect: Rect, scale: f32) -> (Rect, (i32, i32)) {
+    let x0 = (rect.x * scale).floor();
+    let y0 = (rect.y * scale).floor();
+    let w = (rect.w * scale - 1e-3).ceil().max(0.0);
+    let h = (rect.h * scale - 1e-3).ceil().max(0.0);
+    (
+        Rect::new(x0 / scale, y0 / scale, w / scale, h / scale),
+        (w as i32, h as i32),
+    )
 }
 
 impl<'a> SnapshotPainter<'a> {
@@ -309,12 +416,31 @@ impl<'a> SnapshotPainter<'a> {
             widget,
             cache,
             paths,
+            kept: None,
+            layers: Vec::new(),
             scale,
         }
     }
 
-    fn layout(&self, text: &str, width: f32, style: &TextStyle) -> pango::Layout {
-        let key = TextKey {
+    /// Keep pictures views ask to keep in `kept`.
+    pub fn with_kept(mut self, kept: &'a RefCell<KeptCache>) -> Self {
+        self.kept = Some(kept);
+        self
+    }
+
+    /// Where drawing goes: the picture being kept, or the frame.
+    fn snap(&self) -> &gtk::Snapshot {
+        self.layers.last().map_or(self.snapshot, |l| &l.snapshot)
+    }
+
+    /// Show a kept texture in `rect` (on device pixels: drawn 1:1).
+    fn show_texture(&self, texture: &gdk::Texture, rect: Rect) {
+        self.snap()
+            .append_scaled_texture(texture, gsk::ScalingFilter::Nearest, &grect(rect));
+    }
+
+    fn text_key(text: &str, width: f32, style: &TextStyle) -> TextKey {
+        TextKey {
             text: text.to_string(),
             size: style.size.to_bits(),
             family: style.family as u8,
@@ -322,7 +448,43 @@ impl<'a> SnapshotPainter<'a> {
             tracking: style.tracking.to_bits(),
             width: width.round() as i32,
             align: style.align as u8,
-        };
+        }
+    }
+
+    /// The text node of a label at the origin and its height (made once
+    /// while it keeps being drawn).
+    fn text_node(
+        &self,
+        text: &str,
+        width: f32,
+        style: &TextStyle,
+    ) -> (Option<gsk::RenderNode>, i32) {
+        let c = style.color;
+        let key = (
+            Self::text_key(text, width, style),
+            [c.r.to_bits(), c.g.to_bits(), c.b.to_bits(), c.a.to_bits()],
+        );
+        {
+            let mut cache = self.cache.borrow_mut();
+            let frame = cache.frame;
+            if let Some((node, h, used)) = cache.nodes.get_mut(&key) {
+                *used = frame;
+                return (node.clone(), *h);
+            }
+        }
+        let layout = self.layout(text, width, style);
+        let (_, h) = layout.pixel_size();
+        let snapshot = gtk::Snapshot::new();
+        snapshot.append_layout(&layout, &rgba(c));
+        let node = snapshot.to_node();
+        let mut cache = self.cache.borrow_mut();
+        let frame = cache.frame;
+        cache.nodes.insert(key, (node.clone(), h, frame));
+        (node, h)
+    }
+
+    fn layout(&self, text: &str, width: f32, style: &TextStyle) -> pango::Layout {
+        let key = Self::text_key(text, width, style);
         let mut cache = self.cache.borrow_mut();
         let frame = cache.frame;
         if let Some((layout, used)) = cache.layouts.get_mut(&key) {
@@ -353,7 +515,7 @@ impl<'a> SnapshotPainter<'a> {
     }
 
     fn fill_paint(&self, rect: Rect, paint: &Paint) {
-        let s = self.snapshot;
+        let s = self.snap();
         match paint {
             Paint::Solid(c) => s.append_color(&rgba(*c), &grect(rect)),
             Paint::Linear {
@@ -397,9 +559,9 @@ impl Painter for SnapshotPainter<'_> {
         if radius <= 0.0 {
             return self.fill_paint(rect, paint);
         }
-        self.snapshot.push_rounded_clip(&rounded(rect, radius));
+        self.snap().push_rounded_clip(&rounded(rect, radius));
         self.fill_paint(rect, paint);
-        self.snapshot.pop();
+        self.snap().pop();
     }
 
     fn stroke_rounded(&mut self, rect: Rect, radius: f32, width: f32, color: Color) {
@@ -407,14 +569,14 @@ impl Painter for SnapshotPainter<'_> {
             return;
         }
         let c = rgba(color);
-        self.snapshot
+        self.snap()
             .append_border(&rounded(rect, radius), &[width; 4], &[c, c, c, c]);
     }
 
     fn fill_path(&mut self, path: &Path, color: Color) {
         if !path.is_empty() {
             let path = self.paths.borrow_mut().get(path);
-            self.snapshot
+            self.snap()
                 .append_fill(&path, gsk::FillRule::Winding, &rgba(color));
         }
     }
@@ -427,7 +589,7 @@ impl Painter for SnapshotPainter<'_> {
         stroke.set_line_cap(gsk::LineCap::Round);
         stroke.set_line_join(gsk::LineJoin::Round);
         let path = self.paths.borrow_mut().get(path);
-        self.snapshot.append_stroke(&path, &stroke, &rgba(color));
+        self.snap().append_stroke(&path, &stroke, &rgba(color));
     }
 
     fn fill_path_paint(&mut self, path: &Path, paint: &Paint) {
@@ -441,10 +603,10 @@ impl Painter for SnapshotPainter<'_> {
         let Some(bounds) = p.bounds() else {
             return;
         };
-        self.snapshot.push_fill(&p, gsk::FillRule::Winding);
+        self.snap().push_fill(&p, gsk::FillRule::Winding);
         let r = Rect::new(bounds.x(), bounds.y(), bounds.width(), bounds.height());
         self.fill_paint(r, paint);
-        self.snapshot.pop();
+        self.snap().pop();
     }
 
     fn image(&mut self, image: &Image, src: Rect, dst: Rect, brightness: f32) {
@@ -462,7 +624,7 @@ impl Painter for SnapshotPainter<'_> {
             image.width as f32 * sx,
             image.height as f32 * sy,
         );
-        let s = self.snapshot;
+        let s = self.snap();
         s.push_clip(&grect(dst));
         let dim = brightness < 0.999;
         if dim {
@@ -486,7 +648,7 @@ impl Painter for SnapshotPainter<'_> {
         let Some(tex) = pixel_texture(pixels) else {
             return;
         };
-        let s = self.snapshot;
+        let s = self.snap();
         s.push_clip(&grect(dst));
         s.append_scaled_texture(&tex, gsk::ScalingFilter::Linear, &grect(dst));
         s.pop();
@@ -499,7 +661,7 @@ impl Painter for SnapshotPainter<'_> {
         let Some(tex) = external_texture(image) else {
             return false;
         };
-        let s = self.snapshot;
+        let s = self.snap();
         s.push_clip(&grect(dst));
         s.append_scaled_texture(&tex, gsk::ScalingFilter::Linear, &grect(dst));
         s.pop();
@@ -507,18 +669,18 @@ impl Painter for SnapshotPainter<'_> {
     }
 
     fn push_transform(&mut self, dx: f32, dy: f32, scale: f32) {
-        self.snapshot.save();
-        self.snapshot.translate(&graphene::Point::new(dx, dy));
-        self.snapshot.scale(scale, scale);
+        self.snap().save();
+        self.snap().translate(&graphene::Point::new(dx, dy));
+        self.snap().scale(scale, scale);
     }
 
     fn pop_transform(&mut self) {
-        self.snapshot.restore();
+        self.snap().restore();
     }
 
     fn shadow(&mut self, rect: Rect, radius: f32, color: Color, dx: f32, dy: f32, blur: f32) {
         if !rect.is_empty() {
-            self.snapshot.append_outset_shadow(
+            self.snap().append_outset_shadow(
                 &rounded(rect, radius),
                 &rgba(color),
                 dx,
@@ -531,7 +693,7 @@ impl Painter for SnapshotPainter<'_> {
 
     fn inset_shadow(&mut self, rect: Rect, radius: f32, color: Color, dx: f32, dy: f32, blur: f32) {
         if !rect.is_empty() {
-            self.snapshot.append_inset_shadow(
+            self.snap().append_inset_shadow(
                 &rounded(rect, radius),
                 &rgba(color),
                 dx,
@@ -546,18 +708,20 @@ impl Painter for SnapshotPainter<'_> {
         if text.is_empty() || rect.w <= 1.0 {
             return;
         }
-        let layout = self.layout(text, rect.w, style);
-        let (_, h) = layout.pixel_size();
+        let (node, h) = self.text_node(text, rect.w, style);
+        let Some(node) = node else {
+            return;
+        };
         let y = match style.valign {
             Align::Start => rect.y,
             Align::Center => rect.y + (rect.h - h as f32) * 0.5,
             Align::End => rect.bottom() - h as f32,
         };
-        self.snapshot.save();
-        self.snapshot
+        self.snap().save();
+        self.snap()
             .translate(&graphene::Point::new(rect.x, y.round()));
-        self.snapshot.append_layout(&layout, &rgba(style.color));
-        self.snapshot.restore();
+        self.snap().append_node(&node);
+        self.snap().restore();
     }
 
     fn text_width(&mut self, text: &str, style: &TextStyle) -> f32 {
@@ -565,15 +729,111 @@ impl Painter for SnapshotPainter<'_> {
     }
 
     fn push_clip(&mut self, rect: Rect) {
-        self.snapshot.push_clip(&grect(rect));
+        self.snap().push_clip(&grect(rect));
     }
 
     fn pop_clip(&mut self) {
-        self.snapshot.pop();
+        self.snap().pop();
     }
 
     fn scale_factor(&self) -> f32 {
         self.scale
+    }
+
+    fn show_kept(&mut self, key: u64, rect: Rect) -> bool {
+        let Some(cache) = self.kept else {
+            return false;
+        };
+        let (rect, size) = on_device_pixels(rect, self.scale);
+        let mut cache = cache.borrow_mut();
+        let frame = cache.frame;
+        let Some(k) = cache.pictures.get_mut(&key) else {
+            return false;
+        };
+        if k.scale != self.scale.to_bits() || k.size != size {
+            return false;
+        }
+        k.used = frame;
+        let texture = k.texture.clone();
+        drop(cache);
+        self.show_texture(&texture, rect);
+        true
+    }
+
+    fn begin_keep(&mut self, key: u64, rect: Rect) -> bool {
+        let Some(cache) = self.kept else {
+            return false;
+        };
+        {
+            let mut cache = cache.borrow_mut();
+            if cache.made >= KeptCache::PER_FRAME || !self.layers.is_empty() {
+                return false;
+            }
+            cache.made += 1;
+        }
+        let (rect, _) = on_device_pixels(rect, self.scale);
+        let snapshot = gtk::Snapshot::new();
+        // Drawn in the picture's own coordinates.
+        snapshot.translate(&graphene::Point::new(-rect.x, -rect.y));
+        self.layers.push(Layer {
+            snapshot,
+            key,
+            rect,
+        });
+        true
+    }
+
+    fn end_keep(&mut self) {
+        let Some(layer) = self.layers.pop() else {
+            return;
+        };
+        let (rect, size) = on_device_pixels(layer.rect, self.scale);
+        let Some(node) = layer.snapshot.to_node() else {
+            return;
+        };
+        // Rendered at device pixels into a texture, kept and shown; without
+        // a renderer (not realised) the layer is just drawn.
+        let renderer = self.widget.native().and_then(|n| n.renderer());
+        let texture = renderer.filter(|_| size.0 > 0 && size.1 > 0).map(|r| {
+            let scaled = gsk::TransformNode::new(
+                &node,
+                Some(&gsk::Transform::new().scale(self.scale, self.scale)),
+            );
+            r.render_texture(
+                &scaled,
+                Some(&graphene::Rect::new(0.0, 0.0, size.0 as f32, size.1 as f32)),
+            )
+        });
+        match texture {
+            Some(texture) => {
+                if let Some(cache) = self.kept {
+                    let mut cache = cache.borrow_mut();
+                    let frame = cache.frame;
+                    cache.bytes += size.0 as usize * size.1 as usize * 4;
+                    if let Some(old) = cache.pictures.insert(
+                        layer.key,
+                        Kept {
+                            texture: texture.clone(),
+                            scale: self.scale.to_bits(),
+                            size,
+                            used: frame,
+                        },
+                    ) {
+                        cache.bytes = cache.bytes.saturating_sub(
+                            old.texture.width() as usize * old.texture.height() as usize * 4,
+                        );
+                    }
+                }
+                self.show_texture(&texture, rect);
+            }
+            None => {
+                let s = self.snap();
+                s.save();
+                s.translate(&graphene::Point::new(rect.x, rect.y));
+                s.append_node(&node);
+                s.restore();
+            }
+        }
     }
 }
 

@@ -1,7 +1,8 @@
 //! Audio → Listen: speakers or headphones (the master rendered
 //! binaurally, with a room), whose ears (a built-in head or a SOFA file),
-//! the headphone correction — all remembered — and the mono check (per
-//! session). Listening only: renders stay as mixed.
+//! the headphone correction, bass management of the speakers — all
+//! remembered — and the mono check (per session). Listening only: renders
+//! stay as mixed.
 
 use crate::prefs::Preferences;
 use crate::state::AppState;
@@ -76,6 +77,20 @@ pub fn install_actions(app: &Rc<AppState>) {
             a.dispatch(Action::SetHeadphoneCorrection(path));
         })
         .build();
+    // Bass management of the speakers (its settings in Preferences →
+    // Audio).
+    let weak = Rc::downgrade(app);
+    let bass_on = app.session.borrow().bass_management().enabled;
+    let bass = gio::ActionEntry::builder("bass-management")
+        .state(bass_on.to_variant())
+        .activate(move |_, _, _| {
+            if let Some(a) = weak.upgrade() {
+                let mut b = a.session.borrow().bass_management();
+                b.enabled = !b.enabled;
+                a.dispatch(Action::SetBassManagement(b));
+            }
+        })
+        .build();
     let weak = Rc::downgrade(app);
     let load_sofa = gio::ActionEntry::builder("load-sofa")
         .activate(move |_, _, _| {
@@ -92,8 +107,15 @@ pub fn install_actions(app: &Rc<AppState>) {
             }
         })
         .build();
-    app.app
-        .add_action_entries([listen, mono, head, correction, load_sofa, load_correction]);
+    app.app.add_action_entries([
+        listen,
+        mono,
+        bass,
+        head,
+        correction,
+        load_sofa,
+        load_correction,
+    ]);
 }
 
 #[derive(Clone, Copy)]
@@ -170,6 +192,7 @@ pub fn menu() -> gio::Menu {
     m.append_section(None, &modes);
     let mono = gio::Menu::new();
     mono.append(Some("Mono Check"), Some("app.mono-check"));
+    mono.append(Some("Bass Management"), Some("app.bass-management"));
     m.append_section(None, &mono);
     let heads = gio::Menu::new();
     let dummies = gio::Menu::new();
@@ -211,6 +234,12 @@ pub fn apply_preferences(session: &mut faderframe_session::Session, prefs: &Pref
     }
 }
 
+thread_local! {
+    /// Bass management as last seen by [`follow`].
+    static LAST_BASS: std::cell::Cell<Option<faderframe_core::surround::BassManagement>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// After a change: the menu shows what the session does, and new
 /// headphone settings are remembered.
 pub fn follow(app: &Rc<AppState>) {
@@ -249,5 +278,22 @@ pub fn follow(app: &Rc<AppState>) {
         && a.state().and_then(|v| v.get::<bool>()) != Some(mono)
     {
         a.set_state(&mono.to_variant());
+    }
+    // Bass management: shown and remembered.
+    let bass = app.session.borrow().bass_management();
+    if let Some(a) = action("bass-management")
+        && a.state().and_then(|v| v.get::<bool>()) != Some(bass.enabled)
+    {
+        a.set_state(&bass.enabled.to_variant());
+    }
+    // Saved when it changed (the file is read only then).
+    if LAST_BASS.with(|l| l.replace(Some(bass))) != Some(bass) {
+        let mut p = Preferences::load();
+        if p.bass_management != bass {
+            p.bass_management = bass;
+            if let Err(e) = p.save() {
+                tracing::warn!("cannot save preferences: {e}");
+            }
+        }
     }
 }

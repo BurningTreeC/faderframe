@@ -3,6 +3,8 @@
 use crate::prefs::Preferences;
 use crate::state::{AppState, BackendChoice};
 use faderframe_audio::{STANDARD_BUFFER_SIZES, STANDARD_SAMPLE_RATES, format_sample_rate};
+use faderframe_core::PanLaw;
+use faderframe_core::surround::{BassManagement, Downmix, DownmixMethod};
 use faderframe_project::Command;
 use faderframe_session::Action;
 use gtk::glib;
@@ -213,6 +215,9 @@ fn audio_page(app: &Rc<AppState>, alive: &Rc<std::cell::Cell<bool>>) -> gtk::Wid
         2,
         1,
     );
+
+    bass_rows(app, &g, 10);
+    monitoring_rows(app, &g, 13);
 
     let selected = move |backend: &gtk::DropDown, rate: &gtk::DropDown, buffer: &gtk::DropDown| {
         let backends = BackendChoice::available();
@@ -835,7 +840,7 @@ fn engine_page(app: &Rc<AppState>) -> gtk::Widget {
 
 fn project_page(app: &Rc<AppState>) -> gtk::Widget {
     let g = form();
-    let (name, bpm, rate, crosstalk) = {
+    let (name, bpm, rate, crosstalk, pan_law, downmix) = {
         let s = app.session.borrow();
         let p = s.project();
         (
@@ -843,6 +848,8 @@ fn project_page(app: &Rc<AppState>) -> gtk::Widget {
             p.timeline.tempo.points()[0].bpm,
             p.sample_rate,
             p.crosstalk,
+            p.pan_law,
+            p.downmix,
         )
     };
     let name_entry = gtk::Entry::new();
@@ -874,6 +881,29 @@ fn project_page(app: &Rc<AppState>) -> gtk::Widget {
             }));
         }
     });
+    let law_names: Vec<&str> = PanLaw::ALL.iter().map(|l| l.label()).collect();
+    let law = gtk::DropDown::from_strings(&law_names);
+    law.set_selected(pan_law.index() as u32);
+    law.set_tooltip_text(Some("How a mono track's pan (and each channel of a dual-panned stereo track) spreads it over a stereo destination, named by its level at centre. Stereo balance does not follow it. Saved with this project."));
+    row(&g, 5, "Pan law", &law);
+    g.attach(
+        &note("−3 dB keeps a panned mono source's power constant; −6 dB keeps its mono sum constant; −4.5 dB lies between; 0 dB leaves the centre at unity. Hard left and hard right are unity in every law."),
+        0,
+        6,
+        2,
+        1,
+    );
+    downmix_rows(app, &g, 7, downmix);
+    let weak = Rc::downgrade(app);
+    law.connect_selected_notify(move |d| {
+        if let Some(app) = weak.upgrade() {
+            let law = PanLaw::ALL
+                .get(d.selected() as usize)
+                .copied()
+                .unwrap_or_default();
+            app.dispatch(Action::Edit(Command::SetPanLaw { law }));
+        }
+    });
     let weak = Rc::downgrade(app);
     name_entry.connect_activate(move |e| {
         if let Some(app) = weak.upgrade() {
@@ -889,6 +919,242 @@ fn project_page(app: &Rc<AppState>) -> gtk::Widget {
         }
     });
     g.upcast()
+}
+
+/// Bass management of the speakers (listening only; saved with the
+/// preferences, not the project).
+fn bass_rows(app: &Rc<AppState>, g: &gtk::Grid, y: i32) {
+    let now = app.session.borrow().bass_management();
+    let on = gtk::CheckButton::with_label("High-pass the mains, their bass to the subwoofer");
+    on.set_active(now.enabled);
+    on.set_tooltip_text(Some("Only where the master's speakers have an LFE channel. Monitoring only: renders and meters stay as mixed."));
+    row(g, y, "Bass management", &on);
+    let spin = |lo: f64, hi: f64, step: f64, v: f32| {
+        let s = gtk::SpinButton::with_range(lo, hi, step);
+        s.set_digits(if step < 1.0 { 1 } else { 0 });
+        s.set_value(f64::from(v));
+        s
+    };
+    let crossover = spin(40.0, 200.0, 5.0, now.crossover);
+    let redirect = spin(-30.0, 10.0, 0.5, now.redirect_db);
+    let lfe = spin(40.0, 250.0, 5.0, now.lfe_lowpass);
+    let boxed = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    for (label, w) in [
+        ("Crossover (Hz)", &crossover),
+        ("Bass to sub (dB)", &redirect),
+        ("LFE low-pass (Hz)", &lfe),
+    ] {
+        boxed.append(&gtk::Label::new(Some(label)));
+        boxed.append(w);
+    }
+    row(g, y + 1, "", &boxed);
+    g.attach(
+        &note("Linkwitz–Riley 24 dB/oct: every main speaker is high-passed at the crossover and its bass goes to the LFE output at \"Bass to sub\" (−10 dB for a subwoofer calibrated for the LFE's +10 dB); the LFE channel is only low-passed. Layouts without an LFE channel are left alone."),
+        0,
+        y + 2,
+        2,
+        1,
+    );
+    let send = {
+        let weak = Rc::downgrade(app);
+        let (on, crossover, redirect, lfe) =
+            (on.clone(), crossover.clone(), redirect.clone(), lfe.clone());
+        Rc::new(move || {
+            if let Some(app) = weak.upgrade() {
+                app.dispatch(Action::SetBassManagement(BassManagement {
+                    enabled: on.is_active(),
+                    crossover: crossover.value() as f32,
+                    redirect_db: redirect.value() as f32,
+                    lfe_lowpass: lfe.value() as f32,
+                }));
+            }
+        })
+    };
+    {
+        let send = Rc::clone(&send);
+        on.connect_toggled(move |_| send());
+    }
+    for w in [&crossover, &redirect, &lfe] {
+        let send = Rc::clone(&send);
+        w.connect_value_changed(move |_| send());
+    }
+}
+
+/// Low-latency monitoring and the latency an effect on a monitored path
+/// keeps.
+fn monitoring_rows(app: &Rc<AppState>, g: &gtk::Grid, y: i32) {
+    let (on_now, limit_now) = {
+        let s = app.session.borrow();
+        (s.low_latency_monitoring(), s.low_latency_limit())
+    };
+    let on = gtk::CheckButton::with_label("Hear live inputs without waiting for plugin latency");
+    on.set_active(on_now);
+    row(g, y, "Low-latency monitoring", &on);
+    let limit = gtk::SpinButton::with_range(0.0, 50.0, 0.5);
+    limit.set_digits(1);
+    limit.set_value(f64::from(limit_now));
+    let boxed = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    boxed.append(&gtk::Label::new(Some(
+        "Keep effects with latency up to (ms)",
+    )));
+    boxed.append(&limit);
+    row(g, y + 1, "", &boxed);
+    g.attach(
+        &note("Tracks heard live (a monitored input, a MIDI keyboard) pass every summing point without waiting for the plugin latency elsewhere — the other audio is held back where it joins them — and effects with more latency than this on their way to the outputs (their own, the buses and returns they reach, the master) are bypassed while it is on. Playback stays aligned; recorded takes are placed as always; renders never monitor this way."),
+        0,
+        y + 2,
+        2,
+        1,
+    );
+    let weak = Rc::downgrade(app);
+    on.connect_toggled(move |b| {
+        if let Some(app) = weak.upgrade() {
+            app.dispatch(Action::SetLowLatencyMonitoring(b.is_active()));
+        }
+    });
+    let weak = Rc::downgrade(app);
+    limit.connect_value_changed(move |s| {
+        if let Some(app) = weak.upgrade() {
+            app.dispatch(Action::SetLowLatencyLimit(s.value() as f32));
+        }
+    });
+}
+
+/// The project's surround downmix: a preset, or coefficients in dB.
+fn downmix_rows(app: &Rc<AppState>, g: &gtk::Grid, y: i32, downmix: Downmix) {
+    const PRESETS: [&str; 3] = [
+        "−3 dB centre, surrounds and tops",
+        "By speaker place (older projects)",
+        "Custom",
+    ];
+    let preset = gtk::DropDown::from_strings(&PRESETS);
+    preset.set_selected(if downmix == Downmix::STANDARD {
+        0
+    } else if downmix.method == DownmixMethod::ByPlace {
+        1
+    } else {
+        2
+    });
+    preset.set_tooltip_text(Some("How surround beds fold into stereo and mono: on a stereo device, a bed bus into a stereo one, the mono check. Saved with this project."));
+    row(g, y, "Surround downmix", &preset);
+    let db = |v: f32| f64::from(faderframe_core::gain_to_db(v)).max(-60.0);
+    let spin = |v: f32| {
+        let s = gtk::SpinButton::with_range(-60.0, 6.0, 0.5);
+        s.set_digits(1);
+        s.set_value(db(v));
+        s
+    };
+    let (centre, surround, height) = (
+        spin(downmix.centre),
+        spin(downmix.surround),
+        spin(downmix.height),
+    );
+    let lfe_on = gtk::CheckButton::with_label("LFE into both sides");
+    lfe_on.set_active(downmix.lfe > 0.0);
+    let lfe = spin(if downmix.lfe > 0.0 { downmix.lfe } else { 1.0 });
+    let boxed = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    for (label, w) in [
+        ("Centre", &centre),
+        ("Surrounds", &surround),
+        ("Tops", &height),
+    ] {
+        boxed.append(&gtk::Label::new(Some(label)));
+        boxed.append(w);
+    }
+    row(g, y + 1, "Coefficients (dB)", &boxed);
+    let lfe_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    lfe_box.append(&lfe_on);
+    lfe_box.append(&lfe);
+    row(g, y + 2, "", &lfe_box);
+    g.attach(
+        &note("Lo = L + centre·C + surrounds·Ls + tops·(left tops) [+ LFE]; Ro alike. Mono is (Lo + Ro) / 2. By speaker place puts every speaker where it stands (5.1: surrounds at 0 dB). Nothing is normalised: leave headroom."),
+        0,
+        y + 3,
+        2,
+        1,
+    );
+    let custom = || {
+        let editable = preset.selected() == 2;
+        for w in [&centre, &surround, &height, &lfe] {
+            w.set_sensitive(editable);
+        }
+        lfe_on.set_sensitive(editable);
+    };
+    custom();
+    let send = {
+        let weak = Rc::downgrade(app);
+        let (preset, centre, surround, height, lfe, lfe_on) = (
+            preset.clone(),
+            centre.clone(),
+            surround.clone(),
+            height.clone(),
+            lfe.clone(),
+            lfe_on.clone(),
+        );
+        Rc::new(move || {
+            let Some(app) = weak.upgrade() else {
+                return;
+            };
+            let gain = |s: &gtk::SpinButton| faderframe_core::db_to_gain(s.value() as f32);
+            let downmix = match preset.selected() {
+                0 => Downmix::STANDARD,
+                1 => Downmix::BY_PLACE,
+                _ => Downmix {
+                    method: DownmixMethod::Coefficients,
+                    centre: gain(&centre),
+                    surround: gain(&surround),
+                    height: gain(&height),
+                    lfe: if lfe_on.is_active() { gain(&lfe) } else { 0.0 },
+                },
+            };
+            app.dispatch(Action::Edit(Command::SetDownmix { downmix }));
+        })
+    };
+    {
+        let send = Rc::clone(&send);
+        let (centre, surround, height, lfe, lfe_on) = (
+            centre.clone(),
+            surround.clone(),
+            height.clone(),
+            lfe.clone(),
+            lfe_on.clone(),
+        );
+        preset.connect_selected_notify(move |d| {
+            // A preset shows its coefficients (editable as Custom).
+            let shown = match d.selected() {
+                0 => Some(Downmix::STANDARD),
+                1 => Some(Downmix::BY_PLACE),
+                _ => None,
+            };
+            if let Some(m) = shown {
+                centre.set_value(db(m.centre));
+                surround.set_value(db(m.surround));
+                height.set_value(db(m.height));
+                lfe_on.set_active(m.lfe > 0.0);
+            }
+            let editable = d.selected() == 2;
+            for w in [&centre, &surround, &height, &lfe] {
+                w.set_sensitive(editable);
+            }
+            lfe_on.set_sensitive(editable);
+            send();
+        });
+    }
+    for w in [&centre, &surround, &height, &lfe] {
+        let send = Rc::clone(&send);
+        let preset = preset.clone();
+        w.connect_value_changed(move |_| {
+            if preset.selected() == 2 {
+                send();
+            }
+        });
+    }
+    let preset2 = preset.clone();
+    lfe_on.connect_toggled(move |_| {
+        if preset2.selected() == 2 {
+            send();
+        }
+    });
 }
 
 /// Open (or raise) the preferences window, optionally on a given page.
@@ -920,6 +1186,11 @@ pub fn open(app: &Rc<AppState>, page: Option<&str>) {
         &crate::recording::page(app, row),
         Some("recording"),
         "Recording",
+    );
+    stack.add_titled(
+        &crate::metronome_prefs::page(app, row),
+        Some("metronome"),
+        "Metronome",
     );
     stack.add_titled(&crate::midi_prefs::page(app), Some("midi"), "MIDI");
     stack.add_titled(&video_page(app), Some("video"), "Video");

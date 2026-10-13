@@ -734,6 +734,12 @@ pub struct Reservoir<P: Segments> {
     decay: f32,
     pace: Pace,
     scheduling_read: bool,
+    /// The device callback this call belongs to (its deadline), and the
+    /// timeline where it began: input given since then cannot have been
+    /// processed yet, so a call needing it must wait; frames owed from
+    /// earlier callbacks are a late worker's, concealed.
+    callback_deadline: Option<Instant>,
+    callback_t0: u64,
 }
 
 impl<P: Segments> Reservoir<P> {
@@ -791,6 +797,8 @@ impl<P: Segments> Reservoir<P> {
             decay: (-1.0 / (0.000_5 * config.sample_rate)).exp() as f32,
             pace: Pace::new(),
             scheduling_read: false,
+            callback_deadline: None,
+            callback_t0: 0,
         })
     }
 
@@ -869,6 +877,11 @@ impl<P: Segments> Reservoir<P> {
         let started = Instant::now();
         let rate = self.config.sample_rate;
         let duration = Duration::from_secs_f64(n as f64 / rate);
+        if deadline != self.callback_deadline {
+            // A new device callback.
+            self.callback_deadline = deadline;
+            self.callback_t0 = self.timeline;
+        }
         add(&self.shared.stats.callback.callbacks, 1);
         add(&self.shared.stats.callback.frames, n as u64);
         if !self.scheduling_read {
@@ -967,8 +980,12 @@ impl<P: Segments> Reservoir<P> {
                 // one ends the wait at once.
                 add(&stats.offline_waits, 1);
                 Some(started + OFFLINE_PATIENCE)
-            } else if let Some(deadline) = deadline {
-                // Host-supplied structural budget, bounded across every chunk.
+            } else if let Some(deadline) =
+                deadline.filter(|_| end > self.callback_t0 as i64)
+            {
+                // Chunks of a longer device callback needing input given in
+                // this callback: not processed yet by any worker; waited
+                // for within the host's budget for the whole callback.
                 add(&stats.structural_waits, 1);
                 Some(deadline)
             } else if structural {
@@ -977,6 +994,12 @@ impl<P: Segments> Reservoir<P> {
                 // past its period has missed its deadline anyway.
                 add(&stats.structural_waits, 1);
                 Some(started + duration)
+            } else if deadline.is_some() {
+                // Frames a late worker owes from earlier callbacks:
+                // concealed at once — waiting would spend the budget the
+                // rest of the graph needs (and split calls fool the pacing
+                // below).
+                None
             } else {
                 let allowance = self.pace.allowance(started, due);
                 if allowance > Duration::ZERO {
@@ -1144,8 +1167,16 @@ fn worker_main<P: Segments>(
                 shared.priority.load(Ordering::Relaxed),
             );
             if wanted.0 != 0 && wanted != applied {
+                // macOS: the caller's time constraint as it is; elsewhere a
+                // step below the audio thread (`crate::priority`), so the
+                // callback and its workers come first.
+                #[cfg(target_os = "macos")]
                 crate::apply_thread_scheduling(wanted.0, wanted.1);
                 applied = wanted;
+            }
+            #[cfg(not(target_os = "macos"))]
+            if wanted.0 != 0 {
+                crate::priority::follow_audio(crate::priority::Helper::Near);
             }
             if header.epoch != epoch {
                 epoch = header.epoch;

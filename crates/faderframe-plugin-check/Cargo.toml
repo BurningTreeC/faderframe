@@ -1,0 +1,21 @@
+[package]
+name = "faderframe-plugin-check"
+description = "How a plugin behaves on the audio thread: allocations, waits, page faults, time per block, reset"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-audio-graph.workspace = true
+faderframe-core.workspace = true
+faderframe-midi.workspace = true
+faderframe-plugin-host.workspace = true
+faderframe-realtime.workspace = true
+faderframe-transport.workspace = true
+serde.workspace = true
+serde_json.workspace = true

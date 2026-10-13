@@ -315,6 +315,16 @@ fn recording_and_metronome_do_not_allocate() {
     for _ in 0..4 {
         r.processor.process_device(&mut bufs);
     }
+    // Off-beats too, and other sounds handed over while armed (the old
+    // ones go back as garbage).
+    r.controller
+        .metronome()
+        .set_level(faderframe_engine::ClickKind::OffBeat, 0.5);
+    r.controller
+        .set_click_sounds(faderframe_engine::ClickSounds::synth(
+            faderframe_engine::ClickSound::Cowbell,
+            SR,
+        ));
     let (_, allocs) = armed(|| {
         for _ in 0..200 {
             r.processor.process_device(&mut bufs);
@@ -404,6 +414,545 @@ fn automation_does_not_allocate() {
         }
     });
     assert_eq!(allocs, 0, "allocations while automating");
+}
+
+/// Many ramping lanes on one plugin: hundreds of parameter events in a
+/// block, ordered in place (a stable sort would take heap scratch past a
+/// few hundred).
+#[test]
+fn many_ramping_lanes_do_not_allocate() {
+    let _serial = serial();
+    use faderframe_automation::{
+        AutomationCurve, AutomationLane, AutomationMode, AutomationPoint, AutomationTarget,
+        CurveShape,
+    };
+    use faderframe_core::{ChannelLayout, ParameterId, builtin};
+    use faderframe_plugin_host::devices::channel_strip::id;
+    use faderframe_project::{PluginRef, PluginSlot, TrackKind};
+    use faderframe_timeline::MusicalTime;
+
+    const SR: u32 = 48_000;
+    const BLOCK: usize = 1024;
+    let mut tp = common::TestProject::new(SR);
+    let t = tp.track(TrackKind::Audio, "A", ChannelLayout::Stereo);
+    let src = tp.dc(2, 0.3, 400_000);
+    tp.clip(t, src, MusicalTime::ZERO, 400_000);
+    let plugin = tp.project.ids.allocate();
+    tp.project.track_mut(t).unwrap().inserts.push(PluginSlot {
+        id: plugin,
+        plugin: PluginRef::builtin(builtin::CHANNEL_STRIP, "Channel Strip"),
+        bypass: false,
+        parameters: Vec::new(),
+        state: None,
+        sidechain: None,
+    });
+    let continuous = [
+        id::INPUT,
+        id::HPF,
+        id::LPF,
+        id::GATE_THRESHOLD,
+        id::GATE_RANGE,
+        id::GATE_ATTACK,
+        id::GATE_HOLD,
+        id::GATE_RELEASE,
+        id::COMP_THRESHOLD,
+        id::COMP_RATIO,
+        id::COMP_ATTACK,
+        id::COMP_RELEASE,
+        id::COMP_KNEE,
+        id::COMP_MAKEUP,
+        id::COMP_MIX,
+        id::LF_GAIN,
+        id::LF_FREQ,
+        id::LMF_GAIN,
+        id::LMF_FREQ,
+        id::LMF_Q,
+    ];
+    for (k, &p) in continuous.iter().enumerate() {
+        let curve = AutomationCurve::from_points(
+            (0..16)
+                .map(|i| AutomationPoint {
+                    time: MusicalTime::from_quarters(i as f64),
+                    value: ((i + k) % 5) as f64 * 0.2,
+                    shape: CurveShape::Smooth,
+                })
+                .collect(),
+        );
+        let lane = tp.project.ids.allocate();
+        tp.project
+            .track_mut(t)
+            .unwrap()
+            .automation
+            .lanes
+            .push(AutomationLane {
+                id: lane,
+                target: AutomationTarget::PluginParameter {
+                    plugin,
+                    parameter: ParameterId(p),
+                },
+                curve,
+                mode: AutomationMode::Read,
+                visible: true,
+            });
+    }
+    let config = EngineConfig {
+        sample_rate: SR,
+        max_block_size: BLOCK,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, BLOCK, 2).unwrap();
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, BLOCK);
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    let (_, allocs) = armed(|| {
+        for _ in 0..100 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(
+        allocs,
+        0,
+        "allocations with {} ramping lanes",
+        continuous.len()
+    );
+}
+
+/// Plugin delay compensation's realtime parts: automation read back
+/// behind latency (fader and plugin parameter, across loop wraps), the
+/// click as late as the graph, locates, the heard clock published every
+/// callback.
+#[test]
+fn delay_compensation_does_not_allocate() {
+    let _serial = serial();
+    use faderframe_automation::{
+        AutomationCurve, AutomationLane, AutomationMode, AutomationPoint, AutomationTarget,
+        CurveShape,
+    };
+    use faderframe_core::{ChannelLayout, ParameterId, builtin};
+    use faderframe_engine::MetronomeMode;
+    use faderframe_project::{PluginRef, PluginSlot, SavedParameter, TrackKind};
+    use faderframe_timeline::MusicalTime;
+
+    const SR: u32 = 48_000;
+    let mut tp = common::TestProject::new(SR);
+    let t = tp.track(TrackKind::Audio, "A", ChannelLayout::Stereo);
+    let dry = tp.track(TrackKind::Audio, "Dry", ChannelLayout::Stereo);
+    let src = tp.dc(2, 0.3, 200_000);
+    tp.clip(t, src, MusicalTime::ZERO, 200_000);
+    tp.clip(dry, src, MusicalTime::ZERO, 200_000);
+    let probe = tp.project.ids.allocate();
+    let gain = tp.project.ids.allocate();
+    let track = tp.project.track_mut(t).unwrap();
+    track.inserts.push(PluginSlot {
+        id: probe,
+        plugin: PluginRef::builtin(builtin::LATENCY_PROBE, "Latency"),
+        bypass: false,
+        parameters: vec![SavedParameter {
+            id: ParameterId(0),
+            value: 6400.0,
+        }],
+        state: None,
+        sidechain: None,
+    });
+    track.inserts.push(PluginSlot {
+        id: gain,
+        plugin: PluginRef::builtin(builtin::GAIN, "Gain"),
+        bypass: false,
+        parameters: Vec::new(),
+        state: None,
+        sidechain: None,
+    });
+    for target in [
+        AutomationTarget::TrackVolume,
+        AutomationTarget::PluginParameter {
+            plugin: gain,
+            parameter: ParameterId(0),
+        },
+    ] {
+        let id = tp.project.ids.allocate();
+        let curve = AutomationCurve::from_points(
+            (0..40)
+                .map(|i| AutomationPoint {
+                    time: MusicalTime::from_quarters(i as f64 * 0.05),
+                    value: -(i % 4) as f64 * 3.0,
+                    shape: CurveShape::Linear,
+                })
+                .collect(),
+        );
+        tp.project
+            .track_mut(t)
+            .unwrap()
+            .automation
+            .lanes
+            .push(AutomationLane {
+                id,
+                target,
+                curve,
+                mode: AutomationMode::Read,
+                visible: true,
+            });
+    }
+    // A loop shorter than the latency: every block reads back across wraps.
+    let end = tp.project.timeline.to_musical(5000, f64::from(SR));
+    tp.project.loop_range = faderframe_project::MusicalRange::new(MusicalTime::ZERO, end);
+    tp.project.loop_enabled = true;
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 2).unwrap();
+    r.controller.metronome().set_mode(MetronomeMode::Always);
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    let (_, allocs) = armed(|| {
+        for _ in 0..300 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations behind latency");
+    // Locates and a stop, the history and heard clock taking them.
+    for cmd in [
+        TransportCommand::Locate(48_000),
+        TransportCommand::Stop,
+        TransportCommand::Play,
+    ] {
+        r.controller.transport(cmd).unwrap();
+        let (_, allocs) = armed(|| {
+            for _ in 0..60 {
+                r.processor.process_device(&mut bufs);
+            }
+        });
+        assert_eq!(allocs, 0, "allocations after {cmd:?}");
+    }
+    assert!(r.controller.heard_snapshot().is_some());
+    // A latency changing while it plays: the output dips around the new
+    // graph (built on this thread, taken on the audio thread); a modulator
+    // behind the latency reads its history.
+    {
+        use faderframe_project::modulation::{LfoShape, ModRate, ModRoute, ModSource, ModTarget};
+        let track = tp.project.track_mut(t).unwrap();
+        track.inserts[0].parameters[0].value = 9000.0;
+        let id = tp.project.ids.allocate();
+        let mut m = faderframe_project::modulation::Modulator::new(
+            id,
+            ModSource::Lfo {
+                shape: LfoShape::Sine,
+                rate: ModRate::Sync { beats: 1.0 },
+                phase: 0.0,
+            },
+        );
+        m.routes = vec![ModRoute {
+            target: ModTarget::Volume,
+            depth: 0.1,
+        }];
+        tp.project.track_mut(t).unwrap().modulators.push(m);
+    }
+    r.controller
+        .sync(&tp.project, &tp.sources, faderframe_project::Impact::Graph)
+        .unwrap();
+    let (_, allocs) = armed(|| {
+        for _ in 0..200 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations through a latency change");
+}
+
+#[test]
+fn panning_does_not_allocate() {
+    let _serial = serial();
+    use faderframe_automation::{
+        AutomationCurve, AutomationLane, AutomationMode, AutomationPoint, AutomationTarget,
+        CurveShape,
+    };
+    use faderframe_core::{ChannelLayout, DualPan, PanLaw, PanMode};
+    use faderframe_project::TrackKind;
+    use faderframe_timeline::MusicalTime;
+
+    const SR: u32 = 48_000;
+    let mut tp = common::TestProject::new(SR);
+    let mono = tp.track(TrackKind::Audio, "Mono", ChannelLayout::Mono);
+    let src = tp.dc(1, 0.3, 200_000);
+    tp.clip(mono, src, MusicalTime::ZERO, 200_000);
+    let dual = tp.track(TrackKind::Audio, "Dual", ChannelLayout::Stereo);
+    let src = tp.dc(2, 0.3, 200_000);
+    tp.clip(dual, src, MusicalTime::ZERO, 200_000);
+    let balanced = tp.track(TrackKind::Audio, "Balanced", ChannelLayout::Stereo);
+    let src = tp.dc(2, 0.3, 200_000);
+    tp.clip(balanced, src, MusicalTime::ZERO, 200_000);
+    tp.project.track_mut(dual).unwrap().pan_mode = PanMode::Dual;
+    tp.project.track_mut(balanced).unwrap().pan = 0.4;
+    // Steps and slopes: glides and plain ramps both run.
+    let sweep = |flip: f64| {
+        AutomationCurve::from_points(
+            (0..20)
+                .map(|i| AutomationPoint {
+                    time: MusicalTime::from_quarters(i as f64 * 0.25),
+                    value: flip * if i % 2 == 0 { -1.0 } else { 0.6 },
+                    shape: if i % 3 == 0 {
+                        CurveShape::Step
+                    } else {
+                        CurveShape::Linear
+                    },
+                })
+                .collect(),
+        )
+    };
+    for (track, target, flip) in [
+        (mono, AutomationTarget::TrackPan, 1.0),
+        (dual, AutomationTarget::DualPanLeft, 1.0),
+        (dual, AutomationTarget::DualPanRight, -1.0),
+    ] {
+        let id = tp.project.ids.allocate();
+        tp.project
+            .track_mut(track)
+            .unwrap()
+            .automation
+            .lanes
+            .push(AutomationLane {
+                id,
+                target,
+                curve: sweep(flip),
+                mode: AutomationMode::Read,
+                visible: true,
+            });
+    }
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 2).unwrap();
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    let mut h = History::default();
+    let mut allocs = 0;
+    for cmd in [
+        Command::SetPanLaw {
+            law: PanLaw::Compromise4_5dB,
+        },
+        Command::SetTrackPan {
+            track: balanced,
+            pan: -1.0,
+        },
+        Command::SetTrackPanMode {
+            track: balanced,
+            mode: PanMode::Dual,
+        },
+        Command::SetTrackDualPan {
+            track: balanced,
+            pan: DualPan {
+                left: 0.5,
+                right: -0.5,
+            },
+        },
+        Command::SetTrackPanMode {
+            track: dual,
+            mode: PanMode::Balance,
+        },
+    ] {
+        let impact = h.apply(&mut tp.project, cmd).unwrap();
+        r.controller.sync(&tp.project, &tp.sources, impact).unwrap();
+        allocs += armed(|| {
+            for _ in 0..60 {
+                r.processor.process_device(&mut bufs);
+            }
+        })
+        .1;
+    }
+    assert_eq!(allocs, 0, "allocations while panning");
+}
+
+#[test]
+fn spatial_panning_does_not_allocate() {
+    let _serial = serial();
+    use faderframe_automation::{
+        AutomationCurve, AutomationLane, AutomationMode, AutomationPoint, AutomationTarget,
+        CurveShape,
+    };
+    use faderframe_core::surround::{Downmix, StereoSource, SurroundPanner};
+    use faderframe_core::{ChannelLayout, SurroundFormat, SurroundPan, SurroundParam};
+    use faderframe_project::{OutputRouting, TrackKind};
+    use faderframe_timeline::MusicalTime;
+
+    const SR: u32 = 48_000;
+    let mut tp = common::TestProject::new(SR);
+    let master = tp.master();
+    tp.project.track_mut(master).unwrap().layout = ChannelLayout::Surround(SurroundFormat::S714);
+    // A 5.1 bus into the 7.1.4 master; a mono and a dual stereo track into
+    // the bus by VBAP, a stereo one balanced into the master.
+    let bus = tp.track(
+        TrackKind::Bus,
+        "Bed",
+        ChannelLayout::Surround(SurroundFormat::S51),
+    );
+    let mono = tp.track(TrackKind::Audio, "Mono", ChannelLayout::Mono);
+    let dual = tp.track(TrackKind::Audio, "Dual", ChannelLayout::Stereo);
+    let bal = tp.track(TrackKind::Audio, "Balanced", ChannelLayout::Stereo);
+    let high = tp.track(TrackKind::Audio, "High", ChannelLayout::Mono);
+    for (t, channels) in [(mono, 1), (dual, 2), (bal, 2), (high, 1)] {
+        let src = tp.dc(channels, 0.3, 200_000);
+        tp.clip(t, src, MusicalTime::ZERO, 200_000);
+    }
+    for t in [mono, dual] {
+        tp.project.track_mut(t).unwrap().output = OutputRouting::Track { track: bus };
+    }
+    let vbap = SurroundPan {
+        panner: SurroundPanner::Vbap,
+        lfe_db: -10.0,
+        spread: 0.2,
+        ..SurroundPan::default()
+    };
+    tp.project.track_mut(mono).unwrap().surround = vbap;
+    // A diffuse spread: its decorrelation filters run too.
+    tp.project.track_mut(high).unwrap().surround = SurroundPan {
+        diffuse: true,
+        spread: 0.7,
+        ..vbap
+    };
+    tp.project.track_mut(dual).unwrap().surround = SurroundPan {
+        stereo: StereoSource::Dual,
+        ..vbap
+    };
+    tp.project.track_mut(bal).unwrap().surround = SurroundPan {
+        stereo: StereoSource::Balance,
+        ..vbap
+    };
+    let sweep = |span: f64| {
+        AutomationCurve::from_points(
+            (0..20)
+                .map(|i| AutomationPoint {
+                    time: MusicalTime::from_quarters(i as f64 * 0.25),
+                    value: if i % 2 == 0 { -span } else { span },
+                    shape: if i % 3 == 0 {
+                        CurveShape::Step
+                    } else {
+                        CurveShape::Linear
+                    },
+                })
+                .collect(),
+        )
+    };
+    for (t, target, span) in [
+        (
+            mono,
+            AutomationTarget::Surround(SurroundParam::Azimuth),
+            170.0,
+        ),
+        (
+            dual,
+            AutomationTarget::Surround(SurroundParam::LeftAzimuth),
+            150.0,
+        ),
+        (
+            dual,
+            AutomationTarget::Surround(SurroundParam::RightAzimuth),
+            120.0,
+        ),
+        (
+            high,
+            AutomationTarget::Surround(SurroundParam::Azimuth),
+            180.0,
+        ),
+        (
+            high,
+            AutomationTarget::Surround(SurroundParam::Elevation),
+            45.0,
+        ),
+        (bal, AutomationTarget::TrackPan, 1.0),
+    ] {
+        let id = tp.project.ids.allocate();
+        tp.project
+            .track_mut(t)
+            .unwrap()
+            .automation
+            .lanes
+            .push(AutomationLane {
+                id,
+                target,
+                curve: sweep(span),
+                mode: AutomationMode::Read,
+                visible: true,
+            });
+    }
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    // Twelve outputs: the master as it is (bass managed when on).
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 12).unwrap();
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 12, 256);
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    let mut h = History::default();
+    let mut allocs = armed(|| {
+        for _ in 0..120 {
+            r.processor.process_device(&mut bufs);
+        }
+    })
+    .1;
+    // A new downmix, then headphones on and off: made here, taken there.
+    let impact = h
+        .apply(
+            &mut tp.project,
+            Command::SetDownmix {
+                downmix: Downmix::BY_PLACE,
+            },
+        )
+        .unwrap();
+    r.controller.sync(&tp.project, &tp.sources, impact).unwrap();
+    for room in [Some(faderframe_binaural::Room::Mid), None] {
+        r.controller.set_binaural(room);
+        r.controller.relisten(&tp.project);
+        // Bass management on (the master's speakers have an LFE).
+        r.controller
+            .set_bass_management(faderframe_core::surround::BassManagement {
+                enabled: room.is_none(),
+                ..Default::default()
+            })
+            .unwrap();
+        allocs += armed(|| {
+            for _ in 0..60 {
+                r.processor.process_device(&mut bufs);
+            }
+        })
+        .1;
+        r.controller
+            .sync(&tp.project, &tp.sources, faderframe_project::Impact::None)
+            .unwrap();
+    }
+    // A stereo device: the master folds by the downmix on the way out.
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 2).unwrap();
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    let impact = h
+        .apply(
+            &mut tp.project,
+            Command::SetDownmix {
+                downmix: Downmix::STANDARD,
+            },
+        )
+        .unwrap();
+    r.controller.sync(&tp.project, &tp.sources, impact).unwrap();
+    allocs += armed(|| {
+        for _ in 0..60 {
+            r.processor.process_device(&mut bufs);
+        }
+    })
+    .1;
+    assert_eq!(allocs, 0, "allocations while panning in surround");
 }
 
 #[test]

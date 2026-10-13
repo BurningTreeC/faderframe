@@ -108,6 +108,8 @@ fn samples_are_copied_in_undone_saved_relative_and_reopened() {
     assert!(files(&s, plugin)[1].is_none());
     assert!(!loaded(&s, plugin, 1));
     s.dispatch(Action::Undo).unwrap();
+    // Decoded again (nothing held it): in the background.
+    s.wait_for_samples();
     assert!(loaded(&s, plugin, 1), "the snare is back");
     s.dispatch(Action::Undo).unwrap();
     s.dispatch(Action::Undo).unwrap();
@@ -156,6 +158,9 @@ fn samples_are_copied_in_undone_saved_relative_and_reopened() {
         PathBuf::from(f[5].as_deref().unwrap()).starts_with(&moved),
         "{f:?}"
     );
+    // Opening did not wait for the decoding: it arrives in the background.
+    t.wait_for_samples();
+    assert!(!t.samples_loading());
     assert!(loaded(&t, plugin, 5));
     let _ = std::fs::remove_dir_all(&moved);
     let _ = std::fs::remove_dir_all(&outside);

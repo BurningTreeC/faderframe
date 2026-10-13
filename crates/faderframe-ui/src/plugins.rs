@@ -107,6 +107,44 @@ pub fn sandbox_helper() -> i32 {
     faderframe_plugin_sandbox::child::run(in_process_registry())
 }
 
+/// `faderframe --check-plugin <format> <id> <rate> <block> [unpaced]`:
+/// check one plugin in this process (`faderframe-plugin-check`; `unpaced`:
+/// as fast as it goes) and print the report for the parent
+/// ([`faderframe_plugin_check::print_report`]); returns the exit code.
+pub fn check_helper(format: &str, id: &str, rate: u32, block: u32, paced: bool) -> i32 {
+    use faderframe_plugin_check::{CheckOptions, CheckReport};
+    use faderframe_plugin_host::PluginFormat as F;
+    load_catalogs();
+    let format = match format {
+        "builtin" => F::Builtin,
+        "clap" => F::Clap,
+        "vst3" => F::Vst3,
+        "audio_unit" => F::AudioUnit,
+        "lv2" => F::Lv2,
+        other => {
+            eprintln!("unknown plugin format {other}");
+            return 2;
+        }
+    };
+    let options = CheckOptions {
+        sample_rate: rate,
+        block,
+        paced,
+        ..CheckOptions::default()
+    };
+    let report = match in_process_registry().instantiate(format, id) {
+        Ok(mut instance) => faderframe_plugin_check::check(instance.as_mut(), &options),
+        Err(e) => CheckReport::failed(format!("it would not load: {e}")),
+    };
+    match faderframe_plugin_check::print_report(&report) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
+    }
+}
+
 /// Changes whenever a catalog changes (views refresh on change).
 pub fn catalog_generation() -> u64 {
     let g = faderframe_plugin_clap::catalog_generation()

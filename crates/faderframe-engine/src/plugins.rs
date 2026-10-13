@@ -85,6 +85,8 @@ pub struct PluginHost {
     /// Activate plugins for 64-bit processing where they can.
     double_precision: bool,
     realtime: bool,
+    /// New instances may load what their state names in the background.
+    background_loading: bool,
 }
 
 impl Default for PluginHost {
@@ -110,7 +112,19 @@ impl PluginHost {
             dirty: HashSet::new(),
             double_precision: false,
             realtime: true,
+            background_loading: false,
         }
+    }
+
+    /// Instances made from now on may load what their state names (a
+    /// sampler's samples) in the background (a live session's engine).
+    pub fn set_background_loading(&mut self, on: bool) {
+        self.background_loading = on;
+    }
+
+    /// Whether any instance is still loading what its state names.
+    pub fn loading(&self) -> bool {
+        self.instances.values().any(|h| h.instance.loading())
     }
 
     /// Process plugins in 64-bit floating point where they can (applies
@@ -141,6 +155,9 @@ impl PluginHost {
             let mut instance = self
                 .registry
                 .instantiate(host_format(slot.plugin.format), &slot.plugin.id)?;
+            if self.background_loading {
+                instance.configure_background_loading();
+            }
             // Saved state first (complete), then explicit parameter values.
             if let Some(state) = slot.state.as_deref().and_then(decode_state) {
                 let _ = instance.load_state(&state);
@@ -295,6 +312,22 @@ impl PluginHost {
 
     /// The current state of an instantiated plugin, encoded for
     /// [`PluginSlot::state`].
+    /// Ask a plugin for its state without waiting (`false`: it cannot, use
+    /// [`capture_state`](Self::capture_state)); it arrives through
+    /// [`take_state`](Self::take_state) after later polls.
+    pub fn request_state(&mut self, plugin: PluginInstanceId) -> bool {
+        self.instances
+            .get_mut(&plugin)
+            .is_some_and(|h| h.instance.request_state())
+    }
+
+    /// A state asked for with [`request_state`](Self::request_state), once
+    /// it is here (`Some(None)`: it came empty).
+    pub fn take_state(&mut self, plugin: PluginInstanceId) -> Option<Option<String>> {
+        let bytes = self.instances.get_mut(&plugin)?.instance.take_state()?;
+        Some((!bytes.is_empty()).then(|| encode_state(&bytes)))
+    }
+
     pub fn capture_state(&mut self, plugin: PluginInstanceId) -> Option<String> {
         let bytes = self
             .instances

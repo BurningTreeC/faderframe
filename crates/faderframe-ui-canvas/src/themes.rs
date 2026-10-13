@@ -185,6 +185,8 @@ fn build(s: Spec) -> Theme {
             launch_queued: c(m[2]),
             clip_radius: 4.0,
             clip_header: 22.0,
+            clip_header_alpha: 0.82,
+            clip_alpha: 0.5,
             clip_text: c(s.clip_text),
             selection_outline: c(s.outline),
             track_height: 72.0,

@@ -741,14 +741,15 @@ mod linear_phase {
         inst.set_parameter(global_id(global::PHASE), 2.0).unwrap();
         assert!(inst.poll().restart);
         assert_eq!(inst.latency_samples(), natural::LATENCY);
-        // A spectral band adds its frames.
+        // A spectral band adds its frame and the hop its work is spread
+        // over.
         inst.set_parameter(band_id(0, Field::Enabled), 1.0).unwrap();
         inst.set_parameter(band_id(0, Field::Spectral), 1.0)
             .unwrap();
         assert!(inst.poll().restart);
         assert_eq!(
             inst.latency_samples(),
-            natural::LATENCY + spectral::frame(3) as u32
+            natural::LATENCY + spectral::frame(3) as u32 * 5 / 4
         );
         assert!(!parameters()[global::PHASE].automatable);
     }
@@ -841,7 +842,9 @@ mod spectral_dynamics {
     fn unity_gains_rebuild_the_signal_after_its_latency() {
         let mut rig = spectral_rig();
         // Quiet: nothing triggers, the band is flat.
-        let n = spectral::frame(1);
+        // The frame and the hop its work is spread over.
+        let n = spectral::latency(1);
+        assert_eq!(n, spectral::frame(1) * 5 / 4);
         assert_eq!(rig.eq.latency() as usize, n);
         let input = tone(1_234.0, 0.001);
         let (l, _) = rig.run(64, 0, &input, silence, &[]);
@@ -988,5 +991,237 @@ fn mono_parametric_eq_publishes_both_meter_channels() {
         assert_eq!(meter.held(0), meter.held(1));
         assert_eq!(meter.mean_square(0), meter.mean_square(1));
         assert_eq!(meter.figure(0), meter.figure(1));
+    }
+}
+
+/// The slowest and the mean 64-frame block for set-ups whose work comes
+/// in bursts (a measurement: `cargo test -p faderframe-plugin-host
+/// --release eq_block_peaks -- --ignored --nocapture`).
+#[test]
+#[ignore = "a measurement, not a check"]
+fn eq_block_peaks() {
+    const SMALL: usize = 64;
+    // What moves while it plays: nothing, Gain Scale, every band's frequency.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Moving {
+        No,
+        GainScale,
+        Frequencies,
+    }
+    type Setup<'a> = (&'a str, &'a dyn Fn(&Rig), Moving);
+    let brickwalls = |r: &Rig| {
+        for b in 0..24 {
+            r.bell(b, 40.0 * 1.3f64.powi(b as i32), 6.0);
+            let kind = if b % 2 == 0 {
+                BandType::HighCut
+            } else {
+                BandType::LowCut
+            };
+            r.set_band(b, Field::Type, kind.index() as f64);
+            r.set_band(b, Field::Slope, design::BRICKWALL);
+        }
+    };
+    let setups: [Setup<'_>; 7] = [
+        (
+            "8 bells, linear phase maximum",
+            &|r| {
+                r.set_global(global::PHASE, PhaseMode::Linear.value());
+                r.set_global(global::QUALITY, 4.0);
+                for b in 0..8 {
+                    r.bell(b, 100.0 * 1.6f64.powi(b as i32), 3.0);
+                }
+            },
+            Moving::No,
+        ),
+        (
+            "4 spectral bands, maximum",
+            &|r| {
+                r.set_global(global::QUALITY, 4.0);
+                for b in 0..4 {
+                    r.bell(b, 500.0 * 2f64.powi(b as i32), 0.0);
+                    r.set_band(b, Field::Range, -6.0);
+                    r.set_band(b, Field::Spectral, 1.0);
+                }
+            },
+            Moving::No,
+        ),
+        ("24 brickwall cuts, still", &brickwalls, Moving::No),
+        (
+            "24 brickwall cuts, Gain Scale moving",
+            &brickwalls,
+            Moving::GainScale,
+        ),
+        (
+            "24 brickwall cuts, frequencies moving",
+            &brickwalls,
+            Moving::Frequencies,
+        ),
+        (
+            "24 steep shelves, Gain Scale moving",
+            &|r| {
+                for b in 0..24 {
+                    r.bell(b, 40.0 * 1.3f64.powi(b as i32), 6.0);
+                    let kind = if b % 2 == 0 {
+                        BandType::HighShelf
+                    } else {
+                        BandType::LowShelf
+                    };
+                    r.set_band(b, Field::Type, kind.index() as f64);
+                    r.set_band(b, Field::Slope, 48.0);
+                }
+            },
+            Moving::GainScale,
+        ),
+        (
+            "24 bells + auto gain, Gain Scale moving",
+            &|r| {
+                r.set_global(global::AUTO_GAIN, 1.0);
+                for b in 0..24 {
+                    r.bell(b, 40.0 * 1.3f64.powi(b as i32), 6.0);
+                }
+            },
+            Moving::GainScale,
+        ),
+    ];
+    for (name, setup, moving) in setups {
+        let rig = Rig::new();
+        setup(&rig);
+        let rig = rig.rebuild();
+        let mut eq = rig.eq;
+        let mut ins = vec![
+            AudioBuffer::new(ChannelLayout::Stereo, SMALL),
+            AudioBuffer::new(ChannelLayout::Stereo, SMALL),
+        ];
+        let mut out = vec![AudioBuffer::new(ChannelLayout::Stereo, SMALL)];
+        for b in ins.iter_mut().chain(out.iter_mut()) {
+            b.set_len(SMALL);
+        }
+        let transport = TransportInfo::default();
+        let (mut worst, mut total, mut n) = (0f64, 0f64, 0usize);
+        for block in 0..(6.0 * SR) as usize / SMALL {
+            for c in 0..2 {
+                for (i, v) in ins[0].channel_mut(c).iter_mut().enumerate() {
+                    let t = (block * SMALL + i) as f64 / SR;
+                    *v = (0.3 * (std::f64::consts::TAU * 440.0 * t).sin()) as f32;
+                }
+            }
+            let swing = (block as f64 * 0.01).sin();
+            match moving {
+                Moving::No => {}
+                Moving::GainScale => {
+                    rig.params
+                        .set_by_id(global_id(global::GAIN_SCALE), 1.0 + 0.5 * swing)
+                        .unwrap();
+                }
+                Moving::Frequencies => {
+                    for b in 0..24 {
+                        let f = 40.0 * 1.3f64.powi(b as i32) * (1.0 + 0.3 * swing);
+                        rig.params.set_by_id(band_id(b, Field::Freq), f).unwrap();
+                    }
+                }
+            }
+            let t = std::time::Instant::now();
+            eq.process(
+                &PluginProcessContext {
+                    transport: &transport,
+                    param_events: &[],
+                    harmony: &crate::NO_HARMONY,
+                    param_mods: &[],
+                    note_mods: &[],
+                },
+                &mut NodeIo {
+                    frames: SMALL,
+                    audio_in: &ins,
+                    audio_out: &mut out,
+                    events_in: &[],
+                    events_out: &mut [],
+                },
+            );
+            let us = t.elapsed().as_secs_f64() * 1e6;
+            // After the first second (designs settled).
+            if block * SMALL > SR as usize {
+                worst = worst.max(us);
+                total += us;
+                n += 1;
+            }
+        }
+        println!(
+            "{name:>42}: slowest {worst:>7.1} µs, mean {:>6.1} µs per {SMALL} frames ({:.0} µs available)",
+            total / n.max(1) as f64,
+            SMALL as f64 / SR * 1e6
+        );
+    }
+}
+
+/// Bands moving every block (Gain Scale on 24 steep shelves, whose
+/// redesigns take the whole design budget) keep the auto gain following:
+/// an estimate under way finishes on its own share of the budget instead
+/// of starting over with every change.
+#[test]
+fn auto_gain_follows_bands_that_keep_moving() {
+    let mut rig = Rig::new();
+    for b in 0..24 {
+        rig.set_band(b, Field::Enabled, 1.0);
+        rig.set_band(b, Field::Type, BandType::HighShelf.index() as f64);
+        rig.set_band(b, Field::Freq, 5_000.0);
+        rig.set_band(b, Field::Gain, 1.0);
+        rig.set_band(b, Field::Slope, 48.0);
+    }
+    rig.set_global(global::AUTO_GAIN, 1.0);
+    let blocks = SR as usize / BLOCK;
+    let mut out = Vec::new();
+    let mut scale = 1.0;
+    for b in 0..blocks {
+        scale = 1.0 - 0.4 * b as f64 / blocks as f64;
+        rig.set_global(global::GAIN_SCALE, scale);
+        let (l, _) = rig.run(1, b * BLOCK, sine(100.0), silence, &[]);
+        out.extend_from_slice(&l);
+    }
+    let bands: [BandParams; BANDS] = std::array::from_fn(|b| BandParams::read(&rig.params, b));
+    let change = loudness_change(&bands, scale, false, SR);
+    let first = loudness_change(&bands, 1.0, false, SR);
+    assert!(
+        first - change > 3.0,
+        "the compensation moves: {first} → {change}"
+    );
+    // Below the shelves the level is the compensation, as of now.
+    let level = db(peak(&out[out.len() - 2048..]) / 0.25);
+    assert!((level + change).abs() < 0.5, "{level} vs {change}");
+}
+
+/// A reset forgets everything at once (its delay lines are not cleared,
+/// only marked): after noise and a reset, silence in is exact silence out,
+/// in every phase mode, with a spectral and a dynamic band.
+#[test]
+fn a_reset_leaves_no_tail() {
+    for phase in [0.0, 1.0, 2.0] {
+        let rig = Rig::new();
+        rig.set_global(global::PHASE, phase);
+        rig.set_global(global::QUALITY, 2.0);
+        rig.bell(0, 1_000.0, 6.0);
+        rig.set_band(0, Field::Spectral, 1.0);
+        rig.bell(1, 300.0, -6.0);
+        rig.set_band(1, Field::Dynamics, 1.0);
+        rig.set_band(1, Field::Threshold, -30.0);
+        rig.bell(2, 5_000.0, 3.0);
+        let mut rig = rig.rebuild();
+        let noise = |n: usize| {
+            let x = ((n as u32).wrapping_mul(2_654_435_761) >> 8) as f32 / (1u32 << 24) as f32;
+            (x - 0.5, 0.5 - x)
+        };
+        let latency = rig.eq.latency() as usize;
+        let blocks = (latency * 3) / BLOCK + 40;
+        let (l, _) = rig.run(blocks, 0, noise, noise, &[]);
+        assert!(
+            peak(&l[l.len() - BLOCK..]) > 0.01,
+            "phase {phase}: it plays"
+        );
+        rig.eq.reset();
+        let (l, r) = rig.run(blocks, 0, silence, silence, &[]);
+        assert!(
+            l.iter().chain(&r).all(|v| *v == 0.0),
+            "phase {phase}: a tail after the reset (peak {})",
+            peak(&l)
+        );
     }
 }

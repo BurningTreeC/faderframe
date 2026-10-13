@@ -1574,3 +1574,241 @@ fn the_meter_bridge_puts_vu_meters_over_the_strips() {
         Some(HostRequest::ContextMenu { .. })
     ));
 }
+
+#[test]
+fn a_dual_panned_strip_has_a_knob_per_channel() {
+    use faderframe_core::{DualPan, PanMode};
+    let mut s = session();
+    let theme = Theme::default();
+    let mut view = MixerView::new(theme.clone());
+    let size = Size::new(1400.0, 760.0);
+    view.paint(&mut RecordingPainter::new(), size, &s, &theme);
+    let t = MixerView::channel_tracks(&s)
+        .into_iter()
+        .find(|t| s.project().pans_stereo(t) && t.kind != TrackKind::Master)
+        .expect("a stereo strip")
+        .id;
+    // Balance first: its knob's menu offers the modes.
+    let l = view.layout_of(&s, t, size).unwrap();
+    assert_eq!(
+        view.hit_test(l.pan_knob.center(), size, &s),
+        Some(Hit::Pan(t))
+    );
+    let labels = menu_labels(run(&mut view, right(l.pan_knob.center()), size, &s).1);
+    assert!(labels.iter().any(|l| l == "Balance") && labels.iter().any(|l| l == "Dual Pan"));
+    s.dispatch(Action::Edit(Command::SetTrackPanMode {
+        track: t,
+        mode: PanMode::Dual,
+    }))
+    .unwrap();
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    let texts = p.texts();
+    assert!(
+        texts.contains(&"L100") && texts.contains(&"R100"),
+        "{texts:?}"
+    );
+
+    let l = view.layout_of(&s, t, size).unwrap();
+    let [(left, left_value), (right_knob, _)] = dual_pan_rects(&l);
+    assert!(!left.intersects(&right_knob));
+    assert_eq!(
+        view.hit_test(left.center(), size, &s),
+        Some(Hit::DualPan(t, false))
+    );
+    assert_eq!(
+        view.hit_test(right_knob.center(), size, &s),
+        Some(Hit::DualPan(t, true))
+    );
+    // Between the two knobs nothing reaches the (hidden) balance.
+    let between = Point::new((left.right() + right_knob.x) * 0.5, left.center().y);
+    assert!(!matches!(
+        view.hit_test(between, size, &s),
+        Some(Hit::Pan(_))
+    ));
+
+    // Dragging the right knob up moves only the right channel, as one gesture.
+    let from = right_knob.center();
+    let mut actions = run(&mut view, down(from, 1), size, &s).0;
+    actions.extend(
+        run(
+            &mut view,
+            ViewEvent::PointerMove {
+                pos: Point::new(from.x, from.y + 45.0),
+                modifiers: Modifiers::NONE,
+                dragging: true,
+            },
+            size,
+            &s,
+        )
+        .0,
+    );
+    assert_eq!(actions.first(), Some(&Action::BeginGesture("Pan".into())));
+    match actions.last() {
+        Some(Action::Edit(Command::SetTrackDualPan { track, pan })) => {
+            assert_eq!(*track, t);
+            assert_eq!(pan.left, -1.0);
+            assert!(pan.right < 0.6 && pan.right > 0.4, "{}", pan.right);
+        }
+        other => panic!("{other:?}"),
+    }
+    run(
+        &mut view,
+        ViewEvent::PointerUp {
+            pos: from,
+            button: PointerButton::Primary,
+            modifiers: Modifiers::NONE,
+        },
+        size,
+        &s,
+    );
+
+    // A double-click sends a channel back to its side.
+    s.dispatch(Action::Edit(Command::SetTrackDualPan {
+        track: t,
+        pan: DualPan {
+            left: 0.2,
+            right: 0.2,
+        },
+    }))
+    .unwrap();
+    let (actions, _) = run(&mut view, down(left.center(), 2), size, &s);
+    assert_eq!(
+        actions,
+        vec![Action::Edit(Command::SetTrackDualPan {
+            track: t,
+            pan: DualPan {
+                left: -1.0,
+                right: 0.2
+            }
+        })]
+    );
+    // Its value takes a typed position.
+    let (_, requests) = run(&mut view, down(left_value.center(), 1), size, &s);
+    let Some(HostRequest::TextInput {
+        initial, commit, ..
+    }) = requests.into_iter().next()
+    else {
+        panic!("a text field")
+    };
+    assert_eq!(initial, "R20");
+    assert_eq!(
+        commit("L40"),
+        Some(Action::Edit(Command::SetTrackDualPan {
+            track: t,
+            pan: DualPan {
+                left: -0.4,
+                right: 0.2
+            }
+        }))
+    );
+    // Right-click: that side's MIDI learn and the way back to balance.
+    let labels = menu_labels(run(&mut view, right(left.center()), size, &s).1);
+    assert!(labels[0].ends_with("Left Pan"), "{labels:?}");
+    assert!(labels.iter().any(|l| l == "Balance"));
+}
+
+#[test]
+fn a_strip_into_a_bed_turns_by_vbap_or_balances_on_its_knob() {
+    use faderframe_core::surround::{StereoSource, SurroundPanner};
+    use faderframe_core::{ChannelLayout, SurroundFormat, SurroundPan};
+    let mut s = session();
+    let master = s.project().master_id().unwrap();
+    s.dispatch(Action::Edit(Command::SetTrackLayout {
+        track: master,
+        layout: ChannelLayout::Surround(SurroundFormat::S51),
+    }))
+    .unwrap();
+    let theme = Theme::default();
+    let mut view = MixerView::new(theme.clone());
+    let size = Size::new(1400.0, 760.0);
+    view.paint(&mut RecordingPainter::new(), size, &s, &theme);
+    let t = MixerView::channel_tracks(&s)
+        .into_iter()
+        .find(|t| t.layout == ChannelLayout::Stereo && s.project().surround_panned(t).is_some())
+        .expect("a stereo track into the bed")
+        .id;
+    // VBAP: dragging across the mini room turns the track round.
+    s.dispatch(Action::Edit(Command::SetTrackSurround {
+        track: t,
+        pan: SurroundPan {
+            panner: SurroundPanner::Vbap,
+            ..SurroundPan::default()
+        },
+    }))
+    .unwrap();
+    view.paint(&mut RecordingPainter::new(), size, &s, &theme);
+    let l = view.layout_of(&s, t, size).unwrap();
+    let from = l.pan_knob.center();
+    let mut actions = run(&mut view, down(from, 1), size, &s).0;
+    actions.extend(
+        run(
+            &mut view,
+            ViewEvent::PointerMove {
+                pos: Point::new(from.x - l.pan_knob.w * 0.25, from.y),
+                modifiers: Modifiers::NONE,
+                dragging: true,
+            },
+            size,
+            &s,
+        )
+        .0,
+    );
+    match actions.last() {
+        // A quarter of the room's width to the left: 90° to the left.
+        Some(Action::Edit(Command::SetTrackSurround { pan, .. })) => {
+            assert!((pan.azimuth - 90.0).abs() < 1.0, "{}", pan.azimuth);
+            assert_eq!((pan.x, pan.y), (0.0, 1.0), "the room's place kept");
+        }
+        other => panic!("{other:?}"),
+    }
+    run(
+        &mut view,
+        ViewEvent::PointerUp {
+            pos: from,
+            button: PointerButton::Primary,
+            modifiers: Modifiers::NONE,
+        },
+        size,
+        &s,
+    );
+    // Balanced on L and R: the strip shows its balance knob again.
+    s.dispatch(Action::Edit(Command::SetTrackSurround {
+        track: t,
+        pan: SurroundPan {
+            stereo: StereoSource::Balance,
+            ..SurroundPan::default()
+        },
+    }))
+    .unwrap();
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    let l = view.layout_of(&s, t, size).unwrap();
+    assert_eq!(
+        view.tooltip_body(l.pan_knob.center(), size, &s)
+            .map(|t| t.starts_with("Balance")),
+        Some(true)
+    );
+    let from = l.pan_knob.center();
+    let mut actions = run(&mut view, down(from, 1), size, &s).0;
+    actions.extend(
+        run(
+            &mut view,
+            ViewEvent::PointerMove {
+                pos: Point::new(from.x, from.y - 40.0),
+                modifiers: Modifiers::NONE,
+                dragging: true,
+            },
+            size,
+            &s,
+        )
+        .0,
+    );
+    assert!(
+        matches!(
+            actions.last(),
+            Some(Action::Edit(Command::SetTrackPan { track, pan })) if *track == t && *pan > 0.0
+        ),
+        "{actions:?}"
+    );
+}

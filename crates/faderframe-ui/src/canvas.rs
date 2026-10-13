@@ -8,7 +8,7 @@
 //! same view state) is re-parented when its view moves between docks and
 //! windows.
 
-use crate::painter::{PathCache, SnapshotPainter, TextCache};
+use crate::painter::{KeptCache, PathCache, SnapshotPainter, TextCache};
 use crate::state::AppState;
 use faderframe_session::{Action, Session};
 use faderframe_ui_canvas::{
@@ -33,6 +33,7 @@ mod imp {
         pub app: RefCell<Weak<AppState>>,
         pub text_cache: RefCell<TextCache>,
         pub path_cache: RefCell<PathCache>,
+        pub kept_cache: RefCell<KeptCache>,
         pub dragging: Cell<bool>,
         pub drag_button: Cell<u32>,
         pub drag_origin: Cell<(f64, f64)>,
@@ -113,15 +114,17 @@ mod imp {
                 let theme = app.theme.borrow();
                 let started = paint_stats::enabled().then(std::time::Instant::now);
                 let mut counts = None;
-                let painted = crate::gpu::paint(w, snapshot, size.w, size.h, scale, |p| {
-                    if started.is_some() {
-                        let mut counting = paint_stats::Counting::new(p);
-                        view.paint(&mut counting, size, &session, &theme);
-                        counts = Some(counting.counts);
-                    } else {
-                        view.paint(p, size, &session, &theme);
-                    }
-                });
+                let animating = view.wants_frames(&session);
+                let painted =
+                    crate::gpu::paint(w, snapshot, size.w, size.h, scale, animating, |p| {
+                        if started.is_some() {
+                            let mut counting = paint_stats::Counting::new(p);
+                            view.paint(&mut counting, size, &session, &theme);
+                            counts = Some(counting.counts);
+                        } else {
+                            view.paint(p, size, &session, &theme);
+                        }
+                    });
                 if painted {
                     if let (Some(t), Some(c)) = (started, counts) {
                         paint_stats::note(w, t.elapsed(), c, true);
@@ -131,12 +134,14 @@ mod imp {
             }
             self.text_cache.borrow_mut().begin_frame();
             self.path_cache.borrow_mut().begin_frame();
+            self.kept_cache.borrow_mut().begin_frame();
             snapshot.push_clip(&graphene::Rect::new(0.0, 0.0, size.w, size.h));
             let w: &gtk::Widget = widget.upcast_ref();
             if let Some(view) = self.view.borrow_mut().as_mut() {
                 view.frame_timing(frame_lead(w, &self.presentation_bias), device_scale(w));
             }
-            let mut painter = SnapshotPainter::new(snapshot, w, &self.text_cache, &self.path_cache);
+            let mut painter = SnapshotPainter::new(snapshot, w, &self.text_cache, &self.path_cache)
+                .with_kept(&self.kept_cache);
             if paint_stats::enabled() {
                 let started = std::time::Instant::now();
                 let mut counting = paint_stats::Counting::new(&mut painter);
@@ -1370,7 +1375,9 @@ impl CanvasWidget {
                     .as_ref()
                     .is_some_and(|v| v.wants_frames(&session));
                 drop(session);
-                if animate {
+                // A GPU-painted view that stopped animating a frame behind:
+                // one more paint shows the newest.
+                if animate || crate::gpu::behind(w.upcast_ref()) {
                     w.queue_draw();
                 }
                 w.sync_scrollbars();
@@ -1916,6 +1923,19 @@ mod paint_stats {
         }
         fn scale_factor(&self) -> f32 {
             self.inner.scale_factor()
+        }
+        fn show_kept(&mut self, key: u64, rect: Rect) -> bool {
+            let shown = self.inner.show_kept(key, rect);
+            if shown {
+                self.counts[6] += 1;
+            }
+            shown
+        }
+        fn begin_keep(&mut self, key: u64, rect: Rect) -> bool {
+            self.inner.begin_keep(key, rect)
+        }
+        fn end_keep(&mut self) {
+            self.inner.end_keep();
         }
     }
 

@@ -37,10 +37,26 @@ struct Channel {
     block: Block,
     pipes: Arc<Pipes>,
     seq: u32,
-    sched_sent: bool,
+    /// Blocks processed: the calling thread's scheduling goes to the helper
+    /// on the first and every `SCHED_EVERY` after (the caller may change —
+    /// rendered ahead, then live).
+    blocks: u32,
     /// The instance's gain-reduction cell, set from the helper's answer.
     reduction: Arc<faderframe_plugin_host::Reduction>,
+    /// The engine's deadline for the whole device callback (none: one
+    /// block's duration from the call).
+    deadline: Option<Instant>,
+    /// A block sent and not answered in time: when it was sent. The next
+    /// request waits for it (the helper may still read the shared memory).
+    in_flight: Option<Instant>,
+    /// Seconds per frame (the activation's rate).
+    frame_seconds: f64,
+    /// Blocks given up on (silence played): the engine counts them.
+    late: u64,
 }
+
+/// How often the calling thread's scheduling is sent to the helper again.
+const SCHED_EVERY: u32 = 1024;
 
 fn silence(io: &mut NodeIo<'_>) {
     for out in io.audio_out.iter_mut() {
@@ -55,13 +71,40 @@ impl Channel {
         io: &mut NodeIo<'_>,
         dead: &AtomicBool,
     ) -> ProcessStatus {
+        let started = Instant::now();
         let frames = io.frames.min(self.block.max_frames());
         let h = self.block.header();
-        if !self.sched_sent {
+        if self.blocks.is_multiple_of(SCHED_EVERY) {
+            // A system call now and then: the helper's audio thread takes
+            // the caller's priority.
             let (packed, extra) = faderframe_realtime::thread_scheduling();
             h.sched_extra.store(extra, Ordering::Relaxed);
             h.sched.store(packed, Ordering::Release);
-            self.sched_sent = true;
+        }
+        self.blocks = self.blocks.wrapping_add(1);
+        let fail = |io: &mut NodeIo<'_>| {
+            dead.store(true, Ordering::Relaxed);
+            silence(io);
+            ProcessStatus::Error
+        };
+        // How long this call may wait for the helper: the callback's
+        // budget, else a block's duration (past it the callback is late in
+        // any case) — a stuck helper costs its own track a block of
+        // silence, never the engine a quarter of a second.
+        let limit = self.deadline.unwrap_or_else(|| {
+            started + Duration::from_secs_f64(frames as f64 * self.frame_seconds)
+        });
+        if let Some(sent) = self.in_flight {
+            // The block given up on last time: its answer first.
+            match self.wait_done(limit.max(started), sent) {
+                Wait::Done => self.in_flight = None,
+                Wait::Late => {
+                    self.late += 1;
+                    silence(io);
+                    return ProcessStatus::Continue;
+                }
+                Wait::Dead => return fail(io),
+            }
         }
         // macOS: the helper's audio thread follows the device's workgroup.
         h.wg_gen.store(
@@ -90,26 +133,20 @@ impl Channel {
         });
         self.seq = self.seq.wrapping_add(1);
         h.seq.store(self.seq, Ordering::Release);
-        let fail = |io: &mut NodeIo<'_>| {
-            dead.store(true, Ordering::Relaxed);
-            silence(io);
-            ProcessStatus::Error
-        };
         if !self.pipes.go.signal() {
             return fail(io);
         }
-        let deadline = Instant::now() + BLOCK_TIMEOUT;
-        while h.done.load(Ordering::Acquire) != self.seq {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return fail(io);
+        match self.wait_done(limit, Instant::now()) {
+            Wait::Done => {}
+            Wait::Late => {
+                self.in_flight = Some(Instant::now());
+                self.late += 1;
+                silence(io);
+                return ProcessStatus::Continue;
             }
-            if self.pipes.done.wait(Some(left)) == Ready::HungUp
-                && h.done.load(Ordering::Acquire) != self.seq
-            {
-                return fail(io);
-            }
+            Wait::Dead => return fail(io),
         }
+        let h = self.block.header();
         let status = self
             .block
             .read_response(frames, io.audio_out, io.events_out.first_mut());
@@ -119,6 +156,40 @@ impl Channel {
         }
         status
     }
+
+    /// Wait for the helper's answer to the last block until `limit`; a
+    /// block unanswered `BLOCK_TIMEOUT` after `sent` (or a helper gone)
+    /// means it is dead.
+    fn wait_done(&self, limit: Instant, sent: Instant) -> Wait {
+        let h = self.block.header();
+        let dead_at = sent + BLOCK_TIMEOUT;
+        loop {
+            if h.done.load(Ordering::Acquire) == self.seq {
+                return Wait::Done;
+            }
+            let now = Instant::now();
+            if now >= dead_at {
+                return Wait::Dead;
+            }
+            if now >= limit {
+                return Wait::Late;
+            }
+            let until = limit.min(dead_at);
+            if self.pipes.done.wait(Some(until - now)) == Ready::HungUp
+                && h.done.load(Ordering::Acquire) != self.seq
+            {
+                return Wait::Dead;
+            }
+        }
+    }
+}
+
+/// How waiting for a helper's answer ended.
+enum Wait {
+    Done,
+    /// Not in time for this callback (it may still come).
+    Late,
+    Dead,
 }
 
 /// The audio-thread half of a sandboxed plugin.
@@ -144,6 +215,18 @@ impl PluginProcessor for RemoteProcessor {
             return ProcessStatus::Continue;
         };
         ch.process(ctx, io, &self.dead)
+    }
+
+    fn set_callback_deadline(&mut self, deadline: Option<std::time::Instant>) {
+        if let Some(mut ch) = self.channel.try_lock() {
+            ch.deadline = deadline;
+        }
+    }
+
+    fn take_underruns(&mut self) -> u64 {
+        self.channel
+            .try_lock()
+            .map_or(0, |mut ch| std::mem::take(&mut ch.late))
     }
 
     fn reset(&mut self) {
@@ -190,6 +273,24 @@ pub struct RemoteInstance {
     reaped: bool,
     /// The gain reduction the plugin reports (through the helper).
     reduction: Arc<faderframe_plugin_host::Reduction>,
+    /// A Poll or SaveState sent and not answered yet (since when): they
+    /// are answered at a later tick, so a busy helper never holds up the
+    /// UI.
+    polling: std::cell::Cell<Option<(Waiting, Instant)>>,
+    /// Answers to polls taken in before another request (applied by the
+    /// next `poll`).
+    polled: std::cell::RefCell<Vec<wire::Polled>>,
+    /// The state asked for with `request_state`: wanted (not sent yet),
+    /// and the answer when it came.
+    state_wanted: bool,
+    state: std::cell::RefCell<Option<Vec<u8>>>,
+}
+
+/// What an answer on its way answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Waiting {
+    Poll,
+    State,
 }
 
 fn failed(e: impl std::fmt::Display) -> PluginError {
@@ -243,6 +344,10 @@ impl RemoteInstance {
             needs_restart: false,
             formatted: HashMap::new(),
             reaped: false,
+            polling: std::cell::Cell::new(None),
+            polled: std::cell::RefCell::new(Vec::new()),
+            state_wanted: false,
+            state: std::cell::RefCell::new(None),
             reduction: faderframe_plugin_host::Reduction::unreported(),
         };
         let req = Request::Instantiate {
@@ -294,6 +399,79 @@ impl RemoteInstance {
         }
     }
 
+    /// Take a poll's answer in: values, parameters, editor requests; what
+    /// the host must do about it.
+    fn apply_polled(&mut self, p: wire::Polled) -> PluginPoll {
+        for (id, v) in p.values {
+            self.values.insert(id, v);
+        }
+        if let Some(params) = &p.params {
+            self.params = params.iter().map(ParameterInfo::from).collect();
+            self.modulation = params
+                .iter()
+                .filter(|p| p.modulatable)
+                .map(|p| (p.id, p.per_note))
+                .collect();
+        }
+        if let Some(t) = p.tail {
+            self.tail = t.into();
+        }
+        if let Some(programs) = p.programs {
+            self.programs = programs;
+        }
+        self.program = p.program;
+        self.pending = p.pending;
+        let latency_changed = p.latency != self.latency;
+        self.latency = p.latency;
+        self.edits.extend(p.edits.into_iter().map(EditorEdit::from));
+        let r: EditorRequests = p.editor.into();
+        self.requests.resize = r.resize.or(self.requests.resize);
+        self.requests.show |= r.show;
+        self.requests.hide |= r.hide;
+        self.requests.closed |= r.closed;
+        self.editor_open = p.editor_open;
+        let restart = p.restart || (latency_changed && self.active.is_some());
+        if restart {
+            self.needs_restart = true;
+        }
+        PluginPoll {
+            restart,
+            params_changed: p.params_changed,
+            state_dirty: p.state_dirty,
+        }
+    }
+
+    /// Take in the answer of a poll still on its way, so the next answer
+    /// read is the next request's (`&self`: through another handle on
+    /// the stream).
+    fn collect_answer(&self) -> Result<(), PluginError> {
+        let Some((waiting, _)) = self.polling.take() else {
+            return Ok(());
+        };
+        let mut control = self.control.try_clone().map_err(failed)?;
+        let _ = control.set_read_timeout(Some(match waiting {
+            Waiting::Poll => REQUEST_TIMEOUT,
+            Waiting::State => LOAD_TIMEOUT,
+        }));
+        match wire::recv::<Response>(&mut control) {
+            Ok((Response::Polled(p), _)) => {
+                self.polled.borrow_mut().push(*p);
+                Ok(())
+            }
+            Ok((Response::Bytes, bytes)) if waiting == Waiting::State => {
+                *self.state.borrow_mut() = Some(bytes);
+                Ok(())
+            }
+            // The state could not be had: asked again next time.
+            Ok((Response::Failed(_), _)) if waiting == Waiting::State => Ok(()),
+            Ok((other, _)) => Err(failed(format!("unexpected answer {other:?}"))),
+            Err(e) => {
+                self.dead.store(true, Ordering::Relaxed);
+                Err(failed(format!("the plugin's process does not answer: {e}")))
+            }
+        }
+    }
+
     fn request(
         &mut self,
         req: &Request,
@@ -302,6 +480,10 @@ impl RemoteInstance {
     ) -> Result<(Response, Vec<u8>), PluginError> {
         if self.dead.load(Ordering::Relaxed) {
             return Err(failed("the plugin's process is gone"));
+        }
+        if let Err(e) = self.collect_answer() {
+            self.mark_dead(&e.to_string());
+            return Err(e);
         }
         let _ = self.control.set_read_timeout(Some(timeout));
         let _ = self.control.set_write_timeout(Some(timeout));
@@ -422,7 +604,7 @@ impl PluginInstance for RemoteInstance {
         let Ok(mut control) = self.control.try_clone() else {
             return Vec::new();
         };
-        if self.dead.load(Ordering::Relaxed) {
+        if self.dead.load(Ordering::Relaxed) || self.collect_answer().is_err() {
             return Vec::new();
         }
         let _ = control.set_read_timeout(Some(REQUEST_TIMEOUT));
@@ -438,6 +620,7 @@ impl PluginInstance for RemoteInstance {
         if self.dead.load(Ordering::Relaxed) {
             return Err(failed("the plugin's process is gone"));
         }
+        self.collect_answer()?;
         let mut control = self.control.try_clone().map_err(failed)?;
         let _ = control.set_read_timeout(Some(LOAD_TIMEOUT));
         match wire::send(&mut control, &Request::StateFromPresetFile, data)
@@ -520,47 +703,59 @@ impl PluginInstance for RemoteInstance {
             self.mark_dead(&why);
             return PluginPoll::default();
         }
-        let Ok((Response::Polled(p), _)) = self.request(&Request::Poll, &[], REQUEST_TIMEOUT)
-        else {
-            return PluginPoll::default();
-        };
-        for (id, v) in p.values {
-            self.values.insert(id, v);
+        // Last tick's answer, if it is here (and any taken in before other
+        // requests), then the next poll on its way.
+        if let Some((waiting, sent)) = self.polling.get() {
+            let timeout = match waiting {
+                Waiting::Poll => REQUEST_TIMEOUT,
+                Waiting::State => LOAD_TIMEOUT,
+            };
+            if sys::readable(&self.control) {
+                if let Err(e) = self.collect_answer() {
+                    self.mark_dead(&e.to_string());
+                    return PluginPoll::default();
+                }
+            } else if sent.elapsed() >= timeout {
+                self.mark_dead("it stopped answering");
+                return PluginPoll::default();
+            }
         }
-        if let Some(params) = &p.params {
-            self.params = params.iter().map(ParameterInfo::from).collect();
-            self.modulation = params
-                .iter()
-                .filter(|p| p.modulatable)
-                .map(|p| (p.id, p.per_note))
-                .collect();
+        let answers = std::mem::take(&mut *self.polled.borrow_mut());
+        let mut out = PluginPoll::default();
+        for p in answers {
+            out = out.merge(self.apply_polled(p));
         }
-        if let Some(t) = p.tail {
-            self.tail = t.into();
+        if self.polling.get().is_none() {
+            let (req, waiting) = if std::mem::take(&mut self.state_wanted) {
+                (Request::SaveState, Waiting::State)
+            } else {
+                (Request::Poll, Waiting::Poll)
+            };
+            let _ = self.control.set_write_timeout(Some(REQUEST_TIMEOUT));
+            match wire::send(&mut self.control, &req, &[]) {
+                Ok(()) => self.polling.set(Some((waiting, Instant::now()))),
+                Err(e) => self.mark_dead(&e.to_string()),
+            }
         }
-        if let Some(programs) = p.programs {
-            self.programs = programs;
+        out
+    }
+
+    fn settle(&mut self) {
+        if let Err(e) = self.collect_answer() {
+            self.mark_dead(&e.to_string());
         }
-        self.program = p.program;
-        self.pending = p.pending;
-        let latency_changed = p.latency != self.latency;
-        self.latency = p.latency;
-        self.edits.extend(p.edits.into_iter().map(EditorEdit::from));
-        let r: EditorRequests = p.editor.into();
-        self.requests.resize = r.resize.or(self.requests.resize);
-        self.requests.show |= r.show;
-        self.requests.hide |= r.hide;
-        self.requests.closed |= r.closed;
-        self.editor_open = p.editor_open;
-        let restart = p.restart || (latency_changed && self.active.is_some());
-        if restart {
-            self.needs_restart = true;
+    }
+
+    fn request_state(&mut self) -> bool {
+        if self.dead.load(Ordering::Relaxed) {
+            return false;
         }
-        PluginPoll {
-            restart,
-            params_changed: p.params_changed,
-            state_dirty: p.state_dirty,
-        }
+        self.state_wanted = true;
+        true
+    }
+
+    fn take_state(&mut self) -> Option<Vec<u8>> {
+        self.state.borrow_mut().take()
     }
 
     fn editor(&mut self) -> Option<&mut dyn PluginEditor> {
@@ -629,8 +824,12 @@ impl PluginInstance for RemoteInstance {
                     block,
                     pipes: Arc::clone(&self.pipes),
                     seq: 0,
-                    sched_sent: false,
+                    blocks: 0,
                     reduction: Arc::clone(&self.reduction),
+                    deadline: None,
+                    in_flight: None,
+                    frame_seconds: 1.0 / config.sample_rate.max(1.0),
+                    late: 0,
                 })),
                 Arc::new(AtomicBool::new(false)),
             ));

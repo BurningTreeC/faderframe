@@ -300,6 +300,9 @@ impl UmpClient {
             .spawn(move || {
                 let mut fds = fds;
                 while !shared.stop.load(Ordering::Relaxed) {
+                    faderframe_realtime::priority::follow_audio(
+                        faderframe_realtime::priority::Helper::Ahead,
+                    );
                     // SAFETY: `fds` holds `len` initialised descriptors.
                     let ready =
                         unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 100) };

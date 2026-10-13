@@ -388,3 +388,61 @@ fn measured_cost_decides_what_starts_first() {
     }
     panic!("the heavy job starts first: {seen:?}");
 }
+
+/// Panics in `process` (for the one track whose node fails).
+struct Panics;
+
+impl Processor<Ctx> for Panics {
+    fn process(&mut self, _cx: &ProcessContext<'_, Ctx>, _io: &mut NodeIo<'_>) {
+        panic!("a broken device");
+    }
+}
+
+/// A node that panics — on a worker or the calling thread — counts as
+/// done: the cycle ends and the other tracks play (no thread waits for it
+/// for ever), cycle after cycle.
+#[test]
+fn a_panicking_node_does_not_hang_the_cycle() {
+    let threads = Arc::new(Mutex::new(HashSet::new()));
+    let mut b = GraphBuilder::<Ctx>::new();
+    let master = b.add_node(
+        NodeSpec::new("master").audio_in(Stereo).audio_out(Stereo),
+        Box::new(faderframe_audio_graph::nodes::Passthrough),
+    );
+    for t in 0..8 {
+        let src = b.add_node(
+            NodeSpec::new("src").audio_out(Stereo),
+            Box::new(faderframe_audio_graph::nodes::Constant { value: 0.5 }),
+        );
+        let (first, last) = chain(&mut b, 3, Duration::from_micros(50), &threads);
+        b.connect_audio(src, 0, first, 0).unwrap();
+        if t == 3 {
+            let broken = b.add_node(
+                NodeSpec::new("broken").audio_in(Stereo).audio_out(Stereo),
+                Box::new(Panics),
+            );
+            b.connect_audio(last, 0, broken, 0).unwrap();
+            b.connect_audio(broken, 0, master, 0).unwrap();
+        } else {
+            b.connect_audio(last, 0, master, 0).unwrap();
+        }
+    }
+    let mut config = PrepareConfig::new(48_000.0, BLOCK);
+    config.parallel_min_ns = 0;
+    let mut g = b.compile(&config).unwrap();
+    let pool = WorkerPool::new(PoolConfig::new(3));
+    // Quiet panics (the hook would print each).
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let started = Instant::now();
+    for _ in 0..20 {
+        g.process_parallel(&cx(BLOCK), &pool);
+    }
+    std::panic::set_hook(hook);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let out = g.audio_output(master, 0).unwrap();
+    assert!(
+        out.channel(0).iter().any(|s| s.abs() > 0.1),
+        "the others play"
+    );
+}

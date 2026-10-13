@@ -13,6 +13,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const EVENT_CAPACITY: usize = 1024;
 /// Most automated parameters tracked per plugin.
 const MAX_AUTOMATED: usize = 128;
+/// Most runs of the timeline one block's audio is read back in (a loop
+/// shorter than the block wraps more often; the rest is skipped).
+const MAX_RUNS: usize = 8;
 
 /// Hosts a plugin processor (insert or instrument) inside the graph.
 ///
@@ -46,6 +49,8 @@ pub struct PluginNode {
     /// Latency-matching delay of the dry signal, per channel.
     delay: Vec<Box<[f32]>>,
     delay_pos: usize,
+    /// How late its input is (its automation is read that much earlier).
+    input_latency: u32,
 }
 
 impl PluginNode {
@@ -77,6 +82,7 @@ impl PluginNode {
                 .map(|_| vec![0.0; latency as usize].into_boxed_slice())
                 .collect(),
             delay_pos: 0,
+            input_latency: 0,
         }
     }
 
@@ -90,8 +96,34 @@ impl PluginNode {
         let Some(auto) = cx.data.timeline.automation(self.track) else {
             return;
         };
-        let start = cx.data.transport.sample_position;
-        let playing = cx.data.transport.playing;
+        let latency = self.input_latency;
+        // The runs of the timeline this block's audio was played in: the
+        // block itself, or — behind latency — what the play history says
+        // (split where a loop wrapped or a locate jumped back then).
+        let mut runs = [(0usize, 0usize, crate::history::Played::default()); MAX_RUNS];
+        let mut count = 0;
+        if latency == 0 {
+            runs[0] = (
+                0,
+                frames,
+                crate::history::Played {
+                    pos: cx.data.transport.sample_position,
+                    playing: cx.data.transport.playing,
+                    jumps: 0,
+                    start: 0,
+                },
+            );
+            count = 1;
+        } else {
+            cx.data
+                .history
+                .pieces(latency, 0, frames, |off, n, played| {
+                    if count < MAX_RUNS {
+                        runs[count] = (off, n, played);
+                        count += 1;
+                    }
+                });
+        }
         for (id, lane) in auto.plugin_params(self.plugin) {
             let emit = |node: &mut Self, offset: usize, at: i64| {
                 let Some(v) = lane.value_at(at) else { return };
@@ -113,25 +145,35 @@ impl PluginNode {
                     });
                 }
             };
-            emit(self, 0, automation_at(cx, 0));
-            if !playing {
-                continue;
-            }
-            // Breakpoints inside the block, exactly.
-            let mut s = start;
-            while let Some(at) = lane.next_point_in(s, start + frames as i64) {
-                emit(self, (at - start) as usize, at);
-                s = at;
-            }
-            // Ramps between them.
-            let mut off = AUTOMATION_STEP;
-            while off < frames {
-                emit(self, off, start + off as i64);
-                off += AUTOMATION_STEP;
+            emit(self, 0, automation_at(cx, latency, 0));
+            for &(first, n, played) in &runs[..count] {
+                if first > 0 {
+                    emit(self, first, played.pos);
+                }
+                if !played.playing {
+                    continue;
+                }
+                let start = played.pos;
+                // Breakpoints inside the run, exactly.
+                let mut s = start;
+                while let Some(at) = lane.next_point_in(s, start + n as i64) {
+                    emit(self, first + (at - start) as usize, at);
+                    s = at;
+                }
+                // Ramps between them.
+                let mut off = first.div_ceil(AUTOMATION_STEP).max(1) * AUTOMATION_STEP;
+                while off < first + n {
+                    emit(self, off, start + (off - first) as i64);
+                    off += AUTOMATION_STEP;
+                }
             }
         }
-        // In place (no allocation): stable order by offset.
-        self.events.sort_by_key(|e| e.sample_offset);
+        // By offset, in place: an unstable sort (a stable one takes heap
+        // scratch past a few hundred events). Events tied on offset and
+        // parameter come from the same lane at the same position: the same
+        // value, so their order does not matter.
+        self.events
+            .sort_unstable_by_key(|e| (e.sample_offset, e.parameter.0));
     }
 
     fn soft_bypass(&mut self, cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
@@ -140,7 +182,7 @@ impl PluginNode {
             .timeline
             .automation(self.track)
             .and_then(|a| a.bypass(self.plugin))
-            .and_then(|l| l.value_at(automation_at(cx, io.frames)))
+            .and_then(|l| l.value_at(automation_at(cx, self.input_latency, io.frames)))
             .map_or(0.0, |v| if v >= 0.5 { 1.0 } else { 0.0 });
         // A MIDI effect (no audio): bypassed, its notes pass unchanged.
         if io.audio_out.is_empty() {
@@ -212,6 +254,10 @@ impl Processor<EngineContext> for PluginNode {
         self.latency
     }
 
+    fn set_input_latency(&mut self, frames: u32) {
+        self.input_latency = frames;
+    }
+
     fn process(&mut self, cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
         if self.bypass || self.failed.load(Ordering::Relaxed) {
             for (i, out) in io.audio_out.iter_mut().enumerate() {
@@ -227,7 +273,9 @@ impl Processor<EngineContext> for PluginNode {
         self.note_mods.clear();
         match cx.data.modulation.track(self.track) {
             Some(m) => {
-                m.plugin_mods(self.plugin, &mut self.mods);
+                // The modulation its audio passed the modulators with.
+                let came_in = cx.data.history.chunk_start() - i64::from(self.input_latency);
+                m.plugin_mods_at(self.plugin, &mut self.mods, m.bus.slot_at(came_in));
                 if m.moves_notes_of(self.plugin) {
                     self.voices.process(
                         m,

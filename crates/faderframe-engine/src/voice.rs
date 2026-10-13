@@ -15,6 +15,7 @@ use crate::midi::MidiInputState;
 use faderframe_analysis::polyvoice::PolyTracker;
 use faderframe_analysis::voice::{VoiceConfig, VoiceEvent, VoiceTracker};
 use faderframe_midi::{ExpressionValue, MidiEvent, MidiInputEvent, NoteExpressionKind};
+use faderframe_realtime::TryCell;
 
 /// How sung pitch moves between notes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -34,7 +35,10 @@ pub const MAX_VOICES: usize = 64;
 /// The listening: a tracker, the input channel it hears, the port and the
 /// MIDI channel its notes come on.
 pub struct VoiceRun {
-    tracker: Tracker,
+    /// The tracker and what it heard in this callback: analysed on any DSP
+    /// thread (`analyse`, listeners side by side), delivered on the audio
+    /// thread (`deliver`).
+    analysis: TryCell<Analysis>,
     input: u16,
     port: u16,
     /// The MIDI channel (0-based) its notes are on.
@@ -48,6 +52,81 @@ pub struct VoiceRun {
 enum Tracker {
     Mono(Box<VoiceTracker>),
     Poly(Box<PolyTracker>),
+}
+
+/// Events one listener hears in one callback, at most.
+const HEARD: usize = 512;
+
+struct Analysis {
+    tracker: Tracker,
+    /// (now, at, event) heard in the callback being analysed.
+    heard: Vec<(isize, isize, VoiceEvent)>,
+    /// The callback's frames.
+    frames: usize,
+    /// Events beyond `HEARD` (dropped).
+    lost: u64,
+}
+
+impl Analysis {
+    fn analyse(&mut self, input: &[f32]) {
+        self.heard.clear();
+        self.frames = input.len();
+        let (heard, lost) = (&mut self.heard, &mut self.lost);
+        self.tracker.process(input, |now, at, e| {
+            // The room is made with the listener: never grows here.
+            if heard.len() < heard.capacity() {
+                heard.push((now, at, e));
+            } else {
+                *lost += 1;
+            }
+        });
+    }
+}
+
+/// Several listeners analysed side by side on a worker pool (each one
+/// claims the next).
+pub(crate) struct Listening<'a> {
+    items: [Option<(&'a TryCell<Analysis>, &'a [f32])>; MAX_VOICES],
+    n: usize,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+impl<'a> Listening<'a> {
+    pub(crate) fn new() -> Self {
+        Self {
+            items: [None; MAX_VOICES],
+            n: 0,
+            next: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// `voice` hears `input` in this run.
+    pub(crate) fn add(&mut self, voice: &'a VoiceRun, input: &'a [f32]) {
+        if self.n < MAX_VOICES {
+            self.items[self.n] = Some((&voice.analysis, input));
+            self.n += 1;
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.n
+    }
+}
+
+impl faderframe_realtime::PoolJob for Listening<'_> {
+    fn work(&self) {
+        loop {
+            let i = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if i >= self.n {
+                return;
+            }
+            if let Some((cell, input)) = self.items[i]
+                && let Some(mut a) = cell.try_lock()
+            {
+                a.analyse(input);
+            }
+        }
+    }
 }
 
 impl Tracker {
@@ -125,7 +204,12 @@ impl VoiceRun {
         let (feed, rx) = rtrb::RingBuffer::new(1024);
         (
             Self {
-                tracker,
+                analysis: TryCell::new(Analysis {
+                    tracker,
+                    heard: Vec::with_capacity(HEARD),
+                    frames: 0,
+                    lost: 0,
+                }),
                 input: channel,
                 port,
                 midi_channel: 0,
@@ -141,7 +225,7 @@ impl VoiceRun {
         if self.glide != glide {
             self.release(midi);
         }
-        self.tracker.set_config(config);
+        self.analysis.get_mut().tracker.set_config(config);
         self.glide = glide;
     }
 
@@ -166,22 +250,23 @@ impl VoiceRun {
         self.rate
     }
 
-    /// Listen to a callback's input (audio thread; allocation-free).
-    /// `callback_ns`: the MIDI clock at the callback (its input arrived).
-    pub(crate) fn listen(
+    /// Put what this callback's analysis ([`Listening`]) heard into the
+    /// callback's MIDI (audio thread; allocation-free). `callback_ns`: the
+    /// MIDI clock at the callback (its input arrived).
+    pub(crate) fn deliver(
         &mut self,
-        input: &[f32],
         midi: &mut MidiInputState,
         callback_ns: u64,
         dropped: &std::sync::atomic::AtomicU64,
     ) {
-        let frames = input.len();
-        if frames == 0 {
+        let a = self.analysis.get_mut();
+        let frames = a.frames;
+        if frames == 0 || a.heard.is_empty() {
             return;
         }
         let ns_per_frame = 1e9 / f64::from(self.rate.max(1));
         let (port, glide, channel) = (self.port, self.glide, self.midi_channel);
-        let polyphonic = matches!(self.tracker, Tracker::Poly(_));
+        let polyphonic = matches!(a.tracker, Tracker::Poly(_));
         let feed = &mut self.feed;
         let mut put = |now: isize, at: isize, e: MidiEvent| {
             let offset = now.clamp(0, frames as isize - 1) as u32;
@@ -215,59 +300,61 @@ impl VoiceRun {
                 let _ = feed.push(c);
             }
         };
-        self.tracker.process(input, |now, at, e| match e {
-            VoiceEvent::NoteOn { key, velocity } => {
-                if glide == Glide::PitchBend && !polyphonic {
+        for &(now, at, e) in a.heard.iter() {
+            match e {
+                VoiceEvent::NoteOn { key, velocity } => {
+                    if glide == Glide::PitchBend && !polyphonic {
+                        put(
+                            now,
+                            at,
+                            MidiEvent::PitchBend {
+                                channel,
+                                value: MidiEvent::PITCH_BEND_CENTRE,
+                            },
+                        );
+                    }
                     put(
                         now,
                         at,
-                        MidiEvent::PitchBend {
+                        MidiEvent::NoteOn {
                             channel,
-                            value: MidiEvent::PITCH_BEND_CENTRE,
+                            key,
+                            velocity: velocity.clamp(1, 127),
                         },
                     );
                 }
-                put(
-                    now,
-                    at,
-                    MidiEvent::NoteOn {
-                        channel,
-                        key,
-                        velocity: velocity.clamp(1, 127),
-                    },
-                );
-            }
-            VoiceEvent::NoteOff { key } => {
-                put(
-                    now,
-                    at,
-                    MidiEvent::NoteOff {
-                        channel,
-                        key,
-                        velocity: 0,
-                    },
-                );
-            }
-            VoiceEvent::Bend { key, semitones } => match glide {
-                Glide::Expression => put(
-                    now,
-                    at,
-                    MidiEvent::NoteExpression {
-                        channel,
-                        key,
-                        kind: NoteExpressionKind::Tuning,
-                        value: ExpressionValue::new(f64::from(semitones)),
-                    },
-                ),
-                Glide::PitchBend if !polyphonic => {
-                    let v = (f64::from(MidiEvent::PITCH_BEND_CENTRE)
-                        + f64::from(semitones) / 2.0 * 8192.0)
-                        .clamp(0.0, 16383.0) as u16;
-                    put(now, at, MidiEvent::PitchBend { channel, value: v });
+                VoiceEvent::NoteOff { key } => {
+                    put(
+                        now,
+                        at,
+                        MidiEvent::NoteOff {
+                            channel,
+                            key,
+                            velocity: 0,
+                        },
+                    );
                 }
-                _ => {}
-            },
-        });
+                VoiceEvent::Bend { key, semitones } => match glide {
+                    Glide::Expression => put(
+                        now,
+                        at,
+                        MidiEvent::NoteExpression {
+                            channel,
+                            key,
+                            kind: NoteExpressionKind::Tuning,
+                            value: ExpressionValue::new(f64::from(semitones)),
+                        },
+                    ),
+                    Glide::PitchBend if !polyphonic => {
+                        let v = (f64::from(MidiEvent::PITCH_BEND_CENTRE)
+                            + f64::from(semitones) / 2.0 * 8192.0)
+                            .clamp(0.0, 16383.0) as u16;
+                        put(now, at, MidiEvent::PitchBend { channel, value: v });
+                    }
+                    _ => {}
+                },
+            }
+        }
     }
 
     /// End every sounding note (the listening stops or the input went away).
@@ -284,7 +371,8 @@ impl VoiceRun {
                 }
             }
         };
-        self.tracker.reset(|e| {
+        let analysis = self.analysis.get_mut();
+        analysis.tracker.reset(|e| {
             if let VoiceEvent::NoteOff { key } = e {
                 released = true;
                 put(MidiEvent::NoteOff {
@@ -294,7 +382,10 @@ impl VoiceRun {
                 });
             }
         });
-        if released && self.glide == Glide::PitchBend && matches!(self.tracker, Tracker::Mono(_)) {
+        if released
+            && self.glide == Glide::PitchBend
+            && matches!(analysis.tracker, Tracker::Mono(_))
+        {
             put(MidiEvent::PitchBend {
                 channel,
                 value: MidiEvent::PITCH_BEND_CENTRE,

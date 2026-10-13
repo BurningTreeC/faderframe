@@ -294,6 +294,7 @@ pub enum AutomationMode {
 #[serde(rename_all = "snake_case")]
 pub enum AutomationTarget {
     TrackVolume,
+    /// A mono source's pan, a stereo source's balance.
     TrackPan,
     TrackMute,
     SendLevel(SendId),
@@ -304,6 +305,10 @@ pub enum AutomationTarget {
     PluginBypass(PluginInstanceId),
     /// Where the track sits in the surround bed it feeds.
     Surround(faderframe_core::SurroundParam),
+    /// Dual pan: the left input channel's position (−1…1).
+    DualPanLeft,
+    /// Dual pan: the right input channel's position (−1…1).
+    DualPanRight,
 }
 
 impl AutomationTarget {
@@ -318,6 +323,8 @@ impl AutomationTarget {
             }
             AutomationTarget::PluginBypass(p) => format!("{p} bypass"),
             AutomationTarget::Surround(p) => p.name().into(),
+            AutomationTarget::DualPanLeft => "Left Pan".into(),
+            AutomationTarget::DualPanRight => "Right Pan".into(),
         }
     }
 }

@@ -117,6 +117,8 @@ pub(crate) struct Edge {
     pub from_port: u16,
     pub to: NodeId,
     pub to_port: u16,
+    /// Summed as it arrives (see [`GraphBuilder::connect_audio_early`]).
+    pub early: bool,
 }
 
 pub(crate) struct NodeDesc<C> {
@@ -223,6 +225,29 @@ impl<C> GraphBuilder<C> {
             from_port,
             to,
             to_port,
+            early: false,
+        })
+    }
+
+    /// Connect audio that is summed as it arrives: not delayed to meet
+    /// the other paths into `to`, and not holding them back either (`to`'s
+    /// latency is that of its other inputs). For a live input heard while
+    /// it is played (low-latency monitoring): it does not wait for the
+    /// plugin latency of everything else — and is not aligned with it.
+    pub fn connect_audio_early(
+        &mut self,
+        from: NodeId,
+        from_port: u16,
+        to: NodeId,
+        to_port: u16,
+    ) -> Result<(), GraphError> {
+        self.connect(Edge {
+            kind: EdgeKind::Audio,
+            from,
+            from_port,
+            to,
+            to_port,
+            early: true,
         })
     }
 
@@ -241,6 +266,7 @@ impl<C> GraphBuilder<C> {
             from_port,
             to,
             to_port,
+            early: false,
         })
     }
 

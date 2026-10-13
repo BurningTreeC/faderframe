@@ -194,18 +194,19 @@ impl Session {
             // Into a surround bed the surround panner places it instead.
             if let Some(format) = self.project.surround_panned(t) {
                 let object = self.project.is_object(t);
+                let pan = self.project.effective_surround(t);
                 for p in faderframe_core::SurroundParam::ALL {
                     // Objects have no LFE send.
-                    if !p.applies(t.layout, format)
+                    if !p.applies(t.layout, format, &pan)
                         || (object && p == faderframe_core::SurroundParam::Lfe)
                     {
                         continue;
                     }
-                    let (min, max, default) = p.range();
+                    let (min, max, default) = p.range_in(format);
                     let (kind, unit) = match p {
                         faderframe_core::SurroundParam::X => (ParamKind::Pan, ""),
                         faderframe_core::SurroundParam::Lfe => (ParamKind::Gain, "dB"),
-                        _ => (ParamKind::Linear, ""),
+                        _ => (ParamKind::Linear, p.unit()),
                     };
                     out.push(AutomationParam {
                         target: AutomationTarget::Surround(p),
@@ -217,10 +218,44 @@ impl Session {
                         unit,
                     });
                 }
+                // A stereo source balanced into the bed: its balance.
+                if self.project.balanced_into_bed(t) {
+                    out.push(AutomationParam {
+                        target: AutomationTarget::TrackPan,
+                        name: "Balance".into(),
+                        min: -1.0,
+                        max: 1.0,
+                        default: 0.0,
+                        kind: ParamKind::Pan,
+                        unit: "",
+                    });
+                }
+            } else if self.project.dual_panned(t) {
+                // Dual pan: each input channel's position (the balance
+                // lane, if any, waits for the track's return to balance).
+                for (target, name, default) in [
+                    (AutomationTarget::DualPanLeft, "Left Pan", -1.0),
+                    (AutomationTarget::DualPanRight, "Right Pan", 1.0),
+                ] {
+                    out.push(AutomationParam {
+                        target,
+                        name: name.into(),
+                        min: -1.0,
+                        max: 1.0,
+                        default,
+                        kind: ParamKind::Pan,
+                        unit: "",
+                    });
+                }
             } else if !vca {
                 out.push(AutomationParam {
                     target: AutomationTarget::TrackPan,
-                    name: "Pan".into(),
+                    name: if self.project.pans_stereo(t) {
+                        "Balance"
+                    } else {
+                        "Pan"
+                    }
+                    .into(),
                     min: -1.0,
                     max: 1.0,
                     default: 0.0,
@@ -309,6 +344,8 @@ impl Session {
         Some(match target {
             AutomationTarget::TrackVolume => t.volume_db as f64,
             AutomationTarget::TrackPan => t.pan as f64,
+            AutomationTarget::DualPanLeft => t.dual_pan.left as f64,
+            AutomationTarget::DualPanRight => t.dual_pan.right as f64,
             AutomationTarget::TrackMute => f64::from(u8::from(t.mute)),
             AutomationTarget::SendLevel(s) => t.send(s)?.level_db as f64,
             AutomationTarget::PluginParameter { plugin, parameter } => {
@@ -363,6 +400,20 @@ impl Session {
     pub fn shown_pan(&self, t: &Track) -> f32 {
         self.display_value(t.id, AutomationTarget::TrackPan)
             .map_or(t.pan, |v| v as f32)
+    }
+
+    /// Dual-pan positions a control shows (automated while lanes drive
+    /// them).
+    pub fn shown_dual_pan(&self, t: &Track) -> faderframe_core::DualPan {
+        let side = |target, v: f32| {
+            self.display_value(t.id, target)
+                .map_or(v, |v| v as f32)
+                .clamp(-1.0, 1.0)
+        };
+        faderframe_core::DualPan {
+            left: side(AutomationTarget::DualPanLeft, t.dual_pan.left),
+            right: side(AutomationTarget::DualPanRight, t.dual_pan.right),
+        }
     }
 
     /// Where the surround panner shows the track (automated values while
@@ -585,6 +636,22 @@ impl Session {
                 let v = p.get(pan);
                 if (v - p.get(&before)).abs() > 1e-6 {
                     self.write_point(*track, AutomationTarget::Surround(p), v as f64);
+                }
+            }
+            return;
+        }
+        // Dual pan: each side it moves.
+        if let Command::SetTrackDualPan { track, pan } = cmd {
+            let Some(before) = self.project.track(*track).map(|t| self.shown_dual_pan(t)) else {
+                return;
+            };
+            let pan = pan.clamped();
+            for (target, v, was) in [
+                (AutomationTarget::DualPanLeft, pan.left, before.left),
+                (AutomationTarget::DualPanRight, pan.right, before.right),
+            ] {
+                if (v - was).abs() > 1e-6 {
+                    self.write_point(*track, target, v as f64);
                 }
             }
             return;

@@ -127,6 +127,23 @@ pub fn differences(then: &Project, now: &Project) -> Vec<String> {
             clips(now)
         ));
     }
+    if then.pan_law != now.pan_law {
+        out.push(format!(
+            "Pan law {} → {}",
+            then.pan_law.label(),
+            now.pan_law.label()
+        ));
+    }
+    if then.downmix != now.downmix {
+        out.push("Surround downmix changed".into());
+    }
+    if then.speaker_layouts != now.speaker_layouts {
+        out.push(format!(
+            "Speaker layouts changed ({} → {})",
+            then.speaker_layouts.len(),
+            now.speaker_layouts.len()
+        ));
+    }
     if then.timecode != now.timecode {
         out.push("Timecode changed".into());
     }
@@ -151,6 +168,20 @@ fn track_differences(a: &Track, b: &Track, now: &Project, out: &mut Vec<String>)
             "pan {} → {}",
             faderframe_core::pan::format_pan(a.pan),
             faderframe_core::pan::format_pan(b.pan)
+        ));
+    }
+    if a.pan_mode != b.pan_mode {
+        push(format!(
+            "pan mode {} → {}",
+            a.pan_mode.label(),
+            b.pan_mode.label()
+        ));
+    }
+    if a.dual_pan != b.dual_pan {
+        push(format!(
+            "dual pan {} → {}",
+            faderframe_core::pan::format_dual(a.dual_pan),
+            faderframe_core::pan::format_dual(b.dual_pan)
         ));
     }
     for (was, is, what) in [

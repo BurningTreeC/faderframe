@@ -199,7 +199,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         if gpu {
-            if !faderframe_ui::gpu::paint(widget.upcast_ref(), &snapshot, W, H, scale, &mut paint) {
+            if !faderframe_ui::gpu::paint(
+                widget.upcast_ref(),
+                &snapshot,
+                W,
+                H,
+                scale,
+                false,
+                &mut paint,
+            ) {
                 return Err("GPU painter unavailable".into());
             }
         } else {

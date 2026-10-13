@@ -13,6 +13,8 @@ workspace = true
 [dependencies]
 faderframe-core.workspace = true
 faderframe-project.workspace = true
+faderframe-automation.workspace = true
+faderframe-binaural.workspace = true
 faderframe-engine.workspace = true
 faderframe-audio.workspace = true
 faderframe-audio-files.workspace = true

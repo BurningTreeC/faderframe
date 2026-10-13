@@ -586,6 +586,7 @@ pub fn track_render_project(
             }
             t.volume_db = 0.0;
             t.pan = 0.0;
+            t.pan_mode = faderframe_core::PanMode::Balance;
             t.mute = false;
             t.phase_invert = false;
             t.inserts.clear();
@@ -595,13 +596,18 @@ pub fn track_render_project(
         if t.id == track {
             t.volume_db = 0.0;
             t.pan = 0.0;
+            t.pan_mode = faderframe_core::PanMode::Balance;
+            t.dual_pan = faderframe_core::DualPan::ORIGINAL;
             t.mute = false;
             t.freeze = None;
             t.sends.clear();
             t.output = faderframe_project::OutputRouting::Master;
-            t.automation
-                .lanes
-                .retain(|l| !matches!(l.target, A::TrackVolume | A::TrackPan | A::TrackMute));
+            t.automation.lanes.retain(|l| {
+                !matches!(
+                    l.target,
+                    A::TrackVolume | A::TrackPan | A::DualPanLeft | A::DualPanRight | A::TrackMute
+                )
+            });
         }
     }
     Some((p, start, end))

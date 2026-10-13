@@ -456,3 +456,315 @@ fn a_return_counts_its_latency_from_its_send() {
     assert_eq!(of(pre), 64, "the dry path waits for the return");
     assert_eq!(of(ret), 0);
 }
+
+/// One impulse at frame `at` of the first block (then silence).
+struct ImpulseAt {
+    left: usize,
+}
+
+impl Processor<Ctx> for ImpulseAt {
+    fn process(&mut self, _cx: &ProcessContext<'_, Ctx>, io: &mut NodeIo<'_>) {
+        let out = &mut io.audio_out[0];
+        out.clear();
+        if self.left != usize::MAX && self.left < io.frames {
+            out.channel_mut(0)[self.left] = 1.0;
+            self.left = usize::MAX;
+        } else if self.left != usize::MAX {
+            self.left -= io.frames;
+        }
+    }
+}
+
+fn impulse_at(b: &mut GraphBuilder<Ctx>, at: usize) -> NodeId {
+    b.add_node(
+        NodeSpec::new("Impulse").audio_out(Mono),
+        Box::new(ImpulseAt { left: at }),
+    )
+}
+
+fn hits(out: &[f32]) -> Vec<(usize, f32)> {
+    out.iter()
+        .enumerate()
+        .filter(|(_, v)| **v != 0.0)
+        .map(|(i, v)| (i, *v))
+        .collect()
+}
+
+/// Two hardware outputs (the master on 1/2, a direct out on 3/4) are heard
+/// together: the one with less latency waits for the other.
+#[test]
+fn heard_outputs_are_aligned_with_each_other() {
+    let block = 64;
+    let mut b = GraphBuilder::<Ctx>::new();
+    let imp = impulse_at(&mut b, 3);
+    let fast = b.add_node(
+        NodeSpec::new("Direct").audio_in(Mono).audio_out(Mono),
+        Box::new(Passthrough),
+    );
+    let slow = b.add_node(
+        NodeSpec::new("Linear EQ").audio_in(Mono).audio_out(Mono),
+        Box::new(LatencyProbe::new(300)),
+    );
+    let out = |b: &mut GraphBuilder<Ctx>, ch: u16| {
+        b.add_node(
+            NodeSpec::new(format!("Out {ch}"))
+                .audio_in(Mono)
+                .role(NodeRole::DeviceOutput { first_channel: ch }),
+            Box::new(Passthrough),
+        )
+    };
+    let (o1, o2) = (out(&mut b, 0), out(&mut b, 2));
+    b.connect_audio(imp, 0, fast, 0).unwrap();
+    b.connect_audio(imp, 0, slow, 0).unwrap();
+    b.connect_audio(fast, 0, o1, 0).unwrap();
+    b.connect_audio(slow, 0, o2, 0).unwrap();
+    let mut g = b.compile(&config(block)).unwrap();
+    assert_eq!(g.stats().output_latency, 300);
+    assert_eq!(g.input_latency(o1), Some(300));
+    assert_eq!(g.input_latency(o2), Some(300));
+    let (mut a, mut c) = (Vec::new(), Vec::new());
+    for _ in 0..8 {
+        run(&mut g, block);
+        a.extend_from_slice(g.audio_input(o1, 0).unwrap().channel(0));
+        c.extend_from_slice(g.audio_input(o2, 0).unwrap().channel(0));
+    }
+    assert_eq!(hits(&a), vec![(303, 1.0)]);
+    assert_eq!(hits(&c), vec![(303, 1.0)]);
+}
+
+/// A hardware insert's send keeps its own timing (its return counts from
+/// it); the outputs heard are aligned without it.
+#[test]
+fn a_hardware_send_is_not_held_back_for_the_outputs() {
+    let mut b = GraphBuilder::<Ctx>::new();
+    let src = source(&mut b, "Track", 0.0);
+    let late = b.add_node(
+        NodeSpec::new("Late").audio_in(Mono).audio_out(Mono),
+        Box::new(LatencyProbe::new(1000)),
+    );
+    let send = b.add_node(
+        NodeSpec::new("Send")
+            .audio_in(Mono)
+            .role(NodeRole::DeviceOutput { first_channel: 4 }),
+        Box::new(Passthrough),
+    );
+    let ret = b.add_node(
+        NodeSpec::new("Return")
+            .audio_out(Mono)
+            .role(NodeRole::DeviceInput { first_channel: 4 })
+            .after(send),
+        Box::new(LatencyProbe::new(64)),
+    );
+    let out = b.add_node(
+        NodeSpec::new("Out")
+            .audio_in(Mono)
+            .audio_in(Mono)
+            .role(NodeRole::DeviceOutput { first_channel: 0 }),
+        Box::new(Passthrough),
+    );
+    b.connect_audio(src, 0, send, 0).unwrap();
+    b.connect_audio(src, 0, late, 0).unwrap();
+    b.connect_audio(late, 0, out, 0).unwrap();
+    b.connect_audio(ret, 0, out, 1).unwrap();
+    let g = b.compile(&config(64)).unwrap();
+    assert_eq!(g.compensation_into(send), vec![(src, 0)]);
+    assert_eq!(g.output_latency(ret), Some(64));
+    assert_eq!(g.stats().output_latency, 1000);
+}
+
+/// What a node is told about the latency arriving at it: set when the
+/// graph is compiled, and again when the processor (with its state) is
+/// adopted into a graph where it sits later.
+#[test]
+fn a_node_knows_how_late_its_input_is() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    struct Told(Arc<AtomicU32>);
+    impl Processor<Ctx> for Told {
+        fn set_input_latency(&mut self, frames: u32) {
+            self.0.store(frames, Ordering::Relaxed);
+        }
+        fn process(&mut self, _cx: &ProcessContext<'_, Ctx>, _io: &mut NodeIo<'_>) {}
+    }
+    let build = |latency: u32, told: Arc<AtomicU32>| {
+        let mut b = GraphBuilder::<Ctx>::new();
+        let src = source(&mut b, "Track", 0.0);
+        let fx = b.add_node(
+            NodeSpec::new("FX").audio_in(Mono).audio_out(Mono),
+            Box::new(LatencyProbe::new(latency)),
+        );
+        let dry = source(&mut b, "Dry", 0.0);
+        let strip = b.add_node(
+            NodeSpec::new("Strip")
+                .key(NodeKey(7))
+                .audio_in(Mono)
+                .audio_out(Mono),
+            Box::new(Told(told)),
+        );
+        b.connect_audio(src, 0, fx, 0).unwrap();
+        b.connect_audio(fx, 0, strip, 0).unwrap();
+        b.connect_audio(dry, 0, strip, 0).unwrap();
+        b.compile(&config(64)).unwrap()
+    };
+    let first = Arc::new(AtomicU32::new(u32::MAX));
+    let mut old = build(123, first.clone());
+    assert_eq!(first.load(Ordering::Relaxed), 123);
+    let second = Arc::new(AtomicU32::new(u32::MAX));
+    let mut new = build(6400, second.clone());
+    assert_eq!(new.adopt_state_from(&mut old), 1);
+    assert_eq!(
+        first.load(Ordering::Relaxed),
+        6400,
+        "the adopted processor sits behind 6400 now"
+    );
+}
+
+/// The alignment does not depend on how the host cuts the audio into
+/// blocks: 6400 frames of latency against a dry path, blocks of 1 to the
+/// maximum, ragged sizes too.
+#[test]
+fn compensation_is_the_same_for_every_block_size() {
+    let render = |sizes: &[usize], max: usize| {
+        let mut b = GraphBuilder::<Ctx>::new();
+        let imp = impulse_at(&mut b, 1000);
+        let eq = b.add_node(
+            NodeSpec::new("Linear EQ").audio_in(Mono).audio_out(Mono),
+            Box::new(LatencyProbe::new(6400)),
+        );
+        let gain = b.add_node(
+            NodeSpec::new("Dry").audio_in(Mono).audio_out(Mono),
+            Box::new(Gain { gain: 0.5 }),
+        );
+        let sum = b.add_node(
+            NodeSpec::new("Sum").audio_in(Mono).audio_out(Mono),
+            Box::new(Passthrough),
+        );
+        b.connect_audio(imp, 0, eq, 0).unwrap();
+        b.connect_audio(imp, 0, gain, 0).unwrap();
+        b.connect_audio(eq, 0, sum, 0).unwrap();
+        b.connect_audio(gain, 0, sum, 0).unwrap();
+        let mut g = b.compile(&config(max)).unwrap();
+        let mut out = Vec::new();
+        let mut k = 0;
+        while out.len() < 9000 {
+            let n = sizes[k % sizes.len()];
+            k += 1;
+            run(&mut g, n);
+            out.extend_from_slice(g.audio_output(sum, 0).unwrap().channel(0));
+        }
+        out.truncate(9000);
+        out
+    };
+    let want = render(&[64], 64);
+    assert_eq!(hits(&want), vec![(7400, 1.5)]);
+    for (sizes, max) in [
+        (&[1usize][..], 1usize),
+        (&[7], 7),
+        (&[1024], 1024),
+        (&[8192], 8192),
+        (&[1, 31, 64, 5, 1000, 17], 1024),
+    ] {
+        assert_eq!(render(sizes, max), want, "blocks {sizes:?}");
+    }
+}
+
+/// Low-latency monitoring through a bus: a live vocal (early) joins a bus
+/// that also plays a track; a track elsewhere has 6400 frames of latency.
+/// The vocal comes out at once — the bus's other audio is held back where
+/// it joins, not the bus after — and both playback tracks still meet.
+#[test]
+fn early_audio_passes_every_summing_point_after_it() {
+    let block = 64;
+    let mut b = GraphBuilder::<Ctx>::new();
+    let vocal = impulse_at(&mut b, 100);
+    let keys = impulse_at(&mut b, 1000);
+    let drums = impulse_at(&mut b, 1000);
+    let late = b.add_node(
+        NodeSpec::new("Linear EQ").audio_in(Mono).audio_out(Mono),
+        Box::new(LatencyProbe::new(6400)),
+    );
+    let bus = b.add_node(
+        NodeSpec::new("Bus").audio_in(Mono).audio_out(Mono),
+        Box::new(Passthrough),
+    );
+    let master = b.add_node(
+        NodeSpec::new("Master").audio_in(Mono).audio_out(Mono),
+        Box::new(Passthrough),
+    );
+    let out = b.add_node(
+        NodeSpec::new("Out")
+            .audio_in(Mono)
+            .role(NodeRole::DeviceOutput { first_channel: 0 }),
+        Box::new(Passthrough),
+    );
+    b.connect_audio_early(vocal, 0, bus, 0).unwrap();
+    b.connect_audio(keys, 0, bus, 0).unwrap();
+    b.connect_audio(bus, 0, master, 0).unwrap();
+    b.connect_audio(drums, 0, late, 0).unwrap();
+    b.connect_audio(late, 0, master, 0).unwrap();
+    b.connect_audio(master, 0, out, 0).unwrap();
+    let mut g = b.compile(&config(block)).unwrap();
+    assert_eq!(g.stats().output_latency, 6400);
+    assert_eq!(
+        g.compensation_into(master)
+            .iter()
+            .find(|(n, _)| *n == bus)
+            .unwrap()
+            .1,
+        0,
+        "the bus is not held back at the master"
+    );
+    let mut heard = Vec::new();
+    for _ in 0..(8000 / block + 1) {
+        run(&mut g, block);
+        heard.extend_from_slice(g.audio_input(out, 0).unwrap().channel(0));
+    }
+    // The vocal at once; keys and drums together, 6400 late.
+    assert_eq!(hits(&heard), vec![(100, 1.0), (7400, 2.0)]);
+}
+
+/// Counts its resets.
+struct Resets(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Processor<Ctx> for Resets {
+    fn process(&mut self, _cx: &ProcessContext<'_, Ctx>, _io: &mut NodeIo<'_>) {}
+
+    fn reset(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A panic's resets go a share of a callback at a time: past the time
+/// given, one node per call, each node once, in processing order.
+#[test]
+fn resets_can_be_spread_over_calls() {
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut b = GraphBuilder::<Ctx>::new();
+    let nodes = 5;
+    for i in 0..nodes {
+        b.add_node(
+            NodeSpec::new(format!("N{i}")).audio_out(Mono),
+            Box::new(Resets(count.clone())),
+        );
+    }
+    let mut g = b.compile(&config(64)).unwrap();
+    let past = std::time::Instant::now();
+    let mut from = 0;
+    let mut calls = 0;
+    loop {
+        calls += 1;
+        match g.reset_nodes(from, past) {
+            Some(next) => {
+                assert_eq!(next, from + 1, "one node past the time");
+                from = next;
+            }
+            None => break,
+        }
+    }
+    assert_eq!(calls, nodes);
+    assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), nodes);
+    // With time to spare, all at once.
+    let later = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    assert_eq!(g.reset_nodes(0, later), None);
+    assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 2 * nodes);
+}

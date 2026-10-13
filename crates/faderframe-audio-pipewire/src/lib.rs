@@ -316,8 +316,16 @@ struct RtState {
     silence: Vec<f32>,
     sink: Vec<Vec<f32>>,
     info: StreamInfo,
-    xruns: u64,
+    /// The graph's accumulated xrun duration (samples) last seen: `None`
+    /// before the first cycle.
+    xrun_samples: Option<u64>,
+    /// The data thread's stack mapped (on the first cycle).
+    stack_ready: bool,
 }
+
+/// `SPA_IO_CLOCK_FLAG_XRUN_RECOVER`: this node did not finish the last
+/// cycle in time.
+const XRUN_RECOVER: u32 = 1 << 1;
 
 /// What the filter's events get as their data pointer.
 struct Shared {
@@ -371,6 +379,12 @@ unsafe extern "C" fn on_process(data: *mut c_void, position: *mut spa_sys::spa_i
     if n == 0 || n > MAX_BUFFER_SIZE as usize {
         return;
     }
+    if !rt.stack_ready {
+        // Once: the stack deep calls will reach, mapped now rather than
+        // page by page in later cycles.
+        rt.stack_ready = true;
+        faderframe_realtime::memory::prefault_stack(256 * 1024);
+    }
     let rate = pos.clock.rate.denom;
     if (rate > 0 && rate != rt.info.sample_rate) || n as u32 != rt.info.buffer_size {
         if rate > 0 {
@@ -381,14 +395,14 @@ unsafe extern "C" fn on_process(data: *mut c_void, position: *mut spa_sys::spa_i
         shared.monitor.set_buffer_size(n as u32);
         rt.callback.prepare(&rt.info);
     }
-    if pos.clock.xrun > rt.xruns {
-        if rt.xruns > 0 {
-            for _ in rt.xruns..pos.clock.xrun {
-                shared.monitor.record_xrun();
-            }
-        }
-        rt.xruns = pos.clock.xrun;
+    // One xrun per cycle after which the graph's xrun duration grew (it
+    // is a duration in samples, not a count), or for which PipeWire says
+    // this node itself was late.
+    let grew = rt.xrun_samples.is_some_and(|seen| pos.clock.xrun > seen);
+    if grew || pos.clock.flags & XRUN_RECOVER != 0 {
+        shared.monitor.record_xrun();
     }
+    rt.xrun_samples = Some(pos.clock.xrun);
     let RtState {
         callback,
         inputs,
@@ -569,7 +583,8 @@ fn run(
             outputs,
             silence: vec![0.0; max],
             info,
-            xruns: 0,
+            xrun_samples: None,
+            stack_ready: false,
         }),
         monitor: Arc::clone(&monitor),
     });

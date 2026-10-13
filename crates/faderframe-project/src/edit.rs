@@ -71,6 +71,7 @@ pub enum CoalesceKey {
     TrackVolume(TrackId),
     ConsoleDrive,
     TrackPan(TrackId),
+    TrackDualPan(TrackId),
     TrackSurround(TrackId),
     SendLevel(TrackId, SendId),
     Clip(ClipId),
@@ -111,6 +112,18 @@ pub enum Command {
     SetTrackPan {
         track: TrackId,
         pan: f32,
+    },
+    /// How a stereo source's pan works: balance or dual pan. Both settings
+    /// (and their automation) are kept whichever is in use.
+    SetTrackPanMode {
+        track: TrackId,
+        mode: faderframe_core::PanMode,
+    },
+    /// Where dual pan places a stereo source's channels (clamped; NaN
+    /// back to the original side).
+    SetTrackDualPan {
+        track: TrackId,
+        pan: faderframe_core::DualPan,
     },
     /// Where the track sits in a surround bed (clamped).
     SetTrackSurround {
@@ -309,6 +322,19 @@ pub enum Command {
     /// Enable analogue crosstalk for adjacent mixer channels.
     SetCrosstalk {
         enabled: bool,
+    },
+    /// The project's pan law: how mono pan and each channel of dual pan
+    /// spread a source (never balance).
+    SetPanLaw {
+        law: faderframe_core::PanLaw,
+    },
+    /// How surround beds fold into stereo and mono (clamped).
+    SetDownmix {
+        downmix: faderframe_core::surround::Downmix,
+    },
+    /// The project's library of speaker layouts the user defined.
+    SetSpeakerLayouts {
+        layouts: Vec<faderframe_core::surround::LayoutDef>,
     },
     /// The console the mix runs through (None: in the box). The session
     /// places (or removes) the bus amplifiers in the same step.
@@ -689,7 +715,8 @@ impl Command {
         use Command::*;
         match self {
             SetTrackVolume { .. } => "Change Volume".into(),
-            SetTrackPan { .. } => "Change Pan".into(),
+            SetTrackPan { .. } | SetTrackDualPan { .. } => "Change Pan".into(),
+            SetTrackPanMode { mode, .. } => format!("Pan Mode: {}", mode.label()),
             SetTrackSurround { .. } => "Change Surround Pan".into(),
             SetTrackObject { on: true, .. } => "Make Object".into(),
             SetTrackObject { on: false, .. } => "Back into the Bed".into(),
@@ -740,6 +767,9 @@ impl Command {
             RemoveTrack { .. } => "Remove Track".into(),
             MoveTrack { .. } => "Move Track".into(),
             SetCrosstalk { .. } => "Analogue Crosstalk".into(),
+            SetPanLaw { .. } => "Pan Law".into(),
+            SetDownmix { .. } => "Surround Downmix".into(),
+            SetSpeakerLayouts { .. } => "Speaker Layouts".into(),
             SetConsole { console: Some(c) } => format!("Console: {}", c.name()),
             SetConsole { console: None } => "Console Off".into(),
             SetConsoleDrive { .. } => "Console Drive".into(),
@@ -801,6 +831,7 @@ impl Command {
         Some(match self {
             SetTrackVolume { track, .. } => CoalesceKey::TrackVolume(*track),
             SetTrackPan { track, .. } => CoalesceKey::TrackPan(*track),
+            SetTrackDualPan { track, .. } => CoalesceKey::TrackDualPan(*track),
             SetTrackSurround { track, .. } => CoalesceKey::TrackSurround(*track),
             SetSendLevel { track, send, .. } => CoalesceKey::SendLevel(*track, *send),
             MoveClip { clip, .. } | SetClipContent { clip, .. } => CoalesceKey::Clip(*clip),
@@ -829,6 +860,10 @@ impl Command {
         match self {
             SetTrackVolume { .. }
             | SetTrackPan { .. }
+            | SetTrackPanMode { .. }
+            | SetTrackDualPan { .. }
+            | SetPanLaw { .. }
+            | SetDownmix { .. }
             | SetTrackSurround { .. }
             | SetTrackMute { .. }
             | SetTrackSolo { .. }
@@ -837,7 +872,7 @@ impl Command {
             | SetPluginParameter { .. }
             | SetPluginState { .. }
             | SetConsoleDrive { .. } => Impact::Params,
-            SetConsoleLook { .. } => Impact::None,
+            SetConsoleLook { .. } | SetSpeakerLayouts { .. } => Impact::None,
             RenameTrack { .. }
             | SetTrackBinaural { .. }
             | SetTrackColor { .. }
@@ -954,6 +989,16 @@ impl Command {
                 };
                 let old = std::mem::replace(&mut t.pan, pan);
                 SetTrackPan { track, pan: old }
+            }
+            SetTrackPanMode { track, mode } => {
+                let t = track_mut(p, track)?;
+                let old = std::mem::replace(&mut t.pan_mode, mode);
+                SetTrackPanMode { track, mode: old }
+            }
+            SetTrackDualPan { track, pan } => {
+                let t = track_mut(p, track)?;
+                let old = std::mem::replace(&mut t.dual_pan, pan.clamped());
+                SetTrackDualPan { track, pan: old }
             }
             SetTrackSurround { track, pan } => {
                 let t = track_mut(p, track)?;
@@ -1532,6 +1577,18 @@ impl Command {
             SetCrosstalk { enabled } => {
                 let old = std::mem::replace(&mut p.crosstalk, enabled);
                 SetCrosstalk { enabled: old }
+            }
+            SetPanLaw { law } => {
+                let old = std::mem::replace(&mut p.pan_law, law);
+                SetPanLaw { law: old }
+            }
+            SetDownmix { downmix } => {
+                let old = std::mem::replace(&mut p.downmix, downmix.clamped());
+                SetDownmix { downmix: old }
+            }
+            SetSpeakerLayouts { layouts } => {
+                let old = std::mem::replace(&mut p.speaker_layouts, layouts);
+                SetSpeakerLayouts { layouts: old }
             }
             SetConsole { console } => {
                 let console = console.map(|c| {

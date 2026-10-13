@@ -711,9 +711,12 @@ name = "faderframe-app"
 version = "0.21.0"
 dependencies = [
  "faderframe-audio",
+ "faderframe-plugin-check",
  "faderframe-plugin-clap",
  "faderframe-plugin-vst3",
+ "faderframe-realtime",
  "faderframe-ui",
+ "libc",
  "tracing",
  "tracing-subscriber",
 ]
@@ -778,6 +781,7 @@ name = "faderframe-audio-pipewire"
 version = "0.21.0"
 dependencies = [
  "faderframe-audio",
+ "faderframe-realtime",
  "pipewire",
  "tracing",
 ]
@@ -797,6 +801,8 @@ version = "0.21.0"
 dependencies = [
  "faderframe-audio",
  "faderframe-audio-files",
+ "faderframe-automation",
+ "faderframe-binaural",
  "faderframe-core",
  "faderframe-engine",
  "faderframe-plugin-clap",
@@ -834,12 +840,16 @@ dependencies = [
 [[package]]
 name = "faderframe-control"
 version = "0.21.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "faderframe-core"
 version = "0.21.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -871,6 +881,7 @@ dependencies = [
  "faderframe-stretch",
  "faderframe-timeline",
  "faderframe-transport",
+ "libc",
  "rtrb",
  "thiserror 2.0.21",
  "tracing",
@@ -913,6 +924,7 @@ version = "0.21.0"
 dependencies = [
  "faderframe-midi",
  "faderframe-midi-ump",
+ "faderframe-realtime",
  "midir",
  "rtrb",
  "tracing",
@@ -924,6 +936,7 @@ version = "0.21.0"
 dependencies = [
  "alsa-sys",
  "faderframe-midi",
+ "faderframe-realtime",
  "libc",
 ]
 
@@ -941,6 +954,20 @@ dependencies = [
  "objc2",
  "rtrb",
  "tracing",
+]
+
+[[package]]
+name = "faderframe-plugin-check"
+version = "0.21.0"
+dependencies = [
+ "faderframe-audio-graph",
+ "faderframe-core",
+ "faderframe-midi",
+ "faderframe-plugin-host",
+ "faderframe-realtime",
+ "faderframe-transport",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1192,6 +1219,7 @@ dependencies = [
  "faderframe-engine",
  "faderframe-iamf",
  "faderframe-plugin-au",
+ "faderframe-plugin-check",
  "faderframe-plugin-clap",
  "faderframe-plugin-host",
  "faderframe-plugin-lv2",

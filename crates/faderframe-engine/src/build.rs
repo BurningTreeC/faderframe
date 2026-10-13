@@ -35,7 +35,7 @@ use crate::slots::SlotRegistry;
 use faderframe_audio_graph::nodes::Passthrough;
 use faderframe_audio_graph::{GraphBuilder, NodeId, NodeKey, NodeRole, NodeSpec, PrepareConfig};
 use faderframe_core::PluginInstanceId;
-use faderframe_core::{ChannelLayout, PanLaw, TrackId};
+use faderframe_core::{ChannelLayout, TrackId};
 use faderframe_plugin_host::ProcessConfig;
 use faderframe_project::{
     InputRouting, MonitorMode, OutputRouting, PluginSlot, Project, SendTap, Track, TrackKind,
@@ -66,6 +66,8 @@ pub struct BuiltGraph {
     pub ahead: Option<(GraphBuilder<EngineContext>, Vec<Arc<AheadRing>>)>,
     /// The shallow tier's graph and rings (buses rendered ahead).
     pub bus_ahead: Option<(GraphBuilder<EngineContext>, Vec<Arc<AheadRing>>)>,
+    /// Effects bypassed by low-latency monitoring.
+    pub bypassed_for_monitoring: Vec<PluginInstanceId>,
 }
 
 /// Which tracks are rendered ahead, and where their audio goes.
@@ -506,6 +508,14 @@ struct PluginCx<'a> {
     taken: HashMap<PluginInstanceId, u16>,
     /// Per plugin, which of its buses tracks take.
     taken_buses: HashMap<PluginInstanceId, u64>,
+    /// Low-latency monitoring: the tracks a live input goes through (those
+    /// heard live and the buses, returns and master after them — see
+    /// [`monitored_path`]), whose effects with more latency than the limit
+    /// are bypassed.
+    monitor_path: HashSet<TrackId>,
+    monitor_limit: u32,
+    /// The effects it bypassed.
+    bypassed_for_monitoring: Vec<PluginInstanceId>,
 }
 
 impl PluginCx<'_> {
@@ -614,6 +624,19 @@ impl PluginCx<'_> {
             sidechain: spec.audio_inputs.len() > 1,
             ..self.process
         };
+        // Low-latency monitoring: an effect with more latency than the
+        // limit on a live input's path is bypassed (an instrument — no
+        // audio in — never is).
+        let limit = self.monitor_limit;
+        let monitored = self.monitor_path.contains(&track.id)
+            && matches!(role, Role::Insert)
+            && self.plugins.instance(slot).is_ok_and(|i| {
+                !i.descriptor().audio_inputs.is_empty() && i.latency_samples() > limit
+            });
+        let bypass = slot.bypass || monitored;
+        if monitored && !slot.bypass {
+            self.bypassed_for_monitoring.push(slot.id);
+        }
         if let Ok(instance) = self.plugins.instance(slot) {
             instance.configure_realtime(self.realtime && !slot.bypass);
             // The same in both graphs: latency must not depend on which.
@@ -637,16 +660,16 @@ impl PluginCx<'_> {
                 let sub = slot.id.raw()
                     ^ ((buffered as u64) << 62)
                     ^ ((p.latency as u64) << 40)
-                    ^ ((slot.bypass as u64) << 63)
+                    ^ ((bypass as u64) << 63)
                     ^ p.activation.wrapping_mul(0x9e37_79b9_7f4a_7c15);
                 let channels = spec.audio_outputs.first().map_or(0, |l| l.channel_count());
-                let latency = if slot.bypass { 0 } else { p.latency };
+                let latency = if bypass { 0 } else { p.latency };
                 let node = PluginNode::new(
                     track.id,
                     slot.id,
                     p.processor,
                     p.latency,
-                    slot.bypass,
+                    bypass,
                     p.failed,
                     channels,
                 );
@@ -806,7 +829,7 @@ fn destination_layout(project: &Project, track: &Track) -> ChannelLayout {
 }
 
 /// How the master is listened to (never part of a render unless asked).
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Listen {
     /// On headphones: rendered binaurally with this room …
     pub binaural: Option<faderframe_binaural::Room>,
@@ -814,19 +837,27 @@ pub struct Listen {
     pub head: faderframe_binaural::Head,
     /// … evened out for the headphones.
     pub correction: Option<Arc<faderframe_binaural::Correction>>,
+    /// The way a change reaches the running listening node (no rebuild).
+    pub link: Arc<crate::nodes::ListenLink>,
 }
 
-impl Listen {
-    /// What tells one listening node from another (its node key): a new
-    /// room, head or correction makes a new renderer.
-    fn key(&self) -> u64 {
-        match self.binaural {
-            None => 0,
-            Some(room) => {
-                let c = self.correction.as_ref().map_or(0, |c| c.serial());
-                (1 + room as u64) ^ (self.head.serial() << 8) ^ (c << 36)
-            }
+impl Default for Listen {
+    fn default() -> Self {
+        Self {
+            binaural: None,
+            head: faderframe_binaural::Head::default(),
+            correction: None,
+            link: crate::nodes::ListenLink::new(),
         }
+    }
+}
+
+impl PartialEq for Listen {
+    fn eq(&self, other: &Self) -> bool {
+        self.binaural == other.binaural
+            && self.head == other.head
+            && self.correction == other.correction
+            && Arc::ptr_eq(&self.link, &other.link)
     }
 }
 
@@ -840,7 +871,9 @@ pub fn build_graph(
     mut ahead: Option<AheadPlan<'_>>,
     monitor: &[PluginSlot],
     listen: &Listen,
+    monitoring: &Monitoring,
 ) -> Result<BuiltGraph, EngineError> {
+    let early = &monitoring.tracks;
     let midi_ports = &routing.inputs;
     let mut b = GraphBuilder::<EngineContext>::new();
     let mut ab = GraphBuilder::<EngineContext>::new();
@@ -869,6 +902,9 @@ pub fn build_graph(
         warnings: &mut warnings,
         taken: project.taken_plugin_outputs(),
         taken_buses: project.taken_plugin_buses(),
+        monitor_path: monitored_path(project, &monitoring.tracks),
+        monitor_limit: monitoring.limit,
+        bypassed_for_monitoring: Vec::new(),
     };
     // Nodes (in the audio thread's graph) of plugins whose extra outputs
     // tracks take.
@@ -1262,16 +1298,19 @@ pub fn build_graph(
                         .key(node_key(t.id, Role::ClipPlayer, voices.key(), &[layout]))
                         .group(gi)
                         .audio_out(layout),
-                    Box::new(if voices.is_empty() {
-                        AudioClipPlayer::new(t.id)
-                    } else {
-                        AudioClipPlayer::with_voices(
-                            t.id,
-                            voices,
-                            config.sample_rate,
-                            config.max_block_size,
-                        )
-                    }),
+                    Box::new(
+                        if voices.is_empty() {
+                            AudioClipPlayer::new(t.id)
+                        } else {
+                            AudioClipPlayer::with_voices(
+                                t.id,
+                                voices,
+                                config.sample_rate,
+                                config.max_block_size,
+                            )
+                        }
+                        .live(pcx.realtime),
+                    ),
                 );
                 own(&mut owners, player, t.id, None, NodeWork::Clips);
                 b.connect_audio(player, 0, input, 0)?;
@@ -1517,29 +1556,23 @@ pub fn build_graph(
                     .and_then(|d| nodes.get(&d))
                     .and_then(reachable)
                 {
-                    g.connect_audio(out, 0, dst, 0)?;
+                    connect_out(g, out, dst, early.contains(&t.id))?;
                 }
             }
             OutputRouting::Hardware { first_channel } if !ahead_strip => {
                 let mut dest = destination_layout(project, t);
                 if t.kind == TrackKind::Master {
-                    // Listening: headphones (binaural), a bed folded to the
-                    // device, the mono check.
-                    let to = if listen.binaural.is_some() {
-                        ChannelLayout::Stereo
-                    } else {
-                        fold_for(dest, config.device_outputs, first_channel as usize)
-                            .unwrap_or(dest)
-                    };
+                    // Listening: headphones (binaural, on the device's first
+                    // two channels), a bed folded to the device, the mono
+                    // check. Its key leaves out how it is heard: a rebuild
+                    // keeps the running node (switches reach it without
+                    // one, crossfaded).
+                    let to = fold_for(dest, config.device_outputs, first_channel as usize)
+                        .unwrap_or(dest);
                     let mono = slots.monitor_mono()?;
                     let node = g.add_node(
                         NodeSpec::new(format!("{} · Listen", t.name))
-                            .key(node_key(
-                                t.id,
-                                Role::DeviceOut,
-                                0x115E0 ^ (listen.key() << 20),
-                                &[dest, to],
-                            ))
+                            .key(node_key(t.id, Role::DeviceOut, 0x115E0, &[dest, to]))
                             .group(gi)
                             .audio_in(dest)
                             .audio_out(to),
@@ -1550,6 +1583,8 @@ pub fn build_graph(
                             config.sample_rate as u32,
                             config.max_block_size,
                             mono,
+                            slots.bass_management()?,
+                            slots.mix()?,
                         )),
                     );
                     owned(node, NodeWork::HardwareOut, None);
@@ -1567,7 +1602,7 @@ pub fn build_graph(
                             .group(gi)
                             .audio_in(dest)
                             .audio_out(to),
-                        Box::new(FoldDown::new(dest, to)),
+                        Box::new(FoldDown::new(dest, to, slots.mix()?)),
                     );
                     owned(fold, NodeWork::HardwareOut, None);
                     g.connect_audio(out, 0, fold, 0)?;
@@ -1588,7 +1623,7 @@ pub fn build_graph(
                     Box::new(DeviceOutputSink),
                 );
                 owned(hw, NodeWork::HardwareOut, None);
-                g.connect_audio(out, 0, hw, 0)?;
+                connect_out(g, out, hw, early.contains(&t.id))?;
             }
             OutputRouting::Hardware { .. } | OutputRouting::None => {}
         }
@@ -1611,16 +1646,26 @@ pub fn build_graph(
             let follow = (matches!(send.tap, SendTap::PreFx | SendTap::PreFader)
                 && !surround(t.layout)
                 && surround(target.layout))
-            .then(|| slots.strip_of(t.id).map(|s| s.surround))
+            .then(|| slots.strip_of(t.id))
             .flatten();
-            let node =
-                SendNode::new(t.id, send.id, level).with_layouts(tap_layout, target.layout, follow);
+            let diffuse = follow.is_some() && is_diffuse(project, t);
+            let mut node = SendNode::new(t.id, send.id, level).with_layouts(
+                tap_layout,
+                target.layout,
+                follow,
+                slots.mix()?,
+            );
+            if diffuse {
+                node = node.with_diffuser(config.sample_rate);
+            }
             let node = g.add_node(
                 NodeSpec::new(format!("{} → {}", t.name, target.name))
                     .key(node_key(
                         t.id,
                         Role::Send,
-                        send.id.raw() | (u64::from(follow.is_some()) << 63),
+                        send.id.raw()
+                            | (u64::from(follow.is_some()) << 63)
+                            | (u64::from(diffuse) << 62),
                         &[tap_layout, target.layout],
                     ))
                     .group(gi)
@@ -1630,7 +1675,7 @@ pub fn build_graph(
             );
             owned(node, NodeWork::Send, None);
             g.connect_audio(tap_node, tap_port, node, 0)?;
-            g.connect_audio(node, 0, dst, 0)?;
+            connect_out(g, node, dst, early.contains(&t.id))?;
         }
     }
     if let Some(r) = renderer {
@@ -1638,6 +1683,7 @@ pub fn build_graph(
             b.connect_audio(o, 0, r, 0)?;
         }
     }
+    let bypassed_for_monitoring = std::mem::take(&mut pcx.bypassed_for_monitoring);
     // Sidechains tap their source after its inserts: before its fader,
     // mute and solo, so a muted "ghost" track can still key.
     for (node, src) in sidechains {
@@ -1715,6 +1761,7 @@ pub fn build_graph(
     }
     Ok(BuiltGraph {
         builder: b,
+        bypassed_for_monitoring,
         warnings,
         owners,
         bus_ahead: ahead.as_ref().map(|_| (bb, bus_used_rings)),
@@ -1911,6 +1958,87 @@ fn add_container(
     Ok((sum, latency))
 }
 
+/// Tracks heard live: a hardware input monitored (always, or while armed
+/// with auto monitoring) or live MIDI played into it. With low-latency
+/// monitoring their effects with latency are bypassed and what leaves
+/// them (outputs, sends) is summed as it comes ([`connect_out`]) — heard at
+/// once instead of waiting for the plugin latency elsewhere.
+pub fn live_monitored(project: &Project, live: &HashSet<TrackId>) -> HashSet<TrackId> {
+    project
+        .tracks
+        .iter()
+        .filter(|t| {
+            let input = matches!(t.input, InputRouting::Hardware { .. })
+                && match t.monitor {
+                    MonitorMode::Off => false,
+                    MonitorMode::Input => true,
+                    MonitorMode::Auto => t.record_arm,
+                };
+            input || live.contains(&t.id)
+        })
+        .map(|t| t.id)
+        .collect()
+}
+
+/// Low-latency monitoring as a graph is built: the tracks heard live
+/// (their outputs and sends early) and the latency an effect on their
+/// path may keep (frames).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Monitoring {
+    pub tracks: HashSet<TrackId>,
+    pub limit: u32,
+}
+
+/// The tracks a live input goes through: those heard live and every bus,
+/// return and master their outputs and sends reach, on and on.
+pub fn monitored_path(project: &Project, live: &HashSet<TrackId>) -> HashSet<TrackId> {
+    let mut path: HashSet<TrackId> = live.clone();
+    let mut todo: Vec<TrackId> = live.iter().copied().collect();
+    while let Some(id) = todo.pop() {
+        let Some(t) = project.track(id) else { continue };
+        let next = project
+            .output_target(t)
+            .into_iter()
+            .chain(t.sends.iter().filter(|s| s.enabled).map(|s| s.target));
+        for n in next {
+            if path.insert(n) {
+                todo.push(n);
+            }
+        }
+    }
+    path
+}
+
+/// A track's output or send into `to`: summed as it arrives when `early`
+/// (low-latency monitoring), else aligned with the other paths.
+fn connect_out(
+    g: &mut GraphBuilder<EngineContext>,
+    from: NodeId,
+    to: NodeId,
+    early: bool,
+) -> Result<(), faderframe_audio_graph::GraphError> {
+    if early {
+        g.connect_audio_early(from, 0, to, 0)
+    } else {
+        g.connect_audio(from, 0, to, 0)
+    }
+}
+
+/// The tracks whose spread into a bed is diffuse (their strips and the
+/// sends following them get decorrelation filters).
+pub fn diffuse_tracks(project: &Project) -> Vec<TrackId> {
+    project
+        .tracks
+        .iter()
+        .filter(|t| is_diffuse(project, t))
+        .map(|t| t.id)
+        .collect()
+}
+
+fn is_diffuse(project: &Project, t: &Track) -> bool {
+    project.surround_panned(t).is_some() && project.effective_surround(t).diffuse
+}
+
 /// A track's channel strip, fed from `from` (`quiet`: rendered ahead).
 #[allow(clippy::too_many_arguments)]
 fn add_strip(
@@ -1962,11 +2090,12 @@ fn add_strip(
     let object = project.is_object(t);
     let metered_elsewhere =
         t.kind == TrackKind::Master && project.objects().next().is_some() && !quiet;
+    let diffuse = is_diffuse(project, t);
     let mut spec = NodeSpec::new(format!("{} · Strip", t.name))
         .key(node_key(
             t.id,
             Role::Strip,
-            u64::from(object) | (u64::from(metered_elsewhere) << 1),
+            u64::from(object) | (u64::from(metered_elsewhere) << 1) | (u64::from(diffuse) << 2),
             &[layout, dest],
         ))
         .audio_in(layout)
@@ -1976,12 +2105,15 @@ fn add_strip(
         spec = spec.group(g);
     }
     let mut strip =
-        ChannelStrip::new(t.id, strip_slots, meter, PanLaw::default()).with_layouts(layout, dest);
+        ChannelStrip::new(t.id, strip_slots, meter, slots.mix()?).with_layouts(layout, dest);
     if object {
         strip = strip.object();
     }
     if metered_elsewhere {
         strip = strip.metered_elsewhere();
+    }
+    if diffuse {
+        strip = strip.with_diffuser(config.sample_rate);
     }
     let strip = b.add_node(spec, Box::new(if quiet { strip.quiet() } else { strip }));
     b.connect_audio(from, 0, strip, 0)?;

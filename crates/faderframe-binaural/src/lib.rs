@@ -111,34 +111,58 @@ pub fn resample(x: &[f32], ratio: f64) -> Vec<f32> {
         .collect()
 }
 
-/// The baked direction a speaker of `layout` (by its label) stands at;
-/// `None`: the LFE (or discrete channels).
+/// The baked direction a speaker of `layout` stands at — matched by its
+/// azimuth and elevation (`faderframe_core::surround::Speaker`, the same
+/// table VBAP pans by; both count azimuth positive to the left); `None`:
+/// the LFE (or discrete channels, or a direction not baked).
 pub fn direction(layout: ChannelLayout, channel: usize) -> Option<usize> {
-    let quad = layout == ChannelLayout::Surround(faderframe_core::SurroundFormat::Quad);
     let s = speakers_of(layout)?.get(channel)?;
     if s.lfe {
         return None;
     }
-    Some(match s.label {
-        "C" | "M" => 0,
-        "L" => 1,
-        "R" => 2,
-        "Lss" => 3,
-        "Rss" => 4,
-        "Ls" if quad => 7,
-        "Rs" if quad => 8,
-        "Ls" => 5,
-        "Rs" => 6,
-        "Lrs" => 7,
-        "Rrs" => 8,
-        "Ltf" => 9,
-        "Rtf" => 10,
-        "Ltr" => 11,
-        "Rtr" => 12,
-        "Ltm" => 13,
-        "Rtm" => 14,
-        _ => return None,
-    })
+    DIRECTIONS
+        .iter()
+        .position(|&(az, el)| (az - s.azimuth).abs() < 0.5 && (el - s.elevation).abs() < 0.5)
+}
+
+/// How a speaker of `layout` is heard: the baked directions it is made of
+/// and their gains. A speaker at a baked direction is that direction
+/// alone; any other (a custom layout's) is panned over the baked ones by
+/// VBAP — its filter the blend of the nearest measured responses (an
+/// approximation of a measurement from there; below ear level it is heard
+/// at ear level). Empty: the LFE (or discrete channels).
+pub fn weights(layout: ChannelLayout, channel: usize) -> Vec<(usize, f32)> {
+    if let Some(d) = direction(layout, channel) {
+        return vec![(d, 1.0)];
+    }
+    let Some(s) = speakers_of(layout).and_then(|s| s.get(channel)) else {
+        return Vec::new();
+    };
+    if s.lfe {
+        return Vec::new();
+    }
+    let baked: Vec<faderframe_core::surround::Speaker> = DIRECTIONS
+        .iter()
+        .map(|&(azimuth, elevation)| faderframe_core::surround::Speaker {
+            label: "",
+            mask: 0,
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            azimuth,
+            elevation,
+            lfe: false,
+        })
+        .collect();
+    let Ok(v) = faderframe_core::vbap::Vbap::new(&baked) else {
+        return Vec::new();
+    };
+    let mut g = vec![0.0; DIRECTIONS.len()];
+    v.gains(s.azimuth, s.elevation, &mut g);
+    g.into_iter()
+        .enumerate()
+        .filter(|(_, g)| *g > 0.0)
+        .collect()
 }
 
 /// The magnitude of `x` at `freq` (a single-bin DFT).

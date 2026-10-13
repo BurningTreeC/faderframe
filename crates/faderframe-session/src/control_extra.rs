@@ -194,8 +194,9 @@ impl Session {
     /// the MIDI time code rate.
     pub(crate) fn surface_timecode(&self) -> [i32; 4] {
         let rate = self.sync_settings().mtc_out_rate;
+        // What is heard (as the screen's playhead).
         let seconds =
-            self.transport.position.max(0) as f64 / f64::from(self.engine.sample_rate().max(1));
+            self.transport().position.max(0) as f64 / f64::from(self.engine.sample_rate().max(1));
         let tc = faderframe_midi::timecode::Timecode::from_seconds(seconds, rate);
         [
             i32::from(tc.hours),
@@ -434,6 +435,9 @@ impl Session {
                     EditButton::Delete => Action::DeleteSelection,
                     EditButton::Separate => Action::Separate,
                     EditButton::Capture => Action::CaptureMidi,
+                    EditButton::Quantize => {
+                        Action::QuantizeClips(self.selection.clips.iter().copied().collect())
+                    }
                 };
                 self.dispatch(action)?;
             }
@@ -456,7 +460,7 @@ impl Session {
     }
 
     /// The previous (−1) or next (+1) strip's track selected.
-    fn select_neighbour(&mut self, by: i32) -> crate::Result<()> {
+    pub(crate) fn select_neighbour(&mut self, by: i32) -> crate::Result<()> {
         let tracks: Vec<TrackId> = self.surface_tracks().iter().map(|t| t.id).collect();
         if tracks.is_empty() {
             return Ok(());
@@ -476,6 +480,15 @@ impl Session {
     }
 
     /// Every track `on` returns true for gets `cmd` (one undo step).
+    /// Every mute off (one step).
+    pub(crate) fn clear_mutes(&mut self) -> crate::Result<()> {
+        self.clear_all(
+            |t| t.mute,
+            |track| Command::SetTrackMute { track, on: false },
+            "Unmute All",
+        )
+    }
+
     fn clear_all(
         &mut self,
         on: impl Fn(&Track) -> bool,

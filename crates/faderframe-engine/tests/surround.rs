@@ -147,22 +147,27 @@ fn a_bed_is_metered_on_every_channel() {
     assert!(m.channels[0].peak < 1e-6);
 }
 
-/// A 5.1 master on a stereo device is folded down: the surrounds to their
-/// side, the centre into both at −3 dB; on six outputs nothing folds.
+/// A 5.1 master on a stereo device is folded down by the project's
+/// downmix: the surrounds to their side (−3 dB in new projects, at unity
+/// in older ones, which fold by place), the centre into both at −3 dB; on
+/// six outputs nothing folds.
 #[test]
 fn a_bed_folds_down_to_a_stereo_device() {
-    let rear = levels(
-        &mono_in_51(SurroundPan {
-            x: -1.0,
-            y: -1.0,
-            ..SurroundPan::default()
-        }),
-        2,
-    );
+    let rear_left = SurroundPan {
+        x: -1.0,
+        y: -1.0,
+        ..SurroundPan::default()
+    };
+    let rear = levels(&mono_in_51(rear_left), 2);
     assert_eq!(rear.len(), 2);
+    let h = std::f32::consts::FRAC_1_SQRT_2;
+    assert!(close(rear[0], 0.5 * h) && rear[1].abs() < 1e-6, "{rear:?}");
+    let mut older = mono_in_51(rear_left);
+    older.project.downmix = faderframe_core::surround::Downmix::BY_PLACE;
+    let rear = levels(&older, 2);
     assert!(close(rear[0], 0.5) && rear[1].abs() < 1e-6, "{rear:?}");
     let centre = levels(&mono_in_51(SurroundPan::default()), 2);
-    let h = 0.5 * std::f32::consts::FRAC_1_SQRT_2;
+    let h = 0.5 * h;
     assert!(close(centre[0], h) && close(centre[1], h), "{centre:?}");
     let six = levels(&mono_in_51(SurroundPan::default()), 6);
     assert!(close(six[2], 0.5));

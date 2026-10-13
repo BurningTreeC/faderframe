@@ -600,3 +600,36 @@ fn the_histogram_brackets_its_quantiles() {
         assert_eq!(Histogram::bucket(Histogram::floor(index)), index);
     }
 }
+
+/// Chunks of a device callback wait for input given in that callback (no
+/// worker could have had it yet), but frames a stalled worker owes from an
+/// earlier callback are concealed at once: the chunk does not spend the
+/// callback's budget waiting.
+#[test]
+fn frames_owed_from_an_earlier_callback_are_concealed_not_waited_for() {
+    let _timing = timing();
+    let mut dsp = Stand::new();
+    // The worker stalls on the 7th segment (the first callback's chunk 6).
+    dsp.stall_at = Some(6);
+    dsp.stall = Duration::from_millis(800);
+    let mut reservoir = Reservoir::new(config(128, 1, 512, false), Box::new(dsp));
+    let input = signal(1024);
+    let mut chunks = input.chunks(64);
+    // The first callback: its later chunks wait for its earlier ones.
+    let first = Instant::now() + Duration::from_secs(2);
+    for _ in 0..8 {
+        let mut block = chunks.next().unwrap().to_vec();
+        reservoir.process_with_deadline(&mut [&mut block], 1.0, Some(first));
+    }
+    // The second: its first chunk needs the stalled segment's output.
+    let second = Instant::now() + Duration::from_secs(2);
+    let mut block = chunks.next().unwrap().to_vec();
+    let t = Instant::now();
+    reservoir.process_with_deadline(&mut [&mut block], 1.0, Some(second));
+    assert!(
+        t.elapsed() < Duration::from_millis(200),
+        "waited {:?} for a late worker",
+        t.elapsed()
+    );
+    assert!(reservoir.stats().underruns() > 0, "concealed");
+}

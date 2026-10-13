@@ -167,8 +167,10 @@ impl Chrome {
         let click = s.record.metronome;
         if self.metronome.has_css_class("click-active") != (click != MetronomeMode::Off) {
             set_pressed(&self.metronome, "click-active", click != MetronomeMode::Off);
-            self.metronome
-                .set_tooltip_text(Some(&format!("Metronome: {} (K)", click.label())));
+            self.metronome.set_tooltip_text(Some(&format!(
+                "Metronome: {} (K; right-click: settings)",
+                click.label()
+            )));
         }
         let show = s.editor.show_edit_toolbar;
         if self.edit_bar.is_visible() != show {
@@ -492,6 +494,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             ("Play / Pause", "app.play"),
             ("Stop", "app.stop"),
             ("Return to Start", "app.to-start"),
+            ("Stop Returns to Start", "app.stop-to-start"),
         ]),
     );
     transport.append_section(
@@ -604,8 +607,13 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             ("Restart Audio", "app.restart-audio"),
         ]),
     );
+    audio.append_section(None, &crate::monitoring::menu());
     audio.append_submenu(Some("Listen"), &crate::listen::menu());
     audio.append_submenu(Some("Console"), &crate::console::menu());
+    audio.append_section(
+        None,
+        &section(&[("Speaker Layouts…", "app.speaker-layouts")]),
+    );
     audio.append_section(
         None,
         &section(&[(
@@ -694,6 +702,15 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
     )));
     metronome.set_action_name(Some("app.toggle-metronome"));
     metronome.set_tooltip_text(Some("Metronome (K)"));
+    // Right-click: its sound and levels.
+    let settings = gtk::GestureClick::new();
+    settings.set_button(gtk::gdk::BUTTON_SECONDARY);
+    settings.connect_pressed(|g, _, _, _| {
+        if let Some(w) = g.widget() {
+            let _ = w.activate_action("app.metronome-settings", None);
+        }
+    });
+    metronome.add_controller(settings);
     transport.append(&metronome);
     let edit_button = gtk::Button::with_label("Edit");
     edit_button.set_tooltip_text(Some(

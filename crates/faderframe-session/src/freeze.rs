@@ -214,6 +214,8 @@ impl Session {
             new.output = t.output;
             new.volume_db = t.volume_db;
             new.pan = t.pan;
+            new.pan_mode = t.pan_mode;
+            new.dual_pan = t.dual_pan;
             cmds.push(Command::AddTrack {
                 track: Box::new(new),
                 index,

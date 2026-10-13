@@ -203,10 +203,21 @@ fn the_guitar_station_does_not_allocate_live() {
     set(id::REVERB, 0.4);
     set(id::INTENSITY, 0.5);
     run(&mut p, 400, true, &events[3]);
+    // Late frames from here on only.
+    p.take_underruns();
     p.reset();
     sounded.set(0);
     finite.set(true);
     run(&mut p, 100, true, &[]);
+    // A machine too busy for the workers conceals late blocks (silence) —
+    // every one of them right after the reset when heavily overloaded (the
+    // committed code too: 6 runs in 72 with twelve at once on 16 cores).
+    // While the stages say they are late, up to a second more.
+    let mut blocks = 100;
+    while sounded.get() == 0 && p.take_underruns() > 0 && blocks < 500 {
+        run(&mut p, 20, true, &[]);
+        blocks += 20;
+    }
     let allocations = EVENTS.load(Ordering::SeqCst);
     // The counter counts (a deliberate allocation while armed).
     let probe = std::hint::black_box(vec![1u8; 16]);
@@ -224,13 +235,11 @@ fn the_guitar_station_does_not_allocate_live() {
         WORKSHOP.load(Ordering::SeqCst) > 0,
         "the changed pedals were built while armed"
     );
-    // After the reset it plays again -- anywhere in the run: a machine too
-    // busy for the workers conceals late blocks (silence), most of them
-    // when heavily overloaded.
+    // After the reset it plays again -- anywhere in the run.
     let sounded = sounded.get();
     assert!(
         sounded > 0,
-        "it plays after the reset: {sounded} of 100 blocks"
+        "it plays after the reset: {sounded} of {blocks} blocks"
     );
     assert!(finite.get());
 }

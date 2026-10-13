@@ -172,7 +172,11 @@ pub fn plan(project: &Project) -> Result<AdmPlan, String> {
 }
 
 /// The panner's lanes of `t` that drive it (by `SurroundParam::index`).
-fn lanes(project: &Project, t: &Track, rate: u32) -> [Option<SampleLane>; 6] {
+fn lanes(
+    project: &Project,
+    t: &Track,
+    rate: u32,
+) -> [Option<SampleLane>; SurroundParam::ALL.len()] {
     let tl = &project.timeline;
     let sr = f64::from(rate);
     SurroundParam::ALL.map(|p| {

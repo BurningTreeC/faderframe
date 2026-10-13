@@ -17,6 +17,7 @@ pub struct Crosstalk {
     x: [f64; MAX_CHANNELS],
     y: [f64; MAX_CHANNELS],
     gate: f32,
+    input_latency: u32,
 }
 
 impl Crosstalk {
@@ -29,6 +30,7 @@ impl Crosstalk {
             x: [0.0; MAX_CHANNELS],
             y: [0.0; MAX_CHANNELS],
             gate: f32::NAN,
+            input_latency: 0,
         }
     }
 
@@ -42,6 +44,10 @@ impl Crosstalk {
 }
 
 impl Processor<EngineContext> for Crosstalk {
+    fn set_input_latency(&mut self, frames: u32) {
+        self.input_latency = frames;
+    }
+
     fn prepare(&mut self, config: &PrepareConfig) {
         let k = std::f64::consts::PI * 10_000.0 / config.sample_rate;
         self.a = 1.0 / (1.0 + k);
@@ -69,7 +75,7 @@ impl Processor<EngineContext> for Crosstalk {
         let mut off = 0;
         while off < io.frames {
             let n = step.min(io.frames - off);
-            let at = automation_at(cx, off + n);
+            let at = automation_at(cx, self.input_latency, off + n);
             let mute = mute_lane
                 .and_then(|l| l.value_at(at))
                 .map_or(static_mute, |v| v >= 0.5);

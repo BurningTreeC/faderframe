@@ -1,8 +1,8 @@
 //! The renderer: a layout's channels to two ears.
 
+use crate::BinauralError;
 use crate::correction::{Compiled, Correction};
 use crate::head::Head;
-use crate::{BinauralError, direction};
 use faderframe_core::ChannelLayout;
 use realfft::num_complex::Complex32;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
@@ -234,16 +234,30 @@ impl Renderer {
             let _ = fft.process(&mut t, &mut s);
             s
         };
+        // Each channel's filter: its direction's pair, or a blend of the
+        // pairs it is panned over (`weights`; spectra add linearly).
         let filters = (0..channels)
             .map(|c| {
-                direction(layout, c)
-                    .and_then(|d| set.pairs.get(d))
-                    .map(|pair| {
-                        [
-                            (0..parts).map(|p| spectrum(&pair.left, p)).collect(),
-                            (0..parts).map(|p| spectrum(&pair.right, p)).collect(),
-                        ]
-                    })
+                let w = crate::weights(layout, c);
+                if w.is_empty() || w.iter().any(|(d, _)| set.pairs.get(*d).is_none()) {
+                    return None;
+                }
+                let ear = |right: bool| -> Vec<Vec<Complex32>> {
+                    (0..parts)
+                        .map(|p| {
+                            let mut sum = vec![Complex32::default(); block + 1];
+                            for &(d, g) in &w {
+                                let pair = &set.pairs[d];
+                                let taps = if right { &pair.right } else { &pair.left };
+                                for (o, v) in sum.iter_mut().zip(spectrum(taps, p)) {
+                                    *o += v * g;
+                                }
+                            }
+                            sum
+                        })
+                        .collect()
+                };
+                Some([ear(false), ear(true)])
             })
             .collect();
         let lfe_coef = lowpass(120.0, rate as f32);
@@ -459,6 +473,7 @@ fn biquad(z: &mut [f32; 4], k: &[f32; 5], x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::direction;
     use faderframe_core::SurroundFormat;
 
     fn ku100(layout: ChannelLayout, room: Room) -> Renderer {
@@ -647,5 +662,117 @@ mod tests {
         for i in 10..n {
             assert!((moved[i] - 0.5 * plain[i - 10]).abs() < 1e-5, "{i}");
         }
+    }
+
+    /// An impulse on any one speaker of 5.1 or 7.1 reaches the ears as that
+    /// speaker's own measured pair (by its direction in the speaker table),
+    /// one block late — the channel order is the format's, the LFE has no
+    /// direction.
+    #[test]
+    fn each_speaker_reaches_the_ears_through_its_own_direction() {
+        let head = Head::default();
+        let set = head.at(48_000).unwrap();
+        for f in [
+            SurroundFormat::S51,
+            SurroundFormat::S71,
+            SurroundFormat::S714,
+        ] {
+            let layout = ChannelLayout::Surround(f);
+            for (c, s) in f.speakers().iter().enumerate() {
+                if s.lfe {
+                    continue;
+                }
+                let d = direction(layout, c).unwrap();
+                assert_eq!(
+                    crate::DIRECTIONS[d],
+                    (s.azimuth, s.elevation),
+                    "{} {}",
+                    f.name(),
+                    s.label
+                );
+                let mut r = Renderer::new(layout, 48_000, Room::Near, &head, None).unwrap();
+                let n = 1024 + set.taps;
+                let silent = vec![0.0f32; n];
+                let mut x = vec![0.0f32; n];
+                x[100] = 1.0;
+                let input: Vec<&[f32]> = (0..f.channels())
+                    .map(|i| if i == c { &x[..] } else { &silent[..] })
+                    .collect();
+                let (mut l, mut rr) = (vec![0.0; n], vec![0.0; n]);
+                r.process(&input, &mut l, &mut rr, n);
+                let at = 100 + r.latency();
+                let pair = &set.pairs[d];
+                for k in 0..set.taps.min(n - at) {
+                    assert!(
+                        (l[at + k] - pair.left[k]).abs() < 1e-4
+                            && (rr[at + k] - pair.right[k]).abs() < 1e-4,
+                        "{} {} at {k}",
+                        f.name(),
+                        s.label
+                    );
+                }
+                // Left speakers are louder on the left ear, right ones on
+                // the right.
+                match s.side() {
+                    Some(faderframe_core::surround::Side::Left) => {
+                        assert!(level(&l) > level(&rr), "{}", s.label)
+                    }
+                    Some(faderframe_core::surround::Side::Right) => {
+                        assert!(level(&rr) > level(&l), "{}", s.label)
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    /// A custom layout's speaker between two measured directions is heard
+    /// through their blend; at a measured direction exactly as that one.
+    #[test]
+    fn a_custom_speaker_is_heard_between_the_measured_ones() {
+        use faderframe_core::surround::{LayoutDef, SpeakerDef};
+        let spk = |label: &str, azimuth: f32| SpeakerDef {
+            label: label.into(),
+            azimuth,
+            elevation: 0.0,
+            lfe: false,
+        };
+        let def = LayoutDef {
+            name: "Hexagon".into(),
+            speakers: vec![
+                spk("F", 0.0),
+                spk("FL", 60.0),
+                spk("BL", 120.0),
+                spk("B", 180.0),
+                spk("BR", -120.0),
+                spk("FR", -60.0),
+            ],
+        };
+        let layout = ChannelLayout::Surround(def.intern().unwrap());
+        // Ahead is the measured front; 60° left lies between 30° and 90°.
+        assert_eq!(crate::weights(layout, 0), vec![(0, 1.0)]);
+        let w = crate::weights(layout, 1);
+        let dirs: Vec<usize> = w.iter().map(|(d, _)| *d).collect();
+        assert_eq!(dirs, [1, 3], "{w:?}");
+        assert!((w.iter().map(|(_, g)| g * g).sum::<f32>() - 1.0).abs() < 1e-5);
+        // Rendered: the left speaker louder on the left ear.
+        let mut r = ku100(layout, Room::Near);
+        let n = 8192;
+        let x: Vec<f32> = (0..n).map(|i| (i as f32 * 0.07).sin() * 0.25).collect();
+        let silent = vec![0.0f32; n];
+        let input: Vec<&[f32]> = (0..6)
+            .map(|c| if c == 1 { &x[..] } else { &silent[..] })
+            .collect();
+        let (mut l, mut rr) = (vec![0.0; n], vec![0.0; n]);
+        r.process(&input, &mut l, &mut rr, n);
+        assert!(level(&l) > 1.3 * level(&rr), "{} {}", level(&l), level(&rr));
+    }
+
+    /// A head that is not there is refused (monitoring then stays on the
+    /// speakers), and a SOFA file that is not one too.
+    #[test]
+    fn a_missing_head_is_refused() {
+        assert!(Head::builtin("no-such-head").is_err());
+        assert!(Head::from_sofa(std::path::Path::new("/no/such/file.sofa")).is_err());
     }
 }

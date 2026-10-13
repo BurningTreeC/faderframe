@@ -199,6 +199,24 @@ fn cache() -> &'static Cache {
     CACHE.get_or_init(Default::default)
 }
 
+/// Whether a file is decoded already (and unchanged since).
+fn is_cached(path: &Path) -> bool {
+    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    cache().lock().is_ok_and(|c| {
+        c.get(path)
+            .is_some_and(|(when, weak)| *when == modified && weak.strong_count() > 0)
+    })
+}
+
+/// Whether loading `doc` reads nothing from disk (every file decoded
+/// already; an SFZ always counts as reading).
+fn loads_from_cache(doc: &SampleDoc) -> bool {
+    doc.files.iter().flatten().all(|f| {
+        let path = Path::new(f.as_str());
+        !is_sfz(path) && is_cached(path)
+    })
+}
+
 /// Decode an audio file, or share it if it is decoded already.
 pub fn load_cached(path: &Path) -> Result<Arc<Sample>, String> {
     let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
@@ -262,9 +280,54 @@ pub struct SampleSet {
     /// An SFZ's curves and controllers' initial values.
     pub instrument: Option<Arc<super::sfz::Instrument>>,
     pub errors: Vec<String>,
+    /// Zones by the key they cover (indices into `zones`, in order), made
+    /// with the set ([`SampleSet::index`]): a note looks at its key's
+    /// zones, not at every zone of a big instrument. Empty: not indexed
+    /// (every zone is looked at).
+    pub by_key: Vec<Vec<u32>>,
+    /// Keys that are some zone's keyswitch.
+    pub keyswitch_keys: u128,
+    /// Zones a controller's move can trigger (`on_cc`; usually none).
+    pub cc_zones: Vec<u32>,
 }
 
 impl SampleSet {
+    /// Index the zones for the processor (where the set is made, never on
+    /// the audio thread).
+    pub fn index(&mut self) {
+        if self.zones.is_empty() {
+            return;
+        }
+        let mut by_key = vec![Vec::new(); 128];
+        let mut keyswitch_keys = 0u128;
+        let mut cc_zones = Vec::new();
+        for (i, z) in self.zones.iter().enumerate() {
+            for k in z.lokey..=z.hikey.min(127) {
+                by_key[usize::from(k)].push(i as u32);
+            }
+            for k in 0..128u8 {
+                if z.is_keyswitch(k) {
+                    keyswitch_keys |= 1 << k;
+                }
+            }
+            if !z.on_cc.is_empty() {
+                cc_zones.push(i as u32);
+            }
+        }
+        self.by_key = by_key;
+        self.keyswitch_keys = keyswitch_keys;
+        self.cc_zones = cc_zones;
+    }
+
+    /// Whether `key` is some zone's keyswitch.
+    pub fn is_keyswitch(&self, key: u8) -> bool {
+        if self.by_key.is_empty() {
+            self.zones.iter().any(|z| z.is_keyswitch(key))
+        } else {
+            key < 128 && self.keyswitch_keys >> key & 1 == 1
+        }
+    }
+
     pub fn slot(&self, slot: usize) -> Option<&Sample> {
         self.slots
             .get(slot)
@@ -303,6 +366,11 @@ pub struct SampleHost {
     pub shared: Shared,
     generation: u64,
     pending: Option<Arc<SampleSet>>,
+    /// Documents that read from disk load on a thread of their own (a live
+    /// instance: opening a project does not wait for decoding).
+    background: bool,
+    /// Where a document loading in the background arrives.
+    loading: Option<std::sync::mpsc::Receiver<SampleSet>>,
 }
 
 impl Default for SampleHost {
@@ -312,19 +380,51 @@ impl Default for SampleHost {
             shared: empty(),
             generation: 0,
             pending: None,
+            background: false,
+            loading: None,
         }
     }
 }
 
 impl SampleHost {
-    /// Load what `doc` names (unless it is what is loaded) and hand it to
-    /// the processor and the editor.
+    /// Load documents that read from disk in the background from now on.
+    pub fn set_background(&mut self, on: bool) {
+        self.background = on;
+    }
+
+    /// Whether a document is still loading.
+    pub fn loading(&self) -> bool {
+        self.loading.is_some()
+    }
+
+    /// Load what `doc` names (unless it is what is loaded or loading) and
+    /// hand it to the processor and the editor — at once, or (in the
+    /// background) when [`flush`](Self::flush) finds it loaded.
     pub fn set_doc(&mut self, doc: SampleDoc, tap: Option<&crate::tap::AnalysisTap>) {
-        if doc == self.doc && self.generation > 0 {
+        if doc == self.doc && (self.generation > 0 || self.loading.is_some()) {
             return;
         }
-        let set = Arc::new(load(&doc));
         self.doc = doc;
+        // A load still running for another document is forgotten.
+        self.loading = None;
+        if self.background && !loads_from_cache(&self.doc) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let doc = self.doc.clone();
+            let spawned = std::thread::Builder::new()
+                .name("faderframe-samples".into())
+                .spawn(move || {
+                    let _ = tx.send(load(&doc));
+                });
+            if spawned.is_ok() {
+                self.loading = Some(rx);
+                return;
+            }
+        }
+        let set = Arc::new(load(&self.doc));
+        self.hand_over(set, tap);
+    }
+
+    fn hand_over(&mut self, set: Arc<SampleSet>, tap: Option<&crate::tap::AnalysisTap>) {
         if let Some(t) = tap {
             t.set_assets(Arc::new(Contents {
                 doc: self.doc.clone(),
@@ -332,12 +432,27 @@ impl SampleHost {
             }));
         }
         self.pending = Some(set);
-        self.flush();
+        self.swap_in();
+    }
+
+    /// Take a set loaded in the background, and swap a waiting one in.
+    pub fn flush(&mut self, tap: Option<&crate::tap::AnalysisTap>) {
+        if let Some(rx) = &self.loading {
+            match rx.try_recv() {
+                Ok(set) => {
+                    self.loading = None;
+                    return self.hand_over(Arc::new(set), tap);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.loading = None,
+            }
+        }
+        self.swap_in();
     }
 
     /// Swap a waiting set in (the old one is dropped here, on the control
     /// thread).
-    pub fn flush(&mut self) {
+    fn swap_in(&mut self) {
         let Some(set) = self.pending.take() else {
             return;
         };
@@ -394,6 +509,7 @@ pub fn load(doc: &SampleDoc) -> SampleSet {
             }
         }
     }
+    set.index();
     set
 }
 
@@ -437,6 +553,33 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// A loaded instrument's zones by key, its keyswitches and its
+    /// controller-triggered zones, found without looking at every zone.
+    #[test]
+    fn zones_are_indexed_by_key() {
+        let d = fixtures::dir("index");
+        fixtures::tone(&d.join("a.wav"), 440.0, 48_000, 0.1);
+        let sfz = d.join("i.sfz");
+        std::fs::write(
+            &sfz,
+            "<region> sample=a.wav lokey=60 hikey=62\n\
+             <region> sample=a.wav key=64\n\
+             <region> sample=a.wav sw_last=24 key=70\n\
+             <region> sample=a.wav on_locc1=100 on_hicc1=127 key=40\n",
+        )
+        .unwrap();
+        let mut doc = SampleDoc::default();
+        doc.set(0, Some(sfz.to_string_lossy().into_owned()));
+        let set = load(&doc);
+        assert_eq!(set.zones.len(), 4, "{:?}", set.errors);
+        assert_eq!(set.by_key[61], vec![0]);
+        assert_eq!(set.by_key[64], vec![1]);
+        assert!(set.by_key[63].is_empty());
+        assert!(set.is_keyswitch(24) && !set.is_keyswitch(25));
+        assert_eq!(set.cc_zones, vec![3]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn states_pack_and_unpack() {

@@ -280,7 +280,7 @@ pub fn latency(params: &ParamValues) -> u32 {
 fn stage_latencies(params: &ParamValues) -> [u32; 2] {
     let q = quality(params);
     let spectral = if spectral::wanted(params) {
-        spectral::frame(q) as u32
+        spectral::latency(q) as u32
     } else {
         0
     };
@@ -862,6 +862,117 @@ fn loudness_change_with(
 /// Control steps between two loudness estimates while the bands move.
 const AUTO_EVERY: u32 = 8;
 
+/// Filter sections designed per control step at most (band redesigns and
+/// the auto gain's estimate share it): a preset recall or Gain Scale
+/// moving 24 brickwall bands no longer redesigns them all in one step —
+/// the bands take turns. A jump (a reset, the first step) designs all.
+const DESIGN_BUDGET: usize = 32;
+/// Probe points of the auto gain's estimate evaluated per control step.
+const LOUDNESS_POINTS_PER_STEP: usize = 8;
+/// Sections the auto gain's estimate may design per control step even when
+/// the bands' redesigns took the budget (bands moving all the time).
+const LOUDNESS_SHARE: usize = 16;
+/// Probe points of the auto gain's loudness estimate.
+const LOUDNESS_POINTS: usize = 48;
+
+/// The auto gain's loudness estimate (the change the bands make to pink
+/// noise), made a little at a time: a few bands' designs per control step
+/// within the design budget, then the probe points a few at a time.
+struct Loudness {
+    /// The settings being estimated (`None`: nothing under way).
+    key: Option<([BandParams; BANDS], f64, bool)>,
+    scratch: [([Coefs; MAX_SECTIONS], usize); BANDS],
+    /// The next band to design and the designs made.
+    band: usize,
+    used: usize,
+    /// The next probe point and the power so far.
+    point: usize,
+    power: f64,
+    sample_rate: f64,
+    /// `sin²(w / 2)` of the probe points (equal weight per octave from
+    /// 30 Hz to 16 kHz: pink noise).
+    sin2: [f64; LOUDNESS_POINTS],
+}
+
+impl Loudness {
+    fn new(sample_rate: f64) -> Self {
+        Self {
+            key: None,
+            scratch: [([Coefs::IDENTITY; MAX_SECTIONS], 0); BANDS],
+            band: 0,
+            used: 0,
+            point: 0,
+            power: 0.0,
+            sample_rate,
+            sin2: std::array::from_fn(|i| {
+                let f = 30.0 * (16_000.0f64 / 30.0).powf(i as f64 / (LOUDNESS_POINTS - 1) as f64);
+                let w = 2.0 * std::f64::consts::PI * f / sample_rate;
+                (w / 2.0).sin().powi(2)
+            }),
+        }
+    }
+
+    /// Whether an estimate is under way.
+    fn busy(&self) -> bool {
+        self.key.is_some()
+    }
+
+    /// Estimate for `key` (starting over unless it is the one under way).
+    fn start(&mut self, key: ([BandParams; BANDS], f64, bool)) {
+        if self.key.as_ref() == Some(&key) {
+            return;
+        }
+        self.key = Some(key);
+        self.band = 0;
+        self.used = 0;
+        self.point = 0;
+        self.power = 0.0;
+    }
+
+    /// Move on within `budget` sections (`usize::MAX`: to the end); the
+    /// loudness change (dB) once done, with the settings it is for.
+    #[allow(clippy::type_complexity)]
+    fn advance(&mut self, budget: &mut usize) -> Option<(f64, ([BandParams; BANDS], f64, bool))> {
+        let (bands, scale, interact) = self.key?;
+        while self.band < BANDS {
+            let b = bands[self.band];
+            if b.enabled {
+                if *budget == 0 {
+                    return None;
+                }
+                let (s, n) = &mut self.scratch[self.used];
+                *n = design::design(&b.shape(scale, interact), self.sample_rate, s);
+                *budget = budget.saturating_sub((*n).max(1));
+                self.used += 1;
+            }
+            self.band += 1;
+        }
+        let end = if *budget == usize::MAX {
+            LOUDNESS_POINTS
+        } else {
+            (self.point + LOUDNESS_POINTS_PER_STEP).min(LOUDNESS_POINTS)
+        };
+        for i in self.point..end {
+            let s2 = self.sin2[i];
+            let m: f64 = self.scratch[..self.used]
+                .iter()
+                .flat_map(|(s, n)| s[..*n].iter())
+                .map(|c| c.magnitude2_sin2(s2))
+                .product();
+            self.power += m;
+        }
+        self.point = end;
+        if self.point < LOUDNESS_POINTS {
+            return None;
+        }
+        self.key = None;
+        Some((
+            10.0 * (self.power / LOUDNESS_POINTS as f64).max(1e-12).log10(),
+            (bands, scale, interact),
+        ))
+    }
+}
+
 /// Samples per control step: parameters are read, smoothed and turned into
 /// coefficients this often.
 const STEP: usize = 16;
@@ -924,8 +1035,10 @@ struct BandDsp {
     gain: f64,
     lq: f64,
     slope: f64,
-    /// What the coefficients were designed for.
+    /// What the coefficients were designed for, and what they are to be
+    /// designed for next (waiting for the design budget).
     designed: Option<[f64; 6]>,
+    pending: Option<[f64; 6]>,
     /// 0 (out) to 1 (in), and where it is going.
     mix: f64,
     mix_target: f64,
@@ -953,6 +1066,7 @@ impl Default for BandDsp {
             lq: -0.5,
             slope: 12.0,
             designed: None,
+            pending: None,
             mix: 0.0,
             mix_target: 0.0,
             detector: Detector::default(),
@@ -979,6 +1093,9 @@ impl BandDsp {
 struct Delay<const C: usize> {
     buf: Vec<[f64; C]>,
     pos: usize,
+    /// Samples written since the last reset (up to the length): older
+    /// ones come out as silence, so a reset clears nothing.
+    fresh: usize,
 }
 
 impl<const C: usize> Delay<C> {
@@ -986,6 +1103,7 @@ impl<const C: usize> Delay<C> {
         Self {
             buf: vec![[0.0; C]; len],
             pos: 0,
+            fresh: len,
         }
     }
 
@@ -999,11 +1117,16 @@ impl<const C: usize> Delay<C> {
         if self.pos == self.buf.len() {
             self.pos = 0;
         }
+        if self.fresh < self.buf.len() {
+            // Written before the reset.
+            self.fresh += 1;
+            return [0.0; C];
+        }
         y
     }
 
     fn reset(&mut self) {
-        self.buf.fill([0.0; C]);
+        self.fresh = 0;
     }
 }
 
@@ -1044,9 +1167,12 @@ pub struct EqProcessor {
     auto_target: f64,
     /// The static settings the auto gain was computed for.
     auto_for: Option<([BandParams; BANDS], f64, bool)>,
-    /// Steps until the next loudness estimate may run, and its scratch.
+    /// Steps until the next loudness estimate may start, and the estimate.
     auto_wait: u32,
-    auto_scratch: Box<[([Coefs; MAX_SECTIONS], usize); BANDS]>,
+    loudness: Box<Loudness>,
+    /// The band the design budget starts with in the next control step
+    /// (the bands take turns).
+    design_from: usize,
     listen: Option<Listen>,
     character: CharacterStage,
     meters: [[MeterTap; 2]; 2],
@@ -1123,7 +1249,8 @@ impl EqProcessor {
             auto_target: 1.0,
             auto_for: None,
             auto_wait: 0,
-            auto_scratch: Box::new([([Coefs::IDENTITY; MAX_SECTIONS], 0); BANDS]),
+            loudness: Box::new(Loudness::new(sr)),
+            design_from: 0,
             listen: None,
             character: CharacterStage::new(sr),
             meters: [[mt; 2]; 2],
@@ -1221,11 +1348,14 @@ impl EqProcessor {
                 band.dyn_db = 0.0;
             }
             self.tap.set_value(value::DYN + b, band.dyn_db as f32);
+            // A type without gain (cuts, notch, band pass, all pass) does
+            // not change with it: no redesign while only the gain moves.
+            let gains = band.structure.kind.has_gain();
             let want = [
                 band.lf,
-                band.gain,
+                if gains { band.gain } else { 0.0 },
                 band.lq,
-                band.dyn_db,
+                if gains { band.dyn_db } else { 0.0 },
                 band.slope,
                 f64::from(u8::from(interact)),
             ];
@@ -1237,18 +1367,37 @@ impl EqProcessor {
                     || (d[4] - want[4]).abs() > 1e-3
                     || d[5] != want[5]
             });
-            if changed {
-                let mut shape = BandParams {
-                    freq: band.lf.exp2(),
-                    q: band.lq.exp2(),
-                    ..p
-                }
-                .shape_with(band.gain + band.dyn_db, interact);
-                shape.kind = band.structure.kind;
-                shape.slope = band.slope;
-                band.used = design::design(&shape, sr, &mut band.sections);
-                band.designed = Some(want);
+            band.pending = changed.then_some(want);
+        }
+        // The designs, in turn within the step's budget (all at a jump):
+        // a band waiting keeps its coefficients a step or two longer.
+        let mut budget = if jump { usize::MAX } else { DESIGN_BUDGET };
+        let mut designed_any = false;
+        for k in 0..BANDS {
+            let b = (self.design_from + k) % BANDS;
+            let band = &mut self.bands[b];
+            let Some(want) = band.pending else {
+                continue;
+            };
+            if budget == 0 && designed_any {
+                // The rest next step, from here.
+                self.design_from = b;
+                break;
             }
+            let p = statics[b];
+            let mut shape = BandParams {
+                freq: band.lf.exp2(),
+                q: band.lq.exp2(),
+                ..p
+            }
+            .shape_with(band.gain + band.dyn_db, interact);
+            shape.kind = band.structure.kind;
+            shape.slope = band.slope;
+            band.used = design::design(&shape, sr, &mut band.sections);
+            band.designed = Some(want);
+            band.pending = None;
+            budget = budget.saturating_sub(band.used.max(1));
+            designed_any = true;
         }
         // Output: gain, auto gain, pan, phase and bypass.
         let g = |cur: f64, to: f64| to + (cur - to) * glide;
@@ -1285,12 +1434,21 @@ impl EqProcessor {
         if auto_on {
             let key = (statics, scale, interact);
             self.auto_wait = self.auto_wait.saturating_sub(1);
-            if self.auto_for.as_ref() != Some(&key) && (jump || self.auto_wait == 0) {
+            // An estimate under way finishes first (while the bands keep
+            // moving, starting over would never finish one); a jump starts
+            // afresh.
+            if self.auto_for.as_ref() != Some(&key)
+                && (jump || (self.auto_wait == 0 && !self.loudness.busy()))
+            {
                 self.auto_wait = AUTO_EVERY;
-                let change =
-                    loudness_change_with(&statics, scale, interact, sr, &mut self.auto_scratch);
+                self.loudness.start(key);
+            }
+            // The estimate moves on with what is left of the budget, at
+            // least its share.
+            let mut share = budget.max(LOUDNESS_SHARE);
+            if let Some((change, made_for)) = self.loudness.advance(&mut share) {
                 self.auto_target = 10f64.powf(-change / 20.0);
-                self.auto_for = Some(key);
+                self.auto_for = Some(made_for);
             }
         } else {
             self.auto_target = 1.0;

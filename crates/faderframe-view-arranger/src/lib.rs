@@ -174,6 +174,13 @@ enum Drag {
         origin_y: f32,
         start: f32,
     },
+    /// A dual-panned track's header knob: both channels move by as much
+    /// (the image as a whole), from where they were at the press.
+    DualPan {
+        track: TrackId,
+        origin_y: f32,
+        start: faderframe_core::DualPan,
+    },
     Pan2D {
         origin: Point,
         sx: f64,
@@ -218,6 +225,9 @@ struct WaveSpan {
 }
 
 /// Engine samples of a (non-warped) span ↔ the source's own frames.
+/// Width of a waveform's kept tiles (logical pixels).
+const WAVE_TILE: f32 = 256.0;
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FrameMap {
     pub source: faderframe_core::AudioSourceId,
@@ -965,7 +975,23 @@ impl ArrangerView {
         let pr = model.peak_rate(span.source) / model.sample_rate() as f64;
         let src_off = (span.source_offset as f64 * ratio * pr) as i64;
         let channels = peaks.channels();
-        self.fill_wave(
+        // Drawn through kept tiles (unwarped: what a tile shows depends
+        // only on these).
+        let tiles = span.warp.is_none().then(|| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            span.source.hash(&mut h);
+            (std::sync::Arc::as_ptr(peaks) as usize).hash(&mut h);
+            (span.start, span.source_offset, len).hash(&mut h);
+            (span.gain.to_bits(), self.ppq.to_bits(), area.h.to_bits()).hash(&mut h);
+            [color.r, color.g, color.b, color.a]
+                .map(f32::to_bits)
+                .hash(&mut h);
+            model.project().timeline.tempo.fingerprint().hash(&mut h);
+            model.sample_rate().hash(&mut h);
+            h.finish()
+        });
+        self.fill_wave_tiled(
             p,
             area,
             vis,
@@ -975,6 +1001,7 @@ impl ArrangerView {
             span.gain,
             model,
             color,
+            tiles,
             |ch, s0, s1| {
                 let (a, b) = match &span.warp {
                     // Through the time map: engine → project → source frames.
@@ -994,6 +1021,65 @@ impl ArrangerView {
                 peaks.min_max(ch, src_off + a, src_off + b)
             },
         );
+    }
+
+    /// [`Self::fill_wave`] in tiles of [`WAVE_TILE`] pixels from the
+    /// start, each a picture the painter keeps under `tiles` (the key of
+    /// all else it depends on) and its place: the playhead passing over a
+    /// waveform then redraws a picture, not its path. `None`: drawn as is.
+    #[allow(clippy::too_many_arguments)]
+    fn fill_wave_tiled(
+        &self,
+        p: &mut dyn Painter,
+        area: Rect,
+        vis: (f32, f32),
+        start: i64,
+        len: i64,
+        channels: usize,
+        gain: f32,
+        model: &Session,
+        color: Color,
+        tiles: Option<u64>,
+        mut peak: impl FnMut(usize, i64, i64) -> Option<(f32, f32)>,
+    ) {
+        let Some(base) = tiles else {
+            return self.fill_wave(p, area, vis, start, len, channels, gain, model, color, peak);
+        };
+        let xs = self.x_of_sample(model, start);
+        let xe = self.x_of_sample(model, start + len);
+        let (x0, x1) = (xs.max(vis.0), xe.min(vis.1));
+        if area.h < 6.0 || x1 <= x0 || len <= 0 {
+            return;
+        }
+        // Neighbouring tiles overlap by a step (no seam between them).
+        let step = (1.0 / p.scale_factor().max(1.0)).max(0.5);
+        let first = ((x0 - xs) / WAVE_TILE).floor() as i64;
+        let last = ((x1 - xs) / WAVE_TILE).ceil() as i64;
+        for i in first..last {
+            let tx0 = xs + i as f32 * WAVE_TILE;
+            let tx1 = (tx0 + WAVE_TILE).min(xe);
+            let rect = Rect::new(tx0, area.y, tx1 - tx0, area.h);
+            let key = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (base, i, rect.w.to_bits()).hash(&mut h);
+                h.finish()
+            };
+            faderframe_ui_canvas::kept(p, key, rect, |p| {
+                self.fill_wave(
+                    p,
+                    area,
+                    ((tx0 - step).max(xs), (tx1 + step).min(xe)),
+                    start,
+                    len,
+                    channels,
+                    gain,
+                    model,
+                    color,
+                    &mut peak,
+                );
+            });
+        }
     }
 
     /// Fill a min/max waveform for engine samples `start..start + len`,
@@ -1261,26 +1347,27 @@ impl ArrangerView {
         let r = a.clip_radius;
         let selected = model.selection.clips.contains(&clip.id);
         p.shadow(rect, r, Color::rgba(0.0, 0.0, 0.0, 0.45), 0.0, 1.5, 4.0);
-        p.fill_rounded(
-            rect,
-            r,
+        // The name strip and the body below it, side by side (no overlap:
+        // both translucent, the grid shows through evenly).
+        let header_h = a.clip_header.min(rect.h * 0.5);
+        let body = Rect::new(rect.x, rect.y + header_h, rect.w, rect.h - header_h);
+        p.fill_path_paint(
+            &Path::rounded_rect_ends(body, 0.0, r),
             &Paint::vertical(
-                rect,
-                color.darken(0.52).with_alpha(0.96),
-                color.darken(0.66).with_alpha(0.96),
+                body,
+                color.darken(0.52).with_alpha(a.clip_alpha),
+                color.darken(0.66).with_alpha(a.clip_alpha),
             ),
         );
-        let header_h = a.clip_header.min(rect.h * 0.5);
         p.push_clip(rect.intersection(&lanes));
         let header = Rect::new(rect.x, rect.y, rect.w, header_h);
-        p.fill_rounded(
-            Rect::new(rect.x, rect.y, rect.w, header_h + r),
-            r,
-            &Paint::vertical(header, color.lighten(0.08), color.darken(0.05)),
-        );
-        p.fill(
-            Rect::new(rect.x, rect.y + header_h, rect.w, r),
-            color.darken(0.55),
+        p.fill_path_paint(
+            &Path::rounded_rect_ends(header, r, 0.0),
+            &Paint::vertical(
+                header,
+                color.lighten(0.08).with_alpha(a.clip_header_alpha),
+                color.darken(0.05).with_alpha(a.clip_header_alpha),
+            ),
         );
         let vis = (rect.x.max(lanes.x), rect.right().min(lanes.right()));
         let text_color = if color.luminance() > 0.42 {
@@ -1363,7 +1450,7 @@ impl ArrangerView {
                         .map(|w| w.points(audio.source_offset, audio.length)),
                 };
                 self.paint_waveform(p, content, vis, &span, model, color);
-                self.paint_redraw(p, model, clip.id, content);
+                self.paint_redraw(p, model, clip.id, content, &span);
                 self.paint_warp(p, model, clip, rect);
             }
             ClipContent::Midi(_) => self.paint_midi_preview(p, content, vis, clip, color),
@@ -1671,10 +1758,16 @@ impl ArrangerView {
         if let Some(pan) = l.pan
             && t.kind.has_audio()
         {
+            // Dual pan: the image's middle, a dot at each channel.
+            let dual = model
+                .project()
+                .dual_panned(t)
+                .then(|| model.shown_dual_pan(t));
+            let value = dual.map_or(model.shown_pan(t), |d| (d.left + d.right) * 0.5);
             controls::knob(
                 p,
                 pan,
-                (model.shown_pan(t) + 1.0) * 0.5,
+                (value + 1.0) * 0.5,
                 true,
                 KnobLook {
                     cap: c.pan_cap,
@@ -1682,6 +1775,15 @@ impl ArrangerView {
                 },
                 th,
             );
+            if let Some(d) = dual {
+                let (o, r) = (pan.center(), pan.w.min(pan.h) * 0.5 - 1.6);
+                for side in [d.left, d.right] {
+                    let a = controls::knob_angle((side + 1.0) * 0.5);
+                    let at = Point::new(o.x + r * a.cos(), o.y + r * a.sin());
+                    p.circle(at, 2.6, th.ui.background);
+                    p.circle(at, 1.7, th.ui.text);
+                }
+            }
         }
         if t.kind.has_audio() || t.kind == TrackKind::Vca {
             // Mini horizontal fader.
@@ -2326,6 +2428,14 @@ impl ArrangerView {
         if !formats.is_empty() {
             items.push(MenuItem::submenu("Channel Format", formats).separated());
         }
+        let modes: Vec<MenuItem<Action>> = model
+            .pan_mode_choices(t.id)
+            .into_iter()
+            .map(|c| MenuItem::new(c.label, c.action).checked(c.checked))
+            .collect();
+        if !modes.is_empty() {
+            items.push(MenuItem::submenu("Pan Mode", modes));
+        }
         if let Some(c) = model.object_choice(t.id) {
             items.push(MenuItem::new(c.label, c.action).checked(c.checked));
         }
@@ -2337,12 +2447,17 @@ impl ArrangerView {
                 track: t.id,
                 target,
             };
-            let mut targets = vec![
-                (param(A::TrackVolume), "Volume"),
-                (param(A::TrackPan), "Pan"),
-                (param(A::TrackMute), "Mute"),
-                (M::TrackSolo { track: t.id }, "Solo"),
-            ];
+            let mut targets = vec![(param(A::TrackVolume), "Volume")];
+            if model.project().dual_panned(t) {
+                targets.push((param(A::DualPanLeft), "Left Pan"));
+                targets.push((param(A::DualPanRight), "Right Pan"));
+            } else if model.project().pans_stereo(t) {
+                targets.push((param(A::TrackPan), "Balance"));
+            } else {
+                targets.push((param(A::TrackPan), "Pan"));
+            }
+            targets.push((param(A::TrackMute), "Mute"));
+            targets.push((M::TrackSolo { track: t.id }, "Solo"));
             if matches!(
                 t.kind,
                 TrackKind::Audio | TrackKind::Instrument | TrackKind::Midi
@@ -2931,6 +3046,25 @@ impl ArrangerView {
                             cx.set_cursor(Cursor::ResizeHorizontal);
                         }
                     }
+                    HeaderPart::Pan if t.kind.has_audio() && model.project().dual_panned(t) => {
+                        if clicks >= 2 {
+                            edit(
+                                cx,
+                                Command::SetTrackDualPan {
+                                    track: id,
+                                    pan: faderframe_core::DualPan::ORIGINAL,
+                                },
+                            );
+                        } else {
+                            cx.emit(Action::BeginGesture("Pan".into()));
+                            self.drag = Some(Drag::DualPan {
+                                track: id,
+                                origin_y: pos.y,
+                                start: model.shown_dual_pan(t),
+                            });
+                            cx.set_cursor(Cursor::ResizeVertical);
+                        }
+                    }
                     HeaderPart::Pan if t.kind.has_audio() => {
                         if clicks >= 2 {
                             edit(
@@ -3159,6 +3293,21 @@ impl ArrangerView {
                     db: self.law.position_to_db(pos_new),
                 }));
             }
+            Some(Drag::DualPan {
+                track,
+                origin_y,
+                start,
+            }) => {
+                // Knob travel 0…1 is the whole −1…1 range.
+                let by = controls::drag_delta(pos.y - origin_y, mods.fine()) * 2.0;
+                cx.emit(Action::Edit(Command::SetTrackDualPan {
+                    track,
+                    pan: faderframe_core::DualPan {
+                        left: (start.left + by).clamp(-1.0, 1.0),
+                        right: (start.right + by).clamp(-1.0, 1.0),
+                    },
+                }));
+            }
             Some(Drag::Pan {
                 track,
                 origin_y,
@@ -3274,6 +3423,7 @@ impl ArrangerView {
             Some(
                 Drag::Volume { .. }
                 | Drag::Pan { .. }
+                | Drag::DualPan { .. }
                 | Drag::LoopEdge { .. }
                 | Drag::Loop { moved: true, .. },
             ) => {
@@ -3827,6 +3977,16 @@ impl CanvasView<Session, Action> for ArrangerView {
                             track: id,
                             db: base - steps * step,
                         }));
+                    } else if model.project().dual_panned(t) {
+                        let step = if modifiers.fine() { 0.01 } else { 0.05 };
+                        let by = -steps * step;
+                        cx.emit(Action::Edit(Command::SetTrackDualPan {
+                            track: id,
+                            pan: faderframe_core::DualPan {
+                                left: (t.dual_pan.left + by).clamp(-1.0, 1.0),
+                                right: (t.dual_pan.right + by).clamp(-1.0, 1.0),
+                            },
+                        }));
                     } else {
                         let step = if modifiers.fine() { 0.01 } else { 0.05 };
                         cx.emit(Action::Edit(Command::SetTrackPan {
@@ -3933,6 +4093,15 @@ impl CanvasView<Session, Action> for ArrangerView {
                     HeaderPart::Volume => format!(
                         "Volume {} dB · Drag · Double-click for 0 dB",
                         format_db(model.shown_volume_db(t))
+                    ),
+                    HeaderPart::Pan if model.project().dual_panned(t) => format!(
+                        "Dual pan {} · Drag moves both channels · Double-click: as recorded · \
+                         Each channel in the mixer",
+                        faderframe_core::pan::format_dual(model.shown_dual_pan(t))
+                    ),
+                    HeaderPart::Pan if model.project().pans_stereo(t) => format!(
+                        "Balance {} · Double-click to centre",
+                        format_pan(model.shown_pan(t))
                     ),
                     HeaderPart::Pan => {
                         format!("Pan {} · Double-click to centre", format_pan(model.shown_pan(t)))

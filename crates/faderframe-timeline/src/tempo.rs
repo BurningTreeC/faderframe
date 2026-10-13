@@ -75,6 +75,19 @@ impl TempoMap {
         map
     }
 
+    /// A hash of the map (equal maps, equal fingerprints): what a picture
+    /// drawn along musical time was drawn for.
+    pub fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for p in &self.points {
+            p.position.hash(&mut h);
+            p.bpm.to_bits().hash(&mut h);
+            std::mem::discriminant(&p.curve).hash(&mut h);
+        }
+        h.finish()
+    }
+
     pub fn points(&self) -> &[TempoPoint] {
         &self.points
     }

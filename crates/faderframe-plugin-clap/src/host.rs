@@ -61,6 +61,20 @@ pub struct FfShared {
     pub gui_show: AtomicBool,
     pub gui_hide: AtomicBool,
     pub gui_closed: AtomicBool,
+    /// The last message the plugin logged on the audio thread, and how
+    /// many came there: copied, not written out there (formatting and
+    /// stderr are I/O and a lock), logged by the main thread's poll.
+    audio_log: faderframe_realtime::TryCell<AudioLog>,
+}
+
+/// Room for a message logged on the audio thread.
+const AUDIO_LOG_BYTES: usize = 240;
+
+struct AudioLog {
+    bytes: [u8; AUDIO_LOG_BYTES],
+    len: usize,
+    severity: LogSeverity,
+    count: u64,
 }
 
 impl FfShared {
@@ -79,7 +93,34 @@ impl FfShared {
             gui_show: AtomicBool::new(false),
             gui_hide: AtomicBool::new(false),
             gui_closed: AtomicBool::new(false),
+            audio_log: faderframe_realtime::TryCell::new(AudioLog {
+                bytes: [0; AUDIO_LOG_BYTES],
+                len: 0,
+                severity: LogSeverity::Debug,
+                count: 0,
+            }),
         }
+    }
+
+    /// Log what the plugin logged on the audio thread since the last call
+    /// (main thread).
+    pub fn flush_audio_log(&self) {
+        let Some(mut log) = self.audio_log.try_lock() else {
+            return;
+        };
+        if log.count == 0 {
+            return;
+        }
+        let text = String::from_utf8_lossy(&log.bytes[..log.len]).into_owned();
+        let count = std::mem::take(&mut log.count);
+        let severity = log.severity;
+        drop(log);
+        let more = if count > 1 {
+            format!(" ({count} messages on the audio thread; the last)")
+        } else {
+            " (on the audio thread)".to_string()
+        };
+        log_now(severity, &format!("{text}{more}"));
     }
 
     pub fn ext(&self) -> PluginExtensions {
@@ -135,17 +176,35 @@ impl<'a> SharedHandler<'a> for FfShared {
 
 impl HostLogImpl for FfShared {
     fn log(&self, severity: LogSeverity, message: &str) {
-        // Plugins rarely log from the audio thread; doing so is their bug.
-        match severity {
-            LogSeverity::Error
-            | LogSeverity::Fatal
-            | LogSeverity::HostMisbehaving
-            | LogSeverity::PluginMisbehaving => {
-                tracing::warn!("[plugin] {message}");
+        // On the audio thread (CLAP's log is thread-safe, so plugins may):
+        // copied for the main thread, never written out here.
+        if IN_AUDIO.with(std::cell::Cell::get) {
+            if let Some(mut log) = self.audio_log.try_lock() {
+                let mut len = message.len().min(AUDIO_LOG_BYTES);
+                while !message.is_char_boundary(len) {
+                    len -= 1;
+                }
+                log.bytes[..len].copy_from_slice(&message.as_bytes()[..len]);
+                log.len = len;
+                log.severity = severity;
+                log.count += 1;
             }
-            LogSeverity::Warning => tracing::info!("[plugin] {message}"),
-            _ => tracing::debug!("[plugin] {message}"),
+            return;
         }
+        log_now(severity, message);
+    }
+}
+
+fn log_now(severity: LogSeverity, message: &str) {
+    match severity {
+        LogSeverity::Error
+        | LogSeverity::Fatal
+        | LogSeverity::HostMisbehaving
+        | LogSeverity::PluginMisbehaving => {
+            tracing::warn!("[plugin] {message}");
+        }
+        LogSeverity::Warning => tracing::info!("[plugin] {message}"),
+        _ => tracing::debug!("[plugin] {message}"),
     }
 }
 

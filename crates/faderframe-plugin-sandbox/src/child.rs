@@ -441,6 +441,9 @@ impl Helper {
             Ok(p) => p,
             Err(e) => return failed(e),
         };
+        // The plugin's code and constants mapped before its audio thread
+        // first runs them.
+        faderframe_realtime::memory::prefault_code();
         let latency = inst.latency_samples();
         // What the plugin reports it takes off, passed on each block.
         let reduction = inst.reduction();

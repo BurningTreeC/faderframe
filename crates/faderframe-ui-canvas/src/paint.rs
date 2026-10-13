@@ -178,6 +178,43 @@ impl Path {
         p
     }
 
+    /// A rectangle with its top corners rounded by `top` and its bottom ones
+    /// by `bottom` (0: square) — two of them stack without overlapping.
+    pub fn rounded_rect_ends(r: Rect, top: f32, bottom: f32) -> Self {
+        let lim = |x: f32| x.min(r.w * 0.5).min(r.h * 0.5).max(0.0);
+        let (t, b) = (lim(top), lim(bottom));
+        use std::f32::consts::PI;
+        let mut p = Path::new();
+        if t > 0.0 {
+            p.arc(Point::new(r.x + t, r.y + t), t, PI, PI * 1.5, false);
+            p.arc(
+                Point::new(r.right() - t, r.y + t),
+                t,
+                PI * 1.5,
+                PI * 2.0,
+                true,
+            );
+        } else {
+            p.move_to(Point::new(r.x, r.y))
+                .line_to(Point::new(r.right(), r.y));
+        }
+        if b > 0.0 {
+            p.arc(
+                Point::new(r.right() - b, r.bottom() - b),
+                b,
+                0.0,
+                FRAC_PI_2,
+                true,
+            );
+            p.arc(Point::new(r.x + b, r.bottom() - b), b, FRAC_PI_2, PI, true);
+        } else {
+            p.line_to(Point::new(r.right(), r.bottom()))
+                .line_to(Point::new(r.x, r.bottom()));
+        }
+        p.close();
+        p
+    }
+
     pub fn rounded_rect(r: Rect, radius: f32) -> Self {
         let rad = radius.min(r.w * 0.5).min(r.h * 0.5).max(0.0);
         let mut p = Path::new();

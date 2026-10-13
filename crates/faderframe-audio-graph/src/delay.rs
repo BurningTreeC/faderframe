@@ -13,6 +13,9 @@ pub(crate) struct AudioDelay {
     delay: usize,
     ring: Vec<Box<[f32]>>,
     write: usize,
+    /// Frames written since the last reset (up to the capacity): older
+    /// ones read as silence, so a reset clears nothing.
+    fresh: usize,
 }
 
 impl AudioDelay {
@@ -24,7 +27,14 @@ impl AudioDelay {
                 .map(|_| vec![0.0; cap].into_boxed_slice())
                 .collect(),
             write: 0,
+            fresh: cap,
         }
+    }
+
+    /// Forget what it holds (the panic): what comes out until `delay`
+    /// frames have gone in again is silence.
+    pub fn reset(&mut self) {
+        self.fresh = 0;
     }
 
     /// Push `src` into the ring and add the delayed signal into `dst`.
@@ -44,7 +54,10 @@ impl AudioDelay {
             ring[w..w + first].copy_from_slice(&input[..first]);
             ring[..n - first].copy_from_slice(&input[first..n]);
         }
-        // Read the block that was written `delay` frames ago.
+        self.fresh = (self.fresh + n).min(cap);
+        // Read the block that was written `delay` frames ago; its first
+        // `stale` frames were written before a reset (silence).
+        let stale = (self.delay + n).saturating_sub(self.fresh).min(n);
         let r = (w + cap - self.delay) % cap;
         let first = (cap - r).min(n);
         let ring = &self.ring;
@@ -55,10 +68,11 @@ impl AudioDelay {
                 let out = dst.channel_mut(d);
                 let a = &ring[s][r..r + first];
                 let b = &ring[s][..n - first];
-                for (o, i) in out[..first].iter_mut().zip(a) {
+                for (o, i) in out[..first].iter_mut().zip(a).skip(stale) {
                     *o += *i * wgt;
                 }
-                for (o, i) in out[first..n].iter_mut().zip(b) {
+                let skip_b = stale.saturating_sub(first);
+                for (o, i) in out[first..n].iter_mut().zip(b).skip(skip_b) {
                     *o += *i * wgt;
                 }
             },
@@ -84,6 +98,12 @@ impl EventDelay {
             queue: VecDeque::with_capacity(capacity),
             capacity,
         }
+    }
+
+    /// Drop what it holds (the panic: a note-on still on its way would
+    /// sound after the notes were released).
+    pub fn reset(&mut self) {
+        self.queue.clear();
     }
 
     /// Queue `src` events and emit those due in this block into `dst`.
@@ -133,6 +153,36 @@ mod tests {
         let pos = out.iter().position(|&v| v == 1.0);
         assert_eq!(pos, Some(7));
         assert_eq!(out.iter().filter(|&&v| v != 0.0).count(), 1);
+    }
+
+    /// After a reset the line is silent until it has been filled again,
+    /// whatever the block size; then it delays as before.
+    #[test]
+    fn a_reset_audio_delay_is_silent_until_filled_again() {
+        for block in [1usize, 3, 4, 7] {
+            let delay = 6;
+            let mut d = AudioDelay::new(1, delay, block);
+            let mut src = AudioBuffer::new(ChannelLayout::Mono, block);
+            let mut dst = AudioBuffer::new(ChannelLayout::Mono, block);
+            src.set_len(block);
+            dst.set_len(block);
+            let mut run = |d: &mut AudioDelay, value: f32, blocks: usize| {
+                let mut out = Vec::new();
+                for _ in 0..blocks {
+                    src.channel_mut(0).fill(value);
+                    dst.clear();
+                    d.process_mix(&src, &mut dst);
+                    out.extend_from_slice(dst.channel(0));
+                }
+                out
+            };
+            run(&mut d, 1.0, 10);
+            d.reset();
+            // Twos go in after the reset: ones never come out again.
+            let out = run(&mut d, 2.0, 10);
+            assert!(out[..delay].iter().all(|v| *v == 0.0), "{block}: {out:?}");
+            assert!(out[delay..].iter().all(|v| *v == 2.0), "{block}: {out:?}");
+        }
     }
 
     #[test]

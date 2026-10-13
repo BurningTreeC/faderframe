@@ -489,6 +489,124 @@ pub struct BuiltinInstance {
     /// The output buses tracks take (the Drum Sampler's processors read it
     /// every block: an adopted processor follows it too).
     taken: Arc<std::sync::atomic::AtomicU64>,
+    /// The processor last made: graph rebuilds get it again while what it
+    /// was made for holds (as an external plugin's), instead of building
+    /// the Guitar Station's circuits, the EQ's filters or the reverb's
+    /// lines anew on the UI thread at every edit that rebuilds.
+    kept: Option<Kept>,
+}
+
+/// A built-in's processor shared by the graphs that get it.
+struct Kept {
+    made_for: MadeFor,
+    cell: Arc<faderframe_realtime::TryCell<Box<dyn PluginProcessor>>>,
+    block: usize,
+}
+
+/// Everything a built-in's processor is made from (the rest it reads from
+/// the shared parameter values while it runs).
+#[derive(Clone, Copy, PartialEq)]
+struct MadeFor {
+    config: ProcessConfig,
+    channels: usize,
+    realtime: bool,
+    sized_block: usize,
+    latency: u32,
+    shape: u64,
+    reshaped: u64,
+    samples: usize,
+    tap: usize,
+}
+
+/// A graph's hold on a kept processor. One handed out again starts clean
+/// when it first runs, as a new one would; one the next graph adopts
+/// instead (same node) has run already and keeps its state.
+struct SharedProcessor {
+    cell: Arc<faderframe_realtime::TryCell<Box<dyn PluginProcessor>>>,
+    block: usize,
+    fresh: bool,
+}
+
+impl PluginProcessor for SharedProcessor {
+    fn process(&mut self, ctx: &PluginProcessContext<'_>, io: &mut NodeIo<'_>) -> ProcessStatus {
+        let Some(mut p) = self.cell.try_lock() else {
+            // Another graph's turn (a rebuild in flight): silence.
+            for out in io.audio_out.iter_mut() {
+                out.clear();
+            }
+            return ProcessStatus::Continue;
+        };
+        if std::mem::take(&mut self.fresh) {
+            p.reset();
+        }
+        p.process(ctx, io)
+    }
+
+    fn reset(&mut self) {
+        self.fresh = false;
+        if let Some(mut p) = self.cell.try_lock() {
+            p.reset();
+        }
+    }
+
+    fn take_underruns(&mut self) -> u64 {
+        self.cell.try_lock().map_or(0, |mut p| p.take_underruns())
+    }
+
+    fn preferred_block_size(&self) -> usize {
+        self.block
+    }
+
+    fn set_callback_deadline(&mut self, deadline: Option<std::time::Instant>) {
+        if let Some(mut p) = self.cell.try_lock() {
+            p.set_callback_deadline(deadline);
+        }
+    }
+}
+
+impl BuiltinInstance {
+    /// What of the parameters a processor is built for beyond its latency
+    /// (a change restarts it).
+    fn shape(&self) -> u64 {
+        match self.kind {
+            // The samplers' Keep Length needs a processor with stretchers.
+            Kind::Sampler => u64::from(
+                self.params
+                    .get(crate::devices::sampler::id::PITCH_MODE as usize)
+                    >= 0.5,
+            ),
+            Kind::Drums => u64::from(crate::devices::drums::keeps_length(&self.params)),
+            // Its channels and round trip are the graph's (send, return and
+            // the return's latency): built again when they change.
+            Kind::HardwareInsert => {
+                let (send, ret, _, trip) = crate::devices::hardware_insert::routing(&self.params);
+                u64::from(send) | (u64::from(ret) << 8) | (u64::from(trip) << 16)
+            }
+            // The British 73's line is part of its circuit.
+            Kind::Preamp(i) => u64::from(crate::devices::preamp::bridging(i, &self.params)),
+            _ => 0,
+        }
+    }
+
+    fn made_for(&self, config: &ProcessConfig) -> MadeFor {
+        MadeFor {
+            config: *config,
+            channels: self.channels,
+            realtime: self.realtime,
+            sized_block: self.sized_block,
+            latency: self.latency_samples(),
+            shape: self.shape(),
+            reshaped: self.reshaped,
+            samples: self
+                .samples
+                .as_ref()
+                .map_or(0, |h| Arc::as_ptr(&h.shared) as *const () as usize),
+            tap: self
+                .tap
+                .as_ref()
+                .map_or(0, |t| Arc::as_ptr(t) as *const () as usize),
+        }
+    }
 }
 
 impl PluginInstance for BuiltinInstance {
@@ -497,6 +615,14 @@ impl PluginInstance for BuiltinInstance {
     }
     fn configure_realtime(&mut self, realtime: bool) {
         self.realtime = realtime;
+    }
+    fn configure_background_loading(&mut self) {
+        if let Some(h) = &mut self.samples {
+            h.set_background(true);
+        }
+    }
+    fn loading(&self) -> bool {
+        self.samples.as_ref().is_some_and(|h| h.loading())
     }
     fn configure_taken_outputs(&mut self, taken: u64) {
         self.taken
@@ -619,27 +745,11 @@ impl PluginInstance for BuiltinInstance {
         // latency: the graph must be rebuilt (with a processor for the new
         // mode).
         if let Some(h) = &mut self.samples {
-            // Samples the processor kept us from swapping in.
-            h.flush();
+            // Samples loaded in the background, or that the processor kept
+            // us from swapping in.
+            h.flush(self.tap.as_deref());
         }
-        // The samplers' Keep Length needs a processor with stretchers.
-        let shape = match self.kind {
-            Kind::Sampler => u64::from(
-                self.params
-                    .get(crate::devices::sampler::id::PITCH_MODE as usize)
-                    >= 0.5,
-            ),
-            Kind::Drums => u64::from(crate::devices::drums::keeps_length(&self.params)),
-            // Its channels and round trip are the graph's (send, return and
-            // the return's latency): built again when they change.
-            Kind::HardwareInsert => {
-                let (send, ret, _, trip) = crate::devices::hardware_insert::routing(&self.params);
-                u64::from(send) | (u64::from(ret) << 8) | (u64::from(trip) << 16)
-            }
-            // The British 73's line is part of its circuit.
-            Kind::Preamp(i) => u64::from(crate::devices::preamp::bridging(i, &self.params)),
-            _ => 0,
-        };
+        let shape = self.shape();
         if self.device_block == self.sized_block {
             self.block_differs = None;
         } else {
@@ -782,8 +892,39 @@ impl PluginInstance for BuiltinInstance {
         &mut self,
         config: &ProcessConfig,
     ) -> Result<Box<dyn PluginProcessor>, PluginError> {
-        let params = self.params.clone();
         self.rate = config.sample_rate.max(1.0);
+        let made_for = self.made_for(config);
+        if let Some(k) = self.kept.as_ref().filter(|k| k.made_for == made_for) {
+            return Ok(Box::new(SharedProcessor {
+                cell: Arc::clone(&k.cell),
+                block: k.block,
+                fresh: true,
+            }));
+        }
+        // The old one goes with the graphs that still hold it.
+        self.kept = None;
+        let p = self.make_processor(config)?;
+        let block = p.preferred_block_size();
+        let cell = Arc::new(faderframe_realtime::TryCell::new(p));
+        self.kept = Some(Kept {
+            made_for,
+            cell: Arc::clone(&cell),
+            block,
+        });
+        Ok(Box::new(SharedProcessor {
+            cell,
+            block,
+            fresh: false,
+        }))
+    }
+}
+
+impl BuiltinInstance {
+    fn make_processor(
+        &mut self,
+        config: &ProcessConfig,
+    ) -> Result<Box<dyn PluginProcessor>, PluginError> {
+        let params = self.params.clone();
         let tap = || {
             self.tap
                 .clone()
@@ -1071,6 +1212,7 @@ impl PluginFactory for BuiltinFactory {
             program: None,
             rate: 48_000.0,
             samples,
+            kept: None,
         }))
     }
 }

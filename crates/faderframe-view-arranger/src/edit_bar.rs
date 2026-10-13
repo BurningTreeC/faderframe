@@ -400,7 +400,9 @@ impl EditToolbarView {
             Item::Flag(EditFlag::Warp) => {
                 "Warp view: double-click adds a warp marker; drag a transient to move just that hit (Alt: up to the next markers, Ctrl: telescoping), drag inside a selection to warp only the range, Alt-click a marker to remove it".into()
             }
-            Item::Flag(EditFlag::EditToolbar | EditFlag::PolyphonicPitch) => String::new(),
+            Item::Flag(
+                EditFlag::EditToolbar | EditFlag::PolyphonicPitch | EditFlag::StopToStart,
+            ) => String::new(),
             Item::Flag(EditFlag::SnapToSamples) => {
                 "Snap to Samples: positions off the grid (snap off, Alt, Slip) land on whole samples".into()
             }
@@ -480,6 +482,7 @@ impl EditToolbarView {
                     EditFlag::SnapToSamples => e.snap_samples,
                     EditFlag::SnapToZeroCrossings => e.zero_crossings,
                     EditFlag::PolyphonicPitch => e.pitch_polyphonic,
+                    EditFlag::StopToStart => e.stop_to_start,
                 };
                 cx.emit(Action::SetEditFlag(f, !on));
             }

@@ -1,5 +1,7 @@
 use faderframe_automation::AutomationSet;
-use faderframe_core::{ChannelLayout, ClipId, ParameterId, PluginInstanceId, SendId, TrackId};
+use faderframe_core::{
+    ChannelLayout, ClipId, DualPan, PanMode, ParameterId, PluginInstanceId, SendId, TrackId,
+};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -382,8 +384,19 @@ pub struct Track {
 
     /// Static fader level; automation in Read mode overrides it.
     pub volume_db: f32,
-    /// Static pan (-1..1); automation in Read mode overrides it.
+    /// Static pan (-1..1); automation in Read mode overrides it. A mono
+    /// source's position (by `Project::pan_law`), a stereo source's
+    /// balance (in [`PanMode::Balance`]).
     pub pan: f32,
+    /// How a stereo source is placed into a stereo destination: balance
+    /// (`pan`) or dual pan (`dual_pan`). Both settings are kept whichever
+    /// is in use. Mono sources ignore it.
+    #[serde(default, skip_serializing_if = "PanMode::is_default")]
+    pub pan_mode: PanMode,
+    /// Where dual pan places a stereo source's left and right channels
+    /// (in [`PanMode::Dual`]; automation in Read mode overrides each).
+    #[serde(default, skip_serializing_if = "DualPan::is_default")]
+    pub dual_pan: DualPan,
     /// Where the track sits in a surround destination (its output or the
     /// bus it feeds is a bed): the surround panner. Unused for stereo.
     #[serde(
@@ -524,6 +537,8 @@ impl Track {
             },
             volume_db: 0.0,
             pan: 0.0,
+            pan_mode: PanMode::default(),
+            dual_pan: DualPan::ORIGINAL,
             surround: faderframe_core::SurroundPan::default(),
             object: false,
             binaural: None,

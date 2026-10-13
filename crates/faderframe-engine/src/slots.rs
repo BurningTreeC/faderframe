@@ -1,6 +1,7 @@
 //! Stable parameter/meter slot assignment (control thread).
 
 use faderframe_automation::AutomationTarget;
+use faderframe_core::surround::SURROUND_VALUES;
 use faderframe_core::{AutomationLaneId, PluginInstanceId, SendId, TrackId};
 use faderframe_project::Project;
 use faderframe_realtime::{MeterRange, ParamSlot, ParamTable, SlotAllocator};
@@ -11,8 +12,14 @@ use std::collections::{HashMap, HashSet};
 pub struct StripSlots {
     /// Linear fader gain.
     pub volume: ParamSlot,
-    /// Pan/balance, -1..1.
+    /// Mono pan / stereo balance, -1..1.
     pub pan: ParamSlot,
+    /// 1.0 = a stereo source is dual-panned (0.0: balanced).
+    pub pan_mode: ParamSlot,
+    /// Dual pan: the left input channel's position, -1..1.
+    pub pan_left: ParamSlot,
+    /// Dual pan: the right input channel's position, -1..1.
+    pub pan_right: ParamSlot,
     /// 1.0 = muted (explicitly or by another track's solo).
     pub mute: ParamSlot,
     /// 1.0 = polarity inverted.
@@ -23,11 +30,29 @@ pub struct StripSlots {
     /// Linear gain of the track's VCAs whose faders are not automated
     /// (automated ones come with the timeline snapshot).
     pub vca: ParamSlot,
-    /// The surround panner: x, y, z, spread, width, LFE send (dB).
-    pub surround: [ParamSlot; 6],
+    /// The surround panner: its values in
+    /// [`faderframe_core::SurroundPan::values`]'s order.
+    pub surround: [ParamSlot; SURROUND_VALUES],
 }
 
-const STRIP_SLOT_COUNT: u32 = 12;
+const STRIP_SLOT_COUNT: u32 = 9 + SURROUND_VALUES as u32;
+
+/// Parameter slots every strip and fold reads (one set per session).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MixSlots {
+    /// The project's pan law ([`faderframe_core::PanLaw::index`]).
+    pub pan_law: ParamSlot,
+    /// How beds fold into stereo and mono
+    /// ([`faderframe_core::surround::Downmix::values`]).
+    pub downmix: [ParamSlot; 5],
+}
+
+impl MixSlots {
+    /// The downmix as the slots say.
+    pub fn downmix(&self, params: &ParamTable) -> faderframe_core::surround::Downmix {
+        faderframe_core::surround::Downmix::from_values(&self.downmix.map(|s| params.get(s)))
+    }
+}
 
 /// Parameter slots of a container's chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,6 +88,10 @@ pub struct SlotRegistry {
     monitor_mono: Option<ParamSlot>,
     /// The console's channel drive (dB).
     console_drive: Option<ParamSlot>,
+    /// The pan law and the downmix.
+    mix: Option<MixSlots>,
+    /// Bass management of the speaker monitoring (listening only).
+    bass: Option<[ParamSlot; 4]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -83,6 +112,8 @@ impl SlotRegistry {
             chains: HashMap::new(),
             monitor_mono: None,
             console_drive: None,
+            mix: None,
+            bass: None,
         }
     }
 
@@ -163,6 +194,38 @@ impl SlotRegistry {
         Ok(s)
     }
 
+    /// Bass management of the speaker monitoring (one set for the
+    /// session; [`faderframe_core::surround::BassManagement::values`]).
+    pub fn bass_management(&mut self) -> Result<[ParamSlot; 4], SlotsExhausted> {
+        if let Some(s) = self.bass {
+            return Ok(s);
+        }
+        let base = self
+            .params
+            .allocate(4)
+            .ok_or(SlotsExhausted("parameters"))?;
+        let s = std::array::from_fn(|i| ParamSlot(base + i as u32));
+        self.bass = Some(s);
+        Ok(s)
+    }
+
+    /// The pan law and the downmix (one set for the session).
+    pub fn mix(&mut self) -> Result<MixSlots, SlotsExhausted> {
+        if let Some(s) = self.mix {
+            return Ok(s);
+        }
+        let base = self
+            .params
+            .allocate(6)
+            .ok_or(SlotsExhausted("parameters"))?;
+        let s = MixSlots {
+            pan_law: ParamSlot(base),
+            downmix: std::array::from_fn(|i| ParamSlot(base + 1 + i as u32)),
+        };
+        self.mix = Some(s);
+        Ok(s)
+    }
+
     pub fn strip(&mut self, track: TrackId) -> Result<StripSlots, SlotsExhausted> {
         if let Some(s) = self.strips.get(&track) {
             return Ok(*s);
@@ -178,7 +241,10 @@ impl SlotRegistry {
             phase: ParamSlot(base + 3),
             solo_mute: ParamSlot(base + 4),
             vca: ParamSlot(base + 5),
-            surround: std::array::from_fn(|i| ParamSlot(base + 6 + i as u32)),
+            pan_mode: ParamSlot(base + 6),
+            pan_left: ParamSlot(base + 7),
+            pan_right: ParamSlot(base + 8),
+            surround: std::array::from_fn(|i| ParamSlot(base + 9 + i as u32)),
         };
         self.strips.insert(track, s);
         Ok(s)
@@ -316,6 +382,11 @@ impl SlotRegistry {
             let slot = self.console_drive()?;
             table.set(slot, c.drive_db as f32);
         }
+        let mix = self.mix()?;
+        table.set(mix.pan_law, project.pan_law.index() as f32);
+        for (slot, v) in mix.downmix.iter().zip(project.downmix.values()) {
+            table.set(*slot, v);
+        }
         for t in &project.tracks {
             if t.input.is_midi() {
                 let slot = self.midi_live(t.id)?;
@@ -334,12 +405,11 @@ impl SlotRegistry {
             let s = self.strip(t.id)?;
             table.set(s.volume, faderframe_core::db_to_gain(t.volume_db));
             table.set(s.pan, t.pan);
-            let sp = t.surround;
-            for (slot, v) in s
-                .surround
-                .iter()
-                .zip([sp.x, sp.y, sp.z, sp.spread, sp.width, sp.lfe_db])
-            {
+            let dual = t.pan_mode == faderframe_core::PanMode::Dual;
+            table.set(s.pan_mode, if dual { 1.0 } else { 0.0 });
+            table.set(s.pan_left, t.dual_pan.left);
+            table.set(s.pan_right, t.dual_pan.right);
+            for (slot, v) in s.surround.iter().zip(t.surround.values()) {
                 table.set(*slot, v);
             }
             // VCAs: static faders and mutes here, automated ones in the

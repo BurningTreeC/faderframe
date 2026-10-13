@@ -283,10 +283,16 @@ impl Processor<EngineContext> for AheadReader {
             };
             let (a, b) = chunk.as_slices();
             let outs = out.num_channels();
-            for (j, s) in a.iter().chain(b).enumerate() {
-                let (frame, c) = (j / ch, j % ch);
+            // Interleaved → planar with counters (no division per sample).
+            let (mut frame, mut c) = (done, 0);
+            for s in a.iter().chain(b) {
                 if c < outs {
-                    out.channel_mut(c)[done + frame] = *s;
+                    out.channel_mut(c)[frame] = *s;
+                }
+                c += 1;
+                if c == ch {
+                    c = 0;
+                    frame += 1;
                 }
             }
             chunk.commit_all();
@@ -356,6 +362,28 @@ impl Scheduling {
 pub(crate) struct Tier {
     to_ahead: Producer<Sequence>,
     ready: Arc<AtomicU64>,
+    resets: Resets,
+}
+
+/// A panic's resets between the link and an anticipator: how many were
+/// asked for, how many it has done, and from which frame of which sequence
+/// (a progress word) what it renders is clean — what it had rendered
+/// before still carries the tails.
+#[derive(Clone)]
+struct Resets {
+    asked: Arc<AtomicU64>,
+    done: Arc<AtomicU64>,
+    clean_from: Arc<AtomicU64>,
+}
+
+impl Resets {
+    fn new() -> Self {
+        Self {
+            asked: Arc::new(AtomicU64::new(0)),
+            done: Arc::new(AtomicU64::new(0)),
+            clean_from: Arc::new(AtomicU64::new(0)),
+        }
+    }
 }
 
 /// The audio thread's side: the current sequence and transport changes on
@@ -371,6 +399,13 @@ pub(crate) struct AheadLink {
     max_wait: usize,
     scheduling: Arc<Scheduling>,
     scheduling_read: bool,
+    /// Frames of the current sequence played, this callback's included.
+    played: usize,
+    /// Resets asked of the anticipators; whether what plays still carries
+    /// tails from before the last one, and how long that has been.
+    resets: u64,
+    resetting: bool,
+    reset_waited: usize,
 }
 
 impl AheadLink {
@@ -383,6 +418,10 @@ impl AheadLink {
             max_wait: (rate * 0.25) as usize,
             scheduling,
             scheduling_read: false,
+            played: 0,
+            resets: 0,
+            resetting: false,
+            reset_waited: 0,
         }
     }
 
@@ -443,6 +482,49 @@ impl AheadLink {
         self.hand_over(next);
     }
 
+    /// Whether what the audio thread plays still carries tails from before
+    /// the last [`Self::reset`] (as of the end of this callback).
+    pub(crate) fn restarting(&self) -> bool {
+        self.resetting
+    }
+
+    /// The panic (realtime-safe): every anticipator resets its processors
+    /// on its own thread, where it is in its sequence; the transport goes
+    /// on as it was (no new sequence, no jump). What they rendered before
+    /// — up to the lookahead — still carries the tails: [`Self::restarting`]
+    /// says so until the audio thread has played past it.
+    pub(crate) fn reset(&mut self) {
+        self.resets += 1;
+        for tier in &self.tiers {
+            tier.resets.asked.store(self.resets, Ordering::Release);
+        }
+        self.resetting = true;
+        self.reset_waited = 0;
+    }
+
+    /// After the callback's frames: whether they are still from before the
+    /// anticipators' resets.
+    fn still_resetting(&mut self, frames: usize) -> bool {
+        let now = progress(self.seq, self.played);
+        let mut waiting = false;
+        for tier in &self.tiers {
+            if tier.resets.done.load(Ordering::Acquire) < self.resets {
+                // Not done yet (or that anticipator is stuck: give up after
+                // a while rather than stay silent).
+                waiting = true;
+                continue;
+            }
+            if now < tier.resets.clean_from.load(Ordering::Acquire) {
+                return true;
+            }
+        }
+        if waiting {
+            self.reset_waited += frames;
+            return self.reset_waited < self.max_wait * 4;
+        }
+        false
+    }
+
     /// Before a callback: switch to the pending sequence when every
     /// anticipator has it ready (or it took too long).
     pub(crate) fn poll(&mut self, current: &mut TransportState, frames: usize) {
@@ -453,17 +535,30 @@ impl AheadLink {
             self.scheduling.extra.store(extra, Ordering::Relaxed);
             self.scheduling.packed.store(packed, Ordering::Release);
         }
-        let Some(p) = &mut self.pending else { return };
-        let ready = self
-            .tiers
-            .iter()
-            .all(|t| t.ready.load(Ordering::Acquire) >= p.seq);
-        if ready || p.waited >= self.max_wait {
-            *current = p.transport.clone();
-            self.seq = p.seq;
-            self.pending = None;
+        let mut switched = false;
+        if let Some(p) = &mut self.pending {
+            let ready = self
+                .tiers
+                .iter()
+                .all(|t| t.ready.load(Ordering::Acquire) >= p.seq);
+            if ready || p.waited >= self.max_wait {
+                *current = p.transport.clone();
+                self.seq = p.seq;
+                self.pending = None;
+                switched = true;
+            } else {
+                p.waited += frames;
+            }
+        }
+        // This callback plays the sequence's next `frames` (the
+        // anticipators count its frames from the same start).
+        self.played = if switched {
+            frames
         } else {
-            p.waited += frames;
+            self.played + frames
+        };
+        if self.resetting {
+            self.resetting = self.still_resetting(frames);
         }
     }
 }
@@ -561,6 +656,7 @@ struct Worker {
     modulation_rx: MailboxReceiver<Arc<crate::modulation::ModulationSet>>,
     sequences: Consumer<Sequence>,
     ready: Arc<AtomicU64>,
+    resets: Resets,
     garbage: Producer<AheadGarbage>,
     stop: Arc<AtomicBool>,
     ctx: EngineContext,
@@ -575,6 +671,9 @@ struct Worker {
     /// The audio thread's scheduling, to adopt.
     scheduling: Option<Arc<Scheduling>>,
     idle: Duration,
+    /// This thread's place among the readers of streamed pages: pages are
+    /// freed only after a cycle reading them is over (`PageTable`).
+    reader: Option<faderframe_realtime::Reader>,
 }
 
 /// How an anticipator runs.
@@ -586,6 +685,8 @@ pub(crate) struct Options {
     pub upstream: Option<Arc<AtomicU64>>,
     /// Keep pace with the audio thread: adopt its scheduling, sleep briefly.
     pub follow: Option<Arc<Scheduling>>,
+    /// The epoch guarding the streamed pages its graphs read.
+    pub epoch: Arc<faderframe_realtime::Epoch>,
 }
 
 /// Start an anticipator as `options` say; returns its handle and its tier
@@ -600,6 +701,7 @@ pub(crate) fn start(ctx: EngineContext, rate: f64, options: Options) -> (Anticip
     let (seq_tx, seq_rx) = RingBuffer::new(64);
     let (garbage_tx, garbage_rx) = RingBuffer::new(64);
     let ready = Arc::new(AtomicU64::new(0));
+    let resets = Resets::new();
     let stop = Arc::new(AtomicBool::new(false));
     let progress_word = Arc::new(AtomicU64::new(0));
     let target = Arc::new(AtomicUsize::new(lookahead));
@@ -614,6 +716,7 @@ pub(crate) fn start(ctx: EngineContext, rate: f64, options: Options) -> (Anticip
         modulation_rx,
         sequences: seq_rx,
         ready: Arc::clone(&ready),
+        resets: resets.clone(),
         garbage: garbage_tx,
         stop: Arc::clone(&stop),
         ctx,
@@ -626,6 +729,13 @@ pub(crate) fn start(ctx: EngineContext, rate: f64, options: Options) -> (Anticip
         upstream: options.upstream,
         scheduling: options.follow,
         idle,
+        reader: {
+            let r = options.epoch.reader();
+            if r.is_none() {
+                tracing::warn!("render ahead: no reader slot left on the page epoch");
+            }
+            r
+        },
     };
     let name = if worker.scheduling.is_some() {
         "ff-ahead-bus"
@@ -652,6 +762,7 @@ pub(crate) fn start(ctx: EngineContext, rate: f64, options: Options) -> (Anticip
         Tier {
             to_ahead: seq_tx,
             ready,
+            resets,
         },
     )
 }
@@ -677,16 +788,28 @@ impl Worker {
         let startup = STARTUP_BLOCKS * self.block;
         let idle = self.idle;
         let mut adopted = 0u64;
+        let mut resets_done = 0u64;
+        // The deep tier hasn't the shallow one's urgency: further below
+        // the audio thread (`faderframe_realtime::priority`).
+        let helper = if self.scheduling.is_some() {
+            faderframe_realtime::priority::Helper::Near
+        } else {
+            faderframe_realtime::priority::Helper::Ahead
+        };
         while !self.stop.load(Ordering::Relaxed) {
-            if let Some(s) = &self.scheduling {
-                let packed = s.packed.load(Ordering::Acquire);
-                if packed != adopted {
-                    adopted = packed;
-                    faderframe_realtime::apply_thread_scheduling(
-                        packed,
-                        s.extra.load(Ordering::Relaxed),
-                    );
+            match &self.scheduling {
+                // macOS: the audio thread's time constraint, as it is.
+                Some(s) if cfg!(target_os = "macos") => {
+                    let packed = s.packed.load(Ordering::Acquire);
+                    if packed != adopted {
+                        adopted = packed;
+                        faderframe_realtime::apply_thread_scheduling(
+                            packed,
+                            s.extra.load(Ordering::Relaxed),
+                        );
+                    }
                 }
+                _ => faderframe_realtime::priority::follow_audio(helper),
             }
             if let Some(mut new) = self.graph_rx.take() {
                 if let Some(mut old) = graph.take() {
@@ -705,6 +828,21 @@ impl Worker {
             }
             while let Ok(s) = self.sequences.pop() {
                 current = Some((s.id, s.transport, 0, true));
+            }
+            // A panic: reset here (this thread's time, not the audio
+            // thread's) and say from which frame on what it renders is
+            // clean.
+            let asked = self.resets.asked.load(Ordering::Acquire);
+            if asked != resets_done {
+                if let Some(g) = graph.as_mut() {
+                    g.graph.reset_all();
+                }
+                let from = current
+                    .as_ref()
+                    .map_or(0, |(seq, _, primed, _)| progress(*seq, *primed));
+                self.resets.clean_from.store(from, Ordering::Release);
+                self.resets.done.store(asked, Ordering::Release);
+                resets_done = asked;
             }
             let Some((seq, transport, primed, first)) = current.as_mut() else {
                 std::thread::sleep(idle);
@@ -743,9 +881,16 @@ impl Worker {
                 sample_rate: self.rate,
                 data: &self.ctx,
             };
+            // Streamed pages read in this cycle stay until it is over.
+            if let Some(r) = &self.reader {
+                r.begin();
+            }
             match &self.pool {
                 Some(pool) => g.graph.process_parallel(&cx, pool),
                 None => g.graph.process(&cx),
+            }
+            if let Some(r) = &self.reader {
+                r.end();
             }
             transport.advance(n);
             *primed += n;

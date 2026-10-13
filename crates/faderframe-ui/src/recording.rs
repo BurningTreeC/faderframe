@@ -116,7 +116,35 @@ pub fn install_actions(app: &Rc<AppState>) {
             }
         })
         .build();
+    let weak = Rc::downgrade(app);
+    let metronome_settings = gio::ActionEntry::builder("metronome-settings")
+        .activate(move |_, _, _| {
+            if let Some(app) = weak.upgrade() {
+                crate::preferences::open(&app, Some("metronome"));
+            }
+        })
+        .build();
+    let weak = Rc::downgrade(app);
+    let stop_to_start = gio::ActionEntry::builder("stop-to-start")
+        .state(app.session.borrow().editor.stop_to_start.to_variant())
+        .activate(move |_, action, _| {
+            let Some(app) = weak.upgrade() else { return };
+            let on = !app.session.borrow().editor.stop_to_start;
+            app.dispatch(Action::SetEditFlag(
+                faderframe_session::EditFlag::StopToStart,
+                on,
+            ));
+            action.set_state(&on.to_variant());
+            let mut p = Preferences::load();
+            p.stop_to_start = on;
+            if let Err(e) = p.save() {
+                tracing::warn!("cannot save preferences: {e}");
+            }
+        })
+        .build();
     app.app.add_action_entries([
+        metronome_settings,
+        stop_to_start,
         toggle_metronome,
         radio(app, "record-mode", r.mode.id(), |r, id| {
             r.mode = RecordMode::from_id(id).unwrap_or(r.mode);
@@ -175,6 +203,7 @@ pub fn menu() -> gio::Menu {
             MetronomeMode::ALL.map(|x| (x.label().to_string(), x.id().to_string())),
         ),
     );
+    opts.append(Some("Metronome Settings…"), Some("app.metronome-settings"));
     opts.append_submenu(
         Some("Pre-roll"),
         &radio_menu(
@@ -209,10 +238,8 @@ pub fn page(app: &Rc<AppState>, row: impl Fn(&gtk::Grid, i32, &str, &gtk::Widget
     row(&g, 0, "Recording over clips", mode.upcast_ref());
     let loop_mode = dropdown(&LoopRecordMode::ALL, |m| m.label().to_string(), r.loop_mode);
     row(&g, 1, "Loop recording", loop_mode.upcast_ref());
-    let metronome = dropdown(&MetronomeMode::ALL, |m| m.label().to_string(), r.metronome);
-    row(&g, 2, "Metronome", metronome.upcast_ref());
     let preroll = dropdown(&PREROLL_BARS, preroll_label, r.preroll_bars);
-    row(&g, 3, "Pre-roll", preroll.upcast_ref());
+    row(&g, 2, "Pre-roll", preroll.upcast_ref());
     let offset = gtk::SpinButton::with_range(-4096.0, 4096.0, 1.0);
     offset.set_value(r.latency_offset as f64);
     offset.set_tooltip_text(Some(
@@ -220,7 +247,7 @@ pub fn page(app: &Rc<AppState>, row: impl Fn(&gtk::Grid, i32, &str, &gtk::Widget
     ));
     row(
         &g,
-        4,
+        3,
         "Extra latency compensation (frames)",
         offset.upcast_ref(),
     );
@@ -229,7 +256,8 @@ pub fn page(app: &Rc<AppState>, row: impl Fn(&gtk::Grid, i32, &str, &gtk::Widget
          take in — open the folder's take lanes to comp by clicking or swiping. Replace: existing \
          clips are cut back underneath the new take.\n\nLoop recording keeps every pass as a take, \
          only the last pass, or puts earlier passes on new muted tracks. Takes are written as 32-bit \
-         float WAV into the project's Audio folder and compensated for input and output latency.",
+         float WAV into the project's Audio folder and compensated for input and output latency. \
+         The metronome has a page of its own.",
     ));
     help.set_wrap(true);
     // Bounded line length: consistent height-for-width measuring.
@@ -237,14 +265,13 @@ pub fn page(app: &Rc<AppState>, row: impl Fn(&gtk::Grid, i32, &str, &gtk::Widget
     help.set_natural_wrap_mode(gtk::NaturalWrapMode::Word);
     help.set_xalign(0.0);
     help.add_css_class("dim-label");
-    g.attach(&help, 0, 5, 2, 1);
+    g.attach(&help, 0, 4, 2, 1);
 
     let update = {
         let weak = Rc::downgrade(app);
-        let (mode, loop_mode, metronome, preroll, offset) = (
+        let (mode, loop_mode, preroll, offset) = (
             mode.clone(),
             loop_mode.clone(),
-            metronome.clone(),
             preroll.clone(),
             offset.clone(),
         );
@@ -254,8 +281,6 @@ pub fn page(app: &Rc<AppState>, row: impl Fn(&gtk::Grid, i32, &str, &gtk::Widget
             r.mode = RecordMode::ALL[mode.selected() as usize % RecordMode::ALL.len()];
             r.loop_mode =
                 LoopRecordMode::ALL[loop_mode.selected() as usize % LoopRecordMode::ALL.len()];
-            r.metronome =
-                MetronomeMode::ALL[metronome.selected() as usize % MetronomeMode::ALL.len()];
             r.preroll_bars = PREROLL_BARS[preroll.selected() as usize % PREROLL_BARS.len()];
             r.latency_offset = offset.value() as i64;
             if r != app.session.borrow().record {
@@ -264,7 +289,7 @@ pub fn page(app: &Rc<AppState>, row: impl Fn(&gtk::Grid, i32, &str, &gtk::Widget
         }
     };
     let update = Rc::new(update);
-    for d in [&mode, &loop_mode, &metronome, &preroll] {
+    for d in [&mode, &loop_mode, &preroll] {
         let u = Rc::clone(&update);
         d.connect_selected_notify(move |_| u());
     }

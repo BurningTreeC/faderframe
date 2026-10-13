@@ -1,9 +1,11 @@
 //! Engine-specific graph processors.
 
+mod bass;
 mod chain;
 mod clip_player;
 mod console;
 mod crosstalk;
+mod diffuse;
 mod io;
 mod listen;
 mod midi_player;
@@ -19,8 +21,9 @@ pub use crosstalk::Crosstalk;
 pub use io::{
     DeviceInputTap, DeviceOutputSink, FoldDown, HardwareReturn, HardwareSendGain, MonitorGate,
 };
-pub use listen::ListenOut;
+pub use listen::{ListenLink, ListenOut, Listening};
 pub use midi_player::MidiClipPlayer;
+pub(crate) use midi_player::chase_key;
 pub use plugin::PluginNode;
 pub use send::SendNode;
 pub use strip::{ChannelStrip, ObjectRenderer, StripEcho};
@@ -32,13 +35,21 @@ pub(crate) const MAX_CHANNELS: usize = 16;
 /// while a curve changes: 0.7 ms at 48 kHz.
 pub(crate) const AUTOMATION_STEP: usize = 32;
 
-/// Timeline sample at which automation is read for block offset `offset`:
-/// while stopped the playhead does not move, so every offset reads it.
+/// Timeline sample at which automation is read for block offset `offset`
+/// by a node whose input arrives `latency` frames late (its
+/// [`Processor::set_input_latency`](faderframe_audio_graph::Processor)):
+/// the audio there was played that many frames ago — maybe before a loop
+/// wrap, a locate or a stop — so it reads the play history. While stopped
+/// the playhead does not move, so every offset reads it.
 #[inline]
 pub(crate) fn automation_at(
     cx: &faderframe_audio_graph::ProcessContext<'_, crate::context::EngineContext>,
+    latency: u32,
     offset: usize,
 ) -> i64 {
+    if latency > 0 {
+        return cx.data.history.delayed(latency, offset).pos;
+    }
     let t = &cx.data.transport;
     if t.playing {
         t.sample_position + offset as i64

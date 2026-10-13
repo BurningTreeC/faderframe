@@ -53,6 +53,8 @@ pub struct PluginPerformance {
     pub load: Load,
     pub latency: u32,
     pub bypassed: bool,
+    /// Bypassed by low-latency monitoring (its track is heard live).
+    pub monitoring: bool,
     pub failed: bool,
 }
 
@@ -68,6 +70,11 @@ pub struct TrackPerformance {
     /// The track's own work without its plugins (playback, mixing).
     pub mixing: Load,
     pub plugins: Vec<PluginPerformance>,
+    /// Plugin delay compensation: the latency its audio has after its
+    /// strip (its path so far), and the delay it then waits for the paths
+    /// it meets until the outputs (frames).
+    pub latency: u32,
+    pub waits: u32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -102,7 +109,13 @@ pub struct PerformanceReport {
     pub late_disk_reads: u64,
     pub graph_nodes: usize,
     pub graph_levels: usize,
+    /// The graph's output latency (plugin delay compensation lines every
+    /// path up to it) and the device's (buffer, output, varispeed): what
+    /// is processed is heard their sum later.
     pub output_latency: u32,
+    pub device_latency: u32,
+    /// Tracks heard live with low-latency monitoring (none when it is off).
+    pub low_latency_tracks: usize,
 }
 
 impl PerformanceReport {
@@ -242,6 +255,7 @@ impl PerformanceMonitor {
                         load: *load,
                         latency: engine.plugin_latency(slot.id).unwrap_or(0),
                         bypassed: slot.bypass,
+                        monitoring: engine.bypassed_for_monitoring().contains(&slot.id),
                         failed: failed.contains(&slot.id),
                     }
                 })
@@ -254,6 +268,8 @@ impl PerformanceMonitor {
                 load,
                 mixing,
                 plugins,
+                latency: engine.track_latency(t.id),
+                waits: engine.meter_delay(t.id),
             });
         }
         // Forget removed tracks and plugins.
@@ -299,6 +315,8 @@ impl PerformanceMonitor {
             graph_nodes: stats.nodes,
             graph_levels: stats.levels,
             output_latency: stats.output_latency,
+            device_latency: engine.device_latency(),
+            low_latency_tracks: engine.low_latency_tracks().len(),
         };
     }
 

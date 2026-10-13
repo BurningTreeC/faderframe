@@ -75,6 +75,14 @@ pub trait Processor<C>: Send {
         0
     }
 
+    /// How far behind the timeline the audio arriving at this node is
+    /// (frames): the latency of everything upstream of it, compensation
+    /// included — what the graph aligned its inputs to. Set when compiling
+    /// and again when a processor is adopted into a new graph (control or
+    /// audio thread; keep it a plain store). A node that reads the timeline
+    /// for the audio it processes (automation) reads it that much earlier.
+    fn set_input_latency(&mut self, _frames: u32) {}
+
     /// Preferred processing quantum, queried when compiling. Smaller chunks
     /// let asynchronous nodes enqueue every track before waiting for output.
     /// Processors must still accept their full prepared maximum block size.

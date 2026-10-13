@@ -51,6 +51,7 @@ impl PluginFactory for Broken {
             broken_descriptor("test.crash"),
             broken_descriptor("test.hang"),
             broken_descriptor("test.sysex"),
+            broken_descriptor("test.slow"),
         ]
     }
     fn instantiate(&self, id: &str) -> Result<Box<dyn PluginInstance>, PluginError> {
@@ -78,6 +79,11 @@ impl PluginInstance for BrokenInstance {
         TailLength::None
     }
     fn save_state(&mut self) -> Result<Vec<u8>, PluginError> {
+        if self.0.id == "test.slow" {
+            // A big state, slow to write.
+            std::thread::sleep(Duration::from_millis(400));
+            return Ok(vec![7; 1000]);
+        }
         Ok(Vec::new())
     }
     fn load_state(&mut self, _data: &[u8]) -> Result<(), PluginError> {
@@ -229,6 +235,13 @@ fn remote(format: PluginFormat, id: &str) -> Box<dyn PluginInstance> {
     instantiate_sandboxed(&launcher(), format, id).unwrap()
 }
 
+/// A poll answered now (the helper's answers come at the next poll).
+fn poll_answered(inst: &mut dyn PluginInstance) -> faderframe_plugin_host::PluginPoll {
+    let first = inst.poll();
+    inst.settle();
+    first.merge(inst.poll())
+}
+
 // --- the tests -------------------------------------------------------------------------
 
 #[test]
@@ -312,7 +325,7 @@ fn a_sandboxed_gain_matches_the_one_in_process() {
     let state = b.save_state().unwrap();
     b.set_parameter(gain, -20.0).unwrap();
     b.load_state(&state).unwrap();
-    b.poll();
+    poll_answered(b.as_mut());
     assert_eq!(b.parameter(gain), a.parameter(gain));
     assert_eq!(
         b.format_parameter(gain, -6.0),
@@ -490,13 +503,30 @@ fn a_crashing_plugin_takes_only_its_own_process_down() {
 fn a_hanging_plugin_is_given_up_after_the_deadline() {
     let mut inst = remote(PluginFormat::Vst3, "test.hang");
     let mut p = inst.create_processor(&CONFIG).unwrap();
+    // Each block waits about a block's duration at most (then plays
+    // silence and counts it), never the whole timeout: a stuck helper costs
+    // its track, not the engine's deadline. After the timeout it is dead.
     let t = Instant::now();
-    assert_eq!(run(p.as_mut(), 1, &[], &[]).1, ProcessStatus::Error);
+    let mut slowest = Duration::ZERO;
+    let status = loop {
+        let call = Instant::now();
+        let status = run(p.as_mut(), 1, &[], &[]).1;
+        slowest = slowest.max(call.elapsed());
+        if status == ProcessStatus::Error || t.elapsed() > Duration::from_secs(2) {
+            break status;
+        }
+    };
+    assert_eq!(status, ProcessStatus::Error);
     let waited = t.elapsed();
     assert!(
         waited >= Duration::from_millis(200) && waited < Duration::from_secs(2),
         "{waited:?}"
     );
+    assert!(
+        slowest < Duration::from_millis(50),
+        "a call waited {slowest:?}"
+    );
+    assert!(p.take_underruns() > 0, "the silent blocks are counted");
     let t = Instant::now();
     assert_eq!(run(p.as_mut(), 1, &[], &[]).1, ProcessStatus::Error);
     assert!(t.elapsed() < Duration::from_millis(100));
@@ -644,4 +674,34 @@ fn a_sandboxed_compressor_reports_its_gain_reduction() {
     let mut pc = c.create_processor(&CONFIG).unwrap();
     run(pc.as_mut(), 2, &[], &[]);
     assert_eq!(c.reduction().and_then(|r| r.get()), None);
+}
+
+/// Polls and the state taken every few seconds never wait for the helper:
+/// a state slow to write arrives through later polls, which return at once
+/// meanwhile; a request for the state now still gets it.
+#[test]
+fn the_host_does_not_wait_for_a_busy_helper() {
+    let mut inst = remote(PluginFormat::Vst3, "test.slow");
+    poll_answered(inst.as_mut());
+    assert!(inst.request_state());
+    let t = Instant::now();
+    let mut state = None;
+    let mut slowest = Duration::ZERO;
+    while state.is_none() && t.elapsed() < Duration::from_secs(5) {
+        let p = Instant::now();
+        inst.poll();
+        slowest = slowest.max(p.elapsed());
+        state = inst.take_state();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(state, Some(vec![7; 1000]));
+    assert!(t.elapsed() >= Duration::from_millis(400));
+    assert!(
+        slowest < Duration::from_millis(50),
+        "a poll waited {slowest:?}"
+    );
+    // Asking directly waits for the answer on its way first.
+    assert!(inst.request_state());
+    inst.poll();
+    assert_eq!(inst.save_state().unwrap(), vec![7; 1000]);
 }

@@ -15,13 +15,18 @@
 //! ([`grid::Grid`]: Launchpad Mini MK3 / X / Pro MK3, APC mini and mk2,
 //! Push 2) play the clip launcher: their pads are its slots, their
 //! columns the tracks that hold clips (a bank of their own), lit in the
-//! clips' colours as the [`LauncherView`] says.
+//! clips' colours as the [`LauncherView`] says. Keyboards and surfaces
+//! with a DAW mode of their own ([`controllers`]: Arturia, Novation,
+//! Korg, NI, M-Audio, Akai, Behringer, PreSonus, iCON) are Mackie
+//! profiles or tables ([`mapped`]).
 
 #![forbid(unsafe_code)]
 
+pub mod controllers;
 pub mod grid;
 pub mod hui;
 pub mod mackie;
+pub mod mapped;
 pub mod osc;
 
 /// The master fader's strip number in [`SurfaceInput`]s.
@@ -51,6 +56,8 @@ pub struct StripState {
     pub selected: bool,
     /// Peak level (dBFS) since the last state.
     pub meter_db: f32,
+    /// The track's colour (scribble strips, pads that show it).
+    pub color: [u8; 3],
 }
 
 impl Default for StripState {
@@ -68,6 +75,7 @@ impl Default for StripState {
             arm: false,
             selected: false,
             meter_db: f32::NEG_INFINITY,
+            color: [0, 0, 0],
         }
     }
 }
@@ -110,6 +118,8 @@ pub struct SurfaceState {
     pub timecode: Option<[i32; 4]>,
     /// The surface's modes and what its mode lights show.
     pub modes: Modes,
+    /// The fader travel of 0 dB (a surface resetting a level).
+    pub unity: f32,
 }
 
 /// Modes the surface switches (and their lights).
@@ -192,6 +202,8 @@ pub enum EditButton {
     Separate,
     /// Capture the MIDI just played.
     Capture,
+    /// Quantise the selected clips.
+    Quantize,
 }
 
 /// What a launcher slot shows.
@@ -330,6 +342,7 @@ pub enum Button {
     ChannelLeft,
     ChannelRight,
     Undo,
+    Redo,
     Save,
     Marker,
     /// Faders and pots swap.
@@ -429,6 +442,14 @@ pub enum SurfaceInput {
         strip: usize,
         pan: f32,
     },
+    /// A knob that says where it is (0…1): a potentiometer, or an
+    /// endless knob that keeps its own value. It sets what the pot
+    /// controls on its page (pan, a send, a parameter; flipped, the
+    /// volume).
+    Knob {
+        strip: usize,
+        value: f32,
+    },
     /// Launch a clip-launcher slot (track and scene, 0-based from the
     /// bank's and the scene bank's start).
     LaunchClip {
@@ -447,6 +468,32 @@ pub enum SurfaceInput {
     BackToArrangement,
     /// Send everything again.
     Refresh,
+    /// Something beyond a button (single-strip surfaces' navigators).
+    Command(SurfaceCommand),
+}
+
+/// What a surface asks for beyond its buttons.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceCommand {
+    /// The track above or below selected.
+    SelectPrevious,
+    SelectNext,
+    /// The playhead to the marker (section) before or after it.
+    MarkerPrevious,
+    MarkerNext,
+    SectionPrevious,
+    SectionNext,
+    /// The selected clips nudged.
+    Nudge {
+        forward: bool,
+    },
+    ZoomIn,
+    ZoomOut,
+    ZoomFit,
+    /// Every plugin of the strip's track bypassed (or all back on).
+    BypassTrack(usize),
+    /// Every mute off.
+    ClearMutes,
 }
 
 /// A surface protocol (see the crate docs).
@@ -476,6 +523,16 @@ pub trait Protocol {
     /// Whether it answers (surfaces that say so: HUI's pings).
     fn online(&self) -> Option<bool> {
         None
+    }
+    /// Its port carries the keyboard too: what it takes (its DAW
+    /// messages) is kept from the instruments; everything else is played.
+    /// `None`: the port serves only the surface.
+    fn claims(&self) -> Option<fn(&[u8]) -> bool> {
+        None
+    }
+    /// A single strip showing the selected track (no bank of its own).
+    fn follows_selection(&self) -> bool {
+        false
     }
 }
 

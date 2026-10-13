@@ -204,3 +204,50 @@ fn metronome_clicks_on_beats_only_when_enabled() {
     );
     assert_eq!(bufs.output_channels(), 2);
 }
+
+/// Off-beats click between the beats when they have a level; each kind of
+/// click plays its own sound at its own level (here sounds of constant
+/// value, so the output shows level × volume exactly).
+#[test]
+fn metronome_levels_sounds_and_off_beats() {
+    use faderframe_engine::{ClickKind, ClickSounds};
+    let (mut r, _) = renderer();
+    let mut bufs = OwnedBuffers::new(2, 2, BLOCK);
+    let m = r.controller.metronome();
+    m.set_mode(MetronomeMode::Always);
+    m.set_gain(0.5);
+    m.set_level(ClickKind::Accent, 1.0);
+    m.set_level(ClickKind::Beat, 0.5);
+    m.set_level(ClickKind::OffBeat, 0.25);
+    let sound = |v: f32| vec![[v, v]; 100];
+    r.controller
+        .set_click_sounds(ClickSounds::new(48_000, sound(1.0), sound(0.8), sound(0.6)));
+    r.play_from(0).unwrap();
+    // 120 bpm at 48 kHz in 4/4: a beat every 24 000 samples, an off-beat
+    // 12 000 after each.
+    let mut out = Vec::new();
+    for _ in 0..(2 * 48_000 / BLOCK) {
+        bufs.set_frames(BLOCK);
+        r.processor.process_device(&mut bufs);
+        out.extend_from_slice(bufs.output_ref(0));
+    }
+    let at = |i: usize| out[i];
+    assert_eq!(at(0), 0.5 * 1.0 * 1.0, "the accent");
+    assert_eq!(at(99), 0.5);
+    assert_eq!(at(100), 0.0, "a click as long as its sound");
+    assert_eq!(at(12_000), 0.5 * 0.25 * 0.6, "an off-beat");
+    assert_eq!(at(24_000), 0.5 * 0.5 * 0.8, "a beat");
+    assert_eq!(at(36_000), 0.5 * 0.25 * 0.6);
+    assert_eq!(at(96_000 - 1), 0.0);
+    // No off-beats without a level.
+    r.controller.metronome().set_level(ClickKind::OffBeat, 0.0);
+    r.controller.transport(TransportCommand::Locate(0)).unwrap();
+    let mut out = Vec::new();
+    for _ in 0..(48_000 / BLOCK) {
+        bufs.set_frames(BLOCK);
+        r.processor.process_device(&mut bufs);
+        out.extend_from_slice(bufs.output_ref(0));
+    }
+    assert_eq!(out[12_000], 0.0);
+    assert_eq!(out[24_000], 0.5 * 0.5 * 0.8);
+}

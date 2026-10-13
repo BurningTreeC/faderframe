@@ -19,6 +19,75 @@ unsafe extern "C" {
     ) -> i32;
 }
 
+thread_local! {
+    /// Set while this thread is inside a plugin's processing.
+    static IN_RUN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks this thread as inside a plugin's processing while alive.
+pub(crate) struct RunScope(bool);
+
+impl RunScope {
+    pub(crate) fn enter() -> Self {
+        Self(IN_RUN.with(|r| r.replace(true)))
+    }
+}
+
+impl Drop for RunScope {
+    fn drop(&mut self) {
+        IN_RUN.with(|r| r.set(self.0));
+    }
+}
+
+/// Room for a message logged while processing.
+const AUDIO_LOG_BYTES: usize = 240;
+
+/// The last message logged while processing, and how many there were:
+/// copied there (formatting it out is I/O and a lock), logged by
+/// [`flush_audio_log`] on the main thread.
+struct AudioLog {
+    bytes: [u8; AUDIO_LOG_BYTES],
+    len: usize,
+    kind: u32,
+    count: u64,
+}
+
+static AUDIO_LOG: std::sync::OnceLock<faderframe_realtime::TryCell<AudioLog>> =
+    std::sync::OnceLock::new();
+
+/// Made on a control thread (with an instance's features), so the audio
+/// thread never initialises it.
+fn audio_log() -> &'static faderframe_realtime::TryCell<AudioLog> {
+    AUDIO_LOG.get_or_init(|| {
+        faderframe_realtime::TryCell::new(AudioLog {
+            bytes: [0; AUDIO_LOG_BYTES],
+            len: 0,
+            kind: 0,
+            count: 0,
+        })
+    })
+}
+
+/// Log what plugins logged while processing since the last call (main
+/// thread).
+pub fn flush_audio_log() {
+    let Some(mut log) = AUDIO_LOG.get().and_then(|l| l.try_lock()) else {
+        return;
+    };
+    if log.count == 0 {
+        return;
+    }
+    let text = String::from_utf8_lossy(&log.bytes[..log.len]).into_owned();
+    let (kind, count) = (log.kind, std::mem::take(&mut log.count));
+    drop(log);
+    let more = if count > 1 {
+        format!(" ({count} messages while processing; the last)")
+    } else {
+        " (while processing)".to_string()
+    };
+    log_now(kind, &format!("{}{more}", text.trim_end()));
+}
+
 /// A plugin's log message (formatted by `log.c`).
 #[unsafe(no_mangle)]
 extern "C" fn ff_lv2_log_message(_handle: *mut c_void, type_: u32, message: *const c_char) {
@@ -26,8 +95,23 @@ extern "C" fn ff_lv2_log_message(_handle: *mut c_void, type_: u32, message: *con
         return;
     }
     // SAFETY: `log.c` passes a null-terminated buffer.
-    let text = unsafe { CStr::from_ptr(message) }.to_string_lossy();
-    let text = text.trim_end();
+    let bytes = unsafe { CStr::from_ptr(message) }.to_bytes();
+    if IN_RUN.with(std::cell::Cell::get) {
+        // The audio thread: copied, not written out.
+        if let Some(mut log) = AUDIO_LOG.get().and_then(|l| l.try_lock()) {
+            let len = bytes.len().min(AUDIO_LOG_BYTES);
+            log.bytes[..len].copy_from_slice(&bytes[..len]);
+            log.len = len;
+            log.kind = type_;
+            log.count += 1;
+        }
+        return;
+    }
+    let text = String::from_utf8_lossy(bytes);
+    log_now(type_, text.trim_end());
+}
+
+fn log_now(type_: u32, text: &str) {
     let u = Urids::get();
     if type_ == u.log_error {
         tracing::warn!("LV2 plugin error: {text}");
@@ -88,6 +172,7 @@ impl HostFeatures {
         schedule: Option<sys::LV2_Worker_Schedule>,
     ) -> Box<HostFeatures> {
         let u = Urids::get();
+        audio_log();
         let map = Box::new(crate::urid::map_feature());
         let unmap = Box::new(crate::urid::unmap_feature());
         let values = Box::new(OptionValues {

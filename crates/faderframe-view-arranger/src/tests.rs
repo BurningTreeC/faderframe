@@ -1704,3 +1704,74 @@ fn return_to_start_brings_the_arranger_back_to_the_start() {
     }
     assert_eq!(view.scroll_x, 0.0, "back at the start");
 }
+
+#[test]
+fn a_dual_panned_header_knob_moves_the_whole_image() {
+    use faderframe_core::{DualPan, PanMode};
+    let mut s = session();
+    let track = ArrangerView::lane_tracks(&s)
+        .into_iter()
+        .find(|t| s.project().pans_stereo(t))
+        .expect("a stereo track")
+        .id;
+    s.dispatch(Action::Edit(Command::SetTrackPanMode {
+        track,
+        mode: PanMode::Dual,
+    }))
+    .unwrap();
+    s.dispatch(Action::Edit(Command::SetTrackDualPan {
+        track,
+        pan: DualPan {
+            left: -0.5,
+            right: 0.5,
+        },
+    }))
+    .unwrap();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 1400.0);
+    view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
+    let knob = view
+        .header_layout(&s, track, size)
+        .unwrap()
+        .pan
+        .expect("a pan knob");
+    let at = knob.center();
+    assert_eq!(
+        view.hit_test(at, size, &s),
+        Some(Hit::Header(track, HeaderPart::Pan))
+    );
+    let mut actions = run(&mut view, down(at), size, &s).0;
+    // Up by a quarter of the knob's travel: both channels half a unit right.
+    actions.extend(run(&mut view, mv(Point::new(at.x, at.y - 45.0)), size, &s).0);
+    actions.extend(run(&mut view, up(Point::new(at.x, at.y - 45.0)), size, &s).0);
+    assert_eq!(actions.first(), Some(&Action::BeginGesture("Pan".into())));
+    assert_eq!(actions.last(), Some(&Action::EndGesture));
+    let moved = actions.iter().rev().find_map(|a| match a {
+        Action::Edit(Command::SetTrackDualPan { pan, .. }) => Some(*pan),
+        _ => None,
+    });
+    let moved = moved.expect("a dual pan edit");
+    assert!(
+        (moved.left - 0.0).abs() < 1e-5 && (moved.right - 1.0).abs() < 1e-5,
+        "{moved:?}"
+    );
+    // A double-click: the channels back where they came from.
+    let (actions, _) = run(
+        &mut view,
+        ViewEvent::PointerDown {
+            pos: at,
+            button: PointerButton::Primary,
+            modifiers: Modifiers::NONE,
+            clicks: 2,
+        },
+        size,
+        &s,
+    );
+    assert_eq!(
+        actions.last(),
+        Some(&Action::Edit(Command::SetTrackDualPan {
+            track,
+            pan: DualPan::ORIGINAL
+        }))
+    );
+}

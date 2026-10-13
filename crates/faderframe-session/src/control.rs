@@ -49,21 +49,39 @@ pub enum SurfaceKind {
     ApcMini,
     ApcMiniMk2,
     Push2,
+    /// A keyboard or surface known by name, in its DAW mode
+    /// ([`faderframe_control::controllers`]).
+    Controller(faderframe_control::controllers::Controller),
 }
 
 impl SurfaceKind {
-    pub const ALL: [SurfaceKind; 10] = [
-        SurfaceKind::Mackie,
-        SurfaceKind::MackieExtender,
-        SurfaceKind::Hui,
-        SurfaceKind::Osc,
-        SurfaceKind::LaunchpadMiniMk3,
-        SurfaceKind::LaunchpadX,
-        SurfaceKind::LaunchpadProMk3,
-        SurfaceKind::ApcMini,
-        SurfaceKind::ApcMiniMk2,
-        SurfaceKind::Push2,
-    ];
+    pub const ALL: [SurfaceKind; 10 + faderframe_control::controllers::Controller::ALL.len()] = {
+        use faderframe_control::controllers::Controller;
+        let base = [
+            SurfaceKind::Mackie,
+            SurfaceKind::MackieExtender,
+            SurfaceKind::Hui,
+            SurfaceKind::Osc,
+            SurfaceKind::LaunchpadMiniMk3,
+            SurfaceKind::LaunchpadX,
+            SurfaceKind::LaunchpadProMk3,
+            SurfaceKind::ApcMini,
+            SurfaceKind::ApcMiniMk2,
+            SurfaceKind::Push2,
+        ];
+        let mut all = [SurfaceKind::Mackie; 10 + Controller::ALL.len()];
+        let mut i = 0;
+        while i < 10 {
+            all[i] = base[i];
+            i += 1;
+        }
+        let mut k = 0;
+        while k < Controller::ALL.len() {
+            all[10 + k] = SurfaceKind::Controller(Controller::ALL[k]);
+            k += 1;
+        }
+        all
+    };
 
     pub fn label(self) -> &'static str {
         match self {
@@ -77,6 +95,15 @@ impl SurfaceKind {
             SurfaceKind::ApcMini => "APC mini",
             SurfaceKind::ApcMiniMk2 => "APC mini mk2",
             SurfaceKind::Push2 => "Push 2 (User Mode)",
+            SurfaceKind::Controller(c) => c.label(),
+        }
+    }
+
+    /// What to do on the device (controllers known by name).
+    pub fn setup(self) -> Option<&'static str> {
+        match self {
+            SurfaceKind::Controller(c) => Some(c.setup()),
+            _ => None,
         }
     }
 
@@ -304,6 +331,39 @@ impl Session {
         self.revision += 1;
     }
 
+    /// Controllers FaderFrame knows among the MIDI ports, set up as they
+    /// should be (their DAW ports) — those not set up already.
+    pub fn detect_control_surfaces(&self) -> Vec<SurfaceSettings> {
+        let inputs: Vec<String> = self
+            .midi_ports()
+            .into_iter()
+            .filter(|p| !p.is_virtual)
+            .map(|p| p.key)
+            .collect();
+        let outputs: Vec<String> = self
+            .midi_outputs()
+            .into_iter()
+            .filter(|p| !p.is_virtual)
+            .map(|p| p.key)
+            .collect();
+        faderframe_control::controllers::detect(&inputs, &outputs)
+            .into_iter()
+            .filter(|d| {
+                !self
+                    .control
+                    .settings
+                    .iter()
+                    .any(|s| !s.input.is_empty() && s.input == d.input)
+            })
+            .map(|d| SurfaceSettings {
+                kind: SurfaceKind::Controller(d.controller),
+                input: d.input,
+                output: d.output,
+                ..SurfaceSettings::default()
+            })
+            .collect()
+    }
+
     /// A surface on the given ports (tests): its protocol on `ports`.
     pub fn add_virtual_surface(&mut self, kind: SurfaceKind) -> faderframe_midi_io::VirtualSurface {
         let (ports, other) = faderframe_midi_io::SurfacePorts::virtual_pair();
@@ -321,19 +381,35 @@ impl Session {
         other
     }
 
-    /// The MIDI ports surfaces use (keys).
-    pub(crate) fn surface_ports(&self) -> (Vec<String>, Vec<String>) {
+    /// The MIDI ports surfaces use (keys): those they take whole, and
+    /// those they share with the keys (with what they claim there).
+    pub(crate) fn surface_ports(
+        &self,
+    ) -> (
+        Vec<String>,
+        Vec<String>,
+        std::collections::HashMap<String, faderframe_midi_io::Claim>,
+    ) {
         let midi = self.control.settings.iter().filter(|s| s.kind.is_midi());
-        let ins = midi
-            .clone()
-            .filter(|s| !s.input.is_empty())
-            .map(|s| s.input.clone())
-            .collect();
-        let outs = midi
-            .filter(|s| !s.output.is_empty())
-            .map(|s| s.output.clone())
-            .collect();
-        (ins, outs)
+        let mut ins = Vec::new();
+        let mut outs = Vec::new();
+        let mut shared = std::collections::HashMap::new();
+        for s in midi {
+            let claim = protocol_for(s).claims();
+            if !s.input.is_empty() {
+                match claim {
+                    Some(c) => {
+                        shared.insert(s.input.clone(), c);
+                    }
+                    None => ins.push(s.input.clone()),
+                }
+            }
+            // A shared port's output stays the tracks' too.
+            if !s.output.is_empty() && claim.is_none() {
+                outs.push(s.output.clone());
+            }
+        }
+        (ins, outs, shared)
     }
 
     /// Every tick: what came from the surfaces, then what they show.
@@ -405,9 +481,13 @@ impl Session {
                 &tracks
             };
             let own = self.control.surfaces[k].own_bank;
+            let follows = self.control.surfaces[k].protocol.follows_selection();
             let start = own.unwrap_or(first);
-            let shown: Vec<Option<TrackId>> =
-                (start..start + n).map(|i| list.get(i).copied()).collect();
+            let shown: Vec<Option<TrackId>> = if follows {
+                vec![self.followed_track()]
+            } else {
+                (start..start + n).map(|i| list.get(i).copied()).collect()
+            };
             // Channel-strip pages: the parameters from this surface's first
             // pot on.
             let params_at = if own.is_some() {
@@ -475,7 +555,7 @@ impl Session {
                         name,
                         fader,
                         level,
-                        pan: self.shown_pan(t),
+                        pan: self.surface_pan(t),
                         pot,
                         pot_bipolar,
                         mute: self.shown_mute(t),
@@ -483,6 +563,7 @@ impl Session {
                         arm: t.record_arm,
                         selected: self.selection.tracks.contains(&t.id),
                         meter_db: m.left.level_db.max(m.right.level_db),
+                        color: track_rgb(t),
                     }
                 })
                 .collect();
@@ -501,6 +582,7 @@ impl Session {
                 launcher,
                 timecode: self.control.extra.timecode.then(|| self.surface_timecode()),
                 modes: self.surface_modes(),
+                unity: law.db_to_position(0.0),
             };
             let s = &mut self.control.surfaces[k];
             let mut out = Vec::new();
@@ -508,7 +590,7 @@ impl Session {
             if !out.is_empty() {
                 sends.push((k, out));
             }
-            if own.is_none() {
+            if own.is_none() && !follows {
                 first += n;
             }
         }
@@ -638,6 +720,9 @@ impl Session {
             return self.project.master().map(|m| m.id);
         }
         let s = &self.control.surfaces[k];
+        if s.protocol.follows_selection() {
+            return self.followed_track();
+        }
         if s.protocol.launcher_columns() {
             return self
                 .launcher_tracks()
@@ -649,7 +734,7 @@ impl Session {
             None => {
                 let before: usize = self.control.surfaces[..k]
                     .iter()
-                    .filter(|s| s.own_bank.is_none())
+                    .filter(|s| s.own_bank.is_none() && !s.protocol.follows_selection())
                     .map(|s| s.protocol.strips())
                     .sum();
                 self.control.bank + before
@@ -659,13 +744,24 @@ impl Session {
     }
 
     /// The channel-strip page's parameter index of surface `k`'s strip.
+    /// The track a single strip following the selection shows: the
+    /// selected one (the first of them), else the first.
+    fn followed_track(&self) -> Option<TrackId> {
+        let tracks = self.surface_tracks();
+        tracks
+            .iter()
+            .find(|t| self.selection.tracks.contains(&t.id))
+            .or_else(|| tracks.first())
+            .map(|t| t.id)
+    }
+
     fn param_index(&self, k: usize, strip: usize) -> usize {
         let before: usize = if self.control.surfaces[k].own_bank.is_some() {
             0
         } else {
             self.control.surfaces[..k]
                 .iter()
-                .filter(|s| s.own_bank.is_none())
+                .filter(|s| s.own_bank.is_none() && !s.protocol.follows_selection())
                 .map(|s| s.protocol.strips())
                 .sum()
         };
@@ -749,15 +845,44 @@ impl Session {
                     self.set_pot(track, (v + delta as f32 * step).clamp(0.0, 1.0))?;
                 }
             }
+            SurfaceInput::Knob { strip, value }
+                if self.control.page.is_channel_strip() && !self.control.flip =>
+            {
+                self.begin_surface_gesture()?;
+                let i = self.param_index(k, strip);
+                self.move_param(i, value)?;
+            }
+            SurfaceInput::Knob { strip, value } => {
+                let Some(track) = self.strip_track(k, strip) else {
+                    return Ok(());
+                };
+                self.begin_surface_gesture()?;
+                if self.control.flip {
+                    self.dispatch(Action::Edit(Command::SetTrackVolume {
+                        track,
+                        db: law.position_to_db(value.clamp(0.0, 1.0)),
+                    }))?;
+                } else {
+                    self.set_pot(track, value.clamp(0.0, 1.0))?;
+                }
+            }
             SurfaceInput::Pan { strip, pan } => {
                 let Some(track) = self.strip_track(k, strip) else {
                     return Ok(());
                 };
                 self.begin_surface_gesture()?;
-                self.dispatch(Action::Edit(Command::SetTrackPan {
-                    track,
-                    pan: pan.clamp(-1.0, 1.0),
-                }))?;
+                let dual = self
+                    .project
+                    .track(track)
+                    .is_some_and(|t| self.project.dual_panned(t));
+                if dual {
+                    self.set_dual_pan_from_surface(track, pan)?;
+                } else {
+                    self.dispatch(Action::Edit(Command::SetTrackPan {
+                        track,
+                        pan: pan.clamp(-1.0, 1.0),
+                    }))?;
+                }
             }
             SurfaceInput::Jog(ticks) => self.surface_jog(ticks)?,
             SurfaceInput::Button {
@@ -810,6 +935,89 @@ impl Session {
                 ))?;
             }
             SurfaceInput::Refresh => self.control.surfaces[k].protocol.reset(),
+            SurfaceInput::Command(c) => self.surface_command(k, c)?,
+        }
+        Ok(())
+    }
+
+    /// What a surface asks for beyond its buttons.
+    fn surface_command(
+        &mut self,
+        k: usize,
+        c: faderframe_control::SurfaceCommand,
+    ) -> crate::Result<()> {
+        use faderframe_control::SurfaceCommand as C;
+        match c {
+            C::SelectPrevious => self.select_neighbour(-1)?,
+            C::SelectNext => self.select_neighbour(1)?,
+            C::MarkerPrevious | C::MarkerNext => {
+                let at = self.playhead();
+                let mut times: Vec<faderframe_timeline::MusicalTime> =
+                    self.project.markers.iter().map(|m| m.position).collect();
+                times.sort();
+                self.locate_step(at, &times, c == C::MarkerNext)?;
+            }
+            C::SectionPrevious | C::SectionNext => {
+                let at = self.playhead();
+                let mut times: Vec<faderframe_timeline::MusicalTime> =
+                    self.project.sections.iter().map(|s| s.start).collect();
+                times.sort();
+                self.locate_step(at, &times, c == C::SectionNext)?;
+            }
+            C::Nudge { forward } => self.dispatch(Action::Nudge {
+                forward,
+                target: crate::NudgeTarget::Move,
+            })?,
+            C::ZoomIn => self.dispatch(Action::Zoom(crate::ZoomRequest::In))?,
+            C::ZoomOut => self.dispatch(Action::Zoom(crate::ZoomRequest::Out))?,
+            C::ZoomFit => self.dispatch(Action::Zoom(crate::ZoomRequest::Fit))?,
+            C::BypassTrack(strip) => {
+                let Some(t) = self
+                    .strip_track(k, strip)
+                    .and_then(|t| self.project.track(t))
+                else {
+                    return Ok(());
+                };
+                // Every insert off — or, all off already, all on again.
+                let all_off = !t.inserts.is_empty() && t.inserts.iter().all(|s| s.bypass);
+                let commands: Vec<Command> = t
+                    .inserts
+                    .iter()
+                    .filter(|s| s.bypass != !all_off)
+                    .map(|s| Command::SetPluginBypass {
+                        track: t.id,
+                        plugin: s.id,
+                        bypass: !all_off,
+                    })
+                    .collect();
+                if !commands.is_empty() {
+                    self.edit(Command::Batch {
+                        label: "Bypass Track".into(),
+                        commands,
+                    })?;
+                }
+            }
+            C::ClearMutes => self.clear_mutes()?,
+        }
+        Ok(())
+    }
+
+    /// Locate to the time in `times` (sorted) after the playhead, or before
+    /// it (a little before counts as at it: a second press goes further).
+    fn locate_step(
+        &mut self,
+        at: faderframe_timeline::MusicalTime,
+        times: &[faderframe_timeline::MusicalTime],
+        forward: bool,
+    ) -> crate::Result<()> {
+        let near = faderframe_timeline::MusicalTime::QUARTER.ticks() / 8;
+        let to = if forward {
+            times.iter().find(|t| t.ticks() > at.ticks() + near)
+        } else {
+            times.iter().rev().find(|t| t.ticks() < at.ticks() - near)
+        };
+        if let Some(to) = to {
+            self.dispatch(Action::Transport(TransportAction::Locate(*to)))?;
         }
         Ok(())
     }
@@ -952,6 +1160,7 @@ impl Session {
             }
             Button::Undo if shift => self.dispatch(Action::Redo)?,
             Button::Undo => self.dispatch(Action::Undo)?,
+            Button::Redo => self.dispatch(Action::Redo)?,
             // The arrows: zooming, nudging, else the channel.
             Button::Left | Button::Right => {
                 let right = button == Button::Right;
@@ -1065,6 +1274,17 @@ impl Session {
     /// whether it is bipolar, its value as text.
     fn pot_value(&self, t: &Track) -> Option<(f32, bool, String)> {
         match self.control.page {
+            Page::Pan if self.project.dual_panned(t) => {
+                // Dual pan: the image as a whole, or the side held.
+                let d = self.shown_dual_pan(t);
+                let pan = self.surface_pan(t);
+                let text = match self.dual_side() {
+                    Some(false) => format!("<{}", pan_text(d.left)),
+                    Some(true) => format!("{}>", pan_text(d.right)),
+                    None => format!("{}{}", pan_text(d.left), pan_text(d.right)),
+                };
+                Some(((pan + 1.0) / 2.0, true, text))
+            }
             Page::Pan => {
                 let pan = self.shown_pan(t);
                 Some(((pan + 1.0) / 2.0, true, pan_text(pan)))
@@ -1082,9 +1302,71 @@ impl Session {
         }
     }
 
+    /// Which side of a dual pan a pan pot moves: `None` both (the image
+    /// as a whole), the left with Shift held, the right with Option.
+    fn dual_side(&self) -> Option<bool> {
+        if self.control.extra.held(faderframe_control::Modifier::Shift) {
+            Some(false)
+        } else if self
+            .control
+            .extra
+            .held(faderframe_control::Modifier::Option)
+        {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    /// Where a surface shows a track's pan: its pan or balance; dual
+    /// panned, the image's middle (or the side held).
+    fn surface_pan(&self, t: &Track) -> f32 {
+        if !self.project.dual_panned(t) {
+            return self.shown_pan(t);
+        }
+        let d = self.shown_dual_pan(t);
+        match self.dual_side() {
+            Some(false) => d.left,
+            Some(true) => d.right,
+            None => 0.5 * (d.left + d.right),
+        }
+    }
+
+    /// A dual-panned track's pan control set to `pan` (−1…1): the side
+    /// held there, or the image moved so its middle is — stopping at the
+    /// sides rather than narrowing it.
+    fn set_dual_pan_from_surface(&mut self, track: TrackId, pan: f32) -> crate::Result<()> {
+        let Some(t) = self.project.track(track) else {
+            return Ok(());
+        };
+        let d = self.shown_dual_pan(t);
+        let pan = pan.clamp(-1.0, 1.0);
+        let moved = match self.dual_side() {
+            Some(false) => d.with_side(false, pan),
+            Some(true) => d.with_side(true, pan),
+            None => {
+                let by = (pan - 0.5 * (d.left + d.right))
+                    .clamp(-1.0 - d.left.min(d.right), 1.0 - d.left.max(d.right));
+                faderframe_core::DualPan {
+                    left: d.left + by,
+                    right: d.right + by,
+                }
+            }
+        };
+        self.dispatch(Action::Edit(Command::SetTrackDualPan { track, pan: moved }))
+    }
+
     /// Set what the pot controls on the current page from travel (0…1).
     fn set_pot(&mut self, track: TrackId, travel: f32) -> crate::Result<()> {
         match self.control.page {
+            Page::Pan
+                if self
+                    .project
+                    .track(track)
+                    .is_some_and(|t| self.project.dual_panned(t)) =>
+            {
+                self.set_dual_pan_from_surface(track, travel * 2.0 - 1.0)
+            }
             Page::Pan => self.dispatch(Action::Edit(Command::SetTrackPan {
                 track,
                 pan: (travel * 2.0 - 1.0).clamp(-1.0, 1.0),
@@ -1167,6 +1449,7 @@ fn protocol_for(s: &SurfaceSettings) -> Box<dyn Protocol> {
             faderframe_control::mackie::XT,
         )),
         SurfaceKind::Hui => Box::new(faderframe_control::hui::Hui::new()),
+        SurfaceKind::Controller(c) => c.protocol(),
         SurfaceKind::Osc => Box::new(faderframe_control::osc::OscSurface::new(usize::from(
             s.strips.max(1),
         ))),
@@ -1191,4 +1474,9 @@ fn open(s: &SurfaceSettings) -> Result<Surface, String> {
         }
     };
     Ok(Surface::new(protocol_for(s), link, s))
+}
+
+/// A track's colour as the surfaces show it.
+fn track_rgb(t: &Track) -> [u8; 3] {
+    [t.color.r, t.color.g, t.color.b]
 }

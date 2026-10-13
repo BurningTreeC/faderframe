@@ -259,6 +259,66 @@ pub struct MidiRegion {
     pub events: Vec<(i64, MidiEvent)>,
     /// SysEx messages (`F0 … F7`) for the track's plugins, sorted.
     pub sysex: Vec<(i64, Box<[u8]>)>,
+    /// The controllers' values along `events`, for chasing.
+    pub chase: ChasePoints,
+}
+
+/// Events between two [`ChasePoints`].
+pub const CHASE_EVERY: usize = 512;
+
+/// The controller values in effect every [`CHASE_EVERY`] events of a
+/// region (made here, on the control thread): playback starting mid-region
+/// reads the values from the point before and goes through at most that
+/// many events, not every event from the region's start (a long take full
+/// of controller data, at every loop wrap).
+#[derive(Debug, Default)]
+pub struct ChasePoints {
+    /// The event index each point is at (point `k` at `(k + 1) ×
+    /// CHASE_EVERY`) and where its values start in `values`.
+    starts: Vec<usize>,
+    /// Per point: the values the events before it leave (controller key =
+    /// channel × slots + slot, and the last event there).
+    values: Vec<(u16, MidiEvent)>,
+}
+
+impl ChasePoints {
+    /// Points for `events`; `key` places an event among the chased
+    /// controllers (`None`: not chased).
+    pub fn new(events: &[(i64, MidiEvent)], key: impl Fn(MidiEvent) -> Option<u16>) -> Self {
+        let mut points = Self::default();
+        if events.len() <= CHASE_EVERY {
+            return points;
+        }
+        let mut state: HashMap<u16, MidiEvent> = HashMap::new();
+        let mut order: Vec<u16> = Vec::new();
+        for (i, &(_, ev)) in events.iter().enumerate() {
+            if i > 0 && i % CHASE_EVERY == 0 {
+                points.starts.push(points.values.len());
+                points.values.extend(order.iter().map(|k| (*k, state[k])));
+            }
+            if let Some(k) = key(ev)
+                && state.insert(k, ev).is_none()
+            {
+                order.push(k);
+            }
+        }
+        points
+    }
+
+    /// Hand `set` the values in effect before event `upto` as far as a point
+    /// knows them; the event to go on from (realtime-safe).
+    pub fn load(&self, upto: usize, mut set: impl FnMut(u16, MidiEvent)) -> usize {
+        let k = (upto / CHASE_EVERY).min(self.starts.len());
+        if k == 0 {
+            return 0;
+        }
+        let from = self.starts[k - 1];
+        let to = self.starts.get(k).copied().unwrap_or(self.values.len());
+        for &(key, ev) in &self.values[from..to] {
+            set(key, ev);
+        }
+        k * CHASE_EVERY
+    }
 }
 
 /// A launcher slot's clip as played: its lane from sample 0, looping over
@@ -472,6 +532,9 @@ fn mpe_note_events(
 pub struct TrackAutomation {
     pub volume: Option<SampleLane>,
     pub pan: Option<SampleLane>,
+    /// Dual pan: the left and right input channels' positions.
+    pub pan_left: Option<SampleLane>,
+    pub pan_right: Option<SampleLane>,
     pub mute: Option<SampleLane>,
     /// Automated faders (dB) of the VCAs scaling the track.
     pub vca_volume: Vec<SampleLane>,
@@ -481,7 +544,7 @@ pub struct TrackAutomation {
     pub params: Vec<(PluginInstanceId, ParameterId, SampleLane)>,
     pub bypass: Vec<(PluginInstanceId, SampleLane)>,
     /// The surround panner, by [`faderframe_core::SurroundParam::index`].
-    pub surround: [Option<SampleLane>; 6],
+    pub surround: [Option<SampleLane>; faderframe_core::SurroundParam::ALL.len()],
 }
 
 impl TrackAutomation {
@@ -489,6 +552,8 @@ impl TrackAutomation {
         self.surround.iter().all(Option::is_none)
             && self.volume.is_none()
             && self.pan.is_none()
+            && self.pan_left.is_none()
+            && self.pan_right.is_none()
             && self.mute.is_none()
             && self.vca_volume.is_empty()
             && self.vca_mute.is_empty()
@@ -863,6 +928,7 @@ impl TimelineSnapshot {
                         })
                         .collect();
                     sysex.sort_by_key(|(t, _)| *t);
+                    let chase = ChasePoints::new(&events, crate::nodes::chase_key);
                     lane_for(&mut lanes, &mut launch_lanes, clip.track, slot)
                         .midi
                         .push(MidiRegion {
@@ -870,6 +936,7 @@ impl TimelineSnapshot {
                             end,
                             events,
                             sysex,
+                            chase,
                         });
                 }
             }
@@ -959,6 +1026,8 @@ impl TimelineSnapshot {
                 match lane.target {
                     AutomationTarget::TrackVolume => a.volume = Some(rt),
                     AutomationTarget::TrackPan => a.pan = Some(rt),
+                    AutomationTarget::DualPanLeft => a.pan_left = Some(rt),
+                    AutomationTarget::DualPanRight => a.pan_right = Some(rt),
                     AutomationTarget::TrackMute => a.mute = Some(rt),
                     AutomationTarget::SendLevel(s) => a.sends.push((s, rt)),
                     AutomationTarget::PluginParameter { plugin, parameter } => {
@@ -1294,13 +1363,42 @@ impl StreamPlan {
         reclaimer: &mut Reclaimer<Page>,
         scratch: &mut Vec<u8>,
     ) -> std::io::Result<usize> {
+        // Breadth first: every source's first page of a window (where the
+        // playhead is or is going), then every second page… — after a
+        // locate all tracks come back together, not one after another. A
+        // source that fails does not hold up the others (the first error
+        // is returned once all have had their turn).
+        let needed = self.needed(windows);
         let mut loaded = 0;
-        for (source, ranges) in self.needed(windows) {
-            for r in ranges {
-                loaded += source.ensure(r, epoch, reclaimer, scratch)?;
+        let mut error = None;
+        let mut failed: Vec<bool> = vec![false; needed.len()];
+        for k in 0.. {
+            let mut any = false;
+            for ((source, ranges), failed) in needed.iter().zip(failed.iter_mut()) {
+                if *failed {
+                    continue;
+                }
+                for r in ranges {
+                    let i = r.start + k;
+                    if i >= r.end {
+                        continue;
+                    }
+                    any = true;
+                    match source.ensure(i..i + 1, epoch, reclaimer, scratch) {
+                        Ok(n) => loaded += n,
+                        Err(e) => {
+                            *failed = true;
+                            error.get_or_insert(e);
+                            break;
+                        }
+                    }
+                }
+            }
+            if !any {
+                break;
             }
         }
-        Ok(loaded)
+        error.map_or(Ok(loaded), Err)
     }
 
     /// Evict every page not needed for `keep` windows (loader thread).

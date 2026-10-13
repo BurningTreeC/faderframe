@@ -38,6 +38,10 @@ pub struct Preferences {
     /// "always").
     pub metronome_on: String,
     pub preroll_bars: u32,
+    /// How the metronome sounds (Preferences → Metronome).
+    pub metronome_sound: faderframe_session::MetronomeSettings,
+    /// Stop puts the playhead at the start of the project.
+    pub stop_to_start: bool,
     /// Extra recording latency compensation in frames.
     pub record_latency_offset: i64,
     /// MIDI inputs (port keys) not to use.
@@ -84,6 +88,14 @@ pub struct Preferences {
     pub headphone_head: Option<String>,
     /// The headphone correction's file.
     pub headphone_correction: Option<String>,
+    /// Bass management of the speakers (crossover, redirect, LFE
+    /// low-pass; off by default).
+    pub bass_management: faderframe_core::surround::BassManagement,
+    /// Low-latency monitoring (tracks heard live skip plugin delay
+    /// compensation).
+    pub low_latency_monitoring: bool,
+    /// Effects on a monitored path with at most this latency stay on (ms).
+    pub low_latency_limit_ms: f32,
     /// Keyboard shortcuts changed in the shortcut editor (detailed action
     /// → accelerators; empty: none), over the defaults.
     pub shortcuts: std::collections::BTreeMap<String, Vec<String>>,
@@ -122,6 +134,8 @@ impl Default for Preferences {
             metronome: MetronomeMode::Recording.id().into(),
             metronome_on: MetronomeMode::Always.id().into(),
             preroll_bars: 0,
+            metronome_sound: Default::default(),
+            stop_to_start: false,
             record_latency_offset: 0,
             midi_disabled_inputs: Vec::new(),
             midi_disabled_outputs: Vec::new(),
@@ -143,6 +157,9 @@ impl Default for Preferences {
             headphones: None,
             headphone_head: None,
             headphone_correction: None,
+            bass_management: Default::default(),
+            low_latency_monitoring: false,
+            low_latency_limit_ms: faderframe_session::DEFAULT_LOW_LATENCY_LIMIT_MS,
             shortcuts: Default::default(),
             default_template: None,
             video_proxy_height: 540,

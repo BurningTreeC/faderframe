@@ -662,3 +662,179 @@ fn crosstalk_is_saved_undoable_and_defaults_off_in_older_files() {
     old["project"].as_object_mut().unwrap().remove("crosstalk");
     assert!(!file::from_str(&old.to_string()).unwrap().project.crosstalk);
 }
+
+#[test]
+fn pan_modes_dual_pan_and_the_pan_law_are_saved_and_undoable() {
+    use faderframe_core::{DualPan, PanLaw, PanMode};
+    let mut p = Project::new("Panning", 48_000);
+    let mut h = History::default();
+    let id: TrackId = p.ids.allocate();
+    let t = Track::new(id, TrackKind::Audio, "Keys", TrackColor::palette(1))
+        .with_layout(faderframe_core::ChannelLayout::Stereo);
+    h.apply(
+        &mut p,
+        Command::AddTrack {
+            track: Box::new(t),
+            index: 0,
+        },
+    )
+    .unwrap();
+    let before = p.clone();
+    for cmd in [
+        Command::SetTrackPan {
+            track: id,
+            pan: 0.3,
+        },
+        Command::SetTrackPanMode {
+            track: id,
+            mode: PanMode::Dual,
+        },
+        Command::SetTrackDualPan {
+            track: id,
+            pan: DualPan {
+                left: -0.4,
+                right: 0.9,
+            },
+        },
+        Command::SetPanLaw {
+            law: PanLaw::Linear6dB,
+        },
+    ] {
+        assert_eq!(h.apply(&mut p, cmd).unwrap(), Impact::Params);
+    }
+    let t = p.track(id).unwrap();
+    // Both settings are kept, whichever mode is in use.
+    assert_eq!((t.pan, t.pan_mode), (0.3, PanMode::Dual));
+    assert_eq!(
+        t.dual_pan,
+        DualPan {
+            left: -0.4,
+            right: 0.9
+        }
+    );
+    assert_eq!(p.pan_law, PanLaw::Linear6dB);
+    assert!(p.pans_stereo(t) && p.dual_panned(t));
+
+    let loaded = file::from_str(&file::to_string(&p, None).unwrap()).unwrap();
+    assert_eq!(loaded.project, p);
+
+    for _ in 0..4 {
+        h.undo(&mut p).unwrap();
+    }
+    assert_same(&p, &before);
+    for _ in 0..4 {
+        h.redo(&mut p).unwrap();
+    }
+    assert_eq!(p.track(id).unwrap().pan_mode, PanMode::Dual);
+    // Back to balance: the dual positions wait for the next switch.
+    h.apply(
+        &mut p,
+        Command::SetTrackPanMode {
+            track: id,
+            mode: PanMode::Balance,
+        },
+    )
+    .unwrap();
+    let t = p.track(id).unwrap();
+    assert_eq!((t.pan, t.dual_pan.left, t.dual_pan.right), (0.3, -0.4, 0.9));
+    assert!(!p.dual_panned(t));
+}
+
+#[test]
+fn bad_dual_pan_values_are_made_safe() {
+    use faderframe_core::DualPan;
+    let mut p = demo_project(48_000);
+    let mut h = History::default();
+    let bass = track_by_name(&p, "Bass");
+    h.apply(
+        &mut p,
+        Command::SetTrackDualPan {
+            track: bass,
+            pan: DualPan {
+                left: f32::NAN,
+                right: 4.0,
+            },
+        },
+    )
+    .unwrap();
+    assert_eq!(p.track(bass).unwrap().dual_pan, DualPan::ORIGINAL);
+    h.apply(
+        &mut p,
+        Command::SetTrackDualPan {
+            track: bass,
+            pan: DualPan {
+                left: -7.0,
+                right: f32::NEG_INFINITY,
+            },
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        p.track(bass).unwrap().dual_pan,
+        DualPan {
+            left: -1.0,
+            right: -1.0
+        }
+    );
+    // A typo in a file is refused, not misread.
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&file::to_string(&p, None).unwrap()).unwrap();
+    doc["project"]["pan_law"] = serde_json::json!("minus_5db");
+    assert!(file::from_str(&doc.to_string()).is_err());
+}
+
+#[test]
+fn older_projects_keep_their_panning() {
+    use faderframe_core::{DualPan, PanLaw, PanMode};
+    // Files written before pan modes: no `pan_mode`, `dual_pan` or
+    // `pan_law` anywhere. They load as balance for stereo, the −3 dB law
+    // for mono — what FaderFrame always did — with their pans untouched.
+    let demo = demo_project(48_000);
+    let text = file::to_string(&demo, None).unwrap();
+    assert!(!text.contains("pan_mode") && !text.contains("dual_pan"));
+    assert!(!text.contains("pan_law"));
+    let mut doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+    doc["version"] = serde_json::json!(1);
+    let loaded = file::from_str(&doc.to_string()).unwrap().project;
+    assert_eq!(loaded.pan_law, PanLaw::ConstantPower3dB);
+    for (old, new) in demo.tracks.iter().zip(&loaded.tracks) {
+        assert_eq!(new.pan, old.pan, "{}", new.name);
+        assert_eq!(new.pan_mode, PanMode::Balance);
+        assert_eq!(new.dual_pan, DualPan::ORIGINAL);
+    }
+    // Only what was changed is written.
+    let mut p = demo.clone();
+    let bass = track_by_name(&p, "Bass");
+    p.track_mut(bass).unwrap().pan_mode = PanMode::Dual;
+    let text = file::to_string(&p, None).unwrap();
+    assert_eq!(text.matches("\"pan_mode\"").count(), 1);
+    assert!(!text.contains("dual_pan") && !text.contains("pan_law"));
+}
+
+#[test]
+fn version_comparison_names_pan_changes() {
+    use faderframe_core::{DualPan, PanLaw, PanMode};
+    let then = demo_project(48_000);
+    let mut now = then.clone();
+    let bass = track_by_name(&now, "Bass");
+    let t = now.track_mut(bass).unwrap();
+    t.pan_mode = PanMode::Dual;
+    t.dual_pan = DualPan {
+        left: -0.5,
+        right: 0.5,
+    };
+    now.pan_law = PanLaw::Compromise4_5dB;
+    let lines = faderframe_project::compare::differences(&then, &now);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("pan mode Balance → Dual Pan")),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("dual pan L100 · R100 → L50 · R50"))
+    );
+    assert!(lines.iter().any(|l| l.starts_with("Pan law")));
+}

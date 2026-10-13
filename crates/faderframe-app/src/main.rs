@@ -1,11 +1,43 @@
 //! `faderframe` — the FaderFrame DAW.
 
-#![forbid(unsafe_code)]
+// Unsafe only in `alloc_probe` (the C allocator's entry points).
+#![deny(unsafe_code)]
 // Release builds on Windows are GUI programs: no console window (also none
 // for the plugin-scan helper processes).
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use faderframe_ui::{BackendChoice, RunOptions};
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[allow(unsafe_code)]
+mod alloc_probe;
+
+// Large allocations are mapped where they are made, never on the audio
+// thread that first writes them (`faderframe_realtime::memory`).
+#[global_allocator]
+static GLOBAL: faderframe_realtime::memory::Prefaulting = faderframe_realtime::memory::Prefaulting;
+
+/// Keep the process's memory resident (where the memory-lock limit
+/// allows) and say what happened.
+fn lock_memory() {
+    use faderframe_realtime::memory::{MemoryLock, lock_process_memory};
+    match lock_process_memory() {
+        MemoryLock::Locked => {
+            tracing::info!("memory locked: nothing the audio needs is swapped out")
+        }
+        MemoryLock::Limited(bytes) => tracing::info!(
+            "memory not locked: the memory-lock limit is {} KiB (unlimited for members of the \
+             realtime or audio group keeps audio memory from being swapped out)",
+            bytes / 1024
+        ),
+        MemoryLock::Off => {}
+        MemoryLock::Failed(errno) => tracing::warn!("memory not locked (errno {errno})"),
+    }
+    // Code and constants too (first runs on the audio thread would fault
+    // them in); plugins' after they are loaded (`EngineController`).
+    let bytes = faderframe_realtime::memory::prefault_code();
+    tracing::debug!("code mapped: {} MiB", bytes >> 20);
+}
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -110,7 +142,22 @@ fn main() -> ExitCode {
             .with_target(false)
             .with_writer(std::io::stderr)
             .init();
+        lock_memory();
         let code = faderframe_ui::plugins::sandbox_helper();
+        return ExitCode::from(code.clamp(0, 255) as u8);
+    }
+    // Plugin check helper: plays one plugin under measurement.
+    if args.get(1).map(String::as_str) == Some("--check-plugin")
+        && let (Some(format), Some(id)) = (args.get(2), args.get(3))
+    {
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        faderframe_plugin_check::set_alloc_counter(alloc_probe::counter());
+        // As the program runs (memory locked where allowed, code mapped).
+        lock_memory();
+        let rate = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(48_000);
+        let block = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(128);
+        let paced = args.get(6).map(String::as_str) != Some("unpaced");
+        let code = faderframe_ui::plugins::check_helper(format, id, rate, block, paced);
         return ExitCode::from(code.clamp(0, 255) as u8);
     }
     if args.get(1).map(String::as_str) == Some("--scan-clap")
@@ -135,6 +182,7 @@ fn main() -> ExitCode {
 
     match parse(std::env::args().skip(1)) {
         Ok(Some(options)) => {
+            lock_memory();
             let code = faderframe_ui::run(options);
             if code == gtk_exit_success() {
                 ExitCode::SUCCESS

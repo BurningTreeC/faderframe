@@ -27,6 +27,12 @@
 //! dot), the two-digit one the page (CC 74–75). Meters are
 //! channel pressure (strip in the high nibble, segment 0–12 in the low),
 //! sent again every 100 ms (the surface lets them fall).
+//!
+//! Devices that speak it with a difference are a [`MackieProfile`]: what
+//! puts them into their Mackie mode (and back), notes on channel 1 only (a
+//! keyboard's pads share its DAW port), another display (Arturia's 2×16
+//! LCD) or none, the X-Touch's coloured scribble strips, notes a device
+//! sends for others, a single strip that follows the selection.
 
 use crate::{
     AutomationButton, Button, MASTER, Modifier, Page, Protocol, SurfaceInput, SurfaceState,
@@ -124,21 +130,80 @@ impl Default for Sent {
     }
 }
 
+/// What a device shows text on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Display {
+    /// The Mackie LCD (2 × 56).
+    Mackie,
+    /// Arturia's keyboards' 2 × 16 LCD (`F0 00 20 6B 7F 42 04 00 60 …`):
+    /// the selected track, its level, the position and the transport.
+    Arturia,
+    None,
+}
+
+/// How a device departs from the Mackie Control (see the module docs).
+#[derive(Clone, Copy, Debug)]
+pub struct MackieProfile {
+    /// The SysEx device id (LCD, colours).
+    pub device: u8,
+    /// Sent when it is opened (into its Mackie mode) and when it is closed.
+    pub hello: &'static [&'static [u8]],
+    pub goodbye: &'static [&'static [u8]],
+    /// Notes count on channel 1 only.
+    pub channel_1: bool,
+    pub display: Display,
+    /// The time display and the meters.
+    pub timecode: bool,
+    pub meters: bool,
+    /// Scribble strips in the tracks' colours (X-Touch).
+    pub colours: bool,
+    /// (the device's note, the Mackie note it means), both ways.
+    pub remap: &'static [(u8, u8)],
+    /// Channel strips (1: it follows the selection).
+    pub strips: usize,
+}
+
+impl MackieProfile {
+    /// The Mackie Control itself (or an extender: [`XT`]).
+    pub const fn plain(device: u8) -> Self {
+        Self {
+            device,
+            hello: &[],
+            goodbye: &[],
+            channel_1: false,
+            display: Display::Mackie,
+            timecode: true,
+            meters: true,
+            colours: false,
+            remap: &[],
+            strips: STRIPS,
+        }
+    }
+}
+
 pub struct Mackie {
-    device: u8,
+    profile: MackieProfile,
     sent: Sent,
     touched: [bool; STRIPS + 1],
     meters_at: f64,
+    greeted: bool,
+    colours: Option<Vec<u8>>,
 }
 
 impl Mackie {
     /// A surface with `device` id ([`MCU`] or [`XT`]).
     pub fn new(device: u8) -> Self {
+        Self::with_profile(MackieProfile::plain(device))
+    }
+
+    pub fn with_profile(profile: MackieProfile) -> Self {
         Self {
-            device,
+            profile,
             sent: Sent::default(),
             touched: [false; STRIPS + 1],
             meters_at: f64::NEG_INFINITY,
+            greeted: false,
+            colours: None,
         }
     }
 
@@ -146,7 +211,91 @@ impl Mackie {
         let slot = &mut self.sent.leds[note as usize & 0x7F];
         if *slot != Some(on) {
             *slot = Some(on);
+            // The device's own note for it.
+            let note = self
+                .profile
+                .remap
+                .iter()
+                .find(|(_, m)| *m == note)
+                .map_or(note, |(d, _)| *d);
             out.push(vec![0x90, note, if on { 0x7F } else { 0x00 }]);
+        }
+    }
+
+    /// Arturia's 2 × 16 LCD: the selected track (else the first) above,
+    /// its level, the position and the transport below.
+    fn arturia_lcd(&mut self, state: &SurfaceState, out: &mut Vec<Vec<u8>>) {
+        let shown = state
+            .strips
+            .iter()
+            .find(|s| s.present && s.selected)
+            .or_else(|| state.strips.iter().find(|s| s.present));
+        let top = shown.map_or_else(|| "FaderFrame".to_string(), |s| s.name.clone());
+        let transport = if state.recording {
+            "REC"
+        } else if state.playing {
+            "PLAY"
+        } else {
+            "STOP"
+        };
+        let p = state.position;
+        let bottom = format!(
+            "{:<7}{:>9}",
+            shown.map_or(String::new(), |s| s.level.clone()),
+            format!("{}.{} {transport}", p.bar, p.beat)
+        );
+        let text = [fit(&top, 16), fit(&bottom, 16)].concat();
+        if self.sent.lcd[0].as_ref() == Some(&text) {
+            return;
+        }
+        let mut msg = vec![0xF0, 0x00, 0x20, 0x6B, 0x7F, 0x42, 0x04, 0x00, 0x60, 0x01];
+        msg.extend_from_slice(&text[..16]);
+        msg.extend_from_slice(&[0x00, 0x02]);
+        msg.extend_from_slice(&text[16..]);
+        msg.extend_from_slice(&[0x00, 0xF7]);
+        out.push(msg);
+        self.sent.lcd[0] = Some(text);
+    }
+
+    /// The X-Touch's scribble strips in the tracks' colours (bit 0 red,
+    /// 1 green, 2 blue; black shows white, an empty strip none).
+    fn colours(&mut self, state: &SurfaceState, out: &mut Vec<Vec<u8>>) {
+        let codes: Vec<u8> = (0..STRIPS)
+            .map(|i| match state.strips.get(i).filter(|s| s.present) {
+                None => 0,
+                Some(s) => {
+                    let [r, g, b] = s.color;
+                    let c = u8::from(r > 0x7F) | u8::from(g > 0x7F) << 1 | u8::from(b > 0x7F) << 2;
+                    if c == 0 { 7 } else { c }
+                }
+            })
+            .collect();
+        if self.colours.as_ref() == Some(&codes) {
+            return;
+        }
+        let mut msg = vec![0xF0, 0x00, 0x00, 0x66, self.profile.device, 0x72];
+        msg.extend_from_slice(&codes);
+        msg.push(0xF7);
+        out.push(msg);
+        self.colours = Some(codes);
+    }
+
+    /// Meters: again every 100 ms while they show anything.
+    fn meters(&mut self, state: &SurfaceState, now: f64, out: &mut Vec<Vec<u8>>) {
+        if !self.profile.meters || now - self.meters_at < METER_EVERY {
+            return;
+        }
+        self.meters_at = now;
+        for i in 0..STRIPS {
+            let level = state
+                .strips
+                .get(i)
+                .filter(|s| s.present)
+                .map_or(0, |s| meter_level(s.meter_db));
+            if level > 0 || self.sent.meters[i] > 0 {
+                out.push(vec![0xD0, (i as u8) << 4 | level]);
+            }
+            self.sent.meters[i] = level;
         }
     }
 
@@ -159,7 +308,7 @@ impl Mackie {
             0x00,
             0x00,
             0x66,
-            self.device,
+            self.profile.device,
             0x12,
             (row * LCD_WIDTH) as u8,
         ];
@@ -201,7 +350,15 @@ fn ticks(v: u8) -> i32 {
 
 impl Protocol for Mackie {
     fn strips(&self) -> usize {
-        STRIPS
+        self.profile.strips
+    }
+
+    fn follows_selection(&self) -> bool {
+        self.profile.strips == 1
+    }
+
+    fn goodbye(&self) -> Vec<Vec<u8>> {
+        self.profile.goodbye.iter().map(|m| m.to_vec()).collect()
     }
 
     fn receive(&mut self, msg: &[u8], out: &mut Vec<SurfaceInput>) {
@@ -209,7 +366,14 @@ impl Protocol for Mackie {
             return;
         };
         match status & 0xF0 {
+            0x90 | 0x80 if self.profile.channel_1 && status & 0x0F != 0 => {}
             0x90 | 0x80 => {
+                let a = self
+                    .profile
+                    .remap
+                    .iter()
+                    .find(|(d, _)| *d == a)
+                    .map_or(a, |(_, m)| *m);
                 let pressed = status & 0xF0 == 0x90 && b > 0;
                 let strip = |base: u8| (a - base) as usize;
                 let button = match a {
@@ -314,21 +478,34 @@ impl Protocol for Mackie {
     }
 
     fn update(&mut self, state: &SurfaceState, now: f64, out: &mut Vec<Vec<u8>>) {
-        let strip = |i: usize| state.strips.get(i).filter(|s| s.present);
-        // The LCD: names above, levels below.
-        let mut names = Vec::with_capacity(LCD_WIDTH);
-        let mut levels = Vec::with_capacity(LCD_WIDTH);
-        for i in 0..STRIPS {
-            let (n, l) = strip(i).map_or((String::new(), String::new()), |s| {
-                (abbreviate(&s.name, 6), s.level.clone())
-            });
-            names.extend(fit(&n, 6));
-            names.push(b' ');
-            levels.extend(fit(&format!("{l:>6}"), 6));
-            levels.push(b' ');
+        if !self.greeted {
+            self.greeted = true;
+            out.extend(self.profile.hello.iter().map(|m| m.to_vec()));
         }
-        self.lcd_line(0, names, out);
-        self.lcd_line(1, levels, out);
+        let strip = |i: usize| state.strips.get(i).filter(|s| s.present);
+        match self.profile.display {
+            // The LCD: names above, levels below.
+            Display::Mackie => {
+                let mut names = Vec::with_capacity(LCD_WIDTH);
+                let mut levels = Vec::with_capacity(LCD_WIDTH);
+                for i in 0..STRIPS {
+                    let (n, l) = strip(i).map_or((String::new(), String::new()), |s| {
+                        (abbreviate(&s.name, 6), s.level.clone())
+                    });
+                    names.extend(fit(&n, 6));
+                    names.push(b' ');
+                    levels.extend(fit(&format!("{l:>6}"), 6));
+                    levels.push(b' ');
+                }
+                self.lcd_line(0, names, out);
+                self.lcd_line(1, levels, out);
+            }
+            Display::Arturia => self.arturia_lcd(state, out),
+            Display::None => {}
+        }
+        if self.profile.colours {
+            self.colours(state, out);
+        }
         // Faders (not while held), pot rings, strip LEDs.
         for i in 0..=STRIPS {
             let travel = if i == STRIPS {
@@ -402,6 +579,10 @@ impl Protocol for Mackie {
         ] {
             self.led(n, state.automation == Some(b), out);
         }
+        if !self.profile.timecode {
+            self.meters(state, now, out);
+            return;
+        }
         // Bars, beats, sixteenths, ticks (or hours, minutes, seconds,
         // frames); the page.
         let p = state.position;
@@ -438,22 +619,14 @@ impl Protocol for Mackie {
                 out.push(vec![0xB0, cc, v]);
             }
         }
-        // Meters: again every 100 ms while they show anything.
-        if now - self.meters_at >= METER_EVERY {
-            self.meters_at = now;
-            for i in 0..STRIPS {
-                let level = strip(i).map_or(0, |s| meter_level(s.meter_db));
-                if level > 0 || self.sent.meters[i] > 0 {
-                    out.push(vec![0xD0, (i as u8) << 4 | level]);
-                }
-                self.sent.meters[i] = level;
-            }
-        }
+        self.meters(state, now, out);
     }
 
     fn reset(&mut self) {
         self.sent = Sent::default();
         self.meters_at = f64::NEG_INFINITY;
+        self.greeted = false;
+        self.colours = None;
     }
 }
 

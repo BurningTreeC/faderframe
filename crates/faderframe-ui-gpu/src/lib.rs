@@ -25,7 +25,7 @@ mod text;
 #[cfg(windows)]
 pub use d3d12::SharedFrame;
 #[cfg(target_os = "linux")]
-pub use dmabuf::{DmabufFrame, FOURCC_AB24, MODIFIER_LINEAR, Release};
+pub use dmabuf::{DmabufFrame, FOURCC_AB24, MODIFIER_LINEAR, POOL as DMABUF_POOL, Release};
 
 use faderframe_ui_canvas::Painter;
 use std::num::NonZeroUsize;
@@ -110,6 +110,8 @@ pub enum Output {
     Dmabuf(DmabufFrame),
     #[cfg(windows)]
     Shared(SharedFrame),
+    /// Rendering ahead: no frame finished yet (the caller shows its last).
+    Pending,
 }
 
 /// The GPU, vello and the text and image caches; one per UI thread.
@@ -130,6 +132,10 @@ pub struct GpuRenderer {
     adapter: String,
     /// Frame buffers the toolkit gave back.
     pool: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    /// Pipelined dmabuf frames still on the GPU, per view (see
+    /// [`Self::render_ahead`]).
+    #[cfg(target_os = "linux")]
+    in_flight: std::collections::HashMap<u64, (dmabuf::DmabufFrame, wgpu::SubmissionIndex)>,
 }
 
 impl GpuRenderer {
@@ -257,6 +263,8 @@ impl GpuRenderer {
             images: scene::ImageCache::default(),
             adapter: format!("{} ({:?})", info.name, info.backend),
             pool: Default::default(),
+            #[cfg(target_os = "linux")]
+            in_flight: std::collections::HashMap::new(),
         })
     }
 
@@ -293,6 +301,7 @@ impl GpuRenderer {
     ) -> Result<Frame, GpuError> {
         match self.render_to(width, height, scale, false, paint)? {
             Output::Pixels(frame) => Ok(frame),
+            Output::Pending => Err(GpuError::Readback("no frame finished".into())),
             #[cfg(target_os = "linux")]
             Output::Dmabuf(_) => Err(GpuError::Readback("a dmabuf was not asked for".into())),
             #[cfg(windows)]
@@ -302,11 +311,66 @@ impl GpuRenderer {
         }
     }
 
+    /// [`Self::render_to`] for a view that animates (`view` names it): a
+    /// dmabuf frame is handed over a frame later — the one submitted last
+    /// time, finished by now — so the UI thread does not wait for the GPU
+    /// (Linux; elsewhere, or read back, as `render_to`). The newest frame
+    /// stays on the GPU until the next call: [`Self::behind`] says so, and
+    /// `render_to` (a paint that waits) shows the newest again.
+    pub fn render_ahead(
+        &mut self,
+        view: u64,
+        width: u32,
+        height: u32,
+        scale: f32,
+        paint: impl FnOnce(&mut dyn Painter),
+    ) -> Result<Output, GpuError> {
+        self.render_with(Some(view), width, height, scale, true, paint)
+    }
+
+    /// Whether a newer frame of `view` is still on the GPU (the one shown
+    /// is a frame behind).
+    pub fn behind(&self, view: u64) -> bool {
+        #[cfg(target_os = "linux")]
+        return self.in_flight.contains_key(&view);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = view;
+            false
+        }
+    }
+
     /// [`Self::render`], handed over without a readback when `dmabuf` — a
     /// dmabuf (Linux) or a shared texture (Windows), when one is free (the
     /// toolkit may still show the others) — else read back.
     pub fn render_to(
         &mut self,
+        width: u32,
+        height: u32,
+        scale: f32,
+        dmabuf: bool,
+        paint: impl FnOnce(&mut dyn Painter),
+    ) -> Result<Output, GpuError> {
+        self.render_with(None, width, height, scale, dmabuf, paint)
+    }
+
+    /// Waits for `view`'s frame on the GPU, if any, and forgets it (its
+    /// buffer goes back to the pool).
+    pub fn settle(&mut self, view: u64) {
+        #[cfg(target_os = "linux")]
+        if let Some((_, index)) = self.in_flight.remove(&view) {
+            let _ = self.device.poll(wgpu::PollType::Wait {
+                submission_index: Some(index),
+                timeout: None,
+            });
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = view;
+    }
+
+    fn render_with(
+        &mut self,
+        ahead: Option<u64>,
         width: u32,
         height: u32,
         scale: f32,
@@ -368,7 +432,26 @@ impl GpuRenderer {
                     depth_or_array_layers: 1,
                 },
             );
-            self.queue.submit([encoder.finish()]);
+            let index = self.queue.submit([encoder.finish()]);
+            // Ahead: the frame submitted last time goes to the toolkit
+            // (finished a frame later, or waited for the rest), this one
+            // stays on the GPU.
+            let frame = match ahead {
+                Some(view) => match self.in_flight.insert(view, (frame, index)) {
+                    Some((previous, at)) => {
+                        self.device
+                            .poll(wgpu::PollType::Wait {
+                                submission_index: Some(at),
+                                timeout: None,
+                            })
+                            .map_err(|e| GpuError::Readback(e.to_string()))?;
+                        return Ok(Output::Dmabuf(previous));
+                    }
+                    // Nothing finished yet: the caller shows its last.
+                    None => return Ok(Output::Pending),
+                },
+                None => frame,
+            };
             // Done before the toolkit reads it (no fences cross over).
             self.device
                 .poll(wgpu::PollType::wait_indefinitely())
@@ -404,6 +487,9 @@ impl GpuRenderer {
         }
         #[cfg(not(any(target_os = "linux", windows)))]
         let _ = dmabuf;
+        // Frames are only rendered ahead as dmabufs.
+        #[cfg(not(target_os = "linux"))]
+        let _ = ahead;
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {

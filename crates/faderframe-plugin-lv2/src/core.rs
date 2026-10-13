@@ -521,6 +521,9 @@ impl Core {
         io: &mut NodeIo<'_>,
     ) -> ProcessStatus {
         let n = io.frames.min(self.max_frames);
+        // Log calls from here on are the audio thread's (copied, not
+        // written out).
+        let _run = crate::features::RunScope::enter();
         // SAFETY: reading the descriptor's function table.
         let run = unsafe { (*self.desc).run };
         let (true, true, Some(run)) = (self.live, self.active, run) else {

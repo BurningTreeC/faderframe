@@ -293,6 +293,7 @@ pub fn install(app: &Rc<AppState>) {
         entry(app, "command-palette", crate::palette::open),
         entry(app, "shortcuts", crate::palette::shortcuts),
         dispatch(app, "show-versions", A::ShowVersions),
+        entry(app, "speaker-layouts", crate::speaker_layouts::open),
         dispatch(app, "save-template", A::PromptSaveTemplate),
         dispatch(
             app,
@@ -662,6 +663,32 @@ pub fn install(app: &Rc<AppState>) {
             };
             a.dispatch(Action::SetEditTool(tool));
         }),
+        // The realtime check from scripts: `check-plugins:all` (every
+        // plugin from another maker not checked in its version) or
+        // `check-plugins:<name>` (those whose name has it, again).
+        named("check-plugins", |a, arg| {
+            let wanted = arg.to_lowercase();
+            let todo: Vec<_> = a
+                .session
+                .borrow()
+                .available_plugins()
+                .into_iter()
+                .filter(|p| p.plugin.format != faderframe_project::PluginFormat::Builtin)
+                .filter(|p| {
+                    if wanted == "all" {
+                        crate::plugin_check::report(&p.plugin, &p.version).is_none()
+                    } else {
+                        p.plugin.name.to_lowercase().contains(&wanted)
+                    }
+                })
+                .map(|p| (p.plugin, p.version))
+                .collect();
+            tracing::info!("check-plugins: {} plugin(s)", todo.len());
+            crate::plugin_check::check(a, todo);
+        }),
+        named("plugin-browser-search", |_, arg| {
+            crate::plugin_browser::search(arg);
+        }),
         named("edit-flag", |a, arg| {
             use faderframe_session::EditFlag as F;
             let e = a.session.borrow().editor;
@@ -675,6 +702,7 @@ pub fn install(app: &Rc<AppState>) {
                 "samples" => (F::SnapToSamples, e.snap_samples),
                 "zero-crossings" => (F::SnapToZeroCrossings, e.zero_crossings),
                 "polyphonic-pitch" => (F::PolyphonicPitch, e.pitch_polyphonic),
+                "stop-to-start" => (F::StopToStart, e.stop_to_start),
                 _ => return tracing::warn!("edit-flag: unknown '{arg}'"),
             };
             a.dispatch(Action::SetEditFlag(flag, !on));
@@ -1468,7 +1496,9 @@ pub fn install(app: &Rc<AppState>) {
             }
         }),
         // `add-surface:<mackie|xt|hui|osc[@<listen port>]>`: a control
-        // surface without ports (MIDI) or listening on that UDP port.
+        // surface without ports (MIDI) or listening on that UDP port; a
+        // controller by name (`add-surface:Arturia KeyLab Essential mk3`);
+        // `add-surface:find` sets up the known controllers connected.
         // `set-varispeed:<percent|off>`: the manual varispeed.
         named("set-varispeed", |a, arg| {
             let p = if arg == "off" {
@@ -1481,14 +1511,24 @@ pub fn install(app: &Rc<AppState>) {
         named("add-surface", |a, arg| {
             use faderframe_session::control::{SurfaceKind, SurfaceSettings};
             let (kind, port) = arg.split_once('@').unwrap_or((arg, ""));
+            let mut all = a.session.borrow().control_surfaces().to_vec();
+            if kind == "find" {
+                let found = a.session.borrow().detect_control_surfaces();
+                tracing::info!("add-surface: found {}", found.len());
+                all.extend(found);
+                a.session.borrow_mut().set_control_surfaces(all);
+                return;
+            }
             let kind = match kind {
                 "mackie" => SurfaceKind::Mackie,
                 "xt" => SurfaceKind::MackieExtender,
                 "hui" => SurfaceKind::Hui,
                 "osc" => SurfaceKind::Osc,
-                _ => return,
+                name => match SurfaceKind::ALL.iter().find(|k| k.label() == name) {
+                    Some(k) => *k,
+                    None => return tracing::warn!("add-surface: no '{name}'"),
+                },
             };
-            let mut all = a.session.borrow().control_surfaces().to_vec();
             let mut s = SurfaceSettings {
                 kind,
                 ..SurfaceSettings::default()
@@ -2287,6 +2327,80 @@ pub fn install(app: &Rc<AppState>) {
                 None => tracing::warn!("track-format: no choice '{arg}'"),
             }
         }),
+        // Development aid: `pan-mode:<track>=<balance|dual>` (a stereo
+        // track's pan mode, as its Pan Mode menu sets it).
+        named("pan-mode", |a, arg| {
+            let Some((name, mode)) = arg.split_once('=') else {
+                tracing::warn!("pan-mode: '{arg}' is not <track>=<balance|dual>");
+                return;
+            };
+            let action = {
+                let s = a.session.borrow();
+                s.project()
+                    .tracks
+                    .iter()
+                    .find(|t| t.name == name)
+                    .and_then(|t| {
+                        s.pan_mode_choices(t.id).into_iter().find(|c| {
+                            c.label
+                                .split(' ')
+                                .next()
+                                .is_some_and(|l| l.eq_ignore_ascii_case(mode))
+                        })
+                    })
+                    .map(|c| c.action)
+            };
+            match action {
+                Some(action) => a.dispatch(action),
+                None => tracing::warn!("pan-mode: no choice '{arg}' (a stereo track?)"),
+            }
+        }),
+        // Development aid: `dual-pan:<track>=<left>/<right>` (positions as
+        // typed in the mixer: C, L30, R45 or −100…100).
+        named("dual-pan", |a, arg| {
+            let parsed = arg.split_once('=').and_then(|(name, v)| {
+                let (l, r) = v.split_once('/')?;
+                let pan = faderframe_core::DualPan {
+                    left: faderframe_core::pan::parse_pan(l)?,
+                    right: faderframe_core::pan::parse_pan(r)?,
+                };
+                Some((name, pan))
+            });
+            let Some((name, pan)) = parsed else {
+                tracing::warn!("dual-pan: '{arg}' is not <track>=<left>/<right>");
+                return;
+            };
+            let track = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.id);
+            match track {
+                Some(track) => {
+                    a.dispatch(Action::Edit(faderframe_project::Command::SetTrackDualPan {
+                        track,
+                        pan,
+                    }))
+                }
+                None => tracing::warn!("dual-pan: no track '{name}'"),
+            }
+        }),
+        // Development aid: `pan-law:<-3|-4.5|-6|0>` (the project's pan law).
+        named("pan-law", |a, arg| {
+            match faderframe_core::PanLaw::ALL.into_iter().find(|l| {
+                l.label()
+                    .replace('−', "-")
+                    .starts_with(&format!("{arg} dB"))
+            }) {
+                Some(law) => {
+                    a.dispatch(Action::Edit(faderframe_project::Command::SetPanLaw { law }))
+                }
+                None => tracing::warn!("pan-law: '{arg}' is not -3, -4.5, -6 or 0"),
+            }
+        }),
         // Development aid: `surround:<track>=<x>/<y>[/<z>/<spread>/<width>/<lfe dB>]`
         // (where the track sits in the bed it feeds).
         named("surround", |a, arg| {
@@ -2313,6 +2427,103 @@ pub fn install(app: &Rc<AppState>) {
                 Some(action) => a.dispatch(action),
                 None => tracing::warn!("surround: no track '{name}'"),
             }
+        }),
+        // Development aid: `surround-panner:<track>=<room|vbap>` and
+        // `surround-stereo:<track>=<image|balance|dual>` (how the track is
+        // placed into the bed it feeds).
+        named("surround-panner", |a, arg| {
+            surround_mode(a, "surround-panner", arg)
+        }),
+        named("surround-stereo", |a, arg| {
+            surround_mode(a, "surround-stereo", arg)
+        }),
+        // `surround-spread:<track>=<coherent|diffuse>`.
+        named("surround-spread", |a, arg| {
+            surround_mode(a, "surround-spread", arg)
+        }),
+        // Development aid: `bass-management:<on|off>[@<crossover Hz>]`
+        // (the speakers' bass management).
+        named("bass-management", |a, arg| {
+            let (state, hz) = arg.split_once('@').unwrap_or((arg, ""));
+            let mut b = a.session.borrow().bass_management();
+            b.enabled = match state {
+                "on" => true,
+                "off" => false,
+                _ => {
+                    tracing::warn!("bass-management: '{arg}' is not on|off[@Hz]");
+                    return;
+                }
+            };
+            if let Ok(hz) = hz.parse::<f32>() {
+                b.crossover = hz;
+            }
+            a.dispatch(faderframe_session::Action::SetBassManagement(b));
+        }),
+        // Development aid: `speaker-layout:<name>=<label>@<azimuth>[/<elevation>][;…]`
+        // (a speaker layout in the project's library; the label `LFE`
+        // alone is the LFE channel), e.g.
+        // `speaker-layout:Hexagon=F@0;FL@60;BL@120;B@180;BR@-120;FR@-60`.
+        named("speaker-layout", |a, arg| {
+            use faderframe_core::surround::{LayoutDef, SpeakerDef};
+            let Some((name, list)) = arg.split_once('=') else {
+                tracing::warn!("speaker-layout: '{arg}' is not <name>=<label>@<az>[/<el>];…");
+                return;
+            };
+            let speakers: Option<Vec<SpeakerDef>> = list
+                .split(';')
+                .map(|s| {
+                    let s = s.trim();
+                    if s.eq_ignore_ascii_case("lfe") {
+                        return Some(SpeakerDef {
+                            label: "LFE".into(),
+                            azimuth: 0.0,
+                            elevation: 0.0,
+                            lfe: true,
+                        });
+                    }
+                    let (label, dir) = s.split_once('@')?;
+                    let (az, el) = dir.split_once('/').unwrap_or((dir, "0"));
+                    Some(SpeakerDef {
+                        label: label.into(),
+                        azimuth: az.trim().parse().ok()?,
+                        elevation: el.trim().parse().ok()?,
+                        lfe: false,
+                    })
+                })
+                .collect();
+            let Some(speakers) = speakers else {
+                tracing::warn!("speaker-layout: cannot read '{list}'");
+                return;
+            };
+            let replace = a
+                .session
+                .borrow()
+                .speaker_layouts()
+                .iter()
+                .any(|d| d.name == name)
+                .then(|| name.to_string());
+            a.dispatch(faderframe_session::Action::SaveSpeakerLayout {
+                replace,
+                layout: LayoutDef {
+                    name: name.into(),
+                    speakers,
+                },
+            });
+        }),
+        // Development aid: `downmix:<standard|by-place>` (how the project's
+        // beds fold into stereo and mono).
+        named("downmix", |a, arg| {
+            let downmix = match arg {
+                "standard" => faderframe_core::surround::Downmix::STANDARD,
+                "by-place" => faderframe_core::surround::Downmix::BY_PLACE,
+                _ => {
+                    tracing::warn!("downmix: '{arg}' is not standard or by-place");
+                    return;
+                }
+            };
+            a.dispatch(faderframe_session::Action::Edit(
+                faderframe_project::Command::SetDownmix { downmix },
+            ));
         }),
         // Development aid: `object:<track>=<on|off>` (deliver the track as
         // an object), `import-adm-from:<path>`, `render-adm:<path>[|itu]`
@@ -3307,4 +3518,40 @@ fn slot_by_name(
         .and_then(|n| p.launcher.scenes.get(n.saturating_sub(1)))?
         .id;
     Some((track, scene))
+}
+
+/// `surround-panner:` / `surround-stereo:` (see the dev actions above).
+fn surround_mode(a: &Rc<AppState>, name: &str, arg: &str) {
+    use faderframe_core::surround::{StereoSource, SurroundPanner};
+    let Some((track, mode)) = arg.split_once('=') else {
+        tracing::warn!("{name}: '{arg}' is not <track>=<mode>");
+        return;
+    };
+    let action = {
+        let s = a.session.borrow();
+        s.project()
+            .tracks
+            .iter()
+            .find(|t| t.name == track)
+            .and_then(|t| {
+                let mut pan = t.surround;
+                match (name, mode) {
+                    ("surround-panner", "room") => pan.panner = SurroundPanner::Room,
+                    ("surround-panner", "vbap") => pan.panner = SurroundPanner::Vbap,
+                    ("surround-stereo", "image") => pan.stereo = StereoSource::Image,
+                    ("surround-stereo", "balance") => pan.stereo = StereoSource::Balance,
+                    ("surround-stereo", "dual") => pan.stereo = StereoSource::Dual,
+                    ("surround-spread", "coherent") => pan.diffuse = false,
+                    ("surround-spread", "diffuse") => pan.diffuse = true,
+                    _ => return None,
+                }
+                Some(faderframe_session::Action::Edit(
+                    faderframe_project::Command::SetTrackSurround { track: t.id, pan },
+                ))
+            })
+    };
+    match action {
+        Some(action) => a.dispatch(action),
+        None => tracing::warn!("{name}: no track or mode in '{arg}'"),
+    }
 }

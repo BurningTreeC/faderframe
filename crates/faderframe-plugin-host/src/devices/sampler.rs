@@ -1267,7 +1267,7 @@ impl SamplerProcessor {
         let attack = kind == NoteKind::Attack;
         // A keyswitch: remembered, and it plays nothing itself unless a
         // zone covers the key.
-        if attack && set.zones.iter().any(|z| z.is_keyswitch(key)) {
+        if attack && set.is_keyswitch(key) {
             self.controls.last_keyswitch = Some(key);
         }
         let k = key as usize & 127;
@@ -1283,7 +1283,14 @@ impl SamplerProcessor {
         // Other keys held (first and legato triggers).
         let others = self.controls.held.saturating_sub(u32::from(attack));
         let previous_velocity = self.controls.previous.map_or(velocity, |(_, v)| v);
-        for (i, z) in set.zones.iter().enumerate() {
+        // The key's zones (indexed with the set), else all.
+        let list = set.by_key.get(k).filter(|_| !set.by_key.is_empty());
+        let count = list.map_or(set.zones.len(), Vec::len);
+        for n in 0..count {
+            let i = list.map_or(n, |l| l[n] as usize);
+            let Some(z) = set.zones.get(i) else {
+                continue;
+            };
             let fits = match (z.trigger, kind) {
                 (Trigger::Attack, NoteKind::Attack) => true,
                 (Trigger::First, NoteKind::Attack) => others == 0,
@@ -1320,7 +1327,18 @@ impl SamplerProcessor {
         new: f32,
     ) {
         let (old, new) = ((old * 127.0).round() as u8, (new * 127.0).round() as u8);
-        for (i, z) in set.zones.iter().enumerate() {
+        // Only zones with `on_cc` (indexed with the set), else all.
+        let indexed = !set.by_key.is_empty();
+        let count = if indexed {
+            set.cc_zones.len()
+        } else {
+            set.zones.len()
+        };
+        for n in 0..count {
+            let i = if indexed { set.cc_zones[n] as usize } else { n };
+            let Some(z) = set.zones.get(i) else {
+                continue;
+            };
             let fires = z.on_cc.iter().any(|&(c, lo, hi)| {
                 c == cc && (lo..=hi).contains(&new) && !(lo..=hi).contains(&old)
             });

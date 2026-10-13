@@ -1008,19 +1008,71 @@ fn ladder_meter(
         // lit at its level (an average meter with a peak dot).
         let bar = inner_lit.unwrap_or(lit);
         let peak_seg = inner_lit.map(|_| segment_of(lit));
-        for s in 0..segments {
-            let norm = (s as f32 + 0.5) / segments as f32;
-            let y = ladder.bottom() - (s as f32 + 1.0) * pitch + m.gap;
-            let base = zones.colour(db_of(norm), theme);
-            let on = norm <= bar;
-            let is_hold = hold_seg > 0 && s + 1 == hold_seg && hold > 0.01;
-            let is_peak = peak_seg.is_some_and(|p| p > 0 && s + 1 == p && lit > 0.01);
-            let color = if on || is_hold || is_peak {
-                base
-            } else {
-                base.mix(m.background, 1.0 - m.unlit)
-            };
-            p.fill(Rect::new(x, y, col_w, m.segment), color);
+        let y_of = |s: usize| ladder.bottom() - (s as f32 + 1.0) * pitch + m.gap;
+        // The ladder unlit, and lit up to the bar (segments whose middle is
+        // at or under it): two pictures kept for every meter of the size,
+        // the lit one shown clipped — not a rectangle per segment a frame.
+        let column = Rect::new(x, ladder.y, col_w, ladder.h);
+        let key = |on: bool| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (
+                "ladder",
+                on,
+                segments,
+                column.w.to_bits(),
+                column.h.to_bits(),
+            )
+                .hash(&mut h);
+            match zones {
+                MeterZones::Digital => (0u8, 0u32),
+                MeterZones::Ppm => (1, 0),
+                MeterZones::K(z) => (2, z.to_bits()),
+                MeterZones::Vu(z) => (3, z.to_bits()),
+            }
+            .hash(&mut h);
+            for c in [m.background, m.green, m.yellow, m.orange, m.red] {
+                [c.r, c.g, c.b, c.a].map(f32::to_bits).hash(&mut h);
+            }
+            [m.unlit, m.segment, m.gap].map(f32::to_bits).hash(&mut h);
+            h.finish()
+        };
+        let segments_in = |p: &mut dyn Painter, on: bool| {
+            for s in 0..segments {
+                let norm = (s as f32 + 0.5) / segments as f32;
+                let base = zones.colour(db_of(norm), theme);
+                let color = if on {
+                    base
+                } else {
+                    base.mix(m.background, 1.0 - m.unlit)
+                };
+                p.fill(Rect::new(x, y_of(s), col_w, m.segment), color);
+            }
+        };
+        crate::kept(p, key(false), column, |p| segments_in(p, false));
+        let lit_count =
+            ((bar * segments as f32 - 0.5).floor() + 1.0).clamp(0.0, segments as f32) as usize;
+        if lit_count > 0 {
+            let top = y_of(lit_count - 1);
+            p.push_clip(Rect::new(x, top, col_w, ladder.bottom() - top));
+            crate::kept(p, key(true), column, |p| segments_in(p, true));
+            p.pop_clip();
+        }
+        // The hold and peak LEDs above the bar.
+        for s in [
+            (hold_seg > 0 && hold > 0.01).then(|| hold_seg - 1),
+            peak_seg.filter(|&p| p > 0 && lit > 0.01).map(|p| p - 1),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if s >= lit_count {
+                let norm = (s as f32 + 0.5) / segments as f32;
+                p.fill(
+                    Rect::new(x, y_of(s), col_w, m.segment),
+                    zones.colour(db_of(norm), theme),
+                );
+            }
         }
     }
 }

@@ -10,7 +10,7 @@
 //! scheduled ahead with its due time; scheduled SysEx can be cancelled (the
 //! transport stopped or jumped).
 
-use crate::{CLIENT_NAME, UmpClient, port_identity, ump_ports};
+use crate::{CLIENT_NAME, UmpClient, ump_ports};
 use faderframe_midi::ump::Midi1ToMidi2;
 use faderframe_midi::{MidiClock, MidiOutputEvent, MidiOutputQueue, midi_output_queue};
 use faderframe_midi_ump::UmpWriter;
@@ -178,6 +178,8 @@ fn run(sinks: Sinks, clock: MidiClock, ch: Channels, stop: Arc<AtomicBool>) {
     let mut sysex: BinaryHeap<Reverse<PendingSysex>> = BinaryHeap::new();
     let mut seq = 0u64;
     while !stop.load(Ordering::Relaxed) {
+        // Messages leave on time however busy the system is.
+        faderframe_realtime::priority::follow_audio(faderframe_realtime::priority::Helper::Ahead);
         loop {
             match ch.queues.try_recv() {
                 Ok(q) => rx = Some(q),
@@ -393,7 +395,7 @@ impl MidiOutputs {
             .as_ref()
             .map(|c| c.ump_clients().into_iter().collect())
             .unwrap_or_default();
-        let mut present = Vec::new();
+        let mut listed = Vec::new();
         let ports = lister.map(midir::MidiOutput::ports).unwrap_or_default();
         for p in ports {
             let Some(Ok(full)) = lister.map(|l| l.port_name(&p)) else {
@@ -404,9 +406,14 @@ impl MidiOutputs {
             {
                 continue;
             }
-            let (key, name) = port_identity(&full);
-            present.push((key, name, p));
+            listed.push((full, p));
         }
+        let ids = crate::port_identities(listed.iter().map(|(f, _)| f.as_str()));
+        let present: Vec<_> = ids
+            .into_iter()
+            .zip(listed)
+            .map(|((key, name), (_, p))| (key, name, p))
+            .collect();
         let ump_present: Vec<faderframe_midi_ump::UmpPort> = self
             .ump
             .as_ref()

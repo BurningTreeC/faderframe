@@ -417,6 +417,19 @@ pub trait PluginInstance {
     /// Whether processing has a live deadline. Offline/ahead graphs can run
     /// buffered built-ins synchronously, with identical reported latency.
     fn configure_realtime(&mut self, _realtime: bool) {}
+    /// The instance plays in a live session (set before its state loads):
+    /// what its state names on disk (samples) may load in the background,
+    /// arriving through [`poll`](Self::poll), instead of before
+    /// `load_state` returns. Offline renders never ask.
+    fn configure_background_loading(&mut self) {}
+    /// Whether something its state names is still loading.
+    fn loading(&self) -> bool {
+        false
+    }
+    /// Wait for answers already on their way (a helper process answers
+    /// polls at a later tick): the next [`poll`](Self::poll) has them.
+    /// For tests and checks that need a poll's answer now.
+    fn settle(&mut self) {}
     /// Frames per device callback (0: unknown, offline), supplied before
     /// activation: buffered built-ins buffer at least this much.
     fn configure_device_block(&mut self, _frames: usize) {}
@@ -521,6 +534,16 @@ pub trait PluginInstance {
     }
     fn tail(&self) -> TailLength;
     fn save_state(&mut self) -> Result<Vec<u8>, PluginError>;
+    /// Ask for the state without waiting for it (a helper process answers
+    /// through a later [`poll`](Self::poll)); `false`: ask `save_state`.
+    fn request_state(&mut self) -> bool {
+        false
+    }
+    /// The state asked for with [`request_state`](Self::request_state),
+    /// once it is here.
+    fn take_state(&mut self) -> Option<Vec<u8>> {
+        None
+    }
     fn load_state(&mut self, data: &[u8]) -> Result<(), PluginError>;
     /// Handle plugin requests (main-thread callbacks, restarts); call
     /// regularly on the control thread.

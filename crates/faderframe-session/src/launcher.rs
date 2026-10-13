@@ -1236,7 +1236,7 @@ impl Session {
     pub(crate) fn poll_launcher(&mut self, was_playing: bool) {
         let status = self.engine.launch_status();
         if status != self.launcher.status {
-            self.revision += 1;
+            self.shown_changed();
         }
         if self.transport.playing {
             // Everything moves while a clip plays.
@@ -1244,7 +1244,7 @@ impl Session {
                 .iter()
                 .any(|s| s.playing.is_some() || s.queued.is_some())
             {
-                self.revision += 1;
+                self.shown_changed();
             }
             self.launcher.last_pos = self.transport.position;
         }

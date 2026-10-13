@@ -20,7 +20,7 @@ use crate::{
     AuxSend, Command, EditError, InputRouting, MonitorMode, OutputRouting, PluginRef, PluginSlot,
     Project, SavedParameter, SendTap, Track, TrackColor, TrackKind,
 };
-use faderframe_core::{ChannelLayout, PluginInstanceId, TrackId};
+use faderframe_core::{ChannelLayout, DualPan, PanMode, PluginInstanceId, TrackId};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -216,6 +216,10 @@ pub struct TrackPreset {
     pub output: PresetOutput,
     pub volume_db: f32,
     pub pan: f32,
+    #[serde(default, skip_serializing_if = "PanMode::is_default")]
+    pub pan_mode: PanMode,
+    #[serde(default, skip_serializing_if = "DualPan::is_default")]
+    pub dual_pan: DualPan,
     #[serde(default)]
     pub phase_invert: bool,
     #[serde(default)]
@@ -259,6 +263,8 @@ impl TrackPreset {
             output,
             volume_db: track.volume_db,
             pan: track.pan,
+            pan_mode: track.pan_mode,
+            dual_pan: track.dual_pan,
             phase_invert: track.phase_invert,
             monitor: track.monitor,
             instrument: track
@@ -460,6 +466,8 @@ impl TrackPreset {
         t.input = self.input.clone();
         t.volume_db = self.volume_db;
         t.pan = self.pan;
+        t.pan_mode = self.pan_mode;
+        t.dual_pan = self.dual_pan.clamped();
         t.phase_invert = self.phase_invert;
         t.monitor = self.monitor;
         let built = self.build(p);
@@ -512,6 +520,14 @@ impl TrackPreset {
             Command::SetTrackPan {
                 track,
                 pan: self.pan,
+            },
+            Command::SetTrackPanMode {
+                track,
+                mode: self.pan_mode,
+            },
+            Command::SetTrackDualPan {
+                track,
+                pan: self.dual_pan,
             },
             Command::SetTrackPhaseInvert {
                 track,

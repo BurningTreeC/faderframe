@@ -1,8 +1,12 @@
 //! The surround panner (`ViewKind::Surround`): the selected track in the
-//! bed it feeds, seen from above. Drag the puck (a stereo track's two
-//! channels sit its width apart) or click where it should go; the knobs set
-//! its height (formats with top speakers), spread, stereo width and LFE
-//! send. Every move is one undo step (`SetTrackSurround` in a gesture) and
+//! bed it feeds, seen from above. The toolbar picks the panner — the room
+//! (a box: drag the puck to a place) or VBAP (a circle of directions: drag
+//! round the listener) — and how a stereo source goes in: as an image (its
+//! channels `width` apart), balanced on L and R (the strip's balance knob),
+//! or each channel on its own direction (dual, VBAP). The knobs set what
+//! applies: azimuth, elevation (formats with top speakers), height (room),
+//! spread, stereo width and the LFE send; a click on a knob's value types
+//! it. Every move is one undo step (`SetTrackSurround` in a gesture) and
 //! writes automation like the faders do; automated values are shown as
 //! they play. The speakers light up with what the track sends them.
 
@@ -10,7 +14,8 @@
 
 pub mod room;
 
-use faderframe_core::{SurroundPan, SurroundParam, TrackId};
+use faderframe_core::surround::{StereoSource, SurroundPanner};
+use faderframe_core::{ChannelLayout, SurroundFormat, SurroundPan, SurroundParam, TrackId};
 use faderframe_project::{Command, Track};
 use faderframe_session::{Action, Session};
 use faderframe_ui_canvas::controls::{self, KnobLook};
@@ -20,22 +25,47 @@ use faderframe_ui_canvas::{
 };
 
 const HEADER_H: f32 = 34.0;
+const TOOLBAR_H: f32 = 30.0;
 const KNOBS_W: f32 = 96.0;
 const KNOB: f32 = 40.0;
 const KNOB_ROW: f32 = 74.0;
 /// Pixels of vertical drag for a knob's whole range.
 const KNOB_TRAVEL: f32 = 160.0;
 /// The knobs, top to bottom (those that apply).
-const KNOBS: [SurroundParam; 4] = [
+const KNOBS: [SurroundParam; 8] = [
+    SurroundParam::Azimuth,
+    SurroundParam::LeftAzimuth,
+    SurroundParam::RightAzimuth,
+    SurroundParam::Elevation,
     SurroundParam::Z,
     SurroundParam::Spread,
     SurroundParam::Width,
     SurroundParam::Lfe,
 ];
 
+/// A toolbar button: a panner or a way in for stereo.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Mode {
+    Panner(SurroundPanner),
+    Stereo(StereoSource),
+    /// The spread diffuse (on) or coherent.
+    Diffuse,
+}
+
+/// What a drag on the circle moves.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Turn {
+    /// The position, `offset` degrees from where the pointer is.
+    Centre { offset: f32 },
+    /// Dual pan's left or right channel.
+    Side { right: bool },
+}
+
 enum Drag {
     /// The puck, grabbed `grab` away from its centre.
     Puck { track: TrackId, grab: Point },
+    /// Round the listener (VBAP).
+    Direction { track: TrackId, turn: Turn },
     Knob {
         track: TrackId,
         param: SurroundParam,
@@ -52,30 +82,37 @@ pub struct SurroundView {
 struct Layout {
     room: Rect,
     knobs: Vec<(SurroundParam, Rect)>,
+    /// The toolbar's buttons.
+    modes: Vec<(Mode, Rect)>,
     /// The Object toggle (tracks feeding the master's bed).
     object: Option<Rect>,
 }
 
-/// A knob's position (0…1) for `v`; the LFE send is off at 0, then
-/// −40 … +12 dB.
-fn position(param: SurroundParam, v: f32) -> f32 {
+/// A knob's value readout under it.
+fn readout_rect(knob: Rect) -> Rect {
+    Rect::new(knob.x - 14.0, knob.bottom() + 4.0, knob.w + 28.0, 14.0)
+}
+
+/// A knob's position (0…1) for `v` in `format` (elevation's range is the
+/// format's); the LFE send is off at 0, then −40 … +12 dB.
+fn position(param: SurroundParam, v: f32, format: SurroundFormat) -> f32 {
     match param {
         SurroundParam::Lfe if v <= faderframe_core::surround::LFE_OFF_DB => 0.0,
         SurroundParam::Lfe => ((v + 40.0) / 52.0).clamp(0.01, 1.0),
         _ => {
-            let (lo, hi, _) = param.range();
+            let (lo, hi, _) = param.range_in(format);
             ((v - lo) / (hi - lo)).clamp(0.0, 1.0)
         }
     }
 }
 
-fn value(param: SurroundParam, pos: f32) -> f32 {
+fn value(param: SurroundParam, pos: f32, format: SurroundFormat) -> f32 {
     let pos = pos.clamp(0.0, 1.0);
     match param {
         SurroundParam::Lfe if pos < 0.01 => faderframe_core::surround::LFE_OFF_DB,
         SurroundParam::Lfe => -40.0 + pos * 52.0,
         _ => {
-            let (lo, hi, _) = param.range();
+            let (lo, hi, _) = param.range_in(format);
             lo + pos * (hi - lo)
         }
     }
@@ -85,7 +122,40 @@ fn format_value(param: SurroundParam, v: f32) -> String {
     match param {
         SurroundParam::Lfe if v <= faderframe_core::surround::LFE_OFF_DB => "Off".into(),
         SurroundParam::Lfe => format!("{v:+.1} dB"),
+        p if p.wraps() => room::format_direction(v, 0.0),
+        SurroundParam::Elevation => format!("{v:.0}°"),
         _ => format!("{:.0} %", v * 100.0),
+    }
+}
+
+/// A typed value: degrees for directions (`L30`, `R110`, `-45`, `180`;
+/// positive is left), dB or `off` for the LFE, percent for the rest.
+fn parse_value(param: SurroundParam, text: &str) -> Option<f32> {
+    let t = text
+        .trim()
+        .trim_end_matches(['°', '%'])
+        .trim()
+        .to_ascii_uppercase();
+    let t = t.trim_end_matches("DB").trim();
+    let number = |s: &str| s.trim().parse::<f32>().ok().filter(|v| v.is_finite());
+    match param {
+        SurroundParam::Lfe if t == "OFF" || t.is_empty() => {
+            Some(faderframe_core::surround::LFE_OFF_DB)
+        }
+        SurroundParam::Lfe => number(t),
+        p if p.wraps() => {
+            if t == "C" {
+                Some(0.0)
+            } else if let Some(rest) = t.strip_prefix('L') {
+                number(rest)
+            } else if let Some(rest) = t.strip_prefix('R') {
+                number(rest).map(|v| -v)
+            } else {
+                number(t)
+            }
+        }
+        SurroundParam::Elevation => number(t),
+        _ => number(t).map(|v| v / 100.0),
     }
 }
 
@@ -97,6 +167,10 @@ fn knob_label(param: SurroundParam) -> &'static str {
         SurroundParam::Lfe => "LFE",
         SurroundParam::X => "L/R",
         SurroundParam::Y => "F/B",
+        SurroundParam::Azimuth => "AZIMUTH",
+        SurroundParam::Elevation => "ELEVATION",
+        SurroundParam::LeftAzimuth => "LEFT",
+        SurroundParam::RightAzimuth => "RIGHT",
     }
 }
 
@@ -116,7 +190,45 @@ impl SurroundView {
     }
 
     fn layout(&self, size: Size, model: &Session, t: &Track) -> Layout {
-        let area = Rect::new(0.0, HEADER_H, size.w, size.h - HEADER_H).inset(14.0);
+        let is_object = model.project().is_object(t);
+        let pan = Self::effective(model, t);
+        // The toolbar: the panner (objects are always in the room), then a
+        // stereo source's way in.
+        let mut wanted: Vec<(Mode, f32)> = Vec::new();
+        if !is_object {
+            wanted.extend(SurroundPanner::ALL.map(|p| (Mode::Panner(p), 58.0)));
+            if t.layout == ChannelLayout::Stereo {
+                wanted.extend(
+                    StereoSource::ALL
+                        .into_iter()
+                        .filter(|m| *m != StereoSource::Dual || pan.panner == SurroundPanner::Vbap)
+                        .map(|m| (Mode::Stereo(m), 66.0)),
+                );
+            }
+        }
+        // Diffuse spread, where spread applies.
+        if !is_object
+            && model
+                .project()
+                .surround_panned(t)
+                .is_some_and(|f| SurroundParam::Spread.applies(t.layout, f, &pan))
+        {
+            wanted.push((Mode::Diffuse, 66.0));
+        }
+        let mut modes = Vec::new();
+        let mut x = 14.0;
+        for (i, (mode, w)) in wanted.into_iter().enumerate() {
+            // A gap after the panners, and before diffuse spread.
+            if i == SurroundPanner::ALL.len()
+                || (mode == Mode::Diffuse && i > SurroundPanner::ALL.len())
+            {
+                x += 14.0;
+            }
+            modes.push((mode, Rect::new(x, HEADER_H + 4.0, w, TOOLBAR_H - 8.0)));
+            x += w + 4.0;
+        }
+        let top = HEADER_H + TOOLBAR_H;
+        let area = Rect::new(0.0, top, size.w, size.h - top).inset(14.0);
         let (left, right) = area.split_right(KNOBS_W);
         let side = left.w.min(left.h).max(40.0);
         let room = Rect::new(
@@ -126,21 +238,30 @@ impl SurroundView {
             side,
         );
         let format = model.project().surround_panned(t);
-        let is_object = model.project().is_object(t);
-        let mut knobs = Vec::new();
-        let mut y = right.y;
-        for p in KNOBS {
-            // Objects have no LFE send.
-            if format.is_some_and(|f| p.applies(t.layout, f))
-                && !(is_object && p == SurroundParam::Lfe)
-            {
-                knobs.push((
+        let shown: Vec<SurroundParam> = KNOBS
+            .into_iter()
+            .filter(|p| {
+                // Objects have no LFE send.
+                format.is_some_and(|f| p.applies(t.layout, f, &pan))
+                    && !(is_object && *p == SurroundParam::Lfe)
+            })
+            .collect();
+        let row = if shown.is_empty() {
+            KNOB_ROW
+        } else {
+            (right.h / shown.len() as f32).clamp(58.0, KNOB_ROW)
+        };
+        let knobs = shown
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let y = right.y + i as f32 * row;
+                (
                     p,
                     Rect::new(right.x + (right.w - KNOB) * 0.5, y + 14.0, KNOB, KNOB),
-                ));
-                y += KNOB_ROW;
-            }
-        }
+                )
+            })
+            .collect();
         let object = model
             .project()
             .may_be_object(t)
@@ -148,13 +269,131 @@ impl SurroundView {
         Layout {
             room,
             knobs,
+            modes,
             object,
         }
+    }
+
+    /// The track's panner as it plays (automation), as the engine applies
+    /// it (objects in the room).
+    fn effective(model: &Session, t: &Track) -> SurroundPan {
+        let mut pan = model.shown_surround(t);
+        let fixed = model.project().effective_surround(t);
+        pan.panner = fixed.panner;
+        pan.stereo = fixed.stereo;
+        pan
     }
 
     fn set(cx: &mut EventCx<'_, Action>, track: TrackId, pan: SurroundPan) {
         cx.emit(Action::Edit(Command::SetTrackSurround { track, pan }));
     }
+
+    /// `pan` switched to `mode`. Switching to VBAP for the first time
+    /// starts from the direction of the room position.
+    fn switched(pan: SurroundPan, mode: Mode) -> SurroundPan {
+        match mode {
+            Mode::Panner(SurroundPanner::Vbap) if pan.panner != SurroundPanner::Vbap => {
+                let fresh = pan.azimuth == 0.0 && pan.elevation == 0.0;
+                let moved = pan.x.abs() > 1e-3 || (pan.y - 1.0).abs() > 1e-3;
+                let azimuth = if fresh && moved && (pan.x.abs() > 1e-3 || pan.y.abs() > 1e-3) {
+                    faderframe_core::vbap::direction_of([pan.x, pan.y, 0.0]).0
+                } else {
+                    pan.azimuth
+                };
+                SurroundPan {
+                    panner: SurroundPanner::Vbap,
+                    azimuth,
+                    ..pan
+                }
+            }
+            Mode::Panner(p) => SurroundPan { panner: p, ..pan },
+            Mode::Stereo(m) => SurroundPan { stereo: m, ..pan },
+            Mode::Diffuse => SurroundPan {
+                diffuse: !pan.diffuse,
+                ..pan
+            },
+        }
+    }
+
+    fn mode_on(pan: &SurroundPan, mode: Mode) -> bool {
+        match mode {
+            Mode::Panner(p) => pan.panner == p,
+            Mode::Stereo(m) => pan.stereo == m,
+            Mode::Diffuse => pan.diffuse,
+        }
+    }
+
+    fn mode_label(mode: Mode) -> &'static str {
+        match mode {
+            Mode::Panner(p) => p.label(),
+            Mode::Stereo(m) => m.label(),
+            Mode::Diffuse => "Diffuse",
+        }
+    }
+
+    fn mode_tip(mode: Mode) -> &'static str {
+        match mode {
+            Mode::Panner(SurroundPanner::Room) => {
+                "Room panner: a place in the room box (x, y, height), crossfaded between layers, rows and speakers"
+            }
+            Mode::Panner(SurroundPanner::Vbap) => {
+                "VBAP: a direction (azimuth, elevation), on the two or three speakers around it at constant power"
+            }
+            Mode::Stereo(StereoSource::Image) => {
+                "Image: the stereo pair placed as a whole, its channels the width apart"
+            }
+            Mode::Stereo(StereoSource::Balance) => {
+                "Balance: left on L, right on R, at the strip's balance — not spread into the room"
+            }
+            Mode::Stereo(StereoSource::Dual) => {
+                "Dual: each channel at its own direction (drag either; the knobs set them exactly)"
+            }
+            Mode::Diffuse => {
+                "Diffuse spread: the spread's share reaches every speaker through its own decorrelation filter (all-pass, no delay) instead of as the same signal — no comb filtering off-centre, transients a little smeared"
+            }
+        }
+    }
+
+    /// Type a knob's value.
+    fn type_value(
+        track: TrackId,
+        pan: SurroundPan,
+        param: SurroundParam,
+        at: Rect,
+    ) -> HostRequest<Action> {
+        HostRequest::TextInput {
+            at,
+            initial: format_value(param, param.get(&pan)),
+            commit: Box::new(move |text| {
+                parse_value(param, text).map(|v| {
+                    Action::Edit(Command::SetTrackSurround {
+                        track,
+                        pan: param.set(pan, v),
+                    })
+                })
+            }),
+        }
+    }
+}
+
+/// A toolbar button (lit when on), as the Object toggle.
+fn toggle(p: &mut dyn Painter, r: Rect, label: &str, on: bool, th: &Theme) {
+    p.fill_rounded(
+        r,
+        4.0,
+        &(if on {
+            th.ui.selection
+        } else {
+            th.ui.surface_alt
+        })
+        .into(),
+    );
+    p.stroke_rounded(r, 4.0, 1.0, th.ui.border);
+    p.text(
+        label,
+        r,
+        &TextStyle::new(th.fonts.small, th.ui.text).align(Align::Center),
+    );
 }
 
 impl CanvasView<Session, Action> for SurroundView {
@@ -204,7 +443,7 @@ impl CanvasView<Session, Action> for SurroundView {
             );
             return;
         };
-        let pan = model.shown_surround(t);
+        let pan = Self::effective(model, t);
         let dest = model
             .project()
             .output_target(t)
@@ -222,30 +461,45 @@ impl CanvasView<Session, Action> for SurroundView {
             readout.w = r.x - 12.0 - readout.x;
             // The Object toggle: lit when the track is one.
             let on = model.project().is_object(t);
-            p.fill_rounded(
-                r,
-                4.0,
-                &(if on {
-                    th.ui.selection
-                } else {
-                    th.ui.surface_alt
-                })
-                .into(),
-            );
-            p.stroke_rounded(r, 4.0, 1.0, th.ui.border);
-            p.text(
-                if on { "■ Object" } else { "Object" },
-                r,
-                &TextStyle::new(th.fonts.small, th.ui.text).align(Align::Center),
-            );
+            toggle(p, r, if on { "■ Object" } else { "Object" }, on, th);
         }
+        let place = if model.project().balanced_into_bed(t) {
+            format!(
+                "Balance {}",
+                faderframe_core::pan::format_pan(model.shown_pan(t))
+            )
+        } else {
+            room::format_place(&pan)
+        };
         p.text(
-            &room::format_place(&pan),
+            &place,
             readout,
             &TextStyle::new(th.fonts.normal, th.ui.text_dim)
                 .family(faderframe_ui_canvas::FontFamily::Mono)
                 .align(Align::End),
         );
+        p.hline(
+            0.0,
+            size.w,
+            HEADER_H + TOOLBAR_H - 0.5,
+            th.ui.border.with_alpha(0.5),
+        );
+        for (mode, r) in &l.modes {
+            toggle(
+                p,
+                *r,
+                Self::mode_label(*mode),
+                Self::mode_on(&pan, *mode),
+                th,
+            );
+        }
+        if model.project().is_object(t) {
+            p.text(
+                "Objects are placed in the room (their ADM position).",
+                Rect::new(14.0, HEADER_H, size.w - 28.0, TOOLBAR_H),
+                &TextStyle::new(th.fonts.small, th.ui.text_dim),
+            );
+        }
         let meter = model.meter(t.id);
         let levels: Vec<f32> = meter.shown().iter().map(|c| c.level_db).collect();
         let c = t.color;
@@ -272,13 +526,10 @@ impl CanvasView<Session, Action> for SurroundView {
                 th,
                 Align::Center,
             );
-            controls::knob(p, *r, position(*param, v), false, look, th);
-            controls::readout(
-                p,
-                Rect::new(r.x - 14.0, r.bottom() + 4.0, r.w + 28.0, 14.0),
-                &format_value(*param, v),
-                th,
-            );
+            let bipolar =
+                param.wraps() || (*param == SurroundParam::Elevation && format.has_lower());
+            controls::knob(p, *r, position(*param, v, format), bipolar, look, th);
+            controls::readout(p, readout_rect(*r), &format_value(*param, v), th);
         }
     }
 
@@ -297,6 +548,10 @@ impl CanvasView<Session, Action> for SurroundView {
         }
         let l = self.layout(size, model, t);
         let pan = model.shown_surround(t);
+        let shown = Self::effective(model, t);
+        let directions = room::by_direction(&shown, model.project().is_object(t));
+        let mode = room::stereo_mode(&shown, t.layout, model.project().is_object(t));
+        let floor = room::floor(l.room, false);
         match *ev {
             // MIDI learn: a knob's parameter, or (on the room) each of
             // them.
@@ -329,7 +584,7 @@ impl CanvasView<Session, Action> for SurroundView {
                     }
                     None => SurroundParam::ALL
                         .into_iter()
-                        .filter(|p| p.applies(t.layout, format))
+                        .filter(|p| p.applies(t.layout, format, &shown))
                         .map(|p| {
                             let target = learn(p);
                             let mapped = !model.midi_mappings_for(target).is_empty();
@@ -358,6 +613,18 @@ impl CanvasView<Session, Action> for SurroundView {
                     }));
                     return true;
                 }
+                if let Some((m, _)) = l.modes.iter().find(|(_, r)| r.contains(pos)) {
+                    if *m == Mode::Diffuse || !Self::mode_on(&pan, *m) {
+                        Self::set(cx, t.id, Self::switched(pan, *m));
+                    }
+                    return true;
+                }
+                if let Some((param, r)) =
+                    l.knobs.iter().find(|(_, r)| readout_rect(*r).contains(pos))
+                {
+                    cx.request(Self::type_value(t.id, pan, *param, readout_rect(*r)));
+                    return true;
+                }
                 if let Some((param, _)) = l.knobs.iter().find(|(_, r)| r.inset(-6.0).contains(pos))
                 {
                     if clicks >= 2 {
@@ -369,43 +636,91 @@ impl CanvasView<Session, Action> for SurroundView {
                         track: t.id,
                         param: *param,
                         start_y: pos.y,
-                        start: position(*param, param.get(&pan)),
+                        start: position(
+                            *param,
+                            param.get(&pan),
+                            model
+                                .project()
+                                .surround_panned(t)
+                                .unwrap_or(SurroundFormat::S51),
+                        ),
                     });
                     cx.set_cursor(Cursor::ResizeVertical);
                     return true;
                 }
-                let floor = room::floor(l.room, false);
-                if floor.inset(-10.0).contains(pos) {
+                if !floor.inset(-10.0).contains(pos) || mode == StereoSource::Balance {
+                    return false;
+                }
+                if directions {
+                    let at = room::azimuth_at(floor, pos);
                     if clicks >= 2 {
-                        // Back to the front centre.
-                        Self::set(
-                            cx,
-                            t.id,
-                            SurroundPan {
-                                x: 0.0,
-                                y: 1.0,
+                        // Back ahead (dual: the pair back on L and R).
+                        let reset = match mode {
+                            StereoSource::Dual => SurroundPan {
+                                left: 30.0,
+                                right: -30.0,
                                 ..pan
                             },
-                        );
+                            _ => SurroundPan {
+                                azimuth: 0.0,
+                                ..pan
+                            },
+                        };
+                        Self::set(cx, t.id, reset);
                         return true;
                     }
-                    let at = room::to_view(floor, pan.x, pan.y);
-                    // A click on one of a stereo track's channels grabs the
-                    // pair; elsewhere the puck jumps there.
-                    let grab = room::sources(&pan, t.layout)
-                        .into_iter()
-                        .chain(std::iter::once((pan.x, pan.y)))
-                        .map(|(x, y)| room::to_view(floor, x, y))
-                        .find(|p| p.distance(pos) < 14.0)
-                        .map_or(Point::new(0.0, 0.0), |p| Point::new(at.x - p.x, at.y - p.y));
+                    // Dual: the nearer channel; an image: the whole, kept
+                    // as far from the pointer as where it was grabbed (a
+                    // click elsewhere puts it there).
+                    let gap = |a: f32, b: f32| ((a - b + 540.0).rem_euclid(360.0) - 180.0).abs();
+                    let turn = match mode {
+                        StereoSource::Dual => Turn::Side {
+                            right: gap(at, pan.right) < gap(at, pan.left),
+                        },
+                        _ => {
+                            let grabbed = room::directions(&shown, t.layout)
+                                .into_iter()
+                                .map(|(a, e)| (a, room::direction_to_view(floor, a, e)))
+                                .find(|(_, p)| p.distance(pos) < 14.0);
+                            Turn::Centre {
+                                offset: grabbed.map_or(0.0, |(a, _)| pan.azimuth - a),
+                            }
+                        }
+                    };
                     cx.emit(Action::BeginGesture("Surround Pan".into()));
-                    let (x, y) = room::from_view(floor, Point::new(pos.x + grab.x, pos.y + grab.y));
-                    Self::set(cx, t.id, SurroundPan { x, y, ..pan });
-                    self.drag = Some(Drag::Puck { track: t.id, grab });
+                    Self::set(cx, t.id, turned(pan, turn, at));
+                    self.drag = Some(Drag::Direction { track: t.id, turn });
                     cx.set_cursor(Cursor::Grabbing);
                     return true;
                 }
-                false
+                if clicks >= 2 {
+                    // Back to the front centre.
+                    Self::set(
+                        cx,
+                        t.id,
+                        SurroundPan {
+                            x: 0.0,
+                            y: 1.0,
+                            ..pan
+                        },
+                    );
+                    return true;
+                }
+                let at = room::to_view(floor, pan.x, pan.y);
+                // A click on one of a stereo track's channels grabs the
+                // pair; elsewhere the puck jumps there.
+                let grab = room::sources(&pan, t.layout)
+                    .into_iter()
+                    .chain(std::iter::once((pan.x, pan.y)))
+                    .map(|(x, y)| room::to_view(floor, x, y))
+                    .find(|p| p.distance(pos) < 14.0)
+                    .map_or(Point::new(0.0, 0.0), |p| Point::new(at.x - p.x, at.y - p.y));
+                cx.emit(Action::BeginGesture("Surround Pan".into()));
+                let (x, y) = room::from_view(floor, Point::new(pos.x + grab.x, pos.y + grab.y));
+                Self::set(cx, t.id, SurroundPan { x, y, ..pan });
+                self.drag = Some(Drag::Puck { track: t.id, grab });
+                cx.set_cursor(Cursor::Grabbing);
+                true
             }
             ViewEvent::PointerMove {
                 pos,
@@ -413,11 +728,12 @@ impl CanvasView<Session, Action> for SurroundView {
                 dragging: true,
             } => match self.drag {
                 Some(Drag::Puck { track, grab }) if track == t.id => {
-                    let (x, y) = room::from_view(
-                        room::floor(l.room, false),
-                        Point::new(pos.x + grab.x, pos.y + grab.y),
-                    );
+                    let (x, y) = room::from_view(floor, Point::new(pos.x + grab.x, pos.y + grab.y));
                     Self::set(cx, track, SurroundPan { x, y, ..pan });
+                    true
+                }
+                Some(Drag::Direction { track, turn }) if track == t.id => {
+                    Self::set(cx, track, turned(pan, turn, room::azimuth_at(floor, pos)));
                     true
                 }
                 Some(Drag::Knob {
@@ -428,7 +744,11 @@ impl CanvasView<Session, Action> for SurroundView {
                 }) if track == t.id => {
                     let fine = if modifiers.shift { 0.2 } else { 1.0 };
                     let at = start + (start_y - pos.y) / KNOB_TRAVEL * fine;
-                    Self::set(cx, track, param.set(pan, value(param, at)));
+                    let format = model
+                        .project()
+                        .surround_panned(t)
+                        .unwrap_or(SurroundFormat::S51);
+                    Self::set(cx, track, param.set(pan, value(param, at, format)));
                     true
                 }
                 _ => false,
@@ -449,11 +769,38 @@ impl CanvasView<Session, Action> for SurroundView {
         let t = Self::track(model)?;
         model.project().surround_panned(t)?;
         let l = self.layout(size, model, t);
+        if let Some((m, _)) = l.modes.iter().find(|(_, r)| r.contains(pos)) {
+            return Some(Self::mode_tip(*m).into());
+        }
+        let shown = Self::effective(model, t);
         if room::floor(l.room, false).inset(-10.0).contains(pos) {
+            let object = model.project().is_object(t);
             return Some(
-                "Drag the puck, or click where the track should sit · double-click: front centre"
-                    .into(),
+                match room::stereo_mode(&shown, t.layout, object) {
+                    StereoSource::Balance => {
+                        "Balanced on L and R: set it with the strip's balance knob"
+                    }
+                    StereoSource::Dual if room::by_direction(&shown, object) => {
+                        "Drag either channel round the listener · double-click: back on L and R"
+                    }
+                    _ if room::by_direction(&shown, object) => {
+                        "Drag round the listener, or click a direction · double-click: ahead"
+                    }
+                    _ => "Drag the puck, or click where the track should sit · double-click: front centre",
+                }
+                .into(),
             );
+        }
+        if let Some((p, _)) = l.knobs.iter().find(|(_, r)| readout_rect(*r).contains(pos)) {
+            return Some(format!(
+                "{} · click to type{}",
+                p.name(),
+                if p.wraps() {
+                    " (L30, R110, −45, 180; positive is left)"
+                } else {
+                    ""
+                }
+            ));
         }
         l.knobs.iter().find(|(_, r)| r.contains(pos)).map(|(p, _)| {
             format!(
@@ -464,7 +811,16 @@ impl CanvasView<Session, Action> for SurroundView {
     }
 
     fn min_size(&self) -> Size {
-        Size::new(360.0, 300.0)
+        Size::new(360.0, 330.0)
+    }
+}
+
+/// `pan` turned so its `turn` points at `azimuth`.
+fn turned(pan: SurroundPan, turn: Turn, azimuth: f32) -> SurroundPan {
+    match turn {
+        Turn::Centre { offset } => SurroundParam::Azimuth.set(pan, azimuth + offset),
+        Turn::Side { right: false } => SurroundParam::LeftAzimuth.set(pan, azimuth),
+        Turn::Side { right: true } => SurroundParam::RightAzimuth.set(pan, azimuth),
     }
 }
 
@@ -559,14 +915,254 @@ mod tests {
     fn knob_positions_round_trip() {
         for param in KNOBS {
             for pos in [0.0, 0.25, 0.5, 1.0] {
-                let v = value(param, pos);
-                assert!((position(param, v) - pos).abs() < 1e-4, "{param:?} {pos}");
+                let f = SurroundFormat::S714;
+                let v = value(param, pos, f);
+                assert!(
+                    (position(param, v, f) - pos).abs() < 1e-4,
+                    "{param:?} {pos}"
+                );
             }
         }
         assert_eq!(
-            format_value(SurroundParam::Lfe, value(SurroundParam::Lfe, 0.0)),
+            format_value(
+                SurroundParam::Lfe,
+                value(SurroundParam::Lfe, 0.0, SurroundFormat::S51)
+            ),
             "Off"
         );
         assert_eq!(format_value(SurroundParam::Spread, 0.5), "50 %");
+        // Elevation: from ear level in the built-in formats, from below it
+        // where a layout has speakers down there.
+        let e = SurroundParam::Elevation;
+        assert_eq!(value(e, 0.0, SurroundFormat::S714), 0.0);
+        let sphere = faderframe_core::surround::LayoutDef {
+            name: "View Sphere".into(),
+            speakers: [
+                (0.0f32, 0.0f32),
+                (120.0, 0.0),
+                (-120.0, 0.0),
+                (0.0, 60.0),
+                (60.0, -50.0),
+                (-60.0, -50.0),
+                (180.0, -50.0),
+            ]
+            .iter()
+            .enumerate()
+            .map(
+                |(i, &(azimuth, elevation))| faderframe_core::surround::SpeakerDef {
+                    label: format!("S{i}"),
+                    azimuth,
+                    elevation,
+                    lfe: false,
+                },
+            )
+            .collect(),
+        }
+        .intern()
+        .unwrap();
+        assert_eq!(value(e, 0.0, sphere), -90.0);
+        assert_eq!(position(e, 0.0, sphere), 0.5);
+    }
+
+    fn select_pad_into(s: &mut Session, f: faderframe_core::SurroundFormat) -> TrackId {
+        let pad = s
+            .project()
+            .tracks
+            .iter()
+            .find(|t| t.name == "Pad")
+            .unwrap()
+            .id;
+        s.dispatch(Action::SelectTracks {
+            tracks: vec![pad],
+            mode: faderframe_session::SelectMode::Replace,
+        })
+        .unwrap();
+        let master = s.project().master_id().unwrap();
+        s.dispatch(Action::Edit(Command::SetTrackLayout {
+            track: master,
+            layout: faderframe_core::ChannelLayout::Surround(f),
+        }))
+        .unwrap();
+        pad
+    }
+
+    fn dispatch_all(s: &mut Session, actions: Vec<Action>) {
+        for a in actions {
+            s.dispatch(a).unwrap();
+        }
+    }
+
+    /// VBAP from the toolbar, then a click round the listener sets the
+    /// direction; dual pan turns either channel; the knobs follow the mode.
+    #[test]
+    fn vbap_turns_the_track_round_the_listener() {
+        use faderframe_core::SurroundFormat;
+        let mut s = Session::demo(faderframe_engine::EngineConfig::default()).unwrap();
+        let pad = select_pad_into(&mut s, SurroundFormat::S51);
+        let theme = Theme::default();
+        let mut view = SurroundView::new(theme.clone());
+        let size = Size::new(700.0, 520.0);
+        view.paint(&mut RecordingPainter::new(), size, &s, &theme);
+        let t = s.project().track(pad).unwrap().clone();
+        let l = view.layout(size, &s, &t);
+        let labels: Vec<&str> = l
+            .modes
+            .iter()
+            .map(|(m, _)| SurroundView::mode_label(*m))
+            .collect();
+        // Room for now: no dual pan to choose.
+        assert_eq!(labels, ["Room", "VBAP", "Image", "Balance", "Diffuse"]);
+        let vbap = l
+            .modes
+            .iter()
+            .find(|(m, _)| *m == Mode::Panner(SurroundPanner::Vbap))
+            .unwrap()
+            .1;
+        let actions = run(&mut view, down(vbap.center(), 1), size, &s);
+        dispatch_all(&mut s, actions);
+        let t = s.project().track(pad).unwrap().clone();
+        assert_eq!(t.surround.panner, SurroundPanner::Vbap);
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, size, &s, &theme);
+        let l = view.layout(size, &s, &t);
+        let knobs: Vec<SurroundParam> = l.knobs.iter().map(|(p, _)| *p).collect();
+        // 5.1 has no tops: no elevation.
+        assert_eq!(
+            knobs,
+            [
+                SurroundParam::Azimuth,
+                SurroundParam::Spread,
+                SurroundParam::Width,
+                SurroundParam::Lfe
+            ]
+        );
+        // A click to the left surround's direction.
+        let floor = room::floor(l.room, false);
+        let at = room::direction_to_view(floor, 110.0, 0.0);
+        let actions = run(&mut view, down(at, 1), size, &s);
+        match &actions[..] {
+            [
+                Action::BeginGesture(_),
+                Action::Edit(Command::SetTrackSurround { pan, .. }),
+            ] => assert!((pan.azimuth - 110.0).abs() < 0.5, "{}", pan.azimuth),
+            other => panic!("{other:?}"),
+        }
+        dispatch_all(&mut s, actions);
+        run(
+            &mut view,
+            ViewEvent::PointerUp {
+                pos: at,
+                button: PointerButton::Primary,
+                modifiers: Modifiers::NONE,
+            },
+            size,
+            &s,
+        );
+        s.dispatch(Action::EndGesture).unwrap();
+        // Dual: the right channel turned on its own.
+        let l = view.layout(size, &s, s.project().track(pad).unwrap());
+        let dual = l
+            .modes
+            .iter()
+            .find(|(m, _)| *m == Mode::Stereo(StereoSource::Dual))
+            .expect("dual pan with VBAP")
+            .1;
+        let actions = run(&mut view, down(dual.center(), 1), size, &s);
+        dispatch_all(&mut s, actions);
+        // Diffuse spread toggles on and off.
+        let diffuse = |view: &SurroundView, s: &Session| {
+            view.layout(size, s, s.project().track(pad).unwrap())
+                .modes
+                .iter()
+                .find(|(m, _)| *m == Mode::Diffuse)
+                .unwrap()
+                .1
+        };
+        let at = diffuse(&view, &s).center();
+        let actions = run(&mut view, down(at, 1), size, &s);
+        dispatch_all(&mut s, actions);
+        assert!(s.project().track(pad).unwrap().surround.diffuse);
+        let actions = run(&mut view, down(at, 1), size, &s);
+        dispatch_all(&mut s, actions);
+        assert!(!s.project().track(pad).unwrap().surround.diffuse);
+        let l = view.layout(size, &s, s.project().track(pad).unwrap());
+        let floor = room::floor(l.room, false);
+        let near_right = room::direction_to_view(floor, -40.0, 0.0);
+        let actions = run(&mut view, down(near_right, 1), size, &s);
+        match &actions[..] {
+            [
+                Action::BeginGesture(_),
+                Action::Edit(Command::SetTrackSurround { pan, .. }),
+            ] => {
+                assert_eq!(pan.left, 30.0);
+                assert!((pan.right + 40.0).abs() < 0.5, "{}", pan.right);
+            }
+            other => panic!("{other:?}"),
+        }
+        let knobs: Vec<SurroundParam> = l.knobs.iter().map(|(p, _)| *p).collect();
+        assert_eq!(
+            knobs[..2],
+            [SurroundParam::LeftAzimuth, SurroundParam::RightAzimuth]
+        );
+    }
+
+    /// Balanced: nothing to drag, only the LFE knob; the strip's balance
+    /// is shown.
+    #[test]
+    fn a_balanced_stereo_track_is_not_placed() {
+        use faderframe_core::SurroundFormat;
+        let mut s = Session::demo(faderframe_engine::EngineConfig::default()).unwrap();
+        let pad = select_pad_into(&mut s, SurroundFormat::S51);
+        let pan = SurroundPan {
+            stereo: StereoSource::Balance,
+            ..s.project().track(pad).unwrap().surround
+        };
+        s.dispatch(Action::Edit(Command::SetTrackSurround { track: pad, pan }))
+            .unwrap();
+        let theme = Theme::default();
+        let mut view = SurroundView::new(theme.clone());
+        let size = Size::new(700.0, 520.0);
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, size, &s, &theme);
+        assert!(
+            p.texts().iter().any(|t| t.starts_with("Balance")),
+            "{:?}",
+            p.texts()
+        );
+        let l = view.layout(size, &s, s.project().track(pad).unwrap());
+        assert_eq!(l.knobs.len(), 1);
+        assert_eq!(l.knobs[0].0, SurroundParam::Lfe);
+        assert!(run(&mut view, down(l.room.center(), 1), size, &s).is_empty());
+    }
+
+    #[test]
+    fn values_are_typed() {
+        assert_eq!(parse_value(SurroundParam::Azimuth, "L30"), Some(30.0));
+        assert_eq!(parse_value(SurroundParam::Azimuth, "r110°"), Some(-110.0));
+        assert_eq!(parse_value(SurroundParam::Azimuth, "-45"), Some(-45.0));
+        assert_eq!(parse_value(SurroundParam::RightAzimuth, "c"), Some(0.0));
+        assert_eq!(parse_value(SurroundParam::Elevation, "30°"), Some(30.0));
+        assert_eq!(
+            parse_value(SurroundParam::Lfe, "off"),
+            Some(faderframe_core::surround::LFE_OFF_DB)
+        );
+        assert_eq!(parse_value(SurroundParam::Lfe, "-6 dB"), Some(-6.0));
+        assert_eq!(parse_value(SurroundParam::Spread, "50 %"), Some(0.5));
+        assert_eq!(parse_value(SurroundParam::Azimuth, "left"), None);
+        for p in [
+            SurroundParam::Azimuth,
+            SurroundParam::Elevation,
+            SurroundParam::Lfe,
+        ] {
+            for v in [0.0f32, 30.0, -110.0] {
+                let v = p.set(SurroundPan::default(), v);
+                let shown = format_value(p, p.get(&v));
+                assert_eq!(
+                    parse_value(p, &shown).map(|x| x.round()),
+                    Some(p.get(&v).round()),
+                    "{p:?} {shown}"
+                );
+            }
+        }
     }
 }

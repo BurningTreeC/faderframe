@@ -29,6 +29,55 @@ use std::time::Duration;
 
 /// Seconds of capture the input ring holds.
 const INPUT_RING_SECONDS: f32 = 0.5;
+/// Seconds of smaller callbacks before the nominal block size shrinks.
+const SHRINK_AFTER_SECONDS: u64 = 3;
+
+/// The block size the stream reports. Callbacks vary in size on some
+/// systems (WASAPI's shared mode, ALSA through cpal, a callback larger
+/// than [`MAX_BUFFER_SIZE`] run in chunks), and every size reported is a
+/// graph rebuild for the buffered devices (preamps, buses rendered
+/// ahead) and a step in the output latency. So: the largest callback,
+/// larger at once (the buffered devices need room for it), smaller only
+/// after [`SHRINK_AFTER_SECONDS`] of smaller callbacks.
+#[derive(Debug)]
+struct Nominal {
+    size: u32,
+    /// The largest callback since the window began, and its frames.
+    window_max: u32,
+    window_frames: u64,
+}
+
+impl Nominal {
+    fn new(size: u32) -> Self {
+        Self {
+            size,
+            window_max: 0,
+            window_frames: 0,
+        }
+    }
+
+    /// A callback of `n` frames at `rate`: the new nominal size when it
+    /// changes.
+    fn see(&mut self, n: u32, rate: u32) -> Option<u32> {
+        if n > self.size {
+            self.size = n;
+            self.window_max = 0;
+            self.window_frames = 0;
+            return Some(n);
+        }
+        self.window_max = self.window_max.max(n);
+        self.window_frames += u64::from(n);
+        if self.window_frames < u64::from(rate) * SHRINK_AFTER_SECONDS {
+            return None;
+        }
+        let max = std::mem::take(&mut self.window_max);
+        self.window_frames = 0;
+        (max > 0 && max < self.size).then(|| {
+            self.size = max;
+            max
+        })
+    }
+}
 
 /// Which of cpal's audio APIs a backend uses.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -325,6 +374,8 @@ fn open(
         outputs: vec![vec![0.0; MAX_BUFFER_SIZE as usize]; channels as usize],
         input_rx,
         frame: vec![0.0; input_channels as usize],
+        promoted: false,
+        nominal: Nominal::new(nominal),
     };
     let output = match format {
         SampleFormat::F32 => build_output::<f32>(&device, &out_config, rt),
@@ -366,10 +417,16 @@ fn build_input(
 ) -> Result<cpal::Stream, AudioError> {
     let m = Arc::clone(&monitor);
     let err = move |e| on_error(&m, e);
+    let mut promoted = false;
     let stream = match format {
         SampleFormat::F32 => device.build_input_stream::<f32, _, _>(
             *config,
             move |data, _| {
+                // The capture thread is on the audio path too.
+                if !promoted {
+                    promoted = true;
+                    faderframe_realtime::priority::make_audio_thread_realtime();
+                }
                 for v in data {
                     let _ = tx.push(*v);
                 }
@@ -380,6 +437,11 @@ fn build_input(
         SampleFormat::I32 => device.build_input_stream::<i32, _, _>(
             *config,
             move |data, _| {
+                // The capture thread is on the audio path too.
+                if !promoted {
+                    promoted = true;
+                    faderframe_realtime::priority::make_audio_thread_realtime();
+                }
                 for v in data {
                     let _ = tx.push(f32::from_sample(*v));
                 }
@@ -390,6 +452,11 @@ fn build_input(
         _ => device.build_input_stream::<i16, _, _>(
             *config,
             move |data, _| {
+                // The capture thread is on the audio path too.
+                if !promoted {
+                    promoted = true;
+                    faderframe_realtime::priority::make_audio_thread_realtime();
+                }
                 for v in data {
                     let _ = tx.push(f32::from_sample(*v));
                 }
@@ -411,6 +478,11 @@ struct Rt {
     input_rx: Option<rtrb::Consumer<f32>>,
     /// One interleaved capture frame.
     frame: Vec<f32>,
+    /// The callback's thread made realtime (cpal leaves it as it comes:
+    /// its own promotion is a feature not built), on the first callback.
+    promoted: bool,
+    /// The block size reported (`info.buffer_size` follows it).
+    nominal: Nominal,
 }
 
 struct Io<'a> {
@@ -445,11 +517,18 @@ impl Rt {
     /// One chunk of at most `MAX_BUFFER_SIZE` frames into `out`
     /// (interleaved).
     fn run<T: SizedSample + FromSample<f32>>(&mut self, out: &mut [T]) {
+        if !self.promoted {
+            // Once, at the stream's start (system calls): realtime, and
+            // the stack mapped before deep calls need it.
+            self.promoted = true;
+            faderframe_realtime::priority::make_audio_thread_realtime();
+            faderframe_realtime::memory::prefault_stack(256 * 1024);
+        }
         let ch = self.outputs.len().max(1);
         let n = out.len() / ch;
-        if n as u32 != self.info.buffer_size {
-            self.info.buffer_size = n as u32;
-            self.monitor.set_buffer_size(n as u32);
+        if let Some(size) = self.nominal.see(n as u32, self.info.sample_rate) {
+            self.info.buffer_size = size;
+            self.monitor.set_buffer_size(size);
             self.callback.prepare(&self.info);
         }
         // Captured frames, or silence when the ring runs dry.
@@ -538,5 +617,35 @@ impl Drop for CpalStream {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Callbacks varying in size give one nominal size, not one per
+    /// callback: larger at once, smaller after a few seconds of smaller
+    /// ones.
+    #[test]
+    fn the_nominal_block_size_follows_varying_callbacks_slowly() {
+        let rate = 44_100;
+        let mut n = Nominal::new(512);
+        let mut changes = Vec::new();
+        // Two sizes taking turns for 10 s.
+        let mut frames = 0u64;
+        let mut i = 0;
+        while frames < 10 * u64::from(rate) {
+            let size = if i % 2 == 0 { 441 } else { 448 };
+            frames += u64::from(size);
+            i += 1;
+            if let Some(s) = n.see(size, rate) {
+                changes.push(s);
+            }
+        }
+        assert_eq!(changes, vec![448], "one change, to the largest");
+        // A larger callback goes in at once.
+        assert_eq!(n.see(1024, rate), Some(1024));
+        assert_eq!(n.see(448, rate), None);
     }
 }

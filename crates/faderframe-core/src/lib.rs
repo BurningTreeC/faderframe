@@ -14,6 +14,7 @@ pub mod pan;
 pub mod paths;
 pub mod surround;
 pub mod timecode;
+pub mod vbap;
 
 pub use channel::ChannelLayout;
 pub use gain::{Decibels, FaderLaw, db_to_gain, gain_to_db};
@@ -22,5 +23,5 @@ pub use id::{
     MidiMappingId, ModulatorId, NoteId, ParameterId, PluginInstanceId, SceneId, SectionId, SendId,
     SongId, TrackId, VideoClipId, VideoSourceId, VideoTrackId,
 };
-pub use pan::PanLaw;
+pub use pan::{DualPan, PanLaw, PanMode};
 pub use surround::{SurroundFormat, SurroundPan, SurroundParam};

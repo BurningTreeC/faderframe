@@ -172,6 +172,8 @@ pub struct AppState {
     /// Session revision the widgets show (changes made by the frame tick —
     /// finished recordings, imports, analyses — redraw too).
     shown_rev: Cell<u64>,
+    /// The session's display revision last repainted for.
+    shown_display: Cell<u64>,
     last_tick: Cell<Option<Instant>>,
     frame: Cell<u64>,
     /// File → Open Recent (rebuilt when the list changes).
@@ -188,6 +190,7 @@ impl AppState {
             app: app.clone(),
             layout_rev: Cell::new(session.layout_revision()),
             shown_rev: Cell::new(session.revision()),
+            shown_display: Cell::new(session.display_revision()),
             session: RefCell::new(session),
             theme: RefCell::new(Theme::by_id(&crate::prefs::Preferences::load().theme)),
             options: RefCell::new(options),
@@ -301,6 +304,7 @@ impl AppState {
         self.update_chrome(true);
         crate::recent::note_session_path(self);
         crate::listen::follow(self);
+        crate::monitoring::follow(self);
         crate::console::follow(self);
     }
 
@@ -344,22 +348,33 @@ impl AppState {
     }
 
     /// Frame tick (~60 Hz): poll the engine, animate chrome.
+    /// Whether the last tick is less than `within` ago.
+    pub fn ticked_within(&self, within: std::time::Duration) -> bool {
+        self.last_tick.get().is_some_and(|t| t.elapsed() < within)
+    }
+
     pub fn tick(self: &Rc<Self>) {
         let now = Instant::now();
         let dt = self
             .last_tick
             .replace(Some(now))
             .map_or(1.0 / 60.0, |t| (now - t).as_secs_f32().min(0.25));
-        let changed = match self.session.try_borrow_mut() {
+        let (changed, shown) = match self.session.try_borrow_mut() {
             Ok(mut s) => {
                 s.tick(dt);
-                s.revision() != self.shown_rev.get()
+                (
+                    s.revision() != self.shown_rev.get(),
+                    s.display_revision() != self.shown_display.replace(s.display_revision()),
+                )
             }
-            Err(_) => false,
+            Err(_) => (false, false),
         };
         if changed {
             // e.g. a take placed after the recording stopped.
             self.after_change();
+        } else if shown {
+            // Only what views show (keys held, launcher clips playing).
+            self.redraw_all();
         }
         crate::plugin_window::tick(self);
         // Windows views asked for.

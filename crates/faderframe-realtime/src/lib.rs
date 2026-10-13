@@ -21,6 +21,10 @@
 //! * [`ScopedFlushDenormals`] — flush-to-zero on DSP threads.
 //! * [`Workgroup`] — the audio device's `os_workgroup` (macOS) the DSP
 //!   workers join.
+//! * [`memory`] — memory mapped before the audio thread touches it (the
+//!   prefaulting allocator, stacks) and kept resident (`mlockall`).
+//! * [`priority`] — the audio path's threads at realtime priority, in
+//!   order below the audio thread.
 //! * [`reservoir`] — GainStageFx's fixed-delay asynchronous DSP worker,
 //!   used for live circuit plugins. Offline/ahead callers use inline DSP.
 //!
@@ -30,7 +34,8 @@
 //! `unsafe` code is
 //! confined to `mailbox` and `pages` (pointer ownership transfer through
 //! `AtomicPtr`s), `cells` (interior mutability guarded by atomic states),
-//! `pool` (scoped job pointer, futex, thread scheduling), `denormals`
+//! `pool` (scoped job pointer, futex, thread scheduling), `memory` (the
+//! prefaulting allocator, `mlockall`), `denormals`
 //! (the FP control register) and `workgroup` (CoreAudio and
 //! `os_workgroup` calls), and the reservoir's single-writer output ring,
 //! with invariants documented inline.
@@ -39,14 +44,19 @@ mod atomic;
 mod cells;
 mod denormals;
 mod mailbox;
+pub mod memory;
 mod meters;
 mod metrics;
 mod pages;
 mod params;
 mod pool;
+pub mod priority;
+#[cfg(target_os = "linux")]
+pub mod rtkit;
 mod scope;
 mod slots;
 mod trycell;
+pub mod usage;
 mod workgroup;
 // GainStageFx's generic DSP reservoir; see faderframe-circuit/UPSTREAM.md.
 #[rustfmt::skip]
@@ -61,7 +71,7 @@ pub use denormals::{ScopedFlushDenormals, flush_denormals_on_this_thread};
 pub use mailbox::{MailboxReceiver, MailboxSender, mailbox};
 pub use meters::{MeterBank, MeterRange, MeterReading, PPM_ATTACK_S, PPM_FALL_DB_PER_S};
 pub use metrics::{CallbackMetrics, MetricsSnapshot};
-pub use pages::{Epoch, PageTable, Reclaimer, Retired};
+pub use pages::{Epoch, PageTable, Reader, Reclaimer, Retired};
 pub use params::{ParamSlot, ParamTable};
 pub use pool::{
     PoolConfig, PoolJob, WorkerPool, apply_thread_scheduling, default_worker_count, physical_cores,

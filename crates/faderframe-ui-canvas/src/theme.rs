@@ -202,6 +202,10 @@ pub struct ArrangerTheme {
     pub launch_queued: Color,
     pub clip_radius: f32,
     pub clip_header: f32,
+    /// Opacity of a clip's name strip and of its body: translucent, so the
+    /// grid lines show through.
+    pub clip_header_alpha: f32,
+    pub clip_alpha: f32,
     pub clip_text: Color,
     pub selection_outline: Color,
     pub track_height: f32,
@@ -540,6 +544,8 @@ impl Theme {
                 clip_radius: 4.0,
                 // Tall enough for the clip gain knob.
                 clip_header: 22.0,
+                clip_header_alpha: 0.82,
+                clip_alpha: 0.5,
                 clip_text: Color::hex(0x121212),
                 selection_outline: Color::hex(0xf5f5f5),
                 track_height: 72.0,

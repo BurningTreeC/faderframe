@@ -38,4 +38,7 @@ pub struct EngineContext {
     pub preview_active: bool,
     /// The clip launcher (see [`crate::launch`]).
     pub launch: crate::launch::LaunchState,
+    /// What this graph's frames played lately (see [`crate::history`]):
+    /// nodes behind latency read their automation through it.
+    pub history: crate::history::PlayHistory,
 }

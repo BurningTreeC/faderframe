@@ -37,9 +37,16 @@ use std::sync::Arc;
 /// dynamics would smear too long beyond it).
 pub const FRAMES: [usize; 5] = [1024, 2048, 4096, 4096, 4096];
 
-/// The frame size (and latency) at a resolution.
+/// The frame size at a resolution.
 pub fn frame(quality: usize) -> usize {
     FRAMES[quality.min(FRAMES.len() - 1)]
+}
+
+/// The stage's latency at a resolution: the frame and the hop its work is
+/// spread over.
+pub fn latency(quality: usize) -> usize {
+    let n = frame(quality);
+    n + n / 4
 }
 
 /// Whether any band in use is spectral (the stage exists; switching one off
@@ -103,6 +110,13 @@ struct Band {
     env: Vec<f64>,
     reference: Vec<f64>,
     live: bool,
+    /// A remake in parts: the analog shapes it evaluates, the weight's
+    /// peak so far, and whether only the density changed (nothing to
+    /// evaluate).
+    analog: Option<AnalogBand>,
+    unit: Option<AnalogBand>,
+    peak: f64,
+    density_only: bool,
 }
 
 impl Band {
@@ -115,10 +129,42 @@ impl Band {
             env: vec![FLOOR; bins],
             reference: vec![-60.0; bins],
             live: false,
+            analog: None,
+            unit: None,
+            peak: 0.0,
+            density_only: false,
         }
     }
 }
 
+/// Parts a band's curves are remade in (bins split evenly).
+const REMAKE_PARTS: usize = 8;
+/// Steps of one frame at most: four forward transforms, per band its
+/// remake and its dynamics, the gains, two inverse transforms.
+const MAX_STEPS: usize = 4 + BANDS * (REMAKE_PARTS + 1) + 3;
+
+/// One step of a frame's work.
+#[derive(Clone, Copy, Debug)]
+enum Step {
+    /// The forward transform of an input (left, right, key left, key
+    /// right).
+    Forward(usize),
+    /// A part of a band's curves.
+    Remake { band: usize, part: usize },
+    /// A band's movement per frequency, into the gains.
+    Band(usize),
+    /// The gains onto the spectra.
+    Gains,
+    /// The inverse transform of a channel, overlapped into the output.
+    Inverse(usize),
+}
+
+/// The spectral stage. A frame's work is spread over the hop after it:
+/// at a hop's end the windowed input is copied and the frame planned in
+/// steps (transforms, a band's curves in parts, a band's dynamics, the
+/// gains); the steps run as the next hop's samples arrive, evenly, and
+/// the frame's output plays from the hop after — one hop more latency
+/// than the frame itself, no burst of every transform on one sample.
 pub struct Spectral {
     params: ParamValues,
     tap: Arc<AnalysisTap>,
@@ -131,9 +177,13 @@ pub struct Spectral {
     /// (left, right); `pos` is the oldest.
     rings: [Vec<f64>; 4],
     pos: usize,
+    /// The output playing, and the one the frame under way makes.
     out: [Vec<f64>; 2],
+    next: [Vec<f64>; 2],
     out_pos: usize,
     acc: [Vec<f64>; 2],
+    /// The frame's windowed inputs (copied at the hop's end).
+    frames: [Vec<f64>; 4],
     forward: Arc<dyn RealToComplex<f64>>,
     inverse: Arc<dyn ComplexToReal<f64>>,
     scratch_f: Vec<C64>,
@@ -144,6 +194,7 @@ pub struct Spectral {
     bands: Box<[Band]>,
     /// Gains (dB) on both channels, left, right, mid, side.
     gains: [Vec<f64>; 5],
+    touched: [bool; 5],
     power: Vec<f64>,
     smoothed: Vec<f64>,
     wide: Vec<f64>,
@@ -153,6 +204,14 @@ pub struct Spectral {
     wide_coeff: Vec<f64>,
     /// Power to a sine's peak level.
     norm: f64,
+    /// The frame's settings (read at the hop's end).
+    read: [BandParams; BANDS],
+    scale: f64,
+    interact: bool,
+    /// The frame's steps, how many there are and how many are done.
+    plan: [Step; MAX_STEPS],
+    steps: usize,
+    done: usize,
 }
 
 impl Spectral {
@@ -168,6 +227,7 @@ impl Spectral {
         let tilt = freq.iter().map(|f| f / 1000.0).collect();
         let mut wide_coeff = vec![0.0; bins];
         widths(1.0, bins, &mut wide_coeff);
+        let read = [BandParams::read(&params, 0); BANDS];
         Self {
             params,
             tap,
@@ -181,8 +241,10 @@ impl Spectral {
             rings: std::array::from_fn(|_| vec![0.0; n]),
             pos: 0,
             out: [vec![0.0; n / 4], vec![0.0; n / 4]],
+            next: [vec![0.0; n / 4], vec![0.0; n / 4]],
             out_pos: 0,
             acc: [vec![0.0; n], vec![0.0; n]],
+            frames: std::array::from_fn(|_| vec![0.0; n]),
             scratch_f: forward.make_scratch_vec(),
             scratch_i: inverse.make_scratch_vec(),
             forward,
@@ -198,6 +260,7 @@ impl Spectral {
             ],
             bands: (0..BANDS).map(|_| Band::new(bins)).collect(),
             gains: std::array::from_fn(|_| vec![0.0; bins]),
+            touched: [false; 5],
             power: vec![0.0; bins],
             smoothed: vec![0.0; bins],
             wide: vec![0.0; bins],
@@ -206,15 +269,23 @@ impl Spectral {
             tilt,
             wide_coeff,
             norm: (std::f64::consts::PI / n as f64).powi(2),
+            read,
+            scale: 1.0,
+            interact: false,
+            plan: [Step::Gains; MAX_STEPS],
+            steps: 0,
+            done: 0,
         }
     }
 
-    /// The stage's latency (samples).
+    /// The stage's latency (samples): the frame and the hop its work is
+    /// spread over.
     pub fn latency(&self) -> usize {
-        self.n
+        self.n + self.hop
     }
 
-    /// One frame in (the input and the sidechain), one out, `n` later.
+    /// One frame in (the input and the sidechain), one out, `latency()`
+    /// later.
     #[inline]
     pub fn process(&mut self, l: f64, r: f64, side: [f64; 2]) -> (f64, f64) {
         let p = self.pos;
@@ -225,198 +296,263 @@ impl Spectral {
         self.pos = if p + 1 == self.n { 0 } else { p + 1 };
         let y = (self.out[0][self.out_pos], self.out[1][self.out_pos]);
         self.out_pos += 1;
+        // The frame under way: its steps due by this sample.
+        let due = self.steps * self.out_pos / self.hop;
+        while self.done < due {
+            let step = self.plan[self.done];
+            self.done += 1;
+            self.run(step);
+        }
         if self.out_pos == self.hop {
             self.out_pos = 0;
-            self.frame();
+            self.hop_end();
         }
         y
     }
 
-    fn transform(&mut self, ring: usize, external: bool, ch: usize) {
-        let n = self.n;
-        for i in 0..n {
-            let mut j = self.pos + i;
-            if j >= n {
-                j -= n;
-            }
-            self.time[i] = self.rings[ring][j] * self.window[i];
+    /// A hop's end: the finished frame's output plays next; the next frame
+    /// is copied and planned.
+    fn hop_end(&mut self) {
+        while self.done < self.steps {
+            let step = self.plan[self.done];
+            self.done += 1;
+            self.run(step);
         }
-        let dst = if external {
-            &mut self.key[ch]
-        } else {
-            &mut self.main[ch]
-        };
-        if self
-            .forward
-            .process_with_scratch(&mut self.time, dst, &mut self.scratch_f)
-            .is_err()
-        {
-            dst.fill(C64::new(0.0, 0.0));
-        }
-    }
-
-    fn frame(&mut self) {
-        self.transform(0, false, 0);
-        self.transform(1, false, 1);
-        let scale = f64::from(self.params.get(global::GAIN_SCALE));
-        let interact = self.params.get(global::GAIN_Q) >= 0.5;
-        let mut read = [BandParams::read(&self.params, 0); BANDS];
-        for (b, slot) in read.iter_mut().enumerate().skip(1) {
+        std::mem::swap(&mut self.out, &mut self.next);
+        // The settings for this frame.
+        self.scale = f64::from(self.params.get(global::GAIN_SCALE));
+        self.interact = self.params.get(global::GAIN_Q) >= 0.5;
+        for (b, slot) in self.read.iter_mut().enumerate() {
             *slot = BandParams::read(&self.params, b);
         }
         let live = |p: &BandParams| p.enabled && p.is_spectral();
-        if read
+        let keyed = self
+            .read
             .iter()
-            .any(|p| live(p) && p.dynamics_on() && p.keyed_externally())
-        {
-            self.transform(2, true, 0);
-            self.transform(3, true, 1);
+            .any(|p| live(p) && p.dynamics_on() && p.keyed_externally());
+        // The windowed input as it is now.
+        let (n, pos) = (self.n, self.pos);
+        for f in 0..if keyed { 4 } else { 2 } {
+            let (ring, frame) = (&self.rings[f], &mut self.frames[f]);
+            for (i, (x, w)) in frame.iter_mut().zip(&self.window).enumerate() {
+                let mut j = pos + i;
+                if j >= n {
+                    j -= n;
+                }
+                *x = ring[j] * w;
+            }
         }
         for g in &mut self.gains {
             g.fill(0.0);
         }
-        let mut touched = [false; 5];
-        let hop_s = self.hop as f64 / self.sr;
-        for (b, p) in read.iter().enumerate() {
-            if !live(p) {
+        self.touched = [false; 5];
+        // The steps.
+        let mut steps = 0;
+        let mut push = |plan: &mut [Step; MAX_STEPS], s: Step| {
+            if steps < MAX_STEPS {
+                plan[steps] = s;
+                steps += 1;
+            }
+        };
+        for f in 0..if keyed { 4 } else { 2 } {
+            push(&mut self.plan, Step::Forward(f));
+        }
+        for b in 0..BANDS {
+            let p = self.read[b];
+            if !live(&p) {
                 if self.bands[b].live {
                     self.bands[b].live = false;
                     self.publish_rest(b);
                 }
                 continue;
             }
-            let shape = p.shape(scale, interact);
-            self.remake(b, &shape, p.density);
-            let band = &mut self.bands[b];
-            if !band.live {
-                band.live = true;
-                band.env.fill(FLOOR);
-                band.reference.fill(-60.0);
+            let shape = p.shape(self.scale, self.interact);
+            if self.bands[b].made_for != Some((shape, p.density)) {
+                for part in 0..REMAKE_PARTS {
+                    push(&mut self.plan, Step::Remake { band: b, part });
+                }
             }
-            let target = p.placement.index();
-            touched[target] = true;
-            if p.dynamics_on() {
-                // The trigger's power per frequency.
-                let src = if p.keyed_externally() {
-                    &self.key
-                } else {
-                    &self.main
-                };
-                for (((power, a), c), tilt) in self
-                    .power
-                    .iter_mut()
-                    .zip(&src[0])
-                    .zip(&src[1])
-                    .zip(&self.tilt)
-                {
-                    let (a, c) = (*a, *c);
-                    let pw = match p.placement {
-                        Placement::Stereo => a.norm_sqr().max(c.norm_sqr()),
-                        Placement::Left => a.norm_sqr(),
-                        Placement::Right => c.norm_sqr(),
-                        Placement::Mid => ((a + c) * 0.5).norm_sqr(),
-                        Placement::Side => ((a - c) * 0.5).norm_sqr(),
-                    };
-                    *power = if p.spectral_tilt { pw * tilt } else { pw };
-                }
-                smooth(&self.power, &band.density, &mut self.smoothed);
-                let auto = p.auto_threshold();
-                if auto {
-                    smooth(&self.power, &self.wide_coeff, &mut self.wide);
-                }
-                let (fa, fr) = p.time_factors();
-                let ka = 1.0 - (-hop_s / (AUTO_ATTACK * fa * 0.001)).exp();
-                let kr = 1.0 - (-hop_s / (AUTO_RELEASE * fr * 0.001)).exp();
-                let k_auto = 1.0 - (-hop_s / AUTO_TIME).exp();
-                let range = p.range * scale;
-                let (mut extreme, mut loudest, mut thr_sum, mut weight_sum) =
-                    (0.0f64, FLOOR, 0.0, 0.0);
-                for k in 0..self.bins {
-                    let level = 10.0 * (self.smoothed[k] * self.norm + 1e-30).log10();
-                    let e = &mut band.env[k];
-                    *e += (level - *e) * if level > *e { ka } else { kr };
-                    let threshold = if auto {
-                        let wide = 10.0 * (self.wide[k] * self.norm + 1e-30).log10();
-                        let r = &mut band.reference[k];
-                        if wide > -100.0 {
-                            *r += (wide - *r) * k_auto;
-                        }
-                        *r + AUTO_MARGIN
-                    } else {
-                        p.threshold
-                    };
-                    let w = band.weight[k];
-                    let moved = dynamic_gain(range, threshold, *e) * w;
-                    self.moved[k] = moved;
-                    if moved.abs() > extreme.abs() {
-                        extreme = moved;
-                    }
-                    if w > 0.5 {
-                        loudest = loudest.max(*e);
-                        thr_sum += threshold * w;
-                        weight_sum += w;
-                    }
-                }
-                self.tap.set_value(value::DYN + b, extreme as f32);
-                self.tap.set_value(value::KEY + b, loudest as f32);
-                if weight_sum > 0.0 {
-                    self.tap
-                        .set_value(value::THRESHOLD + b, (thr_sum / weight_sum) as f32);
-                }
-            } else {
-                self.moved.fill(0.0);
-                self.tap.set_value(value::DYN + b, 0.0);
-            }
-            let band = &self.bands[b];
-            for ((g, s), m) in self.gains[target]
-                .iter_mut()
-                .zip(&band.static_db)
-                .zip(&self.moved)
-            {
-                *g += s + m;
-            }
-            self.publish(b);
+            push(&mut self.plan, Step::Band(b));
         }
-        self.apply(&touched);
+        push(&mut self.plan, Step::Gains);
+        push(&mut self.plan, Step::Inverse(0));
+        push(&mut self.plan, Step::Inverse(1));
+        self.steps = steps;
+        self.done = 0;
     }
 
-    /// Make a band's weight and static curves for `shape`.
-    fn remake(&mut self, b: usize, shape: &BandShape, density: f64) {
+    fn run(&mut self, step: Step) {
+        match step {
+            Step::Forward(f) => {
+                self.time.copy_from_slice(&self.frames[f]);
+                let dst = if f < 2 {
+                    &mut self.main[f]
+                } else {
+                    &mut self.key[f - 2]
+                };
+                if self
+                    .forward
+                    .process_with_scratch(&mut self.time, dst, &mut self.scratch_f)
+                    .is_err()
+                {
+                    dst.fill(C64::new(0.0, 0.0));
+                }
+            }
+            Step::Remake { band, part } => self.remake(band, part),
+            Step::Band(b) => self.band(b),
+            Step::Gains => self.gains(),
+            Step::Inverse(c) => self.inverse(c),
+        }
+    }
+
+    /// A part of a band's weight and static curves (for its shape now).
+    fn remake(&mut self, b: usize, part: usize) {
+        let p = self.read[b];
+        let shape = p.shape(self.scale, self.interact);
+        let bins = self.bins;
         let band = &mut self.bands[b];
-        if band.made_for == Some((*shape, density)) {
+        if part == 0 {
+            let same_shape = band.made_for.is_some_and(|(s, _)| s == shape);
+            band.made_for = Some((shape, p.density));
+            // From a full octave at 0 % down to about a fiftieth at 100 %.
+            let octaves = 2f64.powf(-p.density.clamp(0.0, 1.0) * 5.6);
+            widths(octaves, bins, &mut band.density);
+            band.density_only = same_shape;
+            if same_shape {
+                return;
+            }
+            band.analog = Some(AnalogBand::new(&shape));
+            // The band's region: its shape at +12 dB, normalised.
+            band.unit = (shape.kind != BandType::FlatTilt).then(|| {
+                AnalogBand::new(&BandShape {
+                    gain: 12.0,
+                    ..shape
+                })
+            });
+            band.peak = 0.0;
+        }
+        if band.density_only {
             return;
         }
-        let same_shape = band.made_for.is_some_and(|(s, _)| s == *shape);
-        band.made_for = Some((*shape, density));
-        // From a full octave at 0 % down to about a fiftieth at 100 %.
-        let octaves = 2f64.powf(-density.clamp(0.0, 1.0) * 5.6);
-        widths(octaves, self.bins, &mut band.density);
-        if same_shape {
-            return;
-        }
-        let analog = AnalogBand::new(shape);
-        for (s, f) in band.static_db.iter_mut().zip(&self.freq) {
-            *s = analog.db(*f);
-        }
-        if shape.kind == BandType::FlatTilt {
-            band.weight.fill(1.0);
-            return;
-        }
-        // The band's region: its shape at +12 dB, normalised.
-        let unit = AnalogBand::new(&BandShape {
-            gain: 12.0,
-            ..*shape
-        });
-        let mut peak = 0.0f64;
-        for (w, f) in band.weight.iter_mut().zip(&self.freq) {
-            *w = unit.db(*f).abs();
-            peak = peak.max(*w);
-        }
-        if peak > 0.0 {
-            for w in &mut band.weight {
-                *w /= peak;
+        let (from, to) = (bins * part / REMAKE_PARTS, bins * (part + 1) / REMAKE_PARTS);
+        if let Some(analog) = &band.analog {
+            for (s, f) in band.static_db[from..to]
+                .iter_mut()
+                .zip(&self.freq[from..to])
+            {
+                *s = analog.db(*f);
             }
         }
+        match &band.unit {
+            None => band.weight[from..to].fill(1.0),
+            Some(unit) => {
+                for (w, f) in band.weight[from..to].iter_mut().zip(&self.freq[from..to]) {
+                    *w = unit.db(*f).abs();
+                    band.peak = band.peak.max(*w);
+                }
+                if part + 1 == REMAKE_PARTS && band.peak > 0.0 {
+                    let peak = band.peak;
+                    for w in &mut band.weight {
+                        *w /= peak;
+                    }
+                }
+            }
+        }
+    }
+
+    /// A band's movement per frequency, added into the gains.
+    fn band(&mut self, b: usize) {
+        let p = self.read[b];
+        let scale = self.scale;
+        let hop_s = self.hop as f64 / self.sr;
+        let band = &mut self.bands[b];
+        if !band.live {
+            band.live = true;
+            band.env.fill(FLOOR);
+            band.reference.fill(-60.0);
+        }
+        let target = p.placement.index();
+        self.touched[target] = true;
+        if p.dynamics_on() {
+            // The trigger's power per frequency.
+            let src = if p.keyed_externally() {
+                &self.key
+            } else {
+                &self.main
+            };
+            for (((power, a), c), tilt) in self
+                .power
+                .iter_mut()
+                .zip(&src[0])
+                .zip(&src[1])
+                .zip(&self.tilt)
+            {
+                let (a, c) = (*a, *c);
+                let pw = match p.placement {
+                    Placement::Stereo => a.norm_sqr().max(c.norm_sqr()),
+                    Placement::Left => a.norm_sqr(),
+                    Placement::Right => c.norm_sqr(),
+                    Placement::Mid => ((a + c) * 0.5).norm_sqr(),
+                    Placement::Side => ((a - c) * 0.5).norm_sqr(),
+                };
+                *power = if p.spectral_tilt { pw * tilt } else { pw };
+            }
+            smooth(&self.power, &band.density, &mut self.smoothed);
+            let auto = p.auto_threshold();
+            if auto {
+                smooth(&self.power, &self.wide_coeff, &mut self.wide);
+            }
+            let (fa, fr) = p.time_factors();
+            let ka = 1.0 - (-hop_s / (AUTO_ATTACK * fa * 0.001)).exp();
+            let kr = 1.0 - (-hop_s / (AUTO_RELEASE * fr * 0.001)).exp();
+            let k_auto = 1.0 - (-hop_s / AUTO_TIME).exp();
+            let range = p.range * scale;
+            let (mut extreme, mut loudest, mut thr_sum, mut weight_sum) = (0.0f64, FLOOR, 0.0, 0.0);
+            for k in 0..self.bins {
+                let level = 10.0 * (self.smoothed[k] * self.norm + 1e-30).log10();
+                let e = &mut band.env[k];
+                *e += (level - *e) * if level > *e { ka } else { kr };
+                let threshold = if auto {
+                    let wide = 10.0 * (self.wide[k] * self.norm + 1e-30).log10();
+                    let r = &mut band.reference[k];
+                    if wide > -100.0 {
+                        *r += (wide - *r) * k_auto;
+                    }
+                    *r + AUTO_MARGIN
+                } else {
+                    p.threshold
+                };
+                let w = band.weight[k];
+                let moved = dynamic_gain(range, threshold, *e) * w;
+                self.moved[k] = moved;
+                if moved.abs() > extreme.abs() {
+                    extreme = moved;
+                }
+                if w > 0.5 {
+                    loudest = loudest.max(*e);
+                    thr_sum += threshold * w;
+                    weight_sum += w;
+                }
+            }
+            self.tap.set_value(value::DYN + b, extreme as f32);
+            self.tap.set_value(value::KEY + b, loudest as f32);
+            if weight_sum > 0.0 {
+                self.tap
+                    .set_value(value::THRESHOLD + b, (thr_sum / weight_sum) as f32);
+            }
+        } else {
+            self.moved.fill(0.0);
+            self.tap.set_value(value::DYN + b, 0.0);
+        }
+        let band = &self.bands[b];
+        for ((g, s), m) in self.gains[target]
+            .iter_mut()
+            .zip(&band.static_db)
+            .zip(&self.moved)
+        {
+            *g += s + m;
+        }
+        self.publish(b);
     }
 
     /// Publish a band's movement per frequency for the editor.
@@ -452,9 +588,10 @@ impl Spectral {
         self.tap.set_value(value::DYN + b, 0.0);
     }
 
-    /// Apply the gains, transform back and overlap-add.
-    fn apply(&mut self, touched: &[bool; 5]) {
+    /// Apply the gains to the spectra.
+    fn gains(&mut self) {
         let db = |v: f64| 10f64.powf(v / 20.0);
+        let touched = self.touched;
         for c in 0..2 {
             let side = 1 + c;
             if touched[0] || touched[side] {
@@ -475,27 +612,29 @@ impl Spectral {
                 self.main[1][k] = m - s;
             }
         }
+    }
+
+    /// Transform a channel back and overlap-add it: the next hop's output.
+    fn inverse(&mut self, c: usize) {
         // Square-root Hann twice at 75 % overlap sums to 2.
         let norm = 1.0 / (2.0 * self.n as f64);
         let (n, hop) = (self.n, self.hop);
-        for c in 0..2 {
-            self.main[c][0].im = 0.0;
-            self.main[c][self.bins - 1].im = 0.0;
-            if self
-                .inverse
-                .process_with_scratch(&mut self.main[c], &mut self.time, &mut self.scratch_i)
-                .is_err()
-            {
-                self.time.fill(0.0);
-            }
-            let acc = &mut self.acc[c];
-            for ((a, t), w) in acc.iter_mut().zip(&self.time).zip(&self.window) {
-                *a += t * w * norm;
-            }
-            self.out[c].copy_from_slice(&acc[..hop]);
-            acc.copy_within(hop.., 0);
-            acc[n - hop..].fill(0.0);
+        self.main[c][0].im = 0.0;
+        self.main[c][self.bins - 1].im = 0.0;
+        if self
+            .inverse
+            .process_with_scratch(&mut self.main[c], &mut self.time, &mut self.scratch_i)
+            .is_err()
+        {
+            self.time.fill(0.0);
         }
+        let acc = &mut self.acc[c];
+        for ((a, t), w) in acc.iter_mut().zip(&self.time).zip(&self.window) {
+            *a += t * w * norm;
+        }
+        self.next[c].copy_from_slice(&acc[..hop]);
+        acc.copy_within(hop.., 0);
+        acc[n - hop..].fill(0.0);
     }
 
     pub fn reset(&mut self) {
@@ -504,12 +643,16 @@ impl Spectral {
         }
         for c in 0..2 {
             self.out[c].fill(0.0);
+            self.next[c].fill(0.0);
             self.acc[c].fill(0.0);
         }
         self.out_pos = 0;
+        self.steps = 0;
+        self.done = 0;
+        // A band's envelopes start again when it next runs (as when it
+        // comes on): a reset clears nothing there.
         for b in self.bands.iter_mut() {
-            b.env.fill(FLOOR);
-            b.reference.fill(-60.0);
+            b.live = false;
         }
     }
 }

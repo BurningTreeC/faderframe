@@ -11,6 +11,12 @@
 //! the reader has completed at least one more processing cycle, at which
 //! point it can no longer hold a reference.
 //!
+//! Further readers (render-ahead threads reading the same tables) each take
+//! a [`Reader`] slot of the epoch and mark their cycles
+//! ([`Reader::begin`]/[`Reader::end`]): a page is freed only once every
+//! such reader that was inside a cycle when the page was unlinked has left
+//! it (or begun another, which cannot see the page).
+//!
 //! # Protocol
 //!
 //! * The reader only accesses pages inside [`PageTable::with`] and never
@@ -38,15 +44,95 @@ use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
+/// Further readers an epoch tracks (besides the audio thread).
+pub const MAX_READERS: usize = 8;
+
 /// Counts completed reader cycles.
 #[derive(Debug, Default)]
 pub struct Epoch {
     done: AtomicU64,
+    readers: [ReaderSlot; MAX_READERS],
 }
+
+#[derive(Debug, Default)]
+struct ReaderSlot {
+    taken: std::sync::atomic::AtomicBool,
+    busy: std::sync::atomic::AtomicBool,
+    cycles: AtomicU64,
+}
+
+/// A further reader's slot (released when dropped).
+#[derive(Debug)]
+pub struct Reader {
+    epoch: Arc<Epoch>,
+    slot: usize,
+}
+
+impl Reader {
+    /// Before a cycle that may read pages (realtime-safe).
+    #[inline]
+    pub fn begin(&self) {
+        self.epoch.readers[self.slot]
+            .busy
+            .store(true, Ordering::SeqCst);
+    }
+
+    /// After it: no page references are held any more (realtime-safe).
+    #[inline]
+    pub fn end(&self) {
+        let s = &self.epoch.readers[self.slot];
+        s.cycles.fetch_add(1, Ordering::SeqCst);
+        s.busy.store(false, Ordering::SeqCst);
+    }
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        let s = &self.epoch.readers[self.slot];
+        s.busy.store(false, Ordering::SeqCst);
+        s.taken.store(false, Ordering::SeqCst);
+    }
+}
+
+/// A further reader not inside a cycle when a page was unlinked.
+const IDLE: u64 = u64::MAX;
 
 impl Epoch {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// A slot for a further reader of the tables this epoch guards (`None`:
+    /// all `MAX_READERS` taken).
+    pub fn reader(self: &Arc<Self>) -> Option<Reader> {
+        let slot = self.readers.iter().position(|s| {
+            s.taken
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        })?;
+        Some(Reader {
+            epoch: Arc::clone(self),
+            slot,
+        })
+    }
+
+    /// Per further reader: its cycles if it is inside one now, else `IDLE`.
+    fn readers_now(&self) -> [u64; MAX_READERS] {
+        std::array::from_fn(|i| {
+            let s = &self.readers[i];
+            if s.busy.load(Ordering::SeqCst) {
+                s.cycles.load(Ordering::SeqCst)
+            } else {
+                IDLE
+            }
+        })
+    }
+
+    /// Whether every further reader inside a cycle at `then` has left it.
+    fn readers_past(&self, then: &[u64; MAX_READERS]) -> bool {
+        then.iter().zip(&self.readers).all(|(&c, s)| {
+            c == IDLE || !s.busy.load(Ordering::SeqCst) || s.cycles.load(Ordering::SeqCst) > c
+        })
     }
 
     /// Reader: a processing cycle is complete (no page references are held).
@@ -67,13 +153,15 @@ pub struct Retired<T> {
     page: Box<T>,
     /// Reader cycles completed when the page was unlinked.
     seen: u64,
+    /// The further readers' cycles then (`IDLE`: not inside one).
+    readers: [u64; MAX_READERS],
 }
 
 impl<T> Retired<T> {
     /// Free the page if the reader has completed a cycle since it was
     /// unlinked; otherwise give it back.
     pub fn try_free(self, epoch: &Epoch) -> Result<(), Self> {
-        if epoch.completed() > self.seen {
+        if epoch.completed() > self.seen && epoch.readers_past(&self.readers) {
             drop(self.page);
             Ok(())
         } else {
@@ -173,11 +261,16 @@ impl<T: Send + Sync> PageTable<T> {
         // completed count exceeds `seen` that cycle (and its reference) is
         // over; later cycles can no longer observe the unlinked pointer.
         let seen = epoch.completed();
+        // The further readers likewise: one that marks a cycle after this
+        // read loads the slot after the swap (sequentially consistent) and
+        // cannot see the old page.
+        let readers = epoch.readers_now();
         // SAFETY: the swap removed the pointer from the table, so this is
         // its unique owner; it came from `Box::into_raw`.
         Some(Retired {
             page: unsafe { Box::from_raw(old) },
             seen,
+            readers,
         })
     }
 }
@@ -293,5 +386,44 @@ mod tests {
         epoch.advance();
         rec.collect(&epoch);
         assert_eq!(rec.pending(), 0);
+    }
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+
+    /// A page unlinked while a further reader is inside a cycle waits for
+    /// that cycle to end, whatever the audio thread's epoch says; readers
+    /// not inside a cycle then do not hold it up.
+    #[test]
+    fn further_readers_hold_pages_until_their_cycle_ends() {
+        let epoch = Epoch::new();
+        let table = PageTable::<Vec<f32>>::new(2);
+        let ahead = epoch.reader().unwrap();
+        let idle = epoch.reader().unwrap();
+        assert!(table.install(0, Box::new(vec![1.0]), &epoch).is_none());
+        ahead.begin();
+        let mut rec = Reclaimer::default();
+        rec.extend(table.evict(0, &epoch));
+        epoch.advance();
+        epoch.advance();
+        assert_eq!(rec.collect(&epoch), 1, "the render-ahead cycle is not over");
+        ahead.end();
+        assert_eq!(rec.collect(&epoch), 0);
+        // A reader that begins a cycle after the unlink cannot see the page.
+        assert!(table.install(1, Box::new(vec![2.0]), &epoch).is_none());
+        rec.extend(table.evict(1, &epoch));
+        ahead.begin();
+        epoch.advance();
+        assert_eq!(rec.collect(&epoch), 0);
+        ahead.end();
+        drop(idle);
+        // Slots come back.
+        let taken: Vec<_> = (0..MAX_READERS - 1)
+            .filter_map(|_| epoch.reader())
+            .collect();
+        assert_eq!(taken.len(), MAX_READERS - 1);
+        assert!(epoch.reader().is_none());
     }
 }

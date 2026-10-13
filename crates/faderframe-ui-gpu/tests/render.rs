@@ -246,16 +246,14 @@ fn frames_go_out_as_dmabufs() {
         let b = &pixels.pixels.as_ref()[y * 280..(y + 1) * 280];
         assert_eq!(a, b, "row {y}");
     }
-    // Shown: the next frames take other buffers, at most four at once.
-    let second = r.render_to(70, 70, 1.0, true, paint).unwrap();
-    let third = r.render_to(70, 70, 1.0, true, paint).unwrap();
-    let fourth = r.render_to(70, 70, 1.0, true, paint).unwrap();
-    let Output::Dmabuf(second) = second else {
-        panic!()
-    };
-    assert_ne!(second.fd, frame.fd);
-    assert!(matches!(third, Output::Dmabuf(_)));
-    assert!(matches!(fourth, Output::Dmabuf(_)));
+    // Shown: the next frames take other buffers, a pool's worth at once.
+    let shown: Vec<_> = (1..faderframe_ui_gpu::DMABUF_POOL)
+        .map(|_| match r.render_to(70, 70, 1.0, true, paint).unwrap() {
+            Output::Dmabuf(f) => f,
+            _ => panic!("a buffer was free"),
+        })
+        .collect();
+    assert_ne!(shown[0].fd, frame.fd);
     assert!(
         matches!(
             r.render_to(70, 70, 1.0, true, paint).unwrap(),
@@ -271,6 +269,7 @@ fn frames_go_out_as_dmabufs() {
     let again = loop {
         match r.render_to(70, 70, 1.0, true, paint).unwrap() {
             Output::Dmabuf(frame) => break frame,
+            Output::Pending => panic!("not rendering ahead"),
             Output::Pixels(frame) => {
                 assert_eq!(frame.pixels.as_ref(), pixels.pixels.as_ref());
                 assert!(
@@ -282,7 +281,48 @@ fn frames_go_out_as_dmabufs() {
         }
     };
     assert_eq!(again.fd, fd);
-    drop((second, third, fourth, again));
+    drop((shown, again));
+}
+
+/// Rendering ahead hands the frame submitted last time over (nothing the
+/// first time) and keeps the newest on the GPU until it is settled.
+#[cfg(target_os = "linux")]
+#[test]
+fn frames_rendered_ahead_come_a_frame_later() {
+    use faderframe_ui_gpu::Output;
+    let Some((_turn, mut r)) = renderer() else {
+        return;
+    };
+    if !r.exports_dmabufs() {
+        eprintln!("skipped: no dmabuf export on {}", r.adapter());
+        return;
+    }
+    let colour = |c: Color| {
+        move |p: &mut dyn faderframe_ui_canvas::Painter| p.fill(Rect::new(0.0, 0.0, 8.0, 8.0), c)
+    };
+    let red = r
+        .render(8, 8, 1.0, colour(Color::rgb(1.0, 0.0, 0.0)))
+        .unwrap();
+    let view = 7;
+    assert!(matches!(
+        r.render_ahead(view, 8, 8, 1.0, colour(Color::rgb(1.0, 0.0, 0.0)))
+            .unwrap(),
+        Output::Pending
+    ));
+    assert!(r.behind(view));
+    // The red frame comes with the next (blue) one.
+    let Output::Dmabuf(frame) = r
+        .render_ahead(view, 8, 8, 1.0, colour(Color::rgb(0.0, 0.0, 1.0)))
+        .unwrap()
+    else {
+        panic!("no dmabuf");
+    };
+    let rows = r.read_dmabuf(&frame).unwrap();
+    assert_eq!(&rows[..32], &red.pixels.as_ref()[..32]);
+    assert!(r.behind(view));
+    r.settle(view);
+    assert!(!r.behind(view));
+    assert!(!r.behind(view + 1));
 }
 
 /// On Windows (D3D12) a frame can go out as a shared texture: the same

@@ -196,6 +196,7 @@ impl ClapInstance {
     fn poll_requests(&mut self) -> faderframe_plugin_host::PluginPoll {
         let (callback, restart, latency, params, dirty, flush) =
             self.instance.access_shared_handler(|s| {
+                s.flush_audio_log();
                 (
                     FfShared::take(&s.callback),
                     FfShared::take(&s.restart),

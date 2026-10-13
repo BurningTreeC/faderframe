@@ -126,6 +126,15 @@ scrollbar { background-color: @ff_bg; }
 .detail-grid { margin-top: 10px; font-size: 9.5pt; }
 .chip { font-size: 8pt; padding: 2px 8px; border-radius: 10px; background-color: @ff_surface_alt; color: @ff_dim; }
 .place-button { min-height: 34px; font-weight: 700; border-radius: 8px; }
+.badge-rt-ok { background-color: alpha(@ff_ok, 0.25); color: @ff_fg; }
+.badge-rt-warn { background-color: alpha(@ff_warning, 0.3); color: @ff_fg; }
+.badge-rt-bad { background-color: alpha(@ff_error, 0.35); color: @ff_fg; }
+.badge-rt-failed { background-color: @ff_surface_alt; color: @ff_dim; }
+.check-section { margin-top: 14px; font-size: 9.5pt; }
+.check-heading { font-weight: 800; font-size: 10pt; color: @ff_fg; }
+.check-verdict { font-weight: 700; padding: 2px 8px; border-radius: 8px; }
+.check-numbers { font-size: 8.5pt; color: @ff_dim; }
+.check-status { color: @ff_dim; font-size: 9pt; }
 "#;
 
 fn css_color(c: Color) -> String {

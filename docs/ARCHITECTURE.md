@@ -125,6 +125,186 @@ enforced by `crates/faderframe-engine/tests/realtime_alloc.rs`, which runs the
 demo project (synth voices, echo, loop wrap, stop/start, graph swap) under a
 counting global allocator and asserts zero allocations and deallocations.
 
+### Keeping the deadline
+
+Allocation-free is not enough: a callback is late when its thread waits
+for memory, for the CPU or for another thread. What FaderFrame does about
+each:
+
+* **Memory the audio thread touches is mapped before it does.** Buffers
+  are made on control threads but first written on the audio thread — a
+  new graph's buffers and delay lines, a delay line as its write head
+  moves on, a recording's capture rings; every first touch of a page was a
+  fault there (553 in 400 callbacks of the demo, 300 more after a graph
+  swap; with transparent huge pages one fault zeroes 2 MB, ~100 µs). The
+  programs install `faderframe_realtime::memory::Prefaulting` as global
+  allocator: every allocation is touched page by page where it is made.
+  RT threads map their stacks at start (`prefault_stack`: DSP workers,
+  the PipeWire data loop's and cpal's first callback). Code and constants
+  fault in too, the first time a path runs (found as a fault in one run of
+  five: the recorder's ring write, run first when recording starts, on a
+  code page nothing had mapped yet): `prefault_code` maps the program's,
+  the C/C++ runtimes', the audio libraries' (PipeWire and its SPA plugins,
+  JACK, ALSA) and the plugin binaries' code and data — at start-up, after
+  each graph build (plugins just loaded; only new mappings) and in the
+  sandbox helper — locked with the rest. `tests/realtime_faults.rs`
+  counts the audio thread's page faults (`RUSAGE_THREAD`): playing, after a
+  graph swap, recording — 0 (40 runs of 40).
+* **Nothing it needs is swapped out.** With an unlimited memory-lock limit
+  (the `realtime`/`audio` group), the process locks every page it touches
+  (`lock_process_memory`: `mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)`
+  — untouched stacks and mappings stay unmapped): decoded samples played
+  once an hour, streamed pages, code. With a finite limit nothing is locked
+  (an allocation past the limit would fail) and the log says why.
+* **The audio path runs at realtime priority, in order**
+  (`faderframe_realtime::priority`): the audio callback on top (PipeWire's
+  and JACK's own; cpal's thread is made `SCHED_FIFO` 80 /
+  MMCSS "Pro Audio" critical on its first callback — cpal itself does not);
+  the DSP workers and sandboxed plugins' audio threads take its scheduling;
+  helpers follow it a step below, re-applied when it changes (the audio
+  thread publishes it every 4096 callbacks): circuit reservoirs and the
+  shallow render-ahead tier P − 1, the deep tier and its workers and MIDI
+  in/out P − 5, disk streaming and the recording writer P − 10 (their I/O
+  takes the realtime I/O class with it). PipeWire's data loop runs
+  `SCHED_FIFO | SCHED_RESET_ON_FORK`: the flag is masked when testing for
+  realtime (it once made the pool and helpers take the audio thread for a
+  normal one), and helpers set it too (threads they start are normal);
+  pools re-read their caller's scheduling when the audio thread's
+  changes. Measured with PipeWire (data loop 83): DSP workers 83, shallow
+  tier 82, deep tier and its workers 78, MIDI out 78, disk 73, UI normal;
+  memory locked; no page faults on any audio-path thread. The UI and other work stay normal:
+  at realtime they would compete with the audio. Threads that cannot get
+  their priority are counted and the session says so once
+  (`priority_failures`); a realtime caller whose pool workers could not
+  follow it runs serially (a preempted worker would stall it). Where the
+  process may not take realtime itself (no `RLIMIT_RTPRIO`), a thread asks
+  RealtimeKit (`faderframe_realtime::rtkit`: `rtkit-daemon` on the system
+  bus, else the desktop portal's Realtime interface — the way out of a
+  Flatpak), through a small D-Bus client of its own (no library): `SCHED_RR`
+  at the priority wanted, capped by rtkit's maximum (20 by default). rtkit
+  wants `RLIMIT_RTTIME`: set to its maximum (hard) and half of it (soft);
+  a thread realtime that long without sleeping gets `SIGXCPU`, whose
+  handler returns it to normal scheduling and counts it, before the hard
+  limit's `SIGKILL`. So that none gets there, helpers breathe under any
+  such limit (ours, or PipeWire's client asking rtkit in our process):
+  `priority::breathe` (in `follow_audio`, which every helper loop calls)
+  blocks 50 µs once a quarter of the soft limit has passed since the
+  thread last did — the kernel counts realtime time only since a thread
+  last slept — and pool workers take the same breath while idle when
+  cycles come too close for them to sleep (`tests/rttime.rs`: against the
+  kernel, a spinning `SCHED_FIFO` thread gets `SIGXCPU`, a breathing one
+  not). A thread already where rtkit would put it does not ask (rtkit
+  allows 25 requests in 20 s by default). rtkit caps priorities at its
+  `MaxRealtimePriority` (20 unless its daemon is started with another
+  `--max-realtime-priority`): the order below the audio thread is kept
+  (19/15/10 under 20); higher needs the `realtime` group.
+* **CPUs stay awake** while the stream runs (`CpuWakeLatency`: 0 µs held in
+  `/dev/cpu_dma_latency` where the system allows; workers sleep between
+  callbacks, and a deep C-state takes hundreds of µs to leave).
+* **No unbounded waits on other threads.** A late circuit reservoir worker
+  is waited for only when its frames cannot exist yet (input given in this
+  very device callback); frames it owes from earlier callbacks are
+  concealed at once (`frames_owed_from_an_earlier_callback_are_concealed_not_waited_for`).
+  A sandboxed plugin's helper is waited for until the callback's deadline
+  (else a block's duration), then its block is silent and counted
+  (`take_underruns`); it is dead only after `BLOCK_TIMEOUT`. A panicking
+  node counts as done (the pool and the executor catch it), so no thread
+  waits for it for ever; the caller of a parallel cycle always keeps a seat
+  (workers still spinning from the last cycle cannot leave it only
+  waiting).
+* **Bursts are spread.** Voice to MIDI listeners are analysed side by side
+  on the DSP workers (`voice::Listening`), not one after another; warped
+  clips prime their stretchers within a quarter of the callback (more
+  wait a block, in the live graph only); a loop is at least
+  `MIN_LOOP_SECONDS` long (every wrap is another pass through the graph);
+  SFZ instruments look up their zones by key (`SampleSet::index`). The EQ:
+  its convolver (linear and natural phase) multiplies a partition's
+  products a share per block (`fir::Convolver::prepare`), a new kernel set
+  prepared over one block before the crossfade; the spectral stage spreads
+  a frame's work (transforms, a band's curves in eight parts, a band's
+  dynamics, the gains, the inverse transforms) evenly over the hop after
+  it, one hop more latency (`spectral::latency` = frame + hop); band
+  designs share a budget of `DESIGN_BUDGET` sections per control step (the
+  bands take turns: a preset recall or Gain Scale moving 24 steep bands
+  takes a few steps, not one), a band without gain (cuts, notch, band
+  pass, all pass) is not redesigned when only its gain moves, and auto
+  gain's loudness estimate advances within what is left (`Loudness`: a few
+  bands' designs, then eight probe points per step). Slowest of 4096
+  64-frame blocks at 48 kHz (`eq_block_peaks`, release; 1333 µs available;
+  ranges over runs), before → after: 24 brickwall cuts with Gain Scale
+  moving 804 → 107–110 µs, with their frequencies moving 809 → 155–193 µs,
+  24 steep shelves with Gain Scale moving 629 → 158–163 µs, 4 spectral
+  bands at the highest resolution 339 → 85–113 µs, 8 bells linear phase at
+  the highest resolution 195–347 → 80–167 µs; auto gain keeps up with
+  bands that never stop moving (`LOUDNESS_SHARE`: an estimate under way
+  finishes first, `auto_gain_follows_bands_that_keep_moving`). MIDI regions carry the controllers' values every
+  `CHASE_EVERY` (512) events (`snapshot::ChasePoints`, made with the
+  snapshot): a jump into a long take chases from the point before, not from
+  the region's start.
+* **A panic resets without a burst.** `reset_processors` fades the output
+  out (the graph-swap dip), resets the graph's nodes in processing order a
+  quarter of a callback at a time while silent (`CompiledGraph::reset_nodes`;
+  upstream nodes first, so nothing reset is fed old tails), then fades in.
+  A node's reset includes the delay lines compensating its inputs (audio
+  and MIDI waiting there came out after the panic before — a note-on still
+  on its way sounded after the notes were released). Large state resets
+  in constant time by being forgotten rather than cleared: delay lines
+  (`dsp::DelayLine`: the Delay's 5 s lines, reverb, modulation; the graph's
+  `AudioDelay`; the EQ's dry delay) count what was written since and read
+  older samples as silence, the EQ's convolver skips spectra from before
+  the reset, its spectral bands start their envelopes again when they next
+  run. Every built-in's reset after playing, at 192 kHz
+  (`tests/reset_cost.rs`, ignored): at most 4 µs (the EQ at its heaviest:
+  137–245 µs before), the Guitar Station's stages reset on their workers
+  (live; 0.6 ms inline, in renders only). Render-ahead tiers reset in place
+  (`AheadLink::reset`: each anticipator on its own thread, at the frame of
+  its sequence it has reached, which it publishes): the transport goes on
+  — no new sequence, no jump — and the output stays silent until the
+  audio thread plays past those frames (what was rendered before still
+  holds the tails; at most the lookahead) (`tests/panic.rs`: the echoes
+  gone, a later click on its sample, the position moving one callback per
+  callback).
+* **The system backend reports one block size.** cpal callbacks vary in
+  size on some systems (and larger ones run in chunks); the nominal size
+  is the largest callback, larger at once, smaller only after 3 s of
+  smaller callbacks (`Nominal`) — no longer a re-prepare and a graph
+  rebuild (preamps, buses rendered ahead) per size, nor a step in the
+  output latency.
+* **No I/O in plugins' log calls**: CLAP and LV2 messages logged while
+  processing are copied into a slot and written by the main thread's poll.
+* **Pages for a locate are loaded first** (`EngineShared::recent_locate`),
+  breadth-first across sources so all tracks come back together, and one
+  failing file no longer stops the others. Render-ahead threads hold epoch
+  reader slots (`Epoch::reader`) so a streamed page is never freed while
+  they read it.
+* PipeWire's xrun count counts xruns (`spa_io_clock.xrun` is a duration in
+  samples; `XRUN_RECOVER` marks this node late).
+
+* **Plugins from other makers are measured, not trusted.** Their code is
+  theirs; the plugin check (`faderframe-plugin-check`) plays one for a few
+  seconds in a `faderframe --check-plugin` helper process (paced like a
+  device; noise in, chords for instruments; then five resets) and counts
+  per call on its audio thread: allocations — the program defines
+  `malloc` and its kin itself (`faderframe-app`'s `alloc_probe`, Linux
+  with glibc: plain forwarding to `__libc_malloc` …, a thread-local check
+  per call; C and C++ plugins allocate there), and the host's own Rust
+  allocations, counted by the prefaulting allocator, are told apart (a
+  FaderFrame bug, reported as such) —, waits (voluntary context switches),
+  page faults and CPU time per block (`faderframe_realtime::usage`). The
+  report's findings and verdict (realtime-safe / mostly / not / not
+  checked) and advice show in the plugin browser (a badge per plugin, the
+  detail panel, "With findings"; "Check" runs those not checked in their
+  version, one after another, cached in `plugin-checks.json`). First
+  results here: PultEQFx and the built-ins clean; Satin allocates in every
+  block (16 per block), Pro-Q 4 waits in every block, Diva allocates now
+  and then and when reset — with the host's allocations at zero in each.
+
+Limits that remain: hosted plugins' (CLAP, VST3, LV2, AU) resets are
+theirs — a panic resets them one per share of a callback, but one that
+clears a lot at once still does it in one go (the check measures it);
+through rtkit, the priority cap is the system's setting; allocations,
+waits and page faults are counted on Linux only.
+
 ## 3. Project model
 
 `faderframe_project::Project` is the persistent model and contains only
@@ -202,8 +382,203 @@ nothing about projects.
   arrival latency over all its inputs (main, sidechain, events) plus its own
   latency; every edge arriving early gets a delay line of exactly the
   difference. Tracks, inserts, buses, sends, returns and the master are all
-  covered because they are all just nodes.
+  covered because they are all just nodes (details below).
 * **Scheduling** is dependency-driven and multicore (below).
+
+### Plugin delay compensation and what is heard
+
+**The latency contract.** `Processor::latency()` is the delay a node adds,
+in whole frames at the graph's (host) rate, read when compiling; zero
+unless declared. Plugins report through `PluginInstance::latency_samples()`
+in host frames — built-ins compute it from their parameters (a device that
+oversamples or runs a reservoir reports its total in host frames; the
+EQ's linear phase is `N / 2 + PARTITION`, its spectral stage one frame
+size and the hop its work is spread over, natural phase `PRE +
+PARTITION`: resolution 1 linear phase with a spectral band is 4352 + 2048
++ 512 = 6912 frames, whatever the rate, so 144 ms at 48 kHz and 72 ms at
+96 kHz), CLAP/VST3/LV2/AU from the plugin. A
+change (phase mode, resolution, a CLAP `latency.changed`, VST3
+`kLatencyChanged`, an LV2 latency port) makes `poll()` ask for a restart:
+the graph is rebuilt off the audio thread and swapped in whole; latency is
+part of a plugin node's key, so the old processor is not adopted into the
+new place. Bypassing a plugin from the slot rebuilds with the node at zero
+latency (a plain pass-through); *automated* bypass is soft — the plugin
+keeps running and the dry signal is delayed by its latency, so nothing
+moves. Nothing counts a latency twice: a node reports its own, the graph
+adds upstream. `engine/tests/pdc.rs` measures the EQ: an impulse alone
+comes out 6912 frames late (the reported figure), and beside a dry track
+both meet on that sample.
+
+**Arrival.** `compile()` walks the nodes in topological order: a node's
+*arrival* is the latest output latency among its non-early inputs (and the
+node it follows without an edge, a hardware insert's send); each input is
+delayed by arrival − its latency (`AudioDelay`/`EventDelay`, ring buffers
+of delay + max block, made with the graph; any block size, delays not
+multiples of it). Serial plugins add (128 + 6400 + 256 = 6784); paths that
+split and meet again (sends to a return with latency, containers' chains,
+nested buses) meet on the same sample — the compensation goes on the
+shorter edge at the summing point only, so nothing is delayed twice.
+
+**Outputs heard together.** After the walk, every *heard* output — the
+device outputs and MIDI outputs, not a hardware insert's send (its return
+times itself from it) — is held back to the latest of them: a direct out
+on 3/4 waits for the master on 1/2. `GraphStats::output_latency` is that
+figure: how far behind the timeline processed every output is.
+
+**Feedback.** The graph is a DAG: routings that would close a loop are
+refused by the project layer and the compiler (and crosstalk that would
+form one is skipped with a warning), so there is no cyclic case to
+compensate.
+
+**Automation behind latency.** The graph tells each processor its arrival
+(`Processor::set_input_latency`, at compile time and again when a processor
+is adopted into a new graph). A node whose input arrives `L` frames late
+processes audio that was played `L` frames ago — so strips, sends,
+crosstalk and plugin nodes read their automation there
+(`nodes::automation_at(cx, latency, offset)`): a fader step after a
+6400-frame plugin comes 6400 frames later than its curve's point, exactly
+with its audio. "Played `L` frames ago" goes through the **play history**
+(`engine::history::PlayHistory`, in every graph's `EngineContext`): each
+chunk processed is recorded (graph frame counter, timeline position,
+playing, the transport's jumps), as runs that continue each other — a
+fixed ring of 64 runs, no allocation. Reading back across a loop wrap, a
+locate or a stop gives the position from before it
+(`PlayHistory::pieces` splits a block where a run starts; plugin
+parameter events follow each run). The render-ahead graphs keep their own
+history.
+
+**Modulation behind latency.** Modulators are evaluated where the track's
+input is (`ModNode`) and stamped with the graph frame of the audio they
+belong to: the `ModBus` keeps the last `MOD_HISTORY` (1024) blocks, each
+stamped `chunk_start − input latency` of the modulation node. Strips and
+plugin nodes read the block of their own audio
+(`TrackModulation::{strip_at, plugin_mods_at}` at `chunk_start − their
+arrival`): an LFO on a device after a 6400-frame plugin moves with the
+audio it shapes, not 6400 frames early (`engine/tests/modulation.rs`
+`modulation_behind_latency_follows_its_audio`).
+
+**A latency change while playing** (a phase mode switched, a plugin
+reporting another figure) swaps in a graph whose paths line up again —
+but the audio would jump by the difference. The engine compares the two
+graphs node by node (`CompiledGraph::timing_changed_from`: a merge over
+their sorted keys, no allocation) and, when anything that both have sits
+at another latency, dips instead of clicking: the old graph fades out over
+`DIP_SECONDS` (4 ms), a few silent blocks while the delay lines fill, the
+new one fades in (`engine.rs` `Dip`, `apply_dip` after the render;
+`a_latency_change_while_playing_dips_instead_of_clicking`). A change no
+path notices (a new track) installs at once.
+
+**The metronome** plays as late as the outputs: its beats are those of
+the history `output_latency` back (a locate restarts it as heard). It
+clicks the first beat of each bar, the other beats and — when given a
+level — the off-beats (the eighths between beats), each at its own level
+under one volume (`MetronomeShared` atomics). The sounds (`ClickSounds`: a
+built-in `ClickSound` synthesised, or the user's audio files, an optional
+second one for the first beat) are made on the control side at the
+stream's rate (`session::metronome`, made again when the rate changes) and
+handed over whole through a mailbox; the audio thread plays them in a few
+overlapping voices (Preferences → Metronome; right-click the metronome
+button).
+
+**Timing model: processed versus heard.** Four positions, kept apart:
+
+* the *timeline* (musical) position — what clips, automation, markers and
+  edits are anchored to; nothing is moved for latency;
+* the *processing* position — `TransportState::position`, where the
+  sources are being read (`Session::processing_position`);
+* the graph's *output latency* (above) and the device's (`buffer +
+  driver output latency`, varispeed's resampler):
+  `EngineController::output_latency() = device_latency() +
+  graph_latency()` — processing to hearing;
+* the *heard* position — the timeline position of the audio leaving the
+  speakers now.
+
+After every callback the audio thread publishes the history around what
+will be heard until the next one (`history::HeardClock`: a seqlock over
+atomics — the reader retries, the audio thread never waits) with the
+callback's start time. `EngineController::heard_at(now)` maps a time to the
+heard position: frames since that callback at the stream rate (× speed),
+less the device latency and the graph's, looked up in the runs — exact
+across wraps and locates, never past what was processed, `None` after a
+second without callbacks. While a locate or stop has not reached the ears
+it reports where the transport went (`Heard::jumped`).
+
+`Session::transport()` / `playhead()` present that: computed when asked
+(views painting get their own frame's position, not the 16 ms tick's),
+steadied — callbacks are stamped when they start, which jitters, so the
+playhead moves at the playback rate and eases onto the measured position
+(within ~0.2 s), and takes a new run (wrap, locate, start, stop) or a
+far-off measurement as it is. A locate shows its target at once and waits
+there until its audio arrives; play from stopped waits at the start while
+the latency fills. Everything drawn from the transport — arranger and
+piano-roll playheads, follow scrolling, the transport display, surface
+timecode, automation values shown (`display_value` reads the curve at the
+playhead) and automation written while touching (at the playhead the
+player heard) — follows the heard position. Things timed against the
+engine use the processing position (launcher quantisation, stop-at,
+render-ahead). External sync uses `output_latency()`: MIDI clock and MTC
+are sent when their position is heard; video pictures, captured MIDI,
+recorded SysEx and MTC chase all count the graph's latency too.
+
+**Meters** read a strip as it is processed; its audio is heard after the
+latency still ahead of it (buses, the master's devices, compensation —
+`EngineController::meter_delay(track)` = output latency − the latency
+where it is metered) plus the device's. The session holds each reading
+back by that (`Session::tick_meters`: per track a queue of stamped readings,
+ballistics run as they are shown), so a dry track's meter beside a
+6400-frame one lights when it is heard, the latent one's at once; peaks and
+overs are kept, just later. The Tools analysers read the master's scope as
+processed and **read as heard**: `poll_analysis` reads the scope up to
+`written − (meter_delay(source) + device latency)` (`ScopeRing::read_between`),
+so a spectrum or loudness reading of a track behind a 6400-frame plugin
+moves with what is heard (`the_analyser_reads_its_track_when_it_is_heard`).
+
+**Recording.** A player hears playback the output latency after it is
+processed and plays along: takes move back by the device's input and
+output latency, the user's offset **and the graph's output latency**
+(`session/tests/pdc.rs`: a take of the playback through a patch cable
+lands on the same sample with 6400 frames of plugin latency as without).
+
+**Offline renders** run the same graph through `OfflineRenderer` (one
+engine, the same compensation and history) and drop `output_latency`
+frames from the front, rendering that much further so the tail is whole
+(`render_one`; freezes keep the latency and are claimed by the frozen
+player). Renders never use low-latency monitoring (their engines are
+their own).
+
+**Low-latency monitoring** (Audio → Low-Latency Monitoring,
+`Session::set_low_latency_monitoring`, remembered): tracks *heard live* —
+a hardware input monitored (always, or armed with auto monitoring) or
+played from a MIDI keyboard (`build::live_monitored`) — bypass their
+effects with latency (instruments never) and their outputs and sends are
+**early** edges (`GraphBuilder::connect_audio_early`: summed as they
+arrive, not delayed to the other paths, not holding them back). The
+player hears themselves at once instead of after the slowest plugin
+elsewhere; everything else stays aligned, takes are placed as always. A
+track's own playback while it is heard live is early too. **The whole way
+out** is cleared: the buses, returns and master a monitored track reaches
+(`build::monitored_path`) bypass their effects with more latency than the
+limit (Preferences → Audio, `Session::set_low_latency_limit`, default
+`DEFAULT_LOW_LATENCY_LIMIT_MS` 3 ms — short lookaheads and console stages
+stay), and the compiler's `clear_the_way` pass carries early audio through
+every summing point after it (a bus summing an early input and late ones
+lets the early one through at once and delays the others to each other),
+so nothing on the path waits (`early_audio_passes_every_summing_point_after_it`,
+`low_latency_monitoring_clears_the_whole_way_out`). Arming or a live MIDI
+change rebuilds when the set changes; the Performance view lists the
+tracks and the effects bypassed ("bypassed while monitoring").
+
+**Cost.** Recording a callback in the history, 64 read-backs and the
+heard clock: ~136 ns (`history::cost::cost_per_callback`, release). The
+128-track benchmark (64 frames, one thread) with 6400 frames of latency
+on every other track: 280 → 316 µs per callback, the delay lines' memory
+traffic; pan automation behind it ~8 µs more than without latency
+(`faderframe-bench --latency 6400 [--pan-automation]`).
+
+**Diagnostics.** The Performance view (F8) shows per plugin its latency,
+per track the latency where it is metered or the compensation it waits
+for, and the graph's compensation and processing-to-hearing totals in
+frames and milliseconds.
 
 ### Multicore processing
 
@@ -374,8 +749,8 @@ MIDI clip player ──events──► instrument plugin       MIDI tracks ─�
 
 The channel strip implements polarity, mute, the fader (dB via a table-driven
 console `FaderLaw`, unity at 75 % travel, "-inf" stored as −144 dB) and
-pan: constant-power −3 dB for mono sources, 0 dB balance for stereo sources
-(`faderframe_core::pan`). All gain changes are ramped per block. A strip
+pan (see *Panning* below: mono pan by the project's pan law, balance or
+dual pan for stereo sources). All gain changes are ramped per block. A strip
 also applies its VCAs: the static gain of unautomated VCAs comes in a
 parameter slot, automated VCA faders and mutes as lanes in the timeline
 snapshot (so VCA automation is sample-accurate on every member). The strip
@@ -435,36 +810,267 @@ of the analysed track (the Tools view) copies its post-fader output into a
   nodes: a clip player plays the rendered file into the strip, and the
   plugin host unloads their plugins (state stays in the slots).
 
+### Panning
+
+Positions are −1…1 (hard left … hard right, 0 centre) everywhere: the
+project, lanes, parameter slots and `faderframe_core::pan`, whose functions
+clamp and read NaN as centre (`pan::position`) so no value can reach the
+audio as NaN. Gains are a 2 × 2 `PanMatrix`, `m[source][destination]`. The
+strip chooses by what it has to place — its input is `Track::chain_layout()`
+(after the inserts, so a device that widens a mono track makes it stereo),
+its output `Project::destination_layout`:
+
+* **Mono pan** (a mono source into stereo): `PanLaw::mono_gains`, by the
+  project's pan law (`Project::pan_law`, Preferences → Project; the
+  default is −3 dB). Every law gives exactly `(1, 0)` hard left and
+  `(0, 1)` hard right and is mirror-symmetric:
+  * −3 dB, constant power (default): `θ = π (p + 1) / 4`, `L = cos θ`,
+    `R = sin θ` (computed as `sin(π/4 (1 − p))`, `sin(π/4 (1 + p))` so the
+    ends are exact); `L² + R² = 1`; centre 0.7071 (−3.0103 dB).
+  * −4.5 dB, compromise: `L = √(cos θ · (1 − p)/2)`, `R` likewise — the
+    geometric mean of the −3 dB and −6 dB laws; centre 0.5946
+    (−4.515 dB); power dips 1.5 dB at centre.
+  * −6 dB, linear: `L = (1 − p)/2`, `R = (1 + p)/2`; `L + R = 1`, so the
+    output's mono sum never changes; centre 0.5.
+  * 0 dB: `L = min(1, 1 − p)`, `R = min(1, 1 + p)`; centre at unity, a
+    centred source 3 dB louder (power) than one at a side.
+* **Balance** (a stereo source into stereo, `PanMode::Balance`, the
+  default): `L·min(1, 1 − p)`, `R·min(1, 1 + p)` — centre unity on both
+  sides, the opposite side attenuated linearly, a diagonal matrix (no
+  crossfeed, nothing summed, left stays left). The pan law never applies.
+* **Dual pan** (a stereo source into stereo, `PanMode::Dual`,
+  `Track::dual_pan`): each input channel is a mono source placed by the pan
+  law from its own position — `out_L = in_L·law(l).L + in_R·law(r).L`,
+  `out_R = in_L·law(l).R + in_R·law(r).R`. The defaults (`DualPan::ORIGINAL`,
+  −1/+1) are the identity, as is balance at centre, so switching an
+  unpanned track changes nothing. Moving the positions together narrows
+  the image, moving both one way moves it, `(+1, −1)` swaps the sides.
+  Where the positions meet the channels add: at one position the source is
+  mono there, `(in_L + in_R)` by the law (−3 dB law, centre: `0.707 (L + R)`
+  per side — correlated material rises 3 dB, uncorrelated keeps its power;
+  antiphase material cancels as it would in any mono fold). With the −3 dB
+  law each channel's power is spread, never changed.
+* Into a **mono** destination there is nothing to pan: the graph's channel
+  rule folds stereo to `(L + R)/2` and pan, balance and dual pan do not
+  apply (`Project::pans_stereo` is false; the UI offers no mode). Other
+  layouts (`Discrete`, beds) go through the graph's rules or the surround
+  panner's matrix (below), never through these laws.
+
+Stereo **width** is not a strip control: the Utility insert has an M/S
+width (and balance, channel modes, mono bass), and dual pan narrows by
+position. The mode is per track (`Track::pan_mode`, `Command::SetTrackPanMode`);
+both settings are kept whatever the mode, so switching back restores the
+earlier sound, and lanes of the other mode stay in the project (they do not
+drive anything until the mode returns).
+
+**In the engine** the law, the mode and both dual positions are parameter
+slots (`SlotRegistry::pan_law`, `StripSlots::{pan_mode, pan_left,
+pan_right}`), so every pan edit — the law and the mode too — is
+`Impact::Params`: no rebuild, applied at the next block. Each
+source/destination pair ramps from its gain at the end of the last range
+to the new one. When only positions move (same mode and law) they glide:
+the strip interpolates the *positions* across the range, a matrix every
+16th of the pan range moved (`GLIDE_STEPS_PER_UNIT`, at most one a frame),
+the gains ramping linearly between — a hard-left-to-right jump keeps the
+−3 dB law's power within 0.003 dB on the way instead of dipping 3 dB as a
+crossfade of the gains would. A change of mode or law crossfades the
+matrices over the block. Pan automation (`TrackPan`, `DualPanLeft`,
+`DualPanRight`) is read every `AUTOMATION_STEP` (32) frames like the fader,
+from absolute timeline positions, so with blocks that are multiples of 32
+any block size renders identically (`automation_plays_the_same_whatever_the_block_size`).
+Pan modulation moves the mono pan or balance, and a dual-panned image as a
+whole (both positions, each clamped). No pan stage adds latency, buffering
+or allocation (`panning_does_not_allocate`).
+
+**Signal path.** Pan sits in the strip after the inserts and the fader:
+the post-fader output (out 0) is panned into the destination layout and
+feeds the destination, post-fader sends and the meters; the pre-fader
+output (out 1) and pre-FX taps are unpanned, in the track's layout, so
+pre-fader and pre-FX sends ignore both the fader and the pan (a mono
+track's pre-fader send reaches both sides of a stereo return at unity, the
+graph's channel rule) while post-fader sends carry the panned, faded
+signal. Buses and the master pan their own sum once with their own control
+(a stereo bus or master: balance or dual pan) — nothing is panned twice.
+Into a surround bed the surround panner takes over (below). A strip's
+meters show its post-fader, post-pan output in the destination layout.
+
+**Compatibility.** `pan_mode`, `dual_pan` and `pan_law` are new optional
+fields (written only when not the default), so files from before load as
+they always played — mono −3 dB constant power, stereo linear balance — and
+the file version did not change. Older FaderFrame builds ignore the fields
+(a dual-panned track opens there as balanced). Track presets carry the mode
+and positions the same way. Tests: `faderframe-core` `pan::tests`
+(reference values, invariants, NaN/out-of-range), `engine/tests/panning.rs`
+(output samples per law and mode, glides, mode switches, automation
+timing, buses, sends, the master, mono destinations, phase),
+`project/tests/project.rs` (undo, files, older files), `session/tests/panning.rs`,
+the mixer's and the arranger's view tests.
+
+**Controls.** A mono strip has one Pan knob; a stereo strip's knob is a
+Balance (tooltip, accessible name and lane say so). Right-click it (or the
+strip's or track header's menu → Pan Mode) for Balance / Dual Pan; in dual
+pan the mixer shows two knobs side by side — left input, right input —
+each with its readout (click to type, double-click: back to its side,
+wheel, Shift/Ctrl fine, MIDI learn per side). The arranger's header keeps
+one knob: its pointer at the image's middle, a dot per channel; dragging it
+moves both channels, a double-click restores them. The "Pan" MIDI-learn
+target addresses the mono pan / balance (a dual-panned track's sides are
+learnable on their own knobs). A control surface's pan pot on a
+dual-panned track moves the image as a whole — stopping at the side, never
+narrowing it — or, with Shift held, the left side, with Option the right;
+its ring and display show the image's middle (or that side; `L60R40`,
+`<L60`, `R40>`), OSC's absolute pan centres the image there
+(`session::control` `set_dual_pan_from_surface`, test
+`a_pan_pot_moves_a_dual_panned_image`).
+
 ### Surround beds
 
 Channel-based beds before any object-based format: `faderframe_core::surround`
 defines the formats (LCR, quad, 5.0/5.1, 7.0/7.1, 5.1.2/5.1.4, 7.1.2/7.1.4;
 `ChannelLayout::Surround`) with their channels in WAVE channel-mask order —
-files and device outputs need no reordering — and each speaker's place in
-a room box (`x` left/right, `y` back/front, `z` ear level/ceiling; the LFE
-has none). Any audio track, bus, aux or the master can be a bed (Channel
-Format in the track menus, `Session::format_choices`).
+files and device outputs need no reordering (hardware outputs map a bed's
+channels in that order from the output's first channel). Each `Speaker`
+has an identity (label, mask; the LFE flagged, with no place or direction)
+and two descriptions of where it stands: a place in a room box (`x`
+left/right, `y` back/front, `z` ear level/ceiling) for the room panner and
+a direction (`azimuth` in degrees, 0 ahead, positive to the left as in
+ITU-R BS.2051/ADM; `elevation` above ear level) for VBAP and binaural
+listening — one table both use. Fronts stand at ±30°, 5.x surrounds at
+±110°, 7.x sides at ±90° and backs at ±135°, quad's rears at ±135°, tops at
+±45°/±135° and 30° up (x.1.4), top middles at ±90° and 45° up (x.1.2).
+`Speaker::role` (front, centre, surround, height, LFE) and `side` come from
+the direction, never from a channel index. Any audio track, bus, aux or the
+master can be a bed (Channel Format in the track menus,
+`Session::format_choices`).
+
+* **Custom speaker layouts** (Audio → Speaker Layouts…,
+  `faderframe-ui/src/speaker_layouts.rs`; dev action
+  `speaker-layout:<name>=<label>@<az>[/<el>];…`, `LFE` alone the LFE):
+  a `LayoutDef` lists up to `MAX_SPEAKERS` (16) channels in order — the
+  order of the device's outputs and of files — each a direction
+  (azimuth −180…180°, elevation −90…90°) or the LFE (at most one).
+  `LayoutDef::validate` refuses an empty or built-in name, repeated or
+  empty labels, a second LFE, no main speaker and anything VBAP cannot pan
+  over (`Vbap::new`: two speakers within 1°, a 3D set that leaves the
+  listener outside). `LayoutDef::intern` makes it a format,
+  `SurroundFormat::Custom(&'static CustomLayout)`: interned once per
+  definition (the leaked layout lives as long as the program; formats
+  compare and hash by it), so `ChannelLayout` stays `Copy` and the audio
+  thread holds a plain reference — no lock, no allocation. Each speaker's
+  room place is derived from its direction (on the box's walls; above ear
+  level the top layer), its WAVE mask is 0 (files carry no speaker
+  positions for it). The project keeps its library
+  (`Project::speaker_layouts`, `Command::SetSpeakerLayouts`, no audio
+  impact); a track's file entry carries the layout it uses in full, so a
+  project or a preset reads back on its own. `Session::save_speaker_layout`
+  (`Action::SaveSpeakerLayout`) moves the tracks on a layout it replaces
+  to the new version in the same undo step; `remove_speaker_layout` refuses
+  a layout in use. Into or out of a custom layout a bed's speakers are
+  placed by VBAP at their directions (between built-in formats by their
+  room places, as before); into stereo or mono by the downmix's roles
+  (from the directions); IAMF refuses a custom master whose speakers do
+  not all have a place in the IAMF layout (by label), ADM writes speakers
+  outside a standard bed as fixed objects at their places.
 
 * **Panning.** A mono or stereo track feeding a bed
-  (`Project::surround_panned`) is placed by its `SurroundPan` (x, y, z,
-  spread, stereo width, LFE send; `Command::SetTrackSurround`): power-
-  preserving crossfades between the floor and the top layer, the rows of a
-  layer and the speakers of a row, as console and Dolby bed panners work;
-  `spread` blends towards all speakers alike; a stereo source's channels sit
-  `width` either side of the position; the LFE is a separate send. A bed
-  into another format places each of its speakers where it stands (7.1.4
-  into 5.1, 5.1 into stereo, 5.1 opened up into 7.1.4); into its own format
-  it passes straight. `surround::matrix` computes all of these without
+  (`Project::surround_panned`) is placed by its `SurroundPan`
+  (`Command::SetTrackSurround`) through one of two panners
+  (`SurroundPan::panner`; each keeps its own values when the other is
+  chosen):
+  * **Room** (the default; what older projects use): x, y, z —
+    power-preserving crossfades between the floor and the top layer, the
+    rows of a layer and the speakers of a row, as console and Dolby bed
+    panners work. Objects are always placed by it (their ADM metadata is
+    the room position; `Project::effective_surround`).
+  * **VBAP** (`faderframe_core::vbap`): azimuth and elevation. A source
+    plays on the two (horizontal formats) or three (formats with tops)
+    speakers around its direction, `p = Σ gᵢ sᵢ` solved with the
+    precomputed inverse of each region's matrix and normalised to
+    constant power (`Σ g² = 1`); exactly one speaker at its own direction,
+    continuous across region edges, mirror-symmetric in symmetric formats,
+    never the LFE. 2D: neighbours by azimuth; a gap of 180° or more (LCR
+    or stereo behind the listener) cannot be represented with positive
+    gains and is crossfaded by angle between its end speakers (`covers`
+    says so). 3D: the convex hull of the speakers plus a virtual one below
+    (nothing in FaderFrame's formats is below ear level; its share is left
+    out), faces of four or more coplanar speakers (7.1.4's tops) split
+    around a virtual centre speaker whose share goes to each at 1/√k, so
+    overhead in 7.1.4 is the four tops alike; elevation 0…90°, down to
+    −90° in a (custom) layout with speakers below ear level — which has
+    no virtual speaker below and is panned over the whole sphere
+    (`SurroundFormat::elevation_range`, `SurroundParam::range_in`: the
+    knob and the lane offer what the format has; `Vbap::min_elevation`);
+    ignored in 2D formats (the panner offers no elevation there). `Vbap::new`
+    validates a speaker set (no speakers, duplicates within 1°, NaN, a
+    hull that leaves the listener outside) and runs off the audio thread:
+    each `MatrixMix` into a bed makes its destination's geometry when the
+    node is built; `gains` then allocates nothing and never yields NaN.
+  * **Spread** (both panners) blends a point's gains towards every main
+    speaker alike, power for power (`g' = √((1 − s)g² + s/n)`): the same
+    signal on more speakers — a wider, coherent image (off-centre
+    listeners hear comb filtering, a fold to fewer speakers adds it in
+    phase). **Diffuse** (`SurroundPan::diffuse`, the panner's Diffuse
+    button) instead leaves the point `√(1 − s)` of its gains and adds a
+    diffuse field: the source's channels summed, `√(s/n)` on each main
+    speaker through a decorrelation filter of its own
+    (`surround::diffuse_gain`, `nodes::diffuse::Diffuser`: four Schroeder
+    all-pass sections, feedback 0.5, delays 1.7–9.3 ms offset per
+    speaker) — the same power as the coherent spread, flat in level, no
+    delay as a whole; copies uncorrelated with each other (they add in
+    power when folded), transients smeared over the filters' tails. The
+    filters are made with the graph, only for tracks whose spread is
+    diffuse (`build::diffuse_tracks`; a parameter edit that changes that
+    set rebuilds; strips' and following sends' node keys carry it);
+    objects are always coherent.
+  * **Stereo sources** (`SurroundPan::stereo`): **Image** (default) — the
+    pair placed as a whole, its channels `width` either side (room:
+    `x ∓ width`; VBAP: `azimuth ± 30° × width`, so width 1 at azimuth 0 is
+    the format's L and R exactly; turned to the back the image is rotated,
+    its left on the listener's right-back); **Balance** — not placed: left
+    on the format's L, right on its R, at the strip's balance (`Track::pan`
+    and its lane; unity at centre, no spread, no crossfeed; the strip shows
+    its balance knob); **Dual** (VBAP) — each channel at its own azimuth
+    (`left`, `right`, shared elevation); where they meet they add.
+  * **LFE**: a separate send (`lfe_db`, shared by a source's channels),
+    never reached by a position and never part of the panners'
+    normalisation. Nothing filters it: what is sent reaches the LFE
+    channel full range (bass management is not implemented; binaural
+    listening low-passes it at 120 Hz for the ears only).
+  A bed into its own format passes straight; into another bed each of its
+  speakers is placed where it stands (7.1.4 into 5.1, 5.1 opened up into
+  7.1.4), LFE to LFE; into stereo or mono it folds by the project's
+  downmix (below). `surround::matrix` computes all of these without
   allocating.
+* **Downmix** (`Project::downmix`, `Command::SetDownmix`, Preferences →
+  Project; parameter slots, so a change is heard at once, ramped): with
+  coefficients, `Lo = fronts on the left + centre·C + surround·(left
+  surrounds) + height·(left tops) + lfe·LFE`, `Ro` alike, mono
+  `(Lo + Ro) / 2` (as FaderFrame folds any stereo to mono). New projects
+  use −3 dB (1/√2) for the centre, surrounds and tops and leave the LFE out
+  — the centre and surround coefficients of the common ITU-R BS.775 Lo/Ro
+  downmix (FaderFrame claims no conformance beyond them; BS.775 has no
+  tops). Projects saved before the setting fold **by place** (each
+  speaker where the room panner puts it: 5.1 → `L + 0.707·C + Ls`, the
+  surrounds at unity) as they always did — except into mono, where the
+  old fold summed every speaker at unity (up to +14 dB) and now takes
+  `(Lo + Ro) / 2`. Nothing normalises: a full-scale 5.1 whose channels all
+  carry one signal peaks at 1 + √2 (+7.7 dB) in the −3 dB fold. The
+  downmix applies wherever a bed becomes stereo or mono: strips and sends
+  into narrower layouts, `FoldDown` and `ListenOut` before the device, the
+  mono check, stereo renders of a bed master.
 * **The strip.** Into or out of a bed the `ChannelStrip` mixes through that
   matrix instead of its pan law (each source/destination pair ramped; the
-  matrix is remade when the panner's six slots move). The pan values are
-  automatable (`AutomationTarget::Surround(SurroundParam)`; the snapshot's
-  `TrackAutomation::surround`, read every `AUTOMATION_STEP` like pan,
-  echoed by `StripEcho` when rendered ahead); a panned track lists them in
-  place of Pan, the session writes them from `SetTrackSurround` in
-  Touch/Latch/Write, MIDI learn sets one value. Node keys tell layouts of
-  equal width apart.
+  matrix is remade when the panner's slots, the balance or the downmix
+  move — `SURROUND_VALUES` slots per strip, `SurroundPan::values`). The
+  values are automatable (`AutomationTarget::Surround(SurroundParam)`: x,
+  y, z, spread, width, LFE, azimuth, elevation, the dual pair's azimuths;
+  azimuths wrap round ±180°; the snapshot's `TrackAutomation::surround`,
+  read every `AUTOMATION_STEP` like pan, echoed by `StripEcho` when
+  rendered ahead, so movement through speaker regions is sample-for-sample
+  the same at any block size that is a multiple of 32); a panned track lists
+  those its panner and mode use (`SurroundParam::applies`) in place of Pan,
+  the session writes them from `SetTrackSurround` in Touch/Latch/Write,
+  MIDI learn sets one value. Node keys tell layouts of equal width apart.
 * **Sends** into or out of a bed mix through the same matrix
   (`nodes::strip::MatrixMix`, shared with the strip): a mono or stereo
   track's pre-FX or pre-fader send into a bed follows the track's panner
@@ -483,14 +1089,42 @@ Format in the track menus, `Session::format_choices`).
   (`write_wav_mask`, `WavWriter::create_with_mask`; `read_wav` reads masks
   back); stereo folds it down.
 * **Views.** The mixer strip of a track panned into a bed shows the room
-  from above in place of the pan knob (drag the puck, wheel for left/right,
-  double-click or a click on the readout opens the panner), a bed's own
+  from above in place of the pan knob (room: drag the puck, wheel for
+  left/right; VBAP: the circle of directions, a drag across or the wheel
+  turns it, a dual pair together; double-click or a click on the readout
+  opens the panner; balanced into the bed: its balance knob), a bed's own
   strip shows its format, meters widen for every channel and a folded
   hardware output says so. The Surround Panner (`faderframe-view-surround`,
   `ViewKind::Surround`, View → Surround Panner) shows the selected track's
-  room with its speakers lit by what they play, the puck (a stereo track's
-  two channels), its spread and height, and knobs for height, spread, width
-  and the LFE send; every move is one gesture.
+  room with its speakers lit by what they play; a toolbar picks the panner
+  (Room/VBAP; the first switch to VBAP starts from the room position's
+  direction) and a stereo source's way in (Image/Balance/Dual); VBAP draws
+  the circle (speakers at their azimuths, tops nearer the middle by the
+  cosine of their elevation) and drags round the listener (dual: either
+  channel); the knobs show what applies (azimuth, the dual pair, elevation
+  in formats with tops, height, spread, width, LFE) and a click on a
+  knob's value types it (`L30`, `R110`, `-45`, `off`); every move is one
+  gesture. Dev actions `surround-panner:<track>=<room|vbap>`,
+  `surround-stereo:<track>=<image|balance|dual>`,
+  `downmix:<standard|by-place>`; `surround:` takes the values in
+  `SurroundParam::ALL` order (x/y/z/spread/width/lfe/azimuth/elevation/…).
+* **Tests.** `faderframe-core` `vbap::tests` (speaker-aligned positions,
+  reference values, symmetry, continuity, 5.1 vs 7.1, gaps, 3D and
+  elevation, invalid layouts and values) and `surround::placing` (downmix
+  coefficients, mono, headroom, stereo modes, LFE, persistence),
+  `engine/tests/spatial.rs` (output samples in 5.1/7.1/7.1.4, LFE, stereo
+  modes, azimuth and elevation automation, live downmix, the headphone
+  switch), `engine/tests/surround.rs`, `spatial_panning_does_not_allocate`,
+  `session/tests/spatial.rs`, the surround view's and the mixer's tests,
+  `binaural` `each_speaker_reaches_the_ears_through_its_own_direction`.
+  `faderframe-bench --bed 5.1|7.1|7.1.4 --panner room|vbap [--pan
+  mono|balance|dual] [--pan-automation] [--headphones]` measures them.
+  Custom layouts: `surround::custom` (identity, files, validation,
+  places, folds, 16 channels), `a_custom_layout_is_a_bed_like_the_others`,
+  `speaker_layouts_are_kept_edited_and_offered`; bass management:
+  `nodes::bass::tests` (crossover flatness, routing, LFE band limit,
+  crossfade), `bass_management_moves_the_mains_lows_to_the_sub`,
+  `bass_management_is_listening_only`.
 
 ### Object-based masters
 
@@ -595,17 +1229,36 @@ open encoder, a paid specification and per-unit patent royalties.
 
 What the master does on its way to the interface is listening, never part
 of a render (renders build their own engine, which listens on speakers):
-the master's hardware output always passes `nodes::ListenOut`
-(`build::Listen` from `EngineController::set_binaural`, a graph rebuild;
-other tracks with hardware outputs keep the plain fold-down).
+the master's hardware output always passes `nodes::ListenOut` (other
+tracks with hardware outputs keep the plain fold-down). Its node key leaves
+listening out, so a rebuild keeps the running node; a change of listening
+(`EngineController::set_binaural`/`set_head`/`set_headphone_correction`
+then `relisten`) makes the new `nodes::Listening` (a renderer for the
+master's layout, or none) on the control thread and hands it over through
+`nodes::ListenLink` (two mailboxes); the node crossfades to it over 30 ms
+(constant power, `SWITCH_SECONDS`) and hands the old one back to be
+dropped on the control thread — switching speakers ⇄ headphones never
+rebuilds or clicks. Headphones play on the device's first two outputs
+(a 5.1 device's others are silent). A head that cannot be read is refused
+by the session and listening stays as it was; a renderer that cannot be
+made leaves the speakers. Binaural renders set their listening before
+their engine's first graph is installed, so they are built with it (and
+its latency taken off the front). The Performance view's graph latency is
+the node's as last built.
 
 * **Headphones** (Audio → Listen, or Listen in the master strip's menu;
   `Session::set_headphones`, `Preferences::headphones`): the master —
   a bed, stereo or mono — rendered binaurally by `faderframe-binaural`.
   Each speaker's feed is convolved with the impulse responses measured at
   the ears of a `Head` from its direction: fifteen BS.2051 directions
-  (`binaural::direction` maps speaker labels — quad's rears sit at ±135°,
-  5.x surrounds at ±110°) baked by `scripts/binaural_hrirs.py` at
+  (`binaural::direction` finds each speaker's by its azimuth and
+  elevation in the speaker table — the same VBAP uses; quad's rears sit at
+  ±135°, 5.x surrounds at ±110°; a custom layout's speaker between them
+  is heard through a blend of the measured responses around it,
+  `binaural::weights`: VBAP over the baked directions, the spectra added —
+  an approximation of a measurement from there; the baked heads have no
+  direction below ear level, so a speaker below it is heard at ear level
+  on headphones) baked by `scripts/binaural_hrirs.py` at
   44.1/48/96 kHz (other rates resampled from the nearest) for twenty SADIE
   II subjects (University of York, Apache-2.0: the KU100 — the default —
   and KEMAR dummy heads and the listeners H3–H20, `BUILTIN_HEADS`,
@@ -626,7 +1279,8 @@ other tracks with hardware outputs keep the plain fold-down).
   ear after the room in the same block — no added latency.
   The convolution is uniformly partitioned (blocks of 64 frames, 128 above
   50 kHz; one forward FFT per speaker, one inverse per ear), so it adds
-  one block of latency, reported by the node. The LFE reaches both ears
+  one block of latency to what is heard (1.3 ms), reported by the node;
+  it is monitoring only, so nothing in the mix is delayed for it. The LFE reaches both ears
   low-passed at 120 Hz and +10 dB. Rooms: Near is the dry measurement, Mid
   and Far add an eight-line feedback delay network fed in mono (about 8
   and 3 dB under the direct sound). Render → "Headphones (binaural · room)"
@@ -638,6 +1292,27 @@ other tracks with hardware outputs keep the plain fold-down).
   (`SlotRegistry::monitor_mono`), no rebuild; what is heard is folded to
   stereo and summed to (L + R) / 2 on both speakers, after the binaural
   render when both are on. Per session, not saved.
+* **Bass management** (Audio → Listen → Bass Management, settings in
+  Preferences → Audio, `Preferences::bass_management`;
+  `Session::set_bass_management`, `Action::SetBassManagement`;
+  `faderframe_core::surround::BassManagement`, `nodes::bass`): a property
+  of the room, so per machine, never in the project, a render or the
+  meters. With it on, on the speakers only (not on headphones), after the
+  mono check: every main speaker is high-passed at the crossover (40–200
+  Hz, default 80) and the bass taken from them, summed, goes to the
+  layout's LFE output at "Bass to sub" (default −10 dB: for a subwoofer
+  calibrated for the LFE's +10 dB in-band gain, so the redirected bass
+  plays at the mains' level); the LFE channel itself is only low-passed
+  (default 120 Hz). Both crossovers are Linkwitz–Riley 24 dB/octave (two
+  Butterworth sections in f64): a main's high and its low add to its own
+  level at every frequency at 0 dB redirect, each −6 dB at the crossover.
+  Layouts without an LFE channel are left alone
+  (`BassManagement::applies_to`, `Session::bass_management_applies`).
+  Parameter slots (`SlotRegistry::bass_management`): changes are heard at
+  once, switching on or off crossfades over 20 ms, nothing allocates.
+  `recreate_engine` carries it (and headphones, head, correction, the
+  mono check) over to a new engine. Dev action
+  `bass-management:<on|off>[@<Hz>]`.
 
 ## 6. Transport and timing
 
@@ -837,6 +1512,22 @@ sampler and drum sampler (see *Built-in devices*).
 Failed plugins
 are bypassed and flagged; missing formats pass audio through with a
 warning.
+
+**Processors survive rebuilds.** Graph rebuilds (an edit that changes
+routing, a track selected and so made live, a latency change elsewhere)
+ask every slot for a processor again. External formats hand out their
+active one (shared through a `TryCell`); built-ins do the same: a
+`BuiltinInstance` keeps the processor it made with what it was made for
+(`MadeFor`: process config, channels, live or not, buffer size, latency,
+shape, activation, its samples and tap) and gives graphs `SharedProcessor`s
+of it while that holds — the Guitar Station's circuits and workers, the
+EQ's filters, the reverb's lines are not built anew on the UI thread at
+each rebuild. A graph that adopts the running processor (same node) keeps
+its state; one that gets it handed out again (its node changed: bypass,
+latency) resets it when it first runs, as a new processor would be
+(`rebuilds_share_the_processor_made_and_start_it_clean`). The live and the
+render-ahead graphs configure built-ins differently (`realtime`), so a
+processor never moves between them with state rendered ahead.
 
 ### Built-in devices
 
@@ -1166,7 +1857,14 @@ covered by `the_stock_devices_do_not_allocate`.
   anyone holds a sample — offline renders reuse the live ones), then one
   "Load Samples" undo step sets the state and the instance loads from the
   cache at once; concurrent loads merge into the document as it is when
-  each lands. In memory the paths are absolute; the project file stores
+  each lands. A state naming samples not decoded yet (opening a project,
+  undo to samples nothing holds any more) loads them **in the background**
+  in the live session (`PluginInstance::configure_background_loading`,
+  asked by the engine's `PluginHost::set_background_loading`, which the
+  session turns on): `SampleHost::set_doc` starts a thread, `flush` (from
+  `poll`) swaps the set in when it is there; the device plays what it had
+  meanwhile. Offline renders and tests load before `load_state` returns.
+  `Session::{samples_loading, wait_for_samples}`. In memory the paths are absolute; the project file stores
   them relative to itself (`samples::map_states` in `save_as`/`open`), and
   the first save moves the scratch folder's samples with the media
   (`media_moves`, also applied to states brought back by undo).
@@ -1284,6 +1982,18 @@ pagefile-backed file mapping, all named in the helper's environment).
   `Action::ReloadPlugin` drops the instance and builds it again from its
   slot. Sandboxed plugins that report unsaved state have it taken into
   their slots every 5 s, so a reload restores recent settings.
+* **The UI never waits for a helper** on its regular round: the tick's
+  Poll is sent and its answer read at a later tick when it is there
+  (`sys::readable`: `poll` with no wait / `PeekNamedPipe`), one request on
+  its way at a time; the 5-second state capture rides the same way
+  (`PluginInstance::{request_state, take_state}`: a SaveState sent in the
+  Poll's place, the answer stored by the session when it comes,
+  `session::sandbox`). Any other request first takes in an answer still on
+  its way (`collect_answer`), so replies never cross; a helper that
+  leaves a poll unanswered for `REQUEST_TIMEOUT` (60 s for a state) is
+  given up. `PluginInstance::settle` waits for answers on their way
+  (tests). `the_host_does_not_wait_for_a_busy_helper`: a state taking
+  400 ms to write arrives while polls return within milliseconds.
 * **Editors** run in the helper. Its main thread services the plugin
   GUI's descriptors and timers along with the control stream: Unix `poll`s
   them (macOS also hands AppKit its events and run loop every 10 ms while
@@ -1911,7 +2621,12 @@ The Pencil at sample-level zoom redraws audio samples (click repair). The
 redraw never touches the original: the source is copied in chunks with the
 drawn samples into a new float WAV in the media folder, and only that clip
 switches to it (`AddSource` + `SetClipContent`, one undo step). Other clips
-on the source keep the original.
+on the source keep the original. The copy is written on a thread
+(`session::redraw`: strokes queue, each copying the source the clip has
+when it starts, so quick strokes add up; `poll_redraws` applies one when
+its file is done, dropping it if the clip changed meanwhile); the arranger
+keeps drawing released strokes until then (`Session::pending_redraws`),
+and saving waits for them (the media folder may move).
 
 ### Media: import and disk streaming
 
@@ -1992,9 +2707,11 @@ take's waveform while it is being recorded — every frame, at a cost bounded
 by the coarse level however long the take gets. When the rings are abandoned the files
 are finalised and the session turns them into clips in **one undo step**
 (`Batch "Record"`): an `AddSource`, then the takes. Takes are compensated
-for input + output latency as reported by the driver plus a user offset —
-the file is read `latency` frames later than its capture position, so
-what was played lines up with what was heard.
+for input + output latency as reported by the driver, the graph's output
+latency (plugin delay compensation: what the player heard was processed
+that much earlier) plus a user offset — the file is read `latency` frames
+later than its capture position, so what was played lines up with what
+was heard.
 
 **Take folders.** `ClipContent::Takes(TakeFolder)` holds several `Take`s
 (each a source, its alignment and the folder range it has material for) and
@@ -2597,6 +3314,88 @@ arrow and mode buttons and the APCs' faders as their module docs say;
 `Protocol::goodbye` puts them back in their own mode. OSC shows the
 launcher too (`/launcher/clip/N/S` and friends, see `osc`).
 
+**Controllers known by name** (`faderframe_control::controllers::
+Controller`, `SurfaceKind::Controller`): keyboards and surfaces with a DAW
+mode of their own, each with what to do on the device
+(`Controller::setup`, the kind's tooltip in Preferences) and only what
+sources document (each module names its own: vendors' manuals and
+programmer's guides, else open-source integrations that agree —
+Bitwig's official extensions, Ableton's scripts, Ardour, DrivenByMoss;
+GPL and decompiled code read for facts only). Two families:
+
+* **Mackie profiles** (`mackie::MackieProfile`): hello/goodbye messages
+  (Arturia's Mackie DAW mode and DAW map, the X-Touch Mini's MC mode by
+  CC 127), notes on channel 1 only (a keyboard's pads share the DAW
+  port), another display (`Display::Arturia`: the 2 × 16 LCD with the
+  selected track, its level, the position) or none, no time display or
+  meters, the X-Touch's scribble strips in the tracks' colours, note
+  remaps both ways (iCON Platform M+: Read/Write swapped, Mixer =
+  Flip; X-Touch One: SCRUB sends F8), one strip following the selection.
+  KeyLab Essential (mkI), KeyLab mkII, BeatStep Pro (its MCU knob
+  layer), X-Touch, X-Touch Extender, X-Touch One, X-Touch Mini, Platform
+  M+.
+* **Tables** (`mapped::Profile` run by `mapped::Mapped`): the controls as
+  (message, `Does`) — buttons, strip buttons (or the strip in the value:
+  NI), faders (7-bit CC or pitch bend), knobs absolute or relative
+  (`Encoding::{SignedBit, TwosComplement, Offset64}`), wheels, relative
+  volume and pan, the selected track's pan, fader touch, launcher pads,
+  fixed inputs — plus hello/goodbye, a keep-alive (FaderPort's `A0 00
+  00` each second), a handshake to be answered before any state goes
+  out (Komplete Kontrol), presses without releases, and a feedback
+  function writing lights and displays through `Feedback` (sent when
+  changed; a held motor fader is not moved and goes where it should when
+  let go). KeyLab Essential mk3 and MiniLab 3 (Arturia's DAW program:
+  connection handshake, RGB lights, screen, knobs re-seeded to the values
+  shown), Launchkey MK3 / 88 MK3 / Mini MK3 / MK4 / Mini MK4 (DAW mode,
+  session pads on the launcher in the shared palette — static, flashing
+  on channel 2, pulsing on 3 —, the LCD or OLED), SL MkIII (InControl:
+  relative knobs, the screens' knob layout with the tracks' names, the
+  LEDs, pads), nanoKONTROL2 (Korg's native mode, host-lit buttons),
+  Komplete Kontrol S MK3 (NI's Kontrol protocol on its DAW port: names,
+  states, knob rings by SysEx/CC), Oxygen Pro and MKV (M-Audio's DAW
+  mode), MPK mini Plus (Akai's transport CCs), FaderPort 8/16 (native
+  mode: motor faders, RGB select buttons, scribble strips, value bars,
+  meters).
+* **Stateful protocols** where a table cannot hold the surface: the
+  single-fader FaderPort (2018) (`controllers::presonus::FaderPortOne`,
+  native "Studio One" mode per the manual's §2.4 and §8.2) keeps its
+  session navigator's mode — Link, Master, Pan, Channel, Scroll (Shift:
+  zoom), Section, Marker — lit on the mode buttons, and gives the encoder,
+  its push and Prev/Next that mode's job: select the track above/below,
+  the master's level (push: 0 dB), the selected track's pan (push:
+  centre), the playhead (push: the whole project), zoom, nudge the
+  selected clips and go through the sections, go through the markers
+  (push: drop one). Shift + Prev/Next undo and redo, Shift + Pan puts the
+  pan on the motor fader, Shift + Master/Click/Section/Marker are F1–F4
+  (workspaces 1–4: Shift stays inside the protocol, the session's Shift
+  would make them marker jumps),
+  Shift + Arm/Solo/Mute arm all, unsolo and unmute all, Bypass bypasses
+  the track's devices (again: all back), Shift + Touch latches, Shift +
+  Read turns automation off. What a surface asks beyond a button is a
+  `SurfaceInput::Command(SurfaceCommand)` (the session's
+  `surface_command`; `SurfaceState::unity` is the fader travel of 0 dB).
+
+Absolute knobs arrive as `SurfaceInput::Knob { strip, value }` (the pan,
+a send, a channel-strip parameter or — flipped — the volume, set where
+the knob is), relative ones as `Pot` ticks. **Shared ports**: keyboards
+whose DAW controls arrive on the keys' port (KeyLab Essential mk3,
+MiniLab 3, MPK mini Plus; `Protocol::claims`) keep it in the MIDI hub —
+`MidiHub::set_claims` filters what the profile takes (its controls, the
+vendor's SysEx) out of what reaches the instruments, so the keys, pads
+and wheels still play. **Finding them** (`controllers::detect`,
+`Session::detect_control_surfaces`, Preferences → MIDI → Find
+Controllers, dev action `add-surface:find`): by the device's (ALSA
+client's) name and the order of its ports — port names are cut to 31
+characters and change between kernels, and ports whose names come out
+alike are told apart by their order (`faderframe_midi_io::
+port_identities`: "… #2"). Not covered (no documented protocol, or
+nothing to map): the Komplete Kontrol A/M32/S MK2 (NI's helper only),
+Nektar's DAW modes, Alesis, Roland A-series, MPC Studio; Oxygen and
+Keystation Mackie modes, the nanoKONTROL2's DAW modes and other plain
+Mackie/HUI devices work as "Mackie Control"/"HUI". Tests: each module's,
+`session/tests/control.rs` (`a_keylab_essential_mk3_runs_the_transport_
+and_the_strips`, `an_x_touch_one_follows_the_selection`).
+
 ### Track presets
 
 `faderframe_project::preset::TrackPreset` captures a track's channel
@@ -2676,10 +3475,46 @@ come from the palette or a colour chooser (click a track's colour stripe in
 the arranger or the colour bar in the mixer); the mixer shows each strip's
 group and VCA in a tag row once a project has any.
 
-The UI's frame tick (`AppState::tick`, every 16 ms) redraws every view
-when the session's revision changed during the tick — finished recordings,
-imports and analyses arrive there, not through a user action. Warnings and
-errors also pop up as a toast at the top of the main window.
+The UI's tick (`AppState::tick`) runs with the main window's frames — a
+tick callback on its frame clock, so in each frame's update phase, right
+before layout and paint (a frame shows that moment's playhead and meters,
+one tick a frame at the display's rate, no beat against a free timer) —
+and on a 16 ms timer only while no frames come (the window hidden: the
+compositor sends none). It redraws every view when the session's revision
+changed during the tick — finished recordings, imports and analyses
+arrive there, not through a user action; what only changes the picture
+(keys held on a MIDI input, launcher clips playing) bumps
+`Session::display_revision` instead, which repaints the views without the
+shell's full `after_change`. Warnings and errors also pop up as a toast at
+the top of the main window. The start-up project opens after the
+window's first frame (`open_after_first_frame`, "Opening …" meanwhile);
+scripted start-up actions run after it.
+
+**What a frame costs** (the demo playing, arranger and mixer, 2524×1371,
+dev build; `FADERFRAME_PAINT_STATS=1` and the UI thread's CPU time from
+`/proc`): 54 % of a core at first — 28 % of the profile cairo filling
+paths again where the playhead and meters damaged them (GTK's renderer
+re-rasterises a cached path cut by a new clip region), 15 % pango laying
+labels out again. Three caches took it to 26 %, the views' paint from
+1.7 + 1.7 to 0.3 + 0.5 ms a frame, the rest is GTK's renderer:
+
+* **Text nodes** (`painter::TextCache`): the finished text node of a
+  label (by text, style, width, colour) is appended again under a
+  translation — pango and GTK's glyph measuring run once per label.
+* **Kept pictures** (`faderframe_ui_canvas::kept(p, key, rect, draw)`,
+  `Painter::{show_kept, begin_keep, end_keep}`; the GSK painter's
+  `KeptCache`): a layer that rarely changes under one that does is drawn
+  once into a texture (rendered by the widget's renderer at device pixels,
+  sized by its size alone so equal pictures anywhere are one) and shown
+  again while its key holds; at most six are made a frame (a zoom gesture
+  draws directly until it stops), unseen ones go after ten seconds or past
+  192 MB. Painters without a store (the GPU painter, recordings) draw.
+  Used for clip waveforms in 256-pixel tiles from the clip's start (keyed
+  by source, its peaks, offset, gain, colour, height, zoom, tempo map;
+  warped and live-recording waveforms draw directly) and for the ladder
+  meters' unlit and lit ladders (the lit one clipped to the level — about
+  a thousand rectangles a frame fewer in the demo's mixer).
+* `PathCache` (below).
 
 **The GPU painter.** GTK 4.22's renderer rasterises every fill and stroke
 node with cairo on the CPU when its path changes, over the path's bounds:
@@ -2707,12 +3542,20 @@ copies each frame on the GPU into a pooled buffer whose memory is a
 dmabuf — linear rows padded to 256 bytes, DRM `AB24`, straight alpha —
 and GTK takes it as a `GdkDmabufTexture` (`GpuRenderer::render_to`,
 `Output::Dmabuf`); a buffer is reused only once GTK's release callback
-gave it back (three at most; with all of them shown a frame is read back).
+gave it back (`DMABUF_POOL`, eight; with all of them shown a frame is read back).
 It is used when the display imports linear `AB24` (`dmabuf_formats`);
 if GTK refuses a frame, frames are read back from then on
 (`FADERFRAME_GPU_DMABUF=0` turns it off). Measured on a Radeon iGPU
 (RADV): the mastering tools at 2411×711 device pixels 4.98 → 3.80 ms per
-paint, 52 → 60 fps. On Windows the frames go over as shared D3D12
+paint, 52 → 60 fps. Without fences the UI thread waited for each frame
+(2.9 ms of a 4.0 ms paint at 3786×716): a view that animates now renders
+**ahead** (`GpuRenderer::render_ahead(view, …)`): its frame stays on the
+GPU and the one submitted the frame before — finished by then — goes to
+GTK (`Output::Pending` the first time: the view's last texture is shown
+again); a paint that is not animation (an event, the frame after the
+animation stops, which the canvas asks for while `gpu::behind`) settles
+the view and waits as before. The tools: 4.0 → 1.24 ms per paint. The pool
+holds eight buffers. On Windows the frames go over as shared D3D12
 textures (`d3d12::Exporter`: pooled committed textures on a shared heap
 with simultaneous access, so they decay to the common state after the
 copy, and an NT handle each; `Output::Shared`): the painter renders on the
@@ -2876,7 +3719,10 @@ master out. The arranger's host lays its scrollbars over the canvas
 ## 12. Metering and metrics
 
 Meters: the RT side accumulates per-channel peak and mean square with atomic
-max; the UI consumes with atomic swap — no peak is lost between frames.
+max; the UI consumes with atomic swap — no peak is lost between frames. A
+channel strip's meter reads its post-fader, post-pan output in the
+destination layout (a mono strip into mono lights both bars alike); buses
+and the master meter what they sum, after their own fader and pan.
 Metrics: `CallbackMetrics` records every callback's duration against its
 deadline in a log-scaled histogram (p50/p95/p99/max, deadline misses, xruns),
 the sum of deadlines (average load over any window) and the worst callback
@@ -2964,8 +3810,11 @@ for its editor.
    view or per window.
 7. The graph is a DAG; feedback is rejected both by the project layer and the
    graph compiler.
-8. Every summing point is latency-aligned; plugin latency is part of a
-   node's identity (a change rebuilds the graph).
+8. Every summing point is latency-aligned (but for early edges of
+   low-latency monitoring), every heard output too; plugin latency is part
+   of a node's identity (a change rebuilds the graph); automation is read
+   at the position a node's audio was played; what is shown as playing is
+   what is heard.
 9. Channel layouts are explicit everywhere; nothing assumes stereo.
 10. IDs are persisted newtypes, allocated by the project's `IdAllocator`.
 11. `unsafe` is forbidden in every crate except `faderframe-realtime`

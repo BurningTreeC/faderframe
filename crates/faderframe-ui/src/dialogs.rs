@@ -38,7 +38,7 @@ pub fn open_project(app: &Rc<AppState>) {
     });
 }
 
-fn audio_filters() -> gio::ListStore {
+pub(crate) fn audio_filters() -> gio::ListStore {
     let audio = gtk::FileFilter::new();
     audio.set_name(Some("Audio files"));
     for ext in faderframe_audio_files::decode::SUPPORTED_EXTENSIONS {

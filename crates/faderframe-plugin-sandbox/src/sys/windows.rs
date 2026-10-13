@@ -32,7 +32,7 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-    PIPE_TYPE_BYTE, PIPE_WAIT,
+    PIPE_TYPE_BYTE, PIPE_WAIT, PeekNamedPipe,
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CreateEventW, EVENT_MODIFY_STATE, GetCurrentProcess, INFINITE, OpenEventW,
@@ -310,6 +310,24 @@ impl Control {
             Ready::Woken => closed(read, e),
         }
     }
+}
+
+/// Whether the other side has written something to read (or the pipe
+/// broke: the read then says so) — without waiting.
+pub fn readable(control: &Control) -> bool {
+    let mut avail = 0u32;
+    // SAFETY: a peek of the byte count only (no buffer) on our handle.
+    let ok = unsafe {
+        PeekNamedPipe(
+            control.pipe.raw(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut avail,
+            std::ptr::null_mut(),
+        )
+    };
+    ok == 0 || avail > 0
 }
 
 /// A failed transfer: a closed pipe reads as the end of the stream.

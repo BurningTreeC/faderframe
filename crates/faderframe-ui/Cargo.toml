@@ -23,6 +23,7 @@ faderframe-plugin-clap.workspace = true
 faderframe-plugin-vst3.workspace = true
 faderframe-plugin-sandbox.workspace = true
 faderframe-plugin-host.workspace = true
+faderframe-plugin-check.workspace = true
 gtk.workspace = true
 faderframe-core.workspace = true
 faderframe-automation.workspace = true

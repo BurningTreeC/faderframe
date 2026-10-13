@@ -273,3 +273,79 @@ fn a_note_source_moves_the_instrument_by_the_note() {
     let db = 20.0 * (soft / plain).log10();
     assert!((db + 10.8 * 64.0 / 127.0).abs() < 0.5, "{db}");
 }
+
+/// Behind 6400 frames of plugin latency the strip and a device after it
+/// are modulated with what their audio passed the modulators with: a
+/// square a quarter long moves the fader (and a utility's gain) 6400
+/// frames later, with its audio — not 6400 frames early.
+#[test]
+fn modulation_behind_latency_follows_its_audio() {
+    let law = FaderLaw::console();
+    let unity = law.db_to_position(0.0);
+    let up = 0.5 * db_to_gain(law.position_to_db(unity + 0.1));
+    let down = 0.5 * db_to_gain(law.position_to_db(unity - 0.1));
+    let square = ModSource::Lfo {
+        shape: LfoShape::Square,
+        rate: ModRate::Sync { beats: 1.0 },
+        phase: 0.0,
+    };
+    // The fader.
+    let mut tp = TestProject::new(48_000);
+    let t = dc_track(&mut tp, "Tone", 72_000);
+    let id = tp.project.ids.allocate();
+    tp.project.track_mut(t).unwrap().inserts.push(PluginSlot {
+        id,
+        plugin: PluginRef::builtin(builtin::LATENCY_PROBE, "Latency"),
+        bypass: false,
+        parameters: vec![faderframe_project::SavedParameter {
+            id: ParameterId(0),
+            value: 6400.0,
+        }],
+        state: None,
+        sidechain: None,
+    });
+    let m = modulator(&mut tp, square.clone(), &[(ModTarget::Volume, 0.1)]);
+    tp.project.track_mut(t).unwrap().modulators.push(m);
+    let out = render(&tp, 60_000);
+    // Output frame f carries position f − 6400: up for the first half of
+    // each quarter (24 000 frames).
+    for (pos, want) in [(6_000, up), (18_000, down), (30_000, up), (42_000, down)] {
+        let got = out[0][pos + 6400];
+        assert!((got - want).abs() < 1e-3, "{pos}: {got} vs {want}");
+    }
+    // A device after the latency: a utility's gain, the same square.
+    let mut tp = TestProject::new(48_000);
+    let t = dc_track(&mut tp, "Tone", 72_000);
+    let probe = PluginSlot {
+        id: tp.project.ids.allocate(),
+        plugin: PluginRef::builtin(builtin::LATENCY_PROBE, "Latency"),
+        bypass: false,
+        parameters: vec![faderframe_project::SavedParameter {
+            id: ParameterId(0),
+            value: 6400.0,
+        }],
+        state: None,
+        sidechain: None,
+    };
+    let utility = PluginSlot {
+        id: tp.project.ids.allocate(),
+        plugin: PluginRef::builtin(builtin::GAIN, "Utility"),
+        bypass: false,
+        parameters: vec![],
+        state: None,
+        sidechain: None,
+    };
+    let gain = ModTarget::Plugin {
+        plugin: utility.id,
+        parameter: ParameterId(0),
+    };
+    tp.project.track_mut(t).unwrap().inserts = vec![probe, utility];
+    let m = modulator(&mut tp, square, &[(gain, -0.1)]);
+    tp.project.track_mut(t).unwrap().modulators.push(m);
+    let out = render(&tp, 60_000);
+    let lo = out[0][6_000 + 6400];
+    let hi = out[0][18_000 + 6400];
+    // Up (the first half): the gain lowered; down: raised.
+    assert!(lo < hi - 0.05, "{lo} {hi}");
+    assert!((out[0][30_000 + 6400] - lo).abs() < 1e-3);
+}

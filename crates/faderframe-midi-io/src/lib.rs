@@ -104,6 +104,31 @@ pub fn port_identity(full: &str) -> (String, String) {
     (key, name)
 }
 
+/// What a control surface sharing a port with the keys takes from it.
+pub type Claim = fn(&[u8]) -> bool;
+
+/// [`port_identity`] of every port of a listing, in its order, a name that
+/// came before getting " #2", " #3", … — a device whose ports' names are
+/// cut to the same 31 characters ("Arturia KeyLab Essential 61 MID" twice)
+/// has them told apart by their order (the sequencer lists a client's
+/// ports by number).
+pub fn port_identities<'a>(fulls: impl IntoIterator<Item = &'a str>) -> Vec<(String, String)> {
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    fulls
+        .into_iter()
+        .map(|full| {
+            let (key, name) = port_identity(full);
+            let n = seen.entry(key.clone()).or_insert(0);
+            *n += 1;
+            if *n == 1 {
+                (key, name)
+            } else {
+                (format!("{key} #{n}"), format!("{name} #{n}"))
+            }
+        })
+        .collect()
+}
+
 /// Feeds a virtual input port.
 #[derive(Clone)]
 pub struct VirtualMidiInput {
@@ -154,6 +179,9 @@ pub struct MidiHub {
     by_key: HashMap<String, u16>,
     connections: HashMap<String, midir::MidiInputConnection<()>>,
     disabled: HashSet<String>,
+    /// Ports a control surface shares with the keys: what it claims is
+    /// kept from the instruments (see [`Self::set_claims`]).
+    claims: HashMap<String, Claim>,
     /// Enumerates ports (connections need their own clients).
     lister: Option<midir::MidiInput>,
     error: Option<String>,
@@ -173,6 +201,7 @@ impl MidiHub {
             by_key: HashMap::new(),
             connections: HashMap::new(),
             disabled: HashSet::new(),
+            claims: HashMap::new(),
             lister: None,
             error: None,
             ump: None,
@@ -285,6 +314,27 @@ impl MidiHub {
         }
     }
 
+    /// Ports (by key) a control surface shares with the keys: messages
+    /// `claim` says are the surface's (its DAW controls) do not reach the
+    /// instruments; everything else does. Connections whose claim changed
+    /// are made again.
+    pub fn set_claims(&mut self, claims: HashMap<String, Claim>) {
+        let changed: Vec<String> = self
+            .claims
+            .keys()
+            .chain(claims.keys())
+            .filter(|k| {
+                self.claims.get(*k).map(|c| *c as usize) != claims.get(*k).map(|c| *c as usize)
+            })
+            .cloned()
+            .collect();
+        self.claims = claims;
+        for k in changed {
+            self.connections.remove(&k);
+        }
+        self.refresh();
+    }
+
     /// Ports (by key) that must not be connected.
     pub fn set_disabled(&mut self, keys: impl IntoIterator<Item = String>) {
         self.disabled = keys.into_iter().collect();
@@ -307,7 +357,7 @@ impl MidiHub {
             .as_ref()
             .map(|c| c.ump_clients().into_iter().collect())
             .unwrap_or_default();
-        let mut present: Vec<(String, String, midir::MidiInputPort)> = Vec::new();
+        let mut listed: Vec<(String, midir::MidiInputPort)> = Vec::new();
         for p in lister.ports() {
             let Ok(full) = lister.port_name(&p) else {
                 continue;
@@ -317,9 +367,14 @@ impl MidiHub {
             {
                 continue;
             }
-            let (key, name) = port_identity(&full);
-            present.push((key, name, p));
+            listed.push((full, p));
         }
+        let ids = port_identities(listed.iter().map(|(f, _)| f.as_str()));
+        let present: Vec<(String, String, midir::MidiInputPort)> = ids
+            .into_iter()
+            .zip(listed)
+            .map(|((key, name), (_, p))| (key, name, p))
+            .collect();
         let mut changed = false;
         let keys: HashSet<&str> = present.iter().map(|(k, _, _)| k.as_str()).collect();
         let before = self.connections.len();
@@ -423,11 +478,20 @@ impl MidiHub {
         // synchronisation and recording.
         input.ignore(midir::Ignore::ActiveSense);
         let tx = self.tx.clone();
+        let claim = self.claims.get(key).copied();
         input
             .connect(
                 port,
                 &format!("{CLIENT_NAME} in: {key}"),
                 move |_, msg, _| {
+                    // Keys reach the engine before other work runs
+                    // (`faderframe_realtime::priority`).
+                    faderframe_realtime::priority::follow_audio(
+                        faderframe_realtime::priority::Helper::Ahead,
+                    );
+                    if claim.is_some_and(|c| c(msg)) {
+                        return;
+                    }
                     tx.send(index, msg);
                 },
                 (),
@@ -489,6 +553,24 @@ mod tests {
             ("Plain Name".to_string(), "Plain Name".to_string())
         );
         assert_eq!(port_identity("Dev:Port 1 x:y").0, "Dev:Port 1 x:y");
+    }
+
+    #[test]
+    fn ports_cut_to_the_same_name_are_told_apart_by_their_order() {
+        let ids = port_identities([
+            "Arturia KeyLab Essential 61:Arturia KeyLab Essential 61 MID 28:0",
+            "Arturia KeyLab Essential 61:Arturia KeyLab Essential 61 MID 28:1",
+            "Midi Through:Midi Through Port-0 14:0",
+        ]);
+        assert_eq!(
+            ids.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            [
+                "Arturia KeyLab Essential 61:Arturia KeyLab Essential 61 MID",
+                "Arturia KeyLab Essential 61:Arturia KeyLab Essential 61 MID #2",
+                "Midi Through:Midi Through Port-0",
+            ]
+        );
+        assert_eq!(ids[1].1, "Arturia KeyLab Essential 61 MID #2");
     }
 
     #[test]

@@ -22,6 +22,17 @@ const DONE_FD: RawFd = 5;
 /// The control stream: framed messages both ways, with timeouts.
 pub type Control = UnixStream;
 
+/// Whether the other side has written something to read (or hung up: the
+/// read then says so) — without waiting.
+pub fn readable(control: &Control) -> bool {
+    let mut fds = [libc::pollfd {
+        fd: control.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    poll(&mut fds, 0).map_or(true, |n| n > 0)
+}
+
 /// Wakes the other side: a byte into a non-blocking pipe.
 pub struct Signal(OwnedFd);
 
