@@ -34,6 +34,20 @@ impl GlobalLane {
         GlobalLane::Tempo,
     ];
 
+    /// A stable name (the View menu's `app.lane-<id>` actions, scripts).
+    pub fn id(self) -> &'static str {
+        match self {
+            GlobalLane::Video => "video",
+            GlobalLane::Markers => "markers",
+            GlobalLane::Arranger => "arranger",
+            GlobalLane::Key => "key",
+            GlobalLane::Chords => "chords",
+            GlobalLane::Lyrics => "lyrics",
+            GlobalLane::Signature => "signature",
+            GlobalLane::Tempo => "tempo",
+        }
+    }
+
     pub fn title(self) -> &'static str {
         match self {
             GlobalLane::Video => "Video",

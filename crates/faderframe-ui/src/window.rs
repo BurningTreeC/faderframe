@@ -585,6 +585,11 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
         &section(&[("Reset Current Workspace", "app.workspace-reset")]),
     );
     view.append_submenu(Some("Workspace"), &ws);
+    let lanes = gio::Menu::new();
+    for lane in faderframe_session::lanes::GlobalLane::ALL {
+        lanes.append(Some(lane.title()), Some(&format!("app.lane-{}", lane.id())));
+    }
+    view.append_submenu(Some("Lanes"), &lanes);
     let heights = gio::Menu::new();
     for (i, (name, _)) in faderframe_view_arranger::TRACK_HEIGHTS.iter().enumerate() {
         heights.append(Some(name), Some(&format!("app.track-height-{i}")));

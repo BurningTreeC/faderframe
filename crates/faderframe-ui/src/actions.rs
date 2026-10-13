@@ -3282,6 +3282,22 @@ pub fn install(app: &Rc<AppState>) {
         })
         .build();
     app.app.add_action_entries([theme]);
+    // View → Lanes: the arranger's lanes as check items (also in the lane
+    // headers' menu; kept in step by `sync_lane_actions`).
+    for lane in faderframe_session::lanes::GlobalLane::ALL {
+        let weak = Rc::downgrade(app);
+        let shown = app.session.borrow().editor.lanes.shows(lane);
+        let entry = gio::ActionEntry::builder(&format!("lane-{}", lane.id()))
+            .state(shown.to_variant())
+            .activate(move |_, _, _| {
+                if let Some(a) = weak.upgrade() {
+                    let shown = a.session.borrow().editor.lanes.shows(lane);
+                    a.dispatch(Action::ShowGlobalLane(lane, !shown));
+                }
+            })
+            .build();
+        app.app.add_action_entries([entry]);
+    }
     // View → Master Strip at the Side (per workspace; a checkbox).
     let weak = Rc::downgrade(app);
     let shown = app.session.borrow().master_panel();
@@ -3553,5 +3569,26 @@ fn surround_mode(a: &Rc<AppState>, name: &str, arg: &str) {
     match action {
         Some(action) => a.dispatch(action),
         None => tracing::warn!("{name}: no track or mode in '{arg}'"),
+    }
+}
+
+/// The View → Lanes check items as the session shows the lanes.
+pub(crate) fn sync_lane_actions(app: &Rc<AppState>) {
+    let Ok(s) = app.session.try_borrow() else {
+        return;
+    };
+    let lanes = s.editor.lanes;
+    drop(s);
+    for lane in faderframe_session::lanes::GlobalLane::ALL {
+        if let Some(a) = app
+            .app
+            .lookup_action(&format!("lane-{}", lane.id()))
+            .and_then(|a| a.downcast::<gio::SimpleAction>().ok())
+        {
+            let on = lanes.shows(lane);
+            if a.state().and_then(|v| v.get::<bool>()) != Some(on) {
+                a.set_state(&on.to_variant());
+            }
+        }
     }
 }

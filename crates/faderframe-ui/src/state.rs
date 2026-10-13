@@ -268,6 +268,8 @@ impl AppState {
             if let Err(e) = prefs.save() {
                 tracing::warn!("cannot save lane preferences: {e}");
             }
+            // The View → Lanes ticks, wherever the change came from.
+            crate::actions::sync_lane_actions(self);
         }
         self.after_change();
     }
