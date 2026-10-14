@@ -560,10 +560,20 @@ pub struct TrackAutomation {
     /// Automated mutes of the VCAs scaling the track.
     pub vca_mute: Vec<SampleLane>,
     pub sends: Vec<(SendId, SampleLane)>,
+    /// The track's sends to cue mixes (level in dB, pan, on).
+    pub cue_sends: Vec<(faderframe_core::CueId, CueSendLanes)>,
     pub params: Vec<(PluginInstanceId, ParameterId, SampleLane)>,
     pub bypass: Vec<(PluginInstanceId, SampleLane)>,
     /// The surround panner, by [`faderframe_core::SurroundParam::index`].
     pub surround: [Option<SampleLane>; faderframe_core::SurroundParam::ALL.len()],
+}
+
+/// The lanes driving a track's send to one cue mix.
+#[derive(Clone, Debug, Default)]
+pub struct CueSendLanes {
+    pub level: Option<SampleLane>,
+    pub pan: Option<SampleLane>,
+    pub on: Option<SampleLane>,
 }
 
 impl TrackAutomation {
@@ -577,6 +587,7 @@ impl TrackAutomation {
             && self.vca_volume.is_empty()
             && self.vca_mute.is_empty()
             && self.sends.is_empty()
+            && self.cue_sends.is_empty()
             && self.params.is_empty()
             && self.bypass.is_empty()
     }
@@ -584,6 +595,12 @@ impl TrackAutomation {
     #[inline]
     pub fn send(&self, id: SendId) -> Option<&SampleLane> {
         self.sends.iter().find(|(s, _)| *s == id).map(|(_, l)| l)
+    }
+
+    /// The lanes of the track's send to cue mix `cue`.
+    #[inline]
+    pub fn cue_send(&self, cue: faderframe_core::CueId) -> Option<&CueSendLanes> {
+        self.cue_sends.iter().find(|(c, _)| *c == cue).map(|(_, l)| l)
     }
 
     #[inline]
@@ -1023,6 +1040,9 @@ impl TimelineSnapshot {
         }
         lanes.sort_by_key(|(t, _)| *t);
         let mut automation: Vec<(TrackId, TrackAutomation)> = Vec::new();
+        // The cue mixes' master levels (lanes of the master track), keyed
+        // by the cue mix's channel for its strip.
+        let mut cue_levels: Vec<(faderframe_core::CueId, SampleLane)> = Vec::new();
         for t in &project.tracks {
             let mut a = TrackAutomation::default();
             if t.kind.has_audio() {
@@ -1054,10 +1074,37 @@ impl TimelineSnapshot {
                     }
                     AutomationTarget::PluginBypass(p) => a.bypass.push((p, rt)),
                     AutomationTarget::Surround(p) => a.surround[p.index()] = Some(rt),
+                    AutomationTarget::CueSend { cue, what } => {
+                        use faderframe_automation::CueSendParam;
+                        let lanes = match a.cue_sends.iter_mut().find(|(c, _)| *c == cue) {
+                            Some((_, l)) => l,
+                            None => {
+                                a.cue_sends.push((cue, CueSendLanes::default()));
+                                &mut a.cue_sends.last_mut().expect("just pushed").1
+                            }
+                        };
+                        match what {
+                            CueSendParam::Level => lanes.level = Some(rt),
+                            CueSendParam::Pan => lanes.pan = Some(rt),
+                            CueSendParam::On => lanes.on = Some(rt),
+                        }
+                    }
+                    AutomationTarget::CueLevel { cue } => cue_levels.push((cue, rt)),
                 }
             }
             if !a.is_empty() {
                 automation.push((t.id, a));
+            }
+        }
+        for (cue, rt) in cue_levels {
+            if let Some(c) = project.cue(cue) {
+                automation.push((
+                    c.channel(),
+                    TrackAutomation {
+                        volume: Some(rt),
+                        ..TrackAutomation::default()
+                    },
+                ));
             }
         }
         automation.sort_by_key(|(t, _)| *t);

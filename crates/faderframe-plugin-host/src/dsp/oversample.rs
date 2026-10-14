@@ -194,9 +194,15 @@ impl Oversampler {
 
     /// Round trip latency in samples at the host rate.
     pub fn latency(&self) -> u32 {
+        Self::latency_of(self.factor())
+    }
+
+    /// The round trip latency (samples at the host rate) of an oversampler
+    /// made for `factor`.
+    pub fn latency_of(factor: usize) -> u32 {
         STAGES
             .iter()
-            .take(self.active)
+            .take(Self::stages(factor))
             .enumerate()
             .map(|(i, &(m, _))| (m >> i) as u32)
             .sum()

@@ -1854,15 +1854,31 @@ level history and the analyser. Peaks a face shows travel through
 them), so a 40 fps history misses no transient. Their real-time safety is
 covered by `the_stock_devices_do_not_allocate`.
 
-* **Compressor** (`devices::compressor`): five styles — Clean (feed
+* **Compressor** (`devices::compressor`): seven styles — Clean (feed
   forward, RMS), Punch (peak), Opto (feedback, programme-dependent
-  release), Vintage (feedback, fast, colour), Bus (glue) —; the feedback
-  styles' slope is compensated so the ratio knob reads true; threshold,
-  ratio up to ∞, soft knee, attack, release with auto release, range,
-  auto makeup, lookahead (latency), RMS or peak detection, stereo link,
-  colour (saturation), mix, an external sidechain (on by default once one
-  is routed) with high/low cuts and listen. Editor: the transfer curve
-  with the level moving on it (drag to set the threshold) and a history.
+  release), Vintage (feedback, fast, colour), Bus (glue), Mastering (long
+  RMS window, slow, wide knee), Pumping (peak, quick, a hold of its own
+  before the release) —; the feedback styles' slope is compensated so the
+  ratio knob reads true; threshold, ratio up to ∞, soft knee, attack,
+  hold (`id::HOLD`: the reduction waits before releasing), release with
+  auto release, range, upward compression (`id::UPWARD`: the curve
+  mirrored below the threshold, `lift`, capped in dB; lifted at the
+  release rate, let down at the attack rate), auto makeup, lookahead
+  (latency), RMS or peak detection, stereo link in left/right or mid/side
+  (`id::CHANNELS`: detected and compressed as M and S), colour
+  (saturation, oversampled 2×/4× on request — `id::OVERSAMPLE`, a fixed
+  parameter: the oversampler's round trip is latency and the dry path of
+  the mix is delayed to match), mix, delta listening (`id::DELTA`: wet −
+  dry), an external sidechain (on by default once one is routed) with
+  high/low cuts and listen. Ids are positions; 19–23 came with the second
+  revision and are neutral at their defaults (projects saved before sound
+  the same). Published values: reduction (≥ 0), its peak, in/out peaks,
+  the detector level, `value::GAIN` = the net gain (negative down,
+  positive lifted). Editor: the transfer curve (`curve`: knee, range,
+  lift) with the level moving on it (drag to set the threshold), the
+  reduction readout and a history. Presets: the 14 at the top of the menu
+  plus groups Vocals, Drums, Bass, Bus, Master, Creative (levelled on the
+  preset tests' material: `the_grouped_dynamics_presets_are_levelled…`).
 * **76 Compressor** (`devices::fet76`, id `faderframe.76-compressor`): a
   FET limiting amplifier in the manner of the 1176, written from how the
   hardware behaves (its owner's manual), not from another plugin. Feedback
@@ -1895,12 +1911,25 @@ covered by `the_stock_devices_do_not_allocate`.
 * **Limiter** (`devices::limiter`): a lookahead limiter that guarantees
   its ceiling — per channel the minimum needed gain over the lookahead
   window, averaged over an attack window no longer than the lookahead
-  (Transparent: all of it, Punchy: a half, Aggressive: a quarter), so the
-  gain is down before the peak arrives; release (auto: slower while
-  limiting goes on); stereo link; a true-peak mode measuring the 4×
-  oversampled output (6 samples more latency); unity gain listening.
-  Editor: history of in, out and reduction with the ceiling, held readouts
-  of the reduction and the output's (true) peak.
+  (`limiter::style`: Transparent all of it, Punchy a half, Aggressive a
+  quarter, Allround 0.7, Bus 0.6 with a slower and always programme
+  dependent release, Safe all of it with a 0.3 dB margin under the ceiling
+  so true peaks stay under it through the interpolator's error, Modern
+  0.4 quick and programme dependent), so the gain is down before the peak
+  arrives; release (auto: slower while limiting goes on); stereo link of
+  the detection and `id::RELEASE_LINK` of the reduction (each side pulled
+  towards the deeper one); a true-peak mode measuring the 4× oversampled
+  input (6 samples more latency) and publishing the output's true peak;
+  `id::OUTPUT` trims after the clamp (the output ceiling is the ceiling
+  plus the trim); unity gain listening. The output's momentary and
+  short-term loudness (`dsp::loudness::LoudnessMeter`: BS.1770
+  K-weighting, 100 ms buckets, allocation free) are published
+  (`value::{LUFS_MOMENTARY, LUFS_SHORT}`). Ids 9–10 are the second
+  revision's, neutral by default. Editor: history of in, out and
+  reduction with the ceiling, readouts of the reduction, the output's
+  (true) peak now and its highest since the readout was clicked, the
+  short-term and momentary loudness. Presets: 13 at the top of the menu
+  plus the same six groups as the compressor's.
 * **Gate** (`devices::gate`): gate (with hysteresis and hold, opening and
   closing in dB at the attack/release rates), downward expander (ratio,
   range) and ducker; key from the input or the sidechain through high and

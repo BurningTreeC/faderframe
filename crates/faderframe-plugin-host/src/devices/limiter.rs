@@ -8,14 +8,23 @@
 //! the gain is down by the time the delayed peak comes out, and it gets
 //! there smoothly instead of in a step. The styles set that window
 //! (Transparent the whole lookahead, Punchy half, Aggressive a quarter:
-//! later, steeper attacks that keep transients) and the release, which in
-//! auto mode slows down while the limiting goes on. What comes out is
-//! never over the ceiling (a last clip catches rounding). Input gain
-//! drives into the limiter; listening at unity gain takes the gain back
-//! off to hear what the limiting does.
+//! later, steeper attacks that keep transients; Allround between, Bus
+//! slower and always programme dependent, Safe the whole window with a
+//! margin so true peaks stay under the ceiling even through the
+//! interpolator's error, Modern quick with a programme dependent release)
+//! and the release, which in auto mode slows down while the limiting goes
+//! on. Channels link in the detection (Stereo Link) and in the release
+//! (Release Link: each side's reduction pulled towards the deeper one).
+//! What comes out is never over the ceiling (a last clip catches
+//! rounding), then trimmed by Output (the output ceiling is the ceiling
+//! plus the trim). Input gain drives into the limiter; listening at unity
+//! gain takes the gain back off to hear what the limiting does. The
+//! output's momentary and short-term loudness (BS.1770) and its true peak
+//! are published for the editor.
 
 use super::{fixed, on_off, param, pass_through, pick, stepped};
 use crate::dsp::env::DualRelease;
+use crate::dsp::loudness::LoudnessMeter;
 use crate::dsp::smooth::Smoothed;
 use crate::dsp::truepeak::{self, TruePeak};
 use crate::dsp::{db, gain};
@@ -38,19 +47,65 @@ pub mod id {
     pub const LINK: u32 = 6;
     pub const AUTO_RELEASE: u32 = 7;
     pub const UNITY: u32 = 8;
+    /// Trim after the limiter (dB, ≤ 0): the output ceiling is the ceiling
+    /// plus this.
+    pub const OUTPUT: u32 = 9;
+    /// How far each channel's reduction follows the deeper one's.
+    pub const RELEASE_LINK: u32 = 10;
 }
 
 /// Published values: reduction now and its peak (dB), the input's and the
-/// output's peaks (linear, true peaks for the output) since last taken.
+/// output's peaks (linear; the output's a true peak in true peak mode)
+/// since last taken, the output's momentary and short-term loudness
+/// (LUFS, −∞ before a window is full).
 pub mod value {
     pub const REDUCTION: usize = 0;
     pub const REDUCTION_PEAK: usize = 1;
     pub const IN_PEAK: usize = 2;
     pub const OUT_PEAK: usize = 3;
+    pub const LUFS_MOMENTARY: usize = 4;
+    pub const LUFS_SHORT: usize = 5;
 }
-pub const TAP_VALUES: usize = 4;
+pub const TAP_VALUES: usize = 6;
 
-pub const STYLES: [&str; 3] = ["Transparent", "Punchy", "Aggressive"];
+pub const STYLES: [&str; 7] = [
+    "Transparent",
+    "Punchy",
+    "Aggressive",
+    "Allround",
+    "Bus",
+    "Safe",
+    "Modern",
+];
+
+/// How a style limits: the share of the lookahead its attack window
+/// takes, its release time scale, whether its release is always programme
+/// dependent, and the margin (dB) it keeps under the ceiling.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Style {
+    pub attack_share: f64,
+    pub release: f64,
+    pub always_auto: bool,
+    pub margin: f64,
+}
+
+pub fn style(i: usize) -> Style {
+    let (attack_share, release, always_auto, margin) = match i {
+        1 => (0.5, 0.7, false, 0.0),
+        2 => (0.25, 0.4, false, 0.0),
+        3 => (0.7, 0.85, false, 0.0),
+        4 => (0.6, 1.3, true, 0.0),
+        5 => (1.0, 1.5, true, 0.3),
+        6 => (0.4, 0.55, true, 0.0),
+        _ => (1.0, 1.0, false, 0.0),
+    };
+    Style {
+        attack_share,
+        release,
+        always_auto,
+        margin,
+    }
+}
 
 pub fn parameters() -> Vec<ParameterInfo> {
     use ParameterUnit::*;
@@ -66,11 +121,13 @@ pub fn parameters() -> Vec<ParameterInfo> {
             4.0,
             Milliseconds,
         )),
-        stepped(id::STYLE, "Style", 2.0, 0.0),
+        stepped(id::STYLE, "Style", (STYLES.len() - 1) as f64, 0.0),
         fixed(stepped(id::TRUE_PEAK, "True Peak", 1.0, 1.0)),
         param(id::LINK, "Stereo Link", 0.0, 1.0, 1.0, Percent),
         stepped(id::AUTO_RELEASE, "Auto Release", 1.0, 1.0),
         stepped(id::UNITY, "Unity Gain", 1.0, 0.0),
+        param(id::OUTPUT, "Output", -30.0, 0.0, 0.0, Decibels),
+        param(id::RELEASE_LINK, "Release Link", 0.0, 1.0, 0.0, Percent),
     ]
 }
 
@@ -239,6 +296,9 @@ pub struct LimiterProcessor {
     tp: [TruePeak; 2],
     /// The input, delayed to line up with the true peak detector.
     tp_align: Delay2,
+    /// The output's true peaks (in true peak mode).
+    out_tp: [TruePeak; 2],
+    loudness: LoudnessMeter,
     audio: Delay2,
     /// Per channel: the window minimum of the needed gain, its mean over
     /// the attack window, the release.
@@ -246,6 +306,7 @@ pub struct LimiterProcessor {
     mean: [Mean; 2],
     release: [DualRelease; 2],
     drive: Smoothed,
+    trim: Smoothed,
     meters: [[MeterTap; 2]; 2],
     scratch: [Vec<f32>; 2],
 }
@@ -259,6 +320,7 @@ impl LimiterProcessor {
         let mt = MeterTap::new(sr as f32);
         let delay = look + if true_peak { truepeak::LATENCY } else { 0 };
         let drive = Smoothed::new(gain(get(&params, id::GAIN)), 20.0, sr);
+        let trim = Smoothed::new(gain(get(&params, id::OUTPUT)), 20.0, sr);
         Self {
             watching: Watching::new(sr as f32),
             sr,
@@ -266,11 +328,14 @@ impl LimiterProcessor {
             true_peak,
             tp: [TruePeak::new(), TruePeak::new()],
             tp_align: Delay2::new(truepeak::LATENCY),
+            out_tp: [TruePeak::new(), TruePeak::new()],
+            loudness: LoudnessMeter::new(sr),
             audio: Delay2::new(delay),
             window: [WindowMin::new(look), WindowMin::new(look)],
             mean: [Mean::new(look + 1), Mean::new(look + 1)],
             release: [DualRelease::default(); 2],
             drive,
+            trim,
             meters: [[mt; 2]; 2],
             scratch: [vec![0.0; block], vec![0.0; block]],
             params,
@@ -317,23 +382,23 @@ impl PluginProcessor for LimiterProcessor {
                     break;
                 }
             }
+            let st = style(self.get(id::STYLE).round().max(0.0) as usize);
+            // The ceiling kept (with the style's margin) and the one
+            // nothing passes.
             let ceiling = gain(self.get(id::CEILING));
-            let style = self.get(id::STYLE).round().max(0.0) as usize;
-            let (attack_share, release_scale) = match style {
-                1 => (0.5, 0.7),
-                2 => (0.25, 0.4),
-                _ => (1.0, 1.0),
-            };
-            let attack_len = ((self.look as f64 * attack_share).round() as usize).max(1) + 1;
-            let release_ms = self.get(id::RELEASE) * release_scale;
+            let kept = gain(self.get(id::CEILING) - st.margin);
+            let attack_len = ((self.look as f64 * st.attack_share).round() as usize).max(1) + 1;
+            let release_ms = self.get(id::RELEASE) * st.release;
             for c in 0..2 {
                 self.mean[c].set_len(attack_len);
                 self.release[c].set(0.0001, release_ms, self.sr);
             }
-            let auto = self.get(id::AUTO_RELEASE) >= 0.5;
+            let auto = st.always_auto || self.get(id::AUTO_RELEASE) >= 0.5;
             let link = self.get(id::LINK).clamp(0.0, 1.0);
+            let release_link = self.get(id::RELEASE_LINK).clamp(0.0, 1.0);
             let drive_db = self.get(id::GAIN);
             self.drive.set(gain(drive_db));
+            self.trim.set(gain(self.get(id::OUTPUT).min(0.0)));
             let unity = if self.get(id::UNITY) >= 0.5 {
                 gain(-drive_db)
             } else {
@@ -341,6 +406,7 @@ impl PluginProcessor for LimiterProcessor {
             };
             for i in at..end {
                 let d = self.drive.tick();
+                let trim = self.trim.tick() * unity;
                 let x = [
                     f64::from(self.scratch[0][i]) * d,
                     f64::from(self.scratch[1][i]) * d,
@@ -362,21 +428,40 @@ impl PluginProcessor for LimiterProcessor {
                 let loudest = level[0].max(level[1]);
                 let dry = self.audio.tick(x);
                 let mut y = [0.0f64; 2];
+                let mut gr = [0.0f64; 2];
+                let mut avg = [1.0f64; 2];
                 for c in 0..2 {
                     let p = level[c].max(link * loudest);
-                    let need = if p > ceiling { ceiling / p } else { 1.0 };
+                    let need = if p > kept { kept / p } else { 1.0 };
                     let held = self.window[c].push(need);
-                    let avg = self.mean[c].push(held).min(1.0);
+                    avg[c] = self.mean[c].push(held).min(1.0);
                     // Instant down (the window has shaped it), released
                     // gently; never above what the window asks.
-                    let gr = self.release[c].process((-db(avg)).max(0.0), auto);
-                    let g = gain(-gr).min(avg);
+                    gr[c] = self.release[c].process((-db(avg[c])).max(0.0), auto);
+                }
+                // The release link: each side pulled towards the deeper
+                // reduction (more reduction keeps the ceiling as well).
+                if release_link > 0.0 {
+                    let deeper = gr[0].max(gr[1]);
+                    for g in &mut gr {
+                        *g += release_link * (deeper - *g);
+                    }
+                }
+                for c in 0..2 {
+                    let g = gain(-gr[c]).min(avg[c]);
                     gr_peak = gr_peak.max(-db(g));
                     // Rounding and release corners: nothing passes the
                     // ceiling.
-                    y[c] = (dry[c] * g).clamp(-ceiling, ceiling) * unity;
+                    y[c] = (dry[c] * g).clamp(-ceiling, ceiling) * trim;
                 }
-                out_peak = out_peak.max(y[0].abs()).max(y[1].abs());
+                if self.true_peak {
+                    for (tp, v) in self.out_tp.iter_mut().zip(y) {
+                        out_peak = out_peak.max(tp.process(v));
+                    }
+                } else {
+                    out_peak = out_peak.max(y[0].abs()).max(y[1].abs());
+                }
+                self.loudness.add(y, channels);
                 if channels >= 2 {
                     out.channel_mut(0)[i] = y[0] as f32;
                     out.channel_mut(1)[i] = y[1] as f32;
@@ -389,8 +474,13 @@ impl PluginProcessor for LimiterProcessor {
         for e in events {
             self.params.apply_event(e.parameter, e.value);
         }
+        self.loudness.flush();
         let gr_now = self.release[0].fast.max(self.release[1].fast).max(0.0);
         self.tap.set_value(value::REDUCTION, gr_now as f32);
+        self.tap
+            .set_value(value::LUFS_MOMENTARY, self.loudness.momentary() as f32);
+        self.tap
+            .set_value(value::LUFS_SHORT, self.loudness.short_term() as f32);
         self.tap.raise_value(value::REDUCTION_PEAK, gr_peak as f32);
         self.tap.raise_value(value::IN_PEAK, in_peak as f32);
         self.tap.raise_value(value::OUT_PEAK, out_peak as f32);
@@ -415,6 +505,8 @@ impl PluginProcessor for LimiterProcessor {
 
     fn reset(&mut self) {
         self.tp.iter_mut().for_each(TruePeak::reset);
+        self.out_tp.iter_mut().for_each(TruePeak::reset);
+        self.loudness.reset();
         self.tp_align.reset();
         self.audio.reset();
         for c in 0..2 {

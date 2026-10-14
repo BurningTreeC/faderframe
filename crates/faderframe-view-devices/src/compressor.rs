@@ -1,7 +1,8 @@
-//! The Compressor's face: its transfer curve with the level moving on it
-//! (drag across the curve to set the threshold), a scrolling history of
-//! what goes in, what comes out and how much is taken, the controls and
-//! the meters.
+//! The Compressor's face: its transfer curve (the knee, the range, the
+//! upward lift below the threshold) with the level moving on it (drag
+//! across the curve to set the threshold), a scrolling history of what
+//! goes in, what comes out and how much is taken, the controls and the
+//! meters.
 
 use crate::kit::{
     self, Ctl, Ctx, Edit, Face, KNOB, Meter, MeterKind, Panel, SMALL, SWITCH_H, Scale, at,
@@ -53,27 +54,24 @@ impl Face for CompressorFace {
     }
 
     fn min_size(&self) -> Size {
-        Size::new(820.0, 470.0)
+        Size::new(980.0, 500.0)
     }
 
     fn panel(&self, size: Size) -> Panel {
-        let (display, deck, meter) = kit::frame(size, 196.0, 70.0);
+        let (display, deck, meter) = kit::frame(size, 214.0, 70.0);
         let s = kit::sections(
             deck,
             &[
                 ("COMPRESSION", 5.0),
-                ("TIME", 4.0),
-                ("CHARACTER", 3.0),
+                ("TIME", 4.6),
+                ("CHARACTER", 3.4),
                 ("SIDECHAIN", 2.5),
-                ("OUTPUT", 2.6),
+                ("OUTPUT", 3.0),
             ],
         );
         let mut c = Vec::new();
         let r = kit::inside(&s[0]);
-        let k = kit::row(
-            Rect::new(r.x, r.y, r.w, KNOB.1),
-            &[KNOB.0, KNOB.0, SMALL.0, SMALL.0],
-        );
+        let k = kit::row(Rect::new(r.x, r.y, r.w, KNOB.1), &[KNOB.0, KNOB.0, SMALL.0]);
         c.push(Ctl::knob(pid(id::THRESHOLD), "THRESHOLD", k[0]));
         c.push(Ctl::knob(pid(id::RATIO), "RATIO", k[1]).scaled(Scale::Log));
         c.push(Ctl::small(
@@ -81,30 +79,27 @@ impl Face for CompressorFace {
             "KNEE",
             at(k[2], 0.0, 6.0, SMALL.0, SMALL.1),
         ));
-        c.push(Ctl::small(
-            pid(id::RANGE),
-            "RANGE",
-            at(k[3], 0.0, 6.0, SMALL.0, SMALL.1),
-        ));
-        let row2 = Rect::new(r.x, r.y + KNOB.1 + 10.0, r.w, SWITCH_H + 26.0);
+        let row2 = Rect::new(r.x, r.y + KNOB.1 + 8.0, r.w, SMALL.1);
+        let k = kit::row(row2, &[SMALL.0, SMALL.0, 100.0]);
+        c.push(Ctl::small(pid(id::RANGE), "RANGE", k[0]));
+        c.push(Ctl::small(pid(id::UPWARD), "UPWARD", k[1]));
         c.push(Ctl::segments(
             pid(id::DETECTOR),
             "DETECTOR",
-            Rect::new(row2.x + 8.0, row2.y, 132.0, 38.0),
+            Rect::new(k[2].x, row2.y + 8.0, 100.0, 38.0),
         ));
         let r = kit::inside(&s[1]);
-        let k = kit::row(Rect::new(r.x, r.y, r.w, KNOB.1), &[KNOB.0, KNOB.0, SMALL.0]);
+        let k = kit::row(Rect::new(r.x, r.y, r.w, KNOB.1), &[KNOB.0, KNOB.0]);
         c.push(Ctl::knob(pid(id::ATTACK), "ATTACK", k[0]).scaled(Scale::Log));
         c.push(Ctl::knob(pid(id::RELEASE), "RELEASE", k[1]).scaled(Scale::Log));
-        c.push(Ctl::small(
-            pid(id::LOOKAHEAD),
-            "LOOKAHEAD",
-            at(k[2], 0.0, 6.0, SMALL.0, SMALL.1),
-        ));
+        let row2 = Rect::new(r.x, r.y + KNOB.1 + 8.0, r.w, SMALL.1);
+        let k = kit::row(row2, &[SMALL.0, SMALL.0, 96.0]);
+        c.push(Ctl::small(pid(id::HOLD), "HOLD", k[0]));
+        c.push(Ctl::small(pid(id::LOOKAHEAD), "LOOKAHEAD", k[1]));
         c.push(Ctl::toggle(
             pid(id::AUTO_RELEASE),
             "Auto Release",
-            Rect::new(r.x + 8.0, r.y + KNOB.1 + 18.0, 120.0, SWITCH_H),
+            Rect::new(k[2].x, row2.y + 16.0, 96.0, SWITCH_H),
         ));
         let r = kit::inside(&s[2]);
         c.push(Ctl::choice(
@@ -115,6 +110,17 @@ impl Face for CompressorFace {
         let k = kit::spread(Rect::new(r.x, r.y + 46.0, r.w, SMALL.1), 2, SMALL.0);
         c.push(Ctl::small(pid(id::COLOR), "COLOR", k[0]));
         c.push(Ctl::small(pid(id::LINK), "LINK", k[1]));
+        let row3 = r.y + 46.0 + SMALL.1 + 4.0;
+        c.push(Ctl::segments(
+            pid(id::CHANNELS),
+            "CHANNELS",
+            Rect::new(r.x + 4.0, row3, 76.0, 38.0),
+        ));
+        c.push(Ctl::choice(
+            pid(id::OVERSAMPLE),
+            "OVERSAMPLE",
+            Rect::new(r.x + 88.0, row3, r.w - 92.0, 38.0),
+        ));
         let r = kit::inside(&s[3]);
         c.push(Ctl::toggle(
             pid(id::EXTERNAL),
@@ -136,7 +142,17 @@ impl Face for CompressorFace {
         c.push(Ctl::toggle(
             pid(id::AUTO_MAKEUP),
             "Auto Makeup",
-            Rect::new(r.x + 4.0, r.y + KNOB.1 + 18.0, r.w - 8.0, SWITCH_H),
+            Rect::new(r.x + 4.0, r.y + KNOB.1 + 12.0, r.w - 8.0, SWITCH_H),
+        ));
+        c.push(Ctl::toggle(
+            pid(id::DELTA),
+            "Delta",
+            Rect::new(
+                r.x + 4.0,
+                r.y + KNOB.1 + 12.0 + SWITCH_H + 8.0,
+                r.w - 8.0,
+                SWITCH_H,
+            ),
         ));
         let w = (meter.w - 8.0) / 3.0;
         let meters = vec![
@@ -199,10 +215,11 @@ impl Face for CompressorFace {
         let knee = cx.value(pid(id::KNEE));
         let range = cx.value(pid(id::RANGE));
         let range = if range >= 59.5 { f64::INFINITY } else { range };
+        let upward = cx.value(pid(id::UPWARD));
         let pts: Vec<Point> = (0..=120)
             .map(|i| {
                 let x = -60.0 + f64::from(i) * 0.5;
-                let y = x - comp::reduction(x, threshold, ratio, knee).min(range);
+                let y = x + comp::curve(x, threshold, ratio, knee, range, upward);
                 Point::new(to_x(x), to_y(y))
             })
             .collect();
@@ -231,11 +248,11 @@ impl Face for CompressorFace {
             );
             y += 8.0;
         }
-        // Where the signal is now.
+        // Where the signal is now: the level in, the gain it gets.
         let level = f64::from(cx.published(value::LEVEL));
         if level > -60.0 {
-            let gr = f64::from(cx.published(value::REDUCTION));
-            let at = Point::new(to_x(level), to_y(level - gr));
+            let gain = f64::from(cx.published(value::GAIN));
+            let at = Point::new(to_x(level), to_y(level + gain));
             p.circle(at, 7.0, self.accent.with_alpha(0.25));
             p.circle(at, 4.0, th.ui.text);
         }
@@ -247,6 +264,17 @@ impl Face for CompressorFace {
             ),
             Rect::new(curve.x + 6.0, curve.y + 4.0, curve.w - 12.0, 14.0),
             &TextStyle::new(th.fonts.tiny + 0.5, th.ui.text_dim),
+        );
+        // The reduction now, held a moment.
+        let gr = self.history.recent_max(2, 1.0).max(0.0);
+        p.text(
+            &if gr > 0.05 {
+                format!("−{gr:.1} dB")
+            } else {
+                "0.0 dB".into()
+            },
+            Rect::new(curve.x + 6.0, curve.y + 20.0, curve.w - 12.0, 16.0),
+            &TextStyle::new(th.fonts.small, th.device.reduction).bold(),
         );
         // The history: input filled, output a line, reduction from the top.
         self.history.paint(p, hist, cx, -60.0, 24.0, false);
@@ -301,15 +329,20 @@ impl Face for CompressorFace {
     fn tip(&self, pid: ParameterId) -> Option<&'static str> {
         Some(match pid.0 {
             id::STYLE => {
-                "Clean (transparent), Punch (peaks, snappy), Opto (smooth, programme dependent), Vintage (fast, with bite), Bus (glue)"
+                "Clean (transparent), Punch (peaks, snappy), Opto (smooth, programme dependent), Vintage (fast, with bite), Bus (glue), Mastering (slow, wide knee), Pumping (held, then one swell back)"
             }
             id::KNEE => "How gradually compression starts round the threshold",
             id::RANGE => "The most it may turn down",
+            id::UPWARD => "Lift what is under the threshold, at most this much",
+            id::HOLD => "Keep the reduction this long before it releases",
             id::LOOKAHEAD => "See peaks coming (adds as much latency)",
             id::COLOR => "Harmonic saturation",
+            id::OVERSAMPLE => "Saturate at a higher rate, free of aliasing (adds latency)",
             id::LINK => "How much both channels follow the louder one",
+            id::CHANNELS => "Compress left and right, or the middle and the sides",
             id::EXTERNAL => "Key from the sidechain when one is routed in",
             id::LISTEN => "Hear the key through its filters",
+            id::DELTA => "Hear only what the compressor takes away",
             _ => return None,
         })
     }

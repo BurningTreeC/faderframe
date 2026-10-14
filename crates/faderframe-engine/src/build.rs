@@ -35,7 +35,7 @@ use crate::slots::SlotRegistry;
 use faderframe_audio_graph::nodes::Passthrough;
 use faderframe_audio_graph::{GraphBuilder, NodeId, NodeKey, NodeRole, NodeSpec, PrepareConfig};
 use faderframe_core::PluginInstanceId;
-use faderframe_core::{ChannelLayout, TrackId};
+use faderframe_core::{ChannelLayout, CueId, TrackId};
 use faderframe_plugin_host::ProcessConfig;
 use faderframe_project::{
     InputRouting, MonitorMode, OutputRouting, PluginSlot, Project, SendTap, Track, TrackKind,
@@ -85,25 +85,36 @@ pub struct AheadPlan<'a> {
     /// the audio thread, buses' outputs to their strips.
     pub bus_rings: &'a mut HashMap<TrackId, Arc<AheadRing>>,
     pub bus_ring_frames: usize,
+    /// The cue paths' rings from the shallow tier to the audio thread, by
+    /// (track or cue channel, port).
+    pub cue_rings: &'a mut HashMap<(TrackId, u8), Arc<AheadRing>>,
     pub misses: Arc<AtomicU64>,
 }
 
-/// `rings[track]` if it has `channels` and `frames`, else a new one there.
-fn ring_of(
-    rings: &mut HashMap<TrackId, Arc<AheadRing>>,
-    track: TrackId,
+/// `rings[key]` if it has `channels` and `frames`, else a new one there.
+fn ring_of<K: std::hash::Hash + Eq>(
+    rings: &mut HashMap<K, Arc<AheadRing>>,
+    key: K,
     channels: usize,
     frames: usize,
 ) -> Arc<AheadRing> {
     let channels = channels.max(1);
-    match rings.get(&track) {
+    match rings.get(&key) {
         Some(r) if r.channels() == channels && r.capacity() == frames => Arc::clone(r),
         _ => {
             let r = AheadRing::new(channels, frames);
-            rings.insert(track, Arc::clone(&r));
+            rings.insert(key, Arc::clone(&r));
             r
         }
     }
+}
+
+/// Buses and returns have a *cue path*: a second sum of their sources
+/// as the cue mixes hear them (never muted, no solo), through a second
+/// instance of each of their devices (cue shadows) and a solo-safe strip,
+/// which their cue sends tap.
+pub fn has_cue_path(t: &Track) -> bool {
+    matches!(t.kind, TrackKind::Bus | TrackKind::Aux)
 }
 
 /// What is rendered ahead: the chains of `tracks`, and of those the
@@ -198,8 +209,6 @@ pub fn ahead_sets(
         .map(|t| t.id)
         .collect();
     let mut strips = HashSet::new();
-    // Cue mixes take every strip's cue taps on the audio thread.
-    let buses = buses && project.cue_mixes.is_empty();
     if !buses {
         if let Some(k) = keep {
             tracks.retain(|t| !k.strips.contains(t));
@@ -388,6 +397,16 @@ enum Role {
     Console = 20,
     CueInput = 21,
     CueSend = 22,
+    /// A bus's cue path: its sum.
+    CueBusInput = 23,
+    /// A bus's cue path: its strip.
+    CueStrip = 24,
+    /// A cue path's way from the shallow tier to the audio thread.
+    CueAhead = 25,
+    /// The talkback microphone.
+    Talkback = 26,
+    /// A cue mix after its level: its strip plus the talkback.
+    CueOut = 27,
 }
 
 /// Stretcher voices a track's clip player needs: one per pitch-preserving
@@ -520,9 +539,23 @@ struct PluginCx<'a> {
     monitor_limit: u32,
     /// The effects it bypassed.
     bypassed_for_monitoring: Vec<PluginInstanceId>,
+    /// Building a bus's cue path: every plugin node is the slot's *cue
+    /// shadow* (a second instance, [`PluginInstanceId::cue_shadow`]),
+    /// keyed apart from the main one.
+    shadow: bool,
 }
 
 impl PluginCx<'_> {
+    /// The track id node keys are made with (a cue path's apart from the
+    /// main path's).
+    fn key_track(&self, t: &Track) -> TrackId {
+        if self.shadow {
+            TrackId(t.id.raw() | (1 << 62))
+        } else {
+            t.id
+        }
+    }
+
     fn audio_chain<'a>(&mut self, t: &'a Track) -> Vec<&'a PluginSlot> {
         let mut slots: Vec<_> = t.inserts.iter().collect();
         if let Some(preamp) = &t.preamp {
@@ -602,8 +635,12 @@ impl PluginCx<'_> {
             }
         }
         // Extra output buses tracks take, up to the highest (the channels
-        // the plugin gives them).
-        let extra = self.taken.get(&slot.id).copied().unwrap_or(0);
+        // the plugin gives them). A cue shadow plays its main output only.
+        let extra = if self.shadow {
+            0
+        } else {
+            self.taken.get(&slot.id).copied().unwrap_or(0)
+        };
         if extra > 0
             && let Ok(inst) = self.plugins.instance(slot)
         {
@@ -638,20 +675,37 @@ impl PluginCx<'_> {
                 !i.descriptor().audio_inputs.is_empty() && i.latency_samples() > limit
             });
         let bypass = slot.bypass || monitored;
-        if monitored && !slot.bypass {
+        if monitored && !slot.bypass && !self.shadow {
             self.bypassed_for_monitoring.push(slot.id);
         }
-        if let Ok(instance) = self.plugins.instance(slot) {
+        // A cue shadow: the slot's second instance, hosted under the
+        // shadow id (its state and values follow the slot's).
+        let shadow_slot;
+        let host_slot: &PluginSlot = if self.shadow {
+            shadow_slot = PluginSlot {
+                id: slot.id.cue_shadow(),
+                ..slot.clone()
+            };
+            &shadow_slot
+        } else {
+            slot
+        };
+        let taken = if self.shadow {
+            1
+        } else {
+            self.taken_buses.get(&slot.id).copied().unwrap_or(0) | 1
+        };
+        if let Ok(instance) = self.plugins.instance(host_slot) {
             instance.configure_realtime(self.realtime && !slot.bypass);
             // The same in both graphs: latency must not depend on which.
             instance.configure_device_block(self.device_block);
             instance
                 .configure_channels(spec.audio_outputs.first().map_or(0, |l| l.channel_count()));
             instance.configure_outputs(spec.audio_outputs.len().max(1));
-            instance
-                .configure_taken_outputs(self.taken_buses.get(&slot.id).copied().unwrap_or(0) | 1);
+            instance.configure_taken_outputs(taken);
         }
-        match self.plugins.activate(slot, &process) {
+        let key_track = self.key_track(track);
+        match self.plugins.activate(host_slot, &process) {
             Ok(p) => {
                 // Latency and bypass change the node's behaviour, and a
                 // restarted plugin's old processor is dead: all are part of
@@ -661,7 +715,7 @@ impl PluginCx<'_> {
                 // needs a different adoption key. External plugins retain
                 // their keys when moving between live and ahead graphs.
                 let buffered = p.processor.preferred_block_size() != usize::MAX;
-                let sub = slot.id.raw()
+                let sub = host_slot.id.raw()
                     ^ ((buffered as u64) << 62)
                     ^ ((p.latency as u64) << 40)
                     ^ ((bypass as u64) << 63)
@@ -679,7 +733,7 @@ impl PluginCx<'_> {
                 );
                 (
                     b.add_node(
-                        spec.key(node_key(track.id, role, sub, &layouts)),
+                        spec.key(node_key(key_track, role, sub, &layouts)),
                         Box::new(node),
                     ),
                     latency,
@@ -876,6 +930,7 @@ pub fn build_graph(
     monitor: &[PluginSlot],
     listen: &Listen,
     monitoring: &Monitoring,
+    talkback: &crate::slots::Talkback,
 ) -> Result<BuiltGraph, EngineError> {
     let early = &monitoring.tracks;
     let midi_ports = &routing.inputs;
@@ -885,7 +940,11 @@ pub fn build_graph(
     } else {
         Vec::new()
     };
-    let cue_taps = |t: &Track| !cues.is_empty() && faderframe_project::cue::feeds_cues(t.kind);
+    // Tracks whose own strip has the cue mixes' taps (buses have a cue
+    // path of their own instead).
+    let cue_taps = |t: &Track| {
+        !cues.is_empty() && faderframe_project::cue::feeds_cues(t.kind) && !has_cue_path(t)
+    };
     let mut b = GraphBuilder::<EngineContext>::new();
     let mut ab = GraphBuilder::<EngineContext>::new();
     let mut used_rings: Vec<Arc<AheadRing>> = Vec::new();
@@ -916,6 +975,7 @@ pub fn build_graph(
         monitor_path: monitored_path(project, &monitoring.tracks),
         monitor_limit: monitoring.limit,
         bypassed_for_monitoring: Vec::new(),
+        shadow: false,
     };
     // Nodes (in the audio thread's graph) of plugins whose extra outputs
     // tracks take.
@@ -951,6 +1011,9 @@ pub fn build_graph(
     // Strips rendered ahead: the latency of their signal (buses rendered
     // ahead are built after everything that reaches them, to know it).
     let mut strip_latency: HashMap<TrackId, u32> = HashMap::new();
+    // Every track rendered ahead: the latency of its chain's end (a bus's
+    // with what reaches it).
+    let mut ahead_latency: HashMap<TrackId, u32> = HashMap::new();
     let order = match &ahead {
         Some(plan) if !plan.strips.is_empty() => ahead_order(project, plan.tracks),
         _ => (0..project.tracks.len()).collect(),
@@ -1002,6 +1065,7 @@ pub fn build_graph(
                 .max()
                 .unwrap_or(0);
             let latency = fed_latency + chain_latency;
+            ahead_latency.insert(t.id, latency);
             if bus {
                 tn.input = Some(input);
                 tn.input_ahead = true;
@@ -1065,7 +1129,19 @@ pub fn build_graph(
                         &plan.misses,
                     )
                 };
-                let strip = add_strip(&mut bb, project, slots, config, t, None, end, true, false)?;
+                let strip = add_strip(
+                    &mut bb,
+                    project,
+                    slots,
+                    config,
+                    t,
+                    None,
+                    end,
+                    StripKind::Main {
+                        quiet: true,
+                        cue_taps: cue_taps(t),
+                    },
+                )?;
                 let echo = ring_of(
                     plan.bus_rings,
                     t.id,
@@ -1124,8 +1200,10 @@ pub fn build_graph(
                     t,
                     Some(gi),
                     back,
-                    false,
-                    cue_taps(t),
+                    StripKind::Main {
+                        quiet: false,
+                        cue_taps: cue_taps(t),
+                    },
                 )?;
                 tn.post_fx = Some(back);
                 tn.strip = Some(own(&mut owners, strip, t.id, None, NodeWork::Strip));
@@ -1483,8 +1561,10 @@ pub fn build_graph(
             t,
             Some(gi),
             prev,
-            false,
-            cue_taps(t),
+            StripKind::Main {
+                quiet: false,
+                cue_taps: cue_taps(t),
+            },
         )?;
         tn.post_fx = Some(prev);
         tn.strip = Some(own(&mut owners, strip, t.id, None, NodeWork::Strip));
@@ -1716,11 +1796,33 @@ pub fn build_graph(
     }
 
     // Pass 3: the cue mixes. Each sums its sends into its own strip (its
-    // level and mute) and plays on its outputs: a heard output like the
+    // level and mute, dimmed for talkback), adds the talkback microphone
+    // after it and plays on its outputs: a heard output like the
     // master's, aligned with it, never through the master's listening.
     // Every track that feeds cue mixes sends to each from its strip's cue
     // tap (before or after the fader, never muted), a send it has none of
     // silent — so the sends' levels, pans and switches are parameters.
+    // Buses and returns send from their *cue path* (below): their sources
+    // as the cue hears them, through their devices' cue shadows.
+    let talk_in = talkback.input.filter(|_| !cues.is_empty()).map(|ch| {
+        b.add_node(
+            NodeSpec::new("Talkback · Hardware In")
+                .key(node_key(
+                    TALKBACK_CHANNEL,
+                    Role::Talkback,
+                    u64::from(ch),
+                    &[ChannelLayout::Mono],
+                ))
+                .role(NodeRole::DeviceInput { first_channel: ch })
+                .audio_out(ChannelLayout::Mono),
+            Box::new(DeviceInputTap),
+        )
+    });
+    // Per cue mix: its sum on the audio thread, and (made when a send is
+    // rendered ahead) its sum in the shallow tier with the latency of what
+    // reaches it.
+    let mut cue_inputs: HashMap<CueId, NodeId> = HashMap::new();
+    let mut cue_ahead: HashMap<CueId, (NodeId, u32)> = HashMap::new();
     for cue in &cues {
         let ch = cue.channel();
         let layout = cue.layout;
@@ -1731,9 +1833,10 @@ pub fn build_graph(
                 .audio_out(layout),
             Box::new(Passthrough),
         );
+        let talk = slots.cue_talk(cue.id)?;
         let strip = b.add_node(
             NodeSpec::new(format!("Cue · {} · Strip", cue.name))
-                .key(node_key(ch, Role::Strip, 0, &[layout, layout]))
+                .key(node_key(ch, Role::Strip, 1, &[layout, layout]))
                 .audio_in(layout)
                 .audio_out(layout),
             Box::new(
@@ -1743,11 +1846,44 @@ pub fn build_graph(
                     slots.meter(ch, layout.channel_count())?,
                     slots.mix()?,
                 )
-                .with_layouts(layout, layout),
+                .with_layouts(layout, layout)
+                .with_trim(talk.dim),
             ),
         );
         own(&mut owners, strip, ch, None, NodeWork::Strip);
         b.connect_audio(input, 0, strip, 0)?;
+        // After its level and dim: the talkback (never dimmed, heard at
+        // once), then its outputs.
+        let out = b.add_node(
+            NodeSpec::new(format!("Cue · {} · Out", cue.name))
+                .key(node_key(ch, Role::CueOut, 0, &[layout]))
+                .audio_in(layout)
+                .audio_out(layout),
+            Box::new(Passthrough),
+        );
+        b.connect_audio(strip, 0, out, 0)?;
+        if let Some(mic) = talk_in {
+            let node = b.add_node(
+                NodeSpec::new(format!("Talkback → {}", cue.name))
+                    .key(node_key(
+                        ch,
+                        Role::Talkback,
+                        0,
+                        &[ChannelLayout::Mono, layout],
+                    ))
+                    .audio_in(ChannelLayout::Mono)
+                    .audio_out(layout),
+                Box::new(SendNode::plain(ch, talk.talk).with_layouts(
+                    ChannelLayout::Mono,
+                    layout,
+                    None,
+                    slots.mix()?,
+                )),
+            );
+            own(&mut owners, node, ch, None, NodeWork::Send);
+            b.connect_audio(mic, 0, node, 0)?;
+            b.connect_audio_early(node, 0, out, 0)?;
+        }
         let first_channel = cue.first_channel;
         let hw = b.add_node(
             NodeSpec::new(format!("Cue · {} · Hardware Out", cue.name))
@@ -1762,43 +1898,267 @@ pub fn build_graph(
             Box::new(DeviceOutputSink),
         );
         own(&mut owners, hw, ch, None, NodeWork::HardwareOut);
-        b.connect_audio(strip, 0, hw, 0)?;
-        let port = if cue.post_fader() { 3 } else { 2 };
+        b.connect_audio(out, 0, hw, 0)?;
+        cue_inputs.insert(cue.id, input);
+    }
+
+    // The buses' cue paths, feeders first: a sum of their sources' cue
+    // images (post-fader, panned, never muted) and of their sends taken
+    // from the never-muted taps, through cue shadows of their devices
+    // (outboard gear plays once, in the main mix) into a solo-safe strip.
+    // A bus whose chain is rendered ahead has its cue path in the shallow
+    // tier too (its sources are strips rendered ahead there); a cue path
+    // there feeding one on the audio thread crosses through a ring.
+    let mut cue_paths: HashMap<TrackId, CuePath> = HashMap::new();
+    if !cues.is_empty() {
+        for bi in cue_bus_order(project) {
+            let t = &project.tracks[bi];
+            let gi = bi as u32;
+            let in_bb = ahead.as_ref().is_some_and(|p| p.tracks.contains(&t.id));
+            let layout = t.layout;
+            let spec = NodeSpec::new(format!("{} · Cue", t.name))
+                .key(node_key(t.id, Role::CueBusInput, 0, &[layout]))
+                .audio_in(layout)
+                .audio_out(layout);
+            let sum = if in_bb {
+                bb.add_node(spec, Box::new(Passthrough))
+            } else {
+                let n = b.add_node(spec.group(gi), Box::new(Passthrough));
+                own(&mut owners, n, t.id, None, NodeWork::Input);
+                n
+            };
+            let mut fed_latency = 0u32;
+            // Its sources' post-fader cue images (sub-buses: their cue
+            // paths), and the sends reaching it from the never-muted taps.
+            let mut feeds: Vec<(CueTap, Option<(&Track, &faderframe_project::AuxSend)>)> =
+                Vec::new();
+            for src in &project.tracks {
+                if !faderframe_project::cue::feeds_cues(src.kind) {
+                    continue;
+                }
+                if project.output_target(src) == Some(t.id)
+                    && let Some(tap) =
+                        cue_tap(project, &nodes, &cue_paths, &strip_latency, src, true)
+                {
+                    feeds.push((tap, None));
+                }
+                for send in src.sends.iter().filter(|x| x.enabled && x.target == t.id) {
+                    let tap = match send.tap {
+                        SendTap::PreFx => cue_prefx_tap(&nodes, &cue_paths, src),
+                        SendTap::PreFader => {
+                            cue_tap(project, &nodes, &cue_paths, &strip_latency, src, false)
+                        }
+                        SendTap::PostFader => {
+                            cue_tap(project, &nodes, &cue_paths, &strip_latency, src, true)
+                        }
+                    };
+                    if let Some(tap) = tap {
+                        feeds.push((tap, Some((src, send))));
+                    }
+                }
+            }
+            for (tap, send) in feeds {
+                let early_src = early.contains(&tap.track);
+                // A send: its node where the tap is (the same slots as the
+                // main one's, quiet).
+                let (from, port, from_layout) = match send {
+                    Some((src, send)) => {
+                        let level = slots.send(send.id)?;
+                        let surround = |l: ChannelLayout| matches!(l, ChannelLayout::Surround(_));
+                        let follow = (matches!(send.tap, SendTap::PreFx | SendTap::PreFader)
+                            && !surround(src.layout)
+                            && surround(t.layout))
+                        .then(|| slots.strip_of(src.id))
+                        .flatten();
+                        let diffuse = follow.is_some() && is_diffuse(project, src);
+                        let mut node = SendNode::new(src.id, send.id, level)
+                            .with_pan(slots.send_pan(send.id)?)
+                            .with_layouts(tap.layout, t.layout, follow, slots.mix()?)
+                            .quiet();
+                        if diffuse {
+                            node = node.with_diffuser(config.sample_rate);
+                        }
+                        let spec = NodeSpec::new(format!("{} → {} · Cue", src.name, t.name))
+                            .key(node_key(
+                                src.id,
+                                Role::CueSend,
+                                send.id.raw()
+                                    | (u64::from(follow.is_some()) << 63)
+                                    | (u64::from(diffuse) << 62)
+                                    | (1 << 58),
+                                &[tap.layout, t.layout],
+                            ))
+                            .audio_in(tap.layout)
+                            .audio_out(t.layout);
+                        let n = if tap.in_bb {
+                            let n = bb.add_node(spec, Box::new(node));
+                            bb.connect_audio(tap.node, tap.port, n, 0)?;
+                            n
+                        } else {
+                            let n = b.add_node(spec.group(gi), Box::new(node));
+                            own(&mut owners, n, src.id, None, NodeWork::Send);
+                            b.connect_audio(tap.node, tap.port, n, 0)?;
+                            n
+                        };
+                        (n, 0, t.layout)
+                    }
+                    None => (tap.node, tap.port, tap.layout),
+                };
+                match (in_bb, tap.in_bb) {
+                    (true, true) => {
+                        bb.connect_audio(from, port, sum, 0)?;
+                        fed_latency = fed_latency.max(tap.latency);
+                    }
+                    (false, true) => {
+                        let back = cross(
+                            &mut bb,
+                            &mut b,
+                            ahead.as_mut(),
+                            &mut bus_used_rings,
+                            &mut owners,
+                            from,
+                            port,
+                            from_layout,
+                            tap.latency,
+                            (tap.track, port as u8 | (u8::from(send.is_some()) << 4)),
+                            &format!("{} → {} · Cue", tap.name, t.name),
+                        )?;
+                        b.connect_audio(back, 0, sum, 0)?;
+                    }
+                    // A cue path rendered ahead has every source there.
+                    (true, false) => {}
+                    (false, false) => {
+                        if early_src {
+                            b.connect_audio_early(from, port, sum, 0)?;
+                        } else {
+                            b.connect_audio(from, port, sum, 0)?;
+                        }
+                    }
+                }
+            }
+            // Through the cue shadows of its devices into its strip.
+            let realtime = pcx.realtime;
+            if in_bb {
+                pcx.realtime = false;
+            }
+            let g = if in_bb { &mut bb } else { &mut b };
+            let (end, chain_latency, prefx) = build_cue_chain(
+                g,
+                &mut pcx,
+                slots,
+                &mut owners,
+                &mut sidechains,
+                project,
+                t,
+                config,
+                sum,
+                (!in_bb).then_some(gi),
+            )?;
+            pcx.realtime = realtime;
+            let strip = add_strip(
+                g,
+                project,
+                slots,
+                config,
+                t,
+                (!in_bb).then_some(gi),
+                end,
+                StripKind::Cue,
+            )?;
+            if !in_bb {
+                own(&mut owners, strip, t.id, None, NodeWork::Strip);
+            }
+            cue_paths.insert(
+                t.id,
+                CuePath {
+                    prefx,
+                    strip,
+                    in_bb,
+                    latency: fed_latency + chain_latency,
+                },
+            );
+        }
+    }
+
+    // The cue sends: every channel into every cue mix.
+    for cue in &cues {
+        let ch = cue.channel();
+        let layout = cue.layout;
+        let Some(&input) = cue_inputs.get(&cue.id) else {
+            continue;
+        };
+        let post = cue.post_fader();
         for (gi, t) in project.tracks.iter().enumerate() {
-            if !cue_taps(t) {
+            if !faderframe_project::cue::feeds_cues(t.kind) {
                 continue;
             }
-            let Some(strip) = nodes
-                .get(&t.id)
-                .filter(|n| !n.strip_ahead)
-                .and_then(|n| n.strip)
-            else {
+            let Some(tap) = cue_tap(project, &nodes, &cue_paths, &strip_latency, t, post) else {
                 continue;
             };
-            let tap = t.chain_layout();
             let s = slots.cue_send(t.id, cue.id)?;
-            let node = b.add_node(
-                NodeSpec::new(format!("{} → {}", t.name, cue.name))
-                    .key(node_key(
-                        t.id,
-                        Role::CueSend,
-                        cue.id.raw() | (u64::from(port) << 60),
-                        &[tap, layout],
-                    ))
-                    .group(gi as u32)
-                    .audio_in(tap)
-                    .audio_out(layout),
-                Box::new(SendNode::cue(t.id, s.gain, s.pan).with_layouts(
-                    tap,
-                    layout,
-                    None,
-                    slots.mix()?,
-                )),
+            let spec = NodeSpec::new(format!("{} → {}", t.name, cue.name))
+                .key(node_key(
+                    t.id,
+                    Role::CueSend,
+                    cue.id.raw() | (u64::from(tap.port) << 60),
+                    &[tap.layout, layout],
+                ))
+                .audio_in(tap.layout)
+                .audio_out(layout);
+            let node = SendNode::cue(t.id, cue.id, s).with_layouts(
+                tap.layout,
+                layout,
+                None,
+                slots.mix()?,
             );
-            own(&mut owners, node, t.id, None, NodeWork::Send);
-            b.connect_audio(strip, port, node, 0)?;
-            connect_out(&mut b, node, input, early.contains(&t.id))?;
+            if tap.in_bb {
+                let n = bb.add_node(spec, Box::new(node.quiet()));
+                bb.connect_audio(tap.node, tap.port, n, 0)?;
+                let (sum, latency) = match cue_ahead.get(&cue.id) {
+                    Some(&(sum, l)) => (sum, l),
+                    None => (
+                        bb.add_node(
+                            NodeSpec::new(format!("Cue · {} · Ahead", cue.name))
+                                .key(node_key(ch, Role::CueAhead, 0, &[layout]))
+                                .audio_in(layout)
+                                .audio_out(layout),
+                            Box::new(Passthrough),
+                        ),
+                        0,
+                    ),
+                };
+                bb.connect_audio(n, 0, sum, 0)?;
+                cue_ahead.insert(cue.id, (sum, latency.max(tap.latency)));
+            } else {
+                let n = b.add_node(spec.group(gi as u32), Box::new(node));
+                own(&mut owners, n, t.id, None, NodeWork::Send);
+                b.connect_audio(tap.node, tap.port, n, 0)?;
+                connect_out(&mut b, n, input, early.contains(&t.id))?;
+            }
         }
+    }
+    // What was sent in the shallow tier comes back to the audio thread
+    // with the latency of the slowest of it.
+    for cue in &cues {
+        let (Some(&(sum, latency)), Some(&input)) =
+            (cue_ahead.get(&cue.id), cue_inputs.get(&cue.id))
+        else {
+            continue;
+        };
+        let back = cross(
+            &mut bb,
+            &mut b,
+            ahead.as_mut(),
+            &mut bus_used_rings,
+            &mut owners,
+            sum,
+            0,
+            cue.layout,
+            latency,
+            (cue.channel(), 0),
+            &format!("Cue · {} · Ahead", cue.name),
+        )?;
+        b.connect_audio(back, 0, input, 0)?;
     }
     let bypassed_for_monitoring = std::mem::take(&mut pcx.bypassed_for_monitoring);
     // Sidechains tap their source after its inserts: before its fader,
@@ -1938,10 +2298,11 @@ fn add_container(
             },
         ));
     };
+    let key_track = pcx.key_track(t);
     let sum = b.add_node(
         NodeSpec::new(format!("{} · {}", t.name, t.name_of(container)))
             .key(node_key(
-                t.id,
+                key_track,
                 Role::ContainerSum,
                 container.id.raw(),
                 &[layout],
@@ -1973,7 +2334,7 @@ fn add_container(
                     t.name_of(container),
                     chain.name
                 ))
-                .key(node_key(t.id, Role::ChainNotes, sub, &[]))
+                .key(node_key(key_track, Role::ChainNotes, sub, &[]))
                 .group(gi)
                 .events_in(1)
                 .events_out(1),
@@ -2061,7 +2422,7 @@ fn add_container(
                 chain.name
             ))
             .key(node_key(
-                t.id,
+                key_track,
                 Role::ChainMix,
                 container.id.raw().rotate_left(8) ^ i as u64,
                 &[layout],
@@ -2160,8 +2521,19 @@ fn is_diffuse(project: &Project, t: &Track) -> bool {
     project.surround_panned(t).is_some() && project.effective_surround(t).diffuse
 }
 
-/// A track's channel strip, fed from `from` (`quiet`: rendered ahead;
-/// `cue_taps`: with the cue mixes' taps, outputs 2 and 3).
+/// Which strip [`add_strip`] builds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StripKind {
+    /// The track's own: live or rendered ahead (`quiet`), with the cue
+    /// mixes' taps (outputs 2 and 3) when `cue_taps`.
+    Main { quiet: bool, cue_taps: bool },
+    /// A bus's cue path's: solo-safe and quiet, outputs 0 (post-fader,
+    /// panned, the destination layout), 1 (pre-fader) and 2 (the cue
+    /// mixes' pre-fader tap).
+    Cue,
+}
+
+/// A track's channel strip, fed from `from`.
 #[allow(clippy::too_many_arguments)]
 fn add_strip(
     b: &mut GraphBuilder<EngineContext>,
@@ -2171,10 +2543,14 @@ fn add_strip(
     t: &Track,
     group: Option<u32>,
     from: NodeId,
-    quiet: bool,
-    cue_taps: bool,
+    kind: StripKind,
 ) -> Result<NodeId, EngineError> {
     let layout = t.chain_layout();
+    let cue = kind == StripKind::Cue;
+    let (quiet, cue_taps) = match kind {
+        StripKind::Main { quiet, cue_taps } => (quiet, cue_taps),
+        StripKind::Cue => (true, false),
+    };
     // The console's channel line amplifier, before the strip (wherever
     // the strip is built, the stage comes with it).
     let from = match &project.console {
@@ -2183,7 +2559,7 @@ fn add_strip(
                 .key(node_key(
                     t.id,
                     Role::Console,
-                    u64::from(c.family),
+                    u64::from(c.family) | (u64::from(cue) << 32),
                     &[layout],
                 ))
                 .audio_in(layout)
@@ -2214,24 +2590,34 @@ fn add_strip(
     let metered_elsewhere =
         t.kind == TrackKind::Master && project.objects().next().is_some() && !quiet;
     let diffuse = is_diffuse(project, t);
-    let mut spec = NodeSpec::new(format!("{} · Strip", t.name))
-        .key(node_key(
-            t.id,
-            Role::Strip,
-            u64::from(object) | (u64::from(metered_elsewhere) << 1) | (u64::from(diffuse) << 2),
-            &[layout, dest],
-        ))
-        .audio_in(layout)
-        .audio_out(dest)
-        .audio_out(layout);
+    let mut spec = NodeSpec::new(if cue {
+        format!("{} · Cue Strip", t.name)
+    } else {
+        format!("{} · Strip", t.name)
+    })
+    .key(node_key(
+        t.id,
+        if cue { Role::CueStrip } else { Role::Strip },
+        u64::from(object) | (u64::from(metered_elsewhere) << 1) | (u64::from(diffuse) << 2),
+        &[layout, dest],
+    ))
+    .audio_in(layout)
+    .audio_out(dest)
+    .audio_out(layout);
     if cue_taps {
-        spec = spec.audio_out(layout).audio_out(layout);
+        spec = spec.audio_out(layout).audio_out(dest);
+    }
+    if cue {
+        spec = spec.audio_out(layout);
     }
     if let Some(g) = group {
         spec = spec.group(g);
     }
     let mut strip =
         ChannelStrip::new(t.id, strip_slots, meter, slots.mix()?).with_layouts(layout, dest);
+    if cue_taps {
+        strip = strip.with_cue_image();
+    }
     if object {
         strip = strip.object();
     }
@@ -2241,9 +2627,321 @@ fn add_strip(
     if diffuse {
         strip = strip.with_diffuser(config.sample_rate);
     }
+    if cue {
+        strip = strip.solo_safe();
+    }
     let strip = b.add_node(spec, Box::new(if quiet { strip.quiet() } else { strip }));
     b.connect_audio(from, 0, strip, 0)?;
     Ok(strip)
+}
+
+/// The talkback microphone's node key channel (no track of its own).
+const TALKBACK_CHANNEL: TrackId = TrackId(0x7A1B_BAC4);
+
+/// A bus's cue path (see pass 3 of [`build_graph`]).
+#[derive(Clone, Copy)]
+struct CuePath {
+    /// After its preamp (what a pre-FX send taps).
+    prefx: NodeId,
+    /// Its solo-safe strip.
+    strip: NodeId,
+    /// In the shallow tier's graph.
+    in_bb: bool,
+    /// The latency of its strip's input (when in the shallow tier).
+    latency: u32,
+}
+
+/// Where a channel's cue signal is taken: a node and port, its layout,
+/// which graph it is in and (in the shallow tier) its latency.
+#[derive(Clone, Copy)]
+struct CueTap<'a> {
+    track: TrackId,
+    name: &'a str,
+    node: NodeId,
+    port: u16,
+    layout: ChannelLayout,
+    in_bb: bool,
+    latency: u32,
+}
+
+/// `t`'s never-muted tap for the cue mixes: after the fader (`post`: the
+/// post-fader image, panned, in the destination layout) or before it (the
+/// chain layout) — a bus from its cue path's strip, a track from its own
+/// strip.
+fn cue_tap<'a>(
+    project: &Project,
+    nodes: &HashMap<TrackId, TrackNodes>,
+    cue_paths: &HashMap<TrackId, CuePath>,
+    strip_latency: &HashMap<TrackId, u32>,
+    t: &'a Track,
+    post: bool,
+) -> Option<CueTap<'a>> {
+    let layout = if post {
+        destination_layout(project, t)
+    } else {
+        t.chain_layout()
+    };
+    if has_cue_path(t) {
+        let c = cue_paths.get(&t.id)?;
+        Some(CueTap {
+            track: t.id,
+            name: &t.name,
+            node: c.strip,
+            port: if post { 0 } else { 2 },
+            layout,
+            in_bb: c.in_bb,
+            latency: c.latency,
+        })
+    } else {
+        let n = nodes.get(&t.id)?;
+        Some(CueTap {
+            track: t.id,
+            name: &t.name,
+            node: n.strip?,
+            port: if post { 3 } else { 2 },
+            layout,
+            in_bb: n.strip_ahead,
+            latency: strip_latency.get(&t.id).copied().unwrap_or(0),
+        })
+    }
+}
+
+/// `t`'s pre-FX tap for a cue path's send: a bus's cue path after its
+/// preamp, a track's input (never muted, never rendered ahead).
+fn cue_prefx_tap<'a>(
+    nodes: &HashMap<TrackId, TrackNodes>,
+    cue_paths: &HashMap<TrackId, CuePath>,
+    t: &'a Track,
+) -> Option<CueTap<'a>> {
+    if has_cue_path(t) {
+        let c = cue_paths.get(&t.id)?;
+        Some(CueTap {
+            track: t.id,
+            name: &t.name,
+            node: c.prefx,
+            port: 0,
+            layout: t.layout,
+            in_bb: c.in_bb,
+            latency: 0,
+        })
+    } else {
+        let n = nodes.get(&t.id)?;
+        let node = n.preamp.or(n.input).or(n.strip)?;
+        (!n.input_ahead).then_some(CueTap {
+            track: t.id,
+            name: &t.name,
+            node,
+            port: 0,
+            layout: t.layout,
+            in_bb: false,
+            latency: 0,
+        })
+    }
+}
+
+/// Audio of the shallow tier's `from` on the audio thread: a writer there
+/// into a ring (kept across builds by `key`) and a reader here reporting
+/// `latency`.
+#[allow(clippy::too_many_arguments)]
+fn cross(
+    bb: &mut GraphBuilder<EngineContext>,
+    b: &mut GraphBuilder<EngineContext>,
+    plan: Option<&mut AheadPlan<'_>>,
+    used: &mut Vec<Arc<AheadRing>>,
+    owners: &mut Vec<(NodeId, NodeOwner)>,
+    from: NodeId,
+    port: u16,
+    layout: ChannelLayout,
+    latency: u32,
+    key: (TrackId, u8),
+    name: &str,
+) -> Result<NodeId, EngineError> {
+    let Some(plan) = plan else {
+        return Err(faderframe_audio_graph::GraphError::UnknownNode(from).into());
+    };
+    let ring = ring_of(
+        plan.cue_rings,
+        key,
+        layout.channel_count(),
+        plan.bus_ring_frames,
+    );
+    used.push(Arc::clone(&ring));
+    let sub = u64::from(key.1) << 8;
+    let w = bb.add_node(
+        NodeSpec::new(format!("{name} · To Ring"))
+            .key(node_key(key.0, Role::CueAhead, sub | 1 ^ ring.identity(), &[layout]))
+            .audio_in(layout),
+        Box::new(AheadWriter::new(Arc::clone(&ring))),
+    );
+    bb.connect_audio(from, port, w, 0)?;
+    let r = b.add_node(
+        NodeSpec::new(format!("{name} · Ahead"))
+            .key(node_key(
+                key.0,
+                Role::CueAhead,
+                sub | 2 ^ (u64::from(latency) << 16) ^ ring.identity().rotate_left(17),
+                &[layout],
+            ))
+            .audio_out(layout),
+        Box::new(AheadReader::new(ring, latency, Arc::clone(&plan.misses))),
+    );
+    owners.push((
+        r,
+        NodeOwner {
+            track: key.0,
+            plugin: None,
+            work: NodeWork::Ahead,
+        },
+    ));
+    Ok(r)
+}
+
+/// The buses with cue paths, feeders first (a bus after the buses whose
+/// outputs or sends reach it).
+fn cue_bus_order(project: &Project) -> Vec<usize> {
+    let mut left: Vec<usize> = (0..project.tracks.len())
+        .filter(|&i| has_cue_path(&project.tracks[i]))
+        .collect();
+    let mut order = Vec::new();
+    let mut placed: HashSet<TrackId> = HashSet::new();
+    while !left.is_empty() {
+        let before = left.len();
+        left.retain(|&i| {
+            let id = project.tracks[i].id;
+            let ready = project.tracks.iter().all(|f| {
+                !has_cue_path(f)
+                    || placed.contains(&f.id)
+                    || f.id == id
+                    || (project.output_target(f) != Some(id)
+                        && !f.sends.iter().any(|s| s.enabled && s.target == id))
+            });
+            if ready {
+                order.push(i);
+                placed.insert(id);
+            }
+            !ready
+        });
+        if left.len() == before {
+            // A loop (refused by the routing): whatever is left, in order.
+            order.extend(left.drain(..));
+        }
+    }
+    order
+}
+
+/// A bus's devices on its cue path, from `input` (its cue sum): the cue
+/// shadow of each (a second instance; outboard gear is passed by — it
+/// plays once, in the main mix), containers included. Returns the chain's
+/// end, its latency and the node after the preamp.
+#[allow(clippy::too_many_arguments)]
+fn build_cue_chain(
+    g: &mut GraphBuilder<EngineContext>,
+    pcx: &mut PluginCx<'_>,
+    slots: &mut SlotRegistry,
+    owners: &mut Vec<(NodeId, NodeOwner)>,
+    sidechains: &mut Vec<(NodeId, TrackId)>,
+    project: &Project,
+    t: &Track,
+    config: &PrepareConfig,
+    input: NodeId,
+    group: Option<u32>,
+) -> Result<(NodeId, u32, NodeId), EngineError> {
+    let _ = config;
+    let was = pcx.shadow;
+    pcx.shadow = true;
+    let result = cue_chain_nodes(g, pcx, slots, owners, sidechains, project, t, input, group);
+    pcx.shadow = was;
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cue_chain_nodes(
+    g: &mut GraphBuilder<EngineContext>,
+    pcx: &mut PluginCx<'_>,
+    slots: &mut SlotRegistry,
+    owners: &mut Vec<(NodeId, NodeOwner)>,
+    sidechains: &mut Vec<(NodeId, TrackId)>,
+    project: &Project,
+    t: &Track,
+    input: NodeId,
+    group: Option<u32>,
+) -> Result<(NodeId, u32, NodeId), EngineError> {
+    let chain = pcx.audio_chain(t);
+    let mut prev = input;
+    let mut prefx = input;
+    let mut layout = t.layout;
+    let mut latency = 0u32;
+    let mut takes_notes = Vec::new();
+    for slot in chain {
+        if slot.plugin.is_container() {
+            let mut links = ChainLinks {
+                project,
+                notes: false,
+                events: &[],
+                raw: false,
+                takes_notes: &mut takes_notes,
+                sidechains,
+            };
+            let (out, l) = add_container(
+                g,
+                pcx,
+                slots,
+                owners,
+                t,
+                slot,
+                (prev, layout),
+                group.unwrap_or(0),
+                0,
+                &mut links,
+            )?;
+            latency += l;
+            prev = out;
+            continue;
+        }
+        if slot.plugin.id == faderframe_core::builtin::HARDWARE_INSERT {
+            continue;
+        }
+        layout = slot.plugin.output_layout(layout);
+        let mut spec = NodeSpec::new(format!("{} · {} · Cue", t.name, t.name_of(slot)))
+            .audio_in(layout)
+            .audio_out(layout);
+        if let Some(gi) = group {
+            spec = spec.group(gi);
+        }
+        // A sidechain source that has a pre-fader signal and does not
+        // depend on this track (as the main path's).
+        let key = slot.sidechain.filter(|&src| {
+            project
+                .track(src)
+                .is_some_and(|s| s.kind.has_audio() && s.kind != TrackKind::Midi)
+                && !project.reaches(t.id, src, None)
+        });
+        let key = key.and_then(|src| Some((src, pcx.sidechain_layout(slot)?)));
+        if let Some((_, l)) = key {
+            spec = spec.audio_in(l);
+        }
+        let (node, l) = pcx.node(g, slot, t, spec, Role::Insert);
+        if let Some((src, _)) = key {
+            sidechains.push((node, src));
+        }
+        latency += l;
+        if group.is_some() {
+            owners.push((
+                node,
+                NodeOwner {
+                    track: t.id,
+                    plugin: Some(slot.id),
+                    work: NodeWork::Insert,
+                },
+            ));
+        }
+        g.connect_audio(prev, 0, node, 0)?;
+        if t.preamp.as_ref().is_some_and(|p| p.id == slot.id) {
+            prefx = node;
+        }
+        prev = node;
+    }
+    Ok((prev, latency, prefx))
 }
 
 /// A track's MIDI effects in `chain` order, the first fed by `sources`,

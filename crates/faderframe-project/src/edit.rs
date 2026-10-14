@@ -287,6 +287,11 @@ pub enum Command {
         cue: CueId,
         on: bool,
     },
+    /// Whether a cue mix hears the talkback microphone.
+    SetCueTalkback {
+        cue: CueId,
+        on: bool,
+    },
 
     // --- plugins -----------------------------------------------------------
     InsertPlugin {
@@ -850,6 +855,7 @@ impl Command {
             SetCueSendPan { .. } => "Cue Send Pan".into(),
             SetCueSendOn { on: true, .. } => "Cue Send On".into(),
             SetCueSendOn { on: false, .. } => "Cue Send Off".into(),
+            SetCueTalkback { .. } => "Cue Mix Talkback".into(),
             InsertPlugin { .. } => "Insert Plugin".into(),
             RemovePlugin { .. } => "Remove Plugin".into(),
             SetPluginBypass { .. } => "Toggle Bypass".into(),
@@ -994,6 +1000,7 @@ impl Command {
             | SetCueSendLevel { .. }
             | SetCueSendPan { .. }
             | SetCueSendOn { .. }
+            | SetCueTalkback { .. }
             | SetPluginParameter { .. }
             | SetPluginState { .. }
             | SetConsoleDrive { .. } => Impact::Params,
@@ -1429,6 +1436,11 @@ impl Command {
                 }
             })?,
             SetCueSendOn { track, cue, on } => cue_send_edit(p, track, cue, |s| s.on = on)?,
+            SetCueTalkback { cue, on } => {
+                let c = p.cue_mut(cue).ok_or(EditError::UnknownCue(cue))?;
+                let old = std::mem::replace(&mut c.talkback, on);
+                SetCueTalkback { cue, on: old }
+            }
             InsertPlugin { track, index, slot } => {
                 let t = track_mut(p, track)?;
                 let id = slot.id;
@@ -1738,6 +1750,8 @@ impl Command {
                 track.clips.clear();
                 let i = index.min(p.tracks.len());
                 p.tracks.insert(i, track);
+                // In every cue mix there is (never a silent track).
+                p.join_cue_mixes(id);
                 RemoveTrack { track: id }
             }
             RemoveTrack { track } => {
@@ -1807,6 +1821,9 @@ impl Command {
                 let id = track.id;
                 let i = index.min(p.tracks.len());
                 p.tracks.insert(i, track);
+                // Its sends as they were, plus one to every cue mix made
+                // since (as the main mix has it).
+                p.join_cue_mixes(id);
                 for c in clips {
                     p.clips.insert(c.id, c);
                 }

@@ -57,10 +57,47 @@ impl MixSlots {
 /// Parameter slots of a track's send to a cue mix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CueSendSlots {
-    /// Linear gain; 0 while the send is off.
+    /// Linear gain of its level.
     pub gain: ParamSlot,
     /// −1…1 (a mono tap by the pan law, a stereo one's balance).
     pub pan: ParamSlot,
+    /// 1.0 while the send is on.
+    pub on: ParamSlot,
+}
+
+/// Parameter slots of a cue mix's talkback: the microphone's gain into it
+/// and how much the mix dims while the engineer talks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CueTalkSlots {
+    /// Linear gain of the talkback microphone into this cue mix (0: not
+    /// talking, or the cue mix does not hear it).
+    pub talk: ParamSlot,
+    /// Linear gain the cue mix is dimmed by while talking (1: not).
+    pub dim: ParamSlot,
+}
+
+/// The talkback microphone as the engine has it (a session setting, not
+/// the project's): switched on, its device input, its gain, the dim.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Talkback {
+    pub on: bool,
+    /// The device input it comes from (`None`: no talkback at all).
+    pub input: Option<u16>,
+    /// Linear gain of the microphone into the cue mixes that hear it.
+    pub level: f32,
+    /// Linear gain the cue mixes hearing it play at while talking.
+    pub dim: f32,
+}
+
+impl Default for Talkback {
+    fn default() -> Self {
+        Self {
+            on: false,
+            input: None,
+            level: 1.0,
+            dim: faderframe_core::db_to_gain(-20.0),
+        }
+    }
 }
 
 /// Parameter slots of a container's chain.
@@ -86,6 +123,8 @@ pub struct SlotRegistry {
     send_pans: HashMap<SendId, ParamSlot>,
     /// Tracks' sends to cue mixes.
     cue_sends: HashMap<(TrackId, CueId), CueSendSlots>,
+    /// The cue mixes' talkback slots.
+    cue_talk: HashMap<CueId, CueTalkSlots>,
     track_meters: HashMap<TrackId, MeterRange>,
     /// How many of its meter channels a track's strip uses now (the range
     /// keeps its size when a track goes back to fewer channels).
@@ -120,6 +159,7 @@ impl SlotRegistry {
             sends: HashMap::new(),
             send_pans: HashMap::new(),
             cue_sends: HashMap::new(),
+            cue_talk: HashMap::new(),
             track_meters: HashMap::new(),
             metered: HashMap::new(),
             midi_live: HashMap::new(),
@@ -299,11 +339,12 @@ impl SlotRegistry {
         }
         let base = self
             .params
-            .allocate(2)
+            .allocate(3)
             .ok_or(SlotsExhausted("parameters"))?;
         let s = CueSendSlots {
             gain: ParamSlot(base),
             pan: ParamSlot(base + 1),
+            on: ParamSlot(base + 2),
         };
         self.cue_sends.insert((track, cue), s);
         Ok(s)
@@ -311,6 +352,40 @@ impl SlotRegistry {
 
     pub fn cue_send_of(&self, track: TrackId, cue: CueId) -> Option<CueSendSlots> {
         self.cue_sends.get(&(track, cue)).copied()
+    }
+
+    /// The talkback slots of cue mix `cue`.
+    pub fn cue_talk(&mut self, cue: CueId) -> Result<CueTalkSlots, SlotsExhausted> {
+        if let Some(s) = self.cue_talk.get(&cue) {
+            return Ok(*s);
+        }
+        let base = self
+            .params
+            .allocate(2)
+            .ok_or(SlotsExhausted("parameters"))?;
+        let s = CueTalkSlots {
+            talk: ParamSlot(base),
+            dim: ParamSlot(base + 1),
+        };
+        self.cue_talk.insert(cue, s);
+        Ok(s)
+    }
+
+    /// The talkback's gains into every cue mix (and their dims) from the
+    /// session's talkback state and which cue mixes hear it.
+    pub fn write_talkback(
+        &mut self,
+        project: &Project,
+        table: &ParamTable,
+        talk: &Talkback,
+    ) -> Result<(), SlotsExhausted> {
+        for c in &project.cue_mixes {
+            let s = self.cue_talk(c.id)?;
+            let talking = talk.on && talk.input.is_some() && c.talkback;
+            table.set(s.talk, if talking { talk.level.max(0.0) } else { 0.0 });
+            table.set(s.dim, if talking { talk.dim.clamp(0.0, 1.0) } else { 1.0 });
+        }
+        Ok(())
     }
 
     /// The meter channels of a track's strip, at least `channels` of them
@@ -395,7 +470,14 @@ impl SlotRegistry {
         self.cue_sends.retain(|(t, c), s| {
             let keep = tracks.contains(t) && cues.contains(c);
             if !keep {
-                params.release(s.gain.0, 2);
+                params.release(s.gain.0, 3);
+            }
+            keep
+        });
+        self.cue_talk.retain(|c, s| {
+            let keep = cues.contains(c);
+            if !keep {
+                params.release(s.talk.0, 2);
             }
             keep
         });
@@ -515,11 +597,10 @@ impl SlotRegistry {
                 for c in &project.cue_mixes {
                     let s = self.cue_send(t.id, c.id)?;
                     let send = t.cue_send(c.id);
-                    let gain = send
-                        .filter(|s| s.on)
-                        .map_or(0.0, |s| faderframe_core::db_to_gain(s.level_db));
+                    let gain = send.map_or(0.0, |s| faderframe_core::db_to_gain(s.level_db));
                     table.set(s.gain, gain);
                     table.set(s.pan, send.map_or(0.0, |s| s.pan));
+                    table.set(s.on, if send.is_some_and(|s| s.on) { 1.0 } else { 0.0 });
                 }
             }
             for (container, chains) in &t.containers {

@@ -89,7 +89,7 @@ pub struct Lfo {
 }
 
 impl Lfo {
-    pub fn new(seed: u32) -> Self {
+    pub const fn new(seed: u32) -> Self {
         Self {
             phase: 0.0,
             held: 0.0,

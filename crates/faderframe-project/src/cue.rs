@@ -14,11 +14,20 @@
 //! A cue send is solo-safe: it taps the channel before its mute and the
 //! solo, so what the engineer mutes or solos in the main mix never
 //! changes what a performer hears — and pre-fader it ignores the main
-//! fader too. A bus or a return carries what reaches it in the main mix
-//! (its members after their faders, mutes and solos): that is what a bus
-//! is, so a new cue mix leaves buses and returns off and takes every
-//! source on its own (at the level it reaches the master with), and a cue
-//! is solo-safe as long as its buses stay off.
+//! fader too. A bus or a return sends what its sources bring it *as the
+//! cue hears them* (the engine sums them solo-safe and mute-safe through
+//! the bus's own devices), so buses and returns are in the cue mixes like
+//! any channel. **The console rule:** a channel is in a cue mix once —
+//! where it reaches the master. A track that reaches the master through
+//! a bus is sent to the cue through that bus (its own send is off in a
+//! copy of the main mix, there for more of it in the headphones); a track
+//! straight into the master, a bus or a return into the master, is sent
+//! on its own.
+//!
+//! Talkback (the engineer's microphone into the performers' headphones)
+//! is a session setting (the input, its level, how much the cue mixes
+//! dim while talking); each cue mix only says whether it hears it
+//! ([`CueMix::talkback`]).
 //!
 //! Cue mixes are monitoring: renders, exports, stems, bounces, freezes and
 //! the album never contain them (their engines build none), and they never
@@ -72,6 +81,9 @@ pub struct CueMix {
     /// The click's level here, relative to the metronome's volume.
     #[serde(default)]
     pub click_db: f32,
+    /// Hears the talkback microphone (and dims while it talks).
+    #[serde(default = "yes")]
+    pub talkback: bool,
 }
 
 fn pre_fader() -> SendTap {
@@ -101,6 +113,7 @@ impl CueMix {
             tap: SendTap::PreFader,
             click: true,
             click_db: 0.0,
+            talkback: true,
         }
     }
 
@@ -242,39 +255,76 @@ impl Project {
 
     /// `t`'s send to `cue` as the main mix has it: the level it reaches
     /// the master with (its fader and VCAs for a pre-fader cue mix, which
-    /// a post-fader one has already, plus the faders of the buses on its
-    /// way), its pan (a dual-panned image's middle), on when the main mix
-    /// hears it (not muted, reaching the master). Buses and returns are
-    /// off: what they carry depends on the main mix's mutes and solos, and
-    /// their sources are in the cue mix on their own.
+    /// a post-fader one has already), its pan (a dual-panned image's
+    /// middle), on when the main mix hears it straight from this channel
+    /// (not muted, its output into the master). The console rule: a track
+    /// whose output is a bus is sent to the cue by that bus (its own send
+    /// is off), a bus or a return into the master on its own.
     pub fn main_mix_send(&self, t: &Track, cue: &CueMix) -> CueSend {
+        self.main_mix_send_with(t, cue, |t| (t.volume_db, t.pan, t.mute))
+    }
+
+    /// [`Self::main_mix_send`] from the values `shown` gives for each
+    /// track (its fader in dB, pan, mute: what a control shows while
+    /// automation plays, rather than the static fields).
+    pub fn main_mix_send_with(
+        &self,
+        t: &Track,
+        cue: &CueMix,
+        shown: impl Fn(&Track) -> (f32, f32, bool),
+    ) -> CueSend {
         let path = self.path_to_master(t);
+        let (volume_db, pan, mute) = shown(t);
         let own = if cue.post_fader() {
             0.0
         } else {
-            t.volume_db + self.vca_chain(t).iter().map(|v| v.volume_db).sum::<f32>()
+            volume_db + self.vca_chain(t).iter().map(|v| shown(v).0).sum::<f32>()
         };
-        let buses: f32 = path.iter().flatten().map(|b| b.volume_db).sum();
-        let level = own + buses;
-        let level = if level <= SILENCE_DB || t.volume_db <= SILENCE_DB {
+        let level = if own <= SILENCE_DB || volume_db <= SILENCE_DB {
             SILENCE_DB
         } else {
-            crate::edit::clamp_level(level)
+            crate::edit::clamp_level(own)
         };
         let pan = match t.pan_mode {
             faderframe_core::PanMode::Dual if t.chain_layout().channel_count() == 2 => {
                 (t.dual_pan.left + t.dual_pan.right) * 0.5
             }
-            _ => t.pan,
+            _ => pan,
         };
-        let muted = self.effectively_muted(t, None)
-            || self.folder_chain(t).iter().any(|f| f.mute)
-            || path.iter().flatten().any(|b| b.mute);
+        let muted = mute
+            || self.effectively_muted(t, None)
+            || self.folder_chain(t).iter().any(|f| shown(f).2);
         CueSend {
             cue: cue.id,
             level_db: level,
             pan: pan.clamp(-1.0, 1.0),
-            on: path.is_some() && !muted && !t.kind.is_summing(),
+            on: path.as_ref().is_some_and(Vec::is_empty) && !muted,
+        }
+    }
+
+    /// Adds `t`'s sends to the cue mixes it has none to yet (as the main
+    /// mix has them) and drops those to cue mixes that are gone: a track
+    /// added or restored joins every cue mix there is.
+    pub fn join_cue_mixes(&mut self, track: TrackId) {
+        let Some(t) = self.track(track) else {
+            return;
+        };
+        if !feeds_cues(t.kind) {
+            if let Some(t) = self.track_mut(track) {
+                t.cue_sends.clear();
+            }
+            return;
+        }
+        let missing: Vec<CueSend> = self
+            .cue_mixes
+            .iter()
+            .filter(|c| t.cue_send(c.id).is_none())
+            .map(|c| self.main_mix_send(t, c))
+            .collect();
+        let cues: Vec<CueId> = self.cue_mixes.iter().map(|c| c.id).collect();
+        if let Some(t) = self.track_mut(track) {
+            t.cue_sends.retain(|s| cues.contains(&s.cue));
+            t.cue_sends.extend(missing);
         }
     }
 
@@ -408,12 +458,13 @@ mod tests {
                 on: true
             }
         );
-        // Through the bus: its fader too.
-        assert_eq!(s[&m.kick].level_db, -7.0);
-        assert!(s[&m.kick].on);
-        // Buses and returns carry the main mix's mutes and solos: off.
-        assert!(!s[&m.drums].on && !s[&m.verb].on);
-        assert_eq!(s[&m.verb].level_db, -10.0);
+        // Through the bus: sent to the cue by the bus (the console rule),
+        // its own send off at its fader level.
+        assert_eq!(s[&m.kick].level_db, -3.0);
+        assert!(!s[&m.kick].on);
+        // Buses and returns into the master: on, at their faders.
+        assert!(s[&m.drums].on && s[&m.verb].on);
+        assert_eq!((s[&m.drums].level_db, s[&m.verb].level_db), (-4.0, -10.0));
         // Muted in the main mix, not heard there at all: off.
         assert!(!s[&m.gtr].on);
         assert!(!s[&m.guide].on);
@@ -425,7 +476,112 @@ mod tests {
         };
         let s = sends(&m.p, &post);
         assert_eq!(s[&m.vox].level_db, 0.0);
-        assert_eq!(s[&m.kick].level_db, -4.0);
+        assert_eq!(s[&m.drums].level_db, 0.0);
+        // Shown values (automation playing) instead of the static fields.
+        let s: std::collections::HashMap<TrackId, CueSend> = m
+            .p
+            .tracks
+            .iter()
+            .filter(|t| feeds_cues(t.kind))
+            .map(|t| {
+                (
+                    t.id,
+                    m.p.main_mix_send_with(t, &cue, |t| (-12.0, 0.5, t.id == m.vox)),
+                )
+            })
+            .collect();
+        assert_eq!((s[&m.vox].level_db, s[&m.vox].on), (-12.0, false));
+        assert_eq!((s[&m.drums].level_db, s[&m.drums].pan), (-12.0, 0.5));
+    }
+
+    #[test]
+    fn a_track_added_or_restored_joins_every_cue_mix() {
+        let mut m = mix();
+        let mut h = History::default();
+        let id: CueId = m.p.ids.allocate();
+        let cue = CueMix::new(id, "Cue 1", CUE_COLORS[0], 2, ChannelLayout::Stereo);
+        let all = m.p.copy_main_mix(&cue);
+        h.apply(
+            &mut m.p,
+            Command::AddCueMix {
+                cue: Box::new(cue),
+                index: None,
+                sends: all,
+            },
+        )
+        .unwrap();
+        // Removed, a second cue mix made, restored: a send to both (the
+        // old one as it was, the new one as the main mix has it).
+        h.apply(
+            &mut m.p,
+            Command::SetCueSendLevel {
+                track: m.vox,
+                cue: id,
+                db: -9.0,
+            },
+        )
+        .unwrap();
+        h.apply(&mut m.p, Command::RemoveTrack { track: m.vox })
+            .unwrap();
+        let second: CueId = m.p.ids.allocate();
+        let cue2 = CueMix::new(second, "Cue 2", CUE_COLORS[1], 4, ChannelLayout::Stereo);
+        let all = m.p.copy_main_mix(&cue2);
+        h.apply(
+            &mut m.p,
+            Command::AddCueMix {
+                cue: Box::new(cue2),
+                index: None,
+                sends: all,
+            },
+        )
+        .unwrap();
+        h.undo(&mut m.p).unwrap();
+        h.undo(&mut m.p).unwrap();
+        let vox = m.p.track(m.vox).unwrap();
+        assert_eq!(vox.cue_send(id).unwrap().level_db, -9.0);
+        assert_eq!(vox.cue_send(second), None, "the second was undone too");
+        h.redo(&mut m.p).unwrap();
+        h.redo(&mut m.p).unwrap();
+        h.undo(&mut m.p).unwrap();
+        let vox = m.p.track(m.vox).unwrap();
+        assert_eq!(vox.cue_send(id).unwrap().level_db, -9.0);
+        let new = vox.cue_send(second).unwrap();
+        assert_eq!((new.level_db, new.on), (-6.0, true), "as the main mix has it");
+        // A track added plain joins too; one that cannot feed cue mixes
+        // carries none.
+        let t = Track::new(
+            m.p.ids.allocate(),
+            TrackKind::Audio,
+            "New",
+            TrackColor::palette(0),
+        );
+        let new_id = t.id;
+        h.apply(
+            &mut m.p,
+            Command::AddTrack {
+                track: Box::new(t),
+                index: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(m.p.track(new_id).unwrap().cue_sends.len(), 2);
+        let mut v = Track::new(
+            m.p.ids.allocate(),
+            TrackKind::Vca,
+            "VCA",
+            TrackColor::palette(0),
+        );
+        v.cue_sends.push(CueSend::new(id));
+        let v_id = v.id;
+        h.apply(
+            &mut m.p,
+            Command::AddTrack {
+                track: Box::new(v),
+                index: 0,
+            },
+        )
+        .unwrap();
+        assert!(m.p.track(v_id).unwrap().cue_sends.is_empty());
     }
 
     #[test]

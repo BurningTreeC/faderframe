@@ -1,10 +1,10 @@
 use super::strip::{MatrixMix, surround_at};
 use super::{AUTOMATION_STEP, automation_at, ramp_step};
 use crate::context::EngineContext;
-use crate::slots::{MixSlots, StripSlots};
+use crate::slots::{CueSendSlots, MixSlots, StripSlots};
 use faderframe_audio_graph::{NodeIo, ProcessContext, Processor};
 use faderframe_core::pan::{self, PanLaw, PanMatrix};
-use faderframe_core::{ChannelLayout, SendId, SurroundPan, TrackId, db_to_gain};
+use faderframe_core::{ChannelLayout, CueId, SendId, SurroundPan, TrackId, db_to_gain};
 use faderframe_realtime::ParamSlot;
 
 /// An aux/bus send: level-controlled copy of a tap point, converted to the
@@ -24,9 +24,13 @@ use faderframe_realtime::ParamSlot;
 /// channel rule: a mono tap at unity on both sides).
 pub struct SendNode {
     track: TrackId,
-    /// Its automation lanes' key (`None`: a cue mix's send, not automated).
+    /// Its automation lanes' key (`None`: a cue mix's send, or none).
     send: Option<SendId>,
+    /// A cue mix's send: its lanes' key (level, pan, on).
+    cue: Option<CueId>,
     level: ParamSlot,
+    /// Its switch (1: on; `None`: always on).
+    on: Option<ParamSlot>,
     /// Its pan (see above).
     pan: Option<ParamSlot>,
     /// Each pair's gain at the end of the last range, panned (NaN: none).
@@ -48,7 +52,9 @@ impl SendNode {
         Self {
             track,
             send: Some(send),
+            cue: None,
             level,
+            on: None,
             pan: None,
             pairs: [[f32::NAN; 2]; 2],
             current: f32::NAN,
@@ -60,11 +66,23 @@ impl SendNode {
         }
     }
 
-    /// A track's send to a cue mix: its level (0 while off) and pan.
-    pub fn cue(track: TrackId, level: ParamSlot, pan: ParamSlot) -> Self {
+    /// A track's send to cue mix `cue`: its level, pan and switch (its
+    /// lanes drive them while they play).
+    pub fn cue(track: TrackId, cue: CueId, slots: CueSendSlots) -> Self {
         Self {
             send: None,
-            pan: Some(pan),
+            cue: Some(cue),
+            on: Some(slots.on),
+            pan: Some(slots.pan),
+            ..Self::new(track, SendId(0), slots.gain)
+        }
+    }
+
+    /// A plain level into a sum (the talkback microphone into a cue mix):
+    /// no lanes, unpanned (the graph's channel rule).
+    pub fn plain(track: TrackId, level: ParamSlot) -> Self {
+        Self {
+            send: None,
             ..Self::new(track, SendId(0), level)
         }
     }
@@ -151,8 +169,17 @@ impl Processor<EngineContext> for SendNode {
 
     fn process(&mut self, cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
         let static_level = cx.data.params.get(self.level);
+        let static_on = self
+            .on
+            .map_or(1.0, |s| if cx.data.params.get(s) >= 0.5 { 1.0 } else { 0.0 });
         let auto = cx.data.timeline.automation(self.track);
-        let lane = self.send.and_then(|send| auto.and_then(|a| a.send(send)));
+        let cue_lanes = self.cue.and_then(|c| auto.and_then(|a| a.cue_send(c)));
+        let lane = self
+            .send
+            .and_then(|send| auto.and_then(|a| a.send(send)))
+            .or_else(|| cue_lanes.and_then(|l| l.level.as_ref()));
+        let on_lane = cue_lanes.and_then(|l| l.on.as_ref());
+        let cue_pan_lane = cue_lanes.and_then(|l| l.pan.as_ref());
         let pan_lanes = auto
             .map(|a| &a.surround)
             .filter(|l| self.follow.is_some() && l.iter().any(Option::is_some));
@@ -164,25 +191,29 @@ impl Processor<EngineContext> for SendNode {
             return;
         };
         let n = io.frames;
+        // The level at `at`: its lane (dB) or the slot, times the switch.
+        let level_at = |at: i64| {
+            let level = lane
+                .and_then(|l| l.value_at(at))
+                .map_or(static_level, |db| db_to_gain(db as f32));
+            let on = on_lane
+                .and_then(|l| l.value_at(at))
+                .map_or(static_on, |v| if v >= 0.5 { 1.0 } else { 0.0 });
+            level * on
+        };
         // Panned (a mono or stereo tap into stereo, a position set).
         let position = self
             .pan
             .map(|s| cx.data.params.get(s))
             .filter(|p| !p.is_nan());
-        if let Some(position) = position.filter(|_| {
+        if let Some(static_position) = position.filter(|_| {
             self.mix.is_none() && out.num_channels() == 2 && (1..=2).contains(&input.num_channels())
         }) {
             out.clear();
             let law = self.shared.map_or(PanLaw::default(), |s| {
                 PanLaw::from_index(cx.data.params.get(s.pan_law))
             });
-            let position = pan::position(position);
-            let place = if input.num_channels() == 1 {
-                pan::mono_pan(law, position)
-            } else {
-                pan::balance(position)
-            };
-            let step = if lane.is_some() {
+            let step = if lane.is_some() || on_lane.is_some() || cue_pan_lane.is_some() {
                 AUTOMATION_STEP
             } else {
                 n.max(1)
@@ -190,9 +221,17 @@ impl Processor<EngineContext> for SendNode {
             let mut off = 0;
             while off < n {
                 let m = step.min(n - off);
-                let target = lane
-                    .and_then(|l| l.value_at(automation_at(cx, self.input_latency, off + m)))
-                    .map_or(static_level, |db| db_to_gain(db as f32));
+                let at = automation_at(cx, self.input_latency, off + m);
+                let position = cue_pan_lane
+                    .and_then(|l| l.value_at(at))
+                    .map_or(static_position, |v| v as f32);
+                let position = pan::position(position);
+                let place = if input.num_channels() == 1 {
+                    pan::mono_pan(law, position)
+                } else {
+                    pan::balance(position)
+                };
+                let target = level_at(at);
                 // Silent and staying so: nothing to add.
                 if target == 0.0 && self.current == 0.0 {
                     self.pairs = [[0.0; 2]; 2];
@@ -202,7 +241,7 @@ impl Processor<EngineContext> for SendNode {
                 self.current = target;
                 off += m;
             }
-            if lane.is_some() && !self.quiet {
+            if lane.is_some() && self.send.is_some() && !self.quiet {
                 cx.data.readback.set(self.level, self.current);
             }
             return;
@@ -214,7 +253,11 @@ impl Processor<EngineContext> for SendNode {
         } else {
             out.copy_from(input);
         }
-        let step = if lane.is_some() || pan_lanes.is_some() || balance_lane.is_some() {
+        let step = if lane.is_some()
+            || on_lane.is_some()
+            || pan_lanes.is_some()
+            || balance_lane.is_some()
+        {
             AUTOMATION_STEP
         } else {
             n.max(1)
@@ -222,12 +265,10 @@ impl Processor<EngineContext> for SendNode {
         let mut off = 0;
         while off < n {
             let m = step.min(n - off);
-            let target = lane
-                .and_then(|l| l.value_at(automation_at(cx, self.input_latency, off + m)))
-                .map_or(static_level, |db| db_to_gain(db as f32));
+            let at = automation_at(cx, self.input_latency, off + m);
+            let target = level_at(at);
             if let Some(mix) = self.mix.as_mut() {
                 // Through the matrix (its pairs ramp the level too).
-                let at = automation_at(cx, self.input_latency, off + m);
                 let (pan, balance) = match &self.follow {
                     Some(slots) => (
                         surround_at(&slots.surround, &cx.data.params, pan_lanes, at),
@@ -259,7 +300,7 @@ impl Processor<EngineContext> for SendNode {
             self.current = target;
             off += m;
         }
-        if lane.is_some() && !self.quiet {
+        if lane.is_some() && self.send.is_some() && !self.quiet {
             cx.data.readback.set(self.level, self.current);
         }
     }

@@ -2291,12 +2291,46 @@ fn the_stock_devices_do_not_allocate() {
             1,
             (2.0, 20.0),
         ),
+        // The second revision's paths: hold, mid/side, upward, the
+        // oversampled colour, delta listening, the Pumping style.
+        (
+            builtin::COMPRESSOR,
+            vec![
+                set(0, -24.0),
+                set(6, 6.0),
+                set(13, 0.0),
+                set(18, 0.6),
+                set(19, 80.0),
+                set(20, 1.0),
+                set(21, 6.0),
+                set(22, 2.0),
+                set(7, 1.0),
+            ],
+            false,
+            21,
+            (0.0, 12.0),
+        ),
+        (
+            builtin::COMPRESSOR,
+            vec![set(0, -20.0), set(6, 5.0), set(13, 0.0), set(23, 1.0)],
+            false,
+            19,
+            (0.0, 200.0),
+        ),
         (
             builtin::LIMITER,
             vec![set(0, 12.0), set(4, 1.0), set(6, 0.5)],
             false,
             1,
             (-6.0, -0.3),
+        ),
+        // Safe style, the output trim automated, the release link.
+        (
+            builtin::LIMITER,
+            vec![set(0, 10.0), set(4, 5.0), set(6, 0.3), set(10, 0.8)],
+            false,
+            9,
+            (-12.0, 0.0),
         ),
         (
             builtin::LIMITER,

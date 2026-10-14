@@ -205,6 +205,8 @@ impl PluginHost {
 
     /// Plugins that reported unsaved state since the last call.
     pub fn take_dirty(&mut self) -> Vec<PluginInstanceId> {
+        // A cue shadow's state is its base's: nothing of its own to save.
+        self.dirty.retain(|id| !id.is_cue_shadow());
         self.dirty.drain().collect()
     }
 
@@ -342,13 +344,16 @@ impl PluginHost {
     /// instantiated plugins; values dropped from a slot fall back to the
     /// plugin's own value from before.
     pub fn sync_parameters(&mut self, project: &Project) {
-        for slot in project
+        // A slot's cue shadow (a bus device's second instance on the cue
+        // path) follows the same state and values.
+        for (slot, id) in project
             .tracks
             .iter()
             .flat_map(|t| t.slots())
             .chain(project.album.inserts())
+            .flat_map(|slot| [(slot, slot.id), (slot, slot.id.cue_shadow())])
         {
-            let Some(h) = self.instances.get_mut(&slot.id) else {
+            let Some(h) = self.instances.get_mut(&id) else {
                 continue;
             };
             if h.state != slot.state {
@@ -518,7 +523,8 @@ impl PluginHost {
         })
     }
 
-    /// Drop instances whose slots no longer exist in the project.
+    /// Drop instances whose slots no longer exist in the project (cue
+    /// shadows: whose bus has no cue path any more).
     pub fn retain_project(&mut self, project: &Project) {
         // Frozen tracks' plugins are unloaded (restored from their slots).
         let live: HashSet<PluginInstanceId> = project
@@ -528,7 +534,23 @@ impl PluginHost {
             .flat_map(|t| t.slots().into_iter().map(|s| s.id))
             .chain(project.album.inserts().map(|s| s.id))
             .collect();
-        self.instances.retain(|id, _| live.contains(id));
+        let shadowed: HashSet<PluginInstanceId> = if project.cue_mixes.is_empty() {
+            HashSet::new()
+        } else {
+            project
+                .tracks
+                .iter()
+                .filter(|t| t.freeze.is_none() && crate::build::has_cue_path(t))
+                .flat_map(|t| t.slots().into_iter().map(|s| s.id))
+                .collect()
+        };
+        self.instances.retain(|id, _| {
+            if id.is_cue_shadow() {
+                shadowed.contains(&id.base())
+            } else {
+                live.contains(id)
+            }
+        });
     }
 
     /// Latency a hosted plugin reports (samples).
@@ -557,13 +579,18 @@ impl PluginHost {
             .map(|h| h.instance.latency_samples())
     }
 
-    /// Plugins that reported a processing failure.
+    /// Plugins that reported a processing failure (a cue shadow's as its
+    /// slot's).
     pub fn failed(&self) -> Vec<PluginInstanceId> {
-        self.instances
+        let mut out: Vec<PluginInstanceId> = self
+            .instances
             .iter()
             .filter(|(_, h)| h.failed.load(std::sync::atomic::Ordering::Relaxed))
-            .map(|(id, _)| *id)
-            .collect()
+            .map(|(id, _)| id.base())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 }
 

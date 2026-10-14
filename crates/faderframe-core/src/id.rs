@@ -58,6 +58,27 @@ define_id!(
     /// A hosted plugin instance (insert or instrument).
     PluginInstanceId, "plugin#"
 );
+
+impl PluginInstanceId {
+    /// The bit marking a plugin's *cue shadow*: the second instance of a
+    /// bus's device that plays the solo-safe, mute-safe cue path of the
+    /// bus (never in a project file; ids are allocated well below it).
+    const CUE_SHADOW: u64 = 1 << 62;
+
+    /// The id of this slot's cue shadow instance.
+    pub const fn cue_shadow(self) -> Self {
+        Self(self.0 | Self::CUE_SHADOW)
+    }
+
+    pub const fn is_cue_shadow(self) -> bool {
+        self.0 & Self::CUE_SHADOW != 0
+    }
+
+    /// The slot's own id (a shadow's base, else itself).
+    pub const fn base(self) -> Self {
+        Self(self.0 & !Self::CUE_SHADOW)
+    }
+}
 define_id!(
     /// An audio source (file or generated material) referenced by clips.
     AudioSourceId, "source#"

@@ -434,8 +434,10 @@ pub fn create_with_epoch(
         ahead: None,
         ahead_setting: None,
         bus_rings: Default::default(),
+        cue_rings: Default::default(),
         bus_ahead: None,
         ahead_threads: 0,
+        talkback: crate::slots::Talkback::default(),
         ahead_rings: Default::default(),
         ahead_tracks: Default::default(),
         ahead_strips: Default::default(),
@@ -1514,6 +1516,11 @@ pub struct EngineController {
     ahead_threads: usize,
     /// The shallow tier's rings by track (strips' echoes, buses' outputs).
     bus_rings: std::collections::HashMap<faderframe_core::TrackId, Arc<crate::ahead::AheadRing>>,
+    /// The cue paths' rings from the shallow tier, by (channel, port).
+    cue_rings:
+        std::collections::HashMap<(faderframe_core::TrackId, u8), Arc<crate::ahead::AheadRing>>,
+    /// The talkback microphone (a session setting).
+    talkback: crate::slots::Talkback,
     ahead_setting: Option<std::time::Duration>,
     ahead_rings: std::collections::HashMap<faderframe_core::TrackId, Arc<crate::ahead::AheadRing>>,
     ahead_tracks: std::collections::HashSet<faderframe_core::TrackId>,
@@ -2217,6 +2224,8 @@ impl EngineController {
             &self.midi_live,
             &self.suspended_lanes,
         )?;
+        self.slots
+            .write_talkback(project, &self.params, &self.talkback)?;
         self.shared.metronome.set_cues(&cue_clicks(project));
         self.plugins.sync_parameters(project);
         Ok(())
@@ -2292,6 +2301,7 @@ impl EngineController {
             ring_frames: crate::ahead::ring_frames(lookahead, self.config.max_block_size),
             bus_rings: &mut self.bus_rings,
             bus_ring_frames,
+            cue_rings: &mut self.cue_rings,
             misses: Arc::clone(&self.ahead_misses),
         });
         // Album songs' inserts are hosted (editors, parameters) even when
@@ -2318,6 +2328,7 @@ impl EngineController {
                 tracks: monitoring.clone(),
                 limit: self.low_latency_limit,
             },
+            &self.talkback,
         )?;
         self.low_latency_tracks = monitoring;
         self.bypassed_for_monitoring = built.bypassed_for_monitoring.clone();
@@ -2343,6 +2354,9 @@ impl EngineController {
         }
         self.ahead_rings.retain(|t, _| sets.tracks.contains(t));
         self.bus_rings.retain(|t, _| sets.tracks.contains(t));
+        if sets.tracks.is_empty() {
+            self.cue_rings.clear();
+        }
         self.ahead_tracks = sets.tracks;
         self.ahead_strips = sets.strips;
         self.voices = voice_needs(project);
@@ -2356,6 +2370,8 @@ impl EngineController {
             &self.midi_live,
             &self.suspended_lanes,
         )?;
+        self.slots
+            .write_talkback(project, &self.params, &self.talkback)?;
         self.stats = compiled.stats().clone();
         // Where each track is metered (its strip, or the echo of a strip
         // rendered ahead), and how much later that is heard.
@@ -2737,6 +2753,27 @@ impl EngineController {
         Ok(())
     }
 
+    /// The talkback microphone: switched on or off, its level and dim
+    /// reach the cue mixes at once (parameters); another input rebuilds
+    /// the graph (the caller syncs with [`Impact::Graph`] when `true`).
+    pub fn set_talkback(
+        &mut self,
+        project: &Project,
+        talkback: crate::slots::Talkback,
+    ) -> Result<bool, EngineError> {
+        let rebuild = talkback.input != self.talkback.input;
+        self.talkback = talkback;
+        if !rebuild {
+            self.slots
+                .write_talkback(project, &self.params, &self.talkback)?;
+        }
+        Ok(rebuild)
+    }
+
+    pub fn talkback(&self) -> crate::slots::Talkback {
+        self.talkback
+    }
+
     /// The mono check (immediate, no rebuild).
     pub fn set_mono_check(&mut self, on: bool) -> Result<(), EngineError> {
         let slot = self.slots.monitor_mono()?;
@@ -2774,6 +2811,7 @@ impl EngineController {
         }
         self.ahead_rings.clear();
         self.bus_rings.clear();
+        self.cue_rings.clear();
         self.ahead_tracks.clear();
         self.ahead_strips.clear();
         let Some(lookahead) = self.ahead_setting else {

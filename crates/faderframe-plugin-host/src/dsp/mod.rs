@@ -1,13 +1,14 @@
 //! Building blocks the built-in devices share: filters (the EQ's matched
 //! designs, a zero-delay-feedback state variable filter, one poles, a DC
 //! blocker), oversampling, interpolated delay lines, envelope followers,
-//! LFOs (tempo synced too), parameter smoothing, true peak detection and
-//! noise. Everything here is allocation free once made.
+//! LFOs (tempo synced too), parameter smoothing, true peak detection,
+//! K-weighted loudness and noise. Everything here is allocation free once made.
 
 pub mod delay;
 pub mod env;
 pub mod filter;
 pub mod lfo;
+pub mod loudness;
 pub mod oversample;
 pub mod smooth;
 pub mod truepeak;
@@ -35,8 +36,8 @@ pub fn flush(x: f64) -> f64 {
 pub struct Noise(u32);
 
 impl Noise {
-    pub fn new(seed: u32) -> Self {
-        Self(seed.max(1))
+    pub const fn new(seed: u32) -> Self {
+        Self(if seed == 0 { 1 } else { seed })
     }
 
     #[inline]

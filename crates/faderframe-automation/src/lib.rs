@@ -309,6 +309,35 @@ pub enum AutomationTarget {
     DualPanLeft,
     /// Dual pan: the right input channel's position (−1…1).
     DualPanRight,
+    /// The track's send to a cue mix: its level (dB), pan (−1…1) or
+    /// switch (0/1).
+    CueSend {
+        cue: faderframe_core::CueId,
+        what: CueSendParam,
+    },
+    /// A cue mix's master level (dB); a lane of the master track.
+    CueLevel {
+        cue: faderframe_core::CueId,
+    },
+}
+
+/// What a cue send lane moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CueSendParam {
+    Level,
+    Pan,
+    On,
+}
+
+impl CueSendParam {
+    pub fn label(self) -> &'static str {
+        match self {
+            CueSendParam::Level => "Level",
+            CueSendParam::Pan => "Pan",
+            CueSendParam::On => "On",
+        }
+    }
 }
 
 impl AutomationTarget {
@@ -325,6 +354,8 @@ impl AutomationTarget {
             AutomationTarget::Surround(p) => p.name().into(),
             AutomationTarget::DualPanLeft => "Left Pan".into(),
             AutomationTarget::DualPanRight => "Right Pan".into(),
+            AutomationTarget::CueSend { cue, what } => format!("Cue {cue} {}", what.label()),
+            AutomationTarget::CueLevel { cue } => format!("Cue {cue} Level"),
         }
     }
 }

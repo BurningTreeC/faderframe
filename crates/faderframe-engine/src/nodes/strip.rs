@@ -21,10 +21,13 @@ use faderframe_realtime::{MeterRange, ParamSlot};
 /// * output 1 — pre-fader (post-insert, post-mute) in the track layout,
 ///   unpanned, used by pre-fader sends
 /// * outputs 2 and 3 (only while the project has cue mixes) — the cue
-///   mixes' taps, in the track layout, unpanned, with the polarity and
-///   never muted (neither the track's mute nor a solo elsewhere reaches a
-///   performer's headphones): 2 before the fader, 3 after it (fader, VCAs
-///   and modulation as the main mix has them)
+///   mixes' taps, with the polarity and never muted (neither the track's
+///   mute nor a solo elsewhere reaches a performer's headphones): 2
+///   before the fader, in the track layout, unpanned; 3 the post-fader
+///   image — output 0 (fader, VCAs, modulation and panning as the main
+///   mix has them, in the destination layout) without the mute
+/// * a bus's cue path has a strip of its own (`solo_safe`): the mute,
+///   the solos and VCA mutes never reach any of its outputs
 ///
 /// All gain changes are ramped linearly, so fader moves, mutes and solos
 /// never click. Automated volume, pan and mute are evaluated every
@@ -60,21 +63,24 @@ pub struct ChannelStrip {
     /// The project's pan law and downmix.
     shared: MixSlots,
     law: FaderLaw,
-    post: [f32; MAX_CHANNELS],
+    layouts: (ChannelLayout, ChannelLayout),
     pre: f32,
-    /// The cue taps' gains at the end of the last range (NaN: none yet).
+    /// The cue mixes' pre-fader tap's gain at the end of the last range
+    /// (NaN: none yet).
     cue_pre: f32,
-    cue_post: f32,
-    /// Into stereo: the placement and the gain (fader × VCA × mute) at the
-    /// end of the last range, and every pair's gain there (NaN: none yet).
-    placed: Option<Placement>,
-    gain: f32,
-    pairs: PanMatrix,
-    /// Mixing through the surround panner's matrix (a bed in or out).
-    mix: Option<MatrixMix>,
+    /// The post-fader image (output 0): its placement and ramps.
+    main: Stage,
+    /// The cue mixes' post-fader image (output 3: the same, never muted),
+    /// with ramps of its own.
+    cue: Option<Stage>,
     /// Rendered ahead: no meters, scope or shown values (a [`StripEcho`]
     /// publishes them when the audio is heard).
     quiet: bool,
+    /// A bus's cue path: the track's mute, the solos of the main mix and
+    /// VCA mutes never reach it (the fader, VCAs and polarity do).
+    solo_safe: bool,
+    /// A linear gain on top of the fader (a cue mix dimmed for talkback).
+    trim: Option<ParamSlot>,
     /// An object: no LFE send (objects have none, as in Atmos).
     object: bool,
     /// Its meters and scope are fed by another node (the master's, by the
@@ -84,177 +90,75 @@ pub struct ChannelStrip {
     input_latency: u32,
 }
 
-impl ChannelStrip {
-    /// `shared`: the slots of the project's pan law and downmix.
-    pub fn new(track: TrackId, slots: StripSlots, meter: MeterRange, shared: MixSlots) -> Self {
+/// One post-fader image of a strip's input: into stereo through a
+/// [`Placement`] (with glides), into or out of a bed through the
+/// panner's matrix, otherwise by the graph's channel rules — and the
+/// ramp state of each.
+struct Stage {
+    post: [f32; MAX_CHANNELS],
+    /// Into stereo: the placement and the gain (fader × VCA × mute) at the
+    /// end of the last range, and every pair's gain there (NaN: none yet).
+    placed: Option<Placement>,
+    gain: f32,
+    pairs: PanMatrix,
+    /// Mixing through the surround panner's matrix (a bed in or out).
+    mix: Option<MatrixMix>,
+}
+
+impl Stage {
+    fn new(input: ChannelLayout, output: ChannelLayout) -> Self {
         Self {
-            track,
-            slots,
-            meter,
-            shared,
-            law: FaderLaw::console(),
             post: [f32::NAN; MAX_CHANNELS],
-            pre: f32::NAN,
-            cue_pre: f32::NAN,
-            cue_post: f32::NAN,
             placed: None,
             gain: f32::NAN,
             pairs: [[f32::NAN; 2]; 2],
-            mix: None,
-            quiet: false,
-            object: false,
-            metered_elsewhere: false,
-            input_latency: 0,
-        }
-    }
-
-    /// Panned as an object: everything but the LFE send.
-    pub fn object(self) -> Self {
-        Self {
-            object: true,
-            ..self
-        }
-    }
-
-    /// Meters and scope fed by another node.
-    pub fn metered_elsewhere(self) -> Self {
-        Self {
-            metered_elsewhere: true,
-            ..self
-        }
-    }
-
-    /// From `input` into `output` (the matrix when either is a surround
-    /// bed).
-    pub fn with_layouts(self, input: ChannelLayout, output: ChannelLayout) -> Self {
-        Self {
             mix: MatrixMix::new(input, output),
-            ..self
         }
     }
 
-    /// With decorrelation filters for a diffuse spread into its bed.
-    pub fn with_diffuser(self, rate: f64) -> Self {
+    fn with_diffuser(self, rate: f64) -> Self {
         Self {
             mix: self.mix.map(|m| m.with_diffuser(rate)),
             ..self
         }
     }
 
-    /// Rendered ahead of the playhead (see [`StripEcho`]).
-    pub fn quiet(self) -> Self {
-        Self {
-            quiet: true,
-            ..self
-        }
-    }
-
-    /// The cue mixes' taps (outputs 2 and 3, when the node has them) for
-    /// frames `off..off + m`: the input with its polarity, before and
-    /// after the fader `fader` (never muted).
-    fn render_cue_taps(
-        &mut self,
-        input: &AudioBuffer,
-        outs: &mut [AudioBuffer],
-        off: usize,
-        m: usize,
-        polarity: f32,
-        fader: f32,
-    ) {
-        let in_ch = input.num_channels();
-        for (port, target) in [(2, polarity), (3, polarity * fader)] {
-            let Some(out) = outs.get_mut(port) else {
-                return;
-            };
-            let current = if port == 2 {
-                &mut self.cue_pre
-            } else {
-                &mut self.cue_post
-            };
-            let from = if current.is_nan() { target } else { *current };
-            *current = target;
-            let step = ramp_step(from, target, m);
-            for c in 0..out.num_channels() {
-                let src = &input.channel(c.min(in_ch.saturating_sub(1)))[off..off + m];
-                let mut g = from;
-                for (o, &x) in out.channel_mut(c)[off..off + m].iter_mut().zip(src) {
-                    g += step;
-                    *o = x * g;
-                }
-            }
-        }
-    }
-
-    /// Frames `off..off + m` through the surround matrix, every pair's gain
-    /// reaching `gain` × its matrix entry at the end of the range (the
-    /// pre-fader output as [`Self::render`] makes it).
+    /// Frames `off..off + m` of `input` into `post` through the surround
+    /// matrix, every pair's gain reaching `gain` × its matrix entry at the
+    /// end of the range.
     fn render_matrix(
         &mut self,
         input: &AudioBuffer,
-        outs: &mut [AudioBuffer],
+        post: &mut AudioBuffer,
         off: usize,
         m: usize,
         gain: f32,
-        audible: f32,
     ) {
-        if let Some(pre) = outs.get_mut(1) {
-            let in_ch = input.num_channels();
-            let from = if self.pre.is_nan() { audible } else { self.pre };
-            let step = ramp_step(from, audible, m);
-            for c in 0..pre.num_channels() {
-                let src = &input.channel(c.min(in_ch.saturating_sub(1)))[off..off + m];
-                let mut g = from;
-                for (o, &x) in pre.channel_mut(c)[off..off + m].iter_mut().zip(src) {
-                    g += step;
-                    *o = x * g;
-                }
-            }
-            self.pre = audible;
-        }
-        if let (Some(post), Some(mix)) = (outs.first_mut(), self.mix.as_mut()) {
+        if let Some(mix) = self.mix.as_mut() {
             mix.mix(input, post, off, m, gain);
         }
     }
 
-    /// Gains for frames `off..off + m` reaching `fader`/`place`/`audible`
-    /// at the end of the range.
-    #[allow(clippy::too_many_arguments)]
+    /// Frames `off..off + m` of `input` into `post`, the gains reaching
+    /// `gain` through `place` at the end of the range.
     fn render(
         &mut self,
         input: &AudioBuffer,
-        outs: &mut [AudioBuffer],
+        post: &mut AudioBuffer,
         off: usize,
         m: usize,
-        fader: f32,
+        gain: f32,
         place: Placement,
-        audible: f32,
     ) {
         let in_ch = input.num_channels();
-        // Pre-fader output (track layout).
-        if let Some(pre) = outs.get_mut(1) {
-            let from = if self.pre.is_nan() { audible } else { self.pre };
-            let step = ramp_step(from, audible, m);
-            for c in 0..pre.num_channels() {
-                let src = &input.channel(c.min(in_ch.saturating_sub(1)))[off..off + m];
-                let mut g = from;
-                for (o, &x) in pre.channel_mut(c)[off..off + m].iter_mut().zip(src) {
-                    g += step;
-                    *o = x * g;
-                }
-            }
-            self.pre = audible;
-        }
-        let Some(post) = outs.first_mut() else {
-            return;
-        };
         if post.num_channels() == 2 && (1..=2).contains(&in_ch) {
-            self.render_stereo(input, post, off, m, fader * audible, place);
+            self.render_stereo(input, post, off, m, gain, place);
             return;
         }
         // Other layouts: the graph's channel rules, nothing to pan.
         let out_ch = post.num_channels().min(MAX_CHANNELS);
         let mut target = [0.0f32; MAX_CHANNELS];
-        target[..out_ch].fill(fader * audible);
+        target[..out_ch].fill(gain);
         let current = self.post;
         for_each_channel_route(in_ch, post.num_channels(), |s, d, w| {
             if d >= MAX_CHANNELS {
@@ -336,6 +240,153 @@ impl ChannelStrip {
         }
         self.placed = Some(place);
         self.gain = gain;
+    }
+}
+
+impl ChannelStrip {
+    /// `shared`: the slots of the project's pan law and downmix.
+    pub fn new(track: TrackId, slots: StripSlots, meter: MeterRange, shared: MixSlots) -> Self {
+        Self {
+            track,
+            slots,
+            meter,
+            shared,
+            law: FaderLaw::console(),
+            layouts: (ChannelLayout::Stereo, ChannelLayout::Stereo),
+            pre: f32::NAN,
+            cue_pre: f32::NAN,
+            main: Stage::new(ChannelLayout::Stereo, ChannelLayout::Stereo),
+            cue: None,
+            quiet: false,
+            solo_safe: false,
+            trim: None,
+            object: false,
+            metered_elsewhere: false,
+            input_latency: 0,
+        }
+    }
+
+    /// Panned as an object: everything but the LFE send.
+    pub fn object(self) -> Self {
+        Self {
+            object: true,
+            ..self
+        }
+    }
+
+    /// Meters and scope fed by another node.
+    pub fn metered_elsewhere(self) -> Self {
+        Self {
+            metered_elsewhere: true,
+            ..self
+        }
+    }
+
+    /// From `input` into `output` (the matrix when either is a surround
+    /// bed).
+    pub fn with_layouts(self, input: ChannelLayout, output: ChannelLayout) -> Self {
+        Self {
+            layouts: (input, output),
+            main: Stage::new(input, output),
+            cue: self.cue.map(|_| Stage::new(input, output)),
+            ..self
+        }
+    }
+
+    /// With the cue mixes' post-fader image (output 3): the post-fader
+    /// output as [`Self::with_layouts`] makes it, never muted (call after
+    /// `with_layouts`).
+    pub fn with_cue_image(self) -> Self {
+        let (input, output) = self.layouts;
+        Self {
+            cue: Some(Stage::new(input, output)),
+            ..self
+        }
+    }
+
+    /// With decorrelation filters for a diffuse spread into its bed.
+    pub fn with_diffuser(self, rate: f64) -> Self {
+        Self {
+            main: self.main.with_diffuser(rate),
+            cue: self.cue.map(|c| c.with_diffuser(rate)),
+            ..self
+        }
+    }
+
+    /// Rendered ahead of the playhead (see [`StripEcho`]).
+    pub fn quiet(self) -> Self {
+        Self {
+            quiet: true,
+            ..self
+        }
+    }
+
+    /// A bus's cue path: mutes and solos never reach it.
+    pub fn solo_safe(self) -> Self {
+        Self {
+            solo_safe: true,
+            ..self
+        }
+    }
+
+    /// A linear gain on top of the fader, from a parameter slot (a cue
+    /// mix dimmed while the engineer talks).
+    pub fn with_trim(self, trim: ParamSlot) -> Self {
+        Self {
+            trim: Some(trim),
+            ..self
+        }
+    }
+
+    /// The cue mixes' pre-fader tap (output 2, when the node has it) for
+    /// frames `off..off + m`: the input with its polarity, never muted.
+    fn render_cue_pre(
+        &mut self,
+        input: &AudioBuffer,
+        outs: &mut [AudioBuffer],
+        off: usize,
+        m: usize,
+        polarity: f32,
+    ) {
+        let Some(out) = outs.get_mut(2) else {
+            return;
+        };
+        let in_ch = input.num_channels();
+        let from = if self.cue_pre.is_nan() {
+            polarity
+        } else {
+            self.cue_pre
+        };
+        self.cue_pre = polarity;
+        let step = ramp_step(from, polarity, m);
+        for c in 0..out.num_channels() {
+            let src = &input.channel(c.min(in_ch.saturating_sub(1)))[off..off + m];
+            let mut g = from;
+            for (o, &x) in out.channel_mut(c)[off..off + m].iter_mut().zip(src) {
+                g += step;
+                *o = x * g;
+            }
+        }
+    }
+
+    /// The pre-fader output (1, track layout) for frames `off..off + m`,
+    /// reaching `audible` at the end of the range.
+    fn render_pre(&mut self, input: &AudioBuffer, outs: &mut [AudioBuffer], off: usize, m: usize, audible: f32) {
+        let Some(pre) = outs.get_mut(1) else {
+            return;
+        };
+        let in_ch = input.num_channels();
+        let from = if self.pre.is_nan() { audible } else { self.pre };
+        let step = ramp_step(from, audible, m);
+        for c in 0..pre.num_channels() {
+            let src = &input.channel(c.min(in_ch.saturating_sub(1)))[off..off + m];
+            let mut g = from;
+            for (o, &x) in pre.channel_mut(c)[off..off + m].iter_mut().zip(src) {
+                g += step;
+                *o = x * g;
+            }
+        }
+        self.pre = audible;
     }
 }
 
@@ -427,17 +478,22 @@ impl Processor<EngineContext> for ChannelStrip {
         };
         let pan_law = PanLaw::from_index(params.get(self.shared.pan_law));
         let downmix = self.shared.downmix(params);
-        let static_mute = params.get(self.slots.mute) >= 0.5;
-        let solo_muted = params.get(self.slots.solo_mute) >= 0.5;
+        let static_mute = params.get(self.slots.mute) >= 0.5 && !self.solo_safe;
+        let solo_muted = params.get(self.slots.solo_mute) >= 0.5 && !self.solo_safe;
         let polarity = if params.get(self.slots.phase) >= 0.5 {
             -1.0
         } else {
             1.0
         };
         let vca_gain = params.get(self.slots.vca);
+        let trim = self.trim.map_or(1.0, |s| params.get(s).max(0.0));
         let auto = cx.data.timeline.automation(self.track);
         let (vol_lane, pan_lane, mute_lane) = auto.map_or((None, None, None), |a| {
-            (a.volume.as_ref(), a.pan.as_ref(), a.mute.as_ref())
+            (
+                a.volume.as_ref(),
+                a.pan.as_ref(),
+                a.mute.as_ref().filter(|_| !self.solo_safe),
+            )
         });
         let Some(input) = io.audio_in.first() else {
             return;
@@ -449,7 +505,10 @@ impl Processor<EngineContext> for ChannelStrip {
         });
         let (vca_volume, vca_mute): (&[SampleLane], &[SampleLane]) =
             auto.map_or((&[], &[]), |a| (&a.vca_volume, &a.vca_mute));
-        let surround_lanes = auto.map(|a| &a.surround).filter(|_| self.mix.is_some());
+        let vca_mute: &[SampleLane] = if self.solo_safe { &[] } else { vca_mute };
+        let surround_lanes = auto
+            .map(|a| &a.surround)
+            .filter(|_| self.main.mix.is_some());
         let automated = vol_lane.is_some()
             || pan_lane.is_some()
             || left_lane.is_some()
@@ -462,6 +521,9 @@ impl Processor<EngineContext> for ChannelStrip {
         let n = io.frames;
         if let Some(post) = io.audio_out.first_mut() {
             post.clear();
+        }
+        if let Some(image) = io.audio_out.get_mut(3) {
+            image.clear();
         }
         let step = if automated { AUTOMATION_STEP } else { n.max(1) };
         // The modulation its audio passed the modulators with.
@@ -513,6 +575,7 @@ impl Processor<EngineContext> for ChannelStrip {
                     (pan + pan_mod).clamp(-1.0, 1.0),
                 )
             };
+            let fader_m = fader_m * trim;
             // Pan modulation moves a dual-panned image as a whole.
             let place = if input.num_channels() != 2 {
                 Placement::Mono {
@@ -533,10 +596,9 @@ impl Processor<EngineContext> for ChannelStrip {
                     pan: pan::position(pan_m),
                 }
             };
-            if io.audio_out.len() > 2 {
-                self.render_cue_taps(input, io.audio_out, off, m, polarity, fader_m * vca);
-            }
-            if let Some(mix) = self.mix.as_mut() {
+            self.render_cue_pre(input, io.audio_out, off, m, polarity);
+            self.render_pre(input, io.audio_out, off, m, audible);
+            if self.main.mix.is_some() {
                 let mut pan = surround_at(&self.slots.surround, params, surround_lanes, at);
                 if self.object {
                     pan.lfe_db = surround::LFE_OFF_DB;
@@ -544,17 +606,27 @@ impl Processor<EngineContext> for ChannelStrip {
                     pan.stereo = StereoSource::Image;
                     pan.diffuse = false;
                 }
-                mix.pan(&pan, pan_m, downmix);
-                self.render_matrix(
-                    input,
-                    io.audio_out,
-                    off,
-                    m,
-                    fader_m * vca * audible,
-                    audible,
-                );
+                let (post, rest) = io.audio_out.split_at_mut(1);
+                if let (Some(post), Some(mix)) = (post.first_mut(), self.main.mix.as_mut()) {
+                    mix.pan(&pan, pan_m, downmix);
+                    self.main
+                        .render_matrix(input, post, off, m, fader_m * vca * audible);
+                }
+                if let (Some(image), Some(cue)) = (rest.get_mut(2), self.cue.as_mut()) {
+                    if let Some(mix) = cue.mix.as_mut() {
+                        mix.pan(&pan, pan_m, downmix);
+                    }
+                    cue.render_matrix(input, image, off, m, fader_m * vca * polarity);
+                }
             } else {
-                self.render(input, io.audio_out, off, m, fader_m * vca, place, audible);
+                let (post, rest) = io.audio_out.split_at_mut(1);
+                if let Some(post) = post.first_mut() {
+                    self.main
+                        .render(input, post, off, m, fader_m * vca * audible, place);
+                }
+                if let (Some(image), Some(cue)) = (rest.get_mut(2), self.cue.as_mut()) {
+                    cue.render(input, image, off, m, fader_m * vca * polarity, place);
+                }
             }
             values = (fader, pan, mute, dual_pan);
             off += m;
@@ -570,7 +642,7 @@ impl Processor<EngineContext> for ChannelStrip {
             rb.set(self.slots.mute, if values.2 { 1.0 } else { 0.0 });
             rb.set(self.slots.pan_left, values.3.left);
             rb.set(self.slots.pan_right, values.3.right);
-            if let Some(pan) = self.mix.as_ref().and_then(MatrixMix::made_for) {
+            if let Some(pan) = self.main.mix.as_ref().and_then(MatrixMix::made_for) {
                 set_surround(rb, &self.slots.surround, &pan);
             }
         }

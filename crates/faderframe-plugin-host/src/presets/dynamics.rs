@@ -9,6 +9,8 @@ pub(super) fn compressor() -> Vec<FactoryPreset> {
     const OPTO: f64 = 2.0;
     const VINTAGE: f64 = 3.0;
     const BUS: f64 = 4.0;
+    const MASTERING: f64 = 5.0;
+    const PUMPING: f64 = 6.0;
     vec![
         // An optical leveller: slow, programme dependent, smooth.
         preset(
@@ -203,6 +205,446 @@ pub(super) fn compressor() -> Vec<FactoryPreset> {
                 (COLOR, 0.15),
             ],
         ),
+        // The groups below use what the second revision added: hold, M/S,
+        // upward compression, oversampled colour, delta, the Mastering and
+        // Pumping styles. Levelled for programme peaking round −6 dB.
+        // Vocals.
+        preset(
+            "Vocal Rider (Upward)",
+            &[
+                (STYLE, CLEAN),
+                (DETECTOR, 1.0),
+                (THRESHOLD, -28.0),
+                (RATIO, 2.5),
+                (ATTACK, 20.0),
+                (RELEASE, 200.0),
+                (KNEE, 10.0),
+                (UPWARD, 4.0),
+                (MAKEUP, -1.0),
+                (SC_LOW, 80.0),
+            ],
+        )
+        .in_group("Vocals"),
+        // Two stages in series: the opto levels, the FET catches the rest.
+        preset(
+            "Vocal Serial 1 — Opto Level",
+            &[
+                (STYLE, OPTO),
+                (THRESHOLD, -22.0),
+                (RATIO, 2.5),
+                (ATTACK, 15.0),
+                (RELEASE, 400.0),
+                (KNEE, 8.0),
+                (MAKEUP, 3.0),
+                (SC_LOW, 100.0),
+            ],
+        )
+        .in_group("Vocals"),
+        preset(
+            "Vocal Serial 2 — FET Catch",
+            &[
+                (STYLE, VINTAGE),
+                (THRESHOLD, -16.0),
+                (RATIO, 6.0),
+                (ATTACK, 1.0),
+                (RELEASE, 60.0),
+                (KNEE, 2.0),
+                (MAKEUP, 3.0),
+                (COLOR, 0.2),
+                (OVERSAMPLE, 1.0),
+            ],
+        )
+        .in_group("Vocals"),
+        preset(
+            "Rap Vocal In Your Face",
+            &[
+                (STYLE, VINTAGE),
+                (THRESHOLD, -20.0),
+                (RATIO, 8.0),
+                (ATTACK, 0.5),
+                (RELEASE, 80.0),
+                (KNEE, 0.0),
+                (MAKEUP, 7.0),
+                (COLOR, 0.35),
+                (OVERSAMPLE, 1.0),
+                (SC_LOW, 120.0),
+            ],
+        )
+        .in_group("Vocals"),
+        preset(
+            "Backing Vocals Tuck",
+            &[
+                (STYLE, BUS),
+                (THRESHOLD, -24.0),
+                (RATIO, 3.0),
+                (ATTACK, 10.0),
+                (RELEASE, 150.0),
+                (AUTO_RELEASE, 1.0),
+                (HOLD, 20.0),
+                (KNEE, 6.0),
+                (MAKEUP, 3.0),
+            ],
+        )
+        .in_group("Vocals"),
+        // Drums.
+        preset(
+            "Kick Hold & Punch",
+            &[
+                (STYLE, PUNCH),
+                (THRESHOLD, -18.0),
+                (RATIO, 6.0),
+                (ATTACK, 20.0),
+                (HOLD, 60.0),
+                (RELEASE, 40.0),
+                (KNEE, 2.0),
+                (MAKEUP, 0.5),
+            ],
+        )
+        .in_group("Drums"),
+        preset(
+            "Snare Pump",
+            &[
+                (STYLE, PUMPING),
+                (THRESHOLD, -22.0),
+                (RATIO, 6.0),
+                (ATTACK, 8.0),
+                (HOLD, 80.0),
+                (RELEASE, 120.0),
+                (KNEE, 2.0),
+                (MAKEUP, 4.0),
+            ],
+        )
+        .in_group("Drums"),
+        // Mid and side on their own: the kick in the middle does not pump
+        // the cymbals at the sides.
+        preset(
+            "Drum Bus Mid/Side Glue",
+            &[
+                (STYLE, BUS),
+                (CHANNELS, 1.0),
+                (LINK, 0.3),
+                (THRESHOLD, -18.0),
+                (RATIO, 3.0),
+                (ATTACK, 20.0),
+                (RELEASE, 120.0),
+                (AUTO_RELEASE, 1.0),
+                (KNEE, 4.0),
+                (MAKEUP, 2.5),
+            ],
+        )
+        .in_group("Drums"),
+        preset(
+            "Overheads Smooth",
+            &[
+                (STYLE, CLEAN),
+                (DETECTOR, 1.0),
+                (THRESHOLD, -26.0),
+                (RATIO, 2.5),
+                (ATTACK, 20.0),
+                (RELEASE, 250.0),
+                (KNEE, 8.0),
+                (MAKEUP, 2.0),
+                (SC_LOW, 150.0),
+            ],
+        )
+        .in_group("Drums"),
+        preset(
+            "Room Mics Pump",
+            &[
+                (STYLE, PUMPING),
+                (THRESHOLD, -30.0),
+                (RATIO, 10.0),
+                (ATTACK, 1.0),
+                (HOLD, 100.0),
+                (RELEASE, 200.0),
+                (KNEE, 3.0),
+                (MAKEUP, 10.0),
+                (COLOR, 0.3),
+                (MIX, 0.7),
+            ],
+        )
+        .in_group("Drums"),
+        // A slow attack passes the hit, the rest clamps: more transient.
+        preset(
+            "Drum Transient Shaper",
+            &[
+                (STYLE, PUNCH),
+                (THRESHOLD, -14.0),
+                (RATIO, 10.0),
+                (ATTACK, 30.0),
+                (RELEASE, 60.0),
+                (KNEE, 0.0),
+                (MAKEUP, 0.0),
+            ],
+        )
+        .in_group("Drums"),
+        // Bass.
+        preset(
+            "Bass Upfront FET",
+            &[
+                (STYLE, VINTAGE),
+                (THRESHOLD, -22.0),
+                (RATIO, 4.0),
+                (ATTACK, 3.0),
+                (RELEASE, 150.0),
+                (KNEE, 3.0),
+                (MAKEUP, 5.0),
+                (COLOR, 0.2),
+                (OVERSAMPLE, 1.0),
+            ],
+        )
+        .in_group("Bass"),
+        preset(
+            "Bass Constant (Upward)",
+            &[
+                (STYLE, CLEAN),
+                (DETECTOR, 1.0),
+                (THRESHOLD, -24.0),
+                (RATIO, 4.0),
+                (ATTACK, 10.0),
+                (RELEASE, 150.0),
+                (KNEE, 6.0),
+                (UPWARD, 5.0),
+                (MAKEUP, -1.0),
+            ],
+        )
+        .in_group("Bass"),
+        // Keyed by the lows only: the sub is held even, the top plays.
+        preset(
+            "Sub Bass Tamer",
+            &[
+                (STYLE, MASTERING),
+                (THRESHOLD, -20.0),
+                (RATIO, 3.0),
+                (ATTACK, 30.0),
+                (RELEASE, 400.0),
+                (KNEE, 6.0),
+                (SC_HIGH, 500.0),
+                (MAKEUP, 2.0),
+            ],
+        )
+        .in_group("Bass"),
+        preset(
+            "Slap Bass Peaks",
+            &[
+                (STYLE, PUNCH),
+                (THRESHOLD, -12.0),
+                (RATIO, 8.0),
+                (ATTACK, 0.5),
+                (RELEASE, 60.0),
+                (KNEE, 2.0),
+                (LOOKAHEAD, 1.0),
+                (RANGE, 10.0),
+                (MAKEUP, 1.0),
+            ],
+        )
+        .in_group("Bass"),
+        // Bus.
+        preset(
+            "Mix Bus Mid/Side",
+            &[
+                (STYLE, BUS),
+                (CHANNELS, 1.0),
+                (LINK, 0.5),
+                (THRESHOLD, -16.0),
+                (RATIO, 2.0),
+                (ATTACK, 30.0),
+                (RELEASE, 300.0),
+                (AUTO_RELEASE, 1.0),
+                (KNEE, 4.0),
+                (MAKEUP, 1.5),
+            ],
+        )
+        .in_group("Bus"),
+        preset(
+            "Mix Bus 2:1 Slow",
+            &[
+                (STYLE, MASTERING),
+                (THRESHOLD, -18.0),
+                (RATIO, 2.0),
+                (ATTACK, 50.0),
+                (RELEASE, 500.0),
+                (AUTO_RELEASE, 1.0),
+                (KNEE, 6.0),
+                (MAKEUP, 1.0),
+            ],
+        )
+        .in_group("Bus"),
+        preset(
+            "Guitar Bus Even",
+            &[
+                (STYLE, OPTO),
+                (THRESHOLD, -22.0),
+                (RATIO, 3.0),
+                (ATTACK, 20.0),
+                (RELEASE, 300.0),
+                (KNEE, 6.0),
+                (MAKEUP, 3.0),
+            ],
+        )
+        .in_group("Bus"),
+        preset(
+            "Synth Bus Pump (Keyed)",
+            &[
+                (STYLE, PUMPING),
+                (EXTERNAL, 1.0),
+                (THRESHOLD, -30.0),
+                (RATIO, 10.0),
+                (ATTACK, 1.0),
+                (HOLD, 40.0),
+                (RELEASE, 200.0),
+                (KNEE, 3.0),
+                (RANGE, 12.0),
+            ],
+        )
+        .in_group("Bus"),
+        preset(
+            "Pads Leveler (Upward)",
+            &[
+                (STYLE, MASTERING),
+                (THRESHOLD, -26.0),
+                (RATIO, 2.0),
+                (ATTACK, 40.0),
+                (RELEASE, 600.0),
+                (KNEE, 10.0),
+                (UPWARD, 6.0),
+                (MAKEUP, 2.0),
+            ],
+        )
+        .in_group("Bus"),
+        // Master.
+        preset(
+            "Mastering Gentle 1.5:1",
+            &[
+                (STYLE, MASTERING),
+                (THRESHOLD, -20.0),
+                (RATIO, 1.5),
+                (ATTACK, 30.0),
+                (RELEASE, 400.0),
+                (AUTO_RELEASE, 1.0),
+                (KNEE, 12.0),
+                (MAKEUP, 1.0),
+            ],
+        )
+        .in_group("Master"),
+        preset(
+            "Mastering Mid/Side",
+            &[
+                (STYLE, MASTERING),
+                (CHANNELS, 1.0),
+                (LINK, 0.2),
+                (THRESHOLD, -18.0),
+                (RATIO, 1.8),
+                (ATTACK, 30.0),
+                (RELEASE, 500.0),
+                (AUTO_RELEASE, 1.0),
+                (KNEE, 10.0),
+                (MAKEUP, 1.0),
+            ],
+        )
+        .in_group("Master"),
+        preset(
+            "Mastering Upward Lift",
+            &[
+                (STYLE, MASTERING),
+                (THRESHOLD, -24.0),
+                (RATIO, 1.5),
+                (ATTACK, 50.0),
+                (RELEASE, 800.0),
+                (KNEE, 12.0),
+                (UPWARD, 4.0),
+                (MAKEUP, 0.5),
+            ],
+        )
+        .in_group("Master"),
+        preset(
+            "Mastering Colour (4× OS)",
+            &[
+                (STYLE, BUS),
+                (THRESHOLD, -16.0),
+                (RATIO, 2.0),
+                (ATTACK, 30.0),
+                (RELEASE, 300.0),
+                (AUTO_RELEASE, 1.0),
+                (KNEE, 6.0),
+                (COLOR, 0.3),
+                (OVERSAMPLE, 2.0),
+                (MAKEUP, 1.5),
+            ],
+        )
+        .in_group("Master"),
+        // Creative.
+        preset(
+            "Delta — Hear What Goes",
+            &[
+                (STYLE, CLEAN),
+                (DELTA, 1.0),
+                (THRESHOLD, -24.0),
+                (RATIO, 4.0),
+                (ATTACK, 10.0),
+                (RELEASE, 120.0),
+            ],
+        )
+        .in_group("Creative"),
+        preset(
+            "Sidechain Pump (Held)",
+            &[
+                (STYLE, PUMPING),
+                (EXTERNAL, 1.0),
+                (THRESHOLD, -35.0),
+                (RATIO, 20.0),
+                (ATTACK, 0.5),
+                (HOLD, 60.0),
+                (RELEASE, 150.0),
+                (KNEE, 0.0),
+                (RANGE, 24.0),
+            ],
+        )
+        .in_group("Creative"),
+        preset(
+            "Lo-Fi Crush (4× OS)",
+            &[
+                (STYLE, VINTAGE),
+                (THRESHOLD, -40.0),
+                (RATIO, 20.0),
+                (ATTACK, 0.1),
+                (RELEASE, 100.0),
+                (KNEE, 0.0),
+                (COLOR, 1.0),
+                (OVERSAMPLE, 2.0),
+                (MAKEUP, 16.0),
+                (MIX, 0.8),
+            ],
+        )
+        .in_group("Creative"),
+        preset(
+            "Breathing Pad",
+            &[
+                (STYLE, MASTERING),
+                (THRESHOLD, -30.0),
+                (RATIO, 100.0),
+                (ATTACK, 100.0),
+                (RELEASE, 1000.0),
+                (KNEE, 12.0),
+                (UPWARD, 12.0),
+                (MAKEUP, 2.0),
+            ],
+        )
+        .in_group("Creative"),
+        preset(
+            "Stutter Hold",
+            &[
+                (STYLE, PUMPING),
+                (THRESHOLD, -24.0),
+                (RATIO, 10.0),
+                (ATTACK, 0.1),
+                (HOLD, 300.0),
+                (RELEASE, 10.0),
+                (KNEE, 0.0),
+                (MAKEUP, 4.0),
+            ],
+        )
+        .in_group("Creative"),
     ]
 }
 
@@ -210,6 +652,10 @@ pub(super) fn limiter() -> Vec<FactoryPreset> {
     use crate::devices::limiter::id::*;
     const PUNCHY: f64 = 1.0;
     const AGGRESSIVE: f64 = 2.0;
+    const ALLROUND: f64 = 3.0;
+    const BUS: f64 = 4.0;
+    const SAFE: f64 = 5.0;
+    const MODERN: f64 = 6.0;
     vec![
         // Catches the odd over and nothing else.
         preset(
@@ -347,6 +793,273 @@ pub(super) fn limiter() -> Vec<FactoryPreset> {
                 (LOOKAHEAD, 5.0),
             ],
         ),
+        // The groups below use the later styles (Allround, Bus, Safe,
+        // Modern), the output trim and the release link.
+        // Vocals.
+        preset(
+            "Vocal Safety (−3 dB)",
+            &[
+                (GAIN, 0.0),
+                (CEILING, -3.0),
+                (STYLE, SAFE),
+                (RELEASE, 80.0),
+                (LOOKAHEAD, 4.0),
+            ],
+        )
+        .in_group("Vocals"),
+        preset(
+            "Vocal Dense",
+            &[
+                (GAIN, 4.0),
+                (CEILING, -2.0),
+                (STYLE, ALLROUND),
+                (RELEASE, 60.0),
+                (LOOKAHEAD, 3.0),
+            ],
+        )
+        .in_group("Vocals"),
+        preset(
+            "Vocal Modern Leveler",
+            &[
+                (GAIN, 6.0),
+                (CEILING, -4.0),
+                (STYLE, MODERN),
+                (RELEASE, 40.0),
+                (LOOKAHEAD, 2.0),
+            ],
+        )
+        .in_group("Vocals"),
+        // Drums.
+        preset(
+            "Drum Bus Allround",
+            &[
+                (GAIN, 5.0),
+                (CEILING, -2.0),
+                (STYLE, ALLROUND),
+                (RELEASE, 30.0),
+                (LOOKAHEAD, 2.0),
+                (TRUE_PEAK, 0.0),
+            ],
+        )
+        .in_group("Drums"),
+        preset(
+            "Drum Bus Modern Slam",
+            &[
+                (GAIN, 10.0),
+                (CEILING, -1.0),
+                (STYLE, MODERN),
+                (RELEASE, 20.0),
+                (LOOKAHEAD, 1.5),
+            ],
+        )
+        .in_group("Drums"),
+        // The shortest window: the kick's top is shaved, not shaped.
+        preset(
+            "Kick Peak Shave",
+            &[
+                (GAIN, 3.0),
+                (CEILING, -3.0),
+                (STYLE, AGGRESSIVE),
+                (RELEASE, 10.0),
+                (AUTO_RELEASE, 0.0),
+                (LOOKAHEAD, 0.5),
+                (TRUE_PEAK, 0.0),
+            ],
+        )
+        .in_group("Drums"),
+        preset(
+            "Overheads Glass",
+            &[
+                (GAIN, 2.0),
+                (CEILING, -3.0),
+                (STYLE, SAFE),
+                (RELEASE, 200.0),
+                (LOOKAHEAD, 8.0),
+            ],
+        )
+        .in_group("Drums"),
+        // Bass.
+        preset(
+            "Bass Modern Tight",
+            &[
+                (GAIN, 6.0),
+                (CEILING, -3.0),
+                (STYLE, MODERN),
+                (RELEASE, 150.0),
+                (LOOKAHEAD, 6.0),
+                (TRUE_PEAK, 0.0),
+                (RELEASE_LINK, 1.0),
+            ],
+        )
+        .in_group("Bass"),
+        preset(
+            "Sub Safe",
+            &[
+                (GAIN, 3.0),
+                (CEILING, -2.0),
+                (STYLE, SAFE),
+                (RELEASE, 400.0),
+                (LOOKAHEAD, 10.0),
+            ],
+        )
+        .in_group("Bass"),
+        // Bus.
+        preset(
+            "Bus Glue Limiter",
+            &[
+                (GAIN, 3.0),
+                (CEILING, -2.0),
+                (STYLE, BUS),
+                (RELEASE, 150.0),
+                (LOOKAHEAD, 5.0),
+            ],
+        )
+        .in_group("Bus"),
+        preset(
+            "Stem Export Safe (−1 dBTP)",
+            &[
+                (GAIN, 0.0),
+                (CEILING, -1.0),
+                (STYLE, SAFE),
+                (RELEASE, 100.0),
+                (LOOKAHEAD, 5.0),
+            ],
+        )
+        .in_group("Bus"),
+        preset(
+            "Instrument Bus Allround",
+            &[
+                (GAIN, 4.0),
+                (CEILING, -2.0),
+                (STYLE, ALLROUND),
+                (RELEASE, 80.0),
+                (LOOKAHEAD, 4.0),
+            ],
+        )
+        .in_group("Bus"),
+        // Master.
+        preset(
+            "Streaming Safe (−14 LUFS)",
+            &[
+                (GAIN, 5.0),
+                (CEILING, -1.0),
+                (STYLE, SAFE),
+                (RELEASE, 120.0),
+                (LOOKAHEAD, 6.0),
+            ],
+        )
+        .in_group("Master"),
+        preset(
+            "Apple Digital Masters (−1 dBTP)",
+            &[
+                (GAIN, 3.0),
+                (CEILING, -1.0),
+                (STYLE, SAFE),
+                (RELEASE, 100.0),
+                (LOOKAHEAD, 5.0),
+            ],
+        )
+        .in_group("Master"),
+        preset(
+            "Loud Master (−9 LUFS)",
+            &[
+                (GAIN, 10.0),
+                (CEILING, -1.0),
+                (STYLE, MODERN),
+                (RELEASE, 60.0),
+                (LOOKAHEAD, 3.0),
+            ],
+        )
+        .in_group("Master"),
+        preset(
+            "Club Master",
+            &[
+                (GAIN, 8.0),
+                (CEILING, -0.5),
+                (STYLE, BUS),
+                (RELEASE, 50.0),
+                (LOOKAHEAD, 3.0),
+                (LINK, 0.5),
+                (RELEASE_LINK, 0.7),
+            ],
+        )
+        .in_group("Master"),
+        preset(
+            "Vinyl Pre-Master (−3 dB)",
+            &[
+                (GAIN, 2.0),
+                (CEILING, -3.0),
+                (STYLE, SAFE),
+                (RELEASE, 300.0),
+                (LOOKAHEAD, 10.0),
+            ],
+        )
+        .in_group("Master"),
+        // Limited loud, heard 6 dB down: compare against the unlimited
+        // mix at one level.
+        preset(
+            "Reference Level (Output −6 dB)",
+            &[
+                (GAIN, 6.0),
+                (CEILING, -1.0),
+                (STYLE, ALLROUND),
+                (RELEASE, 100.0),
+                (LOOKAHEAD, 4.0),
+                (OUTPUT, -6.0),
+            ],
+        )
+        .in_group("Master"),
+        preset(
+            "Dense Linked Release",
+            &[
+                (GAIN, 6.0),
+                (CEILING, -1.0),
+                (STYLE, ALLROUND),
+                (RELEASE, 120.0),
+                (LOOKAHEAD, 4.0),
+                (LINK, 0.3),
+                (RELEASE_LINK, 1.0),
+            ],
+        )
+        .in_group("Master"),
+        // Creative.
+        preset(
+            "Pump Limiter",
+            &[
+                (GAIN, 14.0),
+                (CEILING, -1.0),
+                (STYLE, AGGRESSIVE),
+                (RELEASE, 400.0),
+                (AUTO_RELEASE, 0.0),
+                (LOOKAHEAD, 1.0),
+            ],
+        )
+        .in_group("Creative"),
+        preset(
+            "Brick Wall Distortion",
+            &[
+                (GAIN, 24.0),
+                (CEILING, -1.0),
+                (STYLE, AGGRESSIVE),
+                (RELEASE, 5.0),
+                (AUTO_RELEASE, 0.0),
+                (LOOKAHEAD, 0.5),
+                (TRUE_PEAK, 0.0),
+            ],
+        )
+        .in_group("Creative"),
+        preset(
+            "Loudness Check at Unity",
+            &[
+                (GAIN, 8.0),
+                (CEILING, -1.0),
+                (STYLE, SAFE),
+                (RELEASE, 100.0),
+                (LOOKAHEAD, 5.0),
+                (UNITY, 1.0),
+            ],
+        )
+        .in_group("Creative"),
     ]
 }
 

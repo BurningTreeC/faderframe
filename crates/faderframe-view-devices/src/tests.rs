@@ -492,3 +492,91 @@ fn a_stock_devices_controls_are_reachable_by_the_keyboard() {
         "sections as groups"
     );
 }
+
+/// The Compressor's and the Limiter's decks at their editor sizes: every
+/// control inside a section, none over another, and the second
+/// revision's controls (hold, channels, upward, oversampling, delta;
+/// output, release link) on them.
+#[test]
+fn the_dynamics_decks_hold_every_control_inside_their_sections() {
+    use crate::kit::{Face, Panel};
+    use faderframe_plugin_host::devices::{compressor, limiter};
+    let theme = Theme::default();
+    let check = |id: &str, panel: Panel, min: Size, wanted: &[u32]| {
+        let (w, h) = crate::editor_size(id).unwrap();
+        assert!(
+            w as f32 >= min.w && h as f32 >= min.h,
+            "{id}: editor smaller than its face"
+        );
+        for c in &panel.controls {
+            let r = c.rect;
+            assert!(
+                panel.sections.iter().any(|s| {
+                    r.x >= s.rect.x - 0.5
+                        && r.right() <= s.rect.right() + 0.5
+                        && r.y >= s.rect.y
+                        && r.bottom() <= s.rect.bottom() + 0.5
+                }),
+                "{id}: {} ({:?}) outside every section",
+                c.label,
+                r
+            );
+            if let Some(d) = panel.display {
+                assert!(r.y >= d.bottom(), "{id}: {} over the display", c.label);
+            }
+        }
+        for (i, a) in panel.controls.iter().enumerate() {
+            for b in &panel.controls[i + 1..] {
+                let (p, q) = (a.rect, b.rect);
+                let apart =
+                    p.right() <= q.x || q.right() <= p.x || p.bottom() <= q.y || q.bottom() <= p.y;
+                assert!(apart, "{id}: {} and {} overlap", a.label, b.label);
+            }
+        }
+        for want in wanted {
+            assert!(
+                panel.controls.iter().any(|c| c.id.0 == *want),
+                "{id}: no control for parameter {want}"
+            );
+        }
+    };
+    let face = crate::compressor::CompressorFace::new(&theme);
+    let (w, h) = crate::editor_size(builtin::COMPRESSOR).unwrap();
+    check(
+        builtin::COMPRESSOR,
+        face.panel(Size::new(w as f32, h as f32)),
+        face.min_size(),
+        &[
+            compressor::id::HOLD,
+            compressor::id::CHANNELS,
+            compressor::id::UPWARD,
+            compressor::id::OVERSAMPLE,
+            compressor::id::DELTA,
+        ],
+    );
+    // And at its smallest.
+    check(
+        builtin::COMPRESSOR,
+        face.panel(face.min_size()),
+        face.min_size(),
+        &[],
+    );
+    let face = crate::limiter::LimiterFace::new(&theme);
+    let (w, h) = crate::editor_size(builtin::LIMITER).unwrap();
+    check(
+        builtin::LIMITER,
+        face.panel(Size::new(w as f32, h as f32)),
+        face.min_size(),
+        &[
+            limiter::id::OUTPUT,
+            limiter::id::RELEASE_LINK,
+            limiter::id::STYLE,
+        ],
+    );
+    check(
+        builtin::LIMITER,
+        face.panel(face.min_size()),
+        face.min_size(),
+        &[],
+    );
+}

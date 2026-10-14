@@ -721,6 +721,7 @@ fn every_midi_effect_preset_plays_and_lets_go() {
     }
 }
 
+<<<<<<< ours
 /// The Delay's and the Reverb's presets are levelled: fully wet, a click
 /// comes back at a sensible level, nothing clips or runs away, and every
 /// one of them makes sound.
@@ -769,4 +770,72 @@ fn delay_and_reverb_presets_are_levelled() {
             assert!(e > -36.0 && e < 6.0, "{id} '{}': {e:.1} dB", preset.name);
         }
     }
+}
+
+=======
+>>>>>>> theirs
+/// The compressor's and the limiter's grouped presets (Vocals, Drums,
+/// Bass, Bus, Master, Creative) are levelled like the ones at the top of
+/// the menu: audible, no more than 12 dB from the input, never over the
+/// limiter's output ceiling, and the groups hold at least twenty of them.
+#[test]
+fn the_grouped_dynamics_presets_are_levelled_and_keep_their_ceilings() {
+    use crate::devices::{compressor, limiter};
+    let (input, key) = material(4.0);
+    let in_db = stereo_rms_db(&input);
+    let mut wrongs = Vec::new();
+    for id in [builtin::COMPRESSOR, builtin::LIMITER] {
+        let presets = factory_presets(id);
+        let grouped: Vec<_> = presets.iter().filter(|p| p.group.is_some()).collect();
+        assert!(
+            grouped.len() >= 20,
+            "{id}: {} grouped presets",
+            grouped.len()
+        );
+        for group in ["Vocals", "Drums", "Bass", "Bus", "Master", "Creative"] {
+            assert!(
+                grouped.iter().any(|p| p.group == Some(group)),
+                "{id}: no {group} presets"
+            );
+        }
+        for (i, preset) in presets.iter().enumerate() {
+            if preset.group.is_none() {
+                continue;
+            }
+            let name = preset.name;
+            let r = render(id, i, &input, &key, &[], 4.0);
+            for c in &r.out {
+                assert!(c.iter().all(|v| v.is_finite()), "{id} '{name}': not finite");
+            }
+            let peak = peak_db(&r.out[0]).max(peak_db(&r.out[1]));
+            let level = stereo_rms_db(&r.out);
+            let values = preset.values(&parameters(id));
+            let of = |pid: u32| {
+                values
+                    .iter()
+                    .find(|(p, _)| p.0 == pid)
+                    .map_or(0.0, |(_, v)| *v)
+            };
+            let mut wrong = |what: String| wrongs.push(format!("{id} '{name}': {what}"));
+            if level <= -50.0 {
+                wrong(format!("silent ({level:.1} dB)"));
+            }
+            if peak >= 0.0 {
+                wrong(format!("peak {peak:.1} dBFS"));
+            }
+            // Delta listening plays only what is taken: quieter by design.
+            let delta = id == builtin::COMPRESSOR && of(compressor::id::DELTA) > 0.5;
+            let allowed = if delta { 30.0 } else { 12.0 };
+            if (level - in_db).abs() >= allowed {
+                wrong(format!("{in_db:.1} → {level:.1} dB"));
+            }
+            if id == builtin::LIMITER && of(limiter::id::UNITY) < 0.5 {
+                let ceiling = of(limiter::id::CEILING) + of(limiter::id::OUTPUT);
+                if peak > ceiling + 0.05 {
+                    wrong(format!("{peak:.2} over {ceiling}"));
+                }
+            }
+        }
+    }
+    assert!(wrongs.is_empty(), "{wrongs:#?}");
 }

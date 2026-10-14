@@ -1,4 +1,4 @@
-//! Compressor: a feed-forward or feedback compressor in five styles.
+//! Compressor: a feed-forward or feedback compressor in seven styles.
 //!
 //! * Clean: feed-forward, an RMS-leaning detector, no colour: transparent.
 //! * Punch: feed-forward on the peaks, quick to let go: drums keep their
@@ -9,19 +9,26 @@
 //! * Vintage: feedback on the peaks, very fast, and saturation that grows
 //!   with the reduction: the bite of a FET limiting amplifier.
 //! * Bus: feed-forward RMS, stereo linked, auto release: glue for groups.
+//! * Mastering: feed-forward on a long RMS window, slow, a very wide knee:
+//!   a decibel or two nobody hears happening.
+//! * Pumping: feed-forward on the peaks, quick, and a hold before the
+//!   release: the reduction stays down and comes back as one swell.
 //!
 //! Around the gain computer (threshold, ratio up to ∞:1, a soft knee of any
-//! width, a range that caps the reduction) are the attack and release
-//! (smoothed in dB; auto release rides a slow stage), lookahead (the audio
-//! is delayed, the detector sees ahead), stereo link, parallel mix (the dry
-//! path delayed to match), makeup (manual or automatic), colour (harmonic
-//! saturation) and a sidechain: the external input or the input itself,
+//! width, a range that caps the reduction, upward compression below the
+//! threshold) are the attack, hold and release (smoothed in dB; auto
+//! release rides a slow stage), lookahead (the audio is delayed, the
+//! detector sees ahead), stereo link in left/right or mid/side, parallel mix
+//! (the dry path delayed to match), delta listening (what is taken away),
+//! makeup (manual or automatic), colour (harmonic saturation, oversampled
+//! on request) and a sidechain: the external input or the input itself,
 //! through high and low cuts, which can be heard on its own.
 
 use super::{fixed, on_off, param, pass_through, pick, stepped};
 use crate::dsp::delay::DelayLine;
-use crate::dsp::env::{DualRelease, MeanSquare};
+use crate::dsp::env::{DualRelease, MeanSquare, coeff};
 use crate::dsp::filter::{BandShape, BandType, Filter};
+use crate::dsp::oversample::Oversampler;
 use crate::dsp::smooth::Smoothed;
 use crate::dsp::{db, flush, gain};
 use crate::tap::{AnalysisTap, MeterTap, Watching};
@@ -33,7 +40,8 @@ use faderframe_audio_graph::NodeIo;
 use faderframe_core::ParameterId;
 use std::sync::Arc;
 
-/// Parameter ids (0–4 are the first compressor's and keep their meaning).
+/// Parameter ids (0–4 are the first compressor's and keep their meaning;
+/// 19 on came with the second revision, all neutral at their defaults).
 pub mod id {
     pub const THRESHOLD: u32 = 0;
     pub const RATIO: u32 = 1;
@@ -54,25 +62,47 @@ pub mod id {
     pub const LISTEN: u32 = 16;
     pub const RANGE: u32 = 17;
     pub const COLOR: u32 = 18;
+    /// The reduction waits this long before it releases (ms).
+    pub const HOLD: u32 = 19;
+    /// 0: left/right, 1: mid/side (detected and compressed as M and S).
+    pub const CHANNELS: u32 = 20;
+    /// Upward compression below the threshold, at most this much (dB).
+    pub const UPWARD: u32 = 21;
+    /// Oversampling of the saturation: 0 off, 1 2×, 2 4× (latency).
+    pub const OVERSAMPLE: u32 = 22;
+    /// Hear what the compressor takes away (wet − dry).
+    pub const DELTA: u32 = 23;
 }
 
 /// Published values: the reduction now and its peak since the editor last
 /// looked (dB), the input and output peaks since then (linear), the
-/// detector's level now (dB).
+/// detector's level now (dB), the net gain now (dB: negative down, positive
+/// where upward compression lifts).
 pub mod value {
     pub const REDUCTION: usize = 0;
     pub const REDUCTION_PEAK: usize = 1;
     pub const IN_PEAK: usize = 2;
     pub const OUT_PEAK: usize = 3;
     pub const LEVEL: usize = 4;
+    pub const GAIN: usize = 5;
 }
-pub const TAP_VALUES: usize = 5;
+pub const TAP_VALUES: usize = 6;
 
 /// The ratio meaning "∞:1".
 pub const INFINITE: f64 = 100.0;
 
-pub const STYLES: [&str; 5] = ["Clean", "Punch", "Opto", "Vintage", "Bus"];
+pub const STYLES: [&str; 7] = [
+    "Clean",
+    "Punch",
+    "Opto",
+    "Vintage",
+    "Bus",
+    "Mastering",
+    "Pumping",
+];
 pub const DETECTORS: [&str; 2] = ["Peak", "RMS"];
+pub const CHANNEL_MODES: [&str; 2] = ["L/R", "M/S"];
+pub const OVERSAMPLING: [&str; 3] = ["Off", "2×", "4×"];
 
 pub fn parameters() -> Vec<ParameterInfo> {
     use ParameterUnit::*;
@@ -83,7 +113,7 @@ pub fn parameters() -> Vec<ParameterInfo> {
         param(id::RELEASE, "Release", 5.0, 2500.0, 120.0, Milliseconds),
         param(id::MAKEUP, "Makeup", -12.0, 30.0, 0.0, Decibels),
         param(id::KNEE, "Knee", 0.0, 24.0, 6.0, Decibels),
-        stepped(id::STYLE, "Style", 4.0, 0.0),
+        stepped(id::STYLE, "Style", (STYLES.len() - 1) as f64, 0.0),
         stepped(id::AUTO_RELEASE, "Auto Release", 1.0, 0.0),
         stepped(id::AUTO_MAKEUP, "Auto Makeup", 1.0, 0.0),
         param(id::MIX, "Mix", 0.0, 1.0, 1.0, Percent),
@@ -111,6 +141,11 @@ pub fn parameters() -> Vec<ParameterInfo> {
         stepped(id::LISTEN, "Sidechain Listen", 1.0, 0.0),
         param(id::RANGE, "Range", 0.0, 60.0, 60.0, Decibels),
         param(id::COLOR, "Color", 0.0, 1.0, 0.0, Percent),
+        param(id::HOLD, "Hold", 0.0, 500.0, 0.0, Milliseconds),
+        stepped(id::CHANNELS, "Channels", 1.0, 0.0),
+        param(id::UPWARD, "Upward", 0.0, 24.0, 0.0, Decibels),
+        fixed(stepped(id::OVERSAMPLE, "Oversampling", 2.0, 0.0)),
+        stepped(id::DELTA, "Delta", 1.0, 0.0),
     ]
 }
 
@@ -120,19 +155,33 @@ pub fn format(pid: ParameterId, v: f64) -> Option<String> {
         id::RATIO => format!("{v:.1} : 1"),
         id::STYLE => pick(&STYLES, v),
         id::DETECTOR => pick(&DETECTORS, v),
-        id::AUTO_RELEASE | id::AUTO_MAKEUP | id::EXTERNAL | id::LISTEN => on_off(v),
+        id::CHANNELS => pick(&CHANNEL_MODES, v),
+        id::OVERSAMPLE => pick(&OVERSAMPLING, v),
+        id::AUTO_RELEASE | id::AUTO_MAKEUP | id::EXTERNAL | id::LISTEN | id::DELTA => on_off(v),
         id::SC_LOW if v <= 10.5 => "Off".into(),
         id::SC_HIGH if v >= 29_500.0 => "Off".into(),
         id::RANGE if v >= 59.5 => "Full".into(),
         id::KNEE if v < 0.05 => "Hard".into(),
+        id::HOLD if v < 0.05 => "Off".into(),
+        id::UPWARD if v < 0.05 => "Off".into(),
         _ => return None,
     })
 }
 
-/// The lookahead's latency at `rate` (samples).
+/// The oversampling factor a setting asks for.
+fn oversampling(params: &ParamValues) -> usize {
+    match params.get(index(id::OVERSAMPLE)).round() as i32 {
+        1 => 2,
+        2 => 4,
+        _ => 1,
+    }
+}
+
+/// The latency at `rate` (samples): the lookahead and the oversampler's
+/// round trip.
 pub fn latency(params: &ParamValues, rate: f64) -> u32 {
     let ms = f64::from(params.get(index(id::LOOKAHEAD)));
-    (ms * 0.001 * rate).round() as u32
+    (ms * 0.001 * rate).round() as u32 + Oversampler::latency_of(oversampling(params))
 }
 
 /// Index of a parameter by id (ids are the indexes).
@@ -152,6 +201,23 @@ pub fn slope(ratio: f64) -> f64 {
 /// The reduction (dB, ≥ 0) the gain computer asks for at `level` (dB).
 pub fn reduction(level: f64, threshold: f64, ratio: f64, knee: f64) -> f64 {
     reduction_by(level, threshold, slope(ratio), knee)
+}
+
+/// The lift (dB, ≥ 0) upward compression gives at `level` (dB): the
+/// downward curve mirrored below the threshold (the same ratio and knee),
+/// never more than `upward`.
+pub fn lift(level: f64, threshold: f64, ratio: f64, knee: f64, upward: f64) -> f64 {
+    if upward <= 0.0 {
+        return 0.0;
+    }
+    reduction_by(2.0 * threshold - level, threshold, slope(ratio), knee).min(upward)
+}
+
+/// The net gain (dB) of the static curve at `level`: the lift less the
+/// reduction (capped by `range`).
+pub fn curve(level: f64, threshold: f64, ratio: f64, knee: f64, range: f64, upward: f64) -> f64 {
+    lift(level, threshold, ratio, knee, upward)
+        - reduction(level, threshold, ratio, knee).min(range)
 }
 
 /// [`reduction`] for a slope (a feedback compressor's may exceed 1).
@@ -181,60 +247,69 @@ struct Style {
     color: f64,
     gr_color: f64,
     always_auto: bool,
+    /// A hold of its own before the release (ms).
+    hold: f64,
 }
 
 fn style(i: usize) -> Style {
+    let plain = Style {
+        feedback: false,
+        rms: 3.0,
+        attack: 1.0,
+        release: 1.0,
+        knee: 0.0,
+        color: 0.0,
+        gr_color: 0.0,
+        always_auto: false,
+        hold: 0.0,
+    };
     match i {
         1 => Style {
-            feedback: false,
             rms: 0.0,
-            attack: 1.0,
             release: 0.6,
-            knee: 0.0,
-            color: 0.0,
-            gr_color: 0.0,
-            always_auto: false,
+            ..plain
         },
         2 => Style {
             feedback: true,
             rms: 8.0,
             attack: 2.0,
-            release: 1.0,
             knee: 6.0,
             color: 0.15,
             gr_color: 0.01,
             always_auto: true,
+            ..plain
         },
         3 => Style {
             feedback: true,
             rms: 0.0,
             attack: 0.25,
             release: 0.8,
-            knee: 0.0,
             color: 0.3,
             gr_color: 0.04,
-            always_auto: false,
+            ..plain
         },
         4 => Style {
-            feedback: false,
             rms: 12.0,
-            attack: 1.0,
-            release: 1.0,
             knee: 2.0,
             color: 0.05,
-            gr_color: 0.0,
-            always_auto: false,
+            ..plain
         },
-        _ => Style {
-            feedback: false,
-            rms: 3.0,
-            attack: 1.0,
-            release: 1.0,
-            knee: 0.0,
-            color: 0.0,
-            gr_color: 0.0,
-            always_auto: false,
+        5 => Style {
+            rms: 30.0,
+            attack: 1.5,
+            release: 1.5,
+            knee: 6.0,
+            ..plain
         },
+        6 => Style {
+            rms: 0.0,
+            attack: 0.5,
+            release: 0.5,
+            color: 0.1,
+            hold: 50.0,
+            ..plain
+        },
+        _ => plain,
     }
 }
 
@@ -251,8 +326,35 @@ fn saturate(x: f64, drive: f64) -> f64 {
     x + drive.min(1.0) * (y - x)
 }
 
+/// Left/right to mid/side (and back: the same sum and difference, scaled
+/// so a mono signal keeps its level).
+#[inline]
+fn to_ms(x: [f64; 2]) -> [f64; 2] {
+    [0.5 * (x[0] + x[1]), 0.5 * (x[0] - x[1])]
+}
+
+#[inline]
+fn from_ms(x: [f64; 2]) -> [f64; 2] {
+    [x[0] + x[1], x[0] - x[1]]
+}
+
 /// Sub-blocks the controls are updated in.
 const STEP: usize = 32;
+
+/// The controls as read for a sub-block.
+struct Controls {
+    st: Style,
+    threshold: f64,
+    /// The gain computer's slope (steepened for feedback styles).
+    slope: f64,
+    knee: f64,
+    rms: bool,
+    auto: bool,
+    listen: bool,
+    upward: f64,
+    delta: bool,
+    mid_side: bool,
+}
 
 pub struct CompressorProcessor {
     params: ParamValues,
@@ -267,11 +369,20 @@ pub struct CompressorProcessor {
     peak: [f64; 2],
     peak_fall: f64,
     gr: [DualRelease; 2],
+    /// The hold left per channel (samples) and the hold set.
+    held: [usize; 2],
+    hold: usize,
+    /// The upward lift per channel (dB) and its attack/release factors.
+    up: [f64; 2],
+    up_k: (f64, f64),
     /// The gain computer's slope as a feed-forward compressor has it (a
     /// feedback style's equilibrium).
     ff_slope: f64,
     delay: [DelayLine; 2],
     look: usize,
+    /// The oversamplers of the saturation and their round trip.
+    os: [Oversampler; 2],
+    os_latency: usize,
     makeup: Smoothed,
     mix: Smoothed,
     meters: [[MeterTap; 2]; 2],
@@ -281,9 +392,12 @@ pub struct CompressorProcessor {
 impl CompressorProcessor {
     pub fn new(params: ParamValues, tap: Arc<AnalysisTap>, config: &ProcessConfig) -> Self {
         let sr = config.sample_rate.max(1.0);
-        let look = latency(&params, sr) as usize;
+        let look = (f64::from(params.get(index(id::LOOKAHEAD))) * 0.001 * sr).round() as usize;
+        let factor = oversampling(&params);
+        let os_latency = Oversampler::latency_of(factor) as usize;
         let block = config.max_block_size.max(1) as usize;
         let mt = MeterTap::new(sr as f32);
+        let capacity = look + os_latency + 1;
         let mut p = Self {
             watching: Watching::new(sr as f32),
             sr,
@@ -293,9 +407,15 @@ impl CompressorProcessor {
             peak: [0.0; 2],
             peak_fall: (-1.0 / (0.010 * sr)).exp(),
             gr: [DualRelease::default(); 2],
+            held: [0; 2],
+            hold: 0,
+            up: [0.0; 2],
+            up_k: (1.0, 1.0),
             ff_slope: 0.0,
-            delay: [DelayLine::new(look + 1), DelayLine::new(look + 1)],
+            delay: [DelayLine::new(capacity), DelayLine::new(capacity)],
             look,
+            os: [Oversampler::new(factor), Oversampler::new(factor)],
+            os_latency,
             makeup: Smoothed::new(1.0, 20.0, sr),
             mix: Smoothed::new(1.0, 20.0, sr),
             meters: [[mt; 2]; 2],
@@ -314,9 +434,8 @@ impl CompressorProcessor {
         f64::from(self.params.get(index(pid)))
     }
 
-    /// Read the controls (every sub-block): the style, threshold, slope,
-    /// knee, whether RMS, auto release, listen.
-    fn control(&mut self) -> (Style, f64, f64, f64, f64, bool, bool) {
+    /// Read the controls (every sub-block).
+    fn control(&mut self) -> Controls {
         let st = style(self.get(id::STYLE).round().max(0.0) as usize);
         let sr = self.sr;
         let attack = self.get(id::ATTACK) * st.attack;
@@ -324,6 +443,8 @@ impl CompressorProcessor {
         for g in &mut self.gr {
             g.set(attack, release, sr);
         }
+        self.up_k = (coeff(attack, sr), coeff(release, sr));
+        self.hold = ((self.get(id::HOLD) + st.hold) * 0.001 * sr).round() as usize;
         let rms_ms = if self.get(id::DETECTOR) >= 0.5 {
             st.rms.max(10.0)
         } else {
@@ -366,17 +487,18 @@ impl CompressorProcessor {
         };
         self.makeup.set(gain(makeup));
         self.mix.set(self.get(id::MIX).clamp(0.0, 1.0));
-        let auto = st.always_auto || self.get(id::AUTO_RELEASE) >= 0.5;
-        let listen = self.get(id::LISTEN) >= 0.5;
-        (
+        Controls {
             st,
             threshold,
             slope,
             knee,
-            if rms_ms > 0.0 { 1.0 } else { 0.0 },
-            auto,
-            listen,
-        )
+            rms: rms_ms > 0.0,
+            auto: st.always_auto || self.get(id::AUTO_RELEASE) >= 0.5,
+            listen: self.get(id::LISTEN) >= 0.5,
+            upward: self.get(id::UPWARD).max(0.0),
+            delta: self.get(id::DELTA) >= 0.5,
+            mid_side: self.get(id::CHANNELS) >= 0.5,
+        }
     }
 }
 
@@ -428,23 +550,28 @@ impl PluginProcessor for CompressorProcessor {
                     break;
                 }
             }
-            let (st, threshold, slope, knee, rms, auto, listen) = self.control();
+            let k = self.control();
+            let feedback = k.st.feedback && !external;
             for i in at..end {
-                let x = [f64::from(self.scratch[0][i]), f64::from(self.scratch[1][i])];
-                let key = match side {
-                    Some(k) if external => [
-                        f64::from(k.channel(0)[i]),
-                        f64::from(k.channel(1.min(k.num_channels() - 1))[i]),
+                let mut x = [f64::from(self.scratch[0][i]), f64::from(self.scratch[1][i])];
+                let mut key = match side {
+                    Some(s) if external => [
+                        f64::from(s.channel(0)[i]),
+                        f64::from(s.channel(1.min(s.num_channels() - 1))[i]),
                     ],
                     _ => x,
                 };
+                if k.mid_side {
+                    x = to_ms(x);
+                    key = to_ms(key);
+                }
                 // The detector: the key through the sidechain filters.
                 let mut levels = [0.0f64; 2];
                 let mut heard = [0.0f64; 2];
                 for c in 0..2 {
                     let f = self.sc_high.process(c, self.sc_low.process(c, key[c]));
                     heard[c] = f;
-                    levels[c] = if rms > 0.0 {
+                    levels[c] = if k.rms {
                         10.0 * (2.0 * self.rms[c].process(f)).max(1e-24).log10()
                     } else {
                         let a = f.abs();
@@ -458,7 +585,6 @@ impl PluginProcessor for CompressorProcessor {
                 let makeup = self.makeup.tick();
                 let mix = self.mix.tick();
                 let mut y = [0.0; 2];
-                let feedback = st.feedback && !external;
                 for c in 0..2 {
                     let level = link * loudest + (1.0 - link) * levels[c];
                     let want = if feedback {
@@ -468,34 +594,63 @@ impl PluginProcessor for CompressorProcessor {
                         // would ratchet the reduction far past the curve),
                         // and never more than the curve's equilibrium.
                         let out = level - self.gr[c].fast;
-                        reduction_by(out, threshold, slope, knee).min(reduction_by(
+                        reduction_by(out, k.threshold, k.slope, k.knee).min(reduction_by(
                             level,
-                            threshold,
+                            k.threshold,
                             self.ff_slope,
-                            knee,
+                            k.knee,
                         ))
                     } else {
                         // An external key never hears the compressed
                         // output, so feedback slope compensation would
                         // multiply its reduction instead of its ratio.
-                        reduction_by(level, threshold, self.ff_slope, knee)
+                        reduction_by(level, k.threshold, self.ff_slope, k.knee)
                     }
                     .min(range);
-                    let gr = self.gr[c].process(want, auto);
+                    // The hold: once the reduction would fall, it waits.
+                    let target = if want >= self.gr[c].fast {
+                        self.held[c] = self.hold;
+                        want
+                    } else if self.held[c] > 0 {
+                        self.held[c] -= 1;
+                        self.gr[c].fast
+                    } else {
+                        want
+                    };
+                    let gr = self.gr[c].process(target, k.auto);
                     gr_peak = gr_peak.max(gr);
+                    // Upward compression: lifted at the release rate, let
+                    // down at the attack rate.
+                    let lift = if k.upward > 0.0 {
+                        reduction_by(
+                            2.0 * k.threshold - level,
+                            k.threshold,
+                            self.ff_slope,
+                            k.knee,
+                        )
+                        .min(k.upward)
+                    } else {
+                        0.0
+                    };
+                    let up = &mut self.up[c];
+                    *up += (lift - *up) * if lift < *up { self.up_k.0 } else { self.up_k.1 };
+                    let up = *up;
                     self.delay[c].push(x[c]);
-                    let dry = if self.look > 0 {
-                        self.delay[c].tap(self.look)
-                    } else {
-                        x[c]
-                    };
-                    let drive = color * (0.2 + st.color) + st.gr_color * gr;
-                    let wet = saturate(dry * gain(-gr), drive) * makeup;
-                    y[c] = if listen {
+                    let dry = self.delay[c].tap(self.look);
+                    let dry_mix = self.delay[c].tap(self.look + self.os_latency);
+                    let drive = color * (0.2 + k.st.color) + k.st.gr_color * gr;
+                    let driven = dry * gain(up - gr);
+                    let wet = self.os[c].process(driven, &mut |v| saturate(v, drive)) * makeup;
+                    y[c] = if k.listen {
                         heard[c]
+                    } else if k.delta {
+                        wet - dry_mix
                     } else {
-                        dry + (wet - dry) * mix
+                        dry_mix + (wet - dry_mix) * mix
                     };
+                }
+                if k.mid_side {
+                    y = from_ms(y);
                 }
                 if channels >= 2 {
                     out.channel_mut(0)[i] = y[0] as f32;
@@ -512,14 +667,17 @@ impl PluginProcessor for CompressorProcessor {
         for c in 0..2 {
             self.peak[c] = flush(self.peak[c]);
             self.rms[c].flush();
+            self.up[c] = flush(self.up[c]);
         }
         self.sc_low.flush();
         self.sc_high.flush();
         // Meters and published values.
         let gr_now = self.gr[0].fast.max(self.gr[1].fast);
-        self.tap.set_value(value::REDUCTION, gr_now as f32);
+        let up_now = self.up[0].max(self.up[1]);
+        self.tap.set_value(value::REDUCTION, gr_now.max(0.0) as f32);
         self.tap.raise_value(value::REDUCTION_PEAK, gr_peak as f32);
         self.tap.set_value(value::LEVEL, level_now as f32);
+        self.tap.set_value(value::GAIN, (up_now - gr_now) as f32);
         let mut peaks = [0.0f32; 2];
         for c in 0..2 {
             let o = out.channel(c.min(channels - 1));
@@ -553,7 +711,10 @@ impl PluginProcessor for CompressorProcessor {
             self.gr[c].reset();
             self.rms[c].reset();
             self.delay[c].reset();
+            self.os[c].reset();
             self.peak[c] = 0.0;
+            self.held[c] = 0;
+            self.up[c] = 0.0;
         }
         self.sc_low.reset();
         self.sc_high.reset();
