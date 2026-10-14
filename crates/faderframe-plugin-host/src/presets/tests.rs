@@ -721,7 +721,6 @@ fn every_midi_effect_preset_plays_and_lets_go() {
     }
 }
 
-<<<<<<< ours
 /// The Delay's and the Reverb's presets are levelled: fully wet, a click
 /// comes back at a sensible level, nothing clips or runs away, and every
 /// one of them makes sound.
@@ -772,8 +771,6 @@ fn delay_and_reverb_presets_are_levelled() {
     }
 }
 
-=======
->>>>>>> theirs
 /// The compressor's and the limiter's grouped presets (Vocals, Drums,
 /// Bass, Bus, Master, Creative) are levelled like the ones at the top of
 /// the menu: audible, no more than 12 dB from the input, never over the

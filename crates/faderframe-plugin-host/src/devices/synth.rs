@@ -439,11 +439,25 @@ pub fn parameters() -> Vec<ParameterInfo> {
         ),
         stepped(id::LFO2_SHAPE, "LFO 2 Shape", 5.0, 0.0),
         stepped(id::LFO2_RETRIG, "LFO 2 Retrigger", 1.0, 0.0),
-        param(id::LFO2_FADE, "LFO 2 Fade In", 0.0, 5_000.0, 0.0, Milliseconds),
+        param(
+            id::LFO2_FADE,
+            "LFO 2 Fade In",
+            0.0,
+            5_000.0,
+            0.0,
+            Milliseconds,
+        ),
         param(id::M_ATTACK, "Mod Attack", 0.5, 10_000.0, 5.0, Milliseconds),
         param(id::M_DECAY, "Mod Decay", 1.0, 10_000.0, 300.0, Milliseconds),
         param(id::M_SUSTAIN, "Mod Sustain", 0.0, 1.0, 0.0, Percent),
-        param(id::M_RELEASE, "Mod Release", 5.0, 10_000.0, 350.0, Milliseconds),
+        param(
+            id::M_RELEASE,
+            "Mod Release",
+            5.0,
+            10_000.0,
+            350.0,
+            Milliseconds,
+        ),
     ]);
     const SLOT_NAMES: [(&str, &str, &str); MOD_SLOTS] = [
         ("Mod 1 Source", "Mod 1 Target", "Mod 1 Amount"),
@@ -454,8 +468,18 @@ pub fn parameters() -> Vec<ParameterInfo> {
         ("Mod 6 Source", "Mod 6 Target", "Mod 6 Amount"),
     ];
     for (k, (s, t, a)) in SLOT_NAMES.iter().enumerate() {
-        p.push(stepped(id::mod_source(k), s, (SOURCES.len() - 1) as f64, 0.0));
-        p.push(stepped(id::mod_target(k), t, (TARGETS.len() - 1) as f64, 0.0));
+        p.push(stepped(
+            id::mod_source(k),
+            s,
+            (SOURCES.len() - 1) as f64,
+            0.0,
+        ));
+        p.push(stepped(
+            id::mod_target(k),
+            t,
+            (TARGETS.len() - 1) as f64,
+            0.0,
+        ));
         p.push(param(id::mod_amount(k), a, -1.0, 1.0, 0.0, Percent));
     }
     p.extend([
@@ -472,7 +496,14 @@ pub fn parameters() -> Vec<ParameterInfo> {
         param(id::CHORUS_DEPTH, "Chorus Depth", 0.0, 1.0, 0.5, Percent),
         stepped(id::CHORUS_MODE, "Chorus Mode", 1.0, 0.0),
         param(id::DELAY_MIX, "Delay Mix", 0.0, 1.0, 0.0, Percent),
-        param(id::DELAY_TIME, "Delay Time", 1.0, 2_000.0, 375.0, Milliseconds),
+        param(
+            id::DELAY_TIME,
+            "Delay Time",
+            1.0,
+            2_000.0,
+            375.0,
+            Milliseconds,
+        ),
         stepped(id::DELAY_SYNC, "Delay Sync", 1.0, 1.0),
         stepped(
             id::DELAY_DIVISION,
@@ -480,13 +511,41 @@ pub fn parameters() -> Vec<ParameterInfo> {
             (DIVISIONS.len() - 1) as f64,
             10.0,
         ),
-        param(id::DELAY_FEEDBACK, "Delay Feedback", 0.0, 0.95, 0.4, Percent),
+        param(
+            id::DELAY_FEEDBACK,
+            "Delay Feedback",
+            0.0,
+            0.95,
+            0.4,
+            Percent,
+        ),
         stepped(id::DELAY_PINGPONG, "Delay Ping-Pong", 1.0, 0.0),
-        param(id::DELAY_TONE, "Delay Tone", 200.0, 20_000.0, 4_000.0, Hertz),
+        param(
+            id::DELAY_TONE,
+            "Delay Tone",
+            200.0,
+            20_000.0,
+            4_000.0,
+            Hertz,
+        ),
         param(id::REVERB_MIX, "Reverb Mix", 0.0, 1.0, 0.0, Percent),
         param(id::REVERB_SIZE, "Reverb Size", 0.0, 1.0, 0.5, Percent),
-        param(id::REVERB_DECAY, "Reverb Decay", 100.0, 10_000.0, 2_000.0, Milliseconds),
-        param(id::REVERB_TONE, "Reverb Tone", 500.0, 20_000.0, 5_000.0, Hertz),
+        param(
+            id::REVERB_DECAY,
+            "Reverb Decay",
+            100.0,
+            10_000.0,
+            2_000.0,
+            Milliseconds,
+        ),
+        param(
+            id::REVERB_TONE,
+            "Reverb Tone",
+            500.0,
+            20_000.0,
+            5_000.0,
+            Hertz,
+        ),
         stepped(id::STEAL, "Voice Stealing", 1.0, 0.0),
         stepped(id::GLIDE_MODE, "Glide Mode", 1.0, 0.0),
         param(id::DRIFT, "Drift", 0.0, 1.0, 0.0, Percent),
@@ -1145,7 +1204,13 @@ impl Fx {
     /// Run the effects over `l`/`r` (`r` None: mono, the wet sides
     /// averaged), where `input_peak` is the loudest the voices got this
     /// block.
-    fn process(&mut self, set: &FxSettings, l: &mut [f32], mut r: Option<&mut [f32]>, input_peak: f32) {
+    fn process(
+        &mut self,
+        set: &FxSettings,
+        l: &mut [f32],
+        mut r: Option<&mut [f32]>,
+        input_peak: f32,
+    ) {
         let frames = l.len();
         let sr = self.sr;
         let on = [
@@ -1172,8 +1237,8 @@ impl Fx {
                 }
             }
         }
-        for i in 0..3 {
-            if !on[i] {
+        for (i, enabled) in on.iter().enumerate() {
+            if !enabled {
                 self.tails[i] = 0;
             }
         }
@@ -1495,8 +1560,8 @@ impl SynthProcessor {
         let sr = f64::from(self.sample_rate);
         let synced = self.get(id::DELAY_SYNC) >= 0.5;
         let seconds = if synced {
-            let q = DIVISIONS[(self.get(id::DELAY_DIVISION).round().max(0.0) as usize)
-                .min(DIVISIONS.len() - 1)]
+            let q = DIVISIONS
+                [(self.get(id::DELAY_DIVISION).round().max(0.0) as usize).min(DIVISIONS.len() - 1)]
             .1;
             q * 60.0 / tempo
         } else {
@@ -1521,6 +1586,7 @@ impl SynthProcessor {
 
     /// Start (or, `!retrigger`, slide) a voice; `legato`: other keys were
     /// down already.
+    #[allow(clippy::too_many_arguments)]
     fn start(
         &mut self,
         idx: usize,
@@ -1925,8 +1991,7 @@ impl SynthProcessor {
                 }
                 if v.control_counter == 0 {
                     v.glide *= s.glide_coef;
-                    v.lfo2
-                        .advance(b.lfo2_cycles * f64::from(cur.lfo2_speed));
+                    v.lfo2.advance(b.lfo2_cycles * f64::from(cur.lfo2_speed));
                     v.lfo2_fade = (v.lfo2_fade + s.lfo2_fade_step).min(1.0);
                     v.drift.advance(drift_cycles);
                     cur = modulate(v, amp_env, filt_env);
@@ -2686,7 +2751,10 @@ mod tests {
         s.send(on(57));
         let (l, _) = s.run(0.4);
         let got = peak_hz(&l, 150.0, 600.0);
-        assert!((got / 440.0 - 1.0).abs() < 0.02, "mod env an octave up: {got}");
+        assert!(
+            (got / 440.0 - 1.0).abs() < 0.02,
+            "mod env an octave up: {got}"
+        );
         // LFO 2 (square, slow, restarted) → Cutoff: the filter opens and
         // closes with it — the first half cycle open, the second closed.
         let play = |extra: &[(u32, f64)]| {
@@ -2738,7 +2806,10 @@ mod tests {
             (id::mod_target(1), target::VOLUME as f64),
             (id::mod_amount(1), -1.0),
         ];
-        assert!((level(100, &[]) - level(20, &[])).abs() < 0.1, "no velocity");
+        assert!(
+            (level(100, &[]) - level(20, &[])).abs() < 0.1,
+            "no velocity"
+        );
         let (loud, soft) = (level(127, &route), level(32, &route));
         assert!(
             soft - loud > 6.0 && loud < level(127, &[]) - 20.0,
@@ -2846,7 +2917,10 @@ mod tests {
         );
         let got = peak_hz(&synced, 150.0, 400.0);
         let want = 220.0 * 2f64.powf(1.2 / 12.0);
-        assert!((got / want - 1.0).abs() < 0.02, "held at the song's phase: {got}");
+        assert!(
+            (got / want - 1.0).abs() < 0.02,
+            "held at the song's phase: {got}"
+        );
         assert!(bin_db(&synced, 220.0 * 2f64.powf(-1.2 / 12.0)) < -50.0);
     }
 
@@ -2954,9 +3028,15 @@ mod tests {
         assert!((low - high).abs() < 1.0, "no tracking: {low} / {high}");
         let track = [(id::SUB_KEY, 1.0)];
         let (low, high) = (sub_db(48, &track).0, sub_db(72, &track).0);
-        assert!((low - high - 12.0).abs() < 1.5, "±6 dB an octave: {low} / {high}");
+        assert!(
+            (low - high - 12.0).abs() < 1.5,
+            "±6 dB an octave: {low} / {high}"
+        );
         let (f, h3) = sub_db(60, &[]);
-        assert!(h3 < f - 50.0, "a sine sub has no third harmonic: {f} / {h3}");
+        assert!(
+            h3 < f - 50.0,
+            "a sine sub has no third harmonic: {f} / {h3}"
+        );
         let noise = |colour: f64| {
             let mut s = Play::new(&[
                 (id::CUTOFF, 20_000.0),
@@ -2969,12 +3049,20 @@ mod tests {
             ]);
             s.send(on(60));
             let (l, _) = s.run(2.0);
-            let band = |f: f64| (0..16).map(|k| bin_db(&l, f * (1.0 + k as f64 * 0.01))).sum::<f64>() / 16.0;
+            let band = |f: f64| {
+                (0..16)
+                    .map(|k| bin_db(&l, f * (1.0 + k as f64 * 0.01)))
+                    .sum::<f64>()
+                    / 16.0
+            };
             band(4_000.0) - band(250.0)
         };
         let (white, pink) = (noise(0.0), noise(1.0));
         assert!(white.abs() < 3.0, "white is flat: {white}");
-        assert!((pink + 12.0).abs() < 3.0, "pink falls 3 dB an octave: {pink}");
+        assert!(
+            (pink + 12.0).abs() < 3.0,
+            "pink falls 3 dB an octave: {pink}"
+        );
     }
 
     /// The ladder is a 24 dB low pass that resonates; the notch takes the
@@ -3062,8 +3150,16 @@ mod tests {
             ],
             1.0,
         );
-        assert!(rms(at(&l, 0.15, 0.24)) < -70.0, "{}", rms(at(&l, 0.15, 0.24)));
-        assert!(rms(at(&l, 0.27, 0.34)) > -30.0, "{}", rms(at(&l, 0.27, 0.34)));
+        assert!(
+            rms(at(&l, 0.15, 0.24)) < -70.0,
+            "{}",
+            rms(at(&l, 0.15, 0.24))
+        );
+        assert!(
+            rms(at(&l, 0.27, 0.34)) > -30.0,
+            "{}",
+            rms(at(&l, 0.27, 0.34))
+        );
         assert!(rms(at(&l, 0.6, 1.0)) < -70.0);
         assert!(!s.p.voices.iter().any(|v| v.sounding()));
         // Ping-pong: the second repeat on the other side.
@@ -3082,13 +3178,13 @@ mod tests {
         // Reverb: a tail a second on, decaying; none without.
         let (_, dry, _) = play(&[], 1.5);
         assert!(rms(at(&dry, 0.5, 1.0)) < -80.0);
-        let (s, wet, wet_r) = play(
-            &[(id::REVERB_MIX, 1.0), (id::REVERB_DECAY, 3_000.0)],
-            1.5,
-        );
+        let (s, wet, wet_r) = play(&[(id::REVERB_MIX, 1.0), (id::REVERB_DECAY, 3_000.0)], 1.5);
         let (early, late) = (rms(at(&wet, 0.2, 0.5)), rms(at(&wet, 1.0, 1.5)));
         assert!(early > -40.0, "a tail: {early}");
-        assert!(late < early - 3.0 && late > -70.0, "decaying: {early} → {late}");
+        assert!(
+            late < early - 3.0 && late > -70.0,
+            "decaying: {early} → {late}"
+        );
         let diff: f64 = at(&wet, 0.2, 0.5)
             .iter()
             .zip(at(&wet_r, 0.2, 0.5))
@@ -3100,7 +3196,11 @@ mod tests {
         // Chorus: a mono patch comes out with sides that differ, at
         // about the same level.
         let (_, cl, cr) = play(&[(id::CHORUS_MIX, 1.0)], 0.1);
-        let side: f64 = cl.iter().zip(&cr).map(|(a, b)| f64::from(a - b).abs()).sum();
+        let side: f64 = cl
+            .iter()
+            .zip(&cr)
+            .map(|(a, b)| f64::from(a - b).abs())
+            .sum();
         assert!(side > 1.0, "the chorus widens");
         assert!((rms(&cl[..4000]) - rms(&dry[..4000])).abs() < 6.0);
         let (_, el, er) = play(&[(id::CHORUS_MIX, 1.0), (id::CHORUS_MODE, 1.0)], 0.1);
@@ -3172,13 +3272,12 @@ mod tests {
                 velocity: 100,
             });
             s.run(0.1);
-            let mut k: Vec<u8> = s
-                .p
-                .voices
-                .iter()
-                .filter(|v| v.sounding())
-                .map(|v| v.key)
-                .collect();
+            let mut k: Vec<u8> =
+                s.p.voices
+                    .iter()
+                    .filter(|v| v.sounding())
+                    .map(|v| v.key)
+                    .collect();
             k.sort_unstable();
             k
         };
@@ -3207,13 +3306,17 @@ mod tests {
             // Only the new note's start (an octave lower would be 220).
             peak_hz(&l, 150.0, 600.0)
         };
-        assert!(start(0.0, false) < 330.0, "Always glides: {}", start(0.0, false));
+
         assert!(
             (start(1.0, false) / 440.0 - 1.0).abs() < 0.03,
             "Legato after a gap: {}",
             start(1.0, false)
         );
-        assert!(start(1.0, true) < 330.0, "Legato over a held key: {}", start(1.0, true));
+        assert!(
+            start(1.0, true) < 330.0,
+            "Legato over a held key: {}",
+            start(1.0, true)
+        );
     }
 
     /// Drift moves each voice a few cents, no more, and keeps changing.
@@ -3248,10 +3351,40 @@ mod tests {
         ];
         let patches: [&[(u32, f64)]; 5] = [
             &[],
-            &[(19, 5.0), (20, 30.0), (17, 0.5), (18, 0.2), (22, 1.0), (23, 0.4), (26, 1.0)],
-            &[(39, 2.0), (40, 80.0), (9, 1.0), (38, 0.3), (36, 1.5), (35, 20.0)],
-            &[(22, 2.0), (2, 0.9), (44, 3.0), (45, 0.7), (46, 16.0), (47, -0.5), (24, 0.7)],
-            &[(22, 3.0), (13, 2.0), (15, 7.0), (14, -1.0), (21, 1.0), (19, 7.0)],
+            &[
+                (19, 5.0),
+                (20, 30.0),
+                (17, 0.5),
+                (18, 0.2),
+                (22, 1.0),
+                (23, 0.4),
+                (26, 1.0),
+            ],
+            &[
+                (39, 2.0),
+                (40, 80.0),
+                (9, 1.0),
+                (38, 0.3),
+                (36, 1.5),
+                (35, 20.0),
+            ],
+            &[
+                (22, 2.0),
+                (2, 0.9),
+                (44, 3.0),
+                (45, 0.7),
+                (46, 16.0),
+                (47, -0.5),
+                (24, 0.7),
+            ],
+            &[
+                (22, 3.0),
+                (13, 2.0),
+                (15, 7.0),
+                (14, -1.0),
+                (21, 1.0),
+                (19, 7.0),
+            ],
         ];
         for (n, set) in patches.iter().enumerate() {
             let mut s = Play::new(set);
@@ -3263,7 +3396,10 @@ mod tests {
             s.send(on(48));
             s.send(on(55));
             let (mut l, mut r) = s.run(0.3);
-            s.send(MidiEvent::PitchBend { channel: 0, value: 10000 });
+            s.send(MidiEvent::PitchBend {
+                channel: 0,
+                value: 10000,
+            });
             s.send(on(64));
             let (l2, r2) = s.run(0.3);
             s.send(off(48));

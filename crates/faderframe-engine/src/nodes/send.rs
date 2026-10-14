@@ -169,9 +169,13 @@ impl Processor<EngineContext> for SendNode {
 
     fn process(&mut self, cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
         let static_level = cx.data.params.get(self.level);
-        let static_on = self
-            .on
-            .map_or(1.0, |s| if cx.data.params.get(s) >= 0.5 { 1.0 } else { 0.0 });
+        let static_on = self.on.map_or(1.0, |s| {
+            if cx.data.params.get(s) >= 0.5 {
+                1.0
+            } else {
+                0.0
+            }
+        });
         let auto = cx.data.timeline.automation(self.track);
         let cue_lanes = self.cue.and_then(|c| auto.and_then(|a| a.cue_send(c)));
         let lane = self
@@ -253,15 +257,13 @@ impl Processor<EngineContext> for SendNode {
         } else {
             out.copy_from(input);
         }
-        let step = if lane.is_some()
-            || on_lane.is_some()
-            || pan_lanes.is_some()
-            || balance_lane.is_some()
-        {
-            AUTOMATION_STEP
-        } else {
-            n.max(1)
-        };
+        let step =
+            if lane.is_some() || on_lane.is_some() || pan_lanes.is_some() || balance_lane.is_some()
+            {
+                AUTOMATION_STEP
+            } else {
+                n.max(1)
+            };
         let mut off = 0;
         while off < n {
             let m = step.min(n - off);

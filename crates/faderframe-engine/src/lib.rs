@@ -49,7 +49,9 @@ pub use engine::{
 };
 pub use plugins::{ActivatedPlugin, OutputBus, PluginHost, decode_state, encode_state};
 pub use record::{RecordBlock, RecordStreams, RecordTarget};
-pub use slots::{ChainSlots, CueSendSlots, CueTalkSlots, SlotRegistry, SlotsExhausted, StripSlots, Talkback};
+pub use slots::{
+    ChainSlots, CueSendSlots, CueTalkSlots, SlotRegistry, SlotsExhausted, StripSlots, Talkback,
+};
 pub use snapshot::{
     AudioRegion, Lane, MidiRegion, Source, SourceMap, StreamPlan, StreamRegion, TimelineSnapshot,
     WarpMode, WarpedRegion, render_generated_sources,

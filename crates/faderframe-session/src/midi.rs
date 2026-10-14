@@ -1716,6 +1716,24 @@ impl Session {
                 send,
                 db: v as f32,
             },
+            AutomationTarget::CueSend { cue, what } => match what {
+                faderframe_automation::CueSendParam::Level => Command::SetCueSendLevel {
+                    track,
+                    cue,
+                    db: v as f32,
+                },
+                faderframe_automation::CueSendParam::Pan => Command::SetCueSendPan {
+                    track,
+                    cue,
+                    pan: v as f32,
+                },
+                faderframe_automation::CueSendParam::On => Command::SetCueSendOn {
+                    track,
+                    cue,
+                    on: v >= 0.5,
+                },
+            },
+            AutomationTarget::CueLevel { cue } => Command::SetCueLevel { cue, db: v as f32 },
             AutomationTarget::PluginParameter { plugin, parameter } => {
                 Command::SetPluginParameter {
                     track,

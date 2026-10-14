@@ -2105,12 +2105,8 @@ pub fn build_graph(
                 ))
                 .audio_in(tap.layout)
                 .audio_out(layout);
-            let node = SendNode::cue(t.id, cue.id, s).with_layouts(
-                tap.layout,
-                layout,
-                None,
-                slots.mix()?,
-            );
+            let node =
+                SendNode::cue(t.id, cue.id, s).with_layouts(tap.layout, layout, None, slots.mix()?);
             if tap.in_bb {
                 let n = bb.add_node(spec, Box::new(node.quiet()));
                 bb.connect_audio(tap.node, tap.port, n, 0)?;
@@ -2769,7 +2765,12 @@ fn cross(
     let sub = u64::from(key.1) << 8;
     let w = bb.add_node(
         NodeSpec::new(format!("{name} · To Ring"))
-            .key(node_key(key.0, Role::CueAhead, sub | 1 ^ ring.identity(), &[layout]))
+            .key(node_key(
+                key.0,
+                Role::CueAhead,
+                sub | 1 ^ ring.identity(),
+                &[layout],
+            ))
             .audio_in(layout),
         Box::new(AheadWriter::new(Arc::clone(&ring))),
     );
@@ -2823,7 +2824,7 @@ fn cue_bus_order(project: &Project) -> Vec<usize> {
         });
         if left.len() == before {
             // A loop (refused by the routing): whatever is left, in order.
-            order.extend(left.drain(..));
+            order.append(&mut left);
         }
     }
     order

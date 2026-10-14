@@ -600,7 +600,10 @@ impl TrackAutomation {
     /// The lanes of the track's send to cue mix `cue`.
     #[inline]
     pub fn cue_send(&self, cue: faderframe_core::CueId) -> Option<&CueSendLanes> {
-        self.cue_sends.iter().find(|(c, _)| *c == cue).map(|(_, l)| l)
+        self.cue_sends
+            .iter()
+            .find(|(c, _)| *c == cue)
+            .map(|(_, l)| l)
     }
 
     #[inline]

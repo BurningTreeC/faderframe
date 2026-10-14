@@ -349,6 +349,15 @@ impl Session {
             AutomationTarget::DualPanRight => t.dual_pan.right as f64,
             AutomationTarget::TrackMute => f64::from(u8::from(t.mute)),
             AutomationTarget::SendLevel(s) => t.send(s)?.level_db as f64,
+            AutomationTarget::CueSend { cue, what } => {
+                let send = t.cue_send(cue)?;
+                match what {
+                    faderframe_automation::CueSendParam::Level => send.level_db as f64,
+                    faderframe_automation::CueSendParam::Pan => send.pan as f64,
+                    faderframe_automation::CueSendParam::On => f64::from(u8::from(send.on)),
+                }
+            }
+            AutomationTarget::CueLevel { cue } => self.project.cue(cue)?.level_db as f64,
             AutomationTarget::PluginParameter { plugin, parameter } => {
                 let slot = t.plugin(plugin)?;
                 match slot.parameters.iter().find(|p| p.id == parameter) {

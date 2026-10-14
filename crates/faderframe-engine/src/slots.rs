@@ -383,7 +383,14 @@ impl SlotRegistry {
             let s = self.cue_talk(c.id)?;
             let talking = talk.on && talk.input.is_some() && c.talkback;
             table.set(s.talk, if talking { talk.level.max(0.0) } else { 0.0 });
-            table.set(s.dim, if talking { talk.dim.clamp(0.0, 1.0) } else { 1.0 });
+            table.set(
+                s.dim,
+                if talking {
+                    talk.dim.clamp(0.0, 1.0)
+                } else {
+                    1.0
+                },
+            );
         }
         Ok(())
     }
