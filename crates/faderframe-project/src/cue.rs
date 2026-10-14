@@ -478,18 +478,17 @@ mod tests {
         assert_eq!(s[&m.vox].level_db, 0.0);
         assert_eq!(s[&m.drums].level_db, 0.0);
         // Shown values (automation playing) instead of the static fields.
-        let s: std::collections::HashMap<TrackId, CueSend> = m
-            .p
-            .tracks
-            .iter()
-            .filter(|t| feeds_cues(t.kind))
-            .map(|t| {
-                (
-                    t.id,
-                    m.p.main_mix_send_with(t, &cue, |t| (-12.0, 0.5, t.id == m.vox)),
-                )
-            })
-            .collect();
+        let s: std::collections::HashMap<TrackId, CueSend> =
+            m.p.tracks
+                .iter()
+                .filter(|t| feeds_cues(t.kind))
+                .map(|t| {
+                    (
+                        t.id,
+                        m.p.main_mix_send_with(t, &cue, |t| (-12.0, 0.5, t.id == m.vox)),
+                    )
+                })
+                .collect();
         assert_eq!((s[&m.vox].level_db, s[&m.vox].on), (-12.0, false));
         assert_eq!((s[&m.drums].level_db, s[&m.drums].pan), (-12.0, 0.5));
     }
@@ -546,7 +545,11 @@ mod tests {
         let vox = m.p.track(m.vox).unwrap();
         assert_eq!(vox.cue_send(id).unwrap().level_db, -9.0);
         let new = vox.cue_send(second).unwrap();
-        assert_eq!((new.level_db, new.on), (-6.0, true), "as the main mix has it");
+        assert_eq!(
+            (new.level_db, new.on),
+            (-6.0, true),
+            "as the main mix has it"
+        );
         // A track added plain joins too; one that cannot feed cue mixes
         // carries none.
         let t = Track::new(
