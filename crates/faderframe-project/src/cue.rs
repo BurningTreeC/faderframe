@@ -472,7 +472,7 @@ mod tests {
         // Post-fader: the fader is in the tap already.
         let post = CueMix {
             tap: SendTap::PostFader,
-            ..cue
+            ..cue.clone()
         };
         let s = sends(&m.p, &post);
         assert_eq!(s[&m.vox].level_db, 0.0);
