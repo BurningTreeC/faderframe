@@ -1733,10 +1733,7 @@ impl Session {
                     on: v >= 0.5,
                 },
             },
-            AutomationTarget::CueLevel { cue } => Command::SetCueLevel {
-                cue,
-                db: v as f32,
-            },
+            AutomationTarget::CueLevel { cue } => Command::SetCueLevel { cue, db: v as f32 },
             AutomationTarget::PluginParameter { plugin, parameter } => {
                 Command::SetPluginParameter {
                     track,
