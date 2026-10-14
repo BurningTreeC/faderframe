@@ -1237,8 +1237,8 @@ impl Fx {
                 }
             }
         }
-        for i in 0..3 {
-            if !on[i] {
+        for (i, enabled) in on.iter().enumerate() {
+            if !enabled {
                 self.tails[i] = 0;
             }
         }
@@ -1586,6 +1586,7 @@ impl SynthProcessor {
 
     /// Start (or, `!retrigger`, slide) a voice; `legato`: other keys were
     /// down already.
+    #[allow(clippy::too_many_arguments)]
     fn start(
         &mut self,
         idx: usize,
