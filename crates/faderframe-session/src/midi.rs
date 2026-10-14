@@ -1637,6 +1637,7 @@ impl Session {
                 TransportControl::Record => TransportAction::ToggleRecord,
                 TransportControl::Loop => TransportAction::ToggleLoop,
                 TransportControl::ToStart => TransportAction::ReturnToStart,
+                TransportControl::InputQuantize => TransportAction::ToggleInputQuantize,
             };
             if let Err(e) = self.dispatch(Action::Transport(action)) {
                 self.notify(NoticeLevel::Error, e.to_string());
@@ -1894,6 +1895,16 @@ impl Session {
 }
 
 impl Session {
+    /// How input quantize moves recorded notes: the editor's quantize
+    /// settings on input quantize's grid (or the edit grid).
+    pub fn input_quantize_settings(&self) -> faderframe_project::midi_ops::QuantizeSettings {
+        let mut q = self.editor.quantize_settings();
+        if let Some(g) = self.record.input_grid {
+            q.grid = g;
+        }
+        q
+    }
+
     /// The clip a finished MIDI take makes on its `i`th track: bar-rounded
     /// around what was played, or exactly `span` (timeline samples; a
     /// launcher slot's recording), with the clip's start as its position.
@@ -2037,6 +2048,17 @@ impl Session {
             .iter()
             .filter(|c| c.name.starts_with(&format!("{name} Take")))
             .count();
+        // Input quantize: the notes as played land on the grid.
+        let mut midi_notes = midi_notes;
+        if self.record.input_quantize {
+            let q = self.input_quantize_settings();
+            faderframe_project::midi_ops::quantize(
+                &mut midi_notes,
+                start,
+                &q,
+                &self.project.timeline.meter,
+            );
+        }
         Some(Clip {
             id: self.project.ids.allocate(),
             track: *track,

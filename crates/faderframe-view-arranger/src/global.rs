@@ -101,6 +101,19 @@ pub(crate) enum GlobalDrag {
         /// Locked to vertical (tempo) or horizontal (position) once moved.
         axis: Option<bool>,
     },
+    /// Drawing a passage in another key (bar starts).
+    NewKey {
+        anchor: MusicalTime,
+        to: MusicalTime,
+        origin: Point,
+    },
+    /// Moving a key change (by bars).
+    KeyChange {
+        from: MusicalTime,
+        to: MusicalTime,
+        origin: Point,
+        moved: bool,
+    },
     NewChord {
         anchor: MusicalTime,
         to: MusicalTime,
@@ -727,7 +740,10 @@ impl ArrangerView {
                 }
             }
             GlobalDrag::NewSection { to, .. } => *to = self.snap(t_at, model, mods),
-            GlobalDrag::NewChord { .. } | GlobalDrag::Chord { .. } => {
+            GlobalDrag::NewChord { .. }
+            | GlobalDrag::Chord { .. }
+            | GlobalDrag::NewKey { .. }
+            | GlobalDrag::KeyChange { .. } => {
                 self.chord_drag(&mut drag, pos, mods, model, cx);
             }
             GlobalDrag::Section {
@@ -835,7 +851,10 @@ impl ArrangerView {
             return false;
         };
         match drag {
-            d @ (GlobalDrag::NewChord { .. } | GlobalDrag::Chord { .. }) => {
+            d @ (GlobalDrag::NewChord { .. }
+            | GlobalDrag::Chord { .. }
+            | GlobalDrag::NewKey { .. }
+            | GlobalDrag::KeyChange { .. }) => {
                 self.chord_release(d, size, model, cx);
             }
             GlobalDrag::Marker { marker, moved, .. } => {
@@ -1106,7 +1125,7 @@ impl ArrangerView {
                     .separated(),
                 ],
             },
-            GlobalHit::Empty(GlobalLane::Chords, _) => Self::chords_lane_menu(pos),
+            GlobalHit::Empty(GlobalLane::Chords, _) => Self::chords_lane_menu(model, pos),
             GlobalHit::Empty(lane, _) => Self::lanes_menu(model, lane, pos),
         }
     }

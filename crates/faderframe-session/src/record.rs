@@ -18,11 +18,125 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+/// The unit of a pre- or post-roll.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RollUnit {
+    Bars,
+    /// Of the time signature (a quarter in 4/4, an eighth in 6/8).
+    Beats,
+    Seconds,
+}
+
+/// How much is played before a take (pre-roll) or after a punch-out
+/// (post-roll); `amount` 0 is none.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Roll {
+    pub amount: f64,
+    pub unit: RollUnit,
+}
+
+impl Roll {
+    pub const OFF: Roll = Roll {
+        amount: 0.0,
+        unit: RollUnit::Bars,
+    };
+    /// The lengths the menus offer.
+    pub const PRESETS: [Roll; 9] = [
+        Roll::OFF,
+        Roll::beats(1.0),
+        Roll::beats(2.0),
+        Roll::bars(1.0),
+        Roll::bars(2.0),
+        Roll::bars(4.0),
+        Roll::seconds(1.0),
+        Roll::seconds(2.0),
+        Roll::seconds(4.0),
+    ];
+
+    pub const fn bars(amount: f64) -> Roll {
+        Roll {
+            amount,
+            unit: RollUnit::Bars,
+        }
+    }
+
+    pub const fn beats(amount: f64) -> Roll {
+        Roll {
+            amount,
+            unit: RollUnit::Beats,
+        }
+    }
+
+    pub const fn seconds(amount: f64) -> Roll {
+        Roll {
+            amount,
+            unit: RollUnit::Seconds,
+        }
+    }
+
+    pub fn is_off(&self) -> bool {
+        self.amount <= 0.0
+    }
+
+    /// "2 bars", "1 beat", "1.5 s"; "Off".
+    pub fn label(&self) -> String {
+        if self.is_off() {
+            return "Off".into();
+        }
+        let n = if self.amount.fract() == 0.0 {
+            format!("{}", self.amount as i64)
+        } else {
+            format!("{}", self.amount)
+        };
+        let one = self.amount == 1.0;
+        match self.unit {
+            RollUnit::Bars => format!("{n} {}", if one { "bar" } else { "bars" }),
+            RollUnit::Beats => format!("{n} {}", if one { "beat" } else { "beats" }),
+            RollUnit::Seconds => format!("{n} s"),
+        }
+    }
+
+    /// A stable id ("2bars", "1beats", "1.5s", "off") for menus and the
+    /// preferences.
+    pub fn id(&self) -> String {
+        if self.is_off() {
+            return "off".into();
+        }
+        let unit = match self.unit {
+            RollUnit::Bars => "bars",
+            RollUnit::Beats => "beats",
+            RollUnit::Seconds => "s",
+        };
+        format!("{}{unit}", self.amount)
+    }
+
+    pub fn from_id(id: &str) -> Option<Roll> {
+        if id == "off" {
+            return Some(Roll::OFF);
+        }
+        let (n, unit) = if let Some(n) = id.strip_suffix("bars") {
+            (n, RollUnit::Bars)
+        } else if let Some(n) = id.strip_suffix("beats") {
+            (n, RollUnit::Beats)
+        } else {
+            (id.strip_suffix('s')?, RollUnit::Seconds)
+        };
+        let amount: f64 = n.parse().ok()?;
+        (amount.is_finite() && (0.0..=64.0).contains(&amount)).then_some(Roll { amount, unit })
+    }
+}
+
 /// User-facing recording options.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RecordSettings {
-    /// Bars played before the record start when starting from stop.
-    pub preroll_bars: u32,
+    /// Played before the record start when starting from stop.
+    pub preroll: Roll,
+    /// The pre-roll starts on a bar line (back from where it would).
+    pub preroll_on_bar: bool,
+    /// The pre-roll plays the click alone (the arrangement waits).
+    pub count_in: bool,
+    /// Played after a punch-out, then playback stops (punch range only).
+    pub postroll: Roll,
     pub metronome: MetronomeMode,
     /// Extra latency compensation on top of what the driver reports
     /// (positive moves takes earlier), in frames.
@@ -32,17 +146,28 @@ pub struct RecordSettings {
     pub buffer_seconds: f64,
     pub mode: RecordMode,
     pub loop_mode: LoopRecordMode,
+    /// Input quantize (the transport's Q): recorded MIDI notes move to the
+    /// grid as they are placed (with the editor's quantize strength, swing
+    /// and ends).
+    pub input_quantize: bool,
+    /// Its grid (None: the edit grid).
+    pub input_grid: Option<faderframe_timeline::GridDivision>,
 }
 
 impl Default for RecordSettings {
     fn default() -> Self {
         Self {
-            preroll_bars: 0,
+            preroll: Roll::OFF,
+            preroll_on_bar: true,
+            count_in: false,
+            postroll: Roll::OFF,
             metronome: MetronomeMode::Recording,
             latency_offset: 0,
             buffer_seconds: 4.0,
             mode: RecordMode::Takes,
             loop_mode: LoopRecordMode::Takes,
+            input_quantize: false,
+            input_grid: None,
         }
     }
 }
@@ -663,21 +788,24 @@ impl Session {
                     pos
                 }
             };
-            let preroll = if slot {
-                u32::from(self.project.launcher.count_in)
+            let (roll, on_bar) = if slot {
+                (Roll::bars(f64::from(self.project.launcher.count_in)), true)
             } else {
-                self.record.preroll_bars
+                (self.record.preroll, self.record.preroll_on_bar)
             };
-            if preroll > 0 {
-                let meter = &self.project.timeline.meter;
-                let at = self.engine.samples_to_musical(&self.project, from);
-                let bar = (meter.bar_at(at) - preroll as i32).max(0);
-                let start = self
-                    .engine
-                    .musical_to_samples(&self.project, meter.bar_start(bar));
-                self.engine
-                    .transport(TransportCommand::Locate(start.min(from)))?;
-                self.show_position(start.min(from));
+            if !roll.is_off() {
+                let start = self.roll_back(from, roll, on_bar);
+                self.engine.transport(TransportCommand::Locate(start))?;
+                self.show_position(start);
+            }
+            // Post-roll: on after the punch-out, then stop.
+            if let Some((_, end)) = punch
+                && !self.record.postroll.is_off()
+                && !self.show.on
+            {
+                let at = self.roll_on(end, self.record.postroll);
+                self.engine.stop_at(Some(at))?;
+                self.postroll_armed = true;
             }
         }
         self.engine.transport(TransportCommand::Play)?;
@@ -687,6 +815,103 @@ impl Session {
             self.play_started_at = Some(self.transport.position);
             self.mtc_started(self.transport.position);
             self.automation_play_started();
+        }
+        Ok(())
+    }
+
+    /// Where a pre-roll of `roll` before `from` (engine samples) starts:
+    /// as far back, or (`on_bar`) from the start of that bar; never before
+    /// the project's start.
+    pub(crate) fn roll_back(&self, from: i64, roll: Roll, on_bar: bool) -> i64 {
+        if roll.is_off() {
+            return from;
+        }
+        let p = &self.project;
+        let meter = &p.timeline.meter;
+        let at = self.engine.samples_to_musical(p, from);
+        let back = match roll.unit {
+            RollUnit::Bars => {
+                // Whole bars back keep the place in the bar.
+                let bar = meter.bar_at(at);
+                let whole = roll.amount.floor() as i32;
+                let into = at - meter.bar_start(bar);
+                let earlier = bar - whole;
+                Some(if earlier < 0 {
+                    MusicalTime::ZERO
+                } else {
+                    let t = meter.bar_start(earlier) + into;
+                    let len = meter.bar_start(earlier + 1) - meter.bar_start(earlier);
+                    let frac = MusicalTime::from_quarters(len.quarters() * roll.amount.fract());
+                    if t > frac {
+                        t - frac
+                    } else {
+                        MusicalTime::ZERO
+                    }
+                })
+            }
+            RollUnit::Beats => {
+                let sig = meter.signature_of_bar(meter.bar_at(at));
+                let beat = 4.0 / f64::from(sig.denominator.max(1));
+                let q = MusicalTime::from_quarters(beat * roll.amount);
+                Some(if at > q { at - q } else { MusicalTime::ZERO })
+            }
+            RollUnit::Seconds => None,
+        };
+        let start = match back {
+            Some(t) => self.engine.musical_to_samples(p, t),
+            None => from - (roll.amount * f64::from(self.engine.sample_rate())).round() as i64,
+        }
+        .max(0);
+        let start = if on_bar {
+            let t = self.engine.samples_to_musical(p, start);
+            self.engine
+                .musical_to_samples(p, meter.bar_start(meter.bar_at(t)))
+        } else {
+            start
+        };
+        start.min(from)
+    }
+
+    /// Where a post-roll of `roll` after `end` (engine samples) ends.
+    pub(crate) fn roll_on(&self, end: i64, roll: Roll) -> i64 {
+        let p = &self.project;
+        let meter = &p.timeline.meter;
+        let at = self.engine.samples_to_musical(p, end);
+        let quarters = match roll.unit {
+            RollUnit::Bars => {
+                let bar = meter.bar_at(at);
+                let len = meter.bar_start(bar + 1) - meter.bar_start(bar);
+                len.quarters() * roll.amount
+            }
+            RollUnit::Beats => {
+                let sig = meter.signature_of_bar(meter.bar_at(at));
+                4.0 / f64::from(sig.denominator.max(1)) * roll.amount
+            }
+            RollUnit::Seconds => {
+                return end + (roll.amount * f64::from(self.engine.sample_rate())).round() as i64;
+            }
+        };
+        self.engine
+            .musical_to_samples(p, at + MusicalTime::from_quarters(quarters))
+            .max(end)
+    }
+
+    /// [`Self::roll_back`] for tests.
+    #[doc(hidden)]
+    pub fn roll_back_for_tests(&self, from: i64, roll: Roll, on_bar: bool) -> i64 {
+        self.roll_back(from, roll, on_bar)
+    }
+
+    /// [`Self::roll_on`] for tests.
+    #[doc(hidden)]
+    pub fn roll_on_for_tests(&self, end: i64, roll: Roll) -> i64 {
+        self.roll_on(end, roll)
+    }
+
+    /// A post-roll stop no longer wanted (the user stopped first).
+    pub(crate) fn disarm_postroll(&mut self) -> Result<()> {
+        if std::mem::take(&mut self.postroll_armed) {
+            self.engine.stop_at(None)?;
         }
         Ok(())
     }

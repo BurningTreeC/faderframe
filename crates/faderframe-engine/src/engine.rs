@@ -74,6 +74,8 @@ enum Message {
     StopAt(Option<i64>),
     BeginRecord(Box<Recorder>),
     EndRecord,
+    /// The pre-roll plays the click alone (see [`crate::record::RecordingNow`]).
+    CountIn(bool),
     MidiInput(Box<faderframe_midi::MidiInputQueue>),
     MidiOutput(Box<faderframe_midi::MidiOutputQueue>),
     BeginMidiRecord(Box<crate::midi::MidiRecorder>),
@@ -356,6 +358,7 @@ pub fn create_with_epoch(
             preview_active: false,
             launch: crate::launch::LaunchState::new(),
             history: Default::default(),
+            recording: Default::default(),
         },
         transport: TransportState::default(),
         shared: Arc::clone(&shared),
@@ -630,12 +633,19 @@ impl EngineProcessor {
                         self.click.reset();
                     }
                 }
+                Message::CountIn(on) => self.ctx.recording.count_in = on,
                 Message::BeginRecord(r) => {
+                    let count_in = self.ctx.recording.count_in;
+                    self.ctx.recording = r.now();
+                    self.ctx.recording.count_in = count_in;
                     if let Some(old) = self.recorder.replace(r) {
                         self.retire(Garbage::Recorder(old));
                     }
                 }
                 Message::EndRecord => {
+                    let count_in = self.ctx.recording.count_in;
+                    self.ctx.recording = Default::default();
+                    self.ctx.recording.count_in = count_in;
                     if let Some(old) = self.recorder.take() {
                         self.retire(Garbage::Recorder(old));
                     }
@@ -1186,11 +1196,18 @@ impl EngineProcessor {
                     }
                 });
             }
-            let click = match self.shared.metronome.mode() {
-                MetronomeMode::Off => false,
-                MetronomeMode::Recording => info.recording,
-                MetronomeMode::Always => true,
-            };
+            // Counting in, the click plays whatever the metronome's mode.
+            let counting = self
+                .ctx
+                .recording
+                .silent_before(info.recording)
+                .is_some_and(|from| info.playing && pos < from);
+            let click = counting
+                || match self.shared.metronome.mode() {
+                    MetronomeMode::Off => false,
+                    MetronomeMode::Recording => info.recording,
+                    MetronomeMode::Always => true,
+                };
             if scrubbing {
                 // Snippets fade in and out (no clicks between them).
                 for c in 0..io.output_channels() {
@@ -1386,6 +1403,40 @@ impl EngineClock {
     pub fn playing(&self) -> bool {
         self.shared.transport.snapshot().playing
     }
+
+    /// [`EngineController::heard_ahead`], from any thread.
+    pub fn heard_ahead(&self, at: std::time::Instant) -> Option<Heard> {
+        let device = self.shared.output_latency.load(Ordering::Relaxed) + self.varispeed_delay;
+        heard(&self.shared, device, at, false)
+    }
+}
+
+/// What is heard at `at` from the play history the audio thread published
+/// (`device`: the device's latency, frames); `hold`: never past the frames
+/// processed.
+fn heard(shared: &EngineShared, device: u32, at: std::time::Instant, hold: bool) -> Option<Heard> {
+    let snap = shared.heard.read()?;
+    let rate = f64::from(shared.stream_sample_rate.load(Ordering::Relaxed).max(1));
+    let speed = shared.speed();
+    let since_ns = crate::history::ns_since_epoch(at) as f64 - snap.callback_ns as f64;
+    // No callback for a second: no stream runs any more.
+    if since_ns > 1e9 {
+        return None;
+    }
+    let device = f64::from(device) * speed;
+    let frames = since_ns.max(0.0) * rate * speed / 1e9 - device;
+    let played = if hold {
+        snap.heard(frames)
+    } else {
+        snap.heard_ahead(frames)
+    }?;
+    Some(Heard {
+        position: played.pos,
+        playing: played.playing,
+        jumped: (played.jumps != snap.jumps).then_some(snap.jumped_to),
+        run: played.start,
+        per_second: rate * speed,
+    })
 }
 
 pub struct EngineController {
@@ -1480,6 +1531,25 @@ pub struct EngineController {
 }
 
 /// The tracks with launcher clips (sorted).
+/// Where the click plays in each cue mix: its outputs, its click level
+/// under its master level (nothing while it is muted), its switch.
+fn cue_clicks(project: &Project) -> Vec<crate::click::CueClick> {
+    project
+        .cue_mixes
+        .iter()
+        .map(|c| crate::click::CueClick {
+            first_channel: c.first_channel,
+            channels: c.layout.channel_count().clamp(1, 2) as u8,
+            gain: if c.mute {
+                0.0
+            } else {
+                faderframe_core::db_to_gain(c.click_db) * faderframe_core::db_to_gain(c.level_db)
+            },
+            on: c.click,
+        })
+        .collect()
+}
+
 fn launch_tracks(project: &Project) -> Vec<faderframe_core::TrackId> {
     let mut v: Vec<_> = project.launcher.slots.keys().map(|k| k.track).collect();
     v.dedup();
@@ -1750,29 +1820,16 @@ impl EngineController {
     /// `None` before the first callback. While a locate or stop has not
     /// reached the ears yet, `jumped` says where the transport went.
     pub fn heard_at(&self, now: std::time::Instant) -> Option<Heard> {
-        let snap = self.shared.heard.read()?;
-        let rate = f64::from(
-            self.shared
-                .stream_sample_rate
-                .load(Ordering::Relaxed)
-                .max(1),
-        );
-        let speed = self.shared.speed();
-        let since_ns = crate::history::ns_since_epoch(now) as f64 - snap.callback_ns as f64;
-        // No callback for a second: no stream runs any more.
-        if since_ns > 1e9 {
-            return None;
-        }
-        let device = f64::from(self.device_latency()) * speed;
-        let frames = since_ns.max(0.0) * rate * speed / 1e9 - device;
-        let played = snap.heard(frames)?;
-        Some(Heard {
-            position: played.pos,
-            playing: played.playing,
-            jumped: (played.jumps != snap.jumps).then_some(snap.jumped_to),
-            run: played.start,
-            per_second: rate * speed,
-        })
+        heard(&self.shared, self.device_latency(), now, true)
+    }
+
+    /// What will be heard at `at`, a moment from now (a picture for when it
+    /// reaches the screen): [`Self::heard_at`], but past the frames
+    /// processed so far the newest run carries on as it goes. After Play
+    /// it stays on the stopped position until the latency has filled, as
+    /// the sound does.
+    pub fn heard_ahead(&self, at: std::time::Instant) -> Option<Heard> {
+        heard(&self.shared, self.device_latency(), at, false)
     }
 
     /// Varispeed's resampler delay each way (0 when it does not run).
@@ -2160,6 +2217,7 @@ impl EngineController {
             &self.midi_live,
             &self.suspended_lanes,
         )?;
+        self.shared.metronome.set_cues(&cue_clicks(project));
         self.plugins.sync_parameters(project);
         Ok(())
     }
@@ -2434,6 +2492,11 @@ impl EngineController {
     /// Start capturing `targets` (only while the transport records, and only
     /// timeline samples `from..to`). Ring capacity covers `seconds` of audio
     /// in case the writer stalls. Returns the ends for the writer thread.
+    /// Whether the pre-roll before a recording plays the click alone.
+    pub fn set_count_in(&mut self, on: bool) -> Result<(), EngineError> {
+        self.send(Message::CountIn(on))
+    }
+
     pub fn begin_recording(
         &mut self,
         targets: Vec<RecordTarget>,
@@ -2732,6 +2795,7 @@ impl EngineController {
             preview_active: false,
             launch: crate::launch::LaunchState::new(),
             history: Default::default(),
+            recording: Default::default(),
         };
         let rate = self.config.sample_rate as f64;
         let (deep, deep_tier) = crate::ahead::start(

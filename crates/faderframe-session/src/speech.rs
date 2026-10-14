@@ -5,7 +5,9 @@
 //! checkpoint (`whisper-base`, 290 MB, Apache-2.0) is downloaded once, on
 //! request, into the data folder's `models` (by the system's `curl`, file
 //! by file through `.part` files). Transcribing runs in a thread on the
-//! clip's part of its source at 16 kHz; its lines replace those starting
+//! clip's part of its source at 16 kHz; each line then starts at the
+//! vocal's attack nearest to where the model heard it (the model's times
+//! are coarse: [`align_to_onsets`]); its lines replace those starting
 //! inside the clip, in one undo step.
 
 use crate::pitch::mono_of;
@@ -37,6 +39,50 @@ type Job = (
 pub(crate) struct SpeechState {
     download: Option<(Download, Arc<AtomicU32>)>,
     jobs: Vec<Job>,
+}
+
+/// How far (seconds) a line's start may move to an attack.
+pub const ONSET_REACH: f64 = 0.35;
+
+/// The segments' starts moved to the attacks (`onsets`, seconds, sorted)
+/// nearest to them within [`ONSET_REACH`], keeping their order; ends stay
+/// after their starts and before the next line.
+pub fn align_to_onsets(segments: &mut [Segment], onsets: &[f64]) {
+    let mut floor = f64::NEG_INFINITY;
+    for s in segments.iter_mut() {
+        let near = onsets
+            .iter()
+            .copied()
+            .filter(|o| (o - s.start).abs() <= ONSET_REACH && *o > floor && *o < s.end)
+            .min_by(|a, b| (a - s.start).abs().total_cmp(&(b - s.start).abs()));
+        if let Some(o) = near {
+            s.start = o;
+        }
+        floor = s.start;
+    }
+    for i in 0..segments.len() {
+        let next = segments.get(i + 1).map(|n| n.start);
+        let s = &mut segments[i];
+        if let Some(n) = next
+            && s.end > n
+        {
+            s.end = n;
+        }
+        if s.end <= s.start {
+            s.end = s.start + 0.1;
+        }
+    }
+}
+
+/// The attacks (seconds) in `mono` at `rate` clear enough for words.
+pub fn word_onsets(mono: &[f32], rate: f64) -> Vec<f64> {
+    use faderframe_audio_files::onsets;
+    let floor = onsets::strength_threshold(0.6);
+    onsets::detect(mono, rate.round() as u32)
+        .into_iter()
+        .filter(|o| o.strength >= floor)
+        .map(|o| o.frame as f64 / rate)
+        .collect()
 }
 
 /// Where the checkpoint lives.
@@ -161,9 +207,12 @@ impl Session {
                 )
                 .ok_or("the clip's audio could not be resampled")?;
                 let w = Whisper::load(&model_dir()).map_err(|e| e.to_string())?;
-                Ok(w.transcribe(&audio, &Options::default(), |f| {
+                let mut segments = w.transcribe(&audio, &Options::default(), |f| {
                     p.store((f * 1000.0) as u32, Ordering::Relaxed);
-                }))
+                });
+                // Lines start where the voice does.
+                align_to_onsets(&mut segments, &word_onsets(&mono[a..b], rate));
+                Ok(segments)
             })
             .map_err(|e| SessionError::Other(e.to_string()))?;
         self.speech.jobs.push((clip, job, progress));
@@ -344,5 +393,59 @@ impl Session {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seg(a: f64, b: f64) -> Segment {
+        Segment {
+            start: a,
+            end: b,
+            text: "la".into(),
+        }
+    }
+
+    #[test]
+    fn lines_start_at_the_nearest_attack() {
+        let mut s = vec![seg(0.8, 2.4), seg(2.6, 3.7), seg(3.8, 5.0), seg(7.0, 8.0)];
+        align_to_onsets(&mut s, &[1.0, 2.5, 4.02, 9.5]);
+        let starts: Vec<f64> = s.iter().map(|s| s.start).collect();
+        // The last has no attack within reach: it stays.
+        assert_eq!(starts, [1.0, 2.5, 4.02, 7.0]);
+        assert!(s.windows(2).all(|w| w[0].end <= w[1].start));
+    }
+
+    /// Bursts of a tone in silence: the attacks are found where they are.
+    #[test]
+    fn word_onsets_are_found_in_audio() {
+        let rate = 16_000.0;
+        let mut mono = vec![0.0f32; (rate * 4.0) as usize];
+        for at in [0.5, 1.7, 3.1] {
+            let a = (at * rate) as usize;
+            for i in 0..(0.4 * rate) as usize {
+                let t = i as f64 / rate;
+                // A word: a quick attack, a smooth end.
+                let fade = (std::f64::consts::PI * t / 0.4).cos() * 0.5 + 0.5;
+                mono[a + i] = (0.5
+                    * (2.0 * std::f64::consts::PI * 220.0 * t).sin()
+                    * (-t * 4.0).exp()
+                    * fade) as f32;
+            }
+        }
+        let found = word_onsets(&mono, rate);
+        for at in [0.5, 1.7, 3.1] {
+            assert!(
+                found.iter().any(|o| (o - at).abs() < 0.03),
+                "{at} in {found:?}"
+            );
+        }
+        let mut s = vec![seg(0.3, 1.5), seg(1.9, 3.0), seg(2.9, 3.9)];
+        align_to_onsets(&mut s, &found);
+        for (got, want) in s.iter().zip([0.5, 1.7, 3.1]) {
+            assert!((got.start - want).abs() < 0.03, "{} vs {want}", got.start);
+        }
     }
 }

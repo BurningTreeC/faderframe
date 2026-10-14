@@ -1,7 +1,8 @@
 //! The Modulation face: the LFO's cycle with where each side is on it,
 //! and what the mode does right now — the voices moving on the delay
-//! (chorus, ensemble, vibrato) or the comb or notches the flanger or the
-//! phaser makes at this moment, over the range they sweep.
+//! (chorus, ensemble, vibrato), the comb or notches the flanger or the
+//! phaser makes at this moment over the range they sweep, the tremolo's
+//! level over a cycle, or the rotary's two rotors turning.
 
 use crate::kit::{self, Ctl, Ctx, Face, KNOB, Meter, MeterKind, Panel, SMALL, SWITCH_H, Scale};
 use faderframe_core::ParameterId;
@@ -182,7 +183,10 @@ impl Face for ModulationFace {
     fn paint_display(&mut self, p: &mut dyn Painter, r: Rect, cx: &Ctx<'_>) {
         let th = cx.theme;
         let (lr, what) = Self::split(r);
-        let mode = cx.value(pid(id::MODE)).round().clamp(0.0, 4.0) as usize;
+        let mode = cx
+            .value(pid(id::MODE))
+            .round()
+            .clamp(0.0, (md::MODES.len() - 1) as f64) as usize;
         let shape_i = cx.value(pid(id::SHAPE)).round().max(0.0) as usize;
         let shape = Shape::from_index(shape_i);
         let phase = f64::from(cx.published(value::PHASE));
@@ -274,7 +278,7 @@ impl Face for ModulationFace {
             )
         };
         let rate = f64::from(cx.model.sample_rate().max(8_000));
-        let mix = if mode == 4 {
+        let mix = if mode == 4 || mode == md::ROTARY {
             1.0
         } else {
             cx.value(pid(id::MIX))
@@ -282,6 +286,103 @@ impl Face for ModulationFace {
         let feedback = cx.value(pid(id::FEEDBACK));
         let delay_ms = cx.value(pid(id::DELAY));
         match mode {
+            md::TREMOLO => {
+                // The level over a cycle per side, each side's place on it.
+                let to_y = |g: f64| plot.y + plot.h * (1.0 - g.clamp(0.0, 1.0) as f32) * 0.92;
+                for (g, t) in [(1.0, "0"), (0.5, "−6"), (0.25, "−12")] {
+                    p.hline(plot.x, plot.right(), to_y(g), th.device.grid);
+                    p.text(
+                        t,
+                        Rect::new(plot.x - 2.0, to_y(g) - 13.0, 30.0, 12.0),
+                        &label,
+                    );
+                }
+                let shown = if matches!(shape, Shape::SampleHold | Shape::Drift) {
+                    Shape::Sine
+                } else {
+                    shape
+                };
+                for c in 0..2 {
+                    let mut l = Lfo::new(0);
+                    let pts: Vec<Point> = (0..=160)
+                        .map(|i| {
+                            let t = f64::from(i) / 160.0;
+                            l.phase = (t + c as f64 * spread).rem_euclid(1.0);
+                            let g = md::tremolo_gain(l.value(shown, 0.0), depth);
+                            Point::new(plot.x + plot.w * t as f32, to_y(g))
+                        })
+                        .collect();
+                    let color = if c == 0 { self.accent } else { th.ui.text_dim };
+                    p.stroke_path(&Path::polyline(&pts), if c == 0 { 2.0 } else { 1.2 }, color);
+                    let i = ((phase * 160.0).round() as usize).min(160);
+                    p.circle(pts[i], 5.0, color);
+                    p.text(
+                        if c == 0 { "L" } else { "R" },
+                        Rect::new(pts[i].x + 7.0, pts[i].y - 6.0, 12.0, 12.0),
+                        &label,
+                    );
+                }
+            }
+            md::ROTARY => {
+                // The horn and the drum: a dot each turning, the microphones
+                // (L, R) round them the spread apart.
+                let drum_phase = f64::from(cx.published(value::DRUM_PHASE));
+                let w = plot.w / 2.0;
+                for (k, (name, ph, rate_k)) in
+                    [("HORN", phase, 1.0), ("DRUM", drum_phase, md::DRUM_RATIO)]
+                        .into_iter()
+                        .enumerate()
+                {
+                    let cell = Rect::new(plot.x + w * k as f32, plot.y, w, plot.h);
+                    let c = Point::new(cell.x + cell.w / 2.0, cell.y + cell.h / 2.0 + 10.0);
+                    let rad = (cell.h / 2.0 - 30.0).min(cell.w / 2.0 - 30.0).max(10.0);
+                    p.stroke_path(&Path::circle(c, rad), 1.0, th.device.grid_strong);
+                    p.text(
+                        name,
+                        Rect::new(cell.x, cell.y + 2.0, cell.w, 12.0),
+                        &title.center(),
+                    );
+                    let speed = if cx.on(pid(id::SYNC)) {
+                        rate_text.clone()
+                    } else {
+                        format!("{:.2} Hz", cx.value(pid(id::RATE)) * rate_k)
+                    };
+                    p.text(
+                        &speed,
+                        Rect::new(cell.x, cell.y + 15.0, cell.w, 12.0),
+                        &label.center(),
+                    );
+                    // The rotor (the opening faces the microphone at 0).
+                    let a = TAU * ph;
+                    let tip = Point::new(
+                        c.x + rad * 0.82 * a.cos() as f32,
+                        c.y + rad * 0.82 * a.sin() as f32,
+                    );
+                    p.line(c, tip, 3.0, self.accent.with_alpha(0.8));
+                    p.circle(tip, 6.0, self.accent);
+                    // The level a rotor gives each microphone now.
+                    for (m, mic) in ["L", "R"].into_iter().enumerate() {
+                        let at = TAU * (m as f64 * spread).rem_euclid(1.0);
+                        let pt = Point::new(
+                            c.x + (rad + 14.0) * at.cos() as f32,
+                            c.y + (rad + 14.0) * at.sin() as f32,
+                        );
+                        let shade = if k == 0 { 0.6 } else { 0.4 };
+                        let level =
+                            md::rotor_level((ph - m as f64 * spread).rem_euclid(1.0), depth, shade);
+                        p.circle(
+                            pt,
+                            4.0 + 3.0 * level as f32,
+                            th.ui.text.with_alpha(0.35 + 0.6 * level as f32),
+                        );
+                        p.text(
+                            mic,
+                            Rect::new(pt.x - 6.0, pt.y - 20.0, 12.0, 12.0),
+                            &label.center(),
+                        );
+                    }
+                }
+            }
             2 | 3 => {
                 // The response now (left side) and its sweep's extremes.
                 let response = |v: f64, f: f64| -> f64 {
@@ -425,13 +526,21 @@ impl Face for ModulationFace {
 
     fn tip(&self, pid: ParameterId) -> Option<&'static str> {
         Some(match pid.0 {
-            id::MODE => "Chorus, Ensemble (string machine), Flanger, Phaser, Vibrato (all wet)",
+            id::MODE => {
+                "Chorus, Ensemble (string machine), Flanger, Phaser, Vibrato (all wet), Tremolo, Rotary speaker (all wet)"
+            }
+            id::RATE => "The LFO's rate; the rotary's horn speed (its drum turns at 0.84 of it)",
+            id::DEPTH => {
+                "How far the sweep goes; a tremolo's dip; the rotary's Doppler and shading"
+            }
             id::DELAY => "The delay the voices move round (the flanger: the longest)",
             id::FEEDBACK => "Flanger and phaser: feed back for resonance (negative: hollow)",
             id::VOICES => "Chorus voices a side",
             id::STAGES => "Phaser stages: two per notch",
             id::CENTER => "Where the phaser's notches sweep round",
-            id::SPREAD => "How far ahead the right side runs",
+            id::SPREAD => {
+                "How far ahead the right side runs (180°: a tremolo pans; the rotary's microphones round the cabinet)"
+            }
             _ => return None,
         })
     }

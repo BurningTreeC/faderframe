@@ -136,6 +136,8 @@ enum Drag {
         dk: i32,
         moved: bool,
         copy: bool,
+        /// The press chose the selection (Shift, Ctrl): a click keeps it.
+        keep: bool,
     },
     /// Changing the selection's starts (`start`) or ends.
     Resize {

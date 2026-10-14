@@ -58,7 +58,7 @@ pub(crate) fn test_kernel_covers(pattern: &[u64], plan: &[u8]) -> bool {
 
 /// Kernels a single partition may choose between: the plans compiled for its
 /// pattern.
-const KERNEL_CANDIDATES: usize = 32;
+const KERNEL_CANDIDATES: usize = 64;
 
 /// Records which reduced systems are solved and how often, for
 /// `examples/kernels.rs` to choose what to compile. Off unless that example
@@ -624,6 +624,9 @@ pub struct ReducedNonlinear {
     /// exactly the same order as the row-major dot product, but the hot inner
     /// loop no longer carries a floating-point dependency between iterations.
     internal_boundary_response_by_boundary: Vec<f64>,
+    /// The same response by internal row without its zeros, as recovery
+    /// walks it (`recover_sparse`).
+    recovery: SparseRows,
     /// Persistent contiguous recovery workspace. This is scratch only and is
     /// fully overwritten from `internal_rhs_base` on every Newton pass.
     internal_recovery_work: Vec<f64>,
@@ -633,8 +636,12 @@ pub struct ReducedNonlinear {
     /// an i x i inverse mat-vec every audio sample.
     active_rhs_nodes: Vec<usize>,
     active_internal_local: Vec<usize>,
-    internal_rhs_responses: Vec<f64>,
-    boundary_rhs_responses: Vec<f64>,
+    /// Each internal unknown's and each boundary correction's response to the
+    /// active nodes (`accumulate_sparse`).
+    internal_rhs_responses: SparseRows,
+    boundary_rhs_responses: SparseRows,
+    /// This sample's RHS at `active_rhs_nodes` (scratch).
+    active_rhs_values: Vec<f64>,
     rhs_prepared: bool,
     /// Pivot swap sequence learned on the first reduced solve after rebuild and
     /// replayed thereafter. The reduced topology is fixed and its dominant
@@ -809,157 +816,101 @@ fn avx_available() -> bool {
     }
 }
 
-/// Recover every internal unknown from the solved boundary voltages.
-///
-/// Boundary-major: one boundary voltage at a time, updating every independent
-/// internal row contiguously. Each internal row still sees the boundary
-/// columns in exactly the order the row-major dot product used, so the result
-/// is bit-identical, but the inner loop carries no floating-point dependency
-/// between iterations and vectorises.
-#[inline(always)]
-fn recover_boundary_major_body(
-    work: &mut [f64],
-    base: &[f64],
-    response_by_boundary: &[f64],
-    boundary_solution: &[f64],
-) {
-    let i = base.len();
-    let b = boundary_solution.len();
-    debug_assert_eq!(work.len(), i);
-    debug_assert_eq!(response_by_boundary.len(), i * b);
-    work.copy_from_slice(base);
-    for (column, &boundary_voltage) in boundary_solution.iter().enumerate() {
-        let response = &response_by_boundary[column * i..(column + 1) * i];
-        for (value, &coefficient) in work.iter_mut().zip(response) {
-            *value -= coefficient * boundary_voltage;
+/// A matrix by rows with its exact zeros left out: row `r` holds
+/// `values[k]` at column `columns[k]` for `k` in `rows[r]`, in column order.
+/// Built with room for the dense matrix, so filling it again (a control
+/// moved) or copying it never allocates.
+#[derive(Clone, Debug, Default)]
+struct SparseRows {
+    rows: Vec<(u32, u32)>,
+    columns: Vec<u32>,
+    values: Vec<f64>,
+}
+
+impl SparseRows {
+    fn with_capacity(rows: usize, columns: usize) -> Self {
+        Self {
+            rows: Vec::with_capacity(rows),
+            columns: Vec::with_capacity(rows * columns),
+            values: Vec::with_capacity(rows * columns),
         }
+    }
+
+    /// The `rows` x `columns` matrix whose entries are `at(row, column)`.
+    fn fill(&mut self, rows: usize, columns: usize, at: impl Fn(usize, usize) -> f64) {
+        self.rows.clear();
+        self.columns.clear();
+        self.values.clear();
+        for row in 0..rows {
+            let first = self.columns.len() as u32;
+            for column in 0..columns {
+                let value = at(row, column);
+                if value != 0.0 {
+                    self.columns.push(column as u32);
+                    self.values.push(value);
+                }
+            }
+            self.rows.push((first, self.columns.len() as u32));
+        }
+    }
+
+    fn copy_from(&mut self, source: &Self) {
+        self.rows.clear();
+        self.rows.extend_from_slice(&source.rows);
+        self.columns.clear();
+        self.columns.extend_from_slice(&source.columns);
+        self.values.clear();
+        self.values.extend_from_slice(&source.values);
+    }
+
+    /// Row `row`'s entries.
+    #[inline(always)]
+    fn row(&self, row: (u32, u32)) -> (&[u32], &[f64]) {
+        let range = row.0 as usize..row.1 as usize;
+        (&self.columns[range.clone()], &self.values[range])
     }
 }
 
-/// The same recovery, four lanes wide. See `avx_available` for why this is
-/// bit-identical to the scalar body rather than merely equivalent.
-///
-/// # Safety
-/// The caller must have established that the CPU supports AVX.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx")]
-unsafe fn recover_boundary_major_avx(
-    work: &mut [f64],
-    base: &[f64],
-    response_by_boundary: &[f64],
-    boundary_solution: &[f64],
-) {
-    recover_boundary_major_body(work, base, response_by_boundary, boundary_solution);
-}
-
-/// `internal += response * rhs[node]` and `correction += response * rhs[node]`
-/// for every active RHS node, in the order `prepare_rhs` has always taken
-/// them. Each target sums its nodes in that order and the arithmetic within a
-/// node is elementwise, so any vector width gives the same bits; the wide
-/// build is `accumulate_rhs_responses_avx`. Measured on the JC-120's power
-/// stage, this was two thirds of `prepare_rhs` and ran two lanes wide.
-#[inline(always)]
-fn accumulate_rhs_responses_body(
-    active: &[usize],
-    rhs: &[f64],
-    internal_responses: &[f64],
-    boundary_responses: &[f64],
-    internal: &mut [f64],
-    correction: &mut [f64],
-) {
-    let (i, b) = (internal.len(), correction.len());
-    for (column, &global) in active.iter().enumerate() {
-        let scalar = rhs[global];
-        if scalar == 0.0 {
-            continue;
+/// Recover every internal unknown from the solved boundary voltages:
+/// `work[r] = base[r] - sum of response[r][j] * boundary[j]`, each row's
+/// terms in boundary order, as the dense recovery took them, so the result
+/// is the same. Only the nonzero responses are visited: a cascade's internal
+/// nodes respond to the boundary of their own stage (the German 76's 38
+/// internal unknowns to 109 of 722 pairs), and the skipped `x -= 0.0 * v`
+/// can change nothing but the sign of an exact zero.
+#[inline]
+fn recover_sparse(work: &mut [f64], base: &[f64], response: &SparseRows, boundary: &[f64]) {
+    debug_assert_eq!(work.len(), base.len());
+    debug_assert_eq!(response.rows.len(), base.len());
+    for ((value, &start), &row) in work.iter_mut().zip(base).zip(&response.rows) {
+        let (columns, coefficients) = response.row(row);
+        let mut sum = start;
+        for (&column, &coefficient) in columns.iter().zip(coefficients) {
+            sum -= coefficient * boundary[column as usize];
         }
-        let responses = &internal_responses[column * i..(column + 1) * i];
-        for (target, &response) in internal.iter_mut().zip(responses) {
-            *target += response * scalar;
-        }
-        let responses = &boundary_responses[column * b..(column + 1) * b];
-        for (target, &response) in correction.iter_mut().zip(responses) {
-            *target += response * scalar;
-        }
+        *value = sum;
     }
 }
 
-/// # Safety
-/// The caller must have established that the CPU supports AVX.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx")]
-unsafe fn accumulate_rhs_responses_avx(
-    active: &[usize],
-    rhs: &[f64],
-    internal_responses: &[f64],
-    boundary_responses: &[f64],
-    internal: &mut [f64],
-    correction: &mut [f64],
-) {
-    accumulate_rhs_responses_body(
-        active,
-        rhs,
-        internal_responses,
-        boundary_responses,
-        internal,
-        correction,
-    );
-}
-
-#[inline(always)]
-fn accumulate_rhs_responses(
-    active: &[usize],
-    rhs: &[f64],
-    internal_responses: &[f64],
-    boundary_responses: &[f64],
-    internal: &mut [f64],
-    correction: &mut [f64],
-    avx: bool,
-) {
-    #[cfg(target_arch = "x86_64")]
-    if avx {
-        // SAFETY: `avx` is only ever set from `avx_available()`.
-        unsafe {
-            accumulate_rhs_responses_avx(
-                active,
-                rhs,
-                internal_responses,
-                boundary_responses,
-                internal,
-                correction,
-            );
+/// `targets[t] = sum of response[t][c] * values[c]` over the active RHS
+/// nodes, in the order `prepare_rhs` has always taken them, a zero value
+/// adding nothing. Sparse like `recover_sparse`: the inverse of a cascade's
+/// internal block is mostly zeros (the German 76's: 274 of 1425 pairs are
+/// not).
+#[inline]
+fn accumulate_sparse(targets: &mut [f64], response: &SparseRows, values: &[f64]) {
+    debug_assert_eq!(response.rows.len(), targets.len());
+    for (target, &row) in targets.iter_mut().zip(&response.rows) {
+        let (columns, coefficients) = response.row(row);
+        let mut sum = 0.0;
+        for (&column, &coefficient) in columns.iter().zip(coefficients) {
+            let value = values[column as usize];
+            if value != 0.0 {
+                sum += coefficient * value;
+            }
         }
-        return;
+        *target = sum;
     }
-    let _ = avx;
-    accumulate_rhs_responses_body(
-        active,
-        rhs,
-        internal_responses,
-        boundary_responses,
-        internal,
-        correction,
-    );
-}
-
-#[inline(always)]
-fn recover_boundary_major_in_place(
-    work: &mut [f64],
-    base: &[f64],
-    response_by_boundary: &[f64],
-    boundary_solution: &[f64],
-    avx: bool,
-) {
-    #[cfg(target_arch = "x86_64")]
-    if avx {
-        // SAFETY: `avx` is only ever set from `avx_available()`.
-        unsafe {
-            recover_boundary_major_avx(work, base, response_by_boundary, boundary_solution);
-        }
-        return;
-    }
-    let _ = avx;
-    recover_boundary_major_body(work, base, response_by_boundary, boundary_solution);
 }
 
 #[inline(always)]
@@ -1006,10 +957,11 @@ impl ReducedNonlinear {
             .copy_from_slice(&source.internal_boundary_response);
         self.internal_boundary_response_by_boundary
             .copy_from_slice(&source.internal_boundary_response_by_boundary);
+        self.recovery.copy_from(&source.recovery);
         self.internal_rhs_responses
-            .copy_from_slice(&source.internal_rhs_responses);
+            .copy_from(&source.internal_rhs_responses);
         self.boundary_rhs_responses
-            .copy_from_slice(&source.boundary_rhs_responses);
+            .copy_from(&source.boundary_rhs_responses);
         self.pivot_plan.copy_from_slice(&source.pivot_plan);
         self.pivot_planned = source.pivot_planned;
         self.device_pattern.copy_from_slice(&source.device_pattern);
@@ -1112,11 +1064,13 @@ impl ReducedNonlinear {
             internal_rhs_base: vec![0.0; i],
             internal_boundary_response: vec![0.0; i * b],
             internal_boundary_response_by_boundary: vec![0.0; b * i],
+            recovery: SparseRows::with_capacity(i, b),
             internal_recovery_work: vec![0.0; i],
             active_rhs_nodes,
             active_internal_local,
-            internal_rhs_responses: vec![0.0; active * i],
-            boundary_rhs_responses: vec![0.0; active * b],
+            internal_rhs_responses: SparseRows::with_capacity(i, active),
+            boundary_rhs_responses: SparseRows::with_capacity(b, active),
+            active_rhs_values: vec![0.0; active],
             rhs_prepared: false,
             pivot_plan: (0..b).collect(),
             pivot_planned: false,
@@ -1435,8 +1389,7 @@ impl ReducedNonlinear {
             || self.internal_boundary_response.len() != i * b
             || self.internal_boundary_response_by_boundary.len() != b * i
             || self.internal_recovery_work.len() != i
-            || self.internal_rhs_responses.len() != self.active_rhs_nodes.len() * i
-            || self.boundary_rhs_responses.len() != self.active_rhs_nodes.len() * b
+            || self.active_rhs_values.len() != self.active_rhs_nodes.len()
             || self.pivot_plan.len() != b
             || self.refresh_work.len() != 2 * i * i
         {
@@ -1631,16 +1584,18 @@ impl ReducedNonlinear {
             self.rhs_prepared = false;
             return false;
         }
-        self.internal_rhs_base.fill(0.0);
-        self.rhs_internal_correction.fill(0.0);
-        accumulate_rhs_responses(
-            &self.active_rhs_nodes,
-            rhs,
-            &self.internal_rhs_responses,
-            &self.boundary_rhs_responses,
+        for (value, &global) in self.active_rhs_values.iter_mut().zip(&self.active_rhs_nodes) {
+            *value = rhs[global];
+        }
+        accumulate_sparse(
             &mut self.internal_rhs_base,
+            &self.internal_rhs_responses,
+            &self.active_rhs_values,
+        );
+        accumulate_sparse(
             &mut self.rhs_internal_correction,
-            self.avx,
+            &self.boundary_rhs_responses,
+            &self.active_rhs_values,
         );
         for ((value, &global), &correction) in self
             .merit_rhs_base
@@ -2318,12 +2273,11 @@ impl ReducedNonlinear {
         }
         let boundary_major = self.use_boundary_major_recovery();
         if boundary_major {
-            recover_boundary_major_in_place(
+            recover_sparse(
                 &mut self.internal_recovery_work,
                 &self.internal_rhs_base,
-                &self.internal_boundary_response_by_boundary,
+                &self.recovery,
                 &boundary_solution,
-                self.avx,
             );
             for (row, &node) in self.condensed.internal.iter().enumerate() {
                 let value = self.internal_recovery_work[row];
@@ -2498,12 +2452,11 @@ impl ReducedNonlinear {
             moved = moved.max(d.abs() / (tolerance + relative * current[node].abs()));
         }
         if self.use_boundary_major_recovery() {
-            recover_boundary_major_in_place(
+            recover_sparse(
                 &mut self.internal_recovery_work,
                 &self.internal_rhs_base,
-                &self.internal_boundary_response_by_boundary,
+                &self.recovery,
                 &self.reduced_rhs,
-                self.avx,
             );
             for (row, &node) in self.condensed.internal.iter().enumerate() {
                 let value = self.internal_recovery_work[row];
@@ -2677,12 +2630,11 @@ impl ReducedNonlinear {
             full[node] = self.reduced_rhs[index];
         }
         if self.use_boundary_major_recovery() {
-            recover_boundary_major_in_place(
+            recover_sparse(
                 &mut self.internal_recovery_work,
                 &self.internal_rhs_base,
-                &self.internal_boundary_response_by_boundary,
+                &self.recovery,
                 &self.reduced_rhs,
-                self.avx,
             );
             for (row, &node) in self.condensed.internal.iter().enumerate() {
                 full[node] = self.internal_recovery_work[row];
@@ -2724,16 +2676,14 @@ impl ReducedNonlinear {
     fn update_rhs_responses(&mut self) {
         let i = self.condensed.internal.len();
         let b = self.condensed.boundary.len();
-        for (column, &local) in self.active_internal_local.iter().enumerate() {
-            for row in 0..i {
-                self.internal_rhs_responses[column * i + row] =
-                    self.condensed.inverse_internal[row * i + local];
-            }
-            for row in 0..b {
-                self.boundary_rhs_responses[column * b + row] =
-                    self.condensed.boundary_internal[row * i + local];
-            }
-        }
+        let (active, condensed) = (&self.active_internal_local, &self.condensed);
+        let count = active.len();
+        self.internal_rhs_responses.fill(i, count, |row, column| {
+            condensed.inverse_internal[row * i + active[column]]
+        });
+        self.boundary_rhs_responses.fill(b, count, |row, column| {
+            condensed.boundary_internal[row * i + active[column]]
+        });
     }
 
     /// Cache `inv(A_ii) * A_ib` after construction/rebuild. This matrix is
@@ -2754,6 +2704,9 @@ impl ReducedNonlinear {
                 self.internal_boundary_response_by_boundary[column * i + row] = value;
             }
         }
+        let response = &self.internal_boundary_response;
+        self.recovery
+            .fill(i, b, |row, column| response[row * b + column]);
     }
 
     fn update_coupling(&mut self) {
@@ -3937,8 +3890,8 @@ mod tests {
     }
 
     use super::{
-        avx_available, condense, kernels, merit_stamped_fixed_13, recover_boundary_major_in_place,
-        solve_compiled, solve_dense_planned, solve_dense_planned_fixed,
+        avx_available, condense, kernels, merit_stamped_fixed_13, recover_sparse, solve_compiled,
+        SparseRows, solve_dense_planned, solve_dense_planned_fixed,
         solve_dense_planned_fixed_13_reciprocal, solve_dense_planned_search_tail,
         solve_masked_planned, test_thread_cpu_time_ns, ReducedLinear, ReducedNonlinear,
     };
@@ -4001,7 +3954,7 @@ mod tests {
     }
 
     #[test]
-    fn boundary_major_recovery_matches_row_major_bit_for_bit() {
+    fn sparse_recovery_matches_row_major_bit_for_bit() {
         const INTERNAL: usize = 18;
         const BOUNDARY: usize = 13;
         let base: Vec<f64> = (0..INTERNAL)
@@ -4029,22 +3982,17 @@ mod tests {
             legacy[row] = value;
         }
 
-        let mut transposed = vec![0.0; INTERNAL];
-        recover_boundary_major_in_place(&mut transposed, &base, &boundary_major, &boundary, false);
-        let mut wide = vec![0.0; INTERNAL];
-        recover_boundary_major_in_place(&mut wide, &base, &boundary_major, &boundary, true);
-        for (&candidate, &reference) in transposed.iter().zip(&legacy) {
-            assert_eq!(candidate.to_bits(), reference.to_bits());
-        }
-        // The wide kernel is only selected on a CPU that has AVX, and on one
-        // that does not `recover_boundary_major_in_place` ignores the request,
-        // so this compares the scalar body with itself there. Either way the
-        // requirement is the same: bit-for-bit, not merely close.
-        for (&candidate, &reference) in wide.iter().zip(&legacy) {
+        let mut sparse = SparseRows::with_capacity(INTERNAL, BOUNDARY);
+        sparse.fill(INTERNAL, BOUNDARY, |row, column| {
+            boundary_major[column * INTERNAL + row]
+        });
+        let mut recovered = vec![0.0; INTERNAL];
+        recover_sparse(&mut recovered, &base, &sparse, &boundary);
+        for (&candidate, &reference) in recovered.iter().zip(&legacy) {
             assert_eq!(
                 candidate.to_bits(),
                 reference.to_bits(),
-                "the wide recovery kernel must be bit-identical to the row-major dot product"
+                "the sparse recovery must be bit-identical to the row-major dot product"
             );
         }
     }

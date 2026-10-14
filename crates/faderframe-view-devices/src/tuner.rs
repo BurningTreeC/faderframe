@@ -4,7 +4,7 @@
 //! smoothed, so the needle moves calmly and a strobe drifts at the rate the
 //! string is out.
 
-use crate::kit::{self, Ctl, Ctx, Face, KNOB, Meter, MeterKind, Panel, SWITCH_H};
+use crate::kit::{self, Ctl, Ctx, Face, KNOB, Meter, MeterKind, Panel, SMALL, SWITCH_H};
 use crate::values::note_name;
 use faderframe_analysis::pitch::{Detector, FRAMES, note_at};
 use faderframe_core::ParameterId;
@@ -68,7 +68,9 @@ impl TunerFace {
             return;
         }
         let reference = cx.value(pid(id::REFERENCE));
-        self.recent[self.count % 5] = note_at(p.freq, reference);
+        // Shown as a transposing instrument's player reads it.
+        let transpose = cx.value(pid(id::TRANSPOSE)).round();
+        self.recent[self.count % 5] = note_at(p.freq, reference) + transpose;
         self.count += 1;
         let mut sorted = self.recent;
         let have = self.count.min(5);
@@ -82,7 +84,7 @@ impl TunerFace {
         } else {
             self.cents += (cents - self.cents) * 0.35;
         }
-        self.freq = reference * 2f64.powf((median - 69.0) / 12.0);
+        self.freq = reference * 2f64.powf((median - transpose - 69.0) / 12.0);
         self.silent = 0.0;
     }
 }
@@ -100,15 +102,20 @@ impl Face for TunerFace {
         let (display, deck, meter) = kit::frame(size, 130.0, 30.0);
         let s = kit::sections(
             deck,
-            &[("REFERENCE", 3.0), ("DISPLAY", 3.0), ("OUTPUT", 2.6)],
+            &[("REFERENCE", 3.6), ("DISPLAY", 2.6), ("OUTPUT", 2.4)],
         );
         let mut c = Vec::new();
         let r = kit::inside(&s[0]);
-        c.push(Ctl::knob(
-            pid(id::REFERENCE),
-            "A4",
-            Rect::new(r.x + (r.w - KNOB.0) / 2.0, r.y, KNOB.0, KNOB.1),
-        ));
+        let k = kit::row(Rect::new(r.x, r.y, r.w, KNOB.1), &[KNOB.0, SMALL.0]);
+        c.push(Ctl::knob(pid(id::REFERENCE), "A4", k[0]));
+        c.push(
+            Ctl::small(
+                pid(id::TRANSPOSE),
+                "TRANSPOSE",
+                kit::at(k[1], 0.0, 6.0, SMALL.0, SMALL.1),
+            )
+            .bipolar(),
+        );
         let r = kit::inside(&s[1]);
         c.push(Ctl::segments(
             pid(id::DISPLAY),
@@ -184,12 +191,19 @@ impl Face for TunerFace {
             ),
             &TextStyle::new(th.fonts.large, th.ui.text_dim).bold(),
         );
+        let transpose = cx.value(pid(id::TRANSPOSE)).round() as i32;
         let reading = if heard {
             format!(
                 "{:.1} Hz   {}{:.0} ¢",
                 self.freq,
                 if cents >= 0.0 { "+" } else { "−" },
                 cents.abs()
+            )
+        } else if transpose != 0 {
+            format!(
+                "A4 = {:.1} Hz   transposed {}",
+                cx.value(pid(id::REFERENCE)),
+                tun::format(pid(id::TRANSPOSE), f64::from(transpose)).unwrap_or_default()
             )
         } else {
             format!("A4 = {:.1} Hz", cx.value(pid(id::REFERENCE)))
@@ -274,6 +288,9 @@ impl Face for TunerFace {
             id::REFERENCE => "The frequency of A above middle C",
             id::MUTE => "Silence the output while tuning",
             id::DISPLAY => "A needle, or strobe bars that stand still when in tune",
+            id::TRANSPOSE => {
+                "Name the notes as a transposing instrument reads them (B♭: +2, E♭: +9 or −3, F: +7)"
+            }
             _ => return None,
         })
     }

@@ -92,6 +92,7 @@ fn kk_feedback(state: &SurfaceState, f: &mut Feedback) {
     f.cc(15, 0x12, on(state.recording));
     f.cc(15, 0x16, on(state.looping));
     f.cc(15, 0x17, on(state.click));
+    f.cc(15, 0x22, on(state.input_quantize));
     f.cc(15, 0x14, on(!state.playing));
     // Navigation possible both ways.
     f.cc(15, 0x30, 3);
@@ -202,5 +203,33 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// Its Quantize button reaches the host, and its light shows the
+    /// transport's Q (input quantize).
+    #[test]
+    fn the_quantize_light_follows_input_quantize() {
+        let mut p = Mapped::new(&KOMPLETE_KONTROL_MK3);
+        let mut inputs = Vec::new();
+        p.receive(&[0xBF, 0x01, 0x04], &mut inputs);
+        inputs.clear();
+        p.receive(&[0xBF, 0x22, 1], &mut inputs);
+        assert_eq!(
+            inputs[0],
+            SurfaceInput::Button {
+                button: Button::Edit(EditButton::Quantize),
+                pressed: true
+            }
+        );
+        let mut out = Vec::new();
+        let on = SurfaceState {
+            input_quantize: true,
+            ..SurfaceState::default()
+        };
+        p.update(&on, 0.1, &mut out);
+        assert!(out.contains(&vec![0xBF, 0x22, 1]), "lit");
+        out.clear();
+        p.update(&SurfaceState::default(), 0.2, &mut out);
+        assert!(out.contains(&vec![0xBF, 0x22, 0]), "dark");
     }
 }

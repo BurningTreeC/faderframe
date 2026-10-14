@@ -273,7 +273,7 @@ impl PianoRollView {
                 .into_iter()
                 .find(|(_, r, ..)| r.contains(pos))
             {
-                self.toolbar_press(item, rect, model, cx);
+                self.toolbar_press(item, rect, size, model, cx);
             }
             return true;
         }
@@ -373,7 +373,30 @@ impl PianoRollView {
                     return true;
                 }
                 let already = model.selection.notes.contains(&n.id);
-                let mut notes: Vec<NoteId> = if already {
+                // Shift: the notes from the one last clicked to this one —
+                // the keys between theirs, over the time they span.
+                let range = (mods.shift && !mods.toggle())
+                    .then(|| {
+                        let a = m
+                            .notes
+                            .iter()
+                            .find(|x| Some(x.id) == model.selection.anchor_note)?;
+                        let (k0, k1) = (a.key.min(n.key), a.key.max(n.key));
+                        let (t0, t1) = (a.start.min(n.start), a.end().max(n.end()));
+                        Some(
+                            m.notes
+                                .iter()
+                                .filter(|x| {
+                                    (k0..=k1).contains(&x.key) && x.start < t1 && x.end() > t0
+                                })
+                                .map(|x| x.id)
+                                .collect::<Vec<NoteId>>(),
+                        )
+                    })
+                    .flatten();
+                let mut notes: Vec<NoteId> = if let Some(r) = &range {
+                    r.clone()
+                } else if already {
                     Self::selection_ids(m, model)
                 } else if mods.shift {
                     let mut v = Self::selection_ids(m, model);
@@ -382,7 +405,9 @@ impl PianoRollView {
                 } else {
                     vec![n.id]
                 };
-                if mods.toggle() {
+                if let Some(r) = range {
+                    Self::select(cx, r, SelectMode::Replace);
+                } else if mods.toggle() {
                     Self::select(cx, vec![n.id], SelectMode::Toggle);
                     if already {
                         return true;
@@ -416,6 +441,7 @@ impl PianoRollView {
                             dk: 0,
                             moved: false,
                             copy: mods.alt,
+                            keep: mods.shift || mods.toggle(),
                         });
                     }
                 }
@@ -735,13 +761,14 @@ impl PianoRollView {
                 dk,
                 moved,
                 copy,
+                keep,
                 ..
             } => {
                 cx.emit(Action::AuditionOff);
                 if !moved {
                     // A plain click on one of several selected notes selects
                     // just that one.
-                    if notes.len() > 1 && model.selection.notes.contains(&grab.id) {
+                    if !keep && notes.len() > 1 && model.selection.notes.contains(&grab.id) {
                         Self::select(cx, vec![grab.id], SelectMode::Replace);
                     }
                 } else if copy {
@@ -1491,6 +1518,50 @@ impl PianoRollView {
         true
     }
 
+    /// A zoom button: in or out around the middle, the selection, the clip.
+    pub(crate) fn zoom(&mut self, z: crate::toolbar::Zoom, size: Size, model: &Session) {
+        use crate::toolbar::Zoom;
+        let g = self.layout(size).grid;
+        let Some((_, _, m)) = Self::clip(model) else {
+            return;
+        };
+        let notes: Vec<&MidiNote> = match z {
+            Zoom::Selection => Self::selected(m, model),
+            _ => m.notes.iter().collect(),
+        };
+        let span = match z {
+            Zoom::In => return self.zoom_x(1.6, g.center().x),
+            Zoom::Out => return self.zoom_x(1.0 / 1.6, g.center().x),
+            Zoom::Fit => Some((MusicalTime::ZERO, m.length)),
+            Zoom::Selection => {
+                let a = notes.iter().map(|n| n.start).min();
+                let b = notes.iter().map(|n| n.end()).max();
+                a.zip(b)
+            }
+        };
+        let Some((a, b)) = span else {
+            return;
+        };
+        // Time: the span fills the grid's width (a little margin).
+        let q = (b - a).quarters().max(0.25) as f32;
+        self.ppq = (g.w * 0.94 / q).clamp(8.0, 1200.0);
+        self.scroll_x = (a.quarters() as f32 * self.ppq - g.w * 0.03).max(0.0);
+        // Keys: the rows from the highest note to the lowest.
+        let hi = notes.iter().map(|n| n.key).max();
+        let lo = notes.iter().map(|n| n.key).min();
+        if let (Some(hi), Some(lo)) = (hi, lo)
+            && let (Some(top), Some(bottom)) = (self.row_of(hi), self.row_of(lo))
+        {
+            let (top, bottom) = (top.min(bottom), top.max(bottom));
+            let rows = (bottom - top + 1) as f32 + 2.0;
+            self.row_h = (g.h / rows).clamp(6.0, 36.0);
+            let middle = (top + bottom + 1) as f32 / 2.0 * self.row_h;
+            self.scroll_y = middle - g.h / 2.0;
+        }
+        self.auto_centre = false;
+        self.clamp_scroll(size, m.length);
+    }
+
     fn zoom_x(&mut self, factor: f32, anchor_x: f32) {
         let t = self.time_at(anchor_x);
         self.ppq = (self.ppq * factor).clamp(8.0, 1200.0);
@@ -1512,7 +1583,8 @@ impl PianoRollView {
         let len = Self::clip(model).map_or(MusicalTime::QUARTER, |(_, _, m)| m.length);
         self.auto_centre = false;
         let steps = if precise { dy / 30.0 } else { dy };
-        if mods.ctrl && mods.shift {
+        // Alt (as for the arranger's track heights) or Ctrl+Shift.
+        if (mods.alt && !mods.ctrl) || (mods.ctrl && mods.shift) {
             // Row height around the pointer.
             let key = self.key_at(pos.y);
             let row = self.row_of(key).unwrap_or(0) as f32;

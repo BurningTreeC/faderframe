@@ -511,8 +511,29 @@ impl Processor<EngineContext> for AudioClipPlayer {
             let to = from + n as i64;
             match play {
                 Play::Arrangement => {
-                    if let Some(lane) = timeline.lane(self.track) {
-                        self.play_span(lane, out, from, to, pos);
+                    let Some(lane) = timeline.lane(self.track) else {
+                        continue;
+                    };
+                    // Counting in: nothing before the take starts.
+                    let from = match cx.data.recording.silent_before(t.recording) {
+                        Some(start) if start >= to => continue,
+                        Some(start) => from.max(start),
+                        None => from,
+                    };
+                    let n = (to - from) as usize;
+                    // Recording this track: inside the record window the
+                    // take replaces what is there, so that stays silent.
+                    match cx.data.recording.inside(self.track, t.recording, from, n) {
+                        Some((a, b)) => {
+                            let (a, b) = (from + a as i64, from + b as i64);
+                            if from < a {
+                                self.play_span(lane, out, from, a, pos);
+                            }
+                            if b < to {
+                                self.play_span(lane, out, b, to, pos);
+                            }
+                        }
+                        None => self.play_span(lane, out, from, to, pos),
                     }
                 }
                 Play::Clip { slot, start } => {

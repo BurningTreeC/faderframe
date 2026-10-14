@@ -268,6 +268,8 @@ impl EqView {
                 let index = match item {
                     OutputItem::Gain => Some(global::OUTPUT),
                     OutputItem::Pan => Some(global::PAN),
+                    OutputItem::Mix => Some(global::MIX),
+                    OutputItem::Drive => Some(global::CHARACTER_DRIVE),
                     OutputItem::Scale => Some(global::GAIN_SCALE),
                     OutputItem::PanMode => Some(global::PAN_MODE),
                     OutputItem::Invert => Some(global::INVERT),
@@ -692,6 +694,10 @@ impl EqView {
             return;
         };
         let scale = Self::scale(&tap).max(0.01);
+        // Solo While Dragging: the band held is heard alone once the drag
+        // has begun (set here, done after the borrow of the drag ends).
+        let mut solo_now = None;
+        let solo_drag = self.settings(model).solo_drag;
         match &mut self.drag {
             Some(Drag::Pending { start, sketch }) => {
                 if start.distance(pos) < SLOP {
@@ -747,6 +753,9 @@ impl EqView {
                     }
                     *moved = true;
                     *click = None;
+                    if solo_drag {
+                        solo_now = Some(*anchor);
+                    }
                 }
                 if !*began {
                     *began = true;
@@ -898,6 +907,9 @@ impl EqView {
                 );
             }
             None => {}
+        }
+        if let Some(b) = solo_now {
+            self.listen(model, Some(b));
         }
     }
 
@@ -1330,14 +1342,15 @@ impl EqView {
         let flip = |g: usize| if tap.params.get(g) >= 0.5 { 0.0 } else { 1.0 };
         let _ = size;
         match item {
-            OutputItem::Gain | OutputItem::Pan => {
-                let index = if item == OutputItem::Gain {
-                    global::OUTPUT
-                } else {
-                    global::PAN
+            OutputItem::Gain | OutputItem::Pan | OutputItem::Mix | OutputItem::Drive => {
+                let (index, home) = match item {
+                    OutputItem::Gain => (global::OUTPUT, 0.0),
+                    OutputItem::Pan => (global::PAN, 0.0),
+                    OutputItem::Mix => (global::MIX, 1.0),
+                    _ => (global::CHARACTER_DRIVE, 1.0),
                 };
                 if clicks >= 2 {
-                    self.set_once(model, cx, global_id(index), 0.0);
+                    self.set_once(model, cx, global_id(index), home);
                 } else {
                     cx.emit(Action::BeginGesture("EQ Output".into()));
                     self.drag = Some(Drag::Global {
@@ -1802,7 +1815,48 @@ impl EqView {
             if let Some(a) = self.batch(model, "Delete EQ Bands", &changes) {
                 items.push(MenuItem::new("Delete All Bands", a));
             }
+            // Every band's gain to zero (and static), or the other way.
+            let gained: Vec<(usize, BandParams)> = used
+                .iter()
+                .map(|b| (*b, BandParams::read(&tap.params, *b)))
+                .filter(|(_, p)| p.kind.has_gain())
+                .collect();
+            if !gained.is_empty() {
+                let flat: Vec<_> = gained
+                    .iter()
+                    .flat_map(|(b, _)| {
+                        [
+                            (band_id(*b, Field::Gain), 0.0),
+                            (band_id(*b, Field::Range), 0.0),
+                        ]
+                    })
+                    .collect();
+                if let Some(a) = self.batch(model, "Flatten EQ", &flat) {
+                    items.push(MenuItem::new("Flatten All Gains", a).separated());
+                }
+                let inverted: Vec<_> = gained
+                    .iter()
+                    .flat_map(|(b, p)| {
+                        [
+                            (band_id(*b, Field::Gain), -p.gain),
+                            (band_id(*b, Field::Range), -p.range),
+                        ]
+                    })
+                    .collect();
+                if let Some(a) = self.batch(model, "Invert EQ Gains", &inverted) {
+                    items.push(MenuItem::new("Invert All Gains", a));
+                }
+            }
         }
+        let solo_drag = self.settings(model).solo_drag;
+        items.push(
+            MenuItem::new(
+                "Solo While Dragging",
+                self.view_action(key::SOLO_DRAG, if solo_drag { 0.0 } else { 1.0 }),
+            )
+            .checked(solo_drag)
+            .separated(),
+        );
         Some(HostRequest::ContextMenu { at, items })
     }
 
@@ -1957,10 +2011,15 @@ impl EqView {
                 Hit::Bottom(BottomItem::Mode) => "Zero latency, natural phase (the analog phase too, 128 samples) or linear phase (no phase shift)",
                 Hit::Bottom(BottomItem::Instances) => "Every EQ in the project: their spectra, collisions, EQ Match",
                 Hit::Bottom(BottomItem::Analyser) => "The analyser: pre, post, the external spectrum, and its settings",
-                Hit::Bottom(BottomItem::Character) => "Clean, Subtle (transformer) or Warm (tube) colour",
+                Hit::Bottom(BottomItem::Character) => "Character: Clean, Subtle (transformer), Warm (tube), Console (line amplifier) or Tape; its oversampling and drive",
                 Hit::Bottom(BottomItem::AutoGain) => "Keep the loudness of pink noise where it was",
                 Hit::Bottom(BottomItem::Bypass) => "Bypass the whole EQ (soft and latency compensated)",
-                Hit::Bottom(BottomItem::Output) => "Output gain, pan, phase invert, gain scale",
+                Hit::Bottom(BottomItem::Output) => "Output gain, pan, mix, character drive, phase invert, gain scale",
+                Hit::Output(OutputItem::Mix) => "Mix: the EQ against the input (delayed by the latency) — parallel EQ; double-click: 100 %",
+                Hit::Output(OutputItem::Drive) => "How hard the character stage is driven (the level is kept); double-click: 100 %",
+                Hit::Output(OutputItem::Gain) => "Output gain; double-click: 0 dB",
+                Hit::Output(OutputItem::Pan) => "Output pan (left/right or mid/side); double-click: centre",
+                Hit::Output(OutputItem::Scale) => "Gain scale: every band's gain scaled; double-click: 100 %",
                 Hit::Panel(PanelItem::Ring) => "Dynamic range: drag to make the band move with the level (double-click: static)",
                 Hit::Panel(PanelItem::Expand) => "The dynamics' own settings (else all automatic)",
                 Hit::Panel(PanelItem::Spectral) => "Spectral dynamics: only the frequencies over the threshold move",

@@ -1,5 +1,6 @@
 //! The Delay's face: the repeats on a timeline (left up, right down; their
-//! height what feedback leaves of them), the times as set, what one pass
+//! height what feedback leaves of them, their spread the diffusion), the
+//! times as set (each side's note value when unlinked), what one pass
 //! through the loop does to the spectrum, the controls and meters.
 
 use crate::kit::{
@@ -58,24 +59,30 @@ impl Face for DelayFace {
     }
 
     fn min_size(&self) -> Size {
-        Size::new(940.0, 470.0)
+        Size::new(1_000.0, 480.0)
     }
 
     fn panel(&self, size: Size) -> Panel {
-        let (display, deck, meter) = kit::frame(size, 196.0, 48.0);
+        let (display, deck, meter) = kit::frame(size, 206.0, 48.0);
         let s = kit::sections(
             deck,
             &[
-                ("TIME", 5.6),
-                ("FEEDBACK", 2.4),
-                ("LOOP", 4.6),
-                ("WOW", 2.6),
-                ("OUTPUT", 4.2),
+                ("TIME", 6.2),
+                ("FEEDBACK", 1.9),
+                ("LOOP", 5.8),
+                ("MOTION", 3.5),
+                ("OUTPUT", 3.6),
             ],
         );
         let mut c = Vec::new();
         let r = kit::inside(&s[0]);
-        let k = kit::row(Rect::new(r.x, r.y, r.w * 0.6, KNOB.1), &[KNOB.0, SMALL.0]);
+        // Left: the time, the offset; the right side's own time and note;
+        // a column of sync, note and link.
+        let side_w = 66.0;
+        let k = kit::row(
+            Rect::new(r.x, r.y, r.w - side_w - 6.0, KNOB.1),
+            &[KNOB.0, SMALL.0, SMALL.0],
+        );
         c.push(Ctl::knob(pid(id::TIME), "TIME", k[0]).scaled(Scale::Log));
         c.push(
             Ctl::small(
@@ -85,7 +92,20 @@ impl Face for DelayFace {
             )
             .bipolar(),
         );
-        let side = Rect::new(r.x + r.w * 0.6 + 2.0, r.y, r.w * 0.4 - 8.0, r.h);
+        c.push(
+            Ctl::small(
+                pid(id::TIME_R),
+                "TIME R",
+                kit::at(k[2], 0.0, 6.0, SMALL.0, SMALL.1),
+            )
+            .scaled(Scale::Log),
+        );
+        c.push(Ctl::choice(
+            pid(id::DIVISION_R),
+            "NOTE R",
+            Rect::new(k[2].x - 4.0, r.y + SMALL.1 + 8.0, SMALL.0 + 8.0, 38.0),
+        ));
+        let side = Rect::new(r.right() - side_w, r.y, side_w, r.h);
         c.push(Ctl::toggle(
             pid(id::SYNC),
             "Sync",
@@ -96,10 +116,20 @@ impl Face for DelayFace {
             "NOTE",
             Rect::new(side.x, side.y + 34.0, side.w, 38.0),
         ));
+        c.push(Ctl::toggle(
+            pid(id::LINK),
+            "Link",
+            Rect::new(side.x, side.y + SMALL.1 + 24.0, side.w, SWITCH_H),
+        ));
         c.push(Ctl::segments(
             pid(id::MODE),
             "MODE",
-            Rect::new(r.x + 8.0, r.y + KNOB.1 + 10.0, r.w - 16.0, 38.0),
+            Rect::new(
+                r.x + 4.0,
+                r.y + KNOB.1 + 10.0,
+                k[1].right() - r.x - 4.0,
+                38.0,
+            ),
         ));
         let r = kit::inside(&s[1]);
         c.push(Ctl::knob(
@@ -115,28 +145,35 @@ impl Face for DelayFace {
         let r = kit::inside(&s[2]);
         let k = kit::row(
             Rect::new(r.x, r.y, r.w, SMALL.1),
-            &[SMALL.0, SMALL.0, SMALL.0],
+            &[SMALL.0, SMALL.0, SMALL.0, SMALL.0],
         );
         c.push(Ctl::small(pid(id::LOW_CUT), "LOW CUT", k[0]).scaled(Scale::Log));
         c.push(Ctl::small(pid(id::DAMPING), "DAMPING", k[1]));
-        c.push(Ctl::small(pid(id::SATURATION), "DRIVE", k[2]));
+        c.push(Ctl::small(pid(id::TILT), "TILT", k[2]).bipolar());
+        c.push(Ctl::small(pid(id::SATURATION), "DRIVE", k[3]));
         c.push(Ctl::segments(
             pid(id::STYLE),
             "STYLE",
-            Rect::new(r.x + 8.0, r.bottom() - 40.0, r.w - 16.0, 38.0),
+            Rect::new(r.x + 8.0, r.y + SMALL.1 + 8.0, r.w - 16.0, 38.0),
         ));
+        // Motion: the tape's wow and the chorus, each depth over rate.
         let r = kit::inside(&s[3]);
-        let k = kit::spread(Rect::new(r.x, r.y, r.w, SMALL.1 * 2.0 + 8.0), 1, SMALL.0);
-        c.push(Ctl::small(
-            pid(id::WOW),
-            "DEPTH",
-            Rect::new(k[0].x, r.y, SMALL.0, SMALL.1),
-        ));
+        let k = kit::row(Rect::new(r.x, r.y, r.w, SMALL.1), &[SMALL.0, SMALL.0]);
+        c.push(Ctl::small(pid(id::WOW), "WOW", k[0]));
         c.push(
             Ctl::small(
                 pid(id::WOW_RATE),
+                "WOW RATE",
+                kit::at(k[0], 0.0, SMALL.1 + 6.0, SMALL.0, SMALL.1),
+            )
+            .scaled(Scale::Log),
+        );
+        c.push(Ctl::small(pid(id::MODULATION), "CHORUS", k[1]));
+        c.push(
+            Ctl::small(
+                pid(id::MOD_RATE),
                 "RATE",
-                Rect::new(k[0].x, r.y + SMALL.1 + 6.0, SMALL.0, SMALL.1),
+                kit::at(k[1], 0.0, SMALL.1 + 6.0, SMALL.0, SMALL.1),
             )
             .scaled(Scale::Log),
         );
@@ -148,16 +185,12 @@ impl Face for DelayFace {
             "WIDTH",
             kit::at(k[1], 0.0, 6.0, SMALL.0, SMALL.1),
         ));
-        c.push(Ctl::small(
-            pid(id::DUCKING),
-            "DUCKING",
-            Rect::new(
-                r.x + (r.w - SMALL.0) / 2.0,
-                r.y + KNOB.1 + 4.0,
-                SMALL.0,
-                SMALL.1,
-            ),
-        ));
+        let k = kit::row(
+            Rect::new(r.x, r.y + KNOB.1 + 2.0, r.w, SMALL.1),
+            &[SMALL.0, SMALL.0],
+        );
+        c.push(Ctl::small(pid(id::DIFFUSION), "DIFFUSE", k[0]));
+        c.push(Ctl::small(pid(id::DUCKING), "DUCKING", k[1]));
         let w = (meter.w - 4.0) / 2.0;
         let meters = vec![
             Meter {
@@ -209,12 +242,22 @@ impl Face for DelayFace {
                 format!("{:.0} ms", t * 1000.0)
             }
         };
+        let linked = cx.on(pid(id::LINK)) || mode == 2;
         if synced {
-            p.text(
-                division_name(cx.value(pid(id::DIVISION)).round().max(0.0) as usize),
-                Rect::new(times.x, times.y + 34.0, times.w, 34.0),
-                &big,
-            );
+            let note = |id: u32| division_name(cx.value(pid(id)).round().max(0.0) as usize);
+            if linked {
+                p.text(
+                    note(id::DIVISION),
+                    Rect::new(times.x, times.y + 34.0, times.w, 34.0),
+                    &big,
+                );
+            } else {
+                p.text(
+                    &format!("{} · {}", note(id::DIVISION), note(id::DIVISION_R)),
+                    Rect::new(times.x, times.y + 34.0, times.w, 34.0),
+                    &TextStyle::new(th.fonts.large, self.accent).bold().center(),
+                );
+            }
             p.text(
                 &ms(tl),
                 Rect::new(times.x, times.y + 70.0, times.w, 16.0),
@@ -262,7 +305,12 @@ impl Face for DelayFace {
             if synced { "SYNCED" } else { "FREE" },
             synced,
         );
-        badge(p, times.bottom() - 28.0, "FROZEN", frozen);
+        badge(
+            p,
+            times.bottom() - 28.0,
+            if frozen { "FROZEN" } else { "UNLINKED" },
+            frozen || !linked,
+        );
         // The timeline.
         p.fill_rounded(line, 4.0, &Paint::Solid(th.device.display.darken(0.12)));
         let span = Self::span(tl, tr);
@@ -295,7 +343,11 @@ impl Face for DelayFace {
         self.wet = peak.max(self.wet * (1.0 - 2.0 * cx.dt).max(0.0));
         let glow = 0.5 + 0.5 * self.wet.min(1.0);
         let h = line.h / 2.0 - 14.0;
-        let stem = |p: &mut dyn Painter, t: f64, level: f64, up: bool, alpha: f32| {
+        // Diffusion smears each repeat over the diffusers' length (and
+        // more with every pass).
+        let diffusion = cx.value(pid(id::DIFFUSION));
+        let smear = diffusion * dly::diffuser_seconds(true);
+        let stem = |p: &mut dyn Painter, t: f64, level: f64, up: bool, alpha: f32, k: i32| {
             let x = x_of(t);
             let len = h * level.clamp(0.0, 1.0) as f32;
             let (a, b) = if up {
@@ -303,6 +355,14 @@ impl Face for DelayFace {
             } else {
                 (mid, mid + len)
             };
+            if smear > 0.0 {
+                let w = ((x_of(t + smear * f64::from(k)) - x) * 2.0).max(4.0);
+                p.fill_rounded(
+                    Rect::new(x - 2.5, a, w, (b - a).max(1.0)),
+                    2.0,
+                    &Paint::Solid(self.accent.with_alpha(alpha * 0.3)),
+                );
+            }
             p.fill_rounded(
                 Rect::new(x - 2.5, a, 5.0, (b - a).max(1.0)),
                 2.0,
@@ -330,15 +390,15 @@ impl Face for DelayFace {
                     // right one more, left…
                     at += if k % 2 == 1 { tl } else { tr };
                     if at <= span {
-                        stem(p, at, level, k % 2 == 1, a);
+                        stem(p, at, level, k % 2 == 1, a, k);
                     }
                 }
                 _ => {
                     if tl * f64::from(k) <= span {
-                        stem(p, tl * f64::from(k), level, true, a);
+                        stem(p, tl * f64::from(k), level, true, a, k);
                     }
                     if tr * f64::from(k) <= span {
-                        stem(p, tr * f64::from(k), level, false, a);
+                        stem(p, tr * f64::from(k), level, false, a, k);
                     }
                 }
             }
@@ -361,6 +421,7 @@ impl Face for DelayFace {
         let rate = f64::from(cx.model.sample_rate().max(8_000));
         let low = cx.value(pid(id::LOW_CUT));
         let damping = dly::damping_hz(cx.value(pid(id::DAMPING)), rate);
+        let tilt = cx.value(pid(id::TILT));
         let style = cx.value(pid(id::STYLE)).round() as i64;
         let to_y = |d: f64| plot.y + plot.h * ((6.0 - d) / 36.0).clamp(0.0, 1.0) as f32;
         for d in [0.0, -12.0, -24.0] {
@@ -377,6 +438,9 @@ impl Face for DelayFace {
                 }
                 if let Some(hz) = damping {
                     d += -10.0 * (1.0 + (f / hz).powi(2)).log10();
+                }
+                if tilt.abs() >= 0.05 {
+                    d += band_db(&tilt_shape(tilt), rate, f);
                 }
                 match style {
                     1 => {
@@ -450,6 +514,13 @@ impl Face for DelayFace {
         Some(match pid.0 {
             id::MODE => "Stereo (each side its own), Ping-Pong (repeats cross), Mono",
             id::OFFSET => "The right side's time longer or shorter",
+            id::LINK => "The right side follows the left; off, it has its own time and note",
+            id::TIME_R => "The right side's own time (unlinked, free)",
+            id::DIVISION_R => "The right side's own note value (unlinked, synced)",
+            id::TILT => "Each pass tilts brighter (right) or darker (left) round 1 kHz",
+            id::DIFFUSION => "Each repeat smeared into a short cloud",
+            id::MODULATION => "A chorus on the repeats",
+            id::MOD_RATE => "How fast the chorus moves",
             id::DAMPING => "Each pass loses its highs",
             id::LOW_CUT => "Each pass loses its lows",
             id::SATURATION => "Each pass is driven a little",
@@ -468,6 +539,16 @@ fn cut(kind: BandType, freq: f64) -> BandShape {
         kind,
         freq,
         gain: 0.0,
+        q: std::f64::consts::FRAC_1_SQRT_2,
+        slope: 12.0,
+    }
+}
+
+fn tilt_shape(gain: f64) -> BandShape {
+    BandShape {
+        kind: BandType::TiltShelf,
+        freq: dly::TILT_HZ,
+        gain,
         q: std::f64::consts::FRAC_1_SQRT_2,
         slope: 12.0,
     }

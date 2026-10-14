@@ -167,6 +167,8 @@ impl Preamp {
         let net = console_bus::build(family, 10_000.0)?;
         let inner = rate.max(1.0) * OVERSAMPLING as f64;
         let mut circuit = Simulation::new(net, inner);
+        // As the microphone models (see `Self::with_line`).
+        circuit.set_early_acceptance(true);
         if let Some(c) = console_bus::control(family) {
             circuit.set_control(0, c);
         }
@@ -239,13 +241,19 @@ impl Preamp {
         let net = netlist(model)?;
         let rate = rate.max(1.0);
         let mut circuit = Simulation::new(net, rate * OVERSAMPLING as f64);
+        // A solve stops after one Newton pass where a second would only
+        // confirm it (see `Simulation::set_early_acceptance`): about a third
+        // of the work of a steady signal, at -117 dB or less.
+        circuit.set_early_acceptance(true);
         circuit.set_control(0, gain.clamp(0.0, 1.0));
         circuit.reset();
         let line = if model == 0 {
-            Some(Simulation::new(
+            let mut line = Simulation::new(
                 neve::output(LINE_SOURCE, if bridging { BRIDGING } else { TERMINATED })?,
                 rate * OVERSAMPLING as f64,
-            ))
+            );
+            line.set_early_acceptance(true);
+            Some(line)
         } else {
             None
         };

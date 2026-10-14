@@ -224,11 +224,15 @@ fn title_of(app: &AppState, plugin: PluginInstanceId) -> Option<(TrackId, String
         let master = s.project().master_id()?;
         return Some((
             master,
-            format!("{} — {} (album)", slot.plugin.name, song.title),
+            format!(
+                "{} — {} (album)",
+                faderframe_project::device_name(&song.inserts, slot),
+                song.title
+            ),
         ));
     }
     let (t, slot) = s.plugin_slot(plugin)?;
-    Some((t.id, format!("{} — {}", slot.plugin.name, t.name)))
+    Some((t.id, format!("{} — {}", t.name_of(slot), t.name)))
 }
 
 /// Show `plugin`'s editor: its own GUI unless `generic` (or it has none).
@@ -502,7 +506,8 @@ fn open_device(app: &Rc<AppState>, plugin: PluginInstanceId) -> bool {
         }
         (
             slot.plugin.id.clone(),
-            slot.plugin.name.clone(),
+            s.device_name(plugin)
+                .unwrap_or_else(|| slot.plugin.name.clone()),
             track,
             slot.bypass,
         )
@@ -1182,7 +1187,10 @@ fn open_generic(app: &Rc<AppState>, plugin: PluginInstanceId) {
                 .find(|p| p.plugin.id == slot.plugin.id && p.plugin.format == slot.plugin.format)
                 .map(|p| p.vendor)
                 .unwrap_or_default();
-            (vendor, slot.bypass, slot.plugin.name.clone())
+            let name = s
+                .device_name(plugin)
+                .unwrap_or_else(|| slot.plugin.name.clone());
+            (vendor, slot.bypass, name)
         });
         let Some((vendor, bypassed, name)) = info else {
             return;

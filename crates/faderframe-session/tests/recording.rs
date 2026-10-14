@@ -396,3 +396,60 @@ fn the_record_button_starts_playing_and_warns_when_nothing_is_armed() {
     assert_eq!(n.level, faderframe_session::NoticeLevel::Warning);
     assert!(n.text.starts_with("Nothing is armed"), "{}", n.text);
 }
+
+/// Pre-roll in bars, beats or seconds, from the bar line or exactly; a
+/// post-roll after the punch-out stops playback and ends the take.
+#[test]
+fn pre_and_post_roll_lengths_and_the_post_roll_stop() {
+    use faderframe_session::Roll;
+    let (mut s, t) = session();
+    // 120 BPM 4/4: a beat is 24 000 samples, a bar 96 000.
+    let from = 5 * 96_000 + 24_000;
+    let back = |s: &Session, r: Roll, on_bar: bool| s.roll_back_for_tests(from, r, on_bar);
+    assert_eq!(back(&s, Roll::bars(1.0), true), 4 * 96_000);
+    assert_eq!(back(&s, Roll::bars(1.0), false), from - 96_000);
+    assert_eq!(back(&s, Roll::bars(1.5), false), from - 144_000);
+    assert_eq!(back(&s, Roll::beats(2.0), false), from - 48_000);
+    assert_eq!(back(&s, Roll::beats(2.0), true), 4 * 96_000);
+    assert_eq!(back(&s, Roll::seconds(1.0), false), from - 48_000);
+    assert_eq!(back(&s, Roll::bars(9.0), false), 0, "not before the start");
+    assert_eq!(back(&s, Roll::OFF, true), from);
+    let on = |s: &Session, r: Roll| s.roll_on_for_tests(5 * 96_000, r);
+    assert_eq!(on(&s, Roll::bars(1.0)), 6 * 96_000);
+    assert_eq!(on(&s, Roll::beats(2.0)), 5 * 96_000 + 48_000);
+    assert_eq!(on(&s, Roll::seconds(2.0)), 6 * 96_000);
+    for r in Roll::PRESETS {
+        assert_eq!(Roll::from_id(&r.id()), Some(r), "{}", r.label());
+    }
+
+    // Punch 0.1–0.3 s, a post-roll of a quarter of a second: playback
+    // stops at 0.55 s by itself and the take is placed.
+    let mut r = s.record;
+    r.postroll = Roll::seconds(0.25);
+    s.dispatch(Action::SetRecordSettings(r)).unwrap();
+    let range = MusicalRange::new(secs(&s, 0.1), secs(&s, 0.3)).unwrap();
+    s.dispatch(Action::Transport(TransportAction::SetPunch(Some(range))))
+        .unwrap();
+    s.dispatch(Action::Transport(TransportAction::TogglePunch))
+        .unwrap();
+    s.dispatch(Action::Transport(TransportAction::ToggleRecord))
+        .unwrap();
+    s.dispatch(Action::Transport(TransportAction::Play))
+        .unwrap();
+    wait_position(&mut s, 0.2);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while s.transport().playing && Instant::now() < deadline {
+        s.tick(0.005);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!s.transport().playing, "the post-roll stops playback");
+    assert!(
+        (s.processing_position() - 26_400).abs() < 2_000 || s.processing_position() == 0,
+        "stopped at 0.55 s (or back at the start): {}",
+        s.processing_position()
+    );
+    s.wait_for_recordings();
+    let c = clips(&s, t);
+    assert_eq!(c.len(), 1, "the take is placed");
+    assert_eq!(c[0].start, range.start);
+}

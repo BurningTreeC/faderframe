@@ -9,8 +9,9 @@
 //!   an external spectrum (outlined): the sidechain, or any other EQ's
 //!   output. Where the output and the external spectrum crowd the same
 //!   frequencies they glow red (collisions). Resolution, speed, range,
-//!   tilt and freeze are settings; hovering still over the spectrum for a
-//!   moment offers its peaks to grab and drag into bells (Spectrum Grab).
+//!   tilt, freeze and a peak hold line are settings; hovering still over
+//!   the spectrum for a moment offers its peaks to grab and drag into
+//!   bells (Spectrum Grab).
 //! * Bands are created by clicking or double-clicking (the shape follows
 //!   where: cuts at the ends, a notch low down, bells elsewhere), by
 //!   dragging the overall curve (shelves at its ends), with Alt for a
@@ -22,8 +23,9 @@
 //!   changes its shape, Alt+Shift its slope; double-click types a value
 //!   ("1k", "A4", "C#2+13").
 //! * Next to a band its values can be dragged, scrolled or typed, it can be
-//!   heard on its own (hold the solo button or the middle button), bypassed
-//!   or deleted.
+//!   heard on its own (hold the solo button or the middle button — or,
+//!   with Solo While Dragging, whenever it is dragged), bypassed or
+//!   deleted. The background menu flattens or inverts every band's gain.
 //! * The piano display quantizes band frequencies to notes (a double-click
 //!   on a key adds a band on its note); the frequency scale zooms (drag up
 //!   and down) and scrolls (drag sideways).
@@ -70,6 +72,10 @@ pub(crate) mod key {
     pub const FREEZE: &str = "eq.analyser.freeze";
     pub const GRAB: &str = "eq.analyser.grab";
     pub const COLLISIONS: &str = "eq.analyser.collisions";
+    /// A line holding the output spectrum's peaks.
+    pub const PEAK_HOLD: &str = "eq.analyser.hold";
+    /// A band dragged is heard on its own meanwhile.
+    pub const SOLO_DRAG: &str = "eq.solo_drag";
     pub const DISPLAY: &str = "eq.display.range";
     pub const PIANO: &str = "eq.display.piano";
     pub const SKETCH: &str = "eq.sketch";
@@ -116,6 +122,8 @@ pub(crate) struct Settings {
     pub freeze: bool,
     pub grab: bool,
     pub collisions: bool,
+    pub peak_hold: bool,
+    pub solo_drag: bool,
     pub display: f32,
     pub piano: bool,
     pub sketch: bool,
@@ -324,6 +332,8 @@ impl EqView {
             freeze: on(key::FREEZE, false),
             grab: on(key::GRAB, true),
             collisions: on(key::COLLISIONS, true),
+            peak_hold: on(key::PEAK_HOLD, false),
+            solo_drag: on(key::SOLO_DRAG, false),
             display: DISPLAY_RANGES[pick(key::DISPLAY, 2, DISPLAY_RANGES.len())],
             piano: on(key::PIANO, false),
             sketch: on(key::SKETCH, false),
@@ -381,6 +391,11 @@ impl EqView {
 
     pub(crate) fn interact(tap: &AnalysisTap) -> bool {
         tap.params.get(global::GAIN_Q) >= 0.5
+    }
+
+    /// The character stage's oversampling factor as set.
+    pub(crate) fn oversampling(tap: &AnalysisTap) -> usize {
+        faderframe_plugin_host::eq::oversampling(&tap.params)
     }
 
     pub(crate) fn band_color(band: usize) -> Color {

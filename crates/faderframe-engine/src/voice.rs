@@ -9,13 +9,16 @@
 //! track takes, see [`crate::EngineController::add_voice`]). Each event
 //! also keeps how much earlier its sound began (the block's `early`): a
 //! recording puts it there. A copy of each goes to the control side
-//! (Capture MIDI, activity), stamped with when it was sung.
+//! (Capture MIDI, activity), stamped with when it was sung, and what each
+//! listener hears is counted by level for it ([`VoiceRun::meter`]: a
+//! calibration, the input's level).
 
 use crate::midi::MidiInputState;
 use faderframe_analysis::polyvoice::PolyTracker;
-use faderframe_analysis::voice::{VoiceConfig, VoiceEvent, VoiceTracker};
+use faderframe_analysis::voice::{Meter, VoiceConfig, VoiceEvent, VoiceTracker};
 use faderframe_midi::{ExpressionValue, MidiEvent, MidiInputEvent, NoteExpressionKind};
 use faderframe_realtime::TryCell;
+use std::sync::Arc;
 
 /// How sung pitch moves between notes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -47,6 +50,8 @@ pub struct VoiceRun {
     /// The device rate the tracker was made for (it waits for it).
     rate: u32,
     feed: rtrb::Producer<MidiInputEvent>,
+    /// What the tracker hears, counted for the control side (calibration).
+    meter: Arc<Meter>,
 }
 
 enum Tracker {
@@ -167,12 +172,15 @@ impl VoiceRun {
         config: VoiceConfig,
         glide: Glide,
     ) -> (Self, rtrb::Consumer<MidiInputEvent>) {
+        let meter = Arc::new(Meter::new());
+        let tracker = VoiceTracker::new(f64::from(rate), config).with_meter(meter.clone());
         Self::with_tracker(
             channel,
             port,
             rate,
             glide,
-            Tracker::Mono(Box::new(VoiceTracker::new(f64::from(rate), config))),
+            Tracker::Mono(Box::new(tracker)),
+            meter,
         )
     }
 
@@ -185,12 +193,15 @@ impl VoiceRun {
         config: VoiceConfig,
         glide: Glide,
     ) -> (Self, rtrb::Consumer<MidiInputEvent>) {
+        let meter = Arc::new(Meter::new());
+        let tracker = PolyTracker::new(f64::from(rate), config).with_meter(meter.clone());
         Self::with_tracker(
             channel,
             port,
             rate,
             glide,
-            Tracker::Poly(Box::new(PolyTracker::new(f64::from(rate), config))),
+            Tracker::Poly(Box::new(tracker)),
+            meter,
         )
     }
 
@@ -200,6 +211,7 @@ impl VoiceRun {
         rate: u32,
         glide: Glide,
         tracker: Tracker,
+        meter: Arc<Meter>,
     ) -> (Self, rtrb::Consumer<MidiInputEvent>) {
         let (feed, rx) = rtrb::RingBuffer::new(1024);
         (
@@ -216,6 +228,7 @@ impl VoiceRun {
                 glide,
                 rate,
                 feed,
+                meter,
             },
             rx,
         )
@@ -244,6 +257,13 @@ impl VoiceRun {
     /// The port its notes come from.
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// What it hears, counted by level (the newest frame's level and gate;
+    /// the frames by decibel for a calibration). Take it before handing the
+    /// listener to the engine.
+    pub fn meter(&self) -> Arc<Meter> {
+        self.meter.clone()
     }
 
     pub(crate) fn rate(&self) -> u32 {

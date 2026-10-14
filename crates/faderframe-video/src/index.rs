@@ -5,7 +5,7 @@
 
 use crate::streams::{Kind, Pipeline};
 use crate::{Result, VideoError};
-use faderframe_core::timecode::{FrameRate, Timecode};
+use faderframe_core::timecode::{FRAME_HAIR_NS, FrameRate, Timecode};
 use gst::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -39,14 +39,23 @@ impl FrameIndex {
     }
 
     /// The frame showing at `t` ns (`None` before the first and from the
-    /// end on).
+    /// end on). A frame shows from [`FRAME_HAIR_NS`] before its start:
+    /// its own start lands in it however it was reckoned — the timeline's
+    /// first sample of a timecode label, a clip placed between two
+    /// samples, or a container that rounded the frame's time (Matroska to
+    /// the millisecond).
     pub fn frame_at(&self, t: i64) -> Option<usize> {
         if t >= self.end {
             return None;
         }
-        // A hair forward: a frame's own start lands in it.
-        let n = self.times.partition_point(|&s| s <= t + 1);
+        let n = self.times.partition_point(|&s| s <= t + FRAME_HAIR_NS);
         n.checked_sub(1)
+    }
+
+    /// The last frame starting before `t` (a clip ending at `t` shows no
+    /// later one).
+    pub fn last_before(&self, t: i64) -> Option<usize> {
+        self.times.partition_point(|&s| s < t).checked_sub(1)
     }
 
     /// Where frame `n` starts and how long it shows (ns).
@@ -184,6 +193,7 @@ pub fn index(path: &Path, cancel: &AtomicBool, progress: impl FnMut(f64)) -> Res
     let pad = sink_el
         .static_pad("sink")
         .ok_or_else(|| VideoError::Gst("appsink without a sink".into()))?;
+    crate::streams::end_after_late_start(&pad);
     let s3 = Arc::clone(&seen);
     p.parse(move |_, kind, n, _| {
         if kind == Kind::Picture && n == 0 {
@@ -195,6 +205,12 @@ pub fn index(path: &Path, cancel: &AtomicBool, progress: impl FnMut(f64)) -> Res
             None
         }
     })?;
+    // Every frame, those after the media's duration too.
+    let started = p.rewind_open_ended();
+    if !seen.lock().is_ok_and(|s| s.picture) {
+        return Err(VideoError::NoPicture(path.to_path_buf()));
+    }
+    started?;
     p.run(cancel, progress)?;
     drop(p);
     let mut s = seen

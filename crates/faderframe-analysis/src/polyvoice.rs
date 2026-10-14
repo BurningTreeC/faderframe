@@ -27,12 +27,18 @@
 //! simultaneous octave doublings and very close pitches may merge. Pure sine waves do not have
 //! the harmonic evidence this tracker needs. Events carry where they were
 //! decided and where the sound began. Allocation-free after [`PolyTracker::new`].
+//!
+//! Levels as the monophonic tracker's ([`crate::voice::level`]): notes
+//! start only while the input is over the threshold and the noise floor it
+//! follows, each note's level must be over that floor and not far under
+//! the loudest notes lately (so any gain works), mains hum starts no note,
+//! velocities follow the loud notes or a calibration's dynamics.
 
 use crate::pitch::note_at;
 use crate::spectrum::fft;
-use crate::voice::{
-    Biquad, Responsiveness, VoiceConfig, VoiceEvent, nearest_in_scale, velocity_of,
-};
+use crate::voice::level::{LevelGate, Meter, on_mains};
+use crate::voice::{Biquad, Responsiveness, VoiceConfig, VoiceEvent, nearest_in_scale};
+use std::sync::Arc;
 
 /// The analysis rate the input is decimated to (about).
 const ANALYSIS_RATE: f64 = 11_025.0;
@@ -129,6 +135,10 @@ const HYSTERESIS: f64 = 0.3;
 /// A sounding key's fundamental this much louder (dB) than a window ago,
 /// with an attack between, is played again.
 const RETRIGGER_DB: f32 = 3.0;
+/// Frames a note played again is still heard (its fundamental not this
+/// much quieter, dB) before it starts again.
+const AGAIN_HOLD: u32 = 3;
+const AGAIN_DROP_DB: f32 = 1.0;
 /// Frames of a note's fundamental level kept (longer than a window).
 const HISTORY: usize = 64;
 /// An attack: the upper band's energy over the last 10 ms this much above
@@ -149,6 +159,19 @@ const ONSET_PEAK_S: f64 = 0.3;
 const ATTACK_SHARE: f64 = 0.85;
 /// Bends at most this often (frames), unless the pitch jumps.
 const BEND_FRAMES: u32 = 2;
+/// The level measured for the gate: the newest this long (s).
+const LEVEL_S: f64 = 0.006;
+/// A note's level (its partials) is gated against the room's broadband
+/// floor this much over it (dB: the spectral floors keep noise out), and
+/// at most this far under the loudest notes lately (the gate follows the
+/// performance's level).
+const FLOOR_MARGIN_DB: f32 = 0.0;
+const UNDER_LOUD_DB: f32 = 22.0;
+/// New notes start only while the input is at most this far (dB) under its
+/// loudest lately, which falls this fast (dB/s): decays and what rings
+/// on from a chord change start none.
+const NEW_UNDER_PEAK_DB: f32 = 24.0;
+const PEAK_FALL_DB_PER_S: f32 = 6.0;
 
 #[cfg(test)]
 thread_local! {
@@ -233,6 +256,11 @@ struct Slot {
     loudest: f32,
     /// Frames not heard since last heard.
     missing: u32,
+    /// Played again at this attack (absolute input frame), heard for this
+    /// many frames since, its fundamental's level then; an attack that was
+    /// not.
+    again: Option<(i64, u32, f32)>,
+    passed: i64,
     /// Its fundamental's level the last frames it was heard (a ring;
     /// `heard` frames so far).
     history: [f32; HISTORY],
@@ -265,6 +293,8 @@ impl Slot {
         first: 0,
         loudest: f32::MIN,
         missing: 0,
+        again: None,
+        passed: i64::MIN,
         history: [f32::MIN; HISTORY],
         heard: 0,
         started: i64::MIN,
@@ -324,6 +354,19 @@ pub struct PolyTracker {
     peak: f64,
     peak_k: f64,
     attack: bool,
+    /// The automatic gate (followed over the newest broadband level); the
+    /// level (dBFS) the input must have for notes to start (the threshold,
+    /// over the room) and each note must have (over the room, not far
+    /// under the loud notes); the onset detector's least energy.
+    gate: LevelGate,
+    gate_db: f32,
+    note_gate_db: f32,
+    onset_floor: f64,
+    /// The newest broadband level (dBFS).
+    frame_db: f32,
+    /// Its loudest lately (falling slowly).
+    frame_peak: f32,
+    meter: Option<Arc<Meter>>,
 }
 
 impl PolyTracker {
@@ -376,9 +419,25 @@ impl PolyTracker {
             peak: 0.0,
             peak_k: (-1.0 / (ONSET_PEAK_S * analysis_rate)).exp(),
             attack: false,
+            gate: LevelGate::new(HOP_SECONDS)
+                .with_margin(FLOOR_MARGIN_DB)
+                .under_loud(UNDER_LOUD_DB),
+            gate_db: config.threshold_db,
+            note_gate_db: config.threshold_db,
+            onset_floor: 0.0,
+            frame_db: f32::NEG_INFINITY,
+            frame_peak: f32::MIN,
+            meter: None,
         };
         t.set_config(config);
         t
+    }
+
+    /// Count what it hears into `meter` (see
+    /// [`crate::voice::VoiceTracker::with_meter`]).
+    pub fn with_meter(mut self, meter: Arc<Meter>) -> Self {
+        self.meter = Some(meter);
+        self
     }
 
     pub fn config(&self) -> VoiceConfig {
@@ -388,6 +447,7 @@ impl PolyTracker {
     /// New settings (allocation-free: the window is recomputed in place).
     pub fn set_config(&mut self, config: VoiceConfig) {
         self.config = config;
+        self.set_gate();
         let n = ((window_seconds(config.responsiveness) * self.analysis_rate).round() as usize)
             .min(self.ring.len());
         if n != self.window {
@@ -424,6 +484,7 @@ impl PolyTracker {
         self.last_onset = i64::MIN / 2;
         self.armed = true;
         self.band_floors.fill(f64::MAX / 1e10);
+        self.frame_peak = f32::MIN;
         for filter in &mut self.filters {
             filter.reset();
         }
@@ -456,7 +517,7 @@ impl PolyTracker {
             }
             if self.armed
                 && self.fast > ONSET_RATIO * self.slow.max(ONSET_OF_PEAK * self.peak)
-                && self.fast > 1e-3 * 10f64.powf(f64::from(self.config.threshold_db) / 10.0)
+                && self.fast > self.onset_floor
                 && self.clock - self.last_onset > gap
             {
                 self.last_onset = self.clock;
@@ -468,11 +529,38 @@ impl PolyTracker {
             self.since_hop += 1;
             if self.since_hop >= self.hop && self.filled >= self.window {
                 self.since_hop = 0;
+                self.measure();
                 self.spectrum();
                 self.find_notes();
                 self.follow(i as isize, &mut emit);
             }
         }
+    }
+
+    /// The newest broadband level: the automatic gate follows it.
+    fn measure(&mut self) {
+        let n = ((LEVEL_S * self.analysis_rate) as usize).clamp(1, self.filled.max(1));
+        let len = self.ring.len();
+        let power = (0..n)
+            .map(|k| f64::from(self.ring[(self.write + len - 1 - k) % len]).powi(2))
+            .sum::<f64>()
+            / n as f64;
+        self.frame_db = (10.0 * power.max(1e-14).log10()) as f32;
+        self.frame_peak = self
+            .frame_db
+            .max(self.frame_peak - PEAK_FALL_DB_PER_S * HOP_SECONDS as f32);
+        let playing = self.slots.iter().any(|s| s.on || s.count > 0);
+        self.gate
+            .hear(self.frame_db, playing, self.config.threshold_db);
+        self.set_gate();
+    }
+
+    /// The gates (dBFS) the input (and its attacks) and each note are
+    /// heard over.
+    fn set_gate(&mut self) {
+        self.gate_db = self.gate.room_db(self.config.threshold_db);
+        self.note_gate_db = self.gate.gate_db(f32::MIN);
+        self.onset_floor = 1e-3 * 10f64.powf(f64::from(self.gate_db) / 10.0);
     }
 
     /// The window's spectrum and its peaks: local maxima not too far under
@@ -546,7 +634,7 @@ impl PolyTracker {
         let held = &held[..held_count];
         self.peaks.clear();
         let floor = (loudest * 10f64.powf(-PEAK_FLOOR_DB / 20.0))
-            .max(10f64.powf(f64::from(self.config.threshold_db - 20.0) / 20.0));
+            .max(10f64.powf(f64::from(self.note_gate_db - 20.0) / 20.0));
         for k in 2..top {
             let b = self.mags[k];
             if b < floor || b <= self.mags[k - 1] || b < self.mags[k + 1] {
@@ -1034,12 +1122,41 @@ impl PolyTracker {
         let rel = |abs: i64| now - (abs_now - abs) as isize;
         // The attack this window holds, if any.
         let attack = (abs_now - self.last_onset <= span).then_some(self.last_onset);
+        let loudest_found = self.found[..self.found_count]
+            .iter()
+            .map(|f| f.level_db)
+            .fold(f32::NEG_INFINITY, f32::max);
+        // The meter counts the loudest note heard, else the room.
+        if let Some(m) = &self.meter {
+            let loudest = self.found[..self.found_count]
+                .iter()
+                .map(|f| f.level_db)
+                .filter(|l| *l >= self.note_gate_db)
+                .fold(f32::NEG_INFINITY, f32::max);
+            if loudest.is_finite() && self.frame_db >= self.gate_db {
+                m.count(loudest, self.gate_db, true);
+            } else {
+                m.count(self.frame_db, self.gate_db, false);
+            }
+        }
         for s in &mut self.slots {
             s.seen = false;
         }
         for i in 0..self.found_count {
             let f = self.found[i];
-            if f.level_db < c.threshold_db {
+            if f.level_db < self.note_gate_db {
+                continue;
+            }
+            // New notes only while the input is over the gate, and none on
+            // mains hum (no equal-tempered note is on it).
+            let held = self
+                .slots
+                .iter()
+                .any(|s| s.on && (f.pitch - f64::from(s.key)).abs() < 0.5 + HYSTERESIS);
+            if !held
+                && (self.frame_db < self.gate_db.max(self.frame_peak - NEW_UNDER_PEAK_DB)
+                    || on_mains(c.reference * 2f64.powf((f.pitch - 69.0) / 12.0)))
+            {
                 continue;
             }
             let key = self
@@ -1118,11 +1235,13 @@ impl PolyTracker {
                         .any(|o| o.on && (o.pitch - pitch).abs() < 0.6)
             });
         }
+        let gate = &mut self.gate;
         for (i, s) in self.slots.iter_mut().enumerate() {
             if s.on {
                 s.age += 1;
                 if !s.seen {
                     s.missing += 1;
+                    s.again = None;
                     if s.missing >= release {
                         let at = (abs_now - i64::from(s.missing - 1) * hop - half).max(s.started);
                         emit(now, rel(at), VoiceEvent::NoteOff { key: s.key });
@@ -1133,22 +1252,22 @@ impl PolyTracker {
                 s.missing = 0;
                 // Played again: an attack since it began, and its own
                 // fundamental louder than a window ago (a note added on its
-                // harmonics leaves the fundamental be).
+                // harmonics leaves the fundamental be) — and still heard a
+                // few frames on (a note dying as the next chord is struck
+                // swells for a frame in its leakage).
                 let back = full as usize;
-                if s.age > full
-                    && s.heard > back + 3
-                    && let Some(a) = attack
-                    && a > s.started
-                {
-                    // Means of three frames (beating moves single ones).
-                    let mean = |from: usize| {
-                        (0..3).map(|k| s.history[(from - k) % HISTORY]).sum::<f32>() / 3.0
-                    };
-                    let newest = mean(s.heard - 1);
-                    let before = mean(s.heard - 1 - back);
-                    if newest >= before + RETRIGGER_DB {
+                let fundamental = s.history[(s.heard - 1) % HISTORY];
+                if let Some((a, held, from)) = s.again {
+                    if fundamental < from - AGAIN_DROP_DB {
+                        // Fading: what rang on.
+                        s.again = None;
+                        s.passed = a;
+                    } else if held + 1 < AGAIN_HOLD {
+                        s.again = Some((a, held + 1, from));
+                    } else {
+                        s.again = None;
                         emit(now, rel(a), VoiceEvent::NoteOff { key: s.key });
-                        let velocity = velocity_of(s.level, c.threshold_db);
+                        let velocity = gate.velocity(s.level, f32::MIN, c.dynamics);
                         emit(
                             now,
                             rel(a),
@@ -1160,6 +1279,23 @@ impl PolyTracker {
                         s.age = 0;
                         s.started = a;
                         s.last_bend = 0.0;
+                    }
+                } else if s.age > full
+                    && s.heard > back + 3
+                    && let Some(a) = attack
+                    && a > s.started
+                    && a != s.passed
+                {
+                    // Means of three frames (beating moves single ones).
+                    let mean = |from: usize| {
+                        (0..3).map(|k| s.history[(from - k) % HISTORY]).sum::<f32>() / 3.0
+                    };
+                    let newest = mean(s.heard - 1);
+                    let before = mean(s.heard - 1 - back);
+                    // (Not a note far under the loudest of the frame: what
+                    // rings on as other strings are struck.)
+                    if newest >= before + RETRIGGER_DB && s.level >= loudest_found - NEW_LEVEL_DB {
+                        s.again = Some((a, 0, fundamental));
                     }
                 }
                 s.since_bend += 1;
@@ -1194,7 +1330,7 @@ impl PolyTracker {
                 let at = attack
                     .filter(|a| *a >= s.first - span)
                     .unwrap_or(s.first - half);
-                let velocity = velocity_of(s.loudest, c.threshold_db);
+                let velocity = gate.velocity(s.loudest, f32::MIN, c.dynamics);
                 emit(
                     now,
                     rel(at),

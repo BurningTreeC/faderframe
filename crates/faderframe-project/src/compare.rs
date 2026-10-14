@@ -113,6 +113,13 @@ pub fn differences(then: &Project, now: &Project) -> Vec<String> {
     if then.groups != now.groups {
         out.push("Groups changed".into());
     }
+    if then.cue_mixes != now.cue_mixes {
+        out.push(format!(
+            "Cue mixes changed ({} → {})",
+            then.cue_mixes.len(),
+            now.cue_mixes.len()
+        ));
+    }
     if then.album != now.album {
         out.push("Album changed".into());
     }
@@ -276,6 +283,9 @@ fn track_differences(a: &Track, b: &Track, now: &Project, out: &mut Vec<String>)
     }
     if a.sends != b.sends {
         push("sends changed".into());
+    }
+    if a.cue_sends != b.cue_sends {
+        push("cue mix sends changed".into());
     }
     if a.automation != b.automation {
         push("automation changed".into());

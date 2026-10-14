@@ -461,6 +461,30 @@ impl ArrangerView {
 
     /// The clips an edit of `clip` applies to: all selected when it is
     /// selected, else only it.
+    /// The clips from the selection's anchor clip to `clicked`: on the
+    /// tracks between theirs (as the rows show them), overlapping the time
+    /// from the earlier start to the later end; and those tracks.
+    fn clip_range(&self, model: &Session, clicked: ClipId) -> Option<(Vec<ClipId>, Vec<TrackId>)> {
+        let p = model.project();
+        let anchor = p.clip(model.selection.anchor_clip?)?;
+        let b = p.clip(clicked)?;
+        let rows = Self::lane_tracks(model);
+        let ra = rows.iter().position(|t| t.id == anchor.track)?;
+        let rb = rows.iter().position(|t| t.id == b.track)?;
+        let end = |c: &Clip| c.end(&p.timeline, p.sample_rate);
+        let (from, to) = (anchor.start.min(b.start), end(anchor).max(end(b)));
+        let (mut clips, mut tracks) = (Vec::new(), Vec::new());
+        for t in &rows[ra.min(rb)..=ra.max(rb)] {
+            tracks.push(t.id);
+            for c in p.clips_of(t.id) {
+                if c.start < to && end(c) > from {
+                    clips.push(c.id);
+                }
+            }
+        }
+        Some((clips, tracks))
+    }
+
     fn targets(model: &Session, clip: ClipId) -> Vec<ClipId> {
         if model.selection.clips.contains(&clip) {
             model.selection.clips.iter().copied().collect()
@@ -511,6 +535,34 @@ impl ArrangerView {
         }
         let zone = self.clip_zone(model, c, rect, pos);
         let selected = model.selection.clips.contains(&clip);
+        // Shift: everything from the clip last clicked to this one — the
+        // tracks between them, over the earlier start to the later end.
+        if clicks == 1
+            && mods.shift
+            && !mods.toggle()
+            && let Some((clips, tracks)) = self.clip_range(model, clip)
+        {
+            cx.emit(Action::SelectClips {
+                clips,
+                mode: SelectMode::Replace,
+            });
+            cx.emit(Action::SelectTracks {
+                tracks,
+                mode: SelectMode::Replace,
+            });
+            return true;
+        }
+        // Ctrl on a clip's body: a click toggles it, a drag draws a
+        // rectangle selecting what it touches (in warp view the body's
+        // Ctrl+drag is the telescope warp).
+        if clicks == 1
+            && mods.toggle()
+            && matches!(zone, ClipZone::Move | ClipZone::Range)
+            && matches!(tool, EditTool::Smart | EditTool::Select | EditTool::Grab)
+        {
+            self.start_marquee(pos, mods, Some((clip, track)), None, model);
+            return true;
+        }
         let additive = mods.shift || mods.toggle();
         if clicks >= 2 {
             return self.double_click_clip(c, zone, pos, model, cx);
@@ -1483,7 +1535,12 @@ impl ArrangerView {
 
     /// A click (no drag): clear the range and, with Link Timeline, move
     /// the playhead to the clicked (snapped) position.
-    fn click_locate(&self, at: MusicalTime, model: &Session, cx: &mut EventCx<'_, Action>) {
+    pub(crate) fn click_locate(
+        &self,
+        at: MusicalTime,
+        model: &Session,
+        cx: &mut EventCx<'_, Action>,
+    ) {
         let t = self.snap(at, model, Modifiers::NONE);
         if model.selection.range.is_some() {
             cx.emit(Action::SetEditRange(None));

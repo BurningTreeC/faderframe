@@ -273,13 +273,26 @@ impl HeardSnapshot {
     /// timeline position and whether it plays — `None` before anything was
     /// published. Never past the frames processed.
     pub fn heard(&self, frames_since: f64) -> Option<Played> {
+        self.played(frames_since, true)
+    }
+
+    /// [`Self::heard`] for a moment ahead too (a picture shown when it
+    /// reaches the screen): past the frames processed so far, the newest
+    /// run carries on as it goes.
+    pub fn heard_ahead(&self, frames_since: f64) -> Option<Played> {
+        self.played(frames_since, false)
+    }
+
+    /// What is heard `frames_since` frames after the callback; `hold`: not
+    /// past the frames processed.
+    fn played(&self, frames_since: f64, hold: bool) -> Option<Played> {
         if self.count == 0 {
             return None;
         }
         let segs = &self.segments[..self.count];
         let last_end = segs[self.count - 1].end;
         let h = (self.frame as f64 + frames_since - self.latency as f64).floor() as i64;
-        let h = h.min(last_end - 1);
+        let h = if hold { h.min(last_end - 1) } else { h };
         let s = segs
             .iter()
             .rev()
@@ -496,6 +509,31 @@ mod tests {
         assert_eq!((p.pos, p.jumps), (9100, 1));
         // Never past what was processed.
         assert_eq!(s.heard(1e9).unwrap().pos, 9255);
+    }
+
+    #[test]
+    fn heard_ahead_goes_on_past_the_frames_processed() {
+        let clock = HeardClock::default();
+        // Stopped at 4000, then playing from it: a latency of 300 frames.
+        let mut h = PlayHistory::default();
+        h.record(4000, false, 0, 256);
+        let frame = h.chunk_start() + 256;
+        h.record(4000, true, 0, 256);
+        clock.publish(&h, 1_000, frame, 300, (0, 4512));
+        let s = clock.read().unwrap();
+        // While the latency fills, the stopped position (as `heard`): never
+        // that less the latency.
+        for ahead in [0.0, 100.0, 299.0] {
+            let p = s.heard_ahead(ahead).unwrap();
+            assert_eq!((p.pos, p.playing), (4000, false), "{ahead} frames on");
+            assert_eq!(s.heard(ahead).unwrap().pos, 4000);
+        }
+        // Then playback from there.
+        assert_eq!(s.heard_ahead(310.0).unwrap().pos, 4010);
+        // Past the frames processed (frame 512): on as it goes, where
+        // `heard` holds.
+        assert_eq!(s.heard(600.0).unwrap().pos, 4255);
+        assert_eq!(s.heard_ahead(600.0).unwrap().pos, 4300);
     }
 }
 

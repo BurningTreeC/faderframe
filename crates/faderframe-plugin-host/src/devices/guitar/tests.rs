@@ -221,7 +221,8 @@ fn workers_match_inline_with_pedals_automation_and_resets() {
         (id::DI_SOURCE, 2.0),
         (id::MIX, 0.8),
     ];
-    for channels in [1, 2] {
+    // 6: a 5.1 track, every stage a helper thread per channel.
+    for channels in [1, 2, 6] {
         let mut worker = Line::new(&set, channels, Run::Deterministic, 128);
         let mut inline = Line::new(&set, channels, Run::Inline, 128);
         let stage = stage_latency(1, 128) as usize;
@@ -260,8 +261,15 @@ fn workers_match_inline_with_pedals_automation_and_resets() {
                         ]
                     })
                     .collect();
-                let signal =
-                    |n: usize, c: usize| pluck(n) * if c == 1 && block >= 6 { 0.5 } else { 1.0 };
+                let signal = |n: usize, c: usize| {
+                    pluck(n)
+                        * match c {
+                            1 if block >= 6 => 0.5,
+                            // A surround track's other channels, each its own.
+                            2.. => 1.0 - 0.1 * c as f32,
+                            _ => 1.0,
+                        }
+                };
                 let at = worker.at;
                 let a = worker.block(len, &events, signal);
                 let b = inline.block(len, &events, signal);

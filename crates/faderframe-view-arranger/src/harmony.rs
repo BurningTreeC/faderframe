@@ -1,5 +1,7 @@
 //! The Key and Chords lanes: key changes as spans named after their key
-//! (click for roots and scales, double-click to type one), and the chord
+//! (click a bar for a change there, drag across for a span in another key,
+//! drag a change to move it; click a change for roots and scales,
+//! double-click to type one), and the chord
 //! track (drag across the lane for a new chord, then type it; drag a chord
 //! to move it, its edges to resize; double-click to retype; right-click
 //! for the key's chords). Edits are whole-list commands (`SetKeys`,
@@ -68,17 +70,36 @@ impl ArrangerView {
         }
     }
 
+    /// A key change is hit on its bar or its name; the rest of its span is
+    /// room for new changes.
     pub(crate) fn key_hit(&self, pos: Point, at: MusicalTime, model: &Session) -> GlobalHit {
-        let keys = &model.project().keys;
+        let p = model.project();
+        let meter = &p.timeline.meter;
         let x = pos.x;
-        for (i, k) in keys.iter().enumerate() {
+        for (i, k) in p.keys.iter().enumerate() {
             let x0 = self.x_of(k.at);
-            let x1 = keys.get(i + 1).map_or(f32::MAX, |n| self.x_of(n.at));
-            if x >= x0 && x < x1 {
+            let bar_end = self.x_of(meter.bar_start(meter.bar_at(k.at) + 1));
+            let label = x0 + k.key.name().chars().count() as f32 * 7.0 + 14.0;
+            let x1 = p.keys.get(i + 1).map_or(f32::MAX, |n| self.x_of(n.at));
+            if x >= x0 - EDGE && x < bar_end.max(label).min(x1) {
                 return GlobalHit::Key(i);
             }
         }
         GlobalHit::Empty(GlobalLane::Key, at)
+    }
+
+    /// The key changes as shown (a move in progress applied).
+    fn shown_keys(&self, model: &Session) -> Vec<harmony::KeyChange> {
+        let keys = &model.project().keys;
+        match &self.global_drag {
+            Some(GlobalDrag::KeyChange {
+                from,
+                to,
+                moved: true,
+                ..
+            }) => harmony::move_key(keys, *from, *to),
+            _ => keys.clone(),
+        }
     }
 
     pub(crate) fn chord_hit(
@@ -107,7 +128,14 @@ impl ArrangerView {
 
     pub(crate) fn paint_keys(&self, p: &mut dyn Painter, r: Rect, model: &Session) {
         let th = &self.theme;
-        let keys = &model.project().keys;
+        let keys = &self.shown_keys(model);
+        if let Some(GlobalDrag::NewKey { anchor, to, .. }) = &self.global_drag {
+            let (a, b) = Self::key_span(model, *anchor, *to);
+            let (x0, x1) = (self.x_of(a), self.x_of(b));
+            let rr = Rect::new(x0, r.y + 2.0, (x1 - x0).max(1.0), r.h - 4.0);
+            p.fill_rounded(rr, 3.0, &Paint::Solid(th.ui.accent.with_alpha(0.3)));
+            p.stroke_rounded(rr, 3.0, 1.0, th.ui.accent);
+        }
         if keys.is_empty() {
             p.text(
                 "No key · click to set one",
@@ -227,7 +255,13 @@ impl ArrangerView {
                         Rect::new(self.x_of(at), pos.y - 10.0, 140.0, 20.0),
                     ));
                 } else {
-                    cx.request(Self::key_menu(model, at, false, pos));
+                    // A click: a change at this bar; a drag: a span.
+                    let bar = Self::key_position(model, t);
+                    self.global_drag = Some(GlobalDrag::NewKey {
+                        anchor: bar,
+                        to: bar,
+                        origin: pos,
+                    });
                 }
             }
             GlobalHit::Key(i) => {
@@ -244,7 +278,13 @@ impl ArrangerView {
                         ),
                     ));
                 } else {
-                    cx.request(Self::key_menu(model, k.at, true, pos));
+                    // A click: its menu (on release); a drag moves it.
+                    self.global_drag = Some(GlobalDrag::KeyChange {
+                        from: k.at,
+                        to: k.at,
+                        origin: pos,
+                        moved: false,
+                    });
                 }
             }
             GlobalHit::Empty(GlobalLane::Chords, t) => {
@@ -323,6 +363,17 @@ impl ArrangerView {
     ) {
         let t_at = self.time_at(pos.x).max(MusicalTime::ZERO);
         match drag {
+            GlobalDrag::NewKey { to, .. } => *to = Self::key_position(model, t_at),
+            GlobalDrag::KeyChange {
+                to, origin, moved, ..
+            } => {
+                if !*moved && pos.distance(*origin) < DRAG_THRESHOLD {
+                    return;
+                }
+                *moved = true;
+                *to = Self::key_position(model, t_at);
+                cx.set_cursor(Cursor::Grabbing);
+            }
             GlobalDrag::NewChord { to, .. } => *to = self.snap(t_at, model, mods),
             GlobalDrag::Chord {
                 index,
@@ -378,6 +429,36 @@ impl ArrangerView {
     ) {
         let p = model.project();
         match drag {
+            GlobalDrag::NewKey { anchor, to, origin } => {
+                if anchor == to {
+                    // The first key starts the song.
+                    let at = if p.keys.is_empty() {
+                        MusicalTime::ZERO
+                    } else {
+                        anchor
+                    };
+                    let existing = p.keys.iter().any(|k| k.at == at);
+                    cx.request(Self::key_menu(model, at, existing, origin));
+                } else {
+                    let (start, end) = Self::key_span(model, anchor, to);
+                    cx.request(Self::key_span_menu(model, start, end, origin));
+                }
+            }
+            GlobalDrag::KeyChange {
+                from,
+                to,
+                origin,
+                moved,
+            } => {
+                if !moved {
+                    cx.request(Self::key_menu(model, from, true, origin));
+                } else if to != from {
+                    cx.emit(Action::Edit(Command::SetKeys {
+                        keys: harmony::move_key(&p.keys, from, to),
+                    }));
+                }
+                cx.set_cursor(Cursor::Default);
+            }
             GlobalDrag::NewChord { anchor, to } => {
                 let (start, end) = (anchor.min(to), anchor.max(to));
                 if end > start {
@@ -445,7 +526,8 @@ impl ArrangerView {
             })
         };
         let mut items = vec![MenuItem::disabled(match current {
-            Some(k) => format!("{} · from bar {bar}", k.name()),
+            Some(k) if existing => format!("{} · from bar {bar}", k.name()),
+            Some(k) => format!("Key change at bar {bar} (now {})", k.name()),
             None => format!("Key from bar {bar}"),
         })];
         let scale = current.map_or(Scale::Major, |k| k.scale);
@@ -473,6 +555,61 @@ impl ArrangerView {
         items.push(MenuItem::new("Detect Key from Clips", Action::DetectKey).separated());
         if existing {
             items.push(MenuItem::new("Remove Key Change", set(None)));
+        }
+        HostRequest::ContextMenu { at: pos, items }
+    }
+
+    /// The bars a key drag covers: from the earlier bar to the end of the
+    /// later one.
+    fn key_span(model: &Session, a: MusicalTime, b: MusicalTime) -> (MusicalTime, MusicalTime) {
+        let meter = &model.project().timeline.meter;
+        let (first, last) = (a.min(b), a.max(b));
+        (first, meter.bar_start(meter.bar_at(last) + 1))
+    }
+
+    /// The keys for a drawn span (`start..end`): the key there changes and
+    /// the one after comes back at its end.
+    fn key_span_menu(
+        model: &Session,
+        start: MusicalTime,
+        end: MusicalTime,
+        pos: Point,
+    ) -> HostRequest<Action> {
+        let p = model.project();
+        let meter = &p.timeline.meter;
+        let current = p.key_at(start);
+        let flats = current.is_some_and(Key::flats);
+        let set = |key: Key| {
+            Action::Edit(Command::SetKeys {
+                keys: harmony::set_key_span(&p.keys, start, end, key),
+            })
+        };
+        let mut items = vec![MenuItem::disabled(format!(
+            "Key for bars {}–{}",
+            meter.bar_at(start) + 1,
+            meter.bar_at(end - MusicalTime::from_ticks(1)) + 1
+        ))];
+        let scale = current.map_or(Scale::Major, |k| k.scale);
+        for root in 0..12u8 {
+            let mut item = MenuItem::new(
+                format!("{} {}", harmony::pc_name(root, flats), scale.name()),
+                set(Key::new(root, scale)),
+            );
+            if root == 0 {
+                item = item.separated();
+            }
+            items.push(item);
+        }
+        let root = current.map_or(0, |k| k.root);
+        for (i, s) in MENU_SCALES.iter().enumerate() {
+            let mut item = MenuItem::new(
+                format!("{} {}", harmony::pc_name(root, flats), s.name()),
+                set(Key::new(root, *s)),
+            );
+            if i == 0 {
+                item = item.separated();
+            }
+            items.push(item);
         }
         HostRequest::ContextMenu { at: pos, items }
     }
@@ -569,30 +706,41 @@ impl ArrangerView {
             .separated(),
         );
         items.push(MenuItem::new(
+            "Delete All Chords",
+            Action::Edit(Command::SetChords { chords: Vec::new() }),
+        ));
+        items.push(MenuItem::new(
             "Detect Chords from Clips",
             Action::DetectChords,
         ));
         HostRequest::ContextMenu { at: pos, items }
     }
 
-    pub(crate) fn chords_lane_menu(pos: Point) -> HostRequest<Action> {
-        HostRequest::ContextMenu {
-            at: pos,
-            items: vec![
-                MenuItem::disabled("Drag across the lane for a chord · double-click for one a bar"),
-                MenuItem::new("Detect Chords from Clips", Action::DetectChords).separated(),
-                MenuItem::new("Detect Key from Clips", Action::DetectKey),
-            ],
+    pub(crate) fn chords_lane_menu(model: &Session, pos: Point) -> HostRequest<Action> {
+        let mut items = vec![
+            MenuItem::disabled("Drag across the lane for a chord · double-click for one a bar"),
+            MenuItem::new("Detect Chords from Clips", Action::DetectChords).separated(),
+            MenuItem::new("Detect Key from Clips", Action::DetectKey),
+        ];
+        if !model.project().chords.is_empty() {
+            items.push(
+                MenuItem::new(
+                    "Delete All Chords",
+                    Action::Edit(Command::SetChords { chords: Vec::new() }),
+                )
+                .separated(),
+            );
         }
+        HostRequest::ContextMenu { at: pos, items }
     }
 
     pub(crate) fn harmony_tooltip(&self, hit: GlobalHit, model: &Session) -> Option<String> {
         let p = model.project();
         Some(match hit {
-            GlobalHit::Empty(GlobalLane::Key, _) => "Click to set the key from this bar · Double-click to type one".into(),
+            GlobalHit::Empty(GlobalLane::Key, _) => "Click for a key change at this bar · Drag across for a passage in another key · Double-click to type one".into(),
             GlobalHit::Key(i) => {
                 let k = p.keys.get(i)?;
-                format!("{} · Click for roots and scales · Double-click to type", k.key.name())
+                format!("{} · Click for roots and scales · Drag to move · Double-click to type", k.key.name())
             }
             GlobalHit::Empty(GlobalLane::Chords, _) => {
                 "Drag across for a chord · Double-click for one a bar · Right-click to detect chords from clips".into()

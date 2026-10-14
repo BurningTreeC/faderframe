@@ -71,10 +71,21 @@ impl ChordFace {
         };
         out.sort_unstable();
         out.dedup();
-        out.into_iter()
-            .filter(|k| (0..=127).contains(k))
-            .map(|k| k as u8)
-            .collect()
+        let mut keys = [0u8; ch::MAX_NOTES];
+        let mut n = 0;
+        for k in out.into_iter().filter(|k| (0..=127).contains(k)) {
+            if n < ch::MAX_NOTES {
+                keys[n] = k as u8;
+                n += 1;
+            }
+        }
+        let n = ch::voiced(
+            &mut keys,
+            n,
+            cx.value(pid(id::INVERSION)).round() as i32,
+            cx.value(pid(id::OCTAVE)).round() as i32,
+        );
+        keys[..n].to_vec()
     }
 }
 
@@ -84,7 +95,7 @@ impl Face for ChordFace {
     }
 
     fn min_size(&self) -> Size {
-        Size::new(900.0, 470.0)
+        Size::new(1040.0, 470.0)
     }
 
     fn panel(&self, size: Size) -> Panel {
@@ -95,6 +106,7 @@ impl Face for ChordFace {
                 ("CHORD", 2.4),
                 ("INTERVALS", 6.0),
                 ("KEY", 3.0),
+                ("VOICING", 2.8),
                 ("STRUM", 3.6),
             ],
         );
@@ -136,6 +148,10 @@ impl Face for ChordFace {
             Rect::new(r.x + r.w * 0.4 + 8.0, r.y + 32.0, r.w * 0.6 - 12.0, 38.0),
         ));
         let r = kit::inside(&s[3]);
+        let k = kit::row(Rect::new(r.x, r.y + 8.0, r.w, SMALL.1), &[SMALL.0, SMALL.0]);
+        c.push(Ctl::small(pid(id::INVERSION), "INVERSION", k[0]).bipolar());
+        c.push(Ctl::small(pid(id::OCTAVE), "OCTAVE", k[1]).bipolar());
+        let r = kit::inside(&s[4]);
         let k = kit::row(Rect::new(r.x, r.y, r.w * 0.55, KNOB.1), &[KNOB.0]);
         c.push(Ctl::knob(pid(id::STRUM), "STRUM", k[0]));
         c.push(Ctl::choice(
@@ -268,6 +284,10 @@ impl Face for ChordFace {
             id::STRUM => "Each note of the chord later than the one before",
             id::DIRECTION => "Strum from the lowest note or from the highest",
             id::VELOCITY => "How loud the added notes are, against the played one",
+            id::INVERSION => {
+                "Each inversion up carries the lowest note an octave up (down: the highest down)"
+            }
+            id::OCTAVE => "The whole chord moved by octaves",
             p if (id::SHIFT..id::SHIFT + ch::SHIFTS as u32).contains(&p) => {
                 "An added note, in semitones from the played one (0: none)"
             }

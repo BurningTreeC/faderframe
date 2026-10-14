@@ -1,9 +1,9 @@
 //! The picture on an output of its own (a DeckLink card's SDI or HDMI —
 //! `faderframe_video::output`): a thread pushes a frame per output frame,
 //! the sink pacing it, each one the picture for when the output will show
-//! it — the engine's position then, less the sound's latency, as the
-//! video window does. The session publishes what plays where (the top
-//! shown video track's clips) for the thread on every tick.
+//! it — the position heard then (the engine's play history), as the video
+//! window does. The session publishes what plays where (the top shown
+//! video track's clips) for the thread on every tick.
 
 use crate::{NoticeLevel, Result, Session, SessionError};
 use faderframe_video::Want;
@@ -28,6 +28,8 @@ struct PictureMap {
     /// The picture's offset against the sound (ns, positive: later).
     offset_ns: i64,
     spans: Vec<Span>,
+    /// A locate shown before the engine got there (the playhead's).
+    held: Option<i64>,
 }
 
 impl PictureMap {
@@ -91,12 +93,24 @@ impl Session {
                 while !st.load(Ordering::Relaxed) {
                     let map = m.lock().map(|g| g.clone()).unwrap_or_default();
                     let lead = output.lead_ns();
-                    let now = midi.now_ns() as i64;
-                    let at = (now + lead - map.offset_ns).max(0) as u64;
                     let playing = clock.playing();
-                    let picture = clock.position_at(at).and_then(|p| {
-                        let latency = clock.output_latency() as f64 * clock.speed();
-                        let pos = p - latency.round() as i64;
+                    // Heard when it is shown: the stopped position while
+                    // stopped and while Play's latency fills (never that
+                    // less the latency: the frame before), a locate's
+                    // target at once. Without a stream, where it stopped.
+                    let position = map
+                        .held
+                        .or_else(|| {
+                            clock
+                                .heard_ahead(crate::video::instant_in(lead - map.offset_ns))
+                                .map(|h| h.jumped.unwrap_or(h.position))
+                        })
+                        .or_else(|| {
+                            (!playing)
+                                .then(|| clock.position_at(midi.now_ns()))
+                                .flatten()
+                        });
+                    let picture = position.and_then(|pos| {
                         let (key, t) = map.at(pos)?;
                         let want = if playing { Want::Play } else { Want::Still };
                         frames.picture(key, t, size, want)
@@ -177,6 +191,7 @@ impl Session {
             rate,
             offset_ns: (p.video.offset_ms * 1e6) as i64,
             spans,
+            held: self.held_position(),
         };
         if let Ok(mut m) = out.map.lock()
             && *m != map

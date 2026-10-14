@@ -199,18 +199,19 @@ impl Default for ProjectTimecode {
 }
 
 impl ProjectTimecode {
-    /// The label at timeline position `pos` (samples at `rate`).
+    /// The label at timeline position `pos` (samples at `rate`; see
+    /// [`FrameRate::frame_at_sample`]).
     pub fn at(&self, pos: i64, rate: u32) -> Timecode {
         let start = self.start.total_frames(self.rate);
-        let seconds = pos as f64 / rate.max(1) as f64;
-        Timecode::from_frames(start + self.rate.frame_at(seconds), self.rate)
+        Timecode::from_frames(start + self.rate.frame_at_sample(pos, rate), self.rate)
     }
 
-    /// Where the label `tc` is on the timeline (samples; negative before
-    /// the start).
+    /// Where the label `tc` is on the timeline: its frame's first sample
+    /// (negative before the start). Never the nearest sample: that may lie
+    /// before the frame, where the label before it reads.
     pub fn position_of(&self, tc: Timecode, rate: u32) -> i64 {
         let frames = tc.total_frames(self.rate) - self.start.total_frames(self.rate);
-        (self.rate.seconds_of(frames) * rate as f64).round() as i64
+        self.rate.first_sample(frames, rate)
     }
 
     /// The label as shown ("01:00:00:00", ";" for drop-frame).
@@ -284,6 +285,55 @@ mod tests {
         assert!((pos - (60.0 * 1001.0 / 30_000.0 * rate as f64) as i64).abs() <= 1);
         assert_eq!(tc.at(pos, rate), hour);
         assert!(tc.position_of(Timecode::parse("00:59:57;29", tc.rate).unwrap(), rate) < 0);
+    }
+
+    /// Every label lands on its frame's first sample and reads back as
+    /// itself — at the rates whose frames start between samples too (at
+    /// 29.97 fps and 48 kHz the nearest sample lay before 40 % of the
+    /// frames, in the frame before: the counter and the picture a frame
+    /// behind what was typed).
+    #[test]
+    fn every_label_lands_on_its_frame_and_reads_back() {
+        use FrameRate::*;
+        for rate in [44_100, 48_000] {
+            // Labels read from a millisecond before their frame, whose
+            // first sample is up to a sample after its start: before
+            // that, the label before.
+            let hair = rate as i64 / 1000 + 2;
+            for fr in [
+                Fps23976,
+                Fps2997,
+                Fps2997Drop,
+                Fps5994,
+                Fps5994Drop,
+                Fps24,
+                Fps25,
+            ] {
+                for start in ["00:00:00:00", "00:59:58:00"] {
+                    let start = Timecode::parse(start, fr).unwrap();
+                    let tc = ProjectTimecode { rate: fr, start };
+                    let first = start.total_frames(fr);
+                    // Two minutes of labels (two drop-frame minutes), and
+                    // some hours on.
+                    for k in (0..2 * 60 * 60).chain([107_892, 863_136, 1_500_000]) {
+                        let label = Timecode::from_frames(first + k, fr);
+                        let pos = tc.position_of(label, rate);
+                        let what = format!("{} at {rate} Hz: {}", fr.id(), label.display(fr));
+                        assert_eq!(tc.at(pos, rate), label, "{what} reads back");
+                        // Its frame's first sample: at or after the start,
+                        // less than a sample on.
+                        let exact = fr.seconds_of(k) * rate as f64;
+                        assert!(
+                            pos as f64 >= exact - 1e-6 && (pos as f64) < exact + 1.0,
+                            "{what}: {pos} for {exact}"
+                        );
+                        // The frame before reads until it.
+                        let before = Timecode::from_frames(first + k - 1, fr);
+                        assert_eq!(tc.at(pos - hair, rate), before, "{what}: before it");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

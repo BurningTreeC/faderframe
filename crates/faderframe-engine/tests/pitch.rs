@@ -83,6 +83,7 @@ fn steady(start: i64, end: i64, pitch: f32) -> PitchNote {
         curve: vec![0; ((end - start) / i64::from(HOP)) as usize],
         gain_db: 0.0,
         muted: false,
+        timing: None,
     }
 }
 
@@ -95,6 +96,7 @@ fn a_moved_note_sounds_at_its_new_pitch_and_its_neighbour_stays() {
         notes: vec![steady(0, 48_000, 57.0), steady(48_000, 96_000, 64.0)],
         keep_formants: true,
         polyphonic: None,
+        removed: Vec::new(),
     };
     // Analysed, nothing moved: played as recorded (no stretcher).
     set_pitch(&mut tp, clip, edit.clone());
@@ -116,6 +118,92 @@ fn a_moved_note_sounds_at_its_new_pitch_and_its_neighbour_stays() {
     assert!((first - 53.5).abs() < 0.1, "{first}");
 }
 
+fn rms(x: &[f32]) -> f32 {
+    (x.iter().map(|v| v * v).sum::<f32>() / x.len().max(1) as f32).sqrt()
+}
+
+#[test]
+fn a_removed_note_is_silent_and_its_neighbour_plays_on() {
+    // A3 for a second, then E4.
+    let (mut tp, clip) = project(tone(2.0, |t| if t < 1.0 { 57.0 } else { 64.0 }));
+    let mut edit = PitchEdit {
+        hop: HOP,
+        notes: vec![steady(0, 48_000, 57.0), steady(48_000, 96_000, 64.0)],
+        keep_formants: true,
+        polyphonic: None,
+        removed: Vec::new(),
+    };
+    let plain = render(&tp, 96_000);
+    let gone = edit.notes.remove(0);
+    edit.removed.push(gone);
+    set_pitch(&mut tp, clip, edit);
+    let out = render(&tp, 96_000);
+    // Silent past its fade, then the E4 as it was.
+    assert_eq!(rms(&out[300..47_700]), 0.0, "the A3 is gone");
+    assert!(rms(&plain[300..47_700]) > 0.1);
+    let (kept, was) = (rms(&out[49_000..95_000]), rms(&plain[49_000..95_000]));
+    assert!((kept / was - 1.0).abs() < 0.03, "{kept} vs {was}");
+    assert!((pitch_of(&out[70_000..74_096]) - 64.0).abs() < 0.05);
+    // Out of the silence in a short fade (within 10 ms): no click.
+    let (before, mid, after) = (
+        rms(&out[47_700..47_750]),
+        rms(&out[47_960..48_040]),
+        rms(&out[48_300..48_400]),
+    );
+    assert!(
+        before == 0.0 && mid > 0.0 && mid < 0.8 * after,
+        "{before} {mid} {after}"
+    );
+}
+
+#[test]
+fn a_note_made_longer_plays_longer_and_its_neighbour_gives_way() {
+    // A3 for a second, then E4 for a second (touching notes).
+    let (mut tp, clip) = project(tone(2.0, |t| if t < 1.0 { 57.0 } else { 64.0 }));
+    let mut edit = PitchEdit {
+        hop: HOP,
+        notes: vec![steady(0, 48_000, 57.0), steady(48_000, 96_000, 64.0)],
+        keep_formants: true,
+        polyphonic: None,
+        removed: Vec::new(),
+    };
+    let lo_hi = (0, 96_000);
+    let longer = |edit: &mut PitchEdit, to: i64| {
+        edit.move_edge(
+            0,
+            faderframe_project::pitch::Edge::End,
+            to,
+            lo_hi.0,
+            lo_hi.1,
+        );
+    };
+    // The A3 on to 1.5 s: the E4 from there, ending where it did.
+    longer(&mut edit, 72_000);
+    assert_eq!(edit.notes[1].placed(), (72_000, 96_000));
+    set_pitch(&mut tp, clip, edit.clone());
+    let out = render(&tp, 96_000);
+    for (at, want) in [(20_000, 57.0), (60_000, 57.0), (66_000, 57.0)] {
+        let got = pitch_of(&out[at..at + 4096]);
+        assert!((got - want).abs() < 0.1, "at {at}: {got}");
+    }
+    for at in [76_000, 88_000] {
+        let got = pitch_of(&out[at..at + 4096]);
+        assert!((got - 64.0).abs() < 0.1, "at {at}: {got}");
+    }
+    // Shorter: the A3 to half a second, the E4 from there on.
+    longer(&mut edit, 24_000);
+    set_pitch(&mut tp, clip, edit);
+    let out = render(&tp, 96_000);
+    let got = pitch_of(&out[10_000..14_096]);
+    assert!((got - 57.0).abs() < 0.1, "{got}");
+    for at in [28_000, 40_000, 60_000, 88_000] {
+        let got = pitch_of(&out[at..at + 4096]);
+        assert!((got - 64.0).abs() < 0.1, "at {at}: {got}");
+    }
+    // Nothing lost at the clip's end: the E4 still sounds there.
+    assert!(rms(&out[91_000..95_000]) > 0.1);
+}
+
 #[test]
 fn straightening_takes_out_the_wandering() {
     // A3 with ±50 cents of vibrato at 5 Hz for two seconds.
@@ -135,6 +223,7 @@ fn straightening_takes_out_the_wandering() {
             notes: vec![n],
             keep_formants: false,
             polyphonic: None,
+            removed: Vec::new(),
         },
     );
     let out = render(&tp, 96_000);
@@ -215,6 +304,7 @@ fn formants_stay_unless_moved() {
                 notes: vec![n],
                 keep_formants: keep,
                 polyphonic: None,
+                removed: Vec::new(),
             },
         );
         let out = render(&tp, 48_000);
@@ -251,6 +341,7 @@ fn playing_from_mid_note_starts_at_once_and_warping_comes_along() {
             notes: vec![n],
             keep_formants: true,
             polyphonic: None,
+            removed: Vec::new(),
         },
     );
     // From the middle of the note: moved from the first frames on.

@@ -67,6 +67,30 @@ pub(super) fn arpeggiator() -> Vec<FactoryPreset> {
             "Rising Thirty-Seconds",
             &[(RATE, D32), (OCTAVES, 3.0), (GATE, 0.5), (VELOCITY, 100.0)],
         ),
+        // The first of every four steps pushed, the rest held back.
+        preset(
+            "Accented Sixteenths",
+            &[
+                (RATE, D16),
+                (GATE, 0.6),
+                (PATTERN, 1.0),
+                (PATTERN_LENGTH, 4.0),
+                (ACCENT, 0.45),
+            ],
+        ),
+        // Louder over eight steps, then again; some steps left out.
+        preset(
+            "Ramped Builder",
+            &[
+                (RATE, D16),
+                (OCTAVES, 2.0),
+                (GATE, 0.7),
+                (PATTERN, 3.0),
+                (PATTERN_LENGTH, 8.0),
+                (ACCENT, 0.7),
+                (CHANCE, 0.85),
+            ],
+        ),
     ]
 }
 
@@ -97,6 +121,13 @@ pub(super) fn chord() -> Vec<FactoryPreset> {
         ),
         shifts("Soft Fifth Pad", &[7.0, 12.0], &[(VELOCITY, 0.6)]),
         // One finger plays the key's chords.
+        // The triad with its root on top (E G C for a C).
+        shifts("First Inversion Triad", &[4.0, 7.0], &[(INVERSION, 1.0)]),
+        shifts(
+            "Low Power Chord",
+            &[7.0, 12.0],
+            &[(OCTAVE, -1.0), (VELOCITY, 0.9)],
+        ),
         preset("Scale Triads (Key Track)", &[(MODE, 1.0)]),
         preset(
             "Scale Sevenths (Key Track)",
@@ -206,6 +237,27 @@ pub(super) fn note_echo() -> Vec<FactoryPreset> {
                 (TIME, 380.0),
                 (REPEATS, 12.0),
                 (FEEDBACK, 0.88),
+            ],
+        ),
+        // Up the key track's scale in thirds: the echoes stay in the song.
+        preset(
+            "In-Key Thirds",
+            &[
+                (DIVISION, D8),
+                (REPEATS, 4.0),
+                (FEEDBACK, 0.8),
+                (PITCH, 2.0),
+                (IN_KEY, 1.0),
+            ],
+        ),
+        // Short repeats whatever the note's length.
+        preset(
+            "Staccato Repeats",
+            &[
+                (DIVISION, D16),
+                (REPEATS, 6.0),
+                (FEEDBACK, 0.8),
+                (LENGTH, 0.3),
             ],
         ),
     ]

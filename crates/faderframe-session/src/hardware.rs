@@ -49,6 +49,10 @@ impl Session {
                 ins = ins.max(at(id::RETURN_CHANNEL) + width);
             }
         }
+        // Every cue mix's outputs.
+        for c in &p.cue_mixes {
+            outs = outs.max(usize::from(c.outputs().end));
+        }
         (ins.min(256) as u16, outs.min(256) as u16)
     }
 
@@ -69,7 +73,7 @@ impl Session {
         self.notify(
             NoticeLevel::Info,
             format!(
-                "Opening the audio device with {} outputs and {} inputs (a hardware insert's)",
+                "Opening the audio device with {} outputs and {} inputs (for a hardware insert or a cue mix)",
                 want.1, want.0
             ),
         );

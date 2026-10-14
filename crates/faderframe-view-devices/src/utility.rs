@@ -1,5 +1,6 @@
 //! The Utility's face: a vectorscope of what comes out (mid up, side
-//! across), its correlation and balance, the controls and meters.
+//! across), its correlation and balance, the controls (the per-side trims
+//! and polarity together) and meters.
 
 use crate::kit::{self, Ctl, Ctx, Face, KNOB, Meter, MeterKind, Panel, SMALL, SWITCH_H, Scale};
 use faderframe_core::ParameterId;
@@ -110,7 +111,7 @@ impl Face for UtilityFace {
     }
 
     fn min_size(&self) -> Size {
-        Size::new(760.0, 470.0)
+        Size::new(840.0, 470.0)
     }
 
     fn panel(&self, size: Size) -> Panel {
@@ -120,7 +121,7 @@ impl Face for UtilityFace {
             &[
                 ("GAIN", 3.2),
                 ("STEREO", 5.0),
-                ("POLARITY", 2.4),
+                ("CHANNELS", 3.4),
                 ("MONO BASS", 2.6),
             ],
         );
@@ -150,16 +151,15 @@ impl Face for UtilityFace {
             Rect::new(r.x + r.w * 0.62 + 4.0, r.y + 10.0, r.w * 0.38 - 10.0, 38.0),
         ));
         let r = kit::inside(&s[2]);
-        c.push(Ctl::toggle(
-            pid(id::INVERT_L),
-            "Ø Left",
-            Rect::new(r.x + 6.0, r.y + 8.0, r.w - 12.0, SWITCH_H),
-        ));
-        c.push(Ctl::toggle(
-            pid(id::INVERT_R),
-            "Ø Right",
-            Rect::new(r.x + 6.0, r.y + 40.0, r.w - 12.0, SWITCH_H),
-        ));
+        let k = kit::row(Rect::new(r.x, r.y, r.w, SMALL.1), &[SMALL.0, SMALL.0]);
+        c.push(Ctl::small(pid(id::TRIM_L), "TRIM L", k[0]).bipolar());
+        c.push(Ctl::small(pid(id::TRIM_R), "TRIM R", k[1]).bipolar());
+        let b = kit::row(
+            Rect::new(r.x, r.y + SMALL.1 + 6.0, r.w, SWITCH_H),
+            &[r.w / 2.0 - 6.0, r.w / 2.0 - 6.0],
+        );
+        c.push(Ctl::toggle(pid(id::INVERT_L), "Ø L", b[0]));
+        c.push(Ctl::toggle(pid(id::INVERT_R), "Ø R", b[1]));
         let r = kit::inside(&s[3]);
         c.push(Ctl::toggle(
             pid(id::MONO_BASS),
@@ -353,6 +353,9 @@ impl Face for UtilityFace {
             id::CHANNELS => "Stereo, left or right on both, swapped, the mid or the side",
             id::MONO_BASS => "Fold the side to mono below the frequency",
             id::DC => "Take DC off (5 Hz high pass)",
+            id::TRIM_L | id::TRIM_R => {
+                "One side's level, before the width (even a lopsided recording)"
+            }
             _ => return None,
         })
     }

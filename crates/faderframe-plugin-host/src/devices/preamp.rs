@@ -59,7 +59,10 @@ const BATCH: usize = 64;
 /// The circuits of a track's channels. Each channel's circuit is
 /// independent, so they are solved side by side: the calling thread and
 /// helper threads (which adopt its scheduling, see [`WorkerPool`]) take a
-/// channel each, and the result is what one thread would compute. Like
+/// channel each — a 5.1 track six threads, a 7.1.4 one twelve — within the
+/// machine's physical cores and the user's processing threads
+/// ([`faderframe_realtime::channel_threads`]; channels beyond them share
+/// threads), and the result is what one thread would compute. Like
 /// GainStageFx, one circuit runs while stereo input is exactly mono; once
 /// the channels differ its state is copied into the dormant one, and both
 /// keep their tails until a reset.
@@ -88,10 +91,10 @@ impl PreampBank {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let helpers = (channels > 1).then(|| {
-            let cores = faderframe_realtime::physical_cores()
-                .saturating_sub(1)
-                .max(1);
-            WorkerPool::new(PoolConfig::new((channels - 1).min(cores).min(BATCH - 1)))
+            WorkerPool::new(PoolConfig::new(faderframe_realtime::channel_helpers(
+                channels,
+                BATCH - 1,
+            )))
         });
         Ok(Self {
             circuits,
@@ -146,8 +149,11 @@ impl PreampBank {
         }
         let (gain, master) = (&gain[range.clone()], &master[range.clone()]);
         let bus_gain = &bus_gain[range.clone()];
+        let threads = self.helpers.as_ref().map_or(1, |h| {
+            faderframe_realtime::channel_threads(active.min(BATCH), h.threads())
+        });
         match &self.helpers {
-            Some(helpers) if active > 1 => {
+            Some(helpers) if threads > 1 => {
                 for start in (0..active).step_by(BATCH) {
                     let n = (active - start).min(BATCH);
                     let mut samples: [TryCell<Option<&mut [f32]>>; BATCH] =
@@ -155,15 +161,18 @@ impl PreampBank {
                     for (cell, channel) in samples.iter_mut().zip(&mut channels[start..start + n]) {
                         *cell.get_mut() = Some(&mut channel[range.clone()]);
                     }
+                    let threads = threads.min(n);
                     let job = Solve {
                         circuits: &self.circuits[start..start + n],
                         samples: &samples[..n],
                         next: AtomicUsize::new(0),
+                        seats: AtomicUsize::new(0),
+                        threads,
                         gain,
                         master,
                         bus_gain,
                     };
-                    helpers.run(&job, n - 1);
+                    helpers.run(&job, threads - 1);
                 }
             }
             _ => {
@@ -203,11 +212,15 @@ impl PreampBank {
     }
 }
 
-/// One pass of the helpers: each thread takes the next channel.
+/// One pass of the helpers: each thread takes the next channel. At most
+/// `threads` threads take part (idle helpers still spinning from an
+/// earlier run join any run; the others leave at once).
 struct Solve<'a, 'b> {
     circuits: &'a [TryCell<Preamp>],
     samples: &'a [TryCell<Option<&'b mut [f32]>>],
     next: AtomicUsize,
+    seats: AtomicUsize,
+    threads: usize,
     gain: &'a [f32],
     master: &'a [f32],
     bus_gain: &'a [f32],
@@ -215,6 +228,9 @@ struct Solve<'a, 'b> {
 
 impl PoolJob for Solve<'_, '_> {
     fn work(&self) {
+        if self.seats.fetch_add(1, Ordering::Relaxed) >= self.threads {
+            return;
+        }
         loop {
             let c = self.next.fetch_add(1, Ordering::Relaxed);
             let (Some(circuit), Some(samples)) = (self.circuits.get(c), self.samples.get(c)) else {
@@ -366,6 +382,57 @@ impl PluginProcessor for PreampProcessor {
 mod tests {
     use super::*;
     use crate::devices::rig::{BLOCK, Rig, SR, silence};
+
+    /// A 5.1 track's six channels are solved side by side, a thread each
+    /// (within the cores), to the same bits as one thread solving them in
+    /// turn — also when the user's processing threads allow fewer.
+    #[test]
+    fn surround_channels_are_solved_side_by_side_to_the_same_bits() {
+        const CHANNELS: usize = 6;
+        const FRAMES: usize = 300;
+        let config = crate::devices::rig::config();
+        let bank = || PreampBank::new(5, &config, CHANNELS, 0.6, 0.0, false).unwrap();
+        let mut parallel = bank();
+        assert_eq!(
+            parallel.helpers.as_ref().map(WorkerPool::threads),
+            Some(faderframe_realtime::channel_helpers(CHANNELS, BATCH - 1)),
+            "a helper per channel beyond the caller, within the cores"
+        );
+        if faderframe_realtime::physical_cores() >= CHANNELS {
+            assert_eq!(
+                parallel.helpers.as_ref().map(WorkerPool::threads),
+                Some(CHANNELS - 1)
+            );
+        }
+        let mut serial = bank();
+        serial.helpers = None;
+        let gain = vec![0.6f32; FRAMES];
+        let master = vec![0.0f32; FRAMES];
+        let bus_gain = vec![0.5f32; FRAMES];
+        let signal = |c: usize, n: usize| {
+            0.2 * (n as f32 * (0.03 + 0.011 * c as f32)).sin()
+                + 0.05 * (n as f32 * 0.17).sin() * (c % 2) as f32
+        };
+        let run = |bank: &mut PreampBank, from: usize| {
+            let mut data: Vec<Vec<f32>> = (0..CHANNELS)
+                .map(|c| (from..from + FRAMES).map(|n| signal(c, n)).collect())
+                .collect();
+            let mut channels: Vec<&mut [f32]> = data.iter_mut().map(Vec::as_mut_slice).collect();
+            let active = bank.active(&channels);
+            assert_eq!(active, CHANNELS);
+            bank.process(&mut channels, active, 0..FRAMES, &gain, &master, &bus_gain);
+            data
+        };
+        for (block, threads) in [None, Some(1), Some(3), None].into_iter().enumerate() {
+            faderframe_realtime::set_processing_threads(threads);
+            let from = block * FRAMES;
+            let a = run(&mut parallel, from);
+            faderframe_realtime::set_processing_threads(None);
+            let b = run(&mut serial, from);
+            assert_eq!(a, b, "block {block}, processing threads {threads:?}");
+            assert!(a.iter().flatten().any(|x| *x != 0.0));
+        }
+    }
 
     #[test]
     fn duplicated_mono_wakes_to_stereo_without_changing_audio_or_losing_tails() {

@@ -118,6 +118,10 @@ define_id!(
     /// A video track.
     VideoTrackId, "vtrack#"
 );
+define_id!(
+    /// A cue mix (a performer's headphone mix on its own outputs).
+    CueId, "cuemix#"
+);
 
 /// Identifier of a parameter *within* a processor or plugin.
 ///

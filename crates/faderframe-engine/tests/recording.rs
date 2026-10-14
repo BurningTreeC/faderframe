@@ -251,3 +251,121 @@ fn metronome_levels_sounds_and_off_beats() {
     assert_eq!(out[12_000], 0.0);
     assert_eq!(out[24_000], 0.5 * 0.5 * 0.8);
 }
+
+/// Recording over a clip: inside the record window the recorded track's
+/// clip is silent and its input is heard (Auto monitoring); before and after
+/// the window the clip plays and the input is not heard.
+#[test]
+fn a_recorded_track_plays_its_input_not_its_clip_inside_the_window() {
+    use faderframe_project::{InputRouting, MonitorMode};
+    use faderframe_timeline::MusicalTime;
+    let mut tp = TestProject::new(SR);
+    let t = tp.track(TrackKind::Audio, "Vox", ChannelLayout::Stereo);
+    let dc = tp.dc(2, 0.25, 20_000);
+    tp.clip(t, dc, MusicalTime::ZERO, 20_000);
+    {
+        let tr = tp.project.track_mut(t).unwrap();
+        tr.input = InputRouting::Hardware { first_channel: 0 };
+        tr.monitor = MonitorMode::Auto;
+        tr.record_arm = true;
+    }
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, BLOCK, 2).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, BLOCK);
+    let mut play = |r: &mut OfflineRenderer, blocks: usize| {
+        let mut out = Vec::new();
+        for _ in 0..blocks {
+            bufs.set_frames(BLOCK);
+            for c in 0..2 {
+                bufs.input_mut(c).fill(1.0);
+            }
+            r.processor.process_device(&mut bufs);
+            r.controller.collect_garbage();
+            out.extend_from_slice(bufs.output(0));
+        }
+        out
+    };
+    // Playing, not recording: the clip, not the input.
+    r.play_from(0).unwrap();
+    let out = play(&mut r, 20);
+    let clip_level = out[1_500];
+    assert!(clip_level > 0.05, "the clip plays: {clip_level}");
+    // Recording from 1234 to 5678.
+    let _s = r
+        .controller
+        .begin_recording(target(t), 1_234, 5_678, 2.0)
+        .unwrap();
+    r.controller
+        .transport(TransportCommand::SetRecording(true))
+        .unwrap();
+    r.controller.transport(TransportCommand::Locate(0)).unwrap();
+    let out = play(&mut r, 80);
+    let at = |i: usize| out[i];
+    assert!((at(1_000) - clip_level).abs() < 1e-4, "before: the clip");
+    assert!((at(7_000) - clip_level).abs() < 1e-4, "after: the clip");
+    let inside = at(3_000);
+    assert!(
+        (inside - 4.0 * clip_level).abs() < 1e-3,
+        "inside: the input alone ({inside} vs clip {clip_level})"
+    );
+    assert!((at(1_234) - inside).abs() < 1e-4, "switches on the frame");
+    assert!((at(1_233) - clip_level).abs() < 1e-4);
+    assert!((at(5_677) - inside).abs() < 1e-4);
+    assert!((at(5_678) - clip_level).abs() < 1e-4);
+}
+
+/// Counting in: before the record window the arrangement is silent and the
+/// click plays (metronome off or not); from the window on, the song.
+#[test]
+fn a_count_in_plays_the_click_alone_before_the_take() {
+    use faderframe_timeline::MusicalTime;
+    let mut tp = TestProject::new(SR);
+    let t = tp.track(TrackKind::Audio, "Song", ChannelLayout::Stereo);
+    let dc = tp.dc(2, 0.25, 200_000);
+    tp.clip(t, dc, MusicalTime::ZERO, 200_000);
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, BLOCK, 2).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, BLOCK);
+    let mut play = |r: &mut OfflineRenderer, blocks: usize| {
+        let mut out = Vec::new();
+        for _ in 0..blocks {
+            bufs.set_frames(BLOCK);
+            r.processor.process_device(&mut bufs);
+            r.controller.collect_garbage();
+            out.extend_from_slice(bufs.output(0));
+        }
+        out
+    };
+    r.controller.metronome().set_mode(MetronomeMode::Off);
+    r.play_from(0).unwrap();
+    let level = play(&mut r, 20)[1_000];
+    assert!(level > 0.05);
+    r.controller.set_count_in(true).unwrap();
+    // The take starts at 60 000 (beat 2.5 at 120 BPM); another track records.
+    let _s = r
+        .controller
+        .begin_recording(target(TrackId(999_999)), 60_000, i64::MAX, 2.0)
+        .unwrap();
+    r.controller
+        .transport(TransportCommand::SetRecording(true))
+        .unwrap();
+    r.controller.transport(TransportCommand::Locate(0)).unwrap();
+    let out = play(&mut r, 800);
+    // Between clicks: nothing at all.
+    assert_eq!(out[30_000], 0.0, "the song waits");
+    assert_eq!(out[59_999], 0.0);
+    // The beat at 24 000 clicks.
+    let click = out[24_000..26_000]
+        .iter()
+        .fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!(click > 0.01, "the click counts in: {click}");
+    // The song from the take on.
+    assert!((out[60_050] - level).abs() < 1e-4, "{}", out[60_050]);
+    assert!((out[70_000] - level).abs() < 1e-4, "{}", out[70_000]);
+}

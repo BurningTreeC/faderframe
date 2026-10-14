@@ -198,6 +198,8 @@ pub fn ahead_sets(
         .map(|t| t.id)
         .collect();
     let mut strips = HashSet::new();
+    // Cue mixes take every strip's cue taps on the audio thread.
+    let buses = buses && project.cue_mixes.is_empty();
     if !buses {
         if let Some(k) = keep {
             tracks.retain(|t| !k.strips.contains(t));
@@ -384,6 +386,8 @@ enum Role {
     HardwareSend = 18,
     HardwareReturn = 19,
     Console = 20,
+    CueInput = 21,
+    CueSend = 22,
 }
 
 /// Stretcher voices a track's clip player needs: one per pitch-preserving
@@ -727,7 +731,7 @@ fn add_hardware_insert(
     };
     let (send_ch, ret_ch, _, trip) =
         faderframe_plugin_host::devices::hardware_insert::routing(&params);
-    let label = format!("{} · {}", t.name, slot.plugin.name);
+    let label = format!("{} · {}", t.name, t.name_of(slot));
     let id = slot.id.raw();
     let level = b.add_node(
         NodeSpec::new(format!("{label} · Send"))
@@ -875,6 +879,13 @@ pub fn build_graph(
 ) -> Result<BuiltGraph, EngineError> {
     let early = &monitoring.tracks;
     let midi_ports = &routing.inputs;
+    // Cue mixes are live monitoring: a render's engine builds none.
+    let cues: Vec<&faderframe_project::CueMix> = if plugins.realtime() {
+        project.cue_mixes.iter().collect()
+    } else {
+        Vec::new()
+    };
+    let cue_taps = |t: &Track| !cues.is_empty() && faderframe_project::cue::feeds_cues(t.kind);
     let mut b = GraphBuilder::<EngineContext>::new();
     let mut ab = GraphBuilder::<EngineContext>::new();
     let mut used_rings: Vec<Arc<AheadRing>> = Vec::new();
@@ -1054,7 +1065,7 @@ pub fn build_graph(
                         &plan.misses,
                     )
                 };
-                let strip = add_strip(&mut bb, project, slots, config, t, None, end, true)?;
+                let strip = add_strip(&mut bb, project, slots, config, t, None, end, true, false)?;
                 let echo = ring_of(
                     plan.bus_rings,
                     t.id,
@@ -1105,7 +1116,17 @@ pub fn build_graph(
                 };
                 let back = reader(&mut b, &ring, latency, end_layout, Some(gi), &plan.misses);
                 own(&mut owners, back, t.id, None, NodeWork::Ahead);
-                let strip = add_strip(&mut b, project, slots, config, t, Some(gi), back, false)?;
+                let strip = add_strip(
+                    &mut b,
+                    project,
+                    slots,
+                    config,
+                    t,
+                    Some(gi),
+                    back,
+                    false,
+                    cue_taps(t),
+                )?;
                 tn.post_fx = Some(back);
                 tn.strip = Some(own(&mut owners, strip, t.id, None, NodeWork::Strip));
             }
@@ -1330,7 +1351,7 @@ pub fn build_graph(
                             .group(gi)
                             .audio_in(layout)
                             .audio_out(layout),
-                        Box::new(MonitorGate::new(t.monitor, t.record_arm)),
+                        Box::new(MonitorGate::new(t.id, t.monitor, t.record_arm)),
                     );
                     own(&mut owners, gate, t.id, None, NodeWork::Monitor);
                     b.connect_audio(dev, 0, gate, 0)?;
@@ -1339,7 +1360,7 @@ pub fn build_graph(
             }
             TrackKind::Instrument => {
                 if let Some(slot) = &t.instrument {
-                    let spec = NodeSpec::new(format!("{} · {}", t.name, slot.plugin.name))
+                    let spec = NodeSpec::new(format!("{} · {}", t.name, t.name_of(slot)))
                         .group(gi)
                         .events_in(1)
                         .audio_out(layout);
@@ -1410,7 +1431,7 @@ pub fn build_graph(
             // A device that widens a mono track takes it as stereo (the
             // graph duplicates it) and everything after it is stereo.
             layout = slot.plugin.output_layout(layout);
-            let mut spec = NodeSpec::new(format!("{} · {}", t.name, slot.plugin.name))
+            let mut spec = NodeSpec::new(format!("{} · {}", t.name, t.name_of(slot)))
                 .group(gi)
                 .audio_in(layout)
                 .audio_out(layout);
@@ -1454,7 +1475,17 @@ pub fn build_graph(
             prev = node;
         }
 
-        let strip = add_strip(&mut b, project, slots, config, t, Some(gi), prev, false)?;
+        let strip = add_strip(
+            &mut b,
+            project,
+            slots,
+            config,
+            t,
+            Some(gi),
+            prev,
+            false,
+            cue_taps(t),
+        )?;
         tn.post_fx = Some(prev);
         tn.strip = Some(own(&mut owners, strip, t.id, None, NodeWork::Strip));
         nodes.insert(t.id, tn);
@@ -1519,10 +1550,13 @@ pub fn build_graph(
         if t.kind == TrackKind::Master {
             let layout = destination_layout(project, t);
             for slot in monitor {
-                let spec = NodeSpec::new(format!("Album · {}", slot.plugin.name))
-                    .group(gi)
-                    .audio_in(layout)
-                    .audio_out(layout);
+                let spec = NodeSpec::new(format!(
+                    "Album · {}",
+                    faderframe_project::device_name(monitor, slot)
+                ))
+                .group(gi)
+                .audio_in(layout)
+                .audio_out(layout);
                 let (node, _) = pcx.node(g, slot, t, spec, Role::Insert);
                 owned(node, NodeWork::Insert, Some(slot.id));
                 g.connect_audio(out, 0, node, 0)?;
@@ -1649,12 +1683,9 @@ pub fn build_graph(
             .then(|| slots.strip_of(t.id))
             .flatten();
             let diffuse = follow.is_some() && is_diffuse(project, t);
-            let mut node = SendNode::new(t.id, send.id, level).with_layouts(
-                tap_layout,
-                target.layout,
-                follow,
-                slots.mix()?,
-            );
+            let mut node = SendNode::new(t.id, send.id, level)
+                .with_pan(slots.send_pan(send.id)?)
+                .with_layouts(tap_layout, target.layout, follow, slots.mix()?);
             if diffuse {
                 node = node.with_diffuser(config.sample_rate);
             }
@@ -1681,6 +1712,92 @@ pub fn build_graph(
     if let Some(r) = renderer {
         for o in object_outs {
             b.connect_audio(o, 0, r, 0)?;
+        }
+    }
+
+    // Pass 3: the cue mixes. Each sums its sends into its own strip (its
+    // level and mute) and plays on its outputs: a heard output like the
+    // master's, aligned with it, never through the master's listening.
+    // Every track that feeds cue mixes sends to each from its strip's cue
+    // tap (before or after the fader, never muted), a send it has none of
+    // silent — so the sends' levels, pans and switches are parameters.
+    for cue in &cues {
+        let ch = cue.channel();
+        let layout = cue.layout;
+        let input = b.add_node(
+            NodeSpec::new(format!("Cue · {}", cue.name))
+                .key(node_key(ch, Role::CueInput, 0, &[layout]))
+                .audio_in(layout)
+                .audio_out(layout),
+            Box::new(Passthrough),
+        );
+        let strip = b.add_node(
+            NodeSpec::new(format!("Cue · {} · Strip", cue.name))
+                .key(node_key(ch, Role::Strip, 0, &[layout, layout]))
+                .audio_in(layout)
+                .audio_out(layout),
+            Box::new(
+                ChannelStrip::new(
+                    ch,
+                    slots.strip(ch)?,
+                    slots.meter(ch, layout.channel_count())?,
+                    slots.mix()?,
+                )
+                .with_layouts(layout, layout),
+            ),
+        );
+        own(&mut owners, strip, ch, None, NodeWork::Strip);
+        b.connect_audio(input, 0, strip, 0)?;
+        let first_channel = cue.first_channel;
+        let hw = b.add_node(
+            NodeSpec::new(format!("Cue · {} · Hardware Out", cue.name))
+                .key(node_key(
+                    ch,
+                    Role::DeviceOut,
+                    u64::from(first_channel),
+                    &[layout],
+                ))
+                .role(NodeRole::DeviceOutput { first_channel })
+                .audio_in(layout),
+            Box::new(DeviceOutputSink),
+        );
+        own(&mut owners, hw, ch, None, NodeWork::HardwareOut);
+        b.connect_audio(strip, 0, hw, 0)?;
+        let port = if cue.post_fader() { 3 } else { 2 };
+        for (gi, t) in project.tracks.iter().enumerate() {
+            if !cue_taps(t) {
+                continue;
+            }
+            let Some(strip) = nodes
+                .get(&t.id)
+                .filter(|n| !n.strip_ahead)
+                .and_then(|n| n.strip)
+            else {
+                continue;
+            };
+            let tap = t.chain_layout();
+            let s = slots.cue_send(t.id, cue.id)?;
+            let node = b.add_node(
+                NodeSpec::new(format!("{} → {}", t.name, cue.name))
+                    .key(node_key(
+                        t.id,
+                        Role::CueSend,
+                        cue.id.raw() | (u64::from(port) << 60),
+                        &[tap, layout],
+                    ))
+                    .group(gi as u32)
+                    .audio_in(tap)
+                    .audio_out(layout),
+                Box::new(SendNode::cue(t.id, s.gain, s.pan).with_layouts(
+                    tap,
+                    layout,
+                    None,
+                    slots.mix()?,
+                )),
+            );
+            own(&mut owners, node, t.id, None, NodeWork::Send);
+            b.connect_audio(strip, port, node, 0)?;
+            connect_out(&mut b, node, input, early.contains(&t.id))?;
         }
     }
     let bypassed_for_monitoring = std::mem::take(&mut pcx.bypassed_for_monitoring);
@@ -1822,7 +1939,7 @@ fn add_container(
         ));
     };
     let sum = b.add_node(
-        NodeSpec::new(format!("{} · {}", t.name, container.plugin.name))
+        NodeSpec::new(format!("{} · {}", t.name, t.name_of(container)))
             .key(node_key(
                 t.id,
                 Role::ContainerSum,
@@ -1852,7 +1969,9 @@ fn add_container(
             let f = b.add_node(
                 NodeSpec::new(format!(
                     "{} · {} · {} · Notes",
-                    t.name, container.plugin.name, chain.name
+                    t.name,
+                    t.name_of(container),
+                    chain.name
                 ))
                 .key(node_key(t.id, Role::ChainNotes, sub, &[]))
                 .group(gi)
@@ -1901,7 +2020,7 @@ fn add_container(
                 }
                 continue;
             }
-            let mut spec = NodeSpec::new(format!("{} · {}", t.name, slot.plugin.name))
+            let mut spec = NodeSpec::new(format!("{} · {}", t.name, t.name_of(slot)))
                 .group(gi)
                 .audio_in(layout)
                 .audio_out(layout);
@@ -1937,7 +2056,9 @@ fn add_container(
         let mix = b.add_node(
             NodeSpec::new(format!(
                 "{} · {} · {}",
-                t.name, container.plugin.name, chain.name
+                t.name,
+                t.name_of(container),
+                chain.name
             ))
             .key(node_key(
                 t.id,
@@ -2039,7 +2160,8 @@ fn is_diffuse(project: &Project, t: &Track) -> bool {
     project.surround_panned(t).is_some() && project.effective_surround(t).diffuse
 }
 
-/// A track's channel strip, fed from `from` (`quiet`: rendered ahead).
+/// A track's channel strip, fed from `from` (`quiet`: rendered ahead;
+/// `cue_taps`: with the cue mixes' taps, outputs 2 and 3).
 #[allow(clippy::too_many_arguments)]
 fn add_strip(
     b: &mut GraphBuilder<EngineContext>,
@@ -2050,6 +2172,7 @@ fn add_strip(
     group: Option<u32>,
     from: NodeId,
     quiet: bool,
+    cue_taps: bool,
 ) -> Result<NodeId, EngineError> {
     let layout = t.chain_layout();
     // The console's channel line amplifier, before the strip (wherever
@@ -2101,6 +2224,9 @@ fn add_strip(
         .audio_in(layout)
         .audio_out(dest)
         .audio_out(layout);
+    if cue_taps {
+        spec = spec.audio_out(layout).audio_out(layout);
+    }
     if let Some(g) = group {
         spec = spec.group(g);
     }
@@ -2136,7 +2262,7 @@ fn note_effects(
         if !pcx.note_effect(slot) {
             continue;
         }
-        let mut spec = NodeSpec::new(format!("{} · {}", t.name, slot.plugin.name))
+        let mut spec = NodeSpec::new(format!("{} · {}", t.name, t.name_of(slot)))
             .events_in(1)
             .events_out(1);
         if let Some(g) = group {
@@ -2254,7 +2380,7 @@ fn build_ahead_chain(
             midi = Some(player);
             fx = note_effects(ab, pcx, t, &chain, &[player], None)?;
             if let Some(slot) = &t.instrument {
-                let spec = NodeSpec::new(format!("{} · {}", t.name, slot.plugin.name))
+                let spec = NodeSpec::new(format!("{} · {}", t.name, t.name_of(slot)))
                     .events_in(1)
                     .audio_out(layout);
                 let (inst, l) = pcx.node(ab, slot, t, spec, Role::Instrument);
@@ -2343,7 +2469,7 @@ fn build_ahead_chain(
         // A device that widens a mono track takes it as stereo (the graph
         // duplicates it) and everything after it is stereo.
         layout = slot.plugin.output_layout(layout);
-        let mut spec = NodeSpec::new(format!("{} · {}", t.name, slot.plugin.name))
+        let mut spec = NodeSpec::new(format!("{} · {}", t.name, t.name_of(slot)))
             .audio_in(layout)
             .audio_out(layout);
         if notes {

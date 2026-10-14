@@ -14,8 +14,12 @@
 #![forbid(unsafe_code)]
 
 mod access;
+mod cue;
 mod layout;
 mod preamp;
+
+pub use cue::BarHit;
+use cue::{Sets, cue_color, sets};
 
 pub use layout::{INSERT_SLOT_STEP, MAX_SEND_ROWS, SENDS_PER_ROW, StripLayout};
 
@@ -39,6 +43,20 @@ const STRIP_WIDTHS: [(&str, Option<f32>); 4] = [
     ("Normal", None),
     ("Wide", Some(130.0)),
     ("Extra Wide", Some(190.0)),
+];
+
+/// The fader scale's marks (dB, label).
+const FADER_MARKS: [(f32, &str); 10] = [
+    (12.0, "12"),
+    (6.0, "6"),
+    (0.0, "0"),
+    (-5.0, "5"),
+    (-10.0, "10"),
+    (-20.0, "20"),
+    (-30.0, "30"),
+    (-40.0, "40"),
+    (-60.0, "60"),
+    (SILENCE_DB, "∞"),
 ];
 
 /// The column right of the last strip with the "+".
@@ -101,15 +119,29 @@ fn folder_layout(rect: Rect) -> FolderLayout {
 /// The bed `t` is placed into by the surround panner (its strip shows the
 /// room); `None` also for a stereo track balanced into a bed (its strip
 /// shows the balance knob).
+/// In a cue mix (the mixer's cue mode) nothing: its sends pan into the
+/// cue mix's stereo.
 fn room_panned(model: &Session, t: &Track) -> Option<faderframe_core::SurroundFormat> {
+    if model.mixer_cue().is_some() {
+        return None;
+    }
     model
         .project()
         .surround_panned(t)
         .filter(|_| !model.project().balanced_into_bed(t))
 }
 
+/// Whether a strip shows dual pan's two knobs (never in a cue mix: a
+/// cue send has one pan).
+fn dual_shown(model: &Session, t: &Track) -> bool {
+    model.mixer_cue().is_none() && model.project().dual_panned(t)
+}
+
 /// Whether a strip's pan knob is a stereo balance.
 fn is_balance(model: &Session, t: &Track) -> bool {
+    if model.mixer_cue().is_some() {
+        return t.chain_layout().channel_count() == 2;
+    }
     model.project().pans_stereo(t) || model.project().balanced_into_bed(t)
 }
 
@@ -278,6 +310,8 @@ pub struct MixerView {
     widths: Vec<f32>,
     /// The side panel shows the master: this mixer leaves it out.
     hide_master: bool,
+    /// The cue bar's button under the pointer.
+    bar_hover: Option<BarHit>,
 }
 
 fn fader_cap_color(kind: TrackKind, theme: &Theme) -> Color {
@@ -413,6 +447,7 @@ impl MixerView {
             hide_master: false,
             offsets: vec![0.0],
             widths: Vec::new(),
+            bar_hover: None,
         }
     }
 
@@ -676,13 +711,16 @@ impl MixerView {
             if t.kind == TrackKind::Midi {
                 return Some(Self::midi_hit(&l, id, pos));
             }
-            if let Some(area) = l.preamp
+            // In a cue mix the master section is the cue mix's own: its
+            // level, mute, click, meters and outputs.
+            let cue_master = matches!(sets(model, t), Sets::CueMaster(_));
+            if let Some(area) = l.preamp.filter(|_| !cue_master)
                 && let Some(hit) = self.preamp_hit(area, t, pos)
             {
                 return Some(hit);
             }
             let geo = FaderGeometry::new(l.fader, &self.theme);
-            let pos_now = self.law.db_to_position(model.shown_volume_db(t));
+            let pos_now = self.law.db_to_position(Self::fader_db(model, t));
             // VCAs have only a fader, mute and solo.
             let audio = (t.kind != TrackKind::Vca).then_some(());
             // A bed's strip has no pan.
@@ -690,7 +728,7 @@ impl MixerView {
                 audio.filter(|_| !matches!(t.layout, faderframe_core::ChannelLayout::Surround(_)));
             let color = Rect::new(l.color_bar.x, l.color_bar.y, l.color_bar.w, 7.0);
             // Dual pan: two knobs, each over its value (and no single one).
-            let dual = pans.is_some() && model.project().dual_panned(t);
+            let dual = pans.is_some() && dual_shown(model, t);
             let pans = pans.filter(|_| !dual);
             if dual {
                 for (i, (knob, value)) in dual_pan_rects(&l).into_iter().enumerate() {
@@ -703,7 +741,7 @@ impl MixerView {
                 }
             }
             let checks: [(Option<Rect>, Hit); 15] = [
-                (Some(color), Hit::Color(id)),
+                ((!cue_master).then_some(color), Hit::Color(id)),
                 (Some(geo.cap_rect(pos_now).inset(-2.0)), Hit::FaderCap(id)),
                 (
                     model.gain_reduction(id).map(|_| reduction_rect(&l)),
@@ -733,6 +771,9 @@ impl MixerView {
                 if r.is_some_and(|r| r.contains(pos)) {
                     return Some(hit);
                 }
+            }
+            if cue_master {
+                return Some(Hit::Strip(id));
             }
             if l.input.is_some_and(|i| i.input.contains(pos)) {
                 return Some(Hit::Input(id));
@@ -917,6 +958,11 @@ impl MixerView {
         let c = &th.console;
         let is_master = t.kind == TrackKind::Master;
         let l = self.layout_for(rect, t, model.project());
+        let sets = sets(model, t);
+        if let Sets::CueMaster(cue) = sets {
+            self.paint_cue_master(p, rect, &l, cue, model);
+            return;
+        }
         let (top, bottom) = if is_master {
             (c.master_panel_top, c.master_panel_bottom)
         } else {
@@ -1086,7 +1132,7 @@ impl MixerView {
                 &faderframe_view_surround::room::format_place(&pan),
                 th,
             );
-        } else if model.project().dual_panned(t) {
+        } else if dual_shown(model, t) {
             // Dual pan: the left and the right input channel, each placed
             // on its own.
             let dual = model.shown_dual_pan(t);
@@ -1106,21 +1152,25 @@ impl MixerView {
                 controls::readout(p, value, &format_pan(pan), th);
             }
         } else {
+            let pan = Self::pan_shown(model, t);
             controls::knob(
                 p,
                 l.pan_knob,
-                (model.shown_pan(t) + 1.0) * 0.5,
+                (pan + 1.0) * 0.5,
                 true,
                 KnobLook {
-                    cap: c.pan_cap,
+                    cap: match (sets, model.mixer_cue()) {
+                        (Sets::Send(_), Some(cue)) => cue_color(cue),
+                        _ => c.pan_cap,
+                    },
                     ring: c.panel_label,
                 },
                 th,
             );
-            controls::readout(p, l.pan_readout, &format_pan(model.shown_pan(t)), th);
+            controls::readout(p, l.pan_readout, &format_pan(pan), th);
         }
         // Modulated: where the pan and the fader are now (a dot).
-        let (travel, pan_mod) = if vca {
+        let (travel, pan_mod) = if vca || sets != Sets::Main {
             (0.0, 0.0)
         } else {
             model.strip_modulation(t.id)
@@ -1131,7 +1181,7 @@ impl MixerView {
         };
         if pan_mod != 0.0 && bed.is_none() {
             // A dual-panned image moves as a whole.
-            let knobs: Vec<(Rect, f32)> = if model.project().dual_panned(t) {
+            let knobs: Vec<(Rect, f32)> = if dual_shown(model, t) {
                 let dual = model.shown_dual_pan(t);
                 dual_pan_rects(&l)
                     .into_iter()
@@ -1149,8 +1199,10 @@ impl MixerView {
             }
         }
 
-        controls::led_button(p, l.mute, "M", model.shown_mute(t), c.led.mute, th);
-        controls::led_button(p, l.solo, "S", t.solo, c.led.solo, th);
+        controls::led_button(p, l.mute, "M", Self::mute_shown(model, t), c.led.mute, th);
+        // Solo is the main mix's (cue mixes are solo-safe): dark in a cue
+        // mix.
+        controls::led_button(p, l.solo, "S", t.solo && sets == Sets::Main, c.led.solo, th);
         if vca {
             controls::led_button(p, l.record, "·", false, c.led.record, th);
         } else if t.kind == TrackKind::Master {
@@ -1168,34 +1220,23 @@ impl MixerView {
             controls::led_button(p, l.record, "·", false, c.led.record, th);
         }
 
-        controls::readout(p, l.level_readout, &format_db(model.shown_volume_db(t)), th);
+        let level = Self::fader_db(model, t);
+        controls::readout(p, l.level_readout, &format_db(level), th);
         let geo = FaderGeometry::new(l.fader, th);
-        let marks: [(f32, &str); 10] = [
-            (12.0, "12"),
-            (6.0, "6"),
-            (0.0, "0"),
-            (-5.0, "5"),
-            (-10.0, "10"),
-            (-20.0, "20"),
-            (-30.0, "30"),
-            (-40.0, "40"),
-            (-60.0, "60"),
-            (SILENCE_DB, "∞"),
-        ];
-        let scale: Vec<(f32, &str)> = marks
-            .iter()
-            .map(|&(db, s)| (self.law.db_to_position(db), s))
-            .collect();
+        let scale = self.fader_scale();
         controls::fader(
             p,
             &geo,
-            self.law.db_to_position(model.shown_volume_db(t)),
-            fader_cap_color(t.kind, th),
+            self.law.db_to_position(level),
+            match (sets, model.mixer_cue()) {
+                (Sets::Send(_), Some(cue)) => cue_color(cue),
+                _ => fader_cap_color(t.kind, th),
+            },
             &scale,
             th,
         );
         if travel != 0.0 {
-            let now = self.law.db_to_position(model.shown_volume_db(t)) + travel;
+            let now = self.law.db_to_position(level) + travel;
             dot(p, Point::new(geo.slot.center().x, geo.y_for(now)));
         }
         if vca {
@@ -1469,7 +1510,8 @@ impl MixerView {
                 }
                 match t.inserts.get(i) {
                     Some(s) => {
-                        let name = s.plugin.name.trim_start_matches("FaderFrame ");
+                        let named = t.name_of(s);
+                        let name = named.trim_start_matches("FaderFrame ");
                         // Keyed plugins name their sidechain source.
                         let key = s
                             .sidechain
@@ -1563,11 +1605,34 @@ impl MixerView {
         }
     }
 
+    /// The fader scale (travel, label).
+    fn fader_scale(&self) -> Vec<(f32, &'static str)> {
+        FADER_MARKS
+            .iter()
+            .map(|&(db, s)| (self.law.db_to_position(db), s))
+            .collect()
+    }
+
     fn track(model: &Session, id: TrackId) -> Option<&Track> {
         model.project().track(id)
     }
 
-    fn knob_value(&self, t: &Track, target: KnobTarget) -> Option<f32> {
+    fn knob_value(&self, model: &Session, t: &Track, target: KnobTarget) -> Option<f32> {
+        // In a cue mix: the track's pan there, the master's knob the
+        // click's level.
+        if target == KnobTarget::Pan {
+            match sets(model, t) {
+                Sets::Main => {}
+                Sets::Send(_) => return Some((Self::pan_shown(model, t) + 1.0) * 0.5),
+                Sets::CueMaster(cue) => {
+                    return model
+                        .project()
+                        .cue(cue)
+                        .map(|c| self.law.db_to_position(c.click_db));
+                }
+                Sets::Nothing => return None,
+            }
+        }
         match target {
             KnobTarget::Preamp(id) => t
                 .preamp
@@ -1579,8 +1644,33 @@ impl MixerView {
         }
     }
 
-    fn knob_command(&self, t: &Track, target: KnobTarget, value: f32) -> Option<Command> {
+    fn knob_command(
+        &self,
+        model: &Session,
+        t: &Track,
+        target: KnobTarget,
+        value: f32,
+    ) -> Option<Command> {
         let value = value.clamp(0.0, 1.0);
+        if target == KnobTarget::Pan {
+            match sets(model, t) {
+                Sets::Main => {}
+                Sets::Send(_) => {
+                    let pan = value * 2.0 - 1.0;
+                    let pan = if pan.abs() < 0.01 { 0.0 } else { pan };
+                    return Self::pan_command(model, t, pan);
+                }
+                Sets::CueMaster(cue) => {
+                    return Self::click_command(
+                        model,
+                        cue,
+                        None,
+                        Some(self.law.position_to_db(value)),
+                    );
+                }
+                Sets::Nothing => return None,
+            }
+        }
         match target {
             KnobTarget::Preamp(id) => t.preamp.as_ref().map(|slot| Command::SetPluginParameter {
                 track: t.id,
@@ -1769,7 +1859,7 @@ impl MixerView {
         let mut items = Vec::new();
         match t.inserts.get(slot) {
             Some(s) => {
-                items.push(MenuItem::disabled(s.plugin.name.clone()));
+                items.push(MenuItem::disabled(t.name_of(s)));
                 let builtin = s.plugin.format == faderframe_project::PluginFormat::Builtin;
                 if model.plugin_failed(s.id) {
                     items.push(MenuItem::new(
@@ -2076,6 +2166,30 @@ impl MixerView {
                         .checked(s.tap == tap),
                     );
                 }
+                // Its own pan (none: as tapped, a mono tap on both sides).
+                let pans: Vec<MenuItem<Action>> = [
+                    (None, "As Tapped".to_string()),
+                    (Some(-1.0), format_pan(-1.0)),
+                    (Some(-0.5), format_pan(-0.5)),
+                    (Some(0.0), "Centre".to_string()),
+                    (Some(0.5), format_pan(0.5)),
+                    (Some(1.0), format_pan(1.0)),
+                ]
+                .into_iter()
+                .map(|(pan, label)| {
+                    MenuItem::new(
+                        label,
+                        Action::Edit(Command::SetSendPan {
+                            track: t.id,
+                            send: s.id,
+                            pan,
+                        }),
+                    )
+                    .checked(s.pan == pan)
+                })
+                .collect();
+                let now = s.pan.map_or_else(|| "as tapped".to_string(), format_pan);
+                items.push(MenuItem::submenu(format!("Pan ({now})"), pans));
                 items.push(
                     MenuItem::new(
                         if s.enabled { "Disable" } else { "Enable" },
@@ -2134,7 +2248,11 @@ impl MixerView {
     }
 
     fn track_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
-        let mut items = Vec::new();
+        let mut items: Vec<MenuItem<Action>> = model
+            .duplicate_menu(t.id)
+            .into_iter()
+            .map(menu_item)
+            .collect();
         if t.kind != TrackKind::Master {
             items.push(MenuItem::new(
                 "Remove Track",
@@ -2264,13 +2382,22 @@ impl MixerView {
         }
     }
 
-    fn level_request(t: &Track, at: Rect) -> HostRequest<Action> {
-        let id = t.id;
+    fn level_request(model: &Session, t: &Track, at: Rect) -> HostRequest<Action> {
+        // What the fader sets (in a cue mix: the send there).
+        let set = Self::fader_command(model, t, 0.0);
         HostRequest::TextInput {
             at,
-            initial: format_db(t.volume_db),
+            initial: format_db(Self::fader_db(model, t)),
             commit: Box::new(move |text| {
-                parse_db(text).map(|db| Action::Edit(Command::SetTrackVolume { track: id, db }))
+                let db = parse_db(text)?;
+                Some(Action::Edit(match set.clone()? {
+                    Command::SetTrackVolume { track, .. } => Command::SetTrackVolume { track, db },
+                    Command::SetCueSendLevel { track, cue, .. } => {
+                        Command::SetCueSendLevel { track, cue, db }
+                    }
+                    Command::SetCueLevel { cue, .. } => Command::SetCueLevel { cue, db },
+                    other => other,
+                }))
             }),
         }
     }
@@ -2290,9 +2417,14 @@ impl MixerView {
         };
         let th = &self.theme;
         let name = Self::track(model, track)
-            .and_then(|t| t.inserts.iter().find(|s| s.id == plugin))
-            .map_or_else(String::new, |s| {
-                s.plugin.name.trim_start_matches("FaderFrame ").to_string()
+            .and_then(|t| {
+                t.inserts
+                    .iter()
+                    .find(|s| s.id == plugin)
+                    .map(|s| t.name_of(s))
+            })
+            .map_or_else(String::new, |n| {
+                n.trim_start_matches("FaderFrame ").to_string()
             });
         let target = match self.hit_test(pos, size, model) {
             Some(Hit::Insert(to, i)) => self
@@ -2425,11 +2557,37 @@ impl MixerView {
 
     fn pan_request(model: &Session, t: &Track, at: Rect) -> HostRequest<Action> {
         let id = t.id;
+        // In a cue mix the master's pan place is the click's level.
+        if let Sets::CueMaster(cue) = sets(model, t)
+            && let Some(c) = model.project().cue(cue)
+        {
+            let on = c.click;
+            return HostRequest::TextInput {
+                at,
+                initial: format_db(c.click_db),
+                commit: Box::new(move |text| {
+                    parse_db(text).map(|db| Action::Edit(Command::SetCueClick { cue, on, db }))
+                }),
+            };
+        }
+        let cue = match sets(model, t) {
+            Sets::Send(cue) => Some(cue),
+            _ => None,
+        };
         HostRequest::TextInput {
             at,
-            initial: format_pan(model.shown_pan(t)),
+            initial: format_pan(Self::pan_shown(model, t)),
             commit: Box::new(move |text| {
-                parse_pan(text).map(|pan| Action::Edit(Command::SetTrackPan { track: id, pan }))
+                parse_pan(text).map(|pan| {
+                    Action::Edit(match cue {
+                        Some(cue) => Command::SetCueSendPan {
+                            track: id,
+                            cue,
+                            pan,
+                        },
+                        None => Command::SetTrackPan { track: id, pan },
+                    })
+                })
             }),
         }
     }
@@ -2579,21 +2737,33 @@ impl MixerView {
                 let Some(t) = Self::track(model, id) else {
                     return false;
                 };
+                // In a cue mix: the track's send level there (a VCA:
+                // nothing).
+                let Some(unity) = Self::fader_command(model, t, 0.0) else {
+                    return true;
+                };
                 if clicks >= 2 {
-                    cx.emit(Action::Edit(Command::SetTrackVolume { track: id, db: 0.0 }));
+                    cx.emit(Action::Edit(unity));
                     return true;
                 }
-                cx.emit(Action::BeginGesture("Volume".into()));
-                let mut start = self.law.db_to_position(model.shown_volume_db(t));
+                cx.emit(Action::BeginGesture(
+                    if model.mixer_cue().is_some() {
+                        "Cue Level"
+                    } else {
+                        "Volume"
+                    }
+                    .into(),
+                ));
+                let mut start = self.law.db_to_position(Self::fader_db(model, t));
                 if matches!(hit, Hit::FaderTrack(_))
                     && let Some(l) = self.layout_of(model, id, size)
                 {
                     // Clicking the slot jumps the cap there.
                     start = FaderGeometry::new(l.fader, &self.theme).pos_for(pos.y);
-                    cx.emit(Action::Edit(Command::SetTrackVolume {
-                        track: id,
-                        db: self.law.position_to_db(start),
-                    }));
+                    if let Some(cmd) = Self::fader_command(model, t, self.law.position_to_db(start))
+                    {
+                        cx.emit(Action::Edit(cmd));
+                    }
                 }
                 self.drag = Some(Drag::Fader {
                     track: id,
@@ -2638,7 +2808,7 @@ impl MixerView {
                     Hit::DualPan(_, right) => KnobTarget::DualPan(right),
                     _ => KnobTarget::Pan,
                 };
-                let Some(value) = self.knob_value(t, target) else {
+                let Some(value) = self.knob_value(model, t, target) else {
                     if let Hit::Send(_, i) = hit {
                         cx.request(Self::send_menu(model, t, i, pos));
                     }
@@ -2650,6 +2820,10 @@ impl MixerView {
                             let f = preamp::face(slot);
                             preamp::position(&f, f.ranges[f.index(id)].2, id)
                         }),
+                        // The click's level back to 0 dB.
+                        KnobTarget::Pan if matches!(sets(model, t), Sets::CueMaster(_)) => {
+                            self.law.unity_position()
+                        }
                         KnobTarget::Pan => 0.5,
                         // Back to where the channel came from.
                         KnobTarget::DualPan(right) => {
@@ -2661,13 +2835,17 @@ impl MixerView {
                         }
                         KnobTarget::Send(_) => self.law.unity_position(),
                     };
-                    if let Some(cmd) = self.knob_command(t, target, reset) {
+                    if let Some(cmd) = self.knob_command(model, t, target, reset) {
                         cx.emit(Action::Edit(cmd));
                     }
                     return true;
                 }
                 cx.emit(Action::BeginGesture(match target {
                     KnobTarget::Preamp(_) => "Preamp".into(),
+                    KnobTarget::Pan if matches!(sets(model, t), Sets::CueMaster(_)) => {
+                        "Click Level".into()
+                    }
+                    KnobTarget::Pan if model.mixer_cue().is_some() => "Cue Pan".into(),
                     KnobTarget::Pan | KnobTarget::DualPan(_) => "Pan".into(),
                     KnobTarget::Send(_) => "Send Level".into(),
                 }));
@@ -2680,18 +2858,14 @@ impl MixerView {
                 cx.set_cursor(Cursor::ResizeVertical);
             }
             Hit::Mute(id) => {
-                if let Some(t) = Self::track(model, id) {
-                    toggle(
-                        cx,
-                        Command::SetTrackMute {
-                            track: id,
-                            on: !t.mute,
-                        },
-                    );
+                if let Some(cmd) = Self::track(model, id).and_then(|t| Self::mute_command(model, t))
+                {
+                    toggle(cx, cmd);
                 }
             }
             Hit::Solo(id) => {
-                if let Some(t) = Self::track(model, id) {
+                // Solo is the main mix's: a cue mix never hears it.
+                if let Some(t) = Self::track(model, id).filter(|t| sets(model, t) == Sets::Main) {
                     toggle(
                         cx,
                         Command::SetTrackSolo {
@@ -2701,7 +2875,15 @@ impl MixerView {
                     );
                 }
             }
-            Hit::MonoCheck => cx.emit(Action::SetMonoCheck(!model.mono_check())),
+            Hit::MonoCheck => match model.mixer_cue() {
+                // In a cue mix: its click on or off.
+                Some(c) => {
+                    if let Some(cmd) = Self::click_command(model, c.id, Some(!c.click), None) {
+                        cx.emit(Action::Edit(cmd));
+                    }
+                }
+                None => cx.emit(Action::SetMonoCheck(!model.mono_check())),
+            },
             Hit::Record(id) => {
                 if let Some(t) = Self::track(model, id).filter(|t| t.kind.has_clips()) {
                     toggle(
@@ -2740,7 +2922,14 @@ impl MixerView {
                 }
             }
             Hit::Output(id) => {
-                if let Some(t) = Self::track(model, id) {
+                if let Some(t) = Self::track(model, id)
+                    && let Sets::CueMaster(cue) = sets(model, t)
+                {
+                    cx.request(HostRequest::ContextMenu {
+                        at: pos,
+                        items: Self::cue_menu(model, cue),
+                    });
+                } else if let Some(t) = Self::track(model, id) {
                     cx.request(if t.kind == TrackKind::Midi {
                         Self::midi_out_menu(model, t, pos)
                     } else {
@@ -2820,7 +3009,7 @@ impl MixerView {
                 if let (Some(t), Some(l)) =
                     (Self::track(model, id), self.layout_of(model, id, size))
                 {
-                    cx.request(Self::level_request(t, l.level_readout));
+                    cx.request(Self::level_request(model, t, l.level_readout));
                 }
             }
             Hit::PanValue(id) => {
@@ -2849,6 +3038,20 @@ impl MixerView {
                         (Self::track(model, id), self.scribble_rect(model, id, size))
                 {
                     cx.request(Self::rename_request(t, at));
+                    return true;
+                }
+                // Shift: the strips from the one last clicked to this one.
+                let strips = Self::channel_tracks(model);
+                let at = |t: TrackId| strips.iter().position(|s| s.id == t);
+                if mods.shift
+                    && !mods.toggle()
+                    && let Some(a) = model.selection.anchor_track.and_then(at)
+                    && let Some(b) = at(id)
+                {
+                    cx.emit(Action::SelectTracks {
+                        tracks: strips[a.min(b)..=a.max(b)].iter().map(|t| t.id).collect(),
+                        mode: SelectMode::Replace,
+                    });
                     return true;
                 }
                 let mode = if mods.toggle() {
@@ -2888,6 +3091,35 @@ impl MixerView {
         let Some(hit) = self.hit_test(pos, size, model) else {
             return false;
         };
+        // In a cue mix: the cue master's menu, a strip's send there.
+        let on_track = match hit {
+            Hit::FaderCap(id)
+            | Hit::FaderTrack(id)
+            | Hit::Pan(id)
+            | Hit::PanValue(id)
+            | Hit::Mute(id)
+            | Hit::Level(id)
+            | Hit::Output(id)
+            | Hit::Scribble(id)
+            | Hit::Strip(id) => Self::track(model, id),
+            Hit::MonoCheck => model.project().master(),
+            _ => None,
+        };
+        if let Some(t) = on_track {
+            let items = match sets(model, t) {
+                Sets::CueMaster(cue) => Self::cue_menu(model, cue),
+                Sets::Send(cue)
+                    if !matches!(hit, Hit::Output(_) | Hit::Scribble(_) | Hit::Strip(_)) =>
+                {
+                    Self::cue_send_menu(model, t, cue)
+                }
+                _ => Vec::new(),
+            };
+            if !items.is_empty() {
+                cx.request(HostRequest::ContextMenu { at: pos, items });
+                return true;
+            }
+        }
         let req = match hit {
             Hit::PreampChoose(id) | Hit::PreampRemove(id) => {
                 Self::track(model, id).map(|t| Self::stage_menu(model, t, pos))
@@ -2928,7 +3160,7 @@ impl MixerView {
                 items: meter_menu(model, Some(id)),
             }),
             Hit::Level(id) => match (Self::track(model, id), self.layout_of(model, id, size)) {
-                (Some(t), Some(l)) => Some(Self::level_request(t, l.level_readout)),
+                (Some(t), Some(l)) => Some(Self::level_request(model, t, l.level_readout)),
                 _ => None,
             },
             Hit::FaderCap(id) | Hit::FaderTrack(id) => Self::track(model, id).map(|t| {
@@ -3009,6 +3241,63 @@ impl MixerView {
                 .map(|t| t.name.clone())
                 .unwrap_or_default()
         };
+        if let Some(c) = model.mixer_cue() {
+            let master = |id| Self::track(model, id).is_some_and(|t| t.kind == TrackKind::Master);
+            let cue_tip = match hit {
+                Hit::FaderCap(id) | Hit::FaderTrack(id) if master(id) => Some(format!(
+                    "{}'s level: {} dB (the click's too)\nDrag · Double-click for 0 dB · Right-click: the cue mix",
+                    c.name,
+                    format_db(c.level_db)
+                )),
+                Hit::FaderCap(id) | Hit::FaderTrack(id) => {
+                    let t = Self::track(model, id)?;
+                    Some(match sets(model, t) {
+                        Sets::Send(_) => format!(
+                            "{} in {}: {} dB ({})\nDrag · Double-click for 0 dB · Right-click: its send",
+                            t.name,
+                            c.name,
+                            format_db(model.cue_send(t, c.id).level_db),
+                            if c.post_fader() {
+                                "post-fader"
+                            } else {
+                                "pre-fader"
+                            }
+                        ),
+                        _ => format!("{} is not in cue mixes", t.name),
+                    })
+                }
+                Hit::Pan(id) | Hit::PanValue(id) if master(id) => Some(format!(
+                    "The click's level in {}: {} dB · Click the value to type one",
+                    c.name,
+                    format_db(c.click_db)
+                )),
+                Hit::Pan(id) | Hit::PanValue(id) => Some(format!(
+                    "{}'s pan in {} · Double-click: centre",
+                    name(id),
+                    c.name
+                )),
+                Hit::Mute(id) if master(id) => Some(format!("Mute {}", c.name)),
+                Hit::Mute(id) => Some(format!("{} in {}: on or off", name(id), c.name)),
+                Hit::Solo(_) => Some(
+                    "Solo is the main mix's: cue mixes never hear it (back to the main mix to solo)"
+                        .into(),
+                ),
+                Hit::MonoCheck => Some(format!(
+                    "The click in {}: {}",
+                    c.name,
+                    if c.click { "on" } else { "off" }
+                )),
+                Hit::Output(id) if master(id) => Some(format!(
+                    "{} plays on {} · Click: its outputs and settings",
+                    c.name,
+                    c.output_label()
+                )),
+                _ => None,
+            };
+            if cue_tip.is_some() {
+                return cue_tip;
+            }
+        }
         Some(match hit {
             Hit::PreampChoose(id) | Hit::PreampRemove(id) => {
                 let kind = Self::track(model, id)?.kind;
@@ -3378,6 +3667,7 @@ impl MixerView {
                     .count();
                 self.paint_strip(p, rect, tracks[i], number, model);
             }
+            self.paint_cue_mark(p, rect, tracks[i], model);
             // What a strip is in: a band of each folder's colour along its
             // foot, the innermost lowest.
             for (k, f) in model.project().folder_chain(tracks[i]).iter().enumerate() {
@@ -3470,6 +3760,7 @@ impl MixerView {
             && !self.hide_master
         {
             self.paint_strip(p, master, m, 0, model);
+            self.paint_cue_mark(p, master, m, model);
         }
         if cheek > 0.0 {
             controls::wood_cheek(p, Rect::new(0.0, 0.0, cheek, size.h), theme);
@@ -3534,10 +3825,12 @@ impl MixerView {
                         let geo = FaderGeometry::new(l.fader, &self.theme);
                         let scale = if modifiers.fine() { 0.2 } else { 1.0 };
                         let pos_new = start_pos + (start_y - pos.y) / geo.travel().max(1.0) * scale;
-                        cx.emit(Action::Edit(Command::SetTrackVolume {
-                            track,
-                            db: self.law.position_to_db(pos_new.clamp(0.0, 1.0)),
-                        }));
+                        let db = self.law.position_to_db(pos_new.clamp(0.0, 1.0));
+                        if let Some(cmd) = Self::track(model, track)
+                            .and_then(|t| Self::fader_command(model, t, db))
+                        {
+                            cx.emit(Action::Edit(cmd));
+                        }
                     }
                     Some(Drag::Surround {
                         track,
@@ -3577,7 +3870,7 @@ impl MixerView {
                         if let Some(t) = Self::track(model, track) {
                             let v = start_value
                                 + controls::drag_delta(pos.y - start_y, modifiers.fine());
-                            if let Some(cmd) = self.knob_command(t, target, v) {
+                            if let Some(cmd) = self.knob_command(model, t, target, v) {
                                 cx.emit(Action::Edit(cmd));
                             }
                         }
@@ -3742,15 +4035,11 @@ impl MixerView {
                     Some(Hit::FaderCap(id) | Hit::FaderTrack(id)) if dx == 0.0 => {
                         if let Some(t) = Self::track(model, id) {
                             let step = if modifiers.fine() { 0.1 } else { 0.5 };
-                            let base = if t.volume_db <= SILENCE_DB {
-                                -80.0
-                            } else {
-                                t.volume_db
-                            };
-                            cx.emit(Action::Edit(Command::SetTrackVolume {
-                                track: id,
-                                db: base - steps * step,
-                            }));
+                            let now = Self::fader_db(model, t);
+                            let base = if now <= SILENCE_DB { -80.0 } else { now };
+                            if let Some(cmd) = Self::fader_command(model, t, base - steps * step) {
+                                cx.emit(Action::Edit(cmd));
+                            }
                         }
                         true
                     }
@@ -3793,10 +4082,11 @@ impl MixerView {
                             _ => KnobTarget::Pan,
                         };
                         if let Some(t) = Self::track(model, id)
-                            && let Some(v) = self.knob_value(t, target)
+                            && let Some(v) = self.knob_value(model, t, target)
                         {
                             let step = if modifiers.fine() { 0.005 } else { 0.025 };
-                            if let Some(cmd) = self.knob_command(t, target, v - steps * step) {
+                            if let Some(cmd) = self.knob_command(model, t, target, v - steps * step)
+                            {
                                 cx.emit(Action::Edit(cmd));
                             }
                         }
@@ -3846,6 +4136,99 @@ impl CanvasView<Session, Action> for MixerView {
     }
 
     fn paint(&mut self, p: &mut dyn Painter, size: Size, model: &Session, theme: &Theme) {
+        let bar = self.cue_bar_h(model);
+        if bar <= 0.0 {
+            return self.paint_below_bar(p, size, model, theme);
+        }
+        let below = Size::new(size.w, (size.h - bar).max(0.0));
+        p.push_transform(0.0, bar, 1.0);
+        self.paint_below_bar(p, below, model, theme);
+        p.pop_transform();
+        self.paint_cue_bar(p, size.w, model);
+    }
+
+    fn event(
+        &mut self,
+        ev: &ViewEvent,
+        size: Size,
+        model: &Session,
+        cx: &mut EventCx<'_, Action>,
+    ) -> bool {
+        let bar = self.cue_bar_h(model);
+        if bar <= 0.0 {
+            self.bar_hover = None;
+            return self.event_below_bar(ev, size, model, cx);
+        }
+        // Presses in the cue bar are its own (a drag below goes on below).
+        match *ev {
+            ViewEvent::PointerDown { pos, button, .. } if pos.y < bar => {
+                return self.bar_press(pos, button, size.w, model, cx);
+            }
+            ViewEvent::PointerMove { pos, .. } if pos.y < bar && self.drag.is_none() => {
+                let hit = self.bar_hit(pos, size.w, model);
+                if hit != self.bar_hover {
+                    self.bar_hover = hit;
+                    cx.set_cursor(if hit.is_some() {
+                        Cursor::Pointer
+                    } else {
+                        Cursor::Default
+                    });
+                    cx.redraw();
+                }
+                return false;
+            }
+            ViewEvent::Scroll { pos, .. } if pos.y < bar => return false,
+            _ => {}
+        }
+        if self.bar_hover.take().is_some() {
+            cx.redraw();
+        }
+        let below = Size::new(size.w, (size.h - bar).max(0.0));
+        self.event_below_bar(&shifted(ev, bar), below, model, cx)
+    }
+
+    fn tooltip(&self, pos: Point, size: Size, model: &Session) -> Option<String> {
+        let bar = self.cue_bar_h(model);
+        if pos.y < bar {
+            return self.bar_tooltip(pos, size.w, model);
+        }
+        let below = Size::new(size.w, (size.h - bar).max(0.0));
+        self.tooltip_below_bar(Point::new(pos.x, pos.y - bar), below, model)
+    }
+
+    fn wants_frames(&self, model: &Session) -> bool {
+        model.is_animating() || matches!(self.drag, Some(Drag::Track { moved: true, .. }))
+    }
+
+    fn min_size(&self) -> Size {
+        if self.master_only {
+            return Size::new(self.theme.console.master_width + 2.0 * self.cheek(), 330.0);
+        }
+        Size::new(self.theme.console.master_width + self.pitch() * 2.0, 330.0)
+    }
+
+    fn scroll_info(&self, axis: ScrollAxis, size: Size, model: &Session) -> Option<ScrollInfo> {
+        (axis == ScrollAxis::Horizontal && !self.master_only).then(|| ScrollInfo {
+            content: self.content_w(Self::channel_tracks(model).len()),
+            viewport: self.viewport_w(size),
+            offset: self.scroll_x,
+            // The strips: after the cheek, before the pinned master.
+            start: self.cheek(),
+            end: (size.w - self.cheek() - self.viewport_w(size)).max(0.0),
+        })
+    }
+
+    fn set_scroll(&mut self, axis: ScrollAxis, offset: f32) {
+        if axis == ScrollAxis::Horizontal {
+            self.scroll_x = offset.max(0.0);
+        }
+    }
+}
+
+impl MixerView {
+    /// Everything under the cue bar: the meter bridge (when shown) over
+    /// the strips.
+    fn paint_below_bar(&mut self, p: &mut dyn Painter, size: Size, model: &Session, theme: &Theme) {
         let b = Self::bridge_h(model);
         if b <= 0.0 {
             return self.paint_body(p, size, model, theme);
@@ -3857,7 +4240,7 @@ impl CanvasView<Session, Action> for MixerView {
         self.paint_bridge(p, size.w, b, body, model);
     }
 
-    fn event(
+    fn event_below_bar(
         &mut self,
         ev: &ViewEvent,
         size: Size,
@@ -3886,11 +4269,7 @@ impl CanvasView<Session, Action> for MixerView {
         self.event_body(&shifted(ev, b), body, model, cx)
     }
 
-    fn wants_frames(&self, model: &Session) -> bool {
-        model.is_animating() || matches!(self.drag, Some(Drag::Track { moved: true, .. }))
-    }
-
-    fn tooltip(&self, pos: Point, size: Size, model: &Session) -> Option<String> {
+    fn tooltip_below_bar(&self, pos: Point, size: Size, model: &Session) -> Option<String> {
         let b = Self::bridge_h(model);
         let body = Size::new(size.w, (size.h - b).max(0.0));
         if pos.y < b {
@@ -3901,30 +4280,6 @@ impl CanvasView<Session, Action> for MixerView {
             ));
         }
         self.tooltip_body(Point::new(pos.x, pos.y - b), body, model)
-    }
-
-    fn min_size(&self) -> Size {
-        if self.master_only {
-            return Size::new(self.theme.console.master_width + 2.0 * self.cheek(), 330.0);
-        }
-        Size::new(self.theme.console.master_width + self.pitch() * 2.0, 330.0)
-    }
-
-    fn scroll_info(&self, axis: ScrollAxis, size: Size, model: &Session) -> Option<ScrollInfo> {
-        (axis == ScrollAxis::Horizontal && !self.master_only).then(|| ScrollInfo {
-            content: self.content_w(Self::channel_tracks(model).len()),
-            viewport: self.viewport_w(size),
-            offset: self.scroll_x,
-            // The strips: after the cheek, before the pinned master.
-            start: self.cheek(),
-            end: (size.w - self.cheek() - self.viewport_w(size)).max(0.0),
-        })
-    }
-
-    fn set_scroll(&mut self, axis: ScrollAxis, offset: f32) {
-        if axis == ScrollAxis::Horizontal {
-            self.scroll_x = offset.max(0.0);
-        }
     }
 }
 

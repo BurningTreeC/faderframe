@@ -124,6 +124,7 @@ fn audio_preamp_is_before_inserts_and_all_channels_are_processed_independently()
         level_db: 0.0,
         tap: faderframe_project::SendTap::PreFx,
         enabled: true,
+        pan: None,
     });
     assert_eq!(
         out,

@@ -1,12 +1,24 @@
 //! Delay (the built-in "Echo", grown up): stereo, ping-pong or mono
-//! repeats, free or synced to the song, with the loop's sound shaped by a
-//! low cut, damping, saturation, wow and flutter and a style; ducking,
-//! width and freeze.
+//! repeats, free or synced to the song (each side its own note value, or
+//! linked), with the loop's sound shaped by a low cut, damping, a tilt,
+//! diffusion, saturation, wow and flutter, chorus modulation and a style;
+//! ducking, width and freeze.
 //!
 //! The first five parameters are the Echo's and keep their meaning:
 //! time, feedback, damping (the Echo's one-pole low pass in the loop: 0
 //! off, 1 about 1.2 kHz), mix and ping-pong (now a mode: 0 stereo, 1
 //! ping-pong, 2 mono). Time changes glide like a tape's heads moving.
+//! Everything added since is neutral at its default: a project saved
+//! with the Echo, or with the first Delay, sounds as it did.
+//!
+//! * Link (on by default) makes the right side follow the left (times the
+//!   stereo offset); off, the right has its own time and note value.
+//! * Tilt is a tilt shelf round 1 kHz in the loop: every pass gets
+//!   brighter or darker by the amount.
+//! * Diffusion smears each repeat through four allpasses a side (their
+//!   length taken off the delay so the repeat still lands on time).
+//! * Modulation is a chorus on the read heads (faster and deeper than the
+//!   tape's wow, the right side a quarter turn behind).
 //!
 //! * Styles — Digital (clean); Tape (an arctangent saturation, a head
 //!   bump and high frequencies falling with every pass); Analog (a bucket
@@ -19,7 +31,7 @@
 //!   24 dB over 40 dB of input level).
 
 use super::{on_off, param, pass_through, pick, stepped};
-use crate::dsp::delay::DelayLine;
+use crate::dsp::delay::{Allpass, DelayLine};
 use crate::dsp::filter::{BandShape, BandType, Filter, OnePole, Svf};
 use crate::dsp::lfo::{DIVISIONS, division_name, division_seconds};
 use crate::dsp::smooth::Smoothed;
@@ -51,6 +63,14 @@ pub mod id {
     pub const WIDTH: u32 = 13;
     pub const FREEZE: u32 = 14;
     pub const STYLE: u32 = 15;
+    /// The right side follows the left (default on).
+    pub const LINK: u32 = 16;
+    pub const TIME_R: u32 = 17;
+    pub const DIVISION_R: u32 = 18;
+    pub const TILT: u32 = 19;
+    pub const DIFFUSION: u32 = 20;
+    pub const MODULATION: u32 = 21;
+    pub const MOD_RATE: u32 = 22;
 }
 
 /// Published: the left and right times (ms), input, output and repeats'
@@ -96,7 +116,31 @@ pub fn parameters() -> Vec<ParameterInfo> {
         param(id::WIDTH, "Width", 0.0, 1.5, 1.0, Percent),
         stepped(id::FREEZE, "Freeze", 1.0, 0.0),
         stepped(id::STYLE, "Style", 2.0, 0.0),
+        stepped(id::LINK, "Link", 1.0, 1.0),
+        param(id::TIME_R, "Time R", 1.0, 4_000.0, 401.0, Milliseconds),
+        stepped(
+            id::DIVISION_R,
+            "Division R",
+            (DIVISIONS.len() - 1) as f64,
+            DEFAULT_DIVISION,
+        ),
+        param(id::TILT, "Tilt", -12.0, 12.0, 0.0, Decibels),
+        param(id::DIFFUSION, "Diffusion", 0.0, 1.0, 0.0, Percent),
+        param(id::MODULATION, "Modulation", 0.0, 1.0, 0.0, Percent),
+        param(id::MOD_RATE, "Modulation Rate", 0.1, 10.0, 1.5, Hertz),
     ]
+}
+
+/// The diffusers' lengths (ms, left; the right 9 % longer).
+pub const DIFFUSER_MS: [f64; 4] = [1.73, 2.91, 4.37, 6.19];
+/// The tilt's pivot (Hz).
+pub const TILT_HZ: f64 = 1_000.0;
+/// The chorus modulation's depth at 1 (seconds, peak).
+pub const MOD_SECONDS: f64 = 0.004;
+
+/// The diffusers' total length (seconds) a side.
+pub fn diffuser_seconds(right: bool) -> f64 {
+    DIFFUSER_MS.iter().sum::<f64>() * 0.001 * if right { 1.09 } else { 1.0 }
 }
 
 /// The damping's cutoff (Hz) at a rate, as the Echo's one-pole had it.
@@ -111,8 +155,11 @@ pub fn format(pid: ParameterId, v: f64) -> Option<String> {
     Some(match pid.0 {
         id::MODE => pick(&MODES, v),
         id::STYLE => pick(&STYLES, v),
-        id::SYNC | id::FREEZE => on_off(v),
-        id::DIVISION => division_name(v.round().max(0.0) as usize).into(),
+        id::SYNC | id::FREEZE | id::LINK => on_off(v),
+        id::DIVISION | id::DIVISION_R => division_name(v.round().max(0.0) as usize).into(),
+        id::TILT if v.abs() < 0.05 => "Flat".into(),
+        id::TILT => format!("{v:+.1} dB"),
+        id::DIFFUSION | id::MODULATION if v < 0.005 => "Off".into(),
         id::DAMPING => match damping_hz(v, 48_000.0) {
             Some(hz) => crate::eq::format_hz(hz),
             None => "Off".into(),
@@ -134,13 +181,21 @@ fn get(params: &ParamValues, pid: u32) -> f64 {
 
 /// The left and right delay times (seconds) for the parameters at a tempo.
 pub fn times(params: &ParamValues, tempo: f64) -> (f64, f64) {
-    let base = if get(params, id::SYNC) >= 0.5 {
-        division_seconds(get(params, id::DIVISION).round().max(0.0) as usize, tempo)
-    } else {
-        get(params, id::TIME) * 0.001
+    let synced = get(params, id::SYNC) >= 0.5;
+    let of = |division: u32, time: u32| {
+        if synced {
+            division_seconds(get(params, division).round().max(0.0) as usize, tempo)
+        } else {
+            get(params, time) * 0.001
+        }
     };
-    let base = base.clamp(0.001, MAX_SECONDS);
-    let right = (base * (1.0 + get(params, id::OFFSET))).clamp(0.001, MAX_SECONDS);
+    let base = of(id::DIVISION, id::TIME).clamp(0.001, MAX_SECONDS);
+    let own = if get(params, id::LINK) >= 0.5 {
+        base
+    } else {
+        of(id::DIVISION_R, id::TIME_R).clamp(0.001, MAX_SECONDS)
+    };
+    let right = (own * (1.0 + get(params, id::OFFSET))).clamp(0.001, MAX_SECONDS);
     if get(params, id::MODE).round() as i64 == 2 {
         (base, base)
     } else {
@@ -168,6 +223,13 @@ pub struct DelayProcessor {
     /// Wow (slow) and flutter (fast) phases.
     wow: f64,
     flutter: f64,
+    /// The chorus modulation's phase.
+    chorus: f64,
+    tilt: Filter<2>,
+    diffusers: [[Allpass; 4]; 2],
+    /// What the diffusers delay a side (samples), taken off the read.
+    diffuser_len: [f64; 2],
+    diffusion: Smoothed,
     duck_env: f64,
     duck: f64,
     freeze: Smoothed,
@@ -188,6 +250,17 @@ impl DelayProcessor {
         for s in bbd.iter_mut().flatten() {
             s.set(4_500.0, FRAC_1_SQRT_2, sr);
         }
+        let ap_cap = (DIFFUSER_MS[3] * 1.09 * 0.001 * sr) as usize + 8;
+        let mut diffusers: [[Allpass; 4]; 2] =
+            std::array::from_fn(|_| std::array::from_fn(|_| Allpass::new(ap_cap)));
+        let mut diffuser_len = [0.0; 2];
+        for (c, side) in diffusers.iter_mut().enumerate() {
+            for (ap, ms) in side.iter_mut().zip(DIFFUSER_MS) {
+                let n = (ms * 0.001 * sr * if c == 1 { 1.09 } else { 1.0 }).round() as usize;
+                ap.set_len(n.max(1));
+                diffuser_len[c] += ap.delay() as f64;
+            }
+        }
         let mut s = Self {
             watching: Watching::new(sr as f32),
             sr,
@@ -201,6 +274,11 @@ impl DelayProcessor {
             bbd,
             wow: 0.0,
             flutter: 0.0,
+            chorus: 0.0,
+            tilt: Filter::default(),
+            diffusers,
+            diffuser_len,
+            diffusion: Smoothed::new(0.0, 30.0, sr),
             duck_env: 0.0,
             duck: 1.0,
             freeze: Smoothed::new(0.0, 15.0, sr),
@@ -215,6 +293,7 @@ impl DelayProcessor {
         s.freeze.snap();
         s.mix.snap();
         s.feedback.snap();
+        s.diffusion.snap();
         s
     }
 
@@ -252,6 +331,22 @@ impl DelayProcessor {
         } else {
             self.low_cut.clear();
         }
+        let tilt = self.get(id::TILT);
+        if tilt.abs() >= 0.05 {
+            self.tilt.set(
+                BandShape {
+                    kind: BandType::TiltShelf,
+                    freq: TILT_HZ,
+                    gain: tilt,
+                    q: FRAC_1_SQRT_2,
+                    slope: 12.0,
+                },
+                sr,
+            );
+        } else {
+            self.tilt.clear();
+        }
+        self.diffusion.set(self.get(id::DIFFUSION).clamp(0.0, 1.0));
         if self.get(id::STYLE).round() as i64 == 1 {
             self.bump.set(
                 BandShape {
@@ -340,8 +435,11 @@ impl PluginProcessor for DelayProcessor {
             let wow_depth =
                 self.get(id::WOW) * 0.0025 * sr + if style == 1 { 0.0003 * sr } else { 0.0 };
             let wow_step = self.get(id::WOW_RATE) / sr;
+            let mod_depth = self.get(id::MODULATION) * MOD_SECONDS * sr;
+            let mod_step = self.get(id::MOD_RATE) / sr;
             let ducking = self.get(id::DUCKING);
             let width = self.get(id::WIDTH);
+            let tilted = self.tilt.is_active();
             for i in at..end {
                 let x = [f64::from(self.scratch[0][i]), f64::from(self.scratch[1][i])];
                 in_peak = in_peak.max(x[0].abs()).max(x[1].abs());
@@ -352,7 +450,9 @@ impl PluginProcessor for DelayProcessor {
                 // turn later).
                 self.wow = (self.wow + wow_step).fract();
                 self.flutter = (self.flutter + wow_step * 9.7).fract();
+                self.chorus = (self.chorus + mod_step).fract();
                 let live = 1.0 - frozen;
+                let diffusion = self.diffusion.tick();
                 let mut wet = [0.0; 2];
                 for c in 0..2 {
                     self.delay[c] += (target[c] - self.delay[c]) * glide;
@@ -361,8 +461,21 @@ impl PluginProcessor for DelayProcessor {
                         * live
                         * (0.8 * (TAU * (self.wow + ph)).sin()
                             + 0.2 * (TAU * (self.flutter + ph)).sin());
-                    // Read before this sample is written: one less.
-                    wet[c] = self.lines[c].read(self.delay[c] + wow_depth + m - 1.0);
+                    let chorus = mod_depth * live * (TAU * (self.chorus + ph)).sin();
+                    // Read before this sample is written: one less; the
+                    // diffusers' own delay comes off the read.
+                    let mut d = self.delay[c] + wow_depth + m + chorus - 1.0;
+                    if diffusion > 0.0 {
+                        d -= self.diffuser_len[c];
+                    }
+                    let mut v = self.lines[c].read(d);
+                    if diffusion > 0.0 {
+                        let g = 0.5 * diffusion;
+                        for ap in &mut self.diffusers[c] {
+                            v = ap.process(v, g);
+                        }
+                    }
+                    wet[c] = v;
                 }
                 // The loop: what comes back, shaped (untouched when frozen).
                 let mut back = wet;
@@ -372,6 +485,9 @@ impl PluginProcessor for DelayProcessor {
                         v = self.damp[c].low(v);
                     }
                     v = self.low_cut.process(c, v);
+                    if tilted {
+                        v = self.tilt.process(c, v);
+                    }
                     match style {
                         1 => v = self.head[c].low(self.bump.process(c, v)),
                         2 => {
@@ -442,6 +558,7 @@ impl PluginProcessor for DelayProcessor {
         }
         self.low_cut.flush();
         self.bump.flush();
+        self.tilt.flush();
         self.duck_env = flush(self.duck_env);
         for c in 2..channels {
             out.channel_mut(c).fill(0.0);
@@ -482,9 +599,13 @@ impl PluginProcessor for DelayProcessor {
             for s in &mut self.bbd[c] {
                 s.reset();
             }
+            for ap in &mut self.diffusers[c] {
+                ap.reset();
+            }
         }
         self.low_cut.reset();
         self.bump.reset();
+        self.tilt.reset();
         self.duck_env = 0.0;
         self.duck = 1.0;
         self.meters.iter_mut().flatten().for_each(MeterTap::reset);
@@ -622,6 +743,104 @@ mod tests {
             "analog is dark"
         );
         let _ = SR;
+    }
+
+    #[test]
+    fn unlinked_sides_have_their_own_times_and_linked_ones_ignore_them() {
+        let base = [(id::MODE, 0.0), (id::DAMPING, 0.0), (id::FEEDBACK, 0.0)];
+        // Free: 100 ms left, 150 ms right.
+        let mut set = base.to_vec();
+        set.extend([(id::LINK, 0.0), (id::TIME, 100.0), (id::TIME_R, 150.0)]);
+        let mut r = rig(&set);
+        let (l, rr) = r.run(0.5, click(1_000), silence);
+        assert_eq!(hit(&l, 1_000 + 4_800, 8).0, 5_800);
+        assert_eq!(hit(&rr, 1_000 + 7_200, 8).0, 8_200);
+        assert!(hit(&rr, 5_800, 8).1 < 0.01 && hit(&l, 8_200, 8).1 < 0.01);
+        // Synced: 1/8 left (250 ms at 120), 1/8 triplet right (166.7 ms).
+        let mut set = base.to_vec();
+        set.extend([
+            (id::LINK, 0.0),
+            (id::SYNC, 1.0),
+            (id::DIVISION, 8.0),
+            (id::DIVISION_R, 6.0),
+        ]);
+        let mut r = rig(&set);
+        r.transport.tempo = 120.0;
+        let (l, rr) = r.run(0.5, click(1_000), silence);
+        assert_eq!(hit(&l, 1_000 + 12_000, 8).0, 13_000);
+        assert_eq!(hit(&rr, 1_000 + 8_000, 8).0, 9_000);
+        // Linked (the default): the right side's own settings do nothing.
+        let mut set = base.to_vec();
+        set.push((id::TIME, 100.0));
+        let mut plain = rig(&set);
+        set.extend([(id::TIME_R, 999.0), (id::DIVISION_R, 3.0)]);
+        let mut other = rig(&set);
+        let (a, _) = plain.run(0.5, click(1_000), silence);
+        let (b, _) = other.run(0.5, click(1_000), silence);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn diffusion_smears_the_repeat_and_keeps_its_time() {
+        let spread = |diffusion: f64| {
+            let mut r = rig(&[
+                (id::MODE, 0.0),
+                (id::DAMPING, 0.0),
+                (id::FEEDBACK, 0.0),
+                (id::TIME, 100.0),
+                (id::DIFFUSION, diffusion),
+            ]);
+            let (l, _) = r.run(0.5, click(1_000), silence);
+            let (at, peak) = hit(&l, 5_800, 1_200);
+            let energy: f64 = l[4_000..8_000].iter().map(|v| f64::from(*v).powi(2)).sum();
+            (at, f64::from(peak).powi(2) / energy)
+        };
+        let (at0, focus0) = spread(0.0);
+        let (at1, focus1) = spread(1.0);
+        assert_eq!(at0, 5_800);
+        assert_eq!(at1, 5_800, "the smeared repeat still lands on time");
+        assert!(focus0 > 0.99, "{focus0}");
+        assert!(focus1 < 0.5, "spread over the diffusers: {focus1}");
+    }
+
+    #[test]
+    fn the_tilt_brightens_or_darkens_every_pass() {
+        let after = |tilt: f64, f: f64| {
+            let mut r = rig(&[
+                (id::MODE, 0.0),
+                (id::TIME, 20.0),
+                (id::FEEDBACK, 0.9),
+                (id::DAMPING, 0.0),
+                (id::TILT, tilt),
+            ]);
+            r.run(0.05, tone(f, 0.3), silence);
+            let (l, _) = r.run(0.4, silence, silence);
+            bin_db(&l, f)
+        };
+        let (flat_low, flat_high) = (after(0.0, 100.0), after(0.0, 8_000.0));
+        assert!(after(12.0, 8_000.0) > flat_high + 6.0, "brighter");
+        assert!(after(12.0, 100.0) < flat_low - 6.0);
+        assert!(after(-12.0, 8_000.0) < flat_high - 6.0, "darker");
+        assert!(after(-12.0, 100.0) > flat_low + 6.0);
+    }
+
+    #[test]
+    fn modulation_moves_the_repeats_in_pitch() {
+        let steady = |depth: f64| {
+            let mut r = rig(&[
+                (id::MODE, 0.0),
+                (id::TIME, 100.0),
+                (id::FEEDBACK, 0.0),
+                (id::DAMPING, 0.0),
+                (id::MODULATION, depth),
+                (id::MOD_RATE, 2.0),
+            ]);
+            let (l, _) = r.run(1.0, tone(1_000.0, 0.5), silence);
+            bin_db(&l, 1_000.0)
+        };
+        let (still, moving) = (steady(0.0), steady(1.0));
+        // ±4 ms at 2 Hz: ±5 % of pitch — the tone is no longer at 1 kHz.
+        assert!(moving < still - 6.0, "{still:.1} → {moving:.1}");
     }
 
     #[test]

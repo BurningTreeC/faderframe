@@ -19,6 +19,10 @@ pub struct Chrome {
     pub record: gtk::Button,
     pub looping: gtk::Button,
     pub metronome: gtk::Button,
+    /// Input quantize (Q).
+    pub quantize: gtk::Button,
+    /// Input quantize as last saved in the preferences.
+    pub quantize_saved: Cell<(bool, Option<faderframe_timeline::GridDivision>)>,
     pub capture: gtk::Button,
     pub edit_button: gtk::Button,
     pub edit_bar: CanvasWidget,
@@ -163,6 +167,28 @@ impl Chrome {
         let can = s.can_capture_midi();
         if self.capture.is_sensitive() != can {
             self.capture.set_sensitive(can);
+        }
+        let q = (s.record.input_quantize, s.record.input_grid);
+        if self.quantize.has_css_class("q-active") != q.0
+            || !self.quantize.has_css_class("a11y-pressed")
+        {
+            set_pressed(&self.quantize, "q-active", q.0);
+            self.quantize.set_tooltip_text(Some(&format!(
+                "Input quantize {}: recorded MIDI lands on {} (right-click: grid, MIDI learn)",
+                if q.0 { "on" } else { "off" },
+                s.input_quantize_settings().grid.label()
+            )));
+        }
+        // Changed (by the button, a controller, a mapping): remembered.
+        if self.quantize_saved.get() != q {
+            self.quantize_saved.set(q);
+            let mut p = crate::prefs::Preferences::load();
+            if (p.input_quantize, p.input_grid) != q {
+                (p.input_quantize, p.input_grid) = q;
+                if let Err(e) = p.save() {
+                    tracing::warn!("cannot save preferences: {e}");
+                }
+            }
         }
         let click = s.record.metronome;
         if self.metronome.has_css_class("click-active") != (click != MetronomeMode::Off) {
@@ -402,6 +428,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
         ("Cut Range (Ctrl+X)", "cut"),
         ("Paste at Playhead (Ctrl+V)", "paste"),
         ("Duplicate Range (Ctrl+D)", "duplicate"),
+        ("Merge Selected Clips", "merge-clips"),
     ] {
         range.append_item(&target(label, "app.edit", arg));
     }
@@ -470,6 +497,11 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
         &section(&[
             ("Plugin Browser…", "app.plugin-browser"),
             ("Record-Arm Selected Tracks", "app.arm-selected"),
+            ("Duplicate Selected Tracks", "app.duplicate-tracks"),
+            (
+                "Duplicate Selected Tracks with Content",
+                "app.duplicate-tracks-content",
+            ),
             ("Remove Selected Tracks", "app.remove-tracks"),
         ]),
     );
@@ -523,7 +555,10 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
         ]),
     );
     transport.append_submenu(Some("Shuttle"), &shuttle);
-    transport.append_section(None, &crate::recording::menu());
+    transport.append_section(
+        None,
+        &crate::recording::menu_for(&crate::prefs::Preferences::load().record_settings()),
+    );
     transport.append_section(None, &section(&[("Panic (All Notes Off)", "app.panic")]));
     menu.append_submenu(Some("Transport"), &transport);
 
@@ -615,6 +650,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
     audio.append_section(None, &crate::monitoring::menu());
     audio.append_submenu(Some("Listen"), &crate::listen::menu());
     audio.append_submenu(Some("Console"), &crate::console::menu());
+    audio.append_submenu(Some("Cue Mixes"), &crate::cues::menu());
     audio.append_section(
         None,
         &section(&[("Speaker Layouts…", "app.speaker-layouts")]),
@@ -687,6 +723,54 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
     transport.append(&capture);
     let looping = icon_button("media-playlist-repeat-symbolic", "Loop (L)", "app.loop");
     transport.append(&looping);
+    // Input quantize: recorded MIDI lands on the grid.
+    let quantize = gtk::Button::with_label("Q");
+    quantize.add_css_class("quantize-toggle");
+    quantize.set_action_name(Some("app.input-quantize"));
+    quantize.update_property(&[gtk::accessible::Property::Label("Input quantize")]);
+    transport.append(&quantize);
+    crate::learn::on_right_click_with(
+        app,
+        &quantize,
+        faderframe_project::MappingTarget::Transport {
+            control: faderframe_project::TransportControl::InputQuantize,
+        },
+        |s| {
+            use faderframe_timeline::GridDivision as G;
+            let r = s.record;
+            let mark = |on: bool, label: String| {
+                if on {
+                    format!("✓ {label}")
+                } else {
+                    format!("   {label}")
+                }
+            };
+            let set = |grid: Option<G>| {
+                Action::SetRecordSettings(faderframe_session::RecordSettings {
+                    input_grid: grid,
+                    ..r
+                })
+            };
+            let mut out = vec![(
+                mark(
+                    r.input_grid.is_none(),
+                    format!("Edit Grid ({})", s.editor.grid.label()),
+                ),
+                set(None),
+            )];
+            for g in [
+                G::Note(4),
+                G::Note(8),
+                G::Note(16),
+                G::Note(32),
+                G::Triplet(8),
+                G::Triplet(16),
+            ] {
+                out.push((mark(r.input_grid == Some(g), g.label()), set(Some(g))));
+            }
+            out
+        },
+    );
     // A right-click on each learns a MIDI control for it (or forgets one).
     {
         use faderframe_project::{MappingTarget, TransportControl as T};
@@ -866,6 +950,8 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
         record,
         looping,
         metronome,
+        quantize,
+        quantize_saved: Cell::new((false, None)),
         capture,
         edit_button,
         edit_bar,

@@ -18,6 +18,7 @@ faderframe-core.workspace = true
 faderframe-plugin-host.workspace = true
 faderframe-guitar.workspace = true
 faderframe-project.workspace = true
+faderframe-timeline.workspace = true
 faderframe-session.workspace = true
 faderframe-ui-canvas.workspace = true
 

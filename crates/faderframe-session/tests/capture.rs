@@ -195,3 +195,49 @@ fn notes_played_while_playing_land_where_they_were_heard() {
     let len = n.length.quarters() * 60.0 / tempo;
     assert!((len - held).abs() < 0.03, "{len} for {held}");
 }
+
+/// Input quantize (the transport's Q): what is recorded or captured lands
+/// on its grid; off, it stays as played.
+#[test]
+fn input_quantize_puts_played_notes_on_the_grid() {
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let lead = track(&s, "Lead Synth");
+    s.selection.select_tracks(&[lead], SelectMode::Replace);
+    let mut r = s.record;
+    r.input_grid = Some(faderframe_timeline::GridDivision::Note(16));
+    s.dispatch(Action::SetRecordSettings(r)).unwrap();
+    s.dispatch(Action::Transport(TransportAction::ToggleInputQuantize))
+        .unwrap();
+    assert!(s.record.input_quantize);
+    run(&mut s, 30);
+    // Off the grid on purpose: 70 ms and 110 ms apart.
+    play(&mut s, 60, 70);
+    play(&mut s, 64, 110);
+    play(&mut s, 67, 90);
+    let before = clip_ids(&s, lead);
+    s.dispatch(Action::CaptureMidi).unwrap();
+    let notes = new_notes(&s, lead, &before);
+    assert_eq!(notes.len(), 3);
+    for (start, n) in &notes {
+        let q = (*start + n.start).quarters() * 4.0;
+        assert!((q - q.round()).abs() < 1e-6, "on a sixteenth: {q}");
+    }
+    // Off: as played (a later phrase, a bar on).
+    s.dispatch(Action::Transport(TransportAction::ToggleInputQuantize))
+        .unwrap();
+    s.dispatch(Action::Transport(TransportAction::Locate(
+        MusicalTime::from_quarters(40.0),
+    )))
+    .unwrap();
+    run(&mut s, 30);
+    play(&mut s, 60, 70);
+    play(&mut s, 64, 110);
+    let before = clip_ids(&s, lead);
+    s.dispatch(Action::CaptureMidi).unwrap();
+    let notes = new_notes(&s, lead, &before);
+    let off_grid = notes.iter().any(|(start, n)| {
+        let q = (*start + n.start).quarters() * 4.0;
+        (q - q.round()).abs() > 1e-3
+    });
+    assert!(off_grid, "unquantized notes keep their timing");
+}

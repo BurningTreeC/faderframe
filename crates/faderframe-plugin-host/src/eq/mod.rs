@@ -17,10 +17,12 @@
 //!   sidechain) and its filtering (the band's region, or free low and high
 //!   cuts) are the band's own. Spectral bands act on each frequency of
 //!   their region on its own, linear phase ([`spectral`]).
-//! * Character modes (clean, subtle transformer, warm tube; [`character`]),
-//!   output gain, pan (left/right or mid/side) and phase invert, auto gain,
-//!   a gain scale, gain-Q interaction and a soft, latency compensated
-//!   bypass.
+//! * Character modes (clean, subtle transformer, warm tube, console line
+//!   amplifier, tape; [`character`]) with a drive and optional 2×/4×
+//!   oversampling, output gain, pan (left/right or mid/side) and phase
+//!   invert, auto gain, a gain scale, gain-Q interaction, a dry/wet mix
+//!   (parallel EQ against the latency compensated input) and a soft,
+//!   latency compensated bypass.
 //! * Changes are click free: frequency, gain, Q and slope glide, and a band
 //!   that is switched on or off or changes its structure fades out and back
 //!   in. Any band can be heard on its own, and so can its trigger.
@@ -54,7 +56,7 @@ use std::sync::Arc;
 /// Bands the EQ has.
 pub const BANDS: usize = 24;
 /// Global parameters.
-pub const GLOBALS: usize = 11;
+pub const GLOBALS: usize = 14;
 /// Parameters per band.
 pub const FIELDS: usize = 20;
 /// Parameter ids of band `b`: `BAND_BASE + b * BAND_STRIDE + slot` for the
@@ -76,11 +78,18 @@ pub mod global {
     pub const INVERT: usize = 8;
     pub const BYPASS: usize = 9;
     pub const GAIN_Q: usize = 10;
+    /// Dry/wet (1: the EQ alone).
+    pub const MIX: usize = 11;
+    /// How hard the character stage is driven (1: as designed).
+    pub const CHARACTER_DRIVE: usize = 12;
+    /// The character stage's oversampling (0 off, 1 = 2×, 2 = 4×).
+    pub const OVERSAMPLING: usize = 13;
 }
 
 /// Ids of the global parameters (5 to 7 belonged to the first version's
-/// global attack, release and sidechain switch).
-const GLOBAL_IDS: [u32; GLOBALS] = [0, 1, 2, 3, 4, 8, 9, 10, 11, 12, 13];
+/// global attack, release and sidechain switch; ids 14 to 16 came later:
+/// mix, character drive and oversampling).
+const GLOBAL_IDS: [u32; GLOBALS] = [0, 1, 2, 3, 4, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 
 /// A band's parameters, in order. `Enabled` is the band's state:
 /// 0 unused (not shown), 1 on, 2 bypassed (shown, not heard).
@@ -276,8 +285,14 @@ pub fn latency(params: &ParamValues) -> u32 {
     stage_latencies(params).iter().sum()
 }
 
-/// The latencies of the spectral stage and of the FIR.
-fn stage_latencies(params: &ParamValues) -> [u32; 2] {
+/// The character stage's oversampling factor the parameters ask for.
+pub fn oversampling(params: &ParamValues) -> usize {
+    character::oversampling_factor(f64::from(params.get(global::OVERSAMPLING)))
+}
+
+/// The latencies of the spectral stage, of the FIR and of the character
+/// stage's oversampling.
+fn stage_latencies(params: &ParamValues) -> [u32; 3] {
     let q = quality(params);
     let spectral = if spectral::wanted(params) {
         spectral::latency(q) as u32
@@ -289,7 +304,8 @@ fn stage_latencies(params: &ParamValues) -> [u32; 2] {
         PhaseMode::Linear => linear::latency(q),
         PhaseMode::Natural => natural::LATENCY,
     };
-    [spectral, fir]
+    let over = character::oversampling_latency(oversampling(params));
+    [spectral, fir, over]
 }
 
 /// Index of a global parameter's value.
@@ -433,7 +449,15 @@ pub fn parameters() -> Vec<ParameterInfo> {
             None,
             true,
         )),
-        g(global::CHARACTER, "Character", 0.0, 2.0, 0.0, None, true),
+        g(
+            global::CHARACTER,
+            "Character",
+            0.0,
+            (Character::ALL.len() - 1) as f64,
+            0.0,
+            None,
+            true,
+        ),
         g(global::PAN, "Output Pan", -1.0, 1.0, 0.0, None, false),
         g(global::PAN_MODE, "Pan Mode", 0.0, 1.0, 0.0, None, true),
         g(global::INVERT, "Phase Invert", 0.0, 1.0, 0.0, None, true),
@@ -447,6 +471,26 @@ pub fn parameters() -> Vec<ParameterInfo> {
             None,
             true,
         ),
+        g(global::MIX, "Mix", 0.0, 1.0, 1.0, Percent, false),
+        g(
+            global::CHARACTER_DRIVE,
+            "Character Drive",
+            0.0,
+            2.0,
+            1.0,
+            Percent,
+            false,
+        ),
+        // Changes the latency: not automatable.
+        fixed(g(
+            global::OVERSAMPLING,
+            "Character Oversampling",
+            0.0,
+            (character::OVERSAMPLING.len() - 1) as f64,
+            0.0,
+            None,
+            true,
+        )),
     ];
     debug_assert_eq!(out.len(), GLOBALS);
     for b in 0..BANDS {
@@ -601,8 +645,14 @@ pub fn format(id: ParameterId, value: f64) -> Option<String> {
             global::AUTO_GAIN | global::INVERT | global::BYPASS | global::GAIN_Q => on_off(value),
             global::PHASE => Some(PhaseMode::from_value(value).name().into()),
             global::QUALITY => Some(QUALITIES[i.min(QUALITIES.len() - 1)].into()),
-            global::GAIN_SCALE => Some(format!("{:.0} %", value * 100.0)),
+            global::GAIN_SCALE | global::MIX | global::CHARACTER_DRIVE => {
+                Some(format!("{:.0} %", value * 100.0))
+            }
             global::CHARACTER => Some(Character::from_index(i).name().into()),
+            global::OVERSAMPLING => Some(
+                character::OVERSAMPLING_NAMES[i.min(character::OVERSAMPLING_NAMES.len() - 1)]
+                    .into(),
+            ),
             global::PAN_MODE => Some(
                 if value >= 0.5 {
                     "Mid/Side"
@@ -1148,6 +1198,8 @@ struct Output {
     sign: f64,
     /// 0: processed, 1: bypassed.
     bypass: f64,
+    /// 1: the EQ alone, 0: the (delayed) input alone.
+    mix: f64,
 }
 
 pub struct EqProcessor {
@@ -1196,7 +1248,9 @@ impl EqProcessor {
         let block = config.max_block_size.max(1) as usize;
         let mt = MeterTap::new(sr as f32);
         let mode = PhaseMode::of(&params);
-        let [spectral_latency, fir_latency] = stage_latencies(&params);
+        let [spectral_latency, fir_latency, over_latency] = stage_latencies(&params);
+        let character = CharacterStage::new(sr, oversampling(&params));
+        debug_assert_eq!(character.latency(), over_latency);
         let spectral = (spectral_latency > 0).then(|| {
             Box::new(spectral::Spectral::new(
                 params.clone(),
@@ -1244,6 +1298,7 @@ impl EqProcessor {
                 mid_side: false,
                 sign: 1.0,
                 bypass: 0.0,
+                mix: 1.0,
             },
             auto: 1.0,
             auto_target: 1.0,
@@ -1252,13 +1307,13 @@ impl EqProcessor {
             loudness: Box::new(Loudness::new(sr)),
             design_from: 0,
             listen: None,
-            character: CharacterStage::new(sr),
+            character,
             meters: [[mt; 2]; 2],
             scratch: [vec![0.0; block], vec![0.0; block]],
             spectral,
             fir,
             keys: Delay::new(before_sections as usize),
-            dry: Delay::new((spectral_latency + fir_latency) as usize),
+            dry: Delay::new((spectral_latency + fir_latency + over_latency) as usize),
             tap,
         };
         p.control(true);
@@ -1430,6 +1485,8 @@ impl EqProcessor {
             STEP as f64 / (BYPASS_RAMP * sr)
         };
         self.out.bypass += (bypass - self.out.bypass).clamp(-ramp, ramp);
+        let mix = f64::from(self.params.get(global::MIX)).clamp(0.0, 1.0);
+        self.out.mix = g(self.out.mix, mix);
         let auto_on = self.params.get(global::AUTO_GAIN) >= 0.5;
         if auto_on {
             let key = (statics, scale, interact);
@@ -1458,6 +1515,8 @@ impl EqProcessor {
         self.character.set(Character::from_index(
             self.params.get(global::CHARACTER).round().max(0.0) as usize,
         ));
+        self.character
+            .set_drive(f64::from(self.params.get(global::CHARACTER_DRIVE)));
         // Listening to one band (or its trigger) on its own.
         self.update_listen(&statics);
     }
@@ -1606,6 +1665,11 @@ impl EqProcessor {
             }
             l *= gain;
             r *= gain;
+            if o.mix < 1.0 {
+                let m = o.mix;
+                l = dry[0] + m * (l - dry[0]);
+                r = dry[1] + m * (r - dry[1]);
+            }
             if o.bypass > 0.0 {
                 let b = o.bypass;
                 l = dry[0] * b + l * (1.0 - b);

@@ -59,6 +59,66 @@ impl RecordStreams {
     }
 }
 
+/// Most tracks [`RecordingNow`] knows (more record targets than this keep
+/// playing their clips while recording).
+pub const RECORDING_TRACKS: usize = 128;
+
+/// What is being recorded, as the graph's processors see it: the record
+/// window and the tracks whose input is captured. Their clips are silent
+/// inside the window and their input is heard there (tape style), so
+/// recording over a clip does not play the clip under the new take.
+///
+/// With a count-in, nothing of the arrangement plays before the window
+/// (the pre-roll is the click alone).
+#[derive(Clone, Copy, Debug)]
+pub struct RecordingNow {
+    window: Option<(i64, i64)>,
+    tracks: [Option<TrackId>; RECORDING_TRACKS],
+    pub(crate) count_in: bool,
+}
+
+impl Default for RecordingNow {
+    fn default() -> Self {
+        Self {
+            window: None,
+            tracks: [None; RECORDING_TRACKS],
+            count_in: false,
+        }
+    }
+}
+
+impl RecordingNow {
+    /// Counting in: the arrangement is silent before this position.
+    pub fn silent_before(&self, recording: bool) -> Option<i64> {
+        let (from, _) = self.window?;
+        (self.count_in && recording).then_some(from)
+    }
+
+    /// Records `track`?
+    pub fn records(&self, track: TrackId) -> bool {
+        self.window.is_some() && self.tracks.iter().map_while(|t| *t).any(|t| t == track)
+    }
+
+    /// The frames `a..b` of a block of `n` frames at timeline position
+    /// `pos` that are inside the record window, when `track` is recorded
+    /// and the transport records (`recording`).
+    pub fn inside(
+        &self,
+        track: TrackId,
+        recording: bool,
+        pos: i64,
+        n: usize,
+    ) -> Option<(usize, usize)> {
+        let (from, to) = self.window?;
+        if !recording || !self.records(track) {
+            return None;
+        }
+        let a = pos.max(from);
+        let b = (pos + n as i64).min(to);
+        (a < b).then(|| ((a - pos) as usize, (b - pos) as usize))
+    }
+}
+
 /// Audio-thread side.
 pub(crate) struct Recorder {
     targets: Vec<RecordTarget>,
@@ -106,6 +166,18 @@ pub(crate) fn rings(
 }
 
 impl Recorder {
+    /// The window and tracks, for the processors.
+    pub(crate) fn now(&self) -> RecordingNow {
+        let mut now = RecordingNow {
+            window: Some((self.from, self.to)),
+            ..RecordingNow::default()
+        };
+        for (slot, t) in now.tracks.iter_mut().zip(&self.targets) {
+            *slot = Some(t.track);
+        }
+        now
+    }
+
     /// Capture device input frames `offset..offset + n`, which play at
     /// timeline position `pos`. Realtime-safe; returns frames captured.
     pub(crate) fn capture(

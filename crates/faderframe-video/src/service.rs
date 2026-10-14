@@ -552,6 +552,19 @@ fn open_dmabuf(file: &PathBuf, size: (u32, u32), s: &Shared) -> Option<Decoder> 
     None
 }
 
+/// Where time `t` of `m`'s original is in `file` as `d` reads it: the
+/// same, or in its proxy as far from the proxy's first frame as from the
+/// original's. (Matroska readers start a stream at its first block, so a
+/// picture starting after 0 — an MP4's B-frame delay without an edit list,
+/// sound starting first — read back that much early in its proxy.)
+fn in_file(m: &Media, file: &std::path::Path, d: &Decoder, t: i64) -> i64 {
+    if file == m.original {
+        return t;
+    }
+    let first = m.index.times.first().copied().unwrap_or(0);
+    t - first + d.first_time()
+}
+
 /// Which file and size playing and scrubbing read: the proxy when there is
 /// one (at its size, or smaller), else the original at the size wanted.
 fn moving_source(m: &Media, size: (u32, u32)) -> (PathBuf, (u32, u32)) {
@@ -607,7 +620,7 @@ fn play_step(s: &Shared, lane: &mut Lane, key: Key, m: &Media) -> bool {
             let Some(d) = decoder_for(&mut lane.open, key, m, &file, dsize, true, s) else {
                 return false;
             };
-            if let Err(e) = d.play_from(t) {
+            if let Err(e) = d.play_from(in_file(m, &file, d, t)) {
                 tracing::warn!("{}: {e}", file.display());
                 return false;
             }
@@ -719,7 +732,7 @@ fn still_step(s: &Shared, d: &mut Stills, key: Key, m: &Media) {
             && !have_frame(s, key, k as u32, dsize.0)
             && let Some(&kt) = m.index.times.get(k)
             && let Some(dec) = decoder_for(&mut d.moving, key, m, &file, dsize, false, s)
-            && let Ok(Some(f)) = dec.frame_at(kt, false)
+            && let Ok(Some(f)) = dec.frame_at(in_file(m, &file, dec, kt), false)
         {
             lock(&s.cache).put((key, k as u32, dsize.0), Arc::new(f), s.budget);
         }
@@ -727,7 +740,7 @@ fn still_step(s: &Shared, d: &mut Stills, key: Key, m: &Media) {
             return;
         }
         if let Some(dec) = decoder_for(&mut d.moving, key, m, &file, dsize, false, s) {
-            match dec.frame_at(t, true) {
+            match dec.frame_at(in_file(m, &file, dec, t), true) {
                 Ok(Some(f)) => lock(&s.cache).put((key, n, dsize.0), Arc::new(f), s.budget),
                 Ok(None) => {}
                 Err(e) => tracing::warn!("{}: {e}", file.display()),
@@ -772,7 +785,7 @@ fn thumbnailer(s: &Shared) {
                 };
                 let size = m.fit((u32::MAX, height));
                 if let Some(d) = decoder_for(&mut open, key, &m, &file, size, false, s) {
-                    match d.frame_at(t, exact) {
+                    match d.frame_at(in_file(&m, &file, d, t), exact) {
                         Ok(Some(f)) => {
                             lock(&s.thumbs).put(slot, Arc::new(f), s.thumb_budget);
                         }

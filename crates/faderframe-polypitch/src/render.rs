@@ -12,6 +12,14 @@
 //! and are scaled by the note's gain. Bins no note owns (noise, breath,
 //! attacks) stay where they are.
 //!
+//! A note made longer or shorter (`Moved::placed`) leaves where it was
+//! played (its partials taken out, as a gain of 0 does) and is heard over
+//! its new span instead: each frame there takes the note's partials from
+//! the frame of its own sound that falls there (the note stretched
+//! evenly), their phases turned so each partial runs on at its frequency
+//! from frame to frame (a phase vocoder on the note's peaks alone). The
+//! rest of the sound stays where it is.
+//!
 //! Only the spans of notes that change are processed; around each span the
 //! result is crossfaded into the original over half a window, and outside
 //! them the output is the input sample for sample.
@@ -40,9 +48,36 @@ pub struct Moved {
     pub ratio: Vec<f32>,
     /// Its gain (linear; 0 removes it).
     pub gain: Vec<f32>,
+    /// Where it sounds now when made longer or shorter (source frames;
+    /// `None`: where it was played). Its curves stay where it was played.
+    pub placed: Option<(i64, i64)>,
 }
 
 impl Moved {
+    /// Made longer or shorter (or moved in time)?
+    pub fn stretched(&self) -> bool {
+        self.placed.is_some_and(|p| p != (self.start, self.end))
+    }
+
+    /// The frames it changes: where it was played and where it sounds.
+    fn reach(&self) -> (i64, i64) {
+        match self.placed {
+            Some((a, b)) => (self.start.min(a), self.end.max(b)),
+            None => (self.start, self.end),
+        }
+    }
+
+    /// The frame of its own sound heard at frame `t` (inside where it
+    /// sounds now, when stretched).
+    fn source_of(&self, t: f64) -> Option<f64> {
+        let (a, b) = self.placed.filter(|_| self.stretched())?;
+        if t < a as f64 || t > b as f64 {
+            return None;
+        }
+        let f = (t - a as f64) / (b - a).max(1) as f64;
+        Some(self.start as f64 + f * (self.end - self.start) as f64)
+    }
+
     /// A curve's value at source frame `t` (between its points), `None`
     /// outside the note.
     fn at(&self, v: &[f32], t: f64) -> Option<f32> {
@@ -62,6 +97,7 @@ impl Moved {
     pub fn changes(&self) -> bool {
         self.ratio.iter().any(|r| (r - 1.0).abs() > 1e-6)
             || self.gain.iter().any(|g| (g - 1.0).abs() > 1e-6)
+            || self.stretched()
     }
 }
 
@@ -103,13 +139,16 @@ pub fn together(starts_ends: &[(i64, i64)], a: i64, b: i64, rate: f64) -> bool {
 
 /// The window [`render`] uses over `a..b`.
 fn window_over(rate: f64, notes: &[Moved], a: i64, b: i64) -> usize {
-    let near: Vec<&Moved> = notes.iter().filter(|n| n.start < b && n.end > a).collect();
+    let near: Vec<&Moved> = notes
+        .iter()
+        .filter(|n| n.reach().0 < b && n.reach().1 > a)
+        .collect();
     let lowest = near
         .iter()
         .flat_map(|n| n.f0.iter().copied())
         .filter(|f| *f > 0.0)
         .fold(f32::MAX, f32::min);
-    let spans: Vec<(i64, i64)> = near.iter().map(|n| (n.start, n.end)).collect();
+    let spans: Vec<(i64, i64)> = near.iter().map(|n| n.reach()).collect();
     window_for(rate, f64::from(lowest), together(&spans, a, b, rate))
 }
 
@@ -120,7 +159,10 @@ pub fn spans(notes: &[Moved], rate: f64, len: i64) -> Vec<(i64, i64)> {
     let mut s: Vec<(i64, i64)> = notes
         .iter()
         .filter(|n| n.changes())
-        .map(|n| ((n.start - half).max(0), (n.end + half).min(len)))
+        .map(|n| {
+            let (a, b) = n.reach();
+            ((a - half).max(0), (b + half).min(len))
+        })
         .filter(|(a, b)| b > a)
         .collect();
     s.sort_unstable();
@@ -143,10 +185,43 @@ struct Sounding {
     gain: f64,
 }
 
+/// The notes played at source frame `t` (a stretched one silent there
+/// when `leaving`: it sounds elsewhere now).
+fn sounding(notes: &[Moved], t: f64, leaving: bool) -> Vec<Sounding> {
+    notes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| {
+            let f0 = f64::from(m.at(&m.f0, t)?);
+            let gone = leaving && m.stretched();
+            (f0 > 0.0).then(|| Sounding {
+                note: i,
+                f0,
+                ratio: f64::from(m.at(&m.ratio, t).unwrap_or(1.0)),
+                gain: if gone {
+                    0.0
+                } else {
+                    f64::from(m.at(&m.gain, t).unwrap_or(1.0))
+                },
+            })
+        })
+        .collect()
+}
+
 /// A spectral peak and the notes sharing it (note, harmonic, share).
 struct Peak {
     bin: usize,
     owners: Vec<(usize, u32, f64)>,
+}
+
+/// Each partial's phase turned so far, by (note, harmonic): where notes are
+/// played (`here`) and where stretched ones are heard now (`brought`, with
+/// the frame of their own sound each frame took last).
+#[derive(Default)]
+struct Phases {
+    here: HashMap<(usize, u32), f64>,
+    brought: HashMap<(usize, u32), f64>,
+    last: HashMap<usize, i64>,
 }
 
 struct Work {
@@ -182,31 +257,27 @@ impl Work {
         }
     }
 
-    /// Move the notes in the frame now in `re`/`im` (centred at source
-    /// frame `t`); `phase` keeps each partial's turned phase.
-    fn frame(&mut self, t: f64, notes: &[Moved], phase: &mut HashMap<(usize, u32), f64>) {
-        let n = self.n;
-        let bins = n / 2;
-        let bin_hz = self.rate / n as f64;
-        let sounding: Vec<Sounding> = notes
-            .iter()
-            .enumerate()
-            .filter_map(|(i, m)| {
-                let f0 = f64::from(m.at(&m.f0, t)?);
-                (f0 > 0.0).then(|| Sounding {
-                    note: i,
-                    f0,
-                    ratio: f64::from(m.at(&m.ratio, t).unwrap_or(1.0)),
-                    gain: f64::from(m.at(&m.gain, t).unwrap_or(1.0)),
-                })
-            })
-            .collect();
-        if sounding
-            .iter()
-            .all(|s| (s.ratio - 1.0).abs() < 1e-9 && (s.gain - 1.0).abs() < 1e-9)
-        {
-            return;
+    /// The windowed spectrum of `src` around frame `c` into `re`/`im`.
+    fn load(&mut self, src: &[f32], c: i64) {
+        let half = self.n as i64 / 2;
+        for i in 0..self.n {
+            let t = c - half + i as i64;
+            let x = if t >= 0 && t < src.len() as i64 {
+                f64::from(src[t as usize])
+            } else {
+                0.0
+            };
+            self.re[i] = x * self.window[i];
+            self.im[i] = 0.0;
         }
+        self.fft.run(&mut self.re, &mut self.im, false);
+    }
+
+    /// The partials of the `sounding` notes as peaks of the spectrum now
+    /// in `re`/`im`, and the bins each takes along.
+    fn peaks(&mut self, sounding: &[Sounding]) -> (Vec<Peak>, Vec<(usize, usize)>) {
+        let bins = self.n / 2;
+        let bin_hz = self.rate / self.n as f64;
         for k in 0..=bins {
             self.mag[k] = (self.re[k] * self.re[k] + self.im[k] * self.im[k]).sqrt();
         }
@@ -271,10 +342,6 @@ impl Work {
                 }),
             }
         }
-        // Every bin stays, but those a peak takes along.
-        self.owned.fill(false);
-        self.yre.fill(0.0);
-        self.yim.fill(0.0);
         let regions: Vec<(usize, usize)> = (0..peaks.len())
             .map(|i| {
                 let k = peaks[i].bin;
@@ -291,18 +358,25 @@ impl Work {
                 (lo, hi)
             })
             .collect();
-        for &(lo, hi) in &regions {
-            for o in &mut self.owned[lo..=hi] {
-                *o = true;
-            }
-        }
-        for k in 0..=bins {
-            if !self.owned[k] {
-                self.yre[k] = self.re[k];
-                self.yim[k] = self.im[k];
-            }
-        }
-        for (p, &(lo, hi)) in peaks.iter().zip(&regions) {
+        (peaks, regions)
+    }
+
+    /// Add the owners' shares of `peaks` (only those of `sounding[only]`
+    /// when given) into `yre`/`yim`, each moved by its note's ratio and
+    /// scaled by its gain; the input moved on `dt` frames since the last
+    /// frame (the hop, but where a stretched note's own sound is taken).
+    fn move_peaks(
+        &mut self,
+        sounding: &[Sounding],
+        (peaks, regions): (&[Peak], &[(usize, usize)]),
+        only: Option<usize>,
+        dt: f64,
+        phase: &mut HashMap<(usize, u32), f64>,
+    ) {
+        let bins = self.n / 2;
+        let bin_hz = self.rate / self.n as f64;
+        let hop = self.hop as f64;
+        for (p, &(lo, hi)) in peaks.iter().zip(regions) {
             let k = p.bin;
             // The peak's frequency between bins (a parabola through the
             // log magnitudes).
@@ -320,11 +394,16 @@ impl Work {
             let f = (k as f64 + frac) * bin_hz;
             let total: f64 = p.owners.iter().map(|o| o.2).sum::<f64>().max(1e-30);
             for &(si, h, w) in &p.owners {
+                if only.is_some_and(|o| o != si) {
+                    continue;
+                }
                 let s = sounding[si];
                 let df = f * (s.ratio - 1.0);
                 let dk = (df / bin_hz).round() as i64;
+                // Turned on by what the new frequency runs on in a hop less
+                // what the input's phase moved on by itself.
                 let th = phase.entry((s.note, h)).or_insert(0.0);
-                *th = (*th + 2.0 * PI * df * self.hop as f64 / self.rate) % (2.0 * PI);
+                *th = (*th + 2.0 * PI * f * (s.ratio * hop - dt) / self.rate) % (2.0 * PI);
                 let (sin, cos) = th.sin_cos();
                 let g = s.gain * w / total;
                 let (gr, gi) = (cos * g, sin * g);
@@ -339,6 +418,60 @@ impl Work {
                     self.yim[to] += xr * gi + xi * gr;
                 }
             }
+        }
+    }
+
+    /// Move the notes in the frame now in `re`/`im` (centred at frame `c`
+    /// of `src`), and bring in stretched notes heard there now.
+    fn frame(&mut self, c: i64, src: &[f32], notes: &[Moved], phase: &mut Phases) {
+        let n = self.n;
+        let bins = n / 2;
+        let t = c as f64;
+        let here = sounding(notes, t, true);
+        let brought: Vec<(usize, i64)> = notes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| Some((i, m.source_of(t)?.round() as i64)))
+            .collect();
+        if brought.is_empty()
+            && here
+                .iter()
+                .all(|s| (s.ratio - 1.0).abs() < 1e-9 && (s.gain - 1.0).abs() < 1e-9)
+        {
+            return;
+        }
+        let (peaks, regions) = self.peaks(&here);
+        // Every bin stays, but those a peak takes along.
+        self.owned.fill(false);
+        self.yre.fill(0.0);
+        self.yim.fill(0.0);
+        for &(lo, hi) in &regions {
+            for o in &mut self.owned[lo..=hi] {
+                *o = true;
+            }
+        }
+        for k in 0..=bins {
+            if !self.owned[k] {
+                self.yre[k] = self.re[k];
+                self.yim[k] = self.im[k];
+            }
+        }
+        let hop = self.hop as f64;
+        self.move_peaks(&here, (&peaks, &regions), None, hop, &mut phase.here);
+        // Stretched notes heard here: their partials from the frame of
+        // their own sound that falls here (shared ones split as there).
+        for (note, from) in brought {
+            let dt = phase
+                .last
+                .insert(note, from)
+                .map_or(hop, |last| (from - last) as f64);
+            self.load(src, from);
+            let there = sounding(notes, from as f64, false);
+            let Some(si) = there.iter().position(|s| s.note == note) else {
+                continue;
+            };
+            let (peaks, regions) = self.peaks(&there);
+            self.move_peaks(&there, (&peaks, &regions), Some(si), dt, &mut phase.brought);
         }
         // The other half: the conjugate mirror.
         self.yim[0] = 0.0;
@@ -381,21 +514,11 @@ pub fn render(
         let mut y = vec![0.0f64; (c1 - c0 + n) as usize];
         for (ch, src) in channels.iter().enumerate() {
             y.fill(0.0);
-            let mut phase: HashMap<(usize, u32), f64> = HashMap::new();
+            let mut phase = Phases::default();
             let mut c = c0;
             while c <= c1 {
-                for i in 0..w.n {
-                    let t = c - half + i as i64;
-                    let x = if t >= 0 && t < src.len() as i64 {
-                        f64::from(src[t as usize])
-                    } else {
-                        0.0
-                    };
-                    w.re[i] = x * w.window[i];
-                    w.im[i] = 0.0;
-                }
-                w.fft.run(&mut w.re, &mut w.im, false);
-                w.frame(c as f64, notes, &mut phase);
+                w.load(src, c);
+                w.frame(c, src, notes, &mut phase);
                 w.fft.run(&mut w.re, &mut w.im, true);
                 let at = (c - half - base) as usize;
                 for i in 0..w.n {

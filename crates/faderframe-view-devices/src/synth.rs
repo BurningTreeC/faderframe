@@ -1,8 +1,9 @@
 //! The Synth's face: one cycle of each oscillator as set, the filter's
 //! response (its reach under the envelope shaded, where the newest voice
 //! has it now marked) and both envelopes with their levels now; below,
-//! two rows of sections for the oscillators, mix and voicing, filter,
-//! envelopes, LFO and output.
+//! two rows of sections for the oscillators, mix and voicing, the wheels
+//! (pitch-bend range, what the mod wheel does), filter, envelopes, LFO and
+//! output.
 
 use crate::kit::{self, Ctl, Ctx, Face, KNOB, Meter, MeterKind, Panel, SMALL, Scale, Section};
 use crate::values::note_name;
@@ -91,7 +92,7 @@ impl Face for SynthFace {
     }
 
     fn min_size(&self) -> Size {
-        Size::new(1240.0, 640.0)
+        Size::new(1380.0, 640.0)
     }
 
     fn panel(&self, size: Size) -> Panel {
@@ -101,7 +102,13 @@ impl Face for SynthFace {
         let bottom = Rect::new(deck.x, deck.y + 186.0, deck.w, 178.0);
         let mut s: Vec<Section> = kit::sections(
             top,
-            &[("OSC 1", 5.0), ("OSC 2", 5.0), ("MIX", 6.6), ("VOICE", 4.4)],
+            &[
+                ("OSC 1", 4.6),
+                ("OSC 2", 4.6),
+                ("MIX", 7.4),
+                ("VOICE", 4.4),
+                ("WHEELS", 4.8),
+            ],
         );
         s.extend(kit::sections(
             bottom,
@@ -163,8 +170,33 @@ impl Face for SynthFace {
                 (id::VELOCITY_AMP, "VELOCITY", None, false),
             ],
         );
-        // Filter.
+        // The pitch-bend range, then the mod wheel's slots: what each
+        // drives and how much.
         let r = kit::inside(&s[4]);
+        c.push(Ctl::slider(
+            pid(id::BEND_RANGE),
+            "PITCH BEND",
+            Rect::new(r.x + 4.0, r.y, r.w - 8.0, 26.0),
+        ));
+        for k in 0..syn::WHEEL_SLOTS {
+            let y = r.y + 34.0 + 34.0 * k as f32;
+            let split = (r.w - 12.0) * 0.52;
+            c.push(Ctl::choice(
+                pid(id::wheel_target(k)),
+                "",
+                Rect::new(r.x + 4.0, y + 4.0, split, 22.0),
+            ));
+            c.push(
+                Ctl::slider(
+                    pid(id::wheel_amount(k)),
+                    ["MOD WHEEL 1", "MOD WHEEL 2", "MOD WHEEL 3"][k],
+                    Rect::new(r.x + 10.0 + split, y, r.w - 14.0 - split, 26.0),
+                )
+                .bipolar(),
+            );
+        }
+        // Filter.
+        let r = kit::inside(&s[5]);
         c.push(Ctl::segments(pid(id::FILTER_TYPE), "", seg(r)));
         let k = kit::row(
             Rect::new(r.x, r.y + 30.0, r.w, KNOB.1),
@@ -178,7 +210,7 @@ impl Face for SynthFace {
         c.push(Ctl::small(pid(id::KEY_TRACK), "KEY", small_at(k[4])));
         c.push(Ctl::small(pid(id::VELOCITY_CUTOFF), "VEL", small_at(k[5])));
         // Envelopes.
-        let r = kit::inside(&s[5]);
+        let r = kit::inside(&s[6]);
         c.push(Ctl::segments(pid(id::FILTER_ENV), "", seg(r)));
         let ms = Some(Scale::Log);
         smalls(
@@ -191,7 +223,7 @@ impl Face for SynthFace {
                 (id::F_RELEASE, "R", ms, false),
             ],
         );
-        let r = kit::inside(&s[6]);
+        let r = kit::inside(&s[7]);
         smalls(
             &mut c,
             below(r),
@@ -203,7 +235,7 @@ impl Face for SynthFace {
             ],
         );
         // LFO.
-        let r = kit::inside(&s[7]);
+        let r = kit::inside(&s[8]);
         let third = (r.w - 16.0) / 3.0;
         c.push(Ctl::choice(
             pid(id::LFO_SHAPE),
@@ -231,7 +263,7 @@ impl Face for SynthFace {
                 (id::LFO_PW, "PW", None, false),
             ],
         );
-        let r = kit::inside(&s[8]);
+        let r = kit::inside(&s[9]);
         c.push(Ctl::knob(
             pid(id::VOLUME),
             "VOLUME",
@@ -476,6 +508,13 @@ impl Face for SynthFace {
             id::VELOCITY_AMP => "How much velocity sets the level",
             id::VOICE_MODE => "Poly, Mono (always retriggers), Legato (slides between held keys)",
             id::GLIDE => "Slide from the last note",
+            id::BEND_RANGE => {
+                "Semitones a full pitch-wheel throw bends (a controller setting it with RPN 0 wins on its channel)"
+            }
+            44 | 46 | 48 => "What the mod wheel drives in this slot",
+            45 | 47 | 49 => {
+                "How much (at full wheel): negative takes away; for LFO Amount and Volume, positive brings it in as the wheel goes up"
+            }
             _ => return None,
         })
     }

@@ -199,6 +199,22 @@ enum Drag {
     },
 }
 
+/// Ctrl+drag: a rectangle selecting the clips under it (kept outside
+/// `Drag`, which is `Copy`).
+struct Marquee {
+    origin: Point,
+    current: Point,
+    moved: bool,
+    /// Ctrl+Shift: added to what was selected at the press.
+    base: Vec<ClipId>,
+    base_tracks: Vec<TrackId>,
+    /// Pressed on a clip: a click (no drag) toggles it, as a Ctrl-click
+    /// always did.
+    click: Option<(ClipId, TrackId)>,
+    /// Pressed on a lane or below the tracks: a click moves the playhead.
+    at: Option<MusicalTime>,
+}
+
 /// Swipe comping in progress (kept outside `Drag`, which is `Copy`).
 struct CompDrag {
     clip: ClipId,
@@ -294,6 +310,7 @@ pub struct ArrangerView {
     /// Files being dragged in: target track (`None` = new tracks) and time.
     drop_at: Option<(Option<TrackId>, MusicalTime)>,
     comp: Option<CompDrag>,
+    marquee: Option<Marquee>,
     auto_drag: Option<automation::AutoDrag>,
     /// Track header column width (from the layout, else the theme).
     header_width: f32,
@@ -331,7 +348,94 @@ fn folder_name_rect(l: &HeaderLayout) -> Rect {
     )
 }
 
+/// The lead sheet entries of a clip's menu: of this clip, and of the
+/// selected clips it is one of (those of a track on one staff; on several
+/// tracks a score, a staff a track).
+fn lead_sheet_items(model: &Session, clip: &Clip, targets: &[ClipId]) -> Vec<MenuItem<Action>> {
+    use faderframe_session::leadsheet::{Grid, LeadSheetOf};
+    let make = |of| Action::MakeLeadSheet {
+        of,
+        grid: Grid::Auto,
+    };
+    let tab = |of| Action::MakeTab { of };
+    let mut items = vec![
+        MenuItem::new(
+            "Lead Sheet (Melody, Chords, Words)",
+            make(LeadSheetOf::Clip(clip.id)),
+        ),
+        MenuItem::new("Guitar Tab", tab(LeadSheetOf::Clip(clip.id))),
+    ];
+    let p = model.project();
+    let mut clips: Vec<ClipId> = targets
+        .iter()
+        .copied()
+        .filter(|c| p.clip(*c).is_some())
+        .collect();
+    clips.sort();
+    if clips.len() > 1 {
+        let mut tracks: Vec<TrackId> = clips
+            .iter()
+            .filter_map(|c| p.clip(*c).map(|c| c.track))
+            .collect();
+        tracks.sort();
+        tracks.dedup();
+        let (label, tab_label) = if tracks.len() > 1 {
+            (
+                format!(
+                    "Score of the Selected Clips ({} Tracks, a Staff Each)",
+                    tracks.len()
+                ),
+                format!("Score with Guitar Tab ({} Tracks)", tracks.len()),
+            )
+        } else {
+            (
+                format!("Lead Sheet of the {} Selected Clips", clips.len()),
+                format!("Guitar Tab of the {} Selected Clips", clips.len()),
+            )
+        };
+        items.push(MenuItem::new(
+            label,
+            make(LeadSheetOf::Clips(clips.clone())),
+        ));
+        items.push(MenuItem::new(tab_label, tab(LeadSheetOf::Clips(clips))));
+    }
+    items
+}
+
+/// The tracks a score of the selection has, top to bottom: the selected
+/// tracks with clips that hold notes or audio.
+fn score_tracks(model: &Session) -> Vec<TrackId> {
+    let p = model.project();
+    p.folder_order()
+        .into_iter()
+        .filter(|t| {
+            model.selection.tracks.contains(&t.id)
+                && matches!(
+                    t.kind,
+                    TrackKind::Audio | TrackKind::Midi | TrackKind::Instrument
+                )
+                && !p.clips_of(t.id).is_empty()
+        })
+        .map(|t| t.id)
+        .collect()
+}
+
 /// The entries making a sample of a track's selection (audio tracks).
+/// A menu entry the session describes, as a menu item.
+fn entry_item(e: faderframe_session::GroupMenuEntry) -> MenuItem<Action> {
+    let mut m = match e.action {
+        Some(a) => MenuItem::new(e.label, a),
+        None => MenuItem::disabled(e.label),
+    };
+    if let Some(on) = e.checked {
+        m = m.checked(on);
+    }
+    if e.separated {
+        m = m.separated();
+    }
+    m
+}
+
 fn sample_items(model: &Session, track: TrackId, clip: Option<ClipId>) -> Vec<MenuItem<Action>> {
     model
         .sample_choices(track, clip)
@@ -369,6 +473,7 @@ impl ArrangerView {
             law: FaderLaw::console(),
             drop_at: None,
             comp: None,
+            marquee: None,
             auto_drag: None,
             header_width,
             rows: Vec::new(),
@@ -2195,13 +2300,11 @@ impl ArrangerView {
             MenuItem::new("Add Aux (FX Return)", Action::AddTrack(TrackKind::Aux)),
             MenuItem::new("Add VCA", Action::AddTrack(TrackKind::Vca)),
         ];
-        items.push(
-            MenuItem::new(
-                "Remove Track",
-                Action::Edit(Command::RemoveTrack { track: t.id }),
-            )
-            .separated(),
-        );
+        items.extend(model.duplicate_menu(t.id).into_iter().map(entry_item));
+        items.push(MenuItem::new(
+            "Remove Track",
+            Action::Edit(Command::RemoveTrack { track: t.id }),
+        ));
         items.push(
             MenuItem::new(
                 "Colour…",
@@ -2210,19 +2313,7 @@ impl ArrangerView {
             .separated(),
         );
         // Groups and VCAs.
-        items.extend(model.group_menu(t.id).into_iter().map(|e| {
-            let mut m = match e.action {
-                Some(a) => MenuItem::new(e.label, a),
-                None => MenuItem::disabled(e.label),
-            };
-            if let Some(on) = e.checked {
-                m = m.checked(on);
-            }
-            if e.separated {
-                m = m.separated();
-            }
-            m
-        }));
+        items.extend(model.group_menu(t.id).into_iter().map(entry_item));
         // A sample of the selection (audio tracks).
         items.extend(sample_items(model, t.id, None));
         // Folders: what this one holds; into and out of folders.
@@ -2291,7 +2382,7 @@ impl ArrangerView {
             );
             if let Some(slot) = model.instrument_slot(t) {
                 items.push(MenuItem::new(
-                    format!("Show {} Editor", slot.plugin.name),
+                    format!("Show {} Editor", t.name_of(slot)),
                     Action::OpenPluginEditor {
                         track: t.id,
                         plugin: slot.id,
@@ -2301,9 +2392,9 @@ impl ArrangerView {
                 if slot.plugin.format != faderframe_project::PluginFormat::Builtin {
                     items.push(MenuItem::new(
                         if model.plugin_failed(slot.id) {
-                            format!("Reload {} (it stopped working)", slot.plugin.name)
+                            format!("Reload {} (it stopped working)", t.name_of(slot))
                         } else {
-                            format!("Reload {}", slot.plugin.name)
+                            format!("Reload {}", t.name_of(slot))
                         },
                         Action::ReloadPlugin(slot.id),
                     ));
@@ -2313,7 +2404,7 @@ impl ArrangerView {
         // Editors of the inserts.
         for slot in &t.inserts {
             items.push(MenuItem::new(
-                format!("Show {} Editor", slot.plugin.name),
+                format!("Show {} Editor", t.name_of(slot)),
                 Action::OpenPluginEditor {
                     track: t.id,
                     plugin: slot.id,
@@ -2505,7 +2596,7 @@ impl ArrangerView {
                 .iter()
                 .filter(|o| o.track.is_none())
                 .count();
-            let label = format!("Create Output Tracks · {} ({missing})", slot.plugin.name);
+            let label = format!("Create Output Tracks · {} ({missing})", t.name_of(slot));
             items.push(
                 if missing == 0 {
                     MenuItem::disabled(label)
@@ -2537,6 +2628,32 @@ impl ArrangerView {
                 )
                 .separated(),
             );
+            items.push(MenuItem::new(
+                "Guitar Tab of This Track",
+                Action::MakeTab {
+                    of: faderframe_session::leadsheet::LeadSheetOf::Track(t.id),
+                },
+            ));
+            // A score of the selected tracks it is one of, a staff each.
+            let score = score_tracks(model);
+            if score.len() > 1 && score.contains(&t.id) {
+                items.push(MenuItem::new(
+                    format!(
+                        "Score of the {} Selected Tracks (a Staff Each)",
+                        score.len()
+                    ),
+                    Action::MakeLeadSheet {
+                        of: faderframe_session::leadsheet::LeadSheetOf::Tracks(score.clone()),
+                        grid: faderframe_session::leadsheet::Grid::Auto,
+                    },
+                ));
+                items.push(MenuItem::new(
+                    format!("Score with Guitar Tab ({} Tracks)", score.len()),
+                    Action::MakeTab {
+                        of: faderframe_session::leadsheet::LeadSheetOf::Tracks(score),
+                    },
+                ));
+            }
         }
         // Track presets.
         if t.kind != TrackKind::Master {
@@ -2733,17 +2850,15 @@ impl ArrangerView {
                 clip: clip.id,
                 what,
             };
-            if matches!(clip.content, ClipContent::Midi(_)) {
-                items.push(
-                    MenuItem::new(
-                        "Lead Sheet (Melody, Chords, Words)",
-                        Action::MakeLeadSheet {
-                            of: faderframe_session::leadsheet::LeadSheetOf::Clip(clip.id),
-                            grid: faderframe_session::leadsheet::Grid::Auto,
-                        },
-                    )
-                    .separated(),
-                );
+            // MIDI and take folders: the lead sheet entries apart (an audio
+            // clip's come with its other conversions below).
+            if !matches!(clip.content, ClipContent::Audio(_)) {
+                for (i, item) in lead_sheet_items(model, clip, &targets)
+                    .into_iter()
+                    .enumerate()
+                {
+                    items.push(if i == 0 { item.separated() } else { item });
+                }
             }
             if clip.as_audio().is_some() {
                 use faderframe_session::to_midi::ToMidi;
@@ -2769,13 +2884,7 @@ impl ArrangerView {
                     "Transcribe Words to the Lyrics Lane",
                     Action::Transcribe(clip.id),
                 ));
-                items.push(MenuItem::new(
-                    "Lead Sheet (Melody, Chords, Words)",
-                    Action::MakeLeadSheet {
-                        of: faderframe_session::leadsheet::LeadSheetOf::Clip(clip.id),
-                        grid: faderframe_session::leadsheet::Grid::Auto,
-                    },
-                ));
+                items.extend(lead_sheet_items(model, clip, &targets));
                 // The selected audio clips (a multitrack jam) or this one.
                 let audio: Vec<ClipId> = targets
                     .iter()
@@ -2832,6 +2941,22 @@ impl ArrangerView {
             "Split at Playhead",
             Action::SplitSelectedAtPlayhead,
         ));
+        // Two or more clips of one track: one clip.
+        let p = model.project();
+        let mergeable = targets.iter().any(|a| {
+            let track = p.clip(*a).map(|c| c.track);
+            targets
+                .iter()
+                .filter(|b| p.clip(**b).map(|c| c.track) == track)
+                .count()
+                >= 2
+        });
+        if mergeable {
+            items.push(MenuItem::new(
+                "Merge Clips",
+                Action::MergeClips(targets.clone()),
+            ));
+        }
         // Aliases: copies that share their content.
         items.push(
             MenuItem::new(
@@ -3105,6 +3230,25 @@ impl ArrangerView {
                         }
                     }
                     _ => {
+                        // Shift: the tracks from the one last clicked to
+                        // this one, as the rows show them.
+                        if mods.shift
+                            && !mods.toggle()
+                            && let Some(anchor) = model.selection.anchor_track
+                        {
+                            let rows = Self::lane_tracks(model);
+                            let at = |t: TrackId| rows.iter().position(|r| r.id == t);
+                            if let (Some(a), Some(b)) = (at(anchor), at(id)) {
+                                cx.emit(Action::SelectTracks {
+                                    tracks: rows[a.min(b)..=a.max(b)]
+                                        .iter()
+                                        .map(|t| t.id)
+                                        .collect(),
+                                    mode: SelectMode::Replace,
+                                });
+                                return true;
+                            }
+                        }
                         let mode = if mods.toggle() {
                             SelectMode::Toggle
                         } else {
@@ -3165,16 +3309,161 @@ impl ArrangerView {
                     });
                     return true;
                 }
+                if mods.toggle() && Self::marquee_tool(model) {
+                    self.start_marquee(pos, mods, None, Some(at), model);
+                    return true;
+                }
                 return self.press_lane(track, at, pos, mods, model, cx);
             }
             Hit::Empty(_) if model.editor.tool == faderframe_session::EditTool::Zoom => {
                 return self.press_zoom(pos, mods, cx);
             }
-            Hit::Empty(_) => {
+            Hit::Empty(at) => {
+                if mods.toggle() && Self::marquee_tool(model) {
+                    self.start_marquee(pos, mods, None, Some(at), model);
+                    return true;
+                }
                 cx.emit(Action::ClearSelection);
                 cx.emit(Action::SetEditRange(None));
+                // Below the tracks too, a click puts the playhead there.
+                self.click_locate(self.snap(at, model, mods), model, cx);
             }
         }
+        true
+    }
+
+    /// Tools with which Ctrl+drag draws a selection rectangle.
+    fn marquee_tool(model: &Session) -> bool {
+        use faderframe_session::EditTool as T;
+        matches!(model.editor.tool, T::Smart | T::Select | T::Grab)
+    }
+
+    /// Ctrl pressed in the lanes: a rectangle if it is dragged.
+    pub(crate) fn start_marquee(
+        &mut self,
+        pos: Point,
+        mods: Modifiers,
+        click: Option<(ClipId, TrackId)>,
+        at: Option<MusicalTime>,
+        model: &Session,
+    ) {
+        let s = &model.selection;
+        let add = mods.shift;
+        self.marquee = Some(Marquee {
+            origin: pos,
+            current: pos,
+            moved: false,
+            base: if add {
+                s.clips.iter().copied().collect()
+            } else {
+                Vec::new()
+            },
+            base_tracks: if add {
+                s.tracks.iter().copied().collect()
+            } else {
+                Vec::new()
+            },
+            click,
+            at,
+        });
+    }
+
+    /// The clips (and their tracks) a rectangle in view coordinates
+    /// touches.
+    fn clips_in(&self, area: Rect, size: Size, model: &Session) -> (Vec<ClipId>, Vec<TrackId>) {
+        let (mut clips, mut tracks) = (Vec::new(), Vec::new());
+        for (i, t) in Self::lane_tracks(model).iter().enumerate() {
+            let row = self.row_rect(i, size);
+            if row.bottom() < area.y || row.y > area.bottom() {
+                continue;
+            }
+            for c in model.project().clips_of(t.id) {
+                let r = self.clip_rect(c, row, model);
+                let hit = r.x < area.right()
+                    && r.right() > area.x
+                    && r.y < area.bottom()
+                    && r.bottom() > area.y;
+                if hit {
+                    clips.push(c.id);
+                    if !tracks.contains(&t.id) {
+                        tracks.push(t.id);
+                    }
+                }
+            }
+        }
+        (clips, tracks)
+    }
+
+    fn marquee_rect(m: &Marquee) -> Rect {
+        let (x0, x1) = (m.origin.x.min(m.current.x), m.origin.x.max(m.current.x));
+        let (y0, y1) = (m.origin.y.min(m.current.y), m.origin.y.max(m.current.y));
+        Rect::new(x0, y0, x1 - x0, y1 - y0)
+    }
+
+    fn marquee_move(
+        &mut self,
+        pos: Point,
+        size: Size,
+        model: &Session,
+        cx: &mut EventCx<'_, Action>,
+    ) -> bool {
+        let Some(m) = self.marquee.as_mut() else {
+            return false;
+        };
+        if !m.moved && pos.distance(m.origin) < DRAG_THRESHOLD {
+            return true;
+        }
+        m.moved = true;
+        m.current = pos;
+        let area = Self::marquee_rect(m);
+        let (base, base_tracks) = (m.base.clone(), m.base_tracks.clone());
+        let (mut clips, mut tracks) = self.clips_in(area, size, model);
+        for c in base {
+            if !clips.contains(&c) {
+                clips.push(c);
+            }
+        }
+        for t in base_tracks {
+            if !tracks.contains(&t) {
+                tracks.push(t);
+            }
+        }
+        let now: std::collections::BTreeSet<ClipId> = clips.iter().copied().collect();
+        if now != model.selection.clips {
+            cx.emit(Action::SelectClips {
+                clips,
+                mode: SelectMode::Replace,
+            });
+            cx.emit(Action::SelectTracks {
+                tracks,
+                mode: SelectMode::Replace,
+            });
+        }
+        true
+    }
+
+    fn marquee_release(&mut self, model: &Session, cx: &mut EventCx<'_, Action>) -> bool {
+        let Some(m) = self.marquee.take() else {
+            return false;
+        };
+        if !m.moved {
+            match (m.click, m.at) {
+                // A Ctrl-click on a clip: in or out of the selection.
+                (Some((clip, track)), _) => {
+                    cx.emit(Action::SelectClips {
+                        clips: vec![clip],
+                        mode: SelectMode::Toggle,
+                    });
+                    cx.emit(Action::SelectTracks {
+                        tracks: vec![track],
+                        mode: SelectMode::Add,
+                    });
+                }
+                (None, Some(at)) => self.click_locate(at, model, cx),
+                (None, None) => {}
+            }
+        }
+        cx.set_cursor(Cursor::Default);
         true
     }
 
@@ -3186,6 +3475,9 @@ impl ArrangerView {
         model: &Session,
         cx: &mut EventCx<'_, Action>,
     ) {
+        if self.marquee_move(pos, size, model, cx) {
+            return;
+        }
         if self.global_drag_move(pos, mods, size, model, cx) {
             return;
         }
@@ -3371,6 +3663,9 @@ impl ArrangerView {
     }
 
     fn release(&mut self, model: &Session, size: Size, cx: &mut EventCx<'_, Action>) {
+        if self.marquee_release(model, cx) {
+            return;
+        }
         if self.global_release(model, size, cx) {
             return;
         }
@@ -3745,6 +4040,20 @@ impl CanvasView<Session, Action> for ArrangerView {
             model,
         );
         self.paint_global_lanes(p, size, model);
+        // The selection rectangle being drawn (Ctrl+drag).
+        if let Some(m) = self.marquee.as_ref().filter(|m| m.moved) {
+            let lanes = Rect::new(
+                self.header_w(),
+                self.ruler_h(),
+                (size.w - self.header_w()).max(0.0),
+                (size.h - self.ruler_h()).max(0.0),
+            );
+            let r = Self::marquee_rect(m).intersection(&lanes);
+            p.push_clip(lanes);
+            p.fill(r, theme.ui.selection.with_alpha(0.14));
+            p.stroke_rounded(r, 0.0, 1.0, theme.ui.selection.with_alpha(0.8));
+            p.pop_clip();
+        }
     }
 
     fn event(

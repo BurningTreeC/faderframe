@@ -147,3 +147,54 @@ fn heads_and_corrections_are_chosen_and_renders_follow_the_head() {
     assert!(s.headphone_correction().is_none());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Listening on headphones is the monitoring path only: an export made
+/// while listening binaurally (with the mono check on too) is the export
+/// made on speakers, sample for sample; only a render asked for headphones
+/// goes through the head.
+#[test]
+fn exports_never_carry_what_the_listener_hears() {
+    let dir = std::env::temp_dir().join(format!("ff-listening-out-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut s = session(&dir);
+    let export = |s: &mut Session, name: &str, channels: RenderChannels| {
+        let out = dir.join(name);
+        let job = s
+            .render(RenderSettings {
+                range: RenderRange::Bars { start: 0, end: 1 },
+                source: RenderSource::Master,
+                format: WavFormat::Float32,
+                tail_seconds: 0.0,
+                channels,
+                dither: faderframe_audio_files::Dither::Off,
+                ..RenderSettings::defaults_for(s.project(), out.clone())
+            })
+            .unwrap();
+        job.join().unwrap();
+        read_wav(&out).unwrap().channels
+    };
+    let speakers = export(&mut s, "speakers.wav", RenderChannels::Stereo);
+    let bed = export(&mut s, "bed.wav", RenderChannels::Master);
+    s.dispatch(Action::SetHeadphones(Some(faderframe_binaural::Room::Far)))
+        .unwrap();
+    s.dispatch(Action::SetMonoCheck(true)).unwrap();
+    assert_eq!(
+        export(&mut s, "speakers-2.wav", RenderChannels::Stereo),
+        speakers,
+        "a stereo export is unchanged"
+    );
+    assert_eq!(
+        export(&mut s, "bed-2.wav", RenderChannels::Master),
+        bed,
+        "the 5.1 master too"
+    );
+    assert_eq!(bed.len(), 6);
+    let heard = export(
+        &mut s,
+        "head.wav",
+        RenderChannels::Binaural(faderframe_binaural::Room::Far),
+    );
+    assert_ne!(heard, speakers, "asked for: through the head");
+    let _ = std::fs::remove_dir_all(&dir);
+}

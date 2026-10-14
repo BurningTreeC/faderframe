@@ -51,6 +51,7 @@ fn steady(key: f64, a: f64, b: f64, semitones: f64, gain: f32) -> Moved {
         f0: vec![hz(key) as f32; frames],
         ratio: vec![2f64.powf(semitones / 12.0) as f32; frames],
         gain: vec![gain; frames],
+        placed: None,
     }
 }
 
@@ -131,6 +132,49 @@ fn a_note_is_taken_out_of_a_chord() {
 }
 
 #[test]
+fn one_note_of_a_chord_is_made_longer_and_another_shorter() {
+    // C E G from 0.2 s to 1.0 s; E held on to 1.6 s, G stopped at 0.6 s.
+    let mut x = vec![0.0f32; (2.0 * RATE) as usize];
+    for key in [60.0, 64.0, 67.0] {
+        tone(&mut x, key, 0.2, 1.0, 0.0, 0.15);
+    }
+    let at = |s: f64| (s * RATE) as i64;
+    let mut e = steady(64.0, 0.2, 1.0, 0.0, 1.0);
+    e.placed = Some((at(0.2), at(1.6)));
+    let mut g = steady(67.0, 0.2, 1.0, 0.0, 1.0);
+    g.placed = Some((at(0.2), at(0.6)));
+    let notes = [steady(60.0, 0.2, 1.0, 0.0, 1.0), e, g];
+    let out = render(std::slice::from_ref(&x), RATE, &notes, &mut |_| {})
+        .pop()
+        .unwrap();
+    // While the chord plays all three are there (the G squeezed in).
+    for key in [60.0, 64.0, 67.0] {
+        let d = level(&out, 0.4, hz(key)) - level(&x, 0.4, hz(key));
+        assert!(d.abs() < 3.0, "{key} at 0.4 s: {d:.2} dB");
+    }
+    // The G stopped: gone where the chord still plays.
+    let gone = level(&x, 0.85, hz(67.0)) - level(&out, 0.85, hz(67.0));
+    assert!(gone > 15.0, "G down {gone:.1} dB at 0.85 s");
+    for key in [60.0, 64.0] {
+        let d = level(&out, 0.85, hz(key)) - level(&x, 0.85, hz(key));
+        assert!(d.abs() < 3.0, "{key} at 0.85 s: {d:.2} dB");
+    }
+    // The E rings on alone after the chord, about as loud as it was, its
+    // partials at their own pitch.
+    for h in 1..=3 {
+        let f = hz(64.0) * f64::from(h);
+        let held = level(&out, 1.3, f) - level(&x, 0.6, f);
+        assert!(held.abs() < 4.0, "E partial {h} at 1.3 s: {held:.1} dB");
+    }
+    for key in [60.0, 67.0] {
+        let silent = level(&x, 0.6, hz(key)) - level(&out, 1.3, hz(key));
+        assert!(silent > 30.0, "{key} after the chord: {silent:.1} dB down");
+    }
+    // Past its new end: quiet again.
+    assert!(level(&x, 0.6, hz(64.0)) - level(&out, 1.8, hz(64.0)) > 30.0);
+}
+
+#[test]
 fn each_note_of_a_chord_is_followed_to_the_cent() {
     let mut x = vec![0.0f32; (2.0 * RATE) as usize];
     // C a fifth of a semitone sharp, E and G in tune.
@@ -199,6 +243,7 @@ fn a_wavering_note_comes_out_straight() {
             })
             .collect(),
         gain: vec![1.0; sung.len()],
+        placed: None,
     };
     let out = render(&[x], RATE, &[note], &mut |_| {}).pop().unwrap();
     let after = spread(&pitch_tracks(&out, RATE, &[span], HOP).pop().unwrap());

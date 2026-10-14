@@ -197,6 +197,9 @@ pub struct PresetSend {
     pub tap: SendTap,
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// The send's pan (`None`: unpanned).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pan: Option<f32>,
 }
 
 fn yes() -> bool {
@@ -290,6 +293,7 @@ impl TrackPreset {
                         level_db: s.level_db,
                         tap: s.tap,
                         enabled: s.enabled,
+                        pan: s.pan,
                     })
                 })
                 .collect(),
@@ -449,6 +453,7 @@ impl TrackPreset {
                     level_db: s.level_db,
                     tap: s.tap,
                     enabled: s.enabled,
+                    pan: s.pan,
                 }),
                 None => notes.push(format!("send to '{}' left out: no such track", s.target)),
             }
@@ -658,6 +663,7 @@ mod tests {
             level_db: -12.0,
             tap: SendTap::PreFader,
             enabled: true,
+            pan: None,
         });
         p.tracks.insert(0, t);
         (p, vox, aux)

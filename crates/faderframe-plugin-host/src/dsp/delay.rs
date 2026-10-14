@@ -73,6 +73,46 @@ impl DelayLine {
     }
 }
 
+/// A Schroeder allpass of a whole number of samples (a diffuser: flat in
+/// level, it smears what passes over its length).
+#[derive(Clone, Debug)]
+pub struct Allpass {
+    line: DelayLine,
+    len: usize,
+}
+
+impl Allpass {
+    /// Room for delays up to `capacity` samples, starting at one.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            line: DelayLine::new(capacity),
+            len: 1,
+        }
+    }
+
+    /// Its delay (samples, at least one, at most the capacity).
+    pub fn set_len(&mut self, len: usize) {
+        self.len = len.clamp(1, self.line.capacity());
+    }
+
+    pub fn delay(&self) -> usize {
+        self.len
+    }
+
+    /// One sample through, with feedback `g` (0: a plain delay).
+    #[inline]
+    pub fn process(&mut self, x: f64, g: f64) -> f64 {
+        let d = self.line.tap(self.len - 1);
+        let w = x - g * d;
+        self.line.push(super::flush(w));
+        d + g * w
+    }
+
+    pub fn reset(&mut self) {
+        self.line.reset();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -405,6 +405,7 @@ fn build(args: &Args) -> Project {
                 level_db: -18.0,
                 tap: SendTap::PostFader,
                 enabled: true,
+                pan: None,
             });
         }
         if args.latency > 0 && i % 2 == 0 {

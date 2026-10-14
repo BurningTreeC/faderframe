@@ -217,9 +217,9 @@ impl Session {
         let pos = self.transport.position;
         let to = self.video_frame_step(pos, n).unwrap_or_else(|| {
             let tc = self.project.timecode.unwrap_or_default().rate;
-            let frame = tc.frame_at(pos as f64 / rate.max(1) as f64 + 1e-9);
+            let frame = tc.frame_at_sample(pos, rate);
             let target = (frame + n as i64).max(0);
-            (tc.seconds_of(target) * rate as f64).round() as i64
+            tc.first_sample(target, rate)
         });
         let to = to.max(0);
         self.engine.transport(TransportCommand::Locate(to))?;

@@ -93,6 +93,45 @@ pub fn physical_cores() -> usize {
     logical
 }
 
+/// The processing threads the user allows, the calling thread included (0:
+/// one per core). See [`set_processing_threads`].
+static PROCESSING_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// The user's processing threads (the audio thread included; `None`: one
+/// per core), set by whoever owns the engine's [`WorkerPool`]. Devices that
+/// solve their channels side by side on helpers of their own (circuit
+/// preamps, console buses, the Guitar Station) keep each solve within it as
+/// well: 1 solves every channel on the device's own thread.
+pub fn set_processing_threads(threads: Option<usize>) {
+    PROCESSING_THREADS.store(threads.unwrap_or(0), Ordering::Relaxed);
+}
+
+/// See [`set_processing_threads`]. Realtime-safe.
+pub fn processing_threads() -> Option<usize> {
+    match PROCESSING_THREADS.load(Ordering::Relaxed) {
+        0 => None,
+        n => Some(n),
+    }
+}
+
+/// Helper threads for a device that solves `channels` independent channels
+/// side by side, the calling thread taking one: one more thread per channel,
+/// within the machine's physical cores (the caller included) and `most`.
+/// Channels beyond that share threads. Reads the CPU topology: call it
+/// while building, off the audio thread.
+pub fn channel_helpers(channels: usize, most: usize) -> usize {
+    let cores = physical_cores().saturating_sub(1).max(1);
+    channels.saturating_sub(1).min(cores).min(most)
+}
+
+/// How many threads (the caller included) one solve of `channels` channels
+/// takes with a pool of `helpers` threads: one per channel, within the pool
+/// and the user's processing threads. Realtime-safe.
+pub fn channel_threads(channels: usize, helpers: usize) -> usize {
+    let allowed = processing_threads().unwrap_or(usize::MAX).max(1);
+    channels.min(helpers + 1).min(allowed).max(1)
+}
+
 struct JobRef<'a>(&'a dyn PoolJob);
 
 thread_local! {
@@ -742,5 +781,26 @@ mod tests {
         pool.run(&job, 4);
         assert_eq!(job.done.load(Ordering::Relaxed), 100);
         assert_eq!(job.threads_seen.load(Ordering::Relaxed), 1);
+    }
+
+    /// A channel a thread: a 5.1 device's helpers are five (within the
+    /// cores), and a solve takes six threads unless the pool or the user's
+    /// processing threads allow fewer.
+    #[test]
+    fn surround_channels_get_a_thread_each_within_the_limits() {
+        let others = physical_cores().saturating_sub(1).max(1);
+        assert_eq!(channel_helpers(6, 63), 5.min(others));
+        assert_eq!(channel_helpers(12, 63), 11.min(others));
+        assert_eq!(channel_helpers(1, 63), 0);
+        assert_eq!(channel_helpers(64, 7), 7.min(others));
+        assert_eq!(channel_threads(6, 5), 6);
+        assert_eq!(channel_threads(6, 2), 3);
+        assert_eq!(channel_threads(1, 5), 1);
+        set_processing_threads(Some(4));
+        assert_eq!(channel_threads(6, 5), 4);
+        set_processing_threads(Some(1));
+        assert_eq!(channel_threads(6, 5), 1);
+        set_processing_threads(None);
+        assert_eq!(channel_threads(6, 5), 6);
     }
 }

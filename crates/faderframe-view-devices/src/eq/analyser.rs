@@ -1,8 +1,8 @@
 //! The EQ's analyser: the spectra of what goes in, what comes out and an
 //! external signal (the sidechain, or another EQ's output), with the usual
-//! settings — resolution, how fast levels fall, range, tilt, freeze — plus
-//! long-term averages (for EQ Match), the peaks Spectrum Grab offers and
-//! where two spectra collide.
+//! settings — resolution, how fast levels fall, range, tilt, freeze, a
+//! peak hold line — plus long-term averages (for EQ Match), the peaks
+//! Spectrum Grab offers and where two spectra collide.
 
 use faderframe_analysis::fft;
 use faderframe_plugin_host::tap::{AnalysisTap, AudioRing, RING_FRAMES};
@@ -36,6 +36,9 @@ pub(crate) struct Line {
     im: Vec<f64>,
     /// Level per bin (dBFS).
     level: Vec<f32>,
+    /// The highest level per bin since the hold began (while `holding`).
+    hold: Vec<f32>,
+    pub holding: bool,
     /// Frames of the ring read so far.
     seen: u64,
     /// Long-term average power per bin, while averaging.
@@ -60,6 +63,8 @@ impl Line {
             re: vec![0.0; size],
             im: vec![0.0; size],
             level: vec![FLOOR; size / 2],
+            hold: vec![FLOOR; size / 2],
+            holding: false,
             seen: 0,
             avg: vec![0.0; size / 2],
             avg_frames: 0,
@@ -128,6 +133,9 @@ impl Line {
             } else {
                 (*l - fall).max(db)
             };
+            if self.holding {
+                self.hold[b] = self.hold[b].max(db);
+            }
         }
         if self.averaging {
             self.avg_frames += 1;
@@ -136,7 +144,16 @@ impl Line {
 
     pub fn clear(&mut self) {
         self.level.fill(FLOOR);
+        self.hold.fill(FLOOR);
         self.input.clear();
+    }
+
+    /// Hold the peaks from now on (or stop and forget them).
+    pub fn set_hold(&mut self, on: bool) {
+        if on != self.holding {
+            self.holding = on;
+            self.hold.fill(FLOOR);
+        }
     }
 
     /// Start reading a ring from `written` frames on (not from its past).
@@ -182,7 +199,16 @@ impl Line {
     /// it (so a tone reads its level whatever the resolution), interpolated
     /// where bins are sparser than the points.
     pub fn curve(&self, freqs: &[f64]) -> Vec<f32> {
-        let bins = self.level.len();
+        self.curve_of(&self.level, freqs)
+    }
+
+    /// The peaks held (dBFS) at each of `freqs`.
+    pub fn hold_curve(&self, freqs: &[f64]) -> Vec<f32> {
+        self.curve_of(&self.hold, freqs)
+    }
+
+    fn curve_of(&self, level: &[f32], freqs: &[f64]) -> Vec<f32> {
+        let bins = level.len();
         self.spans(freqs)
             .iter()
             .zip(freqs)
@@ -191,14 +217,14 @@ impl Line {
                     let x = (f * self.size as f64 / self.rate).clamp(0.0, (bins - 1) as f64);
                     let k = x.floor() as usize;
                     let t = (x - k as f64) as f32;
-                    let next = self.level[(k + 1).min(bins - 1)];
-                    self.level[k] + (next - self.level[k]) * t
+                    let next = level[(k + 1).min(bins - 1)];
+                    level[k] + (next - level[k]) * t
                 } else {
                     let (k0, k1) = (
                         (a.round() as usize).min(bins - 1),
                         (b.round() as usize).clamp(1, bins),
                     );
-                    self.level[k0..k1.max(k0 + 1)]
+                    level[k0..k1.max(k0 + 1)]
                         .iter()
                         .copied()
                         .fold(FLOOR, f32::max)

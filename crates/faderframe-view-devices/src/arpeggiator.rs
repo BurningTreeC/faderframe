@@ -35,12 +35,20 @@ impl Face for ArpeggiatorFace {
     }
 
     fn min_size(&self) -> Size {
-        Size::new(820.0, 470.0)
+        Size::new(1000.0, 470.0)
     }
 
     fn panel(&self, size: Size) -> Panel {
         let (display, deck, _) = kit::frame(size, 170.0, 0.0);
-        let s = kit::sections(deck, &[("PATTERN", 4.4), ("TIMING", 4.4), ("PLAY", 2.8)]);
+        let s = kit::sections(
+            deck,
+            &[
+                ("PATTERN", 4.4),
+                ("TIMING", 4.4),
+                ("VELOCITY", 5.2),
+                ("PLAY", 2.8),
+            ],
+        );
         let mut c = Vec::new();
         let r = kit::inside(&s[0]);
         c.push(Ctl::choice(
@@ -67,6 +75,19 @@ impl Face for ArpeggiatorFace {
         c.push(Ctl::knob(pid(id::GATE), "GATE", k[0]));
         c.push(Ctl::knob(pid(id::SWING), "SWING", k[1]));
         let r = kit::inside(&s[2]);
+        c.push(Ctl::choice(
+            pid(id::PATTERN),
+            "PATTERN",
+            Rect::new(r.x + 4.0, r.y + 4.0, r.w * 0.34, 38.0),
+        ));
+        let k = kit::row(
+            Rect::new(r.x + r.w * 0.36, r.y, r.w * 0.64, SMALL.1),
+            &[SMALL.0, SMALL.0, SMALL.0],
+        );
+        c.push(Ctl::small(pid(id::PATTERN_LENGTH), "STEPS", k[0]));
+        c.push(Ctl::small(pid(id::ACCENT), "ACCENT", k[1]));
+        c.push(Ctl::small(pid(id::CHANCE), "CHANCE", k[2]));
+        let r = kit::inside(&s[3]);
         c.push(Ctl::small(
             pid(id::VELOCITY),
             "VELOCITY",
@@ -97,6 +118,9 @@ impl Face for ArpeggiatorFace {
         let octaves = cx.value(pid(id::OCTAVES)).round().clamp(1.0, 4.0) as usize;
         let repeats = cx.value(pid(id::REPEATS)).round().clamp(1.0, 4.0) as u64;
         let gate = cx.value(pid(id::GATE)).clamp(0.05, 1.5) as f32;
+        let pattern = cx.value(pid(id::PATTERN)).round().max(0.0) as usize;
+        let length = cx.value(pid(id::PATTERN_LENGTH)).round().clamp(2.0, 8.0) as usize;
+        let accent_amount = cx.value(pid(id::ACCENT)).clamp(0.0, 1.0);
         let playing = cx.tap.value(value::NOTE);
         let steps = cx.tap.value(value::STEP).max(0.0) as u64;
         let seq = arp::sequence(mode, &held, octaves);
@@ -198,6 +222,12 @@ impl Face for ArpeggiatorFace {
         let n_held = held.len().max(1);
         for k in 0..STEPS {
             let pos = k as u64 / repeats;
+            // The step's loudness from the velocity pattern (random: half).
+            let loud = f64::from(arp::shaped_velocity(
+                100,
+                accent_amount,
+                arp::pattern_weight(pattern, k as u64, length, 0.5),
+            )) / 100.0;
             let notes: Vec<u8> = if mode == 8 {
                 // Chord: all of it, an octave up each step.
                 let group = (pos as usize) % (seq.len() / n_held).max(1);
@@ -232,7 +262,7 @@ impl Face for ArpeggiatorFace {
                 let c = if lit {
                     self.accent
                 } else {
-                    self.accent.with_alpha(0.55)
+                    self.accent.with_alpha(0.2 + 0.4 * loud as f32)
                 };
                 p.fill_rounded(bar, 2.0, &Paint::Solid(c));
                 if gate > 1.0 {
@@ -278,6 +308,12 @@ impl Face for ArpeggiatorFace {
             id::VELOCITY => "A fixed velocity, or as played (all the way down)",
             id::HOLD => "Keep playing the chord after the keys are let go, until a new one",
             id::REPEATS => "Each note played this many times",
+            id::PATTERN => {
+                "How the steps' velocities go: an accent on the first of every few, alternating, ramps, random"
+            }
+            id::PATTERN_LENGTH => "Steps before the velocity pattern repeats",
+            id::ACCENT => "How much the pattern takes off the quieter steps",
+            id::CHANCE => "The share of steps that play (the rest left out at random)",
             _ => return None,
         })
     }

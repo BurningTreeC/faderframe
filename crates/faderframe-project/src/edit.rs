@@ -7,16 +7,16 @@
 //! re-synchronised (parameter values, timeline content, or the whole graph).
 
 use crate::{
-    AudioSource, AuxSend, Clip, ClipContent, ClipFades, InputRouting, Marker, MidiNote,
-    MonitorMode, MusicalRange, OutputRouting, PluginSlot, Project, SendTap, Track, TrackColor,
-    TrackKind,
+    AudioSource, AuxSend, Clip, ClipContent, ClipFades, CueMix, CueSend, InputRouting, Marker,
+    MidiNote, MonitorMode, MusicalRange, OutputRouting, PluginSlot, Project, SendTap, Track,
+    TrackColor, TrackKind,
 };
 use faderframe_automation::AutomationLane;
 use faderframe_core::ChannelLayout;
 use faderframe_core::gain::SILENCE_DB;
 use faderframe_core::{
-    AudioSourceId, AutomationLaneId, ClipId, MarkerId, NoteId, ParameterId, PluginInstanceId,
-    SendId, TrackId,
+    AudioSourceId, AutomationLaneId, ClipId, CueId, MarkerId, NoteId, ParameterId,
+    PluginInstanceId, SendId, TrackId,
 };
 use faderframe_timeline::{MusicalTime, Timeline};
 
@@ -31,6 +31,8 @@ pub enum EditError {
     UnknownClip(ClipId),
     #[error("unknown send {0}")]
     UnknownSend(SendId),
+    #[error("unknown cue mix {0}")]
+    UnknownCue(CueId),
     #[error("unknown plugin {0}")]
     UnknownPlugin(PluginInstanceId),
     #[error("unknown note {0}")]
@@ -74,6 +76,11 @@ pub enum CoalesceKey {
     TrackDualPan(TrackId),
     TrackSurround(TrackId),
     SendLevel(TrackId, SendId),
+    SendPan(TrackId, SendId),
+    CueLevel(CueId),
+    CueClick(CueId),
+    CueSendLevel(TrackId, CueId),
+    CueSendPan(TrackId, CueId),
     Clip(ClipId),
     Note(ClipId, NoteId),
     Tempo,
@@ -216,6 +223,69 @@ pub enum Command {
         track: TrackId,
         send: SendId,
         enabled: bool,
+    },
+    /// A send's pan into its destination (`None`: unpanned, as tapped).
+    SetSendPan {
+        track: TrackId,
+        send: SendId,
+        pan: Option<f32>,
+    },
+
+    // --- cue mixes (see `crate::cue`) ---------------------------------------
+    /// Add a cue mix (at `index`, else last) with the tracks' sends to it.
+    AddCueMix {
+        cue: Box<CueMix>,
+        index: Option<usize>,
+        sends: Vec<(TrackId, CueSend)>,
+    },
+    /// Remove a cue mix and every track's send to it.
+    RemoveCueMix {
+        cue: CueId,
+    },
+    /// Replace a cue mix's settings (name, colour, outputs, tap, level,
+    /// mute, click) by its id.
+    SetCueMix {
+        cue: Box<CueMix>,
+    },
+    /// A cue mix's master level (a drag coalesces).
+    SetCueLevel {
+        cue: CueId,
+        db: f32,
+    },
+    SetCueMute {
+        cue: CueId,
+        on: bool,
+    },
+    /// The click in a cue mix: on or off, and its level (relative to the
+    /// metronome's volume).
+    SetCueClick {
+        cue: CueId,
+        on: bool,
+        db: f32,
+    },
+    /// A track's send to a cue mix, whole (`None`: none — silent there).
+    SetCueSend {
+        track: TrackId,
+        cue: CueId,
+        send: Option<CueSend>,
+    },
+    /// A cue send's level (made when the track has none yet).
+    SetCueSendLevel {
+        track: TrackId,
+        cue: CueId,
+        db: f32,
+    },
+    /// A cue send's pan.
+    SetCueSendPan {
+        track: TrackId,
+        cue: CueId,
+        pan: f32,
+    },
+    /// A cue send on or off.
+    SetCueSendOn {
+        track: TrackId,
+        cue: CueId,
+        on: bool,
     },
 
     // --- plugins -----------------------------------------------------------
@@ -602,11 +672,41 @@ fn plugin_slot_mut(
         .ok_or(EditError::UnknownPlugin(plugin))
 }
 
+/// Change `track`'s send to `cue` (made from [`CueSend::new`] when it has
+/// none); the inverse puts the send back as it was.
+fn cue_send_edit(
+    p: &mut Project,
+    track: TrackId,
+    cue: CueId,
+    edit: impl FnOnce(&mut CueSend),
+) -> Result<Command, EditError> {
+    if p.cue(cue).is_none() {
+        return Err(EditError::UnknownCue(cue));
+    }
+    let t = track_mut(p, track)?;
+    if !crate::cue::feeds_cues(t.kind) {
+        return Err(EditError::InvalidRouting(format!(
+            "'{}' cannot feed a cue mix",
+            t.name
+        )));
+    }
+    let old = t.cue_send(cue).copied();
+    let mut s = old.unwrap_or_else(|| CueSend::new(cue));
+    edit(&mut s);
+    t.cue_sends.retain(|s| s.cue != cue);
+    t.cue_sends.push(s.clamped());
+    Ok(Command::SetCueSend {
+        track,
+        cue,
+        send: old,
+    })
+}
+
 fn clip_mut(p: &mut Project, id: ClipId) -> Result<&mut Clip, EditError> {
     p.clip_mut(id).ok_or(EditError::UnknownClip(id))
 }
 
-fn clamp_level(db: f32) -> f32 {
+pub(crate) fn clamp_level(db: f32) -> f32 {
     if db.is_nan() {
         0.0
     } else {
@@ -738,6 +838,18 @@ impl Command {
             SetSendLevel { .. } => "Change Send Level".into(),
             SetSendTap { .. } => "Change Send Position".into(),
             SetSendEnabled { .. } => "Toggle Send".into(),
+            SetSendPan { .. } => "Change Send Pan".into(),
+            AddCueMix { .. } => "New Cue Mix".into(),
+            RemoveCueMix { .. } => "Remove Cue Mix".into(),
+            SetCueMix { .. } => "Change Cue Mix".into(),
+            SetCueLevel { .. } => "Cue Mix Level".into(),
+            SetCueMute { .. } => "Cue Mix Mute".into(),
+            SetCueClick { .. } => "Cue Mix Click".into(),
+            SetCueSend { .. } => "Change Cue Send".into(),
+            SetCueSendLevel { .. } => "Cue Send Level".into(),
+            SetCueSendPan { .. } => "Cue Send Pan".into(),
+            SetCueSendOn { on: true, .. } => "Cue Send On".into(),
+            SetCueSendOn { on: false, .. } => "Cue Send Off".into(),
             InsertPlugin { .. } => "Insert Plugin".into(),
             RemovePlugin { .. } => "Remove Plugin".into(),
             SetPluginBypass { .. } => "Toggle Bypass".into(),
@@ -834,6 +946,11 @@ impl Command {
             SetTrackDualPan { track, .. } => CoalesceKey::TrackDualPan(*track),
             SetTrackSurround { track, .. } => CoalesceKey::TrackSurround(*track),
             SetSendLevel { track, send, .. } => CoalesceKey::SendLevel(*track, *send),
+            SetSendPan { track, send, .. } => CoalesceKey::SendPan(*track, *send),
+            SetCueLevel { cue, .. } => CoalesceKey::CueLevel(*cue),
+            SetCueClick { cue, .. } => CoalesceKey::CueClick(*cue),
+            SetCueSendLevel { track, cue, .. } => CoalesceKey::CueSendLevel(*track, *cue),
+            SetCueSendPan { track, cue, .. } => CoalesceKey::CueSendPan(*track, *cue),
             MoveClip { clip, .. } | SetClipContent { clip, .. } => CoalesceKey::Clip(*clip),
             UpdateNote { clip, note } => CoalesceKey::Note(*clip, note.id),
             SetTempo { .. } => CoalesceKey::Tempo,
@@ -869,6 +986,14 @@ impl Command {
             | SetTrackSolo { .. }
             | SetTrackPhaseInvert { .. }
             | SetSendLevel { .. }
+            | SetSendPan { .. }
+            | SetCueLevel { .. }
+            | SetCueMute { .. }
+            | SetCueClick { .. }
+            | SetCueSend { .. }
+            | SetCueSendLevel { .. }
+            | SetCueSendPan { .. }
+            | SetCueSendOn { .. }
             | SetPluginParameter { .. }
             | SetPluginState { .. }
             | SetConsoleDrive { .. } => Impact::Params,
@@ -941,6 +1066,9 @@ impl Command {
             | RemoveSend { .. }
             | SetSendTap { .. }
             | SetSendEnabled { .. }
+            | AddCueMix { .. }
+            | RemoveCueMix { .. }
+            | SetCueMix { .. }
             | InsertPlugin { .. }
             | RemovePlugin { .. }
             | SetPluginBypass { .. }
@@ -1171,6 +1299,136 @@ impl Command {
                     enabled: old,
                 }
             }
+            SetSendPan { track, send, pan } => {
+                let s = track_mut(p, track)?
+                    .send_mut(send)
+                    .ok_or(EditError::UnknownSend(send))?;
+                let pan = pan.map(|v| if v.is_nan() { 0.0 } else { v.clamp(-1.0, 1.0) });
+                let old = std::mem::replace(&mut s.pan, pan);
+                SetSendPan {
+                    track,
+                    send,
+                    pan: old,
+                }
+            }
+            AddCueMix { cue, index, sends } => {
+                if p.cue(cue.id).is_some() {
+                    return Err(EditError::Invalid(format!("cue mix {} exists", cue.id)));
+                }
+                if p.cue_mixes.len() >= crate::cue::MAX_CUE_MIXES {
+                    return Err(EditError::Invalid(format!(
+                        "a project has at most {} cue mixes",
+                        crate::cue::MAX_CUE_MIXES
+                    )));
+                }
+                if let Some((t, _)) = sends.iter().find(|(t, _)| p.track(*t).is_none()) {
+                    return Err(EditError::UnknownTrack(*t));
+                }
+                let id = cue.id;
+                let mut cue = *cue;
+                cue.layout = crate::cue::cue_layout(cue.layout);
+                for (t, send) in sends {
+                    if let Some(t) = p.track_mut(t) {
+                        t.cue_sends.retain(|s| s.cue != id);
+                        t.cue_sends.push(CueSend { cue: id, ..send }.clamped());
+                    }
+                }
+                let i = index.unwrap_or(p.cue_mixes.len()).min(p.cue_mixes.len());
+                p.cue_mixes.insert(i, cue);
+                RemoveCueMix { cue: id }
+            }
+            RemoveCueMix { cue } => {
+                let i = p.cue_index(cue).ok_or(EditError::UnknownCue(cue))?;
+                let removed = p.cue_mixes.remove(i);
+                let mut sends = Vec::new();
+                for t in &mut p.tracks {
+                    if let Some(at) = t.cue_sends.iter().position(|s| s.cue == cue) {
+                        sends.push((t.id, t.cue_sends.remove(at)));
+                    }
+                }
+                AddCueMix {
+                    cue: Box::new(removed),
+                    index: Some(i),
+                    sends,
+                }
+            }
+            SetCueMix { cue } => {
+                let mut cue = *cue;
+                let name = cue.name.trim().to_string();
+                if name.is_empty() {
+                    return Err(EditError::Invalid("cue mix names cannot be empty".into()));
+                }
+                if cue.tap == SendTap::PreFx {
+                    return Err(EditError::Invalid(
+                        "cue mixes tap before or after the fader".into(),
+                    ));
+                }
+                cue.name = name;
+                cue.layout = crate::cue::cue_layout(cue.layout);
+                cue.level_db = clamp_level(cue.level_db);
+                cue.click_db = clamp_level(cue.click_db);
+                let c = p.cue_mut(cue.id).ok_or(EditError::UnknownCue(cue.id))?;
+                SetCueMix {
+                    cue: Box::new(std::mem::replace(c, cue)),
+                }
+            }
+            SetCueLevel { cue, db } => {
+                let c = p.cue_mut(cue).ok_or(EditError::UnknownCue(cue))?;
+                let old = std::mem::replace(&mut c.level_db, clamp_level(db));
+                SetCueLevel { cue, db: old }
+            }
+            SetCueMute { cue, on } => {
+                let c = p.cue_mut(cue).ok_or(EditError::UnknownCue(cue))?;
+                let old = std::mem::replace(&mut c.mute, on);
+                SetCueMute { cue, on: old }
+            }
+            SetCueClick { cue, on, db } => {
+                let c = p.cue_mut(cue).ok_or(EditError::UnknownCue(cue))?;
+                let old = (c.click, c.click_db);
+                c.click = on;
+                c.click_db = clamp_level(db);
+                SetCueClick {
+                    cue,
+                    on: old.0,
+                    db: old.1,
+                }
+            }
+            SetCueSend { track, cue, send } => {
+                if p.cue(cue).is_none() {
+                    return Err(EditError::UnknownCue(cue));
+                }
+                let t = track_mut(p, track)?;
+                if send.is_some() && !crate::cue::feeds_cues(t.kind) {
+                    return Err(EditError::InvalidRouting(format!(
+                        "'{}' cannot feed a cue mix",
+                        t.name
+                    )));
+                }
+                let old = t
+                    .cue_sends
+                    .iter()
+                    .position(|s| s.cue == cue)
+                    .map(|i| t.cue_sends.remove(i));
+                if let Some(s) = send {
+                    t.cue_sends.push(CueSend { cue, ..s }.clamped());
+                }
+                SetCueSend {
+                    track,
+                    cue,
+                    send: old,
+                }
+            }
+            SetCueSendLevel { track, cue, db } => {
+                cue_send_edit(p, track, cue, |s| s.level_db = clamp_level(db))?
+            }
+            SetCueSendPan { track, cue, pan } => cue_send_edit(p, track, cue, |s| {
+                s.pan = if pan.is_nan() {
+                    0.0
+                } else {
+                    pan.clamp(-1.0, 1.0)
+                }
+            })?,
+            SetCueSendOn { track, cue, on } => cue_send_edit(p, track, cue, |s| s.on = on)?,
             InsertPlugin { track, index, slot } => {
                 let t = track_mut(p, track)?;
                 let id = slot.id;

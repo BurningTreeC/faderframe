@@ -1,14 +1,16 @@
 //! Pitch editing through the session: a sung phrase's notes are found,
 //! moved (a drag is one lossless step), corrected to the key, split,
-//! joined, reset and removed.
+//! joined, made longer, removed (note by note and the whole edit).
 #![allow(clippy::unwrap_used)]
 
-use faderframe_audio_files::{WavFormat, write_wav};
+use faderframe_audio_files::{WavFormat, read_wav, write_wav};
 use faderframe_core::ClipId;
 use faderframe_engine::EngineConfig;
 use faderframe_project::harmony::{Key, KeyChange, Scale};
+use faderframe_project::pitch::{Edge, PitchEdit};
 use faderframe_project::{Command, Project};
 use faderframe_session::pitch::PitchOp;
+use faderframe_session::render::{RenderChannels, RenderRange, RenderSettings};
 use faderframe_session::{Action, Session};
 use faderframe_timeline::MusicalTime;
 use std::time::{Duration, Instant};
@@ -34,12 +36,39 @@ fn phrase(notes: &[(f64, f64)]) -> Vec<f32> {
     out
 }
 
+/// A line sung without a break: each note `(MIDI, seconds)` straight into
+/// the next, then a short silence.
+fn legato(notes: &[(f64, f64)]) -> Vec<f32> {
+    let total: f64 = notes.iter().map(|n| n.1).sum();
+    let mut out = Vec::new();
+    let mut phase = 0.0f64;
+    for &(note, seconds) in notes {
+        let f = 440.0 * 2f64.powf((note - 69.0) / 12.0);
+        for _ in 0..(seconds * f64::from(SR)) as usize {
+            let t = out.len() as f64 / f64::from(SR);
+            let env = (t / 0.01).min(1.0) * ((total - t) / 0.02).clamp(0.0, 1.0);
+            phase = (phase + f / f64::from(SR)).fract();
+            let v: f64 = (1..=8)
+                .map(|h| (std::f64::consts::TAU * phase * h as f64).sin() / (h * h) as f64)
+                .sum();
+            out.push((v * 0.3 * env) as f32);
+        }
+    }
+    out.extend(std::iter::repeat_n(0.0, (0.3 * f64::from(SR)) as usize));
+    out
+}
+
 /// A session with the phrase imported; returns it and its clip.
 fn session(notes: &[(f64, f64)]) -> (Session, ClipId) {
+    session_of(&format!("Voice{}", notes.len()), phrase(notes))
+}
+
+/// A session with `samples` imported as `name`; returns it and its clip.
+fn session_of(name: &str, samples: Vec<f32>) -> (Session, ClipId) {
     let dir = std::env::temp_dir().join(format!("ff-session-pitch-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
-    let file = dir.join(format!("Voice{}.wav", notes.len()));
-    write_wav(&file, &[phrase(notes)], SR, WavFormat::Float32, false).unwrap();
+    let file = dir.join(format!("{name}.wav"));
+    write_wav(&file, &[samples], SR, WavFormat::Float32, false).unwrap();
     let mut s = Session::new(Project::new("Pitch", SR), None, EngineConfig::default()).unwrap();
     s.dispatch(Action::ImportFiles {
         files: vec![file],
@@ -211,4 +240,105 @@ fn notes_split_join_and_the_edit_goes() {
     assert_eq!(keep(&s), None);
     s.dispatch(Action::Undo).unwrap();
     assert_eq!(keep(&s), Some(false));
+}
+
+/// The clip's pitch edit.
+fn edit_of(s: &Session, clip: ClipId) -> PitchEdit {
+    s.project()
+        .clip(clip)
+        .unwrap()
+        .as_audio()
+        .unwrap()
+        .pitch
+        .clone()
+        .unwrap()
+}
+
+/// The project as rendered (mono, from its start to the clip's end).
+fn rendered(s: &mut Session, name: &str) -> Vec<f32> {
+    let path = std::env::temp_dir().join(format!(
+        "ff-session-pitch-{}-{name}.wav",
+        std::process::id()
+    ));
+    let settings = RenderSettings {
+        range: RenderRange::Project,
+        channels: RenderChannels::Mono,
+        tail_seconds: 0.0,
+        normalize_db: None,
+        format: WavFormat::Float32,
+        ..RenderSettings::defaults_for(s.project(), path.clone())
+    };
+    s.render(settings).unwrap().join().unwrap();
+    let wav = read_wav(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    wav.channels.into_iter().next().unwrap()
+}
+
+/// The pitch heard in 4096 frames of `x` from `at` (MIDI).
+fn pitch_at(x: &[f32], at: i64) -> f64 {
+    let at = at as usize;
+    let p = faderframe_analysis::pitch::Detector::new()
+        .detect(&x[at..at + 4096], f64::from(SR))
+        .unwrap();
+    faderframe_analysis::pitch::note_at(p.freq, 440.0)
+}
+
+fn rms(x: &[f32]) -> f32 {
+    (x.iter().map(|v| v * v).sum::<f32>() / x.len().max(1) as f32).sqrt()
+}
+
+#[test]
+fn notes_are_made_longer_and_removed() {
+    // A3 for a second straight into E4 for a second.
+    let (mut s, clip) = session_of("Legato", legato(&[(57.0, 1.0), (64.0, 1.0)]));
+    detect(&mut s, clip);
+    let sung = edit_of(&s, clip).notes;
+    assert_eq!(sung.len(), 2, "{:?}", notes(&s, clip));
+    // Without a pause: only the transition between them unvoiced.
+    let (end, last) = (sung[0].end, sung[1].end);
+    let gap = sung[1].start - end;
+    assert!(gap < 4_800, "sung without a break: {gap} frames between");
+    let steps = s.history_steps().0.len();
+    // Drag the A3's end half a second on: one step, the E4 giving way.
+    s.dispatch(Action::BeginGesture("Note Length".into()))
+        .unwrap();
+    for by in [4_800, 12_000, 24_000] {
+        edit(
+            &mut s,
+            clip,
+            PitchOp::Length {
+                notes: vec![0],
+                edge: Edge::End,
+                by,
+            },
+        );
+    }
+    s.dispatch(Action::EndGesture).unwrap();
+    assert_eq!(s.history_steps().0.len(), steps + 1);
+    let placed: Vec<(i64, i64)> = edit_of(&s, clip).notes.iter().map(|n| n.placed()).collect();
+    assert_eq!(placed[0].1, end + 24_000, "the last total, not the sum");
+    assert_eq!(
+        placed[1],
+        (end + 24_000 + gap, last),
+        "the E4 ends where it did"
+    );
+    // As played: the A3 where the E4 was, the E4 after it.
+    let longer = rendered(&mut s, "longer");
+    assert!((pitch_at(&longer, end + 12_000) - 57.0).abs() < 0.1);
+    assert!((pitch_at(&longer, end + 30_000) - 64.0).abs() < 0.1);
+    // The E4 removed: silent where it played, the A3 as it was.
+    edit(&mut s, clip, PitchOp::RemoveNotes { notes: vec![1] });
+    let e = edit_of(&s, clip);
+    assert_eq!((e.notes.len(), e.removed.len()), (1, 1));
+    let out = rendered(&mut s, "removed");
+    let from = (end + 24_000 + 2_000) as usize;
+    assert!(rms(&out[from..from + 19_000]) < 1e-4, "the E4 is gone");
+    assert!(rms(&longer[from..from + 19_000]) > 0.05);
+    assert!((pitch_at(&out, end + 12_000) - 57.0).abs() < 0.1);
+    // Undo: the E4 back; again: the lengths as sung.
+    s.dispatch(Action::Undo).unwrap();
+    assert_eq!(edit_of(&s, clip).notes.len(), 2);
+    s.dispatch(Action::Undo).unwrap();
+    assert!(edit_of(&s, clip).notes.iter().all(|n| n.timing.is_none()));
+    assert!(!edit_of(&s, clip).edited());
 }

@@ -41,6 +41,10 @@ pub(crate) enum BottomItem {
 pub(crate) enum OutputItem {
     Gain,
     Pan,
+    /// Dry/wet.
+    Mix,
+    /// The character stage's drive.
+    Drive,
     PanMode,
     Invert,
     AutoGain,
@@ -110,7 +114,7 @@ impl EqView {
 
     /// The output panel, over the Output button.
     pub(crate) fn output_rect(&self, l: &Layout) -> Rect {
-        let w = 300.0;
+        let w = 452.0;
         let h = 156.0;
         Rect::new(l.bottom.right() - w - 8.0, l.bottom.y - h - 4.0, w, h)
     }
@@ -126,16 +130,24 @@ impl EqView {
                 Rect::new(r.x + 92.0, r.y + 28.0, 64.0, 74.0),
             ),
             (
+                OutputItem::Mix,
+                Rect::new(r.x + 168.0, r.y + 28.0, 64.0, 74.0),
+            ),
+            (
+                OutputItem::Drive,
+                Rect::new(r.x + 244.0, r.y + 28.0, 64.0, 74.0),
+            ),
+            (
                 OutputItem::Invert,
-                Rect::new(r.x + 172.0, r.y + 30.0, 116.0, 22.0),
+                Rect::new(r.x + 324.0, r.y + 30.0, 116.0, 22.0),
             ),
             (
                 OutputItem::AutoGain,
-                Rect::new(r.x + 172.0, r.y + 56.0, 116.0, 22.0),
+                Rect::new(r.x + 324.0, r.y + 56.0, 116.0, 22.0),
             ),
             (
                 OutputItem::PanMode,
-                Rect::new(r.x + 172.0, r.y + 82.0, 116.0, 22.0),
+                Rect::new(r.x + 324.0, r.y + 82.0, 116.0, 22.0),
             ),
             (
                 OutputItem::Scale,
@@ -276,7 +288,13 @@ impl EqView {
                 }
                 BottomItem::Character => {
                     let c = Character::from_index(v(global::CHARACTER).round().max(0.0) as usize);
-                    self.button(p, r, &format!("{} ▾", c.name()), c != Character::Clean);
+                    let over = Self::oversampling(tap);
+                    let label = if over > 1 {
+                        format!("{} ×{over} ▾", c.name())
+                    } else {
+                        format!("{} ▾", c.name())
+                    };
+                    self.button(p, r, &label, c != Character::Clean);
                 }
                 BottomItem::AutoGain => {
                     self.button(p, r, "Auto Gain", v(global::AUTO_GAIN) >= 0.5);
@@ -324,25 +342,46 @@ impl EqView {
         let mid_side = v(global::PAN_MODE) >= 0.5;
         for (item, ir) in self.output_items(&r) {
             match item {
-                OutputItem::Gain | OutputItem::Pan => {
-                    let (value, t, label, bipolar) = if item == OutputItem::Gain {
-                        let g = v(global::OUTPUT);
-                        (
-                            format!("{g:+.1} dB").replace('-', "−"),
-                            ((g + 36.0) / 72.0) as f32,
-                            "GAIN",
-                            true,
-                        )
-                    } else {
-                        let pan = v(global::PAN);
-                        (
-                            format_pan(pan, mid_side),
-                            ((pan + 1.0) / 2.0) as f32,
-                            "PAN",
-                            true,
-                        )
+                OutputItem::Gain | OutputItem::Pan | OutputItem::Mix | OutputItem::Drive => {
+                    let (value, t, label, bipolar) = match item {
+                        OutputItem::Gain => {
+                            let g = v(global::OUTPUT);
+                            (
+                                format!("{g:+.1} dB").replace('-', "−"),
+                                ((g + 36.0) / 72.0) as f32,
+                                "GAIN",
+                                true,
+                            )
+                        }
+                        OutputItem::Pan => {
+                            let pan = v(global::PAN);
+                            (
+                                format_pan(pan, mid_side),
+                                ((pan + 1.0) / 2.0) as f32,
+                                "PAN",
+                                true,
+                            )
+                        }
+                        OutputItem::Mix => {
+                            let mix = v(global::MIX);
+                            (format!("{:.0} %", mix * 100.0), mix as f32, "MIX", false)
+                        }
+                        _ => {
+                            let drive = v(global::CHARACTER_DRIVE);
+                            (
+                                format!("{:.0} %", drive * 100.0),
+                                (drive / 2.0) as f32,
+                                "DRIVE",
+                                false,
+                            )
+                        }
                     };
-                    self.small_knob(p, ir, label, &value, t, bipolar, th.device.curve);
+                    let ring = if item == OutputItem::Drive {
+                        th.device.dyn_range
+                    } else {
+                        th.device.curve
+                    };
+                    self.small_knob(p, ir, label, &value, t, bipolar, ring);
                 }
                 OutputItem::Invert => self.button(p, ir, "Phase Invert", v(global::INVERT) >= 0.5),
                 OutputItem::AutoGain => {
@@ -484,13 +523,45 @@ impl EqView {
         r: &Rect,
     ) -> HostRequest<Action> {
         let now = tap.params.get(global::CHARACTER).round() as usize;
-        let items = Character::ALL
+        let mut items: Vec<_> = Character::ALL
             .iter()
             .map(|c| {
                 self.param_item(model, c.name(), global::CHARACTER, c.index() as f64)
                     .checked(now == c.index())
             })
             .collect();
+        // The stage's oversampling (it costs latency).
+        let over = Self::oversampling(tap);
+        for (i, name) in faderframe_plugin_host::eq::character::OVERSAMPLING_NAMES
+            .iter()
+            .enumerate()
+        {
+            let item = self
+                .param_item(
+                    model,
+                    format!("Oversampling: {name}"),
+                    global::OVERSAMPLING,
+                    i as f64,
+                )
+                .checked(faderframe_plugin_host::eq::character::OVERSAMPLING[i] == over);
+            items.push(if i == 0 { item.separated() } else { item });
+        }
+        // The drive, in steps (the knob is in the output panel).
+        let drive = f64::from(tap.params.get(global::CHARACTER_DRIVE));
+        for (i, pc) in [50.0, 75.0, 100.0, 125.0, 150.0, 200.0]
+            .into_iter()
+            .enumerate()
+        {
+            let item = self
+                .param_item(
+                    model,
+                    format!("Drive: {pc:.0} %"),
+                    global::CHARACTER_DRIVE,
+                    pc / 100.0,
+                )
+                .checked((drive * 100.0 - pc).abs() < 0.5);
+            items.push(if i == 0 { item.separated() } else { item });
+        }
         HostRequest::ContextMenu {
             at: below(r),
             items,
@@ -582,6 +653,10 @@ impl EqView {
             self.view_item("Freeze", key::FREEZE, flip(s.freeze))
                 .checked(s.freeze)
                 .separated(),
+        );
+        items.push(
+            self.view_item("Peak Hold", key::PEAK_HOLD, flip(s.peak_hold))
+                .checked(s.peak_hold),
         );
         items.push(
             self.view_item("Spectrum Grab", key::GRAB, flip(s.grab))

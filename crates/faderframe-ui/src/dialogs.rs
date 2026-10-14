@@ -29,11 +29,14 @@ pub fn open_project(app: &Rc<AppState>) {
         .filters(&project_filters())
         .build();
     let weak = Rc::downgrade(app);
+    // (Asked after the choice: a cancelled choice keeps the project open.)
+    let c = closing(app);
     dialog.open(Some(&win), gio::Cancellable::NONE, move |res| {
         if let (Ok(file), Some(app)) = (res, weak.upgrade())
             && let Some(path) = file.path()
         {
             app.with_session(|s| s.open(&path));
+            c.done(&app);
         }
     });
 }
@@ -427,8 +430,118 @@ pub fn save_as(app: &Rc<AppState>, then: Option<AfterSave>) {
     });
 }
 
-/// Run `next` immediately, or after asking what to do with unsaved changes.
+/// "12.3 MB".
+fn size_text(bytes: u64) -> String {
+    let mb = bytes as f64 / 1e6;
+    if mb >= 1000.0 {
+        format!("{:.1} GB", mb / 1000.0)
+    } else if mb >= 10.0 {
+        format!("{mb:.0} MB")
+    } else {
+        format!("{mb:.1} MB")
+    }
+}
+
+fn trash(files: &[std::path::PathBuf]) -> usize {
+    let mut failed = 0;
+    for f in files {
+        if let Err(e) = gio::File::for_path(f).trash(gio::Cancellable::NONE) {
+            tracing::warn!("cannot move {} to the trash: {e}", f.display());
+            failed += 1;
+        }
+    }
+    failed
+}
+
+/// What a closing project leaves behind: its path and the media no saved
+/// state of it uses (see `Session::unused_media`), taken once its unsaved
+/// changes are saved or discarded.
+pub struct Closing {
+    path: Option<std::path::PathBuf>,
+    unused: Option<faderframe_session::cleanup::UnusedMedia>,
+}
+
+pub fn closing(app: &Rc<AppState>) -> Closing {
+    let keep = crate::prefs::Preferences::load().unused_media == "keep";
+    let s = app.session.borrow();
+    Closing {
+        path: s.path().map(std::path::Path::to_path_buf),
+        unused: (!keep)
+            .then(|| s.unused_media())
+            .flatten()
+            .filter(|u| !u.is_empty()),
+    }
+}
+
+impl Closing {
+    /// Another project is open now: the old one's unused media go (as the
+    /// preferences say, after asking by default).
+    pub fn done(self, app: &Rc<AppState>) {
+        if app.session.borrow().path() == self.path.as_deref() {
+            return;
+        }
+        ask_unused(app, self.unused, |_| {});
+    }
+}
+
+/// Unused media to the trash as the preferences say (after asking, by
+/// default), then `then`.
+pub fn ask_unused(
+    app: &Rc<AppState>,
+    unused: Option<faderframe_session::cleanup::UnusedMedia>,
+    then: impl Fn(&Rc<AppState>) + 'static,
+) {
+    let Some(unused) = unused else {
+        then(app);
+        return;
+    };
+    let pref = crate::prefs::Preferences::load().unused_media;
+    let win = app.window.borrow().clone();
+    let Some(win) = win.filter(|_| pref != "trash") else {
+        trash(&unused.files);
+        then(app);
+        return;
+    };
+    let audio = unused
+        .files
+        .iter()
+        .filter(|f| f.extension().is_none_or(|e| e != "ffpk"))
+        .count();
+    let dialog = gtk::AlertDialog::builder()
+        .message("Move unused media to the trash?")
+        .detail(format!(
+            "{audio} audio file{} ({}) in the project's Audio folder {} used by neither the \
+             saved project nor any of its versions — deleted recordings and imports, replaced \
+             renders. With the project closed, Undo cannot bring them back either.\n\n\
+             Preferences → General chooses what happens without asking.",
+            if audio == 1 { "" } else { "s" },
+            size_text(unused.bytes),
+            if audio == 1 { "is" } else { "are" },
+        ))
+        .buttons(["Keep Them", "Move to Trash"])
+        .cancel_button(0)
+        .default_button(1)
+        .modal(true)
+        .build();
+    let weak = Rc::downgrade(app);
+    dialog.choose(Some(&win), gio::Cancellable::NONE, move |res| {
+        let Some(app) = weak.upgrade() else { return };
+        if let Ok(1) = res {
+            trash(&unused.files);
+        }
+        then(&app);
+    });
+}
+
+/// Run `next` immediately, or after asking what to do with unsaved changes;
+/// when `next` has put another project in its place, the old one's unused
+/// media go too ([`Closing`]).
 pub fn confirm_discard(app: &Rc<AppState>, next: impl Fn(&Rc<AppState>) + 'static) {
+    let next = Rc::new(move |a: &Rc<AppState>| {
+        let c = closing(a);
+        next(a);
+        c.done(a);
+    });
     if !app.session.borrow().is_dirty() {
         next(app);
         return;
@@ -446,7 +559,6 @@ pub fn confirm_discard(app: &Rc<AppState>, next: impl Fn(&Rc<AppState>) + 'stati
         .modal(true)
         .build();
     let weak = Rc::downgrade(app);
-    let next = Rc::new(next);
     dialog.choose(Some(&win), gio::Cancellable::NONE, move |res| {
         let Some(app) = weak.upgrade() else { return };
         match res {
@@ -1550,16 +1662,23 @@ pub fn install_close_guard(app: &Rc<AppState>, window: &gtk::ApplicationWindow) 
         let Some(app) = weak.upgrade() else {
             return glib::Propagation::Proceed;
         };
-        if confirmed.get() || !app.session.borrow().is_dirty() {
+        // Nothing to ask: closes at once.
+        if confirmed.get() || (!app.session.borrow().is_dirty() && closing(&app).unused.is_none()) {
             app.app.quit();
             return glib::Propagation::Proceed;
         }
         let confirmed = Rc::clone(&confirmed);
         let w = w.clone();
         confirm_discard(&app, move |a| {
-            confirmed.set(true);
-            a.session.borrow_mut().stop_audio();
-            w.close();
+            // The project closes for good: its unused media first.
+            let (confirmed, w) = (Rc::clone(&confirmed), w.clone());
+            ask_unused(a, closing(a).unused, move |a| {
+                confirmed.set(true);
+                a.session.borrow_mut().stop_audio();
+                // (Not from inside this close request.)
+                let w = w.clone();
+                glib::idle_add_local_once(move || w.close());
+            });
         });
         glib::Propagation::Stop
     });

@@ -479,6 +479,34 @@ fn general_page(app: &Rc<AppState>) -> gtk::Widget {
             b.set_sensitive(false);
         }
     });
+    // What happens to media nothing saved uses when a project closes.
+    const UNUSED: [(&str, &str); 3] = [
+        ("ask", "Ask"),
+        ("trash", "Move to the trash"),
+        ("keep", "Keep"),
+    ];
+    let unused = gtk::DropDown::from_strings(&UNUSED.map(|(_, l)| l));
+    unused.set_selected(
+        UNUSED
+            .iter()
+            .position(|(id, _)| *id == prefs.unused_media)
+            .unwrap_or(0) as u32,
+    );
+    unused.set_tooltip_text(Some(
+        "Audio files in the project's Audio folder that neither the saved project nor any of \
+         its versions uses (deleted recordings and imports, replaced renders). The undo \
+         history ends when the project closes, so nothing else needs them.",
+    ));
+    row(&g, 8, "Unused media on closing", &unused);
+    unused.connect_selected_notify(|d| {
+        let mut p = Preferences::load();
+        p.unused_media = UNUSED[(d.selected() as usize).min(UNUSED.len() - 1)]
+            .0
+            .into();
+        if let Err(e) = p.save() {
+            tracing::warn!("cannot save preferences: {e}");
+        }
+    });
     g.upcast()
 }
 

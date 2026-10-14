@@ -8,13 +8,20 @@
 //! source is analysed. Edits ([`PitchOp`]) change the edit's notes;
 //! drags send the total move inside one gesture and recompute from the
 //! clip as the gesture found it ([`Session::gesture_clip`]).
+//!
+//! Switching the editor between Polyphonic and Melodic detects the clip
+//! it shows again the new way ([`Session::pitch_mode_changed`]), its
+//! corrections carried over to the notes found again
+//! ([`pitch::carry`]).
 
 use crate::{Result, Session, SessionError};
 use faderframe_analysis::melody::{self, PitchTrack};
 use faderframe_audio_files::onsets;
 use faderframe_core::{AudioSourceId, ClipId};
 use faderframe_engine::Source;
-use faderframe_project::pitch::{self, MAX_FORMANT, MAX_SHIFT, PitchEdit, PitchNote, UNVOICED};
+use faderframe_project::pitch::{
+    self, Edge, MAX_FORMANT, MAX_SHIFT, PitchEdit, PitchNote, UNVOICED,
+};
 use faderframe_project::{AudioClip, Clip, ClipContent};
 use faderframe_timeline::MusicalTime;
 use std::collections::HashMap;
@@ -57,6 +64,19 @@ pub enum PitchOp {
     /// Forget notes found where none was played: they leave the edit, the
     /// sound stays as it is.
     Forget { notes: Vec<usize> },
+    /// Remove notes and their sound (melodic: the audio silenced with
+    /// short fades; polyphonic: the note's partials taken out of the
+    /// chord).
+    RemoveNotes { notes: Vec<usize> },
+    /// Make notes longer or shorter: their `edge` moved by `by` source
+    /// frames (inside a gesture: from where it began), each note's audio
+    /// stretched to fill it (see `PitchEdit::move_edge` for what the
+    /// neighbours do).
+    Length {
+        notes: Vec<usize>,
+        edge: Edge,
+        by: i64,
+    },
     /// Forget the analysis and its edits.
     Remove,
 }
@@ -175,6 +195,7 @@ pub fn edit_from(
                 curve,
                 gain_db: 0.0,
                 muted: false,
+                timing: None,
             })
         })
         .collect();
@@ -183,7 +204,17 @@ pub fn edit_from(
         notes,
         keep_formants: true,
         polyphonic: None,
+        removed: Vec::new(),
     }
+}
+
+/// The source a clip's notes are found in: a polyphonic edit's original
+/// (its render is never analysed), else what it plays.
+fn analysed_source(a: &AudioClip) -> AudioSourceId {
+    a.pitch
+        .as_ref()
+        .and_then(|e| e.polyphonic)
+        .map_or(a.source, |p| p.original)
 }
 
 fn audio_of(c: &Clip) -> Result<AudioClip> {
@@ -220,7 +251,7 @@ impl Session {
             let Some(ClipContent::Audio(a)) = self.project.clip(id).map(|c| &c.content) else {
                 continue;
             };
-            let source = a.source;
+            let source = analysed_source(a);
             if self.pitch.tracks.contains_key(&source) {
                 ready.push(id);
                 continue;
@@ -247,6 +278,37 @@ impl Session {
     /// Pitch analyses still running.
     pub fn detecting_pitch(&self) -> bool {
         !self.pitch.jobs.is_empty()
+    }
+
+    /// The editor's Polyphonic option changed: the clip the pitch editor
+    /// shows is detected again the new way when its notes were found (or
+    /// are being found) the other way. Its corrections carry over to the
+    /// notes found again (`pitch::carry`), in one "Detect Pitch" step.
+    pub(crate) fn pitch_mode_changed(&mut self) -> Result<()> {
+        let Some(clip) = self.pitch_clip() else {
+            return Ok(());
+        };
+        let polyphonic = self.editor.pitch_polyphonic;
+        let other_way = self
+            .project
+            .clip(clip)
+            .and_then(|c| c.as_audio())
+            .and_then(|a| a.pitch.as_ref())
+            .is_some_and(|e| e.polyphonic.is_some() != polyphonic);
+        let pending = self.cancel_detection(clip);
+        if other_way || pending {
+            self.detect_pitch(&[clip])?;
+        }
+        Ok(())
+    }
+
+    /// Stop waiting for a clip's notes (either way); whether it was.
+    /// (A polyphonic detection runs on and is dropped; a source's melodic
+    /// analysis is kept for the session.)
+    fn cancel_detection(&mut self, clip: ClipId) -> bool {
+        let waiting = self.pitch.waiting.contains(&clip);
+        self.pitch.waiting.retain(|c| *c != clip);
+        self.cancel_polyphonic(clip) || waiting
     }
 
     /// Collect finished analyses and give the clips waiting for them
@@ -280,7 +342,10 @@ impl Session {
             .iter()
             .copied()
             .filter(|c| match self.project.clip(*c).map(|c| &c.content) {
-                Some(ClipContent::Audio(a)) => !self.pitch.jobs.iter().any(|(s, _)| *s == a.source),
+                Some(ClipContent::Audio(a)) => {
+                    let source = analysed_source(a);
+                    !self.pitch.jobs.iter().any(|(s, _)| *s == source)
+                }
                 _ => true,
             })
             .collect();
@@ -291,7 +356,9 @@ impl Session {
         self.revision += 1;
     }
 
-    /// Give `clips` the notes their (analysed) sources hold.
+    /// Give `clips` the notes their (analysed) sources hold. A clip with
+    /// a polyphonic edit plays its recording again, the edit's corrections
+    /// carried over to the notes found.
     fn apply_detection(&mut self, clips: &[ClipId]) -> Result<()> {
         let rate = self.project.sample_rate as f64;
         let mut commands = Vec::new();
@@ -302,10 +369,17 @@ impl Session {
             let Ok(mut a) = audio_of(c) else {
                 continue;
             };
-            let Some((track, source_rate)) = self.pitch.tracks.get(&a.source) else {
+            let Some((track, source_rate)) = self.pitch.tracks.get(&analysed_source(&a)) else {
                 continue;
             };
-            a.pitch = Some(edit_from(track, *source_rate, rate, &a));
+            let mut edit = edit_from(track, *source_rate, rate, &a);
+            if let Some(old) = a.pitch.take()
+                && let Some(p) = old.polyphonic
+            {
+                pitch::carry(&old, &mut edit);
+                a.source = p.original;
+            }
+            a.pitch = Some(edit);
             commands.push(faderframe_project::Command::SetClipContent {
                 clip: id,
                 start: c.start,
@@ -385,7 +459,7 @@ impl Session {
                 drift,
             } => {
                 for i in chosen(&notes, count) {
-                    let t = self.pitch_time(&c, &a, e.notes[i].start);
+                    let t = self.pitch_time(&c, &a, e.notes[i].placed().0);
                     let scale = self.scale_at(t);
                     let n = &mut e.notes[i];
                     let heard = n.heard();
@@ -423,8 +497,44 @@ impl Session {
                     let n = &mut e.notes[i];
                     (n.shift, n.drift, n.formant) = (0.0, 0.0, 0.0);
                     (n.gain_db, n.muted) = (0.0, false);
+                    e.reset_timing(i);
                 }
                 "Reset Pitch"
+            }
+            PitchOp::RemoveNotes { notes } => {
+                let gone = chosen(&notes, count);
+                if gone.is_empty() {
+                    return Ok(());
+                }
+                let mut kept = Vec::with_capacity(count);
+                for (i, n) in std::mem::take(&mut e.notes).into_iter().enumerate() {
+                    if gone.contains(&i) {
+                        e.removed.push(n);
+                    } else {
+                        kept.push(n);
+                    }
+                }
+                e.notes = kept;
+                "Remove Notes"
+            }
+            PitchOp::Length { notes, edge, by } => {
+                let (lo, hi) = (a.source_offset, a.source_offset + a.source_span());
+                let mut moves: Vec<(usize, i64)> = chosen(&notes, count)
+                    .into_iter()
+                    .map(|i| {
+                        let (start, end) = e.notes[i].placed();
+                        (i, if edge == Edge::Start { start } else { end } + by)
+                    })
+                    .collect();
+                // Moving later, the later notes first: each makes room for
+                // the one before it.
+                if by > 0 {
+                    moves.reverse();
+                }
+                for (i, to) in moves {
+                    e.move_edge(i, edge, to, lo, hi);
+                }
+                "Note Length"
             }
             PitchOp::Gain { notes, db } => {
                 for i in chosen(&notes, count) {

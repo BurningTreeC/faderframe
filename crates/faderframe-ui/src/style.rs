@@ -26,6 +26,8 @@ headerbar popovermenubar { background: transparent; }
 .transport button.rec-active { color: @ff_error; }
 .transport button.loop-active { color: @ff_accent; }
 .transport button.click-active { color: @ff_selection; }
+.transport button.quantize-toggle { font-weight: 800; }
+.transport button.q-active { color: @ff_accent; }
 .lcd { border-radius: 6px; margin: 4px 6px; }
 notebook.dock-tabs > header {
     background-color: @ff_surface;

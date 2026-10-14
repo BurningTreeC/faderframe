@@ -10,10 +10,13 @@
 //! pulse width. Poly, mono or legato with glide.
 //!
 //! The first nine parameters are the old Synth's and keep their meaning,
-//! as do its MIDI handling (sustain pedal, pitch bend ±2 with RPN 0, MPE
-//! zones at ±48, channel pressure louder, CC 74 brighter, mod wheel
-//! vibrato) and per-note expressions (tuning, volume, pan, vibrato,
-//! expression, brightness, pressure).
+//! as do its MIDI handling (sustain pedal, pitch bend over Pitch Bend Range
+//! — a range a controller sets with RPN 0 wins on its channel —, MPE zones
+//! at ±48, channel pressure louder, CC 74 brighter) and per-note
+//! expressions (tuning, volume, pan, vibrato, expression, brightness,
+//! pressure). The mod wheel (CC 1) drives what its three slots are
+//! assigned to (a destination and a bipolar amount each: vibrato, pitch,
+//! cutoff, resonance, …; by default vibrato), per channel and per voice.
 
 use super::{on_off, param, pick, stepped};
 use crate::dsp::lfo::{DIVISIONS, Lfo, Shape, division_name};
@@ -72,6 +75,66 @@ pub mod id {
     pub const GLIDE: u32 = 40;
     pub const VELOCITY_AMP: u32 = 41;
     pub const POLYPHONY: u32 = 42;
+    /// Semitones a full pitch-wheel throw bends.
+    pub const BEND_RANGE: u32 = 43;
+    /// Mod-wheel slots: a destination ([`super::WHEEL_TARGETS`]) and an
+    /// amount (−1…1) each.
+    pub const fn wheel_target(slot: usize) -> u32 {
+        44 + 2 * slot as u32
+    }
+    pub const fn wheel_amount(slot: usize) -> u32 {
+        45 + 2 * slot as u32
+    }
+}
+
+/// Mod-wheel slots.
+pub const WHEEL_SLOTS: usize = 3;
+
+/// What a mod-wheel slot can drive (its target's index). At full wheel and
+/// amount 100 %: vibrato 1 st deep, pitch +12 st, cutoff +4 octaves,
+/// resonance +100 %, filter envelope +6 octaves, drive +100 %, the LFO
+/// brought in (negative: taken out), its rate two octaves faster, pulse
+/// width +45 %, levels +100 %, detune and spread +50 ¢, volume brought in
+/// (negative: taken out).
+pub const WHEEL_TARGETS: [&str; 17] = [
+    "Off",
+    "Vibrato",
+    "Pitch",
+    "Cutoff",
+    "Resonance",
+    "Filter Env",
+    "Drive",
+    "LFO Amount",
+    "LFO Rate",
+    "Pulse Width",
+    "Osc 1 Level",
+    "Osc 2 Level",
+    "Sub",
+    "Noise",
+    "Detune",
+    "Unison Spread",
+    "Volume",
+];
+
+/// [`WHEEL_TARGETS`] by name.
+pub mod wheel {
+    pub const OFF: usize = 0;
+    pub const VIBRATO: usize = 1;
+    pub const PITCH: usize = 2;
+    pub const CUTOFF: usize = 3;
+    pub const RESONANCE: usize = 4;
+    pub const FILTER_ENV: usize = 5;
+    pub const DRIVE: usize = 6;
+    pub const LFO_AMOUNT: usize = 7;
+    pub const LFO_RATE: usize = 8;
+    pub const PULSE_WIDTH: usize = 9;
+    pub const OSC1_LEVEL: usize = 10;
+    pub const OSC2_LEVEL: usize = 11;
+    pub const SUB: usize = 12;
+    pub const NOISE: usize = 13;
+    pub const DETUNE: usize = 14;
+    pub const SPREAD: usize = 15;
+    pub const VOLUME: usize = 16;
 }
 
 /// Published: voices sounding, the newest voice's key, amplifier and
@@ -192,6 +255,49 @@ pub fn parameters() -> Vec<ParameterInfo> {
             Percent,
         ),
         ranged(id::POLYPHONY, "Voices", 1.0, MAX_VOICES as f64, 16.0),
+        ranged(id::BEND_RANGE, "Pitch Bend Range", 1.0, 24.0, 2.0),
+        stepped(
+            id::wheel_target(0),
+            "Mod Wheel 1",
+            (WHEEL_TARGETS.len() - 1) as f64,
+            wheel::VIBRATO as f64,
+        ),
+        param(
+            id::wheel_amount(0),
+            "Mod Wheel 1 Amount",
+            -1.0,
+            1.0,
+            0.5,
+            Percent,
+        ),
+        stepped(
+            id::wheel_target(1),
+            "Mod Wheel 2",
+            (WHEEL_TARGETS.len() - 1) as f64,
+            0.0,
+        ),
+        param(
+            id::wheel_amount(1),
+            "Mod Wheel 2 Amount",
+            -1.0,
+            1.0,
+            0.0,
+            Percent,
+        ),
+        stepped(
+            id::wheel_target(2),
+            "Mod Wheel 3",
+            (WHEEL_TARGETS.len() - 1) as f64,
+            0.0,
+        ),
+        param(
+            id::wheel_amount(2),
+            "Mod Wheel 3 Amount",
+            -1.0,
+            1.0,
+            0.0,
+            Percent,
+        ),
     ]
 }
 
@@ -210,6 +316,13 @@ pub fn format(pid: ParameterId, v: f64) -> Option<String> {
         id::UNISON | id::POLYPHONY => format!("{:.0}", v.round()),
         id::DETUNE | id::UNISON_SPREAD | id::LFO_PITCH => format!("{v:.0} ¢"),
         id::LFO_CUTOFF => format!("{v:.1} oct"),
+        id::BEND_RANGE => format!("±{:.0} st", v.round()),
+        x if (44..44 + 2 * WHEEL_SLOTS as u32).contains(&x) && (x - 44) % 2 == 0 => {
+            pick(&WHEEL_TARGETS, v)
+        }
+        x if (45..45 + 2 * WHEEL_SLOTS as u32).contains(&x) => {
+            format!("{:+.0} %", v * 100.0).replace("+0 %", "0 %")
+        }
         id::LFO_PW => format!("{:.0} %", v * 100.0),
         id::ENV_AMOUNT => format!("{:+.0} %", v * 100.0).replace("+0 %", "0 %"),
         id::GLIDE if v < 0.5 => "Off".into(),
@@ -385,11 +498,10 @@ impl Voice {
     }
 }
 
-/// Default pitch-bend range in semitones (RPN 0 changes it per channel).
-const BEND_RANGE: f32 = 2.0;
 /// MPE member channels' default bend range.
 const MPE_BEND_RANGE: f32 = 48.0;
-/// Full mod wheel: vibrato depth in semitones, at this rate.
+/// A note's full vibrato expression: depth in semitones, at this rate (the
+/// mod wheel's depth is its slot's).
 const VIBRATO_DEPTH: f32 = 0.5;
 const VIBRATO_HZ: f32 = 5.5;
 
@@ -397,8 +509,11 @@ const VIBRATO_HZ: f32 = 5.5;
 #[derive(Clone, Copy, Debug)]
 struct ChannelState {
     sustain: bool,
+    /// The pitch wheel, −1…1.
     bend: f32,
-    bend_range: f32,
+    /// A range set by RPN 0 (or an MPE zone) for this channel; None: the
+    /// Pitch Bend Range parameter's.
+    bend_range: Option<f32>,
     modulation: f32,
     pressure: f32,
     timbre: f32,
@@ -409,7 +524,7 @@ impl ChannelState {
     const REST: ChannelState = ChannelState {
         sustain: false,
         bend: 0.0,
-        bend_range: BEND_RANGE,
+        bend_range: None,
         modulation: 0.0,
         pressure: 0.0,
         timbre: 0.5,
@@ -450,6 +565,72 @@ struct Settings {
     mode: usize,
     glide_coef: f32,
     polyphony: usize,
+    bend_range: f32,
+    resonance: f32,
+    /// The mod-wheel slots: (target, amount).
+    wheel: [(usize, f32); WHEEL_SLOTS],
+}
+
+/// A voice's settings with its channel's mod wheel applied, and what the
+/// wheel adds outside them.
+struct Wheeled {
+    s: Settings,
+    /// Vibrato depth (semitones).
+    vibrato: f32,
+    /// Pitch offset (semitones).
+    pitch: f32,
+    /// The LFO's scale.
+    lfo: f32,
+    /// The level's scale.
+    gain: f32,
+}
+
+impl Settings {
+    /// `self` with the mod wheel at `w` (0…1).
+    fn wheeled(&self, w: f32) -> Wheeled {
+        let mut out = Wheeled {
+            s: *self,
+            vibrato: 0.0,
+            pitch: 0.0,
+            lfo: 1.0,
+            gain: 1.0,
+        };
+        let s = &mut out.s;
+        // Brought in (amount > 0) or taken out (< 0) by the wheel.
+        let fade = |a: f32| {
+            if a >= 0.0 {
+                1.0 - a + a * w
+            } else {
+                1.0 + a * w
+            }
+        };
+        for &(target, a) in &self.wheel {
+            let m = a * w;
+            match target {
+                wheel::VIBRATO => out.vibrato += a.abs() * w,
+                wheel::PITCH => out.pitch += 12.0 * m,
+                wheel::CUTOFF => s.cutoff = (s.cutoff * 2f32.powf(4.0 * m)).clamp(20.0, 20_000.0),
+                wheel::RESONANCE => {
+                    s.resonance = (s.resonance + m).clamp(0.0, 1.0);
+                    s.k = 2.0 - 1.9 * s.resonance;
+                }
+                wheel::FILTER_ENV => s.env_octaves += 6.0 * m,
+                wheel::DRIVE => s.drive = (s.drive + m).clamp(0.0, 1.0),
+                wheel::LFO_AMOUNT => out.lfo *= fade(a),
+                wheel::PULSE_WIDTH => s.pw = (s.pw + 0.45 * m).clamp(0.05, 0.95),
+                wheel::OSC1_LEVEL => s.levels[0] = (s.levels[0] + m).clamp(0.0, 1.0),
+                wheel::OSC2_LEVEL => s.levels[1] = (s.levels[1] + m).clamp(0.0, 1.0),
+                wheel::SUB => s.sub = (s.sub + m).clamp(0.0, 1.0),
+                wheel::NOISE => s.noise = (s.noise + m).clamp(0.0, 1.0),
+                wheel::DETUNE => s.detune += 50.0 * m / 1200.0,
+                wheel::SPREAD => s.spread = (s.spread + 50.0 * m / 1200.0).max(0.0),
+                wheel::VOLUME => out.gain *= fade(a),
+                // The LFO's rate is the processor's (one LFO).
+                _ => {}
+            }
+        }
+        out
+    }
 }
 
 /// A PolyBLEP correction at phase `t` with increment `dt`.
@@ -494,6 +675,8 @@ pub struct SynthProcessor {
     channels: [ChannelState; 16],
     /// Mod-wheel vibrato phase (0..1).
     vibrato_phase: f32,
+    /// The mod wheel as last moved (any channel).
+    wheel_last: f32,
     lfo: Lfo,
     /// The last note's pitch (semitones from A4), for glide.
     last_pitch: Option<f32>,
@@ -515,6 +698,7 @@ impl SynthProcessor {
             counter: 0,
             channels: [ChannelState::REST; 16],
             vibrato_phase: 0.0,
+            wheel_last: 0.0,
             lfo: Lfo::new(0x51_7e),
             last_pitch: None,
             held: [(0, 0, 0); 16],
@@ -580,6 +764,15 @@ impl SynthProcessor {
                 (-6.9 / ms(glide)).exp()
             },
             polyphony: (self.get(id::POLYPHONY).round() as usize).clamp(1, MAX_VOICES),
+            bend_range: self.get(id::BEND_RANGE).round().clamp(1.0, 24.0),
+            resonance: self.get(id::RESONANCE).clamp(0.0, 1.0),
+            wheel: std::array::from_fn(|k| {
+                (
+                    (self.get(id::wheel_target(k)).round().max(0.0) as usize)
+                        .min(WHEEL_TARGETS.len() - 1),
+                    self.get(id::wheel_amount(k)).clamp(-1.0, 1.0),
+                )
+            }),
         }
     }
 
@@ -766,10 +959,15 @@ impl SynthProcessor {
                 channel,
                 controller: 1,
                 value,
-            } => self.channels[(channel & 15) as usize].modulation = value as f32 / 127.0,
+            } => {
+                let w = value as f32 / 127.0;
+                self.channels[(channel & 15) as usize].modulation = w;
+                // The one LFO's rate follows the wheel moved last.
+                self.wheel_last = w;
+            }
             MidiEvent::PitchBend { channel, value } => {
                 let c = &mut self.channels[(channel & 15) as usize];
-                c.bend = (value as f32 - 8192.0) / 8192.0 * c.bend_range;
+                c.bend = ((value as f32 - 8192.0) / 8192.0).clamp(-1.0, 1.0);
             }
             MidiEvent::ChannelPressure { channel, pressure } => {
                 self.channels[(channel & 15) as usize].pressure = pressure as f32 / 127.0;
@@ -816,10 +1014,10 @@ impl SynthProcessor {
     /// master channel: member channels get the MPE default range).
     fn data_entry(&mut self, channel: u8, value: u8) {
         match self.channels[channel as usize].rpn {
-            (0, 0) => self.channels[channel as usize].bend_range = value.max(1) as f32,
+            (0, 0) => self.channels[channel as usize].bend_range = Some(value.max(1) as f32),
             (0, 6) if channel == 0 => {
                 for ch in 1..=(value.min(15) as usize) {
-                    self.channels[ch].bend_range = MPE_BEND_RANGE;
+                    self.channels[ch].bend_range = Some(MPE_BEND_RANGE);
                 }
             }
             _ => {}
@@ -862,10 +1060,15 @@ impl SynthProcessor {
                 (s.width * (at + off)).clamp(-1.0, 1.0),
             ];
         }
-        let pw = (s.pw + s.lfo_pw * lfo).clamp(0.05, 0.95);
-        let tremolo = 1.0 - s.lfo_amp * 0.5 * (1.0 - lfo);
         for v in self.voices.iter_mut().filter(|v| v.sounding()) {
             let ch = channels[(v.channel & 15) as usize];
+            // The settings as the channel's mod wheel makes them.
+            let wheeled = s.wheeled(ch.modulation);
+            let s = &wheeled.s;
+            let lfo = lfo * wheeled.lfo;
+            let pw = (s.pw + s.lfo_pw * lfo).clamp(0.05, 0.95);
+            let tremolo = 1.0 - s.lfo_amp * 0.5 * (1.0 - lfo);
+            let bend = ch.bend * ch.bend_range.unwrap_or(s.bend_range) + wheeled.pitch;
             let (pan_l, pan_r) = ((1.0 - v.pan).min(1.0), (1.0 + v.pan).min(1.0));
             for i in start..end {
                 let amp_env = v.amp.tick(&s.amp);
@@ -882,9 +1085,9 @@ impl SynthProcessor {
                     v.glide *= s.glide_coef;
                     let semis = v.key as f32 - 69.0
                         + v.glide
-                        + ch.bend
+                        + bend
                         + v.tuning
-                        + vib * (ch.modulation + v.vibrato) * VIBRATO_DEPTH
+                        + vib * (wheeled.vibrato + v.vibrato * VIBRATO_DEPTH)
                         + lfo * s.lfo_pitch;
                     let base = 440.0 * 2f32.powf(semis / 12.0);
                     for u in 0..n {
@@ -961,6 +1164,7 @@ impl SynthProcessor {
                     * s.gain
                     * 0.35
                     * tremolo
+                    * wheeled.gain
                     * (1.0 + 0.5 * (ch.pressure + v.pressure))
                     * v.volume
                     * v.expression;
@@ -1028,7 +1232,12 @@ impl PluginProcessor for SynthProcessor {
         let cycles = if synced {
             tempo / 60.0 / period_q / f64::from(self.sample_rate)
         } else {
-            f64::from(self.get(id::LFO_RATE)) / f64::from(self.sample_rate)
+            // A mod-wheel slot on LFO Rate speeds it (or slows it).
+            let speed: f32 = (0..WHEEL_SLOTS)
+                .filter(|k| self.get(id::wheel_target(*k)).round() as usize == wheel::LFO_RATE)
+                .map(|k| 2f32.powf(2.0 * self.get(id::wheel_amount(k)) * self.wheel_last))
+                .product();
+            f64::from(self.get(id::LFO_RATE) * speed) / f64::from(self.sample_rate)
         };
         self.lfo.advance(cycles * frames as f64);
         let Some(out) = io.audio_out.first_mut() else {
@@ -1328,5 +1537,117 @@ mod tests {
         // Sides differ with unison spread.
         let diff: f64 = l.iter().zip(&r).map(|(a, b)| f64::from(a - b).abs()).sum();
         assert!(diff > 1.0);
+    }
+
+    /// The loudest frequency of `l` between `lo` and `hi` Hz (a semitone
+    /// apart: 1/24 octave steps).
+    fn peak_hz(l: &[f32], lo: f64, hi: f64) -> f64 {
+        let mut best = (lo, f64::MIN);
+        let mut f = lo;
+        while f <= hi {
+            let db = bin_db(l, f);
+            if db > best.1 {
+                best = (f, db);
+            }
+            f *= 2f64.powf(1.0 / 48.0);
+        }
+        best.0
+    }
+
+    /// The pitch wheel bends as far as Pitch Bend Range says (a range a
+    /// controller sets with RPN 0 wins on its channel); the mod wheel opens
+    /// the filter as much as Mod Wheel to Cutoff says.
+    #[test]
+    fn the_wheels_bend_and_modulate_as_set() {
+        let plain = |extra: &[(u32, f64)]| {
+            let mut set = vec![
+                (id::CUTOFF, 20_000.0),
+                (id::ENV_AMOUNT, 0.0),
+                (id::DETUNE, 0.0),
+                (id::OSC1_WAVE, 3.0),
+                (id::OSC2_LEVEL, 0.0),
+                (id::SUB, 0.0),
+            ];
+            set.extend_from_slice(extra);
+            Play::new(&set)
+        };
+        // Full bend up: a whole tone by default, an octave at ±12.
+        for (range, want) in [(2.0, 220.0 * 2f64.powf(2.0 / 12.0)), (12.0, 440.0)] {
+            let mut s = plain(&[(id::BEND_RANGE, range)]);
+            s.send(MidiEvent::PitchBend {
+                channel: 0,
+                value: 16383,
+            });
+            s.send(on(57));
+            let (l, _) = s.run(0.4);
+            let got = peak_hz(&l, 150.0, 600.0);
+            assert!(
+                (got / want - 1.0).abs() < 0.02,
+                "±{range}: {got} for {want}"
+            );
+        }
+        // RPN 0 from the controller: ±7 on its channel, whatever the knob.
+        let mut s = plain(&[(id::BEND_RANGE, 12.0)]);
+        for (cc, v) in [(101, 0), (100, 0), (6, 7)] {
+            s.send(MidiEvent::ControlChange {
+                channel: 0,
+                controller: cc,
+                value: v,
+            });
+        }
+        s.send(MidiEvent::PitchBend {
+            channel: 0,
+            value: 16383,
+        });
+        s.send(on(57));
+        let (l, _) = s.run(0.4);
+        let want = 220.0 * 2f64.powf(7.0 / 12.0);
+        let got = peak_hz(&l, 150.0, 600.0);
+        assert!((got / want - 1.0).abs() < 0.02, "RPN ±7: {got}");
+        // Slot 1 on the cutoff (+3 octaves), slot 2 on the volume (taken
+        // out by half), slot 3 off.
+        let play = |wheel: u8, set: &[(u32, f64)]| {
+            let mut all = vec![
+                (id::CUTOFF, 300.0),
+                (id::ENV_AMOUNT, 0.0),
+                (id::RESONANCE, 0.0),
+            ];
+            all.extend_from_slice(set);
+            let mut s = Play::new(&all);
+            s.send(MidiEvent::ControlChange {
+                channel: 0,
+                controller: 1,
+                value: wheel,
+            });
+            s.send(on(57));
+            let (l, _) = s.run(0.4);
+            l
+        };
+        let slots = [
+            (id::wheel_target(0), wheel::CUTOFF as f64),
+            (id::wheel_amount(0), 0.75),
+        ];
+        let (closed, open) = (play(0, &slots), play(127, &slots));
+        let (a, b) = (bin_db(&closed, 220.0 * 8.0), bin_db(&open, 220.0 * 8.0));
+        assert!(b - a > 12.0, "the wheel opens the filter: {a} → {b} dB");
+        let both = [
+            (id::wheel_target(0), wheel::CUTOFF as f64),
+            (id::wheel_amount(0), 0.75),
+            (id::wheel_target(1), wheel::VOLUME as f64),
+            (id::wheel_amount(1), -0.5),
+        ];
+        let quiet = play(127, &both);
+        let fundamental = |l: &[f32]| bin_db(l, 220.0);
+        let drop = fundamental(&open) - fundamental(&quiet);
+        assert!((drop - 6.0).abs() < 1.0, "half the level: {drop} dB");
+        assert!(bin_db(&quiet, 220.0 * 8.0) - a > 6.0, "and still opened");
+        // Off: the wheel does nothing.
+        let off = [(id::wheel_target(0), wheel::OFF as f64)];
+        let (x, y) = (play(0, &off), play(127, &off));
+        assert!((bin_db(&x, 220.0 * 8.0) - bin_db(&y, 220.0 * 8.0)).abs() < 0.5);
+        assert_eq!(
+            format(ParameterId(id::wheel_target(1)), wheel::RESONANCE as f64).as_deref(),
+            Some("Resonance")
+        );
     }
 }

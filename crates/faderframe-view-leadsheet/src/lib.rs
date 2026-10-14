@@ -1,16 +1,20 @@
 //! The Lead Sheet view: the engraved pages of the lead sheet made last
-//! (a clip's melody with its chords and words), on paper, scrolled and
-//! zoomed (Ctrl + wheel); a strip above to write its rhythms with
-//! sixteenths or triplets and to export it as PDF or MusicXML.
+//! (a clip's or a track's melody with its chords and words, or a score of
+//! several tracks, their staves one below the other; guitar tab), on
+//! paper, scrolled and zoomed (Ctrl + wheel); a strip above to write it as
+//! notes, notes with tab or tab alone (with a tuning and capo), its
+//! rhythms with sixteenths or triplets, and to export it as PDF, MusicXML
+//! or plain-text tab.
 
 #![forbid(unsafe_code)]
 
-use faderframe_leadsheet::Grid;
 use faderframe_leadsheet::engrave::{Anchor, Ink, Page};
 use faderframe_leadsheet::glyph::Seg;
+use faderframe_leadsheet::{Grid, TUNINGS};
+use faderframe_session::leadsheet::{Notation, SheetStyle};
 use faderframe_session::{Action, Session};
 use faderframe_ui_canvas::{
-    CanvasView, Color, EventCx, FileChoice, HostRequest, Paint, Painter, Path, Point,
+    CanvasView, Color, EventCx, FileChoice, HostRequest, MenuItem, Paint, Painter, Path, Point,
     PointerButton, Rect, Size, TextStyle, Theme, ViewEvent,
 };
 
@@ -23,8 +27,55 @@ const INK: Color = Color::hex(0x141414);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Button {
     Grid(Grid),
+    Notation(Notation),
+    /// The tab's tuning and capo (a menu).
+    Tuning,
     Pdf,
     MusicXml,
+    /// Plain-text tab.
+    Text,
+}
+
+const NOTATIONS: [(Notation, &str); 3] = [
+    (Notation::Standard, "Notes"),
+    (Notation::WithTab, "Notes + Tab"),
+    (Notation::Tab, "Tab"),
+];
+
+/// The tuning and capo menu.
+fn tuning_menu(style: SheetStyle) -> Vec<MenuItem<Action>> {
+    let mut items: Vec<MenuItem<Action>> = TUNINGS
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let item = MenuItem::new(
+                t.name,
+                Action::SetSheetStyle(SheetStyle { tuning: i, ..style }),
+            )
+            .checked(style.tuning == i);
+            // Basses and the ukulele apart from the guitars.
+            if i > 0 && TUNINGS[i - 1].name.split(' ').next() != t.name.split(' ').next() {
+                item.separated()
+            } else {
+                item
+            }
+        })
+        .collect();
+    let capos = (0..=9u8)
+        .map(|c| {
+            MenuItem::new(
+                if c == 0 {
+                    "No Capo".to_string()
+                } else {
+                    format!("Fret {c}")
+                },
+                Action::SetSheetStyle(SheetStyle { capo: c, ..style }),
+            )
+            .checked(style.capo == c)
+        })
+        .collect();
+    items.push(MenuItem::submenu("Capo", capos).separated());
+    items
 }
 
 const GRIDS: [(Grid, &str); 3] = [
@@ -49,19 +100,34 @@ impl LeadSheetView {
         }
     }
 
-    /// The strip's buttons and where they are.
-    pub fn buttons(size: Size) -> Vec<(Button, Rect)> {
+    /// The strip's buttons and where they are (the tab's when `tab`).
+    pub fn buttons(size: Size, tab: bool) -> Vec<(Button, Rect)> {
         let mut out = Vec::new();
         let mut x = size.w - 12.0;
-        for (b, w) in [(Button::MusicXml, 132.0), (Button::Pdf, 96.0)] {
-            x -= w;
-            out.push((b, Rect::new(x, 6.0, w, HEADER_H - 12.0)));
-            x -= 8.0;
+        let mut add = |b: Button, w: f32, x: &mut f32| {
+            *x -= w;
+            out.push((b, Rect::new(*x, 6.0, w, HEADER_H - 12.0)));
+            *x -= 6.0;
+        };
+        add(Button::MusicXml, 132.0, &mut x);
+        add(Button::Pdf, 96.0, &mut x);
+        if tab {
+            add(Button::Text, 96.0, &mut x);
         }
-        x -= 16.0;
+        x -= 14.0;
         for (g, _) in GRIDS.iter().rev() {
-            x -= 70.0;
-            out.push((Button::Grid(*g), Rect::new(x, 6.0, 68.0, HEADER_H - 12.0)));
+            add(Button::Grid(*g), 66.0, &mut x);
+        }
+        x -= 14.0;
+        if tab {
+            add(Button::Tuning, 150.0, &mut x);
+        }
+        for (n, label) in NOTATIONS.iter().rev() {
+            add(
+                Button::Notation(*n),
+                18.0 + label.len() as f32 * 6.5,
+                &mut x,
+            );
         }
         out
     }
@@ -183,16 +249,22 @@ impl CanvasView<Session, Action> for LeadSheetView {
                 }
             }
             None => {
-                let text = if model.making_lead_sheet() {
-                    "Listening to the melody…"
+                let lines: &[&str] = if model.making_lead_sheet() {
+                    &["Listening to the melody…"]
                 } else {
-                    "No lead sheet yet: right-click a clip in the arranger and choose Lead Sheet (an audio clip's melody is heard, a MIDI clip's notes are read; chords from the chord track, words from the lyrics)"
+                    &[
+                        "No lead sheet yet: right-click a clip in the arranger and choose Lead Sheet (an audio clip's melody is heard, a MIDI clip's notes are read; chords from the chord track, words from the lyrics)",
+                        "Several clips of a track selected make one line; several tracks (or clips on several tracks) a score, a staff each",
+                        "Guitar tab: choose Guitar Tab in the clip or track menu, or Notes + Tab / Tab above (a guitar's chords are kept and fingered; the words go to the notes, a syllable a note)",
+                    ]
                 };
-                p.text(
-                    text,
-                    Rect::new(24.0, HEADER_H + 24.0, size.w - 48.0, 40.0),
-                    &TextStyle::new(th.fonts.normal, th.ui.text_dim),
-                );
+                for (i, text) in lines.iter().enumerate() {
+                    p.text(
+                        text,
+                        Rect::new(24.0, HEADER_H + 24.0 + 24.0 * i as f32, size.w - 48.0, 24.0),
+                        &TextStyle::new(th.fonts.normal, th.ui.text_dim),
+                    );
+                }
             }
         }
         p.pop_clip();
@@ -214,25 +286,54 @@ impl CanvasView<Session, Action> for LeadSheetView {
             p.text(
                 &format!(
                     "{} · {} bars · {} page{}{busy}",
-                    d.part,
-                    d.sheet.measures.len(),
+                    d.parts(),
+                    d.sheet.bars(),
                     d.pages.len(),
                     if d.pages.len() == 1 { "" } else { "s" }
                 ),
-                Rect::new(112.0, 0.0, (size.w - 600.0).max(60.0), HEADER_H),
+                Rect::new(
+                    112.0,
+                    0.0,
+                    (Self::buttons(size, model.sheet_style().tab())
+                        .iter()
+                        .map(|(_, r)| r.x)
+                        .fold(size.w, f32::min)
+                        - 120.0)
+                        .max(60.0),
+                    HEADER_H,
+                ),
                 &TextStyle::new(th.fonts.small, th.ui.text_dim),
             );
         }
-        for (b, r) in Self::buttons(size) {
+        let style = model.sheet_style();
+        for (b, r) in Self::buttons(size, style.tab()) {
+            let tuning_label;
             let (label, on) = match b {
                 Button::Grid(g) => (
                     GRIDS.iter().find(|(x, _)| *x == g).map_or("", |(_, l)| *l),
                     doc.is_some_and(|d| d.grid == g),
                 ),
+                Button::Notation(n) => (
+                    NOTATIONS
+                        .iter()
+                        .find(|(x, _)| *x == n)
+                        .map_or("", |(_, l)| *l),
+                    style.notation == n,
+                ),
+                Button::Tuning => {
+                    tuning_label = if style.capo > 0 {
+                        format!("{} · Capo {} ▾", style.tuning().name, style.capo)
+                    } else {
+                        format!("{} ▾", style.tuning().name)
+                    };
+                    (tuning_label.as_str(), false)
+                }
                 Button::Pdf => ("Export PDF…", false),
                 Button::MusicXml => ("Export MusicXML…", false),
+                Button::Text => ("Export Tab…", false),
             };
-            let enabled = doc.is_some();
+            // The notation and tuning apply to the next sheet too.
+            let enabled = doc.is_some() || matches!(b, Button::Notation(_) | Button::Tuning);
             p.fill_rounded(
                 r,
                 4.0,
@@ -272,13 +373,28 @@ impl CanvasView<Session, Action> for LeadSheetView {
                 button: PointerButton::Primary,
                 ..
             } => {
-                let Some(doc) = model.lead_sheet() else {
-                    return false;
-                };
-                let Some((b, _)) = Self::buttons(size)
+                let style = model.sheet_style();
+                let Some((b, r)) = Self::buttons(size, style.tab())
                     .into_iter()
                     .find(|(_, r)| r.contains(pos))
                 else {
+                    return false;
+                };
+                match b {
+                    Button::Notation(notation) => {
+                        cx.emit(Action::SetSheetStyle(SheetStyle { notation, ..style }));
+                        return true;
+                    }
+                    Button::Tuning => {
+                        cx.request(HostRequest::ContextMenu {
+                            at: Point::new(r.x, r.bottom()),
+                            items: tuning_menu(style),
+                        });
+                        return true;
+                    }
+                    _ => {}
+                }
+                let Some(doc) = model.lead_sheet() else {
                     return false;
                 };
                 let name = |ext: &str| {
@@ -294,10 +410,29 @@ impl CanvasView<Session, Action> for LeadSheetView {
                             }
                         })
                         .collect();
-                    format!("{} Lead Sheet.{ext}", t.trim())
+                    let what = if doc.sheet.parts.iter().any(|p| p.tab.is_some()) {
+                        "Tab"
+                    } else {
+                        "Lead Sheet"
+                    };
+                    format!("{} {what}.{ext}", t.trim())
                 };
                 match b {
-                    Button::Grid(grid) => cx.emit(Action::MakeLeadSheet { of: doc.of, grid }),
+                    Button::Notation(_) | Button::Tuning => {}
+                    Button::Text => cx.request(HostRequest::ChooseFiles {
+                        choice: FileChoice::Save {
+                            title: "Export the Tab as Text".into(),
+                            name: name("txt"),
+                            filters: vec![("Text".into(), vec!["*.txt".into()])],
+                        },
+                        commit: Box::new(|paths| {
+                            paths.first().map(|p| Action::ExportLeadSheet(p.clone()))
+                        }),
+                    }),
+                    Button::Grid(grid) => cx.emit(Action::MakeLeadSheet {
+                        of: doc.of.clone(),
+                        grid,
+                    }),
                     Button::Pdf => cx.request(HostRequest::ChooseFiles {
                         choice: FileChoice::Save {
                             title: "Export the Lead Sheet as PDF".into(),
@@ -412,7 +547,7 @@ mod tests {
         })
         .unwrap();
         let doc = s.lead_sheet().unwrap();
-        assert_eq!(doc.sheet.measures.len(), 2);
+        assert_eq!(doc.sheet.bars(), 2);
         let mut view = LeadSheetView::new(Theme::default());
         let size = Size::new(900.0, 700.0);
         let mut p = RecordingPainter::new();
@@ -423,7 +558,7 @@ mod tests {
         let mut actions = Vec::new();
         let mut requests = Vec::new();
         let click = |b: Button| {
-            let r = LeadSheetView::buttons(size)
+            let r = LeadSheetView::buttons(size, false)
                 .into_iter()
                 .find(|(x, _)| *x == b)
                 .unwrap()
@@ -460,5 +595,164 @@ mod tests {
                 .is_err()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A MIDI clip of `notes` (start, length, key in quarters) at the start.
+    fn clip_of(id: u64, track: faderframe_core::TrackId, notes: &[(f64, f64, u8)]) -> Action {
+        let q = MusicalTime::from_quarters;
+        Action::Edit(Command::AddClip {
+            clip: Box::new(Clip {
+                id: faderframe_core::ClipId(id),
+                track,
+                name: format!("clip {id}"),
+                color: None,
+                start: MusicalTime::ZERO,
+                muted: false,
+                content: ClipContent::Midi(MidiClip {
+                    length: q(8.0),
+                    notes: notes
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &(a, l, key))| MidiNote {
+                            id: faderframe_core::NoteId(id * 100 + i as u64),
+                            start: q(a),
+                            length: q(l),
+                            key,
+                            velocity: 100,
+                            channel: 0,
+                            muted: false,
+                            release: None,
+                        })
+                        .collect(),
+                    ..MidiClip::default()
+                }),
+            }),
+        })
+    }
+
+    #[test]
+    fn a_score_shows_its_staves_named_and_rewrites_as_a_score() {
+        let mut s = Session::new(
+            faderframe_project::Project::new("Duet", 48_000),
+            None,
+            EngineConfig::default(),
+        )
+        .unwrap();
+        let mut tracks = Vec::new();
+        for (name, id, notes) in [
+            ("Voice", 1, [(0.0, 2.0, 67), (2.0, 2.0, 72), (4.0, 4.0, 76)]),
+            ("Bass", 2, [(0.0, 4.0, 36), (4.0, 2.0, 41), (6.0, 2.0, 43)]),
+        ] {
+            let t = s.add_track(TrackKind::Midi).unwrap();
+            s.dispatch(Action::Edit(Command::RenameTrack {
+                track: t,
+                name: name.into(),
+            }))
+            .unwrap();
+            s.dispatch(clip_of(id, t, &notes)).unwrap();
+            tracks.push(t);
+        }
+        let of = LeadSheetOf::Tracks(tracks.clone());
+        s.dispatch(Action::MakeLeadSheet {
+            of: of.clone(),
+            grid: Grid::Auto,
+        })
+        .unwrap();
+        assert_eq!(s.lead_sheet().unwrap().sheet.parts.len(), 2);
+        let mut view = LeadSheetView::new(Theme::default());
+        let size = Size::new(900.0, 700.0);
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, size, &s, &Theme::default());
+        assert!(p.balanced_clips());
+        let texts = p.texts();
+        // The parts named at the left of the first system, and in the strip.
+        assert!(texts.contains(&"Voice") && texts.contains(&"Bass"));
+        assert!(
+            texts.iter().any(|t| t.starts_with("Voice, Bass · 2 bars")),
+            "{texts:?}"
+        );
+        // Another grid writes the score again.
+        let r = LeadSheetView::buttons(size, false)
+            .into_iter()
+            .find(|(b, _)| *b == Button::Grid(Grid::Straight))
+            .unwrap()
+            .1;
+        let mut actions = Vec::new();
+        let mut requests = Vec::new();
+        {
+            let mut cx = EventCx::new(&mut actions, &mut requests);
+            view.event(
+                &ViewEvent::PointerDown {
+                    pos: r.center(),
+                    button: PointerButton::Primary,
+                    modifiers: faderframe_ui_canvas::Modifiers::NONE,
+                    clicks: 1,
+                },
+                size,
+                &s,
+                &mut cx,
+            );
+        }
+        assert_eq!(
+            actions,
+            [Action::MakeLeadSheet {
+                of,
+                grid: Grid::Straight
+            }]
+        );
+    }
+
+    /// The notation buttons set the style; with tab the tuning button's
+    /// menu offers the tunings and a capo, and plain-text tab is exported.
+    #[test]
+    fn the_strip_switches_to_tab_and_offers_tunings() {
+        let mut s = Session::new(
+            faderframe_project::Project::new("Tab", 48_000),
+            None,
+            EngineConfig::default(),
+        )
+        .unwrap();
+        let mut view = LeadSheetView::new(Theme::default());
+        let size = Size::new(1400.0, 600.0);
+        let press = |view: &mut LeadSheetView, s: &Session, b: Button| {
+            let r = LeadSheetView::buttons(size, s.sheet_style().tab())
+                .into_iter()
+                .find(|(x, _)| *x == b)
+                .unwrap()
+                .1;
+            let mut actions = Vec::new();
+            let mut requests = Vec::new();
+            let mut cx = EventCx::new(&mut actions, &mut requests);
+            view.event(
+                &ViewEvent::PointerDown {
+                    pos: r.center(),
+                    button: PointerButton::Primary,
+                    modifiers: faderframe_ui_canvas::Modifiers::NONE,
+                    clicks: 1,
+                },
+                size,
+                s,
+                &mut cx,
+            );
+            (actions, requests)
+        };
+        assert!(
+            !LeadSheetView::buttons(size, false)
+                .iter()
+                .any(|(b, _)| *b == Button::Tuning)
+        );
+        let (a, _) = press(&mut view, &s, Button::Notation(Notation::Tab));
+        for a in a {
+            s.dispatch(a).unwrap();
+        }
+        assert_eq!(s.sheet_style().notation, Notation::Tab);
+        let (_, req) = press(&mut view, &s, Button::Tuning);
+        let Some(HostRequest::ContextMenu { items, .. }) = req.into_iter().next() else {
+            panic!("the tuning menu")
+        };
+        assert!(items.iter().any(|i| i.label == "Guitar · Drop D"));
+        assert!(items.iter().any(|i| i.label == "Bass · 4 Strings"));
+        assert!(items.iter().any(|i| i.label == "Capo"));
+        view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
     }
 }

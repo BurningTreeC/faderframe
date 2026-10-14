@@ -267,6 +267,7 @@ impl EqView {
         if let Some(a) = self.analyser.as_mut() {
             let fall = analyser::SPEEDS[s.speed].1;
             let frozen = s.freeze || self.grab.is_some();
+            a.post.set_hold(s.peak_hold);
             a.update(&tap, external.as_ref(), s.external, fall, frozen);
         }
         if let Some(m) = self.matching.as_mut() {
@@ -410,6 +411,21 @@ impl EqView {
                 .collect()
         };
         let dim = if self.grab.is_some() { 1.6 } else { 1.0 };
+        if s.post && s.peak_hold {
+            // The peaks held: a thin line over the output.
+            let held: Vec<f32> = a
+                .post
+                .hold_curve(&freqs)
+                .iter()
+                .zip(&freqs)
+                .map(|(d, f)| d + s.tilt * (f / 1000.0).log2() as f32)
+                .collect();
+            p.stroke_path(
+                &Path::polyline(&shape(&held)),
+                1.0,
+                th.device.post.with_alpha(0.9),
+            );
+        }
         if s.post {
             let post_levels = levels(&a.post);
             let post = shape(&post_levels);

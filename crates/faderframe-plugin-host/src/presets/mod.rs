@@ -22,6 +22,8 @@ mod synth;
 mod tests;
 
 use crate::ParameterInfo;
+/// The EQ's preset groups.
+pub use equalisers::group as eq_group;
 use faderframe_core::{ParameterId, builtin};
 
 /// One factory preset of a stock device.
@@ -84,6 +86,7 @@ pub fn factory_presets(plugin_id: &str) -> Vec<FactoryPreset> {
         builtin::LIMITER => dynamics::limiter(),
         builtin::GATE => dynamics::gate(),
         builtin::DEESSER => dynamics::deesser(),
+        builtin::CHANNEL_STRIP => dynamics::channel_strip(),
         builtin::SATURATOR => effects::saturator(),
         builtin::ECHO => effects::delay(),
         builtin::REVERB => effects::reverb(),
@@ -110,6 +113,7 @@ pub fn parameters(plugin_id: &str) -> Vec<ParameterInfo> {
         builtin::LIMITER => limiter::parameters(),
         builtin::GATE => gate::parameters(),
         builtin::DEESSER => deesser::parameters(),
+        builtin::CHANNEL_STRIP => channel_strip::parameters(),
         builtin::SATURATOR => saturator::parameters(),
         builtin::ECHO => delay::parameters(),
         builtin::REVERB => reverb::parameters(),

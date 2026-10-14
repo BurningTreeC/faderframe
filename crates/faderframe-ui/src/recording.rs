@@ -5,19 +5,41 @@
 use crate::prefs::Preferences;
 use crate::state::AppState;
 use faderframe_engine::MetronomeMode;
-use faderframe_session::{Action, LoopRecordMode, RecordMode, RecordSettings, TransportAction};
+use faderframe_session::{
+    Action, LoopRecordMode, RecordMode, RecordSettings, Roll, RollUnit, TransportAction,
+};
 use gtk::gio;
 use gtk::prelude::*;
 use std::rc::Rc;
 
-const PREROLL_BARS: [u32; 4] = [0, 1, 2, 4];
+/// The units the Preferences page offers.
+const UNITS: [RollUnit; 3] = [RollUnit::Bars, RollUnit::Beats, RollUnit::Seconds];
 
-fn preroll_label(bars: u32) -> String {
-    match bars {
-        0 => "No pre-roll".into(),
-        1 => "1 bar".into(),
-        n => format!("{n} bars"),
+fn unit_label(u: RollUnit) -> String {
+    match u {
+        RollUnit::Bars => "bars",
+        RollUnit::Beats => "beats",
+        RollUnit::Seconds => "seconds",
     }
+    .into()
+}
+
+/// The menus' choices: the presets, and the current length if it is none.
+fn roll_choices(current: Roll, off: &str) -> Vec<(String, String)> {
+    let mut v: Vec<Roll> = Roll::PRESETS.to_vec();
+    if !v.contains(&current) {
+        v.push(current);
+    }
+    v.into_iter()
+        .map(|r| {
+            let label = if r.is_off() {
+                off.to_string()
+            } else {
+                r.label()
+            };
+            (label, r.id())
+        })
+        .collect()
 }
 
 /// Change the recording settings everywhere.
@@ -63,7 +85,39 @@ fn sync_actions(app: &Rc<AppState>, r: &RecordSettings) {
     set_state(app, "record-mode", r.mode.id());
     set_state(app, "loop-record-mode", r.loop_mode.id());
     set_state(app, "metronome", r.metronome.id());
-    set_state(app, "preroll", &r.preroll_bars.to_string());
+    set_state(app, "preroll", &r.preroll.id());
+    set_state(app, "postroll", &r.postroll.id());
+    for (name, on) in [
+        ("preroll-on-bar", r.preroll_on_bar),
+        ("count-in", r.count_in),
+    ] {
+        if let Some(a) = app
+            .app
+            .lookup_action(name)
+            .and_downcast::<gio::SimpleAction>()
+        {
+            a.set_state(&on.to_variant());
+        }
+    }
+}
+
+/// A recording setting switched on and off from the menu.
+fn toggle(
+    app: &Rc<AppState>,
+    name: &str,
+    initial: bool,
+    update: impl Fn(&mut RecordSettings) + 'static,
+) -> gio::ActionEntry<gtk::Application> {
+    let weak = Rc::downgrade(app);
+    gio::ActionEntry::builder(name)
+        .state(initial.to_variant())
+        .activate(move |_, _, _| {
+            let Some(app) = weak.upgrade() else { return };
+            let mut r = app.session.borrow().record;
+            update(&mut r);
+            apply(&app, r);
+        })
+        .build()
 }
 
 fn radio(
@@ -155,9 +209,16 @@ pub fn install_actions(app: &Rc<AppState>) {
         radio(app, "metronome", r.metronome.id(), |r, id| {
             r.metronome = MetronomeMode::from_id(id).unwrap_or(r.metronome);
         }),
-        radio(app, "preroll", &r.preroll_bars.to_string(), |r, id| {
-            r.preroll_bars = id.parse().unwrap_or(r.preroll_bars);
+        radio(app, "preroll", &r.preroll.id(), |r, id| {
+            r.preroll = Roll::from_id(id).unwrap_or(r.preroll);
         }),
+        radio(app, "postroll", &r.postroll.id(), |r, id| {
+            r.postroll = Roll::from_id(id).unwrap_or(r.postroll);
+        }),
+        toggle(app, "preroll-on-bar", r.preroll_on_bar, |r| {
+            r.preroll_on_bar = !r.preroll_on_bar;
+        }),
+        toggle(app, "count-in", r.count_in, |r| r.count_in = !r.count_in),
         punch,
         punch_from_loop,
     ]);
@@ -174,8 +235,9 @@ fn radio_menu(action: &str, items: impl IntoIterator<Item = (String, String)>) -
     m
 }
 
-/// The recording part of the Transport menu.
-pub fn menu() -> gio::Menu {
+/// The recording part of the Transport menu (its choices as `r` has them:
+/// a length set in the Preferences shows too).
+pub fn menu_for(r: &RecordSettings) -> gio::Menu {
     let m = gio::Menu::new();
     let punch = gio::Menu::new();
     punch.append(Some("Punch In/Out"), Some("app.punch"));
@@ -204,15 +266,30 @@ pub fn menu() -> gio::Menu {
         ),
     );
     opts.append(Some("Metronome Settings…"), Some("app.metronome-settings"));
+    let pre = radio_menu("app.preroll", roll_choices(r.preroll, "No pre-roll"));
+    let how = gio::Menu::new();
+    how.append(Some("Start on a Bar Line"), Some("app.preroll-on-bar"));
+    how.append(Some("Count-in (Click Only)"), Some("app.count-in"));
+    pre.append_section(None, &how);
+    opts.append_submenu(Some("Pre-roll"), &pre);
     opts.append_submenu(
-        Some("Pre-roll"),
-        &radio_menu(
-            "app.preroll",
-            PREROLL_BARS.map(|b| (preroll_label(b), b.to_string())),
-        ),
+        Some("Post-roll (after Punch-out)"),
+        &radio_menu("app.postroll", roll_choices(r.postroll, "No post-roll")),
     );
     m.append_section(None, &opts);
     m
+}
+
+/// An amount and its unit (pre- and post-roll on the Preferences page).
+fn roll_editor(r: Roll) -> (gtk::Box, gtk::SpinButton, gtk::DropDown) {
+    let b = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let amount = gtk::SpinButton::with_range(0.0, 64.0, 0.5);
+    amount.set_digits(1);
+    amount.set_value(r.amount);
+    let unit = dropdown(&UNITS, unit_label, r.unit);
+    b.append(&amount);
+    b.append(&unit);
+    (b, amount, unit)
 }
 
 fn dropdown<T: Copy + PartialEq + 'static>(
@@ -238,8 +315,29 @@ pub fn page(app: &Rc<AppState>, row: impl Fn(&gtk::Grid, i32, &str, &gtk::Widget
     row(&g, 0, "Recording over clips", mode.upcast_ref());
     let loop_mode = dropdown(&LoopRecordMode::ALL, |m| m.label().to_string(), r.loop_mode);
     row(&g, 1, "Loop recording", loop_mode.upcast_ref());
-    let preroll = dropdown(&PREROLL_BARS, preroll_label, r.preroll_bars);
-    row(&g, 2, "Pre-roll", preroll.upcast_ref());
+    let (preroll_box, pre_amount, pre_unit) = roll_editor(r.preroll);
+    row(&g, 2, "Pre-roll (0: none)", preroll_box.upcast_ref());
+    let on_bar = gtk::Switch::new();
+    on_bar.set_active(r.preroll_on_bar);
+    on_bar.set_halign(gtk::Align::Start);
+    row(&g, 5, "Pre-roll starts on a bar line", on_bar.upcast_ref());
+    let count_in = gtk::Switch::new();
+    count_in.set_active(r.count_in);
+    count_in.set_halign(gtk::Align::Start);
+    count_in.set_tooltip_text(Some(
+        "During the pre-roll only the click plays; the song starts with the take.",
+    ));
+    row(&g, 6, "Count-in (click only)", count_in.upcast_ref());
+    let (postroll_box, post_amount, post_unit) = roll_editor(r.postroll);
+    postroll_box.set_tooltip_text(Some(
+        "With a punch range: playback goes on this long after the punch-out, then stops.",
+    ));
+    row(
+        &g,
+        7,
+        "Post-roll after punch-out",
+        postroll_box.upcast_ref(),
+    );
     let offset = gtk::SpinButton::with_range(-4096.0, 4096.0, 1.0);
     offset.set_value(r.latency_offset as f64);
     offset.set_tooltip_text(Some(
@@ -265,23 +363,35 @@ pub fn page(app: &Rc<AppState>, row: impl Fn(&gtk::Grid, i32, &str, &gtk::Widget
     help.set_natural_wrap_mode(gtk::NaturalWrapMode::Word);
     help.set_xalign(0.0);
     help.add_css_class("dim-label");
-    g.attach(&help, 0, 4, 2, 1);
+    g.attach(&help, 0, 8, 2, 1);
 
     let update = {
         let weak = Rc::downgrade(app);
-        let (mode, loop_mode, preroll, offset) = (
-            mode.clone(),
-            loop_mode.clone(),
-            preroll.clone(),
-            offset.clone(),
+        let (mode, loop_mode, offset) = (mode.clone(), loop_mode.clone(), offset.clone());
+        let (pre_amount, pre_unit, post_amount, post_unit) = (
+            pre_amount.clone(),
+            pre_unit.clone(),
+            post_amount.clone(),
+            post_unit.clone(),
         );
+        let (on_bar, count_in) = (on_bar.clone(), count_in.clone());
         move || {
             let Some(app) = weak.upgrade() else { return };
             let mut r = app.session.borrow().record;
             r.mode = RecordMode::ALL[mode.selected() as usize % RecordMode::ALL.len()];
             r.loop_mode =
                 LoopRecordMode::ALL[loop_mode.selected() as usize % LoopRecordMode::ALL.len()];
-            r.preroll_bars = PREROLL_BARS[preroll.selected() as usize % PREROLL_BARS.len()];
+            let unit = |d: &gtk::DropDown| UNITS[d.selected() as usize % UNITS.len()];
+            r.preroll = Roll {
+                amount: pre_amount.value(),
+                unit: unit(&pre_unit),
+            };
+            r.postroll = Roll {
+                amount: post_amount.value(),
+                unit: unit(&post_unit),
+            };
+            r.preroll_on_bar = on_bar.is_active();
+            r.count_in = count_in.is_active();
             r.latency_offset = offset.value() as i64;
             if r != app.session.borrow().record {
                 apply(&app, r);
@@ -289,9 +399,17 @@ pub fn page(app: &Rc<AppState>, row: impl Fn(&gtk::Grid, i32, &str, &gtk::Widget
         }
     };
     let update = Rc::new(update);
-    for d in [&mode, &loop_mode, &preroll] {
+    for d in [&mode, &loop_mode, &pre_unit, &post_unit] {
         let u = Rc::clone(&update);
         d.connect_selected_notify(move |_| u());
+    }
+    for s in [&pre_amount, &post_amount] {
+        let u = Rc::clone(&update);
+        s.connect_value_changed(move |_| u());
+    }
+    for s in [&on_bar, &count_in] {
+        let u = Rc::clone(&update);
+        s.connect_active_notify(move |_| u());
     }
     offset.connect_value_changed(move |_| update());
     g.upcast()

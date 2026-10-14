@@ -353,7 +353,11 @@ impl Session {
             }
             Button::PreRoll => {
                 let mut r = self.record;
-                r.preroll_bars = if r.preroll_bars == 0 { 1 } else { 0 };
+                r.preroll = if r.preroll.is_off() {
+                    crate::Roll::bars(1.0)
+                } else {
+                    crate::Roll::OFF
+                };
                 self.dispatch(Action::SetRecordSettings(r))?;
             }
             Button::ClearSolo => self.clear_all(
@@ -435,8 +439,15 @@ impl Session {
                     EditButton::Delete => Action::DeleteSelection,
                     EditButton::Separate => Action::Separate,
                     EditButton::Capture => Action::CaptureMidi,
-                    EditButton::Quantize => {
+                    // The controller's Quantize button is the transport's Q;
+                    // with Shift it quantizes the selected clips.
+                    EditButton::Quantize
+                        if self.control.extra.held(faderframe_control::Modifier::Shift) =>
+                    {
                         Action::QuantizeClips(self.selection.clips.iter().copied().collect())
+                    }
+                    EditButton::Quantize => {
+                        Action::Transport(crate::TransportAction::ToggleInputQuantize)
                     }
                 };
                 self.dispatch(action)?;

@@ -87,6 +87,8 @@ pub struct TransportState {
     /// Jumps so far: stops, locates and scrub returns, not loop wraps
     /// (wrapping, for the control side to notice one).
     jumps: u32,
+    /// Where the newest jump went.
+    jumped_to: i64,
     scrub: Option<Scrub>,
 }
 
@@ -117,9 +119,15 @@ impl TransportState {
         self.jumps
     }
 
+    /// Where the newest jump went (a stop: where it stopped).
+    pub fn jumped_to(&self) -> i64 {
+        self.jumped_to
+    }
+
     fn jumped(&mut self) {
         self.discontinuity = true;
         self.jumps = self.jumps.wrapping_add(1);
+        self.jumped_to = self.position;
     }
 
     /// Playing a scrub snippet (not normal playback).
@@ -352,6 +360,7 @@ pub struct TransportShared {
     looping: AtomicBool,
     scrubbing: AtomicBool,
     jumps: AtomicU32,
+    jumped_to: AtomicI64,
 }
 
 /// What the UI reads.
@@ -368,6 +377,9 @@ pub struct TransportSnapshot {
     /// display's: a locate the session showed has happened once it
     /// changes).
     pub jumps: u32,
+    /// Where the newest of them went ([`TransportState::jumped_to`]): a
+    /// stop's is where it stopped, a locate's its target.
+    pub jumped_to: i64,
 }
 
 impl TransportShared {
@@ -381,7 +393,8 @@ impl TransportShared {
         self.recording.store(state.recording, Ordering::Relaxed);
         self.looping.store(state.looping(), Ordering::Relaxed);
         self.scrubbing.store(scrubbing, Ordering::Relaxed);
-        self.jumps.store(state.jumps, Ordering::Relaxed);
+        self.jumped_to.store(state.jumped_to, Ordering::Relaxed);
+        self.jumps.store(state.jumps, Ordering::Release);
     }
 
     /// Read (control thread).
@@ -392,7 +405,8 @@ impl TransportShared {
             recording: self.recording.load(Ordering::Relaxed),
             looping: self.looping.load(Ordering::Relaxed),
             scrubbing: self.scrubbing.load(Ordering::Relaxed),
-            jumps: self.jumps.load(Ordering::Relaxed),
+            jumps: self.jumps.load(Ordering::Acquire),
+            jumped_to: self.jumped_to.load(Ordering::Relaxed),
         }
     }
 }
@@ -414,11 +428,16 @@ mod tests {
         }
         assert_eq!(t.jumps(), 0, "nor are loop wraps");
         t.apply(TransportCommand::Locate(30));
-        assert_eq!(t.jumps(), 1);
+        assert_eq!((t.jumps(), t.jumped_to()), (1, 30));
         t.apply(TransportCommand::Locate(30));
         assert_eq!(t.jumps(), 1, "a locate to where it is moves nothing");
+        t.advance(10);
         t.apply(TransportCommand::Stop);
-        assert_eq!(t.jumps(), 2);
+        assert_eq!(
+            (t.jumps(), t.jumped_to()),
+            (2, 40),
+            "a stop where it stopped"
+        );
         t.apply(TransportCommand::Scrub {
             position: 500,
             frames: 32,

@@ -249,7 +249,7 @@ impl PerformanceMonitor {
                     load.update(avg, peak);
                     PluginPerformance {
                         plugin: slot.id,
-                        name: slot.plugin.name.clone(),
+                        name: t.name_of(slot),
                         format: slot.plugin.format,
                         instrument,
                         load: *load,

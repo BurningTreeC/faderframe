@@ -20,8 +20,9 @@ const MIDI_EFFECTS: [&str; 4] = [
 ];
 
 /// Every built-in with factory presets.
-const WITH_PRESETS: [&str; 18] = [
+const WITH_PRESETS: [&str; 19] = [
     builtin::COMPRESSOR_76,
+    builtin::CHANNEL_STRIP,
     builtin::ARPEGGIATOR,
     builtin::CHORD,
     builtin::SCALE,
@@ -45,9 +46,35 @@ const WITH_PRESETS: [&str; 18] = [
 fn every_effect_and_the_synth_have_ten_to_fifteen_sound_presets() {
     for id in WITH_PRESETS {
         let presets = factory_presets(id);
-        // At the top of the menu; groups (submenus) may hold more.
+        // At the top of the menu; groups (submenus) may hold more. The
         let top = presets.iter().filter(|p| p.group.is_none()).count();
-        assert!((10..=15).contains(&top), "{id}: {top} presets");
+        // EQ's are all grouped: at least 25 in its eight groups. Delay and
+        // Reverb are grouped too: at least twenty, with no group of one.
+        if id == builtin::EQ {
+            assert_eq!(top, 0, "{id}: ungrouped presets");
+            assert!(presets.len() >= 25, "{id}: {} presets", presets.len());
+            for g in crate::presets::equalisers::group::ALL {
+                let n = presets.iter().filter(|p| p.group == Some(g)).count();
+                assert!(n >= 3, "{id}: {n} presets in {g}");
+            }
+            assert!(
+                presets
+                    .iter()
+                    .all(|p| crate::presets::equalisers::group::ALL.contains(&p.group.unwrap())),
+                "{id}: a preset in no known group"
+            );
+        } else if top == 0 {
+            assert!(presets.len() >= 20, "{id}: {} presets", presets.len());
+            for preset in &presets {
+                let group_size = presets
+                    .iter()
+                    .filter(|other| other.group == preset.group)
+                    .count();
+                assert!(group_size >= 2, "{id}: group {:?} of one", preset.group);
+            }
+        } else {
+            assert!((10..=15).contains(&top), "{id}: {top} presets");
+        }
         let infos = parameters(id);
         assert!(!infos.is_empty(), "{id}");
         let mut names: Vec<&str> = presets.iter().map(|p| p.name).collect();
@@ -256,6 +283,7 @@ pub(crate) fn render(
             && match id {
                 builtin::COMPRESSOR => pid == crate::devices::compressor::id::EXTERNAL,
                 builtin::GATE => pid == crate::devices::gate::id::EXTERNAL,
+                builtin::CHANNEL_STRIP => pid == crate::devices::channel_strip::id::EXTERNAL,
                 builtin::EQ => (0..crate::eq::BANDS)
                     .any(|b| pid == crate::eq::band_id(b, crate::eq::Field::Key).0),
                 _ => false,
@@ -397,7 +425,7 @@ fn every_preset_sounds_and_stays_in_bounds() {
         for (i, preset) in factory_presets(id).iter().enumerate() {
             // The Guitar Station's submenus are played with a guitar
             // (`devices::guitar` tests), every one of them.
-            if preset.group.is_some() {
+            if preset.group.is_some() && id == builtin::GUITAR_STATION {
                 continue;
             }
             let name = preset.name;
@@ -689,6 +717,56 @@ fn every_midi_effect_preset_plays_and_lets_go() {
                 notes.len()
             );
             assert!(balanced(&got), "{id} '{}': a note left on", preset.name);
+        }
+    }
+}
+
+/// The Delay's and the Reverb's presets are levelled: fully wet, a click
+/// comes back at a sensible level, nothing clips or runs away, and every
+/// one of them makes sound.
+#[test]
+fn delay_and_reverb_presets_are_levelled() {
+    use crate::devices::rig::{Rig, silence};
+    use crate::devices::{delay, reverb};
+    let click = |n: usize| if n == 0 { (0.5, 0.5) } else { (0.0, 0.0) };
+    for id in [builtin::ECHO, builtin::REVERB] {
+        let infos = parameters(id);
+        for preset in factory_presets(id) {
+            let mut set: Vec<(u32, f64)> = preset
+                .values(&infos)
+                .into_iter()
+                .map(|(p, v)| (p.0, v))
+                .collect();
+            let mix = send_return_mix(id).unwrap();
+            set.iter_mut().find(|(p, _)| *p == mix.0).unwrap().1 = 1.0;
+            let (l, r) = if id == builtin::ECHO {
+                let mut rig = Rig::with(
+                    infos.clone(),
+                    delay::TAP_VALUES,
+                    &set,
+                    delay::DelayProcessor::new,
+                );
+                rig.transport.tempo = 120.0;
+                rig.run(6.0, click, silence)
+            } else {
+                let mut rig = Rig::with(
+                    infos.clone(),
+                    reverb::TAP_VALUES,
+                    &set,
+                    reverb::ReverbProcessor::new,
+                );
+                rig.transport.tempo = 120.0;
+                rig.run(6.0, click, silence)
+            };
+            let peak = l.iter().chain(&r).fold(0f32, |m, v| m.max(v.abs()));
+            let energy: f64 = l.iter().chain(&r).map(|v| f64::from(*v).powi(2)).sum();
+            let e = 10.0 * energy.max(1e-30).log10();
+            assert!(
+                peak.is_finite() && peak < 1.0,
+                "{id} '{}': peak {peak}",
+                preset.name
+            );
+            assert!(e > -36.0 && e < 6.0, "{id} '{}': {e:.1} dB", preset.name);
         }
     }
 }

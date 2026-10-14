@@ -199,6 +199,7 @@ fn routing_cycles_and_invalid_targets_are_rejected() {
         level_db: -6.0,
         tap: SendTap::PreFader,
         enabled: true,
+        pan: None,
     };
     let err = h
         .apply(

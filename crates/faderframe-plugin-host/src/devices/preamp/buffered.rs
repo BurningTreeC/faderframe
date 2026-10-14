@@ -245,7 +245,8 @@ mod tests {
         for model in
             0..faderframe_circuit::preamp::MODELS + faderframe_circuit::preamp::CONSOLE_BUSES
         {
-            for count in [1, 2, 4] {
+            // 6: a 5.1 track, a helper thread per channel.
+            for count in [1, 2, 4, 6] {
                 let parameters = || {
                     if model < faderframe_circuit::preamp::MODELS {
                         parameters_for(model)

@@ -228,6 +228,7 @@ pub fn demo_project(sample_rate: u32) -> Project {
                 level_db,
                 tap: SendTap::PostFader,
                 enabled: true,
+                pan: None,
             });
         }
     }

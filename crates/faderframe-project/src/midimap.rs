@@ -73,15 +73,18 @@ pub enum TransportControl {
     Record,
     Loop,
     ToStart,
+    /// The Q: input quantize on or off.
+    InputQuantize,
 }
 
 impl TransportControl {
-    pub const ALL: [TransportControl; 5] = [
+    pub const ALL: [TransportControl; 6] = [
         TransportControl::PlayStop,
         TransportControl::Stop,
         TransportControl::Record,
         TransportControl::Loop,
         TransportControl::ToStart,
+        TransportControl::InputQuantize,
     ];
 
     pub fn label(&self) -> &'static str {
@@ -91,6 +94,7 @@ impl TransportControl {
             TransportControl::Record => "Record",
             TransportControl::Loop => "Loop",
             TransportControl::ToStart => "Go to Start",
+            TransportControl::InputQuantize => "Input Quantize",
         }
     }
 }

@@ -68,6 +68,31 @@ pub fn fit(width: u32, height: u32, par: (u32, u32), max_w: u32, max_h: u32) -> 
     (even(w), even(h))
 }
 
+/// How far past the time asked for a seek lands. Containers round frame
+/// times (Matroska counts milliseconds: at 29.97 fps a frame starts up to
+/// half of one off, and the frame before it seems to end that much after
+/// it starts; MP4's ticks become nanoseconds), and a proxy's times are as
+/// far off its original's, which it is asked for. A seek to a frame's
+/// start itself had the decoder cut that sliver from the frame before and
+/// hand it out first, stamped with the start: the frame before instead of
+/// the one asked for. 2 ms in is past any such rounding, and within the
+/// shortest frames (240 fps: 4.2 ms).
+const SEEK_INTO: i64 = 2_000_000;
+
+/// Times within this of each other are one frame's (container rounding).
+const HAIR: i64 = 1_000_000;
+
+/// A frame's start in its file's timeline (stream time; 0 unknown).
+fn sample_time(sample: &gst::Sample) -> i64 {
+    match (sample.segment(), sample.buffer().and_then(|b| b.pts())) {
+        (Some(seg), Some(pts)) => seg
+            .downcast_ref::<gst::ClockTime>()
+            .and_then(|s| s.to_stream_time(pts))
+            .map_or(0, crate::ns),
+        _ => 0,
+    }
+}
+
 /// A decoder of one file's picture at one size.
 pub struct Decoder {
     p: Pipeline,
@@ -78,6 +103,13 @@ pub struct Decoder {
     height: u32,
     playing: bool,
     timeout: gst::ClockTime,
+    /// The time the last seek was for, until the first frame after it is
+    /// out (see [`Self::first_after_seek`]).
+    asked: Option<i64>,
+    /// Where its first frame starts (stream time, as its demuxer has it).
+    first: i64,
+    /// Playing from a seek: frames starting before this are not given.
+    skip_before: Option<i64>,
 }
 
 impl Decoder {
@@ -181,7 +213,12 @@ impl Decoder {
         })?;
         p.pipeline.set_state(gst::State::Paused)?;
         p.settle(Duration::from_secs(20))?;
+        let first = sink
+            .try_pull_preroll(gst::ClockTime::from_seconds(10))
+            .map_or(0, |s| sample_time(&s));
         Ok(Self {
+            first,
+            skip_before: None,
             p,
             sink,
             map: None,
@@ -189,6 +226,7 @@ impl Decoder {
             height,
             playing: false,
             timeout: gst::ClockTime::from_seconds(10),
+            asked: None,
         })
     }
 
@@ -196,6 +234,13 @@ impl Decoder {
         (self.width, self.height)
     }
 
+    /// Where the first frame starts (ns, stream time as this file's
+    /// demuxer reckons it: Matroska's starts a stream at its first block).
+    pub fn first_time(&self) -> i64 {
+        self.first
+    }
+
+    /// Seek for the frame showing at `t`: [`SEEK_INTO`] past it.
     fn seek(&mut self, t: i64, exact: bool) -> Result<()> {
         let flags = if exact {
             gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE
@@ -206,11 +251,27 @@ impl Decoder {
             self.p.pipeline.set_state(gst::State::Paused)?;
             self.playing = false;
         }
-        self.p
-            .pipeline
-            .seek_simple(flags, crate::clock(t))
-            .map_err(|_| VideoError::media(&self.p.path, "cannot seek"))?;
+        self.asked = Some(t);
+        self.skip_before = None;
+        // No end: the frames a demuxer's own stop would cut (see
+        // `Pipeline::rewind_open_ended`) are frames of the index too.
+        if !crate::streams::open_seek(&self.p.pipeline, flags, t + SEEK_INTO) {
+            return Err(VideoError::media(&self.p.path, "cannot seek"));
+        }
         self.p.settle(Duration::from_secs(20))
+    }
+
+    /// The first frame after a seek for `t` carries `t` where the decoder
+    /// stamped it with the seek's time (cut there) or it starts past `t`
+    /// by no more than rounding: it is the frame asked for.
+    fn first_after_seek(&mut self, mut f: Frame) -> Frame {
+        if let Some(t) = self.asked.take()
+            && f.time > t
+            && f.time <= t + SEEK_INTO
+        {
+            f.time = t;
+        }
+        f
     }
 
     fn frame_of(&self, sample: &gst::Sample) -> Result<Frame> {
@@ -220,13 +281,7 @@ impl Decoder {
         let buffer = sample
             .buffer()
             .ok_or_else(|| VideoError::Gst("a sample without a frame".into()))?;
-        let time = match (sample.segment(), buffer.pts()) {
-            (Some(seg), Some(pts)) => seg
-                .downcast_ref::<gst::ClockTime>()
-                .and_then(|s| s.to_stream_time(pts))
-                .map_or(0, crate::ns),
-            _ => 0,
-        };
+        let time = sample_time(sample);
         #[cfg(target_os = "linux")]
         if caps
             .features(0)
@@ -286,18 +341,41 @@ impl Decoder {
     /// The frame showing at `t` ns: exactly (`exact`) or the keyframe at or
     /// before it (at once, for scrubbing). `None` past the end.
     ///
-    /// Ask for a frame by its start ([`crate::FrameIndex::times`]): some
-    /// decoders stamp a frame a seek cut into with the seek's time, so its
-    /// [`Frame::time`] is only its own start when asked for that.
+    /// Ask for a frame by its start ([`crate::FrameIndex::times`]): a frame
+    /// cut by the seek carries the time asked for, so its [`Frame::time`]
+    /// is only its own start when asked for that. (The seek lands
+    /// [`SEEK_INTO`] past `t`, so a time less than that before the next
+    /// frame's start gives the next frame.)
     pub fn frame_at(&mut self, t: i64, exact: bool) -> Result<Option<Frame>> {
         self.seek(t, exact)?;
         let first = match self.sink.try_pull_preroll(self.timeout) {
-            Some(s) => self.frame_of(&s)?,
+            Some(s) => {
+                let f = self.frame_of(&s)?;
+                self.first_after_seek(f)
+            }
             None => return Ok(None),
         };
+        // Short of it: the demuxer could not seek that far (qtdemux stops
+        // a seek at its media's duration, before the frames a B-frame
+        // delay put after it) — on from there.
+        if exact && first.time < t - HAIR {
+            self.p.pipeline.set_state(gst::State::Playing)?;
+            self.playing = true;
+            let mut last = first;
+            while let Some(f) = self.next_frame()? {
+                if f.time > t + HAIR {
+                    break;
+                }
+                let at = f.time >= t - HAIR;
+                last = f;
+                if at {
+                    break;
+                }
+            }
+            return Ok(Some(last));
+        }
         // Past it: the demuxer started at the keyframe after (some MXF
         // index tables) — from further back, decoded up to the frame.
-        const HAIR: i64 = 1_000_000;
         if first.time <= t + HAIR {
             return Ok(Some(first));
         }
@@ -324,10 +402,13 @@ impl Decoder {
         Ok(Some(first))
     }
 
-    /// Play from the frame showing at `t`: [`Self::next_frame`] then gives it
-    /// and the frames after it in order.
+    /// Play from the frame showing at `t` (asked for by its start, as
+    /// [`Self::frame_at`]): [`Self::next_frame`] then gives it and the
+    /// frames after it in order.
     pub fn play_from(&mut self, t: i64) -> Result<()> {
         self.seek(t, true)?;
+        // Frames short of it (see `frame_at`) are passed over.
+        self.skip_before = Some(t - HAIR);
         self.p.pipeline.set_state(gst::State::Playing)?;
         self.playing = true;
         Ok(())
@@ -338,10 +419,22 @@ impl Decoder {
         if !self.playing {
             return Err(VideoError::Gst("not playing".into()));
         }
-        match self.sink.try_pull_sample(self.timeout) {
-            Some(s) => self.frame_of(&s).map(Some),
-            None if self.sink.is_eos() => Ok(None),
-            None => Err(VideoError::media(&self.p.path, "a frame timed out")),
+        loop {
+            let f = match self.sink.try_pull_sample(self.timeout) {
+                Some(s) => {
+                    let f = self.frame_of(&s)?;
+                    self.first_after_seek(f)
+                }
+                None if self.sink.is_eos() => return Ok(None),
+                None => return Err(VideoError::media(&self.p.path, "a frame timed out")),
+            };
+            match self.skip_before {
+                Some(before) if f.time < before => {}
+                _ => {
+                    self.skip_before = None;
+                    return Ok(Some(f));
+                }
+            }
         }
     }
 }

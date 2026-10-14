@@ -52,6 +52,81 @@ fn movie(d: &std::path::Path) -> PathBuf {
     out
 }
 
+/// Frame `n`'s colour in [`numbered_clip`]s (neighbours far apart).
+fn colour(n: u32) -> [u8; 3] {
+    [
+        ((n * 37) % 200 + 20) as u8,
+        ((n * 91) % 200 + 20) as u8,
+        128,
+    ]
+}
+
+/// A clip of `frames` flat-coloured 64×36 frames (frame `n` in
+/// [`colour`]`(n)`) at `num/den` frames a second, MJPEG through `mux`.
+fn numbered_clip(path: &std::path::Path, mux: &str, (num, den): (u64, u64), frames: u32) {
+    use gst::prelude::*;
+    faderframe_video::init().unwrap();
+    let desc = format!(
+        "appsrc name=src format=time caps=video/x-raw,format=RGBA,width=64,height=36,framerate={num}/{den} ! videoconvert ! jpegenc ! {mux} ! filesink name=out"
+    );
+    let pipeline = gst::parse::launch(&desc)
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+    pipeline
+        .by_name("out")
+        .unwrap()
+        .set_property("location", path.to_string_lossy().as_ref());
+    let src = pipeline
+        .by_name("src")
+        .unwrap()
+        .downcast::<gst_app::AppSrc>()
+        .unwrap();
+    pipeline.set_state(gst::State::Playing).unwrap();
+    let at = |n: u32| n as u64 * 1_000_000_000 * den / num;
+    for n in 0..frames {
+        let c = colour(n);
+        let data: Vec<u8> = (0..64 * 36).flat_map(|_| [c[0], c[1], c[2], 255]).collect();
+        let mut buf = gst::Buffer::from_mut_slice(data);
+        {
+            let b = buf.get_mut().unwrap();
+            b.set_pts(gst::ClockTime::from_nseconds(at(n)));
+            b.set_duration(gst::ClockTime::from_nseconds(at(n + 1) - at(n)));
+        }
+        src.push_buffer(buf).unwrap();
+    }
+    src.end_of_stream().unwrap();
+    let msg = pipeline
+        .bus()
+        .unwrap()
+        .timed_pop_filtered(
+            gst::ClockTime::from_seconds(60),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        )
+        .unwrap();
+    if let gst::MessageView::Error(e) = msg.view() {
+        panic!("making {}: {}", path.display(), e.error());
+    }
+    pipeline.set_state(gst::State::Null).unwrap();
+}
+
+/// That the picture shown is frame `n`, not one beside it.
+fn assert_frame(s: &faderframe_session::video::VideoShown, n: u32, what: &str) {
+    let f = &s.picture.as_ref().unwrap().frame;
+    let p = f.pixel(f.width / 2, f.height / 2);
+    let off = |m: u32| -> i32 {
+        let c = colour(m);
+        (0..3).map(|i| (p[i] as i32 - c[i] as i32).abs()).sum()
+    };
+    let nearest = (n.saturating_sub(1)..=n + 1)
+        .min_by_key(|&m| off(m))
+        .unwrap();
+    assert_eq!(
+        nearest, n,
+        "{what}: frame {n} wanted, {p:?} is frame {nearest}'s"
+    );
+}
+
 fn brightness(s: &faderframe_session::video::VideoShown) -> u8 {
     let f = &s.picture.as_ref().unwrap().frame;
     f.pixel(f.width / 2, f.height / 4)[0]
@@ -308,6 +383,241 @@ fn picture_follows_the_engine(recording: bool) {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// Play starts on the frame the playhead stands on. The sound is heard a
+/// latency after it is processed (a long device buffer here: 2048 frames,
+/// 43 ms, more than a frame); until then what is heard is the stopped
+/// position, so the picture waits there too — never the frame before it
+/// (nor no picture at the clip's start) — and then moves on with the
+/// sound.
+#[test]
+fn play_starts_on_the_frame_the_playhead_stands_on() {
+    let _turn = turn();
+    let d = dir("start");
+    let file = movie(&d);
+    let mut s = Session::new(Project::new("Film", 48_000), None, EngineConfig::default()).unwrap();
+    s.import_video(file, false);
+    s.wait_for_video();
+    s.start_audio(
+        vec![Box::new(DummyBackend::default())],
+        &AudioPreferences {
+            buffer_size: Some(2048),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // The clip's start, and frame 50's first sample (two seconds in).
+    for (at, frame) in [(0, 0), (96_000, 50)] {
+        s.dispatch(Action::Transport(TransportAction::Locate(
+            s.engine().samples_to_musical(s.project(), at),
+        )))
+        .unwrap();
+        let v = still(&mut s);
+        assert_eq!((v.frame, v.position), (frame, at));
+        s.dispatch(Action::Transport(TransportAction::Play))
+            .unwrap();
+        let start = Instant::now();
+        let mut shown = Vec::new();
+        // How far the picture is from the playhead heard (the arranger's).
+        let mut apart = Vec::new();
+        while start.elapsed() < Duration::from_millis(300) {
+            s.tick(0.001);
+            let v = s.video_picture(0, (64, 36));
+            apart.push(v.as_ref().map(|v| v.position - s.transport().position));
+            shown.push(v.map(|v| (v.frame, v.position)));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        s.dispatch(Action::Transport(TransportAction::Stop))
+            .unwrap();
+        let stopped_by = Instant::now() + Duration::from_secs(5);
+        while s.transport().playing {
+            assert!(Instant::now() < stopped_by, "still playing");
+            s.tick(0.01);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let first_wrong = shown
+            .iter()
+            .position(|v| v.is_none_or(|(f, p)| f < frame || p < at));
+        assert!(
+            first_wrong.is_none(),
+            "from frame {frame}: {:?} shown at poll {} (a millisecond apart)",
+            shown[first_wrong.unwrap_or(0)],
+            first_wrong.unwrap_or(0),
+        );
+        assert_eq!(shown[0], Some((frame, at)), "the frame standing first");
+        let frames: Vec<usize> = shown.iter().flatten().map(|v| v.0).collect();
+        assert!(frames.windows(2).all(|w| w[1] >= w[0]), "never back");
+        assert!(
+            *frames.last().unwrap() >= frame + 4,
+            "played on: {frames:?}"
+        );
+        // The picture is the one for the sound heard, all along.
+        let worst = apart.iter().flatten().map(|d| d.abs()).max().unwrap();
+        eprintln!("from frame {frame}: at most {worst} samples from the playhead heard");
+        assert!(worst < 1920, "{worst} samples from the playhead heard");
+    }
+    s.stop_audio();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A locate right after Stop shows its target at once and stays there —
+/// the playhead and the picture never show where playback stopped in
+/// between: whether the engine applies both in one callback, or the stop
+/// first (a click a few milliseconds after Stop, callbacks in between).
+/// The stop is a jump too, and it released the shown target before the
+/// locate had landed; the picture, still playing until the next tick,
+/// showed where the sound was.
+#[test]
+fn a_locate_right_after_stop_shows_its_target() {
+    let _turn = turn();
+    let d = dir("stop-locate");
+    let file = movie(&d);
+    let mut s = Session::new(Project::new("Film", 48_000), None, EngineConfig::default()).unwrap();
+    s.import_video(file, false);
+    s.wait_for_video();
+    // 256 frames: a callback every 5 ms.
+    s.start_audio(
+        vec![Box::new(DummyBackend::default())],
+        &AudioPreferences::default(),
+    )
+    .unwrap();
+    for round in 0..6i64 {
+        s.dispatch(Action::Transport(TransportAction::Play))
+            .unwrap();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(250) {
+            s.tick(0.01);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let target = 96_000 + round * 1920;
+        s.dispatch(Action::Transport(TransportAction::Stop))
+            .unwrap();
+        if round % 2 == 1 {
+            // The engine stops before the locate comes (the session not
+            // ticked meanwhile, as between two clicks).
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        s.dispatch(Action::Transport(TransportAction::Locate(
+            s.engine().samples_to_musical(s.project(), target),
+        )))
+        .unwrap();
+        let start = Instant::now();
+        let mut shown = Vec::new();
+        while start.elapsed() < Duration::from_millis(300) {
+            s.tick(0.002);
+            let picture = s.video_picture(0, (64, 36)).map(|v| v.position);
+            shown.push((s.transport().position, picture));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let wrong = shown
+            .iter()
+            .position(|&(p, v)| p != target || v != Some(target));
+        assert!(
+            wrong.is_none(),
+            "round {round}: {:?} shown at poll {} (playhead, picture), the target {target}",
+            shown[wrong.unwrap_or(0)],
+            wrong.unwrap_or(0)
+        );
+        assert!(!s.transport().playing);
+    }
+    s.stop_audio();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A timecode typed lands on its frame: the counter reads it back and the
+/// picture is that frame — at the rates whose frames start between two
+/// samples (29.97, 23.976 and 59.94, drop-frame or not, through a
+/// drop-frame minute; 44.1 and 48 kHz), from files with exact frame times
+/// (QuickTime) and rounded ones (Matroska's milliseconds), and with the
+/// clip spotted to a label that starts between two samples. (The nearest
+/// sample to a label lay before its frame for up to half of them: the
+/// counter and the picture showed the frame before.)
+#[test]
+fn typed_timecodes_land_on_their_frames() {
+    use faderframe_core::timecode::{FrameRate::*, Timecode};
+    use faderframe_project::video::ProjectTimecode;
+    use faderframe_session::{CounterUnit, format_position, parse_position};
+    let _turn = turn();
+    let d = dir("timecode");
+    const N: u32 = 60;
+    let rates: [((u64, u64), &[FrameRate]); 3] = [
+        ((30_000, 1001), &[Fps2997, Fps2997Drop]),
+        ((24_000, 1001), &[Fps23976]),
+        ((60_000, 1001), &[Fps5994, Fps5994Drop]),
+    ];
+    for (fps, labels) in rates {
+        for (mux, ext) in [("qtmux", "mov"), ("matroskamux", "mkv")] {
+            let file = d.join(format!("{}.{ext}", fps.0));
+            numbered_clip(&file, mux, fps, N);
+            for sr in [44_100, 48_000] {
+                for &rate in labels {
+                    let what = |label: Timecode| {
+                        format!("{} {ext} at {sr} Hz: {}", rate.id(), label.display(rate))
+                    };
+                    // Labels through a drop-frame minute (00:01:00;00 and
+                    // ;01 are skipped at 29.97 drop-frame).
+                    let start = Timecode::parse("00:00:59:00", rate).unwrap();
+                    let tc = ProjectTimecode { rate, start };
+                    let first = start.total_frames(rate);
+                    let config = EngineConfig {
+                        sample_rate: sr,
+                        ..EngineConfig::default()
+                    };
+                    let mut s = Session::new(Project::new("TC", sr), None, config).unwrap();
+                    s.edit(faderframe_project::Command::SetTimecode { timecode: Some(tc) })
+                        .unwrap();
+                    s.import_video(file.clone(), false);
+                    s.wait_for_video();
+                    // Spotted at the clip's start, then at the label of
+                    // frame 7 (between two samples at these rates).
+                    for spot in [0, 7] {
+                        if spot > 0 {
+                            let mut video = s.project().video.clone();
+                            video.tracks[0].clips[0].start = rate.first_sample(spot, sr);
+                            s.edit(faderframe_project::Command::SetVideo {
+                                video: Box::new(video),
+                            })
+                            .unwrap();
+                        }
+                        for k in 0..N as i64 - 1 {
+                            let label = Timecode::from_frames(first + spot + k, rate);
+                            let text = label.display(rate);
+                            let timeline = s.project().timeline.clone();
+                            let at =
+                                parse_position(&text, CounterUnit::Timecode, &timeline, sr, tc)
+                                    .unwrap();
+                            s.dispatch(Action::Transport(TransportAction::Locate(at)))
+                                .unwrap();
+                            let pos = s.transport().position;
+                            assert_eq!(pos, rate.first_sample(spot + k, sr), "{}", what(label));
+                            assert_eq!(
+                                format_position(s.project(), pos, CounterUnit::Timecode),
+                                text,
+                                "{}: the counter",
+                                what(label)
+                            );
+                            let v = s.video_picture(0, (64, 36)).unwrap();
+                            assert_eq!(v.frame, k as usize, "{}: the picture", what(label));
+                        }
+                    }
+                    // The pictures themselves (the clip at frame 7's label).
+                    for k in [1u32, 2, 3, 5, 8, 13] {
+                        let label = Timecode::from_frames(first + 7 + k as i64, rate);
+                        let at = s
+                            .engine()
+                            .samples_to_musical(s.project(), tc.position_of(label, sr));
+                        s.dispatch(Action::Transport(TransportAction::Locate(at)))
+                            .unwrap();
+                        let v = still(&mut s);
+                        assert_eq!(v.frame, k as usize);
+                        assert_frame(&v, k, &what(label));
+                    }
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// The cache: what a movie leaves there (its index), cleared on request,
 /// and moved elsewhere by the settings.
 #[test]
@@ -501,6 +811,26 @@ fn the_picture_goes_to_an_output_of_its_own() {
     // The picture moves with the sound: about two seconds in.
     let last = last.expect("a picture, not black");
     assert!((25..=60).contains(&last), "frame {last} after 2 s");
+    // Stopped on frame 50's first sample: frame 50, not the one the
+    // sound's latency back.
+    let stopped_by = Instant::now() + Duration::from_secs(5);
+    while s.transport().playing {
+        assert!(Instant::now() < stopped_by, "still playing");
+        s.tick(0.01);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    s.dispatch(Action::Transport(TransportAction::Locate(
+        s.engine().samples_to_musical(s.project(), 96_000),
+    )))
+    .unwrap();
+    let shown_by = Instant::now() + Duration::from_secs(5);
+    let mut last = None;
+    while Instant::now() < shown_by && last != Some(50) {
+        s.tick(0.01);
+        last = s.picture_output().and_then(|(_, _, l)| l);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(last, Some(50), "the frame stopped on");
     s.set_picture_output(None).unwrap();
     assert!(s.picture_output().is_none());
     s.stop_audio();

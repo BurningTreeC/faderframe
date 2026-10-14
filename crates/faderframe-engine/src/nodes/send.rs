@@ -3,6 +3,7 @@ use super::{AUTOMATION_STEP, automation_at, ramp_step};
 use crate::context::EngineContext;
 use crate::slots::{MixSlots, StripSlots};
 use faderframe_audio_graph::{NodeIo, ProcessContext, Processor};
+use faderframe_core::pan::{self, PanLaw, PanMatrix};
 use faderframe_core::{ChannelLayout, SendId, SurroundPan, TrackId, db_to_gain};
 use faderframe_realtime::ParamSlot;
 
@@ -15,10 +16,21 @@ use faderframe_realtime::ParamSlot;
 /// places (a bed folded into a stereo reverb). An automated level (and
 /// panner) is evaluated every [`AUTOMATION_STEP`] frames and ramped in
 /// between.
+///
+/// With a pan slot holding a position (not NaN), a mono or stereo tap into
+/// a stereo destination is placed there: a mono tap by the project's pan
+/// law, a stereo one balanced (as the strip places them), every
+/// source/destination pair ramped. NaN leaves it as tapped (the graph's
+/// channel rule: a mono tap at unity on both sides).
 pub struct SendNode {
     track: TrackId,
-    send: SendId,
+    /// Its automation lanes' key (`None`: a cue mix's send, not automated).
+    send: Option<SendId>,
     level: ParamSlot,
+    /// Its pan (see above).
+    pan: Option<ParamSlot>,
+    /// Each pair's gain at the end of the last range, panned (NaN: none).
+    pairs: PanMatrix,
     current: f32,
     /// Rendered ahead: shows nothing (a [`super::StripEcho`] does).
     quiet: bool,
@@ -35,14 +47,63 @@ impl SendNode {
     pub fn new(track: TrackId, send: SendId, level: ParamSlot) -> Self {
         Self {
             track,
-            send,
+            send: Some(send),
             level,
+            pan: None,
+            pairs: [[f32::NAN; 2]; 2],
             current: f32::NAN,
             quiet: false,
             mix: None,
             follow: None,
             shared: None,
             input_latency: 0,
+        }
+    }
+
+    /// A track's send to a cue mix: its level (0 while off) and pan.
+    pub fn cue(track: TrackId, level: ParamSlot, pan: ParamSlot) -> Self {
+        Self {
+            send: None,
+            pan: Some(pan),
+            ..Self::new(track, SendId(0), level)
+        }
+    }
+
+    /// Panned by `pan` (see the type).
+    pub fn with_pan(self, pan: ParamSlot) -> Self {
+        Self {
+            pan: Some(pan),
+            ..self
+        }
+    }
+
+    /// Frames `off..off + m` of a mono or stereo `input` added into the
+    /// stereo `out` through `place`, each pair reaching its gain there at
+    /// the end of the range.
+    fn render_panned(
+        &mut self,
+        input: &faderframe_audio_graph::AudioBuffer,
+        out: &mut faderframe_audio_graph::AudioBuffer,
+        off: usize,
+        m: usize,
+        place: PanMatrix,
+    ) {
+        let ins = input.num_channels().min(2);
+        for (s, (row, pairs)) in place.iter().zip(&mut self.pairs).enumerate().take(ins) {
+            let src = &input.channel(s)[off..off + m];
+            for (d, (&to, pair)) in row.iter().zip(pairs.iter_mut()).enumerate() {
+                let from = if pair.is_nan() { to } else { *pair };
+                *pair = to;
+                if from == 0.0 && to == 0.0 {
+                    continue;
+                }
+                let step = ramp_step(from, to, m);
+                let mut g = from;
+                for (o, &x) in out.channel_mut(d)[off..off + m].iter_mut().zip(src) {
+                    g += step;
+                    *o += x * g;
+                }
+            }
         }
     }
 
@@ -91,7 +152,7 @@ impl Processor<EngineContext> for SendNode {
     fn process(&mut self, cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
         let static_level = cx.data.params.get(self.level);
         let auto = cx.data.timeline.automation(self.track);
-        let lane = auto.and_then(|a| a.send(self.send));
+        let lane = self.send.and_then(|send| auto.and_then(|a| a.send(send)));
         let pan_lanes = auto
             .map(|a| &a.surround)
             .filter(|l| self.follow.is_some() && l.iter().any(Option::is_some));
@@ -102,12 +163,57 @@ impl Processor<EngineContext> for SendNode {
         let (Some(input), Some(out)) = (io.audio_in.first(), io.audio_out.first_mut()) else {
             return;
         };
+        let n = io.frames;
+        // Panned (a mono or stereo tap into stereo, a position set).
+        let position = self
+            .pan
+            .map(|s| cx.data.params.get(s))
+            .filter(|p| !p.is_nan());
+        if let Some(position) = position.filter(|_| {
+            self.mix.is_none() && out.num_channels() == 2 && (1..=2).contains(&input.num_channels())
+        }) {
+            out.clear();
+            let law = self.shared.map_or(PanLaw::default(), |s| {
+                PanLaw::from_index(cx.data.params.get(s.pan_law))
+            });
+            let position = pan::position(position);
+            let place = if input.num_channels() == 1 {
+                pan::mono_pan(law, position)
+            } else {
+                pan::balance(position)
+            };
+            let step = if lane.is_some() {
+                AUTOMATION_STEP
+            } else {
+                n.max(1)
+            };
+            let mut off = 0;
+            while off < n {
+                let m = step.min(n - off);
+                let target = lane
+                    .and_then(|l| l.value_at(automation_at(cx, self.input_latency, off + m)))
+                    .map_or(static_level, |db| db_to_gain(db as f32));
+                // Silent and staying so: nothing to add.
+                if target == 0.0 && self.current == 0.0 {
+                    self.pairs = [[0.0; 2]; 2];
+                } else {
+                    self.render_panned(input, out, off, m, pan::scaled(place, target));
+                }
+                self.current = target;
+                off += m;
+            }
+            if lane.is_some() && !self.quiet {
+                cx.data.readback.set(self.level, self.current);
+            }
+            return;
+        }
+        // Unpanned from here on: the pairs start again when it is panned.
+        self.pairs = [[f32::NAN; 2]; 2];
         if self.mix.is_some() {
             out.clear();
         } else {
             out.copy_from(input);
         }
-        let n = io.frames;
         let step = if lane.is_some() || pan_lanes.is_some() || balance_lane.is_some() {
             AUTOMATION_STEP
         } else {

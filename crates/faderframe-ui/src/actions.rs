@@ -193,6 +193,27 @@ pub fn install(app: &Rc<AppState>) {
         dispatch(app, "add-vca", A::AddTrack(TrackKind::Vca)),
         dispatch(app, "group-selected", A::GroupSelectedTracks),
         dispatch(app, "remove-tracks", A::RemoveSelectedTracks),
+        dispatch(
+            app,
+            "input-quantize",
+            A::Transport(faderframe_session::TransportAction::ToggleInputQuantize),
+        ),
+        dispatch(
+            app,
+            "duplicate-tracks",
+            A::DuplicateTracks {
+                tracks: Vec::new(),
+                content: false,
+            },
+        ),
+        dispatch(
+            app,
+            "duplicate-tracks-content",
+            A::DuplicateTracks {
+                tracks: Vec::new(),
+                content: true,
+            },
+        ),
         dispatch(app, "arm-selected", A::ToggleArmSelected),
         entry(app, "save-track-preset", |a| {
             let tracks: Vec<_> = a
@@ -719,6 +740,7 @@ pub fn install(app: &Rc<AppState>) {
                 "cut" => Action::CutRange,
                 "paste" => Action::PasteRange,
                 "duplicate" => Action::RepeatRange(1),
+                "merge-clips" => Action::MergeClips(clips),
                 "quantize" => Action::QuantizeClips(clips),
                 "humanize" => Action::HumanizeClips(clips),
                 "separate-transients" => Action::SeparateAtTransients(clips),
@@ -1929,38 +1951,81 @@ pub fn install(app: &Rc<AppState>) {
             a.dispatch(Action::TempoFromHits(req));
         }),
         // Development aid: `lead-sheet:<track>[@auto|straight|triplets]`
-        // (its first clip) and `export-lead-sheet:<path.pdf|.musicxml>`.
+        // (its first clip; `track:<track>` the whole track,
+        // `tracks:<a>|<b>…` a score of those tracks, `selected` the
+        // selected clips) and `export-lead-sheet:<path.pdf|.musicxml>`.
         named("lead-sheet", |a, arg| {
-            use faderframe_session::leadsheet::Grid;
+            use faderframe_session::leadsheet::{Grid, LeadSheetOf};
             let (name, grid) = match arg.split_once('@') {
                 Some((n, "straight")) => (n, Grid::Straight),
                 Some((n, "triplets")) => (n, Grid::Triplets),
                 Some((n, _)) => (n, Grid::Auto),
                 None => (arg, Grid::Auto),
             };
-            // `track:<name>` for the whole track, else its first clip.
-            let (whole, name) = match name.strip_prefix("track:") {
-                Some(n) => (true, n),
-                None => (false, name),
-            };
             let of = {
                 let s = a.session.borrow();
-                let t = s.project().tracks.iter().find(|t| t.name == name);
-                match (t, whole) {
-                    (Some(t), true) => {
-                        Some(faderframe_session::leadsheet::LeadSheetOf::Track(t.id))
-                    }
-                    (Some(t), false) => t
-                        .clips
-                        .first()
-                        .map(|c| faderframe_session::leadsheet::LeadSheetOf::Clip(*c)),
-                    (None, _) => None,
+                let track = |name: &str| s.project().tracks.iter().find(|t| t.name == name);
+                if let Some(names) = name.strip_prefix("tracks:") {
+                    let tracks: Vec<_> = names
+                        .split('|')
+                        .filter_map(|n| track(n).map(|t| t.id))
+                        .collect();
+                    (!tracks.is_empty()).then_some(LeadSheetOf::Tracks(tracks))
+                } else if name == "selected" {
+                    let clips: Vec<_> = s.selection.clips.iter().copied().collect();
+                    (!clips.is_empty()).then_some(LeadSheetOf::Clips(clips))
+                } else if let Some(name) = name.strip_prefix("track:") {
+                    track(name).map(|t| LeadSheetOf::Track(t.id))
+                } else {
+                    track(name)
+                        .and_then(|t| t.clips.first())
+                        .map(|c| LeadSheetOf::Clip(*c))
                 }
             };
             match of {
                 Some(of) => a.dispatch(Action::MakeLeadSheet { of, grid }),
                 None => tracing::warn!("lead-sheet: no clip on '{name}'"),
             }
+        }),
+        // Development aid: `guitar-tab:<track>` (the whole track) and
+        // `sheet-style:<notes|notes-tab|tab>[@<tuning n>][/<capo>]`.
+        named("guitar-tab", |a, arg| {
+            let of = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == arg)
+                .map(|t| faderframe_session::leadsheet::LeadSheetOf::Track(t.id));
+            match of {
+                Some(of) => a.dispatch(Action::MakeTab { of }),
+                None => tracing::warn!("guitar-tab: no track '{arg}'"),
+            }
+        }),
+        named("sheet-style", |a, arg| {
+            use faderframe_session::leadsheet::Notation;
+            let mut style = a.session.borrow().sheet_style();
+            let (rest, capo) = match arg.split_once('/') {
+                Some((r, c)) => (r, c.parse().ok()),
+                None => (arg, None),
+            };
+            let (notation, tuning) = match rest.split_once('@') {
+                Some((n, t)) => (n, t.parse().ok()),
+                None => (rest, None),
+            };
+            style.notation = match notation {
+                "notes-tab" => Notation::WithTab,
+                "tab" => Notation::Tab,
+                _ => Notation::Standard,
+            };
+            if let Some(t) = tuning {
+                style.tuning = t;
+            }
+            if let Some(c) = capo {
+                style.capo = c;
+            }
+            a.dispatch(Action::SetSheetStyle(style));
         }),
         named("export-lead-sheet", |a, arg| {
             a.dispatch(Action::ExportLeadSheet(std::path::PathBuf::from(arg)));
@@ -2043,6 +2108,22 @@ pub fn install(app: &Rc<AppState>) {
                         on: true,
                     },
                     Err(_) => return,
+                },
+                Some(("remove", v)) => match v.parse::<usize>() {
+                    Ok(n) => PitchOp::RemoveNotes { notes: vec![n] },
+                    Err(_) => return,
+                },
+                // The end of note n later (or earlier) by seconds.
+                Some(("length", v)) => match pair(v) {
+                    Some((n, seconds)) => {
+                        let rate = f64::from(a.session.borrow().project().sample_rate);
+                        PitchOp::Length {
+                            notes: vec![n],
+                            edge: faderframe_project::pitch::Edge::End,
+                            by: (f64::from(seconds) * rate).round() as i64,
+                        }
+                    }
+                    None => return,
                 },
                 Some(("gain", v)) => match pair(v) {
                     Some((n, db)) => PitchOp::Gain { notes: vec![n], db },
@@ -2199,6 +2280,25 @@ pub fn install(app: &Rc<AppState>) {
                     channel: None,
                 },
             }));
+        }),
+        // Development aid: `voice-calibrate:<n|cancel|forget|state>` —
+        // calibrate Voice to MIDI on input n (the room for three seconds,
+        // then the performance for eight; `state` logs where it is).
+        named("voice-calibrate", |a, arg| {
+            let mut s = a.session.borrow_mut();
+            match arg {
+                "cancel" => s.cancel_voice_calibration(),
+                "forget" => s.forget_voice_calibration(),
+                "state" => tracing::info!(
+                    "voice-calibrate: {:?}; {:?}",
+                    s.voice_calibration(),
+                    s.voice_settings()
+                ),
+                n => match n.parse::<u16>().ok().and_then(|n| n.checked_sub(1)) {
+                    Some(input) => s.start_voice_calibration(input),
+                    None => tracing::warn!("voice-calibrate: '{n}' is not <n|cancel|forget|state>"),
+                },
+            }
         }),
         named("access-key", |a, arg| {
             use faderframe_ui_canvas::{Key, Modifiers};

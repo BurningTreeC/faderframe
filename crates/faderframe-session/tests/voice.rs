@@ -7,7 +7,7 @@ use faderframe_audio::dummy::DummyBackend;
 use faderframe_core::{TrackId, builtin};
 use faderframe_engine::EngineConfig;
 use faderframe_project::{ClipContent, Command, InputRouting, PluginRef, Project, TrackKind};
-use faderframe_session::voice::{voice_all_port_key, voice_port_key};
+use faderframe_session::voice::{VoiceCalibration, voice_all_port_key, voice_port_key};
 use faderframe_session::{Action, AudioPreferences, Session, TransportAction};
 use std::time::{Duration, Instant};
 
@@ -230,4 +230,68 @@ fn the_all_inputs_port_puts_each_input_on_its_own_channel() {
     assert_eq!(s.voice_listening(), [0]);
     assert_eq!(s.held_midi_keys(), 1u128 << 57);
     s.stop_audio();
+}
+
+/// A calibration hears the room (the device's silent first second), then
+/// the singer (its tone), and sets the sensitivity between them and the
+/// dynamics velocities span; no track needs to take the input.
+#[test]
+fn calibration_hears_the_room_then_the_singer() {
+    let mut s = Session::new(
+        Project::new("Calibrate", 48_000),
+        None,
+        EngineConfig::default(),
+    )
+    .unwrap();
+    s.start_audio(
+        vec![Box::new(DummyBackend::with_input_spread(220.0, 4.0))],
+        &AudioPreferences::default(),
+    )
+    .unwrap();
+    run(&mut s, Duration::from_millis(50));
+    s.start_voice_calibration_for(1, Duration::from_millis(700), Duration::from_millis(1500));
+    run(&mut s, Duration::from_millis(100));
+    assert_eq!(s.voice_listening(), [1], "listening without a track");
+    assert!(
+        matches!(s.voice_calibration(), Some(VoiceCalibration::Room { .. })),
+        "{:?}",
+        s.voice_calibration()
+    );
+    let start = Instant::now();
+    while !matches!(s.voice_calibration(), Some(VoiceCalibration::Done(_)))
+        && start.elapsed() < Duration::from_secs(5)
+    {
+        run(&mut s, Duration::from_millis(20));
+    }
+    let Some(VoiceCalibration::Done(Ok(c))) = s.voice_calibration() else {
+        panic!("{:?}", s.voice_calibration());
+    };
+    // The tone (a 0.5 sine: −9 dBFS) was the performance, the silence the
+    // room.
+    assert!((c.dynamics.loud_db + 9.0).abs() <= 2.0, "{c:?}");
+    assert!(c.room_db < -100.0, "{c:?}");
+    assert!((-100.0..-30.0).contains(&c.threshold_db), "{c:?}");
+    let settings = s.voice_settings();
+    assert_eq!(settings.threshold_db, c.threshold_db.round());
+    assert!(settings.dynamics.is_some());
+    // The calibration's listener has gone; forgetting it brings the
+    // defaults back.
+    run(&mut s, Duration::from_millis(50));
+    assert!(s.voice_listening().is_empty());
+    s.forget_voice_calibration();
+    assert_eq!(s.voice_settings().dynamics, None);
+    assert_eq!(s.voice_calibration(), None);
+    s.stop_audio();
+    // Without a device there is nothing to hear.
+    s.start_voice_calibration(0);
+    assert!(
+        matches!(
+            s.voice_calibration(),
+            Some(VoiceCalibration::Done(Err(
+                faderframe_analysis::voice::CalibrationError::NoInput
+            )))
+        ),
+        "{:?}",
+        s.voice_calibration()
+    );
 }

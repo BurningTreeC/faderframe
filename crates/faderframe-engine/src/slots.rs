@@ -2,7 +2,7 @@
 
 use faderframe_automation::AutomationTarget;
 use faderframe_core::surround::SURROUND_VALUES;
-use faderframe_core::{AutomationLaneId, PluginInstanceId, SendId, TrackId};
+use faderframe_core::{AutomationLaneId, CueId, PluginInstanceId, SendId, TrackId};
 use faderframe_project::Project;
 use faderframe_realtime::{MeterRange, ParamSlot, ParamTable, SlotAllocator};
 use std::collections::{HashMap, HashSet};
@@ -54,6 +54,15 @@ impl MixSlots {
     }
 }
 
+/// Parameter slots of a track's send to a cue mix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CueSendSlots {
+    /// Linear gain; 0 while the send is off.
+    pub gain: ParamSlot,
+    /// −1…1 (a mono tap by the pan law, a stereo one's balance).
+    pub pan: ParamSlot,
+}
+
 /// Parameter slots of a container's chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChainSlots {
@@ -73,6 +82,10 @@ pub struct SlotRegistry {
     meters: SlotAllocator,
     strips: HashMap<TrackId, StripSlots>,
     sends: HashMap<SendId, ParamSlot>,
+    /// Sends' pans (NaN: unpanned).
+    send_pans: HashMap<SendId, ParamSlot>,
+    /// Tracks' sends to cue mixes.
+    cue_sends: HashMap<(TrackId, CueId), CueSendSlots>,
     track_meters: HashMap<TrackId, MeterRange>,
     /// How many of its meter channels a track's strip uses now (the range
     /// keeps its size when a track goes back to fewer channels).
@@ -105,6 +118,8 @@ impl SlotRegistry {
             meters: SlotAllocator::new(meter_capacity),
             strips: HashMap::new(),
             sends: HashMap::new(),
+            send_pans: HashMap::new(),
+            cue_sends: HashMap::new(),
             track_meters: HashMap::new(),
             metered: HashMap::new(),
             midi_live: HashMap::new(),
@@ -263,6 +278,41 @@ impl SlotRegistry {
         Ok(slot)
     }
 
+    /// The pan of a send (NaN while it is unpanned).
+    pub fn send_pan(&mut self, send: SendId) -> Result<ParamSlot, SlotsExhausted> {
+        if let Some(s) = self.send_pans.get(&send) {
+            return Ok(*s);
+        }
+        let slot = ParamSlot(
+            self.params
+                .allocate(1)
+                .ok_or(SlotsExhausted("parameters"))?,
+        );
+        self.send_pans.insert(send, slot);
+        Ok(slot)
+    }
+
+    /// The slots of `track`'s send to cue mix `cue`.
+    pub fn cue_send(&mut self, track: TrackId, cue: CueId) -> Result<CueSendSlots, SlotsExhausted> {
+        if let Some(s) = self.cue_sends.get(&(track, cue)) {
+            return Ok(*s);
+        }
+        let base = self
+            .params
+            .allocate(2)
+            .ok_or(SlotsExhausted("parameters"))?;
+        let s = CueSendSlots {
+            gain: ParamSlot(base),
+            pan: ParamSlot(base + 1),
+        };
+        self.cue_sends.insert((track, cue), s);
+        Ok(s)
+    }
+
+    pub fn cue_send_of(&self, track: TrackId, cue: CueId) -> Option<CueSendSlots> {
+        self.cue_sends.get(&(track, cue)).copied()
+    }
+
     /// The meter channels of a track's strip, at least `channels` of them
     /// (a range too small for a new format is replaced).
     pub fn meter(&mut self, track: TrackId, channels: usize) -> Result<MeterRange, SlotsExhausted> {
@@ -306,7 +356,14 @@ impl SlotRegistry {
 
     /// Release slots of tracks/sends that no longer exist.
     pub fn retain_project(&mut self, project: &Project) {
-        let tracks: HashSet<TrackId> = project.tracks.iter().map(|t| t.id).collect();
+        // A cue mix's own channel (its master strip, meters) is keyed like
+        // a track's.
+        let tracks: HashSet<TrackId> = project
+            .tracks
+            .iter()
+            .map(|t| t.id)
+            .chain(project.cue_mixes.iter().map(|c| c.channel()))
+            .collect();
         let sends: HashSet<SendId> = project
             .tracks
             .iter()
@@ -324,6 +381,21 @@ impl SlotRegistry {
             let keep = sends.contains(id);
             if !keep {
                 params.release(s.0, 1);
+            }
+            keep
+        });
+        self.send_pans.retain(|id, s| {
+            let keep = sends.contains(id);
+            if !keep {
+                params.release(s.0, 1);
+            }
+            keep
+        });
+        let cues: HashSet<CueId> = project.cue_mixes.iter().map(|c| c.id).collect();
+        self.cue_sends.retain(|(t, c), s| {
+            let keep = tracks.contains(t) && cues.contains(c);
+            if !keep {
+                params.release(s.gain.0, 2);
             }
             keep
         });
@@ -435,6 +507,20 @@ impl SlotRegistry {
             for send in &t.sends {
                 let slot = self.send(send.id)?;
                 table.set(slot, faderframe_core::db_to_gain(send.level_db));
+                let pan = self.send_pan(send.id)?;
+                table.set(pan, send.pan.unwrap_or(f32::NAN));
+            }
+            // Every cue mix it feeds (a send it has none of is silent).
+            if faderframe_project::cue::feeds_cues(t.kind) {
+                for c in &project.cue_mixes {
+                    let s = self.cue_send(t.id, c.id)?;
+                    let send = t.cue_send(c.id);
+                    let gain = send
+                        .filter(|s| s.on)
+                        .map_or(0.0, |s| faderframe_core::db_to_gain(s.level_db));
+                    table.set(s.gain, gain);
+                    table.set(s.pan, send.map_or(0.0, |s| s.pan));
+                }
             }
             for (container, chains) in &t.containers {
                 for (i, c) in chains.iter().enumerate() {
@@ -450,6 +536,27 @@ impl SlotRegistry {
                     );
                     table.set(s.pan, c.pan);
                 }
+            }
+        }
+        // The cue mixes' own channels: their level and mute (nothing else
+        // of a strip moves there).
+        for c in &project.cue_mixes {
+            let s = self.strip(c.channel())?;
+            table.set(s.volume, faderframe_core::db_to_gain(c.level_db));
+            table.set(s.mute, if c.mute { 1.0 } else { 0.0 });
+            table.set(s.pan, 0.0);
+            table.set(s.pan_mode, 0.0);
+            table.set(s.pan_left, -1.0);
+            table.set(s.pan_right, 1.0);
+            table.set(s.phase, 0.0);
+            table.set(s.solo_mute, 0.0);
+            table.set(s.vca, 1.0);
+            for (slot, v) in s
+                .surround
+                .iter()
+                .zip(faderframe_core::SurroundPan::default().values())
+            {
+                table.set(*slot, v);
             }
         }
         Ok(())

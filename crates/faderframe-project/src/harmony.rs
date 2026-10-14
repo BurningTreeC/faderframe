@@ -124,6 +124,51 @@ pub fn set_key(keys: &[KeyChange], at: MusicalTime, key: Option<Key>) -> Vec<Key
     out
 }
 
+/// `keys` with `key` over `start..end`: changes inside give way, and the
+/// key that was in effect at `end` carries on from there.
+pub fn set_key_span(
+    keys: &[KeyChange],
+    start: MusicalTime,
+    end: MusicalTime,
+    key: Key,
+) -> Vec<KeyChange> {
+    if end <= start {
+        return set_key(keys, start, Some(key));
+    }
+    let after = keys.iter().rev().find(|k| k.at <= end).map(|k| k.key);
+    let mut out: Vec<KeyChange> = keys
+        .iter()
+        .copied()
+        .filter(|k| k.at < start || k.at >= end)
+        .collect();
+    out.push(KeyChange { at: start, key });
+    if let Some(after) = after
+        && !out.iter().any(|k| k.at == end)
+    {
+        out.push(KeyChange {
+            at: end,
+            key: after,
+        });
+    }
+    normalize_keys(&mut out);
+    out
+}
+
+/// `keys` with the change at `from` moved to `to` (replacing one there).
+pub fn move_key(keys: &[KeyChange], from: MusicalTime, to: MusicalTime) -> Vec<KeyChange> {
+    let Some(moving) = keys.iter().find(|k| k.at == from).copied() else {
+        return keys.to_vec();
+    };
+    let mut out: Vec<KeyChange> = keys
+        .iter()
+        .copied()
+        .filter(|k| k.at != from && k.at != to)
+        .collect();
+    out.push(KeyChange { at: to, ..moving });
+    normalize_keys(&mut out);
+    out
+}
+
 /// A note for detection: where it sounds and its pitch.
 #[derive(Clone, Copy, Debug)]
 pub struct Sounding {

@@ -171,18 +171,28 @@ pub fn page(app: &Rc<AppState>, row: impl Fn(&gtk::Grid, i32, &str, &gtk::Widget
     off_box.append(&off_on);
     off_box.append(&off);
     row(&g, 7, "Off-beats", off_box.upcast_ref());
+    let main_on = gtk::Switch::new();
+    main_on.set_active(m.main_outputs);
+    main_on.set_halign(gtk::Align::Start);
+    main_on.set_valign(gtk::Align::Center);
+    main_on.set_tooltip_text(Some(
+        "Click on the main outputs (the speakers). Off: only in the cue mixes whose click is on \
+         (Audio → Cue Mixes)",
+    ));
+    row(&g, 8, "Main outputs", main_on.upcast_ref());
 
     let help = gtk::Label::new(Some(
         "Off-beats are the eighths between the beats. With an audio file the metronome plays it \
          on every beat (up to two seconds of it, at the levels above); a second file can mark the \
-         first beat of each bar. The metronome is heard live only — renders never contain it.",
+         first beat of each bar. Each cue mix has its own click switch and level (Audio → Cue \
+         Mixes). The metronome is heard live only — renders never contain it.",
     ));
     help.set_wrap(true);
     help.set_max_width_chars(80);
     help.set_natural_wrap_mode(gtk::NaturalWrapMode::Word);
     help.set_xalign(0.0);
     help.add_css_class("dim-label");
-    g.attach(&help, 0, 8, 2, 1);
+    g.attach(&help, 0, 9, 2, 1);
 
     let custom = |s: &gtk::DropDown| {
         MetronomeSound::ALL[s.selected() as usize % MetronomeSound::ALL.len()]
@@ -204,13 +214,14 @@ pub fn page(app: &Rc<AppState>, row: impl Fn(&gtk::Grid, i32, &str, &gtk::Widget
     )));
     let update = {
         let weak = Rc::downgrade(app);
-        let (sound, volume, accent, beat, off_on, off, files) = (
+        let (sound, volume, accent, beat, off_on, off, main_on, files) = (
             sound.clone(),
             volume.clone(),
             accent.clone(),
             beat.clone(),
             off_on.clone(),
             off.clone(),
+            main_on.clone(),
             Rc::clone(&files),
         );
         Rc::new(move || {
@@ -225,6 +236,7 @@ pub fn page(app: &Rc<AppState>, row: impl Fn(&gtk::Grid, i32, &str, &gtk::Widget
                 beat_db: beat.value() as f32,
                 off_beats: off_on.is_active(),
                 off_beat_db: off.value() as f32,
+                main_outputs: main_on.is_active(),
             };
             off.set_sensitive(settings.off_beats);
             if &settings != app.session.borrow().metronome_settings() {
@@ -257,6 +269,10 @@ pub fn page(app: &Rc<AppState>, row: impl Fn(&gtk::Grid, i32, &str, &gtk::Widget
     {
         let u = Rc::clone(&update);
         off_on.connect_active_notify(move |_| u());
+    }
+    {
+        let u = Rc::clone(&update);
+        main_on.connect_active_notify(move |_| u());
     }
     // The files: chosen, or cleared.
     for (which, row, none) in [

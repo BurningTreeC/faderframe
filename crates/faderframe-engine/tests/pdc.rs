@@ -100,6 +100,7 @@ fn send(tp: &mut TestProject, from: TrackId, to: TrackId, tap: SendTap) {
         level_db: 0.0,
         tap,
         enabled: true,
+        pan: None,
     };
     tp.project.track_mut(from).unwrap().sends.push(s);
 }

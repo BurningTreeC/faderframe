@@ -116,6 +116,7 @@ fn post_fader_send_feeds_aux_return() {
         level_db: -6.020_6,
         tap: SendTap::PostFader,
         enabled: true,
+        pan: None,
     };
     tp.project.track_mut(a).unwrap().sends.push(send.clone());
     let out = render_project(&tp.project, &tp.sources, config(), 64, 0, 2048).unwrap();
@@ -315,6 +316,7 @@ fn feedback_routing_is_refused_by_the_project_layer() {
         level_db: 0.0,
         tap: SendTap::PostFader,
         enabled: true,
+        pan: None,
     };
     assert!(
         h.apply(

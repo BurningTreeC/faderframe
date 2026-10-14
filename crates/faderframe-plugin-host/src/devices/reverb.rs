@@ -18,12 +18,27 @@
 //!
 //! Freeze closes the input and makes every band lossless (and stops the
 //! modulation, whose interpolation would dull the loop); ducking turns the
-//! reverb down while the input plays; the wet signal has low and high cuts
-//! and a width.
+//! reverb down while the input plays; the wet signal has low and high cuts,
+//! a low and a high shelf, and a width.
+//!
+//! Grown since the first version (everything new is neutral at its
+//! default, so saved projects sound as they did):
+//! * Spring: two spring lines (left and right, their lengths scaled by the
+//!   size) looping through a chain of twelve second-order allpasses tuned
+//!   between 1.8 and 3.8 kHz — the dispersion that makes a spring's chirp
+//!   (`Chirp`) — and a 4.2 kHz low pass, their feedback set by the decay;
+//!   the springs are the early part and feed the network.
+//! * Cathedral: the longest lines, a 120 ms reflection pattern.
+//! * Shimmer: the late output, pitch shifted (two crossfaded read heads
+//!   over a 50 ms window, `Shifter`), band limited, softly limited and fed
+//!   back in with the input: every pass climbs by the interval.
+//! * The highs' decay multiplier (a third by default), the bass crossover,
+//!   and a pre-delay synced to the song.
 
 use super::{on_off, param, pass_through, pick, stepped};
-use crate::dsp::delay::DelayLine;
+use crate::dsp::delay::{Allpass, DelayLine};
 use crate::dsp::filter::{BandShape, BandType, Filter, OnePole};
+use crate::dsp::lfo::{DIVISIONS, division_name, division_seconds};
 use crate::dsp::smooth::Smoothed;
 use crate::dsp::{db, flush, gain};
 use crate::tap::{AnalysisTap, MeterTap, Watching};
@@ -33,7 +48,7 @@ use crate::{
 };
 use faderframe_audio_graph::NodeIo;
 use faderframe_core::ParameterId;
-use std::f64::consts::{FRAC_1_SQRT_2, TAU};
+use std::f64::consts::{FRAC_1_SQRT_2, PI, TAU};
 use std::sync::Arc;
 
 pub mod id {
@@ -53,6 +68,15 @@ pub mod id {
     pub const MIX: u32 = 13;
     pub const FREEZE: u32 = 14;
     pub const DUCKING: u32 = 15;
+    pub const PRE_SYNC: u32 = 16;
+    pub const PRE_DIVISION: u32 = 17;
+    /// The highs' decay as a multiple of the decay (a third by default).
+    pub const HIGH_DECAY: u32 = 18;
+    pub const BASS_FREQ: u32 = 19;
+    pub const LOW_SHELF: u32 = 20;
+    pub const HIGH_SHELF: u32 = 21;
+    pub const SHIMMER: u32 = 22;
+    pub const SHIMMER_PITCH: u32 = 23;
 }
 
 /// Published: input, output and wet peaks (linear), the ducking (dB).
@@ -64,7 +88,44 @@ pub mod value {
 }
 pub const TAP_VALUES: usize = 4;
 
-pub const TYPES: [&str; 5] = ["Room", "Hall", "Plate", "Chamber", "Ambience"];
+pub const TYPES: [&str; 7] = [
+    "Room",
+    "Hall",
+    "Plate",
+    "Chamber",
+    "Ambience",
+    "Spring",
+    "Cathedral",
+];
+pub const SPRING: usize = 5;
+pub const CATHEDRAL: usize = 6;
+
+/// The shimmer's intervals (name, semitones).
+pub const SHIMMER_PITCHES: [(&str, f64); 7] = [
+    ("−12", -12.0),
+    ("−5", -5.0),
+    ("+5", 5.0),
+    ("+7", 7.0),
+    ("+12", 12.0),
+    ("+19", 19.0),
+    ("+24", 24.0),
+];
+/// The default shimmer interval (an octave up).
+const DEFAULT_SHIMMER_PITCH: f64 = 4.0;
+/// The low shelf's and the high shelf's corners (Hz).
+pub const LOW_SHELF_HZ: f64 = 250.0;
+pub const HIGH_SHELF_HZ: f64 = 4_000.0;
+/// The spring lines' lengths (ms, left and right, at size 1).
+pub const SPRING_MS: [f64; 2] = [33.0, 41.0];
+/// The spring chain's allpasses: tuned between these (Hz).
+pub const CHIRP_HZ: (f64, f64) = (1_800.0, 3_800.0);
+const CHIRP_STAGES: usize = 12;
+/// The spring loop's low pass (Hz).
+const SPRING_LP_HZ: f64 = 4_200.0;
+/// The pitch shifter's window (seconds).
+const SHIFT_WINDOW: f64 = 0.05;
+/// The longest pre-delay (seconds; synced divisions clamp to it).
+pub const MAX_PRE_SECONDS: f64 = 1.0;
 
 /// A type's voicing.
 pub struct Voicing {
@@ -78,7 +139,7 @@ pub struct Voicing {
     pub late: f64,
 }
 
-pub const VOICINGS: [Voicing; 5] = [
+pub const VOICINGS: [Voicing; 7] = [
     Voicing {
         lines: (7.0, 33.0),
         early: (38.0, 0.9),
@@ -109,7 +170,31 @@ pub const VOICINGS: [Voicing; 5] = [
         diffusers: [1.3, 1.7, 3.9, 2.9],
         late: 1.0,
     },
+    // Spring: the early level is the springs' own.
+    Voicing {
+        lines: (6.0, 29.0),
+        early: (0.0, 0.7),
+        diffusers: [1.1, 1.9, 4.3, 3.1],
+        late: 0.7,
+    },
+    Voicing {
+        lines: (35.0, 130.0),
+        early: (120.0, 0.5),
+        diffusers: [5.9, 4.3, 14.7, 11.1],
+        late: 0.6,
+    },
 ];
+
+/// The longest of every voicing's lines, early span and diffuser (ms).
+fn longest() -> (f64, f64, f64) {
+    VOICINGS.iter().fold((0.0, 0.0, 0.0), |m, v| {
+        (
+            f64::max(m.0, v.lines.1),
+            f64::max(m.1, v.early.0),
+            v.diffusers.iter().copied().fold(m.2, f64::max),
+        )
+    })
+}
 
 /// The early reflections at size 1 of a span: (time as a fraction, level,
 /// left or right).
@@ -131,7 +216,7 @@ const EARLY: [(f64, f64, bool); 12] = [
 pub fn parameters() -> Vec<ParameterInfo> {
     use ParameterUnit::*;
     vec![
-        stepped(id::TYPE, "Type", 4.0, 1.0),
+        stepped(id::TYPE, "Type", (TYPES.len() - 1) as f64, 1.0),
         param(id::SIZE, "Size", 0.0, 1.0, 0.5, Percent),
         param(id::DECAY, "Decay", 0.1, 20.0, 2.0, None),
         param(id::PRE_DELAY, "Pre-Delay", 0.0, 500.0, 12.0, Milliseconds),
@@ -147,13 +232,58 @@ pub fn parameters() -> Vec<ParameterInfo> {
         param(id::MIX, "Mix", 0.0, 1.0, 0.3, Percent),
         stepped(id::FREEZE, "Freeze", 1.0, 0.0),
         param(id::DUCKING, "Ducking", 0.0, 1.0, 0.0, Percent),
+        stepped(id::PRE_SYNC, "Pre-Delay Sync", 1.0, 0.0),
+        stepped(
+            id::PRE_DIVISION,
+            "Pre-Delay Division",
+            (DIVISIONS.len() - 1) as f64,
+            5.0,
+        ),
+        param(id::HIGH_DECAY, "High Decay", 0.1, 2.0, 1.0 / 3.0, None),
+        param(id::BASS_FREQ, "Bass Crossover", 50.0, 1_000.0, 250.0, Hertz),
+        param(id::LOW_SHELF, "Low Shelf", -12.0, 12.0, 0.0, Decibels),
+        param(id::HIGH_SHELF, "High Shelf", -12.0, 12.0, 0.0, Decibels),
+        param(id::SHIMMER, "Shimmer", 0.0, 1.0, 0.0, Percent),
+        stepped(
+            id::SHIMMER_PITCH,
+            "Shimmer Pitch",
+            (SHIMMER_PITCHES.len() - 1) as f64,
+            DEFAULT_SHIMMER_PITCH,
+        ),
     ]
+}
+
+/// The shimmer's interval (semitones) for the parameter.
+pub fn shimmer_semitones(v: f64) -> f64 {
+    SHIMMER_PITCHES[(v.round().max(0.0) as usize).min(SHIMMER_PITCHES.len() - 1)].1
+}
+
+/// The pre-delay (seconds) for the parameters at a tempo.
+pub fn pre_delay_seconds(params: &ParamValues, tempo: f64) -> f64 {
+    let s = if get(params, id::PRE_SYNC) >= 0.5 {
+        division_seconds(
+            get(params, id::PRE_DIVISION).round().max(0.0) as usize,
+            tempo,
+        )
+    } else {
+        get(params, id::PRE_DELAY) * 0.001
+    };
+    s.clamp(0.0, MAX_PRE_SECONDS)
 }
 
 pub fn format(pid: ParameterId, v: f64) -> Option<String> {
     Some(match pid.0 {
         id::TYPE => pick(&TYPES, v),
-        id::FREEZE => on_off(v),
+        id::FREEZE | id::PRE_SYNC => on_off(v),
+        id::PRE_DIVISION => division_name(v.round().max(0.0) as usize).into(),
+        id::HIGH_DECAY => format!("{v:.2}×"),
+        id::LOW_SHELF | id::HIGH_SHELF if v.abs() < 0.05 => "Flat".into(),
+        id::LOW_SHELF | id::HIGH_SHELF => format!("{v:+.1} dB"),
+        id::SHIMMER if v < 0.005 => "Off".into(),
+        id::SHIMMER_PITCH => {
+            let i = (v.round().max(0.0) as usize).min(SHIMMER_PITCHES.len() - 1);
+            SHIMMER_PITCHES[i].0.into()
+        }
         id::DECAY if v < 1.0 => format!("{:.0} ms", v * 1000.0),
         id::DECAY => format!("{v:.2} s"),
         id::BASS => format!("{v:.2}×"),
@@ -186,15 +316,13 @@ pub fn decay_times(params: &ParamValues) -> [f64; 3] {
     let high = if get(params, id::DAMPING) >= 19_500.0 {
         rt
     } else {
-        rt / 3.0
+        rt * get(params, id::HIGH_DECAY).clamp(0.1, 2.0)
     };
     [rt * get(params, id::BASS), rt, high]
 }
 
 const LINES: usize = 16;
 const STEP: usize = 32;
-/// The bass's crossover (Hz).
-const BASS_HZ: f64 = 250.0;
 
 /// The 16 point Hadamard transform, normalised (orthogonal).
 #[inline]
@@ -244,19 +372,123 @@ impl Decay {
     }
 }
 
-/// A Schroeder allpass of a whole number of samples.
-struct Allpass {
-    line: DelayLine,
-    len: usize,
+/// A second-order allpass (transposed direct form II): flat in level,
+/// its group delay peaks at its frequency — a chain of them disperses.
+#[derive(Clone, Copy, Default)]
+struct Allpass2 {
+    a1: f64,
+    a2: f64,
+    s1: f64,
+    s2: f64,
 }
 
-impl Allpass {
+impl Allpass2 {
+    /// Poles at `freq` with radius `r` (closer to 1: sharper, more delay).
+    fn set(&mut self, freq: f64, r: f64, rate: f64) {
+        let theta = TAU * freq.clamp(10.0, 0.45 * rate) / rate;
+        self.a1 = -2.0 * r * theta.cos();
+        self.a2 = r * r;
+    }
+
     #[inline]
-    fn process(&mut self, x: f64, g: f64) -> f64 {
-        let d = self.line.tap(self.len.max(1) - 1);
-        let w = x - g * d;
-        self.line.push(flush(w));
-        d + g * w
+    fn process(&mut self, x: f64) -> f64 {
+        let y = self.a2 * x + self.s1;
+        self.s1 = self.a1 * x - self.a1 * y + self.s2;
+        self.s2 = x - self.a2 * y;
+        y
+    }
+
+    fn reset(&mut self) {
+        self.s1 = 0.0;
+        self.s2 = 0.0;
+    }
+
+    fn flush(&mut self) {
+        self.s1 = flush(self.s1);
+        self.s2 = flush(self.s2);
+    }
+}
+
+/// One spring: a line looping through the chirp chain and a low pass.
+struct Spring {
+    line: DelayLine,
+    chirp: [Allpass2; CHIRP_STAGES],
+    lp: OnePole,
+    /// Its length now (samples) and the loop's gain.
+    len: f64,
+    gain: f64,
+}
+
+impl Spring {
+    fn new(cap: usize, rate: f64) -> Self {
+        let mut chirp = [Allpass2::default(); CHIRP_STAGES];
+        for (i, ap) in chirp.iter_mut().enumerate() {
+            let t = i as f64 / (CHIRP_STAGES - 1) as f64;
+            ap.set(CHIRP_HZ.0 + (CHIRP_HZ.1 - CHIRP_HZ.0) * t, 0.9, rate);
+        }
+        Self {
+            line: DelayLine::new(cap),
+            chirp,
+            lp: OnePole::new(SPRING_LP_HZ, rate),
+            len: 1.0,
+            gain: 0.0,
+        }
+    }
+
+    #[inline]
+    fn process(&mut self, x: f64) -> f64 {
+        let mut y = self.line.read(self.len);
+        for ap in &mut self.chirp {
+            y = ap.process(y);
+        }
+        let y = self.lp.low(y);
+        self.line.push(flush(x + self.gain * y));
+        y
+    }
+
+    fn reset(&mut self) {
+        self.line.reset();
+        self.chirp.iter_mut().for_each(Allpass2::reset);
+        self.lp.reset();
+    }
+
+    fn flush(&mut self) {
+        self.chirp.iter_mut().for_each(Allpass2::flush);
+        self.lp.flush();
+    }
+}
+
+/// A pitch shifter: two read heads crossfaded over a window.
+struct Shifter {
+    line: DelayLine,
+    phase: f64,
+    window: f64,
+}
+
+impl Shifter {
+    fn new(rate: f64) -> Self {
+        let window = (SHIFT_WINDOW * rate).round();
+        Self {
+            line: DelayLine::new(window as usize + 8),
+            phase: 0.0,
+            window,
+        }
+    }
+
+    /// `x` shifted by `ratio` (2: an octave up).
+    #[inline]
+    fn process(&mut self, x: f64, ratio: f64) -> f64 {
+        self.line.push(x);
+        let p1 = self.phase;
+        let p2 = (p1 + 0.5).fract();
+        let y = (PI * p1).sin() * self.line.read(1.0 + p1 * self.window)
+            + (PI * p2).sin() * self.line.read(1.0 + p2 * self.window);
+        self.phase = (self.phase + (1.0 - ratio) / self.window).rem_euclid(1.0);
+        y
+    }
+
+    fn reset(&mut self) {
+        self.line.reset();
     }
 }
 
@@ -277,11 +509,23 @@ pub struct ReverbProcessor {
     rate: [f64; LINES],
     low_cut: Filter<2>,
     high_cut: Filter<2>,
+    low_shelf: Filter<2>,
+    high_shelf: Filter<2>,
+    springs: [Spring; 2],
+    shifters: [Shifter; 2],
+    /// The shimmer feed's band limit.
+    shimmer_lp: [OnePole; 2],
+    shimmer_hp: [OnePole; 2],
+    shimmer: Smoothed,
+    /// The longest pre-delay (samples) the lines hold.
+    pre_max: usize,
     freeze: Smoothed,
     mix: Smoothed,
     modulation: Smoothed,
     duck_env: f64,
     duck: f64,
+    /// The late output of the last sample (what the shimmer shifts).
+    late_out: [f64; 2],
     meters: [[MeterTap; 2]; 2],
     scratch: [Vec<f32>; 2],
 }
@@ -290,16 +534,16 @@ impl ReverbProcessor {
     pub fn new(params: ParamValues, tap: Arc<AnalysisTap>, config: &ProcessConfig) -> Self {
         let sr = config.sample_rate.max(1.0);
         let block = config.max_block_size.max(1) as usize;
-        // The longest line (Hall at the largest size) with room for the
-        // modulation.
-        let line_cap = (0.1 * size_scale(1.0) * sr) as usize + 128;
-        let ap_cap = (0.014 * size_scale(1.0) * sr) as usize + 8;
-        let early_cap = (0.1 * size_scale(1.0) * sr) as usize + 8;
-        let pre_cap = (0.5 * sr) as usize + early_cap + 8;
-        let mk_ap = || Allpass {
-            line: DelayLine::new(ap_cap),
-            len: 1,
-        };
+        // The longest line (Cathedral at the largest size) with room for
+        // the modulation.
+        let (lines_ms, early_ms, ap_ms) = longest();
+        let line_cap = (lines_ms * 0.001 * size_scale(1.0) * sr) as usize + 128;
+        let ap_cap = (ap_ms * 1.07 * 0.001 * size_scale(1.0) * sr) as usize + 8;
+        let early_cap = (early_ms * 0.001 * size_scale(1.0) * sr) as usize + 8;
+        let pre_max = (MAX_PRE_SECONDS * sr) as usize;
+        let pre_cap = pre_max + early_cap + 16;
+        let spring_cap = (SPRING_MS[1] * 0.001 * size_scale(1.0) * sr) as usize + 8;
+        let mk_ap = || Allpass::new(ap_cap);
         let mt = MeterTap::new(sr as f32);
         let mut s = Self {
             watching: Watching::new(sr as f32),
@@ -317,11 +561,20 @@ impl ReverbProcessor {
             rate: std::array::from_fn(|i| 0.7 + 0.6 * i as f64 / (LINES - 1) as f64),
             low_cut: Filter::default(),
             high_cut: Filter::default(),
+            low_shelf: Filter::default(),
+            high_shelf: Filter::default(),
+            springs: [Spring::new(spring_cap, sr), Spring::new(spring_cap, sr)],
+            shifters: [Shifter::new(sr), Shifter::new(sr)],
+            shimmer_lp: [OnePole::new(6_000.0, sr); 2],
+            shimmer_hp: [OnePole::new(150.0, sr); 2],
+            shimmer: Smoothed::new(0.0, 30.0, sr),
+            pre_max,
             freeze: Smoothed::new(0.0, 20.0, sr),
             mix: Smoothed::new(0.3, 20.0, sr),
             modulation: Smoothed::new(0.0, 50.0, sr),
             duck_env: 0.0,
             duck: 1.0,
+            late_out: [0.0; 2],
             meters: [[mt; 2]; 2],
             scratch: [vec![0.0; block], vec![0.0; block]],
             params,
@@ -333,6 +586,7 @@ impl ReverbProcessor {
         s.freeze.snap();
         s.mix.snap();
         s.modulation.snap();
+        s.shimmer.snap();
         s
     }
 
@@ -340,8 +594,12 @@ impl ReverbProcessor {
         get(&self.params, pid)
     }
 
+    fn kind(&self) -> usize {
+        (self.get(id::TYPE).round().max(0.0) as usize).min(TYPES.len() - 1)
+    }
+
     fn voicing(&self) -> &'static Voicing {
-        &VOICINGS[self.get(id::TYPE).round().clamp(0.0, 4.0) as usize]
+        &VOICINGS[self.kind()]
     }
 
     fn control(&mut self) {
@@ -359,13 +617,39 @@ impl ReverbProcessor {
             for (k, ap) in self.diffusers[c].iter_mut().enumerate() {
                 // The right side a little longer: decorrelated from the start.
                 let ms = v.diffusers[k] * scale * if c == 1 { 1.07 } else { 1.0 };
-                ap.len = ((ms * 0.001 * sr).round() as usize).max(1);
+                ap.set_len(((ms * 0.001 * sr).round() as usize).max(1));
             }
         }
+        for (spring, ms) in self.springs.iter_mut().zip(SPRING_MS) {
+            spring.len = (ms * 0.001 * scale * sr).max(1.0);
+        }
         let damping = self.get(id::DAMPING).min(0.45 * sr);
+        let bass = self.get(id::BASS_FREQ).clamp(20.0, 2_000.0);
         for d in &mut self.decay {
-            d.low.set(BASS_HZ, sr);
+            d.low.set(bass, sr);
             d.high.set(damping, sr);
+        }
+        self.shimmer.set(self.get(id::SHIMMER).clamp(0.0, 1.0));
+        let shelf = |kind: BandType, freq: f64, gain: f64| BandShape {
+            kind,
+            freq,
+            gain,
+            q: FRAC_1_SQRT_2,
+            slope: 12.0,
+        };
+        let low = self.get(id::LOW_SHELF);
+        if low.abs() >= 0.05 {
+            self.low_shelf
+                .set(shelf(BandType::LowShelf, LOW_SHELF_HZ, low), sr);
+        } else {
+            self.low_shelf.clear();
+        }
+        let high = self.get(id::HIGH_SHELF);
+        if high.abs() >= 0.05 {
+            self.high_shelf
+                .set(shelf(BandType::HighShelf, HIGH_SHELF_HZ, high), sr);
+        } else {
+            self.high_shelf.clear();
         }
         let frozen = self.get(id::FREEZE) >= 0.5;
         self.freeze.set(if frozen { 1.0 } else { 0.0 });
@@ -389,7 +673,8 @@ impl ReverbProcessor {
         }
     }
 
-    /// The lines' band gains for their lengths now (lossless when frozen).
+    /// The lines' band gains for their lengths now (lossless when frozen),
+    /// and the springs' loop gain for the decay.
     fn decay_gains(&mut self) {
         let rts = decay_times(&self.params);
         let frozen = self.freeze.value;
@@ -398,6 +683,10 @@ impl ReverbProcessor {
                 let g = 10f64.powf(-3.0 * length / (rt * self.sr));
                 *gain = g + frozen * (1.0 - g);
             }
+        }
+        for s in &mut self.springs {
+            let g = 10f64.powf(-3.0 * s.len / (rts[1] * self.sr));
+            s.gain = (g + frozen * (1.0 - g)).min(0.995);
         }
     }
 }
@@ -431,6 +720,11 @@ impl PluginProcessor for ReverbProcessor {
             self.scratch[c][..n].copy_from_slice(&src[..n]);
         }
         let sr = self.sr;
+        let tempo = if ctx.transport.tempo > 0.0 {
+            ctx.transport.tempo
+        } else {
+            120.0
+        };
         let glide = 1.0 - (-(STEP as f64) / (0.15 * sr)).exp();
         let duck_attack = 1.0 - (-1.0 / (0.01 * sr)).exp();
         let duck_release = (-1.0 / (0.3 * sr)).exp();
@@ -457,9 +751,12 @@ impl PluginProcessor for ReverbProcessor {
             }
             self.decay_gains();
             let v = self.voicing();
+            let spring = self.kind() == SPRING;
             let scale = size_scale(self.get(id::SIZE));
-            let pre = (self.get(id::PRE_DELAY) * 0.001 * sr).round() as usize;
+            let pre =
+                ((pre_delay_seconds(&self.params, tempo) * sr).round() as usize).min(self.pre_max);
             let early_span = v.early.0 * 0.001 * scale * sr;
+            let ratio = 2f64.powf(shimmer_semitones(self.get(id::SHIMMER_PITCH)) / 12.0);
             let balance = self.get(id::BALANCE);
             let early_gain = v.early.1 * (2.0 * (1.0 - balance)).min(1.0) * 0.5;
             let late_gain = v.late * (2.0 * balance).min(1.0);
@@ -474,6 +771,7 @@ impl PluginProcessor for ReverbProcessor {
                 let frozen = self.freeze.tick();
                 let mix = self.mix.tick();
                 let modulation = self.modulation.tick() * depth;
+                let shimmer = self.shimmer.tick();
                 let live = 1.0 - frozen;
                 // Pre-delay, then the early reflections from it.
                 let mut early = [0.0; 2];
@@ -482,13 +780,29 @@ impl PluginProcessor for ReverbProcessor {
                     self.pre[c].push(x[c] * live);
                     fed[c] = self.pre[c].tap(pre);
                 }
-                if early_gain > 0.0 {
+                if spring {
+                    // The springs ring on what comes in; they are the
+                    // early part and feed the network.
+                    for c in 0..2 {
+                        early[c] = self.springs[c].process(fed[c]);
+                        fed[c] += 0.5 * early[c];
+                    }
+                } else if early_gain > 0.0 {
                     for (t, g, left) in EARLY {
                         let d = pre + (t * early_span) as usize;
                         let (l, r) = (self.pre[0].tap(d), self.pre[1].tap(d + 7));
                         let (gl, gr) = if left { (1.0, 0.35) } else { (0.35, 1.0) };
                         early[0] += g * gl * l;
                         early[1] += g * gr * r;
+                    }
+                }
+                // The shimmer: the last late output, shifted, band limited
+                // and softly limited, in with the input.
+                if shimmer > 0.0 {
+                    for (c, f) in fed.iter_mut().enumerate() {
+                        let y = self.shifters[c].process(self.late_out[c], ratio);
+                        let y = self.shimmer_hp[c].high(self.shimmer_lp[c].low(y));
+                        *f += shimmer * live * 0.5 * (y * 2.0).tanh();
                     }
                 }
                 // Diffused into the network: left into even lines, right
@@ -523,11 +837,13 @@ impl PluginProcessor for ReverbProcessor {
                     let s = if k % 4 < 2 { 1.0 } else { -1.0 };
                     self.lines[k].push(flush(f[k] + s * inject[k % 2]));
                 }
+                self.late_out = [late_l * 0.25, late_r * 0.25];
                 let late = [late_l * 0.25 * late_gain, late_r * 0.25 * late_gain];
                 let mut wet = [0.0; 2];
                 for c in 0..2 {
                     let w = early[c] * early_gain + late[c];
-                    wet[c] = self.high_cut.process(c, self.low_cut.process(c, w));
+                    let w = self.high_cut.process(c, self.low_cut.process(c, w));
+                    wet[c] = self.high_shelf.process(c, self.low_shelf.process(c, w));
                 }
                 // Width, ducking.
                 let mid = 0.5 * (wet[0] + wet[1]);
@@ -569,6 +885,14 @@ impl PluginProcessor for ReverbProcessor {
         }
         self.low_cut.flush();
         self.high_cut.flush();
+        self.low_shelf.flush();
+        self.high_shelf.flush();
+        for c in 0..2 {
+            self.springs[c].flush();
+            self.shimmer_lp[c].flush();
+            self.shimmer_hp[c].flush();
+            self.late_out[c] = flush(self.late_out[c]);
+        }
         self.duck_env = flush(self.duck_env);
         for c in 2..channels {
             out.channel_mut(c).fill(0.0);
@@ -604,15 +928,22 @@ impl PluginProcessor for ReverbProcessor {
         for c in 0..2 {
             self.pre[c].reset();
             for ap in &mut self.diffusers[c] {
-                ap.line.reset();
+                ap.reset();
             }
+            self.springs[c].reset();
+            self.shifters[c].reset();
+            self.shimmer_lp[c].reset();
+            self.shimmer_hp[c].reset();
         }
+        self.late_out = [0.0; 2];
         for d in &mut self.decay {
             d.low.reset();
             d.high.reset();
         }
         self.low_cut.reset();
         self.high_cut.reset();
+        self.low_shelf.reset();
+        self.high_shelf.reset();
         self.duck_env = 0.0;
         self.duck = 1.0;
         self.meters.iter_mut().flatten().for_each(MeterTap::reset);
@@ -654,7 +985,15 @@ mod tests {
 
     #[test]
     fn the_decay_is_as_set() {
-        for (kind, rt) in [(1.0, 2.0), (0.0, 0.8), (2.0, 4.0), (3.0, 1.5)] {
+        for (kind, rt) in [
+            (1.0, 2.0),
+            (0.0, 0.8),
+            (2.0, 4.0),
+            (3.0, 1.5),
+            (4.0, 0.5),
+            (5.0, 1.2),
+            (6.0, 3.0),
+        ] {
             let mut r = rig(&[
                 (id::TYPE, kind),
                 (id::DECAY, rt),
@@ -672,7 +1011,158 @@ mod tests {
                 "{}: {measured:.2} s for {rt} s",
                 TYPES[kind as usize]
             );
+            // No DC, nothing out of hand.
+            let mean = l.iter().map(|v| f64::from(*v)).sum::<f64>() / l.len() as f64;
+            assert!(mean.abs() < 1e-3, "{}: DC {mean}", TYPES[kind as usize]);
+            assert!(l.iter().all(|v| v.is_finite() && v.abs() < 2.0));
         }
+    }
+
+    #[test]
+    fn the_highs_decay_over_their_own_multiple() {
+        let fall = |mult: f64| {
+            let mut r = rig(&[
+                (id::DECAY, 3.0),
+                (id::DAMPING, 3_000.0),
+                (id::HIGH_DECAY, mult),
+                (id::BASS, 1.0),
+                (id::MIX, 1.0),
+                (id::BALANCE, 1.0),
+                (id::MODULATION, 0.0),
+            ]);
+            r.run(0.4, tone(8_000.0, 0.3), silence);
+            let (a, _) = r.run(0.05, silence, silence);
+            r.run(0.5, silence, silence);
+            let (b, _) = r.run(0.05, silence, silence);
+            bin_db(&a, 8_000.0) - bin_db(&b, 8_000.0)
+        };
+        // Over 0.55 s: 60 dB per 0.6 s at a fifth, per 3 s at one.
+        let (short, long) = (fall(0.2), fall(1.0));
+        assert!(short > 30.0 && long < 16.0, "−{short:.1} vs −{long:.1} dB");
+        // A third is the default: the same as the first version's rt / 3.
+        let rts = decay_times(&ParamValues::new(parameters()));
+        assert!((rts[2] - rts[1] / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_pre_delay_follows_the_tempo_when_synced() {
+        let mut r = rig(&[(id::PRE_SYNC, 1.0), (id::PRE_DIVISION, 5.0), (id::MIX, 1.0)]);
+        // 1/16 at 120 BPM: 125 ms.
+        r.transport.tempo = 120.0;
+        let (l, _) = r.run(0.4, click, silence);
+        assert!(l[..6_000].iter().all(|v| v.abs() < 1e-9));
+        assert!(l[6_000..9_000].iter().any(|v| v.abs() > 1e-3));
+        // Too long a division clamps to the longest pre-delay.
+        let mut r = rig(&[
+            (id::PRE_SYNC, 1.0),
+            (id::PRE_DIVISION, 20.0),
+            (id::MIX, 1.0),
+        ]);
+        r.transport.tempo = 120.0;
+        let (l, _) = r.run(1.3, click, silence);
+        assert!(l[..48_000].iter().all(|v| v.abs() < 1e-9));
+        assert!(l[48_000..52_000].iter().any(|v| v.abs() > 1e-3));
+    }
+
+    #[test]
+    fn the_shelves_shape_the_tail() {
+        let at = |set: &[(u32, f64)], f: f64| {
+            let mut all = vec![(id::MIX, 1.0), (id::BALANCE, 1.0), (id::DECAY, 2.0)];
+            all.extend_from_slice(set);
+            let mut r = rig(&all);
+            let (l, _) = r.run(1.5, tone(f, 0.3), silence);
+            bin_db(&l, f)
+        };
+        let (low, high) = (at(&[], 100.0), at(&[], 8_000.0));
+        assert!(at(&[(id::LOW_SHELF, -12.0)], 100.0) < low - 8.0);
+        assert!(at(&[(id::LOW_SHELF, 6.0)], 100.0) > low + 4.0);
+        assert!(at(&[(id::HIGH_SHELF, -12.0)], 8_000.0) < high - 8.0);
+        assert!(at(&[(id::HIGH_SHELF, 6.0)], 8_000.0) > high + 4.0);
+        // The bass crossover moves where the bass multiplier takes over:
+        // a 400 Hz tone rings longer with the crossover above it.
+        let fall = |bass_hz: f64| {
+            let mut r = rig(&[
+                (id::DECAY, 2.0),
+                (id::BASS, 2.0),
+                (id::BASS_FREQ, bass_hz),
+                (id::DAMPING, 20_000.0),
+                (id::MIX, 1.0),
+                (id::BALANCE, 1.0),
+            ]);
+            r.run(0.4, tone(400.0, 0.3), silence);
+            let (a, _) = r.run(0.05, silence, silence);
+            r.run(0.5, silence, silence);
+            let (b, _) = r.run(0.05, silence, silence);
+            bin_db(&a, 400.0) - bin_db(&b, 400.0)
+        };
+        assert!(fall(800.0) < fall(100.0) - 5.0);
+    }
+
+    #[test]
+    fn shimmer_climbs_an_octave_and_stays_bounded() {
+        let octave = |shimmer: f64| {
+            let mut r = rig(&[
+                (id::TYPE, 1.0),
+                (id::DECAY, 4.0),
+                (id::SHIMMER, shimmer),
+                (id::SHIMMER_PITCH, 4.0),
+                (id::DAMPING, 20_000.0),
+                (id::MIX, 1.0),
+                (id::BALANCE, 1.0),
+            ]);
+            r.run(0.5, tone(440.0, 0.3), silence);
+            let (l, _) = r.run(1.5, silence, silence);
+            bin_db(&l, 880.0) - bin_db(&l, 440.0)
+        };
+        let (plain, shimmered) = (octave(0.0), octave(1.0));
+        assert!(shimmered > plain + 12.0, "{plain:.1} → {shimmered:.1} dB");
+        // At the longest decay with full shimmer it swells, never explodes.
+        let mut r = rig(&[
+            (id::DECAY, 20.0),
+            (id::SHIMMER, 1.0),
+            (id::MIX, 1.0),
+            (id::BALANCE, 1.0),
+        ]);
+        r.run(1.0, tone(440.0, 0.5), silence);
+        let (l, _) = r.run(6.0, silence, silence);
+        assert!(l.iter().all(|v| v.is_finite() && v.abs() < 4.0));
+        // Off, the shifters do not run: the plain hall, untouched.
+        let mut a = rig(&[(id::MIX, 1.0), (id::SHIMMER_PITCH, 0.0)]);
+        let mut b = rig(&[(id::MIX, 1.0)]);
+        assert_eq!(a.run(0.5, click, silence), b.run(0.5, click, silence));
+    }
+
+    #[test]
+    fn the_spring_chirps_where_a_plate_does_not() {
+        // A click through the springs: the band round 2.8 kHz arrives
+        // spread out (the chain's group delay), a plate's does not.
+        let spread = |kind: f64| {
+            let mut r = rig(&[
+                (id::TYPE, kind),
+                (id::DECAY, 1.0),
+                (id::MIX, 1.0),
+                (id::BALANCE, 0.0),
+                (id::PRE_DELAY, 0.0),
+                (id::DAMPING, 20_000.0),
+            ]);
+            let (l, _) = r.run(0.3, click, silence);
+            // The energy's centre of time over the first 60 ms.
+            let (mut sum, mut moment) = (0.0, 0.0);
+            for (i, v) in l[..2_880].iter().enumerate() {
+                let e = f64::from(*v).powi(2);
+                sum += e;
+                moment += e * i as f64;
+            }
+            (sum, moment / sum.max(1e-12) / SR * 1000.0)
+        };
+        let (spring_energy, spring_centre) = spread(SPRING as f64);
+        assert!(spring_energy > 1e-4, "the springs sound ({spring_energy})");
+        assert!(
+            spring_centre > 10.0,
+            "the springs' first bounce is spread late: {spring_centre:.1} ms"
+        );
+        let (_, ambience_centre) = spread(4.0);
+        assert!(ambience_centre < spring_centre);
     }
 
     #[test]

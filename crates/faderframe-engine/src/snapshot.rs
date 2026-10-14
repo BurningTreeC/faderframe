@@ -184,6 +184,9 @@ pub struct PitchCurve {
     pub step: f64,
     /// (semitones, formant semitones, the sung pitch in Hz or 0).
     pub values: Vec<(f32, f32, f32)>,
+    /// The level at the same frames (removed notes silent, fading in and
+    /// out); empty: everything at full level.
+    pub levels: Vec<f32>,
     pub keep_formants: bool,
 }
 
@@ -209,6 +212,22 @@ impl PitchCurve {
             a.2.max(b.2)
         };
         (a.0 + (b.0 - a.0) * f, a.1 + (b.1 - a.1) * f, hz)
+    }
+
+    /// The level at source frame `source` (interpolated; full outside the
+    /// curve). Realtime-safe.
+    #[inline]
+    pub fn level(&self, source: f64) -> f32 {
+        let x = (source - self.start) / self.step.max(1e-9);
+        if x < 0.0 || self.levels.is_empty() {
+            return 1.0;
+        }
+        let i = x.floor() as usize;
+        let Some(&a) = self.levels.get(i) else {
+            return 1.0;
+        };
+        let b = self.levels.get(i + 1).copied().unwrap_or(a);
+        a + (b - a) * (x - i as f64) as f32
     }
 }
 
@@ -1101,10 +1120,17 @@ fn warped_region(
     let out = sr / project_rate;
     let src = source_rate / project_rate;
     let len = region.end - region.start;
-    let mut points: Vec<(i64, f64)> = w
-        .points(a.source_offset, a.length)
+    let anchors = w.points(a.source_offset, a.length);
+    // Notes made longer or shorter: the clip's map through theirs.
+    let timing = a
+        .pitch
+        .as_ref()
+        .filter(|e| e.plays_live())
+        .map(|e| e.time_map(a.source_offset, a.source_offset + w.source_length))
+        .unwrap_or_default();
+    let mut points: Vec<(i64, f64)> = faderframe_project::pitch::through(&anchors, &timing)
         .into_iter()
-        .map(|m| ((m.at as f64 * out).round() as i64, m.source as f64 * src))
+        .map(|(at, s)| ((at * out).round() as i64, s * src))
         .collect();
     // Exact ends, strictly increasing output frames.
     if let Some(last) = points.last_mut() {
@@ -1157,10 +1183,18 @@ fn pitch_curve(
             (st, fm, hz)
         })
         .collect();
+    let levels = if e.removed.is_empty() {
+        Vec::new()
+    } else {
+        (0..count)
+            .map(|k| e.level_at(from + k as i64 * hop, project_rate))
+            .collect()
+    };
     PitchCurve {
         start: from as f64 * src,
         step: hop as f64 * src,
         values,
+        levels,
         keep_formants: e.keep_formants,
     }
 }

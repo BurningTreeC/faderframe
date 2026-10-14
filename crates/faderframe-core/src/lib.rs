@@ -19,9 +19,9 @@ pub mod vbap;
 pub use channel::ChannelLayout;
 pub use gain::{Decibels, FaderLaw, db_to_gain, gain_to_db};
 pub use id::{
-    AdrCueId, AudioSourceId, AutomationLaneId, ClipId, ClipLinkId, GroupId, IdAllocator, MarkerId,
-    MidiMappingId, ModulatorId, NoteId, ParameterId, PluginInstanceId, SceneId, SectionId, SendId,
-    SongId, TrackId, VideoClipId, VideoSourceId, VideoTrackId,
+    AdrCueId, AudioSourceId, AutomationLaneId, ClipId, ClipLinkId, CueId, GroupId, IdAllocator,
+    MarkerId, MidiMappingId, ModulatorId, NoteId, ParameterId, PluginInstanceId, SceneId,
+    SectionId, SendId, SongId, TrackId, VideoClipId, VideoSourceId, VideoTrackId,
 };
 pub use pan::{DualPan, PanLaw, PanMode};
 pub use surround::{SurroundFormat, SurroundPan, SurroundParam};

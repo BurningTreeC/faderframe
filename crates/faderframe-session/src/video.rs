@@ -121,7 +121,9 @@ fn index_of(
 ) -> std::result::Result<FrameIndex, String> {
     // "v3": keep AVI frames that carry DTS but no PTS. Older indexes
     // omitted them and made playback advance through too few frames.
-    let file = cache_dir().join(format!("{}.v3.index.json", cache_key(path)));
+    // "v4": the frames after an MP4's media duration (no edit list, a
+    // B-frame delay) too.
+    let file = cache_dir().join(format!("{}.v4.index.json", cache_key(path)));
     if let Some(ix) = std::fs::read(&file)
         .ok()
         .and_then(|b| serde_json::from_slice::<FrameIndex>(&b).ok())
@@ -140,7 +142,9 @@ fn index_of(
 /// Where `path`'s proxy of `height` is (made or to be made).
 fn proxy_path(path: &Path, height: u32) -> PathBuf {
     // "-2": full-range JPEG colours (the first proxies were washed out).
-    cache_dir().join(format!("{}.proxy{height}-2.mkv", cache_key(path)))
+    // "-3": stream times with the first frame from 0 (a picture starting
+    // after 0 read back early), QuickTime JPEG's levels kept, every frame.
+    cache_dir().join(format!("{}.proxy{height}-3.mkv", cache_key(path)))
 }
 
 /// Bytes the cache folder's indexes and proxies take.
@@ -164,6 +168,29 @@ fn cache_files() -> Vec<PathBuf> {
             name.ends_with(".index.json") || (name.contains(".proxy") && name.ends_with(".mkv"))
         })
         .collect()
+}
+
+/// The frame of `index` that `clip` shows at `file_time`: the one showing
+/// then (from a hair before its start, `FrameIndex::frame_at`), but never
+/// one starting at or after the clip's end.
+fn clip_frame(index: &FrameIndex, clip: &VideoClip, file_time: i64) -> Option<usize> {
+    let n = index.frame_at(file_time)?;
+    Some(
+        index
+            .last_before(clip.offset + clip.length)
+            .map_or(n, |last| n.min(last)),
+    )
+}
+
+/// The moment `ns` from now (negative: before).
+pub(crate) fn instant_in(ns: i64) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    let by = std::time::Duration::from_nanos(ns.unsigned_abs());
+    if ns >= 0 {
+        now + by
+    } else {
+        now.checked_sub(by).unwrap_or(now)
+    }
 }
 
 /// A share done, shared with the shell.
@@ -530,12 +557,19 @@ impl crate::Session {
         let shuttled = self.shuttle_position(lead_ns - offset);
         let position = if let Some(p) = shuttled {
             p
+        } else if let Some(p) = self.held_position() {
+            // A locate shown before the engine got there, as the playhead
+            // shows it (not where the sound still is).
+            p
         } else if playing {
-            let now = self.midi.sender.clock().now_ns() as i64;
-            let at = (now + lead_ns - offset).max(0) as u64;
-            let (p, _) = self.engine.position_and_jumps_at(at)?;
-            let latency = self.engine.output_latency() as f64 * self.engine.speed();
-            p - latency.round() as i64
+            // What is heard when the picture reaches the screen, from the
+            // play history: after Play the stopped position until the
+            // latency has filled (the processing position less the latency
+            // went back before it: the frame before, or none at a clip's
+            // start), a locate's target at once.
+            self.engine
+                .heard_ahead(instant_in(lead_ns - offset))
+                .map_or(self.transport.position, |h| h.jumped.unwrap_or(h.position))
         } else {
             self.transport.position
         };
@@ -543,10 +577,10 @@ impl crate::Session {
             Some(t) => self.project.video.at_track(t, position, rate)?,
             None => self.project.video.at(position, rate)?,
         };
-        let (clip, source) = (clip.id, clip.source);
-        let known = self.video.known.get(&source)?;
+        let known = self.video.known.get(&clip.source)?;
         let index = known.index.as_ref()?;
-        let frame = index.frame_at(file_time)?;
+        let frame = clip_frame(index, clip, file_time)?;
+        let (clip, source) = (clip.id, clip.source);
         // Shuttling seeks (in reverse too): from the proxy where there is
         // one.
         let want = if playing && shuttled.is_none() {
@@ -554,11 +588,13 @@ impl crate::Session {
         } else {
             Want::Still
         };
+        // That frame, asked for by its start.
+        let at = index.times.get(frame).copied().unwrap_or(file_time);
         let picture = self
             .video
             .service
             .as_ref()
-            .and_then(|s| s.picture(source.raw(), file_time, max, want));
+            .and_then(|s| s.picture(source.raw(), at, max, want));
         if playing && track.is_none() {
             let mut last = self.video.last.lock().unwrap_or_else(|p| p.into_inner());
             if *last != Some((source, frame)) {
@@ -616,10 +652,10 @@ impl crate::Session {
         let rate = self.project.sample_rate;
         let (clip, file_time) = self.project.video.at(pos, rate)?;
         let index = self.video.known.get(&clip.source)?.index.as_ref()?;
-        let frame = index.frame_at(file_time)? as i64 + n as i64;
+        let frame = clip_frame(index, clip, file_time)? as i64 + n as i64;
         let first = index.frame_at(clip.offset).unwrap_or(0) as i64;
         let last = index
-            .frame_at(clip.offset + clip.length - 1)
+            .last_before(clip.offset + clip.length)
             .unwrap_or(index.len().saturating_sub(1)) as i64;
         if frame < first || frame > last {
             return None;

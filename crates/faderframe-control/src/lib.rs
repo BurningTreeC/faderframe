@@ -101,6 +101,8 @@ pub struct SurfaceState {
     pub recording: bool,
     pub looping: bool,
     pub click: bool,
+    /// Input quantize (the transport's Q) is on.
+    pub input_quantize: bool,
     pub position: Position,
     /// The first strip's track number (1-based).
     pub first_track: usize,
@@ -202,7 +204,8 @@ pub enum EditButton {
     Separate,
     /// Capture the MIDI just played.
     Capture,
-    /// Quantise the selected clips.
+    /// The Quantize button: input quantize on or off (with Shift: quantise
+    /// the selected clips).
     Quantize,
 }
 

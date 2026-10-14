@@ -292,6 +292,7 @@ impl Session {
             let Some(params) = self.engine.plugin_parameters(slot.id) else {
                 continue;
             };
+            let name = t.name_of(slot);
             for p in params.iter().filter(|p| p.automatable) {
                 let kind = if p.stepped && p.max - p.min <= 1.0 {
                     ParamKind::Toggle
@@ -307,7 +308,7 @@ impl Session {
                         plugin: slot.id,
                         parameter: p.id,
                     },
-                    name: format!("{}: {}", slot.plugin.name, p.name),
+                    name: format!("{}: {}", name, p.name),
                     min: p.min,
                     max: p.max,
                     default: p.default,
@@ -317,7 +318,7 @@ impl Session {
             }
             out.push(AutomationParam {
                 target: AutomationTarget::PluginBypass(slot.id),
-                name: format!("{}: Bypass", slot.plugin.name),
+                name: format!("{name}: Bypass"),
                 min: 0.0,
                 max: 1.0,
                 default: 0.0,

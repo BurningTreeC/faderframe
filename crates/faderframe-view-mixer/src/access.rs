@@ -25,10 +25,6 @@ const PAN_RIGHT: u64 = 9;
 const FLOOR_DB: f64 = -80.0;
 const TOP_DB: f64 = 12.0;
 
-fn volume(track: faderframe_core::TrackId, db: f32) -> Action {
-    Action::Edit(Command::SetTrackVolume { track, db })
-}
-
 impl MixerView {
     fn strip_node(
         &self,
@@ -57,25 +53,37 @@ impl MixerView {
         if t.kind == TrackKind::Folder {
             return strip;
         }
-        let db = model.shown_volume_db(t);
+        // In a cue mix the fader is the track's send level there.
+        let cue = model.mixer_cue().map(|c| c.name.clone());
+        let db = Self::fader_db(model, t);
         let base = if db <= SILENCE_DB { -80.0 } else { db };
-        strip = strip.child(
-            AccessNode::new(access_id(&[VOLUME, id.0]), AccessRole::Slider, "Volume")
-                .at(l.fader)
-                .value(
-                    f64::from(db).clamp(FLOOR_DB, TOP_DB),
-                    FLOOR_DB,
-                    TOP_DB,
-                    format_db(db),
-                )
-                .on_step(volume(id, base + 0.5), volume(id, base - 0.5)),
+        let volume = |db: f32| Self::fader_command(model, t, db).map(Action::Edit);
+        let mut fader = AccessNode::new(
+            access_id(&[VOLUME, id.0]),
+            AccessRole::Slider,
+            match (&cue, t.kind) {
+                (Some(c), TrackKind::Master) => format!("{c} Level"),
+                (Some(c), _) => format!("Level in {c}"),
+                (None, _) => "Volume".into(),
+            },
+        )
+        .at(l.fader)
+        .value(
+            f64::from(db).clamp(FLOOR_DB, TOP_DB),
+            FLOOR_DB,
+            TOP_DB,
+            format_db(db),
         );
+        if let (Some(up), Some(down)) = (volume(base + 0.5), volume(base - 0.5)) {
+            fader = fader.on_step(up, down);
+        }
+        strip = strip.child(fader);
         let surround = matches!(t.layout, faderframe_core::ChannelLayout::Surround(_))
             || crate::room_panned(model, t).is_some();
         if t.kind != TrackKind::Vca
             && !surround
             && t.kind != TrackKind::Midi
-            && model.project().dual_panned(t)
+            && crate::dual_shown(model, t)
         {
             // Dual pan: a slider per input channel.
             let dual = model.shown_dual_pan(t);
@@ -100,40 +108,55 @@ impl MixerView {
                         .on_step(set(pan + 0.05), set(pan - 0.05)),
                 );
             }
-        } else if t.kind != TrackKind::Vca && !surround && t.kind != TrackKind::Midi {
-            let pan = model.shown_pan(t);
-            let set = |p: f32| {
-                Action::Edit(Command::SetTrackPan {
-                    track: id,
-                    pan: p.clamp(-1.0, 1.0),
-                })
-            };
+        } else if t.kind != TrackKind::Vca
+            && !surround
+            && t.kind != TrackKind::Midi
+            && let (Some(up), Some(down)) = (
+                Self::pan_command(
+                    model,
+                    t,
+                    (Self::pan_shown(model, t) + 0.05).clamp(-1.0, 1.0),
+                ),
+                Self::pan_command(
+                    model,
+                    t,
+                    (Self::pan_shown(model, t) - 0.05).clamp(-1.0, 1.0),
+                ),
+            )
+        {
+            let pan = Self::pan_shown(model, t);
             strip = strip.child(
                 AccessNode::new(
                     access_id(&[PAN, id.0]),
                     AccessRole::Slider,
-                    if crate::is_balance(model, t) {
-                        "Balance"
-                    } else {
-                        "Pan"
+                    match &cue {
+                        Some(c) => format!("Pan in {c}"),
+                        None if crate::is_balance(model, t) => "Balance".into(),
+                        None => "Pan".into(),
                     },
                 )
                 .at(l.pan_knob)
                 .value(f64::from(pan), -1.0, 1.0, format_pan(pan))
-                .on_step(set(pan + 0.05), set(pan - 0.05)),
+                .on_step(Action::Edit(up), Action::Edit(down)),
             );
         }
-        let mute = model.shown_mute(t);
-        strip = strip.child(
-            AccessNode::new(access_id(&[MUTE, id.0]), AccessRole::ToggleButton, "Mute")
-                .at(l.mute)
-                .checked(mute)
-                .on_activate(Action::Edit(Command::SetTrackMute {
-                    track: id,
-                    on: !t.mute,
-                })),
-        );
-        if t.kind != TrackKind::Master {
+        let mute = Self::mute_shown(model, t);
+        let mut mute_node = AccessNode::new(
+            access_id(&[MUTE, id.0]),
+            AccessRole::ToggleButton,
+            match (&cue, t.kind) {
+                (Some(c), TrackKind::Master) => format!("Mute {c}"),
+                (Some(c), _) => format!("Off in {c}"),
+                (None, _) => "Mute".into(),
+            },
+        )
+        .at(l.mute)
+        .checked(mute);
+        if let Some(cmd) = Self::mute_command(model, t) {
+            mute_node = mute_node.on_activate(Action::Edit(cmd));
+        }
+        strip = strip.child(mute_node);
+        if t.kind != TrackKind::Master && cue.is_none() {
             strip = strip.child(
                 AccessNode::new(access_id(&[SOLO, id.0]), AccessRole::ToggleButton, "Solo")
                     .at(l.solo)
@@ -161,7 +184,8 @@ impl MixerView {
         }
         let rects = l.inserts.clone().unwrap_or_default();
         for (i, s) in t.inserts.iter().enumerate() {
-            let name = s.plugin.name.trim_start_matches("FaderFrame ");
+            let named = t.name_of(s);
+            let name = named.trim_start_matches("FaderFrame ");
             let label = if s.bypass {
                 format!("Insert {}: {name}, bypassed", i + 1)
             } else {

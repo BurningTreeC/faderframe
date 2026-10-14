@@ -41,4 +41,6 @@ pub struct EngineContext {
     /// What this graph's frames played lately (see [`crate::history`]):
     /// nodes behind latency read their automation through it.
     pub history: crate::history::PlayHistory,
+    /// The audio recording under way (see [`crate::record`]).
+    pub recording: crate::record::RecordingNow,
 }

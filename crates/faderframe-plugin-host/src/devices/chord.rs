@@ -8,7 +8,9 @@
 //! * Chord track — the chord track's chord where the note is, voiced
 //!   round the played key (the note alone where there is none).
 //!
-//! The chord can be strummed (each note later than the one before, from
+//! The chord is then voiced: inverted (each inversion up carries the
+//! lowest note an octave up, down the highest an octave down) and moved by
+//! octaves; it can be strummed (each note later than the one before, from
 //! the bottom or the top) and its added notes played softer. A note's
 //! chord ends with it; notes of a strum not started yet do not start.
 
@@ -35,6 +37,8 @@ pub mod id {
     pub const STRUM: u32 = 9;
     pub const DIRECTION: u32 = 10;
     pub const VELOCITY: u32 = 11;
+    pub const INVERSION: u32 = 12;
+    pub const OCTAVE: u32 = 13;
 }
 /// The intervals.
 pub const SHIFTS: usize = 5;
@@ -53,7 +57,7 @@ pub const ROOTS: [&str; 12] = [
 ];
 
 /// Notes a chord has at most.
-const MAX_NOTES: usize = 8;
+pub const MAX_NOTES: usize = 8;
 
 fn ranged(pid: u32, name: &str, min: f64, max: f64, default: f64) -> ParameterInfo {
     ParameterInfo {
@@ -81,6 +85,8 @@ pub fn parameters() -> Vec<ParameterInfo> {
         param(id::STRUM, "Strum", 0.0, 200.0, 0.0, Milliseconds),
         stepped(id::DIRECTION, "Strum Direction", 1.0, 0.0),
         param(id::VELOCITY, "Added Velocity", 0.0, 1.0, 1.0, Percent),
+        ranged(id::INVERSION, "Inversion", -3.0, 3.0, 0.0),
+        ranged(id::OCTAVE, "Octave", -2.0, 2.0, 0.0),
     ]);
     out
 }
@@ -104,6 +110,8 @@ pub fn format(pid: ParameterId, v: f64) -> Option<String> {
         id::DIRECTION => pick(&DIRECTIONS, v),
         id::STRUM if v < 0.5 => "Off".into(),
         id::STRUM => format!("{v:.0} ms"),
+        id::INVERSION | id::OCTAVE if v.round() == 0.0 => "0".into(),
+        id::INVERSION | id::OCTAVE => format!("{:+.0}", v.round()).replace('-', "−"),
         _ => return None,
     })
 }
@@ -122,6 +130,54 @@ pub(crate) fn key_at(harmony: &Harmony, sample: i64, follow: bool, root: f64, sc
         (root.round().max(0.0) as u8) % 12,
         Scale::ALL[(scale.round().max(0.0) as usize).min(Scale::ALL.len() - 1)],
     )
+}
+
+/// Voice `keys[..n]` (sorted, distinct): `inversion` times the lowest note
+/// an octave up (or, negative, the highest an octave down), then all of
+/// them `octave` octaves on; notes that would leave the keyboard are
+/// dropped. The count left.
+pub fn voiced(keys: &mut [u8; MAX_NOTES], n: usize, inversion: i32, octave: i32) -> usize {
+    let mut n = n.min(MAX_NOTES);
+    let tidy = |keys: &mut [u8; MAX_NOTES], n: &mut usize| {
+        keys[..*n].sort_unstable();
+        let mut m = 0;
+        for i in 0..*n {
+            if m == 0 || keys[m - 1] != keys[i] {
+                keys[m] = keys[i];
+                m += 1;
+            }
+        }
+        *n = m;
+    };
+    for _ in 0..inversion.abs() {
+        if n < 2 {
+            break;
+        }
+        if inversion > 0 {
+            if keys[0] > 115 {
+                break;
+            }
+            keys[0] += 12;
+        } else {
+            if keys[n - 1] < 12 {
+                break;
+            }
+            keys[n - 1] -= 12;
+        }
+        tidy(keys, &mut n);
+    }
+    if octave != 0 {
+        let mut m = 0;
+        for i in 0..n {
+            let k = i32::from(keys[i]) + 12 * octave;
+            if (0..=127).contains(&k) {
+                keys[m] = k as u8;
+                m += 1;
+            }
+        }
+        n = m;
+    }
+    n
 }
 
 /// The chord a note becomes (keys, low to high; the played key first in
@@ -184,6 +240,12 @@ pub fn chord_of(
         }
     }
     keys[..n].sort_unstable();
+    let n = voiced(
+        &mut keys,
+        n,
+        get(id::INVERSION).round() as i32,
+        get(id::OCTAVE).round() as i32,
+    );
     (keys, n)
 }
 
@@ -412,6 +474,44 @@ mod tests {
             played(&mut chord(&[(id::MODE, 3.0)]), 64, &NO_HARMONY),
             [64]
         );
+    }
+
+    #[test]
+    fn inversions_and_octaves_voice_the_chord() {
+        // C major: first inversion E G C, second G C E; down, the top
+        // note under the rest.
+        assert_eq!(
+            played(&mut chord(&[(id::INVERSION, 1.0)]), 60, &NO_HARMONY),
+            [64, 67, 72]
+        );
+        assert_eq!(
+            played(&mut chord(&[(id::INVERSION, 2.0)]), 60, &NO_HARMONY),
+            [67, 72, 76]
+        );
+        assert_eq!(
+            played(&mut chord(&[(id::INVERSION, -1.0)]), 60, &NO_HARMONY),
+            [55, 60, 64]
+        );
+        // An octave down; and past the keyboard's ends notes are dropped.
+        assert_eq!(
+            played(&mut chord(&[(id::OCTAVE, -1.0)]), 60, &NO_HARMONY),
+            [48, 52, 55]
+        );
+        assert_eq!(
+            played(&mut chord(&[(id::OCTAVE, 2.0)]), 110, &NO_HARMONY),
+            [] as [u8; 0]
+        );
+        // Octaves inverted fold onto one note.
+        let mut p = chord(&[
+            (id::SHIFT, 12.0),
+            (id::SHIFT + 1, 0.0),
+            (id::INVERSION, 1.0),
+        ]);
+        assert_eq!(played(&mut p, 60, &NO_HARMONY), [72]);
+        let mut keys = [60, 64, 67, 0, 0, 0, 0, 0];
+        assert_eq!(voiced(&mut keys, 3, 1, 1), 3);
+        assert_eq!(&keys[..3], &[76, 79, 84]);
+        assert!(balanced(&[]));
     }
 
     #[test]

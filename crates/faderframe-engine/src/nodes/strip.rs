@@ -20,6 +20,11 @@ use faderframe_realtime::{MeterRange, ParamSlot};
 /// * output 0 — post-fader, panned, in the destination layout
 /// * output 1 — pre-fader (post-insert, post-mute) in the track layout,
 ///   unpanned, used by pre-fader sends
+/// * outputs 2 and 3 (only while the project has cue mixes) — the cue
+///   mixes' taps, in the track layout, unpanned, with the polarity and
+///   never muted (neither the track's mute nor a solo elsewhere reaches a
+///   performer's headphones): 2 before the fader, 3 after it (fader, VCAs
+///   and modulation as the main mix has them)
 ///
 /// All gain changes are ramped linearly, so fader moves, mutes and solos
 /// never click. Automated volume, pan and mute are evaluated every
@@ -57,6 +62,9 @@ pub struct ChannelStrip {
     law: FaderLaw,
     post: [f32; MAX_CHANNELS],
     pre: f32,
+    /// The cue taps' gains at the end of the last range (NaN: none yet).
+    cue_pre: f32,
+    cue_post: f32,
     /// Into stereo: the placement and the gain (fader × VCA × mute) at the
     /// end of the last range, and every pair's gain there (NaN: none yet).
     placed: Option<Placement>,
@@ -87,6 +95,8 @@ impl ChannelStrip {
             law: FaderLaw::console(),
             post: [f32::NAN; MAX_CHANNELS],
             pre: f32::NAN,
+            cue_pre: f32::NAN,
+            cue_post: f32::NAN,
             placed: None,
             gain: f32::NAN,
             pairs: [[f32::NAN; 2]; 2],
@@ -136,6 +146,42 @@ impl ChannelStrip {
         Self {
             quiet: true,
             ..self
+        }
+    }
+
+    /// The cue mixes' taps (outputs 2 and 3, when the node has them) for
+    /// frames `off..off + m`: the input with its polarity, before and
+    /// after the fader `fader` (never muted).
+    fn render_cue_taps(
+        &mut self,
+        input: &AudioBuffer,
+        outs: &mut [AudioBuffer],
+        off: usize,
+        m: usize,
+        polarity: f32,
+        fader: f32,
+    ) {
+        let in_ch = input.num_channels();
+        for (port, target) in [(2, polarity), (3, polarity * fader)] {
+            let Some(out) = outs.get_mut(port) else {
+                return;
+            };
+            let current = if port == 2 {
+                &mut self.cue_pre
+            } else {
+                &mut self.cue_post
+            };
+            let from = if current.is_nan() { target } else { *current };
+            *current = target;
+            let step = ramp_step(from, target, m);
+            for c in 0..out.num_channels() {
+                let src = &input.channel(c.min(in_ch.saturating_sub(1)))[off..off + m];
+                let mut g = from;
+                for (o, &x) in out.channel_mut(c)[off..off + m].iter_mut().zip(src) {
+                    g += step;
+                    *o = x * g;
+                }
+            }
         }
     }
 
@@ -487,6 +533,9 @@ impl Processor<EngineContext> for ChannelStrip {
                     pan: pan::position(pan_m),
                 }
             };
+            if io.audio_out.len() > 2 {
+                self.render_cue_taps(input, io.audio_out, off, m, polarity, fader_m * vca);
+            }
             if let Some(mix) = self.mix.as_mut() {
                 let mut pan = surround_at(&self.slots.surround, params, surround_lanes, at);
                 if self.object {

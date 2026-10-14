@@ -125,6 +125,23 @@ impl Pipeline {
             .unwrap_or_else(|| parsed.query_caps(None));
         let jpeg = caps.structure(0).is_some_and(|s| s.name() == "image/jpeg");
         if jpeg && let Ok(dec) = make("jpegdec") {
+            // JPEG is full range (JFIF), whatever the container says: a
+            // QuickTime colour atom carries no range, and qtdemux takes it
+            // for video range — jpegdec passed that on, and converting
+            // the frames then stretched their levels (a proxy of 20 came
+            // back 0).
+            if let Some(sink) = dec.static_pad("sink") {
+                end_after_late_start(&sink);
+                sink.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, |_, info| {
+                    if let Some(gst::PadProbeData::Event(ev)) = &mut info.data
+                        && let gst::EventView::Caps(c) = ev.view()
+                        && let Some(caps) = full_range(c.caps())
+                    {
+                        *ev = gst::event::Caps::new(&caps);
+                    }
+                    gst::PadProbeReturn::Ok
+                });
+            }
             self.pipeline.add(&dec)?;
             dec.static_pad("src")
                 .ok_or_else(|| VideoError::Gst("jpegdec without a source".into()))?
@@ -145,9 +162,25 @@ impl Pipeline {
             }
         });
         decode.sync_state_with_parent()?;
-        decode
+        let sink = decode
             .static_pad("sink")
-            .ok_or_else(|| VideoError::Gst("decodebin without a sink".into()))
+            .ok_or_else(|| VideoError::Gst("decodebin without a sink".into()))?;
+        end_after_late_start(&sink);
+        Ok(sink)
+    }
+
+    /// Preroll, then go back to the start with no end: an MP4 without an
+    /// edit list ends, for qtdemux, at its media's duration — cutting off
+    /// the last frames when a B-frame delay puts its pictures after that
+    /// (`ffmpeg -use_editlist 0`). (A source that cannot seek plays as it
+    /// is.)
+    pub(crate) fn rewind_open_ended(&self) -> Result<()> {
+        self.pipeline.set_state(gst::State::Paused)?;
+        self.settle(Duration::from_secs(20))?;
+        if open_seek(&self.pipeline, gst::SeekFlags::FLUSH, 0) {
+            self.settle(Duration::from_secs(20))?;
+        }
+        Ok(())
     }
 
     /// Run until the end (or `cancel`), calling `tick` with the position's
@@ -217,6 +250,89 @@ impl Pipeline {
         tracing::debug!("{}: {}{detail}", self.path.display(), e.error());
         VideoError::media(&self.path, e.error().to_string())
     }
+}
+
+/// Segments through `pad` end as much later as the stream's first picture
+/// starts after its start. An MP4 without an edit list ends, for qtdemux,
+/// at its media's duration from 0, while a B-frame delay starts its
+/// picture later (two frames, with ffmpeg's `-use_editlist 0`): its last
+/// frames, after that end, were cut (pushed after a seek with no end —
+/// see [`Pipeline::rewind_open_ended`] — but outside the segment). Files
+/// whose picture starts at 0 (an edit list) are as they were.
+pub(crate) fn end_after_late_start(pad: &gst::Pad) {
+    use std::sync::Mutex;
+    // The first picture's stream time, as first seen (from the start).
+    let first: Mutex<Option<gst::ClockTime>> = Mutex::new(None);
+    let segment: Mutex<Option<gst::FormattedSegment<gst::ClockTime>>> = Mutex::new(None);
+    pad.add_probe(
+        gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
+        move |_, info| {
+            match &mut info.data {
+                Some(gst::PadProbeData::Event(ev)) => {
+                    if let gst::EventView::Segment(s) = ev.view()
+                        && let Some(seg) = s.segment().downcast_ref::<gst::ClockTime>()
+                    {
+                        let mut seg = seg.clone();
+                        if let Ok(mut g) = segment.lock() {
+                            *g = Some(seg.clone());
+                        }
+                        let late = first.lock().ok().and_then(|f| *f);
+                        if let (Some(late), Some(stop)) = (late, seg.stop())
+                            && late > gst::ClockTime::ZERO
+                        {
+                            seg.set_stop(stop + late);
+                            *ev = gst::event::Segment::new(&seg);
+                        }
+                    }
+                }
+                Some(gst::PadProbeData::Buffer(b)) => {
+                    if let Ok(mut f) = first.lock()
+                        && f.is_none()
+                        && let Some(pts) = b.pts()
+                    {
+                        let seg = segment.lock().ok().and_then(|g| g.clone());
+                        *f = seg.and_then(|s| s.to_stream_time(pts));
+                    }
+                }
+                _ => {}
+            }
+            gst::PadProbeReturn::Ok
+        },
+    );
+}
+
+/// Seek `pipeline` to `t` (ns) with `flags` and no end (see
+/// [`Pipeline::rewind_open_ended`]); whether it took the seek.
+pub(crate) fn open_seek(pipeline: &gst::Pipeline, flags: gst::SeekFlags, t: i64) -> bool {
+    pipeline
+        .seek(
+            1.0,
+            flags,
+            gst::SeekType::Set,
+            crate::clock(t),
+            gst::SeekType::Set,
+            gst::ClockTime::NONE,
+        )
+        .is_ok()
+}
+
+/// `caps` with a colorimetry of limited range made full range (`None`:
+/// nothing to change).
+pub(crate) fn full_range(caps: &gst::CapsRef) -> Option<gst::Caps> {
+    let s = caps.structure(0)?;
+    let c: gst_video::VideoColorimetry = s.get::<&str>("colorimetry").ok()?.parse().ok()?;
+    if c.range() == gst_video::VideoColorRange::Range0_255 {
+        return None;
+    }
+    let full = gst_video::VideoColorimetry::new(
+        gst_video::VideoColorRange::Range0_255,
+        c.matrix(),
+        c.transfer(),
+        c.primaries(),
+    );
+    let mut caps = caps.to_owned();
+    caps.make_mut().set("colorimetry", full.to_string());
+    Some(caps)
 }
 
 /// A stream nobody wants ends in a fakesink (an unlinked stream would stop

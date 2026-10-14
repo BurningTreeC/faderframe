@@ -24,6 +24,8 @@ pub struct Detector {
     nsdf: Vec<f64>,
     /// The peaks found (room for every one: no allocation per call).
     peaks: Vec<(usize, f64)>,
+    /// The longest lag of the last detection.
+    max_lag: usize,
 }
 
 impl Default for Detector {
@@ -39,17 +41,25 @@ impl Detector {
             im: vec![0.0; 2 * FRAMES],
             nsdf: vec![0.0; FRAMES],
             peaks: Vec::with_capacity(FRAMES / 2 + 1),
+            max_lag: 0,
         }
     }
 
     /// The pitch of `x` (at most `FRAMES` long) at `rate`, from 25 Hz to
-    /// 4.2 kHz.
+    /// 4.2 kHz; quieter than −60 dBFS is no pitch.
     pub fn detect(&mut self, x: &[f32], rate: f64) -> Option<Pitch> {
+        self.detect_above(x, rate, 1e-6)
+    }
+
+    /// [`Self::detect`] for windows whose mean power is at least `floor`
+    /// (the caller gates on level itself).
+    pub fn detect_above(&mut self, x: &[f32], rate: f64, floor: f64) -> Option<Pitch> {
+        self.max_lag = 0;
         let n = x.len().min(FRAMES);
         let x = &x[x.len() - n..];
         let mean = x.iter().map(|v| f64::from(*v)).sum::<f64>() / n as f64;
         let energy: f64 = x.iter().map(|v| (f64::from(*v) - mean).powi(2)).sum();
-        if energy / (n as f64) < 1e-6 {
+        if energy / (n as f64) < floor.max(1e-20) || n < 4 {
             return None;
         }
         // The autocorrelation: the power spectrum's transform.
@@ -71,6 +81,7 @@ impl Detector {
         // The overlap's energy, shrinking with the lag.
         let min_lag = (rate / 4_200.0).floor() as usize;
         let max_lag = ((rate / 25.0).ceil() as usize).min(n - 2);
+        self.max_lag = max_lag;
         let mut m = 2.0 * r0;
         self.nsdf.resize(n, 0.0);
         self.nsdf[0] = 1.0;
@@ -121,6 +132,31 @@ impl Detector {
             freq: rate / lag,
             clarity,
         })
+    }
+
+    /// The peak of the last detection's normalised square difference
+    /// within a sample of `lag` (samples): its refined lag and height (the
+    /// clarity of that period). None beyond the lags it looked at or where
+    /// there is no peak.
+    pub fn peak_near(&self, lag: f64) -> Option<(f64, f64)> {
+        let k = lag.round() as usize;
+        if k < 2 || k + 2 > self.max_lag {
+            return None;
+        }
+        let j = [k - 1, k, k + 1]
+            .into_iter()
+            .max_by(|a, b| self.nsdf[*a].total_cmp(&self.nsdf[*b]))?;
+        let (a, b, c) = (self.nsdf[j - 1], self.nsdf[j], self.nsdf[j + 1]);
+        if b < a || b < c || b <= 0.0 {
+            return None;
+        }
+        let d = a - 2.0 * b + c;
+        let shift = if d < -1e-12 {
+            (0.5 * (a - c) / d).clamp(-0.5, 0.5)
+        } else {
+            0.0
+        };
+        Some((j as f64 + shift, b - 0.25 * (a - c) * shift))
     }
 }
 

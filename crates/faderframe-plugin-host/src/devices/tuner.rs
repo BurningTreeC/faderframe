@@ -1,7 +1,9 @@
 //! Tuner: passes the audio (or mutes it while tuning) and lets its editor
 //! hear the input. The pitch is found in the editor (McLeod's normalised
 //! square difference on the tap's ring, `view-devices::tuner`), so the
-//! audio thread does nothing but copy.
+//! audio thread does nothing but copy. Transpose names the notes as a
+//! transposing instrument's player reads them (a B♭ trumpet: +2, so its
+//! sounding B♭ shows as C).
 
 use super::{on_off, param, pass_through, pick, stepped};
 use crate::tap::{AnalysisTap, MeterTap, Watching};
@@ -17,6 +19,7 @@ pub mod id {
     pub const REFERENCE: u32 = 0;
     pub const MUTE: u32 = 1;
     pub const DISPLAY: u32 = 2;
+    pub const TRANSPOSE: u32 = 3;
 }
 
 /// Published: the input's peak (linear).
@@ -39,6 +42,17 @@ pub fn parameters() -> Vec<ParameterInfo> {
         ),
         stepped(id::MUTE, "Mute", 1.0, 0.0),
         stepped(id::DISPLAY, "Display", 1.0, 0.0),
+        ParameterInfo {
+            stepped: true,
+            ..param(
+                id::TRANSPOSE,
+                "Transpose",
+                -12.0,
+                12.0,
+                0.0,
+                ParameterUnit::None,
+            )
+        },
     ]
 }
 
@@ -47,6 +61,8 @@ pub fn format(pid: ParameterId, v: f64) -> Option<String> {
         id::REFERENCE => format!("{v:.1} Hz"),
         id::MUTE => on_off(v),
         id::DISPLAY => pick(&DISPLAYS, v),
+        id::TRANSPOSE if v.round() == 0.0 => "0".into(),
+        id::TRANSPOSE => format!("{:+.0} st", v.round()).replace('-', "−"),
         _ => return None,
     })
 }

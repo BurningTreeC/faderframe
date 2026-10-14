@@ -46,6 +46,21 @@ fn make_clip_with(
     sound: bool,
     paint: impl Fn(u32) -> [u8; 3],
 ) {
+    make_clip_at(path, encoder, mux, sound, (FPS as u64, 1), 0, paint);
+}
+
+/// [`make_clip_with`] at `num/den` frames a second, the picture from
+/// `start` ns (frame `n` from `start + n · den / num` s, to the
+/// nanosecond; the sound from 0).
+fn make_clip_at(
+    path: &Path,
+    encoder: &str,
+    mux: &str,
+    sound: bool,
+    (num, den): (u64, u64),
+    start: u64,
+    paint: impl Fn(u32) -> [u8; 3],
+) {
     faderframe_video::init().unwrap();
     let sound = if sound {
         format!(
@@ -56,7 +71,7 @@ fn make_clip_with(
         String::new()
     };
     let desc = format!(
-        "appsrc name=src format=time caps=video/x-raw,format=RGBA,width={W},height={H},framerate={FPS}/1 ! videoconvert ! {encoder} ! queue ! {mux} name=m ! filesink name=out{sound}"
+        "appsrc name=src format=time caps=video/x-raw,format=RGBA,width={W},height={H},framerate={num}/{den} ! videoconvert ! {encoder} ! queue ! {mux} name=m ! filesink name=out{sound}"
     );
     let pipeline = gst::parse::launch(&desc)
         .unwrap()
@@ -83,9 +98,9 @@ fn make_clip_with(
         let mut buf = gst::Buffer::from_mut_slice(data);
         {
             let b = buf.get_mut().unwrap();
-            let len = 1_000_000_000 / FPS as u64;
-            b.set_pts(gst::ClockTime::from_nseconds(n as u64 * len));
-            b.set_duration(gst::ClockTime::from_nseconds(len));
+            let at = |n: u32| start + n as u64 * 1_000_000_000 * den / num;
+            b.set_pts(gst::ClockTime::from_nseconds(at(n)));
+            b.set_duration(gst::ClockTime::from_nseconds(at(n + 1) - at(n)));
         }
         src.push_buffer(buf).unwrap();
     }
@@ -115,6 +130,23 @@ fn assert_frame(f: &faderframe_video::Frame, n: u32) {
             f.time
         );
     }
+}
+
+/// That `f` is frame `n`, not the one before or after it: of the three
+/// colours, `n`'s is the nearest (whatever a proxy did to the colours).
+fn assert_not_a_neighbour(f: &faderframe_video::Frame, n: u32, what: &str) {
+    let p = f.pixel(f.width / 2, f.height / 2);
+    let off = |m: u32| -> i32 {
+        let c = colour(m);
+        (0..3).map(|i| (p[i] as i32 - c[i] as i32).abs()).sum()
+    };
+    let nearest = (n.saturating_sub(1)..=n + 1)
+        .min_by_key(|&m| off(m))
+        .unwrap();
+    assert_eq!(
+        nearest, n,
+        "{what}: frame {n} wanted, {p:?} is frame {nearest}'s"
+    );
 }
 
 fn frame_ns(n: u32) -> i64 {
@@ -344,6 +376,265 @@ fn an_intra_clip_is_probed_indexed_decoded_proxied_and_remuxed() {
         assert_eq!(info.audio[0].channels, 2);
         let mix = index::index(&out, &cancel, |_| {}).unwrap();
         assert_eq!(mix.len(), ix.len(), "{container:?}: every frame");
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A frame asked for by its start is that frame, whatever its container
+/// rounds frame times to. Matroska counts milliseconds: at 29.97 fps a
+/// frame starts up to half a millisecond off, and the one before it seems
+/// to end that much after it starts (a proxy's frames are as far off the
+/// original's times, which playing asks it for). A seek to the start
+/// itself had the decoder cut that sliver from the frame before and hand
+/// it out first, stamped with the start: a still one frame early, and
+/// every frame of a run played from there one frame late.
+#[test]
+fn a_frame_asked_by_its_start_is_never_the_one_before() {
+    use faderframe_video::{FrameService, Media, Want};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    let d = dir();
+    let cancel = AtomicBool::new(false);
+    // Matroska's own times, and QuickTime's exact ones (its proxy in
+    // Matroska).
+    for (name, mux) in [("ntsc.mkv", "matroskamux"), ("ntsc.mov", "qtmux")] {
+        let clip = d.join(name);
+        make_clip_at(&clip, "jpegenc", mux, false, (30_000, 1001), 0, colour);
+        let ix = Arc::new(index::index(&clip, &cancel, |_| {}).unwrap());
+        assert_eq!(ix.len(), FRAMES as usize, "{name}");
+        let proxy = d.join(format!("{name}.proxy.mkv"));
+        make_proxy(
+            &clip,
+            &proxy,
+            (W, H, (1, 1)),
+            ProxySpec {
+                height: 120,
+                quality: 95,
+            },
+            Default::default(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        // In milliseconds (33.37 ms a frame): the rounding this is about.
+        let pix = index::index(&proxy, &cancel, |_| {}).unwrap();
+        assert_eq!(&pix.times[..4], &[0, 33_000_000, 67_000_000, 100_000_000]);
+        // From the file, and from its proxy at the file's times: every
+        // frame alone, and the first frames played from any of them.
+        for (path, (w, h)) in [(&clip, (W, H)), (&proxy, (160, 120))] {
+            let what = path.file_name().unwrap().to_string_lossy();
+            let mut dec = Decoder::open(path, w, h).unwrap();
+            for n in 0..FRAMES {
+                let t = ix.times[n as usize];
+                let f = dec.frame_at(t, true).unwrap().unwrap();
+                assert_not_a_neighbour(&f, n, &what);
+                assert_eq!(f.time, t, "{what}: frame {n} at its start");
+            }
+            for n in [1, 3, 4, 31, 46, 61] {
+                let t = ix.times[n as usize];
+                dec.play_from(t).unwrap();
+                let f = dec.next_frame().unwrap().unwrap();
+                assert_eq!(f.time, t, "{what}: played from frame {n}");
+                assert_not_a_neighbour(&f, n, &what);
+                for m in n + 1..n + 4 {
+                    assert_not_a_neighbour(&dec.next_frame().unwrap().unwrap(), m, &what);
+                }
+            }
+        }
+        // The service playing from such a frame: each picture in its
+        // place (the player counts the frames it reads from the first).
+        for proxy in [None, Some((proxy.clone(), (160, 120)))] {
+            for from in [1, 3, 31, 46] {
+                let service = FrameService::new(64 << 20);
+                service.set_media(
+                    1,
+                    Media {
+                        original: clip.clone(),
+                        index: ix.clone(),
+                        size: (W, H),
+                        par: (1, 1),
+                        proxy: proxy.clone(),
+                    },
+                );
+                for n in from..from + 6u32 {
+                    let t = ix.times[n as usize];
+                    let ready_by = Instant::now() + Duration::from_secs(10);
+                    let p = loop {
+                        if let Some(p) = service
+                            .picture(1, t, (W, H), Want::Play)
+                            .filter(|p| p.exact && p.number == n as usize)
+                        {
+                            break p;
+                        }
+                        assert!(Instant::now() < ready_by, "{name}: no frame {n}");
+                        std::thread::sleep(Duration::from_millis(2));
+                    };
+                    let proxied = if proxy.is_some() { " (proxy)" } else { "" };
+                    assert_not_a_neighbour(&p.frame, n, &format!("{name}{proxied} from {from}"));
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// `frames` frames of [`colour`] at 29.97 fps through ffmpeg (`args`
+/// between the raw input and `path`); `false` where ffmpeg (or its
+/// encoder) is not there.
+fn ffmpeg_clip(path: &Path, args: &[&str], frames: u32) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let size = format!("{W}x{H}");
+    let Ok(mut child) = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo"])
+        .args([
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            &size,
+            "-r",
+            "30000/1001",
+            "-i",
+            "-",
+        ])
+        .args(args)
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+    else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        for n in 0..frames {
+            let c = colour(n);
+            let frame: Vec<u8> = (0..W * H).flat_map(|_| c).collect();
+            if stdin.write_all(&frame).is_err() {
+                break;
+            }
+        }
+    }
+    child.wait().is_ok_and(|s| s.success())
+}
+
+/// A picture that starts after 0 keeps its times, in the index and in the
+/// proxy, frame for frame: from a Matroska file whose sound starts first,
+/// and (where ffmpeg is here) an MP4 written without an edit list, whose
+/// B-frame delay puts the first picture two frames in and the last two
+/// after the media's duration. The proxy read back early by the picture's
+/// start (Matroska readers start a stream at its first block), and the
+/// MP4's last frames were in neither (qtdemux stopped at the duration).
+#[test]
+fn a_picture_starting_late_keeps_its_times_in_the_proxy() {
+    use faderframe_video::{FrameService, Media, Want};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    let d = dir();
+    let cancel = AtomicBool::new(false);
+    let late = 2 * 1_000_000_000 * 1001 / 30_000;
+    let mkv = d.join("late.mkv");
+    make_clip_at(
+        &mkv,
+        "jpegenc",
+        "matroskamux",
+        true,
+        (30_000, 1001),
+        late,
+        colour,
+    );
+    let mut clips = vec![(mkv, FRAMES)];
+    // 90 frames: past the 75 of the others, so the end is a B-frame's.
+    let mp4 = d.join("no-edit-list.mp4");
+    let x264 = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-bf", "3"];
+    if ffmpeg_clip(&mp4, &[&x264[..], &["-use_editlist", "0"]].concat(), 90) {
+        clips.push((mp4, 90));
+    } else {
+        eprintln!("the MP4 without an edit list skipped: no ffmpeg with libx264 here");
+    }
+    for (clip, frames) in clips {
+        let name = clip.file_name().unwrap().to_string_lossy().into_owned();
+        let ix = Arc::new(index::index(&clip, &cancel, |_| {}).unwrap());
+        assert_eq!(ix.len(), frames as usize, "{name}: every frame");
+        assert!(
+            (ix.times[0] - late as i64).abs() < 1_000_000,
+            "{name}: the picture from {} ns",
+            ix.times[0]
+        );
+        let proxy = d.join(format!("{name}.proxy.mkv"));
+        make_proxy(
+            &clip,
+            &proxy,
+            (W, H, (1, 1)),
+            ProxySpec {
+                height: 120,
+                quality: 95,
+            },
+            Default::default(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        // Frame for frame: the proxy's times are the original's, from its
+        // first frame (a Matroska reader starts it at 0).
+        let pix = index::index(&proxy, &cancel, |_| {}).unwrap();
+        assert_eq!(pix.len(), ix.len(), "{name}: the proxy's frames");
+        for n in 1..ix.len() {
+            let (p, o) = (pix.times[n] - pix.times[0], ix.times[n] - ix.times[0]);
+            assert!(
+                (p - o).abs() <= 1_000_000,
+                "{name}: proxy frame {n} at {p} ns from its first, the original's at {o} ns"
+            );
+        }
+        // Every frame of the original, and of its proxy read from its
+        // first frame (as the frame service reads it).
+        for (path, (w, h)) in [(&clip, (W, H)), (&proxy, (160, 120))] {
+            let what = path.file_name().unwrap().to_string_lossy().into_owned();
+            let mut dec = Decoder::open(path, w, h).unwrap();
+            let shift = if path == &clip {
+                0
+            } else {
+                dec.first_time() - ix.times[0]
+            };
+            for n in 0..frames {
+                let t = ix.times[n as usize] + shift;
+                let f = dec.frame_at(t, true).unwrap().unwrap();
+                assert_not_a_neighbour(&f, n, &what);
+            }
+        }
+        // Through the frame service, from the proxy (asked at its size):
+        // stills, then playing, each picture in its place.
+        let service = FrameService::new(64 << 20);
+        service.set_media(
+            1,
+            Media {
+                original: clip.clone(),
+                index: ix.clone(),
+                size: (W, H),
+                par: (1, 1),
+                proxy: Some((proxy.clone(), (160, 120))),
+            },
+        );
+        let shown = |n: u32, want: Want| {
+            let t = ix.times[n as usize];
+            let ready_by = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(p) = service
+                    .picture(1, t, (160, 120), want)
+                    .filter(|p| p.exact && p.number == n as usize)
+                {
+                    break p;
+                }
+                assert!(Instant::now() < ready_by, "{name}: no frame {n}");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        for n in [frames - 1, 0, 1, 2, frames - 2] {
+            let p = shown(n, Want::Still);
+            assert_not_a_neighbour(&p.frame, n, &format!("{name}: a still from the proxy"));
+        }
+        for n in 3..10 {
+            let p = shown(n, Want::Play);
+            assert_not_a_neighbour(&p.frame, n, &format!("{name} played from the proxy"));
+        }
     }
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -677,6 +968,69 @@ fn proxies_keep_the_colours() {
                 (p[i] as i32 - c[i] as i32).abs() <= 8,
                 "frame {n}: {c:?} came back as {p:?}"
             );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Motion JPEG keeps its colours, in QuickTime as in Matroska, sampled RGB
+/// or YCbCr: shown as painted, and its proxy as the original. (QuickTime's
+/// colour atom carries no range, qtdemux took it for video range, and the
+/// proxy's conversion stretched the levels: 20 came back 0.)
+#[test]
+fn motion_jpeg_keeps_its_colours_in_any_container() {
+    let d = dir();
+    let paint = |n: u32| match n % 4 {
+        0 => [250, 250, 250],
+        1 => [6, 6, 6],
+        2 => [230, 30, 30],
+        _ => [20, 20, 128],
+    };
+    let cancel = AtomicBool::new(false);
+    for (sampling, encoder) in [
+        ("rgb", "jpegenc"),
+        (
+            "yuv",
+            "video/x-raw,format=I420,colorimetry=1:4:0:0 ! jpegenc",
+        ),
+    ] {
+        for (mux, ext) in [("qtmux", "mov"), ("matroskamux", "mkv")] {
+            let clip = d.join(format!("{sampling}.{ext}"));
+            make_clip_with(&clip, &format!("{encoder} quality=95"), mux, false, paint);
+            let ix = index::index(&clip, &cancel, |_| {}).unwrap();
+            let proxy = d.join(format!("{sampling}.{ext}.proxy.mkv"));
+            make_proxy(
+                &clip,
+                &proxy,
+                (W, H, (1, 1)),
+                ProxySpec {
+                    height: 120,
+                    quality: 95,
+                },
+                Default::default(),
+                &cancel,
+                |_| {},
+            )
+            .unwrap();
+            let mut original = Decoder::open(&clip, W, H).unwrap();
+            let mut proxied = Decoder::open(&proxy, 160, 120).unwrap();
+            for n in [4, 5, 6, 7] {
+                let t = ix.times[n as usize];
+                let o = original.frame_at(t, true).unwrap().unwrap();
+                let p = proxied.frame_at(t, true).unwrap().unwrap();
+                let (o, p) = (o.pixel(W / 2, H / 2), p.pixel(80, 60));
+                let c = paint(n);
+                for i in 0..3 {
+                    assert!(
+                        (o[i] as i32 - c[i] as i32).abs() <= 10,
+                        "{sampling} {ext}: frame {n} painted {c:?}, shown {o:?}"
+                    );
+                    assert!(
+                        (p[i] as i32 - o[i] as i32).abs() <= 8,
+                        "{sampling} {ext}: frame {n} shown {o:?}, its proxy {p:?}"
+                    );
+                }
+            }
         }
     }
     let _ = std::fs::remove_dir_all(&d);

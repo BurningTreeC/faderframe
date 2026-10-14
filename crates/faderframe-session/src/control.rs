@@ -574,6 +574,7 @@ impl Session {
                 recording: self.transport.recording,
                 looping: self.project.loop_enabled,
                 click: self.record.metronome != faderframe_engine::MetronomeMode::Off,
+                input_quantize: self.record.input_quantize,
                 position,
                 first_track: first + 1,
                 page: self.control.page,

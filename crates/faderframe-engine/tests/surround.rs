@@ -328,6 +328,7 @@ fn sends_follow_the_panner_into_beds_and_fold_out_of_them() {
             level_db: 0.0,
             tap,
             enabled: true,
+            pan: None,
         });
         levels(&tp, 6)
     };
@@ -364,6 +365,7 @@ fn sends_follow_the_panner_into_beds_and_fold_out_of_them() {
         level_db: 0.0,
         tap: SendTap::PostFader,
         enabled: true,
+        pan: None,
     });
     let mut r =
         OfflineRenderer::new(&tp.project, &tp.sources, EngineConfig::default(), 256, 6).unwrap();

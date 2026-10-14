@@ -132,6 +132,9 @@ pub struct Project {
     pub console: Option<crate::console::Console>,
     /// Display order. Contains exactly one [`TrackKind::Master`].
     pub tracks: Vec<Track>,
+    /// The performers' headphone mixes (see [`crate::cue`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cue_mixes: Vec<crate::cue::CueMix>,
     #[serde(default)]
     pub clips: BTreeMap<ClipId, Clip>,
     #[serde(default)]
@@ -208,6 +211,7 @@ impl Project {
             speaker_layouts: Vec::new(),
             console: None,
             tracks: vec![master],
+            cue_mixes: Vec::new(),
             clips: BTreeMap::new(),
             sources: BTreeMap::new(),
             midi_mappings: Vec::new(),
@@ -351,6 +355,42 @@ impl Project {
 
     pub fn clip_mut(&mut self, id: ClipId) -> Option<&mut Clip> {
         self.clips.get_mut(&id)
+    }
+
+    /// Every source something in the project plays or keeps to go back
+    /// to: clips (each take of a folder too), their originals (clip
+    /// effects, spectral edits, polyphonic pitch) and frozen tracks.
+    pub fn used_sources(&self) -> BTreeSet<AudioSourceId> {
+        fn pitch(p: Option<&crate::pitch::PitchEdit>, out: &mut BTreeSet<AudioSourceId>) {
+            if let Some(poly) = p.and_then(|p| p.polyphonic.as_ref()) {
+                out.insert(poly.original);
+            }
+        }
+        fn audio(a: &crate::AudioClip, out: &mut BTreeSet<AudioSourceId>) {
+            out.insert(a.source);
+            pitch(a.pitch.as_ref(), out);
+            if let Some(e) = &a.effects {
+                out.insert(e.original.source);
+                pitch(e.original.pitch.as_ref(), out);
+            }
+            if let Some(s) = &a.spectral {
+                out.insert(s.original);
+            }
+        }
+        let mut out = BTreeSet::new();
+        for c in self.clips.values() {
+            match &c.content {
+                crate::ClipContent::Audio(a) => audio(a, &mut out),
+                crate::ClipContent::Takes(f) => out.extend(f.sources()),
+                crate::ClipContent::Midi(_) => {}
+            }
+        }
+        for t in &self.tracks {
+            if let Some(f) = &t.freeze {
+                out.insert(f.source);
+            }
+        }
+        out
     }
 
     /// Clips of a track, sorted by start.
@@ -716,6 +756,9 @@ impl Project {
                 }
             }
         }
+        for c in &self.cue_mixes {
+            max_id = max_id.max(c.id.raw());
+        }
         for s in &self.album.songs {
             max_id = max_id.max(s.id.raw());
             for p in &s.inserts {
@@ -807,6 +850,24 @@ impl Project {
                 notes.push(format!("removed dangling sends on '{}'", t.name));
             }
         }
+        // Cue mixes: one send per cue mix and track, to cue mixes that
+        // exist, from tracks that feed them.
+        let mut cues: BTreeSet<faderframe_core::CueId> = BTreeSet::new();
+        self.cue_mixes.retain(|c| cues.insert(c.id));
+        self.cue_mixes.truncate(crate::cue::MAX_CUE_MIXES);
+        let cues: BTreeSet<faderframe_core::CueId> = self.cue_mixes.iter().map(|c| c.id).collect();
+        for c in &mut self.cue_mixes {
+            c.layout = crate::cue::cue_layout(c.layout);
+            if c.tap == crate::SendTap::PreFx {
+                c.tap = crate::SendTap::PreFader;
+            }
+        }
+        for t in &mut self.tracks {
+            let feeds = crate::cue::feeds_cues(t.kind);
+            let mut seen = BTreeSet::new();
+            t.cue_sends
+                .retain(|s| feeds && cues.contains(&s.cue) && seen.insert(s.cue));
+        }
         notes
     }
 }
@@ -831,6 +892,7 @@ mod tests {
             level_db: -6.0,
             tap: Default::default(),
             enabled: true,
+            pan: None,
         });
         let mut tb = Track::new(b, TrackKind::Audio, "B", TrackColor::palette(1));
         tb.output = OutputRouting::Track { track: bus };

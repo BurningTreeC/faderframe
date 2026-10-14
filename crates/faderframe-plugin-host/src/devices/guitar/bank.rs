@@ -1,7 +1,9 @@
 //! A stage's channels, solved side by side exactly as the preamps' are
 //! ([`crate::devices::preamp::PreampBank`]): the thread running the stage
 //! and helper threads (which adopt its scheduling, see [`WorkerPool`]) take
-//! a channel each, so a stereo signal is two threads. While a stereo pair is
+//! a channel each, so a stereo signal is two threads and a 5.1 one six,
+//! within the physical cores and the user's processing threads
+//! ([`faderframe_realtime::channel_threads`]). While a stereo pair is
 //! exactly mono one unit runs; once the channels differ the dormant one
 //! wakes from the running one's exact history, and both keep their tails
 //! until a reset.
@@ -39,10 +41,10 @@ impl<U: Unit> Bank<U> {
     pub(super) fn new(units: Vec<U>) -> Self {
         let channels = units.len();
         let helpers = (channels > 1).then(|| {
-            let cores = faderframe_realtime::physical_cores()
-                .saturating_sub(1)
-                .max(1);
-            WorkerPool::new(PoolConfig::new((channels - 1).min(cores).min(BATCH - 1)))
+            WorkerPool::new(PoolConfig::new(faderframe_realtime::channel_helpers(
+                channels,
+                BATCH - 1,
+            )))
         });
         Self {
             units: units.into_iter().map(TryCell::new).collect(),
@@ -103,8 +105,11 @@ impl<U: Unit> Bank<U> {
             let (a, b) = mics.split_at_mut(0);
             (a, b)
         };
+        let threads = self.helpers.as_ref().map_or(1, |h| {
+            faderframe_realtime::channel_threads(active.min(BATCH), h.threads())
+        });
         match &self.helpers {
-            Some(helpers) if active > 1 => {
+            Some(helpers) if threads > 1 => {
                 for start in (0..active).step_by(BATCH) {
                     let n = (active - start).min(BATCH);
                     let mut lanes: [TryCell<Option<Lanes<'_>>>; BATCH] =
@@ -125,13 +130,16 @@ impl<U: Unit> Bank<U> {
                             mic_b,
                         });
                     }
+                    let threads = threads.min(n);
                     let job = Job {
                         units: &self.units[start..start + n],
                         lanes: &lanes[..n],
                         next: AtomicUsize::new(0),
+                        seats: AtomicUsize::new(0),
+                        threads,
                         work,
                     };
-                    helpers.run(&job, n - 1);
+                    helpers.run(&job, threads - 1);
                 }
             }
             _ => {
@@ -165,11 +173,14 @@ impl<U: Unit> Bank<U> {
     }
 }
 
-/// One pass of the helpers: each thread takes the next channel.
+/// One pass of the helpers: each thread takes the next channel, at most
+/// `threads` threads taking part (see `preamp::Solve`).
 struct Job<'a, 'b, U, F> {
     units: &'a [TryCell<U>],
     lanes: &'a [TryCell<Option<Lanes<'b>>>],
     next: AtomicUsize,
+    seats: AtomicUsize,
+    threads: usize,
     work: &'a F,
 }
 
@@ -179,6 +190,9 @@ where
     F: Fn(&mut U, Lanes<'_>) + Sync,
 {
     fn work(&self) {
+        if self.seats.fetch_add(1, Ordering::Relaxed) >= self.threads {
+            return;
+        }
         loop {
             let c = self.next.fetch_add(1, Ordering::Relaxed);
             let (Some(unit), Some(lanes)) = (self.units.get(c), self.lanes.get(c)) else {

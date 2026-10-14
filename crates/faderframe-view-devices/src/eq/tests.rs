@@ -537,6 +537,7 @@ fn the_analyser_menu_sets_the_editors_own_settings() {
         "Post-EQ",
         "External: Side Chain",
         "Freeze",
+        "Peak Hold",
         "Show Collisions",
         "Resolution: Maximum",
         "Tilt: 3.0 dB/oct",
@@ -986,4 +987,171 @@ fn mono_display_uses_one_meter_reading_for_both_bars() {
             assert!(view.meter[1] < -100.0);
         }
     }
+}
+
+fn set_param(view: &EqView, s: &mut Session, b: usize, f: Field, v: f64) {
+    let a = view.action(s, band_id(b, f), v).unwrap();
+    s.dispatch(a).unwrap();
+}
+
+#[test]
+fn the_background_menu_flattens_and_inverts_every_gain() {
+    let (mut s, plugin) = session();
+    let mut view = EqView::new(plugin, &Theme::default());
+    paint(&mut view, &s);
+    // Two bells with a gain each, one dynamic; a low cut has no gain.
+    for (b, gain, range) in [(0, 4.0, 0.0), (1, -3.0, -6.0)] {
+        set_param(&view, &mut s, b, Field::Enabled, 1.0);
+        set_param(&view, &mut s, b, Field::Gain, gain);
+        set_param(&view, &mut s, b, Field::Range, range);
+    }
+    set_param(&view, &mut s, 2, Field::Enabled, 1.0);
+    set_param(&view, &mut s, 2, Field::Type, 3.0);
+    run(&mut view, &mut s, key(Key::Escape, Modifiers::NONE));
+    let l = view.layout(SIZE, &s);
+    let at = Point::new(l.graph.x + l.graph.w * 0.5, l.graph.y + 20.0);
+    let items = menu(run(
+        &mut view,
+        &mut s,
+        down(at, PointerButton::Secondary, 1),
+    ));
+    for label in [
+        "Flatten All Gains",
+        "Invert All Gains",
+        "Solo While Dragging",
+    ] {
+        assert!(items.iter().any(|i| i.label == label), "{label}");
+    }
+    pick(&mut s, &items, "Invert All Gains");
+    assert_eq!(band(&s, plugin, 0).gain, -4.0);
+    assert_eq!(band(&s, plugin, 1).gain, 3.0);
+    assert_eq!(band(&s, plugin, 1).range, 6.0);
+    assert_eq!(s.history().undo_label(), Some("Invert EQ Gains"));
+    let items = menu(run(
+        &mut view,
+        &mut s,
+        down(at, PointerButton::Secondary, 1),
+    ));
+    pick(&mut s, &items, "Flatten All Gains");
+    assert_eq!(band(&s, plugin, 0).gain, 0.0);
+    assert_eq!(band(&s, plugin, 1).gain, 0.0);
+    assert_eq!(band(&s, plugin, 1).range, 0.0);
+    assert!(band(&s, plugin, 2).used, "the cut stays");
+    assert_eq!(s.history().undo_label(), Some("Flatten EQ"));
+    // Solo While Dragging is the editor's own setting.
+    pick(&mut s, &items, "Solo While Dragging");
+    assert!(view.settings(&s).solo_drag);
+}
+
+#[test]
+fn solo_while_dragging_plays_the_band_held() {
+    let (mut s, plugin) = session();
+    let mut view = EqView::new(plugin, &Theme::default());
+    paint(&mut view, &s);
+    click(
+        &mut view,
+        &mut s,
+        Point::new(590.0, 200.0),
+        1,
+        Modifiers::NONE,
+    );
+    let tap = s.plugin_tap(plugin).unwrap();
+    // Off: a drag leaves the listening alone.
+    let at = node(&view, &s, plugin, 0);
+    run(&mut view, &mut s, down(at, PointerButton::Primary, 1));
+    run(&mut view, &mut s, drag(Point::new(at.x + 60.0, at.y)));
+    assert_eq!(tap.listen(), None);
+    run(&mut view, &mut s, up(Point::new(at.x + 60.0, at.y)));
+    // On: the band is heard alone while it moves, and not afterwards.
+    s.dispatch(view.view_action(key::SOLO_DRAG, 1.0)).unwrap();
+    let at = node(&view, &s, plugin, 0);
+    run(&mut view, &mut s, down(at, PointerButton::Primary, 1));
+    assert_eq!(tap.listen(), None, "not before it moves");
+    run(&mut view, &mut s, drag(Point::new(at.x - 60.0, at.y)));
+    assert_eq!(tap.listen(), Some(0));
+    run(&mut view, &mut s, up(Point::new(at.x - 60.0, at.y)));
+    assert_eq!(tap.listen(), None);
+    assert_eq!(s.history().undo_label(), Some("EQ Band"));
+}
+
+#[test]
+fn the_output_panel_has_mix_and_drive_knobs() {
+    use super::bars::OutputItem;
+    let (mut s, plugin) = session();
+    let mut view = EqView::new(plugin, &Theme::default());
+    paint(&mut view, &s);
+    let l = view.layout(SIZE, &s);
+    let out = view
+        .bottom_items(&l.bottom)
+        .into_iter()
+        .find(|(i, _)| *i == BottomItem::Output)
+        .unwrap()
+        .1;
+    click(&mut view, &mut s, out.center(), 1, Modifiers::NONE);
+    let items = view.output_items(&view.output_rect(&l));
+    let rect = |item: OutputItem| items.iter().find(|(i, _)| *i == item).unwrap().1;
+    let value = |s: &Session, g: usize| f64::from(s.plugin_tap(plugin).unwrap().params.get(g));
+    // Dragging the mix knob down lowers the mix; a double-click puts it
+    // back to 100 %.
+    let at = rect(OutputItem::Mix).center();
+    run(&mut view, &mut s, down(at, PointerButton::Primary, 1));
+    run(&mut view, &mut s, drag(Point::new(at.x, at.y + 80.0)));
+    run(&mut view, &mut s, up(Point::new(at.x, at.y + 80.0)));
+    let mix = value(&s, global::MIX);
+    assert!(mix < 0.7 && mix > 0.0, "{mix}");
+    assert_eq!(s.history().undo_label(), Some("EQ Output"));
+    click(&mut view, &mut s, at, 2, Modifiers::NONE);
+    assert_eq!(value(&s, global::MIX), 1.0);
+    // The drive knob the other way up.
+    let at = rect(OutputItem::Drive).center();
+    run(&mut view, &mut s, down(at, PointerButton::Primary, 1));
+    run(&mut view, &mut s, drag(Point::new(at.x, at.y - 50.0)));
+    run(&mut view, &mut s, up(Point::new(at.x, at.y - 50.0)));
+    assert!(value(&s, global::CHARACTER_DRIVE) > 1.2);
+    click(&mut view, &mut s, at, 2, Modifiers::NONE);
+    assert_eq!(value(&s, global::CHARACTER_DRIVE), 1.0);
+    paint(&mut view, &s);
+}
+
+#[test]
+fn the_character_menu_offers_console_tape_oversampling_and_drive() {
+    let (mut s, plugin) = session();
+    let mut view = EqView::new(plugin, &Theme::default());
+    let l = view.layout(SIZE, &s);
+    let r = view
+        .bottom_items(&l.bottom)
+        .into_iter()
+        .find(|(i, _)| *i == BottomItem::Character)
+        .unwrap()
+        .1;
+    let items = menu(click(&mut view, &mut s, r.center(), 1, Modifiers::NONE));
+    for label in [
+        "Clean",
+        "Subtle",
+        "Warm",
+        "Console",
+        "Tape",
+        "Oversampling: Off",
+        "Oversampling: 2×",
+        "Oversampling: 4×",
+        "Drive: 150 %",
+    ] {
+        assert!(items.iter().any(|i| i.label == label), "{label}");
+    }
+    let value = |s: &Session, g: usize| f64::from(s.plugin_tap(plugin).unwrap().params.get(g));
+    pick(&mut s, &items, "Tape");
+    assert_eq!(value(&s, global::CHARACTER), 4.0);
+    pick(&mut s, &items, "Drive: 150 %");
+    assert_eq!(value(&s, global::CHARACTER_DRIVE), 1.5);
+    pick(&mut s, &items, "Oversampling: 2×");
+    assert_eq!(value(&s, global::OVERSAMPLING), 1.0);
+    // Oversampled, the processor is latent and the button says so.
+    let tap = s.plugin_tap(plugin).unwrap();
+    assert!(faderframe_plugin_host::eq::latency(&tap.params) > 0);
+    let p = paint(&mut view, &s);
+    assert!(
+        p.texts().iter().any(|t| t.contains("Tape ×2")),
+        "{:?}",
+        p.texts()
+    );
 }

@@ -1,7 +1,10 @@
 //! The metronome: a click on every beat (accented on bar downbeats, off-beats
 //! — the eighths between beats — when asked for), following the tempo and
-//! meter maps, mixed into the first two device outputs after the graph.
-//! Live playback only — offline renders never contain it.
+//! meter maps, mixed into the first two device outputs after the graph
+//! (unless switched off there) and into every cue mix's outputs that wants
+//! it, at the cue mix's click level under its master level and mute
+//! ([`MetronomeShared::set_cues`]). Live playback only — offline renders
+//! never contain it.
 //!
 //! The sounds are made on the control thread ([`ClickSounds`]: a built-in
 //! [`ClickSound`] synthesised, or the user's files) at the stream's rate and
@@ -11,7 +14,43 @@
 use faderframe_audio::DeviceBuffers;
 use faderframe_timeline::{MusicalTime, Timeline};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+
+/// Cue mixes the click can play in (see [`faderframe_project::cue::MAX_CUE_MIXES`]).
+pub const MAX_CUE_CLICKS: usize = faderframe_project::cue::MAX_CUE_MIXES;
+
+/// Where (and how loud) the click plays in a cue mix.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CueClick {
+    /// The cue mix's first device output.
+    pub first_channel: u16,
+    /// 1 (mono) or 2.
+    pub channels: u8,
+    /// Linear: the cue's click level × its master level (0 while muted).
+    pub gain: f32,
+    /// The click is on in this cue mix.
+    pub on: bool,
+}
+
+impl CueClick {
+    /// One word: the gain's bits, the first channel, the channel count and
+    /// the switch (bit 56) — read whole, never torn.
+    fn pack(self) -> u64 {
+        u64::from(self.gain.to_bits())
+            | (u64::from(self.first_channel) << 32)
+            | (u64::from(self.channels) << 48)
+            | (u64::from(self.on) << 56)
+    }
+
+    fn unpack(v: u64) -> Self {
+        Self {
+            gain: f32::from_bits(v as u32),
+            first_channel: (v >> 32) as u16,
+            channels: (v >> 48) as u8,
+            on: (v >> 56) & 1 == 1,
+        }
+    }
+}
 
 /// When the click sounds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -149,6 +188,11 @@ pub struct MetronomeShared {
     mode: AtomicU8,
     gain_bits: AtomicU32,
     levels: [AtomicU32; 3],
+    /// It clicks on the main outputs (the first two).
+    main: AtomicBool,
+    /// The cue mixes it may click in (the first `cue_count`).
+    cues: [AtomicU64; MAX_CUE_CLICKS],
+    cue_count: AtomicU8,
 }
 
 impl Default for MetronomeShared {
@@ -161,6 +205,9 @@ impl Default for MetronomeShared {
                 AtomicU32::new(0.7f32.to_bits()),
                 AtomicU32::new(0.0f32.to_bits()),
             ],
+            main: AtomicBool::new(true),
+            cues: std::array::from_fn(|_| AtomicU64::new(0)),
+            cue_count: AtomicU8::new(0),
         }
     }
 }
@@ -197,6 +244,34 @@ impl MetronomeShared {
 
     pub fn level(&self, kind: ClickKind) -> f32 {
         f32::from_bits(self.levels[kind.index()].load(Ordering::Relaxed))
+    }
+
+    /// Whether the click plays on the main outputs (the first two; it may
+    /// play in cue mixes only).
+    pub fn set_main(&self, on: bool) {
+        self.main.store(on, Ordering::Relaxed);
+    }
+
+    pub fn main(&self) -> bool {
+        self.main.load(Ordering::Relaxed)
+    }
+
+    /// The cue mixes the click may play in (control thread; the first
+    /// [`MAX_CUE_CLICKS`]).
+    pub fn set_cues(&self, cues: &[CueClick]) {
+        let n = cues.len().min(MAX_CUE_CLICKS);
+        for (slot, c) in self.cues.iter().zip(cues) {
+            slot.store(c.pack(), Ordering::Relaxed);
+        }
+        self.cue_count.store(n as u8, Ordering::Relaxed);
+    }
+
+    /// The cue mixes the click may play in now.
+    pub fn cues(&self) -> impl Iterator<Item = CueClick> + '_ {
+        let n = usize::from(self.cue_count.load(Ordering::Relaxed)).min(MAX_CUE_CLICKS);
+        self.cues[..n]
+            .iter()
+            .map(|c| CueClick::unpack(c.load(Ordering::Relaxed)))
     }
 }
 
@@ -537,7 +612,23 @@ impl Click {
         if count == 0 && !self.voices.iter().any(|v| v.on) {
             return;
         }
-        let outs = io.output_channels().min(2);
+        // Where it plays: the main outputs (the first two), the cue mixes
+        // that want it — (first channel, channels, gain).
+        let all = io.output_channels();
+        let mut dests = [(0usize, 0usize, 0.0f32); MAX_CUE_CLICKS + 1];
+        let mut n_dests = 0;
+        if shared.main() {
+            dests[0] = (0, all.min(2), 1.0);
+            n_dests = 1;
+        }
+        for c in shared.cues().filter(|c| c.on && c.gain > 0.0) {
+            let first = usize::from(c.first_channel);
+            let channels = usize::from(c.channels.max(1)).min(all.saturating_sub(first));
+            if channels > 0 && n_dests < dests.len() {
+                dests[n_dests] = (first, channels, c.gain);
+                n_dests += 1;
+            }
+        }
         let mut next = 0;
         for i in 0..n {
             while next < count && starts[next].0 == i {
@@ -562,12 +653,14 @@ impl Click {
             if !any {
                 continue;
             }
-            match outs {
-                0 => {}
-                1 => io.output(0)[offset + i] += 0.5 * (l + r),
-                _ => {
-                    io.output(0)[offset + i] += l;
-                    io.output(1)[offset + i] += r;
+            for &(first, channels, g) in &dests[..n_dests] {
+                match channels {
+                    0 => {}
+                    1 => io.output(first)[offset + i] += 0.5 * (l + r) * g,
+                    _ => {
+                        io.output(first)[offset + i] += l * g;
+                        io.output(first + 1)[offset + i] += r * g;
+                    }
                 }
             }
         }

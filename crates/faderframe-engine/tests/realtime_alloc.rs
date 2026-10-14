@@ -1628,8 +1628,9 @@ fn warped_playback_does_not_allocate() {
             curve: vec![12; ((end - start) / 240) as usize],
             gain_db: 0.0,
             muted: false,
+            timing: None,
         };
-        a.pitch = Some(PitchEdit {
+        let mut e = PitchEdit {
             hop: 240,
             notes: vec![
                 note(from, from + span / 2, 57.0, 3.0, 2.0),
@@ -1637,7 +1638,23 @@ fn warped_playback_does_not_allocate() {
             ],
             keep_formants: name == "Pad",
             polyphonic: None,
-        });
+            removed: Vec::new(),
+        };
+        if name == "Pad" {
+            // The first note made longer (the second gives way).
+            e.move_edge(
+                0,
+                faderframe_project::pitch::Edge::End,
+                from + span * 2 / 3,
+                from,
+                from + span,
+            );
+        } else {
+            // A note removed: silenced by the curve's level.
+            let gone = e.notes.remove(1);
+            e.removed.push(gone);
+        }
+        a.pitch = Some(e);
     }
     let sources = render_generated_sources(&project, SR);
     let config = EngineConfig {
@@ -2024,7 +2041,9 @@ fn the_equalisers_do_not_allocate() {
         band(0, Field::Dynamics, 1.0),
         band(0, Field::Threshold, -24.0),
         set(global_id(global::AUTO_GAIN), 1.0),
-        set(global_id(global::CHARACTER), 2.0),
+        // The console character, oversampled 2×.
+        set(global_id(global::CHARACTER), 3.0),
+        set(global_id(global::OVERSAMPLING), 1.0),
         set(global_id(global::PAN), 0.3),
         set(global_id(global::PAN_MODE), 1.0),
         set(global_id(global::GAIN_Q), 1.0),
@@ -2040,7 +2059,12 @@ fn the_equalisers_do_not_allocate() {
     linear.push(set(global_id(global::QUALITY), 0.0));
     let mut natural = bands.clone();
     natural.push(set(global_id(global::PHASE), PhaseMode::Natural.value()));
-    natural.push(set(global_id(global::CHARACTER), 1.0));
+    // The tape character driven hard and oversampled 4×, mixed in
+    // parallel with the input.
+    natural.push(set(global_id(global::CHARACTER), 4.0));
+    natural.push(set(global_id(global::CHARACTER_DRIVE), 1.6));
+    natural.push(set(global_id(global::OVERSAMPLING), 2.0));
+    natural.push(set(global_id(global::MIX), 0.6));
     let track = tp.project.track_mut(t).unwrap();
     for (id, parameters) in [(linear_eq, linear), (natural_eq, natural), (eq, bands)] {
         track.inserts.push(PluginSlot {
@@ -2421,6 +2445,46 @@ fn the_stock_devices_do_not_allocate() {
             2,
             (0.2, 8.0),
         ),
+        // The Delay unlinked and synced (a dotted eighth against a
+        // triplet), tilted, diffused and chorused; its modulation automated.
+        (
+            builtin::ECHO,
+            vec![
+                set(5, 1.0),
+                set(16, 0.0),
+                set(6, 10.0),
+                set(18, 6.0),
+                set(19, 4.0),
+                set(20, 0.8),
+                set(22, 0.7),
+            ],
+            false,
+            21,
+            (0.0, 1.0),
+        ),
+        // The Spring with a synced pre-delay and both shelves; the
+        // Cathedral with the shimmer automated and the highs' own decay.
+        (
+            builtin::REVERB,
+            vec![
+                set(0, 5.0),
+                set(16, 1.0),
+                set(17, 5.0),
+                set(20, 3.0),
+                set(21, -4.0),
+                set(19, 400.0),
+            ],
+            false,
+            2,
+            (0.5, 3.0),
+        ),
+        (
+            builtin::REVERB,
+            vec![set(0, 6.0), set(18, 0.6), set(23, 3.0), set(2, 6.0)],
+            false,
+            22,
+            (0.0, 1.0),
+        ),
         (
             builtin::MODULATION,
             vec![set(0, 3.0), set(5, 0.6), set(8, 5.0)],
@@ -2442,7 +2506,51 @@ fn the_stock_devices_do_not_allocate() {
             1,
             (0.1, 8.0),
         ),
-        (builtin::TUNER, vec![set(1, 1.0)], false, 0, (430.0, 450.0)),
+        // The rotary (its rotors accelerating as the rate is automated)
+        // and a square tremolo panning.
+        (
+            builtin::MODULATION,
+            vec![set(0, 6.0), set(4, 0.9), set(10, 90.0)],
+            false,
+            1,
+            (0.8, 6.7),
+        ),
+        (
+            builtin::MODULATION,
+            vec![set(0, 5.0), set(11, 3.0), set(10, 180.0), set(12, 1.0)],
+            false,
+            4,
+            (0.2, 1.0),
+        ),
+        // The utility's trims; the channel strip listening to its key with
+        // a wide hysteresis.
+        (
+            builtin::GAIN,
+            vec![set(10, -6.0), set(2, 1.4)],
+            false,
+            11,
+            (-12.0, 6.0),
+        ),
+        (
+            builtin::CHANNEL_STRIP,
+            vec![
+                set(39, 1.0),
+                set(21, 1.0),
+                set(5, 1.0),
+                set(4, 1.0),
+                set(1, 200.0),
+            ],
+            true,
+            40,
+            (0.0, 12.0),
+        ),
+        (
+            builtin::TUNER,
+            vec![set(1, 1.0), set(3, 2.0)],
+            false,
+            0,
+            (430.0, 450.0),
+        ),
     ];
     let mut ids = Vec::new();
     for (i, (plugin, parameters, keyed, target, (lo, hi))) in devices.into_iter().enumerate() {
@@ -2932,6 +3040,71 @@ fn microphone_preamps_do_not_allocate_while_automating_or_resetting() {
     }
 }
 
+/// A preamp on a 5.1 track solves its six channels side by side on helper
+/// threads, inline and on its worker: neither allocates, nor does a reset,
+/// nor a solve the user's processing threads hold to fewer threads.
+#[test]
+fn surround_preamps_do_not_allocate() {
+    let _serial = serial();
+    use faderframe_core::{ChannelLayout, SurroundFormat, builtin};
+    use faderframe_project::{PluginRef, PluginSlot, TrackKind};
+    use faderframe_timeline::MusicalTime;
+    let (name, label, _) = builtin::PREAMPS[5];
+    let mut tp = common::TestProject::new(48_000);
+    let master = tp.master();
+    tp.project.track_mut(master).unwrap().layout = ChannelLayout::Surround(SurroundFormat::S51);
+    let t = tp.track(
+        TrackKind::Audio,
+        label,
+        ChannelLayout::Surround(SurroundFormat::S51),
+    );
+    let src = tp.source(faderframe_audio_files::AudioData::from_channels(
+        48_000,
+        (0..6)
+            .map(|c| {
+                (0..8192)
+                    .map(|n| 0.05 * ((n as f32) * (0.02 + 0.007 * c as f32)).sin())
+                    .collect()
+            })
+            .collect(),
+    ));
+    tp.clip(t, src, MusicalTime::ZERO, 8192);
+    let plugin = tp.project.ids.allocate();
+    tp.project.track_mut(t).unwrap().preamp = Some(PluginSlot {
+        id: plugin,
+        plugin: PluginRef::builtin(name, label),
+        bypass: false,
+        parameters: Vec::new(),
+        state: None,
+        sidechain: None,
+    });
+    for realtime in [false, true] {
+        let mut r = OfflineRenderer::new(&tp.project, &tp.sources, EngineConfig::default(), 128, 6)
+            .unwrap();
+        r.controller.plugins().set_realtime(realtime);
+        r.controller.rebuild_graph(&tp.project).unwrap();
+        let mut buffers = OwnedBuffers::new(6, 6, 128);
+        r.play_from(0).unwrap();
+        for threads in [None, Some(2)] {
+            faderframe_realtime::set_processing_threads(threads);
+            let (_, count) = armed(|| {
+                for _ in 0..16 {
+                    r.processor.process_device(&mut buffers);
+                }
+            });
+            faderframe_realtime::set_processing_threads(None);
+            assert_eq!(count, 0, "{label} on 5.1 ({threads:?} threads) allocates");
+        }
+        r.play_from(0).unwrap();
+        let (_, count) = armed(|| {
+            for _ in 0..16 {
+                r.processor.process_device(&mut buffers);
+            }
+        });
+        assert_eq!(count, 0, "{label} on 5.1: transport reset allocates");
+    }
+}
+
 /// Console summing: every family's channel stage on a stereo track and its
 /// bus amplifier on the master, inline and on its workers, the drive
 /// and calibrated Gain turned while playing, a transport reset.
@@ -3162,15 +3335,32 @@ fn the_midi_effects_do_not_allocate() {
         sidechain: None,
     };
     let inserts = vec![
+        // Up-down over two octaves, swung, held; a random velocity
+        // pattern and chance.
         slot(
             builtin::ARPEGGIATOR,
-            &[(0, 2.0), (3, 2.0), (4, 0.5), (6, 1.0)],
+            &[
+                (0, 2.0),
+                (3, 2.0),
+                (4, 0.5),
+                (6, 1.0),
+                (8, 5.0),
+                (10, 0.6),
+                (11, 0.8),
+            ],
         ),
-        slot(builtin::CHORD, &[(0, 1.0), (9, 20.0)]),
+        slot(
+            builtin::CHORD,
+            &[(0, 1.0), (9, 20.0), (12, 1.0), (13, -1.0)],
+        ),
         // The chord track's chords (a slash chord's bass too).
         slot(builtin::CHORD, &[(0, 3.0)]),
         slot(builtin::SCALE, &[(4, 2.0)]),
-        slot(builtin::NOTE_ECHO, &[(3, 8.0), (4, 0.9), (5, 7.0)]),
+        // Echoes stepping in the key, shorter than the notes.
+        slot(
+            builtin::NOTE_ECHO,
+            &[(3, 8.0), (4, 0.9), (5, 2.0), (7, 1.0), (8, 0.5)],
+        ),
         slot(builtin::SYNTH, &[]),
     ];
     tp.project.track_mut(t).unwrap().inserts = inserts;
@@ -3276,6 +3466,7 @@ fn surround_strips_do_not_allocate() {
             level_db: -6.0,
             tap: faderframe_project::SendTap::PreFader,
             enabled: true,
+            pan: None,
         });
     let config = EngineConfig {
         sample_rate: 48_000,
@@ -3388,4 +3579,132 @@ fn the_hardware_insert_and_its_ping_do_not_allocate() {
         }
     });
     assert_eq!(allocs, 0, "allocations with a hardware insert and a ping");
+}
+
+/// Cue mixes (pre- and post-fader, stereo and mono, sends panned, on and
+/// off), a panned ordinary send and the click into the cue mixes: their
+/// levels, pans and switches change (parameters) and the click plays
+/// there, nothing allocates.
+#[test]
+fn cue_mixes_do_not_allocate() {
+    let _serial = serial();
+    use faderframe_core::{ChannelLayout, CueId};
+    use faderframe_engine::MetronomeMode;
+    use faderframe_project::{CueMix, CueSend, SendTap, TrackColor, TrackKind};
+    use faderframe_timeline::MusicalTime;
+
+    const SR: u32 = 48_000;
+    let mut tp = common::TestProject::new(SR);
+    let vox = tp.track(TrackKind::Audio, "Vox", ChannelLayout::Mono);
+    let src = tp.dc(1, 0.3, 200_000);
+    tp.clip(vox, src, MusicalTime::ZERO, 200_000);
+    let keys = tp.track(TrackKind::Audio, "Keys", ChannelLayout::Stereo);
+    let src = tp.dc(2, 0.3, 200_000);
+    tp.clip(keys, src, MusicalTime::ZERO, 200_000);
+    let verb = tp.track(TrackKind::Aux, "Verb", ChannelLayout::Stereo);
+    let send = tp.project.ids.allocate();
+    tp.project
+        .track_mut(vox)
+        .unwrap()
+        .sends
+        .push(faderframe_project::AuxSend {
+            id: send,
+            target: verb,
+            level_db: -6.0,
+            tap: SendTap::PreFader,
+            enabled: true,
+            pan: Some(-0.5),
+        });
+    let mut cues: Vec<CueId> = Vec::new();
+    for (first, layout, tap) in [
+        (2, ChannelLayout::Stereo, SendTap::PreFader),
+        (4, ChannelLayout::Mono, SendTap::PostFader),
+    ] {
+        let id: CueId = tp.project.ids.allocate();
+        let mut c = CueMix::new(id, "Cue", TrackColor::palette(1), first, layout);
+        c.tap = tap;
+        tp.project.cue_mixes.push(c);
+        for t in [vox, keys, verb] {
+            tp.project.track_mut(t).unwrap().cue_sends.push(CueSend {
+                cue: id,
+                level_db: -3.0,
+                pan: 0.3,
+                on: t != verb,
+            });
+        }
+        cues.push(id);
+    }
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 5).unwrap();
+    r.controller.plugins().set_realtime(true);
+    r.controller
+        .sync(&tp.project, &tp.sources, faderframe_project::Impact::Graph)
+        .unwrap();
+    r.controller.metronome().set_mode(MetronomeMode::Always);
+    r.controller.metronome().set_main(false);
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 5, 256);
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    let mut h = History::default();
+    let mut allocs = 0;
+    for cmd in [
+        Command::SetCueSendLevel {
+            track: vox,
+            cue: cues[0],
+            db: -12.0,
+        },
+        Command::SetCueSendPan {
+            track: keys,
+            cue: cues[0],
+            pan: -1.0,
+        },
+        Command::SetCueSendOn {
+            track: verb,
+            cue: cues[1],
+            on: true,
+        },
+        Command::SetCueLevel {
+            cue: cues[1],
+            db: -6.0,
+        },
+        Command::SetCueClick {
+            cue: cues[0],
+            on: true,
+            db: -10.0,
+        },
+        Command::SetCueMute {
+            cue: cues[0],
+            on: true,
+        },
+        Command::SetSendPan {
+            track: vox,
+            send,
+            pan: None,
+        },
+        Command::SetTrackVolume {
+            track: vox,
+            db: -20.0,
+        },
+        Command::SetTrackMute {
+            track: keys,
+            on: true,
+        },
+    ] {
+        let impact = h.apply(&mut tp.project, cmd).unwrap();
+        r.controller.sync(&tp.project, &tp.sources, impact).unwrap();
+        allocs += armed(|| {
+            for _ in 0..60 {
+                r.processor.process_device(&mut bufs);
+            }
+        })
+        .1;
+    }
+    assert_eq!(allocs, 0, "allocations in the cue mixes");
+    let heard = (2..5).any(|c| bufs.output_ref(c).iter().any(|v| v.abs() > 1e-4));
+    assert!(heard, "the cue mixes play");
 }

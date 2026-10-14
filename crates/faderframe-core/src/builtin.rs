@@ -20,7 +20,8 @@ pub const CHANNEL_STRIP: &str = "faderframe.channel-strip";
 pub const DEESSER: &str = "faderframe.deesser";
 /// Saturator: six curves, oversampled (effect).
 pub const SATURATOR: &str = "faderframe.saturator";
-/// Algorithmic reverb: five types, a 16-line network (effect).
+/// Algorithmic reverb: seven types (springs and a shimmer too), a 16-line
+/// network (effect).
 pub const REVERB: &str = "faderframe.reverb";
 /// Chorus, ensemble, flanger, phaser and vibrato (effect).
 pub const MODULATION: &str = "faderframe.modulation";

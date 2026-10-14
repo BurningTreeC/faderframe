@@ -1,6 +1,7 @@
 //! Filters: cascades designed by the EQ (analog-shaped to Nyquist), a
-//! zero-delay-feedback state variable filter for fast modulation, one pole
-//! low and high passes and a DC blocker.
+//! zero-delay-feedback state variable filter for fast modulation, a
+//! Linkwitz–Riley crossover made of it, one pole low and high passes and
+//! a DC blocker.
 
 pub use crate::eq::design::{BandShape, BandType, Coefs, MAX_SECTIONS};
 use std::f64::consts::PI;
@@ -184,6 +185,50 @@ impl Svf {
     pub fn flush(&mut self) {
         self.ic1 = super::flush(self.ic1);
         self.ic2 = super::flush(self.ic2);
+    }
+}
+
+/// A Linkwitz–Riley crossover (24 dB/oct: two Butterworth sections each
+/// way); its two bands sum to an all pass.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Crossover {
+    low: [Svf; 2],
+    high: [Svf; 2],
+}
+
+impl Crossover {
+    pub fn new(freq: f64, rate: f64) -> Self {
+        let mut c = Self::default();
+        c.set(freq, rate);
+        c
+    }
+
+    pub fn set(&mut self, freq: f64, rate: f64) {
+        for s in self.low.iter_mut().chain(&mut self.high) {
+            s.set(freq, std::f64::consts::FRAC_1_SQRT_2, rate);
+        }
+    }
+
+    /// The low and high bands.
+    #[inline]
+    pub fn split(&mut self, x: f64) -> (f64, f64) {
+        let l = self.low[0].process(x).low;
+        let l = self.low[1].process(l).low;
+        let h = self.high[0].process(x).high;
+        let h = self.high[1].process(h).high;
+        (l, h)
+    }
+
+    pub fn reset(&mut self) {
+        for s in self.low.iter_mut().chain(&mut self.high) {
+            s.reset();
+        }
+    }
+
+    pub fn flush(&mut self) {
+        for s in self.low.iter_mut().chain(&mut self.high) {
+            s.flush();
+        }
     }
 }
 

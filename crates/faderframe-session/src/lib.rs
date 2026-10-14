@@ -37,15 +37,18 @@ mod album_master;
 mod aliases;
 pub mod analysis;
 pub mod capture;
+pub mod cleanup;
 pub mod clip_fx;
 pub mod conform;
 pub mod console;
 pub mod containers;
 pub mod control;
 mod control_extra;
+pub mod cues;
 pub mod ddp;
 pub mod delivery;
 pub mod detect;
+mod duplicate;
 pub mod editing;
 mod folders;
 mod freeze;
@@ -58,6 +61,7 @@ pub mod lanes;
 pub mod launcher;
 pub mod leadsheet;
 pub mod listening;
+mod merge;
 pub mod metronome;
 pub mod outputs;
 mod programs;
@@ -131,7 +135,9 @@ pub use midi::{
     KEYBOARD_PORT, LiveNote, MidiOutputStatus, MidiPortStatus, MidiPreferences, StepInput,
 };
 pub use notes::{KeyFold, NoteLength, NoteOp, PianoRollSettings, ToolPreview};
-pub use record::{LiveTake, LoopRecordMode, RecordMode, RecordSettings, RecordedTake};
+pub use record::{
+    LiveTake, LoopRecordMode, RecordMode, RecordSettings, RecordedTake, Roll, RollUnit,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -187,6 +193,8 @@ pub enum TransportAction {
     ToggleRecord,
     /// Restrict recording to the punch range (defaults to the loop range).
     TogglePunch,
+    /// Input quantize on or off (the Q: recorded MIDI lands on the grid).
+    ToggleInputQuantize,
     SetPunch(Option<MusicalRange>),
     /// Move the playhead by whole bars.
     NudgeBars(i32),
@@ -435,8 +443,18 @@ pub enum Action {
         clip: ClipId,
         how: to_midi::ToMidi,
     },
-    /// A lead sheet of a clip's melody (an audio clip is listened to
-    /// first), with the chords and the words, in the Lead Sheet view.
+    /// A lead sheet of a clip's melody, of several clips' or of a track's
+    /// (audio is listened to first) — or a score of several tracks, a
+    /// staff each —, with the chords and the words, in the Lead Sheet
+    /// view.
+    /// Guitar tab of a clip, track, clips or tracks (the sheet style's
+    /// tablature; notes with tab when it was plain notation).
+    MakeTab {
+        of: leadsheet::LeadSheetOf,
+    },
+    /// How lead sheets are written (standard notation, with tab, tab alone;
+    /// its tuning and capo): the sheet made is written again.
+    SetSheetStyle(leadsheet::SheetStyle),
     MakeLeadSheet {
         of: leadsheet::LeadSheetOf,
         grid: leadsheet::Grid,
@@ -455,6 +473,8 @@ pub enum Action {
     },
     /// Edit the setlist.
     Setlist(setlist::SetlistOp),
+    /// Make, remove or change a cue mix, or show one in the mixer.
+    Cue(cues::CueOp),
     /// Show mode's controls.
     Show(setlist::ShowOp),
     /// Set the project's tempo or key from a clip, or warp it to the
@@ -566,6 +586,15 @@ pub enum Action {
     ShowTemplates,
     /// Delete a template.
     DeleteTemplate(PathBuf),
+    /// A copy of each track right after it (devices, sends, automation),
+    /// with its clips when `content`; no tracks = the selected ones.
+    DuplicateTracks {
+        tracks: Vec<TrackId>,
+        content: bool,
+    },
+    /// The clips of a track (two or more) as one: MIDI joined, audio
+    /// rendered as it plays into a new file; none = the selected ones.
+    MergeClips(Vec<ClipId>),
     /// An alias of each clip (sharing its content) right after it.
     DuplicateAsAlias(Vec<ClipId>),
     /// The clips are their own again (no longer aliases).
@@ -1205,6 +1234,18 @@ pub struct AudioPreferences {
     pub threads: Option<u16>,
 }
 
+/// A position shown before the engine got there (see
+/// `Session::show_position`).
+#[derive(Clone, Copy, Debug)]
+struct ShownPosition {
+    target: i64,
+    /// The engine's jumps when it was asked.
+    jumps: u32,
+    at: Instant,
+    /// Held until a jump lands on `target` (else until any jump).
+    exact: bool,
+}
+
 /// A recording in progress (or whose writer is finishing).
 struct ActiveRecording {
     /// Audio takes (none when only MIDI tracks are armed).
@@ -1278,9 +1319,8 @@ pub struct Session {
     ppm_meters: HashMap<TrackId, (Option<faderframe_realtime::MeterRange>, bool)>,
     transport: TransportSnapshot,
     /// A position shown before the engine got there (a locate it applies
-    /// later, e.g. once render-ahead has primed it): the target, the
-    /// engine's jumps when it was asked, and when.
-    shown_position: Option<(i64, u32, Instant)>,
+    /// later, e.g. once render-ahead has primed it).
+    shown_position: Option<ShownPosition>,
     /// The playhead last presented (see [`Session::transport`]): its
     /// position, when, and the run of playback it was in.
     presented: std::cell::Cell<Option<Presented>>,
@@ -1347,6 +1387,8 @@ pub struct Session {
     range_clipboard: editing::RangeClipboard,
     /// Where playback last started (for "insertion follows playback" off).
     play_started_at: Option<i64>,
+    /// The engine stops after a punch-out's post-roll.
+    postroll_armed: bool,
     transients: transients::TransientCache,
     pitch: pitch::PitchCache,
     /// Polyphonic pitch edits: detections and renders.
@@ -1357,6 +1399,7 @@ pub struct Session {
     conversions: to_midi::Conversions,
     lead_sheets: leadsheet::LeadSheets,
     clip_fx: clip_fx::ClipFxState,
+    merges: Vec<merge::MergeJob>,
     spectral: spectral::SpectralState,
     redraw: redraw::RedrawState,
     /// Threads of the audio path that could not take their priority
@@ -1371,6 +1414,8 @@ pub struct Session {
     bounces: Vec<freeze::PendingBounce>,
     /// The mono check is on (listening only).
     mono_check: bool,
+    /// The cue mix the mixer shows and sets (`None`: the main mix).
+    mixer_cue: Option<faderframe_core::CueId>,
     /// Bass management of the speakers (listening only).
     bass: faderframe_core::surround::BassManagement,
     /// The headphone correction's file.
@@ -1626,6 +1671,7 @@ impl Session {
             note_clipboard: Vec::new(),
             range_clipboard: editing::RangeClipboard::default(),
             play_started_at: None,
+            postroll_armed: false,
             transients: transients::TransientCache::default(),
             pitch: pitch::PitchCache::default(),
             poly: polypitch::PolyState::default(),
@@ -1635,6 +1681,7 @@ impl Session {
             conversions: to_midi::Conversions::default(),
             lead_sheets: leadsheet::LeadSheets::default(),
             clip_fx: clip_fx::ClipFxState::default(),
+            merges: Vec::new(),
             spectral: spectral::SpectralState::default(),
             redraw: redraw::RedrawState::default(),
             priority_failures: 0,
@@ -1645,6 +1692,7 @@ impl Session {
             gesture_base: HashMap::new(),
             bounces: Vec::new(),
             mono_check: false,
+            mixer_cue: None,
             bass: faderframe_core::surround::BassManagement::default(),
             correction_path: None,
             adm_imports: Vec::new(),
@@ -1782,10 +1830,36 @@ impl Session {
     }
 
     /// Show `position` as the playhead's now, and until the engine has
-    /// applied the locate that moves it there.
+    /// applied the locate that moves it there: until it has jumped there —
+    /// not just jumped (a Stop sent just before is a jump too, to where
+    /// playback stopped, shown in between).
     pub(crate) fn show_position(&mut self, position: i64) {
-        self.transport.position = position;
-        self.shown_position = Some((position, self.transport.jumps, Instant::now()));
+        self.hold_position(position, true);
+    }
+
+    /// [`Self::show_position`] for a jump that lands near `position`, not
+    /// on it (a chase: the engine adds the time until it applies it):
+    /// until the engine's next jump.
+    pub(crate) fn show_position_until_jump(&mut self, position: i64) {
+        self.hold_position(position, false);
+    }
+
+    fn hold_position(&mut self, target: i64, exact: bool) {
+        self.transport.position = target;
+        self.shown_position = Some(ShownPosition {
+            target,
+            jumps: self.transport.jumps,
+            at: Instant::now(),
+            exact,
+        });
+        // The picture outputs too.
+        self.publish_picture_map();
+    }
+
+    /// The position shown before the engine got there, if any (see
+    /// [`Self::show_position`]).
+    pub(crate) fn held_position(&self) -> Option<i64> {
+        self.shown_position.map(|h| h.target)
     }
 
     /// The transport as the user should see it now: playing, recording,
@@ -1818,11 +1892,19 @@ impl Session {
         let now = Instant::now();
         let rate = f64::from(self.engine.sample_rate().max(1));
         let device = f64::from(self.engine.device_latency());
-        for t in &self.project.tracks {
-            let frames = f64::from(self.engine.meter_delay(t.id)) + device;
+        // The cue mixes' own channels are metered like tracks.
+        let channels: Vec<TrackId> = self
+            .project
+            .tracks
+            .iter()
+            .map(|t| t.id)
+            .chain(self.project.cue_mixes.iter().map(|c| c.channel()))
+            .collect();
+        for id in channels {
+            let frames = f64::from(self.engine.meter_delay(id)) + device;
             let due = now + std::time::Duration::from_secs_f64(frames / rate);
-            let queue = self.meter_queue.entry(t.id).or_default();
-            if let Some(m) = self.engine.take_meter(t.id) {
+            let queue = self.meter_queue.entry(id).or_default();
+            if let Some(m) = self.engine.take_meter(id) {
                 if queue.len() >= MAX_QUEUED {
                     queue.pop_front();
                 }
@@ -1830,7 +1912,7 @@ impl Session {
             }
             let ready = queue.iter().take_while(|(at, _)| *at <= now).count();
             if ready > 0 {
-                let shown = self.meters.entry(t.id).or_default();
+                let shown = self.meters.entry(id).or_default();
                 let step = dt / ready as f32;
                 for (_, m) in queue.drain(..ready) {
                     shown.update(&m, step);
@@ -2224,6 +2306,9 @@ impl Session {
         &mut self,
         threads: Option<u16>,
     ) -> Option<Arc<faderframe_realtime::WorkerPool>> {
+        // Devices solving their channels on helpers of their own keep
+        // within the same count.
+        faderframe_realtime::set_processing_threads(threads.map(|t| usize::from(t).max(1)));
         let workers = match threads {
             Some(t) => (t as usize).saturating_sub(1),
             None => faderframe_realtime::default_worker_count(),
@@ -2559,8 +2644,16 @@ impl Session {
         self.transport = self.engine.transport_snapshot();
         // A locate the engine has not applied yet (render-ahead primes the
         // new position first) stays shown, not the position it left.
-        if let Some((target, jumps, at)) = self.shown_position {
-            let arrived = self.transport.jumps != jumps || self.transport.position == target;
+        if let Some(ShownPosition {
+            target,
+            jumps,
+            at,
+            exact,
+        }) = self.shown_position
+        {
+            let jumped =
+                self.transport.jumps != jumps && (!exact || self.transport.jumped_to == target);
+            let arrived = jumped || self.transport.position == target;
             if arrived || at.elapsed() > std::time::Duration::from_secs(2) {
                 self.shown_position = None;
             } else {
@@ -2611,6 +2704,13 @@ impl Session {
             // Stopped (by the user, the end of a bounce, a dropped stream):
             // Latch/Write automation ends here.
             self.automation_play_stopped();
+            // The post-roll after a punch-out ran out: the take ends too.
+            if std::mem::take(&mut self.postroll_armed) {
+                let done = self.stop_recording().and_then(|_| self.after_stop());
+                if let Err(e) = done {
+                    self.notify(NoticeLevel::Error, e.to_string());
+                }
+            }
         }
         // Stopped: tracks kept on the audio thread while playing go back to
         // being rendered ahead.
@@ -2814,6 +2914,7 @@ impl Session {
         self.poll_conversions();
         self.poll_lead_sheets();
         self.poll_clip_fx();
+        self.poll_merges();
         self.poll_spectral();
         self.poll_redraws();
         self.poll_speech();
@@ -3114,6 +3215,7 @@ impl Session {
         self.history.clear();
         self.saved_revision = self.history.revision();
         self.selection.clear();
+        self.mixer_cue = None;
         self.meters.clear();
         self.meter_queue.clear();
         self.ppm_meters.clear();
@@ -3369,6 +3471,8 @@ impl Session {
         let cmd = self.keep_main_heard(cmd);
         // Buses added while a console is set get its bus amplifier.
         let cmd = self.console_buses_for_new_tracks(cmd);
+        // Tracks added join every cue mix.
+        let cmd = self.cue_sends_for_new_tracks(cmd);
         // Splitting an alias makes it its own; content edits reach the
         // others (one undo step).
         let cmd = self.unlink_split_aliases(cmd);
@@ -3743,9 +3847,12 @@ impl Session {
             Action::FromClip { clip, what } => self.from_clip(clip, what)?,
             Action::SongStructure { clips } => self.song_structure(&clips)?,
             Action::Setlist(op) => self.edit_setlist(op)?,
+            Action::Cue(op) => self.cue_op(op)?,
             Action::Show(op) => self.show_op(op)?,
             Action::ConvertToMidi { clip, how } => self.convert_to_midi(clip, how)?,
             Action::MakeLeadSheet { of, grid } => self.make_lead_sheet(of, grid)?,
+            Action::MakeTab { of } => self.make_tab(of)?,
+            Action::SetSheetStyle(style) => self.set_sheet_style(style)?,
             Action::TempoFromHits(req) => self.tempo_from_hits(&req)?,
             Action::PromptTempoFromHits => self.ui_requests.push(UiRequest::TempoFromHits),
             Action::ExportLeadSheet(path) => {
@@ -3826,6 +3933,22 @@ impl Session {
                 self.notify(NoticeLevel::Info, "deleted the template".to_string());
             }
             Action::RestoreVersion(path) => self.restore_version(&path)?,
+            Action::DuplicateTracks { tracks, content } => {
+                let tracks = if tracks.is_empty() {
+                    self.selection.tracks.iter().copied().collect()
+                } else {
+                    tracks
+                };
+                self.duplicate_tracks(&tracks, content)?;
+            }
+            Action::MergeClips(clips) => {
+                let clips = if clips.is_empty() {
+                    self.selection.clips.iter().copied().collect()
+                } else {
+                    clips
+                };
+                self.merge_clips(&clips)?;
+            }
             Action::DuplicateAsAlias(clips) => {
                 self.duplicate_as_alias(&clips)?;
             }
@@ -3901,6 +4024,7 @@ impl Session {
                     level_db,
                     tap,
                     enabled: true,
+                    pan: None,
                 };
                 self.edit(Command::AddSend {
                     track,
@@ -3959,6 +4083,7 @@ impl Session {
             Action::SetRecordSettings(r) => {
                 self.record = r;
                 self.engine.metronome().set_mode(r.metronome);
+                self.engine.set_count_in(r.count_in)?;
                 self.revision += 1;
             }
             Action::FlattenTakes(clip) => self.flatten_takes(clip)?,
@@ -4260,6 +4385,7 @@ impl Session {
             }
             Action::SetEditFlag(flag, on) => {
                 let e = &mut self.editor;
+                let pitch_mode = flag == EditFlag::PolyphonicPitch && e.pitch_polyphonic != on;
                 match flag {
                     EditFlag::TabToTransients => e.tab_to_transients = on,
                     EditFlag::LinkTimeline => e.link_timeline = on,
@@ -4283,6 +4409,10 @@ impl Session {
                 self.revision += 1;
                 if flag == EditFlag::EditToolbar {
                     self.layout_revision += 1;
+                }
+                // The pitch editor's clip found again the new way.
+                if pitch_mode {
+                    self.pitch_mode_changed()?;
                 }
             }
             Action::SetCounterUnit(u) => {
@@ -4407,6 +4537,7 @@ impl Session {
         match action {
             TransportAction::Play => self.play()?,
             TransportAction::Stop => {
+                self.disarm_postroll()?;
                 if self.transport.playing {
                     self.engine.transport(TransportCommand::Stop)?;
                     self.stop_recording()?;
@@ -4420,6 +4551,7 @@ impl Session {
             }
             TransportAction::TogglePlay => {
                 if self.transport.playing {
+                    self.disarm_postroll()?;
                     self.engine.transport(TransportCommand::Stop)?;
                     self.stop_recording()?;
                     self.automation_stop_sent();
@@ -4448,6 +4580,21 @@ impl Session {
             TransportAction::ReturnToStart => {
                 self.engine.transport(TransportCommand::Locate(0))?;
                 self.show_position(0);
+            }
+            TransportAction::ToggleInputQuantize => {
+                self.record.input_quantize = !self.record.input_quantize;
+                self.notify(
+                    NoticeLevel::Info,
+                    if self.record.input_quantize {
+                        format!(
+                            "Input quantize on: recorded MIDI to {}",
+                            self.input_quantize_settings().grid.label()
+                        )
+                    } else {
+                        "Input quantize off".to_string()
+                    },
+                );
+                self.revision += 1;
             }
             TransportAction::ToggleLoop => {
                 let range = self.project.loop_range.or_else(|| {
@@ -4752,9 +4899,12 @@ impl Session {
 
     /// The names of the devices [`Self::gain_reduction`] adds up.
     pub fn gain_reduction_devices(&self, track: TrackId) -> Vec<String> {
+        let Some(t) = self.project.track(track) else {
+            return Vec::new();
+        };
         self.reducers(track)
             .iter()
-            .map(|(s, _)| s.plugin.name.clone())
+            .map(|(s, _)| t.name_of(s))
             .collect()
     }
 
@@ -4769,6 +4919,16 @@ impl Session {
     /// A device editor's own setting, if it has been set.
     pub fn device_view(&self, plugin: faderframe_core::PluginInstanceId, key: &str) -> Option<f64> {
         self.device_views.get(&(plugin, key.to_string())).copied()
+    }
+
+    /// A device's name as the views show it ("Delay (2)" for the second
+    /// Delay of its track; see [`faderframe_project::device_name`]).
+    pub fn device_name(&self, plugin: faderframe_core::PluginInstanceId) -> Option<String> {
+        if let Some((t, s)) = self.plugin_slot(plugin) {
+            return Some(t.name_of(s));
+        }
+        let (song, s) = self.project.album.insert(plugin)?;
+        Some(faderframe_project::device_name(&song.inserts, s))
     }
 
     /// A plugin's slot and the track its commands name: its own, or the
@@ -5346,7 +5506,7 @@ impl Session {
                         let layout =
                             ChannelLayout::from_channel_count(usize::from(o.channels.max(1)));
                         out.push(InputChoice {
-                            label: format!("{} · {} · {}", other.name, slot.plugin.name, o.name),
+                            label: format!("{} · {} · {}", other.name, other.name_of(slot), o.name),
                             action: set(input.clone(), layout),
                             checked: t.input == input,
                             group_start: first,
@@ -5379,7 +5539,7 @@ impl Session {
                 }
             }
             faderframe_project::InputRouting::Plugin { plugin, bus } => {
-                let Some((_, slot)) = self.plugin_slot(*plugin) else {
+                let Some((owner, slot)) = self.plugin_slot(*plugin) else {
                     return "Plugin output (missing)".into();
                 };
                 let name = self
@@ -5387,7 +5547,7 @@ impl Session {
                     .into_iter()
                     .find(|o| o.bus == *bus)
                     .map_or_else(|| format!("Output {}", bus + 1), |o| o.name);
-                format!("{} · {name}", slot.plugin.name)
+                format!("{} · {name}", owner.name_of(slot))
             }
         }
     }

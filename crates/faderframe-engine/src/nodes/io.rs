@@ -1,5 +1,6 @@
 use crate::context::EngineContext;
 use faderframe_audio_graph::{NodeIo, ProcessContext, Processor};
+use faderframe_core::TrackId;
 use faderframe_project::MonitorMode;
 
 /// Device-input node: its outputs are filled by the engine before the graph
@@ -68,33 +69,45 @@ impl Processor<EngineContext> for HardwareReturn {
 /// Passes live input to the track according to its monitoring mode.
 ///
 /// `Auto` is tape-style: monitor while armed, except during playback that is
-/// not recording (so existing takes can be auditioned).
+/// not recording (so existing takes can be auditioned); while this track is
+/// recorded, the input is heard inside the record window (the punch range)
+/// and the track's clips around it.
 pub struct MonitorGate {
+    track: TrackId,
     mode: MonitorMode,
     armed: bool,
 }
 
 impl MonitorGate {
-    pub fn new(mode: MonitorMode, armed: bool) -> Self {
-        Self { mode, armed }
+    pub fn new(track: TrackId, mode: MonitorMode, armed: bool) -> Self {
+        Self { track, mode, armed }
     }
 }
 
 impl Processor<EngineContext> for MonitorGate {
     fn process(&mut self, cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
         let t = &cx.data.transport;
-        let open = match self.mode {
-            MonitorMode::Off => false,
-            MonitorMode::Input => true,
-            MonitorMode::Auto => self.armed && (!t.playing || t.recording),
-        };
         let (Some(input), Some(out)) = (io.audio_in.first(), io.audio_out.first_mut()) else {
             return;
         };
-        if open {
+        let rec = &cx.data.recording;
+        let (a, b) = match self.mode {
+            MonitorMode::Off => (0, 0),
+            MonitorMode::Input => (0, io.frames),
+            MonitorMode::Auto if !self.armed => (0, 0),
+            MonitorMode::Auto if !t.playing => (0, io.frames),
+            MonitorMode::Auto if t.recording && rec.records(self.track) => rec
+                .inside(self.track, true, t.sample_position, io.frames)
+                .unwrap_or((0, 0)),
+            MonitorMode::Auto => (0, if t.recording { io.frames } else { 0 }),
+        };
+        if (a, b) == (0, io.frames) {
             out.copy_from(input);
-        } else {
-            out.clear();
+            return;
+        }
+        out.clear();
+        for ch in 0..out.num_channels().min(input.num_channels()) {
+            out.channel_mut(ch)[a..b].copy_from_slice(&input.channel(ch)[a..b]);
         }
     }
 }

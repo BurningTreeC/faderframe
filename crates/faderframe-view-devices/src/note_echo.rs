@@ -30,12 +30,12 @@ impl Face for NoteEchoFace {
     }
 
     fn min_size(&self) -> Size {
-        Size::new(800.0, 460.0)
+        Size::new(880.0, 460.0)
     }
 
     fn panel(&self, size: Size) -> Panel {
         let (display, deck, _) = kit::frame(size, 170.0, 0.0);
-        let s = kit::sections(deck, &[("TIME", 4.2), ("REPEATS", 4.0), ("PITCH", 2.6)]);
+        let s = kit::sections(deck, &[("TIME", 4.2), ("REPEATS", 5.2), ("PITCH", 3.2)]);
         let mut c = Vec::new();
         let r = kit::inside(&s[0]);
         c.push(Ctl::toggle(
@@ -54,18 +54,33 @@ impl Face for NoteEchoFace {
         );
         c.push(Ctl::knob(pid(id::TIME), "TIME", k[0]).scaled(Scale::Log));
         let r = kit::inside(&s[1]);
-        let k = kit::row(Rect::new(r.x, r.y, r.w, KNOB.1), &[KNOB.0, KNOB.0]);
+        let k = kit::row(Rect::new(r.x, r.y, r.w, KNOB.1), &[KNOB.0, KNOB.0, SMALL.0]);
         c.push(Ctl::knob(pid(id::REPEATS), "REPEATS", k[0]));
         c.push(Ctl::knob(pid(id::FEEDBACK), "FEEDBACK", k[1]));
+        c.push(Ctl::small(
+            pid(id::LENGTH),
+            "LENGTH",
+            kit::at(k[2], 0.0, 6.0, SMALL.0, SMALL.1),
+        ));
         let r = kit::inside(&s[2]);
         c.push(
             Ctl::small(
                 pid(id::PITCH),
                 "PITCH",
-                Rect::new(r.x + (r.w - SMALL.0) / 2.0, r.y, SMALL.0, SMALL.1),
+                Rect::new(r.x + 4.0, r.y, SMALL.0, SMALL.1),
             )
             .bipolar(),
         );
+        c.push(Ctl::toggle(
+            pid(id::IN_KEY),
+            "In Key",
+            Rect::new(
+                r.x + SMALL.0 + 12.0,
+                r.y + 28.0,
+                (r.w - SMALL.0 - 18.0).max(50.0),
+                SWITCH_H,
+            ),
+        ));
         c.push(Ctl::toggle(
             pid(id::DRY),
             "Played Note",
@@ -86,6 +101,7 @@ impl Face for NoteEchoFace {
         let repeats = cx.value(pid(id::REPEATS)).round().clamp(1.0, 16.0) as i32;
         let feedback = cx.value(pid(id::FEEDBACK)).clamp(0.0, 1.0);
         let pitch = cx.value(pid(id::PITCH)).round() as i32;
+        let in_key = cx.on(pid(id::IN_KEY));
         let dry = cx.on(pid(id::DRY));
         let delay_ms = cx.tap.value(value::DELAY_MS);
         let waiting = cx.tap.value(value::ECHOES).max(0.0) as usize;
@@ -158,6 +174,8 @@ impl Face for NoteEchoFace {
         p.text(
             if pitch == 0 {
                 "each repeat softer by the feedback"
+            } else if in_key {
+                "scale steps from the played note (the key track's key), each repeat softer by the feedback"
             } else {
                 "semitones above the played note, each repeat softer by the feedback"
             },
@@ -175,7 +193,13 @@ impl Face for NoteEchoFace {
             id::SYNC => "Repeats a division of the song's tempo apart (else the time in ms)",
             id::REPEATS => "How many times each note comes back",
             id::FEEDBACK => "Each repeat this much of the one before as loud",
-            id::PITCH => "Each repeat this many semitones from the one before",
+            id::PITCH => {
+                "Each repeat this many semitones (In Key: scale steps) from the one before"
+            }
+            id::IN_KEY => {
+                "Pitch steps are degrees of the key track's key where the note was played"
+            }
+            id::LENGTH => "Each repeat's length as a share of the played note's",
             id::DRY => "Play the note itself too (off: only its echoes)",
             _ => return None,
         })

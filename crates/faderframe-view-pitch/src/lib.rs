@@ -2,16 +2,18 @@
 //! `Session::detect_pitch`) as blobs at the pitch they are heard at, the
 //! pitch curve played drawn through them and, where it was moved, the one
 //! sung. Notes are selected by clicking or a rubber band and moved by
-//! dragging (whole semitones; Alt: freely) or with the arrow keys; a
-//! double click splits a note there; the toolbar corrects the selection
-//! (or every note) to the key, straightens it, keeps or moves the
-//! formants and resets. Time runs left to right as the clip plays on the
-//! timeline; pitch bottom to top, like the piano roll.
+//! dragging (whole semitones; Alt: freely) or with the arrow keys; an
+//! edge dragged (or Ctrl+←/→) makes a note longer or shorter, its audio
+//! stretched; a double click splits a note there; Delete removes notes
+//! and their sound; the toolbar corrects the selection (or every note) to
+//! the key, straightens it, keeps or moves the formants and resets. Time
+//! runs left to right as the clip plays on the timeline; pitch bottom to
+//! top, like the piano roll.
 
 #![forbid(unsafe_code)]
 
 use faderframe_core::ClipId;
-use faderframe_project::pitch::{PitchEdit, PitchNote};
+use faderframe_project::pitch::{Edge, PitchEdit, PitchNote};
 use faderframe_project::{AudioClip, Clip};
 use faderframe_session::pitch::PitchOp;
 use faderframe_session::{Action, Session};
@@ -30,6 +32,11 @@ const TOP: i32 = 96;
 const BOTTOM: i32 = 24;
 const MIN_ROW: f32 = 6.0;
 const MAX_ROW: f32 = 40.0;
+/// How near a note's edge (pixels) grabs it.
+const EDGE_PX: f32 = 5.0;
+/// Ctrl+←/→ makes notes longer or shorter by this much (seconds; with
+/// Shift a tenth of it).
+const LENGTH_STEP: f64 = 0.01;
 
 /// A toolbar control.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +64,16 @@ enum Drag {
         sent: f32,
         begun: bool,
     },
+    /// Making notes longer or shorter: the edge grabbed, where the grabbed
+    /// note's edge played when pressed (placed frame), the move sent last,
+    /// whether the gesture has begun.
+    Edge {
+        edge: Edge,
+        from: i64,
+        notes: Vec<usize>,
+        sent: i64,
+        begun: bool,
+    },
     /// Selecting by a rubber band.
     Band { from: Point, to: Point, add: bool },
     /// Changing a toolbar value (pitch amount or straightening).
@@ -77,6 +94,8 @@ pub struct PitchView {
     seen: Option<(ClipId, usize)>,
     drag: Option<Drag>,
     hover: Option<usize>,
+    /// The note edge under the pointer.
+    hover_edge: Option<(usize, Edge)>,
     /// Correct Pitch: how far to the key (0…1) and how much straightened.
     amount: f32,
     drift: f32,
@@ -164,6 +183,7 @@ impl PitchView {
             seen: None,
             drag: None,
             hover: None,
+            hover_edge: None,
             amount: 1.0,
             drift: 0.5,
             last_size: Size::new(0.0, 0.0),
@@ -229,12 +249,38 @@ impl PitchView {
         self.scroll_y = (TOP as f32 - mid + 0.5) * self.row_h - g.h / 2.0;
     }
 
-    /// The blob of note `n`.
+    /// The blob of note `n`, where it plays now.
     fn note_rect(&self, s: &Shown<'_>, n: &PitchNote, g: Rect) -> Rect {
-        let x0 = self.x_of(s.seconds_of(n.start), g);
-        let x1 = self.x_of(s.seconds_of(n.end), g);
+        let (a, b) = n.placed();
+        let x0 = self.x_of(s.seconds_of(a), g);
+        let x1 = self.x_of(s.seconds_of(b), g);
         let h = (self.row_h * 0.8).max(4.0);
         Rect::new(x0, self.y_of(n.heard(), g) - h / 2.0, (x1 - x0).max(2.0), h)
+    }
+
+    /// The note edge under `pos` (a few pixels either side of it; inside
+    /// a note first, where two meet).
+    pub fn edge_at(&self, pos: Point, size: Size, model: &Session) -> Option<(usize, Edge)> {
+        let g = self.grid(size);
+        if !g.contains(pos) {
+            return None;
+        }
+        let s = shown(model)?;
+        let mut best: Option<(f32, usize, Edge)> = None;
+        for (i, n) in s.edit()?.notes.iter().enumerate() {
+            let r = self.note_rect(&s, n, g);
+            if pos.y < r.y || pos.y > r.bottom() {
+                continue;
+            }
+            let reach = EDGE_PX.min(r.w / 3.0);
+            for (edge, inside) in [(Edge::Start, pos.x - r.x), (Edge::End, r.right() - pos.x)] {
+                let score = inside.abs() - if inside >= 0.0 { 0.5 } else { 0.0 };
+                if inside.abs() <= reach && best.is_none_or(|b| score < b.0) {
+                    best = Some((score, i, edge));
+                }
+            }
+        }
+        best.map(|(_, i, edge)| (i, edge))
     }
 
     /// The note under `pos`.
@@ -340,6 +386,17 @@ impl PitchView {
         let Some(s) = shown(model) else {
             return String::new();
         };
+        if model.detecting_pitch() || model.detecting_polyphonic() {
+            return format!(
+                "{} · finding the notes ({})…",
+                s.clip.name,
+                if model.editor.pitch_polyphonic {
+                    "polyphonic"
+                } else {
+                    "melodic"
+                }
+            );
+        }
         let Some(e) = s.edit() else {
             return s.clip.name.clone();
         };
@@ -351,6 +408,17 @@ impl PitchView {
             .iter()
             .filter_map(|i| e.notes.get(*i))
             .collect();
+        // How long a note plays (and was sung, when that differs).
+        let length = |n: &PitchNote| {
+            let (a, b) = n.placed();
+            let now = (b - a) as f64 / s.rate;
+            if n.timed() {
+                let sung = (n.end - n.start) as f64 / s.rate;
+                format!(" · {now:.2} s (sung {sung:.2} s)")
+            } else {
+                format!(" · {now:.2} s")
+            }
+        };
         match picked.as_slice() {
             [] => format!(
                 "{} · {} notes{}",
@@ -366,7 +434,7 @@ impl PitchView {
                 let heard = n.heard();
                 let cents = ((heard - heard.round()) * 100.0).round() as i32;
                 format!(
-                    "{} {:+}¢ · moved {:+.2} · straightened {:.0}% · {}",
+                    "{} {:+}¢ · moved {:+.2} · straightened {:.0}% · {}{}",
                     note_name(heard.round() as i32),
                     cents,
                     n.shift,
@@ -375,19 +443,21 @@ impl PitchView {
                         "muted".to_string()
                     } else {
                         format!("{:+.1} dB", n.gain_db)
-                    }
+                    },
+                    length(n)
                 )
             }
             [n] => {
                 let heard = n.heard();
                 let cents = ((heard - heard.round()) * 100.0).round() as i32;
                 format!(
-                    "{} {:+}¢ · moved {:+.2} · straightened {:.0}% · formants {:+.1}",
+                    "{} {:+}¢ · moved {:+.2} · straightened {:.0}% · formants {:+.1}{}",
                     note_name(heard.round() as i32),
                     cents,
                     n.shift,
                     n.drift * 100.0,
-                    n.formant
+                    n.formant,
+                    length(n)
                 )
             }
             many => format!("{} notes selected", many.len()),
@@ -502,7 +572,7 @@ impl PitchView {
                     }),
                 ),
                 MenuItem::new(
-                    "Forget (not played: Del)",
+                    "Forget (found where none was played)",
                     op(PitchOp::Forget {
                         notes: notes.clone(),
                     }),
@@ -542,7 +612,16 @@ impl PitchView {
                 .separated(),
             );
         }
-        items.push(MenuItem::new("Reset", op(PitchOp::Reset { notes })).separated());
+        items.push(
+            MenuItem::new(
+                "Remove (Del)",
+                op(PitchOp::RemoveNotes {
+                    notes: notes.clone(),
+                }),
+            )
+            .separated(),
+        );
+        items.push(MenuItem::new("Reset (R)", op(PitchOp::Reset { notes })));
         HostRequest::ContextMenu { at, items }
     }
 
@@ -652,9 +731,16 @@ impl PitchView {
                 continue;
             }
             let selected = self.selected.contains(&i);
-            // Where it was sung, when moved.
-            if n.shift.abs() > 0.005 {
-                let orig = Rect::new(r.x, self.y_of(n.pitch, g) - r.h / 2.0, r.w, r.h);
+            // Where it was sung, when moved or made longer or shorter.
+            if n.shift.abs() > 0.005 || n.timed() {
+                let x0 = self.x_of(s.seconds_of(n.start), g);
+                let x1 = self.x_of(s.seconds_of(n.end), g);
+                let orig = Rect::new(
+                    x0,
+                    self.y_of(n.pitch, g) - r.h / 2.0,
+                    (x1 - x0).max(2.0),
+                    r.h,
+                );
                 p.stroke_rounded(orig, 4.0, 1.0, th.ui.text_faint.with_alpha(0.6));
             }
             let fill = if selected {
@@ -678,6 +764,24 @@ impl PitchView {
                     color.darken(0.3)
                 },
             );
+            // The edge under the pointer (or being dragged): a handle.
+            let handle = match &self.drag {
+                Some(Drag::Edge { edge, notes, .. }) => notes.contains(&i).then_some(*edge),
+                _ => self.hover_edge.filter(|(k, _)| *k == i).map(|(_, e)| e),
+            };
+            if let Some(edge) = handle {
+                let w = 3.0f32.min(r.w / 2.0);
+                let x = if edge == Edge::Start {
+                    r.x
+                } else {
+                    r.right() - w
+                };
+                p.fill_rounded(
+                    Rect::new(x, r.y + 1.0, w, (r.h - 2.0).max(1.0)),
+                    1.5,
+                    &Paint::Solid(th.ui.accent),
+                );
+            }
             // The curve: played, and (faint) sung where it differs.
             let curve = |played: bool| {
                 let mut path = Path::new();
@@ -692,7 +796,10 @@ impl PitchView {
                     };
                     match v {
                         Some(m) => {
-                            let pt = Point::new(self.x_of(s.seconds_of(at), g), self.y_of(m, g));
+                            // Where this part of it plays now.
+                            let placed = n.place_of(at as f64).round() as i64;
+                            let pt =
+                                Point::new(self.x_of(s.seconds_of(placed), g), self.y_of(m, g));
                             // A jump is not a line.
                             if (m - last).abs() > 1.0 {
                                 open = false;
@@ -982,10 +1089,41 @@ impl PitchView {
         let Some(s) = shown(model) else {
             return true;
         };
+        // An edge: make the note (and the others selected) longer or
+        // shorter.
+        if clicks == 1
+            && let Some((i, edge)) = self.edge_at(pos, size, model)
+            && let Some(n) = s.edit().and_then(|e| e.notes.get(i))
+        {
+            if modifiers.toggle() || modifiers.shift {
+                if !self.selected.contains(&i) {
+                    self.selected.push(i);
+                    self.selected.sort_unstable();
+                }
+            } else if !self.selected.contains(&i) {
+                self.selected = vec![i];
+            }
+            let (a, b) = n.placed();
+            self.drag = Some(Drag::Edge {
+                edge,
+                from: if edge == Edge::Start { a } else { b },
+                notes: self.selected.clone(),
+                sent: 0,
+                begun: false,
+            });
+            cx.set_cursor(Cursor::ResizeHorizontal);
+            cx.redraw();
+            return true;
+        }
         match self.note_at(pos, size, model) {
             Some(i) if clicks >= 2 => {
-                // Split the note here.
-                let at = s.source_at(self.seconds_at(pos.x, g));
+                // Split the note here (the frame of its own sound playing
+                // there).
+                let placed = s.source_at(self.seconds_at(pos.x, g));
+                let Some(n) = s.edit().and_then(|e| e.notes.get(i)) else {
+                    return true;
+                };
+                let at = n.source_of(placed as f64).round() as i64;
                 cx.emit(Action::EditPitch {
                     clip: s.id,
                     op: PitchOp::Split { note: i, at },
@@ -1032,7 +1170,38 @@ impl PitchView {
         cx: &mut EventCx<'_, Action>,
     ) -> bool {
         let row_h = self.row_h;
+        let seconds = self.seconds_at(pos.x, self.grid(size));
         match &mut self.drag {
+            Some(Drag::Edge {
+                edge,
+                from,
+                notes,
+                sent,
+                begun,
+            }) => {
+                let Some(s) = shown(model) else {
+                    return true;
+                };
+                // The pointer's place in the clip (placed frames).
+                let by = s.source_at(seconds) - *from;
+                if by != *sent {
+                    if !*begun {
+                        cx.emit(Action::BeginGesture("Note Length".into()));
+                        *begun = true;
+                    }
+                    cx.emit(Action::EditPitch {
+                        clip: s.id,
+                        op: PitchOp::Length {
+                            notes: notes.clone(),
+                            edge: *edge,
+                            by,
+                        },
+                    });
+                    *sent = by;
+                }
+                cx.set_cursor(Cursor::ResizeHorizontal);
+                true
+            }
             Some(Drag::Move {
                 from,
                 notes,
@@ -1083,11 +1252,15 @@ impl PitchView {
             }
             None => {
                 let hover = self.note_at(pos, size, model);
-                if hover != self.hover {
+                let edge = self.edge_at(pos, size, model);
+                if hover != self.hover || edge != self.hover_edge {
                     self.hover = hover;
+                    self.hover_edge = edge;
                     cx.redraw();
                 }
-                if hover.is_some() {
+                if edge.is_some() {
+                    cx.set_cursor(Cursor::ResizeHorizontal);
+                } else if hover.is_some() {
                     cx.set_cursor(Cursor::Pointer);
                 }
                 false
@@ -1097,7 +1270,7 @@ impl PitchView {
 
     fn pointer_up(&mut self, size: Size, model: &Session, cx: &mut EventCx<'_, Action>) -> bool {
         match self.drag.take() {
-            Some(Drag::Move { begun, .. }) => {
+            Some(Drag::Move { begun, .. } | Drag::Edge { begun, .. }) => {
                 if begun {
                     cx.emit(Action::EndGesture);
                 }
@@ -1135,21 +1308,24 @@ impl PitchView {
                     by: if key == Key::Up { step } else { -step },
                 }
             }
-            // Polyphonic: Delete forgets a note found where none was
-            // played, R resets; melodic: Delete resets.
-            Key::Delete | Key::Backspace
-                if !self.selected.is_empty()
-                    && s.edit().is_some_and(|e| e.polyphonic.is_some()) =>
-            {
-                PitchOp::Forget {
-                    notes: std::mem::take(&mut self.selected),
-                }
-            }
-            Key::Delete | Key::Backspace | Key::Char('r') if !self.selected.is_empty() => {
-                PitchOp::Reset {
+            // Shorter or longer: the ends of the selected notes.
+            Key::Left | Key::Right if modifiers.toggle() && !self.selected.is_empty() => {
+                let step = LENGTH_STEP * if modifiers.shift { 0.1 } else { 1.0 };
+                let by = (step * s.rate).round().max(1.0) as i64;
+                PitchOp::Length {
                     notes: self.selected.clone(),
+                    edge: Edge::End,
+                    by: if key == Key::Right { by } else { -by },
                 }
             }
+            // Delete removes notes and their sound (Forget, in the menu,
+            // only the note).
+            Key::Delete | Key::Backspace if !self.selected.is_empty() => PitchOp::RemoveNotes {
+                notes: std::mem::take(&mut self.selected),
+            },
+            Key::Char('r') if !self.selected.is_empty() => PitchOp::Reset {
+                notes: self.selected.clone(),
+            },
             Key::Char('a') if modifiers.toggle() => {
                 self.selected = (0..count).collect();
                 cx.redraw();
@@ -1194,9 +1370,11 @@ impl CanvasView<Session, Action> for PitchView {
         if now != self.seen || size != self.last_size && self.seen.is_none() {
             let new_clip = now.map(|n| n.0) != self.seen.map(|n| n.0);
             let notes_came = now.map(|n| n.1) != self.seen.map(|n| n.1);
-            self.selected.retain(|i| now.is_some_and(|(_, c)| *i < c));
-            if new_clip {
+            // Notes split, joined, removed or back: the indices name other
+            // notes now.
+            if new_clip || notes_came {
                 self.selected.clear();
+                (self.hover, self.hover_edge) = (None, None);
             }
             if let Some(s) = &s
                 && (new_clip || notes_came && self.seen.is_some_and(|n| n.1 == 0))
@@ -1219,11 +1397,13 @@ impl CanvasView<Session, Action> for PitchView {
         self.paint_toolbar(p, size, model);
         let hint = match &s {
             None => Some("Right-click an audio clip and choose Edit Pitch".to_string()),
-            Some(s) if s.edit().is_none() => Some(if model.detecting_pitch() {
-                "Finding the notes…".to_string()
-            } else {
-                "Detect Pitch finds the notes of this clip".to_string()
-            }),
+            Some(s) if s.edit().is_none() => {
+                Some(if model.detecting_pitch() || model.detecting_polyphonic() {
+                    "Finding the notes…".to_string()
+                } else {
+                    "Detect Pitch finds the notes of this clip".to_string()
+                })
+            }
             Some(s) if s.edit().is_some_and(|e| e.notes.is_empty()) => {
                 Some("No notes found: pitch editing needs a single voice or instrument".into())
             }
@@ -1278,7 +1458,7 @@ impl CanvasView<Session, Action> for PitchView {
                 ..
             } => self.pointer_up(size, model, cx),
             ViewEvent::PointerLeave => {
-                if self.hover.take().is_some() {
+                if self.hover.take().is_some() | self.hover_edge.take().is_some() {
                     cx.redraw();
                 }
                 false
@@ -1331,7 +1511,7 @@ impl CanvasView<Session, Action> for PitchView {
             return Some(
                 match self.item_at(pos, size, model)? {
                     Item::Polyphonic => {
-                        "On: every note, chords too, each moved on its own (rendered); off: one line of notes (a voice), played live with its formants kept"
+                        "On: every note, chords too, each moved on its own (rendered); off: one line of notes (a voice), played live with its formants kept. Switching finds the clip's notes again, its corrections carried over"
                     }
                     Item::Detect => "Find the clip's notes (Polyphonic: every note, chords too)",
                     Item::Correct => {
@@ -1349,9 +1529,22 @@ impl CanvasView<Session, Action> for PitchView {
                 .into(),
             );
         }
+        if self.edge_at(pos, size, model).is_some() {
+            let melodic = shown(model)
+                .and_then(|s| s.edit().map(|e| e.polyphonic.is_none()))
+                .unwrap_or(true);
+            return Some(
+                if melodic {
+                    "Drag to make the note longer or shorter (the next note or the pause gives way) · Ctrl+←→ the end"
+                } else {
+                    "Drag to make the note longer or shorter (only its own sound is stretched) · Ctrl+←→ the end"
+                }
+                .into(),
+            );
+        }
         self.note_at(pos, size, model)?;
         Some(
-            "Drag to move (Alt: freely) · double-click to split · ↑↓ move · J join · Delete reset"
+            "Drag to move (Alt: freely) · drag an edge to make it longer or shorter · double-click to split · ↑↓ move · J join · Delete remove · R reset"
                 .into(),
         )
     }
@@ -1424,12 +1617,14 @@ mod tests {
             curve: vec![0; 90],
             gain_db: 0.0,
             muted: false,
+            timing: None,
         };
         a.pitch = Some(PitchEdit {
             hop: 240,
             notes: vec![note(0, 57.0), note(1, 60.0), note(2, 64.0)],
             keep_formants: true,
             polyphonic: None,
+            removed: Vec::new(),
         });
         s.dispatch(Action::Edit(Command::SetClipContent {
             clip: pad,
@@ -1638,6 +1833,185 @@ mod tests {
         };
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(labels.contains(&"Correct to the Key") && labels.contains(&"Straighten"));
+    }
+
+    fn edit_of(s: &Session, clip: ClipId) -> PitchEdit {
+        s.project()
+            .clip(clip)
+            .unwrap()
+            .as_audio()
+            .unwrap()
+            .pitch
+            .clone()
+            .unwrap()
+    }
+
+    fn up(pos: Point) -> ViewEvent {
+        ViewEvent::PointerUp {
+            pos,
+            button: PointerButton::Primary,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    fn drag_to(pos: Point) -> ViewEvent {
+        ViewEvent::PointerMove {
+            pos,
+            modifiers: Modifiers::NONE,
+            dragging: true,
+        }
+    }
+
+    #[test]
+    fn an_edge_dragged_makes_a_note_longer_in_one_step() {
+        let (mut s, clip) = session();
+        let size = Size::new(1000.0, 600.0);
+        let mut view = PitchView::new(Theme::default());
+        view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
+        let g = view.grid(size);
+        let sung = edit_of(&s, clip).notes;
+        let r = view.note_rect(&shown(&s).unwrap(), &sung[0], g);
+        let edge = Point::new(r.right() - 1.0, r.center().y);
+        // Hovering the end: a handle to pull.
+        let (mut actions, mut requests) = (Vec::new(), Vec::new());
+        let mut cx = EventCx::new(&mut actions, &mut requests);
+        view.event(
+            &ViewEvent::PointerMove {
+                pos: edge,
+                modifiers: Modifiers::NONE,
+                dragging: false,
+            },
+            size,
+            &s,
+            &mut cx,
+        );
+        assert_eq!(cx.cursor(), Some(Cursor::ResizeHorizontal));
+        assert_eq!(view.hover_edge, Some((0, Edge::End)));
+        // A tenth of a second on, in three moves: one step.
+        let dx = 0.1 * view.px_per_sec;
+        let to = Point::new(edge.x + dx, edge.y);
+        let want = shown(&s).unwrap().source_at(view.seconds_at(to.x, g));
+        let steps = s.history_steps().0.len();
+        send(&mut view, down(edge, 1), size, &mut s);
+        for x in [edge.x + dx / 4.0, edge.x + dx / 2.0, to.x] {
+            send(&mut view, drag_to(Point::new(x, edge.y)), size, &mut s);
+        }
+        send(&mut view, up(to), size, &mut s);
+        assert_eq!(s.history_steps().0.len(), steps + 1);
+        let e = edit_of(&s, clip);
+        assert_eq!(e.notes[0].placed(), (sung[0].start, want));
+        // The next note (sung on after a short breath) gives way: it
+        // starts later and ends where it did.
+        let grown = want - sung[0].end;
+        assert!(grown > 0);
+        assert_eq!(e.notes[1].placed(), (sung[1].start + grown, sung[1].end));
+        assert_eq!(e.notes[2].placed(), (sung[2].start, sung[2].end));
+        // Ctrl+←: 10 ms shorter.
+        let ctrl = Modifiers {
+            ctrl: true,
+            ..Modifiers::NONE
+        };
+        send(
+            &mut view,
+            ViewEvent::Key {
+                key: Key::Left,
+                modifiers: ctrl,
+            },
+            size,
+            &mut s,
+        );
+        let ms10 = (0.01 * f64::from(s.project().sample_rate)).round() as i64;
+        assert_eq!(edit_of(&s, clip).notes[0].placed().1, want - ms10);
+        // Painted where it plays now: longer than as sung.
+        view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
+        let e = edit_of(&s, clip);
+        let now = view.note_rect(&shown(&s).unwrap(), &e.notes[0], g);
+        assert!(now.w > r.w + dx * 0.8, "{} vs {}", now.w, r.w);
+    }
+
+    #[test]
+    fn delete_removes_notes_and_their_sound() {
+        let (mut s, clip) = session();
+        let size = Size::new(1000.0, 600.0);
+        let mut view = PitchView::new(Theme::default());
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, size, &s, &Theme::default());
+        let labels = p.texts().iter().filter(|t| **t == "C4").count();
+        let g = view.grid(size);
+        let e = edit_of(&s, clip);
+        let r = view.note_rect(&shown(&s).unwrap(), &e.notes[1], g);
+        // The menu offers it.
+        let reqs = send(
+            &mut view,
+            ViewEvent::PointerDown {
+                pos: r.center(),
+                button: PointerButton::Secondary,
+                modifiers: Modifiers::NONE,
+                clicks: 1,
+            },
+            size,
+            &mut s,
+        );
+        let Some(HostRequest::ContextMenu { items, .. }) = reqs.into_iter().next() else {
+            panic!("a menu");
+        };
+        assert!(items.iter().any(|i| i.label == "Remove (Del)"));
+        // Selected, Delete: the note goes into the removed ones.
+        send(&mut view, down(r.center(), 1), size, &mut s);
+        send(&mut view, up(r.center()), size, &mut s);
+        assert_eq!(view.selected, [1]);
+        send(
+            &mut view,
+            ViewEvent::Key {
+                key: Key::Delete,
+                modifiers: Modifiers::NONE,
+            },
+            size,
+            &mut s,
+        );
+        let after = edit_of(&s, clip);
+        assert_eq!(after.notes.len(), 2);
+        assert_eq!(after.removed, [e.notes[1].clone()]);
+        assert!(view.selected.is_empty());
+        // Its label gone (the keyboard's C4 stays).
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, size, &s, &Theme::default());
+        let c4s = p.texts().iter().filter(|t| **t == "C4").count();
+        assert_eq!(c4s, labels - 1, "no longer shown");
+    }
+
+    #[test]
+    fn switching_modes_finds_the_notes_again() {
+        let (mut s, _) = session();
+        let size = Size::new(1000.0, 600.0);
+        let mut view = PitchView::new(Theme::default());
+        view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
+        let toggle = |view: &PitchView, s: &Session| {
+            view.toolbar(size, s)
+                .into_iter()
+                .find(|(i, ..)| *i == Item::Polyphonic)
+                .unwrap()
+                .1
+                .center()
+        };
+        // The fixture's notes are melodic: Melodic changes nothing.
+        let at = toggle(&view, &s);
+        send(&mut view, down(at, 1), size, &mut s);
+        assert!(!s.editor.pitch_polyphonic);
+        assert!(!s.detecting_pitch() && !s.detecting_polyphonic());
+        // Polyphonic: found again that way, shown as it runs.
+        send(&mut view, down(at, 1), size, &mut s);
+        assert!(s.editor.pitch_polyphonic && s.detecting_polyphonic());
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, size, &s, &Theme::default());
+        let texts = p.texts();
+        assert!(texts.contains(&"Finding Notes…"), "{texts:?}");
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.ends_with("finding the notes (polyphonic)…")),
+            "{texts:?}"
+        );
     }
 
     #[test]

@@ -611,7 +611,18 @@ fn the_formatting_names_choices() {
         "Natural Phase"
     );
     assert_eq!(format(global_id(global::CHARACTER), 1.0).unwrap(), "Subtle");
+    assert_eq!(
+        format(global_id(global::CHARACTER), 3.0).unwrap(),
+        "Console"
+    );
+    assert_eq!(format(global_id(global::CHARACTER), 4.0).unwrap(), "Tape");
     assert_eq!(format(global_id(global::PAN), -0.25).unwrap(), "L25");
+    assert_eq!(format(global_id(global::MIX), 0.5).unwrap(), "50 %");
+    assert_eq!(
+        format(global_id(global::CHARACTER_DRIVE), 1.5).unwrap(),
+        "150 %"
+    );
+    assert_eq!(format(global_id(global::OVERSAMPLING), 1.0).unwrap(), "2×");
     assert!(format(global_id(global::OUTPUT), 1.0).is_none());
     assert_eq!(parameters().len(), GLOBALS + BANDS * FIELDS);
     // Indexes and ids agree, ids are unique and decode back.
@@ -633,6 +644,83 @@ fn the_formatting_names_choices() {
     // The first version's ids keep their meaning.
     assert_eq!(band_id(1, Field::Gain).0, 100 + 16 + 3);
     assert_eq!(global_id(global::QUALITY).0, 4);
+    // The later globals come after the retired ids 5 to 7.
+    assert_eq!(global_id(global::MIX).0, 14);
+    assert_eq!(global_id(global::CHARACTER_DRIVE).0, 15);
+    assert_eq!(global_id(global::OVERSAMPLING).0, 16);
+    assert!(global_of(ParameterId(5)).is_none());
+    // Their defaults change nothing: a state from before them sounds
+    // the same.
+    assert_eq!(ps[global::MIX].default, 1.0);
+    assert_eq!(ps[global::CHARACTER_DRIVE].default, 1.0);
+    assert_eq!(ps[global::OVERSAMPLING].default, 0.0);
+    assert!(!ps[global::OVERSAMPLING].automatable);
+}
+
+#[test]
+fn the_mix_blends_the_eq_with_the_delayed_input() {
+    // A 6 dB bell at 1 kHz: at 50 % mix the tone comes out halfway
+    // between the dry and the boosted amplitude (in phase at the centre).
+    let mut rig = Rig::new();
+    rig.bell(0, 1_000.0, 6.0);
+    rig.set_global(global::MIX, 0.5);
+    let (l, _) = rig.run(40, 0, sine(1_000.0), silence, &[]);
+    let got = amplitude(&l[l.len() - 4_800..]) / 0.25;
+    let want = 0.5 * (1.0 + 10f64.powf(6.0 / 20.0));
+    assert!((got - want).abs() < 0.01, "{got} vs {want}");
+    // At 0 % the input comes through untouched — delayed by the latency
+    // in a latent mode.
+    rig.set_global(global::MIX, 0.0);
+    let input = sine(1_000.0);
+    let (l, _) = rig.run(40, 0, &input, silence, &[]);
+    for (i, v) in l.iter().enumerate().skip(l.len() - 2048) {
+        assert!((v - input(i).0).abs() < 1e-4, "at {i}");
+    }
+    rig.set_global(global::PHASE, PhaseMode::Natural.value());
+    let mut rig = rig.rebuild();
+    let lat = rig.eq.latency() as usize;
+    assert_eq!(lat, natural::LATENCY as usize);
+    let (l, _) = rig.run(40, 0, &input, silence, &[]);
+    for (i, v) in l.iter().enumerate().skip(l.len() - 2048) {
+        assert!((v - input(i - lat).0).abs() < 1e-5, "at {i}");
+    }
+}
+
+#[test]
+fn the_character_drive_and_oversampling_reach_the_processor() {
+    let harmonic = |drive: f64, over: f64| {
+        let rig = Rig::new();
+        rig.set_global(global::CHARACTER, 3.0);
+        rig.set_global(global::CHARACTER_DRIVE, drive);
+        rig.set_global(global::OVERSAMPLING, over);
+        let mut rig = rig.rebuild();
+        let (l, _) = rig.run(80, 0, tone(100.0, 0.9), silence, &[]);
+        let tail = &l[l.len() - 9_600..];
+        component(tail, 300.0, 0.9)
+    };
+    let (soft, plain, hard) = (harmonic(0.5, 0.0), harmonic(1.0, 0.0), harmonic(2.0, 0.0));
+    assert!(
+        soft < plain - 6.0 && plain < hard - 3.0,
+        "{soft} {plain} {hard}"
+    );
+    // Oversampled, the in-band harmonic is the same.
+    assert!((harmonic(1.0, 1.0) - plain).abs() < 0.5);
+    // Oversampling costs latency, which the processor reports and the
+    // bypass path compensates.
+    let rig = Rig::new();
+    rig.set_global(global::OVERSAMPLING, 2.0);
+    let mut rig = rig.rebuild();
+    let lat = rig.eq.latency();
+    assert_eq!(lat, latency(&rig.params));
+    assert_eq!(lat, character::oversampling_latency(4));
+    assert!(lat > 0);
+    rig.set_global(global::BYPASS, 1.0);
+    let input = sine(1_000.0);
+    let (l, _) = rig.run(40, 0, &input, silence, &[]);
+    for (i, v) in l.iter().enumerate().skip(l.len() - 2048) {
+        let want = input(i - lat as usize).0;
+        assert!((v - want).abs() < 1e-6, "at {i}: {v} vs {want}");
+    }
 }
 
 mod linear_phase {
@@ -739,6 +827,18 @@ mod linear_phase {
         assert!(inst.poll().restart);
         assert_eq!(inst.latency_samples(), 32_768 / 2 + 256);
         inst.set_parameter(global_id(global::PHASE), 2.0).unwrap();
+        assert!(inst.poll().restart);
+        assert_eq!(inst.latency_samples(), natural::LATENCY);
+        // The character stage's oversampling too.
+        inst.set_parameter(global_id(global::OVERSAMPLING), 1.0)
+            .unwrap();
+        assert!(inst.poll().restart);
+        assert_eq!(
+            inst.latency_samples(),
+            natural::LATENCY + character::oversampling_latency(2)
+        );
+        inst.set_parameter(global_id(global::OVERSAMPLING), 0.0)
+            .unwrap();
         assert!(inst.poll().restart);
         assert_eq!(inst.latency_samples(), natural::LATENCY);
         // A spectral band adds its frame and the hop its work is spread

@@ -1,10 +1,11 @@
 //! Utility (the built-in "Gain", grown up): gain, balance, width, mono
-//! bass, polarity per side, channel choice, a DC filter and mute.
+//! bass, polarity and trim per side, channel choice, a DC filter and mute.
 //!
 //! Everything but mono bass and the DC filter is one 2 × 2 matrix from the
 //! input's left and right to the output's: the channel choice (stereo,
-//! left or right on both, swapped, mid, side), polarity, width (the side
-//! scaled against the mid), balance and gain. Moving any of them ramps the
+//! left or right on both, swapped, mid, side), polarity and trim per side
+//! (before the width, so a trim evens the sides of a lopsided recording),
+//! width (the side scaled against the mid), balance and gain. Moving any of them ramps the
 //! matrix across the block, so nothing clicks; with everything at rest it
 //! is the identity times the gain (the old Gain exactly). Mono bass splits
 //! mid and side at the frequency (Linkwitz–Riley, 24 dB/oct) and keeps only
@@ -15,7 +16,7 @@
 //! controls on the first two.
 
 use super::{on_off, param, pick, stepped};
-use crate::dsp::filter::{DcBlock, Svf};
+use crate::dsp::filter::{Crossover, DcBlock};
 use crate::tap::{AnalysisTap, MeterTap, Watching};
 use crate::{
     ParamValues, ParameterInfo, ParameterUnit, PluginProcessContext, PluginProcessor,
@@ -23,7 +24,7 @@ use crate::{
 };
 use faderframe_audio_graph::NodeIo;
 use faderframe_core::ParameterId;
-use std::f64::consts::{FRAC_1_SQRT_2, FRAC_PI_2};
+use std::f64::consts::FRAC_PI_2;
 use std::sync::Arc;
 
 pub mod id {
@@ -38,6 +39,8 @@ pub mod id {
     pub const CHANNELS: u32 = 7;
     pub const DC: u32 = 8;
     pub const MUTE: u32 = 9;
+    pub const TRIM_L: u32 = 10;
+    pub const TRIM_R: u32 = 11;
 }
 
 /// Published: input and output peaks (linear).
@@ -69,6 +72,8 @@ pub fn parameters() -> Vec<ParameterInfo> {
         stepped(id::CHANNELS, "Channels", 5.0, 0.0),
         stepped(id::DC, "DC Filter", 1.0, 0.0),
         stepped(id::MUTE, "Mute", 1.0, 0.0),
+        param(id::TRIM_L, "Trim Left", -24.0, 24.0, 0.0, Decibels),
+        param(id::TRIM_R, "Trim Right", -24.0, 24.0, 0.0, Decibels),
     ]
 }
 
@@ -108,17 +113,18 @@ pub fn matrix(params: &ParamValues) -> [f64; 4] {
         5 => [0.5, -0.5, 0.5, -0.5],
         _ => [1.0, 0.0, 0.0, 1.0],
     };
+    // Polarity and trim per side.
     let (pl, pr) = (
         if get(params, id::INVERT_L) >= 0.5 {
             -1.0
         } else {
             1.0
-        },
+        } * 10f64.powf(get(params, id::TRIM_L) / 20.0),
         if get(params, id::INVERT_R) >= 0.5 {
             -1.0
         } else {
             1.0
-        },
+        } * 10f64.powf(get(params, id::TRIM_R) / 20.0),
     );
     let w = get(params, id::WIDTH).clamp(0.0, 2.0);
     let width = [
@@ -143,43 +149,6 @@ pub fn matrix(params: &ParamValues) -> [f64; 4] {
     let polarity = [pl, 0.0, 0.0, pr];
     let balance = [bl * gain, 0.0, 0.0, br * gain];
     mul(balance, mul(width, mul(polarity, pick)))
-}
-
-/// A Linkwitz–Riley crossover (two Butterworth sections each way).
-#[derive(Clone, Copy, Default)]
-struct Crossover {
-    low: [Svf; 2],
-    high: [Svf; 2],
-}
-
-impl Crossover {
-    fn set(&mut self, freq: f64, rate: f64) {
-        for s in self.low.iter_mut().chain(&mut self.high) {
-            s.set(freq, FRAC_1_SQRT_2, rate);
-        }
-    }
-
-    /// The low and high bands (they sum to an all pass).
-    #[inline]
-    fn split(&mut self, x: f64) -> (f64, f64) {
-        let l = self.low[0].process(x).low;
-        let l = self.low[1].process(l).low;
-        let h = self.high[0].process(x).high;
-        let h = self.high[1].process(h).high;
-        (l, h)
-    }
-
-    fn reset(&mut self) {
-        for s in self.low.iter_mut().chain(&mut self.high) {
-            s.reset();
-        }
-    }
-
-    fn flush(&mut self) {
-        for s in self.low.iter_mut().chain(&mut self.high) {
-            s.flush();
-        }
-    }
 }
 
 pub struct UtilityProcessor {
@@ -209,8 +178,7 @@ impl UtilityProcessor {
         } else {
             0.0
         };
-        let mut mid = Crossover::default();
-        mid.set(get(&params, id::BASS_FREQ), sr);
+        let mid = Crossover::new(get(&params, id::BASS_FREQ), sr);
         Self {
             watching: Watching::new(sr as f32),
             sr,
@@ -422,6 +390,27 @@ mod tests {
         // Mute.
         let (l, _) = rig(&[(id::MUTE, 1.0)]).run(0.2, &input, silence);
         assert!(l.iter().skip(500).all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn trims_even_the_sides_before_the_width() {
+        let input = stereo(300.0, 0.5, 300.0, 0.25);
+        // The right side 6 dB up: both the same level.
+        let (l, rr) = rig(&[(id::TRIM_R, 6.02)]).run(0.2, &input, silence);
+        assert!((bin_db(&l, 300.0) - 20.0 * 0.5f64.log10()).abs() < 0.1);
+        assert!((bin_db(&rr, 300.0) - 20.0 * 0.5f64.log10()).abs() < 0.1);
+        // Evened, width 0 leaves no side at all (the trim comes first).
+        let (l, rr) = rig(&[(id::TRIM_R, 6.02), (id::WIDTH, 0.0)]).run(0.2, &input, silence);
+        assert!(
+            l.iter()
+                .zip(&rr)
+                .skip(500)
+                .all(|(a, b)| (a - b).abs() < 1e-5)
+        );
+        assert!((bin_db(&l, 300.0) - 20.0 * 0.5f64.log10()).abs() < 0.1);
+        // The left side trimmed down.
+        let (l, _) = rig(&[(id::TRIM_L, -6.02), (id::TRIM_R, 12.0)]).run(0.2, &input, silence);
+        assert!((bin_db(&l, 300.0) - 20.0 * 0.25f64.log10()).abs() < 0.1);
     }
 
     #[test]

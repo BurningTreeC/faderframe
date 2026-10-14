@@ -273,6 +273,12 @@ pub struct AuxSend {
     pub tap: SendTap,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Panned into its destination: −1…1, a mono tap by the project's pan
+    /// law, a stereo one's balance (`None`: as it is tapped — the graph's
+    /// channel rule, a mono tap at unity on both sides of a stereo
+    /// return).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pan: Option<f32>,
 }
 
 fn default_true() -> bool {
@@ -354,6 +360,30 @@ pub struct PluginSlot {
     pub sidechain: Option<TrackId>,
 }
 
+/// A device's name as every view shows it: its plugin's name, and when the
+/// same chain (a track's devices, a song's inserts) holds several of that
+/// name, "(2)", "(3)" … after the first, in the chain's order.
+pub fn device_name<'a>(
+    chain: impl IntoIterator<Item = &'a PluginSlot>,
+    slot: &PluginSlot,
+) -> String {
+    let name = &slot.plugin.name;
+    let mut before = 0;
+    for s in chain {
+        if s.id == slot.id {
+            return if before == 0 {
+                name.clone()
+            } else {
+                format!("{name} ({})", before + 1)
+            };
+        }
+        if s.plugin.name == *name {
+            before += 1;
+        }
+    }
+    name.clone()
+}
+
 /// A channel of the project: audio/instrument/MIDI track, bus, aux or master.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Track {
@@ -376,6 +406,9 @@ pub struct Track {
     pub inserts: Vec<PluginSlot>,
     #[serde(default)]
     pub sends: Vec<AuxSend>,
+    /// Its feed of each cue mix (see [`crate::cue`]): level, pan, on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cue_sends: Vec<crate::cue::CueSend>,
 
     #[serde(default)]
     pub input: InputRouting,
@@ -526,6 +559,7 @@ impl Track {
             preamp: None,
             inserts: Vec::new(),
             sends: Vec::new(),
+            cue_sends: Vec::new(),
             // Instruments play what the keyboard plays.
             input: match kind {
                 TrackKind::Instrument | TrackKind::Midi => InputRouting::all_midi(),
@@ -611,6 +645,12 @@ impl Track {
     /// The slot with `id` (see [`Self::plugin_mut`]).
     pub fn plugin(&self, id: PluginInstanceId) -> Option<&PluginSlot> {
         self.slots().into_iter().find(|p| p.id == id)
+    }
+
+    /// `slot`'s name on this track: numbered after the first of its name
+    /// (see [`device_name`]).
+    pub fn name_of(&self, slot: &PluginSlot) -> String {
+        device_name(self.slots(), slot)
     }
 
     /// Every device of the track: the preamp, the instrument, the inserts

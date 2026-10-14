@@ -53,13 +53,16 @@ pub(crate) struct PolyState {
 }
 
 /// The notes of a polyphonic edit as the renderer moves them (source frames
-/// at the source's `rate`; the edit's at the project's).
+/// at the source's `rate`; the edit's at the project's), its removed notes
+/// taken out.
 fn moved(e: &PitchEdit, rate: f64, project_rate: f64) -> Vec<Moved> {
     let scale = rate / project_rate.max(1.0);
     let hop = (f64::from(e.hop) * scale).round().max(1.0) as usize;
-    e.notes
-        .iter()
-        .map(|n| {
+    let scaled = |f: i64| (f as f64 * scale).round() as i64;
+    let notes = e.notes.iter().map(|n| (n, false));
+    notes
+        .chain(e.removed.iter().map(|n| (n, true)))
+        .map(|(n, gone)| {
             let frames = n.curve.len().max(1);
             let f0: Vec<f32> = (0..frames)
                 .map(|k| match n.curve.get(k) {
@@ -76,18 +79,20 @@ fn moved(e: &PitchEdit, rate: f64, project_rate: f64) -> Vec<Moved> {
                     2f32.powf(n.correction_at(at, e.hop) / 12.0)
                 })
                 .collect();
-            let gain = if n.muted {
+            let gain = if n.muted || gone {
                 0.0
             } else {
                 10f32.powf(n.gain_db / 20.0)
             };
+            let (a, b) = n.placed();
             Moved {
-                start: (n.start as f64 * scale).round() as i64,
-                end: (n.end as f64 * scale).round() as i64,
+                start: scaled(n.start),
+                end: scaled(n.end),
                 hop,
                 f0,
                 ratio,
                 gain: vec![gain; frames],
+                placed: (n.timed() && !gone).then(|| (scaled(a), scaled(b))),
             }
         })
         .collect()
@@ -204,6 +209,7 @@ impl Session {
                                 curve,
                                 gain_db: 0.0,
                                 muted: false,
+                                timing: None,
                             })
                         })
                         .collect();
@@ -216,6 +222,7 @@ impl Session {
                             original,
                             rendered: 0,
                         }),
+                        removed: Vec::new(),
                     })
                 })
                 .map_err(|e| SessionError::Other(e.to_string()))?;
@@ -228,6 +235,14 @@ impl Session {
     /// Polyphonic detections still running.
     pub fn detecting_polyphonic(&self) -> bool {
         !self.poly.detect.is_empty()
+    }
+
+    /// Drop a clip's polyphonic detection (its thread runs on, its notes
+    /// are not placed); whether one was running.
+    pub(crate) fn cancel_polyphonic(&mut self, clip: ClipId) -> bool {
+        let before = self.poly.detect.len();
+        self.poly.detect.retain(|(c, _)| *c != clip);
+        self.poly.detect.len() != before
     }
 
     /// How far a clip's render is (0…1), while one runs.
@@ -362,13 +377,18 @@ impl Session {
         }
     }
 
-    fn place_detection(&mut self, clip: ClipId, edit: PitchEdit) -> Result<()> {
+    /// Give a clip the notes found (a melodic edit's corrections carried
+    /// over to them).
+    fn place_detection(&mut self, clip: ClipId, mut edit: PitchEdit) -> Result<()> {
         let Some(c) = self.project.clip(clip).cloned() else {
             return Ok(());
         };
         let Some(mut a) = c.as_audio().cloned() else {
             return Ok(());
         };
+        if let Some(old) = a.pitch.as_ref().filter(|e| e.polyphonic.is_none()) {
+            faderframe_project::pitch::carry(old, &mut edit);
+        }
         let original = edit.polyphonic.map_or(a.source, |p| p.original);
         let count = edit.notes.len();
         a.source = original;

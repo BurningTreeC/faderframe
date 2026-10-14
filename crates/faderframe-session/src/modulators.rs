@@ -244,7 +244,7 @@ impl Session {
                             plugin: slot.id,
                             parameter: p.id,
                         },
-                        group: slot.plugin.name.clone(),
+                        group: t.name_of(slot),
                         name: p.name.clone(),
                         takes_notes,
                         per_note: takes_notes
@@ -271,7 +271,7 @@ impl Session {
                     .plugin_parameters(plugin)?
                     .iter()
                     .find(|p| p.id == parameter)?;
-                Some(format!("{} · {}", slot.plugin.name, p.name))
+                Some(format!("{} · {}", t.name_of(slot), p.name))
             }
         }
     }

@@ -1,13 +1,16 @@
-//! The Reverb's face: the decay as set — pre-delay, the early reflections,
-//! the tail of the bass, the middle and the highs falling over their
-//! times (drag across it to set the decay) — and the decay time across
-//! the spectrum with the wet cuts, the controls and meters.
+//! The Reverb's face: the decay as set — pre-delay (synced or in ms), the
+//! early reflections (the springs' bounces for the Spring), the tail of
+//! the bass, the middle and the highs falling over their times, the
+//! shimmer's climb (drag across it to set the decay) — and the decay time
+//! across the spectrum with the wet cuts and shelves, the controls and
+//! meters.
 
 use crate::kit::{
     self, Ctl, Ctx, Edit, Face, KNOB, Meter, MeterKind, Panel, SMALL, SWITCH_H, Scale,
 };
 use faderframe_core::ParameterId;
 use faderframe_plugin_host::devices::reverb::{self as rev, id, value};
+use faderframe_plugin_host::eq::design::{BandShape, BandType, band_db};
 use faderframe_ui_canvas::{
     Accent, Color, Paint, Painter, Path, Point, Rect, Size, TextStyle, ViewEvent,
 };
@@ -60,7 +63,18 @@ impl ReverbFace {
             .iter()
             .copied()
             .fold(0.0, f64::max);
-        (cx.value(pid(id::PRE_DELAY)) * 0.001 + rt * 1.1).clamp(0.3, 25.0)
+        (Self::pre(cx) + rt * 1.1).clamp(0.3, 25.0)
+    }
+
+    /// The pre-delay (seconds) at the song's tempo.
+    fn pre(cx: &Ctx<'_>) -> f64 {
+        let tempo = cx
+            .model
+            .project()
+            .timeline
+            .tempo
+            .bpm_at(faderframe_timeline::MusicalTime::ZERO);
+        rev::pre_delay_seconds(&cx.tap.params, tempo)
     }
 }
 
@@ -70,18 +84,18 @@ impl Face for ReverbFace {
     }
 
     fn min_size(&self) -> Size {
-        Size::new(940.0, 480.0)
+        Size::new(1_000.0, 490.0)
     }
 
     fn panel(&self, size: Size) -> Panel {
-        let (display, deck, meter) = kit::frame(size, 196.0, 48.0);
+        let (display, deck, meter) = kit::frame(size, 206.0, 48.0);
         let s = kit::sections(
             deck,
             &[
-                ("SPACE", 5.4),
-                ("TONE", 4.4),
-                ("CHARACTER", 4.4),
-                ("OUTPUT", 4.2),
+                ("SPACE", 6.0),
+                ("TONE", 5.6),
+                ("CHARACTER", 4.6),
+                ("OUTPUT", 3.4),
             ],
         );
         let mut c = Vec::new();
@@ -91,8 +105,9 @@ impl Face for ReverbFace {
             "",
             Rect::new(r.x + 4.0, r.y, r.w - 8.0, 24.0),
         ));
+        let side_w = 66.0;
         let k = kit::row(
-            Rect::new(r.x, r.y + 32.0, r.w, KNOB.1),
+            Rect::new(r.x, r.y + 32.0, r.w - side_w - 6.0, KNOB.1),
             &[KNOB.0, KNOB.0, SMALL.0],
         );
         c.push(Ctl::knob(pid(id::DECAY), "DECAY", k[0]).scaled(Scale::Log));
@@ -105,26 +120,69 @@ impl Face for ReverbFace {
             )
             .scaled(Scale::Skew(2.5)),
         );
+        // The pre-delay synced: a switch and the note.
+        let side = Rect::new(r.right() - side_w, r.y + 32.0, side_w, KNOB.1);
+        c.push(Ctl::toggle(
+            pid(id::PRE_SYNC),
+            "Sync",
+            Rect::new(side.x, side.y + 4.0, side.w, SWITCH_H),
+        ));
+        c.push(Ctl::choice(
+            pid(id::PRE_DIVISION),
+            "NOTE",
+            Rect::new(side.x, side.y + 34.0, side.w, 38.0),
+        ));
         let r = kit::inside(&s[1]);
-        let k = kit::row(Rect::new(r.x, r.y, r.w, KNOB.1), &[KNOB.0, KNOB.0]);
+        let k = kit::row(
+            Rect::new(r.x, r.y, r.w, KNOB.1),
+            &[KNOB.0, KNOB.0, SMALL.0, SMALL.0],
+        );
         c.push(Ctl::knob(pid(id::DAMPING), "DAMPING", k[0]).scaled(Scale::Log));
         c.push(Ctl::knob(pid(id::BASS), "BASS", k[1]).scaled(Scale::Log));
+        c.push(
+            Ctl::small(
+                pid(id::HIGH_DECAY),
+                "HIGH DECAY",
+                kit::at(k[2], 0.0, 6.0, SMALL.0, SMALL.1),
+            )
+            .scaled(Scale::Log),
+        );
+        c.push(
+            Ctl::small(
+                pid(id::BASS_FREQ),
+                "CROSSOVER",
+                kit::at(k[3], 0.0, 6.0, SMALL.0, SMALL.1),
+            )
+            .scaled(Scale::Log),
+        );
         let k = kit::row(
             Rect::new(r.x, r.y + KNOB.1 + 2.0, r.w, SMALL.1),
-            &[SMALL.0, SMALL.0],
+            &[SMALL.0, SMALL.0, SMALL.0, SMALL.0],
         );
         c.push(Ctl::small(pid(id::LOW_CUT), "LOW CUT", k[0]).scaled(Scale::Log));
         c.push(Ctl::small(pid(id::HIGH_CUT), "HIGH CUT", k[1]).scaled(Scale::Log));
+        c.push(Ctl::small(pid(id::LOW_SHELF), "LOW SHELF", k[2]).bipolar());
+        c.push(Ctl::small(pid(id::HIGH_SHELF), "HIGH SHELF", k[3]).bipolar());
         let r = kit::inside(&s[2]);
-        let k = kit::row(Rect::new(r.x, r.y, r.w, KNOB.1), &[KNOB.0, KNOB.0]);
+        let k = kit::row(Rect::new(r.x, r.y, r.w, KNOB.1), &[KNOB.0, KNOB.0, SMALL.0]);
         c.push(Ctl::knob(pid(id::DIFFUSION), "DIFFUSION", k[0]));
         c.push(Ctl::knob(pid(id::BALANCE), "EARLY / LATE", k[1]).bipolar());
+        c.push(Ctl::small(
+            pid(id::SHIMMER),
+            "SHIMMER",
+            kit::at(k[2], 0.0, 6.0, SMALL.0, SMALL.1),
+        ));
         let k = kit::row(
             Rect::new(r.x, r.y + KNOB.1 + 2.0, r.w, SMALL.1),
-            &[SMALL.0, SMALL.0],
+            &[SMALL.0, SMALL.0, 70.0],
         );
         c.push(Ctl::small(pid(id::MODULATION), "MOD", k[0]));
         c.push(Ctl::small(pid(id::MOD_RATE), "RATE", k[1]).scaled(Scale::Log));
+        c.push(Ctl::choice(
+            pid(id::SHIMMER_PITCH),
+            "PITCH",
+            Rect::new(k[2].x, k[2].y + 12.0, 70.0, 38.0),
+        ));
         let r = kit::inside(&s[3]);
         let k = kit::row(Rect::new(r.x, r.y, r.w, KNOB.1), &[KNOB.0, SMALL.0]);
         c.push(Ctl::knob(pid(id::MIX), "MIX", k[0]));
@@ -168,9 +226,10 @@ impl Face for ReverbFace {
         let th = cx.theme;
         let (time, freq) = Self::split(r);
         let rts = rev::decay_times(&cx.tap.params);
-        let pre = cx.value(pid(id::PRE_DELAY)) * 0.001;
-        let kind = cx.value(pid(id::TYPE)).round().clamp(0.0, 4.0) as usize;
+        let pre = Self::pre(cx);
+        let kind = (cx.value(pid(id::TYPE)).round().max(0.0) as usize).min(rev::TYPES.len() - 1);
         let voicing = &rev::VOICINGS[kind];
+        let shimmer = cx.value(pid(id::SHIMMER));
         let scale = rev::size_scale(cx.value(pid(id::SIZE)));
         let balance = cx.value(pid(id::BALANCE));
         let frozen = cx.on(pid(id::FREEZE));
@@ -213,9 +272,27 @@ impl Face for ReverbFace {
             th.device.grid.with_alpha(0.25),
         );
         p.vline(plot.x, plot.y, plot.bottom(), th.ui.text_faint);
-        // Early reflections.
+        // Early reflections (the springs' bounces for the Spring).
         let early = voicing.early.1 * (2.0 * (1.0 - balance)).min(1.0);
-        if early > 0.0 {
+        if kind == rev::SPRING && early > 0.0 {
+            for (k, ms) in rev::SPRING_MS.into_iter().enumerate() {
+                let len = ms * 0.001 * scale;
+                let g = 10f64.powf(-3.0 * len / rts[1]);
+                for n in 1..8 {
+                    let t = pre + len * f64::from(n);
+                    let d = 20.0 * (early * 0.7 * g.powi(n - 1)).log10();
+                    if d < -60.0 || t > span {
+                        break;
+                    }
+                    let x = x_of(t);
+                    let h = plot.bottom() - y_of(d);
+                    p.fill(
+                        Rect::new(x - 1.0, y_of(d), 2.0 + 1.5 * k as f32, h),
+                        self.accent.with_alpha(0.7),
+                    );
+                }
+            }
+        } else if early > 0.0 {
             for (f, g) in EARLY {
                 let t = pre + f * voicing.early.0 * 0.001 * scale;
                 let d = 20.0 * (g * early).log10();
@@ -271,6 +348,19 @@ impl Face for ReverbFace {
             1.4,
             th.device.reduction.with_alpha(0.8),
         );
+        // The shimmer: what climbs an interval with every pass, rising
+        // out of the tail as it feeds back.
+        if shimmer > 0.0 && !frozen && late > 0.0 {
+            let pts: Vec<Point> = (0..=60)
+                .map(|i| {
+                    let t = start + (span - start) * f64::from(i) / 60.0;
+                    let fed = (shimmer * 0.5 * (t - start) / rts[1].max(0.05)).min(1.0);
+                    let d = top - 60.0 * (t - start) / rts[1] + 20.0 * fed.max(1e-3).log10();
+                    Point::new(x_of(t), y_of(d))
+                })
+                .collect();
+            p.stroke_path(&Path::polyline(&pts), 1.4, th.ui.text.with_alpha(0.6));
+        }
         // The live level (a glow at the top left).
         let peak = cx.tap.take_value(value::WET_PEAK);
         self.wet = peak.max(self.wet * (1.0 - 2.0 * cx.dt).max(0.0));
@@ -284,9 +374,18 @@ impl Face for ReverbFace {
         );
         p.text(
             &format!(
-                "{} · {}{}",
+                "{} · {}{}{}",
                 rev::TYPES[kind],
                 rev::format(pid(id::DECAY), rts[1]).unwrap_or_default(),
+                if shimmer > 0.0 {
+                    format!(
+                        " · SHIMMER {}",
+                        rev::format(pid(id::SHIMMER_PITCH), cx.value(pid(id::SHIMMER_PITCH)))
+                            .unwrap_or_default()
+                    )
+                } else {
+                    String::new()
+                },
                 if frozen { " · FROZEN" } else { "" }
             ),
             Rect::new(plot.x + 8.0, plot.y + 2.0, plot.w - 140.0, 14.0),
@@ -305,6 +404,7 @@ impl Face for ReverbFace {
         let max_rt = rts.iter().copied().fold(0.0, f64::max).max(0.2) * 1.3;
         let rt_y = |rt: f64| fp.bottom() - fp.h * (rt / max_rt).clamp(0.0, 1.0) as f32;
         let damping = cx.value(pid(id::DAMPING));
+        let bass_hz = cx.value(pid(id::BASS_FREQ)).max(20.0);
         let low_cut = cx.value(pid(id::LOW_CUT));
         let high_cut = cx.value(pid(id::HIGH_CUT));
         let n = 90;
@@ -313,7 +413,7 @@ impl Face for ReverbFace {
                 let x = fp.x + fp.w * i as f32 / n as f32;
                 let f = kit::Spectrum::freq_at(fp, x);
                 // The one-pole splits' weights.
-                let wl = 1.0 / (1.0 + (f / 250.0).powi(2));
+                let wl = 1.0 / (1.0 + (f / bass_hz).powi(2));
                 let wh = if damping >= 19_500.0 {
                     0.0
                 } else {
@@ -345,6 +445,35 @@ impl Face for ReverbFace {
             .close();
         p.fill_path(&fill, self.accent.with_alpha(0.14));
         p.stroke_path(&Path::polyline(&pts), 2.0, self.accent);
+        // The shelves: the wet signal's level across the spectrum (±12 dB
+        // over the middle of the plot).
+        let (low_shelf, high_shelf) = (cx.value(pid(id::LOW_SHELF)), cx.value(pid(id::HIGH_SHELF)));
+        if low_shelf.abs() >= 0.05 || high_shelf.abs() >= 0.05 {
+            let rate = f64::from(cx.model.sample_rate().max(8_000));
+            let pts: Vec<Point> = (0..=n)
+                .map(|i| {
+                    let x = fp.x + fp.w * i as f32 / n as f32;
+                    let f = kit::Spectrum::freq_at(fp, x);
+                    let mut d = 0.0;
+                    if low_shelf.abs() >= 0.05 {
+                        d += band_db(
+                            &shelf(BandType::LowShelf, rev::LOW_SHELF_HZ, low_shelf),
+                            rate,
+                            f,
+                        );
+                    }
+                    if high_shelf.abs() >= 0.05 {
+                        d += band_db(
+                            &shelf(BandType::HighShelf, rev::HIGH_SHELF_HZ, high_shelf),
+                            rate,
+                            f,
+                        );
+                    }
+                    Point::new(x, fp.y + fp.h * (0.5 - d / 24.0).clamp(0.0, 1.0) as f32)
+                })
+                .collect();
+            p.stroke_path(&Path::polyline(&pts), 1.4, th.ui.text.with_alpha(0.55));
+        }
         for (f, t) in [(100.0, "100"), (1_000.0, "1k"), (10_000.0, "10k")] {
             let x = kit::Spectrum::x_of(fp, f);
             p.vline(x, fp.y, fp.bottom(), th.device.grid);
@@ -404,8 +533,16 @@ impl Face for ReverbFace {
     fn tip(&self, pid: ParameterId) -> Option<&'static str> {
         Some(match pid.0 {
             id::TYPE => {
-                "Room, Hall, Plate (dense, no early reflections), Chamber, Ambience (short, close)"
+                "Room, Hall, Plate (dense, no early reflections), Chamber, Ambience (short, close), Spring (two springs' chirp), Cathedral (the longest)"
             }
+            id::PRE_SYNC => "The pre-delay a note value of the song's tempo",
+            id::PRE_DIVISION => "The synced pre-delay's note value",
+            id::HIGH_DECAY => "How long the highs ring, as a multiple of the decay",
+            id::BASS_FREQ => "Below this the bass multiplier takes over",
+            id::LOW_SHELF => "The tail's lows, round 250 Hz",
+            id::HIGH_SHELF => "The tail's highs, above 4 kHz",
+            id::SHIMMER => "The tail fed back pitch shifted: it climbs with every pass",
+            id::SHIMMER_PITCH => "The shimmer's interval",
             id::SIZE => "How large the space is (its reflections and lines)",
             id::DAMPING => "Above this the reverb dies in a third of the time",
             id::BASS => "How much longer (or shorter) the bass rings",
@@ -416,5 +553,15 @@ impl Face for ReverbFace {
             id::DUCKING => "The reverb steps back while you play",
             _ => return None,
         })
+    }
+}
+
+fn shelf(kind: BandType, freq: f64, gain: f64) -> BandShape {
+    BandShape {
+        kind,
+        freq,
+        gain,
+        q: std::f64::consts::FRAC_1_SQRT_2,
+        slope: 12.0,
     }
 }

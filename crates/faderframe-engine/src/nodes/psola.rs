@@ -5,7 +5,10 @@
 //! period apart: the pitch is exactly the sung one times the correction,
 //! and the formants (each grain's shape) stay where they were. Squeezing
 //! or stretching the grains moves the formants on their own. The marks are
-//! chosen through the clip's time map, so warping comes along too.
+//! chosen through the clip's time map, so warping comes along too — and
+//! notes made longer or shorter, whose timing is part of that map (marks
+//! laid down again or skipped where it runs slower or faster). Removed
+//! notes are silenced by the curve's level where their audio plays.
 //!
 //! Unvoiced audio (no sung pitch) is laid down in 5 ms grains as it was.
 //! With nothing corrected the grains rebuild the source exactly (Hann
@@ -198,6 +201,15 @@ impl PsolaVoice {
                 let slot = ((rel + k as i64) as usize) & (RING - 1);
                 *o = ring[slot];
                 ring[slot] = 0.0;
+            }
+        }
+        // Removed notes: silent where their audio plays.
+        if !curve.levels.is_empty() {
+            for k in 0..n {
+                let g = curve.level(w.source_at((rel + k as i64) as f64));
+                for out in &mut self.output {
+                    out[k] *= g;
+                }
             }
         }
         self.emitted = end;

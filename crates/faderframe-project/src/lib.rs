@@ -22,6 +22,7 @@ pub mod compare;
 pub mod conform;
 pub mod console;
 pub mod container;
+pub mod cue;
 pub mod demo;
 mod edit;
 mod expression;
@@ -49,6 +50,7 @@ pub use clip::{
     AudioClip, Clip, ClipContent, ClipFades, ControllerLane, ControllerPoint, FadeShape, MidiClip,
     MidiController, MidiNote, StretchSettings, SysexEvent, bend_factor,
 };
+pub use cue::{CueMix, CueSend};
 pub use edit::{CoalesceKey, Command, EditError, Impact, MAX_LEVEL_DB, RemovedTrack};
 pub use expression::{ExpressionKind, ExpressionPoint, MpeConfig, NoteExpression};
 pub use harmony::{ChordEvent, KeyChange};
@@ -62,6 +64,6 @@ pub use takes::{CompPiece, CompSegment, DEFAULT_COMP_CROSSFADE, Take, TakeFolder
 pub use track::{
     AuxSend, BinauralRender, Freeze, GroupLink, InputRouting, MidiOutputRouting, MonitorMode,
     OutputRouting, PluginFormat, PluginRef, PluginSlot, SavedParameter, SendTap, Track, TrackColor,
-    TrackGroup, TrackKind, midi_port_display,
+    TrackGroup, TrackKind, device_name, midi_port_display,
 };
 pub use warp::{Warp, WarpAlgorithm, WarpMarker};

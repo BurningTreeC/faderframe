@@ -1,6 +1,9 @@
 //! What a lead sheet says: bars of notes and rests with their values, ties,
 //! beams and words, the chord symbols over them, the key, the clef, the
-//! metre and the tempo. Both the MusicXML writer and the engraver read
+//! metre and the tempo — on one staff, or on several one below the other
+//! (a score: a part a track, the same bars in each). A fretted
+//! instrument's part may also be (or be followed by) tablature: its notes
+//! as strings and frets. Both the MusicXML writer and the engraver read
 //! this, so they agree note for note.
 
 /// Time inside a bar, in divisions of a quarter: 12 to the quarter (a
@@ -13,10 +16,89 @@ pub struct LeadSheet {
     /// Under the title on the right (empty: none).
     pub composer: String,
     pub key: KeySig,
-    pub clef: Clef,
     /// Quarter notes a minute at the start.
     pub tempo: Option<f64>,
+    /// The staves top to bottom (a lead sheet has one), each with the same
+    /// bars. The chord symbols are the top part's.
+    pub parts: Vec<Part>,
+}
+
+impl LeadSheet {
+    /// How many bars (every part has as many).
+    pub fn bars(&self) -> usize {
+        self.parts.first().map_or(0, |p| p.measures.len())
+    }
+
+    /// Whether a score's bar lines run on from staff to staff: not when
+    /// words are sung under a staff above the last (they would cross them).
+    pub fn bar_lines_joined(&self) -> bool {
+        let n = self.parts.len();
+        !self
+            .parts
+            .iter()
+            .take(n.saturating_sub(1))
+            .any(Part::has_lyrics)
+    }
+}
+
+/// One staff's music: whose it is, its clef and its bars.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Part {
+    /// Its name (the track's), at the left of a score's systems.
+    pub name: String,
+    pub clef: Clef,
     pub measures: Vec<Measure>,
+    /// Drawn as tablature (the events' frets), not as notes on a staff.
+    pub tab: Option<TabStaff>,
+}
+
+/// A tablature staff's instrument.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TabStaff {
+    /// The strings' open notes (MIDI), string 1 (the top line) first.
+    pub strings: Vec<u8>,
+    /// The capo's fret (frets count from it).
+    pub capo: u8,
+    /// The rhythm is drawn under it (tablature without notes above).
+    pub rhythm: bool,
+}
+
+/// Where a note is played on a fretted instrument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fret {
+    /// String 1 is the top line of the tablature.
+    pub string: u8,
+    /// From the capo (0: open).
+    pub fret: u8,
+}
+
+impl Part {
+    /// Its name short, for the systems after the first ("Lead Voc.",
+    /// "Bass"): words of up to four letters kept, longer ones cut to three
+    /// and a full stop, two words at most.
+    pub fn abbreviation(&self) -> String {
+        self.name
+            .split_whitespace()
+            .take(2)
+            .map(|w| {
+                if w.chars().count() <= 4 {
+                    w.to_string()
+                } else {
+                    let mut s: String = w.chars().take(3).collect();
+                    s.push('.');
+                    s
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Whether words are sung to it.
+    pub fn has_lyrics(&self) -> bool {
+        self.measures
+            .iter()
+            .any(|m| m.events.iter().any(|e| e.lyric.is_some()))
+    }
 }
 
 /// A key signature: sharps (> 0) or flats (< 0), and whether minor.
@@ -58,6 +140,8 @@ pub enum Clef {
     /// Treble sounding an octave lower (a tenor's or a guitar's part).
     Treble8vb,
     Bass,
+    /// Bass sounding an octave lower (a bass guitar's part).
+    Bass8vb,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -210,6 +294,35 @@ pub struct Lyric {
     pub text: String,
     /// The word is held over the next notes (a melisma's line).
     pub extend: bool,
+    /// Where the syllable is in its word (hyphens join a word's).
+    pub syllabic: Syllabic,
+}
+
+/// A syllable's place in its word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Syllabic {
+    /// A whole word.
+    Single,
+    Begin,
+    Middle,
+    End,
+}
+
+impl Syllabic {
+    /// MusicXML's name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Syllabic::Single => "single",
+            Syllabic::Begin => "begin",
+            Syllabic::Middle => "middle",
+            Syllabic::End => "end",
+        }
+    }
+
+    /// A hyphen follows it (more of the word comes).
+    pub fn continues(self) -> bool {
+        matches!(self, Syllabic::Begin | Syllabic::Middle)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -231,9 +344,20 @@ pub struct Event {
     pub lyric: Option<Lyric>,
     /// A melisma's line runs under it (the word started earlier).
     pub held: bool,
+    /// The other notes sounding with it, ascending (a chord: `pitch` is
+    /// its lowest).
+    pub chord: Vec<Pitch>,
+    /// On a fretted instrument: where `pitch` and then each of `chord` is
+    /// played (empty: not fretted).
+    pub frets: Vec<Fret>,
 }
 
 impl Event {
+    /// Its pitches, lowest first.
+    pub fn pitches(&self) -> impl Iterator<Item = &Pitch> + '_ {
+        self.pitch.iter().chain(&self.chord)
+    }
+
     pub fn end(&self) -> u32 {
         self.at + self.duration.divisions()
     }

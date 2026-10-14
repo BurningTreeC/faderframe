@@ -88,6 +88,9 @@ pub struct MetronomeSettings {
     /// Clicks on the off-beats too, and their level (dB).
     pub off_beats: bool,
     pub off_beat_db: f32,
+    /// It clicks on the main outputs (off: only in the cue mixes whose
+    /// click is on — the performers' headphones, not the speakers).
+    pub main_outputs: bool,
 }
 
 impl Default for MetronomeSettings {
@@ -103,6 +106,7 @@ impl Default for MetronomeSettings {
             beat_db: -3.1,
             off_beats: false,
             off_beat_db: -9.0,
+            main_outputs: true,
         }
     }
 }
@@ -181,6 +185,7 @@ impl Session {
         let m = &self.metronome;
         let shared = self.engine.metronome();
         shared.set_gain(gain(m.volume_db));
+        shared.set_main(m.main_outputs);
         shared.set_level(ClickKind::Accent, gain(m.accent_db));
         shared.set_level(ClickKind::Beat, gain(m.beat_db));
         shared.set_level(

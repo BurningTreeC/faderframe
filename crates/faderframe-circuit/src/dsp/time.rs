@@ -567,6 +567,38 @@ const QUADRATIC_MARGIN: f64 = 0.1;
 /// for the quadratic estimate to be trusted at all. See `quadratically_done`.
 const QUADRATIC_REACH: f64 = 30.0;
 
+/// How far `Simulation::set_early_acceptance` distrusts the quadratic
+/// constant it carries over from earlier solves: the next correction must be
+/// predicted to fall this many times under `QUADRATIC_MARGIN` before a first
+/// pass may stand alone.
+const EARLY_SAFETY: f64 = 10.0;
+
+/// The largest first correction, in the convergence test's units, that may
+/// stand without a second pass. Up to here the extrapolation from the last
+/// samples has landed close enough that Newton is quadratic; a bigger one is
+/// a transient, and transients are where the constant moves.
+const EARLY_REACH: f64 = 10_000.0;
+
+/// `EARLY_REACH` for a circuit with PN junctions (`Device::junction`): an
+/// exponential's curvature moves fastest, and at ten thousand the British
+/// 73 strayed to -104 dB (relative to the signal, on a drum loop at full
+/// gain) where at a thousand it stays at -124 dB; the valve circuits stay
+/// within -117 dB either way and take a tenth fewer passes at the wider one.
+const EARLY_REACH_JUNCTIONS: f64 = 1_000.0;
+
+/// How many consecutive solves may stop after one pass before one takes its
+/// second again and measures the constant afresh.
+const EARLY_RUN: u8 = 7;
+
+/// How much of an earlier measurement of the constant is kept at each new
+/// one (the larger of the two counts): a single high reading stays for a
+/// few solves rather than being forgotten at once.
+const CURVATURE_DECAY: f64 = 0.25;
+
+/// How much larger than the measuring solve's own first correction a first
+/// correction may be and still stand alone.
+const EARLY_GROWTH: f64 = 4.0;
+
 /// Whether a solve converging quadratically can stop on this pass.
 ///
 /// Two thirds of all solves took exactly three passes: one to correct the
@@ -1915,6 +1947,18 @@ pub struct Simulation {
     /// The answer before that, so the next sample can be started from where
     /// the last two were heading rather than from where the last one was.
     earlier: Vec<f64>,
+    /// See `set_early_acceptance`.
+    early_acceptance: bool,
+    /// The quadratic constant `d2 / d1^2` of recent two-pass solves, the
+    /// largest of them with older ones decaying; infinite while unknown.
+    curvature: f64,
+    /// First passes accepted since the last solve that measured `curvature`.
+    early_run: u8,
+    /// The first correction of the solve that last measured `curvature`.
+    measured_move: f64,
+    /// `EARLY_REACH` or, with a junction in the circuit,
+    /// `EARLY_REACH_JUNCTIONS`.
+    early_reach: f64,
     /// Whether the last stamp sits exactly at the point it was given, which
     /// is what says whether its residual may be believed.
     exact: bool,
@@ -2374,6 +2418,7 @@ impl Simulation {
         self.ceiling = source.ceiling;
         self.backtracks = source.backtracks;
         self.late_continuation = source.late_continuation;
+        self.early_acceptance = source.early_acceptance;
         self.at_rest = false;
         self.dirty = true;
         self.rebuild();
@@ -2429,6 +2474,9 @@ impl Simulation {
         self.voltage.copy_from_slice(&source.voltage);
         self.predicted.copy_from_slice(&source.predicted);
         self.earlier.copy_from_slice(&source.earlier);
+        self.curvature = source.curvature;
+        self.early_run = source.early_run;
+        self.measured_move = source.measured_move;
         self.recent_move.copy_from_slice(&source.recent_move);
         self.last_was_unsettled = source.last_was_unsettled;
         self.last_input = source.last_input;
@@ -2440,6 +2488,7 @@ impl Simulation {
         self.last_settled_linearisation_valid = source.last_settled_linearisation_valid;
         self.exact = source.exact;
         self.predictable = source.predictable;
+        self.early_reach = source.early_reach;
         self.moved = source.moved;
         self.capacitors.copy_from_slice(&source.capacitors);
         self.inductors.copy_from_slice(&source.inductors);
@@ -2650,6 +2699,9 @@ impl Simulation {
         self.voltage.copy_from_slice(&source.voltage);
         self.predicted.copy_from_slice(&source.predicted);
         self.earlier.copy_from_slice(&source.earlier);
+        self.curvature = source.curvature;
+        self.early_run = source.early_run;
+        self.measured_move = source.measured_move;
         self.recent_move.copy_from_slice(&source.recent_move);
         self.last_was_unsettled = source.last_was_unsettled;
         self.last_input = source.last_input;
@@ -2664,6 +2716,7 @@ impl Simulation {
         self.last_settled_linearisation_valid = source.last_settled_linearisation_valid;
         self.exact = source.exact;
         self.predictable = source.predictable;
+        self.early_reach = source.early_reach;
         self.moved = source.moved;
         self.capacitors.copy_from_slice(&source.capacitors);
         self.inductors.copy_from_slice(&source.inductors);
@@ -2884,6 +2937,11 @@ impl Simulation {
             earlier_input: 0.0,
             late_continuation: false,
             earlier: vec![0.0; n],
+            early_acceptance: false,
+            curvature: f64::INFINITY,
+            early_run: 0,
+            measured_move: 0.0,
+            early_reach: EARLY_REACH_JUNCTIONS,
             exact: true,
             predictable: false,
             dirty: true,
@@ -3902,6 +3960,8 @@ impl Simulation {
         }
         self.predicted.copy_from_slice(&self.voltage);
         self.earlier.copy_from_slice(&self.voltage);
+        self.curvature = f64::INFINITY;
+        self.early_run = 0;
         self.last_was_unsettled = false;
         self.last_input = 0.0;
         self.earlier_input = 0.0;
@@ -4032,6 +4092,8 @@ impl Simulation {
     /// Stamps everything that does not depend on the solution, and factorises
     /// it once. A pot moving or the rate changing is what invalidates this.
     fn rebuild(&mut self) {
+        self.curvature = f64::INFINITY;
+        self.early_run = 0;
         #[cfg(any())]
         self.invalidate_jacobian_init();
         self.rebuilds += 1;
@@ -4391,6 +4453,11 @@ impl Simulation {
 
         self.device_rate = self.rate;
         self.predictable = !self.devices.iter().any(|d| d.switches());
+        self.early_reach = if self.devices.iter().any(|d| d.junction()) {
+            EARLY_REACH_JUNCTIONS
+        } else {
+            EARLY_REACH
+        };
         // Capacity was reserved from the immutable topology in `new`, so
         // this resize only changes the logical length. The line search may not
         // allocate on the audio thread.
@@ -4721,6 +4788,80 @@ impl Simulation {
         self.backtracks = most.clamp(1, MAX_BACKTRACKS);
     }
 
+    /// Let a solve stop after its first pass when the second would only
+    /// confirm it.
+    ///
+    /// On steady programme almost every sample takes exactly two passes: one
+    /// to correct the extrapolation, and one whose correction comes out a
+    /// thousandth of the tolerance and is taken to say so -- a whole stamp
+    /// and factorisation for nothing. `quadratically_done` already stops on
+    /// the *third* pass when the first two predict it; the first pass alone
+    /// cannot, because the constant `K` of `d2 = K d1^2` is unknown until a
+    /// second correction is measured. Measured on the German 76 it moves
+    /// slowly from one sample to the next (98 % of consecutive measurements
+    /// within a factor of thirty, while `K` itself spans ten decades). So
+    /// the solves that do take their second pass measure it, and in between,
+    /// a first correction `d1` stands alone
+    /// when `EARLY_SAFETY * K * d1^2` is under `QUADRATIC_MARGIN` -- a tenth
+    /// of what `quadratically_done` asks -- on a first pass no limiter held,
+    /// no device crossed a corner of its model (`Device::crossed`), small
+    /// (`EARLY_REACH`, less with junctions) and not much larger than the
+    /// measuring solve's (`EARLY_GROWTH`); one solve in `EARLY_RUN + 1`
+    /// measures again, and any solve that needed more than two passes
+    /// forgets `K`. Circuits whose devices switch (op-amps) are left alone:
+    /// `predictable` is false.
+    ///
+    /// What it leaves behind is the second correction it did not take,
+    /// predicted at a hundredth of the tolerance. Measured against every
+    /// preamp and console bus on the drum loop and the four-tone test at
+    /// every Gain: -117 dB relative to the signal at worst, -145 dB typically;
+    /// only the German 76 driven to chaos (76 dB of gain on the drum loop, the
+    /// same circuit -25 dB from itself with its input moved by 1e-12) differs
+    /// more; levels and THD of test tones move by less than 1e-5 dB and 0.02 %
+    /// of themselves. Passes per solve: 2.0 to 1.1-1.3 on the four-tone test
+    /// (up to 1.8 at full Gain and -6 dBFS), 1.4-2.0 on the drum loop.
+    ///
+    /// Off by default: the guitar voices keep their measured paths.
+    pub fn set_early_acceptance(&mut self, enabled: bool) {
+        self.early_acceptance = enabled;
+        self.curvature = f64::INFINITY;
+        self.early_run = 0;
+    }
+
+    /// Whether the first pass's answer may stand (see `set_early_acceptance`).
+    #[inline]
+    fn first_pass_suffices(&self) -> bool {
+        let d1 = self.moved;
+        self.predictable
+            && self.early_run < EARLY_RUN
+            && d1 < self.early_reach
+            && d1 <= EARLY_GROWTH * self.measured_move
+            && EARLY_SAFETY * self.curvature * d1 * d1 < QUADRATIC_MARGIN
+            && self
+                .devices
+                .iter()
+                .all(|d| d.settled(TOLERANCE) && !d.crossed(&self.voltage))
+    }
+
+    /// What a solve that settled on pass `pass` (counted from 0) says about
+    /// the quadratic constant (see `set_early_acceptance`).
+    #[inline]
+    fn learn_curvature(&mut self, pass: usize, first_moved: f64) {
+        if pass == 1 && first_moved.is_finite() && first_moved > 0.0 {
+            let measured = self.moved / (first_moved * first_moved);
+            self.curvature = if self.curvature.is_finite() {
+                measured.max(self.curvature * CURVATURE_DECAY)
+            } else {
+                measured
+            };
+            self.measured_move = first_moved;
+            self.early_run = 0;
+        } else if pass > 1 {
+            self.curvature = f64::INFINITY;
+            self.early_run = 0;
+        }
+    }
+
     /// Enable the bounded late source-continuation rescue for a circuit whose
     /// realtime tail has been measured to benefit from it. This does not alter
     /// the normal predictor or normal early Newton path.
@@ -4907,6 +5048,8 @@ impl Simulation {
         // treated as following a failure.
         self.predicted.copy_from_slice(&self.voltage);
         self.earlier.copy_from_slice(&self.voltage);
+        self.curvature = f64::INFINITY;
+        self.early_run = 0;
         self.last_was_unsettled = false;
         self.last_input = 0.0;
         self.earlier_input = 0.0;
@@ -5152,16 +5295,18 @@ impl Simulation {
     fn reduced_trial_merit(&mut self, dc: bool, allow_cache_eval: bool) -> Option<f64> {
         #[cfg(any())]
         let profile_started = self.twin_phase_profile_start();
-        // Keep this experiment on the Twin-specific transient path. The cache
-        // is exact for every circuit, but the current optimization target is
-        // the measured Twin tail and broadening scope would add risk without
+        // Keep this experiment on the Twin-specific transient path and the
+        // circuits that opted into `set_early_acceptance` (the preamps and
+        // buses, where it measured bit-identical). The cache is exact for
+        // every circuit, but the current optimization target is the measured
+        // Twin tail and broadening scope further would add risk without
         // improving this A/B. Trial probes still evaluate only the physical
         // current equations. When caching is allowed, devices merely retain
         // intermediates that current evaluation already computed; analytic
         // slopes are formed later only if the exact point becomes the next
         // Newton linearisation.
         let cache_eval = allow_cache_eval
-            && self.late_continuation
+            && (self.late_continuation || self.early_acceptance)
             && !dc
             && self.accepted_trial_device_cache_enabled();
         let point = &self.point;
@@ -6718,6 +6863,7 @@ impl Simulation {
                 self.moved = f64::INFINITY;
                 self.search_merit = 0.0;
                 let mut before = f64::INFINITY;
+                let mut first_moved = f64::INFINITY;
                 for pass in 0..ceiling {
                     // Most realtime solves finish in 1-3 passes. Avoid a clock
                     // read on that hot path; once a solve wants a fourth pass,
@@ -6735,9 +6881,24 @@ impl Simulation {
                     match self.iterate(false, stalled || pass >= FULL_STEPS) {
                         Pass::Settled => {
                             settled = true;
+                            if self.early_acceptance {
+                                self.learn_curvature(pass, first_moved);
+                            }
                             break;
                         }
-                        Pass::Moved => {}
+                        Pass::Moved => {
+                            if pass == 0 {
+                                first_moved = self.moved;
+                                if self.early_acceptance && self.first_pass_suffices() {
+                                    for device in &mut self.devices {
+                                        device.commit(&self.voltage);
+                                    }
+                                    self.early_run += 1;
+                                    settled = true;
+                                    break;
+                                }
+                            }
+                        }
                         Pass::Stuck => break,
                     }
                 }
@@ -7833,6 +7994,11 @@ impl Simulation {
                     self.push_solver_trace(trace);
                 }
             }
+            if !settled {
+                // A hard sample: whatever comes next is no evidence for
+                // stopping early (see `set_early_acceptance`).
+                self.curvature = f64::INFINITY;
+            }
             // Before a failed solve is bounded and used, try the half-step
             // twin. See `enable_half_step_rescue`.
             #[cfg(any())]
@@ -8106,6 +8272,8 @@ impl Simulation {
         self.voltage.fill(0.0);
         self.predicted.fill(0.0);
         self.earlier.fill(0.0);
+        self.curvature = f64::INFINITY;
+        self.early_run = 0;
         self.recent_move.fill(0.0);
         self.point.fill(0.0);
         self.guess.fill(0.0);

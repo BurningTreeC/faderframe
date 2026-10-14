@@ -1398,6 +1398,7 @@ dependencies = [
  "faderframe-plugin-host",
  "faderframe-project",
  "faderframe-session",
+ "faderframe-timeline",
  "faderframe-ui-canvas",
 ]
 

@@ -111,7 +111,8 @@ fn kle3_feedback(state: &SurfaceState, f: &mut Feedback) {
     kle3_rgb(f, RECORD, lit(state.recording, [127, 0, 0]));
     kle3_rgb(f, LOOP, lit(state.looping, [127, 90, 0]));
     kle3_rgb(f, METRONOME, lit(state.click, [0, 60, 127]));
-    for id in [REWIND, FORWARD, SAVE, QUANT, UNDO, REDO] {
+    kle3_rgb(f, QUANT, lit(state.input_quantize, [127, 60, 0]));
+    for id in [REWIND, FORWARD, SAVE, UNDO, REDO] {
         kle3_rgb(f, id, DIM);
     }
     // The screen: the selected track and its level, the position.

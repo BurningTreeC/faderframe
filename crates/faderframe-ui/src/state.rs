@@ -308,6 +308,7 @@ impl AppState {
         crate::listen::follow(self);
         crate::monitoring::follow(self);
         crate::console::follow(self);
+        crate::cues::follow(self);
     }
 
     /// Show an error: always in the status bar, optionally as a dialog.

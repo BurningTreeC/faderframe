@@ -510,15 +510,27 @@ playhead moves at the playback rate and eases onto the measured position
 (within ~0.2 s), and takes a new run (wrap, locate, start, stop) or a
 far-off measurement as it is. A locate shows its target at once and waits
 there until its audio arrives; play from stopped waits at the start while
-the latency fills. Everything drawn from the transport — arranger and
+the latency fills. Until the engine has applied the locate the session
+holds the target (`Session::show_position`), released by a jump *to* it
+(`TransportSnapshot::jumped_to`): a Stop sent just before is a jump too,
+to where playback stopped, and released it early, showing that position
+in between (a chase lands near its target, not on it: any jump releases
+it, `show_position_until_jump`); pictures show the held target as well. Everything drawn from the transport — arranger and
 piano-roll playheads, follow scrolling, the transport display, surface
 timecode, automation values shown (`display_value` reads the curve at the
 playhead) and automation written while touching (at the playhead the
 player heard) — follows the heard position. Things timed against the
 engine use the processing position (launcher quantisation, stop-at,
 render-ahead). External sync uses `output_latency()`: MIDI clock and MTC
-are sent when their position is heard; video pictures, captured MIDI,
-recorded SysEx and MTC chase all count the graph's latency too.
+are sent when their position is heard; captured MIDI, recorded SysEx and
+MTC chase all count the graph's latency too. Video pictures (the video
+window, picture outputs) read the play history itself for the moment the
+frame reaches the screen (`heard_ahead`: as `heard_at`, but going on past
+the frames processed when the screen is further ahead than the sound's
+latency): after Play they stay on the frame standing until the latency
+has filled, as the sound does — the processing position less the latency
+went back before it, to the frame before (or none at a clip's start) —
+and a locate's target shows at once.
 
 **Meters** read a strip as it is processed; its audio is heard after the
 latency still ahead of it (buses, the master's devices, compensation —
@@ -891,7 +903,11 @@ track's pre-fader send reaches both sides of a stereo return at unity, the
 graph's channel rule) while post-fader sends carry the panned, faded
 signal. Buses and the master pan their own sum once with their own control
 (a stereo bus or master: balance or dual pan) — nothing is panned twice.
-Into a surround bed the surround panner takes over (below). A strip's
+Pre-fader output 1 is after the mute and the solos (a muted or solo-muted
+track's pre-fader sends are silent); the cue mixes' taps, outputs 2 and 3,
+are not (see *Cue mixes*). A send with a pan of its own
+(`AuxSend::pan`) places its tap by it. Into a surround bed the surround
+panner takes over (below). A strip's
 meters show its post-fader, post-pan output in the destination layout.
 
 **Compatibility.** `pan_mode`, `dual_pan` and `pan_law` are new optional
@@ -1228,7 +1244,9 @@ open encoder, a paid specification and per-unit patent royalties.
 ### Listening: headphones and the mono check
 
 What the master does on its way to the interface is listening, never part
-of a render (renders build their own engine, which listens on speakers):
+of a render (renders build their own engine, which listens on speakers;
+`exports_never_carry_what_the_listener_hears` holds stereo and bed
+exports bit-identical with headphones and the mono check on):
 the master's hardware output always passes `nodes::ListenOut` (other
 tracks with hardware outputs keep the plain fold-down). Its node key leaves
 listening out, so a rebuild keeps the running node; a change of listening
@@ -1313,6 +1331,122 @@ the node's as last built.
   `recreate_engine` carries it (and headphones, head, correction, the
   mono check) over to a new engine. Dev action
   `bass-management:<on|off>[@<Hz>]`.
+
+### Cue mixes (the performers' headphones)
+
+A cue mix is a headphone mix on its own device outputs, apart from the
+main mix — a console's foldback sends, Cubase's studio sends, Pro Tools'
+cue sends. The model (`faderframe_project::cue`):
+
+* `Project::cue_mixes: Vec<CueMix>` (at most `MAX_CUE_MIXES`, 8): name,
+  colour (what the mixer marks it with), `layout` (stereo or mono),
+  `first_channel` (its outputs), master `level_db` and `mute`, `tap`
+  (`SendTap::PreFader`, the default, or `PostFader`; never before the
+  inserts), `click` and `click_db`. Cue mixes are not tracks — they never
+  show in the arranger, routing menus, stems, solo or anything that walks
+  `Project::tracks`.
+* `Track::cue_sends: Vec<CueSend>` — level, pan, on — one per cue mix on
+  every track that `feeds_cues` (audio, instrument, bus, aux; not the
+  master, MIDI tracks, VCAs, folders). Kept on the track, so they come and
+  go with it (removal and undo, duplicates). New fields with serde
+  defaults, written only when not empty: older files load with none, the
+  file version did not change; `Project::repair` drops sends to cue mixes
+  that are gone.
+* Commands: `AddCueMix` (with every track's send; inverse `RemoveCueMix`,
+  which takes the sends along), `SetCueMix` (name, colour, outputs, tap:
+  `Impact::Graph`), `SetCueLevel`, `SetCueMute`, `SetCueClick`,
+  `SetCueSend` (a whole send or none), `SetCueSendLevel`/`Pan`/`On` (made
+  when missing; their inverse is `SetCueSend`) — all `Impact::Params`; level
+  and pan drags coalesce (`CoalesceKey::{CueLevel, CueClick, CueSendLevel,
+  CueSendPan}`).
+
+**Solo-safe and independent of the main mix.** A cue send taps its
+track's strip at the cue taps (`ChannelStrip` outputs 2 and 3, only while
+the project has cue mixes): the signal after the inserts with its
+polarity, before the fader (2) or after the fader, VCAs and fader
+modulation (3), never muted — the track's mute and the solos of the main
+mix (`solo_mute`, folder and VCA mutes) do not reach it, unlike an
+ordinary pre-fader send (strip output 1 is post-mute). A bus or a return
+carries what reaches it in the main mix (its members after their faders,
+mutes and solos), so a new cue mix — a copy of the main mix
+(`Project::copy_main_mix`/`main_mix_send`: each source at the level it
+reaches the master with, its fader and VCAs plus the faders of the buses
+on its way (post-fader: without its own fader), its pan, off when the
+main mix does not hear it) — takes every source on its own and leaves
+buses and returns off: switched on, they bring the main mix's balance (and
+its solos) into the cue mix.
+
+**Engine** (`build::build_graph` pass 3, live engines only —
+`PluginHost::realtime()`; a render's engine builds none, so exports,
+stems, bounces, freezes, clip effects and the album never contain them):
+per cue mix a sum (`Role::CueInput`), its own `ChannelStrip` (keyed by
+`CueMix::channel()`, the cue id as a `TrackId` — ids share one allocator —
+with `SlotRegistry::strip` slots for level and mute and meters like a
+track's) and a `DeviceOutputSink` on its outputs; per track and cue mix a
+`SendNode::cue` (gain slot = level × on, `SlotRegistry::cue_send(track,
+cue)`), built whether the track has a send or not (none: silent), so a
+send's level, pan and switch are parameters. Cue outputs never pass the
+master's `ListenOut` (headphone rendering, the mono check, bass
+management). They are heard outputs: `compile()` holds them back to the
+graph's output latency with the master (plugin delay compensation as for
+any output), and with low-latency monitoring a track heard live sends to
+its cue mixes over early edges (`connect_audio_early`), which
+`clear_the_way` carries through the cue mix's sum — performers hear
+themselves at once, the playback in their headphones still aligned.
+Cue taps need the strips on the audio thread: while a project has cue
+mixes, buses are not rendered ahead (the shallow tier, `ahead_sets`);
+tracks' chains still are. The session sizes the device for the cue
+outputs (`wanted_channels`, `check_channels` → `UiRequest::ReopenAudio`).
+
+**Send pan.** `SendNode` pans when given a pan slot holding a position: a
+mono tap by the project's pan law, a stereo tap balanced, each
+source/destination pair ramped (NaN: as tapped — the graph's channel
+rule). Cue sends always pan; an ordinary send pans when
+`AuxSend::pan` is `Some` (`Command::SetSendPan`, `Impact::Params`, slot
+`SlotRegistry::send_pan`; carried by track presets) — older sends are
+`None` and play as before. Post-fader taps are already panned into the
+destination: a send's pan balances them.
+
+**The click** plays in every cue mix whose click is on, at its
+`click_db` (relative to the metronome's volume) under its master level
+and mute (`MetronomeShared::set_cues`, packed `CueClick` words written in
+`EngineController::update_params`, read whole by the audio thread), as
+late as the outputs like the main click; a count-in reaches them the same
+way. `MetronomeShared::set_main` (`MetronomeSettings::main_outputs`,
+Preferences → Metronome and the Cue Mixes window) takes it off the main
+outputs, for a click in the headphones only. Tests:
+`engine/tests/cue_mixes.rs` (levels, pans, fader/mute/solo independence,
+post-fader, click and count-in, renders, PDC, low latency, send pan),
+`cue_mixes_do_not_allocate`, `project` `cue::tests`,
+`session/tests/cue_mixes.rs`, the mixer's `in_a_cue_mix_the_strips_set_its_sends`
+and `the_cue_bar_chooses_what_the_faders_set`.
+
+**Session and UI.** `session::cues` (`Action::Cue(CueOp::{New, Remove,
+Rename, SetOutput, SetTap, CopyMainMix, Show})`): New makes a copy of the
+main mix on the next free outputs (`Project::free_cue_outputs` past the
+master, hardware outputs, hardware insert sends and other cue mixes —
+3-4, 5-6 …) and shows it in the mixer; SetTap moves every send by its
+track's fader the other way so the cue mix sounds the same; tracks a
+command adds join every cue mix (`cue_sends_for_new_tracks`, hooked into
+`Session::edit` like the console's buses). The mixer's cue mode is
+presentation state (`Session::mixer_cue`, not saved): a bar over the
+strips (while there are cue mixes) chooses Main Mix or a cue mix, adds
+one, copies the main mix, switches pre/post (right-click a cue mix:
+outputs, click, mute, remove); in a cue mix every strip's fader, pan and
+mute set its send there (`MixerView::{fader_command, pan_command,
+mute_command}`), framed and tagged in the cue mix's colour, the fader caps
+too; solo is dark (the main mix's); strips without cue sends are dimmed;
+the master section is the cue mix's own (level, mute, the click's switch
+on the MONO place and level on the pan knob, its meters and outputs).
+Audio → Cue Mixes: New Cue Mix, Cue Mixes… (a window with every cue mix's
+name, outputs, taps, level, mute, click and click level, Copy Main Mix,
+remove, and the main outputs' click), Copy Main Mix into the Shown Cue
+Mix, Mixer Shows. Dev actions `cue-mix:<new|remove=<n>|rename=<n>=<name>|
+output=<n>=<first output>[/mono]|pre=<n>|post=<n>|click=<n>=<on|off>[@<dB>]|
+level=<n>=<dB>|mute=<n>=<on|off>|copy-main[=<n>]|main-click=<on|off>>`,
+`cue-mode:<n|main>`, `cue-send:<track>@<n>=<dB|on|off>[/<pan>]` (cue
+mixes counted from 1; pans as typed in the mixer, `L60`, `C`, `R40`),
+`cue-mixes` (the window).
 
 ## 6. Transport and timing
 
@@ -1599,20 +1733,33 @@ bypass, automation, listening).
   density and over time by attack and release, against the threshold or
   (auto) the region's octave-smoothed level; the gain is weighted by the
   band's normalised shape and added to its static gain (spectral bands are
-  linear phase). **Output**: character (`eq::character`: clean; a
-  transformer's low-end saturation; a tube's asymmetric curve driven below
-  the top octave, its harmonics DC-blocked), gain, pan (left/right or
-  mid/side), phase invert, auto gain (pink-noise loudness), a gain scale,
-  gain-Q interaction and a 10 ms bypass ramp against the input delayed by
-  the latency. Frequency, gain, Q and a cut's fractional slope glide
-  (15 ms); a band whose structure changes fades out and back in; a band
-  not heard yet starts where it is set. **EQ Match** (`eq::matching`):
+  linear phase). **Output**: character (`eq::character`: clean; Subtle, a
+  transformer's low-end saturation; Warm, a tube's asymmetric curve driven
+  below the top octave, its harmonics DC-blocked; Console, a line
+  amplifier's biased soft limit over the whole band, mostly third harmonic
+  with a touch of second; Tape, a +6 dB record emphasis over 3 kHz into a
+  soft saturation and its exact inverse, so the treble saturates first)
+  with a drive (id 15, the stage hit harder or softer at the same level,
+  glided) and optional 2×/4× oversampling of the stage (id 16, the
+  Saturator's halfband `dsp::oversample`; not automatable — its latency
+  joins the EQ's, `latency()` sums spectral + FIR + oversampling and the
+  dry path is delayed by all three), gain, pan (left/right or mid/side),
+  phase invert, auto gain (pink-noise loudness), a gain scale, gain-Q
+  interaction, a dry/wet mix (id 14, parallel EQ: the whole processed
+  signal against the input delayed by the latency, glided) and a 10 ms
+  bypass ramp against the same delayed input. The three later globals
+  default to neutral values (mix 100 %, drive 100 %, oversampling off), so
+  older states sound as they did. Frequency, gain, Q and a cut's fractional
+  slope glide (15 ms); a band whose structure changes fades out and back
+  in; a band not heard yet starts where it is set. **EQ Match**
+  (`eq::matching`):
   the reference-minus-input spectrum smoothed to a third of an octave and
   centred, bands placed where most is left (bells at the extremes, shelves
   at the ends) and refined by pattern search.
   The editor (`view-devices::eq`): a display with the analyser (pre, post
   and an external spectrum — the sidechain or any other EQ's output — with
-  resolution, speed, range, tilt and freeze; collisions glow red), every
+  resolution, speed, range, tilt, freeze and a peak hold line over the
+  output; collisions glow red), every
   band's curve (a dynamic band's reach shaded, spectral movement per
   frequency) and the overall response per part of the signal (stereo,
   left, right, mid, side); floating band controls under the band in focus
@@ -1625,7 +1772,17 @@ bypass, automation, listening).
   A/B; the sidechain source picked in the editor; the instance list (every
   EQ in the project with its spectrum and collisions; reference, open,
   match) and EQ Match (reference: the sidechain, another EQ, or the input
-  recorded earlier).
+  recorded earlier). The background menu flattens every band's gain (and
+  range) or inverts them in one step, and has Solo While Dragging (a band
+  dragged is heard alone until it is let go — an editor setting,
+  `key::SOLO_DRAG`); the output panel holds gain, pan, mix and character
+  drive knobs beside the switches and the gain scale; the character menu
+  lists the five characters, the oversampling and drive steps, and the
+  button shows the oversampling ("Tape ×2"). Factory presets
+  (`presets::equalisers`, 42) are all grouped — Vocals, Drums, Bass,
+  Guitars, Keys & Synths, Mix & Master, Surgical, Creative
+  (`presets::eq_group`) — the first fifteen keeping their names, settings
+  and order from the first version.
 * **Program EQ** (`plugin_host::program_eq`): PultEQFx by Simon Huber,
   used under the MIT licence — the passive LC/RC network of the classic
   tube program equaliser solved by nodal analysis (trapezoidal companion
@@ -1652,18 +1809,24 @@ four octaves, on the song's grid while playing (the rate a division,
 swing delaying every second step) or from the first key when stopped; a
 new chord's first note plays at once unless the grid's next step is
 close; gate (past 100 %: legato), fixed or played velocity, repeats,
-hold. `order_index`/`sequence` are shared with its editor. The *Chord*
-makes each note a chord: up to five intervals, the key's triad or
-seventh (the key track's key where the note is, or its own), or the
-chord track's chord voiced round the note; strummed up or down, added
-notes softer; notes of a strum not started when the key is let go never
-start. The *Scale* keeps notes in a key (the key track's or its own):
+hold; a velocity pattern (`pattern_weight`: accent on the first of every
+few, alternate, ramps, random, by the accent's amount —
+`shaped_velocity`) and chance (steps left out at random, the pattern
+going on). `order_index`/`sequence`/`pattern_weight` are shared with its
+editor. The *Chord* makes each note a chord: up to five intervals, the
+key's triad or seventh (the key track's key where the note is, or its
+own), or the chord track's chord voiced round the note; then `voiced`
+(inversions carry the lowest note up an octave or the highest down,
+octaves move the whole chord); strummed up or down, added notes softer;
+notes of a strum not started when the key is let go never start. The *Scale* keeps notes in a key (the key track's or its own):
 nearest (ties down), up, down or blocked, then by scale degrees and
 octaves; note-offs, poly pressure and note expressions follow each note
 to where it went. The *Note Echo* repeats each note (a division of the
 tempo or milliseconds apart, up to 16, each the feedback's share as loud
-until too soft to play, optionally moving by semitones), each repeat as
-long as the played note, with or without the note itself. Their editors
+until too soft to play, optionally moving by semitones or, In Key, by
+scale degrees of the key track's key where the note was played —
+`echo_key`), each repeat the Length's share of the played note (its end
+is scheduled when the note ends), with or without the note itself. Their editors
 (`view-devices::{arpeggiator, chord, scale, note_echo}`, accent
 `Accent::Midi`, `keys::keyboard`) show the pattern as a small piano roll,
 the chord on a keyboard with its name, the key's notes with their
@@ -1751,6 +1914,16 @@ covered by `the_stock_devices_do_not_allocate`.
   release, link, lookahead, listen. Editor: the spectrum with the
   detector's band and the cut it makes now (drag the frequency, wheel the
   width) and a history.
+* **Channel Strip** (`devices::channel_strip`, id
+  `faderframe.channel-strip`): input trim, high pass (12/18/24 dB/oct)
+  and low pass, optionally only in the dynamics' key; a gate (threshold,
+  range, attack, hold, release, hysteresis) or 2:1 expander; a compressor
+  (the stock compressor's gain computer, peak or RMS, make-up, mix for
+  parallel compression); four bands (LF/HF shelf or bell, two
+  parametric mids; "Black" narrows bands as their gain grows), before or
+  after the dynamics; console drive; output. The dynamics are keyed by
+  the channel or the sidechain, and Sidechain Listen plays the key.
+  `bands()` is shared with the editor's curve. Zero latency.
 * **Saturator** (`devices::saturator`): low cut → drive → one of six
   curves of unit slope at zero (soft `tanh`, tape arctangent with a head
   bump and high-frequency loss, asymmetric tube, transistor's hard knee,
@@ -1761,45 +1934,82 @@ covered by `the_stock_devices_do_not_allocate`.
   with the input's reach and the spectrum in and out.
 * **Utility** (`devices::utility`, the built-in Gain's id and parameter
   0): one ramped 2 × 2 matrix for channel choice (stereo, left, right,
-  swap, mid, side), polarity, width, balance, gain and mute — at rest the
-  identity times the gain, so old projects sound the same — plus a DC
-  filter and mono bass (Linkwitz–Riley split of the side; the mid through
-  the same crossover's all pass, so above it both stay in phase;
+  swap, mid, side), polarity and trim per side (before the width), width,
+  balance, gain and mute — at rest the identity times the gain, so old
+  projects sound the same — plus a DC filter and mono bass
+  (`dsp::filter::Crossover`, a Linkwitz–Riley split of the side; the mid
+  through the same crossover's all pass, so above it both stay in phase;
   crossfaded on and off). Editor: vectorscope, correlation and balance.
 * **Delay** (`devices::delay`, the built-in Echo's id; its five
   parameters keep their meaning): stereo, ping-pong or mono; free or
-  synced (note divisions), stereo offset, feedback to 110 % into a loop
-  that is linear to full scale and then rounds off; per pass the Echo's
-  damping, a low cut, saturation and a style (digital; tape: arctangent,
-  head bump, high-frequency loss, wow; analog: a bucket brigade's 4.5 kHz
-  band limit); wow and flutter; time changes glide; ducking, width,
-  freeze. Editor: the repeats on a timeline (drag for the time) and one
-  pass's spectrum.
-* **Reverb** (`devices::reverb`): pre-delay; early reflections (a type's
-  12-tap pattern scaled by the size); four allpass diffusers a side into a
-  16-line FDN with Hadamard mixing (orthogonal), line lengths spread
-  geometrically over the type's range and gliding with the size, slowly
-  modulated taps, and per line a three-band decay (one-pole splits at
-  250 Hz and the damping frequency, each band's gain exactly what its
-  decay time asks for the line's length: bass × the bass multiplier,
-  highs a third); orthogonal output taps for decorrelated sides. Types
-  Room, Hall, Plate, Chamber, Ambience; early/late balance, width, wet
-  cuts, freeze (lossless, modulation off), ducking. Tests measure RT60
-  (Schroeder integration) within 12 %. Editor: the decay picture (pre-
-  delay, reflections, bass/middle/high tails; drag for the decay) and the
-  decay time across the spectrum.
+  synced (note divisions, dotted and triplet), stereo offset, feedback to
+  110 % into a loop that is linear to full scale and then rounds off; per
+  pass the Echo's damping, a low cut, a tilt shelf round 1 kHz
+  (`TILT`), saturation and a style (digital; tape: arctangent, head
+  bump, high-frequency loss, wow; analog: a bucket brigade's 4.5 kHz
+  band limit); wow and flutter and a chorus on the read heads
+  (`MODULATION`/`MOD_RATE`, up to ±4 ms); diffusion (four
+  `dsp::delay::Allpass`es a side on the read, their length taken off
+  the delay so the repeat lands on time); time changes glide; ducking,
+  width, freeze. `LINK` (on by default) makes the right side follow the
+  left; off, it has its own time (`TIME_R`) and note value
+  (`DIVISION_R`) — ids 16–22 are all neutral at their defaults, so
+  projects saved before them sound the same. Editor: the repeats on a
+  timeline (drag for the time; smeared by the diffusion, both sides'
+  notes when unlinked) and one pass's spectrum. Presets grouped
+  Slapback, Rhythmic, Ambient, Tape, Creative (the first fourteen are
+  the first version's).
+* **Reverb** (`devices::reverb`): pre-delay (ms, or synced to a note
+  value: `PRE_SYNC`/`PRE_DIVISION`, up to `MAX_PRE_SECONDS`); early
+  reflections (a type's 12-tap pattern scaled by the size); four allpass
+  diffusers a side into a 16-line FDN with Hadamard mixing (orthogonal),
+  line lengths spread geometrically over the type's range and gliding
+  with the size, slowly modulated taps, and per line a three-band decay
+  (one-pole splits at the bass crossover (`BASS_FREQ`, 250 Hz) and the
+  damping frequency, each band's gain exactly what its decay time asks
+  for the line's length: bass × the bass multiplier, highs × `HIGH_DECAY`
+  (a third by default)); orthogonal output taps for decorrelated sides.
+  Types Room, Hall, Plate, Chamber, Ambience, Spring (two spring lines
+  looping through twelve second-order allpasses tuned 1.8–3.8 kHz — the
+  dispersion of a spring's chirp — and a 4.2 kHz low pass, feedback from
+  the decay; they are the early part and feed the network), Cathedral
+  (the longest lines). Shimmer (`SHIMMER`, any type): the late output
+  through a two-head crossfaded pitch shifter (50 ms window,
+  `SHIMMER_PITCHES` −12 … +24 semitones), band limited and softly
+  limited, fed back in with the input. Early/late balance, width, wet
+  cuts and shelves (`LOW_SHELF` 250 Hz, `HIGH_SHELF` 4 kHz), freeze
+  (lossless, modulation off), ducking. Ids 16–23 are neutral at their
+  defaults. Tests measure RT60 (Schroeder integration) within 12 % for
+  every type, the highs' multiple, the synced pre-delay, the shelves and
+  crossover, the shimmer's octave and its bound, the spring's dispersion.
+  Editor: the decay picture (pre-delay, reflections or the springs'
+  bounces, bass/middle/high tails, the shimmer's climb; drag for the
+  decay) and the decay time across the spectrum with the shelves'
+  curve. Presets grouped Rooms, Halls, Plates, Ambiences, Springs,
+  Creative. The Delay's and the Reverb's presets are levelled
+  (`delay_and_reverb_presets_are_levelled`: fully wet, a click's energy
+  within −36 … +6 dB, nothing clips).
 * **Modulation** (`devices::modulation`): chorus (1–4 voices a side),
   ensemble (three voices, slow and fast LFOs), flanger (feedback ±95 %),
   phaser (2–12 first-order allpass stages swept exponentially round the
-  centre, feedback) and vibrato; free or synced LFO in six shapes with a
-  stereo spread; wet high cut and width. Editor: the LFO with each side's
-  position, and the voices on the delay or the comb or notches right now
-  between the sweep's extremes.
+  centre, feedback), vibrato, tremolo (`tremolo_gain`: down by the depth
+  at the trough, the gain slewed over a millisecond so a square does not
+  click; the spread makes an auto-pan) and a rotary speaker (all wet: a
+  Linkwitz–Riley split at 800 Hz into a horn and a drum, each a rotor
+  heard as Doppler on a swept delay line and as its level shading as it
+  turns away from the microphones — `rotor_level`; the drum at 0.84 of
+  the horn's rate on the ensemble's second LFO; rate changes ramp with
+  the rotors' inertia, a second for the horn, two and a half for the
+  drum); free or synced LFO in six shapes with a stereo spread; wet high
+  cut and width. Editor: the LFO with each side's position, and the
+  voices on the delay, the comb or notches right now between the sweep's
+  extremes, the tremolo's level over a cycle, or the two rotors turning.
 * **Tuner** (`devices::tuner`): passes or mutes; the pitch is found in
   the editor (`view-devices::tuner`: McLeod's normalised square
   difference over 4096 frames by FFT, parabolic peak, clarity ≥ 0.8,
   median of five), within a cent from 25 Hz to 4.2 kHz; needle or strobe,
-  reference A4 400–480 Hz.
+  reference A4 400–480 Hz, Transpose names the notes as a transposing
+  instrument's player reads them (B♭: +2).
 * **Synth** (`devices::synth`; the first nine parameters, the MIDI
   handling — pedal, bend with RPN 0, MPE zones, pressure, CC 74, mod-wheel
   vibrato — and per-note expressions are the first Synth's): two PolyBLEP
@@ -1809,8 +2019,16 @@ covered by `the_stock_devices_do_not_allocate`.
   pass, band, high) with key tracking, velocity and its own envelope or
   the amplifier's; an LFO (free or synced, six shapes) to pitch, cutoff,
   level and pulse width; poly (up to 32 voices), mono or legato with
-  glide. Editor: two decks of sections under the oscillator cycles, the
-  filter's response and reach, and both envelopes.
+  glide; the wheels: Pitch Bend Range (id 43, 1–24 st; a range a
+  controller sets with RPN 0, or an MPE zone's ±48, wins on its channel)
+  and three mod-wheel slots (`id::wheel_target(k)`/`wheel_amount(k)` =
+  44 + 2k / 45 + 2k): a destination from `WHEEL_TARGETS` (vibrato, pitch,
+  cutoff, resonance, filter envelope, drive, LFO amount, LFO rate, pulse
+  width, oscillator levels, sub, noise, detune, spread, volume) and a
+  bipolar amount; each voice applies its channel's wheel to a copy of the
+  block's settings (`Settings::wheeled`), LFO rate follows the wheel moved
+  last. Slot 1 defaults to vibrato at 50 % (the first Synth's ½ semitone). Editor: two decks of sections under the oscillator
+  cycles, the filter's response and reach, and both envelopes.
 * **Sampler** and **Drum Sampler** (`devices::{sampler, drums}`): what
   they play is a `samples::SampleDoc` (a file per slot) packed into the
   plugin state after the parameter block (`samples::pack`: `FFSD`, length,
@@ -1889,11 +2107,13 @@ covered by `the_stock_devices_do_not_allocate`.
   `.ffpreset` under the presets folder, or a track preset in the
   library, compared as canonical paths); the menus list only those. The
   shell confirms first (`PromptDeletePreset`).
-  Built-in factory presets live in `plugin_host::presets`: 216 across
-  the EQ, Program EQ, compressor, limiter, gate, de-esser, saturator,
-  utility, delay, reverb, modulation, the four MIDI effects and Synth
-  (MIDI effect presets are played through by a test: notes, none stuck). Samplers, the tuner and
-  the latency probe have none. Each preset expands its overrides over
+  Built-in factory presets live in `plugin_host::presets`: 243 across
+  the EQ, Program EQ, compressor, 76, limiter, gate, de-esser, channel
+  strip, saturator, utility, delay, reverb, modulation (its tremolos in a
+  "Tremolo" submenu), the four MIDI effects and Synth (MIDI effect
+  presets are played through by a test: notes, none stuck; every audio
+  preset is rendered over a drum-and-voice fixture and must stay within
+  12 dB of it). Samplers, the tuner and the latency probe have none. Each preset expands its overrides over
   the device's defaults, replacing every parameter when selected.
   `BuiltinInstance::programs`/`select_program` expose them through the
   existing program API; the editor labels that section "Factory Presets".
@@ -2558,11 +2778,15 @@ at most, from the pitches sounding at least a quarter of each window;
 equal neighbours join) and the key from the selected MIDI clips
 (`Action::DetectChords`/`DetectKey`, one undo step each). In the arranger
 (`view-arranger/src/harmony.rs`) the Key lane shows spans named after
-their key (click: roots and scales, double-click: type one) and the
-Chords lane the chord track (drag across for a chord and type it,
+their key: a change is hit on its bar or its name (click: roots and
+scales, drag: moves it by bars, `harmony::move_key`; double-click: type
+one); a click on any other bar adds a change there, a drag across bars
+draws a passage in another key (`harmony::set_key_span`: changes inside
+give way, the key in effect after it comes back at its end). The Chords
+lane shows the chord track (drag across for a chord and type it,
 double-click for one a bar, drag to move, edges to resize, right-click for
-the key's diatonic chords with their numerals; colours by root round the
-circle of fifths).
+the key's diatonic chords with their numerals, Delete Chord, Delete All
+Chords; colours by root round the circle of fifths).
 
 The piano roll follows them (`PianoRollSettings::follow_key`, on by
 default; the chosen scale applies where the project has no key or when it
@@ -2614,6 +2838,49 @@ polarity, monitoring, colour, output and VCA assignment are set alike
 (invalid targets, such as feedback loops, are skipped). The edit and its
 followers are one `Batch`, one undo step; selecting a member selects its
 group when the group links selection.
+
+### Duplicating tracks, merging clips, device names, unused media
+
+*Duplicate Track* (`Action::DuplicateTracks { tracks, content }`, no
+tracks = the selected ones; `session::duplicate`): each copy goes right
+after its original (a folder after its contents), named on ("Bass" →
+"Bass 2", "Audio 1" → "Audio 2"), with everything a track holds under
+fresh ids — devices (nested ones, the containers' map; their current
+state captured first), sends, automation lanes (plugin and send targets
+remapped), modulators (routes remapped) — not armed, soloed or frozen; a
+plugin output it took goes back to its owner. *With content* copies its
+clips (and a folder's tracks into the new folder). One undo step.
+
+*Merge Clips* (`Action::MergeClips`, `session::merge`): per track, two or
+more clips become one from the first start to the last end. MIDI joins
+at once (notes, controllers and SysEx placed from the new start, fresh
+note ids, expression kept by note, what a clip cut off stays cut off).
+Audio is rendered as it plays — gain, fades, warps, takes, gaps as
+silence, muted clips silent, without the track's devices — on a one-track
+copy in a worker (`render::start`), into a new file; `poll_merges` puts
+it in place as one "Merge Clips" step unless a clip went meanwhile
+(`wait_for_merges` in tests).
+
+*Device names*: `faderframe_project::device_name(chain, slot)` /
+`Track::name_of(slot)` / `Session::device_name(id)`: a plugin's name, and
+"(2)", "(3)" … after the first of that name in a chain (a track's
+`slots()` order, a song's inserts), used by every view that names a
+device (mixer inserts and menus, editor window titles, automation and
+modulation targets, the Performance view, graph node names, plugin
+outputs, sandbox notices). Numbers follow the chain's order.
+
+*Unused media* (`session::cleanup`, `Session::unused_media`): the audio
+files directly in the saved project's `Audio` folder that neither the
+saved file nor any saved version uses — a listed source counts when
+`Project::used_sources` (clips, takes, clip-effect, spectral and
+polyphonic originals, freezes) has it, and a file named anywhere else in
+a saved file is kept; `Samples` and other subfolders are left alone,
+nothing is reported when a saved file cannot be read. The shell asks once
+the project is really replaced or the window closes (`dialogs::Closing`,
+`ask_unused`; File → Open captures it before its chooser and acts after
+it), moving them to the trash; Preferences → General: Ask / Move to the
+trash / Keep. While a project is open its undo history may still need
+them, so nothing is removed then.
 
 ### Sample-level redraw
 
@@ -2731,8 +2998,38 @@ plain clips with the same fades.
 | Record mode (over existing clips) | *Takes* — overlapped clips and folders become takes of one folder, the new take is comped in over its range, playback elsewhere is unchanged · *Replace* — overlapped clips are cut back (tape style) |
 | Loop recording | *Passes as takes* · *Keep last pass* · *New track per pass* (earlier passes on new, muted tracks) |
 | Metronome | Off · While recording · Always (`click.rs`: decaying sine per beat, accented downbeats, follows tempo and meter, live output only) |
-| Pre-roll | 0/1/2/4 bars before the record start when starting from stop |
+| Pre-roll | `Roll` (amount + `RollUnit` bars/beats/seconds; menu presets, any amount in Preferences) before the record start when starting from stop; from that bar's line or exactly (`preroll_on_bar`, `Session::roll_back`); *Count-in* (`count_in`): the pre-roll plays the click alone |
+| Post-roll | `Roll` after a punch-out, then playback stops (`EngineController::stop_at`, `Session::roll_on`; the tick ends the take when it ran out, a user stop disarms it) |
 | Punch | `Project::punch_range` + `punch_enabled` (`Command::SetPunch`); capture only inside it |
+
+**Input quantize (the transport's Q).** `RecordSettings::{input_quantize,
+input_grid}` (None: the edit grid; `Session::input_quantize_settings` =
+the editor's quantize strength, swing and ends on that grid): recorded
+MIDI lands on the grid as `midi_take_clip` places it — takes, Capture
+MIDI, launcher slot recordings and overdubs (only the new notes);
+playing live is not delayed. `TransportAction::ToggleInputQuantize`;
+the Q in the header bar (right-click: its grid, MIDI learn as
+`TransportControl::InputQuantize`); a controller's Quantize button
+(`EditButton::Quantize`) toggles it — Shift+Quantize quantizes the
+selected clips — and its light follows `SurfaceState::input_quantize`
+(Komplete Kontrol, KeyLab Essential mk3). Saved in the preferences.
+Tests `input_quantize_puts_played_notes_on_the_grid`,
+`a_controllers_quantize_button_toggles_input_quantize`,
+`the_quantize_light_follows_input_quantize`.
+
+**Recording over clips.** The audio thread knows what is recorded:
+`EngineContext::recording` (`record::RecordingNow`: the record window and
+the recorded tracks, set on `BeginRecord`, cleared on `EndRecord`).
+Inside the window a recorded track's clip player is silent and its Auto
+monitoring passes the input (`MonitorGate`, sample-accurate at the
+window's edges); before and after it the track plays its clips — so what
+is heard while recording over a clip is the new take, not the old one
+under it. A count-in (`RecordingNow::silent_before`) keeps every clip
+player (audio and MIDI) silent before the window and forces the click
+there, whatever the metronome's mode. Tests `engine/tests/recording.rs`
+(`a_recorded_track_plays_its_input_not_its_clip_inside_the_window`,
+`a_count_in_plays_the_click_alone_before_the_take`), session
+`pre_and_post_roll_lengths_and_the_post_roll_stop`.
 
 **Arranger.** Rows have per-track heights (stored in `WorkspaceSet`:
 default + per-track overrides, saved with the layout; drag a header's
@@ -2949,11 +3246,56 @@ Edits are `Action::EditPitch { clip, op }` with a `PitchOp` (move —
 inside a gesture the total from where it began, recomputed from
 `Session::gesture_clip` —, set, correct to the key at the note's
 position (`pitch::snap`, by an amount, with straightening), split, join,
-reset, keep formants, remove). The editor is `faderframe-view-pitch`
-(`ViewKind::Pitch`, `Session::pitch_clip`, `Action::OpenPitchEditor`
-from the arranger's clip menu: notes as blobs at the heard pitch, the
-played and the sung curve, a drag moves by semitones (Alt: freely), a
-double click splits, ↑↓ move, J joins, Delete resets).
+reset, keep formants, length, remove notes, remove the edit). The editor
+is `faderframe-view-pitch` (`ViewKind::Pitch`, `Session::pitch_clip`,
+`Action::OpenPitchEditor` from the arranger's clip menu: notes as blobs at
+the heard pitch where they play now, the played and the sung curve, a drag
+moves by semitones (Alt: freely), an edge dragged (handle and resize
+cursor on hover; Ctrl+←/→ 10 ms, with Shift 1 ms) makes notes longer or
+shorter, a double click splits, ↑↓ move, J joins, Delete removes, R
+resets).
+
+Note lengths (`PitchOp::Length { notes, edge, by }`, inside a gesture from
+where it began): a note's `PitchNote::timing` is where its start and end
+play now, in the frames of the timing as sung (`placed`, `place_of`,
+`source_of`); `PitchEdit::move_edge` moves one edge. In a melodic edit the
+neighbour on that side gives or takes the time, so nothing else moves —
+the next (previous) note when it follows on within `JOIN_HOPS` (100 ms:
+the unvoiced transition between them moves along and that note is
+squeezed or stretched, its far edge staying), else the pause (squeezed to
+`MIN_GAP_HOPS` at most), or the audio up to the clip's edge; notes keep
+`MIN_NOTE_HOPS`. `PitchEdit::time_map(lo, hi)` turns the notes' edges into
+anchors (placed → source) that `pitch::through` composes with the clip's
+own warp anchors in `warped_region`, so PSOLA plays the stretched notes
+through the time map (marks repeated or skipped) and renders, freezes and
+clip effects follow. Reset gives a note its sung timing back
+(`reset_timing`, the joined neighbour's edge too); split and join keep the
+timing. Removing notes (`PitchOp::RemoveNotes`) moves them to
+`PitchEdit::removed`: no longer shown, their audio silenced where it plays
+(`PitchEdit::level_at`: 0 inside, 5 ms fades centred on their edges, as
+`PitchCurve::levels` every hop applied to the PSOLA voice's output by
+source position). Undo brings them back. Both fields are serde defaults
+(no schema bump).
+
+Polyphonic and Melodic (the editor's `EditFlag::PolyphonicPitch`):
+switching it detects the clip open in the editor again the new way when it
+was detected (or is being detected) the other way
+(`Session::pitch_mode_changed`; a detection of the other kind still
+running is dropped). The notes found replace the old ones in one "Detect
+Pitch" step, but `pitch::carry` brings the corrections over: each new note
+takes the move and straightening (formants into a melodic edit, level and
+mute into a polyphonic one; a muted note becomes a removed one in a
+melodic edit) of the old note it overlaps most — by at least half its
+length — within half a semitone; one lying in a removed note is removed;
+lengths are not carried. Going melodic, the clip plays its recording again
+(the polyphonic render left behind, undo brings both back). The view shows
+"finding the notes (polyphonic|melodic)…" while it runs. Tests:
+`session/tests/pitch.rs` (`notes_are_made_longer_and_removed`: rendered
+pitch where the longer note now plays, silence where the removed one
+did), `session/tests/polypitch.rs`
+(`switching_between_polyphonic_and_melodic_finds_the_notes_again`), engine
+`tests/pitch.rs`, `warped_playback_does_not_allocate` (a longer note and
+a removed one), the view's.
 
 ### Tempo and key from clips
 
@@ -3043,7 +3385,11 @@ Model; the system's `curl`, `.part` files) into the data folder's
 `models`. `Action::Transcribe(clip)` hears an audio clip's part of its
 source at 16 kHz in a thread and puts its lines into the project's lyrics
 (`faderframe_project::lyrics`, `Project::lyrics`, `Command::SetLyrics`),
-replacing those starting inside the clip, in one step. The arranger's
+replacing those starting inside the clip, in one step. Whisper's times are
+coarse, so each line then starts at the vocal's attack nearest to it
+(`speech::word_onsets` = `faderframe_audio_files::onsets` above a strength,
+`align_to_onsets` within `ONSET_REACH` 0.35 s, in order; ends stay before
+the next line). The arranger's
 Lyrics lane (shown once there are lyrics) draws the lines (lit while
 playing), a click goes there, a double-click edits, right-click deletes;
 `arrange` moves, copies and cuts them with sections; `Session::
@@ -3051,24 +3397,35 @@ lyrics_text` writes LRC or SRT.
 
 ### Lead sheets
 
-A clip's melody with its chords and words, written out as notation
+A clip's melody with its chords and words, written out as notation — or
+several tracks' lines as a score, a staff each, one below the other
 (`faderframe-leadsheet`, pure; `session::leadsheet`; view
 `faderframe-view-leadsheet`, `ViewKind::LeadSheet`):
 
-* **Hearing.** Of a clip or of a whole track (`LeadSheetOf`; all its
-  clips, the song): audio clips' melody comes from the pitch analysis
-  (`to_midi::melody`, in a thread; kept, so writing it again with another
-  grid does not listen again), MIDI clips' notes are read. Bars come from
-  the meter map over the clips, the chords from the chord track — or, with
-  none there, from what the other tracks' MIDI plays
-  (`harmony::detect_chords`, half a bar at a time), or, with no MIDI
-  either, from what the other audio tracks play, heard by basic-pitch in
-  the same thread (tracks named like drums left out) —, the key from the
-  key track (else detected from the melody and the chords, which keep a
-  tune from leaning on its fifth's key), words from the lyrics lane. The
-  clef follows the part's middle note (treble; treble 8vb for a tenor;
-  bass for a bass line).
-* **Writing** (`build`): one voice; per beat sixteenths or eighth
+* **Hearing.** `LeadSheetOf::{Clip, Track, Clips, Tracks}`: a staff a
+  track (`Clips`: the chosen clips grouped by track, staves in the
+  arranger's folder order; `Tracks`: in the order given; a track's unmuted
+  clips). A staff's clips make one line on one timeline — gaps are rests,
+  where clips overlap the later one (on top) is written, MIDI notes past a
+  clip's end are left out. Audio clips' melody comes from the pitch
+  analysis (`to_midi::melody`, in a thread; kept by clip, so writing it
+  again with another grid does not listen again), take folders' as their
+  comp plays (piece by piece, `TakeFolder::pieces`), MIDI clips' notes are
+  read (afresh each time). Bars come from the meter map over the clips,
+  the chords from the chord track — or, with none there, from what the
+  other tracks' MIDI plays (`harmony::detect_chords`, half a bar at a
+  time), or, with no MIDI either, from what the other audio tracks play,
+  heard by basic-pitch in the same thread (tracks named like drums left
+  out), or, for a score with none of those, from what its staves play
+  together —, the key from the key track (else detected from all the
+  staves and the chords, which keep a tune from leaning on its fifth's
+  key), words from the lyrics lane, under the first staff whose track is
+  named like a voice (else the top one). Each staff's clef follows its
+  middle note (treble; treble 8vb for a tenor or a guitar; bass for a bass
+  line).
+* **Writing** (`build`, `Input::staves` → `LeadSheet::parts`, the same
+  bars in each, chord symbols on the top part): one voice a staff; per
+  beat sixteenths or eighth
   triplets, whichever fits the onsets (`Grid::{Auto, Straight,
   Triplets}`), short gaps closed; notes cut at bar lines with ties and
   split into the values a reader expects (nothing crosses a beat unless it
@@ -3080,21 +3437,89 @@ A clip's melody with its chords and words, written out as notation
   onsets in the line (by time, words shared out by their syllables), a
   word over several notes drawing its line.
 * **MusicXML 4.0** (`musicxml`, `score-partwise`, valid against the
-  schema): harmony with kinds and degrees, ties, beams, tuplets, lyrics
-  with extenders, the tempo, a final bar line.
+  schema): a `<part>` a staff (a score's in a bracketed `part-group`,
+  names and abbreviations, `group-barline` as engraved), harmony with
+  kinds and degrees, ties, beams, tuplets, lyrics with extenders, the
+  tempo, a final bar line.
 * **Engraving** (`engrave`): a display list (filled outlines, lines,
   text; points, y down) of A4 pages — systems of up to four bars (bars
-  close up to 80 % to share a line), justified; each note's room grows
-  with its value, accidental, dot, word and the chord over it. Glyphs are
-  34 of Bravura's (SIL OFL 1.1), baked with their SMuFL metadata (stem
-  anchors, engraving defaults) by `scripts/notation_assets.py`; text
+  close up to 80 % to share a line), justified; each bar's spacing is
+  planned once for all its staves (`BarPlan`: every staff's onsets and
+  the chords are points, each note wants its room from its start to its
+  end), so notes sounding together stand one above the other; each note's
+  room grows with its value, accidental, dot, word and the chord over it.
+  A score's system draws each staff on its own, measures what it reaches
+  and stacks them clear of each other (room for chords over the top
+  staff, words under a staff that has them), bracketed, part names in
+  full before the first system and short (`Part::abbreviation`) after,
+  bar lines through the system unless words are sung under a staff above
+  the last (`LeadSheet::bar_lines_joined`); a system that does not fit
+  starts the next page; `Layout::for_staves` makes staves smaller as a
+  system has more. Glyphs are 34 of Bravura's (SIL OFL 1.1), baked with
+  their SMuFL metadata (stem anchors, engraving defaults) by
+  `scripts/notation_assets.py` (the bracket is drawn, not a glyph); text
   measured with the Adobe Core 14 widths. **PDF** (`pdf`): a hand-written
   PDF 1.4 with the paths and the standard fonts (WinAnsi, nothing
   embedded). The view draws the same display list on paper.
 * Actions `MakeLeadSheet { of, grid }`, `ExportLeadSheet(path)` (by
-  the extension); the arranger's clip menu and track menu ("Lead Sheet of
-  This Track"); dev actions `lead-sheet:[track:]<track>[@straight|
-  triplets]`, `export-lead-sheet:<path>`.
+  the extension); the arranger's clip menu (this clip; "Lead Sheet of the
+  n Selected Clips" on one track, "Score of the Selected Clips" across
+  tracks) and track menu ("Lead Sheet of This Track"; "Score of the n
+  Selected Tracks"); dev actions `lead-sheet:<track>|track:<track>|
+  tracks:<a>|<b>…|selected[@straight|triplets]`,
+  `export-lead-sheet:<path>`.
+
+**Words a syllable a note.** `build::lay_words` sings each line's words
+on the notes starting in it: cut into syllables (`syllables_in`: between
+vowel groups, English or German rules by `Language::of` the lyrics —
+German keeps a final e and sends the last consonant on, "sch"/"ch"/"ck"
+together) when the line has notes enough, else a word a note; matched in
+order to the nearest onsets by a least-distance alignment of the
+syllables spread over the line. `score::Lyric::syllabic`
+(single/begin/middle/end) gives MusicXML's `syllabic`; the engraver's
+`draw_words` puts hyphens between a word's syllables (after the last on a
+system when the word goes on) and melisma lines only after a word's last
+syllable.
+
+**Guitar tab.** `faderframe_leadsheet::tab`: `TUNINGS` (guitar standard,
+drop, open and 7-string tunings, 4/5-string bass, ukulele; string 1 =
+the top line first), `finger(chords, tuning, capo)` = a Viterbi search
+over each chord's candidate shapes (a string a note; a shape costs its
+stretch beyond four frets, its height on the neck, strings skipped inside
+it and crossed voicings, less for open strings; moving costs the hand's
+travel; out-of-reach notes move by octaves, more notes than strings keep
+the outer ones), `text` = plain-text tab (a row a string, bars, words
+under). A `build::Staff` with a `StaffTab` keeps its chords (notes
+starting together on the grid are one event: `Event::chord`, fingered
+into `Event::frets`) and becomes a notes part and a tab part
+(`Part::tab: Some(TabStaff { strings, capo, rhythm: false })`, no words)
+or a tab part alone (`rhythm: true`, its words and chord symbols on it);
+guitars write on the treble 8vb clef, basses on the bass 8vb clef
+(`Clef::Bass8vb`). The engraver draws chords on one stem (seconds beside
+it, accidentals in columns, a tie a note, stems from the far note), a
+tab staff's lines `TAB_GAP` apart broken around fret numbers (a tied
+note's bracketed), the SMuFL tab clefs and, alone, the rhythm as stems,
+beams, flags, dots and threes under it; staves have their own heights
+(`staff_height`). MusicXML: `<chord/>` notes, a TAB clef with
+`staff-details` (`staff-tuning` from the bottom line, `capo`) and
+`technical` string/fret. The session's `SheetStyle` (`Notation::{Standard,
+WithTab, Tab}`, tuning, capo; `Action::SetSheetStyle` rewrites the sheet
+made, `Action::MakeTab` = notes with tab) applies tab to every staff, or
+in a score to those named like fretted instruments (`fretted`; a bass
+part on a bass tuning, `Tuning::for_part`); their audio is heard as
+chords (basic-pitch `harmony`), the others' as a melody (`Kept::tab`
+remembers which). Arranger clip/track menus: Guitar Tab…; the Lead Sheet
+view's strip: Notes / Notes + Tab / Tab, the tuning and capo menu, Export
+Tab… (`.txt`). Dev actions `guitar-tab:<track>`,
+`sheet-style:<notes|notes-tab|tab>[@<tuning n>][/<capo>]`. Tests:
+`tab::tests` (open C and G shapes, a run in one position, capo, octaves,
+basses), `build::tab_tests` (syllables in both languages, chords kept,
+engraving, MusicXML, text), session
+`a_guitar_staff_becomes_tab_with_the_words_on_the_voice`,
+`recorded_chords_are_heard_as_chords_for_tab`, the view's
+`the_strip_switches_to_tab_and_offers_tunings`. The tab clefs and the bass
+8vb clef were added to `scripts/notation_assets.py` (Bravura 1.482; the
+regenerated assets otherwise byte-identical).
 
 ### Tempo through hit points
 
@@ -3591,6 +4016,11 @@ the GDK backend).
 
 ### Piano roll
 
+**Zoom.** Like the arranger: the toolbar's −, +, Sel (the selected notes'
+span and keys) and Fit (the whole clip, the keys it uses) (`toolbar::Zoom`,
+`PianoRollView::zoom`), Ctrl+wheel for time, Alt+wheel (or Ctrl+Shift) for
+the row height, `+`/`-`.
+
 **MIDI Tools.** `faderframe_project::midi_tools` holds pure, deterministic
 note tools over a `ToolContext` (the clip's start, the meter, the scale
 and key at a time, the chord track): transformations of a selection —
@@ -3653,6 +4083,16 @@ The editing model follows Pro Tools and lives in the session
 (`clip_edit.rs`) and the edit toolbar (`edit_bar.rs`, a canvas view hosted
 full width under the header by `faderframe-ui`, wrapped into rows by
 `faderframe_ui_canvas::Flow`) only turn gestures into actions.
+
+* Selecting: the selection keeps an anchor (`Selection::{anchor_track,
+  anchor_clip, anchor_note}`: the last single item clicked). Shift-click
+  selects from it to the click — clips on the rows between over the time
+  from the earlier start to the later end, track headers and mixer strips
+  in their shown order, piano-roll notes on the keys between over their
+  span; Ctrl-click toggles one. Ctrl+drag (Smart, Select, Grab) draws a
+  rectangle selecting the clips it touches (Ctrl+Shift adds; `Marquee`,
+  outside `Drag`); a click below the last track moves the playhead like a
+  click on a lane.
 
 * `EditorSettings`: edit mode (Shuffle / Slip / Spot / Grid, grid absolute
   or relative — `snap` is true exactly in Grid mode), tool (Smart, Trim,
@@ -3933,8 +4373,25 @@ Windows and macOS builds and packages for all three platforms (see §14).
 Picture (video, phase 1): `faderframe-video` on GStreamer as a library
 (probe, a demux-only frame index, exact-frame decoding, MJPEG proxies,
 sound from video, muxing with the picture copied, a frame service with
-player, seeker and thumbnailer threads); video tracks in absolute time
-with the project's SMPTE timecode (every rate, drop-frame); the presenter
+player, seeker and thumbnailer threads); frames are asked for by their
+index start and the decoder seeks 2 ms into them (`SEEK_INTO`):
+containers round frame times (Matroska to milliseconds, so at 29.97 fps
+a frame's predecessor seems to end after it starts, and a proxy's times
+differ from its original's), and a seek to the start itself handed out a
+sliver of the frame before first — stills one frame early, and every
+frame of a run played from there one frame late. A frame shows (and a
+timecode label reads) from a millisecond before its start
+(`faderframe_core::timecode::FRAME_HAIR_NS`, `FrameIndex::frame_at`,
+`FrameRate::frame_at_sample`), so a frame's start lands in it however it
+was reckoned, and a label's position is its frame's first sample
+(`FrameRate::first_sample`; the nearest one lay before up to half the
+frames at 29.97 and 59.94, the counter and the picture a frame behind a
+typed or spotted timecode). Seeks and the index read past a demuxer's
+own end (`streams::open_seek`, `end_after_late_start`: an MP4 without an
+edit list, whose B-frame delay starts its picture after 0, ended for
+qtdemux at its media's duration, two frames short); video tracks in
+absolute time with the project's SMPTE timecode (every rate,
+drop-frame); the presenter
 showing the frame for the sample heard when it reaches the screen (the
 audio engine is the clock); the video window (docked, detached, full
 screen, timecode overlay), the arranger's Video lane, picture offset,
@@ -3954,7 +4411,13 @@ markers. Colour management: the stream's colours kept with the frame
 index, HDR (PQ, HLG) and wide gamut mapped for an SDR screen
 (`faderframe_video::colour`: BT.2390's EETF to reference white, BT.709
 primaries), proxies mapped the same way (and proxies keep full-range JPEG
-colours now). MXF and DV demuxed in every package; ProRes, DNxHD and the
+colours now). Every proxy is decoded by a `Decoder` (as shown: mapped,
+JPEG at its own full range whatever a QuickTime colour atom implies —
+qtdemux took its missing range for video range) and written at its
+frames' stream times with the source's frame rate; the frame service
+reads a proxy relative to its first frame (`service::in_file`), since
+Matroska readers start a stream at its first block (a picture starting
+after 0 read back early in its proxy). MXF and DV demuxed in every package; ProRes, DNxHD and the
 other intermediates decoded through an LGPL FFmpeg the Linux tarball
 builds (`packaging/linux/lgpl_libav.sh`). Conform to a new cut from EDLs
 or OpenTimelineIO, or by matching the old and new picture shot by shot
@@ -4060,7 +4523,8 @@ DAW does well yet):
 15. **Ideas from what FaderFrame has**:
     - ~~*Lead sheets from a recording*~~ — done (see Lead sheets): the
       melody heard, chords from the chord track or the other tracks' MIDI,
-      words from the lyrics, key and tempo, as MusicXML or a PDF.
+      words from the lyrics, key and tempo, as MusicXML or a PDF; a
+      track's clips as one line, several tracks as a score.
     - *Comping by lyric*: Whisper's word timings on every take; choose
       the best take word by word, the syllable shown under each note in
       the pitch editor.
@@ -4127,9 +4591,11 @@ reservoir worker of its own, one device callback behind the stage before
 it, so a pedal's cost never adds to another's thread, and each stage
 reports its buffer (and at 2x its oversampler) as latency; adding or
 removing a pedal therefore restarts the device, a footswitch or a model
-change does not. Per stage a stereo signal is two threads (a `WorkerPool`
-helper) and a duplicated mono one circuit that wakes the other from its
-history, as the preamps do. A place's circuit is built by the workshop
+change does not. Per stage each channel is a thread of its own (`WorkerPool`
+helpers: a stereo signal two, a 5.1 one six, within the physical cores and
+the user's processing threads, `faderframe_realtime::channel_threads`;
+channels beyond them share threads) and a duplicated mono one circuit that
+wakes the other from its history, as the preamps do. A place's circuit is built by the workshop
 thread and swapped in on the stage's worker without allocating (offline the
 stage waits for it). Guitar lanes travel beside the audio through every
 stage for the DI, which leaves on the second output bus at unity. Offline
@@ -4181,7 +4647,11 @@ finish the way). Master trims after. Each channel
 has independent circuit state and uses fixed 2x oversampling with reported
 latency. A track's channels are solved side by side (`PreampBank`: the
 calling thread and helper threads of a `WorkerPool`, which adopt its
-scheduling, take a channel each; the output is what one thread computes).
+scheduling, take a channel each — a 5.1 track six threads, a 7.1.4 one
+twelve — within the physical cores and the user's processing threads,
+`faderframe_realtime::{channel_helpers, channel_threads}`, which the
+session sets with its own pool; beyond them channels share threads. The
+output is what one thread computes).
 Live preamps run on a dedicated worker through GainStageFx's generic
 reservoir in `faderframe-realtime`, buffering one device callback (at least
 128 host samples, `preamp::buffer_delay`; the engine passes the callback
@@ -4191,8 +4661,8 @@ of each callback's circuit work would be done while the audio thread
 waits. Live, the solver keeps to when the audio is due
 (`Preamp::set_realtime_deadline`): past it, a sample that will not settle
 stops after a few passes instead of the half-step rescue, so a block of hard
-transients (the German 76 at full gain on drums costs up to 3.5× real time
-for a block) cannot drop out. Monitoring stays available: the live signal
+transients (the German 76 at full gain on a drum loop near full scale takes
+up to 3.2× real time for a block) cannot drop out. Monitoring stays available: the live signal
 necessarily incurs that delay (2.67 ms at 48 kHz and up to 128-frame
 callbacks). Offline and already anticipated chains use inline DSP plus the
 same delay and the full solve, keeping renders deterministic. Parameter values travel
@@ -4208,6 +4678,25 @@ applied before decimation, synchronously with circuit gain changes. Constructor
 work runs off the audio thread; processing, automation, and reset use reserved
 storage. Gain switches retain the circuit's discrete positions. Extra hardware
 switches stay at their netlist resting values.
+
+What a channel costs. A sample's solve stops after one Newton pass where the
+second would only confirm it (`Simulation::set_early_acceptance`, on for the
+preamps and buses: the quadratic constant measured on recent two-pass solves
+predicts the correction it skips at a hundredth of the tolerance; −117 dB
+relative to the signal at worst, test tones' levels and THD within 1e-5 dB
+and 0.02 % of themselves). Compiled LU kernels cover the pivot plans the
+preamps and buses meet through their Gain at 44.1, 48 and 96 kHz
+(`examples/kernels.rs` takes the census and regenerates `kernels.rs`);
+before, the Tube 610 at full Level, the British 47 low, the German 76 driven
+hard, most valve buses and much at 44.1 kHz fell back to the masked replay,
+about three times slower. The Schur recovery and the per-sample RHS
+responses skip their exact zeros (bit-identical). Per channel at 48 kHz, CPU
+per 128-frame block (2667 µs), mean over the four-tone test at −30, −18 and
+−6 dBFS and a drum loop at Gain 25–100 %: British 73 512 → 348 µs, Tube 610
+437 → 301, British 47 310 → 222, German 76 616 → 460 (at full Gain on the
+tones 580–700 → 400–530), the valve buses 360–730 → 210–430; a drum loop
+near full scale at full Gain keeps the German 76 at about 920 µs, where its
+plates and grids cross their corners from sample to sample.
 
 As in GainStageFx, exact duplicated stereo input needs only one circuit solve.
 On the first differing block, the dormant channel receives the active channel's
@@ -4230,7 +4719,7 @@ REDD.47 at 34 dB) and German 76 (the V76 on its 34 dB step, with its 40 Hz
 high-pass and 15 kHz low-pass) — all in `circuits::console_bus`
 (`control(family)` = the booster's gain position), calibrated so −18 dBFS is
 +4 dBu at the line (the small-signal gain measured at a millivolt). The bus
-circuits cost 4–8 % of a core per channel (solid state) and 16–34 % (valves,
+circuits cost 2–6 % of a core per channel (solid state) and 11–21 % (valves,
 the German 76 the most) on a hot signal.
 
 * **Buses, returns and the master** sum through the circuit itself: a
@@ -4583,18 +5072,61 @@ places hardware MIDI; a copy of each goes to the session through a ring
 (`VoiceState::take_feed`, joined with the devices' messages in
 `tick_midi`).
 
-The tracker: low-passed and decimated to ~11 kHz; every 1 ms McLeod pitch
-over the shortest window holding 2.3 periods — 12 ms first, 22 or 40 ms
-for low voices, and while a note sounds 2.6 of its periods; a level gate;
-`Responsiveness` sets the holds and the clarity a voiced frame needs (Fast
-2 frames at 0.6, Balanced 4 at 0.78, Stable 14), change after 6/12/22
-frames with half a semitone plus 0.3 of hysteresis (vibrato and scoops stay
-on the note), release after 20/30/40 unvoiced; bends at most every 4 frames
-unless the pitch jumps; each event with where it was decided (`now`) and
-where its sound began (`at`). Allocation-free after `new` (the detector
-keeps its peak list). Glides as note expression (tuning), pitch bend (±2)
-or not at all; notes can snap to the project's key (`VoiceSettings`:
-sensitivity, glide, response, in key — Preferences → MIDI → Voice to MIDI).
+The tracker: high-passed at 50 Hz (rumble), low-passed and decimated to
+~11 kHz; every 1 ms McLeod pitch over the shortest window holding 2.3
+periods — 12 ms first, 22 or 40 ms for low voices, and while a note sounds
+2.6 of its periods — up to 2.3 kHz (whistles); a pitch an octave or a
+twelfth lower that is clearer by 0.04 is taken instead (a vowel's first
+formant on the second harmonic sounds an octave up otherwise,
+`Detector::peak_near`), and before a note starts the next longer window
+must not clearly hear another pitch. `Responsiveness` sets the holds and
+the clarity a voiced frame needs (Fast 2 frames at 0.6, Balanced 4 at
+0.78, Stable 14), change after 6/12/22 frames, release after 20/30/40
+unvoiced. A change waits until the pitch has settled (spread under 0.4
+semitone over 8 frames and not sliding into another key within 30 ms — the
+passing keys of a legato glide are no notes — unless the key holds three
+times its change frames) and never happens while the voice fades (3 dB in
+8 ms: a fall at a note's end). A young note (its first 100 ms) holds only
+0.6 semitone around its key, so a note begun on the way up a scoop moves
+to the key the voice settles on; an established one holds within the swing
+it showed over the last 250 ms plus 0.15, at least 0.8 and at most 0.95
+semitone each way (vibrato on a note sung a little off). Stable waits for
+a scoop to settle before a note starts (up to 90 ms; the others start at
+once — a note's first frames drift while its window fills). A note is
+placed where the voice began, a change where the new key was first heard;
+bends at most every 4 frames unless the pitch jumps; each event with where
+it was decided (`now`) and where its sound began (`at`). Allocation-free
+after `new` (fixed rings of the last 256 frames' pitch and level).
+
+Levels (`voice::level`): a frame is voiced over `VoiceConfig::threshold_db`
+(default −62 dBFS; saved preferences with the old default −45 read as the
+new one) and over the input's own noise floor plus 6 dB (`LevelGate`: the
+6 ms level followed down at once and up at 10 dB/s while nothing plays,
+0.5 dB/s while a note sounds; it starts where the gate is the threshold),
+so any input gain works and the room's noise stays out. Mains hum starts
+no note: a pitch within 18/30 cents of 50/60 Hz or 12 cents of their 2nd–4th
+harmonics only carries on the note it belongs to (no equal-tempered note
+is that near). Velocities follow the performer: 127 at the loudest note
+start lately (a reference at least 12 dB over the gate, falling 1 dB/s),
+1 at 36 dB under it — or a calibration's `Dynamics` (velocity 40 at the
+soft level, 127 at the loud). Each tracker counts every frame's level, and
+the voiced ones, into a `Meter` (1 dB bins, atomics: the audio thread only
+adds; `VoiceRun::meter`), which the session reads as `Levels`.
+
+Calibration (`voice::calibrate`, `Session::start_voice_calibration`,
+Preferences → MIDI → Voice to MIDI → Calibrate…, dev action
+`voice-calibrate:<n|cancel|forget|state>`): the input's listener (one is
+made for it when no track takes it, on that input's own port) counts the
+room alone for 3 s, then the performance for 8 s; the room's 95th
+percentile + 3 dB (and any pitched noise in it + 4) is the lowest the gate
+goes, the soft notes' 10th percentile − 6 the highest; the threshold sits
+35 % of the way up (the soft notes win where they overlap, with advice).
+The soft and loud levels become `VoiceSettings::dynamics`; advice for hot,
+quiet or noisy inputs (`calibration::Advice`); `forget_voice_calibration`
+goes back to the defaults. Glides as note expression (tuning), pitch bend
+(±2) or not at all; notes can snap to the project's key (`VoiceSettings`:
+sensitivity, glide, response, in key, dynamics — Preferences → MIDI →
+Voice to MIDI).
 Polyphonic mode is opt-in (`VoiceSettings::polyphonic`): `PolyTracker`
 uses a 96/128/160 ms Hann window at Fast/Balanced/Stable, analysed every
 4 ms. Harmonic candidates share spectral energy; up to six notes are
@@ -4602,7 +5134,16 @@ followed independently, with per-key tuning in `VoiceEvent::Bend`. The
 longer windows resolve nearby low fundamentals. Ambiguous simultaneous
 octave doublings can merge, and pure sine tones lack the required
 harmonics. Note expression glides each key; channel pitch bend is only
-used in monophonic mode, since it would bend every note together.
+used in monophonic mode, since it would bend every note together. Its
+levels: new notes start only while the input's 6 ms level is over the
+threshold and the floor it follows; each note's level (its partials) must
+be over that floor and at most 22 dB under the loudest notes lately (the
+gate follows the performance, so a quiet guitar is heard like a loud one);
+new notes start only within 24 dB of the input's loudest lately (falling
+6 dB/s: decays start none); mains hum starts no note; a note played again
+starts again only when its fundamental keeps up for 3 more frames (what
+rings on as the next chord is struck swells for a frame in its leakage);
+the meter counts the loudest note's level for voiced frames.
 Changing mono/poly constructs a new listener on the control thread.
 Releases from the old listener are deferred in `MidiInputState` until the
 next nonempty callback, so `take` cannot erase them. The session drains
@@ -4643,6 +5184,21 @@ records a detuned triad, checks each key's expression, and verifies release
 through a zero-frame control pump; the counting allocator covers chords,
 settings changes and listener retirement. Manual timing:
 `cargo test --release -p faderframe-analysis polyvoice::tests::callback_cost -- --ignored --exact --nocapture`.
+Measurement: `faderframe-analysis/tests/voice_corpus` makes sung phrases
+(Rosenberg glottal pulses through vowel formants, scoops, vibrato, notes
+off pitch, falls, breaths, consonants, loudness moving; a man's and a
+woman's voice), whistling, a plucked lead line, strummed and picked guitar
+chords and piano (stiff detuned strings, hammer) — each at −40 to −6 dBFS
+peak in a quiet room, a noisy one (pink noise 32 dB under) and with 60 Hz
+hum — and scores every note (right, late, octave, wrong, missed, merged
+doublings, notes in silence, stray, played again, latency, end, velocity):
+`cargo test --release -p faderframe-analysis --test voice_corpus -- --ignored --nocapture`
+(`VOICE_CORPUS=mono|poly`, `VOICE_RESPONSE=all`, `VOICE_CALIBRATED=1`;
+`voice_corpus_dump` with `VOICE_DUMP=<piece>@<dB>@<room>` lists one case
+note by note, `voice_corpus_cost` times the trackers). At Balanced the F1
+of right notes went from 47 % to 79 % (monophonic) and 52 % to 68 %
+(polyphonic), the same at every level; `voice_corpus_holds_its_accuracy`
+holds it on part of the corpus.
 
 ### Polyphonic pitch editing
 
@@ -4671,6 +5227,20 @@ gain; bins no note owns (noise, attacks) stay. The window is 85 ms where
 notes sound together (their partials apart) and about 4.5 periods (at least
 20 ms) for a note alone (vibrato followed); only the spans of changed notes
 are processed, crossfaded into the original, the rest bit for bit.
+
+Lengths and removal: each note is stretched on its own — the rest of the
+sound (the other notes, noise) stays where it is, and a longer note rings
+on over whatever follows, as a held key would. `Moved::placed` is where it
+sounds now: where it was played it is taken out (its peaks' share at gain
+0, as muting does), and over `placed` each frame takes its partials from
+the frame of its own sound that falls there (stretched evenly; shared peaks
+split as there), turned by `f·(ratio·hop − dt)` per frame, `dt` the step
+between the frames taken — a phase vocoder on that note's peaks alone,
+which reduces to the shift above where nothing is stretched. Removed notes
+(`PitchEdit::removed`) go to the renderer at gain 0. Test:
+`one_note_of_a_chord_is_made_longer_and_another_shorter` (a held E within
+0.01 dB of its level in the chord after the chord ends, C and G 70 dB
+down there; a shortened G gone where the chord still plays).
 
 Playback: the engine plays a polyphonic clip's source like any other
 (`PitchEdit::plays_live` keeps PSOLA to melodic edits). The session renders

@@ -6,9 +6,12 @@
 //! as it is pressed unless the grid's next step is close. The notes are
 //! the held keys over one to four octaves, in one of nine orders; each
 //! step's note lasts the gate (a share of the step, past one: legato), at
-//! the played velocity or a fixed one, and can repeat. Hold keeps playing
-//! the last chord after the keys are let go, until a new one is pressed.
-//! Everything that is not a note passes through.
+//! the played velocity or a fixed one, and can repeat. A velocity pattern
+//! shapes the steps (an accent on the first of every few, alternating,
+//! ramps, random), by the accent's amount; chance leaves steps out at
+//! random. Hold keeps playing the last chord after the keys are let go,
+//! until a new one is pressed. Everything that is not a note passes
+//! through.
 
 use super::midi_fx::{self, Schedule, Sounding};
 use super::{on_off, param, pick, stepped};
@@ -32,6 +35,10 @@ pub mod id {
     pub const VELOCITY: u32 = 5;
     pub const HOLD: u32 = 6;
     pub const REPEATS: u32 = 7;
+    pub const PATTERN: u32 = 8;
+    pub const PATTERN_LENGTH: u32 = 9;
+    pub const ACCENT: u32 = 10;
+    pub const CHANCE: u32 = 11;
 }
 
 /// Published: the note played last (−1: none), the steps played since the
@@ -62,6 +69,16 @@ const AS_PLAYED: usize = 6;
 const RANDOM: usize = 7;
 const CHORD: usize = 8;
 
+/// Velocity patterns over the steps.
+pub const PATTERNS: [&str; 6] = [
+    "Flat",
+    "Accent First",
+    "Alternate",
+    "Ramp Up",
+    "Ramp Down",
+    "Random",
+];
+
 /// The rate's default: 1/16.
 const DEFAULT_RATE: f64 = 5.0;
 /// Keys held at most.
@@ -85,6 +102,15 @@ pub fn parameters() -> Vec<ParameterInfo> {
         ranged(id::VELOCITY, "Velocity", 0.0, 127.0, 0.0),
         stepped(id::HOLD, "Hold", 1.0, 0.0),
         ranged(id::REPEATS, "Repeats", 1.0, 4.0, 1.0),
+        stepped(
+            id::PATTERN,
+            "Velocity Pattern",
+            (PATTERNS.len() - 1) as f64,
+            0.0,
+        ),
+        ranged(id::PATTERN_LENGTH, "Pattern Length", 2.0, 8.0, 4.0),
+        param(id::ACCENT, "Accent", 0.0, 1.0, 0.5, Percent),
+        param(id::CHANCE, "Chance", 0.0, 1.0, 1.0, Percent),
     ]
 }
 
@@ -97,12 +123,37 @@ pub fn format(pid: ParameterId, v: f64) -> Option<String> {
         id::VELOCITY => format!("{:.0}", v.round()),
         id::HOLD => on_off(v),
         id::REPEATS => format!("{:.0}×", v.round()),
+        id::PATTERN => pick(&PATTERNS, v),
+        id::PATTERN_LENGTH => format!("{:.0} steps", v.round()),
         _ => return None,
     })
 }
 
 pub fn latency(_params: &ParamValues, _rate: f64) -> u32 {
     0
+}
+
+/// How loud step `step` of a velocity pattern of `length` steps is, 0
+/// (fully accented down) to 1 (full): `random` (0…1) decides the random
+/// pattern's.
+pub fn pattern_weight(pattern: usize, step: u64, length: usize, random: f64) -> f64 {
+    let length = length.max(2);
+    let k = (step % length as u64) as usize;
+    match pattern {
+        1 => f64::from(u8::from(k == 0)),
+        2 => f64::from(u8::from(step.is_multiple_of(2))),
+        3 => k as f64 / (length - 1) as f64,
+        4 => 1.0 - k as f64 / (length - 1) as f64,
+        5 => random.clamp(0.0, 1.0),
+        _ => 1.0,
+    }
+}
+
+/// A step's velocity: `base` taken down by the accent's share of what the
+/// pattern leaves out (never under 1).
+pub fn shaped_velocity(base: u8, accent: f64, weight: f64) -> u8 {
+    let scale = 1.0 - accent.clamp(0.0, 1.0) * (1.0 - weight.clamp(0.0, 1.0));
+    ((f64::from(base) * scale).round() as u8).max(1)
 }
 
 /// Which note of a pattern of `n` step `pos` plays (`None`: at random).
@@ -263,6 +314,14 @@ impl ArpeggiatorProcessor {
         self.dirty = false;
     }
 
+    /// The next random number (xorshift).
+    fn random(&mut self) -> u32 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 17;
+        self.rng ^= self.rng << 5;
+        self.rng
+    }
+
     /// The index into the pattern for step `pos`.
     fn index(&mut self, pos: u64) -> usize {
         let n = self.n_seq;
@@ -271,10 +330,7 @@ impl ArpeggiatorProcessor {
         }
         let mut i;
         loop {
-            self.rng ^= self.rng << 13;
-            self.rng ^= self.rng >> 17;
-            self.rng ^= self.rng << 5;
-            i = self.rng as usize % n.max(1);
+            i = self.random() as usize % n.max(1);
             if n <= 1 || i != self.last_random {
                 break;
             }
@@ -294,8 +350,20 @@ impl ArpeggiatorProcessor {
         }
         let fixed = self.get(id::VELOCITY).round() as u8;
         let at = self.clock + u64::from(offset);
+        // The step's share of the velocity, and whether it plays at all.
+        let pattern = self.get(id::PATTERN).round().max(0.0) as usize;
+        let steps = self.get(id::PATTERN_LENGTH).round().clamp(2.0, 8.0) as usize;
+        let random = f64::from(self.random()) / f64::from(u32::MAX);
+        let weight = pattern_weight(pattern, self.steps, steps, random);
+        let accent = self.get(id::ACCENT);
+        let chance = self.get(id::CHANCE).clamp(0.0, 1.0);
+        let plays = chance >= 1.0 || f64::from(self.random()) / f64::from(u32::MAX) < chance;
         let mut play = |s: &mut Self, st: Step| {
+            if !plays {
+                return;
+            }
             let velocity = if fixed > 0 { fixed } else { st.velocity };
+            let velocity = shaped_velocity(velocity, accent, weight);
             s.sounding.on(out, offset, st.channel, st.key, velocity);
             let off = faderframe_midi::MidiEvent::NoteOff {
                 channel: st.channel,
@@ -662,6 +730,71 @@ mod tests {
             .unwrap_or_default();
         let later = rig::run(&mut a, &[], 24_000, 120.0, false, &NO_HARMONY);
         assert!(ons(&later).is_empty());
+    }
+
+    #[test]
+    fn velocity_patterns_shape_the_steps_and_chance_leaves_some_out() {
+        let velocities = |set: &[(u32, f64)], steps: usize| {
+            let mut a = arp(set);
+            let got = rig::run(
+                &mut a,
+                &[on(0, 60, 100), on(0, 64, 100)],
+                SIXTEENTH * steps as u64,
+                120.0,
+                true,
+                &NO_HARMONY,
+            );
+            ons(&got)
+                .iter()
+                .filter(|n| n.0 < SIXTEENTH * steps as u64)
+                .map(|n| n.2)
+                .collect::<Vec<u8>>()
+        };
+        // An accent on the first of every four, the rest at half.
+        assert_eq!(
+            velocities(&[(id::PATTERN, 1.0), (id::ACCENT, 0.5)], 6),
+            [100, 50, 50, 50, 100, 50]
+        );
+        // Alternate at full accent: every second step as quiet as can be.
+        assert_eq!(
+            velocities(&[(id::PATTERN, 2.0), (id::ACCENT, 1.0)], 4),
+            [100, 1, 100, 1]
+        );
+        // Ramps over the pattern's length (repeats count as steps).
+        assert_eq!(
+            velocities(
+                &[
+                    (id::PATTERN, 3.0),
+                    (id::ACCENT, 0.6),
+                    (id::PATTERN_LENGTH, 4.0)
+                ],
+                5
+            ),
+            [40, 60, 80, 100, 40]
+        );
+        assert_eq!(
+            velocities(
+                &[
+                    (id::PATTERN, 4.0),
+                    (id::ACCENT, 0.6),
+                    (id::PATTERN_LENGTH, 3.0),
+                    (id::REPEATS, 2.0),
+                ],
+                4
+            ),
+            [100, 70, 40, 100]
+        );
+        // Random: within the accent's reach, not all the same.
+        let v = velocities(&[(id::PATTERN, 5.0), (id::ACCENT, 0.5)], 16);
+        assert!(v.iter().all(|v| (50..=100).contains(v)), "{v:?}");
+        assert!(v.windows(2).any(|w| w[0] != w[1]), "{v:?}");
+        // Chance: none at 0, some at a half, every one at 1.
+        assert!(velocities(&[(id::CHANCE, 0.0)], 16).is_empty());
+        let some = velocities(&[(id::CHANCE, 0.5)], 32).len();
+        assert!((4..=28).contains(&some), "{some}");
+        assert_eq!(velocities(&[], 16).len(), 16);
+        assert_eq!(shaped_velocity(100, 1.0, 0.0), 1);
+        assert_eq!(pattern_weight(0, 7, 4, 0.2), 1.0);
     }
 
     #[test]

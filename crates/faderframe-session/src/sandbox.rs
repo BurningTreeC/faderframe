@@ -42,8 +42,7 @@ impl Default for PluginCare {
 
 impl Session {
     fn slot_name(&self, id: PluginInstanceId) -> String {
-        self.plugin_owner(id)
-            .map_or_else(|| "A plugin".into(), |(_, s)| s.plugin.name.clone())
+        self.device_name(id).unwrap_or_else(|| "A plugin".into())
     }
 
     /// Per tick: report new failures, keep sandboxed plugins' state.

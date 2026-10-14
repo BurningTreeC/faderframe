@@ -5,12 +5,14 @@
 //! * Filters: high pass 16–600 Hz at 12, 18 or 24 dB/oct, low pass
 //!   3–22 kHz at 12 dB/oct; optionally only in the dynamics' key (the
 //!   console's "filters to side-chain").
-//! * Gate: opens over the threshold, closes 3 dB under it after the hold,
-//!   down by the range; as an expander, 2:1 under the threshold.
+//! * Gate: opens over the threshold, closes the hysteresis (3 dB to start
+//!   with) under it after the hold, down by the range; as an expander,
+//!   2:1 under the threshold.
 //! * Compressor: the threshold, ratio and knee of the gain computer the
 //!   stock compressor uses, peak or RMS detection, attack and release,
 //!   make-up and a mix for parallel compression; the dynamics are keyed by
-//!   the channel itself or the sidechain.
+//!   the channel itself or the sidechain, and the key can be heard
+//!   (Sidechain Listen) to set the filters to it.
 //! * EQ: low and high bands as shelves or bells, two parametric mids; the
 //!   "Black" character narrows the bands as their gain grows (proportional
 //!   Q), "Brown" keeps them as set.
@@ -74,6 +76,8 @@ pub mod id {
     pub const ORDER: u32 = 36;
     pub const DRIVE: u32 = 37;
     pub const OUTPUT: u32 = 38;
+    pub const SC_LISTEN: u32 = 39;
+    pub const GATE_HYSTERESIS: u32 = 40;
 }
 
 /// Published: the compressor's reduction now and its peak, the gate's
@@ -183,6 +187,15 @@ pub fn parameters() -> Vec<ParameterInfo> {
         stepped(id::ORDER, "Order", 1.0, 0.0),
         param(id::DRIVE, "Drive", 0.0, 1.0, 0.0, Percent),
         param(id::OUTPUT, "Output", -24.0, 24.0, 0.0, Decibels),
+        stepped(id::SC_LISTEN, "Sidechain Listen", 1.0, 0.0),
+        param(
+            id::GATE_HYSTERESIS,
+            "Gate Hysteresis",
+            0.0,
+            20.0,
+            3.0,
+            Decibels,
+        ),
     ]
 }
 
@@ -199,7 +212,8 @@ pub fn format(pid: ParameterId, v: f64) -> Option<String> {
         | id::EXTERNAL
         | id::EQ
         | id::LF_BELL
-        | id::HF_BELL => on_off(v),
+        | id::HF_BELL
+        | id::SC_LISTEN => on_off(v),
         id::HPF if v <= HPF_OFF + 0.5 => "Off".into(),
         id::LPF if v >= LPF_OFF - 50.0 => "Off".into(),
         id::GATE_RANGE if v <= GATE_FLOOR + 0.5 => "−∞ dB".into(),
@@ -423,12 +437,14 @@ impl PluginProcessor for ChannelStripProcessor {
             let makeup_t = gain(self.get(id::COMP_MAKEUP));
             let to_sc = self.get(id::FILTERS_TO_SC) >= 0.5;
             let external = self.get(id::EXTERNAL) >= 0.5 && side.is_some();
+            let listen = self.get(id::SC_LISTEN) >= 0.5;
             let eq_first = self.get(id::ORDER) < 0.5;
             // Gate.
             let gate_on = self.get(id::GATE) >= 0.5;
             let g_thr = self.get(id::GATE_THRESHOLD);
             let g_range = self.get(id::GATE_RANGE);
             let expander = self.get(id::GATE_MODE) >= 0.5;
+            let hysteresis = self.get(id::GATE_HYSTERESIS).max(0.0);
             let span = (-g_range).max(1.0);
             let rise = span / (self.get(id::GATE_ATTACK).max(0.1) * 0.001 * sr);
             let fall = span / (self.get(id::GATE_RELEASE).max(1.0) * 0.001 * sr);
@@ -508,7 +524,7 @@ impl PluginProcessor for ChannelStripProcessor {
                         if level > g_thr {
                             self.open = true;
                             self.hold = hold;
-                        } else if level < g_thr - 3.0 {
+                        } else if level < g_thr - hysteresis {
                             if self.hold > 0 {
                                 self.hold -= 1;
                             } else {
@@ -563,10 +579,14 @@ impl PluginProcessor for ChannelStripProcessor {
                 if !eq_first {
                     eq(self, &mut x);
                 }
-                let y = [
-                    drive(x[0], amount) * self.output,
-                    drive(x[1], amount) * self.output,
-                ];
+                let y = if listen {
+                    key
+                } else {
+                    [
+                        drive(x[0], amount) * self.output,
+                        drive(x[1], amount) * self.output,
+                    ]
+                };
                 out_peak = out_peak.max(y[0].abs()).max(y[1].abs());
                 out.channel_mut(0)[i] = y[0] as f32;
                 if channels >= 2 {
@@ -637,7 +657,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-    use crate::devices::rig::{Rig, level, silence, tone};
+    use crate::devices::rig::{Rig, bin_db, level, silence, tone};
 
     fn rig(set: &[(u32, f64)]) -> Rig<ChannelStripProcessor> {
         Rig::with(parameters(), TAP_VALUES, set, ChannelStripProcessor::new)
@@ -760,6 +780,73 @@ mod tests {
         );
         let (l, _) = r.run(0.5, tone(500.0, gain(-20.0)), tone(80.0, 0.5));
         assert!(level(&l, 500.0) < -40.0, "keyed: {}", level(&l, 500.0));
+    }
+
+    #[test]
+    fn the_hysteresis_keeps_the_gate_open_between_the_thresholds() {
+        let mut r = rig(&[
+            (id::GATE, 1.0),
+            (id::GATE_THRESHOLD, -30.0),
+            (id::GATE_HYSTERESIS, 10.0),
+            (id::GATE_RANGE, GATE_FLOOR),
+            (id::GATE_HOLD, 0.0),
+        ]);
+        r.run(0.3, tone(500.0, gain(-20.0)), silence);
+        // 5 dB under the threshold but over the closing one: still open.
+        let (l, _) = r.run(0.5, tone(500.0, gain(-35.0)), silence);
+        assert!(
+            (level(&l, 500.0) + 35.0).abs() < 0.3,
+            "{}",
+            level(&l, 500.0)
+        );
+        // Under both: closed.
+        let (l, _) = r.run(0.5, tone(500.0, gain(-45.0)), silence);
+        assert!(level(&l, 500.0) < -100.0, "{}", level(&l, 500.0));
+        // With the default 3 dB, −35 is under both.
+        let mut r = rig(&[
+            (id::GATE, 1.0),
+            (id::GATE_THRESHOLD, -30.0),
+            (id::GATE_RANGE, GATE_FLOOR),
+            (id::GATE_HOLD, 0.0),
+        ]);
+        r.run(0.3, tone(500.0, gain(-20.0)), silence);
+        let (l, _) = r.run(0.5, tone(500.0, gain(-35.0)), silence);
+        assert!(level(&l, 500.0) < -100.0, "{}", level(&l, 500.0));
+    }
+
+    #[test]
+    fn sidechain_listen_plays_what_the_dynamics_hear() {
+        // The filtered key (the filters to the key: a high pass at 1 kHz
+        // takes the 100 Hz tone out of what is heard).
+        let mut r = rig(&[
+            (id::SC_LISTEN, 1.0),
+            (id::FILTERS_TO_SC, 1.0),
+            (id::HPF, 600.0),
+            (id::OUTPUT, -12.0),
+        ]);
+        let signal = |n: usize| {
+            let (a, _) = tone(100.0, 0.3)(n);
+            let (b, _) = tone(3_000.0, 0.3)(n);
+            (a + b, a + b)
+        };
+        r.run(0.3, signal, silence);
+        let (l, _) = r.run(0.5, signal, silence);
+        assert!(bin_db(&l, 100.0) < -10.46 - 30.0, "{}", bin_db(&l, 100.0));
+        // The output gain does not apply to what is listened to.
+        assert!(
+            (bin_db(&l, 3_000.0) + 10.46).abs() < 0.5,
+            "{}",
+            bin_db(&l, 3_000.0)
+        );
+        // The external key.
+        let mut r = rig(&[(id::SC_LISTEN, 1.0), (id::EXTERNAL, 1.0)]);
+        let (l, _) = r.run(0.3, tone(500.0, 0.5), tone(80.0, 0.25));
+        assert!(
+            (bin_db(&l, 80.0) + 12.04).abs() < 0.3,
+            "{}",
+            bin_db(&l, 80.0)
+        );
+        assert!(bin_db(&l, 500.0) < -80.0, "{}", bin_db(&l, 500.0));
     }
 
     #[test]

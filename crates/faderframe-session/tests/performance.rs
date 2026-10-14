@@ -57,10 +57,12 @@ fn loads_are_reported_per_plugin_track_and_in_total() {
     assert_eq!(t_busy.plugins.len(), 3);
     assert!(t_plain.plugins.is_empty());
     let plugins: f64 = t_busy.plugins.iter().map(|p| p.load.average).sum();
+    // Three of a name on one track are numbered, as the views show them.
+    let names: Vec<&str> = t_busy.plugins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["Echo", "Echo (2)", "Echo (3)"]);
     for p in &t_busy.plugins {
         assert!(p.load.average > 0.0, "{p:?}");
         assert!(!p.failed && !p.bypassed);
-        assert_eq!(p.name, "Echo");
     }
     // A track's load includes its plugins and its own mixing work.
     assert!(

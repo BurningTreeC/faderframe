@@ -249,7 +249,14 @@ impl Processor<EngineContext> for MidiClipPlayer {
             let to = from + n as i64;
             match play {
                 Play::Arrangement => {
-                    if let Some(lane) = timeline.lane(self.track) {
+                    // Counting in: nothing before the take starts.
+                    let from = match cx.data.recording.silent_before(t.recording) {
+                        Some(start) => from.max(start),
+                        None => from,
+                    };
+                    if from < to
+                        && let Some(lane) = timeline.lane(self.track)
+                    {
                         self.play_span(lane, out, from, to, pos);
                     }
                 }

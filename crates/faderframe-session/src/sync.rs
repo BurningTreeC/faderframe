@@ -763,7 +763,7 @@ impl Session {
             self.start_recording(target)?;
         }
         self.engine.chase(target, at_ns, true)?;
-        self.show_position(target);
+        self.show_position_until_jump(target);
         self.loader.wake();
         if !self.transport.playing {
             self.transport.playing = true;

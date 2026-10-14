@@ -498,7 +498,7 @@ fn toolbar_wraps_in_narrow_views() {
         view.paint(&mut p, size, &s, &Theme::default());
         let l = view.layout(size);
         let items = view.toolbar_items(l.toolbar, &s);
-        assert_eq!(items.len(), 19, "every control stays reachable at {w}");
+        assert_eq!(items.len(), 23, "every control stays reachable at {w}");
         assert!(
             items
                 .iter()
@@ -784,4 +784,111 @@ fn the_keyboard_plays_the_key_under_the_pointer_as_a_real_one_does() {
             assert_eq!(got, k);
         }
     }
+}
+
+/// Shift-click on a note selects the notes from the one last clicked to it:
+/// the keys between theirs, over the time they span.
+#[test]
+fn shift_click_selects_the_notes_between() {
+    let mut s = session();
+    let mut view = PianoRollView::new(Theme::default());
+    let all = notes(&s);
+    let a = all[0];
+    let b = *all
+        .iter()
+        .find(|n| n.start > a.start && n.key.abs_diff(a.key) <= 4 && n.key != a.key)
+        .expect("a later note near the first");
+    let ya = row_y(&mut view, &s, a.key);
+    let xa = view.x_of(a.start) + 9.0;
+    run(
+        &mut view,
+        down(Point::new(xa, ya), Modifiers::NONE, 1),
+        &mut s,
+    );
+    run(&mut view, up(Point::new(xa, ya), Modifiers::NONE), &mut s);
+    let yb = view.y_of(b.key).unwrap() + view.row_h / 2.0;
+    let xb = view.x_of(b.start) + 9.0;
+    let shift = Modifiers {
+        shift: true,
+        ..Modifiers::NONE
+    };
+    run(&mut view, down(Point::new(xb, yb), shift, 1), &mut s);
+    run(&mut view, up(Point::new(xb, yb), shift), &mut s);
+    let (k0, k1) = (a.key.min(b.key), a.key.max(b.key));
+    let (t0, t1) = (a.start, a.end().max(b.end()));
+    let want: std::collections::BTreeSet<_> = all
+        .iter()
+        .filter(|n| (k0..=k1).contains(&n.key) && n.start < t1 && n.end() > t0)
+        .map(|n| n.id)
+        .collect();
+    assert!(want.len() >= 2);
+    assert_eq!(s.selection.notes, want);
+}
+
+/// Zoom like the arranger: the toolbar's −/+/Sel/Fit, Alt+wheel for the
+/// row height.
+#[test]
+fn the_toolbar_zooms_and_alt_wheel_sizes_the_rows() {
+    use crate::toolbar::{Item, Zoom};
+    let mut s = session();
+    let mut view = PianoRollView::new(Theme::default());
+    paint(&mut view, &s);
+    let l = view.layout(SIZE);
+    let press = |view: &mut PianoRollView, s: &mut Session, z: Zoom| {
+        let items = view.toolbar_items(view.layout(SIZE).toolbar, s);
+        let at = items
+            .iter()
+            .find(|i| i.0 == Item::Zoom(z))
+            .unwrap()
+            .1
+            .center();
+        run(view, down(at, Modifiers::NONE, 1), s);
+        run(view, up(at, Modifiers::NONE), s);
+        paint(view, s);
+    };
+    let ppq = view.ppq;
+    press(&mut view, &mut s, Zoom::In);
+    assert!(view.ppq > ppq * 1.5, "in");
+    press(&mut view, &mut s, Zoom::Out);
+    assert!((view.ppq - ppq).abs() < 0.01, "and out again");
+    // Fit: the clip's length across the grid, its notes' keys in view.
+    press(&mut view, &mut s, Zoom::Fit);
+    let len = notes(&s).iter().map(|n| n.end()).max().unwrap();
+    let m_len = {
+        let id = s.editor_clip().unwrap();
+        s.project().clip(id).unwrap().as_midi().unwrap().length
+    };
+    assert!(view.x_of(m_len) <= l.grid.right() + 1.0, "the clip fits");
+    assert!(view.x_of(len) > l.grid.x);
+    for n in notes(&s) {
+        let y = view.y_of(n.key).unwrap();
+        assert!(
+            y >= l.grid.y - 1.0 && y <= l.grid.bottom(),
+            "{} shown",
+            n.key
+        );
+    }
+    // Alt+wheel: smaller rows, then taller again.
+    let wheel = |view: &mut PianoRollView, s: &mut Session, dy: f32| {
+        run(
+            view,
+            ViewEvent::Scroll {
+                pos: l.grid.center(),
+                dx: 0.0,
+                dy,
+                modifiers: Modifiers {
+                    alt: true,
+                    ..Modifiers::NONE
+                },
+                precise: false,
+            },
+            s,
+        );
+    };
+    let row_h = view.row_h;
+    wheel(&mut view, &mut s, 2.0);
+    let smaller = view.row_h;
+    assert!(smaller < row_h, "{smaller} < {row_h}");
+    wheel(&mut view, &mut s, -1.0);
+    assert!(view.row_h > smaller);
 }

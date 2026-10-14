@@ -1812,3 +1812,242 @@ fn a_strip_into_a_bed_turns_by_vbap_or_balances_on_its_knob() {
         "{actions:?}"
     );
 }
+
+/// Shift-click on a strip's name selects the strips from the one last
+/// clicked to it, as the mixer shows them.
+#[test]
+fn shift_click_selects_the_strips_between() {
+    let mut s = session();
+    let mut view = MixerView::new(Theme::default());
+    let size = Size::new(1600.0, 700.0);
+    view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
+    let strips: Vec<TrackId> = MixerView::channel_tracks(&s).iter().map(|t| t.id).collect();
+    let name = |view: &MixerView, s: &Session, i: usize| {
+        view.scribble_rect(s, strips[i], size).unwrap().center()
+    };
+    let click = |view: &mut MixerView, s: &mut Session, at: Point, mods: Modifiers| {
+        let down = ViewEvent::PointerDown {
+            pos: at,
+            button: PointerButton::Primary,
+            modifiers: mods,
+            clicks: 1,
+        };
+        let up = ViewEvent::PointerUp {
+            pos: at,
+            button: PointerButton::Primary,
+            modifiers: mods,
+        };
+        for ev in [down, up] {
+            for a in run(view, ev, size, s).0 {
+                s.dispatch(a).unwrap();
+            }
+        }
+    };
+    let first = name(&view, &s, 0);
+    click(&mut view, &mut s, first, Modifiers::NONE);
+    let third = name(&view, &s, 3);
+    let shift = Modifiers {
+        shift: true,
+        ..Modifiers::NONE
+    };
+    click(&mut view, &mut s, third, shift);
+    let want: std::collections::BTreeSet<_> = strips[..4].iter().copied().collect();
+    assert_eq!(s.selection.tracks, want);
+}
+
+/// Cue mode: with a cue mix shown, a strip's fader, pan and mute set its
+/// send there (one gesture per drag), solo does nothing, and the master
+/// section is the cue mix's own (level, mute, click); the strips sit under
+/// the cue bar.
+#[test]
+fn in_a_cue_mix_the_strips_set_its_sends() {
+    use faderframe_session::cues::CueOp;
+    let mut s = session();
+    s.dispatch(Action::Cue(CueOp::New)).unwrap();
+    let cue = s.mixer_cue().unwrap().id;
+    let theme = Theme::default();
+    let mut view = MixerView::new(theme.clone());
+    let size = Size::new(1400.0, 800.0);
+    let bar = cue::CUE_BAR_H;
+    let below = Size::new(size.w, size.h - bar);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    let texts = p.texts();
+    assert!(
+        texts.contains(&"CUE 1"),
+        "the bar and the cue master: {texts:?}"
+    );
+    assert!(texts.contains(&"MAIN MIX"));
+    assert!(
+        !texts.contains(&"MASTER"),
+        "the master section is the cue mix's"
+    );
+    let at = |r: Rect| Point::new(r.center().x, r.center().y + bar);
+    let bass = MixerView::channel_tracks(&s)[1].id;
+    let l = view.layout_of(&s, bass, below).unwrap();
+
+    let (a, _) = run(&mut view, down(at(l.mute), 1), size, &s);
+    assert_eq!(
+        a,
+        vec![Action::Edit(Command::SetCueSendOn {
+            track: bass,
+            cue,
+            on: false
+        })]
+    );
+    let (a, _) = run(&mut view, down(at(l.solo), 1), size, &s);
+    assert!(a.is_empty(), "solo is the main mix's: {a:?}");
+    let (a, _) = run(&mut view, down(at(l.pan_knob), 2), size, &s);
+    assert_eq!(
+        a,
+        vec![Action::Edit(Command::SetCueSendPan {
+            track: bass,
+            cue,
+            pan: 0.0
+        })]
+    );
+    // A fader drag: the send level, one gesture.
+    let geo = FaderGeometry::new(l.fader, &theme);
+    let level = s.cue_send(s.project().track(bass).unwrap(), cue).level_db;
+    let cap = geo.cap_rect(view.law.db_to_position(level)).center();
+    let cap = Point::new(cap.x, cap.y + bar);
+    let (mut all, _) = run(&mut view, down(cap, 1), size, &s);
+    assert_eq!(all, vec![Action::BeginGesture("Cue Level".into())]);
+    let (a, _) = run(
+        &mut view,
+        ViewEvent::PointerMove {
+            pos: Point::new(cap.x, cap.y - 30.0),
+            modifiers: Modifiers::NONE,
+            dragging: true,
+        },
+        size,
+        &s,
+    );
+    all.extend(a);
+    let (a, _) = run(
+        &mut view,
+        ViewEvent::PointerUp {
+            pos: cap,
+            button: PointerButton::Primary,
+            modifiers: Modifiers::NONE,
+        },
+        size,
+        &s,
+    );
+    all.extend(a);
+    assert_eq!(all.last(), Some(&Action::EndGesture));
+    assert!(all.iter().any(|a| matches!(
+        a,
+        Action::Edit(Command::SetCueSendLevel { track, db, .. }) if *track == bass && *db > level
+    )));
+    assert!(
+        !all.iter()
+            .any(|a| matches!(a, Action::Edit(Command::SetTrackVolume { .. }))),
+        "the main fader never moves"
+    );
+    // The master section: the cue mix's mute and click.
+    let master = s.project().master_id().unwrap();
+    let m = view.layout_of(&s, master, below).unwrap();
+    let (a, _) = run(&mut view, down(at(m.mute), 1), size, &s);
+    assert_eq!(a, vec![Action::Edit(Command::SetCueMute { cue, on: true })]);
+    let (a, _) = run(&mut view, down(at(m.record), 1), size, &s);
+    assert_eq!(
+        a,
+        vec![Action::Edit(Command::SetCueClick {
+            cue,
+            on: false,
+            db: 0.0
+        })]
+    );
+    // Applied: the bass's send is off, its main mute is not.
+    s.dispatch(Action::Edit(Command::SetCueSendOn {
+        track: bass,
+        cue,
+        on: false,
+    }))
+    .unwrap();
+    assert!(MixerView::mute_shown(&s, s.project().track(bass).unwrap()));
+    assert!(!s.project().track(bass).unwrap().mute);
+}
+
+/// The cue bar: Main Mix and each cue mix to show, "+" for a new one,
+/// Copy Main Mix and Pre/Post for the one shown, its menu on a right-click.
+#[test]
+fn the_cue_bar_chooses_what_the_faders_set() {
+    use faderframe_session::cues::CueOp;
+    let mut s = session();
+    let theme = Theme::default();
+    let mut view = MixerView::new(theme.clone());
+    let size = Size::new(1400.0, 800.0);
+    // No cue mixes: no bar.
+    assert_eq!(view.cue_bar_h(&s), 0.0);
+    s.dispatch(Action::Cue(CueOp::New)).unwrap();
+    let cue = s.mixer_cue().unwrap().id;
+    view.paint(&mut RecordingPainter::new(), size, &s, &theme);
+    assert_eq!(view.cue_bar_h(&s), cue::CUE_BAR_H);
+    let items = view.bar_items(size.w, &s);
+    let find = |want: BarHit| {
+        items
+            .iter()
+            .find(|(_, h, _)| *h == want)
+            .map(|(r, _, _)| r.center())
+            .unwrap()
+    };
+    let (a, _) = run(&mut view, down(find(BarHit::Main), 1), size, &s);
+    assert_eq!(a, vec![Action::Cue(CueOp::Show(None))]);
+    let (a, _) = run(&mut view, down(find(BarHit::Cue(cue)), 1), size, &s);
+    assert_eq!(a, vec![Action::Cue(CueOp::Show(Some(cue)))]);
+    let (a, _) = run(&mut view, down(find(BarHit::New), 1), size, &s);
+    assert_eq!(a, vec![Action::Cue(CueOp::New)]);
+    let (a, _) = run(&mut view, down(find(BarHit::CopyMain), 1), size, &s);
+    assert_eq!(a, vec![Action::Cue(CueOp::CopyMainMix(cue))]);
+    let (a, _) = run(&mut view, down(find(BarHit::Tap), 1), size, &s);
+    assert_eq!(
+        a,
+        vec![Action::Cue(CueOp::SetTap {
+            cue,
+            tap: SendTap::PostFader
+        })]
+    );
+    let (_, r) = run(
+        &mut view,
+        ViewEvent::PointerDown {
+            pos: find(BarHit::Cue(cue)),
+            button: PointerButton::Secondary,
+            modifiers: Modifiers::NONE,
+            clicks: 1,
+        },
+        size,
+        &s,
+    );
+    let Some(HostRequest::ContextMenu { items, .. }) = r.first() else {
+        panic!("a menu");
+    };
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    assert!(labels.contains(&"Remove Cue Mix"), "{labels:?}");
+    assert!(labels.contains(&"Copy Main Mix"));
+    assert!(labels.iter().any(|l| l.starts_with("Outputs (Out 3-4)")));
+    // Back on the main mix the faders are the main mix's again.
+    s.dispatch(Action::Cue(CueOp::Show(None))).unwrap();
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    assert!(p.texts().contains(&"MASTER"));
+    let bar = cue::CUE_BAR_H;
+    let first = MixerView::channel_tracks(&s)[0];
+    let l = view
+        .layout_of(&s, first.id, Size::new(size.w, size.h - bar))
+        .unwrap();
+    let (a, _) = run(
+        &mut view,
+        down(Point::new(l.mute.center().x, l.mute.center().y + bar), 1),
+        size,
+        &s,
+    );
+    assert_eq!(
+        a,
+        vec![Action::Edit(Command::SetTrackMute {
+            track: first.id,
+            on: true
+        })]
+    );
+}

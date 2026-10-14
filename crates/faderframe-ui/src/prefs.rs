@@ -22,6 +22,9 @@ pub struct Preferences {
     pub startup_project: String,
     /// Recently used projects, most recent first (absolute paths).
     pub recent_projects: Vec<String>,
+    /// Media no saved state uses, when a project closes: "ask", "trash"
+    /// or "keep".
+    pub unused_media: String,
     /// The skin (`Theme::id`).
     pub theme: String,
     pub snap: bool,
@@ -37,7 +40,20 @@ pub struct Preferences {
     /// The mode the metronome button switches on ("recording" or
     /// "always").
     pub metronome_on: String,
+    /// The pre-roll in bars of older preferences (`preroll` replaces it).
     pub preroll_bars: u32,
+    /// Input quantize (the transport's Q) and its grid (None: the edit
+    /// grid).
+    pub input_quantize: bool,
+    pub input_grid: Option<faderframe_timeline::GridDivision>,
+    /// The pre-roll (`Roll::id`); empty: `preroll_bars`.
+    pub preroll: String,
+    /// The pre-roll starts on a bar line.
+    pub preroll_on_bar: bool,
+    /// The pre-roll plays the click alone.
+    pub count_in: bool,
+    /// Played after a punch-out (`Roll::id`).
+    pub postroll: String,
     /// How the metronome sounds (Preferences → Metronome).
     pub metronome_sound: faderframe_session::MetronomeSettings,
     /// Stop puts the playhead at the start of the project.
@@ -134,6 +150,13 @@ impl Default for Preferences {
             metronome: MetronomeMode::Recording.id().into(),
             metronome_on: MetronomeMode::Always.id().into(),
             preroll_bars: 0,
+            preroll: String::new(),
+            input_quantize: false,
+            input_grid: None,
+            unused_media: "ask".into(),
+            preroll_on_bar: true,
+            count_in: false,
+            postroll: String::new(),
             metronome_sound: Default::default(),
             stop_to_start: false,
             record_latency_offset: 0,
@@ -237,7 +260,14 @@ impl Preferences {
             mode: RecordMode::from_id(&self.record_mode).unwrap_or(d.mode),
             loop_mode: LoopRecordMode::from_id(&self.loop_record_mode).unwrap_or(d.loop_mode),
             metronome: MetronomeMode::from_id(&self.metronome).unwrap_or(d.metronome),
-            preroll_bars: self.preroll_bars.min(8),
+            preroll: faderframe_session::Roll::from_id(&self.preroll).unwrap_or(
+                faderframe_session::Roll::bars(f64::from(self.preroll_bars.min(8))),
+            ),
+            preroll_on_bar: self.preroll_on_bar,
+            count_in: self.count_in,
+            input_quantize: self.input_quantize,
+            input_grid: self.input_grid,
+            postroll: faderframe_session::Roll::from_id(&self.postroll).unwrap_or(d.postroll),
             latency_offset: self.record_latency_offset,
             ..d
         }
@@ -247,7 +277,12 @@ impl Preferences {
         self.record_mode = r.mode.id().into();
         self.loop_record_mode = r.loop_mode.id().into();
         self.metronome = r.metronome.id().into();
-        self.preroll_bars = r.preroll_bars;
+        self.preroll = r.preroll.id();
+        self.preroll_on_bar = r.preroll_on_bar;
+        self.count_in = r.count_in;
+        self.input_quantize = r.input_quantize;
+        self.input_grid = r.input_grid;
+        self.postroll = r.postroll.id();
         self.record_latency_offset = r.latency_offset;
     }
 

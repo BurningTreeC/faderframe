@@ -91,8 +91,10 @@ pub(crate) enum Kind {
     Choice,
     /// A stepped value with every option in view.
     Segments,
-    /// A horizontal slider.
-    Slider,
+    /// A horizontal slider (a bipolar one filled from its zero).
+    Slider {
+        bipolar: bool,
+    },
 }
 
 /// A control bound to a parameter.
@@ -145,10 +147,9 @@ impl Ctl {
         }
     }
 
-    #[expect(dead_code, reason = "for the faces with sliders still to come")]
     pub fn slider(id: ParameterId, label: &'static str, rect: Rect) -> Self {
         Self {
-            kind: Kind::Slider,
+            kind: Kind::Slider { bipolar: false },
             ..Self::knob(id, label, rect)
         }
     }
@@ -157,6 +158,7 @@ impl Ctl {
         self.kind = match self.kind {
             Kind::Knob { .. } => Kind::Knob { bipolar: true },
             Kind::SmallKnob { .. } => Kind::SmallKnob { bipolar: true },
+            Kind::Slider { .. } => Kind::Slider { bipolar: true },
             k => k,
         };
         self
@@ -596,8 +598,14 @@ impl<F: Face> DeviceView<F> {
                 );
             }
             Kind::Choice => {
-                p.text(c.label, Rect::new(r.x, r.y, r.w, 13.0), &label_style);
-                let b = Rect::new(r.x, r.y + 15.0, r.w, (r.h - 15.0).min(22.0));
+                // Without a label the box takes the top.
+                let top = if c.label.is_empty() {
+                    r.y
+                } else {
+                    p.text(c.label, Rect::new(r.x, r.y, r.w, 13.0), &label_style);
+                    r.y + 15.0
+                };
+                let b = Rect::new(r.x, top, r.w, (r.bottom() - top).min(22.0));
                 p.fill_rounded(b, 4.0, &Paint::Solid(th.ui.surface_alt));
                 p.stroke_rounded(
                     b,
@@ -642,7 +650,7 @@ impl<F: Face> DeviceView<F> {
                 }
                 p.stroke_rounded(b, 4.0, 1.0, th.ui.border);
             }
-            Kind::Slider => {
+            Kind::Slider { bipolar } => {
                 p.text(
                     &format!("{}  {}", c.label, self.text(cx.tap, c.id, v)),
                     Rect::new(r.x, r.y, r.w, 13.0),
@@ -653,8 +661,15 @@ impl<F: Face> DeviceView<F> {
                 let track = Rect::new(r.x, r.y + 20.0, r.w, 5.0);
                 p.fill_rounded(track, 2.5, &Paint::Solid(th.device.display));
                 let t = scale.to_norm(info, v) as f32;
+                // From the start, or (bipolar) from where zero is.
+                let from = if bipolar {
+                    scale.to_norm(info, 0.0) as f32
+                } else {
+                    0.0
+                };
+                let (a, b) = (from.min(t), from.max(t));
                 p.fill_rounded(
-                    Rect::new(track.x, track.y, track.w * t, track.h),
+                    Rect::new(track.x + track.w * a, track.y, track.w * (b - a), track.h),
                     2.5,
                     &Paint::Solid(cx.accent.with_alpha(0.85)),
                 );
@@ -959,14 +974,14 @@ impl<F: Face> DeviceView<F> {
                         .clamp(0.0, (n - 1) as f32);
                     self.set_once(model, cx, c.id, info.min + f64::from(i));
                 }
-                Kind::Knob { .. } | Kind::SmallKnob { .. } | Kind::Slider => {
+                Kind::Knob { .. } | Kind::SmallKnob { .. } | Kind::Slider { .. } => {
                     if clicks >= 2 {
                         self.type_value(model, &tap, &c, cx);
                         return true;
                     }
                     let scale = c.scale.unwrap_or_else(|| Scale::of(&info));
                     self.device.begin(cx, c.label);
-                    let horizontal = c.kind == Kind::Slider;
+                    let horizontal = matches!(c.kind, Kind::Slider { .. });
                     let track = Rect::new(c.rect.x, c.rect.y + 20.0, c.rect.w, 5.0);
                     self.drag = Some(Drag::Control {
                         id: c.id,

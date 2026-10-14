@@ -853,9 +853,9 @@ impl Theme {
         (k.scribble_bg, k.scribble_text) = (c(s.scribble.0), c(s.scribble.1));
         let skin_wood = k.look.wood.is_some();
         k.look = s.look;
-        if skin_wood {
-            k.look.wood = Some((c(s.wood.0), c(s.wood.1)));
-        }
+        // Wooden cheeks (and the room for them) only on a skin that has
+        // them, in the family's wood; never added by the family.
+        k.look.wood = skin_wood.then(|| (c(s.wood.0), c(s.wood.1)));
         t
     }
 
@@ -911,7 +911,16 @@ mod tests {
             assert!((a - b).abs() > 0.4, "family {f}: label contrast");
             // Meters that show the level (a VU face fills a narrow strip).
             assert_ne!(t.console.look.meter, MeterKind::Edgewise, "family {f}");
-            // A skin with wooden cheeks keeps them, in the family's wood.
+            // A skin with wooden cheeks keeps them, in the family's wood;
+            // the others never get them (nor the room for them).
+            for skin in &all {
+                assert_eq!(
+                    skin.with_console_family(f).console.look.wood.is_some(),
+                    skin.console.look.wood.is_some(),
+                    "{} with family {f}",
+                    skin.id
+                );
+            }
             assert!(
                 Theme::by_id("vintage")
                     .with_console_family(f)

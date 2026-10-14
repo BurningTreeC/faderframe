@@ -276,7 +276,11 @@ impl ContainerView {
 
     fn device_menu(model: &Session, track: TrackId, slot: &PluginSlot) -> Vec<MenuItem<Action>> {
         let mut items = vec![
-            MenuItem::disabled(slot.plugin.name.clone()),
+            MenuItem::disabled(
+                model
+                    .device_name(slot.id)
+                    .unwrap_or_else(|| slot.plugin.name.clone()),
+            ),
             MenuItem::new(
                 "Show Editor",
                 Action::OpenPluginEditor {
@@ -447,6 +451,9 @@ impl ContainerView {
                     th.ui.text_faint.with_alpha(0.5)
                 },
             );
+            let named = model
+                .device_name(slot.id)
+                .unwrap_or_else(|| slot.plugin.name.clone());
             let name = if slot.plugin.is_container() {
                 let n = model
                     .container_chains(
@@ -456,9 +463,9 @@ impl ContainerView {
                         slot.id,
                     )
                     .map_or(0, <[Chain]>::len);
-                format!("{} ({n} chains)", slot.plugin.name)
+                format!("{named} ({n} chains)")
             } else {
-                slot.plugin.name.clone()
+                named
             };
             p.text(
                 &name,

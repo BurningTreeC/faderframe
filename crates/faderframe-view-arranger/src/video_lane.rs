@@ -280,8 +280,7 @@ impl ArrangerView {
                     return s;
                 }
                 let fr = model.timecode().rate;
-                let frame = fr.frame_at(s as f64 / rate as f64);
-                (fr.seconds_of(frame) * rate as f64).round() as i64
+                fr.first_sample(fr.frame_at_sample(s, rate), rate)
             };
             let delta = self.sample_at_x(model, pos.x) - d.grab;
             let ns = |samples: i64| faderframe_project::video::samples_to_ns(samples, rate);

@@ -32,6 +32,18 @@ pub(crate) enum Item {
     Inspector,
     /// The MIDI Tools panel.
     MidiTools,
+    Zoom(Zoom),
+}
+
+/// The toolbar's zoom buttons (like the arranger's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Zoom {
+    Out,
+    In,
+    /// The selected notes fill the view.
+    Selection,
+    /// The whole clip, and the keys it uses.
+    Fit,
 }
 
 /// Note lengths offered for new notes.
@@ -108,6 +120,15 @@ impl PianoRollView {
             model.editor.snap,
             42.0,
         );
+        flow.group();
+        for (z, label, w) in [
+            (Zoom::Out, "−", 26.0),
+            (Zoom::In, "+", 26.0),
+            (Zoom::Selection, "Sel", 34.0),
+            (Zoom::Fit, "Fit", 32.0),
+        ] {
+            add(&mut flow, Item::Zoom(z), label.into(), false, w);
+        }
         flow.group();
         add(
             &mut flow,
@@ -290,6 +311,10 @@ impl PianoRollView {
             Item::Audition => "Hear notes while drawing, moving and on the keys".into(),
             Item::Step => "Step input: play notes on your MIDI keyboard to enter them".into(),
             Item::Inspector => "Selection — click to type a velocity".into(),
+            Item::Zoom(Zoom::Out) => "Zoom out (−, Ctrl+wheel; Alt+wheel: row height)".into(),
+            Item::Zoom(Zoom::In) => "Zoom in (+, Ctrl+wheel; Alt+wheel: row height)".into(),
+            Item::Zoom(Zoom::Selection) => "Zoom to the selected notes".into(),
+            Item::Zoom(Zoom::Fit) => "Zoom to the whole clip and the keys it uses".into(),
             Item::MidiTools => {
                 "Transform the selection (strum, chop, arpeggiate, conform…) or generate notes (rhythms, melodies, chords, basslines, drums)".into()
             }
@@ -316,6 +341,7 @@ impl PianoRollView {
         &mut self,
         item: Item,
         rect: Rect,
+        size: faderframe_ui_canvas::Size,
         model: &Session,
         cx: &mut EventCx<'_, Action>,
     ) {
@@ -323,6 +349,7 @@ impl PianoRollView {
         let at = Point::new(rect.x, rect.bottom());
         let clip = Self::clip(model);
         match item {
+            Item::Zoom(z) => self.zoom(z, size, model),
             Item::Tool(t) => self.tool = t,
             Item::Grid => cx.request(HostRequest::ContextMenu {
                 at,

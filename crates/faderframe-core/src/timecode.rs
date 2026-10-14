@@ -182,7 +182,38 @@ impl FrameRate {
         let (n, d) = self.ratio();
         frame as f64 * d as f64 / n as f64
     }
+
+    /// Frame `frame`'s first sample at `sample_rate`: the first at or
+    /// after its start (exact). Most frames of the 1000/1001 rates start
+    /// between two samples; the nearest one may lie before the start, in
+    /// the frame before.
+    pub fn first_sample(self, frame: i64, sample_rate: u32) -> i64 {
+        let (n, d) = self.ratio();
+        let x = frame as i128 * d as i128 * sample_rate.max(1) as i128;
+        let n = n as i128;
+        (x.div_euclid(n) + i128::from(x.rem_euclid(n) != 0)) as i64
+    }
+
+    /// The frame showing at sample `sample` (at `sample_rate`): frames
+    /// show from [`FRAME_HAIR_NS`] before their start, so a position
+    /// taken from a file's frame times (rounded by its container) lands in
+    /// the frame it means.
+    pub fn frame_at_sample(self, sample: i64, sample_rate: u32) -> i64 {
+        let (n, d) = self.ratio();
+        let rate = sample_rate.max(1) as i128;
+        // In samples × 10⁹: the hair exactly, at any rate.
+        let x = sample as i128 * 1_000_000_000 + FRAME_HAIR_NS as i128 * rate;
+        (x * n as i128).div_euclid(d as i128 * rate * 1_000_000_000) as i64
+    }
 }
+
+/// How long before its start a frame shows. Frame times are rounded where
+/// they come from — a container's (Matroska keeps milliseconds: half of
+/// one either way), a timeline's samples (a clip placed between two) — so
+/// a frame's own start, however it was reckoned, has to land in it; a
+/// frame shows (and a timecode label reads) from a millisecond before
+/// its exact start.
+pub const FRAME_HAIR_NS: i64 = 1_000_000;
 
 /// A timecode label (hours:minutes:seconds:frames).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -506,6 +506,22 @@ pub trait Device: Send {
     fn switches(&self) -> bool {
         false
     }
+
+    /// Whether `v` puts this device across one of its model's corners from
+    /// where it was last linearised (a grid starting or stopping to conduct,
+    /// a plate at its edge): a Newton step over a corner is not
+    /// quadratically accurate, so a solve may not stop early on it (see
+    /// `Simulation::set_early_acceptance`).
+    fn crossed(&self, _v: &[f64]) -> bool {
+        false
+    }
+
+    /// Whether the device conducts by a PN junction's exponential, whose
+    /// curvature moves the fastest with the operating point (see
+    /// `Simulation::set_early_acceptance`).
+    fn junction(&self) -> bool {
+        false
+    }
 }
 
 fn across(v: &[f64], a: usize, b: usize) -> f64 {
@@ -689,6 +705,10 @@ impl Diode {
 impl Device for Diode {
     fn footprint(&self, m: &mut Mark) {
         m.conductance(self.a, self.k);
+    }
+
+    fn junction(&self) -> bool {
+        true
     }
 
     fn linearisation(&self) -> Linearisation {
@@ -1112,6 +1132,12 @@ impl Device for Triode {
 
     fn settled(&self, _tolerance: f64) -> bool {
         !self.clamped
+    }
+
+    fn crossed(&self, v: &[f64]) -> bool {
+        let vgk = across(v, self.g, self.k);
+        let vpk = across(v, self.p, self.k);
+        (vgk < 0.0) != (self.vgk < 0.0) || (vpk <= 0.0) != (self.vpk <= 0.0)
     }
 }
 
@@ -1591,6 +1617,15 @@ impl Device for Pentode {
 
     fn settled(&self, _tolerance: f64) -> bool {
         !self.clamped
+    }
+
+    fn crossed(&self, v: &[f64]) -> bool {
+        let vgk = across(v, self.g, self.k);
+        let vpk = across(v, self.p, self.k);
+        let vsk = across(v, self.s, self.k);
+        (vgk < 0.0) != (self.vgk < 0.0)
+            || (vpk <= 0.0) != (self.vpk <= 0.0)
+            || (vsk <= 0.0) != (self.vsk <= 0.0)
     }
 }
 
@@ -2303,6 +2338,10 @@ impl Bipolar {
 }
 
 impl Device for Bipolar {
+    fn junction(&self) -> bool {
+        true
+    }
+
     fn footprint(&self, m: &mut Mark) {
         let (c, b, e) = (self.c, self.b, self.e);
         if self.pnp {
@@ -3333,6 +3372,23 @@ impl Device for AnyDevice {
             AnyDevice::Core(c) => c.switches(),
             AnyDevice::Transconductor(t) => t.switches(),
             AnyDevice::VariableResistor(r) => r.switches(),
+        }
+    }
+
+    #[inline]
+    fn crossed(&self, v: &[f64]) -> bool {
+        match self {
+            AnyDevice::Triode(t) => t.crossed(v),
+            AnyDevice::Pentode(p) => p.crossed(v),
+            _ => false,
+        }
+    }
+
+    fn junction(&self) -> bool {
+        match self {
+            AnyDevice::Diode(d) => d.junction(),
+            AnyDevice::Bipolar(b) => b.junction(),
+            _ => false,
         }
     }
 }

@@ -660,7 +660,11 @@ fn shift_click_selects_more_clips_and_edits_apply_to_all() {
     let lower = |r: Rect| Point::new(r.x + 60.0, r.y + r.h * 0.8);
     drag(&mut view, &mut s, size, lower(r1), &[], Modifiers::NONE);
     drag(&mut view, &mut s, size, lower(r2), &[], shift);
-    assert_eq!(s.selection.clips.len(), 2, "shift adds to the selection");
+    assert_eq!(
+        s.selection.clips.len(),
+        2,
+        "shift selects from the last click to this one"
+    );
     // Dragging one moves both, by the same (snapped) amount, as one step.
     let starts = |s: &Session| {
         (
@@ -690,8 +694,12 @@ fn shift_click_selects_more_clips_and_edits_apply_to_all() {
     assert_eq!(s.selection.clips.len(), 2, "a drag keeps the group");
     s.dispatch(Action::Undo).unwrap();
     assert_eq!(starts(&s), before);
-    // Shift-clicking a selected clip removes it.
-    drag(&mut view, &mut s, size, lower(r2), &[], shift);
+    // Ctrl-clicking a selected clip removes it (Shift selects a range).
+    let ctrl = Modifiers {
+        ctrl: true,
+        ..Modifiers::NONE
+    };
+    drag(&mut view, &mut s, size, lower(r2), &[], ctrl);
     assert_eq!(s.selection.clips.len(), 1);
 }
 
@@ -1120,7 +1128,8 @@ fn the_chord_and_key_lanes_take_typed_chords_moves_and_keys() {
     // Its menu offers the key's chords: set the key first (C major).
     let ky = lane(GlobalLane::Key);
     let at = Point::new(x_at(&view, 1.0), ky);
-    let (_, req) = run(&mut view, down(at), size, &s);
+    run(&mut view, down(at), size, &s);
+    let (_, req) = run(&mut view, up(at), size, &s);
     let Some(HostRequest::ContextMenu { items, .. }) = req
         .into_iter()
         .find(|r| matches!(r, HostRequest::ContextMenu { .. }))
@@ -1774,4 +1783,360 @@ fn a_dual_panned_header_knob_moves_the_whole_image() {
             pan: DualPan::ORIGINAL
         }))
     );
+}
+
+fn with(shift: bool, ctrl: bool) -> Modifiers {
+    Modifiers {
+        shift,
+        ctrl,
+        ..Modifiers::NONE
+    }
+}
+
+/// Shift-click selects everything from the clip last clicked to the one
+/// clicked: the tracks between them, over the time they span.
+#[test]
+fn shift_click_selects_the_clips_from_the_last_click_to_this_one() {
+    let mut s = session();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 900.0);
+    view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
+    let (drums, pad) = (clip_of(&s, "Drums"), clip_of(&s, "Pad"));
+    let lower = |r: Rect| Point::new(r.x + 30.0, r.y + r.h * 0.8);
+    let r1 = view.clip_view_rect(&s, size, drums).unwrap();
+    let r2 = view.clip_view_rect(&s, size, pad).unwrap();
+    drag(&mut view, &mut s, size, lower(r1), &[], Modifiers::NONE);
+    drag(&mut view, &mut s, size, lower(r2), &[], with(true, false));
+    let names: Vec<String> = s
+        .selection
+        .clips
+        .iter()
+        .map(|c| {
+            let t = s.project().clip(*c).unwrap().track;
+            s.project().track(t).unwrap().name.clone()
+        })
+        .collect();
+    for n in ["Drums", "Bass", "Pluck", "Pad"] {
+        assert!(names.iter().any(|x| x == n), "{n} in {names:?}");
+    }
+    assert!(!names.iter().any(|x| x == "Lead Synth"), "below the range");
+    assert_eq!(
+        s.selection.anchor_clip,
+        Some(drums),
+        "the range keeps its anchor"
+    );
+    // Shift-click on a header: the tracks between.
+    let rows: Vec<TrackId> = ArrangerView::lane_tracks(&s).iter().map(|t| t.id).collect();
+    let (h0, h3) = (view.row_rect(0, size), view.row_rect(3, size));
+    drag(
+        &mut view,
+        &mut s,
+        size,
+        Point::new(20.0, h0.y + 8.0),
+        &[],
+        Modifiers::NONE,
+    );
+    drag(
+        &mut view,
+        &mut s,
+        size,
+        Point::new(20.0, h3.y + 8.0),
+        &[],
+        with(true, false),
+    );
+    let want: std::collections::BTreeSet<_> = rows[..4].iter().copied().collect();
+    assert_eq!(s.selection.tracks, want);
+}
+
+/// Ctrl+drag draws a rectangle selecting the clips it touches; a Ctrl-click
+/// without a drag still toggles a clip.
+#[test]
+fn ctrl_drag_selects_the_clips_under_a_rectangle() {
+    let mut s = session();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 900.0);
+    view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
+    let (bass, pluck, drums) = (
+        clip_of(&s, "Bass"),
+        clip_of(&s, "Pluck"),
+        clip_of(&s, "Drums"),
+    );
+    let rb = view.clip_view_rect(&s, size, bass).unwrap();
+    let rp = view.clip_view_rect(&s, size, pluck).unwrap();
+    // From the Bass clip's body down into the Pluck clip's.
+    let from = Point::new(rb.x + 20.0, rb.y + rb.h * 0.6);
+    let to = Point::new(rb.x + 80.0, rp.y + rp.h * 0.6);
+    drag(
+        &mut view,
+        &mut s,
+        size,
+        from,
+        &[Point::new(from.x + 10.0, from.y + 10.0), to],
+        with(false, true),
+    );
+    let want: std::collections::BTreeSet<_> = [bass, pluck].into_iter().collect();
+    assert_eq!(s.selection.clips, want);
+    // Ctrl-click (no drag) on the drum clip adds it, again removes it.
+    let rd = view.clip_view_rect(&s, size, drums).unwrap();
+    let on = Point::new(rd.x + 30.0, rd.y + rd.h * 0.8);
+    drag(&mut view, &mut s, size, on, &[], with(false, true));
+    assert!(s.selection.clips.contains(&drums));
+    drag(&mut view, &mut s, size, on, &[], with(false, true));
+    assert!(!s.selection.clips.contains(&drums));
+    assert!(s.selection.clips.contains(&bass));
+}
+
+/// A click below the last track moves the playhead there too.
+#[test]
+fn a_click_below_the_tracks_moves_the_playhead() {
+    let mut s = session();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 3000.0);
+    view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
+    let rows = ArrangerView::lane_tracks(&s).len();
+    let below = view.row_rect(rows, size).y + 40.0;
+    assert!(below < size.h - 10.0, "room below the tracks");
+    let t = MusicalTime::from_quarters_i(8);
+    let at = Point::new(view.x_of(t) + 1.0, below);
+    assert!(matches!(view.hit_test(at, size, &s), Some(Hit::Empty(_))));
+    drag(&mut view, &mut s, size, at, &[], Modifiers::NONE);
+    assert!(
+        (s.playhead() - t).quarters().abs() < 1e-3,
+        "{:?}",
+        s.playhead()
+    );
+}
+
+/// More than one key: a click on a later bar adds a change there, a drag
+/// across bars draws a passage in another key (the old key comes back after
+/// it), and a change drags to another bar.
+#[test]
+fn key_changes_are_added_drawn_and_moved() {
+    use faderframe_project::harmony::{Key, Scale};
+    use faderframe_session::lanes::GlobalLane;
+    let mut s = bare_session();
+    let theme = Theme::default();
+    let mut view = ArrangerView::new(theme.clone());
+    let size = Size::new(1400.0, 700.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    let (_, y, h) = view
+        .global_lanes()
+        .into_iter()
+        .find(|(l, ..)| *l == GlobalLane::Key)
+        .unwrap();
+    let y = y + h / 2.0;
+    let q = MusicalTime::from_quarters;
+    let at = |view: &ArrangerView, quarters: f64| Point::new(view.x_of(q(quarters)), y);
+    // Choose from the menu a click or a drag opens.
+    let choose = |view: &mut ArrangerView, s: &mut Session, from: Point, to: Point, label: &str| {
+        run(view, down(from), size, s);
+        if to != from {
+            run(view, mv(Point::new((from.x + to.x) / 2.0, y)), size, s);
+            run(view, mv(to), size, s);
+        }
+        let (_, req) = run(view, up(to), size, s);
+        let Some(HostRequest::ContextMenu { items, .. }) = req
+            .into_iter()
+            .find(|r| matches!(r, HostRequest::ContextMenu { .. }))
+        else {
+            panic!("a key menu")
+        };
+        let action = items
+            .iter()
+            .find(|i| i.label == label)
+            .and_then(|i| i.action.clone())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label} in {:?}",
+                    items.iter().map(|i| &i.label).collect::<Vec<_>>()
+                )
+            });
+        s.dispatch(action).unwrap();
+        view.paint(&mut RecordingPainter::new(), size, s, &Theme::default());
+    };
+    // The first key, then a change at bar 5 (quarter 16).
+    let first = at(&view, 1.0);
+    choose(&mut view, &mut s, first, first, "C Major");
+    let bar5 = at(&view, 17.0);
+    choose(&mut view, &mut s, bar5, bar5, "G Major");
+    let keys: Vec<_> = s.project().keys.iter().map(|k| (k.at, k.key)).collect();
+    assert_eq!(
+        keys,
+        [
+            (q(0.0), Key::new(0, Scale::Major)),
+            (q(16.0), Key::new(7, Scale::Major))
+        ]
+    );
+    // Drawn across bars 9–10 (quarters 32–40): D major there, G after.
+    let (a, b) = (at(&view, 33.0), at(&view, 38.0));
+    choose(&mut view, &mut s, a, b, "D Major");
+    assert_eq!(s.project().key_at(q(34.0)), Some(Key::new(2, Scale::Major)));
+    assert_eq!(s.project().key_at(q(40.0)), Some(Key::new(7, Scale::Major)));
+    assert_eq!(s.project().key_at(q(30.0)), Some(Key::new(7, Scale::Major)));
+    // The G change dragged from bar 5 to bar 3 (quarter 8).
+    let path = [at(&view, 12.0), at(&view, 9.0)];
+    let grab = at(&view, 16.5);
+    drag(&mut view, &mut s, size, grab, &path, Modifiers::NONE);
+    assert_eq!(s.project().key_at(q(8.0)), Some(Key::new(7, Scale::Major)));
+    assert_eq!(s.project().key_at(q(7.0)), Some(Key::new(0, Scale::Major)));
+    assert!(s.project().keys.iter().all(|k| k.at != q(16.0)));
+}
+
+#[test]
+fn menus_offer_lead_sheets_of_several_clips_and_scores_of_several_tracks() {
+    use faderframe_session::leadsheet::{Grid, LeadSheetOf};
+    let mut s = Session::new(
+        faderframe_project::Project::new("Menus", 48_000),
+        None,
+        EngineConfig::default(),
+    )
+    .unwrap();
+    let a = s.add_track(TrackKind::Midi).unwrap();
+    let b = s.add_track(TrackKind::Midi).unwrap();
+    let q = MusicalTime::from_quarters;
+    for (id, track, at) in [(1, a, 0.0), (2, a, 8.0), (3, b, 0.0)] {
+        s.dispatch(Action::Edit(Command::AddClip {
+            clip: Box::new(Clip {
+                id: ClipId(id),
+                track,
+                name: format!("clip {id}"),
+                color: None,
+                start: q(at),
+                muted: false,
+                content: ClipContent::Midi(faderframe_project::MidiClip {
+                    length: q(4.0),
+                    ..Default::default()
+                }),
+            }),
+        }))
+        .unwrap();
+    }
+    // The menu's lead sheet entries.
+    let entries = |req: HostRequest<Action>| -> Vec<(String, Option<Action>)> {
+        let HostRequest::ContextMenu { items, .. } = req else {
+            panic!("a menu")
+        };
+        items
+            .into_iter()
+            .filter(|i| {
+                (i.label.contains("Lead Sheet") || i.label.contains("Score"))
+                    && !i.label.contains("Tab")
+            })
+            .map(|i| (i.label, i.action))
+            .collect()
+    };
+    // Its guitar tab entries.
+    let tabs = |req: HostRequest<Action>| -> Vec<(String, Option<Action>)> {
+        let HostRequest::ContextMenu { items, .. } = req else {
+            panic!("a menu")
+        };
+        items
+            .into_iter()
+            .filter(|i| i.label.contains("Guitar Tab"))
+            .map(|i| (i.label, i.action))
+            .collect()
+    };
+    let make = |of| {
+        Some(Action::MakeLeadSheet {
+            of,
+            grid: Grid::Auto,
+        })
+    };
+    let at = Point::new(10.0, 10.0);
+    // Two clips of a track: one line of both.
+    s.dispatch(Action::SelectClips {
+        clips: vec![ClipId(2), ClipId(1)],
+        mode: SelectMode::Replace,
+    })
+    .unwrap();
+    let clip = s.project().clip(ClipId(1)).unwrap().clone();
+    assert_eq!(
+        entries(ArrangerView::clip_menu(&s, &clip, at)),
+        [
+            (
+                "Lead Sheet (Melody, Chords, Words)".to_string(),
+                make(LeadSheetOf::Clip(ClipId(1)))
+            ),
+            (
+                "Lead Sheet of the 2 Selected Clips".to_string(),
+                make(LeadSheetOf::Clips(vec![ClipId(1), ClipId(2)]))
+            ),
+        ]
+    );
+    assert_eq!(
+        tabs(ArrangerView::clip_menu(&s, &clip, at)),
+        [
+            (
+                "Guitar Tab".to_string(),
+                Some(Action::MakeTab {
+                    of: LeadSheetOf::Clip(ClipId(1))
+                })
+            ),
+            (
+                "Guitar Tab of the 2 Selected Clips".to_string(),
+                Some(Action::MakeTab {
+                    of: LeadSheetOf::Clips(vec![ClipId(1), ClipId(2)])
+                })
+            ),
+        ]
+    );
+    // And one on another track: a score.
+    s.dispatch(Action::SelectClips {
+        clips: vec![ClipId(3)],
+        mode: SelectMode::Add,
+    })
+    .unwrap();
+    let items = entries(ArrangerView::clip_menu(&s, &clip, at));
+    assert_eq!(
+        items[1],
+        (
+            "Score of the Selected Clips (2 Tracks, a Staff Each)".to_string(),
+            make(LeadSheetOf::Clips(vec![ClipId(1), ClipId(2), ClipId(3)]))
+        )
+    );
+    // Two tracks selected: the track menu's score, top to bottom.
+    s.dispatch(Action::SelectTracks {
+        tracks: vec![b, a],
+        mode: SelectMode::Replace,
+    })
+    .unwrap();
+    let track = s.project().track(b).unwrap().clone();
+    assert_eq!(
+        entries(ArrangerView::track_menu(&s, &track, at)),
+        [
+            (
+                "Lead Sheet of This Track".to_string(),
+                make(LeadSheetOf::Track(b))
+            ),
+            (
+                "Score of the 2 Selected Tracks (a Staff Each)".to_string(),
+                make(LeadSheetOf::Tracks(vec![a, b]))
+            ),
+        ]
+    );
+    assert_eq!(
+        tabs(ArrangerView::track_menu(&s, &track, at)),
+        [
+            (
+                "Guitar Tab of This Track".to_string(),
+                Some(Action::MakeTab {
+                    of: LeadSheetOf::Track(b)
+                })
+            ),
+            (
+                "Score with Guitar Tab (2 Tracks)".to_string(),
+                Some(Action::MakeTab {
+                    of: LeadSheetOf::Tracks(vec![a, b])
+                })
+            ),
+        ]
+    );
+    // A track that is not one of them offers its own only.
+    s.dispatch(Action::SelectTracks {
+        tracks: vec![b],
+        mode: SelectMode::Replace,
+    })
+    .unwrap();
+    assert_eq!(entries(ArrangerView::track_menu(&s, &track, at)).len(), 1);
 }

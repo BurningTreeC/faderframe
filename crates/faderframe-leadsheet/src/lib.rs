@@ -1,5 +1,6 @@
-//! Lead sheets: a melody with its chords and words, written out as
-//! MusicXML and engraved on pages.
+//! Lead sheets: a melody with its chords and words — or several tracks'
+//! lines, a staff each, one below the other — written out as MusicXML and
+//! engraved on pages.
 
 #![forbid(unsafe_code)]
 
@@ -10,6 +11,8 @@ pub mod glyph;
 pub mod musicxml;
 pub mod pdf;
 pub mod score;
+pub mod tab;
 
-pub use build::{Bar, ChordAt, Grid, Input, Line, Note, build};
-pub use score::LeadSheet;
+pub use build::{Bar, ChordAt, Grid, Input, Line, Note, Staff, StaffTab, build};
+pub use score::{LeadSheet, Part};
+pub use tab::{TUNINGS, Tuning};

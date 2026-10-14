@@ -702,3 +702,22 @@ fn a_faderports_function_keys_switch_workspaces() {
     assert_ne!(s.layout_revision(), layout, "a workspace switch");
     assert_eq!(s.playhead(), before, "no marker jump");
 }
+
+/// A controller's Quantize button is the transport's Q (input quantize).
+#[test]
+fn a_controllers_quantize_button_toggles_input_quantize() {
+    use faderframe_control::controllers::Controller;
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let surface = s.add_virtual_surface(SurfaceKind::Controller(Controller::KeyLabEssentialMk3));
+    s.tick(0.01);
+    surface.take();
+    assert!(!s.record.input_quantize);
+    surface.send(&[0xB0, 41, 127]);
+    surface.send(&[0xB0, 41, 0]);
+    s.tick(0.01);
+    assert!(s.record.input_quantize, "on");
+    surface.send(&[0xB0, 41, 127]);
+    surface.send(&[0xB0, 41, 0]);
+    s.tick(0.01);
+    assert!(!s.record.input_quantize, "and off again");
+}

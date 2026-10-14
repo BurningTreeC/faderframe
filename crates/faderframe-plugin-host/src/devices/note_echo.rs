@@ -3,9 +3,13 @@
 //! The repeats come a division of the song's tempo apart (or a time in
 //! milliseconds), up to sixteen of them, each the feedback's share of the
 //! one before as loud (until too soft to play), and each optionally moved
-//! by some semitones (rising or falling echoes). The played note itself
-//! can be left out. Each repeat lasts as long as the played note did.
+//! by some semitones (rising or falling echoes) — or, In Key, by that many
+//! scale degrees of the key track's key where the note was played (C
+//! major where there is none), so a run of echoes stays in the song. The
+//! played note itself can be left out. Each repeat lasts the length's
+//! share of what the played note did.
 
+use super::chord::key_at;
 use super::midi_fx::{self, Schedule, Sounding};
 use super::{on_off, param, stepped};
 use crate::dsp::lfo::{DIVISIONS, division_name};
@@ -16,6 +20,7 @@ use crate::{
 };
 use faderframe_audio_graph::NodeIo;
 use faderframe_core::ParameterId;
+use faderframe_midi::theory::Key;
 use faderframe_midi::{MidiBuffer, MidiEvent};
 use std::sync::Arc;
 
@@ -27,6 +32,8 @@ pub mod id {
     pub const FEEDBACK: u32 = 4;
     pub const PITCH: u32 = 5;
     pub const DRY: u32 = 6;
+    pub const IN_KEY: u32 = 7;
+    pub const LENGTH: u32 = 8;
 }
 
 /// Published: the repeats sounding now, and the delay (ms).
@@ -61,16 +68,18 @@ pub fn parameters() -> Vec<ParameterInfo> {
         param(id::FEEDBACK, "Feedback", 0.1, 1.0, 0.7, Percent),
         ranged(id::PITCH, "Pitch", -24.0, 24.0, 0.0),
         stepped(id::DRY, "Played Note", 1.0, 1.0),
+        stepped(id::IN_KEY, "In Key", 1.0, 0.0),
+        param(id::LENGTH, "Length", 0.1, 2.0, 1.0, Percent),
     ]
 }
 
 pub fn format(pid: ParameterId, v: f64) -> Option<String> {
     Some(match pid.0 {
-        id::SYNC | id::DRY => on_off(v),
+        id::SYNC | id::DRY | id::IN_KEY => on_off(v),
         id::DIVISION => division_name(v.round().max(0.0) as usize).into(),
         id::REPEATS => format!("{:.0}", v.round()),
-        id::PITCH if v.round() == 0.0 => "0 st".into(),
-        id::PITCH => format!("{:+.0} st", v.round()).replace('-', "−"),
+        id::PITCH if v.round() == 0.0 => "0".into(),
+        id::PITCH => format!("{:+.0}", v.round()).replace('-', "−"),
         _ => return None,
     })
 }
@@ -79,13 +88,28 @@ pub fn latency(_params: &ParamValues, _rate: f64) -> u32 {
     0
 }
 
+/// Repeat `k` of a note at `key` moved by `pitch` a repeat: semitones, or
+/// scale degrees of `in_key`.
+pub fn echo_key(key: u8, k: u32, pitch: i8, in_key: Option<Key>) -> i32 {
+    let by = k as i32 * i32::from(pitch);
+    match in_key {
+        Some(scale) if by != 0 => scale.step(i32::from(key), by),
+        _ => i32::from(key) + by,
+    }
+}
+
 /// The repeats of one played note, as they were set when it started.
 #[derive(Clone, Copy, Default)]
 struct Echoes {
+    /// When the note started (the clock).
+    at: u64,
     delay: u64,
     /// Repeat k plays when bit k of the mask is set (loud enough, in range).
     mask: u32,
     pitch: i8,
+    in_key: Option<Key>,
+    /// The repeats' length as a share of the note's.
+    length: f64,
 }
 
 pub struct NoteEchoProcessor {
@@ -168,6 +192,11 @@ impl PluginProcessor for NoteEchoProcessor {
                         let repeats = self.get(id::REPEATS).round().clamp(1.0, 16.0) as u32;
                         let feedback = self.get(id::FEEDBACK).clamp(0.0, 1.0);
                         let pitch = self.get(id::PITCH).round().clamp(-24.0, 24.0) as i8;
+                        let in_key = (self.get(id::IN_KEY) >= 0.5).then(|| {
+                            let sample = ctx.transport.sample_position + at as i64;
+                            key_at(ctx.harmony, sample, true, 0.0, 0.0)
+                        });
+                        let length = self.get(id::LENGTH).clamp(0.1, 2.0);
                         let src = midi_fx::source(channel, key);
                         let mut mask = 0u32;
                         for k in 1..=repeats {
@@ -175,7 +204,7 @@ impl PluginProcessor for NoteEchoProcessor {
                             if v < 1.0 {
                                 break;
                             }
-                            let key = i32::from(key) + k as i32 * i32::from(pitch);
+                            let key = echo_key(key, k, pitch, in_key);
                             if !(0..=127).contains(&key) {
                                 continue;
                             }
@@ -188,7 +217,14 @@ impl PluginProcessor for NoteEchoProcessor {
                                 mask |= 1 << k;
                             }
                         }
-                        self.echoes[usize::from(src)] = Echoes { delay, mask, pitch };
+                        self.echoes[usize::from(src)] = Echoes {
+                            at: now,
+                            delay,
+                            mask,
+                            pitch,
+                            in_key,
+                            length,
+                        };
                     }
                     Some((false, channel, key, _)) => {
                         if dry {
@@ -196,17 +232,21 @@ impl PluginProcessor for NoteEchoProcessor {
                         }
                         let src = midi_fx::source(channel, key);
                         let echoes = std::mem::take(&mut self.echoes[usize::from(src)]);
+                        // Each repeat lasts the length's share of the note.
+                        let held = now.saturating_sub(echoes.at) as f64;
+                        let lasts = ((held * echoes.length).round() as u64).max(1);
                         for k in 1..32u32 {
                             if echoes.mask & (1 << k) == 0 {
                                 continue;
                             }
-                            let key = i32::from(key) + k as i32 * i32::from(echoes.pitch);
+                            let key = echo_key(key, k, echoes.pitch, echoes.in_key);
                             let off = MidiEvent::NoteOff {
                                 channel,
                                 key: key as u8,
                                 velocity: 0,
                             };
-                            if !self.due.push(now + u64::from(k) * echoes.delay, off, src) {
+                            let ends = echoes.at + u64::from(k) * echoes.delay + lasts;
+                            if !self.due.push(ends, off, src) {
                                 // No room: end it with the note (it may
                                 // not have started; then nothing happens).
                                 self.sounding.off(out, at as u32, channel, key as u8);
@@ -273,6 +313,71 @@ mod tests {
             .collect();
         assert_eq!(ends, [3000, 15_000, 27_000, 39_000]);
         assert!(balanced(&got));
+    }
+
+    #[test]
+    fn in_key_echoes_climb_the_scale_and_the_length_shortens_them() {
+        use crate::Harmony;
+        use faderframe_midi::theory::{Key, Scale};
+        // A minor from the start: thirds up the scale from A — C, E, G.
+        let harmony = Harmony {
+            keys: vec![(0, Key::new(9, Scale::Minor))],
+            chords: Vec::new(),
+        };
+        let set = [
+            (id::IN_KEY, 1.0),
+            (id::PITCH, 2.0),
+            (id::REPEATS, 3.0),
+            (id::FEEDBACK, 1.0),
+            (id::LENGTH, 0.5),
+        ];
+        let mut e = echo(&set);
+        let got = rig::run(
+            &mut e,
+            &[on(0, 57, 90), off(6000, 57)],
+            60_000,
+            120.0,
+            true,
+            &harmony,
+        );
+        assert_eq!(
+            ons(&got),
+            [
+                (0, 57, 90),
+                (12_000, 60, 90),
+                (24_000, 64, 90),
+                (36_000, 67, 90)
+            ]
+        );
+        // The note lasted 6000: the repeats last half of that.
+        let ends: Vec<u64> = got
+            .iter()
+            .filter(|(_, e)| matches!(e, MidiEvent::NoteOff { .. }))
+            .map(|(t, _)| *t)
+            .collect();
+        assert_eq!(ends, [6000, 15_000, 27_000, 39_000]);
+        assert!(balanced(&got));
+        // No key track: C major; a note outside it is snapped first, and
+        // with no pitch step nothing moves.
+        assert_eq!(echo_key(61, 1, 1, Some(Key::new(0, Scale::Major))), 62);
+        assert_eq!(echo_key(61, 2, 0, Some(Key::new(0, Scale::Major))), 61);
+        assert_eq!(echo_key(61, 2, 3, None), 67);
+        // Twice as long as the note.
+        let mut e = echo(&[(id::LENGTH, 2.0), (id::REPEATS, 1.0)]);
+        let got = rig::run(
+            &mut e,
+            &[on(0, 60, 90), off(3000, 60)],
+            40_000,
+            120.0,
+            true,
+            &NO_HARMONY,
+        );
+        let ends: Vec<u64> = got
+            .iter()
+            .filter(|(_, e)| matches!(e, MidiEvent::NoteOff { .. }))
+            .map(|(t, _)| *t)
+            .collect();
+        assert_eq!(ends, [3000, 18_000]);
     }
 
     #[test]

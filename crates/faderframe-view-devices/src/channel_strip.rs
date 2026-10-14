@@ -65,7 +65,7 @@ impl Face for ChannelStripFace {
     }
 
     fn min_size(&self) -> Size {
-        Size::new(1360.0, 560.0)
+        Size::new(1440.0, 560.0)
     }
 
     fn panel(&self, size: Size) -> Panel {
@@ -74,7 +74,7 @@ impl Face for ChannelStripFace {
             deck,
             &[
                 ("INPUT", 3.0),
-                ("GATE", 4.0),
+                ("GATE", 5.0),
                 ("COMPRESSOR", 6.6),
                 ("EQUALISER", 9.6),
                 ("OUTPUT", 2.6),
@@ -101,10 +101,11 @@ impl Face for ChannelStripFace {
         let k = kit::row(Rect::new(r.x, r.y, r.w, KNOB.1), &[KNOB.0, KNOB.0]);
         c.push(Ctl::knob(pid(id::GATE_THRESHOLD), "THRESHOLD", k[0]));
         c.push(Ctl::knob(pid(id::GATE_RANGE), "RANGE", k[1]));
-        let k = kit::row(low(r), &[SMALL.0, SMALL.0, SMALL.0]);
+        let k = kit::row(low(r), &[SMALL.0, SMALL.0, SMALL.0, SMALL.0]);
         c.push(Ctl::small(pid(id::GATE_ATTACK), "ATTACK", k[0]).scaled(Scale::Log));
         c.push(Ctl::small(pid(id::GATE_HOLD), "HOLD", k[1]).scaled(Scale::Skew(2.5)));
         c.push(Ctl::small(pid(id::GATE_RELEASE), "RELEASE", k[2]).scaled(Scale::Log));
+        c.push(Ctl::small(pid(id::GATE_HYSTERESIS), "HYST", k[3]));
         let b = kit::row(bottom(r), &[60.0, (r.w - 72.0).max(60.0)]);
         c.push(Ctl::toggle(pid(id::GATE), "On", b[0]));
         c.push(Ctl::segments(pid(id::GATE_MODE), "", b[1]));
@@ -122,10 +123,11 @@ impl Face for ChannelStripFace {
         c.push(Ctl::small(pid(id::COMP_KNEE), "KNEE", k[0]));
         c.push(Ctl::small(pid(id::COMP_MAKEUP), "MAKE-UP", k[1]));
         c.push(Ctl::small(pid(id::COMP_MIX), "MIX", k[2]));
-        let b = kit::row(bottom(r), &[60.0, 70.0, 100.0]);
+        let b = kit::row(bottom(r), &[56.0, 66.0, 96.0, 72.0]);
         c.push(Ctl::toggle(pid(id::COMP), "On", b[0]));
         c.push(Ctl::toggle(pid(id::COMP_PEAK), "Peak", b[1]));
         c.push(Ctl::toggle(pid(id::EXTERNAL), "Sidechain", b[2]));
+        c.push(Ctl::toggle(pid(id::SC_LISTEN), "Listen", b[3]));
         // Equaliser: four columns.
         let r = kit::inside(&s[3]);
         let cols = kit::spread(
@@ -267,6 +269,13 @@ impl Face for ChannelStripFace {
             &TextStyle::new(th.fonts.tiny + 0.5, th.ui.text_dim),
         );
         self.history.paint(p, hist, cx, -60.0, 30.0, false);
+        if cx.on(pid(id::SC_LISTEN)) {
+            p.text(
+                "LISTENING TO THE KEY",
+                Rect::new(hist.x + 8.0, hist.bottom() - 20.0, hist.w - 16.0, 14.0),
+                &TextStyle::new(th.fonts.tiny + 0.5, th.tools.level_warn),
+            );
+        }
         if cx.on(pid(id::GATE)) && cx.published(value::OPEN) < 0.5 {
             p.text(
                 "GATE CLOSED",
@@ -300,6 +309,12 @@ impl Face for ChannelStripFace {
             id::DRIVE => "Console saturation: rounds the peaks, leaves quiet signals alone",
             id::GATE_MODE => {
                 "Gate (down by the range when closed) or Expander (2:1 under the threshold)"
+            }
+            id::GATE_HYSTERESIS => {
+                "How far under the threshold the gate closes (no chatter round it)"
+            }
+            id::SC_LISTEN => {
+                "Hear what the gate and compressor hear (the key, through the filters)"
             }
             _ => return None,
         })

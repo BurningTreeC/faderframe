@@ -708,7 +708,7 @@ impl AlbumView {
         let master = model.project().master_id();
         let a = |x: AlbumAction| Action::Album(x);
         for (k, slot) in song.inserts.iter().enumerate() {
-            let name = &slot.plugin.name;
+            let name = faderframe_project::device_name(&song.inserts, slot);
             let edit = match master {
                 Some(track) => MenuItem::new(
                     format!("{}. {name}…", k + 1),
@@ -1330,10 +1330,10 @@ impl AlbumView {
             };
             text(p, Column::Isrc, isrc, th.ui.text_dim, false);
             let monitored = model.album_monitor() == Some(song.id);
-            let names: Vec<&str> = song
+            let names: Vec<String> = song
                 .inserts
                 .iter()
-                .map(|s| s.plugin.name.as_str())
+                .map(|s| faderframe_project::device_name(&song.inserts, s))
                 .collect();
             let inserts = match (names.is_empty(), monitored) {
                 (true, _) => "+".to_string(),

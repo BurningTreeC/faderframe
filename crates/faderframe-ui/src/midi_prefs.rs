@@ -322,10 +322,10 @@ fn voice_section(app: &Rc<AppState>) -> gtk::Grid {
             tracing::warn!("cannot save preferences: {e}");
         }
     };
-    let threshold = gtk::SpinButton::with_range(-80.0, -10.0, 1.0);
+    let threshold = gtk::SpinButton::with_range(-100.0, -10.0, 1.0);
     threshold.set_value(f64::from(now.threshold_db));
     threshold.set_tooltip_text(Some(
-        "Quieter input is silence (dBFS): lower it for a soft voice, raise it in a noisy room",
+        "Quieter input is silence (dBFS). Voice to MIDI keeps over the room's own noise by itself, so a low value suits most inputs; Calibrate sets it for your room and voice",
     ));
     {
         let weak = Rc::downgrade(app);
@@ -408,8 +408,9 @@ fn voice_section(app: &Rc<AppState>) -> gtk::Grid {
             }
         });
     }
+    let calibration = calibration_row(app, &threshold);
     let hint = gtk::Label::new(Some(
-        "Sing or play into an audio input and choose “Voice · In n” as an instrument or MIDI track's MIDI input; every input a track takes is heard at once, so several singers or players can each have a track. “Voice · All Inputs” brings every input to one track, input n on MIDI channel n + 1 (an MPE layout: a hexaphonic guitar pickup, one string per input). Enable Polyphonic for chords. The track plays and records the detected notes. For the least delay, use a small audio buffer (Preferences → Audio).",
+        "Sing or play into an audio input and choose “Voice · In n” as an instrument or MIDI track's MIDI input; every input a track takes is heard at once, so several singers or players can each have a track. “Voice · All Inputs” brings every input to one track, input n on MIDI channel n + 1 (an MPE layout: a hexaphonic guitar pickup, one string per input). Enable Polyphonic for chords. The track plays and records the detected notes. Any input level works: the room's noise and mains hum are kept out and velocities follow your loudest notes; Calibrate measures your room and your voice or instrument once (in the mode you use) for surer soft notes and velocities that span your own dynamics. For the least delay, use a small audio buffer (Preferences → Audio).",
     ));
     hint.set_wrap(true);
     hint.set_natural_wrap_mode(gtk::NaturalWrapMode::Word);
@@ -429,8 +430,216 @@ fn voice_section(app: &Rc<AppState>) -> gtk::Grid {
     grid.attach(&speed, 1, 2, 1, 1);
     grid.attach(&in_key, 1, 3, 1, 1);
     grid.attach(&polyphonic, 1, 4, 1, 1);
-    grid.attach(&hint, 0, 5, 2, 1);
+    let l = label("Calibration");
+    // (Level with the buttons, above the line under them.)
+    l.set_valign(gtk::Align::Start);
+    l.set_margin_top(8);
+    grid.attach(&l, 0, 5, 1, 1);
+    grid.attach(&calibration, 1, 5, 1, 1);
+    grid.attach(&hint, 0, 6, 2, 1);
     grid
+}
+
+/// What a finished calibration found, for the performer.
+fn calibrated_text(c: &faderframe_session::voice::Calibration) -> String {
+    let hum = c.hum_db.map_or(String::new(), |h| {
+        format!(" with a tone in it at {h:.0} dB")
+    });
+    let mut text = format!(
+        "Calibrated: the room at {:.0} dB{hum}, your notes from {:.0} to {:.0} dB. Sensitivity {:.0} dB; velocities span your notes.",
+        c.room_db,
+        c.dynamics.soft_db,
+        c.dynamics.loud_db,
+        c.threshold_db.round()
+    );
+    if let Some(a) = c.advice {
+        text.push(' ');
+        text.push_str(a.text());
+    }
+    text
+}
+
+/// Calibrate Voice to MIDI: an input, a button that listens to the room
+/// and then the performer (with a level meter and what to do now), and
+/// one that forgets it.
+fn calibration_row(app: &Rc<AppState>, threshold: &gtk::SpinButton) -> gtk::Box {
+    use faderframe_session::voice::{VoiceCalibration, VoiceSettings};
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    column.set_hexpand(true);
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let (inputs, listening) = {
+        let s = app.session.borrow();
+        (
+            s.engine().stream_inputs().clamp(1, 64),
+            s.voice_listening().first().copied().unwrap_or(0),
+        )
+    };
+    let names: Vec<String> = (1..=inputs).map(|n| format!("Input {n}")).collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let input = gtk::DropDown::from_strings(&names);
+    input.set_selected(u32::from(listening).min(inputs as u32 - 1));
+    input.set_tooltip_text(Some("The audio input you sing or play into"));
+    input.update_property(&[gtk::accessible::Property::Label("Input to calibrate")]);
+    let start = gtk::Button::with_label("Calibrate…");
+    start.set_tooltip_text(Some(
+        "Listens to the room for three seconds (stay quiet), then to you for eight (sing or play as you will, soft and loud), and sets the sensitivity and the velocities",
+    ));
+    let forget = gtk::Button::with_label("Forget");
+    forget.set_tooltip_text(Some(
+        "The default sensitivity again; velocities follow your loudest notes",
+    ));
+    let meter = gtk::LevelBar::for_interval(0.0, 1.0);
+    meter.set_hexpand(true);
+    meter.set_valign(gtk::Align::Center);
+    meter.update_property(&[gtk::accessible::Property::Label("Input level")]);
+    row.append(&input);
+    row.append(&start);
+    row.append(&forget);
+    row.append(&meter);
+    let status = gtk::Label::new(None);
+    status.set_wrap(true);
+    status.set_natural_wrap_mode(gtk::NaturalWrapMode::Word);
+    status.set_xalign(0.0);
+    status.add_css_class("dim-label");
+    column.append(&row);
+    column.append(&status);
+    // (The session holds the calibration's settings already.)
+    let save = |s: VoiceSettings| {
+        let mut p = crate::prefs::Preferences::load();
+        p.voice = s;
+        if let Err(e) = p.save() {
+            tracing::warn!("cannot save preferences: {e}");
+        }
+    };
+    let not_calibrated =
+        "Not calibrated: the default sensitivity; velocities follow your loudest notes.";
+    // Show where a calibration is (one may start from anywhere); when one
+    // ends, the sensitivity shows and the settings are saved.
+    let refresh = {
+        let weak = Rc::downgrade(app);
+        let (input, start, forget, meter, status, threshold) = (
+            input.downgrade(),
+            start.downgrade(),
+            forget.downgrade(),
+            meter.downgrade(),
+            status.downgrade(),
+            threshold.downgrade(),
+        );
+        // (What was shown last: nothing at first.)
+        let shown = std::cell::Cell::new(Some(VoiceCalibration::Starting));
+        move || {
+            let (Some(app), Some(input), Some(start), Some(forget), Some(meter), Some(status)) = (
+                weak.upgrade(),
+                input.upgrade(),
+                start.upgrade(),
+                forget.upgrade(),
+                meter.upgrade(),
+                status.upgrade(),
+            ) else {
+                return glib::ControlFlow::Break;
+            };
+            let (now, settings) = {
+                let s = app.session.borrow();
+                (s.voice_calibration(), s.voice_settings())
+            };
+            let level = |db: f32| f64::from((db + 90.0) / 90.0).clamp(0.0, 1.0);
+            let running = match now {
+                Some(VoiceCalibration::Starting) => {
+                    status.set_text("Starting…");
+                    true
+                }
+                Some(VoiceCalibration::Room { left, level_db }) => {
+                    status.set_text(&format!(
+                        "Stay quiet: listening to the room… {:.0} s",
+                        left.ceil()
+                    ));
+                    meter.set_value(level(level_db));
+                    true
+                }
+                Some(VoiceCalibration::Playing { left, level_db }) => {
+                    status.set_text(&format!(
+                        "Now sing or play as you will, soft and loud… {:.0} s",
+                        left.ceil()
+                    ));
+                    meter.set_value(level(level_db));
+                    true
+                }
+                done => {
+                    if shown.get() != done {
+                        match done {
+                            Some(VoiceCalibration::Done(Ok(c))) => {
+                                status.set_text(&calibrated_text(&c));
+                                // (Saves the new sensitivity with the
+                                // dynamics.)
+                                if let Some(t) = threshold.upgrade() {
+                                    t.set_value(f64::from(settings.threshold_db));
+                                }
+                                save(settings);
+                            }
+                            Some(VoiceCalibration::Done(Err(e))) => status.set_text(e.text()),
+                            _ => status.set_text(&match settings.dynamics {
+                                Some(d) => format!(
+                                    "Calibrated: your notes from {:.0} to {:.0} dB.",
+                                    d.soft_db, d.loud_db
+                                ),
+                                None => not_calibrated.to_string(),
+                            }),
+                        }
+                    }
+                    false
+                }
+            };
+            shown.set(now);
+            start.set_label(if running { "Cancel" } else { "Calibrate…" });
+            input.set_sensitive(!running);
+            forget.set_sensitive(!running && settings.dynamics.is_some());
+            meter.set_visible(running);
+            glib::ControlFlow::Continue
+        }
+    };
+    let refresh = Rc::new(refresh);
+    refresh();
+    {
+        let refresh = refresh.clone();
+        glib::timeout_add_local(Duration::from_millis(100), move || refresh());
+    }
+    {
+        let weak = Rc::downgrade(app);
+        let (input, refresh) = (input.clone(), refresh.clone());
+        start.connect_clicked(move |_| {
+            let Some(app) = weak.upgrade() else { return };
+            let running = matches!(
+                app.session.borrow().voice_calibration(),
+                Some(
+                    VoiceCalibration::Starting
+                        | VoiceCalibration::Room { .. }
+                        | VoiceCalibration::Playing { .. }
+                )
+            );
+            if running {
+                app.session.borrow_mut().cancel_voice_calibration();
+            } else {
+                app.session
+                    .borrow_mut()
+                    .start_voice_calibration(input.selected() as u16);
+            }
+            refresh();
+        });
+    }
+    {
+        let weak = Rc::downgrade(app);
+        let (status, threshold) = (status.clone(), threshold.clone());
+        forget.connect_clicked(move |b| {
+            let Some(app) = weak.upgrade() else { return };
+            app.session.borrow_mut().forget_voice_calibration();
+            let s = app.session.borrow().voice_settings();
+            threshold.set_value(f64::from(s.threshold_db));
+            save(s);
+            status.set_text(not_calibrated);
+            b.set_sensitive(false);
+        });
+    }
+    column
 }
 
 fn sync_section(app: &Rc<AppState>) -> SyncWidgets {

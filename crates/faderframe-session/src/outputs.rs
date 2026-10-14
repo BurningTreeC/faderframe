@@ -165,7 +165,7 @@ impl Session {
                     .iter()
                     .chain(host.instrument.iter())
                     .find(|s| s.id == plugin)
-                    .map(|s| s.plugin.name.clone())
+                    .map(|s| host.name_of(s))
                     .unwrap_or_default();
                 let mut f = Track::new(
                     id,

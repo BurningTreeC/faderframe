@@ -540,6 +540,7 @@ fn pre_fader_sends_are_unpanned_and_post_fader_sends_follow_the_pan() {
         level_db: 0.0,
         tap: SendTap::PostFader,
         enabled: true,
+        pan: None,
     };
     let t = tp.project.track_mut(a).unwrap();
     t.sends.push(send);
@@ -566,6 +567,7 @@ fn pre_fader_sends_are_unpanned_and_post_fader_sends_follow_the_pan() {
         level_db: 0.0,
         tap: SendTap::PreFader,
         enabled: true,
+        pan: None,
     };
     let t = tp.project.track_mut(s).unwrap();
     t.sends.push(send);

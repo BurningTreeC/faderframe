@@ -39,7 +39,8 @@ pub mod voice;
 
 pub use build::{AheadPlan, BuiltGraph, MidiRouting, NodeOwner, NodeWork, build_graph};
 pub use click::{
-    ClickKind, ClickSound, ClickSounds, MAX_CLICK_SECONDS, MetronomeMode, MetronomeShared,
+    ClickKind, ClickSound, ClickSounds, CueClick, MAX_CLICK_SECONDS, MAX_CUE_CLICKS, MetronomeMode,
+    MetronomeShared,
 };
 pub use context::EngineContext;
 pub use engine::{
@@ -48,7 +49,7 @@ pub use engine::{
 };
 pub use plugins::{ActivatedPlugin, OutputBus, PluginHost, decode_state, encode_state};
 pub use record::{RecordBlock, RecordStreams, RecordTarget};
-pub use slots::{ChainSlots, SlotRegistry, SlotsExhausted, StripSlots};
+pub use slots::{ChainSlots, CueSendSlots, SlotRegistry, SlotsExhausted, StripSlots};
 pub use snapshot::{
     AudioRegion, Lane, MidiRegion, Source, SourceMap, StreamPlan, StreamRegion, TimelineSnapshot,
     WarpMode, WarpedRegion, render_generated_sources,
