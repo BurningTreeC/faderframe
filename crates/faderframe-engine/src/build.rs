@@ -2824,7 +2824,7 @@ fn cue_bus_order(project: &Project) -> Vec<usize> {
         });
         if left.len() == before {
             // A loop (refused by the routing): whatever is left, in order.
-            order.extend(left.drain(..));
+            order.append(&mut left);
         }
     }
     order
