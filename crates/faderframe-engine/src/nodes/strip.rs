@@ -371,7 +371,14 @@ impl ChannelStrip {
 
     /// The pre-fader output (1, track layout) for frames `off..off + m`,
     /// reaching `audible` at the end of the range.
-    fn render_pre(&mut self, input: &AudioBuffer, outs: &mut [AudioBuffer], off: usize, m: usize, audible: f32) {
+    fn render_pre(
+        &mut self,
+        input: &AudioBuffer,
+        outs: &mut [AudioBuffer],
+        off: usize,
+        m: usize,
+        audible: f32,
+    ) {
         let Some(pre) = outs.get_mut(1) else {
             return;
         };
