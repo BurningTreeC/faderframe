@@ -586,7 +586,9 @@ pub fn format(pid: ParameterId, v: f64) -> Option<String> {
         x if (44..44 + 2 * WHEEL_SLOTS as u32).contains(&x) && (x - 44) % 2 == 0 => {
             pick(&TARGETS, v)
         }
-        x if (45..45 + 2 * WHEEL_SLOTS as u32).contains(&x) => signed_percent(),
+        x if (45..45 + 2 * WHEEL_SLOTS as u32).contains(&x) && (x - 45) % 2 == 0 => {
+            signed_percent()
+        }
         x if (60..60 + 3 * MOD_SLOTS as u32).contains(&x) => match (x - 60) % 3 {
             0 => pick(&SOURCES, v),
             1 => pick(&TARGETS, v),

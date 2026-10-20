@@ -2051,3 +2051,118 @@ fn the_cue_bar_chooses_what_the_faders_set() {
         })]
     );
 }
+
+/// The cue bar's TALK button: talking while pressed (let go anywhere),
+/// latched by Shift-click; its menu learns MIDI and chooses which cue
+/// mixes hear it. In cue mode a fader's menu learns the cue send (the
+/// master's: the cue mix's level).
+#[test]
+fn the_talk_button_talks_while_held_and_latches_with_shift() {
+    use faderframe_automation::{AutomationTarget, CueSendParam};
+    use faderframe_project::MappingTarget;
+    use faderframe_session::cues::{CueOp, TalkOp};
+    let mut s = session();
+    let theme = Theme::default();
+    let mut view = MixerView::new(theme.clone());
+    let size = Size::new(1400.0, 800.0);
+    s.dispatch(Action::Cue(CueOp::New)).unwrap();
+    let cue = s.mixer_cue().unwrap().id;
+    view.paint(&mut RecordingPainter::new(), size, &s, &theme);
+    let talk = view
+        .bar_items(size.w, &s)
+        .iter()
+        .find(|(_, h, _)| *h == BarHit::Talk)
+        .map(|(r, _, _)| r.center())
+        .unwrap();
+    let (a, _) = run(&mut view, down(talk, 1), size, &s);
+    assert_eq!(a, vec![Action::Talkback(TalkOp::Press)]);
+    let (a, _) = run(
+        &mut view,
+        ViewEvent::PointerUp {
+            pos: Point::new(300.0, 500.0),
+            button: PointerButton::Primary,
+            modifiers: Modifiers::NONE,
+        },
+        size,
+        &s,
+    );
+    assert_eq!(a, vec![Action::Talkback(TalkOp::Release)]);
+    let (a, _) = run(
+        &mut view,
+        ViewEvent::PointerDown {
+            pos: talk,
+            button: PointerButton::Primary,
+            modifiers: Modifiers {
+                shift: true,
+                ..Modifiers::NONE
+            },
+            clicks: 1,
+        },
+        size,
+        &s,
+    );
+    assert_eq!(a, vec![Action::Talkback(TalkOp::Latch(true))]);
+    let (a, _) = run(&mut view, down(talk, 2), size, &s);
+    assert_eq!(a, vec![Action::Talkback(TalkOp::Latch(true))]);
+    s.dispatch(Action::Talkback(TalkOp::Latch(true))).unwrap();
+    let (a, _) = run(&mut view, down(talk, 1), size, &s);
+    assert_eq!(
+        a,
+        vec![Action::Talkback(TalkOp::Latch(false))],
+        "a click unlatches"
+    );
+    let (_, r) = run(
+        &mut view,
+        ViewEvent::PointerDown {
+            pos: talk,
+            button: PointerButton::Secondary,
+            modifiers: Modifiers::NONE,
+            clicks: 1,
+        },
+        size,
+        &s,
+    );
+    let Some(HostRequest::ContextMenu { items, .. }) = r.first() else {
+        panic!("a menu");
+    };
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    assert_eq!(labels[0], "MIDI Learn…");
+    assert!(labels.contains(&"Cue 1 hears talkback"), "{labels:?}");
+    assert_eq!(
+        items[0].action,
+        Some(Action::MidiLearn(MappingTarget::Talkback))
+    );
+    // In cue mode a fader's menu learns the send to the cue mix.
+    let bar = cue::CUE_BAR_H;
+    let below = Size::new(size.w, size.h - bar);
+    let bass = MixerView::channel_tracks(&s)[1].id;
+    let l = view.layout_of(&s, bass, below).unwrap();
+    let (_, r) = run(
+        &mut view,
+        ViewEvent::PointerDown {
+            pos: Point::new(l.fader.center().x, l.fader.center().y + bar),
+            button: PointerButton::Secondary,
+            modifiers: Modifiers::NONE,
+            clicks: 1,
+        },
+        size,
+        &s,
+    );
+    let Some(HostRequest::ContextMenu { items, .. }) = r.first() else {
+        panic!("a menu");
+    };
+    let learn = items
+        .iter()
+        .find(|i| i.label.starts_with("MIDI Learn Level"))
+        .expect("learns the level");
+    assert_eq!(
+        learn.children[0].action,
+        Some(Action::MidiLearn(MappingTarget::Parameter {
+            track: bass,
+            target: AutomationTarget::CueSend {
+                cue,
+                what: CueSendParam::Level
+            }
+        }))
+    );
+}

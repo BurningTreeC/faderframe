@@ -17,6 +17,7 @@ use faderframe_automation::{
 };
 use faderframe_core::{AutomationLaneId, FaderLaw, TrackId};
 use faderframe_plugin_host::ParameterUnit;
+use faderframe_project::cue::CueSend;
 use faderframe_project::{Command, Track, TrackKind};
 use faderframe_timeline::MusicalTime;
 use std::collections::HashMap;
@@ -157,6 +158,18 @@ pub(crate) struct AutomationWriter {
 /// plugin reports no gesture end.
 const PLUGIN_TOUCH_IDLE: std::time::Duration = std::time::Duration::from_millis(750);
 
+/// A switch (written as steps; a click of it is no gesture).
+fn is_switch(target: AutomationTarget) -> bool {
+    matches!(
+        target,
+        AutomationTarget::TrackMute
+            | AutomationTarget::CueSend {
+                what: faderframe_automation::CueSendParam::On,
+                ..
+            }
+    )
+}
+
 fn unit_label(u: ParameterUnit) -> &'static str {
     match u {
         ParameterUnit::None => "",
@@ -287,6 +300,59 @@ impl Session {
                 kind: ParamKind::Gain,
                 unit: "dB",
             });
+        }
+        // Its sends to the cue mixes (level, pan, on); the master: the cue
+        // mixes' levels.
+        use faderframe_automation::CueSendParam;
+        for c in &self.project.cue_mixes {
+            if faderframe_project::cue::feeds_cues(t.kind) {
+                out.push(AutomationParam {
+                    target: AutomationTarget::CueSend {
+                        cue: c.id,
+                        what: CueSendParam::Level,
+                    },
+                    name: format!("Cue → {}", c.name),
+                    min: faderframe_core::gain::SILENCE_DB as f64,
+                    max: faderframe_project::MAX_LEVEL_DB as f64,
+                    default: 0.0,
+                    kind: ParamKind::Gain,
+                    unit: "dB",
+                });
+                out.push(AutomationParam {
+                    target: AutomationTarget::CueSend {
+                        cue: c.id,
+                        what: CueSendParam::Pan,
+                    },
+                    name: format!("Cue → {} Pan", c.name),
+                    min: -1.0,
+                    max: 1.0,
+                    default: 0.0,
+                    kind: ParamKind::Pan,
+                    unit: "",
+                });
+                out.push(AutomationParam {
+                    target: AutomationTarget::CueSend {
+                        cue: c.id,
+                        what: CueSendParam::On,
+                    },
+                    name: format!("Cue → {} On", c.name),
+                    min: 0.0,
+                    max: 1.0,
+                    default: 1.0,
+                    kind: ParamKind::Toggle,
+                    unit: "",
+                });
+            } else if t.kind == TrackKind::Master {
+                out.push(AutomationParam {
+                    target: AutomationTarget::CueLevel { cue: c.id },
+                    name: format!("{} Level", c.name),
+                    min: faderframe_core::gain::SILENCE_DB as f64,
+                    max: faderframe_project::MAX_LEVEL_DB as f64,
+                    default: 0.0,
+                    kind: ParamKind::Gain,
+                    unit: "dB",
+                });
+            }
         }
         for slot in t.slots() {
             let Some(params) = self.engine.plugin_parameters(slot.id) else {
@@ -450,6 +516,30 @@ impl Session {
     pub fn shown_send_db(&self, t: &Track, send: &faderframe_project::AuxSend) -> f32 {
         self.display_value(t.id, AutomationTarget::SendLevel(send.id))
             .map_or(send.level_db, |v| v as f32)
+    }
+
+    /// `t`'s send to `cue` as its controls show it (automated values
+    /// while lanes drive them; a track without one: off, silent).
+    pub fn shown_cue_send(&self, t: &Track, cue: faderframe_core::CueId) -> CueSend {
+        use faderframe_automation::CueSendParam;
+        let s = self.cue_send(t, cue);
+        let v = |what| self.display_value(t.id, AutomationTarget::CueSend { cue, what });
+        CueSend {
+            cue,
+            level_db: v(CueSendParam::Level).map_or(s.level_db, |v| v as f32),
+            pan: v(CueSendParam::Pan).map_or(s.pan, |v| v as f32),
+            on: v(CueSendParam::On).map_or(s.on, |v| v >= 0.5),
+        }
+    }
+
+    /// A cue mix's master level as its fader shows it (its lane on the
+    /// master track while it drives it).
+    pub fn shown_cue_level_db(&self, cue: faderframe_core::CueId) -> f32 {
+        let level = self.project.cue(cue).map_or(0.0, |c| c.level_db);
+        self.project
+            .master_id()
+            .and_then(|m| self.display_value(m, AutomationTarget::CueLevel { cue }))
+            .map_or(level, |v| v as f32)
     }
 
     /// Is a lane driving this parameter right now (controls show it)?
@@ -616,6 +706,35 @@ impl Session {
             Command::SetSendLevel { track, send, db } => {
                 (*track, AutomationTarget::SendLevel(*send), *db as f64)
             }
+            Command::SetCueSendLevel { track, cue, db } => (
+                *track,
+                AutomationTarget::CueSend {
+                    cue: *cue,
+                    what: faderframe_automation::CueSendParam::Level,
+                },
+                *db as f64,
+            ),
+            Command::SetCueSendPan { track, cue, pan } => (
+                *track,
+                AutomationTarget::CueSend {
+                    cue: *cue,
+                    what: faderframe_automation::CueSendParam::Pan,
+                },
+                *pan as f64,
+            ),
+            Command::SetCueSendOn { track, cue, on } => (
+                *track,
+                AutomationTarget::CueSend {
+                    cue: *cue,
+                    what: faderframe_automation::CueSendParam::On,
+                },
+                f64::from(u8::from(*on)),
+            ),
+            Command::SetCueLevel { cue, db } => (
+                self.project.master_id()?,
+                AutomationTarget::CueLevel { cue: *cue },
+                *db as f64,
+            ),
             Command::SetPluginParameter {
                 track,
                 plugin,
@@ -672,7 +791,7 @@ impl Session {
         let written = self.write_point(track, target, value);
         // A click (mute toggle) is not a gesture: Touch ends right away.
         if let Some((_, AutomationMode::Touch)) = written
-            && target == AutomationTarget::TrackMute
+            && is_switch(target)
         {
             self.commit_writes(|_| true);
         }
@@ -727,7 +846,7 @@ impl Session {
         };
         let now = self.playhead();
         let started = !self.automation_writer.writing.contains_key(&lane.0);
-        let shape = if target == AutomationTarget::TrackMute {
+        let shape = if is_switch(target) {
             CurveShape::Step
         } else {
             CurveShape::Linear

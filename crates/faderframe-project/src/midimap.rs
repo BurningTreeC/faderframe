@@ -143,6 +143,9 @@ pub enum MappingTarget {
     Show {
         control: ShowControl,
     },
+    /// The talkback microphone: on while the button is held (a note's
+    /// length, a CC's high value).
+    Talkback,
 }
 
 /// Show mode's buttons.
@@ -184,7 +187,8 @@ impl MappingTarget {
             MappingTarget::LauncherStop { track } => *track,
             MappingTarget::Transport { .. }
             | MappingTarget::LauncherScene { .. }
-            | MappingTarget::Show { .. } => None,
+            | MappingTarget::Show { .. }
+            | MappingTarget::Talkback => None,
         }
     }
 }

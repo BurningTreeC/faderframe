@@ -49,9 +49,12 @@ impl Session {
                 ins = ins.max(at(id::RETURN_CHANNEL) + width);
             }
         }
-        // Every cue mix's outputs.
+        // Every cue mix's outputs, and the talkback microphone's input.
         for c in &p.cue_mixes {
             outs = outs.max(usize::from(c.outputs().end));
+        }
+        if let (Some(input), false) = (self.talkback.input, p.cue_mixes.is_empty()) {
+            ins = ins.max(usize::from(input) + 1);
         }
         (ins.min(256) as u16, outs.min(256) as u16)
     }

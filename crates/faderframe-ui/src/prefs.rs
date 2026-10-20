@@ -56,6 +56,8 @@ pub struct Preferences {
     pub postroll: String,
     /// How the metronome sounds (Preferences → Metronome).
     pub metronome_sound: faderframe_session::MetronomeSettings,
+    /// The talkback microphone (the Cue Mixes window).
+    pub talkback: faderframe_session::cues::TalkbackSettings,
     /// Stop puts the playhead at the start of the project.
     pub stop_to_start: bool,
     /// Extra recording latency compensation in frames.
@@ -158,6 +160,7 @@ impl Default for Preferences {
             count_in: false,
             postroll: String::new(),
             metronome_sound: Default::default(),
+            talkback: Default::default(),
             stop_to_start: false,
             record_latency_offset: 0,
             midi_disabled_inputs: Vec::new(),

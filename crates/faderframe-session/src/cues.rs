@@ -2,14 +2,50 @@
 //! copy of the main mix on the next free outputs), removing, renaming,
 //! moving it to other outputs, pre/post-fader (its levels converted so it
 //! sounds the same), copying the main mix again, the mixer's cue mode
-//! (which mix its faders, pans and mutes set) and new tracks joining every
-//! cue mix. Every change to the project is an undoable edit.
+//! (which mix its faders, pans and mutes set), new tracks joining every
+//! cue mix, and the talkback microphone (a preference: its input, level
+//! and how much the cue mixes dim while the engineer talks; which cue
+//! mixes hear it is the project's). Every change to the project is an
+//! undoable edit.
 
 use crate::{Action, InputChoice, NoticeLevel, Result, Session, SessionError};
 use faderframe_core::gain::SILENCE_DB;
-use faderframe_core::{ChannelLayout, CueId, TrackId};
+use faderframe_core::{ChannelLayout, CueId, TrackId, db_to_gain};
 use faderframe_project::cue::{CUE_COLORS, CueMix, CueSend, MAX_CUE_MIXES, feeds_cues};
 use faderframe_project::{Command, MAX_LEVEL_DB, SendTap, Track};
+use serde::{Deserialize, Serialize};
+
+/// The talkback microphone (Preferences → Audio, the Cue Mixes window).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TalkbackSettings {
+    /// The device input it comes from (0: input 1; `None`: no talkback).
+    pub input: Option<u16>,
+    /// Its level into the cue mixes that hear it (dB).
+    pub level_db: f32,
+    /// How much those cue mixes dim while it talks (dB, ≤ 0).
+    pub dim_db: f32,
+}
+
+impl Default for TalkbackSettings {
+    fn default() -> Self {
+        Self {
+            input: None,
+            level_db: 0.0,
+            dim_db: -20.0,
+        }
+    }
+}
+
+/// The TALK button.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TalkOp {
+    /// Pressed: talking while held.
+    Press,
+    /// Let go (a latched button stays on).
+    Release,
+    /// Latched on or off (Shift-click, a double-click).
+    Latch(bool),
+}
 
 /// What can be done to the cue mixes (besides their levels, pans and
 /// switches, which are plain edits: `Command::SetCue*`).
@@ -40,6 +76,11 @@ pub enum CueOp {
     /// The mixer's faders, pans and mutes set this cue mix's sends
     /// (`None`: the main mix).
     Show(Option<CueId>),
+    /// Whether the cue mix hears the talkback microphone.
+    SetTalkback {
+        cue: CueId,
+        on: bool,
+    },
 }
 
 impl Session {
@@ -104,8 +145,107 @@ impl Session {
                 self.mixer_cue = cue.filter(|c| self.project.cue(*c).is_some());
                 self.revision += 1;
             }
+            CueOp::SetTalkback { cue, on } => {
+                self.cue_or_err(cue)?;
+                self.edit(Command::SetCueTalkback { cue, on })?;
+            }
         }
         Ok(())
+    }
+
+    // --- talkback ----------------------------------------------------------------------
+
+    pub fn talkback_settings(&self) -> &TalkbackSettings {
+        &self.talkback
+    }
+
+    /// The talkback microphone's input, level and dim (a preference);
+    /// another input reopens the device for it when needed.
+    pub fn set_talkback_settings(&mut self, settings: TalkbackSettings) -> Result<()> {
+        let settings = TalkbackSettings {
+            level_db: settings.level_db.clamp(SILENCE_DB, MAX_LEVEL_DB),
+            dim_db: settings.dim_db.clamp(SILENCE_DB, 0.0),
+            ..settings
+        };
+        if settings == self.talkback {
+            return Ok(());
+        }
+        self.talkback = settings;
+        self.revision += 1;
+        self.apply_talkback()?;
+        self.check_channels();
+        Ok(())
+    }
+
+    /// The TALK button.
+    pub(crate) fn talk(&mut self, op: TalkOp) -> Result<()> {
+        let was = self.talking();
+        match op {
+            TalkOp::Press => self.talk_held = true,
+            TalkOp::Release => self.talk_held = false,
+            TalkOp::Latch(on) => {
+                self.talk_latched = on;
+                self.talk_held = false;
+            }
+        }
+        if self.talking() != was {
+            self.revision += 1;
+            if self.talkback.input.is_none() {
+                self.notify(
+                    NoticeLevel::Info,
+                    "Talkback has no input: choose one in the Cue Mixes window",
+                );
+            }
+        }
+        self.apply_talkback()
+    }
+
+    /// The engineer is talking to the performers (the button held, or
+    /// latched).
+    pub fn talking(&self) -> bool {
+        self.talk_held || self.talk_latched
+    }
+
+    pub fn talkback_latched(&self) -> bool {
+        self.talk_latched
+    }
+
+    /// The engine's talkback state from the settings and the button (also
+    /// for a new engine).
+    pub(crate) fn apply_talkback(&mut self) -> Result<()> {
+        let t = faderframe_engine::Talkback {
+            on: self.talking(),
+            input: self.talkback.input,
+            level: db_to_gain(self.talkback.level_db),
+            dim: db_to_gain(self.talkback.dim_db),
+        };
+        if self.engine.set_talkback(&self.project, t)? {
+            self.sync(faderframe_project::Impact::Graph)?;
+        }
+        Ok(())
+    }
+
+    /// `t`'s send to `cue` as the main mix has it now — from what the
+    /// controls show (automation playing), by the console rule
+    /// (`Project::main_mix_send`).
+    pub fn main_mix_send(&self, t: &Track, cue: &CueMix) -> CueSend {
+        self.project.main_mix_send_with(t, cue, |x| {
+            (
+                self.shown_volume_db(x),
+                self.shown_pan(x),
+                self.shown_mute(x),
+            )
+        })
+    }
+
+    /// Every track's send to `cue` as the main mix has it now.
+    fn shown_main_mix(&self, cue: &CueMix) -> Vec<(TrackId, CueSend)> {
+        self.project
+            .tracks
+            .iter()
+            .filter(|t| feeds_cues(t.kind))
+            .map(|t| (t.id, self.main_mix_send(t, cue)))
+            .collect()
     }
 
     fn cue_or_err(&self, cue: CueId) -> Result<&CueMix> {
@@ -133,7 +273,7 @@ impl Session {
         let id: CueId = self.project.ids.allocate();
         let color = CUE_COLORS[self.project.cue_mixes.len() % CUE_COLORS.len()];
         let cue = CueMix::new(id, format!("Cue {n}"), color, first, layout);
-        let sends = self.project.copy_main_mix(&cue);
+        let sends = self.shown_main_mix(&cue);
         self.edit(Command::AddCueMix {
             cue: Box::new(cue),
             index: None,
@@ -214,12 +354,12 @@ impl Session {
         )
     }
 
-    /// Every send to `cue` as the main mix has it (one undo step).
+    /// Every send to `cue` as the main mix has it now — automated and
+    /// live levels, not the static faders (one undo step).
     fn copy_main_mix(&mut self, cue: CueId) -> Result<()> {
         let c = self.cue_or_err(cue)?.clone();
         let commands = self
-            .project
-            .copy_main_mix(&c)
+            .shown_main_mix(&c)
             .into_iter()
             .map(|(track, send)| Command::SetCueSend {
                 track,
@@ -246,7 +386,7 @@ impl Session {
                         .retain(|s| cues.iter().any(|c| c.id == s.cue));
                     for c in cues {
                         if track.cue_send(c.id).is_none() {
-                            let send = self.project.main_mix_send(&track, c);
+                            let send = self.main_mix_send(&track, c);
                             track.cue_sends.push(send);
                         }
                     }

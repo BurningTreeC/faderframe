@@ -274,6 +274,9 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
     if let Err(e) = session.set_metronome(prefs.metronome_sound.clone()) {
         tracing::warn!("metronome: {e}");
     }
+    if let Err(e) = session.set_talkback_settings(prefs.talkback.clone()) {
+        tracing::warn!("talkback: {e}");
+    }
     session.set_sync_settings(prefs.sync_settings());
     session.set_voice_settings(prefs.voice);
     session.set_video_settings(prefs.video_settings());

@@ -1335,15 +1335,16 @@ the node's as last built.
 ### Cue mixes (the performers' headphones)
 
 A cue mix is a headphone mix on its own device outputs, apart from the
-main mix — a console's foldback sends, Cubase's studio sends, Pro Tools'
-cue sends. The model (`faderframe_project::cue`):
+main mix — a console's foldback sends, Cubase's studio sends and Control
+Room, Pro Tools' cue sends. The model (`faderframe_project::cue`):
 
 * `Project::cue_mixes: Vec<CueMix>` (at most `MAX_CUE_MIXES`, 8): name,
   colour (what the mixer marks it with), `layout` (stereo or mono),
   `first_channel` (its outputs), master `level_db` and `mute`, `tap`
   (`SendTap::PreFader`, the default, or `PostFader`; never before the
-  inserts), `click` and `click_db`. Cue mixes are not tracks — they never
-  show in the arranger, routing menus, stems, solo or anything that walks
+  inserts), `click` and `click_db`, `talkback` (hears the talkback
+  microphone, default on). Cue mixes are not tracks — they never show in
+  the arranger, routing menus, stems, solo or anything that walks
   `Project::tracks`.
 * `Track::cue_sends: Vec<CueSend>` — level, pan, on — one per cue mix on
   every track that `feeds_cues` (audio, instrument, bus, aux; not the
@@ -1355,48 +1356,135 @@ cue sends. The model (`faderframe_project::cue`):
 * Commands: `AddCueMix` (with every track's send; inverse `RemoveCueMix`,
   which takes the sends along), `SetCueMix` (name, colour, outputs, tap:
   `Impact::Graph`), `SetCueLevel`, `SetCueMute`, `SetCueClick`,
-  `SetCueSend` (a whole send or none), `SetCueSendLevel`/`Pan`/`On` (made
-  when missing; their inverse is `SetCueSend`) — all `Impact::Params`; level
-  and pan drags coalesce (`CoalesceKey::{CueLevel, CueClick, CueSendLevel,
-  CueSendPan}`).
+  `SetCueTalkback`, `SetCueSend` (a whole send or none),
+  `SetCueSendLevel`/`Pan`/`On` (made when missing; their inverse is
+  `SetCueSend`) — all `Impact::Params`; level and pan drags coalesce
+  (`CoalesceKey::{CueLevel, CueClick, CueSendLevel, CueSendPan}`).
+* A track added or restored joins every cue mix there is
+  (`Project::join_cue_mixes` in `AddTrack`'s and `RestoreTrack`'s
+  `apply`): its sends as it had them, plus one as the main mix has it to
+  every cue mix made since — undoing a removal never brings back a
+  silent track, whatever cue mixes came and went meanwhile.
 
-**Solo-safe and independent of the main mix.** A cue send taps its
+**Solo-safe and mute-safe, buses included.** A cue send taps its
 track's strip at the cue taps (`ChannelStrip` outputs 2 and 3, only while
 the project has cue mixes): the signal after the inserts with its
-polarity, before the fader (2) or after the fader, VCAs and fader
-modulation (3), never muted — the track's mute and the solos of the main
-mix (`solo_mute`, folder and VCA mutes) do not reach it, unlike an
-ordinary pre-fader send (strip output 1 is post-mute). A bus or a return
-carries what reaches it in the main mix (its members after their faders,
-mutes and solos), so a new cue mix — a copy of the main mix
-(`Project::copy_main_mix`/`main_mix_send`: each source at the level it
-reaches the master with, its fader and VCAs plus the faders of the buses
-on its way (post-fader: without its own fader), its pan, off when the
-main mix does not hear it) — takes every source on its own and leaves
-buses and returns off: switched on, they bring the main mix's balance (and
-its solos) into the cue mix.
+polarity, before the fader (2, the chain layout, unpanned) or the
+*post-fader image* (3: output 0 — fader, VCAs, modulation, panning, the
+destination layout — without the mute), never muted: the track's mute
+and the solos of the main mix (`solo_mute`, folder and VCA mutes) do not
+reach a performer's headphones, unlike an ordinary pre-fader send (strip
+output 1 is post-mute). Every bus and return (`build::has_cue_path`) has
+a **cue path** beside its main path: a second sum of its sources *as the
+cue hears them* — the post-fader images of the tracks feeding it, the cue
+paths of sub-buses, and every send into it taken from the never-muted
+taps by a second, quiet `SendNode` on the same slots — through **cue
+shadows** of its devices (a second instance of each slot, hosted under
+`PluginInstanceId::cue_shadow()`, bit 62; `PluginHost::sync_parameters`
+pushes the slot's state and values to both, `retain_project` keeps a
+shadow while its bus has a cue path, its dirt and failures count as the
+slot's; `PluginCx::shadow` makes the nodes and salts every node key with
+`key_track`; outboard gear is passed by — it plays once, in the main
+mix; containers and sidechains as on the main path) into a strip of its
+own (`add_strip` with `StripKind::Cue`: `ChannelStrip::solo_safe()` —
+mute, solo and VCA mutes never reach it, the fader, VCAs and polarity do
+— quiet, outputs 0 post-fader image / 1 pre / 2 cue pre). The bus's cue
+sends tap that strip (pre: 2, post: 0), and a parent bus's cue sum takes
+its output 0. So the main mix is untouched (its sum, devices and strip
+are the same nodes as before), and the cue mix keeps sounding while the
+engineer solos, mutes and rides bus faders: the drum bus and the reverb
+return in the headphones carry what their sources bring them, through the
+bus compressor and the reverb, whatever the main mix does. The price is
+a second instance of every bus device while cue mixes exist (live
+engines only).
+
+**The console rule.** A channel is in a cue mix once, where it reaches
+the master. A copy of the main mix (`Project::main_mix_send`, the
+session's `main_mix_send` from the *shown* values — automated and live
+faders, pans and mutes via `main_mix_send_with`) switches a channel on
+when its output goes straight into the master and it is not muted, at
+the level it reaches the master with (fader and VCAs; post-fader: 0 dB),
+its pan (a dual-panned image's middle): a bus or a return into the
+master is on; a track that reaches the master through a bus is off (its
+level set, there for more of it in the headphones) — it is sent by the
+bus, never doubled, as a console's foldback would. New Cue Mix and Copy
+Main Mix use the shown values (`Session::shown_*`), not the static
+faders.
 
 **Engine** (`build::build_graph` pass 3, live engines only —
 `PluginHost::realtime()`; a render's engine builds none, so exports,
 stems, bounces, freezes, clip effects and the album never contain them):
 per cue mix a sum (`Role::CueInput`), its own `ChannelStrip` (keyed by
 `CueMix::channel()`, the cue id as a `TrackId` — ids share one allocator —
-with `SlotRegistry::strip` slots for level and mute and meters like a
-track's) and a `DeviceOutputSink` on its outputs; per track and cue mix a
-`SendNode::cue` (gain slot = level × on, `SlotRegistry::cue_send(track,
-cue)`), built whether the track has a send or not (none: silent), so a
-send's level, pan and switch are parameters. Cue outputs never pass the
-master's `ListenOut` (headphone rendering, the mono check, bass
-management). They are heard outputs: `compile()` holds them back to the
-graph's output latency with the master (plugin delay compensation as for
-any output), and with low-latency monitoring a track heard live sends to
-its cue mixes over early edges (`connect_audio_early`), which
-`clear_the_way` carries through the cue mix's sum — performers hear
-themselves at once, the playback in their headphones still aligned.
-Cue taps need the strips on the audio thread: while a project has cue
-mixes, buses are not rendered ahead (the shallow tier, `ahead_sets`);
-tracks' chains still are. The session sizes the device for the cue
-outputs (`wanted_channels`, `check_channels` → `UiRequest::ReopenAudio`).
+with `SlotRegistry::strip` slots for level and mute, its talkback dim as
+`with_trim`, and meters like a track's), a `Role::CueOut` sum after it
+(the talkback joins there) and a `DeviceOutputSink` on its outputs; the
+buses' cue paths (`cue_bus_order`: feeders first, `build_cue_chain`,
+`cue_tap`/`cue_prefx_tap` say where a channel's never-muted signal is);
+per channel and cue mix a `SendNode::cue` (slots `SlotRegistry::cue_send
+(track, cue)`: gain = level, pan, on), built whether the track has a
+send or not (none: silent), so a send's level, pan and switch are
+parameters. Cue outputs never pass the master's `ListenOut` (headphone
+rendering, the mono check, bass management). They are heard outputs:
+`compile()` holds them back to the graph's output latency with the master
+(plugin delay compensation as for any output), and with low-latency
+monitoring a track heard live sends to its cue mixes (and into its bus's
+cue sum) over early edges (`connect_audio_early`), which `clear_the_way`
+carries through the sums — performers hear themselves at once, the
+playback in their headphones still aligned. The session sizes the device
+for the cue outputs and the talkback input (`wanted_channels`,
+`check_channels` → `UiRequest::ReopenAudio`).
+
+**Render-ahead.** Buses render ahead with cue mixes as without
+(`ahead_sets` is unchanged by them). A strip rendered ahead carries its
+cue taps in the shallow tier; a bus whose chain is in the shallow tier
+has its cue path there too (its sources are strips rendered ahead there,
+so nothing crosses the other way); the cue sends made there sum per cue
+mix into a `Role::CueAhead` node and come back to the audio thread
+through a ring (`AheadPlan::cue_rings`, `cross`: an `AheadWriter` there,
+an `AheadReader` here reporting the slowest source's latency, as a bus
+strip's echo does) into the cue mix's sum; a sub-bus's cue path in the
+shallow tier feeding a bus on the audio thread crosses the same way. The
+cue output is bit-identical to the non-ahead path
+(`buses_render_ahead_with_a_cue_mix_and_the_cue_sounds_the_same`).
+
+**Automation and control.** `AutomationTarget::CueSend { cue, what:
+CueSendParam::{Level, Pan, On} }` on the channel and `CueLevel { cue }`
+on the master (listed by `automatable_parameters`, so the arranger's
+lanes and the Automation view show them; `static_value`,
+`shown_cue_send`, `shown_cue_level_db`; written in Touch/Latch/Write like
+sends — `write_target` from `SetCueSendLevel`/`Pan`/`On`/`SetCueLevel`;
+On is a switch: steps, Touch ends with the click). The snapshot carries
+them as `TrackAutomation::cue_sends` (`CueSendLanes`) and the cue mix's
+level as the volume lane of its channel; `SendNode::cue` and the cue
+strip read them per `AUTOMATION_STEP`. MIDI learn: `MappingTarget::
+Parameter` with those targets (the mixer's fader/pan/mute menus learn
+the cue send in cue mode — `cue::cue_target` —, the cue menus offer
+"MIDI Learn Level/Pan/On" and the cue master "MIDI Learn Level"), and
+`MappingTarget::Talkback` (momentary: a note or high CC talks while
+down). Control surfaces follow the mixer's cue mode (`Session::
+mixer_cue`): `surface_volume_db`/`surface_pan`/`surface_mute` show the
+shown cue mix's sends (the master fader its level), and a fader, pan pot
+or mute button sets them (`surface_volume_command`,
+`surface_cue_pan_command`, `surface_mute_command`) — Mackie, HUI and the
+mapped profiles alike, through `show_on_surfaces`/`surface_input`.
+
+**Talkback** (Control Room style): `session::cues::TalkbackSettings`
+(`Preferences::talkback`: the device input, level, dim in dB) and the
+button (`Action::Talkback(TalkOp::{Press, Release, Latch})`,
+`Session::{talking, talkback_latched, set_talkback_settings}`); which cue
+mixes hear it is the project's (`CueMix::talkback`). The engine
+(`slots::Talkback`, `EngineController::set_talkback`: another input
+rebuilds, the rest are parameters `SlotRegistry::cue_talk` → `talk` gain
+and `dim`, written by `write_talkback`): a `DeviceInputTap` on the
+microphone's input, per cue mix a plain `SendNode` at level × on × hears
+over an early edge into the cue mix's `CueOut` sum (heard at once, never
+delayed by PDC, never dimmed), while the cue mix's strip is dimmed by the
+`dim` trim — all ramped, nothing allocates, never in the main mix or a
+render. The mixer's cue bar has TALK (held: talking; Shift-click or
+double-click: latched; right-click: MIDI learn, which cue mixes hear it);
+the Cue Mixes window has the microphone's input, level and dim and a
+Talkback check per cue mix.
 
 **Send pan.** `SendNode` pans when given a pan slot holding a position: a
 mono tap by the project's pan law, a stereo tap balanced, each
@@ -1416,37 +1504,48 @@ way. `MetronomeShared::set_main` (`MetronomeSettings::main_outputs`,
 Preferences → Metronome and the Cue Mixes window) takes it off the main
 outputs, for a click in the headphones only. Tests:
 `engine/tests/cue_mixes.rs` (levels, pans, fader/mute/solo independence,
-post-fader, click and count-in, renders, PDC, low latency, send pan),
-`cue_mixes_do_not_allocate`, `project` `cue::tests`,
-`session/tests/cue_mixes.rs`, the mixer's `in_a_cue_mix_the_strips_set_its_sends`
-and `the_cue_bar_chooses_what_the_faders_set`.
+post-fader, click and count-in, renders, PDC, low latency, send pan, a
+bus and a return solo-safe and mute-safe through their devices, a bus in
+a post-fader cue, buses rendered ahead with a cue mix bit-identical,
+talkback, cue lanes), `cue_mixes_do_not_allocate` (a bus with an echo in
+the cue mixes, talkback on and off), `project` `cue::tests` (the console
+rule, restored tracks), `session/tests/cue_mixes.rs` (a copy from shown
+values, a removed track back into every cue mix, Touch writing, MIDI
+learn of a cue send and the talkback, a Mackie Control in cue mode,
+talkback settings), the mixer's `in_a_cue_mix_the_strips_set_its_sends`,
+`the_cue_bar_chooses_what_the_faders_set` and
+`the_talk_button_talks_while_held_and_latches_with_shift`.
 
 **Session and UI.** `session::cues` (`Action::Cue(CueOp::{New, Remove,
-Rename, SetOutput, SetTap, CopyMainMix, Show})`): New makes a copy of the
-main mix on the next free outputs (`Project::free_cue_outputs` past the
-master, hardware outputs, hardware insert sends and other cue mixes —
-3-4, 5-6 …) and shows it in the mixer; SetTap moves every send by its
-track's fader the other way so the cue mix sounds the same; tracks a
-command adds join every cue mix (`cue_sends_for_new_tracks`, hooked into
-`Session::edit` like the console's buses). The mixer's cue mode is
-presentation state (`Session::mixer_cue`, not saved): a bar over the
-strips (while there are cue mixes) chooses Main Mix or a cue mix, adds
-one, copies the main mix, switches pre/post (right-click a cue mix:
-outputs, click, mute, remove); in a cue mix every strip's fader, pan and
-mute set its send there (`MixerView::{fader_command, pan_command,
-mute_command}`), framed and tagged in the cue mix's colour, the fader caps
-too; solo is dark (the main mix's); strips without cue sends are dimmed;
-the master section is the cue mix's own (level, mute, the click's switch
-on the MONO place and level on the pan knob, its meters and outputs).
-Audio → Cue Mixes: New Cue Mix, Cue Mixes… (a window with every cue mix's
-name, outputs, taps, level, mute, click and click level, Copy Main Mix,
-remove, and the main outputs' click), Copy Main Mix into the Shown Cue
+Rename, SetOutput, SetTap, CopyMainMix, Show, SetTalkback})`): New makes
+a copy of the main mix on the next free outputs (`Project::
+free_cue_outputs` past the master, hardware outputs, hardware insert
+sends and other cue mixes — 3-4, 5-6 …) and shows it in the mixer; SetTap
+moves every send by its track's fader the other way so the cue mix sounds
+the same; tracks a command adds join every cue mix
+(`cue_sends_for_new_tracks`, hooked into `Session::edit` like the
+console's buses, and the project's `join_cue_mixes`). The mixer's cue
+mode is presentation state (`Session::mixer_cue`, not saved): a bar over
+the strips (while there are cue mixes) chooses Main Mix or a cue mix,
+adds one, copies the main mix, switches pre/post, TALK (right-click a
+cue mix: outputs, click, mute, talkback, MIDI learn of its level,
+remove); in a cue mix every strip's fader, pan and mute set its send
+there (`MixerView::{fader_command, pan_command, mute_command}`, shown
+from `shown_cue_send`), framed and tagged in the cue mix's colour, the
+fader caps too; solo is dark (the main mix's); strips without cue sends
+are dimmed; the master section is the cue mix's own (level, mute, the
+click's switch on the MONO place and level on the pan knob, its meters
+and outputs). Audio → Cue Mixes: New Cue Mix, Cue Mixes… (a window with
+every cue mix's name, outputs, taps, level, mute, click and click level,
+talkback, Copy Main Mix, remove, the talkback microphone's input, level
+and dim, and the main outputs' click), Copy Main Mix into the Shown Cue
 Mix, Mixer Shows. Dev actions `cue-mix:<new|remove=<n>|rename=<n>=<name>|
 output=<n>=<first output>[/mono]|pre=<n>|post=<n>|click=<n>=<on|off>[@<dB>]|
 level=<n>=<dB>|mute=<n>=<on|off>|copy-main[=<n>]|main-click=<on|off>>`,
 `cue-mode:<n|main>`, `cue-send:<track>@<n>=<dB|on|off>[/<pan>]` (cue
 mixes counted from 1; pans as typed in the mixer, `L60`, `C`, `R40`),
-`cue-mixes` (the window).
+`cue-mixes` (the window), `talkback:<on|off|latch|input=<n|none>|
+level=<dB>|dim=<dB>>` (inputs counted from 1).
 
 ## 6. Transport and timing
 
@@ -2043,21 +2142,58 @@ covered by `the_stock_devices_do_not_allocate`.
   handling — pedal, bend with RPN 0, MPE zones, pressure, CC 74, mod-wheel
   vibrato — and per-note expressions are the first Synth's): two PolyBLEP
   oscillators (saw, square with pulse width, triangle, sine; octave,
-  semitone, level), up to seven unison copies (detuned, spread across the
-  width), sub and noise; drive into a state-variable filter (12/24 dB low
-  pass, band, high) with key tracking, velocity and its own envelope or
-  the amplifier's; an LFO (free or synced, six shapes) to pitch, cutoff,
-  level and pulse width; poly (up to 32 voices), mono or legato with
-  glide; the wheels: Pitch Bend Range (id 43, 1–24 st; a range a
-  controller sets with RPN 0, or an MPE zone's ±48, wins on its channel)
-  and three mod-wheel slots (`id::wheel_target(k)`/`wheel_amount(k)` =
-  44 + 2k / 45 + 2k): a destination from `WHEEL_TARGETS` (vibrato, pitch,
-  cutoff, resonance, filter envelope, drive, LFO amount, LFO rate, pulse
-  width, oscillator levels, sub, noise, detune, spread, volume) and a
-  bipolar amount; each voice applies its channel's wheel to a copy of the
-  block's settings (`Settings::wheeled`), LFO rate follows the wheel moved
-  last. Slot 1 defaults to vibrato at 50 % (the first Synth's ½ semitone). Editor: two decks of sections under the oscillator
-  cycles, the filter's response and reach, and both envelopes.
+  semitone, level) — oscillator 2 hard-synced to 1 (`SYNC`, 78: it
+  restarts when 1 wraps, the step band-limited over the sample held back
+  and the next, `held2`/`pending2`), ring-modulated with it (`RING`, 79),
+  bending 1's phase (`FM`, 80, `FM_CYCLES` at a squared amount) and the
+  cutoff at audio rate (`FILTER_FM`, 85: `g` scaled per sample); phases
+  free-running or reset per note (`PHASE_RESET`, 81) —, up to seven unison
+  copies (detuned, spread across the width), a sub (square, sine or
+  triangle, `SUB_WAVE` 83; its level ±6 dB an octave across the keys,
+  `SUB_KEY` 82) and white or pink noise (`NOISE_COLOUR` 84, Kellet's
+  filter); drive into the filter (`FILTER_TYPE` 0–5: state-variable 12/24
+  dB low pass, band, high, a four-pole ladder — `ladder`: TPT one-poles,
+  the feedback solved linearly, input and feedback through `fast_tanh`,
+  the passband's loss mostly made up —, and a notch) with key tracking,
+  velocity and its own envelope or the amplifier's; LFO 1 (global, free
+  or synced, six shapes) to pitch, cutoff, level and pulse width; LFO 2
+  per voice (50–55: rate/sync/division/shape, retriggered per note,
+  faded in) and a mod envelope (56–59) that reach their targets only
+  through the six-slot matrix (`id::mod_source/mod_target/mod_amount(k)`
+  = 60 + 3k…: a `SOURCES` entry — LFO 1/2, mod/amp/filter envelope,
+  velocity, key (bipolar round C4), aftertouch, wheel, a random value per
+  note — a `TARGETS` entry and a bipolar amount); poly (up to 32 voices,
+  stolen oldest or quietest first, `STEAL` 101), mono or legato with glide
+  (always, or only onto a key played over a held one, `GLIDE_MODE` 102,
+  `keys_down`), analogue drift (`DRIFT` 103: a fixed offset per voice and
+  a slow `Shape::Drift` wander, `DRIFT_CENTS`); the wheels: Pitch Bend
+  Range (id 43, 1–24 st; a range a controller sets with RPN 0, or an MPE
+  zone's ±48, wins on its channel) and three mod-wheel slots
+  (`id::wheel_target(k)`/`wheel_amount(k)` = 44 + 2k / 45 + 2k) — a
+  destination from `TARGETS` (vibrato, pitch, cutoff, resonance, filter
+  envelope, drive, LFO amount, LFO rate, pulse width, oscillator levels,
+  sub, noise, detune, spread, volume, pan, oscillator 2 pitch, FM, ring,
+  filter FM, LFO 2 rate; the wheel's and the matrix's one list, appended
+  to only) and a bipolar amount. Each voice applies its channel's wheel
+  to a copy of the block's settings (`Settings::wheeled` → `Modded`) and
+  the matrix on top of that (`Modded::apply`) at the segment's start and
+  every control tick (16 samples); `Segment` holds what the samples read
+  between ticks. LFO 1's rate follows the wheel moved last. After the
+  voices, `Fx` (made with the processor, lines sized by the rate): a
+  chorus (one tap a side in antiphase) or ensemble (three a side, slow and
+  fast sweeps) (86–89), a stereo delay (90–96: ms or a division, feedback
+  through a one-pole tone, ping-pong) and a small reverb (97–100: two
+  input diffusers, eight modulated lines mixed by a Hadamard matrix,
+  per-line decay gains, damping; orthogonal output rows) — each run only
+  while mixed in; `tails` count what is still to come, so the processor
+  stays awake for echoes and tails and resets the lines when it sleeps.
+  Everything from id 50 on defaults to off, and
+  `earlier_patches_sound_as_they_did` holds five first-wave renders to
+  their checksums. Slot 1 of the wheel defaults to vibrato at 50 % (the
+  first Synth's ½ semitone). Editor (1600 × 840): three decks of sections
+  under the oscillator cycles (synced oscillator 2 drawn restarting), the
+  filter's response (the ladder's and the notch's too) and reach, and the
+  envelopes (the mod envelope faint when a slot uses it).
 * **Sampler** and **Drum Sampler** (`devices::{sampler, drums}`): what
   they play is a `samples::SampleDoc` (a file per slot) packed into the
   plugin state after the parameter block (`samples::pack`: `FFSD`, length,
@@ -2136,10 +2272,12 @@ covered by `the_stock_devices_do_not_allocate`.
   `.ffpreset` under the presets folder, or a track preset in the
   library, compared as canonical paths); the menus list only those. The
   shell confirms first (`PromptDeletePreset`).
-  Built-in factory presets live in `plugin_host::presets`: 243 across
+  Built-in factory presets live in `plugin_host::presets`: 276 across
   the EQ, Program EQ, compressor, 76, limiter, gate, de-esser, channel
   strip, saturator, utility, delay, reverb, modulation (its tremolos in a
-  "Tremolo" submenu), the four MIDI effects and Synth (MIDI effect
+  "Tremolo" submenu), the four MIDI effects and Synth (its first fifteen
+  on top, the second wave's 33 in Bass/Leads/Pads/Keys/Plucks/FX
+  submenus; MIDI effect
   presets are played through by a test: notes, none stuck; every audio
   preset is rendered over a drum-and-voice fixture and must stay within
   12 dB of it). Samplers, the tuner and the latency probe have none. Each preset expands its overrides over

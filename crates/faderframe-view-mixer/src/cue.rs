@@ -4,14 +4,17 @@
 //! (the mute: the send off), drawn in the cue mix's colour so nobody takes
 //! them for the main mix; solo stays the main mix's (dimmed); the master
 //! section becomes the cue mix's own: its level, mute, click (switch and
-//! level on the pan knob), meters and outputs.
+//! level on the pan knob), meters and outputs. The bar's TALK button is
+//! the talkback microphone: on while pressed, latched by Shift-click or a
+//! double-click.
 
 use crate::{MixerView, track_color};
+use faderframe_automation::{AutomationTarget, CueSendParam};
 use faderframe_core::CueId;
 use faderframe_core::gain::format_db;
 use faderframe_project::cue::{CueMix, CueSend, feeds_cues};
-use faderframe_project::{Command, SendTap, Track, TrackKind};
-use faderframe_session::cues::CueOp;
+use faderframe_project::{Command, MappingTarget, SendTap, Track, TrackKind};
+use faderframe_session::cues::{CueOp, TalkOp};
 use faderframe_session::{Action, Session};
 use faderframe_ui_canvas::{
     Color, EventCx, HostRequest, MenuItem, Painter, Point, PointerButton, Rect, TextStyle, Theme,
@@ -32,6 +35,8 @@ pub enum BarHit {
     CopyMain,
     /// The shown cue mix: pre- or post-fader.
     Tap,
+    /// The talkback microphone.
+    Talk,
 }
 
 /// What a strip's fader, pan and mute set now.
@@ -68,13 +73,35 @@ fn tap_name(c: &CueMix) -> &'static str {
     }
 }
 
+/// In cue mode, what a strip's control learns instead of the main mix's
+/// parameter: its send to the cue mix (the master: the cue mix's level).
+pub(crate) fn cue_target(model: &Session, t: &Track, target: AutomationTarget) -> AutomationTarget {
+    match (sets(model, t), target) {
+        (Sets::Send(cue), AutomationTarget::TrackVolume) => AutomationTarget::CueSend {
+            cue,
+            what: CueSendParam::Level,
+        },
+        (Sets::Send(cue), AutomationTarget::TrackPan) => AutomationTarget::CueSend {
+            cue,
+            what: CueSendParam::Pan,
+        },
+        (Sets::Send(cue), AutomationTarget::TrackMute) => AutomationTarget::CueSend {
+            cue,
+            what: CueSendParam::On,
+        },
+        (Sets::CueMaster(cue), AutomationTarget::TrackVolume) => AutomationTarget::CueLevel { cue },
+        _ => target,
+    }
+}
+
 impl MixerView {
-    /// The level a strip's fader shows (dB).
+    /// The level a strip's fader shows (dB): automated values while lanes
+    /// drive them.
     pub(crate) fn fader_db(model: &Session, t: &Track) -> f32 {
         match sets(model, t) {
             Sets::Main | Sets::Nothing => model.shown_volume_db(t),
-            Sets::Send(cue) => model.cue_send(t, cue).level_db,
-            Sets::CueMaster(cue) => model.project().cue(cue).map_or(0.0, |c| c.level_db),
+            Sets::Send(cue) => model.shown_cue_send(t, cue).level_db,
+            Sets::CueMaster(cue) => model.shown_cue_level_db(cue),
         }
     }
 
@@ -95,7 +122,7 @@ impl MixerView {
     /// The pan a strip's knob shows (the master's in a cue mix: none).
     pub(crate) fn pan_shown(model: &Session, t: &Track) -> f32 {
         match sets(model, t) {
-            Sets::Send(cue) => model.cue_send(t, cue).pan,
+            Sets::Send(cue) => model.shown_cue_send(t, cue).pan,
             _ => model.shown_pan(t),
         }
     }
@@ -117,7 +144,7 @@ impl MixerView {
     pub(crate) fn mute_shown(model: &Session, t: &Track) -> bool {
         match sets(model, t) {
             Sets::Main | Sets::Nothing => model.shown_mute(t),
-            Sets::Send(cue) => !model.cue_send(t, cue).on,
+            Sets::Send(cue) => !model.shown_cue_send(t, cue).on,
             Sets::CueMaster(cue) => model.project().cue(cue).is_some_and(|c| c.mute),
         }
     }
@@ -132,7 +159,7 @@ impl MixerView {
             Sets::Send(cue) => Command::SetCueSendOn {
                 track: t.id,
                 cue,
-                on: !model.cue_send(t, cue).on,
+                on: !model.shown_cue_send(t, cue).on,
             },
             Sets::CueMaster(cue) => Command::SetCueMute {
                 cue,
@@ -263,12 +290,13 @@ impl MixerView {
         controls::led_button(p, l.mute, "M", c.mute, k.led.mute, th);
         controls::led_button(p, l.solo, "S", false, k.led.solo, th);
         controls::led_button_fit(p, l.record, &["CLICK", "CL"], c.click, k.led.monitor, th);
-        controls::readout(p, l.level_readout, &format_db(c.level_db), th);
+        let level = model.shown_cue_level_db(cue);
+        controls::readout(p, l.level_readout, &format_db(level), th);
         let geo = FaderGeometry::new(l.fader, th);
         controls::fader(
             p,
             &geo,
-            self.law.db_to_position(c.level_db),
+            self.law.db_to_position(level),
             col,
             &self.fader_scale(),
             th,
@@ -297,7 +325,7 @@ impl MixerView {
     }
 
     /// The bar's buttons, left to right: Main Mix, the cue mixes, "+";
-    /// on the right (a cue mix shown) Copy Main Mix and Pre/Post.
+    /// on the right TALK and (a cue mix shown) Copy Main Mix and Pre/Post.
     pub(crate) fn bar_items(&self, width: f32, model: &Session) -> Vec<(Rect, BarHit, String)> {
         let h = CUE_BAR_H - 6.0;
         let mut out = Vec::new();
@@ -314,20 +342,20 @@ impl MixerView {
         if model.cue_mixes().len() < faderframe_project::cue::MAX_CUE_MIXES {
             push(&mut out, "+".into(), BarHit::New);
         }
+        let mut right: Vec<(&str, BarHit, f32)> = Vec::new();
         if let Some(c) = model.mixer_cue() {
             let tap = if c.post_fader() { "POST" } else { "PRE" };
-            let right = [
-                ("COPY MAIN MIX", BarHit::CopyMain, 108.0),
-                (tap, BarHit::Tap, 44.0),
-            ];
-            let mut rx = width - 6.0;
-            for (label, hit, w) in right.into_iter().rev() {
-                rx -= w;
-                if rx > x + 40.0 {
-                    out.push((Rect::new(rx, 3.0, w, h), hit, label.into()));
-                }
-                rx -= 4.0;
+            right.push(("COPY MAIN MIX", BarHit::CopyMain, 108.0));
+            right.push((tap, BarHit::Tap, 44.0));
+        }
+        right.push(("TALK", BarHit::Talk, 52.0));
+        let mut rx = width - 6.0;
+        for (label, hit, w) in right.into_iter().rev() {
+            rx -= w;
+            if rx > x + 40.0 {
+                out.push((Rect::new(rx, 3.0, w, h), hit, label.into()));
             }
+            rx -= 4.0;
         }
         out
     }
@@ -365,6 +393,15 @@ impl MixerView {
                         (col.with_alpha(0.18), col.with_alpha(0.7))
                     }
                 }
+                // Lit while talking (latched: a ring too).
+                BarHit::Talk if model.talking() => (
+                    th.console.led.record.with_alpha(0.85),
+                    if model.talkback_latched() {
+                        th.ui.text
+                    } else {
+                        th.console.led.record
+                    },
+                ),
                 _ => (th.ui.background.with_alpha(0.6), th.ui.border),
             };
             let hot = self.bar_hover == Some(*hit);
@@ -375,14 +412,14 @@ impl MixerView {
             );
             p.stroke_rounded(*r, 4.0, 1.0, edge);
             p.text(label, *r, &style);
-            if !matches!(hit, BarHit::CopyMain | BarHit::Tap) {
+            if !matches!(hit, BarHit::CopyMain | BarHit::Tap | BarHit::Talk) {
                 end = end.max(r.right());
             }
         }
         // What the faders do now.
         let first_right = items
             .iter()
-            .filter(|(_, h, _)| matches!(h, BarHit::CopyMain | BarHit::Tap))
+            .filter(|(_, h, _)| matches!(h, BarHit::CopyMain | BarHit::Tap | BarHit::Talk))
             .map(|(r, _, _)| r.x)
             .fold(width, f32::min);
         let caption = match shown {
@@ -410,11 +447,15 @@ impl MixerView {
         }
     }
 
-    /// A press in the bar.
+    /// A press in the bar (`shift`, `clicks`: TALK latches with Shift or
+    /// a double-click).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn bar_press(
         &mut self,
         pos: Point,
         button: PointerButton,
+        shift: bool,
+        clicks: u32,
         width: f32,
         model: &Session,
         cx: &mut EventCx<'_, Action>,
@@ -423,16 +464,29 @@ impl MixerView {
             return true;
         };
         if button == PointerButton::Secondary {
-            if let BarHit::Cue(id) = hit {
-                cx.request(HostRequest::ContextMenu {
+            match hit {
+                BarHit::Cue(id) => cx.request(HostRequest::ContextMenu {
                     at: pos,
                     items: Self::cue_menu(model, id),
-                });
+                }),
+                BarHit::Talk => cx.request(Self::talk_menu(model, pos)),
+                _ => {}
             }
             return true;
         }
         let shown = model.mixer_cue().map(|c| c.id);
         match hit {
+            BarHit::Talk => {
+                if shift || clicks >= 2 {
+                    self.talk_pressed = false;
+                    cx.emit(Action::Talkback(TalkOp::Latch(!model.talkback_latched())));
+                } else if model.talkback_latched() {
+                    cx.emit(Action::Talkback(TalkOp::Latch(false)));
+                } else {
+                    self.talk_pressed = true;
+                    cx.emit(Action::Talkback(TalkOp::Press));
+                }
+            }
             BarHit::Main => cx.emit(Action::Cue(CueOp::Show(None))),
             BarHit::Cue(id) => cx.emit(Action::Cue(CueOp::Show(Some(id)))),
             BarHit::New => cx.emit(Action::Cue(CueOp::New)),
@@ -455,8 +509,53 @@ impl MixerView {
         true
     }
 
+    /// The TALK button let go: a momentary press ends.
+    pub(crate) fn talk_release(&mut self, cx: &mut EventCx<'_, Action>) {
+        if std::mem::take(&mut self.talk_pressed) {
+            cx.emit(Action::Talkback(TalkOp::Release));
+        }
+    }
+
+    /// The TALK button's menu: MIDI learn, which cue mixes hear it.
+    fn talk_menu(model: &Session, at: Point) -> HostRequest<Action> {
+        let mut items: Vec<MenuItem<Action>> = model
+            .midi_learn_menu(MappingTarget::Talkback)
+            .into_iter()
+            .map(|(label, action)| MenuItem::new(label, action))
+            .collect();
+        for (i, c) in model.cue_mixes().iter().enumerate() {
+            let item = MenuItem::new(
+                format!("{} hears talkback", c.name),
+                Action::Cue(CueOp::SetTalkback {
+                    cue: c.id,
+                    on: !c.talkback,
+                }),
+            )
+            .checked(c.talkback);
+            items.push(if i == 0 { item.separated() } else { item });
+        }
+        let t = model.talkback_settings();
+        let input = t
+            .input
+            .map_or("no input (Cue Mixes window)".to_string(), |i| {
+                format!("input {}", i + 1)
+            });
+        items.push(
+            MenuItem::disabled(format!(
+                "Talkback: {input}, level {} dB, dim {} dB",
+                format_db(t.level_db),
+                format_db(t.dim_db)
+            ))
+            .separated(),
+        );
+        HostRequest::ContextMenu { at, items }
+    }
+
     pub(crate) fn bar_tooltip(&self, pos: Point, width: f32, model: &Session) -> Option<String> {
         Some(match self.bar_hit(pos, width, model)? {
+            BarHit::Talk => {
+                "Talkback: hold to talk to the performers (the cue mixes that hear it dim); Shift-click or double-click latches · Right-click: MIDI learn, which cue mixes hear it".into()
+            }
             BarHit::Main => "The faders set the main mix".into(),
             BarHit::Cue(id) => {
                 let c = model.project().cue(id)?;
@@ -536,8 +635,27 @@ impl MixerView {
                 }),
             )
             .checked(c.mute),
+            MenuItem::new(
+                "Hears Talkback",
+                Action::Cue(CueOp::SetTalkback {
+                    cue: id,
+                    on: !c.talkback,
+                }),
+            )
+            .checked(c.talkback),
             MenuItem::new("Copy Main Mix", Action::Cue(CueOp::CopyMainMix(id))).separated(),
         ];
+        if let Some(master) = model.project().master() {
+            items.push(
+                Self::learn_submenu(
+                    model,
+                    master,
+                    AutomationTarget::CueLevel { cue: id },
+                    "MIDI Learn Level",
+                )
+                .separated(),
+            );
+        }
         items.push(MenuItem::new("Remove Cue Mix", Action::Cue(CueOp::Remove(id))).separated());
         items
     }
@@ -548,13 +666,16 @@ impl MixerView {
             return Vec::new();
         };
         let send = model.cue_send(t, cue);
-        let main = model.project().main_mix_send(t, c);
+        let main = model.main_mix_send(t, c);
         let set = |s: CueSend| {
             Action::Edit(Command::SetCueSend {
                 track: t.id,
                 cue,
                 send: Some(s),
             })
+        };
+        let learn = |what: CueSendParam, name: &str| {
+            Self::learn_submenu(model, t, AutomationTarget::CueSend { cue, what }, name)
         };
         vec![
             MenuItem::new(
@@ -575,6 +696,9 @@ impl MixerView {
             ),
             MenuItem::new("Pan Centre", set(CueSend { pan: 0.0, ..send })),
             MenuItem::new("As in the Main Mix", set(main)).separated(),
+            learn(CueSendParam::Level, "MIDI Learn Level").separated(),
+            learn(CueSendParam::Pan, "MIDI Learn Pan"),
+            learn(CueSendParam::On, "MIDI Learn On"),
         ]
     }
 }

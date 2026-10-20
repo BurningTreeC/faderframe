@@ -149,7 +149,7 @@ impl Face for LimiterFace {
         );
         self.peak_max = self.peak_max.max(self.history.recent_max(1, 0.1));
         let th = cx.theme;
-        let hist = Rect::new(r.x + 8.0, r.y + 8.0, r.w - 150.0, r.h - 16.0);
+        let hist = Rect::new(r.x + 8.0, r.y + 8.0, r.w - 176.0, r.h - 16.0);
         self.history.paint(p, hist, cx, -36.0, 12.0, true);
         // The ceiling, dashed.
         let ceiling = cx.value(pid(id::CEILING)) as f32;

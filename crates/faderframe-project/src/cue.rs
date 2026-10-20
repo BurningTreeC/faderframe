@@ -509,8 +509,7 @@ mod tests {
             },
         )
         .unwrap();
-        // Removed, a second cue mix made, restored: a send to both (the
-        // old one as it was, the new one as the main mix has it).
+        // Removed and undone: its send as it was.
         h.apply(
             &mut m.p,
             Command::SetCueSendLevel {
@@ -522,26 +521,26 @@ mod tests {
         .unwrap();
         h.apply(&mut m.p, Command::RemoveTrack { track: m.vox })
             .unwrap();
-        let second: CueId = m.p.ids.allocate();
-        let cue2 = CueMix::new(second, "Cue 2", CUE_COLORS[1], 4, ChannelLayout::Stereo);
-        let all = m.p.copy_main_mix(&cue2);
-        h.apply(
-            &mut m.p,
-            Command::AddCueMix {
-                cue: Box::new(cue2),
-                index: None,
-                sends: all,
-            },
-        )
-        .unwrap();
-        h.undo(&mut m.p).unwrap();
         h.undo(&mut m.p).unwrap();
         let vox = m.p.track(m.vox).unwrap();
         assert_eq!(vox.cue_send(id).unwrap().level_db, -9.0);
-        assert_eq!(vox.cue_send(second), None, "the second was undone too");
-        h.redo(&mut m.p).unwrap();
-        h.redo(&mut m.p).unwrap();
-        h.undo(&mut m.p).unwrap();
+        // Removed, a second cue mix made meanwhile, restored (the inverse
+        // applied, as any path restoring a track does): a send to both —
+        // the old one as it was, the new one as the main mix has it.
+        let restore = Command::RemoveTrack { track: m.vox }
+            .apply(&mut m.p)
+            .unwrap();
+        let second: CueId = m.p.ids.allocate();
+        let cue2 = CueMix::new(second, "Cue 2", CUE_COLORS[1], 4, ChannelLayout::Stereo);
+        let all = m.p.copy_main_mix(&cue2);
+        Command::AddCueMix {
+            cue: Box::new(cue2),
+            index: None,
+            sends: all,
+        }
+        .apply(&mut m.p)
+        .unwrap();
+        restore.apply(&mut m.p).unwrap();
         let vox = m.p.track(m.vox).unwrap();
         assert_eq!(vox.cue_send(id).unwrap().level_db, -9.0);
         let new = vox.cue_send(second).unwrap();

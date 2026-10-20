@@ -475,6 +475,8 @@ pub enum Action {
     Setlist(setlist::SetlistOp),
     /// Make, remove or change a cue mix, or show one in the mixer.
     Cue(cues::CueOp),
+    /// The TALK button (the talkback microphone into the cue mixes).
+    Talkback(cues::TalkOp),
     /// Show mode's controls.
     Show(setlist::ShowOp),
     /// Set the project's tempo or key from a clip, or warp it to the
@@ -1416,6 +1418,10 @@ pub struct Session {
     mono_check: bool,
     /// The cue mix the mixer shows and sets (`None`: the main mix).
     mixer_cue: Option<faderframe_core::CueId>,
+    /// The talkback microphone (a preference) and its button.
+    talkback: cues::TalkbackSettings,
+    talk_held: bool,
+    talk_latched: bool,
     /// Bass management of the speakers (listening only).
     bass: faderframe_core::surround::BassManagement,
     /// The headphone correction's file.
@@ -1693,6 +1699,9 @@ impl Session {
             bounces: Vec::new(),
             mono_check: false,
             mixer_cue: None,
+            talkback: cues::TalkbackSettings::default(),
+            talk_held: false,
+            talk_latched: false,
             bass: faderframe_core::surround::BassManagement::default(),
             correction_path: None,
             adm_imports: Vec::new(),
@@ -2185,6 +2194,7 @@ impl Session {
         self.engine.set_mono_check(self.mono_check)?;
         self.engine.set_bass_management(self.bass)?;
         self.engine.set_low_latency_monitoring(low_latency);
+        self.apply_talkback()?;
         self.apply_low_latency_limit();
         self.reapply_metronome();
         // A new meter bank: quasi-peak metering applied again.
@@ -3848,6 +3858,7 @@ impl Session {
             Action::SongStructure { clips } => self.song_structure(&clips)?,
             Action::Setlist(op) => self.edit_setlist(op)?,
             Action::Cue(op) => self.cue_op(op)?,
+            Action::Talkback(op) => self.talk(op)?,
             Action::Show(op) => self.show_op(op)?,
             Action::ConvertToMidi { clip, how } => self.convert_to_midi(clip, how)?,
             Action::MakeLeadSheet { of, grid } => self.make_lead_sheet(of, grid)?,

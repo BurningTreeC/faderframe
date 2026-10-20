@@ -23,6 +23,8 @@ use faderframe_control::{
     SlotState, StripState, SurfaceInput, SurfaceState,
 };
 use faderframe_core::{FaderLaw, TrackId};
+use faderframe_project::TrackKind;
+use faderframe_project::cue::feeds_cues;
 use faderframe_project::{Command, Track};
 use serde::{Deserialize, Serialize};
 use std::net::{SocketAddr, UdpSocket};
@@ -469,7 +471,7 @@ impl Session {
         let master = self
             .project
             .master()
-            .map(|m| law.db_to_position(self.shown_volume_db(m)));
+            .map(|m| law.db_to_position(self.surface_volume_db(m)));
         let columns: Vec<TrackId> = self.launcher_tracks().iter().map(|t| t.id).collect();
         let mut first = self.control.bank;
         let mut sends: Vec<(usize, Vec<Vec<u8>>)> = Vec::new();
@@ -514,7 +516,7 @@ impl Session {
                     let Some(t) = t.and_then(|t| self.project.track(t)) else {
                         return StripState::default();
                     };
-                    let db = self.shown_volume_db(t);
+                    let db = self.surface_volume_db(t);
                     let m = self.meter(t.id);
                     let volume = law.db_to_position(db);
                     let (pot, bipolar, pot_text) =
@@ -558,7 +560,7 @@ impl Session {
                         pan: self.surface_pan(t),
                         pot,
                         pot_bipolar,
-                        mute: self.shown_mute(t),
+                        mute: self.surface_mute(t),
                         solo: t.solo,
                         arm: t.record_arm,
                         selected: self.selection.tracks.contains(&t.id),
@@ -797,10 +799,8 @@ impl Session {
                 } else if self.control.flip && strip != MASTER {
                     self.set_pot(track, travel)?;
                 } else {
-                    self.dispatch(Action::Edit(Command::SetTrackVolume {
-                        track,
-                        db: law.position_to_db(travel),
-                    }))?;
+                    let cmd = self.surface_volume_command(track, law.position_to_db(travel));
+                    self.dispatch(Action::Edit(cmd))?;
                 }
             }
             SurfaceInput::Touch { touched, .. } => {
@@ -829,15 +829,13 @@ impl Session {
                     return Ok(());
                 };
                 let track = t.id;
-                let volume = law.db_to_position(self.shown_volume_db(t));
+                let volume = law.db_to_position(self.surface_volume_db(t));
                 let pot = self.pot_value(t).map(|(v, _, _)| v);
                 self.begin_surface_gesture()?;
                 if self.control.flip {
                     let travel = (volume + delta as f32 * LEVEL_STEP).clamp(0.0, 1.0);
-                    self.dispatch(Action::Edit(Command::SetTrackVolume {
-                        track,
-                        db: law.position_to_db(travel),
-                    }))?;
+                    let cmd = self.surface_volume_command(track, law.position_to_db(travel));
+                    self.dispatch(Action::Edit(cmd))?;
                 } else if let Some(v) = pot {
                     let step = match self.control.page {
                         Page::Pan => PAN_STEP / 2.0,
@@ -859,10 +857,9 @@ impl Session {
                 };
                 self.begin_surface_gesture()?;
                 if self.control.flip {
-                    self.dispatch(Action::Edit(Command::SetTrackVolume {
-                        track,
-                        db: law.position_to_db(value.clamp(0.0, 1.0)),
-                    }))?;
+                    let cmd = self
+                        .surface_volume_command(track, law.position_to_db(value.clamp(0.0, 1.0)));
+                    self.dispatch(Action::Edit(cmd))?;
                 } else {
                     self.set_pot(track, value.clamp(0.0, 1.0))?;
                 }
@@ -876,7 +873,9 @@ impl Session {
                     .project
                     .track(track)
                     .is_some_and(|t| self.project.dual_panned(t));
-                if dual {
+                if let Some(cmd) = self.surface_cue_pan_command(track, pan) {
+                    self.dispatch(Action::Edit(cmd))?;
+                } else if dual {
                     self.set_dual_pan_from_surface(track, pan)?;
                 } else {
                     self.dispatch(Action::Edit(Command::SetTrackPan {
@@ -1049,8 +1048,8 @@ impl Session {
             Button::Arm(_) if option => self.arm_all()?,
             Button::Mute(i) => {
                 if let Some(t) = track(self, i) {
-                    let on = !self.shown_mute(&t);
-                    self.dispatch(edit(Command::SetTrackMute { track: t.id, on }))?;
+                    let cmd = self.surface_mute_command(&t);
+                    self.dispatch(edit(cmd))?;
                 }
             }
             Button::Solo(i) => {
@@ -1275,6 +1274,10 @@ impl Session {
     /// whether it is bipolar, its value as text.
     fn pot_value(&self, t: &Track) -> Option<(f32, bool, String)> {
         match self.control.page {
+            Page::Pan if self.surface_cue(t).is_some() && t.kind != TrackKind::Master => {
+                let pan = self.surface_pan(t);
+                Some(((pan + 1.0) / 2.0, true, pan_text(pan)))
+            }
             Page::Pan if self.project.dual_panned(t) => {
                 // Dual pan: the image as a whole, or the side held.
                 let d = self.shown_dual_pan(t);
@@ -1319,9 +1322,89 @@ impl Session {
         }
     }
 
+    /// What the surface's faders move for `t`: in the mixer's cue mode
+    /// the track's send to the shown cue mix (the master: the cue mix's
+    /// level), else its fader.
+    fn surface_cue(&self, t: &Track) -> Option<faderframe_core::CueId> {
+        let cue = self.mixer_cue()?;
+        (feeds_cues(t.kind) || t.kind == TrackKind::Master).then_some(cue.id)
+    }
+
+    /// The level a surface's fader shows for `t` (dB).
+    fn surface_volume_db(&self, t: &Track) -> f32 {
+        match self.surface_cue(t) {
+            Some(cue) if t.kind == TrackKind::Master => self.shown_cue_level_db(cue),
+            Some(cue) => self.shown_cue_send(t, cue).level_db,
+            None => self.shown_volume_db(t),
+        }
+    }
+
+    /// The edit a surface's fader at `db` makes for `track`.
+    fn surface_volume_command(&self, track: TrackId, db: f32) -> Command {
+        let cue = self.project.track(track).and_then(|t| self.surface_cue(t));
+        match cue {
+            Some(cue)
+                if self
+                    .project
+                    .track(track)
+                    .is_some_and(|t| t.kind == TrackKind::Master) =>
+            {
+                Command::SetCueLevel { cue, db }
+            }
+            Some(cue) => Command::SetCueSendLevel { track, cue, db },
+            None => Command::SetTrackVolume { track, db },
+        }
+    }
+
+    /// In cue mode: the edit a surface's pan pot at `pan` makes (the
+    /// send's pan; the master has none).
+    fn surface_cue_pan_command(&self, track: TrackId, pan: f32) -> Option<Command> {
+        let t = self.project.track(track)?;
+        let cue = self.surface_cue(t)?;
+        (t.kind != TrackKind::Master).then_some(Command::SetCueSendPan {
+            track,
+            cue,
+            pan: pan.clamp(-1.0, 1.0),
+        })
+    }
+
+    /// Whether a surface's mute button is lit for `t` (a cue send: off).
+    fn surface_mute(&self, t: &Track) -> bool {
+        match self.surface_cue(t) {
+            Some(cue) if t.kind == TrackKind::Master => {
+                self.project.cue(cue).is_some_and(|c| c.mute)
+            }
+            Some(cue) => !self.shown_cue_send(t, cue).on,
+            None => self.shown_mute(t),
+        }
+    }
+
+    /// The edit a surface's mute button makes for `t`.
+    fn surface_mute_command(&self, t: &Track) -> Command {
+        match self.surface_cue(t) {
+            Some(cue) if t.kind == TrackKind::Master => Command::SetCueMute {
+                cue,
+                on: !self.project.cue(cue).is_some_and(|c| c.mute),
+            },
+            Some(cue) => Command::SetCueSendOn {
+                track: t.id,
+                cue,
+                on: !self.shown_cue_send(t, cue).on,
+            },
+            None => Command::SetTrackMute {
+                track: t.id,
+                on: !self.shown_mute(t),
+            },
+        }
+    }
+
     /// Where a surface shows a track's pan: its pan or balance; dual
-    /// panned, the image's middle (or the side held).
+    /// panned, the image's middle (or the side held); in cue mode the
+    /// send's pan.
     fn surface_pan(&self, t: &Track) -> f32 {
+        if let Some(cue) = self.surface_cue(t).filter(|_| t.kind != TrackKind::Master) {
+            return self.shown_cue_send(t, cue).pan;
+        }
         if !self.project.dual_panned(t) {
             return self.shown_pan(t);
         }
@@ -1360,6 +1443,12 @@ impl Session {
     /// Set what the pot controls on the current page from travel (0…1).
     fn set_pot(&mut self, track: TrackId, travel: f32) -> crate::Result<()> {
         match self.control.page {
+            Page::Pan if self.surface_cue_pan_command(track, 0.0).is_some() => {
+                if let Some(cmd) = self.surface_cue_pan_command(track, travel * 2.0 - 1.0) {
+                    self.dispatch(Action::Edit(cmd))?;
+                }
+                Ok(())
+            }
             Page::Pan
                 if self
                     .project

@@ -312,6 +312,8 @@ pub struct MixerView {
     hide_master: bool,
     /// The cue bar's button under the pointer.
     bar_hover: Option<BarHit>,
+    /// The cue bar's TALK button is held.
+    talk_pressed: bool,
 }
 
 fn fader_cap_color(kind: TrackKind, theme: &Theme) -> Color {
@@ -448,6 +450,7 @@ impl MixerView {
             offsets: vec![0.0],
             widths: Vec::new(),
             bar_hover: None,
+            talk_pressed: false,
         }
     }
 
@@ -1783,9 +1786,11 @@ impl MixerView {
         target: faderframe_automation::AutomationTarget,
         at: Point,
     ) -> HostRequest<Action> {
+        // In cue mode the control is the cue send's (the master: the cue
+        // mix's level).
         let target = faderframe_project::MappingTarget::Parameter {
             track: t.id,
-            target,
+            target: cue::cue_target(model, t, target),
         };
         Self::learn_target_menu(model, target, at)
     }
@@ -4159,10 +4164,21 @@ impl CanvasView<Session, Action> for MixerView {
             self.bar_hover = None;
             return self.event_below_bar(ev, size, model, cx);
         }
-        // Presses in the cue bar are its own (a drag below goes on below).
+        // Presses in the cue bar are its own (a drag below goes on below);
+        // letting go anywhere ends a TALK press.
         match *ev {
-            ViewEvent::PointerDown { pos, button, .. } if pos.y < bar => {
-                return self.bar_press(pos, button, size.w, model, cx);
+            ViewEvent::PointerDown {
+                pos,
+                button,
+                modifiers,
+                clicks,
+            } if pos.y < bar => {
+                return self.bar_press(pos, button, modifiers.shift, clicks, size.w, model, cx);
+            }
+            ViewEvent::PointerUp { .. } | ViewEvent::PointerLeave | ViewEvent::FocusLost
+                if self.talk_pressed =>
+            {
+                self.talk_release(cx);
             }
             ViewEvent::PointerMove { pos, .. } if pos.y < bar && self.drag.is_none() => {
                 let hit = self.bar_hit(pos, size.w, model);

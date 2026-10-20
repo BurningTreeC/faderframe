@@ -1,13 +1,15 @@
 //! Audio → Cue Mixes: new cue mixes, the Cue Mixes window (names,
-//! outputs, pre/post-fader, levels, mutes, clicks), what the mixer's
-//! faders set (Mixer Shows: the main mix or a cue mix), and the dev
-//! actions `cue-mix:…`, `cue-mode:…` and `cue-send:…` for scripted runs.
+//! outputs, pre/post-fader, levels, mutes, clicks, talkback), what the
+//! mixer's faders set (Mixer Shows: the main mix or a cue mix), and the
+//! dev actions `cue-mix:…`, `cue-mode:…`, `cue-send:…` and `talkback:…`
+//! for scripted runs.
 
+use crate::prefs::Preferences;
 use crate::state::AppState;
 use faderframe_core::{ChannelLayout, CueId};
 use faderframe_project::{Command, SendTap};
 use faderframe_session::Action;
-use faderframe_session::cues::CueOp;
+use faderframe_session::cues::{CueOp, TalkOp, TalkbackSettings};
 use gtk::gio;
 use gtk::prelude::*;
 use std::cell::{Cell, RefCell};
@@ -136,6 +138,66 @@ fn cue_mix(app: &Rc<AppState>, arg: &str) {
 }
 
 /// The metronome on the main outputs or not (Preferences → Metronome).
+/// The talkback settings into the session and the preferences.
+fn apply_talkback(app: &Rc<AppState>, settings: TalkbackSettings) {
+    app.with_session(|s| s.set_talkback_settings(settings.clone()));
+    let mut p = Preferences::load();
+    p.talkback = settings;
+    if let Err(e) = p.save() {
+        tracing::warn!("cannot save preferences: {e}");
+    }
+}
+
+/// `talkback:<on|off|latch|input=<n|none>|level=<dB>|dim=<dB>>` (inputs
+/// counted from 1).
+fn talkback(app: &Rc<AppState>, arg: &str) {
+    let (what, value) = arg.split_once('=').unwrap_or((arg, ""));
+    let settings = app.session.borrow().talkback_settings().clone();
+    match (what.trim(), on_off(what), db(value)) {
+        (_, Some(on), _) => app.dispatch(Action::Talkback(if on {
+            TalkOp::Press
+        } else {
+            TalkOp::Release
+        })),
+        ("latch", _, _) => {
+            let latched = app.session.borrow().talkback_latched();
+            app.dispatch(Action::Talkback(TalkOp::Latch(!latched)));
+        }
+        ("input", _, _) => {
+            let input = if value.trim() == "none" {
+                None
+            } else {
+                match value
+                    .trim()
+                    .parse::<u16>()
+                    .ok()
+                    .and_then(|n| n.checked_sub(1))
+                {
+                    Some(n) => Some(n),
+                    None => {
+                        tracing::warn!("talkback: no input '{value}'");
+                        return;
+                    }
+                }
+            };
+            apply_talkback(app, TalkbackSettings { input, ..settings });
+        }
+        ("level", _, Some(level_db)) => {
+            apply_talkback(
+                app,
+                TalkbackSettings {
+                    level_db,
+                    ..settings
+                },
+            );
+        }
+        ("dim", _, Some(dim_db)) => {
+            apply_talkback(app, TalkbackSettings { dim_db, ..settings });
+        }
+        _ => tracing::warn!("talkback: cannot do '{arg}'"),
+    }
+}
+
 fn set_main_click(app: &Rc<AppState>, on: bool) {
     let mut m = app.session.borrow().metronome_settings().clone();
     m.main_outputs = on;
@@ -222,6 +284,7 @@ pub fn install_actions(app: &Rc<AppState>) {
     app.app.add_action_entries([
         named("cue-mix", cue_mix),
         named("cue-send", cue_send),
+        named("talkback", talkback),
         mode,
         window,
     ]);
@@ -309,6 +372,10 @@ struct Ui {
     win: gtk::Window,
     rows: gtk::Grid,
     main_click: gtk::Switch,
+    /// The talkback microphone's input, level and dim.
+    talk_input: gtk::DropDown,
+    talk_level: gtk::SpinButton,
+    talk_dim: gtk::SpinButton,
     /// What the rows were made for (rebuilt when it changes).
     made_for: RefCell<String>,
     /// Filling the widgets: their signals do nothing.
@@ -331,16 +398,38 @@ impl Ui {
         let Some(app) = self.app.upgrade() else {
             return;
         };
-        let (cues, shown, main_click) = {
+        let (cues, shown, main_click, talk, inputs) = {
             let s = app.session.borrow();
             (
                 s.cue_mixes().to_vec(),
                 s.mixer_cue().map(|c| c.id),
                 s.metronome_settings().main_outputs,
+                s.talkback_settings().clone(),
+                s.stream_info().map_or(8, |i| i.input_channels).max(2),
             )
         };
         self.filling.set(true);
         self.main_click.set_active(main_click);
+        // The talkback input: none, or one of the device's inputs (the
+        // chosen one listed even past them).
+        let n = usize::from(inputs).max(talk.input.map_or(0, |i| usize::from(i) + 1));
+        if self
+            .talk_input
+            .model()
+            .is_none_or(|m| m.n_items() as usize != n + 1)
+        {
+            let labels: Vec<String> = std::iter::once("None".to_string())
+                .chain((1..=n).map(|i| format!("Input {i}")))
+                .collect();
+            let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+            self.talk_input
+                .set_model(Some(&gtk::StringList::new(&refs)));
+        }
+        self.talk_input
+            .set_selected(talk.input.map_or(0, |i| u32::from(i) + 1));
+        self.talk_level
+            .set_value(f64::from(talk.level_db.max(-60.0)));
+        self.talk_dim.set_value(f64::from(talk.dim_db.max(-60.0)));
         let signature = format!(
             "{:?}",
             cues.iter()
@@ -351,7 +440,8 @@ impl Ui {
                     c.layout,
                     c.tap,
                     c.click,
-                    c.mute
+                    c.mute,
+                    c.talkback
                 ))
                 .collect::<Vec<_>>()
         ) + &format!("{shown:?}");
@@ -364,7 +454,8 @@ impl Ui {
             self.rows.remove(&child);
         }
         let head = [
-            "Cue mix", "Outputs", "Taps", "Level dB", "Mute", "Click", "Click dB", "", "", "",
+            "Cue mix", "Outputs", "Taps", "Level dB", "Mute", "Click", "Click dB", "Talkback", "",
+            "", "",
         ];
         for (c, h) in head.iter().enumerate() {
             let l = gtk::Label::new(Some(h));
@@ -377,7 +468,7 @@ impl Ui {
                 "No cue mixes yet: a new one is a copy of the main mix on the next free outputs.",
             ));
             l.add_css_class("dim-label");
-            self.rows.attach(&l, 0, 1, 10, 1);
+            self.rows.attach(&l, 0, 1, 11, 1);
         }
         for (i, c) in cues.iter().enumerate() {
             let row = i as i32 + 1;
@@ -492,6 +583,21 @@ impl Ui {
             }
             self.rows.attach(&click, 5, row, 1, 1);
             self.rows.attach(&click_db, 6, row, 1, 1);
+            let talkback = gtk::CheckButton::new();
+            talkback.set_active(c.talkback);
+            talkback.set_tooltip_text(Some(
+                "Hears the talkback microphone (and dims while the engineer talks)",
+            ));
+            {
+                let ui = Rc::clone(self);
+                talkback.connect_toggled(move |b| {
+                    ui.dispatch(Action::Cue(CueOp::SetTalkback {
+                        cue: id,
+                        on: b.is_active(),
+                    }));
+                });
+            }
+            self.rows.attach(&talkback, 7, row, 1, 1);
             let show = gtk::CheckButton::with_label("In the mixer");
             show.set_active(shown == Some(id));
             show.set_tooltip_text(Some("The mixer's faders, pans and mutes set this cue mix"));
@@ -501,20 +607,23 @@ impl Ui {
                     ui.dispatch(Action::Cue(CueOp::Show(b.is_active().then_some(id))));
                 });
             }
-            self.rows.attach(&show, 7, row, 1, 1);
+            self.rows.attach(&show, 8, row, 1, 1);
             let copy = gtk::Button::with_label("Copy Main Mix");
+            copy.set_tooltip_text(Some(
+                "Every send as the main mix has it now (automated and live levels)",
+            ));
             {
                 let ui = Rc::clone(self);
                 copy.connect_clicked(move |_| ui.dispatch(Action::Cue(CueOp::CopyMainMix(id))));
             }
-            self.rows.attach(&copy, 8, row, 1, 1);
+            self.rows.attach(&copy, 9, row, 1, 1);
             let remove = gtk::Button::from_icon_name("user-trash-symbolic");
             remove.set_tooltip_text(Some("Remove this cue mix (undoable)"));
             {
                 let ui = Rc::clone(self);
                 remove.connect_clicked(move |_| ui.dispatch(Action::Cue(CueOp::Remove(id))));
             }
-            self.rows.attach(&remove, 9, row, 1, 1);
+            self.rows.attach(&remove, 10, row, 1, 1);
         }
         self.filling.set(false);
     }
@@ -543,7 +652,7 @@ pub fn open(app: &Rc<AppState>) {
     body.set_margin_start(14);
     body.set_margin_end(14);
     let intro = gtk::Label::new(Some(
-        "Headphone mixes for the performers, each on its own outputs. Every track sends to every cue mix with its own level, pan and switch — set them in the mixer (the bar over the strips, or Audio → Cue Mixes → Mixer Shows). Cue mixes ignore the main mix's mutes and solos, never reach renders, and come out with the master, early with low-latency monitoring.",
+        "Headphone mixes for the performers, each on its own outputs. Every channel sends to every cue mix with its own level, pan and switch — set them in the mixer (the bar over the strips, or Audio → Cue Mixes → Mixer Shows). Buses and returns send what their sources bring them as the cue hears them: the main mix's mutes, solos and bus faders never reach a cue mix. A copy of the main mix sends a channel once, where it reaches the master (a track into a bus through the bus). Cue mixes never reach renders and come out with the master, early with low-latency monitoring. Talkback: the engineer's microphone into the cue mixes that hear it (the TALK button in the mixer's cue bar), which dim meanwhile.",
     ));
     intro.set_wrap(true);
     intro.set_xalign(0.0);
@@ -557,6 +666,28 @@ pub fn open(app: &Rc<AppState>) {
         .child(&rows)
         .build();
     body.append(&scroll);
+    // Talkback: its input, level and dim.
+    let talk_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    let talk_label = gtk::Label::new(Some("Talkback microphone"));
+    talk_label.add_css_class("dim-label");
+    talk_row.append(&talk_label);
+    let talk_input = gtk::DropDown::from_strings(&["None"]);
+    talk_input.set_tooltip_text(Some(
+        "The device input the talkback microphone is on (the device opens it when needed)",
+    ));
+    talk_row.append(&talk_input);
+    talk_row.append(&gtk::Label::new(Some("Level dB")));
+    let talk_level = gtk::SpinButton::with_range(-60.0, 12.0, 0.5);
+    talk_level.set_digits(1);
+    talk_row.append(&talk_level);
+    talk_row.append(&gtk::Label::new(Some("Dim dB")));
+    let talk_dim = gtk::SpinButton::with_range(-60.0, 0.0, 0.5);
+    talk_dim.set_digits(1);
+    talk_dim.set_tooltip_text(Some(
+        "How much the cue mixes hearing talkback turn down while the engineer talks",
+    ));
+    talk_row.append(&talk_dim);
+    body.append(&talk_row);
     let foot = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     let new = gtk::Button::with_label("New Cue Mix");
     foot.append(&new);
@@ -578,6 +709,9 @@ pub fn open(app: &Rc<AppState>) {
         win: win.clone(),
         rows,
         main_click: main_click.clone(),
+        talk_input: talk_input.clone(),
+        talk_level: talk_level.clone(),
+        talk_dim: talk_dim.clone(),
         made_for: RefCell::new(String::new()),
         filling: Cell::new(false),
     });
@@ -585,6 +719,36 @@ pub fn open(app: &Rc<AppState>) {
         let ui = Rc::clone(&ui);
         new.connect_clicked(move |_| ui.dispatch(Action::Cue(CueOp::New)));
     }
+    // The talkback controls: the settings from all three, applied at once.
+    let talk_changed = {
+        let ui = Rc::clone(&ui);
+        move || {
+            if ui.filling.get() {
+                return;
+            }
+            let Some(app) = ui.app.upgrade() else {
+                return;
+            };
+            let input = ui.talk_input.selected().checked_sub(1).map(|i| i as u16);
+            apply_talkback(
+                &app,
+                TalkbackSettings {
+                    input,
+                    level_db: ui.talk_level.value() as f32,
+                    dim_db: ui.talk_dim.value() as f32,
+                },
+            );
+        }
+    };
+    {
+        let f = talk_changed.clone();
+        talk_input.connect_selected_notify(move |_| f());
+    }
+    {
+        let f = talk_changed.clone();
+        talk_level.connect_value_changed(move |_| f());
+    }
+    talk_dim.connect_value_changed(move |_| talk_changed());
     {
         let ui2 = Rc::clone(&ui);
         main_click.connect_active_notify(move |s| {

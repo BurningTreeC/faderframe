@@ -2817,6 +2817,54 @@ fn the_instruments_do_not_allocate() {
             )),
             vec![],
         ),
+        // The synth's second wave: sync, ring and FM, the ladder with
+        // filter FM, pink noise, a tracked sine sub, LFO 2 and the mod
+        // envelope through the matrix, quietest-first stealing, drift
+        // and all three effects.
+        (
+            builtin::SYNTH,
+            None,
+            vec![
+                set(78, 1.0),
+                set(79, 0.4),
+                set(80, 0.3),
+                set(81, 1.0),
+                set(82, 0.5),
+                set(83, 1.0),
+                set(84, 1.0),
+                set(18, 0.3),
+                set(17, 0.5),
+                set(22, 4.0),
+                set(85, 0.3),
+                set(2, 0.7),
+                set(53, 4.0),
+                set(54, 1.0),
+                set(55, 300.0),
+                set(60, 2.0),
+                set(61, 3.0),
+                set(62, 0.5),
+                set(63, 3.0),
+                set(64, 2.0),
+                set(65, 0.3),
+                set(66, 8.0),
+                set(67, 17.0),
+                set(68, 0.8),
+                set(69, 6.0),
+                set(70, 22.0),
+                set(71, 0.5),
+                set(86, 0.5),
+                set(89, 1.0),
+                set(90, 0.4),
+                set(94, 0.5),
+                set(95, 1.0),
+                set(97, 0.4),
+                set(101, 1.0),
+                set(102, 1.0),
+                set(103, 0.6),
+                set(42, 4.0),
+                set(19, 3.0),
+            ],
+        ),
     ];
     let mut tracks = HashSet::new();
     let mut ids = Vec::new();
@@ -3616,9 +3664,11 @@ fn the_hardware_insert_and_its_ping_do_not_allocate() {
 }
 
 /// Cue mixes (pre- and post-fader, stereo and mono, sends panned, on and
-/// off), a panned ordinary send and the click into the cue mixes: their
-/// levels, pans and switches change (parameters) and the click plays
-/// there, nothing allocates.
+/// off), a bus with a device in them (its cue path: the keys' cue image,
+/// the device's cue shadow, its solo-safe strip), a panned ordinary send,
+/// the click into the cue mixes and the talkback microphone: their
+/// levels, pans and switches change (parameters), the click plays there,
+/// the engineer talks and stops, nothing allocates.
 #[test]
 fn cue_mixes_do_not_allocate() {
     let _serial = serial();
@@ -3649,6 +3699,24 @@ fn cue_mixes_do_not_allocate() {
             enabled: true,
             pan: Some(-0.5),
         });
+    // The keys through a bus with a device (an echo: a cue shadow with
+    // state of its own).
+    let bus = tp.track(TrackKind::Bus, "Keys Bus", ChannelLayout::Stereo);
+    tp.project.track_mut(keys).unwrap().output =
+        faderframe_project::OutputRouting::Track { track: bus };
+    let echo = tp.project.ids.allocate();
+    tp.project
+        .track_mut(bus)
+        .unwrap()
+        .inserts
+        .push(faderframe_project::PluginSlot {
+            id: echo,
+            plugin: faderframe_project::PluginRef::builtin(faderframe_core::builtin::ECHO, "Echo"),
+            bypass: false,
+            parameters: Vec::new(),
+            state: None,
+            sidechain: None,
+        });
     let mut cues: Vec<CueId> = Vec::new();
     for (first, layout, tap) in [
         (2, ChannelLayout::Stereo, SendTap::PreFader),
@@ -3658,12 +3726,12 @@ fn cue_mixes_do_not_allocate() {
         let mut c = CueMix::new(id, "Cue", TrackColor::palette(1), first, layout);
         c.tap = tap;
         tp.project.cue_mixes.push(c);
-        for t in [vox, keys, verb] {
+        for t in [vox, keys, verb, bus] {
             tp.project.track_mut(t).unwrap().cue_sends.push(CueSend {
                 cue: id,
                 level_db: -3.0,
                 pan: 0.3,
-                on: t != verb,
+                on: t != verb && t != keys,
             });
         }
         cues.push(id);
@@ -3674,6 +3742,13 @@ fn cue_mixes_do_not_allocate() {
     };
     let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 5).unwrap();
     r.controller.plugins().set_realtime(true);
+    let mut talk = faderframe_engine::Talkback {
+        on: false,
+        input: Some(1),
+        level: 0.5,
+        dim: 0.1,
+    };
+    r.controller.set_talkback(&tp.project, talk).unwrap();
     r.controller
         .sync(&tp.project, &tp.sources, faderframe_project::Impact::Graph)
         .unwrap();
@@ -3686,6 +3761,17 @@ fn cue_mixes_do_not_allocate() {
     }
     let mut h = History::default();
     let mut allocs = 0;
+    // Talking, and done.
+    for on in [true, false] {
+        talk.on = on;
+        r.controller.set_talkback(&tp.project, talk).unwrap();
+        allocs += armed(|| {
+            for _ in 0..40 {
+                r.processor.process_device(&mut bufs);
+            }
+        })
+        .1;
+    }
     for cmd in [
         Command::SetCueSendLevel {
             track: vox,
@@ -3727,6 +3813,18 @@ fn cue_mixes_do_not_allocate() {
         Command::SetTrackMute {
             track: keys,
             on: true,
+        },
+        Command::SetTrackSolo {
+            track: vox,
+            on: true,
+        },
+        Command::SetTrackVolume {
+            track: bus,
+            db: -9.0,
+        },
+        Command::SetCueTalkback {
+            cue: cues[0],
+            on: false,
         },
     ] {
         let impact = h.apply(&mut tp.project, cmd).unwrap();

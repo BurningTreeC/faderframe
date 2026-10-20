@@ -1357,6 +1357,7 @@ impl Session {
             MappingTarget::LauncherStop { track: None } => "Launcher · Stop All".into(),
             MappingTarget::TrackSolo { track } => format!("{} · Solo", self.track_label(*track)),
             MappingTarget::Show { control } => format!("Show · {}", control.label()),
+            MappingTarget::Talkback => "Talkback".into(),
             MappingTarget::TrackArm { track } => {
                 format!("{} · Record Arm", self.track_label(*track))
             }
@@ -1432,6 +1433,7 @@ impl Session {
         // Solo and arm presses; macro values (the latest a tick).
         let mut buttons: Vec<MappingTarget> = Vec::new();
         let mut macros: Vec<(TrackId, faderframe_core::ModulatorId, f64)> = Vec::new();
+        let mut talk: Option<crate::cues::TalkOp> = None;
         for raw in events {
             let Some(ev) = raw.event() else { continue };
             let Some((channel, control, value)) = control_of(ev) else {
@@ -1516,6 +1518,14 @@ impl Session {
                     | MappingTarget::Show { .. } => {
                         if pressed {
                             buttons.push(m.target);
+                        }
+                    }
+                    // Momentary: on while the key or switch is down.
+                    MappingTarget::Talkback => {
+                        if pressed {
+                            talk = Some(crate::cues::TalkOp::Press);
+                        } else if released {
+                            talk = Some(crate::cues::TalkOp::Release);
                         }
                     }
                     _ if note_off => {}
@@ -1629,6 +1639,11 @@ impl Session {
         }
         if !macros.is_empty() {
             self.apply_macros(macros);
+        }
+        if let Some(op) = talk
+            && let Err(e) = self.dispatch(Action::Talkback(op))
+        {
+            self.notify(NoticeLevel::Warning, format!("MIDI controller: {e}"));
         }
         for tc in transport {
             let action = match tc {
