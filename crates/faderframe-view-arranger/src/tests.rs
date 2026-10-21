@@ -2496,3 +2496,50 @@ fn the_ruler_sets_switches_and_removes_the_play_start_marker() {
     assert_eq!(s.project().play_start, None);
     assert_eq!(paths(&mut view, &s), without);
 }
+
+#[test]
+fn a_clip_being_dragged_keeps_no_pictures_of_its_waveform() {
+    // Issue #18: a picture kept at every step of a drag (in GTK an open
+    // file descriptor each) ran the program out of descriptors.
+    let mut s = session();
+    let mut view = ArrangerView::new(Theme::default());
+    let theme = Theme::default();
+    let size = Size::new(1400.0, 700.0);
+    let tracks = ArrangerView::lane_tracks(&s);
+    let bass_row = tracks.iter().position(|t| t.name == "Bass").unwrap();
+    let clip = s.project().track(tracks[bass_row].id).unwrap().clips[0];
+    let start = s.project().clip(clip).unwrap().start;
+    let row = view.row_rect(bass_row, size);
+    // Pictures asked for inside the clip (not the header's meter).
+    let kept_in_row = |view: &mut ArrangerView, s: &Session| {
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, size, s, &theme);
+        let c = view.clip_view_rect(s, size, clip).unwrap();
+        p.kept
+            .iter()
+            .filter(|r| r.y >= c.y && r.bottom() <= c.bottom())
+            .filter(|r| r.x >= c.x - 1.0 && r.right() <= c.right() + 1.0)
+            .count()
+    };
+    assert!(
+        kept_in_row(&mut view, &s) > 0,
+        "at rest the waveform is drawn through kept pictures"
+    );
+    let grab = Point::new(view.x_of(start) + 30.0, row.y + row.h * 0.8);
+    for a in run(&mut view, down(grab), size, &s).0 {
+        s.dispatch(a).unwrap();
+    }
+    for dx in [10.0, 40.0, 70.0] {
+        let at = Point::new(grab.x + dx, grab.y);
+        for a in run(&mut view, mv(at), size, &s).0 {
+            s.dispatch(a).unwrap();
+        }
+        assert_eq!(kept_in_row(&mut view, &s), 0, "nothing kept while it moves");
+    }
+    let end = Point::new(grab.x + 70.0, grab.y);
+    for a in run(&mut view, up(end), size, &s).0 {
+        s.dispatch(a).unwrap();
+    }
+    assert!(s.project().clip(clip).unwrap().start > start, "it moved");
+    assert!(kept_in_row(&mut view, &s) > 0, "kept again where it landed");
+}

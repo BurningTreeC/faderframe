@@ -324,12 +324,18 @@ struct Layer {
 /// once into textures and shown again while their key holds, so a frame
 /// that changes around them (the playhead over a waveform) renders a
 /// texture there instead of filling paths again with cairo.
+///
+/// Their number is bounded, not only their bytes: GTK exports the
+/// renderer's textures as dmabufs (4.24, Vulkan and GL alike), an open
+/// file descriptor each, and a process may have no more than 1024 open —
+/// pictures made at every step of a drag or a zoom ran Vulkan out of them
+/// (issue #18).
 #[derive(Default)]
 pub struct KeptCache {
     pictures: HashMap<u64, Kept>,
     frame: u64,
     bytes: usize,
-    /// Pictures made this frame (each is a render and a download).
+    /// Pictures made this frame (each is a render into a texture).
     made: usize,
 }
 
@@ -341,11 +347,22 @@ struct Kept {
     used: u64,
 }
 
+impl Kept {
+    fn bytes(&self) -> usize {
+        self.texture.width() as usize * self.texture.height() as usize * 4
+    }
+}
+
 impl KeptCache {
     /// Pictures made per frame at most: the rest draw as usual (a zoom
     /// gesture changes every key every frame).
     const PER_FRAME: usize = 6;
     const MAX_BYTES: usize = 192 << 20;
+    /// Pictures kept at most (open file descriptors, see above). More
+    /// shown at once than this: the rest are drawn as they are.
+    const MAX_PICTURES: usize = 256;
+    /// Kept beyond this, pictures not shown in the last frame go.
+    const CROWDED: usize = Self::MAX_PICTURES * 3 / 4;
     /// Frames a picture not shown is kept (scrolled away and back).
     const KEEP_FRAMES: u64 = 600;
 
@@ -353,39 +370,81 @@ impl KeptCache {
         self.frame += 1;
         self.made = 0;
         let frame = self.frame;
-        if self.bytes > Self::MAX_BYTES || frame.is_multiple_of(60) {
-            let mut bytes = self.bytes;
-            self.pictures.retain(|_, k| {
-                let keep = frame - k.used <= Self::KEEP_FRAMES;
-                if !keep {
-                    bytes -= k.texture.width() as usize * k.texture.height() as usize * 4;
+        let crowded = self.pictures.len() > Self::CROWDED;
+        if !crowded && self.bytes <= Self::MAX_BYTES && !frame.is_multiple_of(60) {
+            return;
+        }
+        let mut bytes = self.bytes;
+        self.pictures.retain(|_, k| {
+            let keep = frame - k.used <= Self::KEEP_FRAMES;
+            if !keep {
+                bytes -= k.bytes();
+            }
+            keep
+        });
+        // Still too many: the longest unseen go — never one the last frame
+        // showed (it would only be made again).
+        if bytes > Self::MAX_BYTES || self.pictures.len() > Self::CROWDED {
+            let mut by_age: Vec<(u64, u64)> = self
+                .pictures
+                .iter()
+                .filter(|(_, k)| k.used + 1 < frame)
+                .map(|(key, k)| (k.used, *key))
+                .collect();
+            by_age.sort_unstable();
+            for (_, key) in by_age {
+                if bytes <= Self::MAX_BYTES / 2 && self.pictures.len() <= Self::MAX_PICTURES / 2 {
+                    break;
                 }
-                keep
-            });
-            // Still too many: the longest unseen go.
-            if bytes > Self::MAX_BYTES {
-                let mut by_age: Vec<(u64, u64)> = self
-                    .pictures
-                    .iter()
-                    .map(|(key, k)| (k.used, *key))
-                    .collect();
-                by_age.sort_unstable();
-                for (_, key) in by_age {
-                    if bytes <= Self::MAX_BYTES / 2 {
-                        break;
-                    }
-                    if let Some(k) = self.pictures.remove(&key) {
-                        bytes -= k.texture.width() as usize * k.texture.height() as usize * 4;
-                    }
+                if let Some(k) = self.pictures.remove(&key) {
+                    bytes -= k.bytes();
                 }
             }
-            self.bytes = bytes;
         }
+        self.bytes = bytes;
     }
 
     pub fn clear(&mut self) {
         self.pictures.clear();
         self.bytes = 0;
+    }
+
+    /// The picture kept under `key` if it was made at this scale and size
+    /// (marked as shown in this frame).
+    fn show(&mut self, key: u64, scale: u32, size: (i32, i32)) -> Option<gdk::Texture> {
+        let frame = self.frame;
+        let k = self.pictures.get_mut(&key)?;
+        if k.scale != scale || k.size != size {
+            return None;
+        }
+        k.used = frame;
+        Some(k.texture.clone())
+    }
+
+    /// Whether another picture may be made this frame (counted if so).
+    fn may_make(&mut self) -> bool {
+        if self.made >= Self::PER_FRAME
+            || self.pictures.len() >= Self::MAX_PICTURES
+            || self.bytes > Self::MAX_BYTES
+        {
+            return false;
+        }
+        self.made += 1;
+        true
+    }
+
+    /// Keep a picture just made (and shown) under `key`.
+    fn keep(&mut self, key: u64, texture: gdk::Texture, scale: u32, size: (i32, i32)) {
+        let kept = Kept {
+            texture,
+            scale,
+            size,
+            used: self.frame,
+        };
+        self.bytes += kept.bytes();
+        if let Some(old) = self.pictures.insert(key, kept) {
+            self.bytes = self.bytes.saturating_sub(old.bytes());
+        }
     }
 }
 
@@ -753,17 +812,10 @@ impl Painter for SnapshotPainter<'_> {
             return false;
         };
         let (rect, size) = on_device_pixels(rect, self.scale);
-        let mut cache = cache.borrow_mut();
-        let frame = cache.frame;
-        let Some(k) = cache.pictures.get_mut(&key) else {
+        let texture = cache.borrow_mut().show(key, self.scale.to_bits(), size);
+        let Some(texture) = texture else {
             return false;
         };
-        if k.scale != self.scale.to_bits() || k.size != size {
-            return false;
-        }
-        k.used = frame;
-        let texture = k.texture.clone();
-        drop(cache);
         self.show_texture(&texture, rect);
         true
     }
@@ -772,12 +824,8 @@ impl Painter for SnapshotPainter<'_> {
         let Some(cache) = self.kept else {
             return false;
         };
-        {
-            let mut cache = cache.borrow_mut();
-            if cache.made >= KeptCache::PER_FRAME || !self.layers.is_empty() {
-                return false;
-            }
-            cache.made += 1;
+        if !self.layers.is_empty() || !cache.borrow_mut().may_make() {
+            return false;
         }
         let (rect, _) = on_device_pixels(rect, self.scale);
         let snapshot = gtk::Snapshot::new();
@@ -815,22 +863,9 @@ impl Painter for SnapshotPainter<'_> {
         match texture {
             Some(texture) => {
                 if let Some(cache) = self.kept {
-                    let mut cache = cache.borrow_mut();
-                    let frame = cache.frame;
-                    cache.bytes += size.0 as usize * size.1 as usize * 4;
-                    if let Some(old) = cache.pictures.insert(
-                        layer.key,
-                        Kept {
-                            texture: texture.clone(),
-                            scale: self.scale.to_bits(),
-                            size,
-                            used: frame,
-                        },
-                    ) {
-                        cache.bytes = cache.bytes.saturating_sub(
-                            old.texture.width() as usize * old.texture.height() as usize * 4,
-                        );
-                    }
+                    cache
+                        .borrow_mut()
+                        .keep(layer.key, texture.clone(), self.scale.to_bits(), size);
                 }
                 self.show_texture(&texture, rect);
             }
@@ -907,5 +942,84 @@ mod tests {
         assert_eq!(native.to_string(), gsk_path(&large).to_string());
         assert!(cache.paths.is_empty());
         assert_eq!(cache.words, 0);
+    }
+
+    /// A small texture standing in for a rendered picture.
+    fn picture() -> gdk::Texture {
+        gdk::MemoryTexture::new(
+            4,
+            4,
+            gdk::MemoryFormat::R8g8b8a8,
+            &gtk::glib::Bytes::from_owned(vec![0u8; 64]),
+            16,
+        )
+        .upcast()
+    }
+
+    /// One frame of a view: `shown` pictures it shows (made where missing
+    /// and allowed). Pictures made.
+    fn paint_frame(cache: &mut KeptCache, shown: impl Iterator<Item = u64>) -> usize {
+        cache.begin_frame();
+        let mut made = 0;
+        for key in shown {
+            if cache.show(key, 1, (4, 4)).is_none() && cache.may_make() {
+                cache.keep(key, picture(), 1, (4, 4));
+                made += 1;
+            }
+        }
+        made
+    }
+
+    #[test]
+    fn a_drag_making_pictures_every_frame_keeps_only_so_many() {
+        // Issue #18: every picture may hold a file descriptor; a drag shows
+        // new ones every frame, and they used to stay for 600 frames.
+        let mut cache = KeptCache::default();
+        let mut next = 0u64;
+        for _ in 0..2000 {
+            let shown = next..next + 6;
+            next += 6;
+            assert_eq!(paint_frame(&mut cache, shown), KeptCache::PER_FRAME);
+            assert!(cache.pictures.len() <= KeptCache::MAX_PICTURES);
+        }
+    }
+
+    #[test]
+    fn pictures_still_shown_outlast_a_drag_past_them() {
+        let mut cache = KeptCache::default();
+        let still: Vec<u64> = (1_000_000..1_000_040).collect();
+        for _ in 0..20 {
+            paint_frame(&mut cache, still.iter().copied());
+        }
+        let mut next = 0u64;
+        for _ in 0..2000 {
+            let moving = next..next + 6;
+            next += 6;
+            // Nothing that stayed in view is made again.
+            assert_eq!(
+                paint_frame(&mut cache, still.iter().copied().chain(moving)),
+                6
+            );
+            assert!(cache.pictures.len() <= KeptCache::MAX_PICTURES);
+        }
+        assert!(still.iter().all(|k| cache.pictures.contains_key(k)));
+    }
+
+    #[test]
+    fn more_shown_than_kept_settles_instead_of_making_pictures_every_frame() {
+        let mut cache = KeptCache::default();
+        let shown = 0..(KeptCache::MAX_PICTURES as u64 + 100);
+        for _ in 0..100 {
+            paint_frame(&mut cache, shown.clone());
+        }
+        assert_eq!(cache.pictures.len(), KeptCache::MAX_PICTURES);
+        for _ in 0..100 {
+            assert_eq!(paint_frame(&mut cache, shown.clone()), 0);
+        }
+        // Scrolled on: the pictures out of view make room again.
+        let scrolled = 10_000..10_000 + KeptCache::MAX_PICTURES as u64 / 2;
+        paint_frame(&mut cache, scrolled.clone());
+        paint_frame(&mut cache, scrolled.clone());
+        assert!(paint_frame(&mut cache, scrolled) > 0);
     }
 }

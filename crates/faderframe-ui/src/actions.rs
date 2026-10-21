@@ -2562,9 +2562,11 @@ pub fn install(app: &Rc<AppState>) {
         // Development aid: `drag:<view>@<x>/<y>=><x>/<y>` presses the
         // primary button at the first point and moves to the second in a
         // few steps, holding it there (a screenshot shows the drag, e.g. a
-        // snap guide); `drag:<view>@release` lets go where it is. Modifiers
-        // held throughout: `drag:<view>+ctrl+shift+alt@…` (a press and a
-        // release at one point is a click).
+        // snap guide); `drag:<view>@=><x>/<y>` moves the held button on
+        // from where it is (one long drag, a frame or more per step with
+        // `wait:` between); `drag:<view>@release` lets go where it is.
+        // Modifiers held throughout: `drag:<view>+ctrl+shift+alt@…` (a press
+        // and a release at one point is a click).
         named("drag", |a, arg| {
             use faderframe_ui_canvas::{Modifiers, Point, PointerButton, ViewEvent};
             let Some((view, at)) = arg.split_once('@') else {
@@ -2609,19 +2611,36 @@ pub fn install(app: &Rc<AppState>) {
                 let mut xy = s.split('/').filter_map(|v| v.trim().parse::<f32>().ok());
                 Some(Point::new(xy.next()?, xy.next()?))
             };
-            let Some((from, to)) = at
-                .split_once("=>")
-                .and_then(|(f, t)| Some((point(f)?, point(t)?)))
-            else {
-                tracing::warn!("drag: '{at}' is not <x>/<y>=><x>/<y>");
+            // Moving on: from where the held button is, with its modifiers.
+            let held = at
+                .strip_prefix("=>")
+                .map(|_| HELD.with(std::cell::Cell::get));
+            if let Some(None) = held {
+                tracing::warn!("drag: '{at}' moves on, but no drag is held");
+                return;
+            }
+            let Some((from, to)) = at.split_once("=>").and_then(|(f, t)| {
+                let from = match held {
+                    Some(Some((x, y, _))) => Point::new(x, y),
+                    _ => point(f)?,
+                };
+                Some((from, point(t)?))
+            }) else {
+                tracing::warn!("drag: '{at}' is not <x>/<y>=><x>/<y> or =><x>/<y>");
                 return;
             };
-            canvas.deliver(ViewEvent::PointerDown {
-                pos: from,
-                button: PointerButton::Primary,
-                modifiers: mods,
-                clicks: 1,
-            });
+            let mods = match held {
+                Some(Some((_, _, m))) => m,
+                _ => mods,
+            };
+            if held.is_none() {
+                canvas.deliver(ViewEvent::PointerDown {
+                    pos: from,
+                    button: PointerButton::Primary,
+                    modifiers: mods,
+                    clicks: 1,
+                });
+            }
             if from != to {
                 for k in 1..=4 {
                     let t = k as f32 / 4.0;

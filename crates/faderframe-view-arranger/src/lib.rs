@@ -313,6 +313,8 @@ struct CompDrag {
 
 /// Audio of one source placed on the timeline, for waveform drawing.
 struct WaveSpan {
+    /// The clip it is (part of).
+    clip: ClipId,
     source: faderframe_core::AudioSourceId,
     /// Engine sample of the first frame.
     start: i64,
@@ -1231,8 +1233,8 @@ impl ArrangerView {
         let src_off = (span.source_offset as f64 * ratio * pr) as i64;
         let channels = peaks.channels();
         // Drawn through kept tiles (unwarped: what a tile shows depends
-        // only on these).
-        let tiles = span.warp.is_none().then(|| {
+        // only on these; not while a drag changes them every frame).
+        let tiles = (span.warp.is_none() && !self.reshaping(span.clip)).then(|| {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
             span.source.hash(&mut h);
@@ -1457,6 +1459,7 @@ impl ArrangerView {
         for piece in f.pieces() {
             let take = &f.takes[piece.take];
             let span = WaveSpan {
+                clip: clip.id,
                 source: take.source,
                 start: base + Self::engine_frames(model, piece.start),
                 source_offset: take.source_offset + piece.start,
@@ -1518,6 +1521,7 @@ impl ArrangerView {
                 &Paint::Solid(color.darken(0.62).with_alpha(0.85)),
             );
             let wave = WaveSpan {
+                clip: clip.id,
                 source: take.source,
                 start: base + Self::engine_frames(model, take.start),
                 source_offset: take.source_offset + take.start,
@@ -1547,6 +1551,7 @@ impl ArrangerView {
                 let r = Rect::new(x0, lane.y + 1.0, x1 - x0, lane.h - 2.0);
                 p.fill(r, color.with_alpha(0.45));
                 let span = WaveSpan {
+                    clip: clip.id,
                     source: take.source,
                     start: base + Self::engine_frames(model, piece.start),
                     source_offset: take.source_offset + piece.start,
@@ -1772,6 +1777,7 @@ impl ArrangerView {
         match &clip.content {
             ClipContent::Audio(audio) => {
                 let span = WaveSpan {
+                    clip: clip.id,
                     source: audio.source,
                     start: Self::clip_start_sample(model, clip),
                     source_offset: audio.source_offset,

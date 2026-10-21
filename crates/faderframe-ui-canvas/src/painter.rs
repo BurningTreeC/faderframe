@@ -132,6 +132,9 @@ pub enum DrawOp {
 #[derive(Debug, Default)]
 pub struct RecordingPainter {
     pub ops: Vec<DrawOp>,
+    /// Where views asked for a picture to be kept ([`crate::kept`]; none
+    /// is: what follows is recorded as drawn).
+    pub kept: Vec<Rect>,
     clips: usize,
 }
 
@@ -204,5 +207,9 @@ impl Painter for RecordingPainter {
     fn pop_clip(&mut self) {
         self.clips = self.clips.saturating_sub(1);
         self.ops.push(DrawOp::PopClip);
+    }
+    fn begin_keep(&mut self, _key: u64, rect: Rect) -> bool {
+        self.kept.push(rect);
+        false
     }
 }

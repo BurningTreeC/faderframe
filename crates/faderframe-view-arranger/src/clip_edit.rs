@@ -638,6 +638,33 @@ impl ArrangerView {
         }
     }
 
+    /// Whether a drag is changing `clip`'s waveform at every step — its
+    /// place, edges, contents or gain: its tiles would be new pictures
+    /// every frame, so it is drawn without keeping them (issue #18). A
+    /// Shuffle move changes nothing before the release.
+    pub(crate) fn reshaping(&self, clip: ClipId) -> bool {
+        match &self.edit_drag {
+            Some(
+                EditDrag::Move {
+                    clips,
+                    moved: true,
+                    ghost: None,
+                    ..
+                }
+                | EditDrag::Trim {
+                    clips, moved: true, ..
+                }
+                | EditDrag::Slip {
+                    clips, moved: true, ..
+                }
+                | EditDrag::Gain {
+                    clips, moved: true, ..
+                },
+            ) => clips.contains(&clip),
+            _ => false,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn press_clip(
         &mut self,
