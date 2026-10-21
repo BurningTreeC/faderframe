@@ -567,8 +567,7 @@ impl CanvasView<Session, Action> for EditToolbarView {
                 p.text(
                     &label,
                     rect.inset_xy(6.0, 0.0),
-                    &TextStyle::new(th.fonts.small, th.ui.lcd_text)
-                        .family(faderframe_ui_canvas::FontFamily::Mono),
+                    &TextStyle::new(th.fonts.small, th.ui.lcd_text).family(th.fonts.numerals),
                 );
                 continue;
             }

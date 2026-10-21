@@ -8,8 +8,8 @@ use faderframe_project::Command;
 use faderframe_session::{Action, CounterUnit, Session, TransportAction, format_position};
 use faderframe_timeline::TimeSignature;
 use faderframe_ui_canvas::{
-    Align, CanvasView, Color, EventCx, FontFamily, HostRequest, MenuItem, Paint, Painter, Point,
-    PointerButton, Rect, Size, TextStyle, Theme, ViewEvent,
+    Align, CanvasView, Chrome, Color, EventCx, FontFamily, FontWeight, HostRequest, MenuItem,
+    Paint, Painter, Point, PointerButton, Rect, Size, TextStyle, Theme, ViewEvent,
 };
 use std::time::{Duration, Instant};
 
@@ -286,14 +286,64 @@ impl CanvasView<Session, Action> for TransportDisplay {
     fn paint(&mut self, p: &mut dyn Painter, size: Size, s: &Session, theme: &Theme) {
         let (lcd_bg, lcd_text, lcd_dim) = (theme.ui.lcd_bg, theme.ui.lcd_text, theme.ui.lcd_dim);
         let r = Rect::from_size(size);
-        p.fill_rounded(r, 6.0, &Paint::vertical(r, lcd_bg.lighten(0.04), lcd_bg));
-        p.inset_shadow(r, 6.0, Color::rgba(0.0, 0.0, 0.0, 0.9), 0.0, 1.5, 4.0);
-        p.stroke_rounded(r, 6.0, 1.0, Color::rgba(1.0, 1.0, 1.0, 0.06));
+        // Planes: a glass readout — flat, a hairline edge, light pooling
+        // under the counter, the figures in the UI face, the flags in the
+        // skin's own colours.
+        let glass = theme.chrome == Chrome::Planes;
         let z = zones(size);
+        if glass {
+            let radius = (r.h * 0.5).min(10.0);
+            p.fill_rounded(r, radius, &Paint::Solid(lcd_bg));
+            let glow = theme.console.look.glow.clamp(0.0, 2.0);
+            if glow > 0.0 {
+                let c = z.bbt.center();
+                p.fill_rounded(
+                    r,
+                    radius,
+                    &Paint::Radial {
+                        center: Point::new(c.x, r.center().y),
+                        radius: z.bbt.w * 0.75,
+                        stops: vec![
+                            (0.0, lcd_text.with_alpha(0.07 * glow)),
+                            (1.0, lcd_text.with_alpha(0.0)),
+                        ],
+                    },
+                );
+            }
+            p.stroke_rounded(r.inset(0.5), radius, 1.0, lcd_text.with_alpha(0.09));
+        } else {
+            p.fill_rounded(r, 6.0, &Paint::vertical(r, lcd_bg.lighten(0.04), lcd_bg));
+            p.inset_shadow(r, 6.0, Color::rgba(0.0, 0.0, 0.0, 0.9), 0.0, 1.5, 4.0);
+            p.stroke_rounded(r, 6.0, 1.0, Color::rgba(1.0, 1.0, 1.0, 0.06));
+        }
         let project = s.project();
         let pos = s.playhead();
-        let mono = |size: f32, c: Color| TextStyle::new(size, c).family(FontFamily::Mono);
-        let small = |c: Color| TextStyle::new(theme.fonts.tiny + 0.5, c).bold();
+        let figures = if glass {
+            theme.fonts.numerals
+        } else {
+            FontFamily::Mono
+        };
+        let mono = |size: f32, c: Color| TextStyle::new(size, c).family(figures);
+        let small = |c: Color| {
+            let s = TextStyle::new(theme.fonts.tiny + 0.5, c).bold();
+            if glass { s.tracking(0.9) } else { s }
+        };
+        // The flags' colours: the skin's on planes.
+        let (record, looped, shuttle, vari) = if glass {
+            (
+                theme.console.led.record,
+                theme.ui.accent,
+                theme.ui.accent,
+                theme.console.led.mute,
+            )
+        } else {
+            (
+                Color::hex(0xff4b4b),
+                Color::hex(0xff8a5c),
+                Color::hex(0x6fd0ff),
+                Color::hex(0xffc24b),
+            )
+        };
         // Long readouts (timecode, samples) shrink to fit.
         let fit = |text: &str, size: f32, room: usize| {
             let n = text.chars().count().max(1);
@@ -307,15 +357,15 @@ impl CanvasView<Session, Action> for TransportDisplay {
         p.text(
             &main,
             z.bbt,
-            &mono(fit(&main, theme.fonts.display - 2.0, 9), lcd_text).bold(),
+            &mono(fit(&main, theme.fonts.display - 2.0, 9), lcd_text).weight(if glass {
+                FontWeight::Medium
+            } else {
+                FontWeight::Bold
+            }),
         );
         if s.count_in_position().is_some() {
             // Counting in before playback: said under the counter.
-            p.text(
-                "COUNT-IN",
-                z.time,
-                &small(Color::hex(0xff4b4b)).family(FontFamily::Mono),
-            );
+            p.text("COUNT-IN", z.time, &small(record).family(figures));
         } else {
             let sub = readout(s, sub_unit(s));
             p.text(
@@ -337,13 +387,13 @@ impl CanvasView<Session, Action> for TransportDisplay {
             p.text(
                 &format!("{arrows} {}×", v.abs()),
                 z.bpm,
-                &small(Color::hex(0x6fd0ff)).align(Align::End),
+                &small(shuttle).align(Align::End),
             );
         } else if (speed - 1.0).abs() > 1e-6 {
             p.text(
                 &format!("VARI {:+.1}%", (speed - 1.0) * 100.0),
                 z.bpm,
-                &small(Color::hex(0xffc24b)).align(Align::End),
+                &small(vari).align(Align::End),
             );
         } else {
             p.text(
@@ -354,16 +404,21 @@ impl CanvasView<Session, Action> for TransportDisplay {
         }
         // The tap pad.
         let lit = self.flashing();
+        let pad_r = if glass {
+            z.tap.h.min(z.tap.w) * 0.5
+        } else {
+            3.0
+        };
         p.fill_rounded(
             z.tap,
-            3.0,
+            pad_r,
             &Paint::Solid(if lit {
                 lcd_text.with_alpha(0.85)
             } else {
                 lcd_text.with_alpha(0.08)
             }),
         );
-        p.stroke_rounded(z.tap, 3.0, 1.0, lcd_text.with_alpha(0.35));
+        p.stroke_rounded(z.tap, pad_r, 1.0, lcd_text.with_alpha(0.35));
         p.text(
             "TAP",
             z.tap,
@@ -394,8 +449,8 @@ impl CanvasView<Session, Action> for TransportDisplay {
             );
         };
         let (f1, f2) = z.flags.split_top(z.flags.h / 2.0);
-        flag(p, f1, "LOOP", project.loop_enabled, Color::hex(0xff8a5c));
-        flag(p, f2, "REC", t.recording, Color::hex(0xff4b4b));
+        flag(p, f1, "LOOP", project.loop_enabled, looped);
+        flag(p, f2, "REC", t.recording, record);
     }
 
     fn event(

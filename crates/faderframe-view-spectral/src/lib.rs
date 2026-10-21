@@ -20,8 +20,8 @@ use faderframe_session::{Action, Session, TransportAction};
 use faderframe_spectral::Spectrogram;
 use faderframe_spectral::spectrogram::LOW_HZ;
 use faderframe_ui_canvas::{
-    CanvasView, Color, Cursor, EventCx, FontFamily, HostRequest, Key, MenuItem, Painter, Path,
-    Pixels, Point, PointerButton, Rect, ScrollAxis, ScrollInfo, Size, TextStyle, Theme, ViewEvent,
+    CanvasView, Color, Cursor, EventCx, HostRequest, Key, MenuItem, Painter, Path, Pixels, Point,
+    PointerButton, Rect, ScrollAxis, ScrollInfo, Size, TextStyle, Theme, ViewEvent,
 };
 
 const BAR_H: f32 = 34.0;
@@ -775,7 +775,7 @@ impl CanvasView<Session, Action> for SpectralView {
                 &self.value_text(which),
                 r,
                 &TextStyle::new(th.fonts.small, th.ui.lcd_text)
-                    .family(FontFamily::Mono)
+                    .family(th.fonts.numerals)
                     .center(),
             );
         }
@@ -958,7 +958,7 @@ impl CanvasView<Session, Action> for SpectralView {
                 &text,
                 r,
                 &TextStyle::new(th.fonts.small, th.ui.text)
-                    .family(FontFamily::Mono)
+                    .family(th.fonts.numerals)
                     .center(),
             );
         }

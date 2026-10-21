@@ -436,19 +436,30 @@ impl ArrangerView {
                 continue;
             }
             let c = Color::rgb8(s.color.r, s.color.g, s.color.b);
-            p.fill_rounded(rr, 3.0, &Paint::Solid(c.with_alpha(*alpha)));
-            p.stroke_rounded(rr, 3.0, 1.0, c.lighten(0.25));
+            let card = th.arranger.clip_style == faderframe_ui_canvas::ClipStyle::Card;
+            let ink = if card {
+                // As the clips: tinted, a line of the colour at the
+                // start, a light name.
+                p.fill_rounded(rr, 3.0, &Paint::Solid(c.with_alpha(0.26 * alpha)));
+                p.stroke_rounded(rr.inset(0.5), 3.0, 1.0, c.with_alpha(0.5 * alpha));
+                p.fill_rounded(
+                    Rect::new(rr.x, rr.y, 2.0, rr.h),
+                    1.0,
+                    &Paint::Solid(c.with_alpha(*alpha)),
+                );
+                th.card_ink(c)
+            } else {
+                p.fill_rounded(rr, 3.0, &Paint::Solid(c.with_alpha(*alpha)));
+                p.stroke_rounded(rr, 3.0, 1.0, c.lighten(0.25));
+                Color::hex(0x141518)
+            };
             let text = Rect::new(
                 rr.x.max(r.x) + 6.0,
                 rr.y,
                 rr.right() - rr.x.max(r.x) - 8.0,
                 rr.h,
             );
-            p.text(
-                &s.name,
-                text,
-                &TextStyle::new(th.fonts.small, Color::hex(0x141518)).bold(),
-            );
+            p.text(&s.name, text, &TextStyle::new(th.fonts.small, ink).bold());
         }
         if let Some(GlobalDrag::NewSection { anchor, to }) = &self.global_drag {
             let (x0, x1) = (self.x_of(*anchor.min(to)), self.x_of(*anchor.max(to)));

@@ -2,8 +2,8 @@
 //! [`Spec`] — the colours and looks that make it distinct — and everything
 //! else is derived consistently.
 
-use crate::Color;
 use crate::theme::*;
+use crate::{Color, FontFamily};
 
 fn c(hex: u32) -> Color {
     Color::hex(hex)
@@ -85,6 +85,7 @@ fn build(s: Spec) -> Theme {
             text_dim: c(s.text_dim),
             text_faint: c(s.text_faint),
             accent,
+            accent_2: accent,
             selection: c(s.selection),
             lcd_bg: c(s.lcd.0),
             lcd_text: c(s.lcd.1),
@@ -189,6 +190,7 @@ fn build(s: Spec) -> Theme {
             clip_header: 22.0,
             clip_header_alpha: 0.82,
             clip_alpha: 0.5,
+            clip_style: ClipStyle::Classic,
             clip_text: c(s.clip_text),
             selection_outline: c(s.outline),
             track_height: 72.0,
@@ -292,6 +294,7 @@ fn build(s: Spec) -> Theme {
             key_black: c(s.keys[2]),
         },
         grid: GridLook::default(),
+        chrome: Chrome::Classic,
     }
 }
 
@@ -302,6 +305,7 @@ fn fonts() -> Typography {
         normal: 11.5,
         large: 13.5,
         display: 20.0,
+        numerals: FontFamily::Mono,
     }
 }
 
@@ -403,6 +407,7 @@ pub fn vintage() -> Theme {
             meter: MeterKind::Plasma,
             engrave: Color::rgba(0.0, 0.0, 0.0, 0.6),
             flat: false,
+            ..ConsoleLook::default()
         },
     })
 }
@@ -612,6 +617,7 @@ pub fn high_contrast() -> Theme {
             normal: 12.5,
             large: 14.5,
             display: 22.0,
+            numerals: FontFamily::Mono,
         },
         bg: 0x000000,
         surface: 0x000000,
@@ -652,6 +658,128 @@ pub fn high_contrast() -> Theme {
             ..ConsoleLook::default()
         },
     })
+}
+
+/// "Lumen": drawn with light, not hardware. Ink and graphite planes set
+/// apart by steps of luminance instead of bevels and borders; hairline
+/// geometry; one luminous accent running from cyan to violet, used
+/// sparingly (playhead, selection, active states, value arcs), and one
+/// warm signal colour kept for record, arm and overload. Halo knobs, pill
+/// faders and buttons that light from within, fine gradient meters with a
+/// bloom, clips as translucent cards, readouts in tabular figures.
+pub fn lumen() -> Theme {
+    let mut t = build(Spec {
+        id: "lumen",
+        name: "Lumen",
+        dark: true,
+        fonts: Typography {
+            tiny: 8.5,
+            small: 10.0,
+            normal: 11.5,
+            large: 13.5,
+            display: 21.0,
+            numerals: FontFamily::Figures,
+        },
+        bg: 0x0b0d12,
+        surface: 0x11141a,
+        surface_alt: 0x191d25,
+        border: 0x06070a,
+        text: 0xe8ecf4,
+        text_dim: 0x9ca4b5,
+        text_faint: 0x7a8397,
+        accent: 0x4fd6f2,
+        selection: 0x9b8cff,
+        lcd: (0x080a0e, 0xdcf6ff, 0x3a4753),
+        panel: (0x1a1d25, 0x15181f),
+        master_panel: (0x1f232c, 0x1a1d25),
+        panel_label: 0x8c94a7,
+        edges: (0.05, 0.35),
+        well: 0x0c0e13,
+        well_text: (0xc8d0df, 0x737c90),
+        knob: [0x0f1217, 0x1d222b, 0x2b313c, 0x1a1e26, 0xe8ecf4, 0x2f3542],
+        knob_caps: [0x9b8cff, 0x8c94a7, 0xff5c50],
+        fader: [0x232832, 0x3a4250, 0x272c36, 0x7c8699],
+        fader_caps: [0xc9d3e6, 0x8fa8ff, 0x5fdcc2, 0x4fd6f2],
+        // Cool to hot: cyan, ice, amber, the signal colour.
+        meter: ([0x07080c, 0x39c8e2, 0xc6f1ff, 0xffb45e, 0xff5c50], 0.09),
+        leds: [0xf2b45c, 0x5fe3b1, 0xff5c50, 0x4fd6f2, 0xa48fff],
+        led_off: [0x1a1e26, 0x9ca4b5, 0x2c323d],
+        scribble: (0x101318, 0xe8ecf4),
+        editor_bg: 0x0c0e13,
+        lanes: (0x0f1217, 0x0d1015, 0x141a26),
+        header: (0x12151b, 0x181f2e, 0x07080b),
+        ruler: (0x0c0e13, 0x8c94a7),
+        line: (0xc4d6ff, 0.8),
+        clip_text: 0x0b0d12,
+        outline: 0x4fd6f2,
+        keys: [0xd6dce7, 0xadb5c4, 0x14171d, 0x566074],
+        look: ConsoleLook {
+            knob_skirt: None,
+            knob_ring: true,
+            sheen: 0.0,
+            brushed: 0.0,
+            screws: false,
+            wood: None,
+            meter: MeterKind::Gradient,
+            engrave: Color::TRANSPARENT,
+            flat: true,
+            knob_kind: KnobKind::Halo,
+            fader_kind: FaderKind::Pill,
+            button_kind: ButtonKind::Pill,
+            panel_kind: PanelKind::Plane,
+            glow: 1.0,
+        },
+    });
+    let text = t.ui.text;
+    let accent = t.ui.accent;
+    let amber = c(0xffb45e);
+    t.ui.accent_2 = c(0x9b8cff);
+    let k = &mut t.console;
+    k.strip_gap = 4.0;
+    k.panel_edge_light = text.with_alpha(0.045);
+    k.panel_edge_dark = Color::rgba(0.0, 0.0, 0.0, 0.4);
+    k.section_line = text.with_alpha(0.07);
+    k.fader.slot_edge = Color::TRANSPARENT;
+    k.fader.cap_width = 26.0;
+    k.fader.cap_height = 22.0;
+    k.fader.cap_line = c(0x0b0d12);
+    k.fader.scale_tick = c(0x7c8699).with_alpha(0.6);
+    k.meter.peak = c(0xf4f7fc);
+    k.meter.vu_face = c(0x12151c);
+    k.meter.vu_needle = c(0xe8ecf4);
+    k.led.label_on = text;
+    k.selected_glow = accent.with_alpha(0.55);
+    let a = &mut t.arranger;
+    a.clip_style = ClipStyle::Card;
+    a.clip_radius = 6.0;
+    a.clip_header_alpha = 0.92;
+    a.clip_alpha = 0.8;
+    a.launch_queued = amber;
+    // The loop band in the ruler: the accent sunk into the ink.
+    a.loop_on = accent.mix(c(0x0b0d12), 0.5).with_alpha(0.22);
+    t.perf.load_warn = amber;
+    t.perf.load_high = c(0xff8a5c);
+    t.perf.graph_peak = t.ui.accent_2;
+    t.tools.level_warn = amber;
+    let d = &mut t.device;
+    d.accents = [
+        c(0xffad5c),
+        c(0xff7a6e),
+        c(0x6ee6a8),
+        c(0xf394d2),
+        c(0xffd36e),
+        c(0x7fa6ff),
+        c(0x4fd6f2),
+        c(0xb39dff),
+        c(0x62c8ff),
+        c(0xff9f7a),
+        c(0xc8ef72),
+    ];
+    d.display = c(0x07090d);
+    d.section_edge = c(0x1f242d);
+    d.panel_edge = c(0x272c36);
+    t.chrome = Chrome::Planes;
+    t
 }
 
 /// A console family's mixer look (`faderframe_project::console::FAMILIES`
@@ -701,6 +829,7 @@ fn family(f: usize) -> Family {
                 meter: MeterKind::Ladder,
                 engrave: Color::rgba(0.0, 0.0, 0.0, 0.6),
                 flat: false,
+                ..ConsoleLook::default()
             },
         },
         // Slate and colour: light caps, colour-coded sections, bar meters.
@@ -725,6 +854,7 @@ fn family(f: usize) -> Family {
                 meter: MeterKind::Bar,
                 engrave: Color::rgba(0.0, 0.0, 0.0, 0.45),
                 flat: false,
+                ..ConsoleLook::default()
             },
         },
         // Taupe and Bakelite: warm plates, dark brown knobs with printed
@@ -750,6 +880,7 @@ fn family(f: usize) -> Family {
                 meter: MeterKind::Plasma,
                 engrave: Color::rgba(0.0, 0.0, 0.0, 0.6),
                 flat: false,
+                ..ConsoleLook::default()
             },
         },
         // Hammertone green-grey: textured plates, black knobs, oak cheeks
@@ -775,6 +906,7 @@ fn family(f: usize) -> Family {
                 meter: MeterKind::Ladder,
                 engrave: Color::rgba(0.0, 0.0, 0.0, 0.55),
                 flat: false,
+                ..ConsoleLook::default()
             },
         },
         // Light enamel grey: broadcast-plain plates, dark legends, black
@@ -800,6 +932,7 @@ fn family(f: usize) -> Family {
                 meter: MeterKind::Bar,
                 engrave: Color::rgba(1.0, 1.0, 1.0, 0.25),
                 flat: false,
+                ..ConsoleLook::default()
             },
         },
         // Pewter and walnut: warm grey-green plates, printed knob scales,
@@ -825,6 +958,7 @@ fn family(f: usize) -> Family {
                 meter: MeterKind::Plasma,
                 engrave: Color::rgba(0.0, 0.0, 0.0, 0.6),
                 flat: false,
+                ..ConsoleLook::default()
             },
         },
     }
@@ -874,6 +1008,7 @@ impl Theme {
             fjord(),
             neon(),
             high_contrast(),
+            lumen(),
         ]
     }
 
@@ -893,7 +1028,7 @@ mod tests {
     #[test]
     fn skins_are_distinct_and_found_by_id() {
         let all = Theme::all();
-        assert_eq!(all.len(), 8);
+        assert_eq!(all.len(), 9);
         let mut ids: Vec<_> = all.iter().map(|t| t.id).collect();
         ids.sort_unstable();
         ids.dedup();
@@ -939,5 +1074,134 @@ mod tests {
             let (a, b) = (t.ui.text.luminance(), t.ui.background.luminance());
             assert!((a - b).abs() > 0.5, "{}: text contrast", t.id);
         }
+    }
+
+    /// The looks added for Lumen default to how skins were drawn before
+    /// them, and no other skin (nor any console family's look) takes them:
+    /// every other skin draws exactly as it did.
+    #[test]
+    fn only_lumen_takes_the_newer_looks() {
+        for t in Theme::all().into_iter().filter(|t| t.id != "lumen") {
+            let looks = std::iter::once(t.console.look.clone())
+                .chain((0..6).map(|f| t.with_console_family(f).console.look));
+            for l in looks {
+                assert_eq!(l.knob_kind, KnobKind::Cap, "{}", t.id);
+                assert_eq!(l.fader_kind, FaderKind::Cap, "{}", t.id);
+                assert_eq!(l.button_kind, ButtonKind::Led, "{}", t.id);
+                assert_eq!(l.panel_kind, PanelKind::Hardware, "{}", t.id);
+                assert_eq!(l.glow, 0.0, "{}", t.id);
+                assert_ne!(l.meter, MeterKind::Gradient, "{}", t.id);
+            }
+            assert_eq!(t.arranger.clip_style, ClipStyle::Classic, "{}", t.id);
+            assert_eq!(t.chrome, Chrome::Classic, "{}", t.id);
+            assert_eq!(t.fonts.numerals, FontFamily::Mono, "{}", t.id);
+            assert_eq!(t.ui.accent_2, t.ui.accent, "{}", t.id);
+        }
+        let l = lumen();
+        let look = &l.console.look;
+        assert!(look.planes() && look.glow > 0.0);
+        assert_eq!(
+            (
+                look.knob_kind,
+                look.fader_kind,
+                look.button_kind,
+                look.meter
+            ),
+            (
+                KnobKind::Halo,
+                FaderKind::Pill,
+                ButtonKind::Pill,
+                MeterKind::Gradient
+            )
+        );
+        assert!(look.knob_skirt.is_none() && look.wood.is_none() && !look.screws);
+        assert_eq!(l.arranger.clip_style, ClipStyle::Card);
+        assert_eq!(l.chrome, Chrome::Planes);
+        assert_eq!(Theme::by_id("lumen").name, "Lumen");
+        // A console family's look still takes the mixer over.
+        assert!(!l.with_console_family(0).console.look.planes());
+    }
+
+    /// Lumen's text and controls meet WCAG AA: 4.5:1 for text (7:1 for the
+    /// main text and the transport's figures), 3:1 for the accent marks.
+    #[test]
+    fn lumen_reads_well() {
+        let t = lumen();
+        let (ui, k) = (&t.ui, &t.console);
+        let aa = |what: &str, fg: Color, bg: Color, min: f32| {
+            let c = fg.contrast(bg);
+            assert!(c >= min, "{what}: {c:.2} < {min}");
+        };
+        aa("text", ui.text, ui.background, 7.0);
+        for (bg, name) in [
+            (ui.background, "background"),
+            (ui.surface, "surface"),
+            (ui.surface_alt, "surface_alt"),
+        ] {
+            aa(&format!("dim on {name}"), ui.text_dim, bg, 4.5);
+            aa(&format!("faint on {name}"), ui.text_faint, bg, 4.0);
+        }
+        aa("faint on the background", ui.text_faint, ui.background, 4.5);
+        aa("transport", ui.lcd_text, ui.lcd_bg, 7.0);
+        aa("legends", k.panel_label, k.panel_top, 4.5);
+        aa("legends", k.panel_label, k.panel_bottom, 4.5);
+        aa("wells", k.well_text, k.well, 4.5);
+        aa("empty wells", k.well_text_empty, k.well, 4.5);
+        aa("scribble strips", k.scribble_text, k.scribble_bg, 4.5);
+        aa("fader legends", k.fader.scale_text, k.panel_top, 4.5);
+        aa("switches off", k.led.label_off, k.led.off, 4.5);
+        aa("ruler", t.arranger.ruler_text, t.arranger.ruler_bg, 4.5);
+        aa("key names", t.piano.key_text, t.piano.key_white, 4.5);
+        for accent in [ui.accent, ui.accent_2, ui.selection] {
+            aa("accent", accent, ui.background, 3.0);
+            aa("accent", accent, k.panel_top, 3.0);
+        }
+        // A lit pill's label on the pill's brightest part.
+        let panel = k.panel_top.mix(k.panel_bottom, 0.5);
+        let l = &k.led;
+        for c in [
+            l.mute,
+            l.solo,
+            l.record,
+            l.monitor,
+            l.phase,
+            t.arranger.automation,
+        ] {
+            let pill = c.with_alpha(0.46).over(panel);
+            aa("lit pill", crate::controls::pill_label(c), pill, 4.5);
+        }
+        // Clip names on cards in every hue a track can wear.
+        for i in 0..12 {
+            let hue = i as f32 / 12.0;
+            let c = hsl(hue, 0.5, 0.56);
+            let card = c
+                .mix(t.arranger.background, 0.7)
+                .with_alpha(t.arranger.clip_alpha)
+                .over(t.arranger.lane_a);
+            let header = c.with_alpha(0.14).over(card);
+            aa("clip name", t.card_ink(c), header, 4.5);
+        }
+    }
+
+    fn hsl(h: f32, s: f32, l: f32) -> Color {
+        let q = if l < 0.5 {
+            l * (1.0 + s)
+        } else {
+            l + s - l * s
+        };
+        let p = 2.0 * l - q;
+        let f = |mut t: f32| {
+            t = t.rem_euclid(1.0);
+            if t < 1.0 / 6.0 {
+                p + (q - p) * 6.0 * t
+            } else if t < 0.5 {
+                q
+            } else if t < 2.0 / 3.0 {
+                p + (q - p) * (2.0 / 3.0 - t) * 6.0
+            } else {
+                p
+            }
+        };
+        Color::rgb(f(h + 1.0 / 3.0), f(h), f(h - 1.0 / 3.0))
     }
 }

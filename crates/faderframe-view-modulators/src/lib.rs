@@ -19,7 +19,7 @@ use faderframe_project::{Track, TrackKind};
 use faderframe_session::{Action, Session};
 use faderframe_ui_canvas::controls::{self, KnobLook};
 use faderframe_ui_canvas::{
-    CanvasView, EventCx, FontFamily, HostRequest, MenuItem, Modifiers, Paint, Painter, Path, Point,
+    CanvasView, EventCx, HostRequest, MenuItem, Modifiers, Paint, Painter, Path, Point,
     PointerButton, Rect, ScrollAxis, ScrollInfo, Size, TextStyle, Theme, ViewEvent,
 };
 
@@ -826,7 +826,7 @@ impl ModulatorsView {
                 &format!("{:+.0} %", route.depth * 100.0),
                 Rect::new(depth.x - 46.0, line.y, 42.0, line.h),
                 &TextStyle::new(th.fonts.tiny, th.ui.text_dim)
-                    .family(FontFamily::Mono)
+                    .family(th.fonts.numerals)
                     .right(),
             );
             p.text(

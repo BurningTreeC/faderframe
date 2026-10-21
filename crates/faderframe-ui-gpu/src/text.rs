@@ -10,7 +10,9 @@ use vello::peniko::Fill;
 /// Font family lists as the toolkit painter asks for them.
 fn families(f: FontFamily) -> &'static str {
     match f {
-        FontFamily::Sans => "Inter, Noto Sans, Fira Sans, Cantarell, DejaVu Sans, sans-serif",
+        FontFamily::Sans | FontFamily::Figures => {
+            "Inter, Noto Sans, Fira Sans, Cantarell, DejaVu Sans, sans-serif"
+        }
         FontFamily::Condensed => {
             "Fira Sans Condensed, Roboto Condensed, Noto Sans, DejaVu Sans Condensed, sans-serif"
         }
@@ -68,9 +70,13 @@ impl TextSystem {
             FontWeight::Normal => parley::FontWeight::NORMAL,
             FontWeight::Medium => parley::FontWeight::MEDIUM,
             FontWeight::Bold => parley::FontWeight::BOLD,
+            FontWeight::Light => parley::FontWeight::LIGHT,
         }));
         if style.family == FontFamily::Condensed {
             b.push_default(StyleProperty::FontWidth(parley::FontWidth::SEMI_CONDENSED));
+        }
+        if style.family == FontFamily::Figures {
+            b.push_default(StyleProperty::FontFeatures("\"tnum\" on".into()));
         }
         if style.tracking > 0.0 {
             b.push_default(StyleProperty::LetterSpacing(style.tracking));

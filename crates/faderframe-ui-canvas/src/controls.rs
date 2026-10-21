@@ -7,10 +7,13 @@
 //! device-pixel ratio.
 
 use crate::{
-    Align, Color, FontFamily, FontWeight, MeterKind, Paint, Painter, Path, Point, Rect, TextStyle,
-    Theme,
+    Align, ButtonKind, Color, FaderKind, FontFamily, FontWeight, KnobKind, MeterKind, Paint,
+    Painter, Path, Point, Rect, TextStyle, Theme,
 };
 use std::f32::consts::PI;
+
+/// Corner radius of a plane ([`crate::PanelKind::Plane`]).
+pub const PLANE_RADIUS: f32 = 7.0;
 
 /// Knob sweep: 270° starting at the lower left (135°, clockwise).
 const KNOB_START: f32 = PI * 0.75;
@@ -39,6 +42,10 @@ fn grain(i: u32) -> f32 {
 pub fn panel(p: &mut dyn Painter, rect: Rect, top: Color, bottom: Color, theme: &Theme) {
     let c = &theme.console;
     let look = &c.look;
+    if look.planes() {
+        plane(p, rect, top, bottom, theme);
+        return;
+    }
     if look.flat {
         p.fill(rect, top.mix(bottom, 0.5));
         p.vline(rect.x, rect.y, rect.bottom(), c.panel_edge_light);
@@ -94,19 +101,37 @@ pub fn panel(p: &mut dyn Painter, rect: Rect, top: Color, bottom: Color, theme: 
     p.hline(rect.x, rect.right(), rect.y, c.panel_edge_light);
 }
 
-/// Thin engraved divider between console sections.
+/// A plane: a flat rounded surface a step of luminance above what it lies
+/// on, with a hairline of light along its edge.
+pub fn plane(p: &mut dyn Painter, rect: Rect, top: Color, bottom: Color, theme: &Theme) {
+    let r = PLANE_RADIUS.min(rect.w * 0.25).min(rect.h * 0.25).max(0.0);
+    p.fill_rounded(rect, r, &Paint::vertical(rect, top, bottom));
+    let px = 1.0 / p.scale_factor().max(1.0);
+    p.stroke_rounded(rect.inset(px * 0.5), r, px, theme.console.panel_edge_light);
+}
+
+/// Thin engraved divider between console sections (a hairline on
+/// planes).
 pub fn section_line(p: &mut dyn Painter, x0: f32, x1: f32, y: f32, theme: &Theme) {
     p.hline(x0, x1, y, theme.console.section_line);
+    if theme.console.look.planes() {
+        return;
+    }
     p.hline(x0, x1, y + 1.0, theme.console.panel_edge_light);
 }
 
-/// Small-caps style legend with an engraved shadow.
+/// Small-caps style legend with an engraved shadow (spaced wider, with no
+/// shadow, on planes).
 pub fn engraved(p: &mut dyn Painter, text: &str, rect: Rect, theme: &Theme, align: Align) {
     let style = TextStyle::new(theme.fonts.tiny, theme.console.panel_label)
         .family(FontFamily::Condensed)
         .weight(FontWeight::Bold)
         .align(align)
-        .tracking(0.6);
+        .tracking(if theme.console.look.planes() {
+            0.9
+        } else {
+            0.6
+        });
     let shadow = theme.console.look.engrave;
     if shadow.a > 0.0 {
         p.text(text, rect.translate(0.0, 1.0), &style.color(shadow));
@@ -117,6 +142,11 @@ pub fn engraved(p: &mut dyn Painter, text: &str, rect: Rect, theme: &Theme, alig
 /// Recessed well (insert slots, readouts). Returns the inner rect.
 pub fn well(p: &mut dyn Painter, rect: Rect, theme: &Theme) -> Rect {
     let c = &theme.console;
+    if c.look.planes() {
+        // A darker inset, flat.
+        p.fill_rounded(rect, 4.0f32.min(rect.h * 0.5), &Paint::Solid(c.well));
+        return rect.inset_xy(4.0, 1.0);
+    }
     p.fill_rounded(rect, 2.5, &Paint::Solid(c.well));
     p.inset_shadow(rect, 2.5, Color::rgba(0.0, 0.0, 0.0, 0.8), 0.0, 1.0, 3.0);
     p.hline(
@@ -173,6 +203,10 @@ pub fn knob(
         skirted_knob(p, c, r, value, look.cap, skirt, theme);
         return;
     }
+    if style.knob_kind == KnobKind::Halo {
+        halo_knob(p, c, r, value, bipolar, look, theme);
+        return;
+    }
     let ring_r = r - 1.6;
     if style.knob_ring {
         let mut track = Path::new();
@@ -227,6 +261,69 @@ pub fn knob(
         Point::new(c.x + co * cap_r * 0.2, c.y + s * cap_r * 0.2),
         Point::new(c.x + co * (body_r - 1.2), c.y + s * (body_r - 1.2)),
         2.0,
+        k.pointer,
+    );
+}
+
+/// The value arc of a knob: from the start, or (bipolar) from the middle.
+fn value_arc(value: f32, bipolar: bool) -> (f32, f32) {
+    if bipolar {
+        let mid = KNOB_START + KNOB_SWEEP * 0.5;
+        let a = knob_angle(value);
+        (mid.min(a), mid.max(a))
+    } else {
+        (KNOB_START, knob_angle(value))
+    }
+}
+
+/// A halo knob: a fine ring over the sweep with the value as an arc of
+/// `look.ring` (a soft glow under it as the look's glow says), a flat disc
+/// inside (tinted a little by the cap colour) with a small dot pointing at
+/// the value.
+fn halo_knob(
+    p: &mut dyn Painter,
+    c: Point,
+    r: f32,
+    value: f32,
+    bipolar: bool,
+    look: KnobLook,
+    theme: &Theme,
+) {
+    let k = &theme.console.knob;
+    let glow = theme.console.look.glow.clamp(0.0, 2.0);
+    let w = (r * 0.13).clamp(1.5, 2.6);
+    let ring_r = r - w * 0.5 - 0.5 - glow.min(1.0);
+    let mut track = Path::new();
+    track.arc(c, ring_r, KNOB_START, KNOB_START + KNOB_SWEEP, false);
+    p.stroke_path(&track, w, k.ring_track);
+    let (a0, a1) = value_arc(value, bipolar);
+    if a1 - a0 > 0.01 {
+        let mut arc = Path::new();
+        arc.arc(c, ring_r, a0, a1, false);
+        if glow > 0.0 {
+            p.stroke_path(&arc, w + 3.0 * glow, look.ring.with_alpha(0.16 * glow));
+        }
+        p.stroke_path(&arc, w, look.ring);
+    }
+    let disc_r = ring_r - w * 0.5 - (r * 0.14).max(2.0);
+    if disc_r < 2.5 {
+        return;
+    }
+    let disc = Rect::new(c.x - disc_r, c.y - disc_r, disc_r * 2.0, disc_r * 2.0);
+    let body = k.body_light.mix(look.cap, 0.1);
+    p.fill_rounded(
+        disc,
+        disc_r,
+        &Paint::vertical(disc, body.lighten(0.05), body),
+    );
+    let px = 1.0 / p.scale_factor().max(1.0);
+    p.stroke_rounded(disc.inset(px * 0.5), disc_r, px, k.cap_top);
+    let a = knob_angle(value);
+    let dot_r = (disc_r * 0.15).clamp(1.2, 2.2);
+    let d = disc_r - dot_r - (disc_r * 0.16).max(1.5);
+    p.circle(
+        Point::new(c.x + a.cos() * d, c.y + a.sin() * d),
+        dot_r,
         k.pointer,
     );
 }
@@ -364,6 +461,10 @@ pub fn fader(
     scale: &[(f32, &str)],
     theme: &Theme,
 ) {
+    if theme.console.look.fader_kind == FaderKind::Pill {
+        pill_fader(p, geo, pos, cap_color, scale, theme);
+        return;
+    }
     let f = &theme.console.fader;
     // Slot.
     p.fill_rounded(geo.slot, 3.0, &Paint::Solid(f.slot));
@@ -460,6 +561,79 @@ pub fn fader(
         cy + 1.0,
         Color::rgba(1.0, 1.0, 1.0, 0.35),
     );
+}
+
+/// A pill fader: a slim track lit from the bottom up to the level in the
+/// cap colour, hairline scale ticks with legends in the numerals face, and
+/// a pill-shaped thumb floating over it with an index line of the cap
+/// colour.
+fn pill_fader(
+    p: &mut dyn Painter,
+    geo: &FaderGeometry,
+    pos: f32,
+    cap_color: Color,
+    scale: &[(f32, &str)],
+    theme: &Theme,
+) {
+    let f = &theme.console.fader;
+    let glow = theme.console.look.glow.clamp(0.0, 2.0);
+    let cx = geo.slot.center().x;
+    let tw = 3.0;
+    let track = Rect::new(cx - tw * 0.5, geo.top - 2.0, tw, geo.travel() + 4.0);
+    p.fill_rounded(track, tw * 0.5, &Paint::Solid(f.slot));
+    let y = geo.y_for(pos);
+    if track.bottom() - y > 0.5 {
+        let lit = Rect::new(track.x, y, tw, track.bottom() - y);
+        p.fill_rounded(
+            lit,
+            tw * 0.5,
+            &Paint::vertical(lit, cap_color.with_alpha(0.8), cap_color.with_alpha(0.06)),
+        );
+    }
+    let label = TextStyle::new(theme.fonts.tiny, f.scale_text)
+        .family(theme.fonts.numerals)
+        .align(Align::End);
+    for &(sp, text) in scale {
+        let yy = geo.y_for(sp);
+        let major = !text.is_empty();
+        let len = if major { 5.0 } else { 2.5 };
+        p.hline(track.x - 5.0 - len, track.x - 5.0, yy, f.scale_tick);
+        if major {
+            let w = geo.area.center().x - geo.area.x - 13.0;
+            p.text(text, Rect::new(geo.area.x - 2.0, yy - 6.0, w, 12.0), &label);
+        }
+    }
+    let cap = geo.cap_rect(pos);
+    let h = (cap.h * 0.62).clamp(10.0, 16.0);
+    let thumb = Rect::new(cap.x, y - h * 0.5, cap.w, h);
+    p.shadow(
+        thumb,
+        h * 0.5,
+        Color::rgba(0.0, 0.0, 0.0, 0.55),
+        0.0,
+        2.0,
+        6.0,
+    );
+    p.fill_rounded(
+        thumb,
+        h * 0.5,
+        &Paint::vertical(thumb, f.cap_top, f.cap_bottom),
+    );
+    let px = 1.0 / p.scale_factor().max(1.0);
+    p.stroke_rounded(
+        thumb.inset(px * 0.5),
+        h * 0.5,
+        px,
+        theme
+            .console
+            .panel_edge_light
+            .with_alpha((theme.console.panel_edge_light.a * 3.0).min(1.0)),
+    );
+    let index = Rect::new(thumb.x + 6.0, y - 1.0, thumb.w - 12.0, 2.0);
+    if glow > 0.0 {
+        p.shadow(index, 1.0, cap_color.with_alpha(0.45 * glow), 0.0, 0.0, 4.0);
+    }
+    p.fill_rounded(index, 1.0, &Paint::Solid(cap_color));
 }
 
 /// IEC 60268-18 style meter scale: dBFS → 0..1 deflection.
@@ -610,6 +784,7 @@ pub fn meter_zoned(
             vu_edgewise(p, rect, &needles, theme)
         }
         MeterKind::Plasma => plasma_meter(p, rect, levels, zones, theme),
+        MeterKind::Gradient => gradient_meter(p, rect, levels, zones, theme),
     }
 }
 
@@ -696,6 +871,88 @@ fn bar_meter(
         if hold > 0.01 {
             let y = body.bottom() - body.h * hold;
             p.fill(Rect::new(body.x, y - 1.0, body.w, 2.0), m.peak);
+        }
+    }
+}
+
+/// Fine gradient bars: each channel a slim rounded column in one smooth
+/// gradient through the zone colours (cool to hot) on a faint track, a
+/// bright edge and a soft bloom at the top of the level (as strong as the
+/// look's glow), the hold as a hairline, a clip dot above; with a second
+/// level (RMS) that is the solid bar and the peak a translucent column
+/// over it.
+fn gradient_meter(
+    p: &mut dyn Painter,
+    rect: Rect,
+    levels: &[MeterLevel],
+    zones: MeterZones,
+    theme: &Theme,
+) {
+    let m = &theme.console.meter;
+    let glow = theme.console.look.glow.clamp(0.0, 2.0);
+    let stops = zones.stops(theme);
+    // Fine columns (5 px at most) centred in the meter's room, no box
+    // around them: their faint tracks draw the meter.
+    let n = levels.len().max(1) as f32;
+    let inner = rect.inset(2.0);
+    let gap = 2.0;
+    let w = ((inner.w - gap * (n - 1.0)) / n).clamp(1.0, 5.0);
+    let x0 = inner.x + (inner.w - (w * n + gap * (n - 1.0))) * 0.5;
+    let columns = (0..levels.len()).map(|i| {
+        let x = x0 + i as f32 * (w + gap);
+        (
+            Rect::new(x, inner.y, w, 3.0),
+            Rect::new(x, inner.y + 6.0, w, (inner.h - 6.0).max(0.0)),
+        )
+    });
+    for (lv, (clip, body)) in levels.iter().zip(columns) {
+        let r = (body.w * 0.5).min(1.5);
+        p.fill_rounded(
+            clip,
+            (clip.h * 0.5).min(clip.w * 0.5),
+            &Paint::Solid(if lv.clipped {
+                m.clip
+            } else {
+                m.clip.mix(m.background, 0.86)
+            }),
+        );
+        p.fill_rounded(
+            body,
+            r,
+            &Paint::Solid(m.green.mix(m.background, 1.0 - m.unlit)),
+        );
+        let top_of = |db: f32| {
+            let lit = zones.position(db).min(1.0);
+            (lit > 0.0).then(|| body.bottom() - body.h * lit)
+        };
+        if lv.inner_db.is_some()
+            && let Some(y) = top_of(lv.level_db)
+        {
+            let faint = stops.iter().map(|(t, c)| (*t, c.with_alpha(0.3))).collect();
+            p.fill_rounded(
+                Rect::new(body.x, y, body.w, body.bottom() - y),
+                r,
+                &Paint::vertical_stops(body, faint),
+            );
+        }
+        let level = lv.inner_db.unwrap_or(lv.level_db);
+        if let Some(y) = top_of(level) {
+            let hot = zones.colour(level, theme);
+            let edge = Rect::new(body.x, y, body.w, 1.0);
+            if glow > 0.0 {
+                p.shadow(edge, r, hot.with_alpha(0.5 * glow), 0.0, 0.0, 5.0);
+            }
+            p.fill_rounded(
+                Rect::new(body.x, y, body.w, body.bottom() - y),
+                r,
+                &Paint::vertical_stops(body, stops.clone()),
+            );
+            p.fill(edge, hot.lighten(0.45));
+        }
+        let hold = zones.position(lv.hold_db).min(1.0);
+        if hold > 0.01 {
+            let y = body.bottom() - body.h * hold;
+            p.fill(Rect::new(body.x, y - 0.5, body.w, 1.0), m.peak);
         }
     }
 }
@@ -1086,6 +1343,10 @@ pub fn led_button(
     color: Color,
     theme: &Theme,
 ) {
+    if theme.console.look.button_kind == ButtonKind::Pill {
+        pill_button(p, rect, label, on, color, theme);
+        return;
+    }
     let l = &theme.console.led;
     if on {
         p.shadow(rect, 3.0, color.with_alpha(0.55), 0.0, 0.0, 7.0);
@@ -1109,6 +1370,53 @@ pub fn led_button(
     )
     .weight(FontWeight::Bold)
     .center();
+    p.text(label, rect, &style);
+}
+
+/// The colour of a lit pill's label (`color` lightened until it reads on
+/// the pill).
+pub fn pill_label(color: Color) -> Color {
+    color.lighten(0.72)
+}
+
+/// A pill switch: off, a ghost pill with a hairline edge; on, lit from
+/// within in `color` with a hairline of it, a light label and a soft glow
+/// (as strong as the look's glow).
+fn pill_button(
+    p: &mut dyn Painter,
+    rect: Rect,
+    label: &str,
+    on: bool,
+    color: Color,
+    theme: &Theme,
+) {
+    let l = &theme.console.led;
+    let glow = theme.console.look.glow.clamp(0.0, 2.0);
+    let r = rect.h.min(rect.w) * 0.5;
+    let px = 1.0 / p.scale_factor().max(1.0);
+    let ink = if on {
+        if glow > 0.0 {
+            p.shadow(rect, r, color.with_alpha(0.3 * glow), 0.0, 0.0, 6.0);
+        }
+        p.fill_rounded(
+            rect,
+            r,
+            &Paint::Radial {
+                center: rect.center(),
+                radius: rect.w.max(rect.h) * 0.7,
+                stops: vec![(0.0, color.with_alpha(0.46)), (1.0, color.with_alpha(0.26))],
+            },
+        );
+        p.stroke_rounded(rect.inset(px * 0.5), r, px, color);
+        pill_label(color)
+    } else {
+        p.fill_rounded(rect, r, &Paint::Solid(l.off));
+        p.stroke_rounded(rect.inset(px * 0.5), r, px, l.bezel);
+        l.label_off
+    };
+    let style = TextStyle::new(theme.fonts.tiny + 0.5, ink)
+        .weight(FontWeight::Bold)
+        .center();
     p.text(label, rect, &style);
 }
 
@@ -1136,6 +1444,22 @@ pub fn led_button_fit(
 /// Cream "tape" label with a track-colour stripe, like console scribble strips.
 pub fn scribble(p: &mut dyn Painter, rect: Rect, text: &str, stripe: Color, theme: &Theme) {
     let c = &theme.console;
+    if c.look.planes() {
+        // A chip: a darker inset with a fine line of the track colour
+        // along its top and the name in the UI face.
+        p.fill_rounded(rect, 4.0, &Paint::Solid(c.scribble_bg));
+        let line = Rect::new(rect.x + 6.0, rect.y, (rect.w - 12.0).max(0.0), 2.0);
+        let glow = c.look.glow.clamp(0.0, 2.0);
+        if glow > 0.0 {
+            p.shadow(line, 1.0, stripe.with_alpha(0.45 * glow), 0.0, 0.0, 4.0);
+        }
+        p.fill_rounded(line, 1.0, &Paint::Solid(stripe));
+        let style = TextStyle::new(theme.fonts.small, c.scribble_text)
+            .weight(FontWeight::Medium)
+            .center();
+        p.text(text, rect.inset_xy(4.0, 0.0).translate(0.0, 1.0), &style);
+        return;
+    }
     p.shadow(rect, 2.0, Color::rgba(0.0, 0.0, 0.0, 0.5), 0.0, 1.0, 2.0);
     p.fill_rounded(
         rect,
@@ -1161,7 +1485,7 @@ pub fn scribble(p: &mut dyn Painter, rect: Rect, text: &str, stripe: Color, them
 pub fn readout(p: &mut dyn Painter, rect: Rect, text: &str, theme: &Theme) {
     let inner = well(p, rect, theme);
     let style = TextStyle::new(theme.fonts.tiny + 0.5, theme.console.well_text)
-        .family(FontFamily::Mono)
+        .family(theme.fonts.numerals)
         .center();
     p.text(text, inner, &style);
 }
@@ -1243,7 +1567,7 @@ pub fn screw(p: &mut dyn Painter, center: Point, r: f32, theme: &Theme) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::RecordingPainter;
+    use crate::{DrawOp, RecordingPainter};
 
     #[test]
     fn meter_scale_is_monotonic() {
@@ -1329,6 +1653,140 @@ mod tests {
         assert!(p.ops.len() > 20);
         assert!(p.texts().contains(&"M"));
         assert!(p.balanced_clips());
+    }
+
+    /// Draws every control with `theme` (at sizes from tiny to large).
+    fn every_control(theme: &Theme) -> RecordingPainter {
+        let mut p = RecordingPainter::new();
+        let c = &theme.console;
+        for size in [3.0, 9.0, 18.0, 30.0, 46.0] {
+            for (v, bipolar) in [(0.0, false), (0.5, true), (0.8, true), (1.0, false)] {
+                knob(
+                    &mut p,
+                    Rect::new(0.0, 0.0, size, size),
+                    v,
+                    bipolar,
+                    KnobLook {
+                        cap: c.send_cap,
+                        ring: c.send_cap,
+                    },
+                    theme,
+                );
+            }
+        }
+        for area in [
+            Rect::new(0.0, 0.0, 60.0, 300.0),
+            Rect::new(0.0, 0.0, 20.0, 40.0),
+        ] {
+            let geo = FaderGeometry::new(area, theme);
+            for pos in [0.0, 0.7, 1.0] {
+                fader(&mut p, &geo, pos, c.fader_cap_master, &[(0.7, "0")], theme);
+            }
+        }
+        for on in [false, true] {
+            led_button(
+                &mut p,
+                Rect::new(0.0, 0.0, 22.0, 16.0),
+                "S",
+                on,
+                c.led.solo,
+                theme,
+            );
+        }
+        for rect in [
+            Rect::new(0.0, 0.0, 12.0, 200.0),
+            Rect::new(0.0, 0.0, 3.0, 8.0),
+        ] {
+            for zones in [MeterZones::Digital, MeterZones::Vu(-18.0)] {
+                meter_zoned(
+                    &mut p,
+                    rect,
+                    &[
+                        MeterLevel::new(-80.0, -80.0, false),
+                        MeterLevel {
+                            inner_db: Some(-14.0),
+                            ..MeterLevel::new(3.0, 4.0, true)
+                        },
+                    ],
+                    zones,
+                    theme,
+                );
+            }
+        }
+        panel(
+            &mut p,
+            Rect::new(0.0, 0.0, 92.0, 400.0),
+            c.panel_top,
+            c.panel_bottom,
+            theme,
+        );
+        section_line(&mut p, 0.0, 90.0, 40.0, theme);
+        scribble(
+            &mut p,
+            Rect::new(0.0, 0.0, 84.0, 20.0),
+            "Bass",
+            Color::hex(0xe0a34a),
+            theme,
+        );
+        readout(&mut p, Rect::new(0.0, 0.0, 40.0, 14.0), "-3.0", theme);
+        p
+    }
+
+    #[test]
+    fn the_newer_looks_draw_their_own_controls() {
+        let studio = every_control(&Theme::default());
+        let lumen = every_control(&Theme::by_id("lumen"));
+        assert!(lumen.balanced_clips() && studio.balanced_clips());
+        assert_ne!(
+            lumen.ops, studio.ops,
+            "halo knobs, pills, planes, fine bars"
+        );
+        for p in [&studio, &lumen] {
+            for t in ["S", "Bass", "-3.0", "0"] {
+                assert!(p.texts().contains(&t), "{t}");
+            }
+        }
+        // Planes have no screws or engraving shadow; the pill switch lights
+        // with a glow (a shadow) only when on.
+        let th = Theme::by_id("lumen");
+        let mut off = RecordingPainter::new();
+        led_button(
+            &mut off,
+            Rect::new(0.0, 0.0, 22.0, 16.0),
+            "M",
+            false,
+            th.console.led.mute,
+            &th,
+        );
+        assert!(!off.ops.iter().any(|o| matches!(o, DrawOp::Shadow(_))));
+        let mut on = RecordingPainter::new();
+        led_button(
+            &mut on,
+            Rect::new(0.0, 0.0, 22.0, 16.0),
+            "M",
+            true,
+            th.console.led.mute,
+            &th,
+        );
+        assert!(on.ops.iter().any(|o| matches!(o, DrawOp::Shadow(_))));
+        let mut engraved_ops = RecordingPainter::new();
+        engraved(
+            &mut engraved_ops,
+            "SENDS",
+            Rect::new(0.0, 0.0, 80.0, 12.0),
+            &th,
+            Align::Center,
+        );
+        assert_eq!(engraved_ops.texts(), ["SENDS"]);
+        // A silent gradient meter draws no bar and no bloom.
+        let mut silent = RecordingPainter::new();
+        meter(
+            &mut silent,
+            Rect::new(0.0, 0.0, 12.0, 200.0),
+            &[MeterLevel::new(-150.0, -150.0, false)],
+            &th,
+        );
+        assert!(!silent.ops.iter().any(|o| matches!(o, DrawOp::Shadow(_))));
     }
 }
 

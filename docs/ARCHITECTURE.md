@@ -5010,20 +5010,52 @@ the event loop. DAW work surfaces are **custom-rendered views**:
   fader, meter, LED buttons, scribble strips) using a `Theme` (skins
   replace the theme, not the views). Track headers reuse the same
   controls.
-* **Skins.** `Theme::all()` lists eight (`themes.rs` derives each from a
+* **Skins.** `Theme::all()` lists nine (`themes.rs` derives each from a
   compact `Spec` of base colours): Studio, Vintage Console, Daylight
-  (light), Midnight, Frost, Fjord, Neon and High Contrast. Besides colours a theme
-  has a `ConsoleLook`: skirted knobs (with or without a value ring), flat
-  or glossy controls, brushed-metal panel grain, screws, walnut cheeks
-  framing the mixer, and the meter kind — LED ladder, continuous bar,
-  plasma bar graph (a glowing column with cell lines) or an edgewise VU
-  meter (0 VU = −18 dBFS, voltage-proportional scale). The
-  shell switches skins live (`AppState::set_theme`: every canvas view gets
-  `CanvasView::set_theme`, GTK's stylesheet is regenerated from the theme
-  as `@define-color`s, and the Adwaita light/dark variant follows the
-  skin, overriding a dark desktop theme for light skins); the choice is a
-  preference. Overlays drawn over editor backgrounds derive from the
-  theme's text and selection colours so they work on light skins too.
+  (light), Midnight, Frost, Fjord, Neon, High Contrast and Lumen. Besides
+  colours a theme has a `ConsoleLook`: skirted knobs (with or without a
+  value ring), flat or glossy controls, brushed-metal panel grain, screws,
+  walnut cheeks framing the mixer, and the meter kind — LED ladder,
+  continuous bar, plasma bar graph (a glowing column with cell lines), an
+  edgewise VU meter (0 VU = −18 dBFS, voltage-proportional scale) or
+  `MeterKind::Gradient` (fine rounded bars in one cool-to-hot gradient, a
+  hairline hold, a bloom at the level). The shell switches skins live
+  (`AppState::set_theme`: every canvas view gets `CanvasView::set_theme`,
+  GTK's stylesheet is regenerated from the theme as `@define-color`s, and
+  the Adwaita light/dark variant follows the skin, overriding a dark
+  desktop theme for light skins); the choice is a preference. Overlays
+  drawn over editor backgrounds derive from the theme's text and selection
+  colours so they work on light skins too.
+* **Lumen** (`themes::lumen`) is drawn with light instead of hardware, on
+  look options that default to the older skins' drawing (so those draw
+  exactly as before — `only_lumen_takes_the_newer_looks`; their painted
+  primitives were compared op for op before and after):
+  `ConsoleLook::{knob_kind: KnobKind::Halo` (a fine ring, the value as a
+  glowing arc, a flat disc with an indicator dot), `fader_kind:
+  FaderKind::Pill` (a slim track lit up to the level in the cap colour, a
+  floating pill thumb with a glowing index), `button_kind:
+  ButtonKind::Pill` (ghost pills lit from within, `controls::pill_label`),
+  `panel_kind: PanelKind::Plane` (flat rounded planes stepped by
+  luminance with a hairline edge, `controls::plane`; hairline section
+  rules, flat wells, scribble strips as chips with a glowing line of the
+  track colour; no screws), `glow}` (the strength of every glow the newer
+  kinds draw — arcs, pills, blooms, the strips' colour lines, the
+  arranger's playhead halo and gradient line, the transport's light
+  pool); `ArrangerTheme::clip_style: ClipStyle::Card` (translucent cards
+  tinted with the clip colour, a line of it along the rounded top, names
+  in `Theme::card_ink`, lighter-at-the-peaks waveforms — the waveform
+  tiles' key names the style and the text colour — and sections and the
+  key lane to match); `Theme::chrome: Chrome::Planes` (the transport as a
+  glass readout, `style::PLANES_CSS`: flat header and tabs on hairlines,
+  pill header buttons, rounded floating menus and popovers, the accent
+  for check marks, switches, selections and focus outlines — GTK's
+  Default theme paints with `background-image`, so the rules set images);
+  `UiPalette::accent_2` (the accent's gradient end: cyan to violet on the
+  master's colour line and the playhead); `Typography::numerals` with
+  `FontFamily::Figures` (the UI face with tabular figures, `tnum` in Pango
+  and parley) for readouts, rulers and counters; `FontWeight::Light`.
+  `lumen_reads_well` checks WCAG AA (`Color::contrast`) for its text,
+  legends, wells, lit pills and card names in every hue.
 
 The arranger has **global lanes** under the ruler (shown or hidden from
 their titles): markers (double-click adds, drag moves, double-click
@@ -5782,7 +5814,7 @@ sections (moved, copied and deleted with their content), time signatures
 and the tempo map, and track colours from a colour chooser.
 
 Shell: docking and detaching, workspaces (Recording, Editing, Mixing,
-MIDI, Mastering), eight skins switched live, performance meter,
+MIDI, Mastering), nine skins switched live, performance meter,
 preferences, recent projects and start-up choice, project templates (a
 project's set-up without its content; a default one for New Project).
 Windows and macOS builds and packages for all three platforms (see §14).

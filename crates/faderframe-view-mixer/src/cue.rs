@@ -249,7 +249,7 @@ impl MixerView {
         let k = &th.console;
         let col = cue_color(c);
         controls::panel(p, rect, k.master_panel_top, k.master_panel_bottom, th);
-        p.fill(l.color_bar, col);
+        crate::paint_color_bar(p, l.color_bar, col, false, th);
         for &y in &l.dividers {
             controls::section_line(p, rect.x + 4.0, rect.right() - 4.0, y, th);
         }

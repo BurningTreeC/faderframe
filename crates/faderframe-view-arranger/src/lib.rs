@@ -36,9 +36,9 @@ use faderframe_timeline::{
 };
 use faderframe_ui_canvas::controls::{self, KnobLook, MeterLevel};
 use faderframe_ui_canvas::{
-    Align, CanvasView, Color, Cursor, EventCx, FontFamily, GridEmphasis, HostRequest, Key,
-    MenuItem, Modifiers, Paint, Painter, Path, Point, PointerButton, Rect, ScrollAxis, ScrollInfo,
-    Size, TextStyle, Theme, ViewEvent,
+    Align, CanvasView, ClipStyle, Color, Cursor, EventCx, FaderKind, FontFamily, GridEmphasis,
+    HostRequest, Key, MenuItem, Modifiers, Paint, Painter, Path, Point, PointerButton, Rect,
+    ScrollAxis, ScrollInfo, Size, TextStyle, Theme, ViewEvent,
 };
 
 const MIN_PPQ: f32 = 1.5;
@@ -1242,6 +1242,12 @@ impl ArrangerView {
             [color.r, color.g, color.b, color.a]
                 .map(f32::to_bits)
                 .hash(&mut h);
+            // The skin's part in the fill (cards mix in its text colour).
+            let text = self.theme.ui.text;
+            (self.theme.arranger.clip_style as u8).hash(&mut h);
+            [text.r, text.g, text.b, text.a]
+                .map(f32::to_bits)
+                .hash(&mut h);
             model.project().timeline.tempo.fingerprint().hash(&mut h);
             model.sample_rate().hash(&mut h);
             h.finish()
@@ -1400,8 +1406,26 @@ impl ArrangerView {
                 path.line_to(*q);
             }
             path.close();
-            p.fill_path(&path, fill);
-            p.hline(x0, x1, mid, color.lighten(0.3).with_alpha(0.25));
+            if self.theme.arranger.clip_style == ClipStyle::Card {
+                // Lighter towards the peaks, the clip's colour at the
+                // middle.
+                let light = color.mix(self.theme.ui.text, 0.35).with_alpha(0.95);
+                p.fill_path_paint(
+                    &path,
+                    &Paint::vertical_stops(
+                        lane,
+                        vec![
+                            (0.0, light),
+                            (0.5, color.lighten(0.08).with_alpha(0.85)),
+                            (1.0, light),
+                        ],
+                    ),
+                );
+                p.hline(x0, x1, mid, color.with_alpha(0.3));
+            } else {
+                p.fill_path(&path, fill);
+                p.hline(x0, x1, mid, color.lighten(0.3).with_alpha(0.25));
+            }
         }
     }
 
@@ -1601,31 +1625,85 @@ impl ArrangerView {
         let color = color_of(clip.color.unwrap_or(track.color));
         let r = a.clip_radius;
         let selected = model.selection.clips.contains(&clip.id);
-        p.shadow(rect, r, Color::rgba(0.0, 0.0, 0.0, 0.45), 0.0, 1.5, 4.0);
-        // The name strip and the body below it, side by side (no overlap:
-        // both translucent, the grid shows through evenly).
+        let card = a.clip_style == ClipStyle::Card;
+        let glow = self.theme.console.look.glow;
         let header_h = a.clip_header.min(rect.h * 0.5);
-        let body = Rect::new(rect.x, rect.y + header_h, rect.w, rect.h - header_h);
-        p.fill_path_paint(
-            &Path::rounded_rect_ends(body, 0.0, r),
-            &Paint::vertical(
-                body,
-                color.darken(0.52).with_alpha(a.clip_alpha),
-                color.darken(0.66).with_alpha(a.clip_alpha),
-            ),
-        );
+        if card {
+            // A translucent card tinted with the clip's colour.
+            if selected && glow > 0.0 {
+                p.shadow(
+                    rect,
+                    r,
+                    a.selection_outline.with_alpha(0.3 * glow),
+                    0.0,
+                    0.0,
+                    8.0,
+                );
+            }
+            p.fill_rounded(
+                rect,
+                r,
+                &Paint::vertical(
+                    rect,
+                    color.mix(a.background, 0.7).with_alpha(a.clip_alpha),
+                    color.mix(a.background, 0.82).with_alpha(a.clip_alpha),
+                ),
+            );
+        } else {
+            p.shadow(rect, r, Color::rgba(0.0, 0.0, 0.0, 0.45), 0.0, 1.5, 4.0);
+            // The name strip and the body below it, side by side (no
+            // overlap: both translucent, the grid shows through evenly).
+            let body = Rect::new(rect.x, rect.y + header_h, rect.w, rect.h - header_h);
+            p.fill_path_paint(
+                &Path::rounded_rect_ends(body, 0.0, r),
+                &Paint::vertical(
+                    body,
+                    color.darken(0.52).with_alpha(a.clip_alpha),
+                    color.darken(0.66).with_alpha(a.clip_alpha),
+                ),
+            );
+        }
         p.push_clip(rect.intersection(&lanes));
         let header = Rect::new(rect.x, rect.y, rect.w, header_h);
-        p.fill_path_paint(
-            &Path::rounded_rect_ends(header, r, 0.0),
-            &Paint::vertical(
-                header,
-                color.lighten(0.08).with_alpha(a.clip_header_alpha),
-                color.darken(0.05).with_alpha(a.clip_header_alpha),
-            ),
-        );
+        if card {
+            // The name strip a step lighter, a fine line of the colour
+            // along the rounded top.
+            p.fill_path_paint(
+                &Path::rounded_rect_ends(header, r, 0.0),
+                &Paint::Solid(color.with_alpha(0.14)),
+            );
+            let rr = r.min(rect.w * 0.5).min(header_h).max(1.0);
+            let mut top = Path::new();
+            let pi = std::f32::consts::PI;
+            top.arc(
+                Point::new(rect.x + rr, rect.y + rr),
+                rr - 1.0,
+                pi,
+                pi * 1.5,
+                false,
+            );
+            top.arc(
+                Point::new(rect.right() - rr, rect.y + rr),
+                rr - 1.0,
+                pi * 1.5,
+                pi * 2.0,
+                false,
+            );
+            p.stroke_path(&top, 2.0, color);
+        } else {
+            p.fill_path_paint(
+                &Path::rounded_rect_ends(header, r, 0.0),
+                &Paint::vertical(
+                    header,
+                    color.lighten(0.08).with_alpha(a.clip_header_alpha),
+                    color.darken(0.05).with_alpha(a.clip_header_alpha),
+                ),
+            );
+        }
         let vis = (rect.x.max(lanes.x), rect.right().min(lanes.right()));
-        let text_color = if color.luminance() > 0.42 {
+        let text_color = if card {
+            self.theme.card_ink(color)
+        } else if color.luminance() > 0.42 {
             a.clip_text
         } else {
             Color::hex(0xf2f0ea)
@@ -1757,6 +1835,8 @@ impl ArrangerView {
         p.pop_clip();
         if selected {
             p.stroke_rounded(rect, r, 1.6, a.selection_outline);
+        } else if card {
+            p.stroke_rounded(rect.inset(0.5), r, 1.0, color.with_alpha(0.32));
         } else {
             p.stroke_rounded(rect, r, 1.0, color.darken(0.25).with_alpha(0.8));
         }
@@ -2078,19 +2158,45 @@ impl ArrangerView {
                 &Paint::Solid(color_of(t.color).with_alpha(0.75)),
             );
             let ux = slot.x + slot.w * self.law.unity_position();
-            p.vline(ux, v.y, v.bottom(), Color::rgba(1.0, 1.0, 1.0, 0.25));
-            let cap = Rect::new(slot.x + slot.w * pos - 4.0, v.y - 1.0, 8.0, v.h + 2.0);
-            p.shadow(cap, 2.0, Color::rgba(0.0, 0.0, 0.0, 0.6), 0.0, 1.0, 2.0);
-            p.fill_rounded(
-                cap,
-                2.0,
-                &Paint::vertical(cap, c.fader.cap_top, c.fader.cap_bottom),
-            );
+            if c.look.fader_kind == FaderKind::Pill {
+                // A round thumb with a dot of the track's colour.
+                p.vline(ux, v.y + 1.0, v.bottom() - 1.0, th.ui.text.with_alpha(0.22));
+                let d = (v.h + 2.0).min(11.0);
+                let cap = Rect::new(
+                    slot.x + slot.w * pos - d * 0.5,
+                    v.center().y - d * 0.5,
+                    d,
+                    d,
+                );
+                p.shadow(cap, d * 0.5, Color::rgba(0.0, 0.0, 0.0, 0.5), 0.0, 1.0, 3.0);
+                p.fill_rounded(
+                    cap,
+                    d * 0.5,
+                    &Paint::vertical(cap, c.fader.cap_top, c.fader.cap_bottom),
+                );
+                let px = 1.0 / p.scale_factor().max(1.0);
+                p.stroke_rounded(
+                    cap.inset(px * 0.5),
+                    d * 0.5,
+                    px,
+                    th.ui.text.with_alpha(0.16),
+                );
+                p.circle(cap.center(), 1.8, color_of(t.color));
+            } else {
+                p.vline(ux, v.y, v.bottom(), Color::rgba(1.0, 1.0, 1.0, 0.25));
+                let cap = Rect::new(slot.x + slot.w * pos - 4.0, v.y - 1.0, 8.0, v.h + 2.0);
+                p.shadow(cap, 2.0, Color::rgba(0.0, 0.0, 0.0, 0.6), 0.0, 1.0, 2.0);
+                p.fill_rounded(
+                    cap,
+                    2.0,
+                    &Paint::vertical(cap, c.fader.cap_top, c.fader.cap_bottom),
+                );
+            }
             p.text(
                 &format_db(model.shown_volume_db(t)),
                 l.volume_text,
                 &TextStyle::new(th.fonts.tiny + 0.5, th.ui.text_dim)
-                    .family(FontFamily::Mono)
+                    .family(th.fonts.numerals)
                     .right(),
             );
             let m = model.meter(t.id);
@@ -2141,12 +2247,12 @@ impl ArrangerView {
         let every = self.ruler_every(model);
         let start = self.time_at(ruler.x).max(MusicalTime::ZERO);
         let end = self.time_at(ruler.right());
-        let label = TextStyle::new(th.fonts.small, a.ruler_text).family(FontFamily::Mono);
+        let label = TextStyle::new(th.fonts.small, a.ruler_text).family(th.fonts.numerals);
         let lines = self.grid_lines(start, end, model);
         // Zoomed in, beats and finer lines get labels too.
         let labelled = ruler_labels(&lines, |t| self.x_of(t), every);
         let fine_label =
-            TextStyle::new(th.fonts.tiny, a.ruler_text.with_alpha(0.8)).family(FontFamily::Mono);
+            TextStyle::new(th.fonts.tiny, a.ruler_text.with_alpha(0.8)).family(th.fonts.numerals);
         for &(t, kind) in &lines {
             let x = self.x_of(t);
             if labelled.contains(&t) {
@@ -4273,7 +4379,28 @@ impl CanvasView<Session, Action> for ArrangerView {
         self.paint_edit_overlay(p, lanes, size, &tracks, model);
         let px = self.x_of(model.playhead());
         if px >= lanes.x {
-            p.fill(Rect::new(px - 0.75, lanes.y, 1.5, lanes.h), a.playhead);
+            let glow = theme.console.look.glow;
+            if glow > 0.0 {
+                // A soft light either side of the line.
+                let halo = Rect::new(px - 6.0, lanes.y, 12.0, lanes.h);
+                p.fill_rect(
+                    halo,
+                    &Paint::Linear {
+                        start: Point::new(halo.x, halo.y),
+                        end: Point::new(halo.right(), halo.y),
+                        stops: vec![
+                            (0.0, a.playhead.with_alpha(0.0)),
+                            (0.5, a.playhead.with_alpha(0.16 * glow.min(2.0))),
+                            (1.0, a.playhead.with_alpha(0.0)),
+                        ],
+                    },
+                );
+                // The line itself in the accent's gradient.
+                let line = Rect::new(px - 0.75, lanes.y, 1.5, lanes.h);
+                p.fill_rect(line, &Paint::vertical(line, a.playhead, theme.ui.accent_2));
+            } else {
+                p.fill(Rect::new(px - 0.75, lanes.y, 1.5, lanes.h), a.playhead);
+            }
         }
         self.paint_snap_guide(p, lanes);
         if let Some((target, at)) = self.drop_at {

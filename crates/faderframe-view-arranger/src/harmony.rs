@@ -154,12 +154,15 @@ impl ArrangerView {
                 continue;
             }
             let band = Rect::new(x0, r.y + 2.0, (x1 - x0).max(1.0), r.h - 4.0);
-            p.fill(
-                band,
+            // Cards keep the accent for the change itself.
+            let tint = if th.arranger.clip_style == faderframe_ui_canvas::ClipStyle::Card {
+                th.ui.text.with_alpha(if i % 2 == 0 { 0.05 } else { 0.08 })
+            } else {
                 th.ui
                     .accent
-                    .with_alpha(if i % 2 == 0 { 0.14 } else { 0.22 }),
-            );
+                    .with_alpha(if i % 2 == 0 { 0.14 } else { 0.22 })
+            };
+            p.fill(band, tint);
             p.fill(Rect::new(self.x_of(k.at), r.y, 2.0, r.h), th.ui.accent);
             p.text(
                 &k.key.name(),

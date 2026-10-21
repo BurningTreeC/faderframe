@@ -9,6 +9,9 @@ pub enum FontFamily {
     Mono,
     /// Narrow face for scribble strips and dense labels.
     Condensed,
+    /// The UI face with tabular (equal-width) figures: readouts set in the
+    /// interface's own type that do not jitter as they count.
+    Figures,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -17,6 +20,7 @@ pub enum FontWeight {
     Normal,
     Medium,
     Bold,
+    Light,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -107,13 +107,17 @@ drum bus and the program EQ:
 
 ![EQ, synth, compressor, reverb, container and program EQ editors](docs/screenshots/devices.png)
 
-Eight skins, switched live (View → Theme or Preferences → General → Theme):
+Nine skins, switched live (View → Theme or Preferences → General → Theme):
 Studio, Vintage Console (walnut cheeks, enamel panels, skirted knobs,
 plasma bar-graph meters), Daylight (light), Midnight, Frost, Fjord (dark
 slate and petrol panels with coral and old-gold light, calm contrast for
-long sessions), Neon and High Contrast:
+long sessions), Neon, High Contrast and Lumen (drawn with light instead of
+hardware: ink planes stepped by luminance, halo knobs with glowing value
+arcs, pill faders and buttons that light from within, fine gradient
+meters with a bloom, clips as translucent cards, a glass transport display
+in tabular figures and one cyan-to-violet accent):
 
-![The eight skins](docs/screenshots/themes.png)
+![The nine skins](docs/screenshots/themes.png)
 
 ## What works today
 

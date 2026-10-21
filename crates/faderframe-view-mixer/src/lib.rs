@@ -342,6 +342,60 @@ pub fn track_color(c: TrackColor) -> Color {
     Color::rgb8(c.r, c.g, c.b)
 }
 
+/// A strip's colour bar: across its top, or on planes a fine line inside
+/// the rounded corners with a glow of its colour — the master's in the
+/// accent's gradient (`signature`).
+pub(crate) fn paint_color_bar(
+    p: &mut dyn Painter,
+    bar: Rect,
+    color: Color,
+    signature: bool,
+    th: &Theme,
+) {
+    let look = &th.console.look;
+    if !look.planes() {
+        p.fill(bar, color);
+        return;
+    }
+    let r = controls::PLANE_RADIUS;
+    let line = Rect::new(bar.x + r, bar.y, (bar.w - 2.0 * r).max(0.0), 2.0);
+    let (from, to) = if signature {
+        (th.ui.accent, th.ui.accent_2)
+    } else {
+        (color, color)
+    };
+    if look.glow > 0.0 {
+        p.shadow(
+            line,
+            1.0,
+            from.mix(to, 0.5).with_alpha(0.5 * look.glow),
+            0.0,
+            1.0,
+            5.0,
+        );
+    }
+    p.fill_rounded(
+        line,
+        1.0,
+        &faderframe_ui_canvas::Paint::horizontal(line, from, to),
+    );
+}
+
+/// The outline of a selected strip (the plane's own rounding on planes).
+pub(crate) fn paint_selected(p: &mut dyn Painter, rect: Rect, th: &Theme) {
+    let c = &th.console;
+    if c.look.planes() {
+        p.stroke_rounded(
+            rect.inset(0.75),
+            controls::PLANE_RADIUS,
+            1.5,
+            c.selected_glow,
+        );
+    } else {
+        p.stroke_rounded(rect.inset(1.0), 2.0, 1.5, c.selected_glow);
+    }
+}
+
 /// A session menu entry as a menu item.
 pub fn menu_item(e: faderframe_session::GroupMenuEntry) -> MenuItem<Action> {
     let mut m = match e.action {
@@ -1009,9 +1063,17 @@ impl MixerView {
             th,
         );
         let color = track_color(t.color);
-        p.fill(f.color_bar, color);
+        if c.look.planes() {
+            p.fill_rounded(
+                f.color_bar.inset_xy(2.0, 2.0),
+                1.5,
+                &faderframe_ui_canvas::Paint::Solid(color),
+            );
+        } else {
+            p.fill(f.color_bar, color);
+        }
         if model.selection.tracks.contains(&t.id) {
-            p.stroke_rounded(rect.inset(1.0), 2.0, 1.5, c.selected_glow);
+            paint_selected(p, rect, th);
         }
         // The triangle: right when closed, down when open.
         let open = model.folder_open(t.id);
@@ -1067,9 +1129,9 @@ impl MixerView {
         };
         controls::panel(p, rect, top, bottom, th);
         let color = track_color(t.color);
-        p.fill(l.color_bar, color);
+        paint_color_bar(p, l.color_bar, color, is_master, th);
         if model.selection.tracks.contains(&t.id) {
-            p.stroke_rounded(rect.inset(1.0), 2.0, 1.5, c.selected_glow);
+            paint_selected(p, rect, th);
         }
         for &y in &l.dividers {
             controls::section_line(p, rect.x + 4.0, rect.right() - 4.0, y, th);
@@ -1081,13 +1143,15 @@ impl MixerView {
 
         // Header.
         if is_master {
-            controls::screw(p, Point::new(rect.x + 8.0, l.header.center().y), 3.0, th);
-            controls::screw(
-                p,
-                Point::new(rect.right() - 8.0, l.header.center().y),
-                3.0,
-                th,
-            );
+            if !c.look.planes() {
+                controls::screw(p, Point::new(rect.x + 8.0, l.header.center().y), 3.0, th);
+                controls::screw(
+                    p,
+                    Point::new(rect.right() - 8.0, l.header.center().y),
+                    3.0,
+                    th,
+                );
+            }
             controls::engraved(p, "MASTER", l.header, th, Align::Center);
         } else {
             controls::engraved(p, &format!("{number}"), l.header, th, Align::Start);
@@ -3856,9 +3920,19 @@ impl MixerView {
             self.paint_cue_mark(p, rect, tracks[i], model);
             // What a strip is in: a band of each folder's colour along its
             // foot, the innermost lowest.
+            let inset = if self.theme.console.look.planes() {
+                controls::PLANE_RADIUS
+            } else {
+                0.0
+            };
             for (k, f) in model.project().folder_chain(tracks[i]).iter().enumerate() {
                 p.fill(
-                    Rect::new(rect.x, rect.bottom() - 3.0 - 4.0 * k as f32, rect.w, 3.0),
+                    Rect::new(
+                        rect.x + inset,
+                        rect.bottom() - 3.0 - 4.0 * k as f32,
+                        rect.w - 2.0 * inset,
+                        3.0,
+                    ),
                     track_color(f.color).with_alpha(0.85),
                 );
             }

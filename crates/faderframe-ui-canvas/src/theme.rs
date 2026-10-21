@@ -3,10 +3,12 @@
 //! All colours, sizes and typographic choices of the custom surfaces live
 //! here instead of being scattered through the views; [`ConsoleLook`] also
 //! decides how console controls are drawn (knob skirts, brushed panels,
-//! wooden cheeks, VU needles, flat controls). [`Theme::all`] lists the
-//! built-in skins; each is an original design — no brand is imitated.
+//! wooden cheeks, VU needles, flat controls — or the planes, halo knobs,
+//! pill faders and buttons and gradient meters of a skin drawn with light
+//! instead of hardware). [`Theme::all`] lists the built-in skins; each is
+//! an original design — no brand is imitated.
 
-use crate::Color;
+use crate::{Color, FontFamily};
 
 #[derive(Clone, Debug)]
 pub struct Typography {
@@ -15,6 +17,9 @@ pub struct Typography {
     pub normal: f32,
     pub large: f32,
     pub display: f32,
+    /// The face of numeric readouts (levels, pan, the transport's
+    /// counters): monospaced, or the UI face with tabular figures.
+    pub numerals: FontFamily,
 }
 
 #[derive(Clone, Debug)]
@@ -28,6 +33,9 @@ pub struct UiPalette {
     pub text_faint: Color,
     /// Playhead / record-ready accent.
     pub accent: Color,
+    /// Where the accent's gradient ends (the accent itself for a skin
+    /// without one).
+    pub accent_2: Color,
     /// Selection highlight.
     pub selection: Color,
     /// LCD-style displays (transport counter, edit counters).
@@ -90,6 +98,75 @@ pub enum MeterKind {
     Edgewise,
     /// Gas-plasma bar graph: a glowing column with fine lines across it.
     Plasma,
+    /// Fine rounded bars, one smooth gradient from cool to hot, a hairline
+    /// peak marker and a soft bloom at the top of the level.
+    Gradient,
+}
+
+/// How knobs without a skirt are drawn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KnobKind {
+    /// A body with a cap and a pointer (inside the value ring when the
+    /// look has one).
+    #[default]
+    Cap,
+    /// A halo: a fine ring with the value as a glowing arc around a flat
+    /// disc with a small indicator dot.
+    Halo,
+}
+
+/// How faders are drawn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FaderKind {
+    /// A slot and a moulded cap with grip ridges.
+    #[default]
+    Cap,
+    /// A slim track lit up to the level and a pill-shaped thumb.
+    Pill,
+}
+
+/// How switches (mute, solo, record …) are drawn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ButtonKind {
+    /// Illuminated push buttons.
+    #[default]
+    Led,
+    /// Ghost pills with a hairline edge that light from within when on.
+    Pill,
+}
+
+/// How console panels are drawn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PanelKind {
+    /// Bevelled plates (with sheen, grain and screws as the look says).
+    #[default]
+    Hardware,
+    /// Flat rounded planes set apart by luminance steps: no bevels,
+    /// sheen, grain or screws; hairline section rules; wells and scribble
+    /// strips as darker insets.
+    Plane,
+}
+
+/// How the arranger draws clips.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClipStyle {
+    /// A coloured name strip over a darker translucent body.
+    #[default]
+    Classic,
+    /// Translucent rounded cards tinted with the clip's colour, a fine
+    /// line of it along the top, a light name and a softer waveform.
+    Card,
+}
+
+/// How the GTK shell around the views is styled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Chrome {
+    /// Adwaita in the skin's colours.
+    #[default]
+    Classic,
+    /// Flat planes: pill buttons, a glass transport display, rounded
+    /// floating menus and popovers, accent check marks and focus rings.
+    Planes,
 }
 
 /// How console controls are drawn beyond their colours.
@@ -112,6 +189,14 @@ pub struct ConsoleLook {
     pub engrave: Color,
     /// Flat controls: no bevels or gradients.
     pub flat: bool,
+    pub knob_kind: KnobKind,
+    pub fader_kind: FaderKind,
+    pub button_kind: ButtonKind,
+    pub panel_kind: PanelKind,
+    /// Strength of the soft glow the newer kinds give lit things (value
+    /// arcs, pills, meter blooms, the playhead, the transport's digits;
+    /// 0: none).
+    pub glow: f32,
 }
 
 impl Default for ConsoleLook {
@@ -126,7 +211,19 @@ impl Default for ConsoleLook {
             meter: MeterKind::Ladder,
             engrave: Color::rgba(0.0, 0.0, 0.0, 0.55),
             flat: false,
+            knob_kind: KnobKind::Cap,
+            fader_kind: FaderKind::Cap,
+            button_kind: ButtonKind::Led,
+            panel_kind: PanelKind::Hardware,
+            glow: 0.0,
         }
+    }
+}
+
+impl ConsoleLook {
+    /// Planes instead of plates (see [`PanelKind::Plane`]).
+    pub fn planes(&self) -> bool {
+        self.panel_kind == PanelKind::Plane
     }
 }
 
@@ -211,6 +308,7 @@ pub struct ArrangerTheme {
     /// grid lines show through.
     pub clip_header_alpha: f32,
     pub clip_alpha: f32,
+    pub clip_style: ClipStyle,
     pub clip_text: Color,
     pub selection_outline: Color,
     pub track_height: f32,
@@ -421,6 +519,8 @@ pub struct Theme {
     /// How strongly the editors draw their time grid (a preference laid
     /// over every skin, [`Theme::with_grid_strength`]).
     pub grid: GridLook,
+    /// How the GTK shell is styled.
+    pub chrome: Chrome,
 }
 
 impl Default for Theme {
@@ -443,6 +543,7 @@ impl Theme {
                 normal: 11.5,
                 large: 13.5,
                 display: 20.0,
+                numerals: FontFamily::Mono,
             },
             ui: UiPalette {
                 background: Color::hex(0x17181b),
@@ -453,6 +554,7 @@ impl Theme {
                 text_dim: Color::hex(0x9a9c9f),
                 text_faint: Color::hex(0x5f6266),
                 accent,
+                accent_2: accent,
                 selection: Color::hex(0x6fc3ff),
                 lcd_bg: Color::hex(0x0d100e),
                 lcd_text: Color::hex(0xf0c46a),
@@ -558,6 +660,7 @@ impl Theme {
                 clip_header: 22.0,
                 clip_header_alpha: 0.82,
                 clip_alpha: 0.5,
+                clip_style: ClipStyle::Classic,
                 clip_text: Color::hex(0x121212),
                 selection_outline: Color::hex(0xf5f5f5),
                 track_height: 72.0,
@@ -661,7 +764,14 @@ impl Theme {
                 key_black: Color::hex(0x24262b),
             },
             grid: GridLook::default(),
+            chrome: Chrome::Classic,
         }
+    }
+
+    /// The ink of a name on a card ([`ClipStyle::Card`]) of `color`: the
+    /// colour drawn towards the skin's text.
+    pub fn card_ink(&self, color: Color) -> Color {
+        color.mix(self.ui.text, 0.62)
     }
 
     /// This skin with its time grid drawn at `strength` (0…1, see

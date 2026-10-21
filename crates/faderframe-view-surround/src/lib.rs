@@ -475,7 +475,7 @@ impl CanvasView<Session, Action> for SurroundView {
             &place,
             readout,
             &TextStyle::new(th.fonts.normal, th.ui.text_dim)
-                .family(faderframe_ui_canvas::FontFamily::Mono)
+                .family(th.fonts.numerals)
                 .align(Align::End),
         );
         p.hline(

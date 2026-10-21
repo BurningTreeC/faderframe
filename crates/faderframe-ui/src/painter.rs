@@ -276,7 +276,9 @@ impl TextCache {
 fn font_description(style: &TextStyle) -> pango::FontDescription {
     let mut fd = pango::FontDescription::new();
     match style.family {
-        FontFamily::Sans => {
+        // Figures: the same face; its tabular figures are a layout
+        // attribute (see `SnapshotPainter::layout`).
+        FontFamily::Sans | FontFamily::Figures => {
             fd.set_family("Inter, Noto Sans, Fira Sans, Cantarell, DejaVu Sans, Sans")
         }
         FontFamily::Condensed => {
@@ -293,6 +295,7 @@ fn font_description(style: &TextStyle) -> pango::FontDescription {
         FontWeight::Normal => pango::Weight::Normal,
         FontWeight::Medium => pango::Weight::Medium,
         FontWeight::Bold => pango::Weight::Bold,
+        FontWeight::Light => pango::Weight::Light,
     });
     fd.set_absolute_size(style.size as f64 * pango::SCALE as f64);
     fd
@@ -493,11 +496,16 @@ impl<'a> SnapshotPainter<'a> {
         }
         let layout = self.widget.create_pango_layout(Some(text));
         layout.set_font_description(Some(&font_description(style)));
-        if style.tracking > 0.0 {
+        if style.tracking > 0.0 || style.family == FontFamily::Figures {
             let attrs = pango::AttrList::new();
-            attrs.insert(pango::AttrInt::new_letter_spacing(
-                (style.tracking * pango::SCALE as f32) as i32,
-            ));
+            if style.tracking > 0.0 {
+                attrs.insert(pango::AttrInt::new_letter_spacing(
+                    (style.tracking * pango::SCALE as f32) as i32,
+                ));
+            }
+            if style.family == FontFamily::Figures {
+                attrs.insert(pango::AttrFontFeatures::new("tnum 1"));
+            }
             layout.set_attributes(Some(&attrs));
         }
         if width > 0.0 {

@@ -13,8 +13,8 @@ use faderframe_project::adr::AdrCue;
 use faderframe_session::adr::AdrOp;
 use faderframe_session::{Action, Session, TransportAction};
 use faderframe_ui_canvas::{
-    CanvasView, Color, EventCx, FontFamily, HostRequest, MenuItem, Painter, Point, PointerButton,
-    Rect, ScrollAxis, ScrollInfo, Size, TextStyle, Theme, ViewEvent, controls,
+    CanvasView, Color, EventCx, HostRequest, MenuItem, Painter, Point, PointerButton, Rect,
+    ScrollAxis, ScrollInfo, Size, TextStyle, Theme, ViewEvent, controls,
 };
 
 const BAR_H: f32 = 34.0;
@@ -355,7 +355,7 @@ impl CanvasView<Session, Action> for AdrView {
             }
             let dim = if cue.done { ui.text_faint } else { ui.text };
             let text = TextStyle::new(th.fonts.small, dim);
-            let mono = TextStyle::new(th.fonts.small, ui.text_dim).family(FontFamily::Mono);
+            let mono = TextStyle::new(th.fonts.small, ui.text_dim).family(th.fonts.numerals);
             let takes = model.adr_takes(cue.id);
             for (cell, r) in Self::cells(size, y) {
                 let inner = Rect::new(r.x + 4.0, r.y, (r.w - 8.0).max(0.0), r.h);

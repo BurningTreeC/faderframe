@@ -19,8 +19,8 @@ use faderframe_project::setlist::{AfterSong, SetSong};
 use faderframe_session::setlist::{SetlistOp, ShowOp};
 use faderframe_session::{Action, Session, TransportAction};
 use faderframe_ui_canvas::{
-    CanvasView, EventCx, FontFamily, FontWeight, HostRequest, Key, MenuItem, Painter, Point,
-    PointerButton, Rect, ScrollAxis, ScrollInfo, Size, TextStyle, Theme, ViewEvent,
+    CanvasView, EventCx, FontWeight, HostRequest, Key, MenuItem, Painter, Point, PointerButton,
+    Rect, ScrollAxis, ScrollInfo, Size, TextStyle, Theme, ViewEvent,
 };
 
 const HEADER_H: f32 = 36.0;
@@ -270,7 +270,7 @@ impl SetlistView {
             ];
             for (c, (text, style)) in cells.iter().enumerate() {
                 let s = if c == 2 || c == 3 {
-                    (**style).family(FontFamily::Mono)
+                    (**style).family(th.fonts.numerals)
                 } else {
                     **style
                 };
@@ -419,7 +419,7 @@ impl SetlistView {
         p.text(
             &format!("{}  /  −{}", mmss(elapsed), mmss(length - elapsed)),
             time,
-            &TextStyle::new(64.0, th.ui.text).family(FontFamily::Mono),
+            &TextStyle::new(64.0, th.ui.text).family(th.fonts.numerals),
         );
         let bar = Rect::new(m.x, time.bottom() + 8.0, m.w, 10.0);
         p.fill_rounded(bar, 5.0, &th.ui.surface.into());
@@ -525,7 +525,7 @@ impl SetlistView {
             p.text(
                 &format!("{}", k + 1),
                 Rect::new(r.x + 12.0, r.y, 30.0, r.h),
-                &TextStyle::new(16.0, th.ui.text_faint).family(FontFamily::Mono),
+                &TextStyle::new(16.0, th.ui.text_faint).family(th.fonts.numerals),
             );
             p.text(
                 &s.name,
@@ -545,7 +545,7 @@ impl SetlistView {
                 &tag,
                 Rect::new(r.x + r.w - 92.0, r.y, 80.0, r.h),
                 &TextStyle::new(14.0, if k == i + 1 { th.ui.accent } else { ink })
-                    .family(FontFamily::Mono)
+                    .family(th.fonts.numerals)
                     .right(),
             );
         }

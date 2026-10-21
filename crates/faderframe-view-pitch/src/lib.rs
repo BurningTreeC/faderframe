@@ -18,9 +18,8 @@ use faderframe_project::{AudioClip, Clip};
 use faderframe_session::pitch::PitchOp;
 use faderframe_session::{Action, Session};
 use faderframe_ui_canvas::{
-    CanvasView, Color, Cursor, EventCx, FontFamily, HostRequest, Key, MenuItem, Modifiers, Paint,
-    Painter, Path, Point, PointerButton, Rect, ScrollAxis, ScrollInfo, Size, TextStyle, Theme,
-    ViewEvent,
+    CanvasView, Color, Cursor, EventCx, HostRequest, Key, MenuItem, Modifiers, Paint, Painter,
+    Path, Point, PointerButton, Rect, ScrollAxis, ScrollInfo, Size, TextStyle, Theme, ViewEvent,
 };
 
 const TOOLBAR_H: f32 = 34.0;
@@ -976,7 +975,7 @@ impl PitchView {
                     &format!("{}", bar + 1),
                     Rect::new(x + 3.0, r.y, 40.0, r.h),
                     &TextStyle::new(th.fonts.small, th.arranger.ruler_text)
-                        .family(FontFamily::Mono),
+                        .family(th.fonts.numerals),
                 );
             }
         }

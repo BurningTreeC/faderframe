@@ -713,7 +713,8 @@ impl PianoRollView {
         let meter = &project.timeline.meter;
         let start = clip.start + self.time_at(r.x).max(MusicalTime::ZERO);
         let end = clip.start + self.time_at(r.right());
-        let style = TextStyle::new(th.fonts.small, th.arranger.ruler_text).family(FontFamily::Mono);
+        let style =
+            TextStyle::new(th.fonts.small, th.arranger.ruler_text).family(th.fonts.numerals);
         let beats = self.ppq >= 14.0;
         for_each_grid_line(start, end, GridDivision::Beat, meter, |t, kind| {
             let x = self.x_of(t - clip.start);

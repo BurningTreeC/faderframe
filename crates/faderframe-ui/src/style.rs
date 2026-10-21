@@ -2,7 +2,7 @@
 //! theme's colours become `@define-color` names the rules below use, and
 //! GTK's own light or dark variant follows the theme.
 
-use faderframe_ui_canvas::{Color, Theme};
+use faderframe_ui_canvas::{Chrome, Color, Theme};
 use gtk::{gdk, glib, prelude::*};
 use std::cell::RefCell;
 
@@ -149,6 +149,111 @@ scrollbar { background-color: @ff_bg; }
 .sidebar-new { margin: 2px 6px 2px 6px; font-size: 9pt; }
 "#;
 
+/// The planes chrome ([`Chrome::Planes`]) over the rules above: flat header
+/// and tabs set apart by hairlines, pill buttons, rounded floating menus
+/// and popovers with soft elevation, the accent for check marks, switches,
+/// selections and focus rings.
+const PLANES_CSS: &str = r#"
+window, dialog { background-color: @ff_bg; }
+headerbar {
+    background-image: none;
+    background-color: @ff_bg;
+    border-bottom: 1px solid @ff_hairline;
+}
+headerbar popovermenubar > item { border-radius: 8px; padding: 4px 10px; }
+headerbar popovermenubar > item:hover,
+headerbar popovermenubar > item:selected { background-color: @ff_hover; }
+headerbar button, .transport button {
+    border-radius: 999px;
+    background-image: none;
+    background-color: transparent;
+    border: none;
+    box-shadow: none;
+}
+headerbar button:hover, .transport button:hover { background-image: image(@ff_hover); }
+headerbar button:checked, .transport button:checked { background-image: image(alpha(@ff_accent, 0.16)); color: @ff_accent; }
+.transport button.play-active { color: @ff_accent; }
+.transport button.loop-active { color: @ff_accent; }
+.transport button.click-active { color: @ff_accent_2; }
+.transport button.q-active { color: @ff_accent; }
+.edit-toggle.edit-active { background-image: image(alpha(@ff_accent, 0.18)); color: @ff_accent; }
+.lcd { border-radius: 12px; }
+button {
+    border-radius: 8px;
+    background-image: image(@ff_surface_alt);
+    border-color: @ff_hairline;
+    box-shadow: none;
+}
+button:hover { background-image: image(shade(@ff_surface_alt, 1.18)); }
+button:active, button:checked { background-image: image(alpha(@ff_accent, 0.2)); color: @ff_fg; }
+button.flat, .tab-button, popover.ff-menu button { background-image: none; border-color: transparent; }
+button.flat:hover, .tab-button:hover { background-image: image(@ff_hover); }
+button.suggested-action { background-image: image(@ff_accent); border-color: @ff_accent; color: @ff_on_accent; }
+button.destructive-action { background-image: image(alpha(@ff_error, 0.85)); border-color: @ff_error; color: @ff_fg; }
+popover > contents {
+    background-color: @ff_surface;
+    border-radius: 12px;
+    border: 1px solid @ff_hairline;
+    box-shadow: 0 14px 36px rgba(0, 0, 0, 0.6), 0 2px 6px rgba(0, 0, 0, 0.4);
+}
+popover > arrow { background-color: @ff_surface; border: 1px solid @ff_hairline; }
+popover.menu > contents { padding: 6px; }
+popover.menu modelbutton, popover.ff-menu button { border-radius: 7px; }
+popover.menu modelbutton:hover, popover.menu modelbutton:selected { background-color: alpha(@ff_accent, 0.13); }
+popover.ff-menu button:hover { background-image: image(alpha(@ff_accent, 0.13)); }
+popover.menu modelbutton check, popover.menu modelbutton radio,
+popover.menu modelbutton arrow { color: @ff_accent; }
+popover.menu modelbutton accelerator { color: @ff_faint; }
+popover.menu separator { background-color: @ff_hairline; margin: 4px 6px; }
+tooltip, tooltip > * { border-radius: 8px; }
+tooltip { background-color: @ff_surface_alt; color: @ff_fg; border: 1px solid @ff_hairline; }
+notebook.dock-tabs > header { background-color: @ff_bg; border-bottom: 1px solid @ff_hairline; }
+notebook.dock-tabs > header > tabs > tab { border-radius: 8px 8px 0 0; }
+notebook.dock-tabs > header > tabs > tab:hover { background-color: @ff_hover; }
+notebook.dock-tabs > header > tabs > tab:checked {
+    background-color: transparent;
+    color: @ff_fg;
+    box-shadow: inset 0 -2px @ff_accent;
+}
+paned > separator { background-color: @ff_bg; }
+.statusbar { background-color: @ff_bg; border-top: 1px solid @ff_hairline; }
+.dock-collapsed { background-color: @ff_bg; border-top: 1px solid @ff_hairline; }
+entry, spinbutton, searchentry, dropdown > button, combobox > box > button {
+    border-radius: 8px;
+    background-image: none;
+    background-color: @ff_well;
+    box-shadow: inset 0 0 0 1px @ff_hairline;
+}
+*:focus-visible, entry:focus-within, spinbutton:focus-within { outline-color: alpha(@ff_accent, 0.8); }
+textview > text > selection:focus-within, entry > text > selection:focus-within,
+label > selection:focus-within { background-color: alpha(@ff_accent, 0.35); }
+switch, switch slider { border-radius: 999px; }
+switch:checked { background-color: @ff_accent; border-color: @ff_accent; color: @ff_on_accent; }
+check, radio { background-image: image(@ff_well); border-color: alpha(@ff_fg, 0.22); box-shadow: none; }
+check:checked, radio:checked, check:indeterminate, radio:indeterminate {
+    background-image: image(@ff_accent);
+    border-color: @ff_accent;
+    color: @ff_on_accent;
+}
+check:checked:hover, radio:checked:hover { background-image: image(shade(@ff_accent, 1.1)); }
+popover.menu check, popover.menu radio {
+    background-image: image(transparent);
+    border-color: transparent;
+    color: @ff_accent;
+}
+popover.menu radio { border-color: alpha(@ff_fg, 0.22); }
+progressbar > trough > progress, scale > trough > highlight { background-color: @ff_accent; border-color: @ff_accent; }
+scale > trough > slider { background-image: image(@ff_fg); border-color: transparent; border-radius: 999px; }
+list, listview { background-color: @ff_surface; }
+row:selected { background-color: alpha(@ff_accent, 0.14); }
+.plugin-list row:selected { background-color: alpha(@ff_accent, 0.12); box-shadow: inset 2px 0 @ff_accent; }
+.toast { border-radius: 12px; border-color: @ff_hairline; }
+scrollbar { background-color: transparent; }
+scrollbar slider { border-radius: 999px; background-color: alpha(@ff_fg, 0.24); }
+scrollbar slider:hover { background-color: alpha(@ff_fg, 0.4); }
+scrollbar slider:active { background-color: @ff_accent; }
+"#;
+
 fn css_color(c: Color) -> String {
     let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     if c.a >= 1.0 {
@@ -189,6 +294,19 @@ pub fn css(theme: &Theme) -> String {
         out.push_str(&format!("@define-color {name} {};\n", css_color(color)));
     }
     out.push_str(CSS);
+    if theme.chrome == Chrome::Planes {
+        let planes = [
+            ("ff_accent_2", ui.accent_2),
+            ("ff_hairline", ui.text.with_alpha(0.07)),
+            ("ff_hover", ui.text.with_alpha(0.07)),
+            ("ff_well", ui.background.mix(ui.border, 0.4)),
+            ("ff_on_accent", ui.background),
+        ];
+        for (name, color) in planes {
+            out.push_str(&format!("@define-color {name} {};\n", css_color(color)));
+        }
+        out.push_str(PLANES_CSS);
+    }
     out
 }
 
