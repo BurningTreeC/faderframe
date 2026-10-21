@@ -35,6 +35,9 @@ pub struct Segment {
     pub playing: bool,
     /// The transport's jumps counter (locates, stops; not loop wraps).
     pub jumps: u32,
+    /// Frames of a count-in left at `frame` before playback starts (0:
+    /// none): the position stands while they count down.
+    pub count_in: u64,
 }
 
 impl Segment {
@@ -48,12 +51,53 @@ impl Segment {
         }
     }
 
+    /// Frames of its count-in left at `frame` (0: none, or over).
+    #[inline]
+    fn count_at(&self, frame: i64) -> u64 {
+        self.count_in
+            .saturating_sub((frame - self.frame).max(0) as u64)
+    }
+
+    /// Where `frame` is (extrapolated outside the segment: past the end of
+    /// a count-in, playing from its position).
+    #[inline]
+    pub fn played(&self, frame: i64) -> Played {
+        if self.count_in > 0 {
+            let left = self.count_at(frame);
+            if left == 0 {
+                let start = self.frame + self.count_in as i64;
+                return Played {
+                    pos: self.pos + (frame - start),
+                    playing: true,
+                    jumps: self.jumps,
+                    start,
+                    count_in: 0,
+                };
+            }
+            return Played {
+                pos: self.pos,
+                playing: false,
+                jumps: self.jumps,
+                start: self.frame,
+                count_in: left,
+            };
+        }
+        Played {
+            pos: self.pos_at(frame),
+            playing: self.playing,
+            jumps: self.jumps,
+            start: self.frame,
+            count_in: 0,
+        }
+    }
+
     /// Whether `next` carries on from it (one run).
-    fn continued_by(&self, frame: i64, pos: i64, playing: bool, jumps: u32) -> bool {
+    fn continued_by(&self, frame: i64, pos: i64, playing: bool, jumps: u32, count_in: u64) -> bool {
         self.end == frame
             && self.playing == playing
             && self.jumps == jumps
             && self.pos_at(frame) == pos
+            && self.count_at(frame) == count_in
     }
 }
 
@@ -65,6 +109,9 @@ pub struct Played {
     pub jumps: u32,
     /// The first frame of its run (a new run: something jumped or wrapped).
     pub start: i64,
+    /// Frames of a count-in left before playback starts (0: none): the
+    /// transport stands at `pos` while counting in, then plays from it.
+    pub count_in: u64,
 }
 
 /// Nanoseconds from the first call (made when an engine is created) to
@@ -107,12 +154,14 @@ impl Default for PlayHistory {
 
 impl PlayHistory {
     /// Record the chunk about to be processed: `n` frames from timeline
-    /// position `pos`. Realtime-safe.
-    pub fn record(&mut self, pos: i64, playing: bool, jumps: u32, n: usize) {
+    /// position `pos` (`count_in`: frames of a count-in left before
+    /// playback starts, see [`Segment::count_in`]). Realtime-safe.
+    pub fn record(&mut self, pos: i64, playing: bool, jumps: u32, count_in: u64, n: usize) {
         let frame = self.end();
         self.chunk = frame;
         let end = frame + n as i64;
-        if self.len > 0 && self.segs[self.newest].continued_by(frame, pos, playing, jumps) {
+        if self.len > 0 && self.segs[self.newest].continued_by(frame, pos, playing, jumps, count_in)
+        {
             self.segs[self.newest].end = end;
             return;
         }
@@ -126,6 +175,7 @@ impl PlayHistory {
             pos,
             playing,
             jumps,
+            count_in,
         };
     }
 
@@ -166,6 +216,7 @@ impl PlayHistory {
         }
         oldest.map(|s| Segment {
             playing: false,
+            count_in: 0,
             ..s
         })
     }
@@ -174,12 +225,7 @@ impl PlayHistory {
     /// stopped).
     pub fn at(&self, frame: i64) -> Played {
         match self.find(frame) {
-            Some(s) => Played {
-                pos: s.pos_at(frame),
-                playing: s.playing,
-                jumps: s.jumps,
-                start: s.frame,
-            },
+            Some(s) => s.played(frame),
             None => Played::default(),
         }
     }
@@ -213,12 +259,7 @@ impl PlayHistory {
                 .filter(|&f| f > at && f < to)
                 .min()
                 .unwrap_or(to);
-            let played = Played {
-                pos: s.pos_at(at),
-                playing: s.playing,
-                jumps: s.jumps,
-                start: s.frame,
-            };
+            let played = s.played(at);
             f((at - from) as usize + offset, (next - at) as usize, played);
             at = next;
         }
@@ -227,7 +268,9 @@ impl PlayHistory {
 
 /// Segments published to the control side.
 pub const PUBLISHED: usize = 8;
-const WORDS: usize = 6 + 4 * PUBLISHED;
+/// Words per published segment.
+const SEGMENT_WORDS: usize = 5;
+const WORDS: usize = 6 + SEGMENT_WORDS * PUBLISHED;
 
 /// The play history around what is being heard, published after every
 /// callback for the control side's playhead (a seqlock over atomics: the
@@ -238,7 +281,8 @@ pub struct HeardClock {
     seq: AtomicU64,
     /// `[callback ns, frame at the callback, frames from processing to
     /// hearing, segment count, newest jumps, position the newest jump went
-    /// to]` and the segments (`frame, end, pos, playing << 63 | jumps`).
+    /// to]` and the segments (`frame, end, pos, playing << 63 | jumps,
+    /// count_in`).
     words: [AtomicU64; WORDS],
 }
 
@@ -300,14 +344,10 @@ impl HeardSnapshot {
             .copied()
             .unwrap_or(Segment {
                 playing: false,
+                count_in: 0,
                 ..segs[0]
             });
-        Some(Played {
-            pos: s.pos_at(h),
-            playing: s.playing,
-            jumps: s.jumps,
-            start: s.frame,
-        })
+        Some(s.played(h))
     }
 }
 
@@ -351,7 +391,7 @@ impl HeardClock {
         w[5].store(jumped_to as u64, Ordering::Relaxed);
         // Oldest of the chosen first.
         for (i, seg) in history.newest_first().take(count).enumerate() {
-            let k = 6 + 4 * (count - 1 - i);
+            let k = 6 + SEGMENT_WORDS * (count - 1 - i);
             w[k].store(seg.frame as u64, Ordering::Relaxed);
             w[k + 1].store(seg.end as u64, Ordering::Relaxed);
             w[k + 2].store(seg.pos as u64, Ordering::Relaxed);
@@ -359,6 +399,7 @@ impl HeardClock {
                 (u64::from(seg.playing) << 63) | u64::from(seg.jumps),
                 Ordering::Relaxed,
             );
+            w[k + 4].store(seg.count_in, Ordering::Relaxed);
         }
         self.seq.store(s.wrapping_add(2), Ordering::Release);
     }
@@ -391,13 +432,14 @@ impl HeardClock {
                 segments: [Segment::default(); PUBLISHED],
             };
             for i in 0..count {
-                let k = 6 + 4 * i;
+                let k = 6 + SEGMENT_WORDS * i;
                 snap.segments[i] = Segment {
                     frame: w[k] as i64,
                     end: w[k + 1] as i64,
                     pos: w[k + 2] as i64,
                     playing: w[k + 3] >> 63 == 1,
                     jumps: w[k + 3] as u32,
+                    count_in: w[k + 4],
                 };
             }
             return Some(snap);
@@ -429,7 +471,7 @@ mod tests {
     fn h(chunks: &[(i64, bool, u32, usize)]) -> PlayHistory {
         let mut h = PlayHistory::default();
         for &(pos, playing, jumps, n) in chunks {
-            h.record(pos, playing, jumps, n);
+            h.record(pos, playing, jumps, 0, n);
         }
         h
     }
@@ -472,12 +514,54 @@ mod tests {
         assert!(!h.at(-1000).playing);
     }
 
+    /// A count-in is a run of its own standing at the start, its frames
+    /// counting down; playback after it another run; both published.
+    #[test]
+    fn a_count_in_counts_down_standing_then_plays() {
+        let h = h_count(&[
+            (0, false, 0, 0, 100),
+            (0, false, 0, 300, 100),
+            (0, false, 0, 200, 200),
+            (0, true, 0, 0, 100),
+        ]);
+        assert_eq!(h.newest_first().count(), 3, "stopped, counting, playing");
+        let p = h.at(150);
+        assert_eq!(
+            (p.pos, p.playing, p.count_in, p.start),
+            (0, false, 250, 100)
+        );
+        let p = h.at(450);
+        assert_eq!((p.pos, p.playing, p.count_in, p.start), (50, true, 0, 400));
+        let mut got = Vec::new();
+        h.pieces(0, 0, 100, |o, n, p| got.push((o, n, p.count_in, p.playing)));
+        assert_eq!(got, vec![(0, 100, 0, true)]);
+        let mut got = Vec::new();
+        h.pieces(50, 0, 100, |o, n, p| {
+            got.push((o, n, p.count_in, p.playing))
+        });
+        assert_eq!(got, vec![(0, 50, 50, false), (50, 50, 0, true)]);
+        // Published: what is heard counts in too.
+        let clock = HeardClock::default();
+        clock.publish(&h, 1_000, 400, 0, (0, 0));
+        let s = clock.read().unwrap();
+        let p = s.heard(-100.0).unwrap();
+        assert_eq!((p.pos, p.playing, p.count_in), (0, false, 100));
+    }
+
+    fn h_count(chunks: &[(i64, bool, u32, u64, usize)]) -> PlayHistory {
+        let mut h = PlayHistory::default();
+        for &(pos, playing, jumps, count_in, n) in chunks {
+            h.record(pos, playing, jumps, count_in, n);
+        }
+        h
+    }
+
     #[test]
     fn the_ring_forgets_the_oldest() {
         let mut h = PlayHistory::default();
         for k in 0..(SEGMENTS as i64 + 10) {
             // A locate every chunk.
-            h.record(k * 1000, true, k as u32, 10);
+            h.record(k * 1000, true, k as u32, 0, 10);
         }
         assert_eq!(h.newest_first().count(), SEGMENTS);
         assert_eq!(h.at(h.end() - 5).pos, (SEGMENTS as i64 + 9) * 1000 + 5);
@@ -489,11 +573,11 @@ mod tests {
         assert!(clock.read().is_none());
         // Stopped at 0, then playing from 0; the jump of a locate to 9000.
         let mut h = PlayHistory::default();
-        h.record(0, false, 0, 256);
-        h.record(0, true, 0, 256);
-        h.record(256, true, 0, 256);
+        h.record(0, false, 0, 0, 256);
+        h.record(0, true, 0, 0, 256);
+        h.record(256, true, 0, 0, 256);
         let frame = h.chunk_start();
-        h.record(9000, true, 1, 256);
+        h.record(9000, true, 1, 0, 256);
         clock.publish(&h, 1_000, frame, 300, (1, 9256));
         let s = clock.read().unwrap();
         assert_eq!((s.jumps, s.jumped_to), (1, 9000));
@@ -516,9 +600,9 @@ mod tests {
         let clock = HeardClock::default();
         // Stopped at 4000, then playing from it: a latency of 300 frames.
         let mut h = PlayHistory::default();
-        h.record(4000, false, 0, 256);
+        h.record(4000, false, 0, 0, 256);
         let frame = h.chunk_start() + 256;
-        h.record(4000, true, 0, 256);
+        h.record(4000, true, 0, 0, 256);
         clock.publish(&h, 1_000, frame, 300, (0, 4512));
         let s = clock.read().unwrap();
         // While the latency fills, the stopped position (as `heard`): never
@@ -559,7 +643,7 @@ mod cost {
             if k % 100 == 0 {
                 pos = 0;
             }
-            h.record(pos, true, 0, 64);
+            h.record(pos, true, 0, 0, 64);
             for o in 0..64 {
                 sum = sum.wrapping_add(h.delayed(6400, o).pos);
             }

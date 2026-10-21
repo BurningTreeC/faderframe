@@ -2004,6 +2004,62 @@ too), Stop stops instead of locating to zero. Show mode: Space and the play
 button are the show's play and stop (`ShowOp::PlayStop`: a stop cues the
 song's start again); the setlist view's own Space never reached it.
 
+**Counting in before playback** (as Logic, Cubase and Studio One do). A
+pre-roll cannot play before the project's start: recording from bar 1 with
+a one-bar pre-roll used to clamp it away entirely — playback and the take
+started at once, the user took the click's first bar for a count-in and
+played a bar late. Now `Session::pre_roll` (`roll_back` is its start)
+measures the pre-roll on the timeline carried back before the start (its
+first tempo and metre: negative positions, bar 0 before bar 1, the
+pre-roll's bar line too) and returns where playback starts (never before
+0) and the frames it could not reach; `play` sends
+`TransportCommand::PlayAfterCountIn(frames)` instead of Play. The
+transport (`TransportState::count_in`, `counting_in()`, `started()`)
+stands where it is — not playing: the graph runs as stopped, so live
+inputs and monitoring keep working, nothing of the arrangement plays,
+nothing is recorded, plugins see a stopped transport, MIDI clock and MTC
+start with playback — while the frames count down
+(`frames_until_wrap` ends a block on the count-in's last frame), then
+plays from the next frame, inside the callback (not a jump). Play while
+counting changes nothing (Record and Play pressed together), Stop and
+TogglePlay cancel it (a jump), Scrub only locates. Rendering ahead it is a
+new sequence like any start: the anticipators count the same frames in
+and render the playback after it ahead during the count-in
+(`ahead_plan`/`amend` treat counting as started). The play history keeps
+the count-in in its runs (`Segment::count_in`, `Played::count_in`,
+published by `HeardClock` — five words a segment — and read back as
+`Heard::counting_in`); the click (`Click::render` takes negative
+positions) plays the count-in's runs at `position − count_in` whatever the
+metronome's mode, as late as the graph's outputs like every click, and a
+count-in run turning into the playback it counted in keeps its clicks
+sounding — so the last count-in beat and bar 1's downbeat are a beat
+apart as heard, behind plugin latency too. A pre-roll partly before the
+start counts in only what is missing: from beat 3 of bar 1 a one-bar
+pre-roll (not on a bar) counts two beats in and plays the first two
+beats, silent with clicks under *Count-in*; a launcher slot's count-in
+(`Launcher::count_in`) recorded from the start counts in the same way.
+The session sees a count-in as playing (started): the tick sets
+`TransportSnapshot::playing` from `started()`, so Stop, Abort (and Abort
+and Restart, which counts in again), the play button and the requested
+play hold work on it; `Session::transport()` carries the count-in as heard
+(`counting_in`) with the playhead held at the start, and
+`Session::count_in_position()` is where it is (the start less the frames
+left). The transport display's main counter shows it before bar 1 (a
+one-bar count-in in 4/4: 0.1.000 … 0.4.xxx, then 1.1.000; two bars from
+−1.1; other units negative), the sub counter reads COUNT-IN; the
+arranger's ruler shows a "Count-in 0.3" badge by the playhead; screen
+readers hear "Counting in". Return to Start on Stop goes back to where
+Play was pressed, before any count-in or pre-roll. Tests
+`engine/tests/count_in.rs` (the clicks a beat apart into bar 1's, the
+song from the frame after the count-in, behind latency; the heard clock;
+Stop/Play while counting), `a_count_in_rendered_ahead_starts_on_the_same_frame`
+(`engine/tests/ahead.rs`), `counting_in_does_not_allocate` and the
+count-in in `rendering_ahead_does_not_allocate_on_the_audio_thread`,
+transport `a_count_in_stands_then_plays_on_the_frame_after_it`, history
+`a_count_in_counts_down_standing_then_plays`, session
+`tests/count_in.rs` (from the start, partial, the Count-in setting, Stop,
+Abort, Toggle, Abort and Restart, a launcher slot).
+
 ## 7. MIDI and instruments
 
 Events always carry a frame offset inside the block (`TimedMidiEvent`).
@@ -3941,7 +3997,7 @@ plain clips with the same fades.
 | Record mode (over existing clips) | *Takes* — overlapped clips and folders become takes of one folder, the new take is comped in over its range, playback elsewhere is unchanged · *Replace* — overlapped clips are cut back (tape style) |
 | Loop recording | *Passes as takes* · *Keep last pass* · *New track per pass* (earlier passes on new, muted tracks) |
 | Metronome | Off · While recording · Always (`click.rs`: decaying sine per beat, accented downbeats, follows tempo and meter, live output only) |
-| Pre-roll | `Roll` (amount + `RollUnit` bars/beats/seconds; menu presets, any amount in Preferences) before the record start when starting from stop; from that bar's line or exactly (`preroll_on_bar`, `Session::roll_back`); *Count-in* (`count_in`): the pre-roll plays the click alone |
+| Pre-roll | `Roll` (amount + `RollUnit` bars/beats/seconds; menu presets, any amount in Preferences) before the record start when starting from stop; from that bar's line or exactly (`preroll_on_bar`, `Session::pre_roll`); what lies before the project's start is counted in before playback (§6, *Counting in before playback*); *Count-in* (`count_in`): the pre-roll plays the click alone |
 | Post-roll | `Roll` after a punch-out, then playback stops (`EngineController::stop_at`, `Session::roll_on`; the tick ends the take when it ran out, a user stop disarms it) |
 | Punch | `Project::punch_range` + `punch_enabled` (`Command::SetPunch`); capture only inside it |
 

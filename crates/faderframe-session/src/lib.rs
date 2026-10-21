@@ -2065,14 +2065,35 @@ impl Session {
     /// its audio arrives; between the engine's callbacks the position
     /// moves on at the playback rate (computed when asked, so a view
     /// painting gets its frame's position).
+    ///
+    /// A count-in before playback (see [`Self::count_in_position`]) is
+    /// `playing` (started), with the frames of it still to be heard in
+    /// `counting_in` while the position stands at the start.
     pub fn transport(&self) -> TransportSnapshot {
         let mut t = self.transport;
+        let now = Instant::now();
         if self.shown_position.is_none()
-            && let Some(p) = self.presented(Instant::now())
+            && let Some(p) = self.presented(now)
         {
             t.position = p;
         }
+        // The count-in as heard (processed a latency earlier).
+        if self.audio.is_some()
+            && let Some(h) = self.engine.heard_at(now)
+        {
+            t.counting_in = h.counting_in;
+        }
         t
+    }
+
+    /// Counting in before playback, as heard: where on the timeline the
+    /// count-in is now — before the position it plays from by the frames
+    /// still to count (negative before the project's start, where the
+    /// first tempo and metre carry back: bar 0 is the bar before bar 1,
+    /// −1 the one before that). `None` while not counting in.
+    pub fn count_in_position(&self) -> Option<i64> {
+        let t = self.transport();
+        (t.counting_in > 0).then(|| t.position - t.counting_in as i64)
     }
 
     /// Read the meters and show each reading when its audio is heard: a
@@ -2846,6 +2867,10 @@ impl Session {
         self.engine.collect_garbage();
         let was_playing = self.transport.playing;
         self.transport = self.engine.transport_snapshot();
+        // Counting in before playback (a pre-roll reaching back before the
+        // project's start): started, so playing as far as the session is
+        // concerned — Stop, Abort and the play button work on it.
+        self.transport.playing = self.transport.started();
         // A locate the engine has not applied yet (render-ahead primes the
         // new position first) stays shown, not the position it left.
         if let Some(ShownPosition {

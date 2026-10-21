@@ -1276,3 +1276,64 @@ fn automation_behind_latency_renders_ahead_as_it_plays() {
         });
     }
 }
+
+/// A count-in rendered ahead: the anticipators get the sequence with the
+/// count-in in it, count the same frames standing and play from the same
+/// frame — what comes out from the count-in's start on is what the audio
+/// thread alone plays, click and song, sample for sample.
+#[test]
+fn a_count_in_rendered_ahead_starts_on_the_same_frame() {
+    /// Not a whole number of blocks: playback starts inside a callback.
+    const COUNT: usize = 50_000;
+    let project = stateless_project();
+    on_time(|| {
+        let mut plain = Run::new(&project, false);
+        let mut ahead = Run::new(&project, true);
+        ahead.run(20, true);
+        // From each one's count-in start: the left output.
+        let mut outs = Vec::new();
+        for (run, paced) in [(&mut plain, false), (&mut ahead, true)] {
+            run.command(TransportCommand::Locate(0));
+            run.command(TransportCommand::PlayAfterCountIn(COUNT as u64));
+            let mut out = Vec::new();
+            let mut counting = false;
+            let blocks = (COUNT + SR as usize) / BLOCK;
+            // Primed first (rendering ahead): the count-in starts with the
+            // callback whose transport counts.
+            for _ in 0..blocks * 2 {
+                run.r.processor.process_device(&mut run.bufs);
+                run.r.controller.collect_garbage();
+                let t = run.r.controller.transport_snapshot();
+                if !counting && t.counting_in > 0 {
+                    counting = true;
+                    assert_eq!(t.counting_in, (COUNT - BLOCK) as u64);
+                    assert_eq!(t.position, 0);
+                }
+                if counting {
+                    out.extend_from_slice(run.bufs.output_ref(0));
+                }
+                if paced {
+                    std::thread::sleep(Duration::from_secs_f64(BLOCK as f64 / SR as f64));
+                }
+                if out.len() >= blocks * BLOCK {
+                    break;
+                }
+            }
+            let t = run.r.controller.transport_snapshot();
+            assert!(t.playing);
+            assert_eq!(t.position as usize, out.len() - COUNT, "played since");
+            outs.push(out);
+        }
+        let misses = ahead.r.controller.ahead_misses();
+        if misses > 0 {
+            return misses;
+        }
+        let (a, b) = (&outs[0], &outs[1]);
+        let n = a.len().min(b.len());
+        let differ = (0..n).filter(|&i| a[i] != b[i]).count();
+        assert_eq!(differ, 0, "{differ} of {n} samples differ");
+        // The song starts with playback (not before), and plays.
+        assert!(a[COUNT..].iter().any(|v| v.abs() > 0.01));
+        0
+    });
+}

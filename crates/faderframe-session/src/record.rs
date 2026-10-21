@@ -791,6 +791,7 @@ impl Session {
         // Where playback starts, before any pre-roll: Return to Start on
         // Stop comes back here, so the next take pre-rolls the same way.
         let start = self.transport.position;
+        let mut count_in = 0;
         if !self.transport.playing && self.recording.is_some() {
             // Slot recordings ignore the punch range and count in by the
             // launcher's setting.
@@ -814,9 +815,12 @@ impl Session {
                 (self.record.preroll, self.record.preroll_on_bar)
             };
             if !roll.is_off() {
-                let start = self.roll_back(from, roll, on_bar);
+                // What the pre-roll cannot play before the project's start
+                // is counted in before playback starts there.
+                let (start, frames) = self.pre_roll(from, roll, on_bar);
                 self.engine.transport(TransportCommand::Locate(start))?;
                 self.show_position(start);
+                count_in = frames;
             }
             // Post-roll: on after the punch-out, then stop.
             if let Some((_, end)) = punch
@@ -828,7 +832,11 @@ impl Session {
                 self.postroll_armed = true;
             }
         }
-        self.engine.transport(TransportCommand::Play)?;
+        self.engine.transport(if count_in > 0 {
+            TransportCommand::PlayAfterCountIn(count_in)
+        } else {
+            TransportCommand::Play
+        })?;
         self.loader.wake();
         self.automation_play_requested();
         if !self.transport.playing {
@@ -953,7 +961,7 @@ impl Session {
         let Some((at, asked)) = self.restart_recording else {
             return;
         };
-        if self.transport.playing || self.engine.transport_snapshot().playing {
+        if self.transport.playing || self.engine.transport_snapshot().started() {
             if asked.elapsed() > Duration::from_secs(2) {
                 // It never stopped (the device is gone?): no retake.
                 self.restart_recording = None;
@@ -1067,12 +1075,25 @@ impl Session {
     /// as far back, or (`on_bar`) from the start of that bar; never before
     /// the project's start.
     pub(crate) fn roll_back(&self, from: i64, roll: Roll, on_bar: bool) -> i64 {
+        self.pre_roll(from, roll, on_bar).0
+    }
+
+    /// A pre-roll of `roll` before `from` (engine samples): where playback
+    /// starts — as far back, or (`on_bar`) from the start of that bar —
+    /// and the frames counted in before it. Before the project's start
+    /// there is nothing to play: the pre-roll starts at the start, and the
+    /// length it could not reach is a count-in before playback (the
+    /// timeline's first tempo and metre carried back, so the beats and
+    /// bar lines before the start are where the pre-roll would have had
+    /// them).
+    pub(crate) fn pre_roll(&self, from: i64, roll: Roll, on_bar: bool) -> (i64, u64) {
         if roll.is_off() {
-            return from;
+            return (from, 0);
         }
         let p = &self.project;
         let meter = &p.timeline.meter;
         let at = self.engine.samples_to_musical(p, from);
+        // Musical positions and samples before the start are negative.
         let back = match roll.unit {
             RollUnit::Bars => {
                 // Whole bars back keep the place in the bar.
@@ -1080,40 +1101,40 @@ impl Session {
                 let whole = roll.amount.floor() as i32;
                 let into = at - meter.bar_start(bar);
                 let earlier = bar - whole;
-                Some(if earlier < 0 {
-                    MusicalTime::ZERO
-                } else {
-                    let t = meter.bar_start(earlier) + into;
-                    let len = meter.bar_start(earlier + 1) - meter.bar_start(earlier);
-                    let frac = MusicalTime::from_quarters(len.quarters() * roll.amount.fract());
-                    if t > frac {
-                        t - frac
-                    } else {
-                        MusicalTime::ZERO
-                    }
-                })
+                let t = meter.bar_start(earlier) + into;
+                let len = meter.bar_start(earlier + 1) - meter.bar_start(earlier);
+                Some(t - MusicalTime::from_quarters(len.quarters() * roll.amount.fract()))
             }
             RollUnit::Beats => {
                 let sig = meter.signature_of_bar(meter.bar_at(at));
                 let beat = 4.0 / f64::from(sig.denominator.max(1));
-                let q = MusicalTime::from_quarters(beat * roll.amount);
-                Some(if at > q { at - q } else { MusicalTime::ZERO })
+                Some(at - MusicalTime::from_quarters(beat * roll.amount))
             }
             RollUnit::Seconds => None,
         };
         let start = match back {
             Some(t) => self.engine.musical_to_samples(p, t),
             None => from - (roll.amount * f64::from(self.engine.sample_rate())).round() as i64,
-        }
-        .max(0);
+        };
         let start = if on_bar {
             let t = self.engine.samples_to_musical(p, start);
             self.engine
                 .musical_to_samples(p, meter.bar_start(meter.bar_at(t)))
         } else {
             start
-        };
-        start.min(from)
+        }
+        .min(from);
+        if start < 0 {
+            (0, start.unsigned_abs())
+        } else {
+            (start, 0)
+        }
+    }
+
+    /// [`Self::pre_roll`] for tests.
+    #[doc(hidden)]
+    pub fn pre_roll_for_tests(&self, from: i64, roll: Roll, on_bar: bool) -> (i64, u64) {
+        self.pre_roll(from, roll, on_bar)
     }
 
     /// Where a post-roll of `roll` after `end` (engine samples) ends.

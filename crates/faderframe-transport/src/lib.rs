@@ -13,7 +13,7 @@
 
 use faderframe_timeline::{TimeSignature, Timeline};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 /// A loop range in absolute samples (`start < end`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +54,13 @@ pub enum TransportCommand {
         position: i64,
         frames: u32,
     },
+    /// Play after a count-in of this many frames: the transport stands
+    /// where it is (not playing: nothing of the arrangement plays, nothing
+    /// is recorded) while it counts, then plays from the frame after the
+    /// count-in — inside a block ([`TransportState::frames_until_wrap`]
+    /// ends a block there). Play while counting changes nothing, Stop (and
+    /// TogglePlay) cancels it. 0 frames: Play.
+    PlayAfterCountIn(u64),
 }
 
 /// A scrub snippet in progress.
@@ -90,11 +97,26 @@ pub struct TransportState {
     /// Where the newest jump went.
     jumped_to: i64,
     scrub: Option<Scrub>,
+    /// Frames of a count-in left before playback starts (0: none; see
+    /// [`TransportCommand::PlayAfterCountIn`]).
+    count_in: u64,
 }
 
 impl TransportState {
+    /// Playback runs (the position advances). Not while counting in.
     pub fn playing(&self) -> bool {
         self.playing
+    }
+
+    /// Frames of a count-in left before playback starts (0: not counting
+    /// in).
+    pub fn counting_in(&self) -> u64 {
+        self.count_in
+    }
+
+    /// Started: playing, or counting in before it plays.
+    pub fn started(&self) -> bool {
+        self.playing || self.count_in > 0
     }
 
     pub fn recording(&self) -> bool {
@@ -163,20 +185,37 @@ impl TransportState {
     pub fn apply(&mut self, cmd: TransportCommand) {
         match cmd {
             TransportCommand::Play => {
-                // Normal playback takes over from a snippet.
+                // Normal playback takes over from a snippet; a count-in
+                // goes on (it plays when it is over).
                 self.end_scrub();
-                self.playing = true;
+                if self.count_in == 0 {
+                    self.playing = true;
+                }
+            }
+            TransportCommand::PlayAfterCountIn(frames) => {
+                if self.playing && self.scrub.is_none() {
+                    // Playing already: nothing to count in.
+                    return;
+                }
+                self.end_scrub();
+                if frames == 0 {
+                    self.count_in = 0;
+                    self.playing = true;
+                } else {
+                    self.count_in = frames;
+                }
             }
             TransportCommand::Stop => {
-                if self.playing {
+                if self.playing || self.count_in > 0 {
                     self.jumped();
                 }
                 self.end_scrub();
                 self.playing = false;
                 self.recording = false;
+                self.count_in = 0;
             }
             TransportCommand::TogglePlay => {
-                if self.playing && self.scrub.is_none() {
+                if (self.playing && self.scrub.is_none()) || self.count_in > 0 {
                     self.apply(TransportCommand::Stop);
                 } else {
                     self.apply(TransportCommand::Play);
@@ -184,7 +223,7 @@ impl TransportState {
             }
             TransportCommand::Scrub { position, frames } => {
                 let frames = frames.max(16);
-                if self.playing && self.scrub.is_none() {
+                if (self.playing || self.count_in > 0) && self.scrub.is_none() {
                     self.apply(TransportCommand::Locate(position));
                     return;
                 }
@@ -235,8 +274,12 @@ impl TransportState {
     }
 
     /// How many of the next `max` frames can be processed before the loop
-    /// end is reached (always `>= 1` when `max >= 1`).
+    /// end is reached, or a count-in ends (always `>= 1` when `max >= 1`).
     pub fn frames_until_wrap(&self, max: usize) -> usize {
+        if self.count_in > 0 {
+            // Playback starts on the frame after the count-in.
+            return (self.count_in.min(max as u64) as usize).clamp(1, max.max(1));
+        }
         if let Some(s) = self.scrub {
             return (s.left as usize).clamp(1, max.max(1));
         }
@@ -251,8 +294,17 @@ impl TransportState {
     }
 
     /// Advance after processing `frames` frames. Returns `true` if the
-    /// playhead wrapped to the loop start.
+    /// playhead wrapped to the loop start. Counting in, the frames count
+    /// the count-in down (the position stands); at its end playback starts
+    /// (not a jump, as Play from stop is not).
     pub fn advance(&mut self, frames: usize) -> bool {
+        if self.count_in > 0 {
+            self.count_in = self.count_in.saturating_sub(frames as u64);
+            if self.count_in == 0 {
+                self.playing = true;
+            }
+            return false;
+        }
         if !self.playing {
             return false;
         }
@@ -371,6 +423,7 @@ pub struct TransportShared {
     recording: AtomicBool,
     looping: AtomicBool,
     scrubbing: AtomicBool,
+    counting_in: AtomicU64,
     jumps: AtomicU32,
     jumped_to: AtomicI64,
 }
@@ -385,6 +438,11 @@ pub struct TransportSnapshot {
     pub looping: bool,
     /// Playing a scrub snippet: the control side treats this as stopped.
     pub scrubbing: bool,
+    /// Frames of a count-in left before playback starts (0: none). The
+    /// engine's snapshot is as processed and not `playing` while counting;
+    /// the session's (`Session::transport`) is as heard and `playing`
+    /// (the transport is started).
+    pub counting_in: u64,
     /// [`TransportState::jumps`] as of the end of the last callback (the
     /// display's: a locate the session showed has happened once it
     /// changes).
@@ -392,6 +450,13 @@ pub struct TransportSnapshot {
     /// Where the newest of them went ([`TransportState::jumped_to`]): a
     /// stop's is where it stopped, a locate's its target.
     pub jumped_to: i64,
+}
+
+impl TransportSnapshot {
+    /// Started: playing, or counting in before playback.
+    pub fn started(&self) -> bool {
+        self.playing || self.counting_in > 0
+    }
 }
 
 impl TransportShared {
@@ -405,6 +470,7 @@ impl TransportShared {
         self.recording.store(state.recording, Ordering::Relaxed);
         self.looping.store(state.looping(), Ordering::Relaxed);
         self.scrubbing.store(scrubbing, Ordering::Relaxed);
+        self.counting_in.store(state.count_in, Ordering::Relaxed);
         self.jumped_to.store(state.jumped_to, Ordering::Relaxed);
         self.jumps.store(state.jumps, Ordering::Release);
     }
@@ -417,6 +483,7 @@ impl TransportShared {
             recording: self.recording.load(Ordering::Relaxed),
             looping: self.looping.load(Ordering::Relaxed),
             scrubbing: self.scrubbing.load(Ordering::Relaxed),
+            counting_in: self.counting_in.load(Ordering::Relaxed),
             jumps: self.jumps.load(Ordering::Acquire),
             jumped_to: self.jumped_to.load(Ordering::Relaxed),
         }
@@ -520,6 +587,58 @@ mod tests {
         });
         assert!(t.playing() && !t.scrubbing());
         assert_eq!(t.position(), 7);
+    }
+
+    /// A count-in stands where it is, ends a block on its last frame and
+    /// plays from the next; Play keeps counting, Stop cancels it.
+    #[test]
+    fn a_count_in_stands_then_plays_on_the_frame_after_it() {
+        let mut t = TransportState::default();
+        t.apply(TransportCommand::Locate(0));
+        t.apply(TransportCommand::PlayAfterCountIn(100));
+        assert!(!t.playing() && t.started());
+        assert_eq!(t.counting_in(), 100);
+        assert_eq!(t.frames_until_wrap(64), 64);
+        assert!(!t.advance(64));
+        assert_eq!((t.position(), t.counting_in()), (0, 36));
+        t.apply(TransportCommand::Play);
+        assert!(!t.playing(), "Play while counting keeps counting");
+        assert_eq!(t.frames_until_wrap(64), 36, "the block ends with it");
+        t.advance(36);
+        assert!(t.playing() && t.counting_in() == 0);
+        assert_eq!(t.position(), 0, "playback starts at the start");
+        assert!(!t.take_discontinuity(), "no jump");
+        t.advance(64);
+        assert_eq!(t.position(), 64);
+        // Stop while counting: no playback, a jump (cancelled).
+        t.apply(TransportCommand::Stop);
+        t.apply(TransportCommand::Locate(0));
+        t.take_discontinuity();
+        let jumps = t.jumps();
+        t.apply(TransportCommand::PlayAfterCountIn(500));
+        t.advance(100);
+        t.apply(TransportCommand::Stop);
+        assert!(!t.started());
+        assert_eq!(t.jumps(), jumps + 1);
+        assert!(t.take_discontinuity());
+        t.advance(1_000);
+        assert!(!t.playing() && t.position() == 0);
+        // TogglePlay cancels too; no frames is Play.
+        t.apply(TransportCommand::PlayAfterCountIn(500));
+        t.apply(TransportCommand::TogglePlay);
+        assert!(!t.started());
+        t.apply(TransportCommand::PlayAfterCountIn(0));
+        assert!(t.playing());
+        // Playing: a count-in asked for changes nothing.
+        t.apply(TransportCommand::PlayAfterCountIn(500));
+        assert_eq!(t.counting_in(), 0);
+        let shared = TransportShared::default();
+        t.apply(TransportCommand::Stop);
+        t.apply(TransportCommand::PlayAfterCountIn(48));
+        shared.publish(&t);
+        let snap = shared.snapshot();
+        assert!(!snap.playing);
+        assert_eq!(snap.counting_in, 48);
     }
 
     #[test]

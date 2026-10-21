@@ -42,9 +42,9 @@ pub struct Chrome {
     pub workspaces: gtk::DropDown,
     pub workspace_guard: Rc<Cell<bool>>,
     /// What screen readers were last told: the notice, the transport
-    /// (playing, recording).
+    /// (playing, recording, counting in).
     pub said_notice: RefCell<String>,
-    pub said_transport: Cell<Option<(bool, bool)>>,
+    pub said_transport: Cell<Option<(bool, bool, bool)>>,
 }
 
 /// A message that slides in at the top of the window.
@@ -154,14 +154,15 @@ impl Chrome {
         set_pressed(&self.record, "rec-active", t.recording);
         set_pressed(&self.looping, "loop-active", s.project().loop_enabled);
         // The transport, said when it changes.
-        let now = (t.playing, t.recording);
+        let now = (t.playing, t.recording, t.counting_in > 0);
         if let Some(before) = self.said_transport.replace(Some(now))
             && before != now
         {
             let text = match now {
-                (true, true) => "Recording",
-                (true, false) => "Playing",
-                (false, _) => "Stopped",
+                (true, _, true) => "Counting in",
+                (true, true, false) => "Recording",
+                (true, false, false) => "Playing",
+                (false, _, _) => "Stopped",
             };
             self.display
                 .announce(text, gtk::AccessibleAnnouncementPriority::Medium);

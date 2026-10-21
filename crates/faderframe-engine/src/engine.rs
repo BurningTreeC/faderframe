@@ -387,6 +387,7 @@ pub fn create_with_epoch(
         varispeed: None,
         ping: None,
         callbacks: 0,
+        count_in_end: i64::MIN,
     };
     let controller = EngineController {
         config,
@@ -507,6 +508,9 @@ pub struct EngineProcessor {
     /// the first and every few thousand after:
     /// `faderframe_realtime::priority`).
     callbacks: u32,
+    /// The play history's frame after the newest count-in frame (the click
+    /// counts in until it is heard).
+    count_in_end: i64,
 }
 
 impl EngineProcessor {
@@ -1066,12 +1070,17 @@ impl EngineProcessor {
             self.midi.chunk(offset, n, &mut self.ctx.midi_input);
             let info = self.transport.info(&self.ctx.timeline.timeline, rate);
             self.ctx.transport = info;
+            let counting_in = self.transport.counting_in();
             self.ctx.history.record(
                 info.sample_position,
                 info.playing,
                 self.transport.jumps(),
+                counting_in,
                 n,
             );
+            if counting_in > 0 {
+                self.count_in_end = self.ctx.history.end();
+            }
             self.ctx.discontinuity = self.transport.take_discontinuity();
             self.ctx
                 .launch
@@ -1242,6 +1251,11 @@ impl EngineProcessor {
                     MetronomeMode::Recording => info.recording,
                     MetronomeMode::Always => true,
                 };
+            // A count-in before playback (the transport standing while it
+            // counts) clicks whatever the metronome's mode: heard with
+            // these frames while it ended less than the latency ago.
+            let count_in_heard =
+                self.count_in_end > self.ctx.history.chunk_start() - i64::from(self.graph_latency);
             if scrubbing {
                 // Snippets fade in and out (no clicks between them).
                 for c in 0..io.output_channels() {
@@ -1250,22 +1264,44 @@ impl EngineProcessor {
                     }
                 }
             }
-            if click && !scrubbing {
+            if (click || count_in_heard || self.click.sounding()) && !scrubbing {
                 // As late as the graph's outputs: the beats of what is heard
                 // with this chunk (before a loop wrap or a locate, maybe).
-                let (click, history, timeline, metronome) = (
+                let (clicks, history, timeline, metronome) = (
                     &mut self.click,
                     &self.ctx.history,
                     &self.ctx.timeline,
                     &self.shared.metronome,
                 );
                 history.pieces(self.graph_latency, 0, n, |o, len, played| {
-                    if played.start != click.run {
-                        click.run = played.start;
-                        click.reset();
+                    if played.start != clicks.run {
+                        // A new run cuts the clicks sounding — not where a
+                        // count-in turns into the playback it counted in.
+                        let counted_in = clicks.counting_in && played.playing;
+                        clicks.run = played.start;
+                        if !counted_in {
+                            clicks.reset();
+                        }
                     }
-                    if played.playing {
-                        click.render(
+                    clicks.counting_in = played.count_in > 0;
+                    if played.count_in > 0 {
+                        // The beats before the start: the timeline's, the
+                        // count-in's frames before its position (before
+                        // the project's start, the tempo and metre there
+                        // carried back).
+                        clicks.render(
+                            io,
+                            offset + o,
+                            len,
+                            played.pos - played.count_in as i64,
+                            &timeline.timeline,
+                            rate,
+                            metronome,
+                            true,
+                        );
+                    } else if played.playing {
+                        // Off: the clicks sounding ring out.
+                        clicks.render(
                             io,
                             offset + o,
                             len,
@@ -1273,6 +1309,7 @@ impl EngineProcessor {
                             &timeline.timeline,
                             rate,
                             metronome,
+                            click,
                         );
                     }
                 });
@@ -1397,6 +1434,9 @@ pub struct Heard {
     /// Timeline frames it moves per second while playing (the stream's
     /// rate times varispeed's speed).
     pub per_second: f64,
+    /// Frames of a count-in heard before playback is (0: none): the
+    /// transport stands at `position` while it counts in.
+    pub counting_in: u64,
 }
 
 /// Where the engine is, from any thread: [`EngineController::clock`].
@@ -1470,6 +1510,7 @@ fn heard(shared: &EngineShared, device: u32, at: std::time::Instant, hold: bool)
         jumped: (played.jumps != snap.jumps).then_some(snap.jumped_to),
         run: played.start,
         per_second: rate * speed,
+        counting_in: played.count_in,
     })
 }
 
@@ -2999,7 +3040,8 @@ impl EngineController {
         if self.ahead.is_none() {
             return Default::default();
         }
-        let playing = self.shared.transport.snapshot().playing;
+        // Counting in is started: what it renders ahead plays after it.
+        let playing = self.shared.transport.snapshot().started();
         let now = crate::build::AheadSets {
             tracks: self.ahead_tracks.clone(),
             strips: self.ahead_strips.clone(),
@@ -3023,7 +3065,7 @@ impl EngineController {
     /// graph rebuild moves them.
     pub fn ahead_wants_rebuild(&self, project: &Project) -> bool {
         self.ahead.is_some()
-            && !self.shared.transport.snapshot().playing
+            && !self.shared.transport.snapshot().started()
             && !self.ahead_plan_installed(project)
     }
 

@@ -2209,6 +2209,22 @@ impl ArrangerView {
             .line_to(Point::new(x, band.bottom() + 8.0))
             .close();
         p.fill_path(&tri, a.playhead);
+        // Counting in before playback (the playhead held at the start): a
+        // badge by it with the beat counted, as the transport display's
+        // counter has it (bar 0 is the bar before bar 1).
+        if let Some(at) = model.count_in_position() {
+            let bbt = project
+                .timeline
+                .meter
+                .to_bbt(model.engine().samples_to_musical(project, at));
+            let label = format!("Count-in {}.{}", bbt.bar + 1, bbt.beat + 1);
+            let style = TextStyle::new(th.fonts.tiny + 0.5, th.ui.text).bold();
+            let w = p.text_width(&label, &style) + 10.0;
+            let h = (ruler.bottom() - band.bottom() - 4.0).clamp(8.0, 15.0);
+            let r = Rect::new(x + 8.0, band.bottom() + 2.0, w, h);
+            p.fill_rounded(r, 3.0, &Paint::Solid(a.record.with_alpha(0.9)));
+            p.text(&label, r, &style.center());
+        }
         p.pop_clip();
         p.hline(
             ruler.x,

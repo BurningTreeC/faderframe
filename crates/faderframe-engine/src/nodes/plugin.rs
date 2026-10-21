@@ -111,6 +111,7 @@ impl PluginNode {
                     playing: cx.data.transport.playing,
                     jumps: 0,
                     start: 0,
+                    count_in: 0,
                 },
             );
             count = 1;

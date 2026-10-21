@@ -334,6 +334,93 @@ fn recording_and_metronome_do_not_allocate() {
     assert!(streams.headers.pop().is_ok(), "blocks were captured");
 }
 
+/// Counting in before playback: the count-in's clicks (behind plugin
+/// latency, into the playback's), the transport starting inside a
+/// callback with a take recording from there, a count-in cancelled.
+#[test]
+fn counting_in_does_not_allocate() {
+    let _serial = serial();
+    use faderframe_core::{ChannelLayout, ParameterId, builtin};
+    use faderframe_engine::{MetronomeMode, RecordTarget};
+    use faderframe_project::{PluginRef, PluginSlot, SavedParameter, TrackKind};
+    use faderframe_timeline::MusicalTime;
+    use faderframe_transport::TransportCommand;
+
+    const SR: u32 = 48_000;
+    let mut tp = common::TestProject::new(SR);
+    let t = tp.track(TrackKind::Audio, "In", ChannelLayout::Stereo);
+    let song = tp.track(TrackKind::Audio, "Song", ChannelLayout::Stereo);
+    let dc = tp.dc(2, 0.25, 200_000);
+    tp.clip(song, dc, MusicalTime::ZERO, 200_000);
+    let probe = tp.project.ids.allocate();
+    tp.project
+        .track_mut(song)
+        .unwrap()
+        .inserts
+        .push(PluginSlot {
+            id: probe,
+            plugin: PluginRef::builtin(builtin::LATENCY_PROBE, "Latency"),
+            bypass: false,
+            parameters: vec![SavedParameter {
+                id: ParameterId(0),
+                value: 3_000.0,
+            }],
+            state: None,
+            sidechain: None,
+        });
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 200, 2).unwrap();
+    let mut streams = r
+        .controller
+        .begin_recording(
+            vec![RecordTarget {
+                track: t,
+                first_channel: 0,
+                channels: 2,
+            }],
+            0,
+            i64::MAX,
+            4.0,
+        )
+        .unwrap();
+    r.controller.metronome().set_mode(MetronomeMode::Recording);
+    r.controller
+        .transport(TransportCommand::SetRecording(true))
+        .unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 200);
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    // A count-in cancelled half way, then one counted to the end and on.
+    r.controller
+        .transport(TransportCommand::PlayAfterCountIn(24_000))
+        .unwrap();
+    let (_, cancelled) = armed(|| {
+        for _ in 0..60 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    r.controller.transport(TransportCommand::Stop).unwrap();
+    r.controller
+        .transport(TransportCommand::SetRecording(true))
+        .unwrap();
+    r.controller
+        .transport(TransportCommand::PlayAfterCountIn(30_100))
+        .unwrap();
+    let (_, allocs) = armed(|| {
+        for _ in 0..400 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(cancelled + allocs, 0, "allocations while counting in");
+    let t = r.controller.transport_snapshot();
+    assert!(t.playing && t.position == 400 * 200 - 30_100);
+    assert!(streams.headers.pop().is_ok(), "the take was captured");
+}
+
 #[test]
 fn automation_does_not_allocate() {
     let _serial = serial();
@@ -2131,6 +2218,12 @@ fn render_ahead_without_allocating(buses: bool) {
         (TransportCommand::SetLoopRange(range(90_000, 151_022)), 3),
         (TransportCommand::SetLoopRange(range(100_000, 120_000)), 30),
         (TransportCommand::SetLoopEnabled(false), 20),
+        // A count-in from the start (a new sequence: the anticipators count
+        // in too), a loop change while counting, playback after it.
+        (TransportCommand::Stop, 40),
+        (TransportCommand::Locate(0), 10),
+        (TransportCommand::PlayAfterCountIn(24_100), 40),
+        (TransportCommand::SetLoopRange(range(0, 96_000)), 80),
     ] {
         r.controller.transport(cmd).unwrap();
         for _ in 0..callbacks {

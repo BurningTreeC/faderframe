@@ -140,8 +140,19 @@ fn sub_unit(s: &Session) -> CounterUnit {
     })
 }
 
-/// The playhead in `unit`.
+/// The playhead in `unit`. Counting in before playback: where the
+/// count-in is, before the start (bar 0 is the bar before bar 1, the
+/// times negative).
 fn readout(s: &Session, unit: CounterUnit) -> String {
+    if let Some(at) = s.count_in_position() {
+        return match unit {
+            CounterUnit::BarsBeats => s
+                .project()
+                .timeline
+                .format_bbt(s.engine().samples_to_musical(s.project(), at)),
+            _ => format_position(s.project(), at, unit),
+        };
+    }
     match unit {
         CounterUnit::BarsBeats => s.project().timeline.format_bbt(s.playhead()),
         _ => format_position(s.project(), s.transport().position, unit),
@@ -244,11 +255,15 @@ impl CanvasView<Session, Action> for TransportDisplay {
             AccessNode::new(
                 access_id(&[61]),
                 AccessRole::Label,
-                format!(
-                    "Position {}, {}",
-                    readout(s, s.editor.main_counter),
-                    readout(s, sub_unit(s))
-                ),
+                if s.count_in_position().is_some() {
+                    format!("Counting in, {}", readout(s, s.editor.main_counter))
+                } else {
+                    format!(
+                        "Position {}, {}",
+                        readout(s, s.editor.main_counter),
+                        readout(s, sub_unit(s))
+                    )
+                },
             )
             .at(z.bbt.union(&z.time)),
             AccessNode::new(access_id(&[62]), AccessRole::SpinButton, "Tempo")
@@ -294,12 +309,21 @@ impl CanvasView<Session, Action> for TransportDisplay {
             z.bbt,
             &mono(fit(&main, theme.fonts.display - 2.0, 9), lcd_text).bold(),
         );
-        let sub = readout(s, sub_unit(s));
-        p.text(
-            &sub,
-            z.time,
-            &mono(fit(&sub, theme.fonts.small, 14), lcd_text.with_alpha(0.75)),
-        );
+        if s.count_in_position().is_some() {
+            // Counting in before playback: said under the counter.
+            p.text(
+                "COUNT-IN",
+                z.time,
+                &small(Color::hex(0xff4b4b)).family(FontFamily::Mono),
+            );
+        } else {
+            let sub = readout(s, sub_unit(s));
+            p.text(
+                &sub,
+                z.time,
+                &mono(fit(&sub, theme.fonts.small, 14), lcd_text.with_alpha(0.75)),
+            );
+        }
         let bpm = project.timeline.tempo.bpm_at(pos);
         p.text(
             &format!("{bpm:.2}"),

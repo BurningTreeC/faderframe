@@ -502,6 +502,9 @@ pub(crate) struct Click {
     /// The run of the play history it last clicked in (a new one cuts the
     /// sounding clicks: the playhead jumped).
     pub(crate) run: i64,
+    /// It last clicked a count-in (the playback it counts in carries its
+    /// clicks on).
+    pub(crate) counting_in: bool,
     voices: [Voice; VOICES],
     /// The sounds (swapped in whole by the engine; the old ones go back to
     /// the control thread).
@@ -513,6 +516,7 @@ impl Click {
     pub(crate) fn new(sounds: Arc<ClickSounds>) -> Self {
         Self {
             run: 0,
+            counting_in: false,
             voices: [Voice::default(); VOICES],
             sounds,
         }
@@ -522,6 +526,11 @@ impl Click {
         for v in &mut self.voices {
             v.on = false;
         }
+    }
+
+    /// A click is still sounding.
+    pub(crate) fn sounding(&self) -> bool {
+        self.voices.iter().any(|v| v.on)
     }
 
     fn start(&mut self, kind: ClickKind, gain: f32) {
@@ -543,7 +552,10 @@ impl Click {
     }
 
     /// Render clicks for device frames `offset..offset + n` playing at
-    /// timeline position `pos`. Realtime-safe.
+    /// timeline position `pos` (negative before the project's start: its
+    /// first tempo and metre carried back); `beats`: start the clicks of
+    /// the beats in there (else only the sounding ones ring on).
+    /// Realtime-safe.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn render(
         &mut self,
@@ -554,7 +566,11 @@ impl Click {
         timeline: &Timeline,
         rate: f64,
         shared: &MetronomeShared,
+        beats: bool,
     ) {
+        if !beats && !self.sounding() {
+            return;
+        }
         let gain = shared.gain();
         let levels = ClickKind::ALL.map(|k| shared.level(k) * gain);
         // Steps per beat: two with off-beats.
@@ -590,7 +606,8 @@ impl Click {
                 k = 0.0;
                 at = bar_start;
             }
-            if at >= q1 || count == MAX_CLICKS_PER_BLOCK {
+            // Not starting clicks: none looked for.
+            if !beats || at >= q1 || count == MAX_CLICKS_PER_BLOCK {
                 break;
             }
             let s = timeline

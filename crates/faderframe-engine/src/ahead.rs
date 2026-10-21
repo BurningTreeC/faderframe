@@ -390,6 +390,7 @@ fn amend_late_is_equal(
     enabled: bool,
 ) -> bool {
     if !transport.playing() || transport.scrubbing() {
+        // Stopped, or still counting in: no wrap rendered yet.
         return true;
     }
     if jumped_at > at {
@@ -607,7 +608,8 @@ impl AheadLink {
         if self.tiers.iter().any(|t| t.to_ahead.slots() == 0) || self.amend_count == MAX_AMENDS {
             return false;
         }
-        let at = (next.playing() && !next.scrubbing()).then(|| self.amend_frame(newest));
+        // Counting in, what is rendered ahead plays after the count-in.
+        let at = (next.started() && !next.scrubbing()).then(|| self.amend_frame(newest));
         match at {
             None => match self.pending.as_mut() {
                 Some(p) => p.transport.set_loop(range, enabled),
@@ -1175,9 +1177,13 @@ impl Worker {
             // modulation) where their audio was played
             // (`nodes::automation_at`), not at position 0 of an empty
             // history.
-            self.ctx
-                .history
-                .record(info.sample_position, info.playing, transport.jumps(), n);
+            self.ctx.history.record(
+                info.sample_position,
+                info.playing,
+                transport.jumps(),
+                transport.counting_in(),
+                n,
+            );
             self.ctx.discontinuity = transport.take_discontinuity() || std::mem::take(first);
             self.ctx.ahead_seq = *seq;
             let cx = ProcessContext {
