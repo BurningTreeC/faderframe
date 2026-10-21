@@ -303,9 +303,22 @@ impl Session {
             return Ok(());
         }
         let i = self.show.current.min(n - 1);
-        let song = songs[i].clone();
         let rate = f64::from(self.project.sample_rate.max(1));
-        let end = self.project.timeline.to_samples(song.end, rate);
+        let starts: Vec<i64> = songs
+            .iter()
+            .map(|s| self.project.timeline.to_samples(s.start, rate))
+            .collect();
+        let ends: Vec<i64> = songs
+            .iter()
+            .map(|s| self.project.timeline.to_samples(s.end, rate))
+            .collect();
+        // A song plays straight on into the next when that starts where it
+        // ends.
+        let straight_on = |j: usize| {
+            matches!(songs[j].then, AfterSong::Continue)
+                && j + 1 < n
+                && (starts[j + 1] - ends[j]).abs() <= (rate * 0.05) as i64
+        };
         let position = self.transport.position;
         // A song to start now?
         if let Some((next, at)) = self.show.pending
@@ -316,42 +329,61 @@ impl Session {
         }
         if self.transport.playing {
             self.show.playing_song = Some(i);
-            match song.then {
-                AfterSong::Continue => {
-                    self.disarm_stop()?;
-                    // Past its end: the next song is the current one (when
-                    // it is not where playback went on, it is jumped to).
-                    if position >= end && i + 1 < n {
-                        let next = songs[i + 1].clone();
-                        let next_start = self.project.timeline.to_samples(next.start, rate);
-                        if (next_start - end).abs() > (rate * 0.05) as i64 {
-                            return self.show_op(ShowOp::Go(i + 1));
-                        }
-                        self.show.current = i + 1;
-                        self.revision += 1;
+            // Past its end into the next song: that is the current one now
+            // (when it is not where playback went on, it is jumped to).
+            if matches!(songs[i].then, AfterSong::Continue) && position >= ends[i] && i + 1 < n {
+                if !straight_on(i) {
+                    return self.show_op(ShowOp::Go(i + 1));
+                }
+                self.show.current = i + 1;
+                self.revision += 1;
+            }
+            // The stop that ends this run of songs: this song's end, or —
+            // through songs playing straight on — the end of the first that
+            // stops. Armed ahead: the engine stops only where it crosses the
+            // frame, and a busy machine's device catching up runs ahead of
+            // the ticks, so a stop armed once the song had begun could come
+            // too late and the show would play on.
+            let mut last = i;
+            while straight_on(last) {
+                last += 1;
+            }
+            let stop = matches!(songs[last].then, AfterSong::Stop | AfterSong::Next { .. })
+                .then(|| ends[last]);
+            match stop {
+                Some(at) if self.show.stop_armed != Some(at) => {
+                    self.show.stop_armed = Some(at);
+                    if self.processing_position() < at {
+                        self.engine.stop_at(Some(at))?;
+                    } else {
+                        // Already past it (the first tick after a start came
+                        // after a short song's end): stop now, on its end,
+                        // rather than play on into what follows.
+                        self.engine.stop_at(None)?;
+                        self.transport_action(TransportAction::Stop)?;
+                        self.transport_action(TransportAction::Locate(songs[last].end))?;
                     }
                 }
-                AfterSong::Stop | AfterSong::Next { .. } => {
-                    if self.show.stop_armed != Some(end) && position < end {
-                        self.engine.stop_at(Some(end))?;
-                        self.show.stop_armed = Some(end);
-                    }
-                }
+                Some(_) => {}
+                None => self.disarm_stop()?,
             }
             return Ok(());
         }
-        // Stopped on the song's last frame: it is over.
-        let ended = self.show.playing_song == Some(i)
-            && self.show.stop_armed == Some(end)
-            && (position - end).abs() <= 1;
-        if ended {
+        // Stopped on the armed last frame: that song is over (also when the
+        // ticks have not followed the songs played on into it yet).
+        if let Some(armed) = self.show.stop_armed
+            && self.show.playing_song.is_some()
+            && (position - armed).abs() <= 1
+        {
+            let j = (i..n).find(|&j| ends[j] == armed).unwrap_or(i);
+            self.show.current = j;
             self.show.stop_armed = None;
             self.show.playing_song = None;
-            if i + 1 < n {
-                self.cue_song(i + 1)?;
-                if let AfterSong::Next { gap } = song.then {
+            if j + 1 < n {
+                self.cue_song(j + 1)?;
+                if let AfterSong::Next { gap } = songs[j].then {
                     self.show.pending = Some((
-                        i + 1,
+                        j + 1,
                         Instant::now() + Duration::from_secs_f32(gap.max(0.0)),
                     ));
                 }

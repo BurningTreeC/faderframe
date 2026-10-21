@@ -28,6 +28,20 @@ fn run(s: &mut Session, millis: u64) {
     }
 }
 
+/// Wait until the device has just called back: a position extrapolated
+/// from that callback is fresh. (A busy runner's device calls back late
+/// and in bursts, and a playhead extrapolated from an old callback — as
+/// both the test's reference and the captured events are — is off by as
+/// much as the callback was late.)
+fn after_a_callback(s: &Session) {
+    let count = |s: &Session| s.stream_status().map_or(0, |st| st.callbacks);
+    let n = count(s);
+    let start = Instant::now();
+    while count(s) == n && start.elapsed() < Duration::from_millis(100) {
+        std::thread::sleep(Duration::from_micros(100));
+    }
+}
+
 /// Play `key` for `millis` on the virtual keyboard; returns when it went
 /// down and how long it was held in seconds (the keyboard stamps events
 /// as they are sent, and a busy machine oversleeps).
@@ -148,11 +162,13 @@ fn notes_played_while_playing_land_where_they_were_heard() {
     // callback, as captured events are: a busy machine's dummy device
     // falls behind, and the playhead it last reported with it).
     let clock = s.midi_keyboard().clock();
+    after_a_callback(&s);
     let at = s.engine().position_at(clock.now_ns()).unwrap();
     s.midi_keyboard().send(&[0x90, 67, 100]);
     let held_from = (Instant::now(), callbacks(&s));
     run(&mut s, 200);
     // The same for the key coming up.
+    after_a_callback(&s);
     let up = s.engine().position_at(clock.now_ns()).unwrap();
     s.midi_keyboard().send(&[0x80, 67, 0]);
     let held_for = (held_from.0.elapsed(), callbacks(&s) - held_from.1);

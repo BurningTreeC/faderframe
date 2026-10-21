@@ -52,7 +52,13 @@ fn wait(s: &mut Session, mut done: impl FnMut(&Session) -> bool, what: &str) {
         }
         std::thread::sleep(Duration::from_millis(1));
     }
-    panic!("timed out waiting for {what}");
+    panic!(
+        "timed out waiting for {what}: playing {}, heard at {}, processing at {}, song {}",
+        s.transport().playing,
+        s.transport().position,
+        s.processing_position(),
+        s.show().current
+    );
 }
 
 #[test]
@@ -99,6 +105,50 @@ fn a_show_plays_its_songs_and_stops_on_their_last_frames() {
     // Leaving the show: nothing stops anything any more.
     s.dispatch(Action::Show(ShowOp::Leave)).unwrap();
     assert!(!s.show_mode());
+}
+
+/// A busy machine's ticks come late (its device catching up runs ahead
+/// of them): the show still stops on a song's last frame. Songs playing
+/// straight on have the stop of the run's last song armed from the first
+/// tick, so no tick is needed near its end; a stop missed altogether (no
+/// tick before a short song ended) stops at once instead of playing on.
+#[test]
+fn late_ticks_still_stop_the_show_on_the_songs_end() {
+    let mut s = session();
+    s.dispatch(Action::Setlist(SetlistOp::FromSections))
+        .unwrap();
+    s.dispatch(Action::Setlist(SetlistOp::Then(0, AfterSong::Stop)))
+        .unwrap();
+    s.dispatch(Action::Setlist(SetlistOp::Then(1, AfterSong::Continue)))
+        .unwrap();
+    s.dispatch(Action::Show(ShowOp::Enter)).unwrap();
+    // B (2 s to 3 s) plays straight on into C (to 4 s, the last): ticks
+    // only until it plays, then none until well past C's end.
+    s.dispatch(Action::Show(ShowOp::Go(1))).unwrap();
+    wait(&mut s, |s| s.transport().playing, "B playing");
+    std::thread::sleep(Duration::from_millis(2600));
+    wait(
+        &mut s,
+        |s| !s.transport().playing && s.transport().position == 4 * i64::from(SR),
+        "the stop at C's end",
+    );
+    // The show follows on its next tick: C was the song that ended.
+    wait(&mut s, |s| s.show().current == 2, "C taken as ended");
+    // A (one second) with no tick until long after its end: stopped then,
+    // and B stood on, rather than playing on through B and C.
+    s.dispatch(Action::Show(ShowOp::Go(0))).unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+    wait(
+        &mut s,
+        |s| !s.transport().playing && s.show().current == 1,
+        "A's end noticed late",
+    );
+    assert!(
+        s.processing_position() < 3 * i64::from(SR),
+        "did not play on into C: {}",
+        s.processing_position()
+    );
+    s.dispatch(Action::Show(ShowOp::Leave)).unwrap();
 }
 
 #[test]

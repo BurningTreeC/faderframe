@@ -478,12 +478,20 @@ fn a_sandboxed_kit_plays_into_its_extra_outputs() {
 fn a_crashing_plugin_takes_only_its_own_process_down() {
     let mut inst = remote(PluginFormat::Vst3, "test.crash");
     let mut p = inst.create_processor(&CONFIG).unwrap();
+    // The helper dies in its first block. A block waits about its own
+    // length for the answer (then plays silence), so on a busy machine the
+    // death shows a block or two later — but long before the deadline,
+    // and silent all along.
     let t = Instant::now();
-    let (out, status) = run(p.as_mut(), 1, &[], &[]);
-    assert_eq!(status, ProcessStatus::Error);
-    assert!(out.iter().all(|v| *v == 0.0));
-    assert!(
-        t.elapsed() < Duration::from_secs(1),
+    let mut status = ProcessStatus::Continue;
+    while status != ProcessStatus::Error && t.elapsed() < Duration::from_secs(1) {
+        let (out, s) = run(p.as_mut(), 1, &[], &[]);
+        assert!(out.iter().all(|v| *v == 0.0));
+        status = s;
+    }
+    assert_eq!(
+        status,
+        ProcessStatus::Error,
         "a death is noticed long before the deadline"
     );
     // From now on immediately.
