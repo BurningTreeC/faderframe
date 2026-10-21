@@ -386,39 +386,10 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use super::{Applied, Helper};
+    use crate::pool::sched::join;
     use windows_sys::Win32::System::Threading::{
-        AVRT_PRIORITY, AVRT_PRIORITY_CRITICAL, AVRT_PRIORITY_HIGH, AVRT_PRIORITY_LOW,
-        AVRT_PRIORITY_NORMAL, AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority,
+        AVRT_PRIORITY_CRITICAL, AVRT_PRIORITY_HIGH, AVRT_PRIORITY_LOW, AVRT_PRIORITY_NORMAL,
     };
-
-    /// "Pro Audio", NUL-terminated UTF-16.
-    const TASK: [u16; 10] = [
-        b'P' as u16,
-        b'r' as u16,
-        b'o' as u16,
-        b' ' as u16,
-        b'A' as u16,
-        b'u' as u16,
-        b'd' as u16,
-        b'i' as u16,
-        b'o' as u16,
-        0,
-    ];
-
-    fn join(priority: AVRT_PRIORITY) -> Applied {
-        let mut index = 0u32;
-        // SAFETY: a NUL-terminated task name and a valid out pointer; the
-        // registration lasts for the thread's life.
-        let joined = unsafe {
-            let task = AvSetMmThreadCharacteristicsW(TASK.as_ptr(), &mut index);
-            !task.is_null() && AvSetMmThreadPriority(task, priority) != 0
-        };
-        if joined {
-            Applied::Now
-        } else {
-            Applied::Failed
-        }
-    }
 
     /// No realtime time limit here.
     pub fn guard_rttime() -> Option<u64> {

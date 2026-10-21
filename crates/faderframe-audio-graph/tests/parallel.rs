@@ -431,6 +431,13 @@ fn a_panicking_node_does_not_hang_the_cycle() {
     config.parallel_min_ns = 0;
     let mut g = b.compile(&config).unwrap();
     let pool = WorkerPool::new(PoolConfig::new(3));
+    // This thread is a normal one: its workers help from the first cycle
+    // (a realtime caller's sit out until they run realtime too, and its
+    // cycles run serially meanwhile — a panic there is the caller's).
+    assert!(
+        pool.useful_helpers() > 0,
+        "a normal caller runs in parallel"
+    );
     // Quiet panics (the hook would print each).
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));

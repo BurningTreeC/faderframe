@@ -639,9 +639,15 @@ mod fatal {
             return;
         };
         let index = SIGNALS.iter().position(|&s| s == sig);
-        // SAFETY: the kernel's siginfo for this signal.
-        let (code, address) = unsafe { ((*info).si_code, fault_address(info) as usize) };
-        if code > 0
+        // SAFETY: the kernel's siginfo for this signal, and the context it
+        // was given with.
+        let (fault, address) = unsafe {
+            (
+                is_fault((*info).si_code, context),
+                fault_address(info) as usize,
+            )
+        };
+        if fault
             && !REPORTING.load(Ordering::SeqCst)
             && !room_for_backtrace()
             && !maybe_overflow(address, context)
@@ -677,7 +683,7 @@ mod fatal {
                 write(fd, &r.header);
                 write(fd, b"\nCRASH: ");
                 write(fd, name_of(sig));
-                if code > 0 {
+                if fault {
                     write(fd, b" at address ");
                     number(fd, address as u64, true);
                 } else {
@@ -701,7 +707,7 @@ mod fatal {
             write(2, r.report.as_bytes());
             write(2, b"\n");
         }
-        if code > 0 {
+        if fault {
             // A fault: as if this handler had not been there — the previous
             // action (Rust's stack overflow report, else the default) meets
             // the fault again as the instruction runs again.
@@ -720,6 +726,80 @@ mod fatal {
                 libc::raise(sig);
             }
         }
+    }
+
+    /// Whether the signal is a fault of the interrupted instruction — which
+    /// runs again, and faults again, once the handler returns — rather
+    /// than sent (`kill`, `raise`, `abort`: nothing runs again). Linux: the
+    /// kernel's own codes are positive, a sender's (`SI_USER`, `SI_TKILL`,
+    /// `SI_QUEUE`) zero or negative.
+    #[cfg(not(target_os = "macos"))]
+    unsafe fn is_fault(code: c_int, _context: *mut c_void) -> bool {
+        code > 0
+    }
+
+    /// macOS gives every `SIGSEGV`, `SIGBUS` and `SIGILL` a fault's code
+    /// however it came (Apple Silicon: always `SEGV_ACCERR`, `BUS_ADRALN`,
+    /// `ILL_ILLTRP`; Intel: `SIGBUS` always `BUS_ADRERR`, while a general
+    /// protection fault's `SIGSEGV` has none), so the code does not tell —
+    /// a `raise(SIGSEGV)` taken for a fault let the process run on. The
+    /// context does: its exception state is the thread's last way into
+    /// the kernel, the fault itself or the system call a sent signal is
+    /// delivered on the way out of (`raise`, `pthread_kill`, `abort`, and
+    /// any thread waiting in a call).
+    #[cfg(target_os = "macos")]
+    unsafe fn is_fault(code: c_int, context: *mut c_void) -> bool {
+        /// Darwin's codes of sent signals start here (`<sys/signal.h>`).
+        const SI_USER: c_int = 0x10001;
+        // SAFETY: the context the kernel gave the handler.
+        match unsafe { entered_by_fault(context) } {
+            Some(fault) => fault,
+            None => code > 0 && code < SI_USER,
+        }
+    }
+
+    /// Whether the interrupted thread last entered the kernel by an
+    /// exception other than a system call (None: no context). On Apple
+    /// Silicon the exception syndrome is the last synchronous exception
+    /// taken (a thread running its own code when another process's signal
+    /// came may show either).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    unsafe fn entered_by_fault(context: *mut c_void) -> Option<bool> {
+        /// The syndrome's exception class of a system call (`SVC` from
+        /// AArch64).
+        const EC_SVC64: u32 = 0x15;
+        let uc = context.cast::<libc::ucontext_t>();
+        if uc.is_null() {
+            return None;
+        }
+        // SAFETY: a SA_SIGINFO handler's third argument is the
+        // interrupted context, its machine context filled by the kernel.
+        let mc = unsafe { (*uc).uc_mcontext };
+        // SAFETY: as above.
+        (!mc.is_null()).then(|| unsafe { (*mc).__es.__esr } >> 26 != EC_SVC64)
+    }
+
+    /// Intel: the trap number of the last entry — the processor's
+    /// exceptions are vectors 0–31; system calls (`T_SYSCALL` 0x85) and
+    /// interrupts come in above them.
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    unsafe fn entered_by_fault(context: *mut c_void) -> Option<bool> {
+        let uc = context.cast::<libc::ucontext_t>();
+        if uc.is_null() {
+            return None;
+        }
+        // SAFETY: as for Apple Silicon.
+        let mc = unsafe { (*uc).uc_mcontext };
+        // SAFETY: as above.
+        (!mc.is_null()).then(|| unsafe { (*mc).__es.__trapno } < 32)
+    }
+
+    #[cfg(all(
+        target_os = "macos",
+        not(any(target_arch = "aarch64", target_arch = "x86_64"))
+    ))]
+    unsafe fn entered_by_fault(_: *mut c_void) -> Option<bool> {
+        None
     }
 
     #[cfg(target_os = "linux")]
@@ -1002,6 +1082,16 @@ mod tests {
         std::fs::read_to_string(report).unwrap()
     }
 
+    /// The signal a write to a page the process may not touch brings, and
+    /// its name in a report: macOS takes a protection fault on memory that
+    /// is mapped for a bus error.
+    #[cfg(unix)]
+    const PROTECTION_FAULT: (libc::c_int, &str) = if cfg!(target_os = "macos") {
+        (libc::SIGBUS, "CRASH: SIGBUS")
+    } else {
+        (libc::SIGSEGV, "CRASH: SIGSEGV")
+    };
+
     /// A native crash (an access to memory the process may not touch) is
     /// written down from the signal handler — what, where, which thread,
     /// the native stack — and the process still ends with its signal (as
@@ -1039,12 +1129,13 @@ mod tests {
             "segv",
         );
         use std::os::unix::process::ExitStatusExt;
-        assert_eq!(status.signal(), Some(libc::SIGSEGV), "{status:?}");
+        let (signal, crash) = PROTECTION_FAULT;
+        assert_eq!(status.signal(), Some(signal), "{status:?}");
         let text = report_in(&dir);
-        assert!(text.contains("CRASH: SIGSEGV"), "{text}");
+        assert!(text.contains(crash), "{text}");
         assert!(text.contains("at address 0x"), "{text}");
         assert!(text.contains(&format!("process: {pid}")), "{text}");
-        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
         assert!(text.contains("native backtrace"), "{text}");
         let runs = previous_runs(&dir);
         assert_eq!(runs.len(), 1);

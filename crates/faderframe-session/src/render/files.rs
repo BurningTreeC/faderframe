@@ -664,7 +664,21 @@ mod tests {
         let gone_dir = d.join(".Album (DDP).ffrender-4000000002-3");
         std::fs::create_dir(&gone_dir).unwrap();
         std::fs::write(gone_dir.join("IMAGE.DAT"), "x").unwrap();
-        std::fs::File::open(&gone_dir)
+        // Windows opens a folder only with backup semantics, and sets its
+        // times only with the right to write its attributes.
+        #[cfg(windows)]
+        let folder = {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            std::fs::OpenOptions::new()
+                .access_mode(FILE_WRITE_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(&gone_dir)
+        };
+        #[cfg(not(windows))]
+        let folder = std::fs::File::open(&gone_dir);
+        folder
             .unwrap()
             .set_modified(std::time::SystemTime::now() - 36 * hour)
             .unwrap();
@@ -677,8 +691,11 @@ mod tests {
         if cfg!(target_os = "linux") {
             // Gone and untouched for an hour: swept; a fresh one waits.
             assert!(!left.contains(&name(&gone)), "{left:?}");
-            assert!(left.contains(&name(&gone_fresh)), "{left:?}");
+        } else {
+            // The system cannot say whether it is gone: it waits a day.
+            assert!(left.contains(&name(&gone)), "{left:?}");
         }
+        assert!(left.contains(&name(&gone_fresh)), "{left:?}");
         // A day and a half: swept wherever the system cannot tell.
         assert!(!left.contains(&name(&gone_dir)), "{left:?}");
         assert_eq!(temporary_owner(&name(&gone_fresh)), Some(4_000_000_001));

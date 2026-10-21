@@ -453,6 +453,7 @@ fn play_starts_on_the_frame_the_playhead_stands_on() {
         },
     )
     .unwrap();
+    let rate = f64::from(s.engine().sample_rate());
     // The clip's start, and frame 50's first sample (two seconds in).
     for (at, frame) in [(0, 0), (96_000, 50)] {
         s.dispatch(Action::Transport(TransportAction::Locate(
@@ -465,12 +466,39 @@ fn play_starts_on_the_frame_the_playhead_stands_on() {
             .unwrap();
         let start = Instant::now();
         let mut shown = Vec::new();
-        // How far the picture is from the playhead heard (the arranger's).
+        // How far the picture is from the playhead heard (the arranger's),
+        // and the samples that passed between reading the one and the
+        // other (a busy machine may stall the test between them).
         let mut apart = Vec::new();
-        while start.elapsed() < Duration::from_millis(300) {
+        // The device's callbacks as the engine stamped them: (ns, frame),
+        // looked at before and after each picture (whichever it used).
+        let mut callbacks: Vec<(u64, i64)> = Vec::new();
+        let mut note_callback = |s: &Session| {
+            if let Some(h) = s.engine().heard_snapshot()
+                && callbacks.last().is_none_or(|c| c.0 != h.callback_ns)
+            {
+                callbacks.push((h.callback_ns, h.frame));
+            }
+        };
+        // 300 ms, and on until the picture has moved on four frames.
+        let played_on = |shown: &[Option<(usize, i64)>]| {
+            shown
+                .iter()
+                .flatten()
+                .last()
+                .is_some_and(|v| v.0 >= frame + 4)
+        };
+        while start.elapsed() < Duration::from_millis(300)
+            || (!played_on(&shown) && start.elapsed() < Duration::from_secs(10))
+        {
             s.tick(0.001);
+            note_callback(&s);
+            let asked = Instant::now();
             let v = s.video_picture(0, (64, 36));
-            apart.push(v.as_ref().map(|v| v.position - s.transport().position));
+            let heard = s.transport().position;
+            let between = (asked.elapsed().as_secs_f64() * rate).ceil() as i64;
+            note_callback(&s);
+            apart.push(v.as_ref().map(|v| (v.position - heard, between)));
             shown.push(v.map(|v| (v.frame, v.position)));
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -493,15 +521,45 @@ fn play_starts_on_the_frame_the_playhead_stands_on() {
         );
         assert_eq!(shown[0], Some((frame, at)), "the frame standing first");
         let frames: Vec<usize> = shown.iter().flatten().map(|v| v.0).collect();
-        assert!(frames.windows(2).all(|w| w[1] >= w[0]), "never back");
+        assert!(played_on(&shown), "played on: {frames:?}");
+        // The heard clock runs from the device's callbacks as they are
+        // stamped: one later than its pace (a dummy device's thread waking
+        // late on a busy machine) sets the clock back by that much, and the
+        // playhead heard eases over it. Within that jitter (none to speak
+        // of where the machine keeps time, as the device's own clock would)
+        // the picture never goes back, and stays within a frame of the
+        // playhead heard.
+        let late: Vec<f64> = callbacks
+            .iter()
+            .map(|&(ns, f)| {
+                let (ns0, f0) = callbacks[0];
+                (ns - ns0) as f64 - (f - f0) as f64 * 1e9 / rate
+            })
+            .collect();
+        let jitter_ns =
+            late.iter().copied().fold(0.0, f64::max) - late.iter().copied().fold(0.0, f64::min);
+        let jitter = (jitter_ns * rate / 1e9).ceil() as i64;
+        let positions: Vec<i64> = shown.iter().flatten().map(|v| v.1).collect();
+        let back = positions.windows(2).map(|w| w[0] - w[1]).max().unwrap_or(0);
         assert!(
-            *frames.last().unwrap() >= frame + 4,
-            "played on: {frames:?}"
+            back <= jitter,
+            "back by {back} samples (callbacks jittered by {jitter}): {frames:?}"
         );
         // The picture is the one for the sound heard, all along.
-        let worst = apart.iter().flatten().map(|d| d.abs()).max().unwrap();
-        eprintln!("from frame {frame}: at most {worst} samples from the playhead heard");
-        assert!(worst < 1920, "{worst} samples from the playhead heard");
+        let worst = apart
+            .iter()
+            .flatten()
+            .map(|&(d, between)| d.abs() - between)
+            .max()
+            .unwrap();
+        eprintln!(
+            "from frame {frame}: at most {worst} samples from the playhead heard, \
+             back by {back} at most, callbacks jittered by {jitter}"
+        );
+        assert!(
+            worst < 1920 + jitter,
+            "{worst} samples from the playhead heard (callbacks jittered by {jitter})"
+        );
     }
     s.stop_audio();
     let _ = std::fs::remove_dir_all(&d);

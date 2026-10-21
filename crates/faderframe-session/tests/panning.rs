@@ -174,13 +174,19 @@ fn track_presets_carry_the_pan_mode() {
     );
 }
 
+/// Play for `ms`, ticking as the app's frame clock does: each tick is told
+/// the time since the last (a busy machine's come later than asked for,
+/// and the meters fall by the time that passed, not by the ticks).
 fn play_for(s: &mut Session, ms: u64, mut each: impl FnMut(&mut Session, f32)) {
     each(s, 0.0);
     let start = Instant::now();
     let total = Duration::from_millis(ms);
+    let mut ticked = start;
     while start.elapsed() < total {
         std::thread::sleep(Duration::from_millis(10));
-        s.tick(0.01);
+        let now = Instant::now();
+        s.tick((now - ticked).as_secs_f32().min(0.25));
+        ticked = now;
         let f = start.elapsed().as_secs_f32() / total.as_secs_f32();
         each(s, f.min(1.0));
     }
@@ -294,8 +300,18 @@ fn returns_buses_and_folder_buses_pan_in_a_running_session() {
         s.dispatch(Action::Edit(Command::SetTrackPan { track, pan: -1.0 }))
             .unwrap();
     }
-    // Long enough for the meters to fall from where they were.
+    // The right meters fall from where they were (26 dB a second, after
+    // the latency): about three seconds; waited for, up to a deadline.
+    let quiet = |s: &Session| {
+        names
+            .iter()
+            .all(|n| s.meter(id(s, n)).right.level_db < -60.0)
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
     play_for(&mut s, 3000, |_, _| {});
+    while !quiet(&s) && Instant::now() < deadline {
+        play_for(&mut s, 250, |_, _| {});
+    }
     for n in names {
         let m = s.meter(id(&s, n));
         assert!(m.left.level_db > -60.0, "{n} left: {}", m.left.level_db);

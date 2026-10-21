@@ -441,11 +441,17 @@ pub(crate) mod sched {
 
 #[cfg(windows)]
 pub(crate) mod sched {
-    //! MMCSS: the WASAPI thread runs in the "Pro Audio" task (cpal puts it
-    //! there); workers join the same task at high priority.
+    //! MMCSS: the audio callback's thread joins the "Pro Audio" task
+    //! (`priority::make_audio_thread_realtime`, WASAPI and ASIO alike);
+    //! workers join the same task at high priority. Windows cannot be
+    //! asked whether a thread is in the task, so each thread remembers
+    //! whether it joined: a thread that did not (a dummy device's, an
+    //! offline render's, a test's) is a normal caller, whose cycles its
+    //! workers help with at once — not one waiting for workers in the task.
     use crate::priority::Applied;
+    use std::cell::Cell;
     use windows_sys::Win32::System::Threading::{
-        AVRT_PRIORITY_HIGH, AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority,
+        AVRT_PRIORITY, AVRT_PRIORITY_HIGH, AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority,
     };
 
     /// "Pro Audio", NUL-terminated UTF-16.
@@ -462,23 +468,37 @@ pub(crate) mod sched {
         0,
     ];
 
-    pub fn current() -> (u64, u64) {
-        (1, 0)
+    thread_local! {
+        /// This thread joined the task (it stays in it for its life).
+        static IN_TASK: Cell<bool> = const { Cell::new(false) };
     }
 
-    pub fn apply(_: u64, _: u64, _: bool) -> Applied {
+    /// Join the "Pro Audio" task at `priority` (remembered for
+    /// [`current`]). A system call or two.
+    pub(crate) fn join(priority: AVRT_PRIORITY) -> Applied {
         let mut index = 0u32;
         // SAFETY: a NUL-terminated task name and a valid out pointer; the
         // registration lasts for the thread's life.
-        let joined = unsafe {
-            let task = AvSetMmThreadCharacteristicsW(TASK.as_ptr(), &mut index);
-            !task.is_null() && AvSetMmThreadPriority(task, AVRT_PRIORITY_HIGH) != 0
-        };
-        if joined {
+        let task = unsafe { AvSetMmThreadCharacteristicsW(TASK.as_ptr(), &mut index) };
+        if task.is_null() {
+            return Applied::Failed;
+        }
+        IN_TASK.with(|t| t.set(true));
+        // SAFETY: the task handle just returned for this thread.
+        if unsafe { AvSetMmThreadPriority(task, priority) } != 0 {
             Applied::Now
         } else {
             Applied::Failed
         }
+    }
+
+    /// 1 for a thread in the task, else 0 (not known: normal).
+    pub fn current() -> (u64, u64) {
+        (u64::from(IN_TASK.with(Cell::get)), 0)
+    }
+
+    pub fn apply(_: u64, _: u64, _: bool) -> Applied {
+        join(AVRT_PRIORITY_HIGH)
     }
 
     /// Whether this thread is in the task: what joining gave.

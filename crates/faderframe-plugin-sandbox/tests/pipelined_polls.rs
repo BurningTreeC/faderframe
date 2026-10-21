@@ -147,12 +147,15 @@ impl PluginInstance for Plugin {
     }
 }
 
+/// Its editor embeds into a parent window (X11, Win32) and, on macOS,
+/// floats in a window of its own (the helper's own windows need the
+/// helper's main thread, which a test helper does not run on).
 impl PluginEditor for Plugin {
-    fn can_embed(&mut self, _api: WindowApi) -> bool {
-        true
+    fn can_embed(&mut self, api: WindowApi) -> bool {
+        api != WindowApi::Cocoa
     }
-    fn can_float(&mut self, _api: WindowApi) -> bool {
-        false
+    fn can_float(&mut self, api: WindowApi) -> bool {
+        api == WindowApi::Cocoa
     }
     fn open_embedded(&mut self, _api: WindowApi, _scale: f64) -> Result<(u32, u32), PluginError> {
         Ok(SIZE)
@@ -161,8 +164,12 @@ impl PluginEditor for Plugin {
         self.open = true;
         Ok(())
     }
-    fn open_floating(&mut self, _api: WindowApi, _title: &str) -> Result<(), PluginError> {
-        Err(PluginError::Failed("embeds only".into()))
+    fn open_floating(&mut self, api: WindowApi, _title: &str) -> Result<(), PluginError> {
+        if api != WindowApi::Cocoa {
+            return Err(PluginError::Failed("floats on macOS only".into()));
+        }
+        self.open = true;
+        Ok(())
     }
     fn close(&mut self) {
         self.open = false;
@@ -225,20 +232,33 @@ fn editor_ticks(inst: &mut dyn PluginInstance, open: bool, why: &str) {
     }
 }
 
+/// Open the editor as FaderFrame does here: embedded into a window of
+/// FaderFrame's (`parent`), or on macOS — where a view cannot go into
+/// another process's window, so a sandboxed editor never embeds — floating.
+fn open_editor(inst: &mut dyn PluginInstance, parent: u64) {
+    let ed = inst.editor().unwrap();
+    if cfg!(target_os = "macos") {
+        assert!(!ed.can_embed(WindowApi::Cocoa), "sandboxed editors float");
+        assert!(ed.can_float(WindowApi::Cocoa));
+        ed.open_floating(WindowApi::Cocoa, "Editor").unwrap();
+    } else {
+        assert!(ed.can_embed(WindowApi::X11));
+        assert_eq!(ed.open_embedded(WindowApi::X11, 1.0).unwrap(), SIZE);
+        ed.attach(ParentWindow {
+            api: WindowApi::X11,
+            handle: parent,
+        })
+        .unwrap();
+    }
+    assert!(ed.is_open());
+}
+
 #[test]
 fn an_editor_opened_while_a_poll_is_on_its_way_stays_open() {
     let mut inst = sandboxed();
     // A tick: the poll is answered as the helper is now — editor closed.
     inst.poll();
-    let ed = inst.editor().unwrap();
-    assert!(ed.can_embed(WindowApi::X11));
-    assert_eq!(ed.open_embedded(WindowApi::X11, 1.0).unwrap(), SIZE);
-    ed.attach(ParentWindow {
-        api: WindowApi::X11,
-        handle: 0x160_0009,
-    })
-    .unwrap();
-    assert!(ed.is_open());
+    open_editor(inst.as_mut(), 0x160_0009);
     editor_ticks(
         inst.as_mut(),
         true,
@@ -251,13 +271,7 @@ fn an_editor_opened_while_a_poll_is_on_its_way_stays_open() {
     editor_ticks(inst.as_mut(), false, "closed stays closed");
     // Open again: the helper's own answers say so.
     inst.poll();
-    let ed = inst.editor().unwrap();
-    ed.open_embedded(WindowApi::X11, 1.0).unwrap();
-    ed.attach(ParentWindow {
-        api: WindowApi::X11,
-        handle: 0x160_0010,
-    })
-    .unwrap();
+    open_editor(inst.as_mut(), 0x160_0010);
     editor_ticks(inst.as_mut(), true, "opened again");
 }
 

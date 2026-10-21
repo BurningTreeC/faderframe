@@ -80,7 +80,8 @@ fn a_show_plays_its_songs_and_stops_on_their_last_frames() {
     assert!(s.show_mode());
     assert_eq!(s.show().current, 0);
     s.dispatch(Action::Show(ShowOp::PlayStop)).unwrap();
-    wait(&mut s, |s| s.transport().playing, "playing");
+    // The outcomes are waited for, not the states between them: a busy
+    // machine may not tick at all while a one-second song plays.
     // Song A: stopped on its last frame (one second), then B stood on.
     wait(
         &mut s,
@@ -89,19 +90,20 @@ fn a_show_plays_its_songs_and_stops_on_their_last_frames() {
     );
     wait(&mut s, |s| s.show().current == 1, "B stood on");
     assert!(s.show_countdown().is_some(), "B waits for its gap");
-    // B after its gap, from its start; it plays on into C.
-    wait(&mut s, |s| s.transport().playing, "B playing");
+    // B after its gap, from its start, playing straight on into C — never
+    // stopped on B's end — and C (the last) stopped on its last frame.
+    let b_end = 3 * i64::from(SR);
+    let mut stopped_on_b = false;
     wait(
         &mut s,
-        |s| s.show().current == 2 && s.transport().playing,
-        "C playing on",
-    );
-    // C (the last): stopped on its last frame.
-    wait(
-        &mut s,
-        |s| !s.transport().playing && s.transport().position == 4 * i64::from(SR),
+        |s| {
+            let t = s.transport();
+            stopped_on_b |= !t.playing && t.position == b_end;
+            !t.playing && t.position == 4 * i64::from(SR) && s.show().current == 2
+        },
         "the stop at C's end",
     );
+    assert!(!stopped_on_b, "B played on into C");
     // Leaving the show: nothing stops anything any more.
     s.dispatch(Action::Show(ShowOp::Leave)).unwrap();
     assert!(!s.show_mode());
