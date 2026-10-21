@@ -3341,11 +3341,12 @@ mod tests {
 
     /// Several first-wave patches render exactly as the first Synth
     /// rendered them (checksums taken before the second wave): projects
-    /// from then sound as they did. The checksums hold where they were
-    /// taken (x86_64 Linux: glibc's libm); elsewhere the system's maths
-    /// library rounds `sin`, `exp` and `tan` differently in the last bit,
-    /// so there every patch is held to its level instead (RMS within
-    /// 0.1 %, which any change to the sound itself breaks).
+    /// from then sound as they did. Every patch is held to its level (RMS
+    /// within 0.1 %, which any change to the sound itself breaks). The
+    /// bit-exact checksums hold only with the maths library they were
+    /// taken with (this machine's glibc: other glibc versions, Windows and
+    /// macOS round `sin`, `exp` and `tan` differently in the last bit), so
+    /// they are checked on request: `FADERFRAME_SYNTH_CHECKSUMS=1`.
     #[test]
     fn earlier_patches_sound_as_they_did() {
         const WANT_RMS: [f64; 5] = [
@@ -3439,7 +3440,7 @@ mod tests {
                 "patch {n}: RMS {rms:e} for {:e}",
                 WANT_RMS[n]
             );
-            if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            if std::env::var_os("FADERFRAME_SYNTH_CHECKSUMS").is_some() {
                 assert_eq!(h, WANT[n], "patch {n}: {h:016x}");
             }
         }
