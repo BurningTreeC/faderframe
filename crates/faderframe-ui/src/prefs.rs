@@ -39,6 +39,9 @@ pub struct Preferences {
     /// Drags snap to clip edges, markers, sections, the loop, the
     /// selection and the playhead (Snap to Objects).
     pub snap_objects: bool,
+    /// Where ripples reach and what follows them (the switch itself is
+    /// not kept: editing starts without rippling).
+    pub ripple: faderframe_session::RippleSettings,
     /// How strongly the editors draw their time grid, 0…1 (Preferences →
     /// Editing → Grid lines; `GridLook`).
     pub grid_strength: f32,
@@ -167,6 +170,7 @@ impl Default for Preferences {
             theme: "studio".into(),
             snap: true,
             snap_objects: true,
+            ripple: Default::default(),
             grid_strength: faderframe_ui_canvas::GridLook::DEFAULT,
             follow_playhead: true,
             global_lanes: Default::default(),

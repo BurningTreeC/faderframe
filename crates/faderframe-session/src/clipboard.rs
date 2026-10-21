@@ -23,10 +23,11 @@
 //!   track, else the top lane's own track. The other lanes follow at their
 //!   distance below; a lane goes on down to the next track that takes its
 //!   clips (audio → audio tracks, MIDI → instrument and MIDI tracks) and
-//!   is left out with a notice when none does. In Shuffle mode the paste
-//!   inserts (what follows moves later, automation too); in the other
-//!   modes it replaces what lies under the pasted clips (a range: under
-//!   the whole range). Pasted clips get fresh ids (never aliases), become
+//!   is left out with a notice when none does. Rippling (Shuffle, or
+//!   ripple on — [`crate::ripple`]) the paste inserts (what follows moves
+//!   later, automation too, on the tracks the ripple keeps in sync as
+//!   well); otherwise it replaces what lies under the pasted clips (a
+//!   range: under the whole range). Pasted clips get fresh ids (never aliases), become
 //!   the selection, and the insertion point moves to the end of what was
 //!   pasted, so pasting again lays copies end to end.
 //! * **Duplicate** (Repeat ×1) places copies of the selection right after
@@ -35,10 +36,12 @@
 //! * Every paste or duplicate is one undo step.
 //!
 //! Time-range operations carry automation (copy, paste, duplicate, and the
-//! time Shuffle and Insert Silence add or take away); object operations on
-//! clips do not (as moves never did).
+//! time a ripple or Insert Silence adds or takes away); moving clips
+//! without rippling does not (automation belongs to the track, not to the
+//! clips).
 
 use crate::editing::{EditMode, EditRange, GridMode};
+use crate::ripple::{RippleScope, RippleShift};
 use crate::{NoticeLevel, Result, SelectMode, Session};
 use faderframe_automation::{
     AutomationCurve, AutomationLane, AutomationMode, AutomationPoint, AutomationTarget,
@@ -195,84 +198,28 @@ fn range_points(curve: &AutomationCurve, a: MusicalTime, b: MusicalTime) -> Vec<
     pts
 }
 
-/// `curve` with `len` of time inserted at `at`: what follows moves later,
-/// the value at `at` holds over the gap.
-pub(crate) fn curve_inserted(
-    curve: &AutomationCurve,
-    at: MusicalTime,
-    len: MusicalTime,
-) -> AutomationCurve {
-    let pts = curve.points();
-    let (Some(v), true) = (curve.value_at(at), len > MusicalTime::ZERO) else {
-        return curve.clone();
-    };
-    let before = pts.iter().any(|q| q.time < at);
-    let after = pts.iter().any(|q| q.time >= at);
-    let mut out: Vec<AutomationPoint> = pts.iter().filter(|q| q.time < at).copied().collect();
-    if before && after {
-        out.push(AutomationPoint {
-            time: at,
-            value: v,
-            shape: Default::default(),
-        });
-        out.push(AutomationPoint {
-            time: at + len,
-            value: v,
-            shape: Default::default(),
-        });
-    }
-    out.extend(
-        pts.iter()
-            .filter(|q| q.time >= at)
-            .map(|q| AutomationPoint {
-                time: q.time + len,
-                ..*q
-            }),
-    );
-    AutomationCurve::from_points(out)
-}
-
-/// `curve` with `[a, b)` taken out: what follows moves earlier (a jump at
-/// `a` from the value there to the value at `b`).
-pub(crate) fn curve_removed(
-    curve: &AutomationCurve,
+/// The automation of `track` over `[a, b)`: per lane with points, the
+/// points relative to `a` with the values at both ends.
+pub(crate) fn range_automation(
+    p: &Project,
+    track: TrackId,
     a: MusicalTime,
     b: MusicalTime,
-) -> AutomationCurve {
-    if b <= a || curve.is_empty() {
-        return curve.clone();
-    }
-    let pts = curve.points();
-    let len = b - a;
-    let before = pts.iter().any(|q| q.time < a);
-    let after = pts.iter().any(|q| q.time >= b);
-    let mut out: Vec<AutomationPoint> = pts.iter().filter(|q| q.time < a).copied().collect();
-    if before && let Some(v) = curve.value_at(a) {
-        out.push(AutomationPoint {
-            time: a,
-            value: v,
-            shape: Default::default(),
-        });
-    }
-    if after
-        && let Some(v) = curve.value_at(b)
-        && !pts.iter().any(|q| q.time == b)
-    {
-        out.push(AutomationPoint {
-            time: a,
-            value: v,
-            shape: Default::default(),
-        });
-    }
-    out.extend(pts.iter().filter(|q| q.time >= b).map(|q| AutomationPoint {
-        time: q.time - len,
-        ..*q
-    }));
-    AutomationCurve::from_points(out)
+) -> Vec<(AutomationTarget, Vec<AutomationPoint>)> {
+    p.track(track)
+        .map(|t| {
+            t.automation
+                .lanes
+                .iter()
+                .filter(|l| !l.curve.is_empty())
+                .map(|l| (l.target, range_points(&l.curve, a, b)))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `curve` with the points in `[a, b)` taken out and nothing moving (a
-/// range cleared outside Shuffle): anchors at both edges keep the values
+/// range cleared without rippling): anchors at both edges keep the values
 /// outside as they were, and the line runs straight between them.
 pub(crate) fn curve_cleared(
     curve: &AutomationCurve,
@@ -360,32 +307,51 @@ impl LaneWork {
         self.lanes.get_mut(i).map(|(_, l, _)| l)
     }
 
-    /// Insert `len` of time at `at` into every lane of `track`.
-    pub(crate) fn insert_time(
+    /// Ripple every lane of `track` by `shifts` (see
+    /// [`faderframe_automation::AutomationCurve::ripple`]; in the
+    /// coordinates before them all, applied from the latest cut back).
+    pub(crate) fn ripple(
         &mut self,
         p: &mut Project,
         track: TrackId,
-        at: MusicalTime,
-        len: MusicalTime,
+        shifts: &[crate::ripple::RippleShift],
     ) {
+        let shifts = crate::ripple::RippleShift::ordered(shifts);
+        if shifts.is_empty() {
+            return;
+        }
         for target in Self::targets(p, track) {
             if let Some(l) = self.lane(p, track, target, false) {
-                l.curve = curve_inserted(&l.curve, at, len);
+                for s in &shifts {
+                    l.curve.ripple(s.cut, s.delta);
+                }
             }
         }
     }
 
-    /// Take `[a, b)` out of every lane of `track`.
-    pub(crate) fn remove_time(
+    /// Put `points` (relative, as [`range_automation`] takes them) into
+    /// `track`'s lanes over `[at, at + len)`.
+    pub(crate) fn write_range(
         &mut self,
         p: &mut Project,
         track: TrackId,
-        a: MusicalTime,
-        b: MusicalTime,
+        at: MusicalTime,
+        points: &[(AutomationTarget, Vec<AutomationPoint>)],
+        len: MusicalTime,
     ) {
-        for target in Self::targets(p, track) {
-            if let Some(l) = self.lane(p, track, target, false) {
-                l.curve = curve_removed(&l.curve, a, b);
+        for (target, pts) in points {
+            if pts.is_empty() {
+                continue;
+            }
+            let shifted: Vec<AutomationPoint> = pts
+                .iter()
+                .map(|q| AutomationPoint {
+                    time: at + q.time,
+                    ..*q
+                })
+                .collect();
+            if let Some(l) = self.lane(p, track, *target, false) {
+                l.curve.replace_range(at, at + len, &shifted);
             }
         }
     }
@@ -472,7 +438,9 @@ fn renumber_notes(content: &mut ClipContent, ids: &mut IdAllocator) {
 }
 
 /// Merge overlapping spans (sorted by start).
-fn merged(mut spans: Vec<(MusicalTime, MusicalTime)>) -> Vec<(MusicalTime, MusicalTime)> {
+pub(crate) fn merged(
+    mut spans: Vec<(MusicalTime, MusicalTime)>,
+) -> Vec<(MusicalTime, MusicalTime)> {
     spans.retain(|(a, b)| b > a);
     spans.sort();
     let mut out: Vec<(MusicalTime, MusicalTime)> = Vec::with_capacity(spans.len());
@@ -700,8 +668,8 @@ impl Session {
         Ok(())
     }
 
-    /// Cut: copy, then clear the range (Shuffle closes the gap) or remove
-    /// the copied clips.
+    /// Cut: copy, then clear the range or remove the copied clips (a
+    /// ripple closes the gap).
     pub(crate) fn cut(&mut self) -> Result<()> {
         if self.selection.range.is_some_and(|r| !r.is_empty()) {
             self.copy_range()?;
@@ -713,12 +681,17 @@ impl Session {
             return Ok(());
         }
         self.clipboard = self.clips_clipboard(&clips);
+        let label = if clips.len() == 1 {
+            "Cut Clip"
+        } else {
+            "Cut Clips"
+        };
+        // Rippling, the time they took closes up.
+        if let Some(scope) = self.ripple_scope() {
+            return self.ripple_delete_clips(scope, Some(label));
+        }
         self.batch(
-            if clips.len() == 1 {
-                "Cut Clip"
-            } else {
-                "Cut Clips"
-            },
+            label,
             clips
                 .iter()
                 .map(|&clip| Command::RemoveClip { clip })
@@ -837,23 +810,31 @@ impl Session {
                 tracks.push(*t);
             }
         }
-        let shuffle = self.editor.edit_mode == EditMode::Shuffle;
         let mut work = LaneWork::default();
         let first = positions.first().copied().unwrap_or(MusicalTime::ZERO);
         let total = MusicalTime(cb.length.ticks() * positions.len() as i64);
-        if shuffle {
+        // The timeline's parts a ripple of all tracks moves (last).
+        let mut timeline = Vec::new();
+        if let Some(scope) = self.ripple_scope() {
             // Make room: everything from the first position on moves later
-            // (on the tracks getting clips or a range's automation).
+            // (on the tracks getting clips or a range's automation, and the
+            // tracks kept in sync with them).
             let mut touched = tracks.clone();
             for (l, t) in &placed {
                 if !l.automation.is_empty() && !touched.contains(t) {
                     touched.push(*t);
                 }
             }
+            let shift = RippleShift::open(first, total);
             for &t in &touched {
                 commands.extend(self.insert_time_commands(t, first, total));
-                work.insert_time(&mut self.project, t, first, total);
+                work.ripple(&mut self.project, t, &[shift]);
             }
+            let followers = self.ripple_followers(&touched, scope);
+            let (follow, global) =
+                self.follow_commands(&[shift], &followers, scope == RippleScope::All, &mut work);
+            commands.extend(follow);
+            timeline = global;
         } else {
             // Replace what lies under the pasted clips (a range: under it
             // all, on the tracks it has clips for).
@@ -925,6 +906,7 @@ impl Session {
             clips.push(made);
         }
         commands.extend(work.commands());
+        commands.extend(timeline);
         Pasted {
             commands,
             clips,
@@ -1197,10 +1179,13 @@ mod tests {
         v.is_some_and(|v| (v - want).abs() < 1e-3)
     }
 
+    /// Insert Silence and pastes that insert ripple the lanes: the value
+    /// at the cut holds over the gap.
     #[test]
     fn inserting_time_holds_the_value_over_the_gap() {
         let c = curve(&[(0.0, 0.0), (4.0, 1.0)]);
-        let out = curve_inserted(&c, q(2.0), q(8.0));
+        let mut out = c.clone();
+        out.ripple(q(2.0), q(8.0));
         assert!(near(out.value_at(q(1.0)), 0.25));
         assert!(near(out.value_at(q(2.0)), 0.5));
         assert!(near(out.value_at(q(6.0)), 0.5));
@@ -1211,7 +1196,8 @@ mod tests {
     #[test]
     fn removing_time_closes_the_gap() {
         let c = curve(&[(0.0, 0.0), (4.0, 1.0), (8.0, 0.0)]);
-        let out = curve_removed(&c, q(2.0), q(6.0));
+        let mut out = c.clone();
+        out.ripple(q(6.0), MusicalTime(-q(4.0).ticks()));
         assert!(near(out.value_at(q(1.0)), 0.25));
         // What played at 6 now plays from 2 on.
         assert!(near(out.value_at(q(2.0) + TICK), 0.5));

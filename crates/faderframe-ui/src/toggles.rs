@@ -15,7 +15,10 @@
 
 use crate::state::AppState;
 use faderframe_engine::MetronomeMode;
-use faderframe_session::{Action, EditFlag, EditMode, EditTool, Session, TransportAction};
+use faderframe_session::{
+    Action, EditFlag, EditMode, EditTool, RippleOp, RippleScope, RippleSettings, Session,
+    TransportAction,
+};
 use gtk::prelude::*;
 use gtk::{gio, glib};
 use std::rc::Rc;
@@ -50,6 +53,37 @@ fn flag(a: &Rc<AppState>, flag: EditFlag, on: fn(&Session) -> bool) {
     a.dispatch(Action::SetEditFlag(flag, !now));
 }
 
+/// Change the ripple settings (remembered by the dispatch).
+fn ripple(a: &Rc<AppState>, change: fn(&mut RippleSettings)) {
+    let mut r = a.session.borrow().ripple_settings();
+    change(&mut r);
+    a.dispatch(Action::Ripple(RippleOp::Settings(r)));
+}
+
+/// The selected tracks that can be left out of ripples (not the master).
+fn ripple_tracks(s: &Session) -> Vec<faderframe_core::TrackId> {
+    s.project()
+        .tracks
+        .iter()
+        .filter(|t| {
+            s.selection.tracks.contains(&t.id)
+                && t.kind != faderframe_project::TrackKind::Master
+                && !t.is_folder()
+        })
+        .map(|t| t.id)
+        .collect()
+}
+
+/// Edit › Ripple: the switch, what of the timeline follows a global
+/// ripple, the selected tracks left out (`ripple-scope` is a choice).
+pub(crate) const RIPPLE_ITEMS: [(&str, &str); 5] = [
+    ("Ripple Editing", "app.ripple"),
+    ("Markers, Sections and Ranges Follow", "app.ripple-markers"),
+    ("Tempo and Metre Follow", "app.ripple-tempo"),
+    ("Key, Chords and Lyrics Follow", "app.ripple-harmony"),
+    ("Leave Selected Tracks Out of Ripples", "app.ripple-exclude"),
+];
+
 /// The edit flags the Edit menu's Options list (the edit toolbar shows
 /// them too).
 pub(crate) const FLAG_ITEMS: [(&str, &str); 8] = [
@@ -78,6 +112,52 @@ pub(crate) const TOGGLES: &[Toggle] = &[
         on: |s| s.editor.snap_objects,
         // Remembered by the dispatch (`EditFlag::SnapToObjects`).
         press: Some(|a| flag(a, EditFlag::SnapToObjects, |s| s.editor.snap_objects)),
+    },
+    // Ripple editing (Ctrl+Alt+R): checked while editing ripples (Shuffle
+    // always does; off leaves it for Slip).
+    Toggle {
+        name: "ripple",
+        on: |s| s.ripples(),
+        press: Some(|a| a.dispatch(Action::Ripple(RippleOp::Toggle))),
+    },
+    Toggle {
+        name: "ripple-markers",
+        on: |s| s.ripple_settings().markers,
+        press: Some(|a| ripple(a, |r| r.markers = !r.markers)),
+    },
+    Toggle {
+        name: "ripple-tempo",
+        on: |s| s.ripple_settings().tempo,
+        press: Some(|a| ripple(a, |r| r.tempo = !r.tempo)),
+    },
+    Toggle {
+        name: "ripple-harmony",
+        on: |s| s.ripple_settings().harmony,
+        press: Some(|a| ripple(a, |r| r.harmony = !r.harmony)),
+    },
+    // Checked while every selected track is left out.
+    Toggle {
+        name: "ripple-exclude",
+        on: |s| {
+            let tracks = ripple_tracks(s);
+            !tracks.is_empty()
+                && tracks
+                    .iter()
+                    .all(|t| s.project().track(*t).is_some_and(|t| t.ripple_excluded))
+        },
+        press: Some(|a| {
+            let (tracks, excluded) = {
+                let s = a.session.borrow();
+                let tracks = ripple_tracks(&s);
+                let all = tracks
+                    .iter()
+                    .all(|t| s.project().track(*t).is_some_and(|t| t.ripple_excluded));
+                (tracks, !all)
+            };
+            if !tracks.is_empty() {
+                a.dispatch(Action::Ripple(RippleOp::Exclude { tracks, excluded }));
+            }
+        }),
     },
     Toggle {
         name: "toggle-follow",
@@ -313,6 +393,21 @@ pub(crate) const CHOICES: &[Choice] = &[
         choose: |a, id| match TOOLS.into_iter().find(|t| tool_id(*t) == id) {
             Some(t) => a.dispatch(Action::SetEditTool(t)),
             None => tracing::warn!("edit-tool: unknown '{id}'"),
+        },
+    },
+    // Edit › Ripple › Tracks (`ripple-scope:<edited|selected|all>`).
+    Choice {
+        name: "ripple-scope",
+        now: |s| s.ripple_settings().scope.id(),
+        choose: |a, id| match RippleScope::from_id(id) {
+            Some(scope) => {
+                let r = a.session.borrow().ripple_settings();
+                a.dispatch(Action::Ripple(RippleOp::Settings(RippleSettings {
+                    scope,
+                    ..r
+                })));
+            }
+            None => tracing::warn!("ripple-scope: unknown '{id}'"),
         },
     },
 ];
@@ -565,6 +660,51 @@ mod tests {
         s.dispatch(Action::ToggleArmSelected).unwrap();
         sync(&g, &s);
         assert_eq!(state(&g, "arm-selected"), true.to_variant());
+    }
+
+    /// Edit › Ripple's checks follow the session: the switch (Shuffle
+    /// always ripples), the scope's radio, what follows a global ripple,
+    /// the selected tracks left out.
+    #[test]
+    fn ripple_items_follow_the_session() {
+        let mut s = Session::demo(faderframe_engine::EngineConfig::default()).unwrap();
+        let g = group(&s);
+        assert_eq!(state(&g, "ripple"), false.to_variant());
+        assert_eq!(state(&g, "ripple-scope"), "edited".to_variant());
+        s.dispatch(Action::SetEditMode(EditMode::Shuffle)).unwrap();
+        sync(&g, &s);
+        assert_eq!(state(&g, "ripple"), true.to_variant(), "Shuffle ripples");
+        s.dispatch(Action::Ripple(RippleOp::Toggle)).unwrap();
+        let r = s.ripple_settings();
+        s.dispatch(Action::Ripple(RippleOp::Settings(RippleSettings {
+            scope: RippleScope::All,
+            tempo: false,
+            ..r
+        })))
+        .unwrap();
+        let bass = s
+            .project()
+            .tracks
+            .iter()
+            .find(|t| t.name == "Bass")
+            .unwrap()
+            .id;
+        s.dispatch(Action::SelectTracks {
+            tracks: vec![bass],
+            mode: faderframe_session::SelectMode::Replace,
+        })
+        .unwrap();
+        s.dispatch(Action::Ripple(RippleOp::Exclude {
+            tracks: vec![bass],
+            excluded: true,
+        }))
+        .unwrap();
+        sync(&g, &s);
+        assert_eq!(state(&g, "ripple"), false.to_variant(), "off left Shuffle");
+        assert_eq!(state(&g, "ripple-scope"), "all".to_variant());
+        assert_eq!(state(&g, "ripple-tempo"), false.to_variant());
+        assert_eq!(state(&g, "ripple-markers"), true.to_variant());
+        assert_eq!(state(&g, "ripple-exclude"), true.to_variant());
     }
 
     /// Every toggle and choice of the table is in the menus (so they show

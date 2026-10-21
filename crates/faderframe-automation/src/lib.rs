@@ -12,6 +12,8 @@ use faderframe_core::{AutomationLaneId, ParameterId, PluginInstanceId, SendId};
 use faderframe_timeline::MusicalTime;
 use serde::{Deserialize, Serialize};
 
+pub mod ripple;
+
 /// Shape of the segment from a point to the next one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

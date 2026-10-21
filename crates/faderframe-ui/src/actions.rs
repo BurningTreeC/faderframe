@@ -773,6 +773,78 @@ pub fn install(app: &Rc<AppState>) {
             };
             a.dispatch(action);
         }),
+        // Edit › Ripple's commands (and scripts):
+        // `ripple-edit:<delete|delete-all|delete-clips|delete-clips-all|
+        // delete-range|delete-range-all|insert-time|insert-time-all|gaps|
+        // gaps-all>` — `delete`: the range, else the selected clips, as far
+        // as the ripple settings reach (Shift+Delete in the arranger);
+        // `-all`: in all tracks with the timeline.
+        named("ripple-edit", ripple_edit),
+        // Development aids: `ripple-exclude-track:<track>=<on|off>` leaves a
+        // track out of ripples; `ripple-offset:<cut>/<delta>[@<track>]`
+        // (bars) moves what lies from the cut on by the offset on that
+        // track, or everywhere (`Session::apply_ripple_offset`).
+        named("ripple-exclude-track", |a, arg| {
+            let Some((name, on)) = arg.split_once('=') else {
+                return tracing::warn!("ripple-exclude-track: '{arg}' is not <track>=<on|off>");
+            };
+            let track = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.id);
+            match track {
+                Some(t) => a.dispatch(Action::Ripple(faderframe_session::RippleOp::Exclude {
+                    tracks: vec![t],
+                    excluded: on != "off",
+                })),
+                None => tracing::warn!("ripple-exclude-track: no track '{name}'"),
+            }
+        }),
+        named("ripple-offset", |a, arg| {
+            use faderframe_timeline::MusicalTime;
+            let (times, track) = match arg.split_once('@') {
+                Some((t, name)) => (t, Some(name)),
+                None => (arg, None),
+            };
+            let bars = |v: &str| {
+                v.trim()
+                    .parse::<f64>()
+                    .ok()
+                    .map(|b| MusicalTime::from_quarters(4.0 * b))
+            };
+            let Some((cut, delta)) = times
+                .split_once('/')
+                .and_then(|(c, d)| Some((bars(c)?, bars(d)?)))
+            else {
+                return tracing::warn!("ripple-offset: '{arg}' is not <cut>/<delta>[@<track>]");
+            };
+            let track = match track {
+                Some(name) => {
+                    let found = a
+                        .session
+                        .borrow()
+                        .project()
+                        .tracks
+                        .iter()
+                        .find(|t| t.name == name)
+                        .map(|t| t.id);
+                    if found.is_none() {
+                        return tracing::warn!("ripple-offset: no track '{name}'");
+                    }
+                    found
+                }
+                None => None,
+            };
+            a.dispatch(Action::Ripple(faderframe_session::RippleOp::Offset {
+                cut,
+                delta,
+                track,
+            }));
+        }),
         // Development aid: `slip:<quarters>` slips what the selected clips
         // play (one gesture, as a Ctrl+Alt drag in the arranger).
         named("slip", |a, arg| {
@@ -4091,6 +4163,69 @@ pub(crate) fn sync_lane_actions(app: &Rc<AppState>) {
                 a.set_state(&on.to_variant());
             }
         }
+    }
+}
+
+/// Edit › Ripple's commands (`ripple-edit:<op>`, see the action list).
+fn ripple_edit(a: &Rc<AppState>, arg: &str) {
+    use faderframe_session::{RippleOp, RippleScope};
+    let (scope, has_range) = {
+        let s = a.session.borrow();
+        (
+            s.ripple_settings().scope,
+            s.selection.range.is_some_and(|r| !r.is_empty()),
+        )
+    };
+    let (op, all) = match arg.strip_suffix("-all") {
+        Some(op) => (op, true),
+        None => (arg, false),
+    };
+    let reach = if all { RippleScope::All } else { scope };
+    let op = match op {
+        "delete" if has_range => RippleOp::DeleteRange(reach),
+        "delete" => RippleOp::DeleteClips(reach),
+        "delete-clips" => RippleOp::DeleteClips(if all {
+            RippleScope::All
+        } else {
+            RippleScope::Edited
+        }),
+        "delete-range" => RippleOp::DeleteRange(if all {
+            RippleScope::All
+        } else {
+            RippleScope::Edited
+        }),
+        "insert-time" => RippleOp::InsertTime(reach),
+        "gaps" => RippleOp::RemoveGaps(if all {
+            RippleScope::All
+        } else {
+            RippleScope::Edited
+        }),
+        _ => return tracing::warn!("ripple-edit: unknown '{arg}'"),
+    };
+    a.dispatch(Action::Ripple(op));
+}
+
+/// The ripple settings are remembered across restarts (where ripples
+/// reach and what follows them, not the switch — editing starts without
+/// rippling, as it starts in Grid mode): called after every dispatch with
+/// the settings before it.
+pub(crate) fn remember_ripple(app: &Rc<AppState>, before: faderframe_session::RippleSettings) {
+    let Ok(s) = app.session.try_borrow() else {
+        return;
+    };
+    let now = s.ripple_settings();
+    drop(s);
+    let kept = |r: faderframe_session::RippleSettings| faderframe_session::RippleSettings {
+        on: false,
+        ..r
+    };
+    if kept(now) == kept(before) {
+        return;
+    }
+    let mut p = crate::prefs::Preferences::load();
+    p.ripple = kept(now);
+    if let Err(e) = p.save() {
+        tracing::warn!("cannot save preferences: {e}");
     }
 }
 

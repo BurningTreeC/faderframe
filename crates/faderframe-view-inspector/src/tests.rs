@@ -767,3 +767,31 @@ fn a_folders_bus_switch_makes_it_a_folder_bus_with_its_controls() {
     s.dispatch(Action::Undo).unwrap();
     assert!(s.project().track(folder).unwrap().is_folder_bus());
 }
+
+/// A track's Ripple line: pressing it leaves the track out of ripples
+/// (edits elsewhere never move it) and back.
+#[test]
+fn a_track_can_be_left_out_of_ripples() {
+    let mut s = session();
+    select(&mut s, &["Bass"]);
+    let bass = id(&s, "Bass");
+    let mut view = InspectorView::new(Theme::default());
+    let t = rows_of(&mut view, &s);
+    assert!(t.iter().any(|x| x == "follows edits"), "{t:?}");
+    let pt = find(COLUMN, 3.0, |p| {
+        view.hit(p, COLUMN, &s) == Some(InspectorHit::Field(Field::Ripple))
+    })
+    .unwrap();
+    let (actions, _) = emitted(&mut view, down(pt), COLUMN, &s);
+    assert_eq!(
+        actions,
+        vec![Action::Ripple(faderframe_session::RippleOp::Exclude {
+            tracks: vec![bass],
+            excluded: true,
+        })]
+    );
+    send(&mut view, down(pt), COLUMN, &mut s);
+    assert!(s.project().track(bass).unwrap().ripple_excluded);
+    let t = rows_of(&mut view, &s);
+    assert!(t.iter().any(|x| x == "left out · stays put"), "{t:?}");
+}

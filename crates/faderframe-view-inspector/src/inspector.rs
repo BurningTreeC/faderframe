@@ -110,6 +110,8 @@ pub enum Field {
     /// holds (`Action::SetFolderBus`).
     FolderBus,
     Automation,
+    /// Whether ripples of edits elsewhere move it (`Track::ripple_excluded`).
+    Ripple,
     Freeze,
     /// The master: speakers or headphones, the mono check.
     Listen,
@@ -466,6 +468,19 @@ impl InspectorView {
                     };
                     push(Field::Automation, "Automation", value, Kind::Menu);
                 }
+                if !t.is_folder() {
+                    push(
+                        Field::Ripple,
+                        "Ripple",
+                        if t.ripple_excluded {
+                            "left out · stays put"
+                        } else {
+                            "follows edits"
+                        }
+                        .into(),
+                        Kind::Toggle(!t.ripple_excluded),
+                    );
+                }
                 if matches!(t.kind, TrackKind::Audio | TrackKind::Instrument) {
                     let value = if model.bouncing().contains(&t.id) {
                         "rendering…"
@@ -575,6 +590,10 @@ impl InspectorView {
                 folder: t.id,
                 on: !t.is_folder_bus(),
             },
+            Field::Ripple => Action::Ripple(faderframe_session::RippleOp::Exclude {
+                tracks: vec![t.id],
+                excluded: !t.ripple_excluded,
+            }),
             Field::Freeze => {
                 if model.bouncing().contains(&t.id) {
                     return None;
@@ -1594,6 +1613,10 @@ impl CanvasView<Session, Action> for InspectorView {
                 }
                 Field::FolderGroup => "Click to switch · When on, arming, selecting and editing \
                                        clips or a range on one of its tracks reach the others"
+                    .into(),
+                Field::Ripple => "Click to switch · Left out, ripples of edits on other tracks \
+                                  never move it (a music bed, a reference); its own edits \
+                                  still ripple"
                     .into(),
                 Field::FolderBus => {
                     "Click to switch: a folder bus sums the tracks it holds (as the \

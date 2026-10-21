@@ -8,6 +8,9 @@ struct Transaction {
     /// Inverses in application order (undo applies them in reverse).
     inverses: Vec<Command>,
     keys: Vec<CoalesceKey>,
+    /// Where [`History::rewind`] goes back to: how many inverses and keys
+    /// there were at [`History::mark`].
+    mark: Option<(usize, usize)>,
 }
 
 impl Transaction {
@@ -16,14 +19,18 @@ impl Transaction {
             label,
             inverses: Vec::new(),
             keys: Vec::new(),
+            mark: None,
         }
     }
 
     fn record(&mut self, inverse: Command, key: Option<CoalesceKey>) {
         if let Some(k) = key {
             // Idempotent setters: the first inverse already restores the
-            // pre-transaction value; later ones would be redundant.
-            if self.keys.contains(&k) {
+            // pre-transaction value; later ones would be redundant. After
+            // a mark only those since count: a rewind must undo what was
+            // set after it, whatever was set before.
+            let since = self.mark.map_or(0, |m| m.1);
+            if self.keys[since..].contains(&k) {
                 return;
             }
             self.keys.push(k);
@@ -97,6 +104,46 @@ impl History {
 
     pub fn in_gesture(&self) -> bool {
         self.depth > 0
+    }
+
+    /// Mark the open gesture where it is now, for [`History::rewind`]; a
+    /// gesture keeps its first mark until it ends. False (nothing marked)
+    /// outside a gesture.
+    pub fn mark(&mut self) -> bool {
+        match &mut self.open {
+            Some(tx) if self.depth > 0 => {
+                if tx.mark.is_none() {
+                    tx.mark = Some((tx.inverses.len(), tx.keys.len()));
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Undo what the open gesture did since its mark; the gesture stays
+    /// open and marked. A drag whose every motion is computed afresh from
+    /// how things were at the mark — one that splits clips or cuts curves
+    /// on the way, which no later motion could take back — rewinds before
+    /// each motion. Returns how much the engine must update.
+    pub fn rewind(&mut self, project: &mut Project) -> Result<Impact, EditError> {
+        let Some(tx) = self.open.as_mut().filter(|_| self.depth > 0) else {
+            return Ok(Impact::None);
+        };
+        let Some((inverses, keys)) = tx.mark else {
+            return Ok(Impact::None);
+        };
+        let undo = tx.inverses.split_off(inverses.min(tx.inverses.len()));
+        tx.keys.truncate(keys);
+        let impact = undo
+            .iter()
+            .map(Command::impact)
+            .max()
+            .unwrap_or(Impact::None);
+        for inv in undo.into_iter().rev() {
+            inv.apply(project)?;
+        }
+        Ok(impact)
     }
 
     /// Drop the open gesture, undoing what it did (nothing is recorded).
@@ -294,5 +341,55 @@ mod amend_tests {
                 .bpm_at(faderframe_timeline::MusicalTime::ZERO),
             120.0
         );
+    }
+}
+
+#[cfg(test)]
+mod rewind_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use crate::Project;
+    use faderframe_timeline::MusicalTime;
+
+    fn bpm(p: &Project) -> f64 {
+        p.timeline.tempo.bpm_at(MusicalTime::ZERO)
+    }
+
+    /// A rewind undoes what followed the mark — a setter done before it
+    /// too — and the gesture stays one undo step.
+    #[test]
+    fn a_rewind_goes_back_to_the_mark_and_the_gesture_stays_one_step() {
+        let mut p = Project::new("A", 48_000);
+        let before = bpm(&p);
+        let mut h = History::default();
+        assert!(!h.mark(), "no gesture, no mark");
+        h.begin("Drag");
+        h.apply(&mut p, Command::SetTempo { bpm: 100.0 }).unwrap();
+        assert!(h.mark());
+        for v in [110.0, 120.0, 130.0] {
+            h.rewind(&mut p).unwrap();
+            assert_eq!(bpm(&p), 100.0, "back at the mark");
+            h.apply(&mut p, Command::SetTempo { bpm: v }).unwrap();
+            h.apply(
+                &mut p,
+                Command::RenameProject {
+                    name: format!("{v}"),
+                },
+            )
+            .unwrap();
+        }
+        // A second mark keeps the first.
+        assert!(h.mark());
+        h.rewind(&mut p).unwrap();
+        assert_eq!(bpm(&p), 100.0);
+        assert_eq!(p.name, "A");
+        h.apply(&mut p, Command::SetTempo { bpm: 140.0 }).unwrap();
+        h.end();
+        assert_eq!(h.undo_labels(), vec!["Drag"]);
+        h.undo(&mut p).unwrap();
+        assert_eq!(bpm(&p), before, "one undo takes the whole gesture back");
+        h.redo(&mut p).unwrap();
+        assert_eq!(bpm(&p), 140.0);
     }
 }

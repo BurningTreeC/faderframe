@@ -271,6 +271,10 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
     let (mut session, error, open) = build_session(&options, &prefs);
     session.editor.snap = prefs.snap;
     session.editor.snap_objects = prefs.snap_objects;
+    session.editor.ripple = faderframe_session::RippleSettings {
+        on: false,
+        ..prefs.ripple
+    };
     session.editor.follow_playhead = prefs.follow_playhead;
     session.editor.stop_to_start = prefs.stop_to_start;
     session.editor.insertion_follows_playback = !prefs.return_to_play_start;

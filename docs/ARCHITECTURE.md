@@ -5348,10 +5348,12 @@ full width under the header by `faderframe-ui`, wrapped into rows by
 * `Selection::range` is the edit selection (a time range on the selected
   tracks). Range operations — separate, trim, clear, copy/cut/paste, repeat,
   insert silence, nudge, Tab — and clip edits are `Batch` commands, one
-  undo step each; Shuffle mode closes and opens gaps. Time added or taken
-  away on tracks (Insert Silence, Shuffle clears, Shuffle pastes) moves
-  their automation too (`clipboard::LaneWork`: one `SetAutomationLane`
-  per changed lane, the value at the edit point held over inserted time).
+  undo step each; rippling (Shuffle, or ripple on: see "Ripple editing")
+  closes and opens gaps. Time added or taken away on tracks (Insert
+  Silence, ripple clears and pastes) moves their automation too
+  (`clipboard::LaneWork::ripple`: one `SetAutomationLane` per changed
+  lane, `AutomationCurve::ripple` holding the value at the edit point over
+  inserted time).
   Clear, Cut and Delete of a range in the other modes take the range's
   automation out, as Copy takes it (`LaneWork::clear_time`,
   `curve_cleared`: the points in it go, anchors at both edges keep the
@@ -5807,8 +5809,9 @@ master with CD-Text), surround beds and objects with ADM BWF (Dolby Atmos
 master profile) and IAMF masters, and binaural monitoring (measured heads
 or a SOFA file, headphone correction) with a mono check.
 
-Editing: Pro Tools-style edit modes and tools, edit-selection ranges, clip
-gain, shaped fades, transient detection, warp markers and pitch-preserving
+Editing: Pro Tools-style edit modes and tools, ripple editing (per
+track, on chosen tracks or across the whole project with the timeline,
+automation moving in sync), edit-selection ranges, clip gain, shaped fades, transient detection, warp markers and pitch-preserving
 playback, sample-level waveform redraw, global lanes for markers, song
 sections (moved, copied and deleted with their content), time signatures
 and the tempo map, and track colours from a colour chooser.
@@ -6386,7 +6389,8 @@ arranger's objects, before the grid; Shift moves freely there
   samples with Snap to Samples). So in Slip only objects attract.
 * **What is edited is never a target** (`SnapSkip`): the moved or trimmed
   clips, the dragged marker or section, the selection while it is drawn,
-  the loop while it is dragged.
+  the loop while it is dragged — nor what a ripple drag moves along with
+  them (see "Ripple editing").
 * **Which edge snaps**: a moved group by its leading or trailing edge or the
   grabbed clip's start or end — whichever is nearest an object, all moving
   by the same shift; a trim by the trimmed edge (audio ends then land on
@@ -6406,6 +6410,119 @@ name (`SnapObject::label`) on a chip; it goes with the release. Tests:
 `snap_tests.rs` (`the_play_start_marker_drags_in_the_ruler_and_snaps`,
 `automation_points_tempo_points_and_chords_snap_to_objects`), piano roll
 `notes_snap_to_other_notes_and_objects`.
+
+### Ripple editing
+
+When an edit changes how much time something takes, a ripple moves what
+follows it — on the tracks the edit is on, on the tracks chosen with them,
+or across the whole project (`faderframe_session::ripple`, the pure parts
+in `faderframe_project::ripple` and `faderframe_automation::ripple`).
+
+* **When**: Shuffle mode always ripples (its moves reorder clips, as in Pro
+  Tools); `RippleSettings::on` makes Grid, Slip and Spot ripple too —
+  snapping as their mode does — with moves pushing what follows them
+  (`Session::ripples`). `RippleOp::Toggle` (Ctrl+Alt+R, the edit toolbar's
+  *Ripple*, Edit → Ripple) switches it; off leaves Shuffle for Slip.
+* **Where** (`RippleScope`, the toolbar's *Track ▾ / Selected ▾ / All ▾*,
+  `app.ripple-scope`): *Edited Tracks* — track-selective, only the tracks
+  the edit is on; *Selected Tracks* — those and every selected track (and
+  what folder groups add), together; *All Tracks* — global, every track and
+  the timeline's parts the settings choose (`RippleSettings::{markers,
+  tempo, harmony}`: markers, sections, loop and punch ranges and the Play
+  Start Marker; tempo and metre; key, chords and lyrics). Video stays: the
+  picture is what sound is edited against. A track left out
+  (`Track::ripple_excluded`, `Command::SetTrackRippleExcluded`, the track
+  menu's *Leave Out of Ripples*, the Inspector's *Ripple* line, its header
+  says "no ripple") is never moved by edits elsewhere; its own edits still
+  ripple. Frozen tracks are left out with a notice (their audio is fixed;
+  once a gesture). Folders hold nothing and are skipped.
+* **The model**: a ripple is a list of `RippleShift { cut, delta }` — at or
+  after `cut` everything moves by `delta`; a negative one takes
+  `[cut + delta, cut)` out — in the coordinates before any of them,
+  applied from the latest cut back (`RippleShift::ordered`). The tracks the
+  edit is on are *moved* (`ClipRipple::Moved`: clips at or after a cut move,
+  into a span taken out onto its start, none is cut — a crossfaded
+  neighbour is not trimmed; the edit places its own clips); the tracks kept
+  in sync are *cut* (`ClipRipple::Cut`: their time opens or closes at the
+  same place, a clip across a cut is split, what lies in a span taken out
+  goes). Positions are worked out with the old tempo map; a changed
+  timeline is the batch's last command. With several edited clips each
+  moves what follows it on its own track and the tracks kept in sync follow
+  the first of them.
+* **Automation** is its own entity on every track that ripples, moved by
+  the same shifts at the same cuts (`LaneWork::ripple` →
+  `AutomationCurve::ripple`): opening time duplicates a point on the cut
+  (one copy stays, one moves) or gives a cut segment two points at its
+  value there; the gap holds that value (of a jump on the cut the first
+  point's: the jump moves with what follows). Taking time out keeps the
+  value reached at the span's start and jumps there to the value the curve
+  had at its end. Linear, step and exponential pieces keep their shape
+  exactly; a cut smooth segment is redrawn as straight pieces within
+  `SMOOTH_TOLERANCE` (0.1 % of its rise). Binary search and `split_off`:
+  O(log n + k) for k points after the cut. Shuffle reorders carry the
+  moved clip's stretch of automation along (`range_automation`,
+  `LaneWork::write_range`); clip moves without rippling carry none.
+* **The timeline's parts** (`ripple::global_commands`): markers move (into
+  a span taken out: onto its start); sections, the loop and punch map as
+  ranges (one across an opened cut grows, one inside a span taken out
+  goes); key changes move (the last one inside a span taken out carries on
+  from its start); chords and lyrics as ranges (lines starting in a span
+  taken out go); tempo: the tempo at the cut holds over an opened gap, a
+  ramp across a cut keeps its slope on both sides (`rippled_tempo`; when
+  taking out, a tick short of the seam: tempo points cannot share a place);
+  signatures move by whole bars from a bar line only.
+* **What ripples**: trims and time-stretch trims of the end keep the clip's
+  start and move what follows by the change of length (a start trim at the
+  start: what was trimmed off its head); moves push what follows the moved
+  clips on their tracks (clips they pass over stay; `push_commands`);
+  nudges and Spot push; Delete and Cut of clips close the time they took
+  (Edited: on each clip's track; Selected/All: the time of all of them);
+  Clear and Cut of a range close it; paste, duplicate, repeat and Insert
+  Silence open room; Trim to Selection closes up both ends (take folders
+  are not trimmed). Explicit commands ripple whatever the mode
+  (`Action::Ripple(RippleOp::…)`, Edit → Ripple, `app.ripple-edit::<op>`):
+  `DeleteClips(scope)`, `DeleteRange(scope)` (Shift+Delete in the
+  arranger: the range, else the clips, as far as the settings reach;
+  Ctrl+Shift+Delete in all tracks), `InsertTime(scope)`,
+  `RemoveGaps(scope)` (Edited: between the selected clips on their tracks;
+  All: the time no track that ripples has a clip in, between the selected
+  clips' ends or over the song) and `Offset { cut, delta, track }` —
+  `Session::apply_ripple_offset(cut_time, delta_t, track_id)`: one track
+  (cut) or, `None`, every track with the timeline.
+* **Drags stay lossless**: a ripple splits clips and cuts curves on the
+  way, which the next motion could not take back from where the last one
+  left things. `History::mark` marks the open gesture at its first ripple
+  motion and `History::rewind` undoes what it did since (a mark makes
+  coalescing count only keys recorded after it, so a setter done before is
+  recorded again); every motion of `move_clips`, `trim_clips`, `trim_clip`
+  and `stretch_clip` rewinds (`Session::rewind_ripple`) and is worked out
+  afresh from the material as it was; `ripple_batch` tells the engine about
+  the rewind with the edit (or on its own when that changes less). Dragging
+  back gives the project back exactly; the drag is one undo step. What the
+  drag moves along (`RippleGesture::moved`: clips, and with All Tracks the
+  markers, sections, loop and Play Start Marker after the edit) is no snap
+  target while it moves.
+* **Seeing it**: while a ripple drag runs, the arranger tints the rows that
+  move from the edit on and marks the cut (All Tracks: a line through the
+  whole view; `ArrangerView::ripple_drag`); its corner reads "RIPPLE
+  TRACK/SELECTED/ALL" while editing ripples; the edit toolbar shows the
+  switch and the scope; Edit → Ripple has the switch, the scope (radio),
+  the three "follow" checks, the commands and *Leave Selected Tracks Out of
+  Ripples* (`toggles.rs` keeps the checks). The scope and the follow
+  settings are remembered (`Preferences::ripple`); the switch is not —
+  editing starts without rippling, as it starts in Grid mode.
+
+Tests: `faderframe-automation` `ripple::tests` (every shape both ways,
+points on the cut, jumps, the curve's ends, before zero, open then close),
+`faderframe-project` `ripple::tests` and `history::rewind_tests`,
+`session/tests/ripple.rs` (one track or everything, automation in sync,
+the scopes and the tracks cut, ripple deletes per track and everywhere,
+the timeline as chosen, left-out and frozen tracks, a lossless drag that is
+one undo step, pushes, duplicates, gaps, Trim to Selection, Insert Time,
+Shuffle carrying automation), arranger `ripple_tests.rs` and
+`edit_bar::tests::ripple_button_and_menu`, the Inspector's
+`a_track_can_be_left_out_of_ripples`, `toggles::tests::
+ripple_items_follow_the_session`.
 
 ### The drawn grid: every zoom, one strength
 

@@ -326,6 +326,7 @@ impl AppState {
     pub fn dispatch(self: &Rc<Self>, action: Action) {
         let lanes_before = self.session.borrow().editor.lanes;
         let objects_before = self.session.borrow().editor.snap_objects;
+        let ripple_before = self.session.borrow().ripple_settings();
         let result = self.session.borrow_mut().dispatch(action);
         if let Err(e) = result {
             self.report(e, false);
@@ -341,6 +342,7 @@ impl AppState {
             crate::actions::sync_lane_actions(self);
         }
         crate::actions::remember_snap_objects(self, objects_before);
+        crate::actions::remember_ripple(self, ripple_before);
         self.after_change();
     }
 

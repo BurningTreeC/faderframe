@@ -82,6 +82,8 @@ pub(crate) const DEFAULT_SHORTCUTS: &[(&str, &[&str])] = &[
     ("app.edit-tool::scrub", &["<Alt>9"]),
     ("app.edit-tool::pencil", &["<Alt>0"]),
     ("app.edit-tool::smart", &["<Alt>s"]),
+    // Ripple editing on and off (Alt+R repeats in the arranger).
+    ("app.ripple", &["<Control><Alt>r"]),
 ];
 
 /// Whether a command is on now (the check or radio dot its menu item

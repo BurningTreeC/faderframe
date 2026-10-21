@@ -84,6 +84,7 @@ mod midifile;
 pub mod presets;
 pub mod record;
 pub mod render;
+pub mod ripple;
 mod selection;
 pub mod shuttle;
 pub mod slip;
@@ -109,6 +110,7 @@ pub use editing::{
 pub use faderframe_workspace::{
     DEFAULT_INSERT_SLOTS, INSERT_SLOTS_RANGE, MeterMode, STRIP_WIDTH_RANGE, VU_REFERENCE,
 };
+pub use ripple::{RippleMenuEntry, RippleOp, RippleScope, RippleSettings, RippleShift};
 pub use snapping::{SnapHit, SnapObject, SnapSkip};
 pub use sync::{MANUAL_SPEED_RANGE, MtcRate, SyncSettings, SyncSource, SyncStatus, Timecode};
 
@@ -1110,6 +1112,8 @@ pub enum Action {
         track: TrackId,
         at: MusicalTime,
     },
+    /// Ripple settings and the explicit ripple commands ([`ripple`]).
+    Ripple(ripple::RippleOp),
     /// To the next (previous) clip boundary or transient; `extend` grows
     /// the selection.
     TabTo {
@@ -1231,6 +1235,9 @@ pub struct EditorSettings {
     pub quantize: QuantizeSettings,
     /// How far Humanize moves notes and transients.
     pub humanize: groove::HumanizeSettings,
+    /// Ripple editing: whether the other modes ripple too, on which tracks
+    /// and what of the timeline moves along ([`ripple`]).
+    pub ripple: ripple::RippleSettings,
 }
 
 impl Default for EditorSettings {
@@ -1263,6 +1270,7 @@ impl Default for EditorSettings {
             lanes: lanes::GlobalLanes::default(),
             quantize: QuantizeSettings::default(),
             humanize: groove::HumanizeSettings::default(),
+            ripple: ripple::RippleSettings::default(),
         }
     }
 }
@@ -1615,6 +1623,8 @@ pub struct Session {
     /// The clips a running gesture's edits named and those they reach in
     /// folder groups (see [`folder_groups`]): kept for the whole drag.
     grouped_targets: Option<(Vec<ClipId>, Vec<ClipId>)>,
+    /// A running ripple drag's rewinds and what it moves ([`ripple`]).
+    ripple_gesture: ripple::RippleGesture,
     /// Expression of the clipboard's notes (by their original ids).
     note_clipboard_expressions: Vec<faderframe_project::NoteExpression>,
     perf: performance::PerformanceMonitor,
@@ -1875,6 +1885,7 @@ impl Session {
             pitch_clip: None,
             gesture_base: HashMap::new(),
             grouped_targets: None,
+            ripple_gesture: ripple::RippleGesture::default(),
             bounces: Vec::new(),
             mono_check: false,
             mixer_cue: None,
@@ -3754,6 +3765,7 @@ impl Session {
             }
             Action::CancelGesture => {
                 let impact = self.history.cancel(&mut self.project)?;
+                self.ripple_gesture_ended();
                 self.gesture_base.clear();
                 self.grouped_targets = None;
                 self.follow_base.clear();
@@ -3763,6 +3775,9 @@ impl Session {
             Action::EndGesture => {
                 self.mapping_gesture_ended();
                 self.history.end();
+                if !self.history.in_gesture() {
+                    self.ripple_gesture_ended();
+                }
                 self.gesture_base.clear();
                 self.grouped_targets = None;
                 self.follow_base.clear();
@@ -4727,6 +4742,7 @@ impl Session {
             Action::SetClipGain { clip, db } => self.set_clip_gain(clip, db)?,
             Action::SpotClip { clip, start } => self.spot_clip(clip, start)?,
             Action::ShuffleClip { clip, track, at } => self.shuffle_grouped(clip, track, at)?,
+            Action::Ripple(op) => self.ripple_op(op)?,
             Action::TabTo { forward, extend } => self.tab_to(forward, extend)?,
             Action::MoveClips { clips, by, tracks } => self.move_clips(&clips, by, tracks)?,
             Action::TrimClips {
@@ -6263,6 +6279,10 @@ impl Session {
     /// Delete the selected arranger clips (launcher clips go through
     /// their slots); the selection goes with them once they are gone.
     fn delete_selected_clips(&mut self) -> Result<()> {
+        // Rippling, the time they took closes up.
+        if let Some(scope) = self.ripple_scope() {
+            return self.ripple_delete_clips(scope, None);
+        }
         let clips = self.selected_arranger_clips();
         if clips.is_empty() {
             return Ok(());

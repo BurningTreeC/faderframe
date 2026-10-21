@@ -2061,18 +2061,25 @@ impl ArrangerView {
                 .and_then(|v| model.project().track(v))
                 .map(|v| format!(" · {}", v.name))
                 .unwrap_or_default();
+            // Left out of ripples (edits elsewhere never move it): first,
+            // so a narrow header still shows it.
+            let held = if t.ripple_excluded {
+                "No ripple · "
+            } else {
+                ""
+            };
             let text = if t.kind == TrackKind::Vca {
                 let n = model.project().vca_members(t.id).len();
                 format!(
-                    "VCA · {n} track{}{group}{vca}",
+                    "{held}VCA · {n} track{}{group}{vca}",
                     if n == 1 { "" } else { "s" }
                 )
             } else if t.kind == TrackKind::Midi {
                 // Notes only: no channel layout.
-                format!("{}{plug}{out}{group}{vca}", t.kind.label())
+                format!("{held}{}{plug}{out}{group}{vca}", t.kind.label())
             } else {
                 format!(
-                    "{} · {}{input}{plug}{out}{group}{vca}",
+                    "{held}{} · {}{input}{plug}{out}{group}{vca}",
                     t.kind.label(),
                     t.layout.short_name()
                 )
@@ -2379,13 +2386,22 @@ impl ArrangerView {
         // leaves less room.
         let from = self.arrangement_rect(model).right() + 8.0;
         let text_rect = Rect::new(from, corner.y, (corner.right() - from).max(0.0), corner.h);
-        let mut text = format!("GRID {grid}  ·  SNAP {snap}  ·  FOLLOW {follow}");
+        // Rippling, where it reaches comes first.
+        let ripple = if model.ripples() {
+            format!("RIPPLE {}  ·  ", ed.ripple.scope.short().to_uppercase())
+        } else {
+            String::new()
+        };
+        let mut text = format!("{ripple}GRID {grid}  ·  SNAP {snap}  ·  FOLLOW {follow}");
         let engraved = TextStyle::new(th.fonts.tiny, th.console.panel_label)
             .family(FontFamily::Condensed)
             .weight(faderframe_ui_canvas::FontWeight::Bold)
             .tracking(0.6);
         if p.text_width(&text, &engraved) > text_rect.w {
-            text = format!("{grid} · SNAP {snap} · FOLLOW {follow}");
+            text = format!(
+                "{}{grid} · SNAP {snap} · FOLLOW {follow}",
+                ripple.replace("  ·  ", " · ")
+            );
         }
         p.push_clip(text_rect);
         controls::engraved(p, &text, text_rect, th, Align::Start);
@@ -2714,6 +2730,21 @@ impl ArrangerView {
                     if separated { item.separated() } else { item }
                 }),
         );
+        // Ripples elsewhere leave it where it is (a music bed, a
+        // reference); its own edits still ripple.
+        if !t.is_folder() {
+            items.push(
+                MenuItem::new(
+                    "Leave Out of Ripples",
+                    Action::Ripple(faderframe_session::RippleOp::Exclude {
+                        tracks: vec![t.id],
+                        excluded: !t.ripple_excluded,
+                    }),
+                )
+                .checked(t.ripple_excluded)
+                .separated(),
+            );
+        }
         // Freezing and bouncing (tracks with clips).
         if matches!(t.kind, TrackKind::Audio | TrackKind::Instrument) {
             let busy = model.bouncing().contains(&t.id);
@@ -4873,6 +4904,23 @@ impl CanvasView<Session, Action> for ArrangerView {
                     return handled;
                 }
                 let action = match key {
+                    // Shift: a ripple delete whatever the mode (Ctrl too:
+                    // in all tracks) — the range, else the selected clips.
+                    Key::Delete | Key::Backspace if modifiers.shift => {
+                        use faderframe_session::{RippleOp, RippleScope};
+                        let scope = if modifiers.ctrl || modifiers.meta {
+                            RippleScope::All
+                        } else {
+                            model.editor.ripple.scope
+                        };
+                        Some(Action::Ripple(
+                            if model.selection.range.is_some_and(|r| !r.is_empty()) {
+                                RippleOp::DeleteRange(scope)
+                            } else {
+                                RippleOp::DeleteClips(scope)
+                            },
+                        ))
+                    }
                     Key::Delete | Key::Backspace => Some(Action::DeleteInArranger),
                     Key::Char('s') | Key::Char('S') if !modifiers.ctrl => {
                         Some(Action::SplitSelectedAtPlayhead)
@@ -5163,6 +5211,9 @@ mod audit_tests;
 
 #[cfg(test)]
 mod scratch_tests;
+
+#[cfg(test)]
+mod ripple_tests;
 
 /// The launcher clips a payload carries (arrangement clips move inside the
 /// arranger's own drag).

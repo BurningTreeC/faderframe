@@ -15,7 +15,9 @@
 //!   (on whole samples with Snap to Samples).
 //! * What is being edited is never a target: the moved or trimmed clips,
 //!   the dragged marker or section, the selection while it is being
-//!   drawn, the loop while it is being dragged.
+//!   drawn, the loop while it is being dragged — nor what a ripple drag
+//!   moves along with them (the clips after the edit, and with All Tracks
+//!   the markers, sections, loop and Play Start Marker after it).
 //! * A moving group snaps by its leading or trailing edge (or the grabbed
 //!   clip's), whichever is nearest an object; a trim by the trimmed edge;
 //!   a range by its moving edge.
@@ -184,7 +186,7 @@ impl Session {
                 continue;
             }
             for id in &track.clips {
-                if skip.clips.contains(id) {
+                if skip.clips.contains(id) || self.ripple_moving_clip(*id) {
                     continue;
                 }
                 let Some(c) = p.clip(*id) else { continue };
@@ -196,20 +198,30 @@ impl Session {
                 );
             }
         }
+        // The timeline's parts a ripple drag moves along are no target.
+        let still = |at: MusicalTime| self.ripple_moving_timeline().is_none_or(|from| at < from);
         for m in &p.markers {
-            if skip.marker != Some(m.id) {
+            if skip.marker != Some(m.id) && still(m.position) {
                 consider(m.position, SnapObject::Marker(m.id), None);
             }
         }
         for s in &p.sections {
             if skip.section != Some(s.id) {
-                consider(s.start, SnapObject::SectionStart(s.id), None);
-                consider(s.end, SnapObject::SectionEnd(s.id), None);
+                if still(s.start) {
+                    consider(s.start, SnapObject::SectionStart(s.id), None);
+                }
+                if still(s.end) {
+                    consider(s.end, SnapObject::SectionEnd(s.id), None);
+                }
             }
         }
         if let Some(r) = p.loop_range.filter(|_| !skip.loop_range) {
-            consider(r.start, SnapObject::LoopStart, None);
-            consider(r.end, SnapObject::LoopEnd, None);
+            if still(r.start) {
+                consider(r.start, SnapObject::LoopStart, None);
+            }
+            if still(r.end) {
+                consider(r.end, SnapObject::LoopEnd, None);
+            }
         }
         if let Some(r) = self
             .selection
@@ -219,7 +231,7 @@ impl Session {
             consider(r.start, SnapObject::SelectionStart, None);
             consider(r.end, SnapObject::SelectionEnd, None);
         }
-        if let Some(m) = p.play_start.filter(|_| !skip.play_start) {
+        if let Some(m) = p.play_start.filter(|m| !skip.play_start && still(m.at)) {
             consider(m.at, SnapObject::PlayStart, None);
         }
         if !self.transport().playing {

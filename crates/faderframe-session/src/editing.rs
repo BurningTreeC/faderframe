@@ -4,7 +4,9 @@
 //!   to grid lines; relative: moves by whole grid steps), *Slip* moves
 //!   freely, *Shuffle* keeps clips butted together (moving reorders,
 //!   trimming and clearing close or open gaps), *Spot* asks for exact
-//!   positions.
+//!   positions. Ripple editing ([`crate::ripple`]: Shuffle, or ripple on
+//!   in any mode) moves what follows an edit — on the edited tracks, the
+//!   selected ones or all of them with the timeline.
 //! * **Tools**: the Smart tool combines selector (upper half of a clip),
 //!   grabber (lower half), trimmer (edges) and fades (upper corners); the
 //!   single tools do one thing everywhere.
@@ -19,6 +21,8 @@
 //! project's clip commands (split, move, remove, add, set content), with
 //! clip ids allocated up front.
 
+use crate::clipboard::LaneWork;
+use crate::ripple::{RippleScope, RippleShift};
 use crate::{Result, Session, SessionError};
 use faderframe_core::{ClipId, TrackId};
 use faderframe_project::{Clip, ClipContent, Command};
@@ -238,11 +242,12 @@ pub const ZERO_CROSSING_REACH: f64 = 0.005;
 pub(crate) struct Trimmed {
     /// The clip as the gesture first saw it.
     pub base: Clip,
-    /// Its start after the trim (Shuffle: as it was).
+    /// Its start after the trim (rippling: as it was).
     pub start: MusicalTime,
     pub content: ClipContent,
-    /// Whether, in Shuffle mode, what follows moves with its end.
-    pub shuffles: bool,
+    /// Rippling: how what follows moves (in the coordinates before the
+    /// trim; empty when nothing does).
+    pub shifts: Vec<RippleShift>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -508,7 +513,7 @@ impl Session {
         })
     }
 
-    /// Delete the selection range on the selected tracks (Shuffle closes
+    /// Delete the selection range on the selected tracks (a ripple closes
     /// the gap).
     pub(crate) fn clear_range(&mut self) -> Result<bool> {
         self.clear_range_as("Clear")
@@ -517,32 +522,51 @@ impl Session {
     /// [`Self::clear_range`] as the undo step `label`: the clips' parts in
     /// the range and the tracks' automation of it go (as Copy takes both).
     pub(crate) fn clear_range_as(&mut self, label: &str) -> Result<bool> {
+        self.clear_range_scoped(label, self.ripple_scope())
+    }
+
+    /// Clear the range; with `ripple` its time goes too (what follows
+    /// moves up) on the range's tracks and those `ripple` keeps in sync.
+    pub(crate) fn clear_range_scoped(
+        &mut self,
+        label: &str,
+        ripple: Option<RippleScope>,
+    ) -> Result<bool> {
         let Some(r) = self.range() else {
             return Ok(false);
         };
         let tracks = self.edit_tracks();
         let (mut cmds, after) = self.clear_commands(r.start, r.end, &tracks);
-        if self.editor.edit_mode == EditMode::Shuffle {
-            let len = r.length();
+        let shift = RippleShift::remove(r.start, r.end);
+        if ripple.is_some() {
             for (clip, track, start) in after {
                 cmds.push(Command::MoveClip {
                     clip,
                     track,
-                    start: (start - len).max(MusicalTime::ZERO),
+                    start: shift.map(start),
                 });
             }
         }
-        // The tracks' automation of the range goes too: the time itself in
-        // Shuffle, else the points in it (the values outside stay).
-        let mut lanes = crate::clipboard::LaneWork::default();
+        // The tracks' automation of the range goes too: the time itself
+        // when rippling, else the points in it (the values outside stay).
+        let mut lanes = LaneWork::default();
         for &track in &tracks {
-            if self.editor.edit_mode == EditMode::Shuffle {
-                lanes.remove_time(&mut self.project, track, r.start, r.end);
+            if ripple.is_some() {
+                lanes.ripple(&mut self.project, track, &[shift]);
             } else {
                 lanes.clear_time(&mut self.project, track, r.start, r.end);
             }
         }
+        let mut timeline = Vec::new();
+        if let Some(scope) = ripple {
+            let followers = self.ripple_followers(&tracks, scope);
+            let (follow, global) =
+                self.follow_commands(&[shift], &followers, scope == RippleScope::All, &mut lanes);
+            cmds.extend(follow);
+            timeline = global;
+        }
         cmds.extend(lanes.commands());
+        cmds.extend(timeline);
         self.batch(label, cmds)?;
         self.selection.clips.clear();
         Ok(true)
@@ -612,12 +636,17 @@ impl Session {
         Ok(())
     }
 
-    /// Keep only what is inside the range of the clips it touches.
+    /// Keep only what is inside the range of the clips it touches
+    /// (rippling, the clips keep their starts and what follows closes up
+    /// by what went from both ends).
     pub(crate) fn trim_to_selection(&mut self) -> Result<()> {
         let Some(r) = self.range() else {
             return Ok(());
         };
         let tracks = self.edit_tracks();
+        if self.ripples() {
+            return self.ripple_trim_to_selection(r, &tracks);
+        }
         let mut cmds = Vec::new();
         for track in tracks {
             let clips: Vec<Clip> = self.project.clips_of(track).into_iter().cloned().collect();
@@ -666,23 +695,124 @@ impl Session {
         self.batch("Trim to Selection", cmds)
     }
 
+    /// Trim to Selection, rippling: each clip across the range's edges is
+    /// trimmed at both (at zero crossings when that is on), keeping its
+    /// start; take folders are not trimmed (as by a drag).
+    fn ripple_trim_to_selection(&mut self, r: EditRange, tracks: &[TrackId]) -> Result<()> {
+        let mut trims = Vec::new();
+        let mut folders = 0;
+        for &track in tracks {
+            let clips: Vec<Clip> = self.project.clips_of(track).into_iter().cloned().collect();
+            for c in clips {
+                let end = self.clip_end(&c);
+                if end <= r.start || c.start >= r.end {
+                    continue;
+                }
+                let cut = |s: &Self, at: MusicalTime| {
+                    let z = s.cut_at(&c, at);
+                    if s.cuts_inside(&c, z) {
+                        Some(z)
+                    } else {
+                        s.cuts_inside(&c, at).then_some(at)
+                    }
+                };
+                let head = if c.start < r.start {
+                    cut(self, r.start)
+                } else {
+                    None
+                };
+                let tail = if end > r.end { cut(self, r.end) } else { None };
+                if head.is_none() && tail.is_none() {
+                    continue;
+                }
+                if matches!(c.content, ClipContent::Takes(_)) {
+                    folders += 1;
+                    continue;
+                }
+                let mut t = Trimmed {
+                    base: c.clone(),
+                    start: c.start,
+                    content: c.content.clone(),
+                    shifts: Vec::new(),
+                };
+                if let Some(a) = head {
+                    t.content = self.trim_part(&c, ClipEdge::Start, a)?.content;
+                    t.shifts.push(RippleShift::remove(c.start, a));
+                }
+                if let Some(b) = tail {
+                    // The kept part's end, from the start it keeps.
+                    let to = match head {
+                        Some(a) if c.content.is_audio() => {
+                            let p = &self.project;
+                            let rate = f64::from(p.sample_rate.max(1));
+                            let from = p.timeline.to_samples(c.start, rate);
+                            p.timeline
+                                .to_musical(from + self.frames_between(a, b), rate)
+                        }
+                        Some(a) => c.start + (b - a),
+                        None => b,
+                    };
+                    let kept = Clip {
+                        content: t.content.clone(),
+                        ..c.clone()
+                    };
+                    t.content = self.trim_part(&kept, ClipEdge::End, to)?.content;
+                    t.shifts.push(RippleShift::remove(b, end));
+                }
+                trims.push(t);
+            }
+        }
+        if folders > 0 {
+            self.notify(
+                crate::NoticeLevel::Info,
+                format!(
+                    "{folders} take folder{} not trimmed: flatten the comp first",
+                    if folders == 1 { " was" } else { "s were" }
+                ),
+            );
+        }
+        let cmds = self.trims_commands(trims)?;
+        self.batch("Trim to Selection", cmds)
+    }
+
     /// Move everything at or after the range start on the selected tracks
-    /// later by the range's length.
+    /// later by the range's length (rippling: on the tracks the ripple
+    /// keeps in sync too).
     pub(crate) fn insert_silence(&mut self) -> Result<()> {
+        self.insert_time_scoped("Insert Silence", self.ripple_scope())
+    }
+
+    /// Open the range's length at its start on the range's tracks, and on
+    /// those `ripple` keeps in sync.
+    pub(crate) fn insert_time_scoped(
+        &mut self,
+        label: &str,
+        ripple: Option<RippleScope>,
+    ) -> Result<()> {
         let Some(r) = self.range() else {
             return Ok(());
         };
         let tracks = self.edit_tracks();
         let len = r.length();
+        let shift = RippleShift::open(r.start, len);
         let mut cmds = Vec::new();
         // The tracks' automation makes room too (holding the value there).
-        let mut lanes = crate::clipboard::LaneWork::default();
-        for track in tracks {
+        let mut lanes = LaneWork::default();
+        for &track in &tracks {
             cmds.extend(self.insert_time_commands(track, r.start, len));
-            lanes.insert_time(&mut self.project, track, r.start, len);
+            lanes.ripple(&mut self.project, track, &[shift]);
+        }
+        let mut timeline = Vec::new();
+        if let Some(scope) = ripple {
+            let followers = self.ripple_followers(&tracks, scope);
+            let (follow, global) =
+                self.follow_commands(&[shift], &followers, scope == RippleScope::All, &mut lanes);
+            cmds.extend(follow);
+            timeline = global;
         }
         cmds.extend(lanes.commands());
-        self.batch("Insert Silence", cmds)
+        cmds.extend(timeline);
+        self.batch(label, cmds)
     }
 
     /// The nudge distance at `at`.
@@ -733,6 +863,29 @@ impl Session {
             .map(|c| c.start)
             .min()
             .unwrap_or(MusicalTime::ZERO);
+        // Rippling, the clips move as one (by the first one's step) and
+        // push what follows them.
+        if target == NudgeTarget::Move && self.ripples() {
+            let first = clips
+                .iter()
+                .min_by_key(|c| c.start)
+                .map_or(room, |c| c.start);
+            let d = self.nudge_delta(first);
+            let by = if forward {
+                d
+            } else {
+                MusicalTime(-d.min(room).ticks())
+            };
+            for c in &clips {
+                cmds.push(Command::MoveClip {
+                    clip: c.id,
+                    track: c.track,
+                    start: c.start + by,
+                });
+            }
+            cmds.extend(self.push_commands(&clips, by.ticks()));
+            return self.batch("Nudge", cmds);
+        }
         for c in clips {
             let d = self.nudge_delta(c.start);
             match target {
@@ -771,8 +924,8 @@ impl Session {
     }
 
     /// Commands that move one edge of `c` to `to` (clamped to the audio
-    /// available and a minimum length). In Shuffle mode the clip keeps its
-    /// start and the clips after it move along with its end.
+    /// available and a minimum length). Rippling, the clip keeps its start
+    /// and what follows moves by as much as its length changed.
     pub(crate) fn trim_commands(
         &mut self,
         c: &Clip,
@@ -868,87 +1021,96 @@ impl Session {
                 ));
             }
         }
-        if self.editor.edit_mode == EditMode::Shuffle {
-            // The clip stays where it is; what follows closes up or opens.
+        let mut shifts = Vec::new();
+        if self.ripples() {
+            // The clip stays where it is; what follows closes up or opens
+            // by as much as its length changed: at its start (what was
+            // trimmed off its head, or revealed) or at its end.
             start = c.start;
+            let new_end = self.clip_end(&Clip {
+                content: content.clone(),
+                start,
+                ..c.clone()
+            });
+            let delta = new_end - end;
+            if delta != MusicalTime::ZERO {
+                shifts.push(match edge {
+                    ClipEdge::Start if delta < MusicalTime::ZERO => {
+                        RippleShift::remove(c.start, c.start - delta)
+                    }
+                    ClipEdge::Start => RippleShift::open(c.start, delta),
+                    ClipEdge::End => RippleShift::new(end, delta),
+                });
+            }
         }
         Ok(Trimmed {
             base: c.clone(),
             start,
             content,
-            shuffles: true,
+            shifts,
         })
     }
 
-    /// The commands placing trimmed clips. In Shuffle mode every clip
-    /// after a trimmed one's end (on its track, as the gesture first saw
-    /// them) moves by as much as that end moved — the trimmed ones too, so
-    /// several trims on one track add up instead of overlapping.
+    /// The commands placing trimmed clips. Rippling, what follows each on
+    /// its track (as the gesture first saw it) moves by its shifts — the
+    /// other trimmed clips too, so several trims on one track add up
+    /// instead of overlapping — with the automation, and the tracks kept
+    /// in sync follow the first trimmed clip ([`crate::ripple`]).
     pub(crate) fn trims_commands(&mut self, trims: Vec<Trimmed>) -> Result<Vec<Command>> {
-        let shuffle = self.editor.edit_mode == EditMode::Shuffle;
-        // (track, old end, how far it moved) of each shuffling trim.
-        let mut moves: Vec<(TrackId, MusicalTime, i64)> = Vec::new();
-        if shuffle {
-            for t in trims.iter().filter(|t| t.shuffles) {
-                let old_end = self.clip_end(&t.base);
-                let new_end = self.clip_end(&Clip {
-                    content: t.content.clone(),
-                    start: t.start,
-                    ..t.base.clone()
-                });
-                moves.push((t.base.track, old_end, (new_end - old_end).ticks()));
+        let mut per_track: Vec<(TrackId, Vec<RippleShift>)> = Vec::new();
+        for t in trims.iter().filter(|t| !t.shifts.is_empty()) {
+            match per_track.iter_mut().find(|(tr, _)| *tr == t.base.track) {
+                Some((_, shifts)) => shifts.extend(t.shifts.iter().copied()),
+                None => per_track.push((t.base.track, t.shifts.clone())),
             }
         }
-        let shift = |track: TrackId, start: MusicalTime, own: ClipId, trims: &[Trimmed]| {
-            moves
+        let shifts_on = |track: TrackId| {
+            per_track
                 .iter()
-                .zip(trims.iter().filter(|t| t.shuffles))
-                .filter(|((t, old_end, _), x)| *t == track && *old_end <= start && x.base.id != own)
-                .map(|((_, _, d), _)| *d)
-                .sum::<i64>()
+                .find(|(t, _)| *t == track)
+                .map_or(&[][..], |(_, s)| s.as_slice())
         };
         let mut cmds = Vec::new();
         for t in &trims {
-            let by = shift(t.base.track, t.base.start, t.base.id, &trims);
             cmds.push(Command::SetClipContent {
                 clip: t.base.id,
-                start: MusicalTime((t.start.ticks() + by).max(0)),
+                start: RippleShift::map_all(shifts_on(t.base.track), t.start),
                 content: Box::new(t.content.clone()),
             });
         }
-        if shuffle && !moves.is_empty() {
-            let mut tracks: Vec<TrackId> = moves.iter().map(|m| m.0).collect();
-            tracks.sort_unstable();
-            tracks.dedup();
-            for track in tracks {
-                let ids: Vec<ClipId> = self
-                    .project
-                    .clips_of(track)
-                    .into_iter()
-                    .map(|o| o.id)
-                    .filter(|id| !trims.iter().any(|t| t.base.id == *id))
-                    .collect();
-                for id in ids {
-                    let o = self.gesture_clip(id)?;
-                    let by = shift(track, o.start, id, &trims);
-                    if by != 0 {
-                        cmds.push(Command::MoveClip {
-                            clip: id,
-                            track: o.track,
-                            start: MusicalTime((o.start.ticks() + by).max(0)),
-                        });
-                    }
-                }
-            }
+        let Some(scope) = self.ripple_scope().filter(|_| !per_track.is_empty()) else {
+            return Ok(cmds);
+        };
+        let skip: std::collections::BTreeSet<ClipId> = trims.iter().map(|t| t.base.id).collect();
+        let mut lanes = LaneWork::default();
+        for (track, shifts) in per_track.clone() {
+            cmds.extend(self.ripple_moved_commands(track, &shifts, &skip, &mut lanes));
         }
+        // The tracks kept in sync follow the first trimmed clip.
+        let first = trims
+            .iter()
+            .filter(|t| !t.shifts.is_empty())
+            .min_by_key(|t| (t.base.start, t.base.id))
+            .map(|t| t.shifts.clone())
+            .unwrap_or_default();
+        let edited: Vec<TrackId> = per_track.iter().map(|(t, _)| *t).collect();
+        let followers = self.ripple_followers(&edited, scope);
+        let (follow, timeline) =
+            self.follow_commands(&first, &followers, scope == RippleScope::All, &mut lanes);
+        cmds.extend(follow);
+        cmds.extend(lanes.commands());
+        cmds.extend(timeline);
         Ok(cmds)
     }
 
     /// Move one edge of a clip.
     pub fn trim_clip(&mut self, clip: ClipId, edge: ClipEdge, to: MusicalTime) -> Result<()> {
+        if self.ripples() {
+            self.rewind_ripple()?;
+        }
         let c = self.gesture_clip(clip)?;
         let cmds = self.trim_commands(&c, edge, to)?;
-        self.batch("Trim Clip", cmds)
+        self.ripple_batch("Trim Clip", cmds)
     }
 
     /// Fade lengths of an audio clip in frames (clamped to its length).
@@ -1052,24 +1214,43 @@ impl Session {
             track,
             start: dest,
         });
+        // The automation keeps with the clips: the clip's time closes on
+        // its old track and opens where it lands, with the clip's own
+        // stretch of automation when it stays on its track.
+        let (from, to) = (original.start, original.start + len);
+        let mut lanes = LaneWork::default();
+        let carried = if track == original.track {
+            crate::clipboard::range_automation(&self.project, original.track, from, to)
+        } else {
+            Vec::new()
+        };
+        lanes.ripple(
+            &mut self.project,
+            original.track,
+            &[RippleShift::remove(from, to)],
+        );
+        lanes.ripple(&mut self.project, track, &[RippleShift::open(dest, len)]);
+        lanes.write_range(&mut self.project, track, dest, &carried, len);
+        cmds.extend(lanes.commands());
         self.batch("Shuffle Clip", cmds)
     }
 
-    /// Place a clip at an exact position (Spot mode).
+    /// Place a clip at an exact position (Spot mode; rippling, what
+    /// follows it moves as far).
     pub fn spot_clip(&mut self, clip: ClipId, start: MusicalTime) -> Result<()> {
         let c = self
             .project
             .clip(clip)
             .cloned()
             .ok_or_else(|| SessionError::Other(format!("no clip {clip}")))?;
-        self.batch(
-            "Spot Clip",
-            vec![Command::MoveClip {
-                clip,
-                track: c.track,
-                start: start.max(MusicalTime::ZERO),
-            }],
-        )
+        let start = start.max(MusicalTime::ZERO);
+        let mut cmds = vec![Command::MoveClip {
+            clip,
+            track: c.track,
+            start,
+        }];
+        cmds.extend(self.push_commands(std::slice::from_ref(&c), start.ticks() - c.start.ticks()));
+        self.batch("Spot Clip", cmds)
     }
 
     /// Positions Tab stops at: clip boundaries on the selected tracks (all
@@ -1141,6 +1322,12 @@ fn fits(track: &faderframe_project::Track, clip: &Clip) -> bool {
 /// changed relative to where the running gesture found it.
 impl Session {
     pub(crate) fn move_clips(&mut self, clips: &[ClipId], by: i64, tracks: i32) -> Result<()> {
+        // Rippling (not Shuffle, which reorders): what follows is pushed
+        // along, worked out afresh each motion.
+        let push = self.ripples() && self.editor.edit_mode != EditMode::Shuffle;
+        if push {
+            self.rewind_ripple()?;
+        }
         let mut base = Vec::with_capacity(clips.len());
         for id in clips {
             base.push(self.gesture_clip(*id)?);
@@ -1164,7 +1351,7 @@ impl Session {
             fits(t, c).then_some(t.id)
         };
         let all_fit = tracks == 0 || base.iter().all(|c| target(c).is_some());
-        let cmds = base
+        let mut cmds: Vec<Command> = base
             .iter()
             .map(|c| Command::MoveClip {
                 clip: c.id,
@@ -1176,14 +1363,16 @@ impl Session {
                 start: MusicalTime(c.start.ticks() + by),
             })
             .collect();
-        self.batch(
-            if clips.len() > 1 {
-                "Move Clips"
-            } else {
-                "Move Clip"
-            },
-            cmds,
-        )
+        let label = if clips.len() > 1 {
+            "Move Clips"
+        } else {
+            "Move Clip"
+        };
+        if !push {
+            return self.batch(label, cmds);
+        }
+        cmds.extend(self.push_commands(&base, by));
+        self.ripple_batch(label, cmds)
     }
 
     pub(crate) fn trim_clips(
@@ -1193,6 +1382,9 @@ impl Session {
         by: i64,
         stretch: bool,
     ) -> Result<()> {
+        if self.ripples() {
+            self.rewind_ripple()?;
+        }
         let mut parts = Vec::new();
         for id in clips {
             let c = self.gesture_clip(*id)?;
@@ -1212,7 +1404,7 @@ impl Session {
             }
         }
         let cmds = self.trims_commands(parts)?;
-        self.batch(if stretch { "Time Stretch" } else { "Trim Clip" }, cmds)
+        self.ripple_batch(if stretch { "Time Stretch" } else { "Trim Clip" }, cmds)
     }
 
     /// Clip gain: `delta` added to the gain the gesture started from, or

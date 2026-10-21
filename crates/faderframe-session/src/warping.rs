@@ -242,8 +242,11 @@ impl Session {
     /// Time-compress or expand a clip by moving one edge: the audio (or the
     /// notes) keep their content and change speed.
     pub fn stretch_clip(&mut self, clip: ClipId, edge: ClipEdge, to: MusicalTime) -> Result<()> {
+        if self.ripples() {
+            self.rewind_ripple()?;
+        }
         let cmds = self.stretch_commands(clip, edge, to)?;
-        self.batch("Time Stretch", cmds)
+        self.ripple_batch("Time Stretch", cmds)
     }
 
     pub(crate) fn stretch_commands(
@@ -257,7 +260,7 @@ impl Session {
     }
 
     /// The clip (as the gesture first saw it) time-stretched by one edge,
-    /// not yet placed (Shuffle moves what follows an end it stretched).
+    /// not yet placed (rippling moves what follows an end it stretched).
     pub(crate) fn stretch_part(
         &mut self,
         clip: ClipId,
@@ -293,11 +296,22 @@ impl Session {
                 ));
             }
         };
+        let mut shifts = Vec::new();
+        if edge == ClipEdge::End && self.ripples() {
+            let stretched = self.clip_end(&faderframe_project::Clip {
+                content: content.clone(),
+                start,
+                ..c.clone()
+            });
+            if stretched != end {
+                shifts.push(crate::ripple::RippleShift::new(end, stretched - end));
+            }
+        }
         Ok(crate::editing::Trimmed {
             base: c,
             start,
             content,
-            shuffles: edge == ClipEdge::End,
+            shifts,
         })
     }
 

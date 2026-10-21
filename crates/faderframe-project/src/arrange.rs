@@ -133,14 +133,18 @@ const TICK: MusicalTime = MusicalTime(1);
 const SLACK: MusicalTime = MusicalTime(faderframe_timeline::TICKS_PER_QUARTER / 500);
 
 /// Whole bars between `a` and `b` if both are bar lines.
-fn whole_bars(meter: &TimeSignatureMap, a: MusicalTime, b: MusicalTime) -> Option<(i32, i32)> {
+pub(crate) fn whole_bars(
+    meter: &TimeSignatureMap,
+    a: MusicalTime,
+    b: MusicalTime,
+) -> Option<(i32, i32)> {
     let (ba, bb) = (meter.bar_at(a), meter.bar_at(b));
     (meter.bar_start(ba) == a && meter.bar_start(bb) == b).then_some((ba, bb))
 }
 
 /// The tempo curve after the point at or before `at` (constant past the
 /// last point).
-fn segment_curve(tempo: &TempoMap, at: MusicalTime) -> TempoCurve {
+pub(crate) fn segment_curve(tempo: &TempoMap, at: MusicalTime) -> TempoCurve {
     let pts = tempo.points();
     let i = pts.partition_point(|p| p.position <= at).saturating_sub(1);
     if i + 1 < pts.len() {
@@ -150,7 +154,7 @@ fn segment_curve(tempo: &TempoMap, at: MusicalTime) -> TempoCurve {
     }
 }
 
-fn rebuild_tempo(points: Vec<TempoPoint>) -> TempoMap {
+pub(crate) fn rebuild_tempo(points: Vec<TempoPoint>) -> TempoMap {
     let mut sorted = points;
     sorted.sort_by_key(|p| p.position);
     // Later points at the same position win; steps to the same tempo go.
@@ -174,7 +178,7 @@ fn rebuild_tempo(points: Vec<TempoPoint>) -> TempoMap {
     map
 }
 
-fn rebuild_meter(changes: Vec<(i32, TimeSignature)>) -> TimeSignatureMap {
+pub(crate) fn rebuild_meter(changes: Vec<(i32, TimeSignature)>) -> TimeSignatureMap {
     let mut sorted = changes;
     sorted.sort_by_key(|c| c.0);
     let first = sorted.first().map_or(TimeSignature::FOUR_FOUR, |c| c.1);
@@ -186,7 +190,7 @@ fn rebuild_meter(changes: Vec<(i32, TimeSignature)>) -> TimeSignatureMap {
 }
 
 /// Drop changes that repeat the signature before them.
-fn simplify_meter(changes: Vec<(i32, TimeSignature)>) -> Vec<(i32, TimeSignature)> {
+pub(crate) fn simplify_meter(changes: Vec<(i32, TimeSignature)>) -> Vec<(i32, TimeSignature)> {
     let mut sorted = changes;
     sorted.sort_by_key(|c| c.0);
     let mut out: Vec<(i32, TimeSignature)> = Vec::new();

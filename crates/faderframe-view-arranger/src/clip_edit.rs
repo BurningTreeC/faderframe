@@ -2162,6 +2162,44 @@ impl ArrangerView {
         }
     }
 
+    /// A ripple drag running: where its edit is (the earliest trimmed edge
+    /// or moved clip start, as they are now) and the tracks it is on.
+    pub(crate) fn ripple_drag(&self, model: &Session) -> Option<(MusicalTime, Vec<TrackId>)> {
+        if !model.ripples() {
+            return None;
+        }
+        let p = model.project();
+        let (clips, edge) = match &self.edit_drag {
+            Some(EditDrag::Trim {
+                clips,
+                edge,
+                stretch,
+                moved: true,
+                ..
+            }) if !(*stretch && *edge == ClipEdge::Start) => (clips, Some(*edge)),
+            Some(EditDrag::Move {
+                clips,
+                moved: true,
+                ghost: None,
+                ..
+            }) if model.editor.edit_mode != EditMode::Shuffle => (clips, None),
+            _ => return None,
+        };
+        let mut cut: Option<MusicalTime> = None;
+        let mut tracks: Vec<TrackId> = Vec::new();
+        for c in clips.iter().filter_map(|c| p.clip(*c)) {
+            let at = match edge {
+                Some(ClipEdge::End) => c.end(&p.timeline, p.sample_rate),
+                _ => c.start,
+            };
+            cut = Some(cut.map_or(at, |x| x.min(at)));
+            if !tracks.contains(&c.track) {
+                tracks.push(c.track);
+            }
+        }
+        cut.map(|c| (c, tracks))
+    }
+
     /// The edit selection, the Shuffle ghost and tool previews.
     pub(crate) fn paint_edit_overlay(
         &self,
@@ -2190,6 +2228,31 @@ impl ArrangerView {
                 }
                 for x in [self.x_of(r.start), self.x_of(r.end)] {
                     p.vline(x, lanes.y, lanes.bottom(), Color::rgba(0.6, 0.8, 1.0, 0.55));
+                }
+            }
+        }
+        // A ripple drag: from its edit on, the tracks that move are tinted
+        // and the cut marked (All Tracks: across the whole view, the
+        // timeline moving too).
+        if let Some((cut, edited)) = self.ripple_drag(model) {
+            let scope = model.editor.ripple.scope;
+            let mut moving = edited.clone();
+            moving.extend(model.ripple_followers(&edited, scope));
+            let x = self.x_of(cut).max(lanes.x);
+            let accent = self.theme.ui.accent;
+            if x < lanes.right() {
+                for (i, t) in tracks.iter().enumerate() {
+                    if moving.contains(&t.id) {
+                        let row = self.row_rect(i, size);
+                        p.fill(
+                            Rect::new(x, row.y, lanes.right() - x, row.h),
+                            accent.with_alpha(0.07),
+                        );
+                        p.vline(x, row.y, row.bottom(), accent.with_alpha(0.85));
+                    }
+                }
+                if scope == faderframe_session::RippleScope::All {
+                    p.vline(x, lanes.y, lanes.bottom(), accent.with_alpha(0.35));
                 }
             }
         }

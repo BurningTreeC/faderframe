@@ -502,6 +502,13 @@ pub struct Track {
     /// default; [`crate::Command::SetFolderGroup`] switches it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub folder_group: bool,
+    /// Left out of ripple editing: edits on other tracks never move it,
+    /// whichever tracks they ripple — a music bed under a dialogue edit, a
+    /// reference or sync track — while its own edits ripple as usual
+    /// (see `faderframe_session::ripple`). Off by default;
+    /// [`crate::Command::SetTrackRippleExcluded`] switches it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ripple_excluded: bool,
     /// Sources that move the track's parameters (LFOs, followers, …).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub modulators: Vec<crate::modulation::Modulator>,
@@ -616,6 +623,7 @@ impl Track {
             folder: None,
             folder_bus: false,
             folder_group: false,
+            ripple_excluded: false,
             modulators: Vec::new(),
             containers: Default::default(),
         }

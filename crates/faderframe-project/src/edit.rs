@@ -409,6 +409,12 @@ pub enum Command {
         track: TrackId,
         on: bool,
     },
+    /// Leave a track out of ripple editing, or take it in again
+    /// ([`Track::ripple_excluded`]).
+    SetTrackRippleExcluded {
+        track: TrackId,
+        excluded: bool,
+    },
     /// Freeze (`Some`) or unfreeze a track.
     SetTrackFreeze {
         track: TrackId,
@@ -928,6 +934,10 @@ impl Command {
             SetFolderBus { on: false, .. } => "Make Folder Plain".into(),
             SetFolderGroup { on: true, .. } => "Group Folder".into(),
             SetFolderGroup { on: false, .. } => "Ungroup Folder".into(),
+            SetTrackRippleExcluded { excluded: true, .. } => "Exclude from Ripple".into(),
+            SetTrackRippleExcluded {
+                excluded: false, ..
+            } => "Include in Ripple".into(),
             SetTrackFreeze {
                 freeze: Some(_), ..
             } => "Freeze Track".into(),
@@ -1086,6 +1096,7 @@ impl Command {
             | UpdateGroup { .. }
             | SetTrackGroup { .. }
             | SetFolderGroup { .. }
+            | SetTrackRippleExcluded { .. }
             | SetClipLink { .. }
             | SetAlbum { .. }
             | SetLyrics { .. }
@@ -1804,6 +1815,14 @@ impl Command {
                 }
                 let old = std::mem::replace(&mut t.folder_group, on);
                 SetFolderGroup { track, on: old }
+            }
+            SetTrackRippleExcluded { track, excluded } => {
+                let t = track_mut(p, track)?;
+                let old = std::mem::replace(&mut t.ripple_excluded, excluded);
+                SetTrackRippleExcluded {
+                    track,
+                    excluded: old,
+                }
             }
             SetTrackFreeze { track, freeze } => {
                 let t = track_mut(p, track)?;

@@ -1,9 +1,10 @@
-//! The edit toolbar: edit modes, tools, grid and nudge values, editing
-//! options, the selection counters and zoom — shown full width under the
-//! transport (toggled there).
+//! The edit toolbar: edit modes, ripple editing, tools, grid and nudge
+//! values, editing options, the selection counters and zoom — shown full
+//! width under the transport (toggled there).
 
 use faderframe_session::{
-    Action, CounterUnit, EditFlag, EditMode, EditTool, GridMode, NudgeValue, Session, ZoomRequest,
+    Action, CounterUnit, EditFlag, EditMode, EditTool, GridMode, NudgeValue, RippleOp, Session,
+    ZoomRequest,
 };
 use faderframe_timeline::{GridDivision, MusicalTime, format_seconds};
 use faderframe_ui_canvas::{
@@ -16,6 +17,10 @@ use faderframe_ui_canvas::{
 pub enum Item {
     Mode(EditMode),
     GridModeMenu,
+    /// Ripple editing on or off.
+    Ripple,
+    /// Where ripples reach, what follows them and the ripple commands.
+    RippleMenu,
     Tool(EditTool),
     TrimMenu,
     GrabMenu,
@@ -41,6 +46,20 @@ pub fn grid_menu(current: GridDivision) -> Vec<MenuItem<Action>> {
         .into_iter()
         .map(|e| {
             let item = MenuItem::new(e.label, Action::SetGrid(e.division)).checked(e.checked);
+            if e.separated { item.separated() } else { item }
+        })
+        .collect()
+}
+
+/// The ripple menu (shared by the arranger).
+pub fn ripple_menu(s: &Session) -> Vec<MenuItem<Action>> {
+    s.ripple_menu()
+        .into_iter()
+        .map(|e| {
+            let item = match e.action {
+                Some(a) => MenuItem::new(e.label, a).checked(e.checked),
+                None => MenuItem::disabled(e.label),
+            };
             if e.separated { item.separated() } else { item }
         })
         .collect()
@@ -106,6 +125,15 @@ impl EditToolbarView {
             },
             false,
             42.0,
+        );
+        flow.group();
+        add(&mut flow, Item::Ripple, "Ripple".into(), s.ripples(), 54.0);
+        add(
+            &mut flow,
+            Item::RippleMenu,
+            format!("{} ▾", e.ripple.scope.short()),
+            false,
+            70.0,
         );
         flow.group();
         let is = |t: &[EditTool]| t.contains(&e.tool);
@@ -372,6 +400,12 @@ impl EditToolbarView {
             Item::Mode(EditMode::Spot) => "Spot (Alt+3): clicking a clip asks for its position".into(),
             Item::Mode(EditMode::Grid) => "Grid (Alt+4): snap to the grid".into(),
             Item::GridModeMenu => "Grid mode: Absolute (to grid lines) or Relative (by grid steps)".into(),
+            Item::Ripple => {
+                "Ripple Editing (Ctrl+Alt+R): trims, deletes, moves and pastes move what follows — in any edit mode (Shuffle always ripples)".into()
+            }
+            Item::RippleMenu => {
+                "Where ripples reach — the edited tracks, the selected tracks too, or all tracks and the timeline — what follows a global ripple, and the ripple commands (Shift+Delete: ripple delete; Ctrl+Shift+Delete: in all tracks)".into()
+            }
             Item::Tool(EditTool::Smart) => {
                 "Smart tool (Alt+S): select in the upper half, grab in the lower half, trim at the edges, fade at the upper corners, drag the dB readout for clip gain".into()
             }
@@ -441,6 +475,11 @@ impl EditToolbarView {
                     MenuItem::new("Relative Grid", Action::SetGridMode(GridMode::Relative))
                         .checked(e.grid_mode == GridMode::Relative),
                 ],
+            }),
+            Item::Ripple => cx.emit(Action::Ripple(RippleOp::Toggle)),
+            Item::RippleMenu => cx.request(HostRequest::ContextMenu {
+                at,
+                items: ripple_menu(s),
             }),
             Item::Tool(t) => cx.emit(Action::SetEditTool(t)),
             Item::TrimMenu => cx.request(HostRequest::ContextMenu {
@@ -684,6 +723,46 @@ mod tests {
         let mut p = RecordingPainter::new();
         v.paint(&mut p, Size::new(1900.0, 36.0), &s, &Theme::default());
         assert!(p.texts().iter().any(|t| t.starts_with("Start ")));
+    }
+
+    /// The Ripple button switches rippling in the mode there is; its menu
+    /// chooses the scope (the button shows it) and offers the commands.
+    #[test]
+    fn ripple_button_and_menu() {
+        use faderframe_session::RippleScope;
+        let mut s = Session::demo(EngineConfig::default()).unwrap();
+        let mut v = EditToolbarView::new(Theme::default());
+        assert!(!s.ripples());
+        click(&mut v, &mut s, Item::Ripple);
+        assert!(s.ripples());
+        assert_eq!(s.editor.edit_mode, EditMode::Grid, "the grid stays");
+        let menus = click(&mut v, &mut s, Item::RippleMenu);
+        let Some(HostRequest::ContextMenu { items, .. }) = menus.first() else {
+            panic!("ripple menu")
+        };
+        let all = items
+            .iter()
+            .find(|i| i.label == "All Tracks and the Timeline")
+            .unwrap();
+        assert_eq!(all.checked, Some(false));
+        assert!(
+            items
+                .iter()
+                .any(|i| i.label == "Ripple Delete Selected Clips in All Tracks"),
+        );
+        s.dispatch(all.action.clone().unwrap()).unwrap();
+        assert_eq!(s.editor.ripple.scope, RippleScope::All);
+        let labels: Vec<String> = v
+            .items(Size::new(1900.0, 36.0), &s)
+            .into_iter()
+            .map(|(_, _, l, _)| l)
+            .collect();
+        assert!(labels.iter().any(|l| l == "All ▾"), "{labels:?}");
+        // Shuffle always ripples: switching off leaves it for Slip.
+        click(&mut v, &mut s, Item::Mode(EditMode::Shuffle));
+        click(&mut v, &mut s, Item::Ripple);
+        assert!(!s.ripples());
+        assert_eq!(s.editor.edit_mode, EditMode::Slip);
     }
 }
 

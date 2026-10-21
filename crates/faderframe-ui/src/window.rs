@@ -504,8 +504,43 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
     ] {
         tools.append_item(&target(label, "app.edit-tool", arg));
     }
+    // Ripple editing: the switch, where ripples reach (`app.ripple-scope`),
+    // what follows a global one (`crate::toggles`), the ripple commands
+    // (`app.ripple-edit::<op>`, see `actions::ripple_edit`).
+    let ripple = gio::Menu::new();
+    ripple.append_section(None, &section(&crate::toggles::RIPPLE_ITEMS[..1]));
+    let scopes = gio::Menu::new();
+    for (label, id) in [
+        ("Edited Tracks Only", "edited"),
+        ("Edited and Selected Tracks", "selected"),
+        ("All Tracks and the Timeline", "all"),
+    ] {
+        scopes.append_item(&target(label, "app.ripple-scope", id));
+    }
+    ripple.append_section(Some("Ripples Reach"), &scopes);
+    ripple.append_section(
+        Some("All Tracks"),
+        &section(&crate::toggles::RIPPLE_ITEMS[1..4]),
+    );
+    let ripple_ops = gio::Menu::new();
+    for (label, arg) in [
+        ("Ripple Delete (Shift+Delete)", "delete"),
+        (
+            "Ripple Delete in All Tracks (Ctrl+Shift+Delete)",
+            "delete-all",
+        ),
+        ("Ripple Delete Clips on Their Tracks", "delete-clips"),
+        ("Insert Time in All Tracks", "insert-time-all"),
+        ("Remove Gaps Between Selected Clips", "gaps"),
+        ("Remove Gaps in All Tracks", "gaps-all"),
+    ] {
+        ripple_ops.append_item(&target(label, "app.ripple-edit", arg));
+    }
+    ripple.append_section(None, &ripple_ops);
+    ripple.append_section(None, &section(&crate::toggles::RIPPLE_ITEMS[4..]));
     let edit_opts = gio::Menu::new();
     edit_opts.append_submenu(Some("Edit Mode"), &modes);
+    edit_opts.append_submenu(Some("Ripple"), &ripple);
     edit_opts.append_submenu(Some("Edit Tool"), &tools);
     edit_opts.append_submenu(Some("Edit Options"), &section(&crate::toggles::FLAG_ITEMS));
     edit_opts.append(Some("Edit Toolbar"), Some("app.toggle-edit-toolbar"));

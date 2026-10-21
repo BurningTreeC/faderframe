@@ -38,6 +38,7 @@ pub mod modulation;
 pub mod pitch;
 pub mod preset;
 mod project;
+pub mod ripple;
 pub mod scratch;
 pub mod setlist;
 pub mod spectral;
