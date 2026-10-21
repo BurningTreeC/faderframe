@@ -126,6 +126,8 @@ struct Page {
     device_rows: [gtk::Label; 4],
     /// What each device entry stands for (`None`: the default / none).
     ids: RefCell<[Vec<Option<String>>; 4]>,
+    /// The output device whose rates and buffer sizes are shown.
+    shown_output: RefCell<Option<String>>,
     clock_note: gtk::Label,
     rate: gtk::DropDown,
     rates: RefCell<Vec<Option<u32>>>,
@@ -172,9 +174,13 @@ impl Page {
             l.set_visible(true);
             dd.set_visible(true);
         }
-        set_items(&self.devices[0], &["Looking for devices…".into()], 0);
         let (tx, rx) = std::sync::mpsc::channel();
         *self.scanning.borrow_mut() = Some(rx);
+        // The placeholder is not the user's choice of output device (its
+        // handler would show the previous audio system's scan again).
+        self.building.set(true);
+        set_items(&self.devices[0], &["Looking for devices…".into()], 0);
+        self.building.set(false);
         let spawned = std::thread::Builder::new()
             .name("audio-devices".into())
             .spawn(move || {
@@ -193,7 +199,7 @@ impl Page {
             match got {
                 Some(Ok(scan)) => {
                     page.scanning.borrow_mut().take();
-                    page.show_scan(scan);
+                    page.show_scan(scan, None);
                     glib::ControlFlow::Break
                 }
                 Some(Err(std::sync::mpsc::TryRecvError::Empty)) => glib::ControlFlow::Continue,
@@ -216,11 +222,13 @@ impl Page {
         }
     }
 
-    /// Fill the controls for a scanned audio system.
-    fn show_scan(self: &Rc<Self>, scan: Scan) {
+    /// Fill the controls for a scanned audio system: as stored, or as
+    /// `keep` has them.
+    fn show_scan(self: &Rc<Self>, scan: Scan, keep: Option<Keep>) {
         self.building.set(true);
         self.reload();
         let stored = self.stored();
+        let shown = keep.as_ref().map_or(&stored, |k| &k.settings);
         let choice = scan
             .backend
             .map(|id| stored.devices_for(id))
@@ -283,7 +291,10 @@ impl Page {
             } else {
                 &choice.inputs
             };
-            let wanted = chosen.get(slot % 2).cloned();
+            let wanted = match &keep {
+                Some(k) => k.devices[slot].clone(),
+                None => chosen.get(slot % 2).cloned(),
+            };
             let mut selected = 0;
             if let Some(id) = wanted {
                 match list.iter().position(|x| x.as_deref() == Some(id.as_str())) {
@@ -300,6 +311,7 @@ impl Page {
             ids[slot] = list;
         }
         *self.ids.borrow_mut() = ids;
+        *self.shown_output.borrow_mut() = self.selected_output();
         if caps.input_devices == 0 && scan.backend.is_some() {
             self.device_rows[2].set_visible(true);
             self.devices[2].set_visible(true);
@@ -321,7 +333,7 @@ impl Page {
         };
         let mut rate_list: Vec<Option<u32>> = vec![None];
         rate_list.extend(rates.iter().map(|r| Some(*r)));
-        if let Some(r) = stored.sample_rate
+        if let Some(r) = shown.sample_rate
             && !rate_list.contains(&Some(r))
         {
             rate_list.push(Some(r));
@@ -336,7 +348,7 @@ impl Page {
             .collect();
         let at = rate_list
             .iter()
-            .position(|r| *r == stored.sample_rate)
+            .position(|r| *r == shown.sample_rate)
             .unwrap_or(0);
         set_items(&self.rate, &rate_items, at);
         *self.rates.borrow_mut() = rate_list;
@@ -363,7 +375,7 @@ impl Page {
                 .filter(|b| range.is_none_or(|(lo, hi)| (lo..=hi).contains(*b)))
                 .map(|b| Some(*b)),
         );
-        if let Some(b) = stored.buffer_size
+        if let Some(b) = shown.buffer_size
             && !buffer_list.contains(&Some(b))
         {
             buffer_list.push(Some(b));
@@ -377,7 +389,7 @@ impl Page {
             .collect();
         let at = buffer_list
             .iter()
-            .position(|b| *b == stored.buffer_size)
+            .position(|b| *b == shown.buffer_size)
             .unwrap_or(0);
         set_items(&self.buffer, &buffer_items, at);
         *self.buffers.borrow_mut() = buffer_list;
@@ -386,11 +398,11 @@ impl Page {
                 .map_or(0, |i| i + 1)
         };
         self.inputs
-            .set_selected(count_at(stored.input_channels) as u32);
+            .set_selected(count_at(shown.input_channels) as u32);
         self.outputs
-            .set_selected(count_at(stored.output_channels) as u32);
+            .set_selected(count_at(shown.output_channels) as u32);
         self.force.set_visible(caps.force_format);
-        self.force.set_active(stored.force_format);
+        self.force.set_active(shown.force_format);
         self.system_note
             .set_text(&system_note(&scan, device.as_ref()));
         *self.scan.borrow_mut() = Some(scan);
@@ -952,6 +964,7 @@ pub fn rows(app: &Rc<AppState>, alive: &Rc<Cell<bool>>, g: &gtk::Grid, mut y: i3
         devices,
         device_rows,
         ids: RefCell::default(),
+        shown_output: RefCell::default(),
         clock_note,
         rate,
         rates: RefCell::default(),
@@ -1015,14 +1028,27 @@ pub fn rows(app: &Rc<AppState>, alive: &Rc<Cell<bool>>, g: &gtk::Grid, mut y: i3
     {
         let weak = Rc::downgrade(&page);
         page.devices[0].connect_selected_notify(move |_| {
-            if let Some(p) = weak.upgrade()
-                && !p.building.get()
-                && let Some(scan) = p.scan.borrow().clone()
-            {
-                // Keep the choice made, show what that device takes.
-                let (_, wanted) = p.wanted();
-                p.show_scan_keeping(scan, wanted);
+            if weak.upgrade().is_none_or(|p| p.building.get()) {
+                return;
             }
+            // Not inside this signal: filling the page replaces this
+            // drop-down's model, and with it the selection still emitting.
+            let weak = weak.clone();
+            glib::idle_add_local_once(move || {
+                let Some(p) = weak.upgrade() else {
+                    return;
+                };
+                // Read out first: `show_scan` stores the scan again.
+                let scan = p.scan.borrow().clone();
+                let scanning = p.scanning.borrow().is_some();
+                let other = p.selected_output() != *p.shown_output.borrow();
+                if !scanning
+                    && other
+                    && let Some(scan) = scan
+                {
+                    p.show_scan_keeping(scan);
+                }
+            });
         });
     }
     {
@@ -1070,32 +1096,21 @@ pub fn rows(app: &Rc<AppState>, alive: &Rc<Cell<bool>>, g: &gtk::Grid, mut y: i3
     y
 }
 
+/// The page's unapplied choices, kept when it is filled again.
+struct Keep {
+    /// Each device slot's pick (`None`: the default / none).
+    devices: [Option<String>; 4],
+    /// Rate, buffer size, channels and format as the controls show them.
+    settings: AudioPreferences,
+}
+
 impl Page {
-    /// Show `scan` again with `wanted` as the stored choice (an output
-    /// device changed: the rates and sizes it takes).
-    fn show_scan_keeping(self: &Rc<Self>, scan: Scan, wanted: AudioPreferences) {
-        // The controls read the stored settings; keep the user's picks by
-        // reselecting them after the rebuild.
-        let picks: Vec<Option<String>> = (0..4).map(|s| self.selected_id(s)).collect();
-        let (rate, buffer) = (wanted.sample_rate, wanted.buffer_size);
-        self.show_scan(scan);
-        self.building.set(true);
-        for (slot, id) in picks.iter().enumerate() {
-            let at = self.ids.borrow()[slot]
-                .iter()
-                .position(|x| x == id)
-                .unwrap_or(0);
-            self.devices[slot].set_selected(at as u32);
-        }
-        if let Some(i) = self.rates.borrow().iter().position(|r| *r == rate) {
-            self.rate.set_selected(i as u32);
-        }
-        if let Some(i) = self.buffers.borrow().iter().position(|b| *b == buffer) {
-            self.buffer.set_selected(i as u32);
-        }
-        self.building.set(false);
-        self.update_clock_note();
-        self.update_plan();
+    /// Show `scan` again keeping the choices made (an output device
+    /// changed: the rates and sizes it takes).
+    fn show_scan_keeping(self: &Rc<Self>, scan: Scan) {
+        let devices = std::array::from_fn(|s| self.selected_id(s));
+        let (_, settings) = self.wanted();
+        self.show_scan(scan, Some(Keep { devices, settings }));
     }
 }
 
@@ -1240,4 +1255,69 @@ fn dsp_load(app: &Rc<AppState>) -> String {
             n => format!(" · {n} without realtime priority"),
         }
     )
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::state::RunOptions;
+    use std::time::Instant;
+
+    /// With a display: choosing an output device, then another audio
+    /// system, rebuilds the page from inside its own handlers (both
+    /// panicked with "RefCell already borrowed" in 0.23 and 0.24).
+    #[test]
+    #[ignore = "requires a GTK display"]
+    fn the_output_device_and_the_audio_system_can_be_changed() {
+        gtk::init().expect("GTK display");
+        let session = faderframe_session::Session::new(
+            faderframe_project::Project::new("Audio", 48_000),
+            None,
+            faderframe_engine::EngineConfig::default(),
+        )
+        .unwrap();
+        let options = RunOptions {
+            backend: BackendChoice::Dummy,
+            ..RunOptions::default()
+        };
+        let app = AppState::new(
+            &gtk::Application::new(None::<&str>, Default::default()),
+            session,
+            options,
+        );
+        let alive = Rc::new(Cell::new(true));
+        let grid = gtk::Grid::new();
+        rows(&app, &alive, &grid, 0);
+        let dropdown = |y| grid.child_at(1, y).and_downcast::<gtk::DropDown>().unwrap();
+        let (backend, output) = (dropdown(1), dropdown(2));
+        // Run what is due; a handler that keeps itself going fails.
+        let pump = |start: Instant| {
+            while glib::MainContext::default().iteration(false) {
+                assert!(start.elapsed() < Duration::from_secs(20), "busy");
+            }
+        };
+        // The devices are listed on a thread: wait until they are shown.
+        let listed = || {
+            let start = Instant::now();
+            while !output.is_sensitive() {
+                assert!(start.elapsed() < Duration::from_secs(20), "no devices");
+                pump(start);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        listed();
+        let n = output.model().unwrap().n_items();
+        assert!(n >= 2, "the default and the dummy device");
+        output.set_selected(1);
+        pump(Instant::now());
+        assert_eq!(output.selected(), 1, "the device chosen stays chosen");
+        let auto = BackendChoice::available()
+            .iter()
+            .position(|b| *b == BackendChoice::Auto)
+            .unwrap();
+        backend.set_selected(auto as u32);
+        listed();
+        alive.set(false);
+    }
 }
